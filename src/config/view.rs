@@ -422,6 +422,11 @@ pub(crate) enum NetworkView {
         /// says so in `sbx config` — a capture is never silent.
         capture: String,
         capture_max_kb: Option<u64>,
+        /// What a configured secret seen leaving through a WebSocket does (`warn`/`block`).
+        /// Surfaced for the reason `capture` is: it is a setting only a trusted or global layer can
+        /// write, and it is invisible from inside the cage — a tunnel that was closed on a sighting
+        /// and one that was closed by its peer look the same from there.
+        websocket_secret: String,
         /// Whether a permitted request may ride an upstream connection an earlier one left behind
         /// (`pool`). A transport choice like `http2`, orthogonal to the verdict, and surfaced for a
         /// sharper version of the same reason: the whole `[network]` table is trusted/global-only,
@@ -1329,6 +1334,10 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
             deny: a.deny_rules().iter().map(|r| r.to_string()).collect(),
             mute: a.mute_rules().iter().map(|r| r.to_string()).collect(),
             http2: a.http2_hosts().iter().map(|h| h.display()).collect(),
+            websocket_secret: match a.websocket_secret() {
+                crate::allowlist::WebsocketSecret::Warn => "warn".to_string(),
+                crate::allowlist::WebsocketSecret::Block => "block".to_string(),
+            },
             capture: a.capture_level().as_str().to_string(),
             capture_max_kb: a
                 .capture_level()
@@ -2011,6 +2020,7 @@ mod tests {
                 http2: vec![],
                 capture: "off".to_string(),
                 capture_max_kb: None,
+                websocket_secret: "warn".to_string(),
                 pool: true,
                 ca_roots: true,
                 dns_cache_ttl: Some(30),

@@ -5243,6 +5243,18 @@ fn validate_network_table(
             "{source_label}: `capture_max_kb` is only meaningful with `capture = \"bodies\"` — ignored"
         ));
     }
+    // What a secret seen leaving through a WebSocket does. An unknown value keeps the default, and
+    // the default is the one that does not tear a live tunnel down: the alternative would end a
+    // conversation on a value nobody chose, which is not a safer failure, only a louder one.
+    if let Some(raw) = &table.websocket_secret {
+        match crate::allowlist::WebsocketSecret::parse(raw) {
+            Some(action) => policy = policy.with_websocket_secret(action),
+            None => warnings.push(format!(
+                "{source_label}: ignoring unknown `websocket_secret = `{raw}`` (expected \"warn\" \
+                 or \"block\") — a secret seen leaving a WebSocket is recorded and relayed"
+            )),
+        }
+    }
     // What declaring a table costs, said where it happens. The policy above was *rebuilt* from this
     // table's keys — only an omitted `mode` is inherited — so a setting the layer below carried and
     // this one does not reverts to the built-in value. Every other layered table amends (`[limits]`

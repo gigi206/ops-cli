@@ -374,6 +374,13 @@ pub(crate) struct Request {
     /// matches in both forms, so it admits a little more than its author may have pictured. A rule
     /// that must be exact about a path is a path rule, which is canonical by construction; a regex
     /// names a family.
+    ///
+    /// Which form a rule is matched against is deliberately **not** configurable. A `[network]`
+    /// setting for it would mean a rule no longer says what it matches: two policies with identical
+    /// rule lists would enforce differently, and a reader would have to hold a distant table in
+    /// mind to know what any `re:` does. What would reopen it is an allow-regex someone genuinely
+    /// needs narrowed to one form — and the place for that is the **rule's own syntax**, a second
+    /// prefix beside `re:`, so the rule keeps saying what it matches.
     canonical_url: String,
 }
 
@@ -751,6 +758,40 @@ pub(crate) enum DefaultAction {
     Ask,
 }
 
+/// What the proxy does when a configured secret is seen crossing a WebSocket tunnel outbound.
+///
+/// The four request planes refuse a request carrying a secret. A WebSocket cannot refuse a request,
+/// because past the `101` there are no requests: there is one tunnel two peers agreed the framing
+/// of, relayed byte for byte. So the only refusal available is tearing the tunnel down, which is
+/// why this is a choice rather than the posture.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum WebsocketSecret {
+    /// Record the sighting on the tunnel's own event and keep relaying (the default). What the user
+    /// gets is the fact, while the tunnel is still open.
+    #[default]
+    Warn,
+    /// Record it and close the tunnel, refusing the frames that carried it.
+    ///
+    /// What this buys is bounded by how the bytes arrive, and the bound is worth knowing: the scan
+    /// runs on each chunk read from the cage, before that chunk is written on, so a secret whole
+    /// inside one chunk never crosses. A secret split across chunks has had its first part relayed
+    /// by the time the second completes the match, and the close then stops the rest.
+    Block,
+}
+
+impl WebsocketSecret {
+    /// Parse the config spelling, or `None` for anything else (the caller warns and keeps the
+    /// default, which is the fail-open direction only because the alternative is a tunnel torn down
+    /// on a value nobody chose).
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "warn" => Some(Self::Warn),
+            "block" => Some(Self::Block),
+            _ => None,
+        }
+    }
+}
+
 /// A classified egress policy: an allow list, a deny list, and a default action for a request
 /// that matches neither. Deny always wins. Under [`DefaultAction::Deny`] an empty allow list
 /// permits nothing; under [`DefaultAction::Allow`] the allow list's only remaining effect is the
@@ -906,6 +947,9 @@ pub(crate) struct EgressPolicy {
     /// The `[network] capture_max_kb` per-body cap, in KiB. `None` means the default; the ring
     /// clamps it to its own ceiling. Read via [`Self::capture_body_kb`].
     capture_body_kb: Option<u64>,
+    /// The `[network] websocket_secret` posture: what happens when a configured secret is seen
+    /// leaving through a WebSocket tunnel. Read via [`Self::websocket_secret`].
+    websocket_secret: WebsocketSecret,
     /// Whether the proxy may carry a permitted request over an upstream connection a previous
     /// request left behind (`[network] pool`). On by default, and never a verdict — it changes how
     /// a request that is already allowed is carried, not whether it is. Read via [`Self::pool`].
@@ -961,6 +1005,7 @@ impl EgressPolicy {
             http2: Vec::new(),
             capture: crate::sandbox::control::CaptureLevel::Off,
             capture_body_kb: None,
+            websocket_secret: WebsocketSecret::default(),
             pool: true,
             ca_roots: true,
             idle_timeout: None,
@@ -1021,6 +1066,7 @@ impl EgressPolicy {
             body_max,
             ca_roots,
             capture,
+            websocket_secret,
             ask_timeout,
             suppress_ask_notice,
         } = self;
@@ -1069,6 +1115,11 @@ impl EgressPolicy {
             "capture",
             parent.capture != neutral.capture,
             *capture == neutral.capture,
+        );
+        lost(
+            "websocket_secret",
+            parent.websocket_secret != neutral.websocket_secret,
+            *websocket_secret == neutral.websocket_secret,
         );
         // The two `ask` settings only where the parked wait exists at all. A layer that also changes
         // the posture (`ask` below, `deny` here) does not *drop* them, it leaves the mode they
@@ -1231,6 +1282,18 @@ impl EgressPolicy {
     /// How much of each inspected exchange this launch captures — [`CaptureLevel::Off`](crate::sandbox::control::CaptureLevel::Off) by default.
     pub(crate) fn capture_level(&self) -> crate::sandbox::control::CaptureLevel {
         self.capture
+    }
+
+    /// Set what a secret seen leaving through a WebSocket does (builder style), from
+    /// `[network] websocket_secret`.
+    pub(crate) fn with_websocket_secret(mut self, action: WebsocketSecret) -> Self {
+        self.websocket_secret = action;
+        self
+    }
+
+    /// What a secret seen leaving through a WebSocket does — [`WebsocketSecret::Warn`] by default.
+    pub(crate) fn websocket_secret(&self) -> WebsocketSecret {
+        self.websocket_secret
     }
 
     /// The per-body capture cap in KiB, defaulted here so every caller sizes its buffers alike.

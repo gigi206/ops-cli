@@ -942,6 +942,7 @@ fn net_table(mode: &str, allow: Vec<String>, deny: Vec<String>) -> NetworkField 
         body_max_mb: None,
         ca_roots: None,
         capture: None,
+        websocket_secret: None,
         capture_max_kb: None,
         // A typed `--net` fragment defines no vocabulary and carries no unknown keys: it is built
         // here from five known postures, not parsed from what someone wrote.

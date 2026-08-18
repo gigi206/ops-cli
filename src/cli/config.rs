@@ -952,6 +952,7 @@ fn network_section(view: &config::view::ConfigView, pal: &style::Palette, detail
             http2,
             capture,
             capture_max_kb,
+            websocket_secret,
             pool,
             ca_roots,
             dns_cache_ttl,
@@ -996,6 +997,18 @@ fn network_section(view: &config::view::ConfigView, pal: &style::Palette, detail
                     "    {}",
                     style::dim_prose(
                         &format!("{cap} — read it with `sbx net logs --with-body`"),
+                        pal
+                    )
+                );
+            }
+            // Stated for the same reason, and only when it is not the default: a tunnel closed on a
+            // sighting looks from inside the cage exactly like one its peer closed.
+            if websocket_secret != "warn" {
+                let _ = writeln!(
+                    o,
+                    "    {}",
+                    style::dim_prose(
+                        "websocket secret: block (a tunnel carrying a configured secret out is                          closed)",
                         pal
                     )
                 );
@@ -1716,6 +1729,7 @@ fn render_app_detail(
             http2,
             capture,
             capture_max_kb,
+            websocket_secret,
             pool,
             ca_roots,
             dns_cache_ttl,
@@ -1755,6 +1769,18 @@ fn render_app_detail(
                     "    {}",
                     style::dim_prose(
                         &format!("{cap} — read it with `sbx net logs --with-body`"),
+                        pal
+                    )
+                );
+            }
+            // Stated for the same reason, and only when it is not the default: a tunnel closed on a
+            // sighting looks from inside the cage exactly like one its peer closed.
+            if websocket_secret != "warn" {
+                let _ = writeln!(
+                    o,
+                    "    {}",
+                    style::dim_prose(
+                        "websocket secret: block (a tunnel carrying a configured secret out is                          closed)",
                         pal
                     )
                 );
@@ -3183,6 +3209,7 @@ mod tests {
                 http2: vec![],
                 capture: "off".to_string(),
                 capture_max_kb: None,
+                websocket_secret: "warn".to_string(),
                 pool: true,
                 ca_roots: true,
                 dns_cache_ttl: None,
@@ -3731,6 +3758,7 @@ mod tests {
                 http2: vec![],
                 capture: "off".to_string(),
                 capture_max_kb: None,
+                websocket_secret: "warn".to_string(),
                 pool: true,
                 ca_roots: true,
                 dns_cache_ttl: None,

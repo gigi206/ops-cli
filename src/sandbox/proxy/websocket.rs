@@ -795,18 +795,21 @@ pub(super) struct TunnelObservers<'a> {
 /// once: one side of a live stream can fill in seconds while the other trickles for hours, so a
 /// single shared trigger would strand whichever filled second. The guard drops a filing that would
 /// show what it already showed, which is what keeps the count bounded.
-fn follow(tee: &mut Option<FrameTee>, chunk: &[u8], way: SecretWay, obs: &TunnelObservers) {
+fn follow(tee: &mut Option<FrameTee>, chunk: &[u8], way: SecretWay, obs: &TunnelObservers) -> bool {
     let Some(tee) = tee.as_mut() else {
-        return;
+        return false;
     };
     if tee.push(chunk)
         && let Some(c) = obs.capture
     {
         c.file_frames_snapshot();
     }
+    let mut seen = false;
     for name in tee.sightings() {
         obs.ctx.websocket_secret_seen(obs.seq, &name, way);
+        seen = true;
     }
+    seen
 }
 
 pub(super) fn relay_websocket(
@@ -862,8 +865,22 @@ pub(super) fn relay_websocket(
     // most once: one side of a live stream can fill in seconds while the other trickles for hours,
     // so a single shared trigger would strand whichever filled second. The guard drops a filing that
     // would show what it already showed, which is what keeps the count bounded.
-    follow(&mut tee_up, client_pending, SecretWay::Out, &obs);
-    follow(&mut tee_down, upstream_pending, SecretWay::Back, &obs);
+    // Whether a secret leaving through this tunnel closes it, from `[network] websocket_secret`.
+    // Read from the config policy rather than the effective one: a `--session` overlay amends the
+    // rules and carries every setting through untouched, so the two answer the same and this one
+    // costs no clone.
+    let blocking = obs.ctx.policy.websocket_secret() == crate::allowlist::WebsocketSecret::Block;
+    // The bytes the cage already sent behind its handshake go through the same gate as the ones
+    // that follow: they are the first frames of the tunnel, not a preamble.
+    let pending_seen = follow(&mut tee_up, client_pending, SecretWay::Out, &obs);
+    let _ = follow(&mut tee_down, upstream_pending, SecretWay::Back, &obs);
+    if pending_seen && blocking {
+        client.conn.send_close_notify();
+        upstream.conn.send_close_notify();
+        let _ = flush_tls(&mut client.conn, &mut client.sock);
+        let _ = flush_tls(&mut upstream.conn, &mut upstream.sock);
+        return Ok(());
+    }
     client.sock.set_nonblocking(true)?;
     upstream.sock.set_nonblocking(true)?;
 
@@ -894,9 +911,24 @@ pub(super) fn relay_websocket(
                     upstream.conn.send_close_notify();
                 }
                 Some(n) => {
+                    // Scanned before it is written on, which is the whole of what `block` can
+                    // promise: a secret whole inside this chunk does not reach the upstream at all.
+                    // One split across chunks had its first part relayed a turn ago, and closing
+                    // now stops the rest — the bound is the read size, not the tunnel.
+                    let seen = follow(&mut tee_up, &buf[..n], SecretWay::Out, &obs);
+                    if seen && blocking {
+                        // Closed on both legs rather than dropped: a peer told the tunnel ended
+                        // stops, where one left waiting on a socket that answers nothing retries.
+                        // The sighting is already on the tunnel's own event, which is where a
+                        // reader finds out why it ended.
+                        client.conn.send_close_notify();
+                        upstream.conn.send_close_notify();
+                        let _ = flush_tls(&mut client.conn, &mut client.sock);
+                        let _ = flush_tls(&mut upstream.conn, &mut upstream.sock);
+                        return Ok(());
+                    }
                     upstream.conn.writer().write_all(&buf[..n])?;
                     up.fetch_add(n as u64, Ordering::Relaxed);
-                    follow(&mut tee_up, &buf[..n], SecretWay::Out, &obs);
                     progressed = true;
                 }
                 None => {}
@@ -910,6 +942,10 @@ pub(super) fn relay_websocket(
                     client.conn.send_close_notify();
                 }
                 Some(n) => {
+                    // The way back is recorded and never refused, whatever `websocket_secret` says.
+                    // A secret arriving *into* the cage is not an exfiltration, and the answer the
+                    // request planes give it is redaction rather than refusal — which a relay two
+                    // peers agreed the framing of cannot do without rewriting their stream.
                     client.conn.writer().write_all(&buf[..n])?;
                     down.fetch_add(n as u64, Ordering::Relaxed);
                     follow(&mut tee_down, &buf[..n], SecretWay::Back, &obs);

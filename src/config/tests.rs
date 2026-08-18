@@ -147,6 +147,7 @@ fn net_table_defaults() -> NetworkTable {
         mute: vec![],
         http2: vec![],
         capture: None,
+        websocket_secret: None,
         capture_max_kb: None,
         groups: Default::default(),
         rest: Default::default(),
@@ -236,6 +237,7 @@ fn a_mute_list_classifies_and_expands_groups_like_allow_deny() {
         mute: vec!["@telemetry".into(), "telemetry.example.com".into()],
         http2: vec![],
         capture: None,
+        websocket_secret: None,
         capture_max_kb: None,
         groups: Default::default(),
         rest: Default::default(),
@@ -625,6 +627,7 @@ fn raw_network_table(allow: &[&str], deny: &[&str]) -> RawConfig {
             mute: vec![],
             http2: vec![],
             capture: None,
+            websocket_secret: None,
             capture_max_kb: None,
             groups: Default::default(),
             rest: Default::default(),
@@ -873,6 +876,7 @@ fn an_untrusted_project_app_cannot_widen_its_default_methods() {
         mute: vec![],
         http2: vec![],
         capture: None,
+        websocket_secret: None,
         capture_max_kb: None,
         groups: Default::default(),
         rest: Default::default(),
@@ -1023,6 +1027,7 @@ fn network_modes_set_the_egress_default_action() {
             mute: vec![],
             http2: vec![],
             capture: None,
+            websocket_secret: None,
             capture_max_kb: None,
             groups: Default::default(),
             rest: Default::default(),
@@ -1130,6 +1135,7 @@ fn a_mode_less_table_inherits_a_filtering_parent_and_keeps_its_own_rules() {
             mute: vec![],
             http2: vec![],
             capture: None,
+            websocket_secret: None,
             capture_max_kb: None,
             groups: Default::default(),
             rest: Default::default(),
@@ -1201,6 +1207,7 @@ fn a_table_names_the_settings_of_the_layer_below_it_gives_up() {
             mute: vec![],
             http2: vec![],
             capture: None,
+            websocket_secret: None,
             capture_max_kb: None,
             groups: Default::default(),
             rest: Default::default(),
@@ -1251,6 +1258,19 @@ fn a_table_names_the_settings_of_the_layer_below_it_gives_up() {
     );
     assert!(w[0].contains("re-declare them"), "{}", w[0]);
 
+    // A setting added to the table has to appear here too, or a layer would give it up without a
+    // word. The exhaustive destructure in `settings_dropped_from` is what makes that a compile
+    // error rather than an omission; this is what makes it a message.
+    let w = warn(&NetworkPolicy::Allowlist(
+        EgressPolicy::default().with_websocket_secret(crate::allowlist::WebsocketSecret::Block),
+    ));
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(
+        w[0].contains("does not apply here: `websocket_secret`"),
+        "{}",
+        w[0]
+    );
+
     // One setting: the singular form, because a message that reads as generated invites being
     // skimmed past.
     let w = warn(&NetworkPolicy::Allowlist(
@@ -1285,6 +1305,7 @@ fn a_mode_less_project_network_table_inherits_the_global_mode() {
             mute: vec![],
             http2: vec![],
             capture: None,
+            websocket_secret: None,
             capture_max_kb: None,
             groups: Default::default(),
             rest: Default::default(),
@@ -1330,6 +1351,7 @@ fn a_mode_less_app_network_table_inherits_the_baseline_mode() {
                 mute: vec![],
                 http2: vec![],
                 capture: None,
+                websocket_secret: None,
                 capture_max_kb: None,
                 groups: Default::default(),
                 rest: Default::default(),
@@ -1374,6 +1396,7 @@ fn the_pool_toggle_defaults_on_and_is_gated_trusted_only() {
             mute: vec![],
             http2: vec![],
             capture: None,
+            websocket_secret: None,
             capture_max_kb: None,
             groups: Default::default(),
             rest: Default::default(),
@@ -1443,6 +1466,7 @@ fn ca_roots_defaults_on_and_a_splice_overrides_a_request_to_drop_them() {
             mute: vec![],
             http2: vec![],
             capture: None,
+            websocket_secret: None,
             capture_max_kb: None,
             groups: Default::default(),
             rest: Default::default(),
@@ -1531,6 +1555,7 @@ fn dns_cache_ttl_flows_from_the_table_to_the_policy() {
             mute: vec![],
             http2: vec![],
             capture: None,
+            websocket_secret: None,
             capture_max_kb: None,
             groups: Default::default(),
             rest: Default::default(),
@@ -1572,6 +1597,7 @@ fn the_connection_settings_flow_from_the_table_and_fail_closed_on_a_value_that_w
             mute: vec![],
             http2: vec![],
             capture: None,
+            websocket_secret: None,
             capture_max_kb: None,
             groups: Default::default(),
             rest: Default::default(),
@@ -1663,6 +1689,63 @@ fn the_connection_settings_flow_from_the_table_and_fail_closed_on_a_value_that_w
     );
 }
 
+/// The WebSocket-secret posture flows from the table to the policy, and an unknown value keeps the
+/// default rather than picking one.
+///
+/// The default is the one that does not tear a live tunnel down, so "fails closed" is the wrong
+/// frame here and the reason is written where the value is parsed: closing on a value nobody chose
+/// ends a conversation, and the setting exists because that is a cost only its author can weigh.
+#[test]
+fn the_websocket_secret_posture_flows_from_the_table_and_keeps_the_default_on_a_typo() {
+    use crate::allowlist::WebsocketSecret;
+    let table = |raw: Option<&str>| {
+        NetworkField::Table(NetworkTable {
+            mute: vec![],
+            http2: vec![],
+            capture: None,
+            capture_max_kb: None,
+            websocket_secret: raw.map(str::to_string),
+            groups: Default::default(),
+            rest: Default::default(),
+            mode: Some("deny".into()),
+            allow: vec!["api.example.com".into()],
+            deny: vec![],
+            ask_timeout: None,
+            ask_notice: None,
+            stats: None,
+            default_methods: None,
+            dns_cache_ttl: None,
+            pool: None,
+            idle_timeout: None,
+            max_connections: None,
+            body_max_mb: None,
+            ca_roots: None,
+        })
+    };
+    let mut w = Vec::new();
+
+    let unset = validate_network(&mut w, GLOBAL_CONFIG, table(None)).unwrap();
+    assert!(matches!(&unset, NetworkPolicy::Allowlist(p)
+            if p.websocket_secret() == WebsocketSecret::Warn));
+
+    let blocking = validate_network(&mut w, GLOBAL_CONFIG, table(Some("block"))).unwrap();
+    assert!(matches!(&blocking, NetworkPolicy::Allowlist(p)
+            if p.websocket_secret() == WebsocketSecret::Block));
+    let warning = validate_network(&mut w, GLOBAL_CONFIG, table(Some("warn"))).unwrap();
+    assert!(matches!(&warning, NetworkPolicy::Allowlist(p)
+            if p.websocket_secret() == WebsocketSecret::Warn));
+    assert!(w.is_empty(), "valid values warn nothing: {w:?}");
+
+    let typo = validate_network(&mut w, GLOBAL_CONFIG, table(Some("blocked"))).unwrap();
+    assert!(
+        matches!(&typo, NetworkPolicy::Allowlist(p)
+            if p.websocket_secret() == WebsocketSecret::Warn),
+        "an unknown value keeps the default rather than choosing one"
+    );
+    assert_eq!(w.len(), 1);
+    assert!(w[0].contains("websocket_secret"), "{w:?}");
+}
+
 #[test]
 fn the_capture_level_flows_from_the_table_to_the_policy_and_fails_closed_on_a_typo() {
     use crate::sandbox::control::CaptureLevel;
@@ -1672,6 +1755,7 @@ fn the_capture_level_flows_from_the_table_to_the_policy_and_fails_closed_on_a_ty
             http2: vec![],
             capture: level.map(str::to_string),
             capture_max_kb: kb,
+            websocket_secret: None,
             groups: Default::default(),
             rest: Default::default(),
             mode: Some("deny".into()),
@@ -1734,6 +1818,7 @@ fn an_untrusted_project_cannot_turn_the_capture_on() {
             http2: vec![],
             capture: Some("bodies".into()),
             capture_max_kb: None,
+            websocket_secret: None,
             groups: Default::default(),
             rest: Default::default(),
             mode: Some("deny".into()),
@@ -1764,6 +1849,7 @@ fn an_untrusted_project_cannot_turn_the_capture_on() {
             mute: vec![],
             http2: vec![],
             capture: None,
+            websocket_secret: None,
             capture_max_kb: None,
             groups: Default::default(),
             rest: Default::default(),
@@ -1836,6 +1922,7 @@ fn ask_mode_parses_and_carries_an_optional_timeout() {
             mute: vec![],
             http2: vec![],
             capture: None,
+            websocket_secret: None,
             capture_max_kb: None,
             groups: Default::default(),
             rest: Default::default(),
@@ -1884,6 +1971,7 @@ fn ask_mode_parses_and_carries_an_optional_timeout() {
         mute: vec![],
         http2: vec![],
         capture: None,
+        websocket_secret: None,
         capture_max_kb: None,
         groups: Default::default(),
         rest: Default::default(),
@@ -1916,6 +2004,7 @@ fn ask_notice_defaults_on_and_can_be_silenced() {
             mute: vec![],
             http2: vec![],
             capture: None,
+            websocket_secret: None,
             capture_max_kb: None,
             groups: Default::default(),
             rest: Default::default(),
@@ -1956,6 +2045,7 @@ fn ask_notice_defaults_on_and_can_be_silenced() {
         mute: vec![],
         http2: vec![],
         capture: None,
+        websocket_secret: None,
         capture_max_kb: None,
         groups: Default::default(),
         rest: Default::default(),
@@ -3554,6 +3644,7 @@ fn a_baseline_default_methods_is_ignored_with_a_warning() {
             mute: vec![],
             http2: vec![],
             capture: None,
+            websocket_secret: None,
             capture_max_kb: None,
             groups: Default::default(),
             rest: Default::default(),
@@ -6409,6 +6500,7 @@ fn an_unknown_network_mode_is_dropped_with_a_warning() {
                 mute: vec![],
                 http2: vec![],
                 capture: None,
+                websocket_secret: None,
                 capture_max_kb: None,
                 groups: Default::default(),
                 rest: Default::default(),
@@ -6525,6 +6617,7 @@ fn raw_secrets(allow: &[&str], secrets: Vec<(String, RawHostSecret)>) -> RawConf
             mute: vec![],
             http2: vec![],
             capture: None,
+            websocket_secret: None,
             capture_max_kb: None,
             groups: Default::default(),
             rest: Default::default(),
@@ -6931,6 +7024,7 @@ fn a_one_shot_override_says_what_its_network_table_gives_up() {
             mute: vec![],
             http2: vec![],
             capture_max_kb: None,
+            websocket_secret: None,
             groups: Default::default(),
             rest: Default::default(),
             deny: vec![],
@@ -7383,6 +7477,7 @@ fn the_egress_stats_toggle_defaults_on_and_is_gated_trusted_only() {
             mute: vec![],
             http2: vec![],
             capture: None,
+            websocket_secret: None,
             capture_max_kb: None,
             groups: Default::default(),
             rest: Default::default(),
@@ -7539,6 +7634,7 @@ fn an_apps_network_stats_toggle_is_warned_and_ignored() {
             mute: vec![],
             http2: vec![],
             capture: None,
+            websocket_secret: None,
             capture_max_kb: None,
             groups: Default::default(),
             rest: Default::default(),
@@ -7647,6 +7743,7 @@ fn allowlist_net(allow: &[&str]) -> Option<NetworkField> {
         mute: vec![],
         http2: vec![],
         capture: None,
+        websocket_secret: None,
         capture_max_kb: None,
         groups: Default::default(),
         rest: Default::default(),

@@ -7922,6 +7922,61 @@ fn one_capture(
 /// debugging convenience a user turns on and off — a security check that followed it would be
 /// absent exactly when it was needed.
 #[test]
+fn a_secret_leaving_through_a_websocket_crosses_or_not_by_the_configured_posture() {
+    use crate::allowlist::WebsocketSecret;
+    use crate::sandbox::control::{LOG_RING_CAP, LogRing};
+    const LEAK: &[u8] = br#"{"send":"SECRET-VALUE-0123456789"}"#;
+
+    // The two postures, driven through the same tunnel: what changes is whether the frame the cage
+    // sent reaches the far side. The upstream reports what it received, so this measures the
+    // relay rather than what came back.
+    for (posture, must_reach) in [
+        (WebsocketSecret::Warn, true),
+        (WebsocketSecret::Block, false),
+    ] {
+        let (addr, upstream_ca, got) = spawn_listening_ws_upstream();
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                proxy_ca,
+                policy(&["{WS} upstream.test:*"]).with_websocket_secret(posture),
+            )
+            .unwrap()
+            .with_upstream(upstream_cfg)
+            .with_log(Arc::new(LogRing::new(LOG_RING_CAP)))
+            .with_redactions(vec![SecretNeedle::named(
+                "demo-token",
+                b"SECRET-VALUE-0123456789".to_vec(),
+            )])
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+
+        let received =
+            ws_send_from_cage(ctx, proxy_ca_der, "upstream.test", addr.port(), LEAK, got);
+        // Compared against the frame as it goes on the wire, not against the payload: a client
+        // frame is masked, so the plaintext appears nowhere in what the upstream receives. The
+        // proxy relays byte for byte, so what crossed is exactly the frame that was sent.
+        let sent = ws_frame(0x1, LEAK, Some(CAGE_MASK));
+        let carried = received.windows(sent.len()).any(|w| w == sent);
+        assert_eq!(
+            carried,
+            must_reach,
+            "{posture:?}: the frame carrying the secret {} have reached the upstream, and it {}",
+            if must_reach { "must" } else { "must not" },
+            if carried { "did" } else { "did not" }
+        );
+    }
+}
+
+#[test]
 fn a_secret_reflected_into_a_websocket_frame_is_reported_on_its_event() {
     use crate::sandbox::control::{LOG_RING_CAP, LogRing, SecretWay};
     const LEAK: &[u8] = br#"{"echo":"SECRET-VALUE-0123456789"}"#;
@@ -8481,6 +8536,118 @@ fn spawn_leaking_ws_upstream(
         let _ = tls.read(&mut buf);
     });
     (addr, ca_der, handle)
+}
+
+/// The mask a test cage puts on its frames. Fixed so a test can rebuild, byte for byte, the frame
+/// it expects to find (or not find) on the far side.
+#[cfg(test)]
+const CAGE_MASK: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+
+/// A WebSocket upstream that completes the handshake and reports every byte the cage sent it,
+/// so a test can say whether a frame reached the far side rather than only what came back.
+#[cfg(test)]
+fn spawn_listening_ws_upstream() -> (
+    SocketAddr,
+    CertificateDer<'static>,
+    std::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    let ca = Arc::new(Ca::ephemeral().unwrap());
+    let ca_der = ca.ca_cert_der();
+    let server_config = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(CertResolver::new(ca))),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let Ok((sock, _)) = listener.accept() else {
+            return;
+        };
+        let Ok(conn) = ServerConnection::new(server_config) else {
+            return;
+        };
+        let mut tls = StreamOwned::new(conn, sock);
+        {
+            let mut br = BufReader::new(&mut tls);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match br.read_line(&mut line) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) if line == "\r\n" || line == "\n" => break,
+                    Ok(_) => {}
+                }
+            }
+        }
+        let _ = tls.write_all(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+              Connection: Upgrade\r\nSec-WebSocket-Accept: test-accept\r\n\r\n",
+        );
+        let _ = tls.flush();
+        let mut got = Vec::new();
+        let _ = tls.read_to_end(&mut got);
+        let _ = tx.send(got);
+    });
+    (addr, ca_der, rx)
+}
+
+/// Drive one tunnel in which the cage sends `payload` as a frame, and hand back what the upstream
+/// received.
+#[cfg(test)]
+fn ws_send_from_cage(
+    ctx: Arc<ProxyCtx>,
+    proxy_ca: CertificateDer<'static>,
+    connect_host: &str,
+    connect_port: u16,
+    payload: &[u8],
+    upstream_got: std::sync::mpsc::Receiver<Vec<u8>>,
+) -> Vec<u8> {
+    let dir = TmpDir::new();
+    let path = dir.join("proxy.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    thread::spawn(move || {
+        let _ = serve(listener, ctx);
+    });
+    let mut sock = UnixStream::connect(&path).unwrap();
+    write!(
+        sock,
+        "CONNECT {connect_host}:{connect_port} HTTP/1.1\r\n\r\n"
+    )
+    .unwrap();
+    sock.flush().unwrap();
+    let _ = read_until_blank(&mut sock).unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(proxy_ca).unwrap();
+    let client_config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = ServerName::try_from(connect_host.to_string()).unwrap();
+    let conn = ClientConnection::new(Arc::new(client_config), name).unwrap();
+    let mut tls = StreamOwned::new(conn, sock);
+    let upgrade = format!(
+        "GET /chat HTTP/1.1\r\nHost: {connect_host}\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n"
+    );
+    tls.write_all(upgrade.as_bytes()).unwrap();
+    tls.flush().unwrap();
+    let head = read_head_until_blank(&mut tls).unwrap();
+    assert!(head.contains("101 Switching Protocols"), "{head:?}");
+    tls.write_all(&ws_frame(0x1, payload, Some(CAGE_MASK)))
+        .unwrap();
+    tls.flush().unwrap();
+    // Closed right behind the frame, so the upstream's read ends and the test does not wait on a
+    // tunnel that has no reason to close. The close travels the same stream as the frame, so the
+    // proxy relays the frame first and only then sees the end — unless it refused, which is the
+    // outcome under test.
+    tls.conn.send_close_notify();
+    let _ = tls.flush();
+    drop(tls);
+    upstream_got
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the upstream thread must report what it received")
 }
 
 /// Encode one WebSocket frame the way a peer would. A client must mask; a server must not.

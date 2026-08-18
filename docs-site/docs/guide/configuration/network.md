@@ -73,6 +73,7 @@ for the full semantics.
 | `http2` | hosts the proxy man-in-the-middles as **HTTP/2** (ALPN `h2`, for gRPC) instead of HTTP/1.1: see below |
 | `capture` | how much of each inspected exchange to keep for [`sbx net logs --with-body`](../networking/observability#seeing-the-traffic-network-capture): `"off"` (default), `"headers"`, `"bodies"` |
 | `capture_max_kb` | bytes kept per captured body, in KiB (default `8`, ceiling `1024`); inert unless `capture = "bodies"` |
+| `websocket_secret` | what a configured secret seen leaving through a WebSocket does: `"warn"` (default, record it) or `"block"` (record it and close the tunnel): see below |
 | `default_methods` | an **app's** read-by-default verbs (see below) |
 
 The `allow`/`deny` entries follow the [rule grammar](../networking/rules): a host,
@@ -93,6 +94,32 @@ allow = ["api.example.com"]
 capture = "bodies"       # "off" (default) | "headers" | "bodies"
 capture_max_kb = 32      # per body; default 8, ceiling 1024
 ```
+
+### A secret leaving through a WebSocket (`websocket_secret`)
+
+A request carrying a configured secret to a host it was not minted for is **refused**, on
+every one of the four request paths. A WebSocket has no request to refuse: past the `101`
+there is one tunnel whose framing the two peers agreed on, relayed byte for byte, so the
+only refusal available is closing it. By default sbx therefore records the sighting on the
+tunnel's own event and keeps relaying, which is what `sbx net logs` shows you while the
+tunnel is still open.
+
+```toml
+[network]
+websocket_secret = "block"   # "warn" (default) | "block"
+```
+
+`"block"` closes the tunnel on the sighting. Two things are worth knowing before setting it.
+It ends a live conversation on a byte-exact match, which can be the app legitimately echoing
+back a value that looks like the secret. And what it prevents is bounded by how the bytes
+arrive: the scan runs on each chunk read from the cage **before** that chunk is written on,
+so a secret contained in one chunk never reaches the far side, while one split across chunks
+has had its first part relayed before the match completes, and the close stops the rest.
+
+The way back is recorded and never closed, whichever setting you choose: a secret arriving
+*into* the cage is not an exfiltration, and the answer the request paths give that is
+redaction, which a byte-for-byte relay cannot do without rewriting a stream two peers agreed
+on.
 
 For a one-off debugging run, prefer the one-shot override, which needs no file edit and
 is trusted by invocation:
@@ -428,8 +455,8 @@ profile add rules without re-declaring the mode.
 The mode is the only setting that carries down. Declaring a `[network]` table **replaces**
 the layer below rather than adding to it, so anything else that layer set reverts to the
 built-in value: `mute`, `http2`, `dns_cache_ttl`, `pool`, `idle_timeout`, `max_connections`,
-`body_max_mb`, `ca_roots`, `capture` (with its `capture_max_kb`), `ask_timeout` and
-`ask_notice`. The `allow`/`deny` rules are replaced too, which is what declaring a table is
+`body_max_mb`, `ca_roots`, `capture` (with its `capture_max_kb`), `websocket_secret`,
+`ask_timeout` and `ask_notice`. The `allow`/`deny` rules are replaced too, which is what declaring a table is
 for.
 
 This is easy to reach without meaning to, because [`sbx net allow --local`](../cli/net)

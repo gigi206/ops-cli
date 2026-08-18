@@ -1677,6 +1677,21 @@ pub(crate) struct NetworkTable {
     /// (fail-closed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) capture: Option<String>,
+    /// What happens when a configured secret is seen leaving through a **WebSocket** tunnel:
+    /// `"warn"` (the default) records the sighting on the tunnel's event and keeps relaying, and
+    /// `"block"` records it and closes the tunnel.
+    ///
+    /// It is a setting rather than a posture because a WebSocket has no request to refuse: past the
+    /// `101` there is one tunnel two peers agreed the framing of, relayed byte for byte, so the only
+    /// refusal available is tearing it down — and that ends a live conversation on a byte-exact
+    /// match, which may be the app legitimately echoing a value that looks like the secret. What
+    /// `"block"` buys is bounded by how the bytes arrive: the scan runs on each chunk read from the
+    /// cage before that chunk is written on, so a secret whole inside one chunk never crosses, while
+    /// one split across chunks has had its first part relayed before the match completes. An unknown
+    /// value is dropped with a warning and the default stays. Trusted/global-only like the rest of
+    /// the table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) websocket_secret: Option<String>,
     /// The per-body capture cap in KiB, meaningful only with `capture = "bodies"`. It is ignored
     /// otherwise, with a warning when `capture` is absent. Absent means the default (8); the value
     /// is clamped to the ceiling (1024) rather than refused, since asking for more retains fewer
@@ -2498,6 +2513,7 @@ mod tests {
                 mute: vec![],
                 http2: vec![],
                 capture: None,
+                websocket_secret: None,
                 capture_max_kb: None,
                 groups: Default::default(),
                 rest: Default::default(),
@@ -2532,6 +2548,7 @@ mod tests {
                 mute: vec![],
                 http2: vec![],
                 capture: None,
+                websocket_secret: None,
                 capture_max_kb: None,
                 groups: Default::default(),
                 rest: Default::default(),
@@ -2563,6 +2580,7 @@ mod tests {
                 mute: vec![],
                 http2: vec![],
                 capture: None,
+                websocket_secret: None,
                 capture_max_kb: None,
                 groups: Default::default(),
                 rest: Default::default(),
