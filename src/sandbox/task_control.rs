@@ -318,6 +318,27 @@ fn sanitize(text: &str) -> String {
 
 /// The session's bounded, in-RAM invocation log. Never written to disk and never readable from the
 /// cage — it is the supervisor's own record for the session's lifetime, and it dies with it.
+///
+/// # The lock cannot be poisoned, and that is a property to keep
+///
+/// Every method here takes the lock with an `expect`, which an audit read as five places a panic in
+/// one connection thread would turn into a plane that answers nothing. It cannot: a mutex is
+/// poisoned by a panic that unwinds *while the guard is held*, and none of the critical sections in
+/// this file or in [`TaskResults`] can unwind. Enumerated, because that is the only way to know it:
+/// stamping a time (`duration_since` is matched, `saturating_sub` cannot overflow), counting,
+/// pushing and popping a `VecDeque`, and cloning entries out of it. No indexing, no slicing, no
+/// arithmetic that can overflow, no `unwrap` on anything fallible, and nothing that calls out.
+///
+/// What would break it: moving fallible or panicking work **inside** a guard — a helper called with
+/// the lock held, a slice index, an `unwrap`. Keep the work outside and hold the lock only for the
+/// container operation, which is what every method here does.
+///
+/// Why `expect` rather than the degrade the proxy's certificate cache chose (its module is private
+/// to `proxy`, so this names it rather than linking it): a leaf that
+/// cannot be read from a cache can be minted again, so continuing there costs a signature. An entry
+/// that is not appended here is gone, and a record that silently loses entries is the one failure
+/// this ring exists to prevent. If the invariant above ever breaks, a caller being told so loudly
+/// is the better of two bad answers.
 #[derive(Default)]
 pub(crate) struct TaskLog {
     inner: Mutex<Inner>,
@@ -414,6 +435,9 @@ impl TaskLog {
 /// resolve, a proxy that will not start — and the caller that would have been told is already gone.
 type Held = Result<TaskOutcome, String>;
 
+/// Its lock cannot be poisoned either, by the same enumeration and for the same reason: the two
+/// critical sections below hold it for a `VecDeque` push, pop and scan, and nothing else. See
+/// [`TaskLog`] for the invariant and what would break it.
 #[derive(Default)]
 pub(crate) struct TaskResults {
     inner: Mutex<std::collections::VecDeque<(u64, Held)>>,
