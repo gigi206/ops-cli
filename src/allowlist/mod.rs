@@ -354,10 +354,27 @@ pub(crate) struct Request {
     /// The canonical path segments: percent-decoded, `.`/`..` resolved, empties dropped,
     /// query removed. `/a//b/../c?x=1` → `["a", "c"]`.
     segs: Vec<String>,
-    /// The canonical URL a `re:` rule matches against: `https://host[:port]<decoded-target>`
-    /// (the port shown only when it is not 443, an IPv6 host bracketed). Egress is HTTPS, so
-    /// the scheme is always `https`. Decoded so a regex deny is not dodged by encoding.
+    /// The request as sent, decoded: `https://host[:port]<decoded-target>` (the port shown only
+    /// when it is not 443, an IPv6 host bracketed). Egress is HTTPS, so the scheme is always
+    /// `https`. Decoded so a regex deny is not dodged by encoding — but `.`/`..` are **not**
+    /// resolved here and the query is still attached, because this is the string the request
+    /// actually carried.
     url: String,
+    /// The same URL rebuilt from [`Self::segs`]: `.`/`..` resolved, empty segments dropped, query
+    /// removed. A `re:` rule is matched against **both** this and [`Self::url`], and matching
+    /// either is a match.
+    ///
+    /// Both, because each form catches what the other cannot, and dropping one would silently
+    /// break rules already written. A deny like `re:…/admin$` sees only the raw form and misses
+    /// `/foo/../admin`, which the origin server resolves to `/admin` and serves — while a deny
+    /// like `re:.*\?debug=1` names something the canonical form does not contain at all, so
+    /// canonicalizing instead of adding would stop it matching anything, without a word.
+    ///
+    /// The cost is on the other side and is worth naming: an **allow** written as a regex also
+    /// matches in both forms, so it admits a little more than its author may have pictured. A rule
+    /// that must be exact about a path is a path rule, which is canonical by construction; a regex
+    /// names a family.
+    canonical_url: String,
 }
 
 impl Request {
@@ -366,16 +383,22 @@ impl Request {
         let host = canonical_host(host);
         let segs = canonical_segments(target);
         let decoded = percent_decode(target);
-        let url = if port == 443 {
-            format!("https://{}{decoded}", display_host(&host))
+        let authority = if port == 443 {
+            display_host(&host)
         } else {
-            format!("https://{}:{port}{decoded}", display_host(&host))
+            format!("{}:{port}", display_host(&host))
         };
+        let url = format!("https://{authority}{decoded}");
+        // Rebuilt from the canonical segments rather than trimmed from the decoded target: the
+        // segments *are* the resolution, so anything derived from them agrees with the path rules
+        // by construction instead of by a second parser that could disagree.
+        let canonical_url = format!("https://{authority}/{}", segs.join("/"));
         Request {
             host,
             port,
             segs,
             url,
+            canonical_url,
         }
     }
 }
@@ -466,7 +489,7 @@ impl RuleKind {
                 path: pa,
                 subtree,
             } => &req.host == h && ports.admits(req.port) && path_matches(&req.segs, pa, *subtree),
-            RuleKind::Regex { re, .. } => re.is_match(&req.url),
+            RuleKind::Regex { re, .. } => re.is_match(&req.url) || re.is_match(&req.canonical_url),
         }
     }
 
@@ -490,7 +513,7 @@ impl RuleKind {
                 subtree,
                 ..
             } => &req.host == h && path_matches(&req.segs, pa, *subtree),
-            RuleKind::Regex { re, .. } => re.is_match(&req.url),
+            RuleKind::Regex { re, .. } => re.is_match(&req.url) || re.is_match(&req.canonical_url),
         }
     }
 }
@@ -2730,6 +2753,49 @@ mod tests {
             !b.permits("host.test", 443, "/x"),
             "port 443 omits the :port"
         );
+    }
+
+    /// A `re:` rule is matched against the request as sent **and** against its canonical form, and
+    /// each form catches what the other cannot.
+    ///
+    /// A deny anchored on a path saw only the raw string, so `/foo/../admin` walked past it while
+    /// the origin server resolved it to `/admin` and served it — the evasion the canonical segments
+    /// exist to close, still open on this one rule kind. Canonicalizing *instead* would have broken
+    /// the other half: a regex naming a query string finds nothing in a form the query was removed
+    /// from, and a deny that stops matching opens what it was written to close.
+    #[test]
+    fn a_regex_rule_sees_both_the_request_as_sent_and_its_canonical_form() {
+        // Only the canonical form can satisfy this one.
+        let d = deny_with_allow_all(&["re:^https://api\\.example\\.com/admin$"]);
+        assert!(
+            !d.permits("api.example.com", 443, "/admin"),
+            "the plain path"
+        );
+        assert!(
+            !d.permits("api.example.com", 443, "/foo/../admin"),
+            "dot segments the origin server would resolve"
+        );
+        assert!(
+            !d.permits("api.example.com", 443, "/admin?x=1"),
+            "a query the anchored pattern cannot see past"
+        );
+        assert!(
+            d.permits("api.example.com", 443, "/admins"),
+            "the negative control: a neighbouring path is not caught"
+        );
+
+        // Only the raw form can satisfy this one, and it still works.
+        let q = deny_with_allow_all(&["re:.*\\?debug=1$"]);
+        assert!(!q.permits("api.example.com", 443, "/x?debug=1"));
+        assert!(q.permits("api.example.com", 443, "/x"));
+    }
+
+    /// An allow-everything policy with one regex deny, which is how a deny is exercised alone.
+    fn deny_with_allow_all(deny: &[&str]) -> EgressPolicy {
+        EgressPolicy::new(
+            vec![rule("api.example.com")],
+            deny.iter().map(|d| rule(d)).collect(),
+        )
     }
 
     #[test]

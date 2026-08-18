@@ -146,9 +146,15 @@ rule cannot express.
 
 Three `re:` caveats:
 
-- Its path is decoded but **not** `.`/`..`-resolved, so a `re:` deny *can* be dodged
-  by `/foo/../secret`. Anchor and structure the pattern accordingly, or use a
-  structured URL rule when a dot-segment-proof deny is what you need.
+- **It is matched twice: against the request as sent, and against its canonical form.**
+  A match on either is a match. The request as sent is decoded, with its query attached
+  and its `.`/`..` left as written; the canonical form is the one a path rule sees, with
+  `.`/`..` resolved and the query removed. So a deny like `re:…/secret$` now catches
+  `/foo/../secret` and `/secret?x=1`, and a pattern naming a query still fires on the
+  form that has one. The cost is on the other side: an **allow** written as a regex is
+  also matched twice, so it admits a little more than one form alone would. When a rule
+  must be exact about a path, write a structured URL rule, which is canonical by
+  construction; `re:` names a family.
 - Because the reconstructed URL omits the port when it is 443, a pattern that tries
   to match `:443` explicitly (`re:…:443/…`) will never fire.
 - **An empty pattern matches everything.** A bare `re:` is not "a regex that matches
