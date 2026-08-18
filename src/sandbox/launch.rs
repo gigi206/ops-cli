@@ -3501,7 +3501,9 @@ fn render_no_active_sessions(pal: &crate::style::Palette) -> String {
 /// SIGKILL if it has not exited within `grace`. Targets are resolved through the same
 /// liveness-validated registry `attach` uses, so a stale or reused pid is never signalled. For ids,
 /// reports each and exits 2 if any matched no live session, else 0; for `--all`, stopping nothing is
-/// a no-op success (there is simply nothing to do).
+/// a no-op success (there is simply nothing to do). A session the host refused a *handle* on — not
+/// the same thing as one that had already exited — is reported and exits 1 under either form: it
+/// may still be running, which outranks a name that matched nothing.
 ///
 /// Residuals (named, not fixed here), both because a signal terminates a supervisor without running
 /// its RAII drops:
@@ -3545,13 +3547,15 @@ pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
         // Sessions are independent cages (separate pid namespaces), so they are torn down one after
         // another — never interfering. A well-behaved agent exits on SIGTERM well before its grace
         // window elapses, so this is not grace-per-session in practice.
+        let mut all_accounted = true;
         for target in &sessions {
-            stop_session(&registry, target, grace, &epal);
+            all_accounted &= stop_session(&registry, target, grace, &epal);
         }
-        return ExitCode::SUCCESS;
+        return ExitCode::from(stop_exit_code(!all_accounted, false));
     }
 
     let mut any_missing = false;
+    let mut any_unstopped = false;
     for id in ids {
         let Some(target) = sessions.iter().find(|s| s.pid.to_string() == *id) else {
             crate::diag::error(&format!(
@@ -3560,14 +3564,10 @@ pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
             any_missing = true;
             continue;
         };
-        stop_session(&registry, target, grace, &epal);
+        any_unstopped |= !stop_session(&registry, target, grace, &epal);
     }
 
-    if any_missing {
-        ExitCode::from(2)
-    } else {
-        ExitCode::SUCCESS
-    }
+    ExitCode::from(stop_exit_code(any_unstopped, any_missing))
 }
 
 /// Render one session's stop outcome (stderr): a clean SIGTERM stop is a real change (green
@@ -3580,7 +3580,7 @@ fn render_stop_outcome(
     grace: Duration,
     pal: &crate::style::Palette,
 ) -> String {
-    let (n, ok, warn, dim, r) = (pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
+    let (n, ok, warn, err, dim, r) = (pal.name, pal.ok, pal.warn, pal.err, pal.dim, pal.reset);
     match outcome {
         session::StopOutcome::AlreadyGone => {
             format!(
@@ -3597,24 +3597,56 @@ fn render_stop_outcome(
                 grace.as_secs()
             )
         }
+        session::StopOutcome::NotSignalled(errno) => {
+            format!(
+                "sbx session stop: {err}cannot stop{r} session {n}{pid}{r} ({n}{label}{r}): {} — \
+                 it was not signalled and may still be running.",
+                io::Error::from_raw_os_error(*errno)
+            )
+        }
     }
 }
 
-/// Stop one resolved session and reap its record: SIGTERM, then SIGKILL after `grace`, report the
-/// outcome by pid and label, and drop the record so `sbx session ls` is clean at once rather than waiting
-/// for the killed process to stop reading as a zombie.
+/// Stop one resolved session and, when it is accounted for, reap its record: SIGTERM, then
+/// SIGKILL after `grace`, report the outcome by pid and label, and drop the record so
+/// `sbx session ls` is clean at once rather than waiting for the killed process to stop reading as
+/// a zombie.
+///
+/// Returns whether the session is accounted for — stopped, or already gone. The one case that is
+/// neither keeps its record: when the host refused a handle on the process, nothing was signalled
+/// and the cage may still be up, so the record is what still names it to a listing and to a second
+/// attempt. Dropping it there would trade a stop that failed for a cage nothing can address.
 fn stop_session(
     registry: &session::Registry,
     target: &session::Session,
     grace: Duration,
     pal: &crate::style::Palette,
-) {
+) -> bool {
     let outcome = target.stop(grace);
     eprintln!(
         "{}",
         render_stop_outcome(target.pid, &target.label(), &outcome, grace, pal)
     );
+    if matches!(outcome, session::StopOutcome::NotSignalled(_)) {
+        return false;
+    }
     registry.reap(target);
+    true
+}
+
+/// The exit code a `stop` run reports, from what its loops observed — one definition for both
+/// forms of the verb, so `--all` and a list of ids answer a caller the same way.
+///
+/// A session that was never signalled outranks an id that matched nothing: both are failures, and
+/// the one that leaves a cage running is the one the caller must act on — the other is a typo.
+fn stop_exit_code(any_unstopped: bool, any_missing: bool) -> u8 {
+    if any_unstopped {
+        1
+    } else if any_missing {
+        2
+    } else {
+        0
+    }
 }
 
 /// Hard prerequisites + per-launch resolution shared by `run` and `shell`. Returns
@@ -7110,6 +7142,70 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             render_stop_outcome(9, "shell", &session::StopOutcome::Killed, grace, &p),
             "sbx session stop: session 9 (shell) did not exit within 10s — sent SIGKILL."
         );
+        // A refused handle must not read like the no-op above: it names the reason and says the
+        // session may still be running, because nothing was signalled.
+        assert_eq!(
+            render_stop_outcome(
+                11,
+                "app:agent",
+                &session::StopOutcome::NotSignalled(libc::EINVAL),
+                grace,
+                &p
+            ),
+            "sbx session stop: cannot stop session 11 (app:agent): Invalid argument (os error 22) \
+             — it was not signalled and may still be running."
+        );
+    }
+
+    #[test]
+    fn a_stop_that_left_something_running_outranks_an_id_that_matched_nothing() {
+        // Nothing wrong is a plain success; an id that named no live session is the long-standing
+        // 2; a session the host refused a handle on is 1 — and when both happened in one run it is
+        // still 1, because a cage that may still be up is what the caller has to act on.
+        assert_eq!(stop_exit_code(false, false), 0);
+        assert_eq!(stop_exit_code(false, true), 2);
+        assert_eq!(stop_exit_code(true, false), 1);
+        assert_eq!(stop_exit_code(true, true), 1);
+    }
+
+    #[test]
+    fn a_stop_that_signalled_nothing_keeps_the_session_record() {
+        // The reap is what makes `sbx session ls` clean the moment a stop lands. Applied to a stop
+        // that did *not* land, it would delete the only handle on a cage that is still up: the
+        // session would vanish from every listing and no second `sbx session stop <pid>` could
+        // name it. So the record survives exactly one outcome, and this test is the contrast —
+        // same call, same registry, two records that differ only in why their pid has no handle.
+        let data = TmpDir::new();
+        let reg = session::Registry::at(data.path());
+        let pal = crate::style::Palette::plain();
+        let sessions = data.path().join("sessions");
+        let record_at = |pid: u32| session::Session {
+            project: PathBuf::from("/work/probe"),
+            pid,
+            start_ticks: 1,
+            kind: session::Kind::Run,
+            runtime: session::SessionRuntime::Project,
+            detached: false,
+        };
+        let count = || {
+            std::fs::read_dir(&sessions)
+                .map(|d| d.filter_map(Result::ok).count())
+                .unwrap_or(0)
+        };
+
+        // Pid 0 is not a pid a process can hold: `pidfd_open` refuses it with `EINVAL`, which says
+        // nothing about a process being alive — the stop reports it and keeps the record.
+        let refused = record_at(0);
+        reg.register(&refused).unwrap();
+        assert!(!stop_session(&reg, &refused, Duration::from_secs(0), &pal));
+        assert_eq!(count(), 1, "an unsignalled session must stay addressable");
+
+        // A pid above the kernel's ceiling cannot exist, so the same call answers `ESRCH` — truly
+        // gone — and the record goes with it.
+        let gone = record_at(1 << 30);
+        reg.register(&gone).unwrap();
+        assert!(stop_session(&reg, &gone, Duration::from_secs(0), &pal));
+        assert_eq!(count(), 1, "only the unsignalled record is left");
     }
 
     #[test]
@@ -7141,8 +7237,9 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
     #[test]
     fn session_verb_confirmations_color_their_outcome_and_identifier_spans() {
         // The hue carries the meaning: a clean stop is a real change (green), a forced kill is the
-        // caution hue (yellow), a no-op is dim, and an identifier is cyan. The verb of an attach
-        // announcement stays plain (it is not a completed state change).
+        // caution hue (yellow), a stop that could not happen is the error hue (red), a no-op is
+        // dim, and an identifier is cyan. The verb of an attach announcement stays plain (it is not
+        // a completed state change).
         let p = crate::style::Palette::colored();
         let grace = Duration::from_secs(10);
 
@@ -7162,6 +7259,18 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
 
         let killed = render_stop_outcome(9, "shell", &session::StopOutcome::Killed, grace, &p);
         assert!(killed.contains(&format!("{}sent SIGKILL{}", p.warn, p.reset)));
+
+        let refused = render_stop_outcome(
+            11,
+            "app:agent",
+            &session::StopOutcome::NotSignalled(libc::EMFILE),
+            grace,
+            &p,
+        );
+        assert!(refused.contains(&format!("{}cannot stop{}", p.err, p.reset)));
+        // Not the dim of a no-op: this one did not happen, it is not a state that was already
+        // reached.
+        assert!(!refused.contains(&format!("{}cannot stop", p.dim)));
 
         let attach = render_attaching(4242, "app:demo-app", &p);
         assert!(attach.contains(&format!("{}4242{}", p.name, p.reset)));

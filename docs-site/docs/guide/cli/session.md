@@ -199,6 +199,11 @@ sbx session stop 12345 12377 --delay 3
 sbx session stop --all
 ```
 
+A session sbx could not get a handle on is a separate outcome from one that had already
+exited. Nothing was signalled, so the cage may still be running: the line names the reason,
+the session keeps its place in `sbx session ls` so a second attempt can still address it, and
+the command exits 1. An id that matched no live session still exits 2.
+
 ## Examples: the life of a background agent
 
 The four subcommands are one workflow. Launch it, find it, watch it, look inside it,

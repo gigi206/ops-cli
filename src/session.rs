@@ -105,6 +105,11 @@ pub(crate) enum StopOutcome {
     Terminated,
     /// The process outlived the grace window and was forced down with SIGKILL.
     Killed,
+    /// Nothing was signalled and the session may well still be running: opening a handle on its
+    /// process failed for a reason other than that process being absent. Carries the `errno`, so
+    /// the report can name it — and so a caller knows it must neither claim a stop nor drop the
+    /// session's record.
+    NotSignalled(i32),
 }
 
 /// One registered sandbox. The `(pid, start_ticks)` pair identifies the live
@@ -201,11 +206,27 @@ impl Session {
     /// kernel reap everything left inside it. The exec path (recorded pid == bubblewrap) is covered
     /// by the same sweep.
     pub(crate) fn stop(&self, grace: Duration) -> StopOutcome {
-        let Some(pidfd) = open_pidfd(self.pid) else {
-            return StopOutcome::AlreadyGone;
+        // Only `ESRCH` says the process is gone. Every other refusal means this stop could not get
+        // a handle on a process that may still be running, and reporting "already gone" there
+        // would be both a false statement and a lost session: the caller drops the record on every
+        // outcome but this one, so a live cage would stop being listable — or nameable to a second
+        // attempt. This is the rule [`pid_is_live`] already states for `kill(2)` (an unexpected
+        // errno is inconclusive, never "dead"), applied to the one liveness answer in this module
+        // that read every failure as absence.
+        let pidfd = match open_pidfd(self.pid) {
+            Ok(fd) => fd,
+            Err(libc::ESRCH) => return StopOutcome::AlreadyGone,
+            Err(errno) => return StopOutcome::NotSignalled(errno),
         };
         // Confirm the pinned process is the one we recorded: the pid could have been reused
         // between listing and the open. Once confirmed, the held fd keeps it pinned.
+        //
+        // A start time that cannot be read counts as gone here, and only here: the pidfd is proof
+        // the process existed a moment ago, so `/proc/<pid>/stat` being absent now means it exited
+        // and was reaped — not that this stop failed to look. The residual is an entry that exists
+        // but cannot be opened (descriptors exhausted between the two calls); it stays folded into
+        // "gone" because the open a line above just succeeded, and telling it apart would need an
+        // outcome of its own for a window one syscall wide.
         if read_start_ticks(self.pid) != Some(self.start_ticks) {
             close_fd(pidfd);
             return StopOutcome::AlreadyGone;
@@ -277,11 +298,24 @@ fn scope_cgroup_procs(pid: u32) -> Option<String> {
     std::fs::read_to_string(dir.join("cgroup.procs")).ok()
 }
 
-/// Open a pidfd for `pid`, or `None` if the process is already gone.
-fn open_pidfd(pid: u32) -> Option<libc::c_int> {
-    // SAFETY: `pidfd_open` only reads `pid`; it returns a new fd or -1.
+/// Open a pidfd for `pid`, or the `errno` the kernel refused with.
+///
+/// The errno is carried out instead of being folded into "gone", because only `ESRCH` means the
+/// process has exited. `pidfd_open` also refuses a pid no process can hold (`EINVAL`), reports the
+/// syscall as unavailable (`ENOSYS`, on a kernel older than 5.3 or under a filter that hides it),
+/// and fails when *this* process is out of descriptors or memory (`EMFILE`, `ENFILE`, `ENOMEM`) —
+/// none of which say anything about whether the target is alive.
+fn open_pidfd(pid: u32) -> Result<libc::c_int, i32> {
+    // SAFETY: `pidfd_open` only reads `pid`; it returns a new fd, or -1 with `errno` set.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
-    (fd >= 0).then_some(fd as libc::c_int)
+    if fd >= 0 {
+        return Ok(fd as libc::c_int);
+    }
+    // `last_os_error` reads the `errno` the failed syscall just set and always carries one; the
+    // fallback exists only to keep the signature total.
+    Err(io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO))
 }
 
 fn close_fd(fd: libc::c_int) {
@@ -291,6 +325,13 @@ fn close_fd(fd: libc::c_int) {
 
 /// Send `signal` to the process a pidfd pins. Returns whether the kernel accepted it (a failure
 /// means the process has already exited).
+///
+/// Unlike the *open*, this failure is not read errno by errno, deliberately: the fd already pins
+/// one live-or-zombie process, so the refusals [`open_pidfd`] must tell apart — no such syscall,
+/// a pid no process can hold, no descriptor left — cannot arise once it has succeeded, and what
+/// remains is the target being reaped between the open and the signal. A caller that ever holds a
+/// pidfd it did not open itself, or signals across a user boundary (`EPERM`), leaves that ground
+/// and would have to discriminate here too.
 fn send_signal(pidfd: libc::c_int, signal: libc::c_int) -> bool {
     // SAFETY: `pidfd_send_signal` with a null `siginfo` sends `signal` as if by `kill`.
     let rc = unsafe {
@@ -724,6 +765,15 @@ mod tests {
         assert!(!is_cage_scope("sbx-probe-99.scope", 42));
     }
 
+    /// A pid no process can hold: above `PID_MAX_LIMIT`, the ceiling `/proc/sys/kernel/pid_max`
+    /// itself cannot exceed (4 194 304 on 64-bit, 32 768 on 32-bit). Both halves of the liveness
+    /// check answer "absent" for it, and `pidfd_open` answers `ESRCH`.
+    ///
+    /// `u32::MAX` does not serve: it casts to `pid_t` as -1, which `kill` reads as *every* process
+    /// the caller may signal — so the pid reads as **live** — and which `pidfd_open` refuses with
+    /// `EINVAL`, the errno that now means "could not look", not "gone".
+    const PID_ABOVE_CEILING: u32 = 1 << 30;
+
     fn session_at(project: &str, pid: u32, start: u64, kind: Kind) -> Session {
         Session {
             project: PathBuf::from(project),
@@ -919,7 +969,7 @@ mod tests {
         let reg = Registry::at(dir.path());
         // A pid that cannot exist (above the kernel's pid ceiling): no /proc entry,
         // kill -> ESRCH.
-        let dead = session_at("/work/gone", u32::MAX, 1, Kind::Run);
+        let dead = session_at("/work/gone", PID_ABOVE_CEILING, 1, Kind::Run);
         reg.register(&dead).unwrap();
 
         assert!(reg.list().unwrap().is_empty());
@@ -939,10 +989,26 @@ mod tests {
 
     #[test]
     fn stop_a_dead_pid_reports_already_gone() {
-        // A pid above the kernel's ceiling cannot exist: pidfd_open fails, so there is nothing to
-        // signal.
-        let s = session_at("/test", u32::MAX, 1, Kind::Run);
+        // A pid above the kernel's ceiling cannot exist, so `pidfd_open` answers `ESRCH` — the one
+        // errno that means the process is gone, and now the only one this outcome is reached by.
+        let s = session_at("/test", PID_ABOVE_CEILING, 1, Kind::Run);
         assert_eq!(s.stop(Duration::from_secs(5)), StopOutcome::AlreadyGone);
+    }
+
+    #[test]
+    fn stop_reports_a_pid_it_cannot_open_rather_than_calling_it_gone() {
+        // Pid 0 is not a pid a process can hold, and `pidfd_open` refuses it with `EINVAL` — a
+        // refusal that says nothing about any process being alive. The stop must carry that out
+        // rather than report the session as already exited: its caller drops the record on
+        // `AlreadyGone`, so answering "gone" to *any* failed open turns a live cage into one no
+        // listing shows and no second `stop` can name. `EMFILE` under descriptor exhaustion is the
+        // same refusal on a genuinely running session; pid 0 is how a test reaches it without
+        // having to exhaust anything.
+        let s = session_at("/test", 0, 1, Kind::Run);
+        assert_eq!(
+            s.stop(Duration::from_secs(5)),
+            StopOutcome::NotSignalled(libc::EINVAL)
+        );
     }
 
     #[test]
