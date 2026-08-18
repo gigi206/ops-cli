@@ -117,6 +117,18 @@ impl Ca {
         // not grow without bound: past the cap, mint per request but stop inserting (a legitimate
         // workload reaches few hosts; only a flood of unique SNIs hits the cap). This bounds host
         // memory; the connection cap bounds the concurrent keygen cost.
+        //
+        // **Minting before the check stands, and it is a decision rather than an oversight.**
+        // Consulting the policy first would mean asking "could any rule admit this host", which no
+        // rule matcher answers: a match needs a path, and a rule may carry a prefix or a regex. The
+        // only way to ask it is a second reader of the rules beside the one that decides — and a
+        // second reader that disagreed would refuse a host the policy allows. Against that, what
+        // reordering saves was measured: a mint is a small fraction of the TLS handshake it happens
+        // inside, and the peer that forces one pays a full handshake of its own to do so, so a
+        // refused connection costs the cage about what it costs the host.
+        //
+        // What would reopen it: a way to ask the *existing* matcher whether a host is reachable at
+        // all — a host-level predicate the decision itself goes through, not a copy of it.
         if let Ok(mut leaves) = self.leaves.lock()
             && leaves.len() < LEAF_CACHE_CAP
         {
