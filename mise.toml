@@ -71,6 +71,31 @@ description = "Build the crate's own rustdoc, denying warnings (a doc reference 
 # short-circuit this. An unchanged tree does, which is what keeps it cheap to chain.
 run = 'RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items'
 
+[tasks.test-cage]
+description = "Run the sandbox e2e with skips turned into failures — the run that proves the cage was exercised"
+# `mise run test` is honest about what skipped, but honesty is not enforcement: on a host that
+# cannot sandbox, every cage test returns early and the suite is still green. This task is the other
+# half — `SBX_REQUIRE_CAPABLE=1` turns `skip_incapable!` into a panic (`src/testskip.rs`), so a host
+# that was *supposed* to manage has to prove it.
+#
+# Run it where the cage can actually start: unprivileged userns available (on Ubuntu 24.04 that
+# means `kernel.apparmor_restrict_unprivileged_userns=0`), plus `nix` and `bwrap` reachable. On a
+# host without them this task is *meant* to fail — that failure is the finding, not a flake.
+#
+# Scoped to the fourteen suites that carry a cage skip rather than to the whole tree: those are the
+# ones a hosted runner silently skips, and they are what "the cage was exercised" has to mean. The
+# list is written out rather than globbed so that a new suite carrying a skip is a deliberate
+# addition here, not a silent omission.
+run = """
+set -uo pipefail
+export SBX_REQUIRE_CAPABLE=1
+rc=0
+for suite in attach completion config detach doctor fs netns plugins proc run sessions shell stop upgrade; do
+  cargo test --test "$suite" --no-fail-fast || rc=$?
+done
+exit $rc
+"""
+
 [tasks.test]
 description = "Run the full test suite and report the tests that skipped for want of a prerequisite"
 # Locally this runs the integration e2e too where the host can sandbox. CI runs
