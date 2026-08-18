@@ -5634,8 +5634,14 @@ fn package_name_and_attribute_validators() {
     ] {
         assert!(is_valid_attr(a), "{a} should be a valid attribute");
     }
-    for a in ["", "a b", "a#b", "a;b", "a$b", "a\"b"] {
-        assert!(!is_valid_attr(a), "{a} should be rejected");
+    // The four after the quote are the ones that matter to the `--expr` the unfree provisioning
+    // branch interpolates into: a brace ends the attribute set being spliced, a backslash escapes
+    // inside a nix string, and a newline ends the line the expression is written on. Pinned here
+    // because this charset is the whole barrier on that path.
+    for a in [
+        "", "a b", "a#b", "a;b", "a$b", "a\"b", "a{b", "a}b", "a\\b", "a\nb", "a'b", "a(b",
+    ] {
+        assert!(!is_valid_attr(a), "{a:?} should be rejected");
     }
     // mise tokens: the everyday forms plus PEP 508 extras (`pkg[web]`, `pkg[web,messaging]`)
     // admitted so a Python install can select optional dependency groups, and the

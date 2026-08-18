@@ -1423,7 +1423,8 @@ fn host_config_for(
 /// - the attribute must be one, by the same rule `[packages]` applies to the same `nix:<attr>`
 ///   syntax. It is not a new policy but the one this value already obeys one table over: what
 ///   follows `nix:` here is interpolated into the `--expr` of the unfree provisioning branch
-///   ([`crate::store::provision_command`]), which is exactly what that rule exists to keep clean.
+///   ([`crate::store::provision_unfree`] and the command it builds), which is exactly what that
+///   rule exists to keep clean.
 ///   The entry is dropped with its reason rather than failing the load, like the two rules above:
 ///   the program then reads as unprovisioned, and the launch says so fail-closed.
 pub(crate) fn validated_programs(
@@ -5733,7 +5734,19 @@ fn is_valid_package_name(name: &str) -> bool {
 /// so a declared value can never widen into a different flake reference or smuggle
 /// shell- or flake-significant characters, even though it is passed to nix as a
 /// single argument.
-fn is_valid_attr(attr: &str) -> bool {
+///
+/// **This charset is the whole barrier on one path.** `[packages]` and `[plugin.<name>] programs`
+/// both feed it, and the unfree provisioning branch composes its `--expr` by interpolating the
+/// attribute into a nix expression ([`crate::store::provision_unfree`]); the free branch passes
+/// `{flake_ref}#{attr}` positionally and does not. So the characters that would end or escape that
+/// interpolation — `{`, `}`, `\`, a newline, a quote — are refused here and pinned by
+/// `package_name_and_attribute_validators`, which is where a widening of this set has to argue with
+/// a test rather than pass unnoticed.
+///
+/// One definition, shared with the nixhub path, which validates the attribute it reads from a third
+/// party before it becomes a flake reference. Two byte-identical copies is how a charset drifts on
+/// one path and not the other.
+pub(crate) fn is_valid_attr(attr: &str) -> bool {
     !attr.is_empty()
         && attr
             .chars()

@@ -493,7 +493,7 @@ impl ResolutionLock {
                     && is_valid_version(version)
                     && is_valid_system(system)
                     && is_commit(commit)
-                    && is_valid_attr(attr)
+                    && crate::config::is_valid_attr(attr)
                     && is_valid_version(resolved)
                 {
                     entries.insert(
@@ -692,7 +692,7 @@ fn select_release(metadata: &serde_json::Value, version_req: &str, system: &str)
     let attr = platform
         .get("attribute_path")?
         .as_str()
-        .filter(|a| is_valid_attr(a))?;
+        .filter(|a| crate::config::is_valid_attr(a))?;
     // validate the resolved version too: it is stored tab-separated in the resolution
     // lock, so it must carry no separator or control character.
     let version = chosen
@@ -762,14 +762,6 @@ fn is_valid_version(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '~'))
-}
-
-/// A nixpkgs attribute path, validated before it flows into a flake reference — the
-/// same restriction the native `[packages]` attribute uses.
-fn is_valid_attr(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+'))
 }
 
 /// A nix system double like `x86_64-linux`: non-empty, lowercase alphanumerics plus `_`/`-`. The
