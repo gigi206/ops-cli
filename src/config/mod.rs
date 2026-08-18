@@ -1420,6 +1420,12 @@ fn host_config_for(
 ///   project-independently, at the moment a plugin is installed: `mise:` is equipped *inside* a
 ///   cage and the prebuilt backends are pinned per project. Refusing the others by name is what
 ///   keeps this from reading as a general backend selector that happens to support one backend.
+/// - the attribute must be one, by the same rule `[packages]` applies to the same `nix:<attr>`
+///   syntax. It is not a new policy but the one this value already obeys one table over: what
+///   follows `nix:` here is interpolated into the `--expr` of the unfree provisioning branch
+///   ([`crate::store::provision_command`]), which is exactly what that rule exists to keep clean.
+///   The entry is dropped with its reason rather than failing the load, like the two rules above:
+///   the program then reads as unprovisioned, and the launch says so fail-closed.
 pub(crate) fn validated_programs(
     plugin_name: &str,
     manifest_programs: &[String],
@@ -1447,6 +1453,13 @@ pub(crate) fn validated_programs(
             ));
             continue;
         };
+        if !is_valid_attr(attr) {
+            warnings.push(format!(
+                "`[plugin.{plugin_name}] programs`: ignoring `{program} = \"{locator}\"` — \
+                 `{attr}` is not a nix attribute"
+            ));
+            continue;
+        }
         out.push((program.clone(), attr.to_string()));
     }
     out

@@ -229,6 +229,9 @@ into its own store and binds that.
   with a warning naming it. `nix:` is the one backend that can be built host-side and
   project-independently at the moment a plugin is installed: a `mise:` tool is equipped *inside* a
   cage, and the prebuilt backends are pinned per project.
+- **What follows `nix:` must be an attribute**, by the same rule `[packages]` applies to the same
+  value: letters, digits, `_`, `-`, `.` and `+`. Anything else is dropped with a warning naming it,
+  because that text goes into the nix expression sbx builds the program from.
 - **The build happens at `sbx plugins install`**, not at launch. A plugin is installed once and
   any project may route a secret through it, so its program belongs to the plugin rather than to
   a project, and a launch only reads the result. The consequence is worth knowing: adding

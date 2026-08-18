@@ -8118,6 +8118,56 @@ fn a_plugin_table_supplies_a_package_only_for_a_program_the_manifest_runs() {
     );
 }
 
+/// What follows `nix:` here reaches the `--expr` of the unfree provisioning branch, so it obeys the
+/// rule `[packages]` already applies to the same syntax. The pair matters: a shell metacharacter is
+/// dropped with its reason, and an ordinary attribute — dots, dashes, digits, the `+` of a C++
+/// library — still goes through, because a guard that also refused those would be worse than the
+/// hole it closes.
+#[test]
+fn a_plugin_table_refuses_an_attribute_that_is_not_one() {
+    let mut p = plugin_reading("vault", &[], &[]);
+    p.sandbox.programs = vec!["vault".to_string()];
+    let reg = PluginRegistry::with([p]);
+
+    let mut hostile = secret_using("vault");
+    hostile.plugin =
+        raw_plugin_table_with("vault", &[], &[("vault", "nix:vault\"; echo pwned; \"")]).plugin;
+    let r = super::resolve(hostile, None, &reg);
+    let host = match &r.secrets[0].sources[0] {
+        SecretSource::Plugin { plugin, .. } => &plugin.host,
+        other => panic!("expected a plugin source, got {other:?}"),
+    };
+    assert!(
+        host.programs.is_empty(),
+        "nothing is supplied: {:?}",
+        host.programs
+    );
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("is not a nix attribute")),
+        "the refusal names the attribute and why: {:?}",
+        r.warnings
+    );
+
+    let mut ordinary = secret_using("vault");
+    ordinary.plugin =
+        raw_plugin_table_with("vault", &[], &[("vault", "nix:python3Packages.hvac-1.2+x")]).plugin;
+    let ok = super::resolve(ordinary, None, &reg);
+    let host = match &ok.secrets[0].sources[0] {
+        SecretSource::Plugin { plugin, .. } => &plugin.host,
+        other => panic!("expected a plugin source, got {other:?}"),
+    };
+    assert_eq!(
+        host.programs,
+        vec![(
+            "vault".to_string(),
+            "python3Packages.hvac-1.2+x".to_string()
+        )],
+        "an ordinary nixpkgs attribute must still be supplied"
+    );
+}
+
 #[test]
 fn a_plugin_table_refuses_every_backend_but_nix() {
     let mut p = plugin_reading("vault", &[], &[]);
