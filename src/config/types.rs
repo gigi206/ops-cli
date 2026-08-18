@@ -528,6 +528,77 @@ pub(crate) struct Bind {
     pub(crate) writable: bool,
 }
 
+/// One resolved inbound forward: the host loopback port sbx binds, and the cage loopback port it
+/// bridges to. Written `forward = [9119]` the two are equal; written `forward = ["9200:9119"]` the
+/// host side moves and the cage side stays where the caged service listens.
+///
+/// **The cage port identifies the forward.** A layer declares *which service inside the cage* it
+/// wants reachable; the host port is how that service is addressed from outside, and the highest
+/// layer decides it. That is what makes a remap a remap rather than a second hole: an override
+/// naming a cage port already forwarded replaces its host port instead of opening another. The
+/// invariant a layer cannot break is unchanged — a layer adds cage ports, never removes one.
+///
+/// **The two are equal for a baked-in redirect.** A tool that authenticates through an OAuth
+/// loopback callback receives a redirect URL fixed by its provider, so the host must answer on the
+/// port the tool asked for: remapping such a forward breaks the login, silently, because the
+/// provider still sends the browser to the original port. sbx cannot tell such a port from a dev
+/// server's, so the choice is the caller's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForwardPort {
+    /// The port bound on the host's `127.0.0.1` (and, best-effort, `[::1]`).
+    pub(crate) host: u16,
+    /// The port the caged service listens on, reached at `127.0.0.1` inside the cage. The
+    /// identity of the forward: two entries with this port in common are one forward.
+    pub(crate) cage: u16,
+}
+
+impl ForwardPort {
+    /// The forward that binds `port` on both sides — what a bare `forward = [port]` means.
+    pub(crate) fn same(port: u16) -> Self {
+        Self {
+            host: port,
+            cage: port,
+        }
+    }
+
+    /// Whether the host and cage sides differ, i.e. the entry is a remap rather than the plain
+    /// same-port form. Drives the display and serialize paths, which keep a same-port entry in its
+    /// minimal `9119` form rather than writing `"9119:9119"`.
+    pub(crate) fn is_remap(self) -> bool {
+        self.host != self.cage
+    }
+}
+
+impl std::fmt::Display for ForwardPort {
+    /// The canonical written form: a bare port when both sides match, `host:cage` when they do not
+    /// — so what a message prints is what a config may declare.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_remap() {
+            write!(f, "{}:{}", self.host, self.cage)
+        } else {
+            write!(f, "{}", self.cage)
+        }
+    }
+}
+
+impl serde::Serialize for ForwardPort {
+    /// A same-port forward serializes as the **integer** it was written as, a remap as its
+    /// `"host:cage"` string — the minimal, canonical form in both cases, the same round-trip rule
+    /// [`super::schema::RawBind`] follows.
+    ///
+    /// It also decides what `sbx config --json` emits, and there the rule earns its keep twice
+    /// over: a reader that has only ever seen bare ports keeps seeing the numbers it parsed before
+    /// this field learned a second form, and a remap is visibly not a port rather than an integer
+    /// that quietly means something else.
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if self.is_remap() {
+            s.serialize_str(&self.to_string())
+        } else {
+            s.serialize_u16(self.cage)
+        }
+    }
+}
+
 /// How a URI handler is launched, once the router has matched a scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum OpenMode {

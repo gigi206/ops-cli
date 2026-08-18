@@ -202,17 +202,19 @@ pub(crate) struct RawConfig {
     /// unaffected by the network posture. Requires `gui = "wayland"` (the GTK backend needs the
     /// compositor to render).
     pub(crate) dbus: Option<bool>,
-    /// Host loopback TCP ports to forward from the host into the cage — a list of port
-    /// numbers (`forward = [1455]`). Each port is bound on the host's `127.0.0.1` and
-    /// bridged, through a bound Unix socket, to the cage's own loopback at the same port,
-    /// so a host process (a browser chasing an OAuth `localhost:<port>` callback, or a
-    /// dev opening a cage-run dev server) can reach a service the agent started inside the
-    /// empty-netns cage. A security field — honored from the global config or a trusted
-    /// project, ignored from an untrusted one: opening a host port is a deliberate inbound
-    /// hole, a choice an untrusted project may not make. A port already in use on the host
-    /// fails the launch closed (the redirect URL is baked in for OAuth, so sbx does not
-    /// pick an ephemeral substitute). Loopback-only — never the host's external interfaces.
-    pub(crate) forward: Option<Vec<u16>>,
+    /// Host loopback TCP ports to forward from the host into the cage — a list of entries, each
+    /// a bare port (`forward = [1455]`) or a `"host:cage"` remap (`forward = ["9200:9119"]`).
+    /// The host side is bound on `127.0.0.1` and bridged, through a bound Unix socket, to the
+    /// cage's own loopback at the cage side, so a host process (a browser chasing an OAuth
+    /// `localhost:<port>` callback, or a dev opening a cage-run dev server) can reach a service
+    /// the agent started inside the empty-netns cage. A bare port means both sides are that port.
+    /// A security field — honored from the global config or a trusted project, ignored from an
+    /// untrusted one: opening a host port is a deliberate inbound hole, a choice an untrusted
+    /// project may not make. A host port already in use fails the launch closed — sbx does not
+    /// pick an ephemeral substitute, because nothing tells it what the caller published. To move
+    /// off a taken host port, say so: that is what the remap form is for. Loopback-only — never
+    /// the host's external interfaces.
+    pub(crate) forward: Option<Vec<RawForward>>,
     /// Credentials the egress proxy injects into matching outbound requests, declared
     /// as the `[secret]` section — a table keyed by destination host. A security field:
     /// honored from the global config or a trusted project, ignored from an untrusted one,
@@ -415,6 +417,30 @@ pub(crate) struct RawBundle {
     /// indistinguishable from not writing one.
     #[serde(flatten)]
     pub(crate) rest: BTreeMap<String, RawIgnored>,
+}
+
+/// One `forward` entry: a bare port number (the host and cage sides are both that port) or a
+/// `"host:cage"` string that moves the host side while leaving the caged service where it listens.
+/// An untagged enum so both forms coexist in one array — `forward = [1455, "9200:9119"]` — keeping
+/// the common same-port case a bare integer, the same string-or-richer shape as [`RawBind`].
+///
+/// The remap form exists for one situation, and it is the common one for a dev server: the cage
+/// port is decided by the app (its `--port` flag, its default), while the host port is decided by
+/// whatever else is already running on your machine. Welding them together meant a host collision
+/// could only be resolved by editing the profile; splitting them means it is resolved by the
+/// one-shot override, which is what an override is for.
+///
+/// A string is parsed downstream, not here: a malformed value is skipped with a per-entry warning
+/// rather than failing the untagged-enum parse and dropping the *whole* config layer (env,
+/// packages, apps and all) — the same reason [`RawBindTable::path`] is optional at this layer.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum RawForward {
+    /// A bare port: bound on the host and reached in the cage at that same port.
+    Port(u16),
+    /// A `"host:cage"` pair. Parsed downstream, so a malformed string warns rather than failing
+    /// the layer.
+    Remap(String),
 }
 
 /// One `binds` entry: a bare path string (bound **read-only**, the default) or a table
@@ -801,11 +827,12 @@ pub(crate) struct RawApp {
     /// security field, like the baseline `dbus`. An unset `Option` is omitted on export, so an app
     /// with no D-Bus need carries no `dbus` line.
     pub(crate) dbus: Option<bool>,
-    /// Host loopback ports forwarded into this app's cage (see `RawConfig.forward`). A
-    /// security field, gated like the baseline `forward`: an app's ports **union** onto
-    /// the baseline's, so an untrusted project can only add its own, never remove or
-    /// override a trusted layer's set. An unset `Option` is omitted on export.
-    pub(crate) forward: Option<Vec<u16>>,
+    /// Host loopback ports forwarded into this app's cage (see [`RawConfig::forward`]) — bare
+    /// ports or `"host:cage"` remaps. A security field, gated like the baseline `forward`: an
+    /// app's entries **union onto the baseline's by cage port**, so an untrusted project can never
+    /// close a forward a trusted layer opened. It may move one to another host port, which opens
+    /// nothing the trusted layer had not already opened. An unset `Option` is omitted on export.
+    pub(crate) forward: Option<Vec<RawForward>>,
     /// Credentials the egress proxy injects for this app. A security field, effective only
     /// under a network allowlist, like the baseline `[secret]` section.
     pub(crate) secret: Option<RawSecretSection>,

@@ -357,7 +357,7 @@ pub(crate) struct Resolved {
     /// field, gated like `network`/`gui`; the merged set is the union of the global and a trusted
     /// project's ports (an untrusted project's ports are dropped, never added), so a trusted
     /// layer's ports survive an untrusted overlay. Empty when no layer declared any.
-    pub(crate) forward: Vec<u16>,
+    pub(crate) forward: Vec<ForwardPort>,
     /// Which layer supplied the winning `forward` set. The union means a value here is the
     /// *highest-trust* layer that contributed any port (`Default` when none did). A display
     /// affordance for `sbx config`; the launcher ignores it.
@@ -561,7 +561,7 @@ pub(crate) struct ResolvedApp {
     /// project's app `forward` is dropped, like its `network`/`gui`). The set **unions** onto the
     /// baseline's at [`merge_app`](Resolved::merge_app); an empty vec means the app adds none and inherits the baseline
     /// set. A security field, gated like the baseline `forward`.
-    pub(crate) forward: Vec<u16>,
+    pub(crate) forward: Vec<ForwardPort>,
     /// Credentials to inject for this app (gated; the plaintext never enters the cage).
     pub(crate) secrets: Vec<HeaderSecret>,
     /// Declared operations this app contributes, unioned onto the baseline's at [`merge_app`](Resolved::merge_app) (the
@@ -1716,9 +1716,10 @@ fn resolve(
         }
         None => false,
     };
-    // `forward` ports are trusted by location at the global layer; each invalid port is dropped
-    // (warned) and the rest kept. The merged set is a union (a project adds ports, never
-    // replaces), so the origin is `Global` only when this layer contributed any port.
+    // `forward` entries are trusted by location at the global layer; each invalid one is dropped
+    // (warned) and the rest kept. The merged set is a union keyed by cage port (a project adds
+    // forwards, and may move one to another host port, but never closes one), so the origin is
+    // `Global` only when this layer contributed any entry.
     let mut forward_origin = Provenance::Default;
     let mut forward = global
         .forward
@@ -2681,17 +2682,28 @@ fn validate_device_path(path: &str) -> Result<PathBuf, &'static str> {
     Ok(p.to_path_buf())
 }
 
-/// Union `extra` ports into `base`, deduped and sorted. The `forward` model — a layer adds
-/// ports, never replaces — shared by the baseline project-over-global merge and the app overlay
-/// onto the baseline. A port already present is kept (idempotent); the result is sorted so two
-/// equivalent layers produce one canonical set.
-fn union_forward(base: &mut Vec<u16>, extra: Vec<u16>) {
-    for port in extra {
-        if !base.contains(&port) {
-            base.push(port);
+/// Union `extra` forwards into `base`, keyed by **cage port**. The `forward` model — a layer adds
+/// cage ports, never removes one — shared by the baseline project-over-global merge, the app
+/// overlay onto the baseline, and the one-shot override onto the resolved set.
+///
+/// The cage port is the key because it is what a layer is actually naming: *this service inside the
+/// cage should be reachable*. The host port is how that service is addressed from outside, and the
+/// higher layer decides it — so an entry whose cage port `base` already forwards **replaces** its
+/// host port rather than opening a second hole. That is the ordinary keyed-collection rule this
+/// crate already applies to `env`, `packages`, `open` and `service`, and it is what makes a remap
+/// resolve a host-port collision instead of adding to it: without it, `SBX_FORWARD=9200:9119` over
+/// a profile's `forward = [9119]` would leave 9119 bound and the collision in place.
+///
+/// The invariant a layer cannot break is untouched: every cage port in `base` is still in the
+/// result. A layer moves a forward; it never closes one.
+fn union_forward(base: &mut Vec<ForwardPort>, extra: Vec<ForwardPort>) {
+    for fwd in extra {
+        match base.iter_mut().find(|f| f.cage == fwd.cage) {
+            Some(prev) => *prev = fwd,
+            None => base.push(fwd),
         }
     }
-    base.sort_unstable();
+    sort_forward(base);
 }
 
 /// Union `extra` device paths into `base`, deduped and sorted — the same additive model as
@@ -2840,24 +2852,97 @@ fn union_devices(base: &mut Vec<PathBuf>, extra: Vec<PathBuf>) {
     base.sort();
 }
 
-/// Validate one `forward` port list: drop a port of `0` (not a real port; the range ceiling is
-/// already enforced by the `u16` type) with a per-port warning, keeping the rest. A collection —
-/// the drop-bad-entry, keep-the-rest shape (like a malformed `binds` entry), not the all-or-nothing
-/// of a scalar posture — so one bad port does not void the valid ones.
-fn validate_forward(warnings: &mut Vec<String>, source: &str, raw: &[u16]) -> Vec<u16> {
-    let mut out = Vec::with_capacity(raw.len());
-    for &port in raw {
-        if port == 0 {
+/// Validate one `forward` list into resolved entries: parse each bare port or `"host:cage"` remap,
+/// drop a malformed one with a per-entry warning, and reduce entries sharing a cage port to the
+/// last. A collection — the drop-bad-entry, keep-the-rest shape (like a malformed `binds` entry),
+/// not the all-or-nothing of a scalar posture — so one bad entry does not void the valid ones.
+///
+/// Two entries naming the same cage port inside **one** list is not the layering case: no higher
+/// layer is speaking, the author simply wrote the same forward twice. Keeping both would wire two
+/// in-cage `socat UNIX-LISTEN` on one socket path, where the second loses the race and its host port
+/// answers into nothing — a silent black hole. The last entry wins, matching what the layered merge
+/// does with the same key, and the warning names both host ports so the dropped one is visible.
+fn validate_forward(
+    warnings: &mut Vec<String>,
+    source: &str,
+    raw: &[schema::RawForward],
+) -> Vec<ForwardPort> {
+    let mut out: Vec<ForwardPort> = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let Some(fwd) = parse_forward_entry(warnings, source, entry) else {
+            continue;
+        };
+        if let Some(prev) = out.iter_mut().find(|f| f.cage == fwd.cage) {
+            if prev.host != fwd.host {
+                warnings.push(format!(
+                    "{source}: `forward` names cage port {cage} twice — keeping host port \
+                     {new}, dropping {old}",
+                    cage = fwd.cage,
+                    new = fwd.host,
+                    old = prev.host,
+                ));
+            }
+            *prev = fwd;
+        } else {
+            out.push(fwd);
+        }
+    }
+    sort_forward(&mut out);
+    out
+}
+
+/// Parse one raw `forward` entry into a resolved [`ForwardPort`], or warn and return `None`.
+///
+/// A bare integer is the same-port form. A string is `"host:cage"`: exactly one colon, both sides
+/// a port in `1..=65535`. Every rejection names the entry as written, because the value came from a
+/// human and the useful message is the one that quotes them back.
+fn parse_forward_entry(
+    warnings: &mut Vec<String>,
+    source: &str,
+    entry: &schema::RawForward,
+) -> Option<ForwardPort> {
+    let spec = match entry {
+        schema::RawForward::Port(0) => {
             warnings.push(format!(
                 "{source}: ignoring `forward` port `0` (not a real port)"
             ));
-        } else {
-            out.push(port);
+            return None;
+        }
+        schema::RawForward::Port(p) => return Some(ForwardPort::same(*p)),
+        schema::RawForward::Remap(s) => s.trim(),
+    };
+    let mut warn = |why: &str| {
+        warnings.push(format!(
+            "{source}: ignoring `forward` entry `{spec}` — {why} (expected a port, or \
+             `<host>:<cage>`)"
+        ));
+    };
+    let Some((host, cage)) = spec.split_once(':') else {
+        warn("no `:` separating the host port from the cage port");
+        return None;
+    };
+    if cage.contains(':') {
+        warn("more than one `:`");
+        return None;
+    }
+    let parse_side = |side: &str| side.trim().parse::<u16>().ok().filter(|&p| p != 0);
+    match (parse_side(host), parse_side(cage)) {
+        (Some(host), Some(cage)) => Some(ForwardPort { host, cage }),
+        (None, _) => {
+            warn("the host side is not a port in 1-65535");
+            None
+        }
+        (_, None) => {
+            warn("the cage side is not a port in 1-65535");
+            None
         }
     }
-    out.sort_unstable();
-    out.dedup();
-    out
+}
+
+/// Order forward entries canonically, by cage port then host port, so two equivalent layers produce
+/// one identical set. The cage port leads because it is the key.
+fn sort_forward(forwards: &mut [ForwardPort]) {
+    forwards.sort_unstable_by_key(|f| (f.cage, f.host));
 }
 
 /// Record `layer` as the provenance of each limit field that `limits` actually sets (a `Some`
@@ -3140,7 +3225,7 @@ fn resolve_app(
     // The app's own loopback forward ports — a security field, gated like `network`/`gui`. The
     // merged effective set (app ∪ baseline) is computed at `merge_app`; this holds only the app's
     // own contribution, with its origin for the per-app view.
-    let mut forward: Vec<u16> = Vec::new();
+    let mut forward: Vec<ForwardPort> = Vec::new();
     let mut forward_origin = Provenance::Default;
     let mut limits_origin = LimitsOrigin::default();
     let mut home_scope_origin: Option<Provenance> = None;

@@ -19,7 +19,7 @@ beats the environment; a security field set from the environment prints a stderr
 | `SBX_NOTIFY` | `--notify` | how loudly a refusal is [announced](../configuration/notify) (`off`/`once`/`always`) |
 | `SBX_NIXPKGS` | `--nixpkgs` | the nixpkgs channel or revision |
 | `SBX_BIND` | `--bind` | a host bind (`/path[:ro\|:rw]`) |
-| `SBX_FORWARD` | `--forward` | host loopback TCP port(s) into the cage, a comma-list (`SBX_FORWARD=1455,8080`) |
+| `SBX_FORWARD` | `--forward` | host loopback TCP forward(s) into the cage, a comma-list of ports or `host:cage` remaps (`SBX_FORWARD=1455,9200:9119`) |
 | `SBX_LIMIT_<key>` | `--limit key=…` | a cgroup limit (`SBX_LIMIT_tasks_max=…`) |
 | `SBX_PACKAGE_<name>` | `--package name=…` | a package (`SBX_PACKAGE_hello=nix:hello`) |
 | `SBX_SECCOMP` | `--seccomp` | relax the syscall denylist, a comma-list of [`[seccomp]`](../configuration/seccomp) tokens (`SBX_SECCOMP=ptrace,unshare`) |

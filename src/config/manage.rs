@@ -608,11 +608,33 @@ fn scalar_value(val: &str) -> Value {
     }
 }
 
-/// Whether the edited document still parses as a config layer. A `set`/`unset` that leaves the
-/// layer unparseable is worse than a no-op: the loader drops the WHOLE layer with only a warning,
-/// silently reverting every security field it carried, so a write is validated before it commits.
+/// Whether the edited document still parses as a config layer **and** says what it appears to say.
+/// A `set`/`unset` that leaves the layer unparseable is worse than a no-op: the loader drops the
+/// WHOLE layer with only a warning, silently reverting every security field it carried, so a write
+/// is validated before it commits.
+///
+/// Parsing alone is not the whole gate. A field whose schema type is broad enough to hold a
+/// malformed value — `forward`, where a `"host:cage"` remap is a string and so any string parses —
+/// would let `add` commit an entry the resolver then drops with a warning nobody reads. The write
+/// would look like it worked and change nothing, which is the same silent revert one layer down.
+/// So every such field is checked here against the resolver's own parser, never a second copy of
+/// its rules.
 fn validate_layer(doc: &DocumentMut) -> Result<(), String> {
-    super::schema::parse(doc.to_string().as_bytes()).map(|_| ())
+    let raw = super::schema::parse(doc.to_string().as_bytes())?;
+    let apps = raw.app.values().filter_map(|a| a.forward.as_ref());
+    for entry in raw.forward.iter().chain(apps).flatten() {
+        let mut warnings = Vec::new();
+        if super::parse_forward_entry(&mut warnings, "", entry).is_none() {
+            // The resolver's warning already names the entry and why it is wrong; strip the empty
+            // source prefix it leads with so the edit error reads as one sentence.
+            return Err(warnings
+                .pop()
+                .unwrap_or_else(|| "invalid `forward` entry".into())
+                .trim_start_matches(": ")
+                .to_string());
+        }
+    }
+    Ok(())
 }
 
 /// Remove a dotted key. Returns whether it existed. An absent file or parent is simply "not
@@ -1733,6 +1755,39 @@ mod tests {
             std::fs::read_to_string(&p).unwrap(),
             before,
             "a refused list edit must leave the file byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn a_forward_remap_is_added_but_a_malformed_one_is_refused() {
+        // `forward` holds two shapes, and only one of them is type-checked by the parse: a remap is
+        // a STRING, so any string parses. Without a semantic gate `add` would happily commit
+        // `"9200:nope"`, the resolver would drop it with a warning nobody reads, and the write would
+        // have looked like it worked while changing nothing.
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "forward = [1455]\n");
+        assert!(add(&p, "forward", "9200:9119").unwrap());
+        assert!(
+            std::fs::read_to_string(&p)
+                .unwrap()
+                .contains(r#"forward = [1455, "9200:9119"]"#),
+            "a valid remap lands as a string beside the bare port"
+        );
+
+        let before = std::fs::read_to_string(&p).unwrap();
+        for bad in ["9200:nope", "9200:9119:8787", "9200:0"] {
+            assert!(
+                matches!(
+                    add(&p, "forward", bad),
+                    Err(ManageError::InvalidValue(_, _))
+                ),
+                "`{bad}` must be refused"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            before,
+            "a refused remap must leave the file byte-for-byte unchanged"
         );
     }
 

@@ -18,7 +18,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use super::{Backend, NetworkPolicy, Resolved};
+use super::{Backend, ForwardPort, NetworkPolicy, Resolved};
 use crate::trust::TrustState;
 use crate::{sandbox, store};
 
@@ -103,9 +103,10 @@ pub(crate) struct ConfigView {
     pub(crate) dbus: bool,
     /// Which layer supplied the D-Bus posture (`Default` when neither config set it).
     pub(crate) dbus_origin: ProvenanceView,
-    /// Host loopback TCP ports forwarded into the cage (`forward`), each a port number. Empty when
-    /// no layer declared any.
-    pub(crate) forward: Vec<u16>,
+    /// Host loopback TCP forwards into the cage (`forward`): a bare port number when the host and
+    /// cage sides match, a `"host:cage"` string when the entry remaps. Empty when no layer
+    /// declared any.
+    pub(crate) forward: Vec<ForwardPort>,
     /// Which layer supplied the `forward` set (`Default` when neither config set it).
     pub(crate) forward_origin: ProvenanceView,
     /// The seccomp denylist relaxation, as the canonical `[seccomp] allow` tokens a trusted config
@@ -801,10 +802,10 @@ pub(crate) struct AppView {
     /// The app's own D-Bus posture, when it set one; `None` inherits the baseline. Mirrors the
     /// app's `gpu`.
     pub(crate) dbus: Option<bool>,
-    /// The host loopback ports this overlay adds over the baseline — a security field, gated like
-    /// the baseline `forward`. The overlay's own ports, not the baseline-merged set; the merge
-    /// unions them only for the launch itself.
-    pub(crate) forward: Vec<u16>,
+    /// The host loopback forwards this overlay adds over the baseline — a security field, gated
+    /// like the baseline `forward`. The overlay's own entries, not the baseline-merged set; the
+    /// merge folds them in by cage port only for the launch itself.
+    pub(crate) forward: Vec<ForwardPort>,
     /// The seccomp relaxation this overlay adds over the baseline — its *own* allow tokens, not the
     /// baseline-merged set. Empty when it relaxes nothing; the merge unions it with the baseline
     /// only for the launch itself.
@@ -882,9 +883,9 @@ pub(crate) struct AppDetailView {
     /// The effective D-Bus posture (the app's own, else the baseline's).
     pub(crate) dbus: bool,
     pub(crate) dbus_origin: ProvenanceView,
-    /// The effective host loopback forward ports — the app's own ∪ the baseline's. The origin is
-    /// `Inherited` when the app added none of its own.
-    pub(crate) forward: Vec<u16>,
+    /// The effective host loopback forwards — the app's own folded onto the baseline's by cage
+    /// port. The origin is `Inherited` when the app added none of its own.
+    pub(crate) forward: Vec<ForwardPort>,
     pub(crate) forward_origin: ProvenanceView,
     /// The effective seccomp relaxation — the app's own ∪ the baseline's, as tokens. The origin is
     /// `Inherited` when the app added none of its own (it takes the baseline's relaxation).
@@ -2043,7 +2044,7 @@ mod tests {
             gpu_origin: ProvenanceView::Project,
             audio_origin: ProvenanceView::Project,
             dbus_origin: ProvenanceView::Project,
-            forward: vec![1455],
+            forward: vec![ForwardPort::same(1455)],
             forward_origin: ProvenanceView::Global,
             seccomp: vec![],
             seccomp_origin: ProvenanceView::Default,
@@ -2094,7 +2095,7 @@ mod tests {
                 gpu: None,
                 audio: None,
                 dbus: None,
-                forward: vec![1455],
+                forward: vec![ForwardPort::same(1455)],
                 seccomp: vec![],
                 devices: vec![],
                 limits: Some(AppLimitsView {
@@ -2369,7 +2370,7 @@ mod tests {
             gpu_origin: Provenance::Default,
             audio_origin: Provenance::Default,
             dbus_origin: Provenance::Default,
-            forward: vec![9090],
+            forward: vec![ForwardPort::same(9090)],
             forward_origin: Provenance::Global,
             proc: Default::default(),
             proc_origin: Default::default(),
@@ -2428,7 +2429,7 @@ mod tests {
                 tasks_max: Some("99".into()),
             },
             // The app adds its own port; the baseline's 9090 must survive the union.
-            forward: vec![1455],
+            forward: vec![ForwardPort::same(1455)],
             secrets: vec![],
             tasks: vec![],
             proc: None,
@@ -2492,7 +2493,7 @@ mod tests {
         );
         assert_eq!(
             merged.forward,
-            vec![1455, 9090],
+            vec![ForwardPort::same(1455), ForwardPort::same(9090)],
             "the union keeps both ports"
         );
 

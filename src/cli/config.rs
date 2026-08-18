@@ -772,7 +772,7 @@ fn forward_section(view: &config::view::ConfigView, pal: &style::Palette) -> Opt
     let ports = view
         .forward
         .iter()
-        .map(u16::to_string)
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ");
     let _ = writeln!(
@@ -1508,7 +1508,7 @@ fn apps_section(
             let ports = app
                 .forward
                 .iter()
-                .map(u16::to_string)
+                .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
             let _ = writeln!(o, "      {dim}forward:{r} {ports} (host loopback → cage)");
@@ -1976,7 +1976,7 @@ fn render_app_detail(
             let ports = view
                 .forward
                 .iter()
-                .map(u16::to_string)
+                .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
             let _ = writeln!(

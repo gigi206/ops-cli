@@ -1,5 +1,6 @@
 use super::schema::{
-    RawEnvDefaults, RawFileDefaults, RawResolverDefaults, RawSecretSection, RawSopsDefaults,
+    RawEnvDefaults, RawFileDefaults, RawForward, RawResolverDefaults, RawSecretSection,
+    RawSopsDefaults,
 };
 use super::*;
 use crate::testutil::TmpDir;
@@ -662,12 +663,29 @@ fn raw_gui(value: &str) -> RawConfig {
     }
 }
 
-/// A `RawConfig` declaring `forward` ports.
+/// A `RawConfig` declaring `forward` ports in the bare same-port form.
 fn raw_forward(ports: &[u16]) -> RawConfig {
+    raw_forward_entries(
+        &ports
+            .iter()
+            .copied()
+            .map(RawForward::Port)
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// A `RawConfig` declaring `forward` entries in whichever form the caller wrote — the way in for a
+/// test that needs the `"host:cage"` remap form alongside bare ports.
+fn raw_forward_entries(entries: &[RawForward]) -> RawConfig {
     RawConfig {
-        forward: Some(ports.to_vec()),
+        forward: Some(entries.to_vec()),
         ..RawConfig::default()
     }
+}
+
+/// The resolved same-port forwards for `ports` — what a bare `forward = [...]` resolves to.
+fn same_forwards(ports: &[u16]) -> Vec<ForwardPort> {
+    ports.iter().copied().map(ForwardPort::same).collect()
 }
 
 /// A `RawConfig` declaring a `[devices] allow` list from the given paths.
@@ -2160,7 +2178,7 @@ fn a_global_apps_forward_survives_an_untrusted_projects_override_attempt() {
     let global = raw_with_app(
         "demo-app",
         RawApp {
-            forward: Some(vec![1455]),
+            forward: Some(vec![RawForward::Port(1455)]),
             ..raw_app(&["demo-app"], &[], &[], &[], None)
         },
     );
@@ -2168,7 +2186,7 @@ fn a_global_apps_forward_survives_an_untrusted_projects_override_attempt() {
     let project = raw_with_app(
         "demo-app",
         RawApp {
-            forward: Some(vec![31337]),
+            forward: Some(vec![RawForward::Port(31337)]),
             ..raw_app(&[], &[], &[], &[], None)
         },
     );
@@ -2176,7 +2194,7 @@ fn a_global_apps_forward_survives_an_untrusted_projects_override_attempt() {
     let app = &r.apps["demo-app"];
     assert_eq!(
         app.forward,
-        vec![1455],
+        same_forwards(&[1455]),
         "an untrusted project may not add a forward port to a trusted app"
     );
     assert!(app.warnings.iter().any(|w| w.contains("forward")));
@@ -2185,7 +2203,7 @@ fn a_global_apps_forward_survives_an_untrusted_projects_override_attempt() {
     let project = raw_with_app(
         "mine",
         RawApp {
-            forward: Some(vec![8080]),
+            forward: Some(vec![RawForward::Port(8080)]),
             ..raw_app(&["tool"], &[], &[], &[], None)
         },
     );
@@ -2204,12 +2222,12 @@ fn a_trusted_app_forward_is_honored() {
     let global = raw_with_app(
         "demo-app",
         RawApp {
-            forward: Some(vec![1455]),
+            forward: Some(vec![RawForward::Port(1455)]),
             ..raw_app(&["demo-app"], &[], &[], &[], None)
         },
     );
     let r = resolve_no_plugins(global, None);
-    assert_eq!(r.apps["demo-app"].forward, vec![1455]);
+    assert_eq!(r.apps["demo-app"].forward, same_forwards(&[1455]));
     assert_eq!(r.apps["demo-app"].forward_origin, Provenance::Global);
 }
 
@@ -5963,7 +5981,7 @@ fn a_trusted_project_forward_unions_onto_the_global_set() {
     );
     assert_eq!(
         r.forward,
-        vec![1455, 8080],
+        same_forwards(&[1455, 8080]),
         "the project adds, never replaces"
     );
     assert!(r.warnings.is_empty());
@@ -5979,7 +5997,7 @@ fn an_untrusted_project_forward_is_dropped_but_the_global_survives() {
         let r = resolve_no_plugins(raw_forward(&[1455]), Some((raw_forward(&[9090]), state)));
         assert_eq!(
             r.forward,
-            vec![1455],
+            same_forwards(&[1455]),
             "the trusted global port survives an untrusted overlay"
         );
         assert!(
@@ -5993,8 +6011,160 @@ fn an_untrusted_project_forward_is_dropped_but_the_global_survives() {
 fn a_zero_forward_port_is_dropped_with_a_warning() {
     // Port 0 is not a real port — dropped (warned), the rest kept.
     let r = resolve_no_plugins(raw_forward(&[0, 1455]), None);
-    assert_eq!(r.forward, vec![1455]);
+    assert_eq!(r.forward, same_forwards(&[1455]));
     assert!(r.warnings.iter().any(|w| w.contains("forward")));
+}
+
+#[test]
+fn a_remap_moves_the_host_side_and_leaves_the_cage_side_alone() {
+    // The remap form parses into the two distinct ports it names — the whole point of the syntax.
+    let r = resolve_no_plugins(
+        raw_forward_entries(&[RawForward::Remap("9200:9119".into())]),
+        None,
+    );
+    assert_eq!(
+        r.forward,
+        vec![ForwardPort {
+            host: 9200,
+            cage: 9119
+        }]
+    );
+    assert!(r.warnings.is_empty());
+}
+
+#[test]
+fn a_trusted_project_remap_moves_a_global_forward_instead_of_adding_one() {
+    // The load-bearing property. A global (or an app profile) publishes the caged service on the
+    // port it listens on; a higher layer that names the SAME cage port is not asking for a second
+    // hole, it is saying where that one service should answer from. Union by cage port, so the
+    // global's 9119 host binding is replaced rather than kept alongside — which is what makes the
+    // remap resolve a host-port collision instead of adding to it.
+    let r = resolve_no_plugins(
+        raw_forward(&[9119]),
+        Some((
+            raw_forward_entries(&[RawForward::Remap("9200:9119".into())]),
+            TrustState::Trusted,
+        )),
+    );
+    assert_eq!(
+        r.forward,
+        vec![ForwardPort {
+            host: 9200,
+            cage: 9119
+        }],
+        "a remap of an already-forwarded cage port moves it, never doubles it"
+    );
+    assert!(
+        !r.forward.iter().any(|f| f.host == 9119),
+        "the replaced host port must not stay bound — that would leave the collision in place"
+    );
+}
+
+#[test]
+fn a_layer_may_move_a_forward_but_never_close_one() {
+    // The invariant the additive model exists for, restated for the keyed merge: whatever a higher
+    // layer says, every cage port a lower layer published is still published afterwards. A layer
+    // changes where a forward answers; it cannot make one disappear.
+    let r = resolve_no_plugins(
+        raw_forward(&[9119, 4096]),
+        Some((
+            raw_forward_entries(&[
+                RawForward::Remap("9200:9119".into()),
+                RawForward::Port(3080),
+            ]),
+            TrustState::Trusted,
+        )),
+    );
+    let cage_ports: Vec<u16> = r.forward.iter().map(|f| f.cage).collect();
+    assert_eq!(
+        cage_ports,
+        vec![3080, 4096, 9119],
+        "every lower-layer cage port survives, and the higher layer's is added"
+    );
+    assert_eq!(
+        r.forward.iter().find(|f| f.cage == 9119).map(|f| f.host),
+        Some(9200),
+        "the remapped one answers from the higher layer's host port"
+    );
+    assert_eq!(
+        r.forward.iter().find(|f| f.cage == 4096).map(|f| f.host),
+        Some(4096),
+        "an untouched forward keeps its own host port"
+    );
+}
+
+#[test]
+fn one_list_naming_a_cage_port_twice_keeps_the_last_and_warns() {
+    // Not the layering case: one author wrote the same forward twice. Keeping both would wire two
+    // in-cage socats onto one socket path, where the second loses the race and its host port
+    // answers into nothing — silently. Last wins, and the dropped host port is named.
+    let r = resolve_no_plugins(
+        raw_forward_entries(&[
+            RawForward::Remap("9200:9119".into()),
+            RawForward::Remap("9300:9119".into()),
+        ]),
+        None,
+    );
+    assert_eq!(
+        r.forward,
+        vec![ForwardPort {
+            host: 9300,
+            cage: 9119
+        }]
+    );
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("9119") && w.contains("9300") && w.contains("9200")),
+        "the warning must name the cage port and both host ports: {:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn a_malformed_remap_is_dropped_with_a_warning_and_the_rest_survives() {
+    // A config file is a collection: one bad entry warns and is skipped, it never voids the layer.
+    // Each rejected form is listed separately, because each is a different mistake to explain.
+    for bad in [
+        "9200:9119:8787", // more than one `:`
+        "nope:9119",      // host side is not a port
+        "9200:nope",      // cage side is not a port
+        "9200:0",         // zero is not a real port, on either side
+        "0:9119",
+        "9200", // a port written as a string is not a remap
+        ":9119",
+        "9200:",
+        "",
+    ] {
+        let r = resolve_no_plugins(
+            raw_forward_entries(&[RawForward::Remap(bad.into()), RawForward::Port(4096)]),
+            None,
+        );
+        assert_eq!(
+            r.forward,
+            same_forwards(&[4096]),
+            "`{bad}` must be dropped and the valid entry kept"
+        );
+        assert!(
+            r.warnings.iter().any(|w| w.contains("forward")),
+            "`{bad}` must warn"
+        );
+    }
+}
+
+#[test]
+fn a_same_port_forward_serializes_as_the_integer_it_was_written_as() {
+    // The round-trip rule, asserted on the EMITTED bytes: a bare port must not come back out as
+    // `"9119:9119"`. `sbx config --json` is read by things that parsed integers before this field
+    // learned a second form, and an entry that never remapped must not change shape under them.
+    let same = serde_json::to_string(&ForwardPort::same(9119)).unwrap();
+    assert_eq!(same, "9119");
+    let remap = serde_json::to_string(&ForwardPort {
+        host: 9200,
+        cage: 9119,
+    })
+    .unwrap();
+    assert_eq!(remap, "\"9200:9119\"");
 }
 
 #[test]
@@ -6903,6 +7073,45 @@ fn with_override(mut resolved: Resolved, raw: RawConfig) -> Resolved {
         .apply_override(Override::for_test(raw))
         .expect("the override applies");
     resolved
+}
+
+#[test]
+fn a_one_shot_forward_remap_moves_the_resolved_host_port() {
+    // The headline path, end to end: a profile publishes its dashboard on the port the caged
+    // server listens on, that port is taken on this machine, and `--forward 9200:9119` republishes
+    // the SAME caged service on a free one for this launch. It has to *move* the forward, not add
+    // a second: adding would leave 9119 bound and the launch would still fail closed on it.
+    let r = with_override(
+        resolve_no_plugins(raw_forward(&[9119]), None),
+        raw_forward_entries(&[RawForward::Remap("9200:9119".into())]),
+    );
+    assert_eq!(
+        r.forward,
+        vec![ForwardPort {
+            host: 9200,
+            cage: 9119
+        }],
+        "the override moves the forward rather than opening a second hole"
+    );
+    assert_eq!(r.forward_origin, Provenance::Override);
+
+    // And the other half of the keyed rule: a cage port the config does not forward is *added*,
+    // leaving the config's own forwards where they were.
+    let r = with_override(
+        resolve_no_plugins(raw_forward(&[9119]), None),
+        raw_forward_entries(&[RawForward::Remap("3080:4096".into())]),
+    );
+    assert_eq!(
+        r.forward,
+        vec![
+            ForwardPort {
+                host: 3080,
+                cage: 4096
+            },
+            ForwardPort::same(9119),
+        ],
+        "an override naming an unforwarded cage port adds it and disturbs nothing"
+    );
 }
 
 #[test]
@@ -10303,7 +10512,7 @@ fn a_trusted_field_lands_in_its_own_slot_and_moves_no_other() {
         (
             "forward",
             "forward = [8080]",
-            Box::new(|r: &Resolved| r.forward == vec![8080]),
+            Box::new(|r: &Resolved| r.forward == same_forwards(&[8080])),
         ),
         (
             "devices",
@@ -10423,7 +10632,7 @@ fn a_trusted_apps_field_lands_in_its_own_slot_and_moves_no_other() {
         (
             "forward",
             "forward = [8080]",
-            Box::new(|a: &ResolvedApp| a.forward == vec![8080]),
+            Box::new(|a: &ResolvedApp| a.forward == same_forwards(&[8080])),
         ),
         (
             "devices",

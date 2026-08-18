@@ -5,18 +5,27 @@
 //! (a browser chasing an OAuth `localhost:<port>` callback, or a developer opening a cage-run
 //! dev server) can reach a service the agent started inside the empty-netns cage.
 //!
+//! A forward has **two** ports: the one bound on the host, and the one the caged service listens
+//! on. `forward = [9119]` makes them equal; `forward = ["9200:9119"]` moves the host side alone,
+//! which is how a host-port collision is resolved without touching the app. The cage side is the
+//! forward's identity — it names which in-cage service is being published — so it keys the merge
+//! and names the socket, and a higher layer restating it moves the host port rather than opening a
+//! second hole. See [`ForwardPort`] for what that costs an OAuth callback, whose host port is fixed
+//! by its provider and must not be moved.
+//!
 //! The shape is the egress forwarder's mirror, with the listener and the dialer swapped:
 //!
-//! - the host binds a `TcpListener` on `127.0.0.1:<port>` (and, best-effort, on `[::1]:<port>` so a
-//!   `localhost` callback the browser sends over IPv6 is caught too) for each declared port —
-//!   loopback only, never an external interface, and **fail-closed on collision** on the primary
-//!   `127.0.0.1` bind (the OAuth redirect URL is baked in, so sbx does not pick an ephemeral
-//!   substitute; a port already in use aborts the launch with a clear message);
+//! - the host binds a `TcpListener` on `127.0.0.1:<host port>` (and, best-effort, on
+//!   `[::1]:<host port>` so a `localhost` callback the browser sends over IPv6 is caught too) for
+//!   each declared forward — loopback only, never an external interface, and **fail-closed on
+//!   collision** on the primary `127.0.0.1` bind: sbx does not pick an ephemeral substitute,
+//!   because it cannot know what the caller published, so a port already in use aborts the launch
+//!   with a message pointing at the remap form;
 //! - a per-launch host directory is bound read-write into the cage at `/tmp/sbx-forward`, so the
 //!   in-cage forwarder can create its per-port Unix socket there and the host sees the same inode;
-//! - inside the cage a `socat UNIX-LISTEN:<cage path>,fork TCP-CONNECT:127.0.0.1:<port>` forwarder
-//!   accepts a Unix connection (from the host, for each accepted TCP conn) and bridges it to the
-//!   cage's own loopback at the same port — where the agent's service listens;
+//! - inside the cage a `socat UNIX-LISTEN:<cage path>,fork TCP-CONNECT:127.0.0.1:<cage port>`
+//!   forwarder accepts a Unix connection (from the host, for each accepted TCP conn) and bridges it
+//!   to the cage's own loopback — where the agent's service listens;
 //! - on the host, each accepted TCP connection is pumped to the matching Unix socket in a
 //!   bidirectional copy, so bytes flow browser ↔ cage service through the one shared inode.
 //!
@@ -33,6 +42,7 @@
 //! with a note).
 
 use super::binds::ExtraBind;
+use crate::config::ForwardPort;
 use crate::store::Layout;
 use std::ffi::OsString;
 use std::io;
@@ -91,9 +101,9 @@ pub(crate) struct Wiring {
 }
 
 /// One declared forward: the cage loopback port (where the agent's service listens) and the
-/// in-cage path of the Unix socket the host pumps into. The cage port equals the host port
-/// (the `forward = [port]` schema), so an OAuth `localhost:<port>` redirect resolves to the same
-/// port on both sides.
+/// in-cage path of the Unix socket the host pumps into. The host port is not named here because
+/// nothing inside the cage can observe it — the cage side of a forward is the same whether the
+/// host bound the same port or another one.
 #[derive(Clone)]
 pub(crate) struct Forward {
     pub(crate) cage_port: u16,
@@ -104,14 +114,41 @@ pub(crate) struct Forward {
 /// dir and the accept threads. Each listener is bound before this returns, so the host port answers
 /// (its backlog queues connections) from the moment the launch is up — never a first-request race
 /// (mirrors [`super::egress::start`]). The primary `127.0.0.1` bind fails the launch **closed** with
-/// a message naming the port when it is already in use: the OAuth redirect URL is fixed, so an
-/// ephemeral substitute would silently break the callback, and two `sbx app <name>` logins colliding
-/// is a one-shot, not a recurring hazard. The `[::1]` bind is best-effort — it catches a `localhost`
-/// callback the browser sends over IPv6, but a host with IPv6 disabled simply keeps the v4 path.
-pub(crate) fn start(layout: &Layout, mut ports: Vec<u16>) -> io::Result<(Forwarder, Wiring)> {
+/// a message naming the port when it is already in use: sbx does not pick an ephemeral substitute,
+/// because nothing tells it what the caller published — an OAuth redirect URL is fixed by its
+/// provider, and a moved dev-server port is one the caller must be told about. Moving off a taken
+/// host port is the remap form's job, and the message says so. The `[::1]` bind is best-effort — it
+/// catches a `localhost` callback the browser sends over IPv6, but a host with IPv6 disabled simply
+/// keeps the v4 path.
+pub(crate) fn start(
+    layout: &Layout,
+    mut ports: Vec<ForwardPort>,
+) -> io::Result<(Forwarder, Wiring)> {
     crate::store::ensure(layout)?;
-    ports.sort_unstable();
-    ports.dedup();
+    // Canonical order only. Reducing two entries that share a cage port is resolution's job (it
+    // keys them and keeps the last), so by the time a list reaches here every cage port is already
+    // distinct and there is nothing left to collapse.
+    ports.sort_unstable_by_key(|f| (f.cage, f.host));
+    // Two forwards claiming one host port cannot both be bound, and the bind error alone would
+    // blame the host ("already in use — another login, or a host service on :9200") for what is
+    // sbx's own configuration double-booking a port. Caught here, ahead of the bind, so the message
+    // names the two cage ports that collided and the caller knows which entry to change. Resolution
+    // keys forwards by cage port, so this is reachable only across *different* cage ports — never
+    // from a duplicate of one.
+    for (i, a) in ports.iter().enumerate() {
+        if let Some(b) = ports[i + 1..].iter().find(|b| b.host == a.host) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "`forward` claims host port {host} twice — for cage port {first} and for \
+                     cage port {second}. One host port reaches one cage port; give each its own.",
+                    host = a.host,
+                    first = a.cage,
+                    second = b.cage,
+                ),
+            ));
+        }
+    }
 
     let dir = layout
         .data_dir()
@@ -126,20 +163,27 @@ pub(crate) fn start(layout: &Layout, mut ports: Vec<u16>) -> io::Result<(Forward
     let mut accepts: Vec<JoinHandle<()>> = Vec::new();
     let mut forwards = Vec::with_capacity(ports.len());
 
-    for &port in &ports {
-        // The host-side socket every listener for this port bridges into; the in-cage forwarder
-        // binds it through the shared dir, and the host connects to the same inode.
-        let host_sock = dir.join(format!("p-{port}.sock"));
+    for &fwd in &ports {
+        // The host-side socket every listener for this forward bridges into; the in-cage forwarder
+        // binds it through the shared dir, and the host connects to the same inode. Named by the
+        // **cage** port, which is what identifies a forward — so two entries can never name one
+        // socket, and the name matches the `TCP-CONNECT` the in-cage `socat` is given.
+        let host_sock = dir.join(format!("p-{}.sock", fwd.cage));
 
         // v4 loopback is mandatory — `127.0.0.1`, never the wildcard, so the port is never exposed
         // on an external interface. Fail-closed on any bind error, naming the port and both likely
-        // causes (already in use, or a privileged port needing capabilities we do not hold).
-        let v4 = TcpListener::bind(("127.0.0.1", port)).map_err(|e| {
+        // causes (already in use, or a privileged port needing capabilities we do not hold), plus
+        // the way out: the remap form moves the host side without touching the caged service.
+        let host = fwd.host;
+        let v4 = TcpListener::bind(("127.0.0.1", host)).map_err(|e| {
             io::Error::new(
                 e.kind(),
                 format!(
-                    "cannot bind host port {port} for forward ({e}) — it is already in use \
-                     (another login, or a host service on :{port}), or binding it needs privilege"
+                    "cannot bind host port {host} for forward ({e}) — it is already in use \
+                     (another login, or a host service on :{host}), or binding it needs \
+                     privilege. To reach the cage's :{cage} from a free host port instead, \
+                     forward `<port>:{cage}`",
+                    cage = fwd.cage,
                 ),
             )
         })?;
@@ -148,13 +192,13 @@ pub(crate) fn start(layout: &Layout, mut ports: Vec<u16>) -> io::Result<(Forward
         // v6 loopback (`::1`) is best-effort: many hosts resolve `localhost` to `::1` first, so
         // binding it too catches an IPv6 callback. A host with IPv6 disabled (or the address
         // already taken) simply skips it — v4 stays the primary path.
-        if let Ok(v6) = TcpListener::bind(("::1", port)) {
+        if let Ok(v6) = TcpListener::bind(("::1", host)) {
             accepts.push(spawn_accept(v6, host_sock.clone(), shutdown.clone()));
         }
 
         forwards.push(Forward {
-            cage_port: port,
-            cage_uds: PathBuf::from(format!("{CAGE_FORWARD_DIR}/p-{port}.sock")),
+            cage_port: fwd.cage,
+            cage_uds: PathBuf::from(format!("{CAGE_FORWARD_DIR}/p-{}.sock", fwd.cage)),
         });
     }
 
@@ -287,22 +331,23 @@ mod tests {
     use std::io::{Read, Write};
 
     /// `start` binds a host loopback listener and a per-launch dir per port, and returns exactly
-    /// one writable `ExtraBind` at the cage forward dir plus one forward per (deduped) port.
+    /// one writable `ExtraBind` at the cage forward dir plus one forward per declared entry.
     #[test]
     fn start_binds_host_listeners_and_wires_the_cage() {
         let data = TmpDir::new();
         let layout = Layout::under(data.path());
-        // Port 0 lets the OS pick a free port so the test never collides; ask twice to prove dedup.
+        // Port 0 lets the OS pick a free port so the test never collides.
         let free = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = free.local_addr().unwrap().port();
         drop(free);
 
-        let (guard, wiring) = start(&layout, vec![port, port]).expect("start binds the port");
+        let (guard, wiring) =
+            start(&layout, vec![ForwardPort::same(port)]).expect("start binds the port");
         // One directory bind, writable, at the fixed cage path — it carries every per-port socket.
         assert_eq!(wiring.binds.len(), 1);
         assert_eq!(wiring.binds[0].dest, PathBuf::from(CAGE_FORWARD_DIR));
         assert!(wiring.binds[0].writable, "the forward dir must be writable");
-        // One forward (the duplicate was deduped), cage port == host port, cage socket under the dir.
+        // One forward, cage port == host port, cage socket under the dir.
         assert_eq!(wiring.forwards.len(), 1);
         assert_eq!(wiring.forwards[0].cage_port, port);
         assert_eq!(
@@ -328,7 +373,7 @@ mod tests {
         let port = free.local_addr().unwrap().port();
         drop(free);
 
-        let (guard, _wiring) = start(&layout, vec![port]).expect("start");
+        let (guard, _wiring) = start(&layout, vec![ForwardPort::same(port)]).expect("start");
         assert!(
             TcpListener::bind(("127.0.0.1", port)).is_err(),
             "the port is held while the guard lives"
@@ -358,7 +403,7 @@ mod tests {
         let held = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = held.local_addr().unwrap().port();
 
-        let msg = match start(&layout, vec![port]) {
+        let msg = match start(&layout, vec![ForwardPort::same(port)]) {
             Ok(_) => panic!("a taken port must fail closed, not succeed"),
             Err(e) => e.to_string(),
         };
@@ -366,7 +411,101 @@ mod tests {
             msg.contains(&port.to_string()) && msg.contains("already in use"),
             "the collision error must name the port: {msg}"
         );
+        // The message must also name the way out, because the way out is the whole reason a caller
+        // reads it: the cage port stays where the service listens, only the host side moves.
+        assert!(
+            msg.contains(&format!("forward `<port>:{port}`")),
+            "the collision error must point at the remap form: {msg}"
+        );
         drop(held);
+    }
+
+    /// A remap binds the **host** side and connects the **cage** side: the listener answers on the
+    /// host port the caller chose, while the cage wiring — the socat's `TCP-CONNECT` port and the
+    /// socket both sides share — stays on the port the caged service actually listens on. Getting
+    /// this backwards is the whole failure mode the remap exists to avoid, and it is invisible from
+    /// either side alone, so both are asserted here.
+    #[test]
+    fn a_remap_binds_the_host_side_and_wires_the_cage_side() {
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        // Two distinct free ports: one to publish on, one standing in for the caged service.
+        let a = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let b = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let host_port = a.local_addr().unwrap().port();
+        let cage_port = b.local_addr().unwrap().port();
+        drop(a);
+        drop(b);
+
+        let (guard, wiring) = start(
+            &layout,
+            vec![ForwardPort {
+                host: host_port,
+                cage: cage_port,
+            }],
+        )
+        .expect("start binds the remapped host port");
+
+        // The cage side is the cage port — on the forward, and on the socket path that names it.
+        assert_eq!(wiring.forwards.len(), 1);
+        assert_eq!(wiring.forwards[0].cage_port, cage_port);
+        assert_eq!(
+            wiring.forwards[0].cage_uds,
+            PathBuf::from(format!("{CAGE_FORWARD_DIR}/p-{cage_port}.sock"))
+        );
+        // The host side is the host port: it is held, and the cage port is NOT bound on the host —
+        // the remap moved the listener rather than adding one.
+        assert!(
+            TcpListener::bind(("127.0.0.1", host_port)).is_err(),
+            "the remapped host port must be held by the forwarder"
+        );
+        assert!(
+            TcpListener::bind(("127.0.0.1", cage_port)).is_ok(),
+            "a remap must not bind the cage port on the host"
+        );
+        drop(guard);
+    }
+
+    /// Two forwards claiming one host port is sbx's own configuration double-booking, not the host
+    /// being busy. It fails before any bind, with a message naming both cage ports — otherwise the
+    /// bind error would blame "another login, or a host service" for a mistake in the config.
+    #[test]
+    fn two_forwards_on_one_host_port_fail_closed_naming_both_cage_ports() {
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let free = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let host_port = free.local_addr().unwrap().port();
+        drop(free);
+
+        let msg = match start(
+            &layout,
+            vec![
+                ForwardPort {
+                    host: host_port,
+                    cage: 9119,
+                },
+                ForwardPort {
+                    host: host_port,
+                    cage: 8787,
+                },
+            ],
+        ) {
+            Ok(_) => panic!("one host port for two cage ports must fail closed"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("9119") && msg.contains("8787") && msg.contains(&host_port.to_string()),
+            "the double-book error must name the host port and both cage ports: {msg}"
+        );
+        assert!(
+            !msg.contains("already in use"),
+            "a config double-book must not be reported as a busy host: {msg}"
+        );
+        // Nothing was bound: the check runs ahead of every listener, so no port leaked.
+        assert!(
+            TcpListener::bind(("127.0.0.1", host_port)).is_ok(),
+            "a rejected double-book must leave the host port free"
+        );
     }
 
     /// `wrap_command` backgrounds one `socat UNIX-LISTEN … TCP-CONNECT 127.0.0.1:<port>` per
@@ -418,7 +557,7 @@ mod tests {
         let port = free.local_addr().unwrap().port();
         drop(free);
 
-        let (guard, _wiring) = start(&layout, vec![port]).expect("start");
+        let (guard, _wiring) = start(&layout, vec![ForwardPort::same(port)]).expect("start");
         // Stand in for the in-cage socat: bind the host-side socket path (the same inode the cage
         // would bind through the dir bind) and echo one line back, uppercased.
         let sock_path = wiring_host_socket(&layout, port);

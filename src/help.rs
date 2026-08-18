@@ -132,9 +132,10 @@ const PAGES: &[Page] = &[
                 "one-shot host bind (read-only by default); repeatable",
             ),
             (
-                "--forward <port[,port…]>",
-                "one-shot host loopback forward port(s) into the cage (e.g. 1455 for an OAuth \
-                 callback, or 1455,8080); repeatable, unions with the config",
+                "--forward <port|host:cage[,…]>",
+                "one-shot host loopback forward into the cage: a port (1455, an OAuth callback) or \
+                 a host:cage remap (9200:9119, same cage service on a free host port); repeatable, \
+                 folds onto the config by cage port",
             ),
             (
                 "--limit <key>=<value>",
@@ -215,7 +216,9 @@ const PAGES: &[Page] = &[
             environment, and a typed flag beats the blob. Scalars\n\
             (`net`/`gui`/`proc`/`notify`/`nixpkgs`/`gpu`/`audio`/`dbus`)\n\
             replace;\n\
-            collections (`env`/`bind`/`forward`/`limit`/`package`/`seccomp`/`device`) union. An override\n\
+            collections (`env`/`bind`/`forward`/`limit`/`package`/`seccomp`/`device`) union — `forward`\n\
+            keyed by its cage port, so naming one already forwarded moves it rather than opening a\n\
+            second hole. An override\n\
             is the final word: it beats a trusted project config and an app's own posture — including\n\
             `--seccomp`/`--device`, which relax the denylist and grant a device a config file gates\n\
             trusted-only (the invoker outranks any config layer, so it may set exactly what a trusted\n\

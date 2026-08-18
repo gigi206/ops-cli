@@ -4718,7 +4718,7 @@ fn build(
                 prep.cfg
                     .forward
                     .iter()
-                    .map(u16::to_string)
+                    .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(",")
             ));

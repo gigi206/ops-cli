@@ -59,7 +59,7 @@ tasks_max = 4096
 | `notify` | security | overrides the baseline refusal-notification policy when set (see [notify](notify)) |
 | `gui` | security | overrides the baseline when set |
 | `gpu`, `audio`, `dbus` | security | override the baseline when set (see [gpu](gpu), [audio](audio), [dbus](dbus)) |
-| `forward` | security | host loopback ports **unioned** onto the baseline's (see [forward](../networking/forward)) |
+| `forward` | security | host loopback forwards folded onto the baseline's **by cage port**: an app adds a forward, or moves one to another host port, but never closes one (see [forward](../networking/forward)) |
 | `secret` | security | credentials for this app's egress |
 | `task` | security | this app's declared operations, `[app.<name>.task.<task>]`, unioned onto the baseline's (see [task](task)) |
 | `limits` | security | per-field override of the baseline cgroup limits |

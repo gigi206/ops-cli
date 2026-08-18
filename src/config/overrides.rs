@@ -707,39 +707,74 @@ fn union_limits(base: Option<RawLimits>, higher: Option<RawLimits>) -> Option<Ra
     }
 }
 
-/// Union two optional forward port lists, deduped and sorted. `None` means "this tier set none"; a
-/// higher tier's ports add to a lower's, never replace — the collection-union rule, so `--forward`
-/// over `SBX_FORWARD` accumulates rather than clobbers.
-fn union_forward_opt(base: Option<Vec<u16>>, higher: Option<Vec<u16>>) -> Option<Vec<u16>> {
+/// Union two optional forward lists. `None` means "this tier set none"; a higher tier's entries
+/// fold onto a lower's **keyed by cage port** — adding a cage port the lower tier did not forward,
+/// and moving the host port of one it did. The keyed-collection rule, so `--forward` over
+/// `SBX_FORWARD` refines rather than accumulating a second hole for the same in-cage service.
+fn union_forward_opt(
+    base: Option<Vec<schema::RawForward>>,
+    higher: Option<Vec<schema::RawForward>>,
+) -> Option<Vec<schema::RawForward>> {
     match (base, higher) {
         (b, None) => b,
         (None, h) => h,
         (Some(mut b), Some(h)) => {
-            // Reuse the resolver's port-union (dedup + sort) so the two paths cannot drift.
-            super::union_forward(&mut b, h);
+            // The tiers hold raw entries — the cage port that keys them is only known after the
+            // resolver parses each one, which happens downstream on the merged list. Concatenating
+            // with `higher` last is exactly what that resolver reduces: `validate_forward` keeps
+            // the last entry for a cage port, so a higher tier's remap wins by position. Doing the
+            // keying here would mean parsing twice, in two places, with two chances to drift.
+            b.extend(h);
             Some(b)
         }
     }
 }
 
-/// Parse one `--forward` value — a single port or a comma-list of ports — into `Vec<u16>`. A
-/// structural error (an empty value, or a token that is not a port number) is fail-closed, since it
-/// is an explicit request the user mistyped. A port of `0` parses here and is dropped downstream
-/// by the resolver's validator (a value-range concern, not a structural one — the additive model).
-fn parse_forward(spec: &str, label: &str) -> Result<Vec<u16>, String> {
-    let ports: Vec<u16> = spec
+/// Parse one `--forward` value — a comma-list whose every token is a port (`1455`) or a `host:cage`
+/// remap (`9200:9119`) — into raw schema entries. A structural error (an empty value, a token that
+/// is not a port, a remap with more than one `:` or a non-port on either side) is fail-closed, since
+/// it is an explicit request the user mistyped: unlike a config file, where a bad entry is warned
+/// and skipped so one typo cannot void a whole layer, there is nothing else in a flag to save.
+///
+/// A port of `0` parses here and is dropped downstream by the resolver's validator (a value-range
+/// concern, not a structural one — the additive model).
+fn parse_forward(spec: &str, label: &str) -> Result<Vec<schema::RawForward>, String> {
+    let entries: Vec<schema::RawForward> = spec
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|t| {
-            t.parse::<u16>()
-                .map_err(|_| format!("{label}: `{t}` is not a valid port (expected 0–65535)"))
-        })
+        .map(|t| parse_forward_token(t, label))
         .collect::<Result<_, _>>()?;
-    if ports.is_empty() {
+    if entries.is_empty() {
         return Err(format!("{label}: no ports given"));
     }
-    Ok(ports)
+    Ok(entries)
+}
+
+/// Parse one token of a `--forward` value. Both sides of a remap are checked here so the flag fails
+/// at the point of the mistake, naming the token as typed.
+fn parse_forward_token(token: &str, label: &str) -> Result<schema::RawForward, String> {
+    let Some((host, cage)) = token.split_once(':') else {
+        return token
+            .parse::<u16>()
+            .map(schema::RawForward::Port)
+            .map_err(|_| format!("{label}: `{token}` is not a valid port (expected 0–65535)"));
+    };
+    let bad = |side: &str, which: &str| {
+        format!(
+            "{label}: `{token}` is not a valid forward — the {which} side `{side}` is not a port \
+             (expected `<host>:<cage>`, e.g. `9200:9119`)"
+        )
+    };
+    if cage.contains(':') {
+        return Err(format!(
+            "{label}: `{token}` is not a valid forward — more than one `:` (expected \
+             `<host>:<cage>`, e.g. `9200:9119`)"
+        ));
+    }
+    host.parse::<u16>().map_err(|_| bad(host, "host"))?;
+    cage.parse::<u16>().map_err(|_| bad(cage, "cage"))?;
+    Ok(schema::RawForward::Remap(token.to_string()))
 }
 
 /// Build a `RawConfig` fragment from a source's typed inputs. A *structural* error (a bad `--net`
@@ -806,7 +841,7 @@ fn build_typed_fragment(
     for spec in binds {
         raw.binds.push(parse_bind(spec, lbl.bind)?);
     }
-    let mut ports: Vec<u16> = Vec::new();
+    let mut ports: Vec<schema::RawForward> = Vec::new();
     for spec in forward {
         ports.extend(parse_forward(spec, lbl.forward)?);
     }
@@ -1200,7 +1235,10 @@ mod tests {
     #[test]
     fn the_forward_flag_parses_a_comma_list_and_unions_across_tiers() {
         // A single `--forward` value may carry a comma-list; repeated flags accumulate; and the
-        // env tier (`SBX_FORWARD`) unions with the CLI tier rather than being replaced.
+        // env tier (`SBX_FORWARD`) unions with the CLI tier rather than being replaced. The order
+        // is the tiers' own — env first, CLI after — because the entries are still raw here: the
+        // cage port that keys them is only known once the resolver parses each one, and it keeps
+        // the last entry per cage port, so a higher tier wins by sitting later in this list.
         let ov = collect_from(
             &CliOverrides {
                 forward: owned(&["1455", "8080,9090"]),
@@ -1212,7 +1250,15 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(ov.raw.forward, Some(vec![1455, 3000, 8080, 9090]));
+        assert_eq!(
+            ov.raw.forward,
+            Some(vec![
+                schema::RawForward::Port(3000),
+                schema::RawForward::Port(1455),
+                schema::RawForward::Port(8080),
+                schema::RawForward::Port(9090),
+            ])
+        );
         // The env contributed a security-relevant collection, so a source notice fires.
         assert!(
             ov.notices()
@@ -1302,6 +1348,38 @@ mod tests {
             err.contains("--forward") && err.contains("notaport"),
             "a bad port must be a structural error naming the flag: {err}"
         );
+    }
+
+    #[test]
+    fn the_forward_flag_accepts_a_remap_and_rejects_every_malformed_one() {
+        // The flag's contract differs from a config file's on purpose: a file is a collection where
+        // one bad entry warns and is skipped so a typo cannot void a whole layer, but a flag has
+        // nothing else to save — the caller typed exactly this and meant it, so it fails closed.
+        let ov = collect_cli(Cli {
+            forward: &["9200:9119,4096"],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            ov.raw.forward,
+            Some(vec![
+                schema::RawForward::Remap("9200:9119".into()),
+                schema::RawForward::Port(4096),
+            ]),
+            "a comma-list mixes remaps and bare ports"
+        );
+
+        for bad in ["9200:9119:8787", "nope:9119", "9200:nope", ":9119", "9200:"] {
+            let err = collect_cli(Cli {
+                forward: &[bad],
+                ..Default::default()
+            })
+            .unwrap_err();
+            assert!(
+                err.contains("--forward") && err.contains(bad),
+                "`{bad}` must be a structural error naming the flag and the token: {err}"
+            );
+        }
     }
 
     #[test]
@@ -1507,7 +1585,7 @@ mod tests {
         assert_eq!(ov.raw.gui.as_deref(), Some("wayland"));
         assert_eq!(
             ov.raw.forward.as_deref(),
-            Some(&[1455][..]),
+            Some(&[schema::RawForward::Port(1455)][..]),
             "forward dropped in merge"
         );
         assert!(!ov.raw.binds.is_empty(), "binds dropped in merge");

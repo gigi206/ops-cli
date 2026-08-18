@@ -49,7 +49,7 @@ Ergonomic shorthands for a single field, each with an `SBX_*` environment equiva
 | `--notify <off\|once\|always>` | `SBX_NOTIFY` | how loudly a refusal is [announced](notify) (a bare mode) |
 | `--nixpkgs <ref>` | `SBX_NIXPKGS` | the nixpkgs channel or revision |
 | `--bind <path[:ro\|:rw]>` | `SBX_BIND` | a host bind (read-only by default); repeatable |
-| `--forward <port[,port…]>` | `SBX_FORWARD` | host loopback TCP port(s) into the cage; repeatable |
+| `--forward <port\|host:cage[,…]>` | `SBX_FORWARD` | host loopback TCP forward(s) into the cage: a port, or a `host:cage` remap; repeatable |
 | `--limit <key>=<value>` | `SBX_LIMIT_<key>` | a cgroup limit (`memory_high`/`memory_max`/`tasks_max`) |
 | `--package <name>=<backend:locator>` | `SBX_PACKAGE_<name>` | a package |
 | `--seccomp <token[,token…]>` | `SBX_SECCOMP` | relax the syscall denylist ([`[seccomp]`](seccomp) grammar); repeatable |
@@ -232,6 +232,13 @@ One uniform rule across all four tiers:
   to whatever the blobs bound, and `--limit tasks_max=…` tunes one limit without dropping
   a blob's `memory_max`.
 
+`forward` is keyed by its **cage** port, the one the caged service listens on. Naming a cage
+port the config already forwards moves it to your host port instead of opening a second hole,
+which is what lets `--forward 9200:9119` resolve a host-port collision rather than add to it.
+Naming one it does not forward adds it. Either way no cage port a config layer published
+stops being published: an override moves a forward, it never closes one. See
+[forward](../networking/forward#one-shot-override).
+
 `[fs]` is the one collection where the union is not just a merge convention but the whole
 guarantee: an override can close *more* of the project for one launch
 (`--config '[fs] deny = ["scratch.key"]'`), and there is no spelling that reopens what a
@@ -249,10 +256,15 @@ posture:
   posture, or, for `--notify`, a *quieter* one, than the mistyped intent.
 - A **structural** error (a `--limit` with no `=`, a `--bind` with an empty path, a bad
   `--net` keyword, an unknown limit key) is likewise a hard error.
-- The **additive** fields (`env`/`binds`/`packages`/`forward`/`seccomp`/`devices`) fail
+- The **additive** fields (`env`/`binds`/`packages`/`seccomp`/`devices`) fail
   *closed* by dropping a bad entry (a missing bind or tool, an unknown syscall token, a
   malformed device path: less capability/relaxation, never a wider posture), so they
   warn and skip.
+- `--forward` is the exception among them: a malformed value (`9200:nope`, `9200:9119:8787`)
+  is a **hard error**. A flag has nothing else to save, and the alternative is worse than a
+  dropped entry: the launch would come up with the forward silently missing and the port you
+  meant to publish answering nothing. A bad entry in a config *file* still warns and skips,
+  because there one typo must not void a whole layer.
 
 ## Environment footgun notice
 
