@@ -133,7 +133,8 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     // Canonicalize the (already absolute) bind sources, dropping any that cannot be
     // resolved — so `binds` is the *effective* list, identical to what the
     // launch will bind, and `sbx config` cannot advertise a bind the launch would
-    // silently skip. Following symlinks here also pins each source against a swap.
+    // silently skip. Following symlinks here also *narrows* each source's swap window
+    // (see [`canonicalize_one`] for what narrows means and what it does not).
     // The bind's read-only/read-write mode carries through unchanged; the per-layer
     // provenance is re-keyed from the raw declared path to the canonical one as we go,
     // so a lookup against the displayed (canonical) path resolves.
@@ -197,8 +198,20 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
 }
 
 /// Canonicalize one bind source, dropping it with a warning if it cannot be resolved (a
-/// missing path or a broken symlink) — bwrap could not bind it anyway. Following symlinks
-/// here also pins the source against a later swap.
+/// missing path or a broken symlink) — bwrap could not bind it anyway.
+///
+/// Following symlinks here **narrows** the source's swap window rather than closing it, and the
+/// distinction is worth the words: the source is pinned to its real location, so a later
+/// project-controlled symlink no longer trivially redirects the bind, but a parent component
+/// swapped between this call and the mount still races. The same sentence is written where the
+/// launch canonicalises (`sandbox::binds`), and the two used to disagree — this side claimed a pin,
+/// that side named the race. One rule, one description of it, or a reader believes whichever they
+/// happen to open.
+///
+/// Closing it rather than narrowing it means resolving at the moment of the mount, under
+/// `openat2(RESOLVE_BENEATH)` or through an `O_PATH` descriptor opened here and mounted from
+/// `/proc/self/fd`. That is a change to how every bind reaches bwrap, not a check added beside
+/// this one.
 fn canonicalize_one(p: &Path, warnings: &mut Vec<String>) -> Option<PathBuf> {
     match p.canonicalize() {
         Ok(canon) => Some(canon),

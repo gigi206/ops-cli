@@ -406,13 +406,26 @@ fn kill_cage(cage: &[(u32, u64)]) {
 
 /// Send `signal` to `pid` only if it is still the incarnation `start_ticks` recorded — the same
 /// reuse guard the registry applies, so a cage member whose pid the kernel has since recycled is
-/// never signalled by mistake. (A vanishingly small window remains between the start-time read and
-/// the `kill`; the recorded process itself is signalled through a race-free pidfd instead.)
+/// never signalled by mistake.
+///
+/// The pidfd is opened **first**, and that ordering is the guard rather than an optimisation. A
+/// bare `kill` behind a start-time check leaves a window: between reading `/proc/<pid>/stat` and the
+/// call, the process can exit and the kernel hand its number to something else, which is then
+/// signalled in its place. Holding a pidfd keeps the number reserved for as long as it is open, so
+/// the start time read after it describes the process the signal will reach — the same pinning the
+/// recorded process already had, extended to the cage members it was not covering.
+///
+/// A pidfd that cannot be opened means nothing is signalled: without it the identity cannot be held
+/// still, and this is a sweep of things that are already meant to be dying, not a step a launch
+/// depends on.
 fn signal_if_match(pid: u32, start_ticks: u64, signal: libc::c_int) {
+    let Ok(pidfd) = open_pidfd(pid) else {
+        return;
+    };
     if read_start_ticks(pid) == Some(start_ticks) {
-        // SAFETY: `kill(pid, signal)`; a failure (e.g. the process just exited) is ignored.
-        unsafe { libc::kill(pid as libc::pid_t, signal) };
+        let _ = send_signal(pidfd, signal);
     }
+    close_fd(pidfd);
 }
 
 /// The transitive descendants of `root` (excluding `root` itself), each paired with its start time,
@@ -1031,6 +1044,43 @@ mod tests {
         // the AlreadyGone above came from the start-time mismatch, not from the pid being absent.
         s.start_ticks = read_start_ticks(std::process::id()).unwrap();
         assert!(is_alive(&s));
+    }
+
+    /// A cage member is signalled only when its start time is the one recorded.
+    ///
+    /// This is the guard `stop` applies to the session's own process through a pidfd, tested on the
+    /// path that sweeps the rest of the cage. What the pidfd adds cannot be seen from here: it keeps
+    /// the kernel from handing the number to something else between the check and the signal, which
+    /// is a window, not an outcome. What is observable is the rule itself, and a mutation that
+    /// dropped it would be seen here rather than at the next pid the kernel recycles.
+    #[test]
+    fn a_cage_member_is_signalled_only_under_the_start_time_recorded() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep");
+        let pid = child.id();
+        let start = read_start_ticks(pid).expect("the child's start time");
+
+        signal_if_match(pid, start.wrapping_add(1), libc::SIGKILL);
+        // Waited for, and read through `try_wait` rather than through the start time: a process
+        // killed but not yet reaped is a zombie whose `/proc/<pid>/stat` still carries the very
+        // start time recorded, so reading that would have called a killed child alive. Measured —
+        // the first version of this test passed with the guard removed.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            child.try_wait().expect("the child can be polled").is_none(),
+            "a wrong start time must signal nothing"
+        );
+
+        signal_if_match(pid, start, libc::SIGKILL);
+        let status = child.wait().expect("the child is reaped");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "the recorded incarnation is signalled"
+        );
     }
 
     #[test]
