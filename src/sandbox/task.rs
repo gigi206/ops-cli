@@ -98,12 +98,27 @@ pub(crate) fn next_invocation() -> u64 {
 /// How many detached invocations may be live at once.
 ///
 /// A separate bound from the session's call quota, which counts admissions over the session's whole
-/// life and so bounds nothing about how many run *together*. An attached invocation needs no such cap
-/// — its caller is blocked waiting for it, which is a limit of one per caller. Detaching removes
-/// exactly that, and each live invocation holds a cage, a per-invocation proxy, an exec supervisor
-/// and a systemd scope: without a cap, `--detach` in a loop is a way to stand up as many of those as
-/// the quota allows, all at once.
+/// life and so bounds nothing about how many run *together*. Detaching removes the caller's own wait
+/// as a limit, and each live invocation holds a cage, a per-invocation proxy, an exec supervisor and
+/// a systemd scope: without a cap, `--detach` in a loop is a way to stand up as many of those as the
+/// quota allows, all at once.
 pub(super) const MAX_DETACHED: usize = 4;
+
+/// How many invocations may be live at once, detached or not.
+///
+/// The reason this exists is that "an attached invocation is bounded by its caller waiting for it"
+/// counts callers, and the caller here is the *cage*: it reaches the plane over a socket it can open
+/// as many times as the plane will serve, and each connection blocks on an invocation of its own.
+/// So the wait bounds one invocation per connection and nothing at all per session, and what was
+/// left holding the line was the connection ceiling — a number sized for what a *connection* costs,
+/// standing in for a bound on what a *cage* costs.
+///
+/// Twice [`MAX_DETACHED`]: an invocation costs the same whether or not anyone is waiting for it, so
+/// the number is of that order, and leaving room above the detached cap is what keeps a full
+/// detached slate from also refusing the attached call that would inspect it. The trigger for
+/// revisiting it is a workload legitimately refused, which `sbx task status` shows as the
+/// invocations that were live at the time.
+pub(super) const MAX_LIVE: usize = 2 * MAX_DETACHED;
 
 /// How often the runner checks whether the command has exited, whether its timeout has passed, and
 /// whether it has been asked to stop. Short enough that a fast task is not visibly delayed, long
@@ -1303,13 +1318,23 @@ impl TaskEngine {
     /// cannot both take it. The cap is checked here rather than beside the call for that reason
     /// alone — a check outside would be a read of a number that can change before it is used.
     ///
-    /// A poisoned registry refuses a detached invocation and admits an attached one. That asymmetry
-    /// is deliberate: the cap is what keeps `--detach` from being a way to stand up unbounded cages,
-    /// and a cap that cannot be evaluated must not be assumed satisfied. An attached invocation is
-    /// bounded by its own caller waiting for it, which no lock is needed to know.
+    /// A poisoned registry refuses **both**, and the asymmetry it used to keep is gone with the
+    /// reason for it: an attached invocation was admitted because its caller waiting for it was a
+    /// limit no lock was needed to know, and [`MAX_LIVE`] is why that is no longer a limit. A cap
+    /// that cannot be evaluated must not be assumed satisfied, and one that a caller could get
+    /// around by arranging for the lock to be poisoned would not be a cap.
     fn enter(&self, id: u64, task: &str, detached: bool) -> Result<RunGuard, String> {
         match self.running.lock() {
             Ok(mut running) => {
+                if running.len() >= MAX_LIVE {
+                    return Err(format!(
+                        "{} invocations are already running, which is the limit — each one holds a \
+                         cage, a proxy and a scope of its own, so what bounds them is how many run \
+                         together rather than the session's call quota. `sbx task status` shows \
+                         them; `sbx task stop <id>` ends one",
+                        running.len()
+                    ));
+                }
                 let live = running.values().filter(|r| r.detached).count();
                 if detached && live >= MAX_DETACHED {
                     return Err(format!(
@@ -1331,14 +1356,13 @@ impl TaskEngine {
                     },
                 );
             }
-            Err(_) if detached => {
+            Err(_) => {
                 return Err(
-                    "the invocation registry is unavailable, so the limit on detached \
-                            invocations cannot be checked"
+                    "the invocation registry is unavailable, so the limit on how many \
+                            invocations run at once cannot be checked"
                         .to_string(),
                 );
             }
-            Err(_) => {}
         }
         Ok(RunGuard {
             id,
@@ -2830,6 +2854,101 @@ mod smoke {
 mod tests {
     use super::*;
     use crate::config::{Encoding, ParamBound, TaskParam, TaskSecret};
+
+    // --- how many run at once ---
+
+    /// The registry admits [`MAX_LIVE`] invocations and refuses the next, whether or not anyone is
+    /// waiting for them.
+    ///
+    /// A caller waiting for its invocation was what stood in for this bound, and it counts callers:
+    /// the cage opens as many connections as the plane serves, each blocking on an invocation of its
+    /// own, so the wait bounds one per connection and nothing per session.
+    #[test]
+    fn live_invocations_are_capped_whether_or_not_a_caller_is_waiting() {
+        let engine = TaskEngine::inventory_only(Vec::new());
+        let mut held: Vec<_> = (0..MAX_LIVE as u64)
+            .map(|id| {
+                engine
+                    .enter(id, "probe", false)
+                    .expect("every invocation under the cap is admitted")
+            })
+            .collect();
+
+        // Matched rather than `expect_err`, which would ask the guard to be printable for a case
+        // that never produces one.
+        let refused = match engine.enter(900, "probe", false) {
+            Ok(_) => panic!("past the cap, an invocation must be refused"),
+            Err(why) => why,
+        };
+        assert!(
+            refused.contains("invocations are already running"),
+            "the refusal must say what the limit is about: {refused}"
+        );
+
+        // The cap is on what is live, not on what has run: a finished invocation gives its slot back.
+        held.pop();
+        engine
+            .enter(901, "probe", false)
+            .expect("a slot given back admits the next caller");
+    }
+
+    /// A registry that cannot be read admits nothing, attached invocations included.
+    ///
+    /// It used to admit them, and the reason was that a caller waiting for its invocation bounded
+    /// it without any lock being consulted. `MAX_LIVE` is a bound that cannot be known without the
+    /// lock, so admitting past a poisoned one would make poisoning it the way around the cap. The
+    /// registry is poisoned here the way production would poison it: a thread that panics holding
+    /// it (the panic message below is the test doing that, not a failure).
+    #[test]
+    fn a_registry_that_cannot_be_read_admits_nothing() {
+        let engine = TaskEngine::inventory_only(Vec::new());
+        let registry = engine.running.clone();
+        let poisoner = std::thread::spawn(move || {
+            let _held = registry.lock().expect("the registry");
+            panic!("a handler failed while holding the registry");
+        })
+        .join();
+        assert!(poisoner.is_err(), "the poisoning thread must have panicked");
+
+        for detached in [false, true] {
+            let refused = match engine.enter(1, "probe", detached) {
+                Ok(_) => panic!("a cap that cannot be evaluated must not be assumed satisfied"),
+                Err(why) => why,
+            };
+            assert!(
+                refused.contains("the invocation registry is unavailable"),
+                "detached={detached}: {refused}"
+            );
+        }
+    }
+
+    /// The detached cap still bites first, and says so: it is the tighter of the two, and its
+    /// refusal is the one that tells a caller `--detach` is what it ran out of.
+    #[test]
+    fn the_detached_cap_is_the_one_that_answers_a_detached_caller() {
+        let engine = TaskEngine::inventory_only(Vec::new());
+        let _held: Vec<_> = (0..MAX_DETACHED as u64)
+            .map(|id| {
+                engine
+                    .enter(id, "probe", true)
+                    .expect("under the detached cap")
+            })
+            .collect();
+
+        let refused = match engine.enter(900, "probe", true) {
+            Ok(_) => panic!("past the detached cap, an invocation must be refused"),
+            Err(why) => why,
+        };
+        assert!(
+            refused.contains("detached invocations are already running"),
+            "{refused}"
+        );
+        // And the wider cap has room left, so an attached caller is still served: a full detached
+        // slate must not refuse the call that would inspect it.
+        engine
+            .enter(901, "probe", false)
+            .expect("an attached invocation with the detached slate full");
+    }
 
     fn task() -> TaskSpec {
         TaskSpec {

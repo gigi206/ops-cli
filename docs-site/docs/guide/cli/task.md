@@ -289,8 +289,10 @@ what prevents.
 
 **At most four run at once.** Separate from the session's call quota, which bounds how many
 invocations are ever *started*, not how many run *together*: each live one holds a cage, a proxy and
-a scope of its own. An attached invocation needs no such cap, because its caller waiting for it is
-already a limit of one.
+a scope of its own. **Eight invocations run at once in all**, detached or not, and that wider ceiling
+is what bounds an attached one: waiting for an invocation limits a caller to one at a time, and the
+caller reaching the plane from the cage opens as many connections as it likes. A refusal names which
+of the two ceilings you met, and [`status`](#status) shows what was holding it.
 
 **It dies with its session.** The plane that runs a detached invocation is part of the session
 process, so closing the session ends it. Detaching frees the *terminal*, not the session.
