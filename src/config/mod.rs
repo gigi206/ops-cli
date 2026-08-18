@@ -5250,8 +5250,8 @@ fn validate_network_table(
         match crate::allowlist::WebsocketSecret::parse(raw) {
             Some(action) => policy = policy.with_websocket_secret(action),
             None => warnings.push(format!(
-                "{source_label}: ignoring unknown `websocket_secret = `{raw}`` (expected \"warn\" \
-                 or \"block\") — a secret seen leaving a WebSocket is recorded and relayed"
+                "{source_label}: ignoring unknown `websocket_secret` value `{raw}` (expected \
+                 \"warn\" or \"block\") — a secret seen leaving a WebSocket is recorded and relayed"
             )),
         }
     }

@@ -95,7 +95,25 @@ capture = "bodies"       # "off" (default) | "headers" | "bodies"
 capture_max_kb = 32      # per body; default 8, ceiling 1024
 ```
 
-### A secret leaving through a WebSocket (`websocket_secret`)
+For a one-off debugging run, prefer the one-shot override, which needs no file edit and
+is trusted by invocation:
+
+```bash
+sbx run --config '[network] capture = "bodies"'
+```
+
+Every inspected path is captured: HTTPS, inspected cleartext,
+[HTTP/2 and gRPC](#http2-and-grpc) per stream, and a WebSocket (its handshake, then
+the messages each direction carried, unmasked. A raw [`tcp://`](../networking/rules)
+splice has no head to read and is the one exception.
+
+Three properties, covered in full on the [observability page](../networking/observability#seeing-the-traffic-network-capture):
+every configured secret is masked out of a capture before it is stored (and an
+sbx-injected credential never enters one at all); a capture lives only in the running
+session's memory, never on disk and never inside the cage; and it is bounded per body,
+per exchange count, and by a total byte budget, reporting whatever it drops.
+
+## A secret leaving through a WebSocket (`websocket_secret`)
 
 A request carrying a configured secret to a host it was not minted for is **refused**, on
 every one of the four request paths. A WebSocket has no request to refuse: past the `101`
@@ -120,24 +138,6 @@ The way back is recorded and never closed, whichever setting you choose: a secre
 *into* the cage is not an exfiltration, and the answer the request paths give that is
 redaction, which a byte-for-byte relay cannot do without rewriting a stream two peers agreed
 on.
-
-For a one-off debugging run, prefer the one-shot override, which needs no file edit and
-is trusted by invocation:
-
-```bash
-sbx run --config '[network] capture = "bodies"'
-```
-
-Every inspected path is captured: HTTPS, inspected cleartext,
-[HTTP/2 and gRPC](#http2-and-grpc) per stream, and a WebSocket (its handshake, then
-the messages each direction carried, unmasked. A raw [`tcp://`](../networking/rules)
-splice has no head to read and is the one exception.
-
-Three properties, covered in full on the [observability page](../networking/observability#seeing-the-traffic-network-capture):
-every configured secret is masked out of a capture before it is stored (and an
-sbx-injected credential never enters one at all); a capture lives only in the running
-session's memory, never on disk and never inside the cage; and it is bounded per body,
-per exchange count, and by a total byte budget, reporting whatever it drops.
 
 ## DNS resolution (`dns_cache_ttl`)
 

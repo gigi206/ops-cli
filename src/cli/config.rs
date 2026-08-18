@@ -1008,7 +1008,7 @@ fn network_section(view: &config::view::ConfigView, pal: &style::Palette, detail
                     o,
                     "    {}",
                     style::dim_prose(
-                        "websocket secret: block (a tunnel carrying a configured secret out is                          closed)",
+                        "websocket secret: block (a tunnel carrying one out is closed)",
                         pal
                     )
                 );
@@ -1780,7 +1780,7 @@ fn render_app_detail(
                     o,
                     "    {}",
                     style::dim_prose(
-                        "websocket secret: block (a tunnel carrying a configured secret out is                          closed)",
+                        "websocket secret: block (a tunnel carrying one out is closed)",
                         pal
                     )
                 );
