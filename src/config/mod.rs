@@ -1061,7 +1061,10 @@ impl Resolved {
         // launch, never reopen what a config layer closed.
         if fs.is_some() {
             let over = apply_fs(&mut self.warnings, OVERRIDE_SOURCE, fs);
-            if !over.is_empty() {
+            // `declares_nothing`, not `is_empty`: the latter asks whether there are mounts to lay
+            // down, and a `scan`-only table lays down none — asking it here dropped the override
+            // entirely, so `--config '[fs] scan = [...]'` protected nothing.
+            if !over.declares_nothing() {
                 self.fs.union(over);
                 self.fs_origin = Provenance::Override;
             }
@@ -1747,7 +1750,7 @@ fn resolve(
     // The `[fs]` masks from the global layer. Ungated (they only close paths), and layered like the
     // device grant: a project's set unions onto this, so a layer can close more and never less.
     let mut fs = apply_fs(&mut warnings, GLOBAL_CONFIG, global.fs);
-    let mut fs_origin = if fs.is_empty() {
+    let mut fs_origin = if fs.declares_nothing() {
         Provenance::Default
     } else {
         Provenance::Global
@@ -2141,7 +2144,7 @@ fn resolve(
         // global set, like `[devices]`.
         if let Some(raw) = proj.fs {
             let project_fs = apply_fs(&mut warnings, PROJECT_CONFIG, Some(raw));
-            if !project_fs.is_empty() {
+            if !project_fs.declares_nothing() {
                 fs_origin = Provenance::Project;
             }
             fs.union(project_fs);
@@ -3227,7 +3230,7 @@ fn resolve_app(
         }
         union_devices(&mut devices, global_devices);
         let global_fs = apply_fs(&mut warnings, &source, app.fs);
-        if !global_fs.is_empty() {
+        if !global_fs.declares_nothing() {
             fs_origin = Provenance::Global;
         }
         fs.union(global_fs);
@@ -3494,7 +3497,7 @@ fn resolve_app(
         // access away from that app's own cage, so an untrusted project declaring them buys nothing.
         if let Some(raw) = app.fs {
             let project_fs = apply_fs(&mut warnings, &source, Some(raw));
-            if !project_fs.is_empty() {
+            if !project_fs.declares_nothing() {
                 fs_origin = Provenance::Project;
             }
             fs.union(project_fs);

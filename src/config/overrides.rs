@@ -601,19 +601,41 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
     base
 }
 
-/// Union two `[fs]` tables, a higher tier's entries appended onto a lower's. Both lists only ever
-/// *close* a path, so appending is the fail-closed direction and matches how the config layers
+/// Union two `[fs]` tables, a higher tier's entries appended onto a lower's. Every list only ever
+/// *closes* something, so appending is the fail-closed direction and matches how the config layers
 /// themselves fold: a repeated `--config` blob, and the two precedence sides, accumulate masks
 /// instead of one silently replacing the other's. `apply_fs` validates and dedups downstream, so a
 /// plain append is enough. Unknown keys ride along so the table's own report still sees them.
+///
+/// `scan_max_kb` is the one field that is not a list, and it folds by the rule its own layer merge
+/// uses ([`crate::config::fspolicy`]): the tighter ceiling wins, because a tier raising it would
+/// widen what a lower one had narrowed.
+///
+/// The higher side is **destructured exhaustively** rather than read field by field. A field added
+/// to [`RawFs`] and forgotten here is dropped in silence, and silence on this table means the thing
+/// the invoker asked to close stays open. That has now happened three times (see the test below),
+/// the third being `scan`, which the hand-written list of fields did not mention. Destructuring
+/// makes the fourth a compile error instead of a launch that quietly protects nothing.
 fn union_fs_opt(base: Option<RawFs>, higher: Option<RawFs>) -> Option<RawFs> {
     match (base, higher) {
         (b, None) => b,
         (None, h) => h,
         (Some(mut b), Some(h)) => {
-            b.deny.extend(h.deny);
-            b.readonly.extend(h.readonly);
-            b.rest.extend(h.rest);
+            let RawFs {
+                deny,
+                readonly,
+                scan,
+                scan_max_kb,
+                rest,
+            } = h;
+            b.deny.extend(deny);
+            b.readonly.extend(readonly);
+            b.scan.extend(scan);
+            b.scan_max_kb = match (b.scan_max_kb, scan_max_kb) {
+                (Some(a), Some(c)) => Some(a.min(c)),
+                (None, other) | (other, None) => other,
+            };
+            b.rest.extend(rest);
             Some(b)
         }
     }
@@ -2123,6 +2145,31 @@ mod tests {
             "neither side may be dropped: {:?}",
             fs.deny
         );
+
+        // `scan` is the field that reproduced this bug a third time: it closes a file by its
+        // CONTENT, so a dropped pattern is a credential the cage keeps reading. Measured on the
+        // shipped binary before the fix, with the same project either way: `[fs] deny` through
+        // `--config` refused the file (rc=1) while `[fs] scan` through `--config` did not (rc=0),
+        // and the same `scan` in a `.sbx.toml` did — the warnings fired on both planes, so the
+        // table looked wired while the launch saw nothing.
+        let scanned = collect_cli(Cli {
+            config: &[
+                "[fs]\nscan = [\"sk-[A-Za-z0-9]{20,}\"]\nscan_max_kb = 512",
+                "[fs]\nscan = [\"AKIA[0-9A-Z]{16}\"]\nscan_max_kb = 64",
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        let fs = scanned.raw.fs.as_ref().expect("fs present");
+        assert!(
+            fs.scan.contains(&"sk-[A-Za-z0-9]{20,}".to_string())
+                && fs.scan.contains(&"AKIA[0-9A-Z]{16}".to_string()),
+            "a repeated blob accumulates scan shapes: {:?}",
+            fs.scan
+        );
+        // The tighter ceiling wins, the rule the layer merge already applies: a later blob may not
+        // widen how far an earlier one had narrowed the read.
+        assert_eq!(fs.scan_max_kb, Some(64));
     }
 
     #[test]

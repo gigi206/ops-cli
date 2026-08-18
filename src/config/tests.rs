@@ -5940,7 +5940,6 @@ fn the_default_devices_grant_is_empty() {
     );
 }
 
-/// A `RawConfig` declaring an `[fs]` table from the given deny/readonly entries.
 /// A `RawConfig` declaring an `[fs]` table carrying content-scan patterns.
 fn raw_fs_scan(scan: &[&str], scan_max_kb: Option<u64>) -> RawConfig {
     RawConfig {
@@ -5973,6 +5972,33 @@ fn a_scan_pattern_that_is_not_a_regex_is_dropped_and_says_what_is_lost() {
     assert!(
         w.contains("no file is closed"),
         "the warning must say what protection is lost, not merely that a line was ignored: {w}"
+    );
+}
+
+/// A `--config` blob carrying nothing but a content scan must reach the launch.
+///
+/// It did not: the override site asked `is_empty`, which answers "are there mounts to lay down",
+/// and a scan lays down none — so the whole table was dropped after its own validation had already
+/// printed warnings about it. Measured on the shipped binary, same project each time: `[fs] deny`
+/// through `--config` refused the file (rc=1), `[fs] scan` through `--config` did not (rc=0), the
+/// same scan in a `.sbx.toml` did, and adding an unrelated `deny` to the blob made the scan work
+/// again — which is what named `is_empty` as the cause rather than the table or the layering.
+#[test]
+fn a_one_shot_override_carrying_only_a_scan_still_closes_the_file() {
+    let resolved = with_override(
+        resolve_no_plugins(RawConfig::default(), None),
+        raw_fs_scan(&[r"sk-[A-Za-z0-9]{20,}"], Some(64)),
+    );
+    assert_eq!(
+        resolved.fs.scan,
+        vec![r"sk-[A-Za-z0-9]{20,}".to_string()],
+        "an override that closes files by content may not be dropped for laying down no mount"
+    );
+    assert_eq!(resolved.fs.scan_max_kb, Some(64));
+    assert_eq!(
+        resolved.fs_origin,
+        Provenance::Override,
+        "and the invoker's word must be visible as such in `config show`"
     );
 }
 

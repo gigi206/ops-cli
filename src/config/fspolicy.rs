@@ -28,16 +28,43 @@ pub(crate) struct FsPolicy {
     ///
     /// Not part of [`FsPolicy::is_empty`]: that question is "are there mounts to lay down", and a
     /// content scan lays down none. It is carried here because it belongs to the same `[fs]` table,
-    /// and for the same reason — it only ever takes access away.
+    /// and for the same reason — it only ever takes access away. A caller asking instead whether a
+    /// layer declared anything must use [`FsPolicy::declares_nothing`].
     pub(crate) scan: Vec<String>,
     /// How much of one file the content scan reads, in KiB. `None` leaves the built-in ceiling.
     pub(crate) scan_max_kb: Option<u64>,
 }
 
 impl FsPolicy {
-    /// Whether this policy closes nothing at all, in which case a launch skips the whole mechanism.
+    /// Whether this policy lays down no mount, in which case a launch skips the whole masking
+    /// mechanism. Deliberately blind to the content scan, which closes files without mounting
+    /// anything — so this is **not** the predicate for "did a layer declare `[fs]` at all". That one
+    /// is [`FsPolicy::declares_nothing`], and using this one in its place drops a table.
     pub(crate) fn is_empty(&self) -> bool {
         self.deny.is_empty() && self.readonly.is_empty()
+    }
+
+    /// Whether this policy declares nothing at all: the question a caller asks before deciding that
+    /// a layer said nothing about `[fs]`.
+    ///
+    /// It differs from [`FsPolicy::is_empty`] exactly on the fields that close a file without a
+    /// mount, and the difference is load-bearing. Measured on the shipped binary when the override
+    /// plane asked the mount question instead of this one: `--config '[fs] scan = [...]'` protected
+    /// nothing at all, while the same table written in a `.sbx.toml` refused the file, and adding an
+    /// unrelated `deny` to the same blob made the scan work again. The warnings fired on both
+    /// planes, so the table looked wired while the launch saw none of it.
+    ///
+    /// The policy is destructured exhaustively rather than read field by field: a field added here
+    /// and forgotten is a table dropped in silence, and on this table silence means the thing the
+    /// invoker asked to close stays open.
+    pub(crate) fn declares_nothing(&self) -> bool {
+        let Self {
+            deny,
+            readonly,
+            scan,
+            scan_max_kb,
+        } = self;
+        deny.is_empty() && readonly.is_empty() && scan.is_empty() && scan_max_kb.is_none()
     }
 
     /// Union `extra` onto this policy, deduped and order-preserving.

@@ -1628,7 +1628,11 @@ fn app_detail_view(
     // the same direction (an app closes more, never less).
     let mut eff_fs = baseline.fs.clone();
     eff_fs.union(app.fs.clone());
-    let fs_origin = origin_or_inherited(!app.fs.is_empty(), app.fs_origin, baseline.fs_origin);
+    let fs_origin = origin_or_inherited(
+        !app.fs.declares_nothing(),
+        app.fs_origin,
+        baseline.fs_origin,
+    );
 
     // Effective ssh-agent grant: the app's own ∪ the baseline's — the same union `merge_app`
     // performs — with the origin `Inherited` when the app named no key of its own.
