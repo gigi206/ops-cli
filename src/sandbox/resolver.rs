@@ -850,6 +850,12 @@ fn nix_closure(program: &Path, layout: Option<&crate::store::Layout>) -> io::Res
     if let Some(layout) = layout {
         cmd.arg("--store").arg(layout.store_dir());
     }
+    // The one subprocess in this file that does **not** go through `output_within`, and the
+    // exemption is deliberate rather than an oversight of the same rule. What that helper bounds is
+    // an untrusted writer: a plugin chooses what to say and how long to take. This is nix's own
+    // binary, run on sbx's side of every boundary, and what it says is a list of store paths whose
+    // size follows the closure being queried. Bounding it by size would refuse a large closure,
+    // and bounding it by time would make a cold query look like a hostile one.
     let out = cmd
         .arg("--query")
         .arg("--requisites")
