@@ -472,6 +472,26 @@ sbx config set packages.jq '"nix:jq"' --trust
 sbx config edit --trust               # opens $EDITOR; re-trusts on save
 ```
 
+## What attests a provisioned artefact
+
+Trusted-only says **who may declare** a tool. It says nothing about **what proves the artefact came
+from its publisher**, and the two are worth keeping apart.
+
+One provisioning path in `sbx` carries a real signature: the [plugin catalogue](../secrets/plugins)
+is signed and verified fail-closed, so an absent or wrong signature refuses the install. The tool
+backends do not, and each stops at a different place:
+
+| Backend | What is checked | What that proves |
+|---|---|---|
+| `nix:` | the revision is pinned and realised as a **locked** flake, its sources fetched under nix's own integrity checks | the build is reproducible from that revision. *Which* revision answers your `(package, version)` comes from the [nixhub](../reference/glossary) index, and `sbx` validates only its **shape** (40 lowercase hex characters). The repository itself is fixed in the code, so a wrong answer can point at another real nixpkgs commit, an older one for instance, never at code of its own |
+| `deb:`, `appimage:`, `tarball:`, `binary:` | the URL charset, then a hash **recorded on the first fetch** and re-checked on every later one | the artefact has not changed since `sbx` first saw it. It does **not** prove that first fetch was the publisher's: the hash is whatever the download returned, and `sbx upgrade` re-resolves from the same place |
+| `deb:apt:` | the above, plus the `Packages` index it reads | as stated with that backend: no `InRelease` or GPG check, so the vendor's own signature is never consulted |
+
+This is a deliberate stopping point rather than an oversight, and for most of these vendors there is
+nothing published to verify against. Where it matters to you, the containment is the one the model
+already gives: a tool provisioned from an unattested source still runs **inside the cage**, under its
+[network posture](../networking/modes) and its filesystem confinement.
+
 ## `[packages]` vs `[tools]`
 
 - `[packages]` is a **global, durable declaration** (`mise use -g`, `nix:` into the

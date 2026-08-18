@@ -33,7 +33,12 @@ bind it at all; bind read-only only what the tool may read but must not modify.
 ## Path rules
 
 - A bind path must be **absolute**. It is canonicalized (resolving symlinks) at
-  resolution time, closing a time-of-check/time-of-use gap.
+  resolution time, which **narrows** the time-of-check/time-of-use gap rather than
+  closing it: the source is pinned to its real location, so a symlink swapped in later
+  no longer redirects the bind, but a **parent directory** swapped between that
+  resolution and the mount still races. Under the
+  [same-uid model](../concepts/security-model) winning that race takes a host process
+  already running as you, which has your rights anyway.
 - A **missing** path is dropped with a warning rather than failing the launch (a
   best-effort bind), so a portable config referencing an optional path still works.
 - A leading `~`, `$HOME`, or `$XDG_RUNTIME_DIR` is expanded from your environment, so
