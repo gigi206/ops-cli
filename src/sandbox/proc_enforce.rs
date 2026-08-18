@@ -557,7 +557,9 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
         }
         if outcome.refused {
             respond_errno(notif_fd, req.id, libc::EACCES);
-        } else if !serve_open(notif_fd, req, dirfd, &named, outcome.probe.as_ref()) {
+        } else if let Some(errno) = outcome.errno {
+            respond_errno(notif_fd, req.id, errno);
+        } else if !serve_open(notif_fd, req, dirfd, &named, outcome.probe) {
             // Nothing sound to serve it from, so the open runs the way it always did — and with it
             // the re-resolution a sibling thread can redirect. The cases that land here are named
             // where each is decided: a target whose type would make a reopen block, flags that
@@ -786,9 +788,8 @@ fn serve_open(
     req: &libc::seccomp_notif,
     dirfd: libc::c_int,
     path: &str,
-    probe: Option<&std::fs::File>,
+    probe: Option<std::fs::File>,
 ) -> bool {
-    use std::os::unix::io::AsRawFd;
     let Some(probe) = probe else { return false };
     let Some(flags) = open_flags(req.pid, req.data.nr, &req.data.args) else {
         return false;
@@ -835,22 +836,193 @@ fn serve_open(
     // `O_CREAT` on a file that exists is a no-op, and `O_NOFOLLOW` has just been answered. Our own
     // descriptor is always close-on-exec; what the *cage's* copy carries is set on the response.
     let reopen = (flags & !libc::O_CREAT & !libc::O_NOFOLLOW) | libc::O_CLOEXEC;
-    let by_fd = format!("/proc/self/fd/{}", probe.as_raw_fd());
-    let Ok(c) = std::ffi::CString::new(by_fd) else {
-        return false;
+    let cloexec = flags & libc::O_CLOEXEC != 0;
+
+    use std::os::unix::fs::FileTypeExt;
+    let kind = probe.metadata().map(|m| m.file_type());
+    let Ok(kind) = kind else { return false };
+
+    // A socket inode cannot be opened at all: measured, `open` on one returns `ENXIO` whatever the
+    // access mode. Answering it here is both the truthful reply and one less door, since no reopen
+    // has to be attempted to know it.
+    if kind.is_socket() {
+        respond_errno(notif_fd, req.id, libc::ENXIO);
+        return true;
+    }
+
+    // A FIFO is the one type whose open blocks by design, and the direction decides how. Measured
+    // on a pipe with no peer at all, which is what the first reading of it got wrong: a probe left
+    // waiting in one direction counts as a peer for the other, and made the write side look
+    // instantaneous.
+    //
+    // - `O_RDWR` never blocks, so it is served here like any other.
+    // - `O_WRONLY` blocks for a reader, and `O_NONBLOCK` reports `ENXIO` until one arrives — so a
+    //   retry loop is *faithful* (the caller does wait for a reader) and bounded (it gives up when
+    //   the notification stops being valid, which is when the target is gone).
+    // - `O_RDONLY` blocks for a writer, and `O_NONBLOCK` succeeds immediately without one — so a
+    //   retry loop would drift, letting the caller past and turning its first `read` into an EOF
+    //   where the open should still have been waiting. Only a blocking open is faithful there.
+    if kind.is_fifo() && flags & libc::O_ACCMODE != libc::O_RDWR {
+        return park_open(notif_fd, req.id, probe, reopen, cloexec);
+    }
+
+    // A character or block device may wait on the hardware behind it (a serial line waiting for
+    // carrier). `O_NONBLOCK` is the standard way to open one without hanging on that, and clearing
+    // it afterwards restores what the caller asked for on the description it receives.
+    let nonblock_dance =
+        (kind.is_char_device() || kind.is_block_device()) && flags & libc::O_NONBLOCK == 0;
+    let attempt = if nonblock_dance {
+        reopen | libc::O_NONBLOCK
+    } else {
+        reopen
     };
-    // SAFETY: c is a live NUL-terminated path for the duration of the call.
-    let served = unsafe { libc::open(c.as_ptr(), reopen) };
+    let served = reopen_probe(&probe, attempt);
     if served < 0 {
-        // A reopen the supervisor could not make is one this increment does not try to attribute to
-        // the cage: falling back leaves the open exactly as it behaved before, race included.
+        // Whose failure is it? An errno about the *file* is one the cage would have met itself,
+        // reopening the same inode on the same mounts under the same identity, so it is the answer
+        // and the path is not walked again. An errno about the *opener* — this process out of
+        // descriptors, the machine out of memory — says nothing about the cage, and inventing it
+        // would fail an open that had every right to succeed. Only those fall back, and with them
+        // the race, for a window the cage cannot arrange from inside.
+        let e = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if matches!(
+            e,
+            libc::EROFS
+                | libc::EACCES
+                | libc::EPERM
+                | libc::ENXIO
+                | libc::ELOOP
+                | libc::ENOTDIR
+                | libc::EISDIR
+                | libc::ENOENT
+                | libc::ETXTBSY
+        ) {
+            respond_errno(notif_fd, req.id, e);
+            return true;
+        }
         return false;
     }
-    let ok = respond_with_fd(notif_fd, req.id, served, flags & libc::O_CLOEXEC != 0);
+    if nonblock_dance {
+        // SAFETY: served is this call's live descriptor; F_SETFL only alters its status flags.
+        unsafe {
+            let cur = libc::fcntl(served, libc::F_GETFL);
+            if cur >= 0 {
+                libc::fcntl(served, libc::F_SETFL, cur & !libc::O_NONBLOCK);
+            }
+        }
+    }
+    let ok = respond_with_fd(notif_fd, req.id, served, cloexec);
     // SAFETY: served is a fresh owned descriptor; the kernel copied it into the target if it took
     // it at all, and either way this side is done with it.
     unsafe { libc::close(served) };
     ok
+}
+
+/// Reopen the inode behind `probe` with `flags`, without walking a path.
+///
+/// `/proc/self/fd/<n>` names the descriptor's inode, not the name it was reached by, so this reaches
+/// exactly what was examined however the cage has since rearranged its tree. Returns a raw
+/// descriptor, or a negative value with `errno` set.
+fn reopen_probe(probe: &std::fs::File, flags: libc::c_int) -> libc::c_int {
+    use std::os::unix::io::AsRawFd;
+    let by_fd = format!("/proc/self/fd/{}", probe.as_raw_fd());
+    let Ok(c) = std::ffi::CString::new(by_fd) else {
+        return -1;
+    };
+    // SAFETY: c is a live NUL-terminated path for the duration of the call.
+    unsafe { libc::open(c.as_ptr(), flags) }
+}
+
+/// How many notified opens may be waiting on a blocking reopen at once.
+///
+/// The same shape as the `ask` registry's cap and for the same reason: a cage that can create pipes
+/// can create them faster than anyone drains them, and a registry that grows with what the cage asks
+/// for is a registry the cage sizes.
+const PARKED_OPEN_CAP: usize = 64;
+
+/// Opens currently parked on a thread of their own.
+static PARKED_OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How often a write-direction FIFO open asks again while it waits for a reader.
+const FIFO_RETRY: Duration = Duration::from_millis(10);
+
+/// Serve an open whose reopen may block, on a thread of its own.
+///
+/// The thread that decides is the one every other open in the cage is queued behind, so it must
+/// never be the thread that waits. Answering from elsewhere is not new here: the `ask` registry
+/// already has the control plane answer parked `execve`s while the receive loop keeps draining, and
+/// the kernel serialises the ioctls that do it.
+///
+/// Over the cap the answer is `EACCES`, never `CONTINUE`. Falling back to `CONTINUE` under pressure
+/// would hand the cage the door back by the simple act of asking for too much at once, which is a
+/// door that opens *wider* the harder it is pushed.
+///
+/// The notification descriptor is duplicated for the thread rather than shared. A parked open can
+/// outlive the supervisor's own descriptor, and answering through a number that has since been
+/// closed and handed to something else would send an ioctl to whatever now holds it.
+fn park_open(
+    notif_fd: libc::c_int,
+    id: u64,
+    probe: std::fs::File,
+    reopen: libc::c_int,
+    cloexec: bool,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    if PARKED_OPENS.fetch_add(1, Ordering::SeqCst) >= PARKED_OPEN_CAP {
+        PARKED_OPENS.fetch_sub(1, Ordering::SeqCst);
+        respond_errno(notif_fd, id, libc::EACCES);
+        return true;
+    }
+    // SAFETY: notif_fd is the supervisor's live notification descriptor; the copy is owned by the
+    // thread below, which closes it.
+    let own_fd = unsafe { libc::dup(notif_fd) };
+    if own_fd < 0 {
+        PARKED_OPENS.fetch_sub(1, Ordering::SeqCst);
+        return false;
+    }
+    let write_side = reopen & libc::O_ACCMODE == libc::O_WRONLY;
+    std::thread::spawn(move || {
+        let served = if write_side {
+            // Faithful *and* bounded: `ENXIO` means no reader yet, and the wait ends either when one
+            // arrives or when the notification stops being valid, which is when the caller is gone.
+            loop {
+                let fd = reopen_probe(&probe, reopen | libc::O_NONBLOCK);
+                if fd >= 0 {
+                    // SAFETY: fd is this thread's live descriptor; F_SETFL only alters status flags.
+                    unsafe {
+                        let cur = libc::fcntl(fd, libc::F_GETFL);
+                        if cur >= 0 {
+                            libc::fcntl(fd, libc::F_SETFL, cur & !libc::O_NONBLOCK);
+                        }
+                    }
+                    break fd;
+                }
+                if io::Error::last_os_error().raw_os_error() != Some(libc::ENXIO)
+                    || !notif_id_valid(own_fd, id)
+                {
+                    break -1;
+                }
+                std::thread::sleep(FIFO_RETRY);
+            }
+        } else {
+            // The read direction has no faithful poll, so this blocks exactly as the cage would
+            // have. It ends when a writer arrives; a pipe no writer ever joins holds this thread for
+            // as long as the supervisor lives, which is the price of not lying to the caller about
+            // whether its open completed.
+            reopen_probe(&probe, reopen)
+        };
+        if served >= 0 {
+            respond_with_fd(own_fd, id, served, cloexec);
+            // SAFETY: served is this thread's owned descriptor, closed exactly once.
+            unsafe { libc::close(served) };
+        } else {
+            respond_errno(own_fd, id, libc::EACCES);
+        }
+        // SAFETY: own_fd is this thread's duplicate, closed exactly once.
+        unsafe { libc::close(own_fd) };
+        PARKED_OPENS.fetch_sub(1, Ordering::SeqCst);
+    });
+    true
 }
 
 /// Read one `u64` from a target's memory. `openat2` passes its flags behind a pointer rather than in
@@ -1176,7 +1348,16 @@ fn open_is_refused(lens: &OpenLens, pid: u32, dirfd: libc::c_int, path: &str) ->
     // SAFETY: cpath is a live NUL-terminated path for the duration of the call.
     let probe = unsafe { libc::open(cpath.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
     if probe < 0 {
-        return OpenOutcome::ALLOWED;
+        // The last way a `CONTINUE` could still be reached, and as cheap to walk as the others were:
+        // name something that is not there while the answer is formed, then put the secret behind it.
+        //
+        // `O_PATH` is the most permissive open there is, succeeding even without read permission, so
+        // a probe that fails describes a path the cage's own open was going to fail on too, with
+        // this very errno. Replying with it is the same answer, reached without a second walk.
+        let e = io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::ENOENT);
+        return OpenOutcome::failed(e);
     }
     // SAFETY: probe is a fresh owned descriptor; the File takes sole ownership and closes it.
     let probe = unsafe { std::fs::File::from_raw_fd(probe) };
@@ -1188,12 +1369,13 @@ fn open_is_refused(lens: &OpenLens, pid: u32, dirfd: libc::c_int, path: &str) ->
     let Ok(meta) = probe.metadata() else {
         return OpenOutcome::ALLOWED;
     };
-    // A FIFO, a socket or a device carries no content this policy is written about, and reopening
-    // one could block the single thread every other open in the cage is queued behind — so it is
-    // allowed, and allowed *without* a descriptor to serve it from. That is a door and it is named
-    // where it is decided (`handle_notif`): such an open falls back on `CONTINUE`, which re-resolves.
+    // A FIFO, a socket or a device carries no content this policy is written about, so none of them
+    // is scanned. The descriptor still rides out: what serves such an open is decided in
+    // `serve_open`, which knows the caller's flags and therefore knows whether reopening one could
+    // block. Answering `CONTINUE` here instead would leave the widest door of all, since the cage
+    // picks what it names first and a `mkfifo` in its own project costs it nothing.
     if !meta.is_file() && !meta.is_dir() {
-        return OpenOutcome::ALLOWED;
+        return OpenOutcome::allowed_from(probe);
     }
     // The type is settled before the project bound, because a file outside the tree is served from a
     // descriptor too. Nothing outside is *scanned* — that is what the bound is for — but a
@@ -1212,6 +1394,7 @@ fn open_is_refused(lens: &OpenLens, pid: u32, dirfd: libc::c_int, path: &str) ->
             refused: remembered,
             report: None,
             probe: (!remembered).then_some(probe),
+            errno: None,
         };
     }
     // Re-opened for reading through the descriptor already resolved, so the bytes scanned belong to
@@ -1246,6 +1429,7 @@ fn open_is_refused(lens: &OpenLens, pid: u32, dirfd: libc::c_int, path: &str) ->
                 partial: true,
             }),
             probe: Some(probe),
+            errno: None,
         };
     }
     // Naming the shapes costs a second walk, paid only here — on content already refused, once per
@@ -1264,6 +1448,7 @@ fn open_is_refused(lens: &OpenLens, pid: u32, dirfd: libc::c_int, path: &str) ->
             partial: false,
         }),
         probe: None,
+        errno: None,
     }
 }
 
@@ -1279,9 +1464,15 @@ struct OpenOutcome {
     /// This is what closes the allow race. The verdict was formed against *this* inode; handing the
     /// cage a descriptor derived from it means the path it wrote is never resolved a second time,
     /// so there is no moment at which a sibling thread's rewrite could redirect the open. Absent
-    /// when there is nothing sound to serve: a refusal (answered with an errno), a target whose
-    /// type would make reopening block, or a probe that could not be taken at all.
+    /// when there is nothing to serve from: a refusal, which is answered with an errno of its own,
+    /// or a probe that could not be taken at all.
     probe: Option<std::fs::File>,
+    /// The errno the supervisor's own probe met, when it met one.
+    ///
+    /// Carried rather than discarded because it *is* the answer: a path the probe could not open is
+    /// a path the cage could not have opened either, so replying with it settles the open without
+    /// the kernel walking that path a second time.
+    errno: Option<libc::c_int>,
 }
 
 impl OpenOutcome {
@@ -1289,7 +1480,18 @@ impl OpenOutcome {
         refused: false,
         report: None,
         probe: None,
+        errno: None,
     };
+
+    /// The open the supervisor's probe could not make, answered with what it met.
+    fn failed(errno: libc::c_int) -> OpenOutcome {
+        OpenOutcome {
+            refused: false,
+            report: None,
+            probe: None,
+            errno: Some(errno),
+        }
+    }
 
     /// Allowed, and servable from the descriptor the supervisor already holds.
     fn allowed_from(probe: std::fs::File) -> OpenOutcome {
@@ -1297,6 +1499,7 @@ impl OpenOutcome {
             refused: false,
             report: None,
             probe: Some(probe),
+            errno: None,
         }
     }
 }
@@ -1647,6 +1850,193 @@ mod tests {
             !out.contains(SECRET),
             "the cage received a descriptor for a file the supervisor never scanned: the verdict was \
              formed against one inode and the open landed on another"
+        );
+    }
+
+    #[test]
+    fn a_non_regular_first_target_no_longer_lets_the_swap_through() {
+        // The door increment one left open, and the cheapest one to walk: the supervisor decides on
+        // the path it read, so the cage picks what that path names *first*. Naming something the
+        // supervisor could not serve from a descriptor sent the answer back to `CONTINUE`, and the
+        // kernel then walked the path again onto whatever the cage had swapped in.
+        //
+        // A unix socket is the sharpest form of it. Its open fails whatever happens, so nothing here
+        // depends on timing or on a peer: the only question is *which* file the failure is about.
+        // Answered from the descriptor, it is the socket, every time. Answered with `CONTINUE`, it
+        // is whatever the link points at by then, and that is a regular file holding a secret.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const SECRET: &str = "sk-ABC123DEF456GHI789";
+        const ROUNDS: usize = 400;
+
+        let dir = TmpDir::new();
+        let secret = dir.join("secret.txt");
+        std::fs::write(&secret, format!("API key: {SECRET}\n")).expect("write the secret fixture");
+        let sock_path = dir.join("stand-in.sock");
+        let _sock = UnixListener::bind(&sock_path).expect("bind the stand-in socket");
+        let door = dir.join("door");
+        std::os::unix::fs::symlink(&secret, &door).expect("plant the door");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let flipper = {
+            let (stop, dir_path, door, secret, sock_path) = (
+                Arc::clone(&stop),
+                dir.join(".").to_path_buf(),
+                door.clone(),
+                secret.clone(),
+                sock_path.clone(),
+            );
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    for target in [sock_path.as_path(), secret.as_path()] {
+                        let tmp = dir_path.join("door.tmp");
+                        let _ = std::fs::remove_file(&tmp);
+                        if std::os::unix::fs::symlink(target, &tmp).is_ok() {
+                            let _ = std::fs::rename(&tmp, &door);
+                        }
+                    }
+                }
+            })
+        };
+
+        let script = format!(
+            "i=0; while [ $i -lt {ROUNDS} ]; do /bin/cat {} 2>/dev/null; i=$((i+1)); done",
+            door.to_str().expect("utf-8 fixture path")
+        );
+        let (_, out) = run_with_open_lens(
+            &["/bin/sh", "-c", &script],
+            &[r"sk-[A-Za-z0-9]{12,}"],
+            &dir.join("."),
+        );
+        stop.store(true, Ordering::Relaxed);
+        flipper.join().expect("the flipper thread");
+
+        assert!(
+            !out.contains(SECRET),
+            "naming a socket first sent the answer back to a path walk, and the walk landed on the \
+             secret: a target the supervisor cannot read is still a target it must answer for"
+        );
+    }
+
+    #[test]
+    fn an_absent_first_target_is_answered_rather_than_walked_again() {
+        // The cheapest door of the three, because it needs no special file at all: point the name at
+        // nothing while the answer is being formed, and a `CONTINUE` would send the kernel back down
+        // the path once the secret is behind it.
+        //
+        // Both halves matter. The secret must not cross, and a missing file must still read as
+        // missing: answering with the probe's own errno is only sound if it is the errno the cage
+        // would have met.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const SECRET: &str = "sk-ABC123DEF456GHI789";
+        const ROUNDS: usize = 400;
+
+        let dir = TmpDir::new();
+        let secret = dir.join("secret.txt");
+        std::fs::write(&secret, format!("API key: {SECRET}\n")).expect("write the secret fixture");
+        let nowhere = dir.join("nowhere.txt");
+        let door = dir.join("door");
+        std::os::unix::fs::symlink(&secret, &door).expect("plant the door");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let flipper = {
+            let (stop, dir_path, door, secret, nowhere) = (
+                Arc::clone(&stop),
+                dir.join(".").to_path_buf(),
+                door.clone(),
+                secret.clone(),
+                nowhere.clone(),
+            );
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    for target in [nowhere.as_path(), secret.as_path()] {
+                        let tmp = dir_path.join("door.tmp");
+                        let _ = std::fs::remove_file(&tmp);
+                        if std::os::unix::fs::symlink(target, &tmp).is_ok() {
+                            let _ = std::fs::rename(&tmp, &door);
+                        }
+                    }
+                }
+            })
+        };
+
+        let script = format!(
+            "i=0; while [ $i -lt {ROUNDS} ]; do /bin/cat {} 2>&1; i=$((i+1)); done",
+            door.to_str().expect("utf-8 fixture path")
+        );
+        let (_, out) = run_with_open_lens(
+            &["/bin/sh", "-c", &script],
+            &[r"sk-[A-Za-z0-9]{12,}"],
+            &dir.join("."),
+        );
+        stop.store(true, Ordering::Relaxed);
+        flipper.join().expect("the flipper thread");
+
+        assert!(
+            !out.contains(SECRET),
+            "naming something absent sent the answer back to a path walk, and the walk landed on \
+             the secret once it was put there"
+        );
+        assert!(
+            out.contains("No such file"),
+            "a path that is not there must still read as not there, or the errno being replied with \
+             is not the one the cage would have met: {out}"
+        );
+    }
+
+    #[test]
+    fn a_device_and_a_fifo_are_served_without_changing_what_the_cage_gets() {
+        // The arms that carry the most machinery are also the ones that would break quietly: a cage
+        // opens `/dev/null` constantly, and a FIFO read is served from a thread of its own. What is
+        // asserted here is that neither behaves differently for being served.
+        //
+        // The `O_NONBLOCK` a character device is opened with is the supervisor's own doing, to avoid
+        // hanging on hardware that waits; leaving it set on what the cage receives would turn a
+        // blocking read into a spurious `EAGAIN` in the caller's hands.
+        let dir = TmpDir::new();
+        let pipe = dir.join("pipe");
+        let c = std::ffi::CString::new(pipe.as_os_str().as_encoded_bytes()).expect("fixture path");
+        // SAFETY: c is a live NUL-terminated path for the duration of the call.
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "make the fixture pipe"
+        );
+
+        // A writer for the whole run, so the read side completes rather than waiting for one, and a
+        // bounded read so the payload ends rather than following the pipe forever.
+        let writer = {
+            let pipe = pipe.clone();
+            std::thread::spawn(move || {
+                if let Ok(mut w) = std::fs::OpenOptions::new().write(true).open(&pipe) {
+                    use std::io::Write;
+                    for _ in 0..200 {
+                        if w.write_all(b"pipebyte").is_err() {
+                            return;
+                        }
+                    }
+                }
+            })
+        };
+
+        let script = format!(
+            "/bin/cat /dev/null; /bin/dd if=/dev/urandom bs=4 count=1 2>/dev/null | /bin/wc -c; \
+             /bin/dd if={} bs=8 count=1 2>/dev/null",
+            pipe.to_str().expect("utf-8 fixture path")
+        );
+        let (code, out) = run_with_open_lens(
+            &["/bin/sh", "-c", &script],
+            &[r"sk-[A-Za-z0-9]{12,}"],
+            &dir.join("."),
+        );
+        let _ = writer.join();
+
+        assert_eq!(code, Some(0), "the payload must run to the end: {out}");
+        // The whole output, not a substring of it: a lone `4` is a digit half the diagnostics in
+        // this file could produce, and an assertion a failure can still satisfy proves nothing.
+        assert_eq!(
+            out.trim_end(),
+            "4\npipebyte",
+            "a device must still deliver its four bytes and a pipe what its writer sent"
         );
     }
 

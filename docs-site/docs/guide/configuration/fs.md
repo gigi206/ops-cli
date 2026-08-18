@@ -168,12 +168,15 @@ progress, so the file that arrives would not be the file that was read. Serving 
 removes the second walk, and the descriptor carries no more authority than the cage had: a read-only
 bind refuses a write through it exactly as it refuses the cage.
 
-Two cases still fall back on the older answer, and in those the swap above is still possible. The
-first is a target that is not a regular file or a directory, such as a named pipe or a device: a
-supervisor that reopened one could block on it, and the open being decided is the one every other
-open in the cage is queued behind. The second is a kernel older than 5.9, which does not offer the
-operation at all. Both are honest gaps rather than closed doors, and both keep `scan` on the footing
-the next paragraph describes.
+Every open a cage makes is answered this way, not only the ones under your project and not only the
+ones that hold a file. That breadth is the point rather than thoroughness for its own sake: the cage
+chooses what its path names **first**, so any shape `sbx` could not answer for would be the shape to
+name. A pipe, a device and a socket are each served or replied to on their own terms, and a path
+that is not there is answered with the same error the cage would have received, rather than being
+looked up a second time once something has been moved into place behind it.
+
+One gap is left, and it is not one a cage can arrange: a kernel older than 5.9 does not offer the
+operation at all, and there `scan` behaves as it did before, swap included.
 
 **What it does not do.** A pattern only finds the shapes you wrote: a password that looks like
 ordinary prose is not one of them, and a scan is a backstop rather than a proof. Rewriting a file

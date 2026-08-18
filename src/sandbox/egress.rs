@@ -1359,7 +1359,10 @@ mod tests {
         // so a fragment that did not wait would finish before it exists.
         const PORT: u16 = 19555;
         let pattern = format!("0100007F:{PORT:04X}");
-        let script = format!("{}printf ran", super::await_listeners(&[pattern.clone()]));
+        let script = format!(
+            "{}printf ran",
+            super::await_listeners(std::slice::from_ref(&pattern))
+        );
 
         let listener = std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_millis(400));
