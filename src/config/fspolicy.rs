@@ -178,30 +178,63 @@ pub(crate) fn matches_component(pattern: &str, name: &str) -> bool {
     glob_match(pattern.as_bytes(), name.as_bytes())
 }
 
-/// The matcher behind [`matches_component`], recursing on `*` with the standard backtrack.
+/// The matcher behind [`matches_component`], recursing on `*` with the standard backtrack, and
+/// **memoised** so that backtrack cannot be exponential.
 ///
 /// No wildcard consumes a `/`. The callers only ever pass single components, so today that changes
 /// no verdict — it is here because the function's name is a promise, and a later caller that hands
 /// it a whole path must not silently get a pattern matching across directories.
+///
+/// The bare recursion re-explores the same state through different splits, and the cost is not
+/// theoretical: measured on this function, `*a*a*a*a*a*a*a*ab` against forty `a`s took **4.1 s**,
+/// and each further star multiplies it, against a component name the kernel lets run to 255 bytes.
+/// `[fs]` is honoured from any layer, including a project nobody has approved, so a cloned
+/// repository could hold the launch that way. The scan added beside it does not have the defect
+/// (one `RegexSet`, one pass), which is what makes the shape here worth naming rather than only
+/// fixing.
+///
+/// Because every branch recurses on a **suffix** of both inputs, a state is identified exactly by
+/// the two remaining lengths, and every edge shortens the pattern — so the walk is a DAG and a
+/// state already explored can only be re-entered with the same answer. Marking it on entry is
+/// therefore sound, and bounds the work at `|pattern| × |name|`. The memo is allocated only when
+/// the pattern holds two `*` or more: with fewer, no state is ever reachable twice, and the common
+/// mask pays nothing.
 fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
+    let mut memo = (pattern.iter().filter(|&&c| c == b'*').count() >= 2)
+        .then(std::collections::HashSet::<(usize, usize)>::new);
+    glob_walk(pattern, name, &mut memo)
+}
+
+fn glob_walk(
+    pattern: &[u8],
+    name: &[u8],
+    memo: &mut Option<std::collections::HashSet<(usize, usize)>>,
+) -> bool {
+    if let Some(seen) = memo.as_mut()
+        && !seen.insert((pattern.len(), name.len()))
+    {
+        return false;
+    }
     match pattern.first() {
         None => name.is_empty(),
         Some(b'*') => {
             // The empty match first, then one more consumed byte each time, stopping at a `/`.
             let stop = name.iter().position(|&c| c == b'/').unwrap_or(name.len());
-            (0..=stop).any(|skip| glob_match(&pattern[1..], &name[skip..]))
+            (0..=stop).any(|skip| glob_walk(&pattern[1..], &name[skip..], memo))
         }
         Some(b'?') => {
-            matches!(name.first(), Some(&c) if c != b'/') && glob_match(&pattern[1..], &name[1..])
+            matches!(name.first(), Some(&c) if c != b'/')
+                && glob_walk(&pattern[1..], &name[1..], memo)
         }
         Some(b'[') => match (name.first(), class_end(pattern)) {
             (Some(&c), Some(end)) if c != b'/' => {
-                class_matches(&pattern[1..end], c) && glob_match(&pattern[end + 1..], &name[1..])
+                class_matches(&pattern[1..end], c)
+                    && glob_walk(&pattern[end + 1..], &name[1..], memo)
             }
             // An unterminated `[` is a literal `[`, as a shell treats it.
-            _ => name.first() == Some(&b'[') && glob_match(&pattern[1..], &name[1..]),
+            _ => name.first() == Some(&b'[') && glob_walk(&pattern[1..], &name[1..], memo),
         },
-        Some(&c) => name.first() == Some(&c) && glob_match(&pattern[1..], &name[1..]),
+        Some(&c) => name.first() == Some(&c) && glob_walk(&pattern[1..], &name[1..], memo),
     }
 }
 
@@ -349,5 +382,36 @@ mod tests {
         assert_eq!(base.readonly, vec!["r".to_string(), "r2".to_string()]);
         assert!(!base.is_empty());
         assert!(FsPolicy::default().is_empty());
+    }
+
+    /// A mask entry is a pattern from any layer, including a project nobody approved, and the
+    /// matcher used to backtrack exponentially: measured on this very function before the memo,
+    /// `*a*a*a*a*a*a*a*ab` against forty `a`s took **4.1 s**, and every added star multiplies that
+    /// against a name the kernel lets run to 255 bytes. The bound here is deliberately loose (a
+    /// second, where the defect needed four) so the test measures the blow-up and not the machine.
+    #[test]
+    fn a_pattern_full_of_stars_cannot_hold_the_launch() {
+        for stars in [8usize, 12, 16] {
+            let pattern = format!("{}b", "*a".repeat(stars));
+            let name = "a".repeat(60);
+            let started = std::time::Instant::now();
+            assert!(
+                !matches_component(&pattern, &name),
+                "the verdict itself must not change: {pattern} matches nothing here"
+            );
+            let took = started.elapsed();
+            assert!(
+                took < std::time::Duration::from_secs(1),
+                "{stars} stars against {} bytes took {took:?} — the backtrack is exponential again",
+                name.len()
+            );
+        }
+        // The grammar is untouched by the memo, on the shapes that make a state reachable twice.
+        assert!(matches_component("*a*a*b", "aaaab"));
+        assert!(matches_component("*.log", "server.log"));
+        assert!(
+            !matches_component("a*c", "a/c") && !matches_component("*", "a/b"),
+            "no wildcard consumes a separator (the literal `/` of a pattern still does)"
+        );
     }
 }
