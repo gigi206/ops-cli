@@ -1387,10 +1387,37 @@ fn valid_revision(s: &str) -> Option<String> {
 /// *inside* the sandbox (where the store is bound at `/nix`); on the host the same
 /// content lives under the store root, so a bind *source* must use this physical
 /// path. Inside-sandbox uses (`PATH`, the loader) keep the logical path.
+///
+/// **The result is always under the store root**, and this is the one place that says so. A plain
+/// `join` does not constrain anything: a `logical` carrying `..` produced a path outside the store,
+/// and the callers are where that would have mattered — of thirteen in production, five read the
+/// path and **eight are bind sources**. Rather than thirteen checks that could each be forgotten,
+/// the walk resolves the path itself: `.` is dropped, `..` steps back through what has been built,
+/// and a `..` at the top is dropped rather than followed, because the store root *is* the root
+/// here. So a benign `a/../b` still means `b`, and an escape means nothing at all.
 pub(crate) fn physical_path(layout: &Layout, logical: &Path) -> PathBuf {
-    layout
-        .store_dir()
-        .join(logical.strip_prefix("/").unwrap_or(logical))
+    use std::path::Component;
+    let mut out = layout.store_dir();
+    // How many components deep below the root we are, which is what makes the clamp cheap: a `..`
+    // with nothing above it has nowhere to go, and comparing paths would answer the same question
+    // more slowly and with more ways to be wrong.
+    let mut depth = 0usize;
+    for part in logical.components() {
+        match part {
+            Component::Normal(p) => {
+                out.push(p);
+                depth += 1;
+            }
+            Component::ParentDir if depth > 0 => {
+                out.pop();
+                depth -= 1;
+            }
+            // A leading `/`, a `.`, a `..` at the top, a Windows prefix: nothing to add and nowhere
+            // to go back to.
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Provision `<flake_ref>#<attr>` into the user-owned store and return its
@@ -2219,6 +2246,35 @@ mod tests {
             physical_path(&layout, Path::new("/nix")),
             PathBuf::from("/data/sbx/store/nix")
         );
+    }
+
+    /// Whatever the logical path says, the physical one is under the store root.
+    ///
+    /// Eight of this function's callers are bind sources, so a result outside the store is a mount
+    /// of something the store never held. A `..` that stays inside keeps its meaning; one that
+    /// would step above the root is dropped, because the store root is the root on this side.
+    #[test]
+    fn physical_path_cannot_be_walked_out_of_the_store() {
+        let layout = Layout::under(Path::new("/data/sbx"));
+        let root = layout.store_dir();
+        for (logical, want) in [
+            // An escape, in the two shapes a store path could carry one.
+            ("/../../etc/passwd", "/data/sbx/store/etc/passwd"),
+            (
+                "/nix/store/../../../etc/passwd",
+                "/data/sbx/store/etc/passwd",
+            ),
+            // A `..` that stays inside still means what it says.
+            ("/nix/store/x/../y", "/data/sbx/store/nix/store/y"),
+            // The no-op components.
+            ("/nix/./store/abc", "/data/sbx/store/nix/store/abc"),
+            ("..", "/data/sbx/store"),
+            ("/", "/data/sbx/store"),
+        ] {
+            let got = physical_path(&layout, Path::new(logical));
+            assert_eq!(got, PathBuf::from(want), "{logical}");
+            assert!(got.starts_with(&root), "{logical} left the store: {got:?}");
+        }
     }
 
     #[test]
