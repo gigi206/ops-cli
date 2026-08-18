@@ -268,6 +268,15 @@ fn deadline_for(brokers: &[super::broker::Reachable]) -> std::time::Duration {
             .unwrap_or_default()
 }
 
+/// The most sbx will read from one host-side step of the secret chain, on each stream.
+///
+/// The same ceiling a broker frame meets, and deliberately not a second number: it is the largest
+/// thing sbx will take from a plugin on any channel, and two ceilings would only mean the smaller
+/// one had been chosen rather than derived. What it guards is what a time bound cannot — a plugin
+/// answering forever is stopped by the deadline, but a plugin answering *fast* is not, and
+/// `read_to_end` on a pipe grows sbx at the speed of the writer.
+const MAX_RESOLUTION_BYTES: usize = crate::plugins::broker::MAX_FRAME_CEILING;
+
 /// Read one of a child's pipes on its own thread, handing the bytes back over `tx`.
 ///
 /// Two pipes need two readers: a process that fills stderr while sbx is reading stdout would
@@ -275,13 +284,21 @@ fn deadline_for(brokers: &[super::broker::Reachable]) -> std::time::Duration {
 /// a deadlock neither side can see. Reading on threads sbx does not have to join is also what
 /// lets a bounded wait *be* bounded: the reader is abandoned, not waited for.
 fn drain<R: io::Read + Send + 'static>(
-    mut pipe: R,
+    pipe: R,
     is_stdout: bool,
     tx: std::sync::mpsc::Sender<(bool, Vec<u8>)>,
 ) {
     std::thread::spawn(move || {
+        use std::io::Read;
         let mut buf = Vec::new();
-        let _ = pipe.read_to_end(&mut buf);
+        // One byte past the ceiling, so a stream that sits exactly on it stays readable and only
+        // the stream that crosses it is refused.
+        let _ = pipe
+            .take(MAX_RESOLUTION_BYTES as u64 + 1)
+            .read_to_end(&mut buf);
+        // The read end closes here, which is what keeps an over-long answer from becoming a
+        // timeout: a process still writing takes EPIPE and stops, instead of blocking on a pipe
+        // nobody is draining until the deadline runs out.
         let _ = tx.send((is_stdout, buf));
     });
 }
@@ -391,6 +408,15 @@ fn output_within_armed_by(
     // the one exit no program produces for itself, so the signal is proof of what sbx did. The
     // second half is the pipe that never closed — the answer was not read in time, whoever is
     // still holding the descriptor.
+    // What the process said is the value, so an answer past the ceiling is refused rather than
+    // truncated: half a secret is not a smaller secret. An over-long *stderr* is not a failure —
+    // it is a diagnostic, already cut to one bounded line before anything sees it — so it stops at
+    // the ceiling and the run carries on.
+    if stdout.len() > MAX_RESOLUTION_BYTES {
+        return Err(io::Error::other(format!(
+            "{what} answered with more than {MAX_RESOLUTION_BYTES} bytes"
+        )));
+    }
     if (!exited && status.signal() == Some(libc::SIGKILL)) || !read_both {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -2047,6 +2073,73 @@ printf 'run-%s' "$n""#,
         assert!(
             !marker.exists(),
             "the command outlived its deadline instead of being killed"
+        );
+    }
+
+    /// An answer past the ceiling is refused, and refused rather than truncated: what the command
+    /// wrote is the secret, and half a secret is not a smaller secret.
+    ///
+    /// The elapsed bound is part of the assertion. Stopping the read without closing the pipe
+    /// would leave the command blocked on a buffer nobody drains, and the refusal would arrive as
+    /// a timeout ten minutes later instead; here the deadline is thirty seconds, so a refusal that
+    /// came from the clock rather than from the ceiling would take thirty.
+    #[test]
+    fn an_answer_past_the_ceiling_is_refused_rather_than_truncated() {
+        let started = std::time::Instant::now();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!(
+            "dd if=/dev/zero bs=1024 count={} 2>/dev/null",
+            MAX_RESOLUTION_BYTES / 1024 + 64
+        ));
+        let err = output_within(&mut cmd, std::time::Duration::from_secs(30), "the probe")
+            .expect_err("an answer past the ceiling must not resolve");
+        assert!(
+            err.to_string()
+                .contains(&format!("more than {MAX_RESOLUTION_BYTES} bytes")),
+            "{err}"
+        );
+        assert_ne!(
+            err.kind(),
+            io::ErrorKind::TimedOut,
+            "refused by the clock: {err}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the writer blocked on a pipe that was never closed: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The negative control for the ceiling: an answer sitting exactly on it still reads, whole.
+    #[test]
+    fn an_answer_at_the_top_of_the_ceiling_still_reads() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!(
+            "dd if=/dev/zero bs=1024 count={} 2>/dev/null",
+            MAX_RESOLUTION_BYTES / 1024
+        ));
+        let out = output_within(&mut cmd, std::time::Duration::from_secs(30), "the probe")
+            .expect("an answer at the ceiling resolves");
+        assert_eq!(out.stdout.len(), MAX_RESOLUTION_BYTES);
+    }
+
+    /// A chatty *stderr* is a diagnostic, not an answer: it stops at the ceiling and the run still
+    /// resolves. It is already cut to one bounded line before anything reads it, so the only thing
+    /// at stake here is how much sbx holds while doing that.
+    #[test]
+    fn a_flood_of_diagnostics_is_capped_without_failing_the_run() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!(
+            "printf resolved; dd if=/dev/zero bs=1024 count={} >&2 2>/dev/null",
+            MAX_RESOLUTION_BYTES / 1024 + 64
+        ));
+        let out = output_within(&mut cmd, std::time::Duration::from_secs(30), "the probe")
+            .expect("a chatty run still resolves");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "resolved");
+        assert!(
+            out.stderr.len() <= MAX_RESOLUTION_BYTES + 1,
+            "{}",
+            out.stderr.len()
         );
     }
 

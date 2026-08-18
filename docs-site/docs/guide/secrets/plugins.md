@@ -270,6 +270,13 @@ and a bound tighter than the wait it is allowed to contain would kill a plugin d
 exactly what the manifests permit. A `sops` source is bounded the same way, by the same
 clock.
 
+**And an answer is bounded in size, not only in time**, because a plugin answering fast is
+not slowed by a clock. `sbx` reads at most **256 KiB** from each stream, the same ceiling a
+broker frame meets, and an answer over it is a hard error rather than a truncation: half a
+secret is not a smaller secret. A plugin that floods **stderr** is not failed for it (that
+stream is a diagnostic, and is cut to a single bounded line before anything reads it); its
+flood simply stops at the ceiling.
+
 A plugin runs in its own cage, built the same way an agent's is: its own user,
 pid, ipc, uts and cgroup namespaces, every capability dropped, a cleared
 environment, and no network unless the manifest asks for one. It carries the
