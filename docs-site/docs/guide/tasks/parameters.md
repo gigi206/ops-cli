@@ -110,6 +110,11 @@ only names.**
 | `params` | a value for each declared name | the **value**, a `match` pattern or an `enum` is mandatory, and it must match the whole value |
 | `env_allow` | `KEY=VALUE` for a listed name | the **name** only: the value is any string |
 
+One thing is refused on both sides whatever you declared: a value carrying a **NUL byte**. It cannot
+be an argument or an environment entry, and a `match` pattern written with `.` would otherwise admit
+one. The refusal names the field, and it happens before the invocation is admitted rather than when
+the command fails to start.
+
 `env_allow` is empty by default, so out of the box a caller can set **nothing**. An unlisted name is
 refused outright rather than dropped: a caller that believed a variable applied would otherwise be
 reasoning about an invocation that never happened.

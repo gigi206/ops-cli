@@ -643,6 +643,18 @@ fn compile_bound(
 /// would accept anything containing a match, so the check anchors it here rather than trusting the
 /// author to have written `^…$`.
 pub(crate) fn check_value(name: &str, value: &str, bound: &ParamBound) -> Result<(), String> {
+    // Before the bound, because it is a fact about the value rather than about what was declared:
+    // a NUL cannot be an argument whatever a pattern admits, and a pattern written with `.` admits
+    // one. The environment side of the same request refuses it here too, and the two are the same
+    // kind of thing — what the caller supplied — so they answer the same way.
+    //
+    // Without this the refusal still happened, one layer down and unrecognisably: `Command::spawn`
+    // builds a `CString` from each argument and fails on the NUL, so the caller was told the
+    // invocation could not start, by an I/O error naming no field, *after* being admitted and given
+    // an invocation of its own.
+    if value.contains('\0') {
+        return Err(format!("parameter `{name}` contains a NUL byte"));
+    }
     match bound {
         ParamBound::Pattern(pattern) => {
             let re = regex::Regex::new(pattern)
@@ -1081,6 +1093,30 @@ mod tests {
         .into_iter()
         .collect();
         assert!(validate(raw).unwrap_err().contains("does not match"));
+    }
+
+    /// A NUL is refused whatever the bound admits, and named as the parameter's.
+    ///
+    /// A pattern written with `.` admits one, so the bound is not what stops it. Without this the
+    /// value reached `Command::spawn`, which builds a `CString` per argument and fails on the NUL:
+    /// a refusal, but one that named no field and arrived after the caller had been admitted. The
+    /// environment half of the same request already answered here, which is what made the pair
+    /// uneven.
+    #[test]
+    fn a_nul_in_a_parameter_value_is_refused_where_the_env_side_refuses_one() {
+        let permissive =
+            compile_bound("sql", Some("^.*$"), &[]).expect("a pattern that admits all");
+        assert!(
+            check_value("sql", "SELECT 1", &permissive).is_ok(),
+            "the negative control: an ordinary value still passes"
+        );
+        let err = check_value("sql", "SELECT\0 1", &permissive)
+            .expect_err("a NUL is not an argument, whatever the pattern says");
+        assert!(err.contains("sql") && err.contains("NUL"), "{err}");
+
+        // A declared `default` goes through the same gate, so a task cannot ship one either.
+        let choice = compile_bound("mode", None, &["a\0b".to_string()]).expect("choices compile");
+        assert!(check_value("mode", "a\0b", &choice).is_err());
     }
 
     // An unanchored pattern must not accept a value that merely *contains* a match: the check
