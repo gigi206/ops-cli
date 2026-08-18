@@ -1108,8 +1108,9 @@ pub(crate) fn prune_shared_gcroots(
             if projects_dir.join(entry.file_name()).exists() {
                 continue; // the project still exists — keep its tools rooted
             }
-            if prune {
-                let _ = force_remove_dir_all(&entry.path());
+            // Only what went, for the reason [`prune_rev_dirs`] gives.
+            if prune && force_remove_dir_all(&entry.path()).is_err() {
+                continue;
             }
             removed.push(entry.path());
         }
@@ -1131,8 +1132,14 @@ fn prune_rev_dirs(dir: &Path, live: &BTreeSet<String>, prune: bool, removed: &mu
         if live.contains(&rev) {
             continue;
         }
-        if prune {
-            let _ = force_remove_dir_all(&entry.path());
+        // Reported only when it actually went. With `prune` off this is a plan and every candidate
+        // belongs in it; with `prune` on it is a report, and a failed removal reported as one makes
+        // `sbx gc` announce bytes that are still on the disk — and hides the entry that keeps
+        // failing, since it is named as gone every time. The removal fails on anything that is not
+        // a directory, which is how a stray regular file in a revision directory stays for good
+        // while being announced as removed on every run.
+        if prune && force_remove_dir_all(&entry.path()).is_err() {
+            continue;
         }
         removed.push(entry.path());
     }
@@ -2097,6 +2104,53 @@ mod tests {
         }
         assert!(!gcroots.join("mise/oldeng").exists() && gcroots.join("mise/eng").is_dir());
         assert!(!gcroots.join("projects/p2").exists() && gcroots.join("projects/p1").is_dir());
+    }
+
+    /// What a prune reports is what it removed, not what it looked at.
+    ///
+    /// A regular file where a revision directory belongs is the case that separates the two: the
+    /// recursive removal fails on it (it reads a directory), the failure is not fatal, and reporting
+    /// the path anyway makes `sbx gc` announce bytes still on the disk — every run, since the file
+    /// that keeps failing is named as gone each time. A dry run is the other half: it is a plan
+    /// rather than a report, so the same entry belongs in it.
+    #[test]
+    fn a_prune_reports_the_roots_it_removed_and_not_the_ones_it_could_not() {
+        let base = TmpDir::new();
+        let gcroots = base.path().join("gcroots");
+        let projects = base.path().join("projects");
+        std::fs::create_dir_all(gcroots.join("base")).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+
+        // A stale revision that will go, and a stray regular file that cannot.
+        let goes = gcroots.join("base/stale");
+        std::fs::create_dir_all(&goes).unwrap();
+        std::os::unix::fs::symlink("/nix/store/x", goes.join("root")).unwrap();
+        let stays = gcroots.join("base/README");
+        std::fs::write(&stays, b"not a revision").unwrap();
+
+        // The same pair on the per-project side, which is a second loop applying the same rule.
+        let dead = gcroots.join("projects/p-dead/tool");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::os::unix::fs::symlink("/nix/store/x", dead.join("root")).unwrap();
+        let stray = gcroots.join("projects/NOTES");
+        std::fs::write(&stray, b"not a project").unwrap();
+
+        let live = BTreeSet::from(["live".to_string()]);
+        let listed = prune_shared_gcroots(&gcroots, &projects, &live, &BTreeSet::new(), false);
+        assert_eq!(listed.len(), 4, "a dry run plans all four: {listed:?}");
+
+        let removed = prune_shared_gcroots(&gcroots, &projects, &live, &BTreeSet::new(), true);
+        assert_eq!(
+            removed,
+            vec![goes.clone(), gcroots.join("projects/p-dead")],
+            "only the roots that actually went are reported"
+        );
+        assert!(!goes.exists());
+        assert!(
+            stays.exists(),
+            "the file the prune could not remove is still there"
+        );
+        assert!(stray.exists(), "and the same on the per-project side");
     }
 
     /// Create an app home directory with one small file, so it is a non-empty tree with a size.
