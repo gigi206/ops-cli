@@ -100,7 +100,16 @@ impl Ca {
     /// [`CertifiedKey`] is what the TLS server hands the client for that host.
     pub(crate) fn leaf_for(&self, host: &str) -> io::Result<Arc<CertifiedKey>> {
         // The cache is the fast path; only a miss does the (relatively costly) keygen + signing.
-        if let Some(ck) = self.leaves.lock().unwrap().get(host) {
+        //
+        // A poisoned lock degrades to minting instead of panicking, like the two other caches this
+        // proxy keeps ([`super::dns`] and [`super::pool`]). Nothing here can poison it today —
+        // `mint_leaf`, the only fallible step, deliberately runs **outside** the guard, and the
+        // critical sections do nothing that unwinds — so this is a property to keep rather than a
+        // bug to fix: a `.unwrap()` would turn a future panic in one connection thread into a panic
+        // in every later handshake, which is the opposite of what a certificate cache should cost.
+        if let Ok(leaves) = self.leaves.lock()
+            && let Some(ck) = leaves.get(host)
+        {
             return Ok(ck.clone());
         }
         let ck = self.mint_leaf(host)?;
@@ -108,8 +117,9 @@ impl Ca {
         // not grow without bound: past the cap, mint per request but stop inserting (a legitimate
         // workload reaches few hosts; only a flood of unique SNIs hits the cap). This bounds host
         // memory; the connection cap bounds the concurrent keygen cost.
-        let mut leaves = self.leaves.lock().unwrap();
-        if leaves.len() < LEAF_CACHE_CAP {
+        if let Ok(mut leaves) = self.leaves.lock()
+            && leaves.len() < LEAF_CACHE_CAP
+        {
             leaves.insert(host.to_string(), ck.clone());
         }
         Ok(ck)
