@@ -928,9 +928,13 @@ const MAX_ANSWER_LINE: u64 = 2 * MAX_FRAME_CEILING as u64 + 4 * 1024;
 /// take. The bound is per *line* — a fresh `take` on each call — so a long session of ordinary
 /// answers is never cut short by what earlier ones used.
 ///
-/// `max` is a parameter because the two plugin protocols that read lines imply different ceilings
-/// (see [`MAX_ANSWER_LINE`] and [`super::signer::MAX_LINE_BYTES`]); the reading itself is one
-/// definition, so a bound added on one protocol cannot be forgotten on the other.
+/// `max` is a parameter because the protocols that read lines imply different ceilings (see
+/// [`MAX_ANSWER_LINE`], [`super::signer::MAX_LINE_BYTES`] and the task plane's request line); the
+/// reading itself is one definition, so a bound added on one protocol cannot be forgotten on the
+/// others.
+///
+/// The wording of both refusals says *peer*, not *plugin*: three protocols share this reader, and
+/// one of them is the cage. Each caller names its own peer in the error it wraps this one in.
 pub(super) fn read_bounded_line(reader: &mut impl io::BufRead, max: u64) -> io::Result<String> {
     use std::io::BufRead as _;
     let mut line = String::new();
@@ -938,13 +942,13 @@ pub(super) fn read_bounded_line(reader: &mut impl io::BufRead, max: u64) -> io::
     if n == 0 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
-            "the plugin closed its side",
+            "the peer closed its side",
         ));
     }
     if !line.ends_with('\n') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("the plugin wrote more than {max} bytes without ending its line"),
+            format!("the peer wrote more than {max} bytes without ending its line"),
         ));
     }
     Ok(line)

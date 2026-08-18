@@ -64,7 +64,7 @@
 //! value can carry the very secret a caller is probing for.
 
 use std::collections::BTreeMap;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -106,6 +106,42 @@ const RESULT_CAPACITY: usize = 32;
 /// primitive, and an exit-status oracle over a credential gets cheaper the more calls it can make.
 /// Reaching it refuses further invocations rather than degrading anything silently.
 const DEFAULT_CALL_QUOTA: u64 = 500;
+
+/// The most one payload may carry: bounded well above any legitimate parameter and far below
+/// anything that would matter.
+const MAX_PAYLOAD_BYTES: usize = 1 << 20;
+
+/// The most one request may make sbx hold, keys and values together, before anything about it has
+/// been validated.
+///
+/// The per-payload ceiling alone does not bound a request: a caller sending a thousand empty
+/// payloads costs nothing per payload and a map entry each time, and the keys are what grows. So
+/// what is bounded is the whole request, keys included, which bounds the count as a consequence
+/// rather than by a second number.
+///
+/// Eight payloads at the ceiling. A choice rather than a derivation, and the trigger for revisiting
+/// it is a task legitimately refused for it: a task declaring eight megabytes of parameters is not
+/// one this bound is in the way of.
+const MAX_REQUEST_BYTES: usize = 8 * MAX_PAYLOAD_BYTES;
+
+/// Read one request line, or `None` when the peer closed cleanly.
+///
+/// The reading is [`super::broker::read_bounded_line`], the same one the broker and signer
+/// protocols use, because the property is the same one: sbx buffers a line before it can bound
+/// anything inside it, so a peer that never writes a newline is a peer taking host memory. It
+/// matters more here than there. The plugin protocols talk to a process sbx started; this socket is
+/// bound host-side and mounted into the cage, and the thread reading it belongs to the sbx process,
+/// **outside** the cgroup bounding the cage's own memory.
+///
+/// A clean close is `None` rather than an error: on this protocol a peer that has said everything
+/// hangs up, and that is not a fault.
+fn read_request_line(reader: &mut BufReader<UnixStream>) -> io::Result<Option<String>> {
+    match super::broker::read_bounded_line(reader, MAX_PAYLOAD_BYTES as u64) {
+        Ok(line) => Ok(Some(line)),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e),
+    }
+}
 
 /// One recorded invocation. The command is **not** recorded — it is fixed by the declaration, so the
 /// task name identifies it — and no parameter value is recorded either: a value can carry a secret,
@@ -543,10 +579,9 @@ fn serve_cage(
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
-    let mut command = String::new();
-    if reader.read_line(&mut command)? == 0 {
+    let Some(command) = read_request_line(&mut reader)? else {
         return Ok(());
-    }
+    };
     let command = command.trim_end();
 
     if command == "LIST" {
@@ -630,11 +665,14 @@ type Payloads = (BTreeMap<String, String>, BTreeMap<String, String>);
 fn read_payloads(reader: &mut BufReader<UnixStream>) -> io::Result<Result<Payloads, &'static str>> {
     let mut params = BTreeMap::new();
     let mut env = BTreeMap::new();
+    // What this request has cost so far, keys and values together. Counted here because it is the
+    // only place that sees every entry: a per-payload ceiling bounds one field, and a caller sends
+    // as many as it likes.
+    let mut held = 0usize;
     loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
+        let Some(line) = read_request_line(reader)? else {
             return Ok(Err("truncated request"));
-        }
+        };
         let line = line.trim_end();
         if line == "run" {
             break;
@@ -648,15 +686,23 @@ fn read_payloads(reader: &mut BufReader<UnixStream>) -> io::Result<Result<Payloa
         let Ok(len) = len.parse::<usize>() else {
             return Ok(Err("malformed payload length"));
         };
-        // A caller must not be able to make sbx allocate arbitrarily: one payload is bounded well
-        // above any legitimate parameter and far below anything that would matter.
-        if len > 1 << 20 {
+        // A caller must not be able to make sbx allocate arbitrarily. Both checks stand before the
+        // allocation, not after it: one bounds this field, the other bounds the request it belongs
+        // to, and a field admitted by the first would still be an unbounded total without the
+        // second.
+        if len > MAX_PAYLOAD_BYTES {
             return Ok(Err("payload too large"));
+        }
+        held = held.saturating_add(key.len()).saturating_add(len);
+        if held > MAX_REQUEST_BYTES {
+            return Ok(Err("request too large"));
         }
         let mut buf = vec![0u8; len];
         reader.read_exact(&mut buf)?;
-        let mut newline = String::new();
-        let _ = reader.read_line(&mut newline);
+        // The newline closing the payload. Bounded like every other line: a caller that writes a
+        // payload and then never ends its line is the same unbounded read as one that never ends
+        // its first, and this one is easy to miss because nothing is done with what it returns.
+        let _ = read_request_line(reader);
         let value = String::from_utf8_lossy(&buf).into_owned();
         match kind {
             "param" => params.insert(key.to_string(), value),
@@ -985,10 +1031,9 @@ fn serve_host(
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
-    let mut command = String::new();
-    if reader.read_line(&mut command)? == 0 {
+    let Some(command) = read_request_line(&mut reader)? else {
         return Ok(());
-    }
+    };
     let command = command.trim_end();
 
     if command == "STATUS" {
@@ -1471,10 +1516,124 @@ pub(crate) mod client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Production reads every line through `read_request_line`, which brings its own; a test client
+    // speaks the protocol from the other side and reads replies straight off the socket.
     use crate::config::{OutputDisposition, ParamBound, TaskParam, TaskSpec};
     use crate::testutil::TmpDir;
+    use std::io::BufRead;
     use std::process::Command;
     use std::time::Duration;
+
+    // --- what a caller can make the host hold ---
+
+    /// Drive `read_payloads` from the other end of a socketpair, the way the cage drives it.
+    ///
+    /// The writer runs on its own thread because the point of these tests is a request larger than
+    /// the socket buffer: writing it from the reading thread would block against itself.
+    fn read_payloads_of(request: Vec<u8>) -> io::Result<Result<Payloads, &'static str>> {
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        let writer = std::thread::spawn(move || {
+            let mut theirs = theirs;
+            // Ignored: a refusal closes the socket while this is still writing, which is the
+            // outcome under test rather than a failure of it.
+            let _ = theirs.write_all(&request);
+        });
+        let out = read_payloads(&mut BufReader::new(ours));
+        let _ = writer.join();
+        out
+    }
+
+    /// A request line that never ends is refused instead of being buffered.
+    ///
+    /// The plane's threads belong to the sbx process, and the socket the cage speaks on is bound
+    /// host-side: what is read here is outside the cgroup that bounds the cage's own memory, so an
+    /// unterminated line is host memory the cage could take.
+    ///
+    /// The peer holds its end **open**, and that is what makes this test measure the ceiling. A
+    /// flood that ends in EOF is refused for having no final newline whatever the ceiling is, so a
+    /// test written that way passes with the bound removed: measured, and it did. Here an unbounded
+    /// read has nothing to return and the answer never comes, which the timeout turns into a
+    /// failure rather than a hang. The flood is finite for the same reason it is written at all.
+    #[test]
+    fn a_request_line_that_never_ends_is_refused_rather_than_buffered() {
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        let mut peer = theirs.try_clone().expect("clone");
+        let flood = std::thread::spawn(move || {
+            let chunk = vec![b'x'; 64 * 1024];
+            for _ in 0..(4 * MAX_PAYLOAD_BYTES / chunk.len()) {
+                // The refusal closes the reading end, and this stops rather than failing the test:
+                // being unable to finish the flood is the outcome under test.
+                if peer.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_payloads(&mut BufReader::new(ours)).map_err(|e| e.kind()));
+        });
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a read that followed the flood instead of stopping at the ceiling");
+        assert_eq!(outcome, Err(io::ErrorKind::InvalidData));
+
+        drop(theirs);
+        let _ = flood.join();
+    }
+
+    /// One payload under the ceiling is admitted; the request they add up to is bounded too.
+    ///
+    /// The per-payload ceiling is not that bound: this request is made of fields each of which is
+    /// legitimate. Nothing about it is refused until the total is.
+    #[test]
+    fn payloads_that_are_each_admissible_are_refused_by_what_they_add_up_to() {
+        let mut request = Vec::new();
+        let value = vec![b'v'; MAX_PAYLOAD_BYTES];
+        for i in 0..(MAX_REQUEST_BYTES / MAX_PAYLOAD_BYTES) + 1 {
+            request.extend_from_slice(format!("param k{i} {MAX_PAYLOAD_BYTES}\n").as_bytes());
+            request.extend_from_slice(&value);
+            request.push(b'\n');
+        }
+        request.extend_from_slice(b"run\n");
+        assert_eq!(
+            read_payloads_of(request).expect("the read itself succeeds"),
+            Err("request too large")
+        );
+    }
+
+    /// A caller sending nothing but keys is bounded too, and by the same rule.
+    ///
+    /// An empty payload costs no value bytes and a map entry every time, so a ceiling counting
+    /// only values would not see this at all. The keys are what grows, which is why the bound
+    /// counts them.
+    #[test]
+    fn a_flood_of_empty_payloads_is_bounded_by_the_keys_it_is_made_of() {
+        let mut request = Vec::new();
+        let key = "k".repeat(1024);
+        for i in 0..(MAX_REQUEST_BYTES / 1024) + 1 {
+            request.extend_from_slice(format!("param {key}{i} 0\n\n").as_bytes());
+        }
+        request.extend_from_slice(b"run\n");
+        assert_eq!(
+            read_payloads_of(request).expect("the read itself succeeds"),
+            Err("request too large")
+        );
+    }
+
+    /// The negative control: an ordinary request is not caught by any of it.
+    #[test]
+    fn an_ordinary_request_passes_every_bound() {
+        let mut request = Vec::new();
+        request.extend_from_slice(b"param sql 8\nSELECT 1\n");
+        request.extend_from_slice(b"env TZ 3\nUTC\n");
+        request.extend_from_slice(b"run\n");
+        let (params, env) = read_payloads_of(request)
+            .expect("the read succeeds")
+            .expect("an ordinary request is admitted");
+        assert_eq!(params.get("sql").map(String::as_str), Some("SELECT 1"));
+        assert_eq!(env.get("TZ").map(String::as_str), Some("UTC"));
+    }
 
     /// A value with the two properties a line-oriented client would get wrong: an embedded newline
     /// (which would forge a protocol line if it were not length-framed) and a multi-byte character
