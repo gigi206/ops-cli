@@ -52,7 +52,11 @@ const MAX_VALUE_BYTES: usize = 8 * 1024;
 /// ceiling a plugin that never writes a newline is a plugin that takes the host's memory. Set well
 /// above what a well-formed answer reaches: with every value already capped at [`MAX_VALUE_BYTES`],
 /// this leaves room for tens of them plus a label.
-const MAX_LINE_BYTES: u64 = 256 * 1024;
+///
+/// The reading itself is [`super::broker::read_bounded_line`], shared with the broker: a signer
+/// line carries header values and a broker line carries a hex-encoded frame, so the two ceilings
+/// differ, but a bound added to one reader is a bound both protocols get.
+pub(super) const MAX_LINE_BYTES: u64 = 256 * 1024;
 
 /// One request put to a signer, in the terms the plugin is allowed to see.
 ///
@@ -373,31 +377,6 @@ fn check_value(name: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Read one newline-terminated line, refusing one that runs past [`MAX_LINE_BYTES`].
-///
-/// Bounded rather than read to the newline: the peer is a separate process whose line sbx buffers
-/// before it can bound anything inside it, so a line that never ends is host memory a plugin can
-/// take. The bound is per *line* — a fresh `take` on each call — so a long session of ordinary
-/// answers is never cut short by what earlier ones used.
-fn read_bounded_line(reader: &mut impl io::BufRead) -> io::Result<String> {
-    use std::io::{BufRead as _, Read as _};
-    let mut line = String::new();
-    let n = (&mut *reader).take(MAX_LINE_BYTES).read_line(&mut line)?;
-    if n == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "the plugin closed its side",
-        ));
-    }
-    if !line.ends_with('\n') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("the plugin wrote more than {MAX_LINE_BYTES} bytes without ending its line"),
-        ));
-    }
-    Ok(line)
-}
-
 /// What a caller needs of a signer, so the callers are testable without a sandbox and a real
 /// plugin. [`SignerProcess`] is the one implementation that runs code.
 pub(crate) trait Signing: Send {
@@ -519,7 +498,7 @@ impl SignerProcess {
     /// One line from the plugin, or an error when it says nothing in time, closes, or says more than
     /// an answer can be.
     fn read_line(&mut self) -> io::Result<String> {
-        read_bounded_line(&mut self.reader)
+        super::broker::read_bounded_line(&mut self.reader, MAX_LINE_BYTES)
     }
 }
 
@@ -685,18 +664,26 @@ mod tests {
     }
 
     /// A line sbx must buffer before it can bound what is inside it. Without a ceiling, a plugin
-    /// that never writes a newline takes host memory for as long as the session lives.
+    /// that never writes a newline takes host memory for as long as the session lives. The reader
+    /// is shared with the broker; what this pins is that the *signer* passes its own ceiling to it.
     #[test]
     fn a_line_that_never_ends_is_refused_rather_than_buffered() {
+        use super::super::broker::read_bounded_line;
         let flood = vec![b'x'; (MAX_LINE_BYTES + 1) as usize];
-        let err = read_bounded_line(&mut io::BufReader::new(flood.as_slice()))
+        let err = read_bounded_line(&mut io::BufReader::new(flood.as_slice()), MAX_LINE_BYTES)
             .expect_err("an unterminated flood is refused");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
 
         // The bound is per line, not per session: an ordinary answer after a long one still reads.
         let mut reader = io::BufReader::new(b"first\nsecond\n".as_slice());
-        assert_eq!(read_bounded_line(&mut reader).expect("first"), "first\n");
-        assert_eq!(read_bounded_line(&mut reader).expect("second"), "second\n");
+        assert_eq!(
+            read_bounded_line(&mut reader, MAX_LINE_BYTES).expect("first"),
+            "first\n"
+        );
+        assert_eq!(
+            read_bounded_line(&mut reader, MAX_LINE_BYTES).expect("second"),
+            "second\n"
+        );
     }
 
     /// A key nothing reads would leave a plugin author believing they had answered something.

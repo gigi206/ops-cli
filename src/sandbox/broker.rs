@@ -39,7 +39,7 @@ use std::io::{self, Read, Write};
 
 use serde::Deserialize;
 
-use crate::plugins::broker::{BrokerSpec, Framing};
+use crate::plugins::broker::{BrokerSpec, Framing, MAX_FRAME_CEILING};
 
 /// The protocol version sbx speaks. A plugin that cannot handle it should fail its handshake
 /// rather than guess: this number changes only when the meaning of a message changes.
@@ -340,13 +340,18 @@ pub(crate) fn parse_answer(
     let data = match &raw.data {
         None => None,
         Some(hex) => {
-            let bytes = from_hex(hex).map_err(|e| format!("`data` is not hex: {e}"))?;
-            if bytes.len() > max_frame {
+            // The bound is read off the *hex*, before decoding it. `from_hex` reserves
+            // `hex.len() / 2` up front, so checking the decoded length afterwards would let the
+            // plugin choose the very allocation `max_frame` exists to bound. Two hex digits are one
+            // byte and an odd length is refused, so this is the same limit one step earlier — not a
+            // second, looser one.
+            let len = hex.len() / 2;
+            if len > max_frame {
                 return Err(format!(
-                    "`data` is {} bytes, above this broker's `max_frame` of {max_frame}",
-                    bytes.len()
+                    "`data` is {len} bytes, above this broker's `max_frame` of {max_frame}"
                 ));
             }
+            let bytes = from_hex(hex).map_err(|e| format!("`data` is not hex: {e}"))?;
             if bytes.is_empty() {
                 // An empty frame is not a frame: the framing writes a length, and a zero-length
                 // one is what a reader treats as a protocol error. Refused here so it cannot be
@@ -904,6 +909,47 @@ pub(crate) fn relay_one<H: Read + Write>(
 /// connection, a host connection and a thread for as long as the session lives.
 const PLUGIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The largest answer line sbx will buffer from a broker plugin.
+///
+/// Derived from the protocol rather than chosen: an answer carries its frame **hex-encoded**, so a
+/// well-formed one reaches twice [`MAX_FRAME_CEILING`] — the ceiling above every `max_frame` a
+/// manifest may declare — plus the JSON envelope around it (`seq`, `verdict`, `more`,
+/// `expect_reply`, and a `label` the lens truncates on its way to the ring). The slack covers that
+/// envelope; a line past this cannot be a well-formed answer, whatever the manifest asked for.
+///
+/// The signer's bound is its own ([`super::signer::MAX_LINE_BYTES`]) because its lines carry header
+/// values, not frames: one reader, two protocols, each with the ceiling its own wire implies.
+const MAX_ANSWER_LINE: u64 = 2 * MAX_FRAME_CEILING as u64 + 4 * 1024;
+
+/// Read one newline-terminated line from a plugin, refusing one that runs past `max`.
+///
+/// Bounded rather than read to the newline: the peer is a separate process whose line sbx buffers
+/// before it can bound anything inside it, so a line that never ends is host memory a plugin can
+/// take. The bound is per *line* — a fresh `take` on each call — so a long session of ordinary
+/// answers is never cut short by what earlier ones used.
+///
+/// `max` is a parameter because the two plugin protocols that read lines imply different ceilings
+/// (see [`MAX_ANSWER_LINE`] and [`super::signer::MAX_LINE_BYTES`]); the reading itself is one
+/// definition, so a bound added on one protocol cannot be forgotten on the other.
+pub(super) fn read_bounded_line(reader: &mut impl io::BufRead, max: u64) -> io::Result<String> {
+    use std::io::BufRead as _;
+    let mut line = String::new();
+    let n = (&mut *reader).take(max).read_line(&mut line)?;
+    if n == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the plugin closed its side",
+        ));
+    }
+    if !line.ends_with('\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the plugin wrote more than {max} bytes without ending its line"),
+        ));
+    }
+    Ok(line)
+}
+
 /// A broker plugin running in its own host-side cage, spoken to over a socket pair.
 ///
 /// A socket rather than a pipe for one reason: a socket takes a read deadline, and a pipe does
@@ -1008,18 +1054,10 @@ impl PluginProcess {
         })
     }
 
-    /// One line from the plugin, or an error when it says nothing in time or closes.
+    /// One line from the plugin, or an error when it says nothing in time, closes, or says more
+    /// than an answer can be.
     fn read_line(&mut self) -> io::Result<String> {
-        use std::io::BufRead as _;
-        let mut line = String::new();
-        let n = self.reader.read_line(&mut line)?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "the plugin closed its side",
-            ));
-        }
-        Ok(line)
+        read_bounded_line(&mut self.reader, MAX_ANSWER_LINE)
     }
 }
 
@@ -1986,6 +2024,47 @@ done"#,
         assert_eq!(answer.label.as_deref(), Some("nothing is allowed"));
     }
 
+    /// The line bound, driven through the real process. A test against the fake decider never
+    /// reaches `PluginProcess::read_line`, which is the only place it is applied — the same reason
+    /// the frame bound below is exercised here rather than against a fake. A plugin that answers
+    /// with a line it never ends takes host memory for as long as the session lives, so the refusal
+    /// must name the ceiling instead of arriving later as a socket deadline.
+    #[test]
+    fn a_plugin_that_never_ends_its_line_is_refused_at_the_ceiling() {
+        let Some(bwrap) = crate::pathfind::find_on_path("bwrap")
+            .filter(|_| matches!(crate::probe_userns(), crate::Userns::Ok))
+        else {
+            skip_incapable!("skipping broker plugin run: no bwrap or no capability-bearing userns");
+            return;
+        };
+        // Accepts the handshake, then writes well past the ceiling without ever ending the line.
+        // The flood is finite on purpose: an endless one makes a *regression* here take the machine
+        // rather than fail the test — measured, the OOM killer ends the run instead of an assertion.
+        // Four mebibytes is eight times the ceiling, enough that a reader without the bound is
+        // plainly buffering and not merely reading a large answer.
+        let (_root, plugin) = staged_broker(
+            r#"read -r hello
+printf '{"ok":true}\n'
+read -r line
+i=0
+while [ $i -lt 4096 ]; do printf '%01024d' 0; i=$((i+1)); done
+sleep 30"#,
+        );
+        let mut proc = PluginProcess::start(&bwrap, &plugin, &["a-key".to_string()], None)
+            .expect("the plugin starts and accepts the handshake");
+        let err = proc
+            .ask(&Ask {
+                seq: 1,
+                dir: Direction::Up,
+                data: &[0x0b],
+            })
+            .expect_err("an endless line must be refused");
+        assert!(
+            err.contains(&format!("more than {MAX_ANSWER_LINE} bytes")),
+            "the refusal must name the ceiling, not arrive as a deadline: {err}"
+        );
+    }
+
     /// The bound applies to what the plugin *hands back*, not only to what the cage sends. Driven
     /// through the real process, because that is where the parameter was once passed as
     /// `usize::MAX` while a test against the fake decider proved the bound worked.
@@ -2710,6 +2789,60 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             .expect_err("3 bytes into a 2-byte protocol");
         assert!(err.contains("max_frame"), "{err}");
         parse_answer(&answer("reply", ",\"data\":\"0b0c\""), 7, 2).expect("the bound itself fits");
+    }
+
+    /// The size is read off the hex, before `from_hex` reserves anything for it. Proved by a
+    /// payload that is oversized **and** not hex: refused for its size means the length was read
+    /// first; refused for its digits would mean the decode ran and the bound came too late.
+    #[test]
+    fn an_oversized_frame_is_refused_before_it_is_decoded() {
+        let hex = "zz".repeat(100);
+        let err = parse_answer(&answer("reply", &format!(",\"data\":\"{hex}\"")), 7, 2)
+            .expect_err("100 bytes into a 2-byte protocol");
+        assert!(
+            err.contains("max_frame"),
+            "the bound must be read off the hex, not after decoding it: {err}"
+        );
+    }
+
+    /// The line bound is derived from this protocol, not borrowed from the signer's: an answer
+    /// carries its frame hex-encoded, so a legitimate one at the top of the ceiling is twice
+    /// `MAX_FRAME_CEILING` on the wire. A bound set to the signer's `MAX_LINE_BYTES` would refuse
+    /// exactly the answers a manifest is allowed to declare.
+    #[test]
+    fn an_answer_at_the_top_of_the_frame_ceiling_still_reads() {
+        let hex = "ab".repeat(MAX_FRAME_CEILING);
+        let line = format!("{{\"seq\":7,\"verdict\":\"reply\",\"data\":\"{hex}\"}}\n");
+        assert!(
+            line.len() > super::super::signer::MAX_LINE_BYTES as usize,
+            "the case only bites if the line is past the signer's ceiling"
+        );
+        let read = read_bounded_line(&mut io::BufReader::new(line.as_bytes()), MAX_ANSWER_LINE)
+            .expect("a maximal well-formed answer must read whole");
+        assert_eq!(read.len(), line.len());
+        let answer = parse_answer(&read, 7, MAX_FRAME_CEILING).expect("and must parse");
+        assert!(matches!(answer.verdict, Verdict::Reply(_)));
+    }
+
+    /// A line sbx must buffer before it can bound what is inside it. Without a ceiling, a plugin
+    /// that never writes a newline takes host memory for as long as the session lives.
+    #[test]
+    fn an_answer_line_that_never_ends_is_refused_rather_than_buffered() {
+        let flood = vec![b'x'; MAX_ANSWER_LINE as usize + 1];
+        let err = read_bounded_line(&mut io::BufReader::new(flood.as_slice()), MAX_ANSWER_LINE)
+            .expect_err("an unterminated flood is refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+
+        // The bound is per line, not per session: an ordinary answer after a long one still reads.
+        let mut reader = io::BufReader::new(b"first\nsecond\n".as_slice());
+        assert_eq!(
+            read_bounded_line(&mut reader, MAX_ANSWER_LINE).expect("first"),
+            "first\n"
+        );
+        assert_eq!(
+            read_bounded_line(&mut reader, MAX_ANSWER_LINE).expect("second"),
+            "second\n"
+        );
     }
 
     #[test]
