@@ -976,8 +976,28 @@ fn project_is_gone(path: &Path) -> bool {
 /// directories read-only (`0555`), so a plain `remove_dir_all` cannot unlink their entries; this
 /// chmods each directory owner-writable before descending. Symlinks are unlinked, never followed —
 /// `file_type` reads the entry's own type without dereferencing.
+///
+/// **Including the one it is handed.** That sentence used to be true of the entries walked and
+/// false of the argument: `set_permissions` and `read_dir` both resolve the path they are given, so
+/// a symlink passed as the root sent the whole recursive removal to wherever it pointed. The
+/// callers did not close it either, and could not have closed it once: of the nine in production,
+/// one guards the root with an `lstat`, three with an `is_dir` or an `exists` that follow, three
+/// with nothing, and one is safe only because it happens to unlink first. A guarantee this function
+/// states is a guarantee it has to hold, whichever caller reaches it.
+///
+/// A symlink root is therefore *unlinked*, which is what "never followed" means for an entry, and
+/// reported as done: what the caller asked to remove is gone, and nothing outside was touched.
 pub(crate) fn force_remove_dir_all(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    // `symlink_metadata` is the lstat: it reads the link itself where `metadata` would read its
+    // target. A root that is not a symlink falls through to exactly what this always did, and a
+    // root that does not exist at all falls through too, so the error still comes from `read_dir`
+    // and says what it always said.
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return std::fs::remove_file(path);
+    }
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
@@ -2031,6 +2051,34 @@ mod tests {
         assert!(
             projects.join("bbbbbbbbbbbbbbbb").is_dir(),
             "the live markerless tree was reaped despite the guard"
+        );
+    }
+
+    /// A symlink handed in as the **root** is unlinked, not followed.
+    ///
+    /// The existing test covers a symlink found while walking, which was always safe: `file_type`
+    /// reads the entry without dereferencing. The root was the other half of the same sentence and
+    /// was not true of it, because `set_permissions` and `read_dir` both resolve what they are
+    /// given. The target here is a directory with a file in it, since that is what the recursion
+    /// would have descended into and emptied.
+    #[test]
+    fn a_symlink_given_as_the_root_is_unlinked_rather_than_followed() {
+        let base = TmpDir::new();
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"x").unwrap();
+
+        let root = base.path().join("root-link");
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+
+        force_remove_dir_all(&root).expect("a symlink root is removed, not refused");
+        assert!(
+            !root.exists() && std::fs::symlink_metadata(&root).is_err(),
+            "the link itself must be gone"
+        );
+        assert!(
+            outside.join("keep").exists(),
+            "the recursion followed the root link and emptied its target"
         );
     }
 
