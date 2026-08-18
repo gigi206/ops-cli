@@ -49,7 +49,7 @@ pub(crate) struct Ca {
 /// The most host leaves cached at once. Past this, a new host is minted per request but not stored,
 /// so a flood of unique SNIs from the cage cannot grow host memory without bound. Far above the
 /// handful of hosts any real workload contacts.
-const LEAF_CACHE_CAP: usize = 1024;
+pub(super) const LEAF_CACHE_CAP: usize = 1024;
 
 // A manual `Debug` that never prints key material — and frees us from requiring `Debug` on the
 // rcgen key/cert types. Needed because the resolver that holds a `Ca` must be `Debug`.

@@ -29,11 +29,21 @@ fn default_resolve(host: &str) -> io::Result<Vec<IpAddr>> {
 /// `Duration::ZERO` ttl disables it, resolving every request). Only successful, non-empty resolutions
 /// are cached (a failure is never cached, so the client's own retry re-resolves). A transient failure
 /// is not retried here: the client (nix/git/curl) already retries the whole request, which re-triggers
-/// this resolution, so a proxy-level retry would be redundant. The cache is unbounded but a proxy
-/// fronts a handful of hosts and dies with its launch.
+/// this resolution, so a proxy-level retry would be redundant. It holds at most
+/// [`DNS_CACHE_CAP`] hosts.
 pub(super) fn caching_resolver(ttl: Duration) -> Resolver {
     cached_resolver(ttl, default_resolve)
 }
+
+/// The most hosts cached at once. Past it a host is resolved per request but not stored, so a name
+/// nothing bounds cannot grow host memory without end.
+///
+/// The same number the leaf certificate cache holds, and the same number by derivation rather than
+/// by coincidence: both are keyed by the hosts one launch actually talks to, and in both the key is
+/// chosen by the cage. Which hosts those are is not "a handful" whenever a rule is a pattern — a
+/// `re:.*` or a `*.example.com` admits as many distinct names as an agent cares to invent, and each
+/// one resolved was an entry that stayed for the life of the launch.
+pub(super) const DNS_CACHE_CAP: usize = super::ca::LEAF_CACHE_CAP;
 
 /// The cache core of [`caching_resolver`], parameterised by the inner resolver so its behaviour is
 /// unit-testable without real DNS. Only a successful, non-empty resolution is cached; `ttl == 0`
@@ -61,7 +71,18 @@ where
             && !ttl.is_zero()
             && let Ok(mut map) = cache.lock()
         {
-            map.insert(host.to_string(), (ips.clone(), Instant::now()));
+            if map.len() >= DNS_CACHE_CAP {
+                // The ttl governed reads only, so an entry for a host never asked for again stayed
+                // until the launch ended. Sweeping here is what makes the ceiling one on entries
+                // that are still worth something rather than on how many names were ever resolved.
+                map.retain(|_, (_, at)| at.elapsed() < ttl);
+            }
+            // Past the ceiling a host still resolves, it is simply not remembered — the same answer
+            // the leaf cache gives, and for the same reason: refusing to serve would turn a memory
+            // bound into a functional one.
+            if map.len() < DNS_CACHE_CAP {
+                map.insert(host.to_string(), (ips.clone(), Instant::now()));
+            }
         }
         Ok(ips)
     })
@@ -70,6 +91,80 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A counting resolver: the number of times the inner one was actually called is how a test
+    /// sees the cache, which has no other handle on it.
+    fn counting_resolver(ttl: Duration) -> (Resolver, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let r = cached_resolver(ttl, move |_| {
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![IpAddr::from([1, 2, 3, 4])])
+        });
+        (r, calls)
+    }
+
+    /// A flood of distinct names stops being remembered at the ceiling, and what was cached under
+    /// it still is.
+    ///
+    /// The ceiling exists because "a proxy fronts a handful of hosts" stops being true the moment a
+    /// rule is a pattern: a `re:.*` admits as many names as an agent invents, and each resolved one
+    /// used to stay for the life of the launch.
+    #[test]
+    fn a_flood_of_distinct_hosts_stops_being_remembered_at_the_ceiling() {
+        use std::sync::atomic::Ordering;
+        // Long enough that nothing expires during the test: what is measured here is the ceiling,
+        // not the sweep.
+        let (r, calls) = counting_resolver(Duration::from_secs(600));
+        for i in 0..DNS_CACHE_CAP {
+            r(&format!("h{i}.example.com")).unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), DNS_CACHE_CAP);
+
+        // Past the ceiling: resolved every time, remembered never.
+        r("flood.example.com").unwrap();
+        r("flood.example.com").unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            DNS_CACHE_CAP + 2,
+            "a host past the ceiling must resolve rather than be refused, and not be stored"
+        );
+
+        // And the ceiling did not cost what was already held.
+        r("h0.example.com").unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            DNS_CACHE_CAP + 2,
+            "an entry under the ceiling must survive the flood"
+        );
+    }
+
+    /// The ttl frees room, because it now governs more than reads.
+    ///
+    /// It only ever governed reads: an entry for a host never asked for again was never removed, so
+    /// a cache filled once stayed filled. Without the sweep a ceiling would turn that into a cache
+    /// that stops working after the first flood.
+    #[test]
+    fn an_expired_entry_makes_room_rather_than_holding_the_ceiling() {
+        use std::sync::atomic::Ordering;
+        let ttl = Duration::from_millis(50);
+        let (r, calls) = counting_resolver(ttl);
+        for i in 0..DNS_CACHE_CAP {
+            r(&format!("h{i}.example.com")).unwrap();
+        }
+        std::thread::sleep(ttl * 3);
+
+        // The first insert past the ceiling sweeps what expired, so this one is remembered...
+        r("later.example.com").unwrap();
+        let after_insert = calls.load(Ordering::SeqCst);
+        r("later.example.com").unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            after_insert,
+            "a cache full of expired entries must take a new one"
+        );
+    }
 
     #[test]
     fn the_dns_cache_resolves_a_host_once_and_reuses_it() {
