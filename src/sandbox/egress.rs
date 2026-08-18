@@ -156,13 +156,76 @@ pub(crate) fn wrap_command(
     // budget and there is no congestion for Nagle to protect anyone from.
     let preamble = format!(
         "{socat} TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr,nodelay UNIX-CONNECT:{uds} \
-         </dev/null >/dev/null 2>&1 & {tcp_forwarders}",
+         </dev/null >/dev/null 2>&1 & {tcp_forwarders}{ready}",
         socat = socat.to_string_lossy(),
         port = CAGE_PROXY_PORT,
         uds = CAGE_UDS,
         tcp_forwarders = tcp_forwarders(socat, tcp),
+        ready = await_listeners(&listener_patterns(tcp)),
     );
     wrap_background(bash, &preamble, "sbx-egress-forward", cmd)
+}
+
+/// How each forwarder's listening socket appears in `/proc/net/tcp`: the local address in the
+/// kernel's own spelling, little-endian hex for the IPv4 quad and big-endian hex for the port.
+///
+/// Derived from the same values the `socat` clauses are built from, so the two can never drift into
+/// waiting for an address nothing binds.
+fn listener_patterns(tcp: &[TcpDestination]) -> Vec<String> {
+    fn at(addr: std::net::Ipv4Addr, port: u16) -> String {
+        let [a, b, c, d] = addr.octets();
+        format!("{d:02X}{c:02X}{b:02X}{a:02X}:{port:04X}")
+    }
+    let mut out = vec![at(std::net::Ipv4Addr::LOCALHOST, CAGE_PROXY_PORT)];
+    for dest in tcp {
+        for port in &dest.ports {
+            out.push(at(dest.cage_addr, *port));
+        }
+    }
+    out
+}
+
+/// Hold the cage's command until the forwarders it depends on are actually listening.
+///
+/// The preamble backgrounds `socat` and then `exec`s the real command, so without this the cage's
+/// first outbound connection races its own forwarder's `bind`/`listen`. `socat` normally wins, which
+/// is why the window went unnoticed; under load it does not, and what surfaces is a bare connection
+/// refused on the proxy port with nothing to attribute it to. The host side of the same question was
+/// answered when the proxy was written ([`start`] returns only once its listener is accepting, so
+/// the cage's first connection is never refused there) and the cage side was left to luck. This
+/// gives both sides the same promise.
+///
+/// Waiting on each listener's own address rather than on a count of them is what makes this hold
+/// wherever it runs: a count would be satisfied on the spot by whatever else a shared netns already
+/// listens on, and would then be a wait in name only.
+///
+/// Bounded, and it never fails the launch. A forwarder that will never listen — a `socat` that died
+/// on its arguments — leaves the loop on its iteration cap and the command runs anyway, meeting the
+/// same refusal it met before this existed. Aborting instead would turn a degraded egress into a
+/// dead cage, and the launch knows nothing here the command will not learn itself.
+///
+/// Bounded in **time**, not in passes: a cage's `/proc/net/tcp` holds a handful of lines, so a count
+/// of passes drains in tens of milliseconds and would be shorter than the startup it is meant to
+/// cover. `SECONDS` is bash's own clock, so the bound costs no process either.
+///
+/// The spin is a spin because bash has no sleep of its own, and reaching for one would put an
+/// external binary on the critical path of every launch. In practice it leaves on the first or
+/// second pass; the five seconds are only ever spent when a forwarder is never coming, and that
+/// launch was going to fail its first request whatever this did.
+fn await_listeners(patterns: &[String]) -> String {
+    let want = patterns.len();
+    let cases = patterns
+        .iter()
+        .map(|p| format!("case $t in *{p}*) n=$((n+1));; esac; "))
+        .collect::<String>();
+    // `$(<file)` is bash's own read, so the wait costs no process. Measured rather than assumed:
+    // `$(<file 2>/dev/null)` reads *nothing* — the redirection defeats the builtin form — so the
+    // group carries the silencing instead, which keeps a missing `/proc/net/tcp` from writing to the
+    // cage's stderr on its way to the iteration cap.
+    format!(
+        "{{ SECONDS=0; while [ $SECONDS -lt 5 ]; do t=$(</proc/net/tcp); n=0; \
+         {cases}[ $n -ge {want} ] && break; done; }} 2>/dev/null; "
+    )
 }
 
 /// A `tcp://` destination given a place of its own inside the cage.
@@ -1285,6 +1348,75 @@ mod tests {
     use super::*;
     use crate::testutil::{EnvVar, TmpDir, env_lock};
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn the_preamble_holds_the_command_until_the_forwarder_listens() {
+        // Run the emitted fragment rather than read it: this one is a shell program, and the two
+        // things that decide whether it works — that bash's `$(<file)` really reads, and that the
+        // bound outlasts a slow start — are invisible to a string comparison.
+        //
+        // A port nothing else is expected to hold, bound only after the script is already waiting,
+        // so a fragment that did not wait would finish before it exists.
+        const PORT: u16 = 19555;
+        let pattern = format!("0100007F:{PORT:04X}");
+        let script = format!("{}printf ran", super::await_listeners(&[pattern.clone()]));
+
+        let listener = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            std::net::TcpListener::bind(("127.0.0.1", PORT)).expect("bind the stand-in forwarder")
+        });
+
+        let started = std::time::Instant::now();
+        let out = std::process::Command::new("bash")
+            .args(["-c", &script])
+            .output()
+            .expect("run the emitted fragment");
+        let waited = started.elapsed();
+        let held = listener.join().expect("the stand-in forwarder thread");
+        drop(held);
+
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "ran",
+            "the command must still run once the wait is over"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(350),
+            "the command ran before its forwarder was listening ({waited:?}): the preamble did not \
+             wait, which is the race this exists to close"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(4),
+            "the wait outlived the listener appearing ({waited:?}): it is not watching for it"
+        );
+    }
+
+    #[test]
+    fn the_awaited_address_is_the_one_the_forwarder_binds() {
+        // The hex is the kernel's spelling, and getting it wrong would wait for an address nothing
+        // ever binds — a launch that always pays the full bound and then proceeds anyway, which
+        // looks exactly like no wait at all.
+        let plain = super::listener_patterns(&[]);
+        assert_eq!(
+            plain,
+            vec![format!("0100007F:{:04X}", super::CAGE_PROXY_PORT)],
+            "the proxy listener is 127.0.0.1 little-endian, its port big-endian"
+        );
+        let with_tcp = super::listener_patterns(&[super::TcpDestination {
+            host: "db.internal".to_string(),
+            ports: vec![5432],
+            cage_addr: std::net::Ipv4Addr::new(127, 0, 0, 2),
+            map_name: true,
+        }]);
+        assert_eq!(
+            with_tcp,
+            vec![
+                format!("0100007F:{:04X}", super::CAGE_PROXY_PORT),
+                "0200007F:1538".to_string()
+            ],
+            "each `tcp://` listener is awaited on its own address too"
+        );
+    }
 
     #[test]
     fn wrap_command_backgrounds_socat_and_execs_the_command_positionally() {
