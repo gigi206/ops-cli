@@ -1144,7 +1144,13 @@ fn read_source(
             // (which would let a permission problem downgrade to a weaker fallback source).
             match path.try_exists() {
                 Ok(false) => Ok(None),
-                Ok(true) => run_sops(Path::new("sops"), &path, key.as_deref(), header),
+                Ok(true) => run_sops(
+                    Path::new("sops"),
+                    &path,
+                    key.as_deref(),
+                    header,
+                    super::resolver::HOST_RESOLUTION_DEADLINE,
+                ),
                 Err(e) => Err(io::Error::other(format!(
                     "the secret for `{header}` cannot stat {}: {e}",
                     path.display()
@@ -1188,11 +1194,17 @@ fn sops_extract_expr(key: &str) -> String {
 /// which, being multi-line, [`classify_value`] turns into a hard error (it cannot be a single header
 /// value), the correct fail-closed outcome. Every failure is a hard error that names the source and
 /// folds in sops's own stderr diagnostic (the plaintext is on stdout, never stderr), never the value.
+///
+/// `deadline` bounds the decryption the same way the resolver runner bounds a plugin, and through
+/// the same helper: sops reaches a key it may have to fetch, or an agent that may stop to ask a
+/// person, and neither may hold the launch open for good. It is a parameter for the reason
+/// `sops_bin` is one — a test proves the bound without waiting out a real one.
 fn run_sops(
     sops_bin: &Path,
     file: &Path,
     key: Option<&str>,
     header: &str,
+    deadline: std::time::Duration,
 ) -> io::Result<Option<String>> {
     let mut cmd = Command::new(sops_bin);
     cmd.arg("--decrypt");
@@ -1200,12 +1212,18 @@ fn run_sops(
         cmd.arg("--extract").arg(sops_extract_expr(k));
     }
     cmd.arg(file);
-    let output = match cmd.output() {
+    let what = format!("sops decrypting {}", file.display());
+    let output = match super::resolver::output_within(&mut cmd, deadline, &what) {
         Ok(out) => out,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Err(io::Error::other(format!(
                 "the secret for `{header}` needs sops, which is not installed or not on PATH"
             )));
+        }
+        // The timeout names the file and the bound already; only the secret it was read for is
+        // missing from it.
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+            return Err(io::Error::other(format!("the secret for `{header}`: {e}")));
         }
         Err(e) => {
             return Err(io::Error::other(format!(
@@ -2194,18 +2212,23 @@ mod tests {
     /// `sops` is an installed binary). Only the spawn-error branch is retried (its message is
     /// distinct), so a genuine decrypt/extract/classify error surfaces on the first attempt and
     /// still fails the test.
+    ///
+    /// The deadline is generous on purpose: these tests are about what sops answered, so a bound
+    /// that could bite would make them measure the machine's load instead. The tests that are
+    /// about the bound call [`run_sops`] directly with one short enough to observe.
     fn run_sops_retrying_spawn(
         sops: &Path,
         file: &Path,
         key: Option<&str>,
         header: &str,
     ) -> io::Result<Option<String>> {
-        let mut attempt = run_sops(sops, file, key, header);
+        let deadline = std::time::Duration::from_secs(60);
+        let mut attempt = run_sops(sops, file, key, header, deadline);
         for _ in 0..100 {
             match &attempt {
                 Err(e) if e.to_string().contains("could not run sops") => {
                     std::thread::sleep(std::time::Duration::from_millis(5));
-                    attempt = run_sops(sops, file, key, header);
+                    attempt = run_sops(sops, file, key, header, deadline);
                 }
                 _ => break,
             }
@@ -2230,6 +2253,40 @@ mod tests {
         assert_eq!(
             sops_path(Path::new("/abs/x.yaml"), root),
             Path::new("/abs/x.yaml")
+        );
+    }
+
+    /// sops that never answers is killed rather than waited on, and the failure names the file.
+    ///
+    /// Called without the retry harness on purpose: a transient ETXTBSY would surface here as a
+    /// spawn error rather than a timeout, which is exactly what the assertion distinguishes. The
+    /// elapsed bound is the real measurement — the sleep ends on its own, so without it the test
+    /// would pass on a kill that never happened.
+    #[test]
+    fn a_sops_that_never_answers_is_killed_rather_than_waited_on() {
+        let dir = TmpDir::new();
+        let sops = fake_sops(&dir, "sleep 30");
+        let file = dir.join("secrets.enc.yaml");
+        std::fs::write(&file, b"x").unwrap();
+
+        let started = std::time::Instant::now();
+        let err = run_sops(
+            &sops,
+            &file,
+            None,
+            "Authorization",
+            std::time::Duration::from_millis(400),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("Authorization") && err.contains("did not answer"),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "sops was waited out rather than killed: {:?}",
+            started.elapsed()
         );
     }
 

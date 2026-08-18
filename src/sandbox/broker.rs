@@ -1156,6 +1156,14 @@ pub(crate) struct Reachable {
     pub(crate) dest: std::path::PathBuf,
     /// The cage variables the manifest declared, resolved against `dest`.
     pub(crate) env: Vec<(String, String)>,
+    /// How long an exchange with this broker's host resource may legitimately take, straight from
+    /// the manifest's `host_deadline`.
+    ///
+    /// Carried on the reachable form because it is not only *this* broker's business: whatever
+    /// waits on a broker inherits its wait. A resolver plugin holding this socket is entitled to
+    /// take that long, so the runner adds it to the plugin's own deadline rather than killing a
+    /// plugin that is doing what the manifest allows.
+    pub(crate) host_deadline: std::time::Duration,
 }
 
 impl Reachable {
@@ -1590,6 +1598,7 @@ pub(crate) fn start(
             name: binding.name.clone(),
             src: host_uds,
             dest: std::path::PathBuf::from(&cage_path),
+            host_deadline: plugin.broker.host_deadline,
             // Each name gets the form its client expects: the socket itself, or the directory
             // holding it (libpq derives `.s.PGSQL.<port>` from `PGHOST`).
             env: plugin

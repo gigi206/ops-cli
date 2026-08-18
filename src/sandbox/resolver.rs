@@ -233,13 +233,199 @@ pub(super) fn compose_cage(plan: &CagePlan<'_>) -> io::Result<(Vec<OsString>, Ve
     super::launch::seccomp_argv(&spec)
 }
 
+/// How long sbx waits on one host-side resolution that reaches nothing but itself.
+///
+/// The line is not invented here: the project already draws it once, for the resource a broker
+/// fronts. Past [`MAX_HOST_DEADLINE_SECS`](crate::plugins::broker::MAX_HOST_DEADLINE_SECS),
+/// "whatever is on the other side is wedged rather than thinking, and no pinentry prompt a person
+/// answers takes that long". A resolver plugin is a program rather than a protocol — it may be
+/// reaching a remote vault across a link sbx knows nothing about — so a tighter bound would be a
+/// number rather than a rule, and it would kill a plugin that is still working.
+///
+/// What it buys is the difference between finite and infinite on the launch's critical path: the
+/// same call runs from `egress::start` before the agent exists and from the refresh thread while it
+/// does, and neither may be held open forever by a plugin that never answers.
+///
+/// What would reopen the number: a resolver manifest declaring its own bound, the way a broker
+/// manifest declares `host_deadline`. Until a shipped plugin needs one, there is nothing to
+/// configure and nothing to keep in step.
+pub(super) const HOST_RESOLUTION_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(crate::plugins::broker::MAX_HOST_DEADLINE_SECS as u64);
+
+/// The deadline for one run of a plugin whose cage can reach `brokers`.
+///
+/// A resolver may wait on a broker, and a broker may hold one exchange for as long as its own
+/// manifest declares — a gpg-agent opening a pinentry answers when the person does. A resolution
+/// bounded tighter than a wait it is allowed to contain would kill a plugin behaving exactly as a
+/// manifest permits, so the longest reachable broker wait is **added** to the base rather than
+/// compared against it: the two waits happen one inside the other, not instead of one another.
+fn deadline_for(brokers: &[super::broker::Reachable]) -> std::time::Duration {
+    HOST_RESOLUTION_DEADLINE
+        + brokers
+            .iter()
+            .map(|b| b.host_deadline)
+            .max()
+            .unwrap_or_default()
+}
+
+/// Read one of a child's pipes on its own thread, handing the bytes back over `tx`.
+///
+/// Two pipes need two readers: a process that fills stderr while sbx is reading stdout would
+/// otherwise block on a pipe nobody is draining, and sbx would block on the one it is draining —
+/// a deadlock neither side can see. Reading on threads sbx does not have to join is also what
+/// lets a bounded wait *be* bounded: the reader is abandoned, not waited for.
+fn drain<R: io::Read + Send + 'static>(
+    mut pipe: R,
+    is_stdout: bool,
+    tx: std::sync::mpsc::Sender<(bool, Vec<u8>)>,
+) {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        let _ = tx.send((is_stdout, buf));
+    });
+}
+
+/// Run `cmd` and return its output, or fail once `deadline` has passed. `what` names the subject
+/// in the timeout error ("the `pass` resolver plugin"), which carries [`io::ErrorKind::TimedOut`]
+/// so a caller can tell it apart from the command's own failures; a spawn failure comes back
+/// untouched, so its kind still reads (`NotFound` for a binary that is not installed).
+///
+/// The one definition of how long a host-side step of the secret chain may take: the resolver
+/// runner and the sops path both come through here, so "this did not answer" means the same thing
+/// whichever source a secret came from.
+///
+/// **What is bounded is the wait, not the process** — and the difference is the whole design.
+/// Killing what sbx spawned does not end the wait, because a pipe stays open as long as *anything*
+/// holds its write end: a shell that forks a helper, sops that forks gpg. Measured, not assumed —
+/// killing `sh -c 'sleep 30'` and then reading to EOF takes thirty seconds, because `sleep`
+/// inherited the descriptor and outlived its parent. So the process is killed *and* the readers
+/// are abandoned where they stand, and the call returns on time whatever still holds the pipe.
+///
+/// The kill goes through a **pidfd**. It pins one process, so it cannot land on whatever inherited
+/// a pid — and the resolver cage, whose `--die-with-parent` init is the process being signalled,
+/// comes down whole with it, the same teardown a session stop relies on.
+pub(super) fn output_within(
+    cmd: &mut Command,
+    deadline: std::time::Duration,
+    what: &str,
+) -> io::Result<std::process::Output> {
+    output_within_armed_by(cmd, deadline, what, crate::session::open_pidfd)
+}
+
+/// [`output_within`] with the arming passed in, so the one branch a machine will not produce on
+/// demand — the kernel refusing a pidfd, out of descriptors — is reachable from a test. What that
+/// branch has to get right is not the message but the process: it must not be left running.
+fn output_within_armed_by(
+    cmd: &mut Command,
+    deadline: std::time::Duration,
+    what: &str,
+    arm: fn(u32) -> Result<libc::c_int, i32>,
+) -> io::Result<std::process::Output> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let started = std::time::Instant::now();
+    let mut child = cmd
+        // Set here rather than left to each caller, because `spawn` and `output` do not agree on
+        // them: `output` captures both pipes and closes stdin, `spawn` inherits all three. A host
+        // step of the secret chain reads no stdin — it must not block on a terminal, and a plugin
+        // prompting there would be prompting *as* sbx — and its stdout is the value, which belongs
+        // to sbx rather than to sbx's own output.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let pidfd = match arm(child.id()) {
+        Ok(fd) => fd,
+        Err(errno) => {
+            // Nothing would be bounding this process, so it does not get to run at all. Failing
+            // here rather than falling back to an unbounded run keeps the promise this function
+            // makes: a silent second path would be an untested degradation on the chain that
+            // carries the plaintext.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other(format!(
+                "the deadline could not be armed: {}",
+                io::Error::from_raw_os_error(errno)
+            )));
+        }
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(pipe) = child.stdout.take() {
+        drain(pipe, true, tx.clone());
+    }
+    if let Some(pipe) = child.stderr.take() {
+        drain(pipe, false, tx.clone());
+    }
+    // The last sender the caller holds, so a reader that died leaves the channel disconnected
+    // rather than making the collection below wait out the deadline for a message never coming.
+    drop(tx);
+
+    let exited = crate::session::wait_for_exit(pidfd, deadline);
+    if !exited {
+        let _ = crate::session::send_signal(pidfd, libc::SIGKILL);
+    }
+    crate::session::close_fd(pidfd);
+    // Immediate either way: the poll said the process is gone, or SIGKILL just made it so.
+    let status = child.wait()?;
+
+    // Collect what the readers have, against what is left of the same deadline — the bound covers
+    // reading the answer, not only producing it.
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut read_both = true;
+    for _ in 0..2 {
+        let left = deadline.saturating_sub(started.elapsed());
+        match rx.recv_timeout(left) {
+            Ok((true, bytes)) => stdout = bytes,
+            Ok((false, bytes)) => stderr = bytes,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                read_both = false;
+                break;
+            }
+        }
+    }
+
+    // A process exiting on its own in the instant the poll timed out is not a timeout: SIGKILL is
+    // the one exit no program produces for itself, so the signal is proof of what sbx did. The
+    // second half is the pipe that never closed — the answer was not read in time, whoever is
+    // still holding the descriptor.
+    if (!exited && status.signal() == Some(libc::SIGKILL)) || !read_both {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "{what} did not answer within {} seconds and was killed",
+                deadline.as_secs()
+            ),
+        ));
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// Run `plugin` to resolve `reff`, returning its raw stdout on success (the caller classifies
-/// empty-as-absent).
+/// empty-as-absent). The run is bounded — see [`deadline_for`].
 pub(crate) fn run(
     bwrap: &Path,
     plugin: &ResolverPlugin,
     reff: &str,
     brokers: &[super::broker::Reachable],
+) -> io::Result<String> {
+    run_within(bwrap, plugin, reff, brokers, deadline_for(brokers))
+}
+
+/// [`run`], with the deadline passed in so a test can prove the bound without waiting out a real
+/// one.
+fn run_within(
+    bwrap: &Path,
+    plugin: &ResolverPlugin,
+    reff: &str,
+    brokers: &[super::broker::Reachable],
+    deadline: std::time::Duration,
 ) -> io::Result<String> {
     let plan = CagePlan {
         kind: crate::plugins::PluginKind::Resolver,
@@ -254,19 +440,23 @@ pub(crate) fn run(
     };
     // `_env` holds the environment descriptor open until bwrap has run.
     let (argv, _env) = compose_cage(&plan)?;
-    let out = Command::new(bwrap)
-        .args(argv)
-        // No stdin: a resolver must not read or block on sbx's stdin.
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| {
-            io::Error::other(format!(
+    let mut cmd = Command::new(bwrap);
+    cmd.args(argv);
+    let out = match output_within(
+        &mut cmd,
+        deadline,
+        &format!("the `{}` resolver plugin", plugin.scheme),
+    ) {
+        Ok(out) => out,
+        // The timeout already names the plugin and what happened to it; a spawn failure does not.
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => return Err(e),
+        Err(e) => {
+            return Err(io::Error::other(format!(
                 "could not run the `{}` resolver plugin: {e}",
                 plugin.scheme
-            ))
-        })?;
+            )));
+        }
+    };
 
     if !out.status.success() {
         // Fold in the plugin's stderr (its diagnostics) but never its stdout (the plaintext).
@@ -962,6 +1152,8 @@ mod tests {
             "--unshare-net",
             "--cap-drop",
             "--clearenv",
+            "--unshare-pid",
+            "--die-with-parent",
         ] {
             assert!(argv.iter().any(|a| a == flag), "missing {flag}: {argv:?}");
         }
@@ -1066,6 +1258,7 @@ mod tests {
     /// A standing broker, as the launcher would hand one over.
     fn standing(name: &str, dest: &str, env: &[(&str, &str)]) -> super::super::broker::Reachable {
         super::super::broker::Reachable {
+            host_deadline: crate::plugins::broker::DEFAULT_HOST_DEADLINE,
             name: name.to_string(),
             src: PathBuf::from(format!("/data/sbx/broker/{name}-1.sock")),
             dest: PathBuf::from(dest),
@@ -1756,6 +1949,168 @@ printf 'run-%s' "$n""#,
         let (_dir, p) = fake_resolver("printf 'resolved:%s' \"$1\"");
         let out = run(&bwrap, &p, "test://hello", &[]).expect("the resolver should run");
         assert_eq!(out, "resolved:test://hello");
+    }
+
+    // --- the deadline ---
+
+    /// The base bound applies when the cage reaches nothing, and a reachable broker's own wait is
+    /// added to it rather than compared against it.
+    ///
+    /// A resolver holding a broker socket is entitled to wait as long as that broker's manifest
+    /// declares — a gpg-agent stopping at a pinentry answers when the person does — so a bound
+    /// that ignored the brokers would kill a plugin behaving exactly as the manifest permits.
+    #[test]
+    fn a_reachable_brokers_own_wait_is_added_to_the_resolution_deadline() {
+        assert_eq!(deadline_for(&[]), HOST_RESOLUTION_DEADLINE);
+
+        let mut quick = standing("quick", "/run/quick.sock", &[]);
+        quick.host_deadline = std::time::Duration::from_secs(5);
+        let mut human = standing("gpg-agent", "/run/gpg.sock", &[]);
+        human.host_deadline = std::time::Duration::from_secs(300);
+
+        // The longest of them, and only once: the waits nest, they do not queue.
+        assert_eq!(
+            deadline_for(&[quick, human]),
+            HOST_RESOLUTION_DEADLINE + std::time::Duration::from_secs(300)
+        );
+    }
+
+    /// A deadline the kernel refuses to arm stops the process instead of running it unbounded.
+    ///
+    /// The elapsed bound is the assertion that matters: the message could be produced while
+    /// leaving the process running, which is the outcome this branch exists to prevent. Thirty
+    /// seconds of `sleep` is what a leaked process would cost.
+    #[test]
+    fn a_deadline_that_cannot_be_armed_stops_the_process_instead_of_running_it_unbounded() {
+        let started = std::time::Instant::now();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("sleep 30");
+        let err = output_within_armed_by(
+            &mut cmd,
+            std::time::Duration::from_secs(30),
+            "the probe",
+            |_| Err(libc::EMFILE),
+        )
+        .expect_err("an unbounded run must not happen");
+        assert!(
+            err.to_string().contains("the deadline could not be armed"),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the process was left running: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The call returns on time even though the pipe it was reading stays open.
+    ///
+    /// This is the property killing the process does *not* give: `sh` forks `sleep`, `sleep`
+    /// inherits the descriptor, and killing the shell leaves the write end held for another thirty
+    /// seconds. So the wait is what is bounded — the readers are abandoned where they stand — and
+    /// the elapsed time is the only thing that says so. Measured before it was written: reading to
+    /// EOF after the kill took the full thirty seconds.
+    #[test]
+    fn a_command_whose_pipe_outlives_it_does_not_hold_the_call() {
+        let started = std::time::Instant::now();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("sleep 30");
+        let err = output_within(&mut cmd, std::time::Duration::from_millis(300), "the probe")
+            .expect_err("a command past its deadline must not resolve");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(err.to_string().contains("the probe"), "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the call waited on a pipe nothing was going to close: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A command that outlives its deadline is killed, not merely left behind.
+    ///
+    /// Separate from the bound on the wait, because the two are independent: the call returns by
+    /// abandoning its readers, which it would do even if nothing were signalled. The marker is
+    /// what measures the kill — the command ignores SIGTERM and would write it a second later, so
+    /// a signal that can be caught, or no signal at all, leaves the file behind.
+    #[test]
+    fn a_command_that_outlives_its_deadline_is_killed_rather_than_left_running() {
+        let dir = TmpDir::new();
+        let marker = dir.join("survived");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(format!("trap '' TERM; sleep 2; : > '{}'", marker.display()));
+        output_within(&mut cmd, std::time::Duration::from_millis(300), "the probe")
+            .expect_err("a command past its deadline must not resolve");
+
+        // Past the moment the command would have reached its own write, had it lived.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        assert!(
+            !marker.exists(),
+            "the command outlived its deadline instead of being killed"
+        );
+    }
+
+    /// The negative control: a command that answers keeps its output, and neither pipe is lost.
+    ///
+    /// It also pins the stdio the helper sets. `spawn` inherits all three descriptors where
+    /// `output` captures two and closes one, so a helper built on the first has to say so — a
+    /// resolver's stdout is the secret, and inheriting it would print the value instead of
+    /// returning it.
+    #[test]
+    fn a_command_that_answers_within_its_deadline_keeps_its_output() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("printf out; printf err >&2");
+        let out = output_within(&mut cmd, std::time::Duration::from_secs(30), "the probe")
+            .expect("a command inside its deadline resolves");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "out");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "err");
+    }
+
+    /// A resolver plugin that never answers is killed, and the cage goes down with it.
+    ///
+    /// The plugin writes into the one path that survives its own run — the state directory — a
+    /// second after the deadline, and ignores SIGTERM on the way. So the marker is a fact about
+    /// the whole cage: it appears if the plugin was not signalled, if it was signalled with
+    /// something it could catch, or if killing the process sbx spawned left the pid namespace
+    /// standing. sbx sees only its own child; this is how the rest of the cage is measured.
+    #[test]
+    fn a_resolver_that_never_answers_is_killed_and_the_cage_with_it() {
+        let Some(bwrap) = sandbox_prereqs() else {
+            skip_incapable!("skipping resolver run: no bwrap or no capability-bearing userns");
+            return;
+        };
+        let (root, p) = installed_resolver(
+            "trap '' TERM\nsleep 2\n: > \"$SBX_PLUGIN_STATE/survived\"",
+            SandboxGrant {
+                state: true,
+                ..SandboxGrant::default()
+            },
+        );
+        let marker = root.join("plugin-state").join("stateful").join("survived");
+        let started = std::time::Instant::now();
+        let err = run_within(
+            &bwrap,
+            &p,
+            "test://x",
+            &[],
+            std::time::Duration::from_millis(500),
+        )
+        .expect_err("a plugin past its deadline must not resolve");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(err.to_string().contains("test"), "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the call waited the plugin out rather than returning: {:?}",
+            started.elapsed()
+        );
+
+        // Past the moment the plugin would have reached its own write, had the cage lived.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        assert!(
+            !marker.exists(),
+            "the plugin outlived its deadline inside a cage that was not torn down"
+        );
     }
 
     #[test]

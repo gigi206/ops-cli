@@ -300,12 +300,16 @@ fn scope_cgroup_procs(pid: u32) -> Option<String> {
 
 /// Open a pidfd for `pid`, or the `errno` the kernel refused with.
 ///
+/// Shared with the resolver runner, which arms a deadline on a plugin process the same way a stop
+/// pins a session's: these three calls are the one place the syscalls are spelled, so a second
+/// caller cannot end up pinning a process by a rule of its own.
+///
 /// The errno is carried out instead of being folded into "gone", because only `ESRCH` means the
 /// process has exited. `pidfd_open` also refuses a pid no process can hold (`EINVAL`), reports the
 /// syscall as unavailable (`ENOSYS`, on a kernel older than 5.3 or under a filter that hides it),
 /// and fails when *this* process is out of descriptors or memory (`EMFILE`, `ENFILE`, `ENOMEM`) —
 /// none of which say anything about whether the target is alive.
-fn open_pidfd(pid: u32) -> Result<libc::c_int, i32> {
+pub(crate) fn open_pidfd(pid: u32) -> Result<libc::c_int, i32> {
     // SAFETY: `pidfd_open` only reads `pid`; it returns a new fd, or -1 with `errno` set.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
     if fd >= 0 {
@@ -318,7 +322,7 @@ fn open_pidfd(pid: u32) -> Result<libc::c_int, i32> {
         .unwrap_or(libc::EIO))
 }
 
-fn close_fd(fd: libc::c_int) {
+pub(crate) fn close_fd(fd: libc::c_int) {
     // SAFETY: closing a fd we opened.
     unsafe { libc::close(fd) };
 }
@@ -332,7 +336,7 @@ fn close_fd(fd: libc::c_int) {
 /// remains is the target being reaped between the open and the signal. A caller that ever holds a
 /// pidfd it did not open itself, or signals across a user boundary (`EPERM`), leaves that ground
 /// and would have to discriminate here too.
-fn send_signal(pidfd: libc::c_int, signal: libc::c_int) -> bool {
+pub(crate) fn send_signal(pidfd: libc::c_int, signal: libc::c_int) -> bool {
     // SAFETY: `pidfd_send_signal` with a null `siginfo` sends `signal` as if by `kill`.
     let rc = unsafe {
         libc::syscall(
@@ -348,7 +352,7 @@ fn send_signal(pidfd: libc::c_int, signal: libc::c_int) -> bool {
 
 /// Wait up to `timeout` for the pinned process to terminate. A pidfd is readable once its process
 /// exits, so a positive poll means it is gone; returns `true` in that case.
-fn wait_for_exit(pidfd: libc::c_int, timeout: Duration) -> bool {
+pub(crate) fn wait_for_exit(pidfd: libc::c_int, timeout: Duration) -> bool {
     let mut pfd = libc::pollfd {
         fd: pidfd,
         events: libc::POLLIN,

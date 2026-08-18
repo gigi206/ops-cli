@@ -259,6 +259,17 @@ exit status and the output streams:
 `stdin` is closed, so a resolver can never prompt for anything: everything it
 needs must come from its `[sandbox]` grant.
 
+**A resolution is bounded.** A resolver runs on the launch's critical path, and again on
+the refresh thread once the session is up, so a plugin that never answers would hold the
+launch open for good. `sbx` gives it **ten minutes**, then kills it (the cage with it) and
+fails the launch with an error naming the plugin. Ten minutes is the same line a broker
+manifest may not cross with its own `host_deadline`: past it, whatever is on the other
+side is wedged rather than thinking. A plugin that reaches a **broker** is given that
+broker's own wait on top, because a gpg-agent stopping at a pinentry answers when you do,
+and a bound tighter than the wait it is allowed to contain would kill a plugin doing
+exactly what the manifests permit. A `sops` source is bounded the same way, by the same
+clock.
+
 A plugin runs in its own cage, built the same way an agent's is: its own user,
 pid, ipc, uts and cgroup namespaces, every capability dropped, a cleared
 environment, and no network unless the manifest asks for one. It carries the
