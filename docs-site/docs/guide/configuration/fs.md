@@ -160,6 +160,21 @@ would pass everything while still looking like a scan.
 slower than it is without a scan. `scan` also brings that supervisor up on its own, without
 `[proc]`, because it is the same notification listener read for a different syscall.
 
+**What an allow hands over.** When a scan comes back clean, `sbx` gives the cage a descriptor for
+the file it just read, rather than letting the open run a second time from the path the cage wrote.
+That distinction matters against a cage with more than one thread: an open that re-runs re-walks its
+path argument, and a sibling thread is free to have pointed it somewhere else while the scan was in
+progress, so the file that arrives would not be the file that was read. Serving the descriptor
+removes the second walk, and the descriptor carries no more authority than the cage had: a read-only
+bind refuses a write through it exactly as it refuses the cage.
+
+Two cases still fall back on the older answer, and in those the swap above is still possible. The
+first is a target that is not a regular file or a directory, such as a named pipe or a device: a
+supervisor that reopened one could block on it, and the open being decided is the one every other
+open in the cage is queued behind. The second is a kernel older than 5.9, which does not offer the
+operation at all. Both are honest gaps rather than closed doors, and both keep `scan` on the footing
+the next paragraph describes.
+
 **What it does not do.** A pattern only finds the shapes you wrote: a password that looks like
 ordinary prose is not one of them, and a scan is a backstop rather than a proof. Rewriting a file
 that currently holds a matching secret is refused too, because a truncating write opens it first;

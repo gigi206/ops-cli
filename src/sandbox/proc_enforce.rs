@@ -530,14 +530,12 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
     // Checked on the syscall number rather than on the lens being present, so a notification the
     // filter should not have produced is still answered as an open.
     if let Some((dirfd, path_addr)) = open_args(req.data.nr, &req.data.args) {
+        let named = read_exec_path(req.pid, path_addr).unwrap_or_default();
         let outcome = match cx.open {
-            Some(lens) => match read_exec_path(req.pid, path_addr) {
-                // An unreadable path is allowed, like an unreadable exec target: the lens takes away
-                // what it can prove, and a cage whose undecidable opens all failed would not run.
-                Some(path) if !path.is_empty() => open_is_refused(lens, req.pid, dirfd, &path),
-                _ => OpenOutcome::ALLOWED,
-            },
-            None => OpenOutcome::ALLOWED,
+            // An unreadable path is allowed, like an unreadable exec target: the lens takes away
+            // what it can prove, and a cage whose undecidable opens all failed would not run.
+            Some(lens) if !named.is_empty() => open_is_refused(lens, req.pid, dirfd, &named),
+            _ => OpenOutcome::ALLOWED,
         };
         if let Some(report) = &outcome.report {
             if report.partial {
@@ -559,7 +557,11 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
         }
         if outcome.refused {
             respond_errno(notif_fd, req.id, libc::EACCES);
-        } else {
+        } else if !serve_open(notif_fd, req, dirfd, &named, outcome.probe.as_ref()) {
+            // Nothing sound to serve it from, so the open runs the way it always did — and with it
+            // the re-resolution a sibling thread can redirect. The cases that land here are named
+            // where each is decided: a target whose type would make a reopen block, flags that
+            // cannot be carried onto a descriptor, and a kernel without `ADDFD`.
             respond_continue(notif_fd, req.id);
         }
         return;
@@ -711,6 +713,183 @@ fn respond_errno(notif_fd: libc::c_int, id: u64, errno: libc::c_int) {
     resp.id = id;
     resp.error = -errno;
     send_resp(notif_fd, &resp);
+}
+
+/// Set once the kernel has refused an `ADDFD` answer, so a host without it pays one failed ioctl
+/// for the whole session rather than one per open.
+static ADDFD_UNAVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Answer a notification by handing the target a descriptor, rather than letting the real syscall
+/// run a second time.
+///
+/// This is what makes an *allow* sound. `SECCOMP_ADDFD_FLAG_SEND` completes the notification in the
+/// same operation that installs the descriptor, and the number it lands on becomes the syscall's
+/// return value — so nothing re-resolves the path the cage wrote, and a sibling thread that rewrites
+/// that buffer changes nothing. A `CONTINUE` answer cannot offer this: it re-runs the syscall from
+/// its arguments, which is why the window exists at all.
+///
+/// `srcfd` is the supervisor's own descriptor for the inode it examined; the kernel duplicates it
+/// into the target and leaves ours alone. Returns `false` when the kernel does not offer the
+/// operation (`SECCOMP_ADDFD_FLAG_SEND` landed in 5.9), leaving the caller to fall back on the
+/// answer every kernel before it had.
+fn respond_with_fd(notif_fd: libc::c_int, id: u64, srcfd: libc::c_int, cloexec: bool) -> bool {
+    use std::sync::atomic::Ordering;
+    if ADDFD_UNAVAILABLE.load(Ordering::Relaxed) {
+        return false;
+    }
+    let mut addfd: libc::seccomp_notif_addfd = unsafe { std::mem::zeroed() };
+    addfd.id = id;
+    addfd.flags = libc::SECCOMP_ADDFD_FLAG_SEND as u32;
+    addfd.srcfd = srcfd as u32;
+    // `newfd` is ignored without `SECCOMP_ADDFD_FLAG_SETFD`: the kernel picks the lowest free
+    // number in the target, which is what an ordinary `open` would have returned.
+    addfd.newfd = 0;
+    addfd.newfd_flags = if cloexec { libc::O_CLOEXEC as u32 } else { 0 };
+    // SAFETY: addfd is a live, correctly-sized request for the ADDFD ioctl to read.
+    let rc = unsafe {
+        libc::ioctl(
+            notif_fd,
+            libc::SECCOMP_IOCTL_NOTIF_ADDFD as libc::Ioctl,
+            &addfd as *const libc::seccomp_notif_addfd,
+        )
+    };
+    if rc >= 0 {
+        return true;
+    }
+    // Told apart on the errno: an old kernel does not know the operation at all, and remembering
+    // that is worth a flag. Anything else is about *this* notification — the target was reaped, or
+    // it ran out of descriptors — and must not condemn the mechanism for the rest of the session.
+    let e = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    if e == libc::EINVAL || e == libc::ENOTTY {
+        ADDFD_UNAVAILABLE.store(true, Ordering::Relaxed);
+    }
+    false
+}
+
+/// Serve one allowed open from the descriptor the supervisor already holds, rather than letting the
+/// syscall run again.
+///
+/// This is the whole point of the lens being sound on an *allow*. The verdict was formed against the
+/// inode behind `probe`; reopening through `/proc/self/fd/<probe>` reaches that same inode without
+/// walking a path, so the descriptor the cage receives is definitionally the one that was examined.
+/// A `CONTINUE` answer would instead re-run the syscall from its arguments, and a sibling thread is
+/// free to have rewritten them meanwhile.
+///
+/// Serving carries no authority the cage did not have: the probe was taken through
+/// `/proc/<pid>/root`, so it sits on the cage's own mounts, and a read-only bind refuses a write
+/// reopen with `EROFS` exactly as it would have refused the cage.
+///
+/// Returns `false` when the call cannot be served this way, leaving the caller to answer `CONTINUE`
+/// — which is the pre-existing behaviour, and with it the pre-existing race.
+fn serve_open(
+    notif_fd: libc::c_int,
+    req: &libc::seccomp_notif,
+    dirfd: libc::c_int,
+    path: &str,
+    probe: Option<&std::fs::File>,
+) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let Some(probe) = probe else { return false };
+    let Some(flags) = open_flags(req.pid, req.data.nr, &req.data.args) else {
+        return false;
+    };
+    let flags = flags as libc::c_int;
+    // `O_TMPFILE` names a directory and asks for a new unnamed inode under it. There is no existing
+    // file to serve, and the probe is not it.
+    if flags & libc::O_TMPFILE == libc::O_TMPFILE {
+        return false;
+    }
+    // The file exists — holding a descriptor on it is the proof — so `O_CREAT|O_EXCL` is precisely
+    // the case the caller asked to be told about, and the errno it expects is the sound answer.
+    if flags & libc::O_CREAT != 0 && flags & libc::O_EXCL != 0 {
+        respond_errno(notif_fd, req.id, libc::EEXIST);
+        return true;
+    }
+    // `O_NOFOLLOW` asks to fail when the final component is a symlink. The probe followed links on
+    // purpose (a scan that stopped at the link would be walked around with one `ln -s`), and
+    // `/proc/self/fd/<n>` is itself a link, so the flag cannot ride into the reopen. It is decided
+    // here instead, against the same path, and answered the way the kernel would have.
+    //
+    // Re-walking the path is a second resolution, and the cage may have moved it since. The two
+    // outcomes of losing that race are a spurious `ELOOP` and serving the inode that was scanned —
+    // never an open the lens did not examine, which is the property being defended.
+    if flags & libc::O_NOFOLLOW != 0 {
+        let target = open_target_path(req.pid, dirfd, path);
+        let Ok(c) = std::ffi::CString::new(target.as_os_str().as_encoded_bytes()) else {
+            return false;
+        };
+        // SAFETY: c is a live NUL-terminated path for the duration of the call.
+        let link_probe = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if link_probe < 0 {
+            respond_errno(notif_fd, req.id, libc::ELOOP);
+            return true;
+        }
+        // SAFETY: link_probe is a fresh owned descriptor this call is done with.
+        unsafe { libc::close(link_probe) };
+    }
+    // `O_CREAT` on a file that exists is a no-op, and `O_NOFOLLOW` has just been answered. Our own
+    // descriptor is always close-on-exec; what the *cage's* copy carries is set on the response.
+    let reopen = (flags & !libc::O_CREAT & !libc::O_NOFOLLOW) | libc::O_CLOEXEC;
+    let by_fd = format!("/proc/self/fd/{}", probe.as_raw_fd());
+    let Ok(c) = std::ffi::CString::new(by_fd) else {
+        return false;
+    };
+    // SAFETY: c is a live NUL-terminated path for the duration of the call.
+    let served = unsafe { libc::open(c.as_ptr(), reopen) };
+    if served < 0 {
+        // A reopen the supervisor could not make is one this increment does not try to attribute to
+        // the cage: falling back leaves the open exactly as it behaved before, race included.
+        return false;
+    }
+    let ok = respond_with_fd(notif_fd, req.id, served, flags & libc::O_CLOEXEC != 0);
+    // SAFETY: served is a fresh owned descriptor; the kernel copied it into the target if it took
+    // it at all, and either way this side is done with it.
+    unsafe { libc::close(served) };
+    ok
+}
+
+/// Read one `u64` from a target's memory. `openat2` passes its flags behind a pointer rather than in
+/// a register, and that word has to be read the same careful way the path is.
+fn read_u64(pid: u32, addr: u64) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(format!("/proc/{pid}/mem")).ok()?;
+    file.seek(SeekFrom::Start(addr)).ok()?;
+    let mut buf = [0u8; 8];
+    file.read_exact(&mut buf).ok()?;
+    Some(u64::from_ne_bytes(buf))
+}
+
+/// The flags a notified open was called with, by syscall number.
+///
+/// The three forms do not agree on where they keep them, exactly as they disagree on the path (see
+/// [`open_args`]): `open(path, flags, …)` and `openat(dirfd, path, flags, …)` pass a register, while
+/// `openat2(dirfd, path, how, size)` passes a pointer to a `struct open_how` whose first field is the
+/// flag word. Reading the wrong register would serve a descriptor opened for something other than
+/// what the cage asked for, so the mapping is explicit and unit-tested rather than inferred.
+///
+/// `None` means the flags could not be established, and a caller that cannot establish them must not
+/// serve the open from a descriptor.
+fn open_flags(pid: u32, nr: libc::c_int, args: &[u64; 6]) -> Option<u64> {
+    if nr as libc::c_long == libc::SYS_open {
+        return Some(args[1]);
+    }
+    if nr as libc::c_long == libc::SYS_openat {
+        return Some(args[2]);
+    }
+    if nr as libc::c_long == libc::SYS_openat2 {
+        // `struct open_how { __u64 flags; __u64 mode; __u64 resolve; }`. Only the first word is
+        // wanted, and a `size` too small to hold it describes a call the kernel refuses anyway.
+        if args[3] < 8 {
+            return None;
+        }
+        return read_u64(pid, args[2]);
+    }
+    None
 }
 
 /// Send a notification response, ignoring `ENOENT` (the target was reaped while we decided).
@@ -1006,16 +1185,22 @@ fn open_is_refused(lens: &OpenLens, pid: u32, dirfd: libc::c_int, path: &str) ->
     let Ok(resolved) = std::fs::read_link(format!("/proc/self/fd/{}", probe.as_raw_fd())) else {
         return OpenOutcome::ALLOWED;
     };
-    if !resolved.starts_with(&lens.root) {
-        return OpenOutcome::ALLOWED;
-    }
     let Ok(meta) = probe.metadata() else {
         return OpenOutcome::ALLOWED;
     };
-    if !meta.is_file() {
-        // A directory, a FIFO, a socket or a device carries no content this policy is written
-        // about, and reading one could block indefinitely.
+    // A FIFO, a socket or a device carries no content this policy is written about, and reopening
+    // one could block the single thread every other open in the cage is queued behind — so it is
+    // allowed, and allowed *without* a descriptor to serve it from. That is a door and it is named
+    // where it is decided (`handle_notif`): such an open falls back on `CONTINUE`, which re-resolves.
+    if !meta.is_file() && !meta.is_dir() {
         return OpenOutcome::ALLOWED;
+    }
+    // The type is settled before the project bound, because a file outside the tree is served from a
+    // descriptor too. Nothing outside is *scanned* — that is what the bound is for — but a
+    // `CONTINUE` there would re-resolve a path the cage can point back *into* the tree after the
+    // fact, which would leave the whole lens walkable by naming `/etc/hostname` first.
+    if !meta.is_file() || !resolved.starts_with(&lens.root) {
+        return OpenOutcome::allowed_from(probe);
     }
     let id = FileId::of(&meta);
     if let Some(remembered) = cache.get(&id) {
@@ -1026,6 +1211,7 @@ fn open_is_refused(lens: &OpenLens, pid: u32, dirfd: libc::c_int, path: &str) ->
         return OpenOutcome {
             refused: remembered,
             report: None,
+            probe: (!remembered).then_some(probe),
         };
     }
     // Re-opened for reading through the descriptor already resolved, so the bytes scanned belong to
@@ -1059,6 +1245,7 @@ fn open_is_refused(lens: &OpenLens, pid: u32, dirfd: libc::c_int, path: &str) ->
                 shapes: Vec::new(),
                 partial: true,
             }),
+            probe: Some(probe),
         };
     }
     // Naming the shapes costs a second walk, paid only here — on content already refused, once per
@@ -1068,6 +1255,7 @@ fn open_is_refused(lens: &OpenLens, pid: u32, dirfd: libc::c_int, path: &str) ->
         .into_iter()
         .map(str::to_string)
         .collect();
+    // A refusal needs no descriptor: it is answered with an errno, and the syscall never runs.
     OpenOutcome {
         refused: true,
         report: Some(OpenReport {
@@ -1075,6 +1263,7 @@ fn open_is_refused(lens: &OpenLens, pid: u32, dirfd: libc::c_int, path: &str) ->
             shapes,
             partial: false,
         }),
+        probe: None,
     }
 }
 
@@ -1084,13 +1273,32 @@ struct OpenOutcome {
     /// Present only the first time this launch scanned the file, so one reopened in a loop is
     /// reported once.
     report: Option<OpenReport>,
+    /// The supervisor's own `O_PATH` descriptor for the inode it examined, when the open can be
+    /// served from one.
+    ///
+    /// This is what closes the allow race. The verdict was formed against *this* inode; handing the
+    /// cage a descriptor derived from it means the path it wrote is never resolved a second time,
+    /// so there is no moment at which a sibling thread's rewrite could redirect the open. Absent
+    /// when there is nothing sound to serve: a refusal (answered with an errno), a target whose
+    /// type would make reopening block, or a probe that could not be taken at all.
+    probe: Option<std::fs::File>,
 }
 
 impl OpenOutcome {
     const ALLOWED: OpenOutcome = OpenOutcome {
         refused: false,
         report: None,
+        probe: None,
     };
+
+    /// Allowed, and servable from the descriptor the supervisor already holds.
+    fn allowed_from(probe: std::fs::File) -> OpenOutcome {
+        OpenOutcome {
+            refused: false,
+            report: None,
+            probe: Some(probe),
+        }
+    }
 }
 
 /// What one file's first scan is worth saying: either the shapes that closed it, or that the answer
@@ -1369,6 +1577,123 @@ mod tests {
         let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&out.stderr));
         (code, text)
+    }
+
+    #[test]
+    fn an_allowed_open_hands_the_cage_the_inode_that_was_scanned() {
+        // The property this defends is what makes an *allow* mean anything. The supervisor forms its
+        // verdict against an inode, and the cage must receive a descriptor for that inode — not for
+        // whatever the path it wrote names once the answer is given.
+        //
+        // The adversary here is a symlink flipped under the cage's feet, which races the same window
+        // a sibling thread rewriting the path argument would: the supervisor scans what the link
+        // pointed at, and the answer decides whether the kernel gets to walk the link a second time.
+        // Answering `CONTINUE` lets it, and the secret crosses; serving the scanned descriptor does
+        // not, and there is no second walk to redirect.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const SECRET: &str = "sk-ABC123DEF456GHI789";
+        const ROUNDS: usize = 400;
+
+        let dir = TmpDir::new();
+        let secret = dir.join("secret.txt");
+        std::fs::write(&secret, format!("API key: {SECRET}\n")).expect("write the secret fixture");
+        let door = dir.join("door");
+        std::os::unix::fs::symlink(&secret, &door).expect("plant the door");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let flipper = {
+            let (stop, dir_path, door, secret) = (
+                Arc::clone(&stop),
+                dir.join(".").to_path_buf(),
+                door.clone(),
+                secret.clone(),
+            );
+            std::thread::spawn(move || {
+                let mut n = 0usize;
+                while !stop.load(Ordering::Relaxed) {
+                    // A fresh inode for the clean side every flip, so its verdict is never answered
+                    // from the cache: a cached answer skips the read, and the read is the widest
+                    // part of the window this test has to be able to lose. Kept small, because the
+                    // flip rate matters more here than the length of any one scan.
+                    let clean = dir_path.join(format!("clean-{}.txt", n % 64));
+                    n += 1;
+                    if std::fs::write(&clean, vec![b'.'; 4096]).is_err() {
+                        return;
+                    }
+                    for target in [clean.as_path(), secret.as_path()] {
+                        let tmp = dir_path.join("door.tmp");
+                        let _ = std::fs::remove_file(&tmp);
+                        if std::os::unix::fs::symlink(target, &tmp).is_ok() {
+                            let _ = std::fs::rename(&tmp, &door);
+                        }
+                    }
+                }
+            })
+        };
+
+        let script = format!(
+            "i=0; while [ $i -lt {ROUNDS} ]; do /bin/cat {} 2>/dev/null; i=$((i+1)); done",
+            door.to_str().expect("utf-8 fixture path")
+        );
+        let (_, out) = run_with_open_lens(
+            &["/bin/sh", "-c", &script],
+            &[r"sk-[A-Za-z0-9]{12,}"],
+            &dir.join("."),
+        );
+        stop.store(true, Ordering::Relaxed);
+        flipper.join().expect("the flipper thread");
+
+        assert!(
+            !out.contains(SECRET),
+            "the cage received a descriptor for a file the supervisor never scanned: the verdict was \
+             formed against one inode and the open landed on another"
+        );
+    }
+
+    #[test]
+    fn each_open_form_keeps_its_flags_where_its_own_abi_puts_them() {
+        // The mirror of `each_open_form_is_read_from_its_own_registers`, for the other argument the
+        // decision now depends on. Reading the wrong register would serve a descriptor opened for
+        // something other than what the cage asked for.
+        let mut args = [0u64; 6];
+        args[1] = 0x111;
+        args[2] = 0x222;
+        assert_eq!(
+            open_flags(std::process::id(), libc::SYS_open as libc::c_int, &args),
+            Some(0x111),
+            "`open` keeps its flags in the second argument"
+        );
+        assert_eq!(
+            open_flags(std::process::id(), libc::SYS_openat as libc::c_int, &args),
+            Some(0x222),
+            "`openat` leads with the descriptor, so its flags sit one along"
+        );
+        assert_eq!(
+            open_flags(std::process::id(), libc::SYS_read as libc::c_int, &args),
+            None,
+            "a syscall that is not an open has no flags to read"
+        );
+    }
+
+    #[test]
+    fn openat2_reads_its_flags_from_the_struct_it_points_at() {
+        // `openat2` is the one form that does not pass its flags in a register, and it is reachable
+        // by an adversary calling the syscall directly whether or not a toolchain emits it.
+        let how: [u64; 3] = [libc::O_RDONLY as u64 | libc::O_CLOEXEC as u64, 0, 0];
+        let mut args = [0u64; 6];
+        args[2] = how.as_ptr() as u64;
+        args[3] = std::mem::size_of_val(&how) as u64;
+        assert_eq!(
+            open_flags(std::process::id(), libc::SYS_openat2 as libc::c_int, &args),
+            Some(libc::O_RDONLY as u64 | libc::O_CLOEXEC as u64),
+            "the flag word is the first field of `struct open_how`"
+        );
+        args[3] = 4;
+        assert_eq!(
+            open_flags(std::process::id(), libc::SYS_openat2 as libc::c_int, &args),
+            None,
+            "a `size` too small to hold the flag word describes a call the kernel refuses anyway"
+        );
     }
 
     #[test]
