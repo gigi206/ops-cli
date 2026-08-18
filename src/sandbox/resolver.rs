@@ -80,6 +80,9 @@ pub(crate) fn state_dir(plugin: &ResolverPlugin) -> Option<PathBuf> {
 /// same grant fields, the same host answers, the same vetting of the executable. Naming that
 /// overlap once is what keeps a broker from growing a second, drifting copy of this file.
 pub(super) struct CagePlan<'a> {
+    /// What kind of plugin this is. Carried because the grant rules a *type* imposes are re-applied
+    /// here, where the grant is honoured, and not only where the manifest was read.
+    pub(super) kind: crate::plugins::PluginKind,
     /// The plugin's installed directory, bound read-only at its real path.
     pub(super) dir: &'a Path,
     /// The executable to run, inside that directory.
@@ -126,6 +129,22 @@ fn state_dir_of(dir: &Path) -> Option<PathBuf> {
 /// nothing relaxes them here — [`SandboxSpec`] carries the unrelaxed policy by default and this path
 /// never sets another.
 pub(super) fn compose_cage(plan: &CagePlan<'_>) -> io::Result<(Vec<OsString>, Vec<std::fs::File>)> {
+    // The grant rules this plugin's *type* imposes, applied again where the grant is honoured. The
+    // manifest loader already refused them, so nothing reaches here today — which is the point: the
+    // check that matters is the one standing between a grant and the cage it builds, not the one
+    // standing between a file and a struct. A second way to build a `BrokerPlugin` (a cache, an
+    // alternate loader, a regression) would otherwise hand a broker the host network, and a signer
+    // holding a credential in plaintext the same, with nothing left to refuse it.
+    //
+    // First, before the executable is even looked at: this needs nothing from the filesystem, and a
+    // grant the type forbids is refused whatever the file turns out to be.
+    crate::plugins::check_kind_sandbox(plan.kind, plan.grant).map_err(|why| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("refusing to run the `{}` plugin: {why}", plan.called),
+        )
+    })?;
+
     // The executable is in the trusted computing base. The perimeter is the data directory's
     // owner-only permissions (a project cannot write there), but defend the thing we actually
     // exec directly: refuse it unless it is a regular file owned by us and not writable by group
@@ -223,6 +242,7 @@ pub(crate) fn run(
     brokers: &[super::broker::Reachable],
 ) -> io::Result<String> {
     let plan = CagePlan {
+        kind: crate::plugins::PluginKind::Resolver,
         dir: &plugin.dir,
         exec: &plugin.exec,
         grant: &plugin.sandbox,
@@ -949,6 +969,7 @@ mod tests {
 
     fn plan_for<'a>(p: &'a ResolverPlugin, reff: &str) -> CagePlan<'a> {
         CagePlan {
+            kind: crate::plugins::PluginKind::Resolver,
             dir: &p.dir,
             exec: &p.exec,
             grant: &p.sandbox,
@@ -958,6 +979,75 @@ mod tests {
             args: vec![OsString::from(reff)],
             brokers: &[],
         }
+    }
+
+    /// The grant a plugin's *type* forbids is refused where the grant is honoured, not only where
+    /// the manifest was read. Driven through `compose_cage` with a plan built by hand, which is
+    /// exactly the shape a second loader — a cache, a regression — would produce: the manifest
+    /// check cannot see it, so this one has to.
+    #[test]
+    fn a_broker_or_signer_that_asks_for_the_network_is_refused_at_the_spawn() {
+        let dir = crate::testutil::TmpDir::new();
+        let networked = SandboxGrant {
+            network: true,
+            ..Default::default()
+        };
+        let stateful = SandboxGrant {
+            state: true,
+            ..Default::default()
+        };
+        let plugin = plugin_in(dir.path(), networked.clone());
+
+        for (kind, grant, needle) in [
+            (crate::plugins::PluginKind::Broker, &networked, "network"),
+            (crate::plugins::PluginKind::Signer, &networked, "network"),
+            (crate::plugins::PluginKind::Broker, &stateful, "state"),
+            (crate::plugins::PluginKind::Signer, &stateful, "state"),
+        ] {
+            let plan = CagePlan {
+                kind,
+                dir: &plugin.dir,
+                exec: &plugin.exec,
+                grant,
+                host: &plugin.host,
+                called: "probe",
+                configured_as: "probe",
+                args: Vec::new(),
+                brokers: &[],
+            };
+            let err = compose_cage(&plan).expect_err("the type forbids this grant");
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::PermissionDenied,
+                "{kind:?}: {err}"
+            );
+            assert!(
+                err.to_string().contains(needle),
+                "{kind:?} must be refused for its `{needle}`: {err}"
+            );
+        }
+    }
+
+    /// The other half of the same rule, and the one a symmetric fix would have broken: a resolver
+    /// *may* declare the network — reaching a vault over it is what most of them are for. The guard
+    /// above must be keyed on the type, not applied to every plugin that passes through here.
+    #[test]
+    fn a_resolver_that_asks_for_the_network_still_composes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::testutil::TmpDir::new();
+        let exec = dir.path().join("resolve");
+        std::fs::write(&exec, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let plugin = plugin_in(
+            dir.path(),
+            SandboxGrant {
+                network: true,
+                ..Default::default()
+            },
+        );
+        compose_cage(&plan_for(&plugin, "test://x"))
+            .expect("a resolver may reach the network; the type guard must not touch it");
     }
 
     fn plugin_in(dir: &Path, grant: SandboxGrant) -> ResolverPlugin {

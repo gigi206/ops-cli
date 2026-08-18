@@ -73,6 +73,24 @@ pub(crate) enum PluginKind {
     Signer,
 }
 
+/// The grant rules a plugin's **type** imposes, whatever its manifest asked for.
+///
+/// One definition, because it is applied twice on purpose: once when the manifest is loaded, so a
+/// bad declaration is refused with a reason its author can act on, and once at the spawn, where the
+/// grant is actually honoured. The load path is the only way a plugin is built today; the spawn is
+/// where a second one — a cache, an alternate loader, a regression — would otherwise hand a broker
+/// or a signer the host network without anything left to stop it.
+///
+/// A resolver is unrestricted here by design: reaching a vault over the network is what most of them
+/// are for. The two that are restricted hold, or stand in front of, the secret itself.
+pub(crate) fn check_kind_sandbox(kind: PluginKind, grant: &SandboxGrant) -> Result<(), String> {
+    match kind {
+        PluginKind::Resolver => Ok(()),
+        PluginKind::Broker => broker::check_sandbox(grant),
+        PluginKind::Signer => signer::check_sandbox(grant),
+    }
+}
+
 impl PluginKind {
     /// The token a manifest and a catalogue both write.
     pub(crate) fn token(self) -> &'static str {
@@ -899,7 +917,7 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<Plugin>, String> {
             let raw_broker = raw
                 .broker
                 .ok_or("missing the `[broker]` table, which a broker plugin is defined by")?;
-            broker::check_sandbox(&sandbox)?;
+            check_kind_sandbox(PluginKind::Broker, &sandbox)?;
             let spec = broker::validate(
                 raw_broker,
                 &name,
@@ -921,7 +939,7 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<Plugin>, String> {
             let raw_signer = raw
                 .signer
                 .ok_or("missing the `[signer]` table, which a signer plugin is defined by")?;
-            signer::check_sandbox(&sandbox)?;
+            check_kind_sandbox(PluginKind::Signer, &sandbox)?;
             let spec = signer::validate(raw_signer, &name)?;
             Ok(Some(Plugin::Signer(Box::new(signer::SignerPlugin {
                 name,

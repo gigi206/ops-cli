@@ -427,6 +427,7 @@ impl SignerProcess {
         ours.set_write_timeout(Some(SIGN_DEADLINE))?;
 
         let plan = super::resolver::CagePlan {
+            kind: crate::plugins::PluginKind::Signer,
             dir: &plugin.dir,
             exec: &plugin.exec,
             grant: &plugin.sandbox,

@@ -985,6 +985,7 @@ impl PluginProcess {
         ours.set_write_timeout(Some(PLUGIN_DEADLINE))?;
 
         let plan = super::resolver::CagePlan {
+            kind: crate::plugins::PluginKind::Broker,
             dir: &plugin.dir,
             exec: &plugin.exec,
             grant: &plugin.sandbox,
