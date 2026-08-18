@@ -9,6 +9,8 @@
 // Launch core: the SandboxSpec -> bwrap-argv -> cage pipeline, plus the terminal.
 mod argv;
 mod binds;
+// The ceiling every host-side accept loop applies to the connections it will serve at once.
+mod conncap;
 mod fhs;
 mod launch;
 mod memfd;

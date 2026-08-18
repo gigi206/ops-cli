@@ -111,6 +111,22 @@ const DEFAULT_CALL_QUOTA: u64 = 500;
 /// anything that would matter.
 const MAX_PAYLOAD_BYTES: usize = 1 << 20;
 
+/// A ceiling on live connections, applied to both of the plane's sockets.
+///
+/// Each connection is served on its own thread, and one serving a `RUN` holds that thread for as
+/// long as the task's timeout allows: without a ceiling, a caller opening connections in a loop
+/// spawns host threads until the process cannot make another. It was the only accept loop in the
+/// binary without one, of four.
+///
+/// The same number the broker applies, and for the same situation: a socket bound host-side,
+/// reachable from the cage, with a host resource on the other end. What crosses it is a handful of
+/// calls from an agent, so the ceiling is far above use and far below exhaustion.
+///
+/// A refusal here is **not** recorded in the invocation log, and that is deliberate: the log is a
+/// 512-entry ring, so a flood of refused connections would evict the invocation history the ring
+/// exists for, which is the very thing a caller unable to connect would want to read.
+const MAX_CONCURRENT_CONNS: usize = 32;
+
 /// The most one request may make sbx hold, keys and values together, before anything about it has
 /// been validated.
 ///
@@ -528,14 +544,19 @@ pub(crate) fn start(
         let engine = Arc::clone(&engine);
         let log = Arc::clone(&log);
         let quota = Arc::clone(&quota);
+        let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
         std::thread::spawn(move || {
             for stream in cage_listener.incoming().flatten() {
+                // Dropping the stream closes it: a caller past the ceiling is refused rather than
+                // queued, so nothing waits on a thread that will not come.
+                let Some(slot) = cap.take() else { continue };
                 let engine = Arc::clone(&engine);
                 let log = Arc::clone(&log);
                 let quota = Arc::clone(&quota);
                 // One thread per connection: an invocation runs for as long as its task's timeout,
                 // and a second caller must not queue behind it.
                 std::thread::spawn(move || {
+                    let _slot = slot;
                     let _ = serve_cage(stream, &engine, &log, &quota);
                 });
             }
@@ -546,8 +567,13 @@ pub(crate) fn start(
         let log = Arc::clone(&log);
         let results = Arc::clone(&results);
         let quota = Arc::clone(&quota);
+        let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
         std::thread::spawn(move || {
             for stream in log_listener.incoming().flatten() {
+                // Its own ceiling rather than a share of the crossing socket's: a cage filling the
+                // one must not be able to lock the user out of the other, which is where `sbx task
+                // status` and `sbx task stop` are answered.
+                let Some(slot) = cap.take() else { continue };
                 let engine = Arc::clone(&engine);
                 let log = Arc::clone(&log);
                 let results = Arc::clone(&results);
@@ -556,6 +582,7 @@ pub(crate) fn start(
                 // `STOP` waits for the invocation to end, and a `STATUS` behind it must not queue
                 // behind that wait.
                 std::thread::spawn(move || {
+                    let _slot = slot;
                     let _ = serve_host(stream, &engine, &log, &results, &quota);
                 });
             }
@@ -1633,6 +1660,84 @@ mod tests {
             .expect("an ordinary request is admitted");
         assert_eq!(params.get("sql").map(String::as_str), Some("SELECT 1"));
         assert_eq!(env.get("TZ").map(String::as_str), Some("UTC"));
+    }
+
+    /// One probe of the crossing socket: `Some(reply)` when the plane served it, `None` when it
+    /// refused the connection.
+    ///
+    /// A refusal is **not** an empty read, and measuring it as one is what a first version of this
+    /// did. The plane closes a refused connection while the request is still unread in its receive
+    /// queue, and a Unix socket closed that way resets: the caller sees `ECONNRESET`, not an
+    /// end-of-file. Emptiness alone would also match a connection that was served but slow to
+    /// answer, which is a loaded machine rather than a ceiling, so the two are told apart by how
+    /// the read ended.
+    fn probe_plane(socket: &Path) -> Option<Vec<u8>> {
+        let Ok(mut probe) = UnixStream::connect(socket) else {
+            return None;
+        };
+        if probe.write_all(b"LIST\n").is_err() {
+            return None;
+        }
+        let _ = probe.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut reply = Vec::new();
+        match probe.read_to_end(&mut reply) {
+            // Closed without a word, either way round: reset while the request sat unread, or a
+            // clean end-of-file if it had been read first.
+            Ok(_) if reply.is_empty() => None,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                None
+            }
+            // Anything else, including a read that timed out with nothing: served, however slowly.
+            _ => Some(reply),
+        }
+    }
+
+    /// A connection past the ceiling is refused instead of pinning another host thread.
+    ///
+    /// Each connection is served on its own thread of the sbx process, and a `RUN` holds its thread
+    /// for as long as the task's timeout allows. This was the only accept loop in the binary
+    /// without a ceiling, of four, so a caller opening connections in a loop spawned host threads
+    /// until the process could not make another.
+    ///
+    /// The held connections say nothing: each is accepted and then blocks reading its first line,
+    /// which is how a slot is held for as long as the test keeps its end open.
+    #[test]
+    fn a_connection_past_the_ceiling_is_refused_rather_than_served() {
+        let Some((_data, plane, _script)) = plane_and_client(vec![probe_task()]) else {
+            skip_incapable!("skipping: bash, socat or head is not on PATH");
+            return;
+        };
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_CONNS {
+            held.push(UnixStream::connect(&plane.cage_socket).expect("connect"));
+        }
+
+        // The accept loop is a thread of its own, so the ceiling is reached shortly after the last
+        // connect returns rather than at it.
+        let refused = (0..200).any(|_| {
+            if probe_plane(&plane.cage_socket).is_none() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            false
+        });
+        assert!(refused, "the ceiling never refused a connection");
+
+        // The negative control, on the same socket: a slot given back is a caller served.
+        held.pop();
+        let served = (0..200).any(|_| {
+            if probe_plane(&plane.cage_socket).is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            false
+        });
+        assert!(served, "a returned slot must serve the next caller");
     }
 
     /// A value with the two properties a line-oriented client would get wrong: an embedded newline

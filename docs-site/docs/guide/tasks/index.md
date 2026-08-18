@@ -132,7 +132,11 @@ process, not in the cage, so what a caller sends is host memory rather than cage
 cgroup ceiling applies to it: one parameter carries at most **1 MiB**, one whole request at most
 **8 MiB** counting its field names, and a request line that never ends is refused instead of being
 read. These are refusals of the framing, so they are answered before the quota is touched and
-before anything about the task is looked up.
+before anything about the task is looked up. **At most 32 connections are served at once** on each
+of the plane's two sockets, since each one costs a host thread for as long as it lives; a caller
+past that is refused rather than queued. The two sockets have separate ceilings, so a cage filling
+the one it reaches cannot lock you out of [`sbx task status`](../cli/task#status) or
+[`sbx task stop`](../cli/task#stop).
 
 The residual to know: the socket a caller reaches is bound into the cage, and same-uid gives **no
 per-process identity**. Its authority is therefore the **cage's**, not the agent's: any process in

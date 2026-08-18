@@ -1531,8 +1531,6 @@ pub(crate) fn start(
     ring: std::sync::Arc<super::broker_control::BrokerRing>,
 ) -> io::Result<(Broker, Reachable)> {
     use std::os::unix::net::UnixListener;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // The data directory is owner-only, and this socket is a reason it must be: whatever connects
     // to it is brokered through to a host resource.
@@ -1555,23 +1553,22 @@ pub(crate) fn start(
     std::thread::spawn(move || {
         let plugin = serving;
         let ring = serving_ring;
-        let live = Arc::new(AtomicUsize::new(0));
+        let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
         for conn in listener.incoming() {
             let Ok(conn) = conn else { continue };
-            if live.fetch_add(1, Ordering::SeqCst) >= MAX_CONCURRENT_CONNS {
-                live.fetch_sub(1, Ordering::SeqCst);
-                continue;
-            }
-            let (bwrap, plugin, allow, host_socket, live, ring, secret) = (
+            let Some(slot) = cap.take() else { continue };
+            let (bwrap, plugin, allow, host_socket, ring, secret) = (
                 bwrap.clone(),
                 plugin.clone(),
                 allow.clone(),
                 host_socket.clone(),
-                live.clone(),
                 ring.clone(),
                 secret.clone(),
             );
             std::thread::spawn(move || {
+                // Held for the connection's life and given back by its `Drop`, so a handler that
+                // panics does not take the slot with it.
+                let _slot = slot;
                 if let Err(why) = serve_conn(
                     conn,
                     &bwrap,
@@ -1588,7 +1585,6 @@ pub(crate) fn start(
                         plugin.name
                     ));
                 }
-                live.fetch_sub(1, Ordering::SeqCst);
             });
         }
     });

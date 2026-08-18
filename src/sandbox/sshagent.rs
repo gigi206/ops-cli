@@ -45,7 +45,6 @@ use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Where the broker's socket appears in the cage. Under the `/tmp` tmpfs (a writable mountpoint — a
 /// bind onto the read-only root would fail). The cage cannot unlink it (a bind-mount target is
@@ -647,11 +646,10 @@ pub(crate) fn serve(
     ring: Arc<AgentRing>,
     confirm: Option<Arc<Confirmer>>,
 ) {
-    let live = Arc::new(AtomicUsize::new(0));
+    let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
-        if live.fetch_add(1, Ordering::SeqCst) >= MAX_CONCURRENT_CONNS {
-            live.fetch_sub(1, Ordering::SeqCst);
+        let Some(slot) = cap.take() else {
             // A connection refused for want of a thread is a fact about the session, not about the
             // request: without this line the client simply sees the socket close.
             ring.push(
@@ -659,15 +657,16 @@ pub(crate) fn serve(
                 "a connection beyond the broker's concurrency ceiling",
             );
             continue;
-        }
+        };
         let host_sock = host_sock.clone();
         let filter = filter.clone();
-        let live = live.clone();
         let ring = ring.clone();
         let confirm = confirm.clone();
         std::thread::spawn(move || {
+            // Held for the connection's life and given back by its `Drop`, so a handler that
+            // panics does not take the slot with it.
+            let _slot = slot;
             let _ = serve_conn(conn, &host_sock, &filter, &ring, confirm.as_deref());
-            live.fetch_sub(1, Ordering::SeqCst);
         });
     }
 }
