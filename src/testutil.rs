@@ -87,8 +87,10 @@ impl Drop for EnvVar {
 /// workspace spends one inotify watch per directory until the machine's `max_user_watches` is
 /// gone — which then breaks systemd's own cgroup watches, so a cage scope never learns it emptied.
 /// No analyzer setting avoids this: `files.exclude` bounds what is *analysed*, not what is
-/// *watched*, whether it arrives from a workspace file or from the client. Pointing this variable
-/// outside the workspace is what actually avoids it, and `mise run test` does so.
+/// *watched* (measured: the watch set is identical with it, without it, and whichever tree it
+/// names), and what decides the watching is whether the editor advertises dynamic file-watch
+/// registration, which no configuration reaches. Pointing this variable outside the workspace is
+/// what actually avoids it, and `mise run test` does so.
 fn fixture_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("SBX_TEST_TMPDIR") {
         return PathBuf::from(dir);
