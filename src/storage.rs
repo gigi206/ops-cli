@@ -171,6 +171,22 @@ pub(crate) fn pointer_can_name(image: &Path) -> Result<(), String> {
     }
 }
 
+/// The scratch file [`write_pointer`] fills before the rename, named per process.
+///
+/// A shared name would void the atomicity the rename is there for. Two writers open it, and both
+/// hold a descriptor on the same inode: whichever renames first publishes it *while the other is
+/// still writing into it*, so the loser's bytes land in the live `storage.toml`, at offset zero, in
+/// a file it already truncated. Measured with that interleaving forced, the published file holds one
+/// writer's record followed by the tail of the other's — the partial the comment at the rename says
+/// cannot happen. `read_pointer` still finds a path there, since the surviving tail is the middle of
+/// one and can spell no header; what is lost is the file being the TOML it promises to be.
+///
+/// Per process rather than per call: one process writes this file once per command, and the same
+/// shape (`std::process::id`) already names the temp of the egress rollup.
+fn pointer_tmp_name() -> String {
+    format!(".{POINTER}.tmp.{}", std::process::id())
+}
+
 /// Record that sbx's data lives in the volume backed by `image`.
 ///
 /// Refuses a path [`pointer_can_name`] rules out. That guard is here, and not only at the command
@@ -185,7 +201,7 @@ pub(crate) fn write_pointer(default_data_dir: &Path, image: &Path) -> io::Result
         .mode(0o700)
         .create(default_data_dir)?;
     let path = default_data_dir.join(POINTER);
-    let tmp = default_data_dir.join(format!(".{POINTER}.tmp"));
+    let tmp = default_data_dir.join(pointer_tmp_name());
     // The value needs no escaping — `pointer_can_name` is what makes that true — and quoting it
     // keeps the file valid TOML for anyone who reads it as such.
     std::fs::write(
@@ -197,7 +213,8 @@ pub(crate) fn write_pointer(default_data_dir: &Path, image: &Path) -> io::Result
             image.display()
         ),
     )?;
-    // Renamed into place so a reader sees the old file or the new one, never a partial.
+    // Renamed into place so a reader sees the old file or the new one, never a partial. The
+    // temp's name is what makes that true for a *second* writer as well — see [`pointer_tmp_name`].
     std::fs::rename(&tmp, &path)
 }
 
@@ -1794,6 +1811,30 @@ this line has no separator at all
         let ok = PathBuf::from("/vol/mes données/sbx storage (2).btrfs");
         write_pointer(&dir, &ok).expect("an ordinary path is recordable");
         assert_eq!(read_pointer(&dir).as_deref(), Some(ok.as_path()));
+    }
+
+    /// Two writers must not share the scratch file, or the rename stops being atomic for the second
+    /// one: it goes on writing into the inode the first has already published. A second *process* is
+    /// what the name has to distinguish, so what a single-process test can hold is that the name
+    /// carries this process's identity — and therefore that no other process derives it.
+    #[test]
+    fn the_scratch_file_is_this_processs_own() {
+        let name = pointer_tmp_name();
+        assert!(
+            name.contains(&std::process::id().to_string()),
+            "a name two processes both derive is a shared scratch file: {name}"
+        );
+        assert!(name.starts_with(&format!(".{POINTER}.")), "{name}");
+
+        // And it is gone once the record is in place, whatever its name: a leftover would be read by
+        // nothing and cleaned by nobody.
+        let base = crate::testutil::TmpDir::new();
+        let dir = base.path().join("sbx");
+        write_pointer(&dir, Path::new("/vol/a.btrfs")).unwrap();
+        assert!(
+            !dir.join(&name).exists(),
+            "the scratch file outlived the rename"
+        );
     }
 
     #[test]
