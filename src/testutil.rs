@@ -81,11 +81,12 @@ impl Drop for EnvVar {
 /// in abundance. It also matches production, where the store lives on disk under the data
 /// directory, never on a tmpfs.
 ///
-/// The default keeps it under `target/`, out of the way and reclaimable by `cargo clean`. That
-/// default has a cost worth knowing before choosing it: the tree is inside the workspace, one
-/// suite leaves hundreds of thousands of directories there, and a language server that watches the
-/// workspace spends one inotify watch per directory until the machine's `max_user_watches` is
-/// gone — which then breaks systemd's own cgroup watches, so a cage scope never learns it emptied.
+/// The default sits outside the workspace, under the user's cache directory, and that is the point
+/// rather than tidiness: one suite leaves hundreds of thousands of directories, and a language
+/// server watching the workspace spends one inotify watch per directory until the machine's
+/// `max_user_watches` is gone — which then breaks systemd's own cgroup watches, so a cage scope
+/// never learns it emptied. It falls back inside `target/` only when neither `XDG_CACHE_HOME` nor
+/// `HOME` names a directory to use, which is a build environment rather than a developer's.
 /// No analyzer setting avoids this: `files.exclude` bounds what is *analysed*, not what is
 /// *watched* (measured: the watch set is identical with it, without it, and whichever tree it
 /// names), and what decides the watching is whether the editor advertises dynamic file-watch
@@ -95,8 +96,11 @@ fn fixture_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("SBX_TEST_TMPDIR") {
         return PathBuf::from(dir);
     }
-    let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    d.push("target/test-tmp");
+    let mut d = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
+    d.push("sbx/test-tmp");
     d
 }
 

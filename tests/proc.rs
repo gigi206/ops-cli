@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 /// near a million inodes. `/tmp` is usually a tmpfs whose inode count is capped machine-wide at
 /// about that, so a run exhausts it and *unrelated* work then fails with "no space left on device"
 /// while the disk is nearly empty. The repo's disk has inodes to spare, it matches production (the
-/// store lives on disk), and `cargo clean` reclaims it.
+/// store lives on disk), and it is reclaimed by removing that tree.
 ///
 /// Keep the per-fixture tag short: a launch's egress proxy binds a Unix socket under the data dir,
 /// and `sun_path` caps the whole path at 108 bytes, which this tree already spends most of.
@@ -27,8 +27,16 @@ fn fixture_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("SBX_TEST_TMPDIR") {
         return PathBuf::from(dir);
     }
-    let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    d.push("target/test-tmp");
+    // Outside the workspace by default, and that is the point rather than an accident: a language
+    // server watching the repository spends one inotify watch per directory, one run of this suite
+    // leaves hundreds of thousands of them, and the machine's `max_user_watches` is what runs out.
+    // Still on disk rather than a tmpfs, whose fixed inode budget a provisioned nix store exhausts.
+    // Falls back inside the workspace only when neither variable names a home to use.
+    let mut d = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
+    d.push("sbx/test-tmp");
     d
 }
 
