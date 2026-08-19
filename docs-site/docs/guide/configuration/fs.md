@@ -176,7 +176,10 @@ that is not there is answered with the same error the cage would have received, 
 looked up a second time once something has been moved into place behind it.
 
 One gap is left, and it is not one a cage can arrange: a kernel older than 5.9 does not offer the
-operation at all, and there `scan` behaves as it did before, swap included.
+operation at all, and there `scan` behaves as it did before, swap included. That fallback is not
+silent. The first allowed open the kernel declines to serve this way prints a warning naming the
+missing operation, once for the session, so a weaker `scan` is something you are told about rather
+than something you have to infer from a kernel version.
 
 **What it does not do.** A pattern only finds the shapes you wrote: a password that looks like
 ordinary prose is not one of them, and a scan is a backstop rather than a proof. Rewriting a file

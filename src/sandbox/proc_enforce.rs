@@ -763,7 +763,22 @@ fn respond_with_fd(notif_fd: libc::c_int, id: u64, srcfd: libc::c_int, cloexec: 
     // it ran out of descriptors — and must not condemn the mechanism for the rest of the session.
     let e = io::Error::last_os_error().raw_os_error().unwrap_or(0);
     if e == libc::EINVAL || e == libc::ENOTTY {
-        ADDFD_UNAVAILABLE.store(true, Ordering::Relaxed);
+        // `swap` rather than `store`: a parked open answers from its own thread, so two can learn
+        // this at once, and the session is meant to say it exactly once.
+        //
+        // Said at all, because the fallback is the whole difference between an allow that hands
+        // over the inode that was examined and one that lets the path resolve a second time. A
+        // person reading `[fs] scan` in their config has no other way to learn that the guard they
+        // configured is running in its weaker form: nothing else in a launch mentions it, and the
+        // kernel version alone does not answer it (a distribution may backport the operation).
+        // This is not covered by a test: reproducing it needs a kernel that lacks the operation.
+        if !ADDFD_UNAVAILABLE.swap(true, Ordering::Relaxed) {
+            crate::diag::warn(
+                "this kernel does not offer the seccomp operation that hands the cage the very \
+                 descriptor `[fs] scan` examined (it landed in 5.9), so an allowed open is re-run \
+                 from its arguments and what the cage receives may not be what was scanned",
+            );
+        }
     }
     false
 }
