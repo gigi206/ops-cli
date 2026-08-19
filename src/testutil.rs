@@ -71,38 +71,8 @@ impl Drop for EnvVar {
     }
 }
 
-/// Where throwaway fixtures are rooted, overridable with `SBX_TEST_TMPDIR` — the same variable the
-/// twenty integration suites already read, so one setting moves every fixture in the repository
-/// rather than the ones that happened to be written last.
-///
-/// Deliberately not the system tmpfs. A test that provisions a nix store copies the entire nixpkgs
-/// source tree into it, a very large file count, and several such tests running concurrently would
-/// exhaust a tmpfs's fixed inode budget (`ENOSPC`, even with bytes to spare) while disk has inodes
-/// in abundance. It also matches production, where the store lives on disk under the data
-/// directory, never on a tmpfs.
-///
-/// The default sits outside the workspace, under the user's cache directory, and that is the point
-/// rather than tidiness: one suite leaves hundreds of thousands of directories, and a language
-/// server watching the workspace spends one inotify watch per directory until the machine's
-/// `max_user_watches` is gone — which then breaks systemd's own cgroup watches, so a cage scope
-/// never learns it emptied. It falls back inside `target/` only when neither `XDG_CACHE_HOME` nor
-/// `HOME` names a directory to use, which is a build environment rather than a developer's.
-/// No analyzer setting avoids this: `files.exclude` bounds what is *analysed*, not what is
-/// *watched* (measured: the watch set is identical with it, without it, and whichever tree it
-/// names), and what decides the watching is whether the editor advertises dynamic file-watch
-/// registration, which no configuration reaches. Pointing this variable outside the workspace is
-/// what actually avoids it, and `mise run test` does so.
-fn fixture_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os("SBX_TEST_TMPDIR") {
-        return PathBuf::from(dir);
-    }
-    let mut d = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
-    d.push("sbx/test-tmp");
-    d
-}
+// The fixtures' root, one definition shared with the integration suites.
+include!("testroot.rs");
 
 /// A unique temp directory that removes itself on drop, so tests leave nothing
 /// behind (cleanup runs on panic-unwind too, not just on success).

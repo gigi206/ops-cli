@@ -20,42 +20,15 @@ fn sbx() -> Command {
     // Isolate XDG_CONFIG_HOME from the user's real `~/.config/sbx` so an e2e never depends on
     // the developer's global sbx config; default it to a fixed empty dir under the test tree
     // (no test here writes a global config, so a shared empty dir is race-free).
-    let mut cfg = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    cfg.push("target/test-tmp/isolated-config");
+    let cfg = fixture_root().join("isolated-config");
     let _ = std::fs::create_dir_all(&cfg);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
     cmd.env("XDG_CONFIG_HOME", cfg);
     cmd
 }
 
-/// Where this suite's throwaway fixtures live: the repo's own test tree, overridable with
-/// `SBX_TEST_TMPDIR`.
-///
-/// Deliberately **not** `std::env::temp_dir()`, which resolves to `/tmp` when `TMPDIR` is unset. A
-/// fixture here holds a provisioned nix store, which is inode-heavy. `/tmp` is usually a tmpfs
-/// whose inode count is capped machine-wide at about a million, so these fixtures exhaust it and
-/// *unrelated* work then fails with "no space left on device" while the disk is nearly empty. The
-/// repo's disk has inodes to spare, it matches production (the store lives on disk), and
-/// `cargo clean` reclaims it.
-///
-/// Keep the per-fixture tag short: a launch's egress proxy binds a Unix socket under the data dir,
-/// and `sun_path` caps the whole path at 108 bytes, which this tree already spends most of.
-fn fixture_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os("SBX_TEST_TMPDIR") {
-        return PathBuf::from(dir);
-    }
-    // Outside the workspace by default, and that is the point rather than an accident: a language
-    // server watching the repository spends one inotify watch per directory, one run of this suite
-    // leaves hundreds of thousands of them, and the machine's `max_user_watches` is what runs out.
-    // Still on disk rather than a tmpfs, whose fixed inode budget a provisioned nix store exhausts.
-    // Falls back inside the workspace only when neither variable names a home to use.
-    let mut d = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
-    d.push("sbx/test-tmp");
-    d
-}
+// The fixtures' root, one definition shared with the unit tests.
+include!("../src/testroot.rs");
 
 /// A unique temp dir removed on drop.
 struct TmpDir(PathBuf);

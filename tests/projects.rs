@@ -16,29 +16,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
-/// Where this suite's throwaway fixtures live: the repo's own test tree, overridable with
-/// `SBX_TEST_TMPDIR`.
-///
-/// On the repo's disk, deliberately not the system tmpfs: a fixture may hold a provisioned nix
-/// store, which is inode-heavy enough that concurrent tests exhaust a tmpfs's machine-wide inode
-/// budget — surfacing as "no space left on device" in *unrelated* work while the disk is nearly
-/// empty. Disk has inodes to spare, it matches production, and it is reclaimed by removing that tree.
-fn fixture_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os("SBX_TEST_TMPDIR") {
-        return PathBuf::from(dir);
-    }
-    // Outside the workspace by default, and that is the point rather than an accident: a language
-    // server watching the repository spends one inotify watch per directory, one run of this suite
-    // leaves hundreds of thousands of them, and the machine's `max_user_watches` is what runs out.
-    // Still on disk rather than a tmpfs, whose fixed inode budget a provisioned nix store exhausts.
-    // Falls back inside the workspace only when neither variable names a home to use.
-    let mut d = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
-    d.push("sbx/test-tmp");
-    d
-}
+// The fixtures' root, one definition shared with the unit tests.
+include!("../src/testroot.rs");
 
 /// A unique temp dir removed on drop, on the repo disk (not tmpfs).
 struct TmpDir(PathBuf);
