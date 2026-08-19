@@ -40,7 +40,7 @@ mod flake;
 mod flake_inline;
 mod mise;
 mod miseplugin;
-mod nixhub;
+pub(crate) mod nixhub;
 mod packages;
 mod prebuilt;
 mod projectstore;

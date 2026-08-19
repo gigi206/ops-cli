@@ -1267,7 +1267,7 @@ fn resolve_ref(
         write_lock(lock_path, source, &seed_rev)?;
         return Ok(format!("{NIXPKGS_FLAKE_PREFIX}{seed_rev}"));
     }
-    let rev = resolve_source_rev(nix, source)?;
+    let rev = resolve_source_rev(nix, layout, source, false)?;
     write_lock(lock_path, source, &rev)?;
     Ok(format!("{NIXPKGS_FLAKE_PREFIX}{rev}"))
 }
@@ -1280,7 +1280,7 @@ fn resolve_ref(
 fn refresh_ref(nix: &Path, layout: &Layout, source: &str, lock_path: &Path) -> io::Result<Upgrade> {
     ensure(layout)?;
     let previous = read_lock(lock_path).and_then(|(s, r)| (s == source).then_some(r));
-    let revision = resolve_source_rev(nix, source)?;
+    let revision = resolve_source_rev(nix, layout, source, true)?;
     write_lock(lock_path, source, &revision)?;
     Ok(Upgrade {
         source: source.to_string(),
@@ -1291,8 +1291,21 @@ fn refresh_ref(nix: &Path, layout: &Layout, source: &str, lock_path: &Path) -> i
 
 /// Resolve a source to its revision: a 40-hex source already *is* the revision (an
 /// exact pin, needing no nix); a branch/channel is resolved via `nix flake metadata`.
-fn resolve_source_rev(nix: &Path, source: &str) -> io::Result<String> {
+///
+/// `fresh` is passed to the witness the pinned form goes through, so it asks with the same currency
+/// as the caller: an upgrade re-asks, a launch may reuse a cached answer. Checking a fresh claim
+/// against a stale answer, or the reverse, is what would produce a warning a re-run cannot clear.
+fn resolve_source_rev(
+    nix: &Path,
+    layout: &Layout,
+    source: &str,
+    fresh: bool,
+) -> io::Result<String> {
     if let Some(rev) = valid_revision(source) {
+        // Witnessed here and not below: a pinned revision is opaque, and nothing about the name it
+        // was written under says it belongs to nixpkgs. The branch form needs no witness, and
+        // asking one of a release branch's head would report an ordinary configuration.
+        witness_revision(nix, layout, &rev, fresh);
         return Ok(rev);
     }
     resolve_channel_rev(nix, &format!("{NIXPKGS_FLAKE_PREFIX}{source}"))
@@ -1380,6 +1393,112 @@ fn valid_revision(s: &str) -> Option<String> {
         && s.bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
     ok.then(|| s.to_string())
+}
+
+/// The branch a pinned revision must be reachable from for `github:NixOS/nixpkgs/<rev>` to mean
+/// what its name says.
+///
+/// `master` rather than a channel, because every channel branch is cut from it: a revision
+/// reachable from a channel is reachable from here too. The converse is what the choice costs. A
+/// fix backported to a release branch *after* that branch was cut belongs to no `master` history,
+/// and reads exactly like a revision that never belonged to nixpkgs at all. That is the reason the
+/// witness warns and never refuses.
+const NIXPKGS_WITNESS_BRANCH: &str = "master";
+
+/// What could be established about a revision's place in nixpkgs history.
+#[derive(Debug, PartialEq, Eq)]
+enum Reachability {
+    /// The branch's history contains the revision, so the pin is what its name says.
+    InHistory,
+    /// The repository answered, and its history does not contain the revision.
+    Absent,
+    /// Nothing to build on: offline, rate-limited, or a body that did not parse. Not evidence
+    /// either way, so it is kept silent rather than turned into an accusation.
+    Unknown,
+}
+
+/// The comparison the witness asks GitHub. `rev` is 40-hex by the time it reaches here, so it
+/// carries nothing that could escape either the URL or the nix string literal the fetch
+/// interpolates it into.
+fn reachability_url(rev: &str) -> String {
+    format!("https://api.github.com/repos/NixOS/nixpkgs/compare/{NIXPKGS_WITNESS_BRANCH}...{rev}")
+}
+
+/// How many commits the compared revision carries that the branch does not. Zero is the whole
+/// question: it means the branch's history already contains the revision.
+fn ahead_by(answer: &serde_json::Value) -> Option<u64> {
+    answer.get("ahead_by")?.as_u64()
+}
+
+/// Ask the party that hosts nixpkgs whether `rev` is part of its history.
+///
+/// Fetching `github:NixOS/nixpkgs/<rev>` proves less than it reads. GitHub keeps pull-request heads
+/// in the *upstream* repository's ref namespace, so a revision pushed to a fork and never merged is
+/// served in full under the upstream name, and the reference alone says nothing about where the
+/// revision came from. Whoever named it is the only thing standing behind it, which is fine for a
+/// branch nix resolved itself and is not fine for an opaque 40-hex string.
+///
+/// The witness adds no trust root of its own: GitHub already serves the artefact, so asking GitHub
+/// about reachability introduces nothing new to manage. What it closes is the *index*, not GitHub.
+fn reachability(nix: &Path, layout: &Layout, rev: &str, fresh: bool) -> Reachability {
+    let Some(rev) = valid_revision(rev) else {
+        return Reachability::Unknown;
+    };
+    let compared =
+        crate::sandbox::nixhub::fetch_url_json(nix, layout, &reachability_url(&rev), fresh)
+            .ok()
+            .map(|answer| ahead_by(&answer));
+    // Short-circuiting: the control question is asked only when the first one came back with
+    // nothing, which is the only case where its answer changes anything.
+    let endpoint_answers = compared.is_some()
+        || crate::sandbox::nixhub::fetch_url_json(
+            nix,
+            layout,
+            &reachability_url(NIXPKGS_WITNESS_BRANCH),
+            fresh,
+        )
+        .is_ok();
+    verdict(compared, endpoint_answers)
+}
+
+/// Read a verdict from what the comparison said, and — when it said nothing at all — from whether
+/// the endpoint answers a question whose answer is already known.
+///
+/// Pure, and that is the point. A failed fetch has two reasons that do not mean the same thing: a
+/// revision the repository does not have is answered `404`, the strongest signal there is, while a
+/// rate limit or an unplugged cable is no answer at all. Telling them apart by a control request
+/// rather than by matching text in an error message keeps the rule off a message that is part of no
+/// contract; keeping the rule itself out of the request keeps it off a budget of sixty questions an
+/// hour, shared with everything else on the host that asks GitHub anything.
+fn verdict(compared: Option<Option<u64>>, endpoint_answers: bool) -> Reachability {
+    match compared {
+        // Zero commits the branch does not already have is the whole question.
+        Some(Some(0)) => Reachability::InHistory,
+        Some(Some(_)) => Reachability::Absent,
+        // A body that carries no comparison to read: an error object, or a shape that moved.
+        Some(None) => Reachability::Unknown,
+        None if endpoint_answers => Reachability::Absent,
+        None => Reachability::Unknown,
+    }
+}
+
+/// Say so when a revision about to be pinned is not one nixpkgs history contains.
+///
+/// Called where a revision arrives as an opaque string, which is where the question has an answer
+/// worth having: a package index's reply, and a revision written by hand into a config. A branch is
+/// not witnessed, because nix resolved it against the repository itself and a branch head is in its
+/// own history by construction.
+pub(crate) fn witness_revision(nix: &Path, layout: &Layout, rev: &str, fresh: bool) {
+    if reachability(nix, layout, rev, fresh) == Reachability::Absent {
+        crate::diag::warn(&format!(
+            "`{rev}` is being pinned under `NixOS/nixpkgs`, whose `{NIXPKGS_WITNESS_BRANCH}` \
+             history does not contain it. A revision pushed to a fork or left on a pull request is \
+             served under the upstream name exactly like one that belongs, so this is the shape a \
+             corrupted or hostile package index produces. A fix backported to a release branch \
+             after that branch was cut reads the same way, and is the benign case. Nothing was \
+             refused: check where the revision came from before trusting what it builds."
+        ));
+    }
 }
 
 /// The host-side path backing a logical store path. `nix build --print-out-paths`
@@ -1901,6 +2020,95 @@ mod tests {
     use super::*;
     use crate::testutil::TmpDir;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn the_witness_asks_about_the_revision_it_was_handed() {
+        assert_eq!(
+            reachability_url("044bfe75bfe4c7bbe043dc17b5e42ea823b84a09"),
+            concat!(
+                "https://api.github.com/repos/NixOS/nixpkgs/compare/",
+                "master...044bfe75bfe4c7bbe043dc17b5e42ea823b84a09"
+            )
+        );
+    }
+
+    #[test]
+    fn a_comparison_answers_the_one_question_the_witness_asks() {
+        // Bodies in the shapes the endpoint returns: a revision the branch already contains, one
+        // carrying commits the branch does not, and the error body for a revision the repository
+        // does not have. Written out rather than fetched, so the test states its own expectation.
+        let contained = serde_json::json!({"status": "behind", "ahead_by": 0, "behind_by": 5279});
+        let carried = serde_json::json!({"status": "diverged", "ahead_by": 2, "behind_by": 15});
+        let absent = serde_json::json!({"message": "Not Found", "status": "404"});
+        assert_eq!(ahead_by(&contained), Some(0));
+        assert_eq!(ahead_by(&carried), Some(2));
+        assert_eq!(
+            ahead_by(&absent),
+            None,
+            "an error body carries no comparison to read"
+        );
+    }
+
+    #[test]
+    fn a_verdict_reads_the_comparison_or_the_control() {
+        // The comparison was read.
+        assert_eq!(verdict(Some(Some(0)), true), Reachability::InHistory);
+        assert_eq!(verdict(Some(Some(2)), true), Reachability::Absent);
+        // Read, but carrying no comparison: an error object, or a shape that moved.
+        assert_eq!(verdict(Some(None), true), Reachability::Unknown);
+        // Nothing came back. The endpoint is answering us, so the failure was about the revision
+        // itself, which is the `404` for one the repository does not have.
+        assert_eq!(verdict(None, true), Reachability::Absent);
+        // Nothing came back and the endpoint is not answering either: no evidence, and a rate
+        // limit must never read as an accusation.
+        assert_eq!(verdict(None, false), Reachability::Unknown);
+    }
+
+    #[test]
+    fn the_witness_separates_a_revision_nixpkgs_holds_from_ones_it_merely_serves() {
+        let Some(nix) = resolve_nix(None) else {
+            skip_incapable!("skipping the nixpkgs witness: no nix on PATH");
+            return;
+        };
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+
+        // An ancestor of `master`: what an honest index answers with.
+        let held = "044bfe75bfe4c7bbe043dc17b5e42ea823b84a09";
+        // A commit backported onto `nixos-25.05` after that branch was cut. It is a real nixpkgs
+        // commit and it is in no `master` history, so it exercises the answered-but-not-contained
+        // branch, and it is the benign case the warning's own wording names.
+        let off_branch = "6c62d013b36c589618eec5a8d450506e15b9cb31";
+        // A revision the repository does not have at all: answered `404`, which is a *failed*
+        // fetch, so this is also what exercises the control request that tells a `404` apart from
+        // a rate limit.
+        let never = "0".repeat(40);
+
+        let verdicts = [
+            reachability(&nix, &layout, held, false),
+            reachability(&nix, &layout, off_branch, false),
+            reachability(&nix, &layout, &never, false),
+        ];
+        // Any `Unknown` is a skip, and that is safe here because no mutation hides behind it: the
+        // rule itself is held by `a_verdict_reads_the_comparison_or_the_control`, which needs no
+        // endpoint. What this test adds is the part a pure function cannot state, that the live
+        // endpoint really does separate the two revisions.
+        if verdicts.contains(&Reachability::Unknown) {
+            skip_unreachable!("skipping the nixpkgs witness: github answered nothing to build on");
+            return;
+        }
+        assert_eq!(
+            verdicts[0],
+            Reachability::InHistory,
+            "an ancestor of master"
+        );
+        assert_eq!(verdicts[1], Reachability::Absent, "a post-cut backport");
+        assert_eq!(
+            verdicts[2],
+            Reachability::Absent,
+            "a revision github does not have"
+        );
+    }
 
     #[test]
     fn layout_derives_store_paths_from_data_dir() {

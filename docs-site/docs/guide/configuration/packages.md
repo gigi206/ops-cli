@@ -483,9 +483,23 @@ backends do not, and each stops at a different place:
 
 | Backend | What is checked | What that proves |
 |---|---|---|
-| `nix:` | the revision is pinned and realised as a **locked** flake, its sources fetched under nix's own integrity checks | the build is reproducible from that revision. *Which* revision answers your `(package, version)` comes from the [nixhub](../reference/glossary) index, and `sbx` validates only its **shape** (40 lowercase hex characters). The repository itself is fixed in the code, so a wrong answer can point at another real nixpkgs commit, an older one for instance, never at code of its own |
+| `nix:` | the revision is pinned and realised as a **locked** flake, its sources fetched under nix's own integrity checks, and the revision is checked against nixpkgs history before it is pinned | the build is reproducible from that revision, and the revision is one the repository's history actually contains. *Which* revision answers your `(package, version)` still comes from the [nixhub](../reference/glossary) index, and `sbx` validates its **shape** (40 lowercase hex characters) |
 | `deb:`, `appimage:`, `tarball:`, `binary:` | the URL charset, then a hash **recorded on the first fetch** and re-checked on every later one | the artefact has not changed since `sbx` first saw it. It does **not** prove that first fetch was the publisher's: the hash is whatever the download returned, and `sbx upgrade` re-resolves from the same place |
 | `deb:apt:` | the above, plus the `Packages` index it reads | as stated with that backend: no `InRelease` or GPG check, so the vendor's own signature is never consulted |
+
+**Why the revision is checked.** Pinning `github:NixOS/nixpkgs/<rev>` reads like a guarantee that the
+revision belongs to nixpkgs, and on its own it is not one. GitHub keeps pull request heads in the
+upstream repository's own ref namespace, so a revision pushed to a fork and never merged is served in
+full under the upstream name. Before pinning one, `sbx` asks GitHub whether the `master` history
+contains it, and warns when it does not. The question is asked where a revision arrives as an opaque
+string, which means the index's answer and a revision you write by hand into `nixpkgs`. A branch name
+is not asked about: nix resolves it against the repository itself, and a branch head is in its own
+history by construction.
+
+Nothing is refused on this ground, for two reasons. A fix backported to a release branch after that
+branch was cut belongs to no `master` history either, so an ordinary stable pin can read like a
+hostile one. And when GitHub answers nothing at all, because you are offline or over its rate limit,
+the launch goes on in silence: no answer is not evidence.
 
 This is a deliberate stopping point rather than an oversight, and for most of these vendors there is
 nothing published to verify against. Where it matters to you, the containment is the one the model

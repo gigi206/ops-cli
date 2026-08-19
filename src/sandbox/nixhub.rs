@@ -563,12 +563,18 @@ pub(crate) fn resolve(
     fresh: bool,
 ) -> io::Result<Pin> {
     let metadata = fetch_metadata(nix, layout, &tool.pkg, fresh)?;
-    select_release(&metadata, &tool.version, system).ok_or_else(|| {
+    let pin = select_release(&metadata, &tool.version, system).ok_or_else(|| {
         io::Error::other(format!(
             "no nixpkgs release of `{}` matches version `{}` for {system}",
             tool.pkg, tool.version
         ))
-    })
+    })?;
+    // The revision arrives as an assertion by a third party: nixhub says this is the nixpkgs commit
+    // that built the version, and nothing in the flake reference built from it carries that claim
+    // any further. Checked here rather than at the pin's every use, so it is asked once per fresh
+    // resolution and never again from the lock.
+    store::witness_revision(nix, layout, &pin.commit, fresh);
+    Ok(pin)
 }
 
 /// Fetch a package's nixhub metadata as JSON. `pkg` is re-validated here so a value
