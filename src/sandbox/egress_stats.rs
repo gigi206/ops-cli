@@ -130,9 +130,18 @@ impl Tally {
     /// Count one request for `host`, giving it a row while there is room and folding it into
     /// [`Self::overflow`] once there is not. A host that already has a row always keeps counting
     /// into it, so the cap never turns a busy destination into an anonymous one part-way through.
+    ///
+    /// The name is sanitised on the way in, so what the row is keyed by and what the file carries are
+    /// the same string. A row is `host\tallow\tdeny\tblocked` on one line, and a host bearing a tab
+    /// or a newline would write extra fields or an extra row — read back as counters for a
+    /// destination nothing ever reached. Today the wire cannot deliver one: a request line is split
+    /// on whitespace before its target is read, and an HTTP/2 `:authority` is re-checked against the
+    /// CONNECT host it must equal. That is an invariant held three parsers away from here, by code
+    /// with its own reasons to change; the format's own rule belongs to the format.
     fn bump(&mut self, host: &str, kind: StatKind) {
-        if self.hosts.contains_key(host) || self.hosts.len() < MAX_HOSTS {
-            self.hosts.entry(host.to_string()).or_default().bump(kind);
+        let host = super::observe_feed::sanitize(host);
+        if self.hosts.contains_key(&host) || self.hosts.len() < MAX_HOSTS {
+            self.hosts.entry(host).or_default().bump(kind);
         } else {
             self.overflow.bump(kind);
         }
@@ -181,12 +190,38 @@ pub(crate) struct EgressStats {
     /// [`start_flusher`] looks at, so the tail of a burst is not left in memory once the traffic
     /// that produced it stops.
     pending: AtomicBool,
+    /// Whether the session file can be written at all — see [`identity_is_recordable`]. Settled once,
+    /// at construction, from the two header values; `false` keeps the counters in memory and writes
+    /// nothing.
+    recordable: bool,
     inner: Mutex<Tally>,
+}
+
+/// Whether a session file can carry this identity.
+///
+/// The two header lines are `project=<path>` and `app=<name>`, each read back as everything after
+/// the `=` to the end of the line. A line break in either does two things, neither of them loud: the
+/// value comes back truncated, so the session's counters answer to a project nobody will ask about;
+/// and what follows the break is read as a further line, so a directory named to spell one hands
+/// `sbx net stats` a `project=` of its choosing and takes another project's totals. A trailing `\r`
+/// is quieter still — `lines()` drops it, and the identity simply stops matching the one the reader
+/// derives from the same directory.
+///
+/// Sanitising is not open to this field the way it is to a host row: these are **matching keys**,
+/// compared for equality against an identity `sbx net stats` derives independently from a cwd, so a
+/// value that changed shape here would either stop matching or, worse, start matching a second
+/// project that normalised to the same string. A name the format cannot carry therefore records no
+/// stats at all — the same outcome a project that cannot be canonicalised already gets, and for the
+/// same reason: counters are worth having, never worth a wrong answer.
+pub(crate) fn identity_is_recordable(project: &str, app: Option<&str>) -> bool {
+    let carries_break = |s: &str| s.contains('\n') || s.contains('\r');
+    !carries_break(project) && !app.is_some_and(carries_break)
 }
 
 impl EgressStats {
     pub(crate) fn new(path: PathBuf, project: String, app: Option<String>) -> Self {
         EgressStats {
+            recordable: identity_is_recordable(&project, app.as_deref()),
             path,
             project,
             app,
@@ -269,6 +304,11 @@ impl EgressStats {
     /// Serialise a snapshot to the session file atomically (temp + rename), so a reader never sees a
     /// torn file and a crash mid-write leaves the prior good file in place.
     fn flush(&self, tally: &Tally) -> io::Result<()> {
+        // Nothing is written for an identity the file cannot carry: the counters stay in memory for
+        // the session and are simply not persisted (see [`identity_is_recordable`]).
+        if !self.recordable {
+            return Ok(());
+        }
         let body = serialize(&self.project, self.app.as_deref(), tally);
         let seq = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
         let tmp = self.path.with_extension(format!("tmp.{seq}"));
@@ -303,6 +343,10 @@ pub(crate) struct SessionStats {
 
 /// The session-file body: `project=`/`app=` metadata lines, then one `host\tallow\tdeny\tblocked`
 /// row per destination (host first; a host carries no tab, so the four fields are unambiguous).
+///
+/// Both halves of that are held upstream rather than here, each where the value enters: a host is
+/// sanitised by [`Tally::bump`], and an identity the header cannot carry writes no file at all
+/// ([`identity_is_recordable`]). This function is therefore total over what reaches it.
 fn serialize(project: &str, app: Option<&str>, tally: &Tally) -> String {
     let mut out = String::new();
     out.push_str(&format!("project={project}\n"));
@@ -721,6 +765,83 @@ mod tests {
         assert_eq!(
             aggregate(egress, "/p", None).hosts["api.example.com"].allow,
             7
+        );
+    }
+
+    /// A destination name cannot write a row of its own: the file is tab-and-newline delimited, so a
+    /// host bearing either would otherwise be read back as extra fields, or as counters for a
+    /// destination nothing ever reached.
+    #[test]
+    fn a_hostile_destination_name_cannot_forge_a_row() {
+        let dir = TmpDir::new();
+        let path = dir.path().join("stats-1");
+        let stats = EgressStats::new(path.clone(), "/p".into(), None);
+
+        // Both delimiters at once: the tab would add fields to this row, the newline a row after it.
+        stats.record("a.test\t9\t9\t9\nb.test\t7\t7\t7", StatKind::Deny);
+        stats.record("ok.test", StatKind::Allow);
+        stats.flush_final();
+
+        let parsed = parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            parsed.tally.hosts.len(),
+            2,
+            "one row per destination recorded, no forged third: {:?}",
+            parsed.tally.hosts
+        );
+        assert!(
+            !parsed.tally.hosts.contains_key("b.test"),
+            "a name carrying a newline invented a destination: {:?}",
+            parsed.tally.hosts
+        );
+        assert_eq!(parsed.tally.hosts["ok.test"].allow, 1);
+        // The counters the hostile name carried are its own row's, and they are the ones recorded —
+        // one deny — rather than the nines it wrote into its name.
+        let (name, counts) = parsed
+            .tally
+            .hosts
+            .iter()
+            .find(|(h, _)| h.starts_with("a.test"))
+            .expect("the destination still has a row of its own");
+        assert_eq!((counts.deny, counts.allow), (1, 0), "row {name}");
+    }
+
+    /// A project path a session file cannot carry records nothing, rather than a header a reader
+    /// would attribute to somebody else. Both halves matter: the forged identity must not appear,
+    /// and the real one must not be silently written under a truncated name either.
+    #[test]
+    fn a_project_path_the_header_cannot_carry_records_no_file() {
+        let dir = TmpDir::new();
+        let egress = dir.path();
+        // A directory named to spell a second header line. Legal on Linux, and the whole attack.
+        let hostile = "/home/u/proj\nproject=/home/u/victim";
+        let stats = EgressStats::new(egress.join("stats-1"), hostile.into(), None);
+        stats.record("api.example.com", StatKind::Allow);
+        stats.flush_final();
+
+        assert!(
+            !egress.join("stats-1").exists(),
+            "a file was written for an identity that cannot be read back"
+        );
+        assert!(
+            aggregate(egress, "/home/u/victim", None).is_empty(),
+            "another project was handed this session's counters"
+        );
+        assert!(
+            aggregate(egress, hostile, None).is_empty(),
+            "the counters were kept under a name no reader can match"
+        );
+        // The counting itself is untouched — only the writing is withheld.
+        assert_eq!(stats.snapshot()["api.example.com"].allow, 1);
+
+        // The same session under an ordinary path writes its file as always: the rule refuses what
+        // the format cannot carry, not paths that merely look unusual.
+        let ok = EgressStats::new(egress.join("stats-2"), "/home/u/my proj (2)".into(), None);
+        ok.record("api.example.com", StatKind::Allow);
+        ok.flush_final();
+        assert_eq!(
+            aggregate(egress, "/home/u/my proj (2)", None).hosts["api.example.com"].allow,
+            1
         );
     }
 
