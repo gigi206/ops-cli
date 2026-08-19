@@ -239,8 +239,12 @@ Per package because widening the shared set would put WebKitGTK's closure (hundr
 every Electron app that never asked for it. The table needs no `resolve` for this: `libs` decorates
 a package declared any of the ways above, and the two fields can also appear together. Each name is
 interpolated into the generated derivation, so it passes the same charset check as a `nix:`
-attribute; an invalid one is dropped with a warning and the rest still apply. `libs` is a
-[trusted-only](../concepts/trust) field, like the package it decorates.
+attribute; an invalid one is dropped with a warning and the rest still apply. One character is
+refused here that a `nix:` attribute may carry: a `+`, because this list is written inside a nix
+expression rather than handed to nix as an argument, and there nix reads it as the addition
+operator. No package of the pinned nixpkgs is named with one, so nothing you can install is out of
+reach; the drop is warned about by name, which the build's own `syntax error` would not have been.
+`libs` is a [trusted-only](../concepts/trust) field, like the package it decorates.
 
 The wrapper also points `GST_PLUGIN_SYSTEM_PATH_1_0` at every input's `lib/gstreamer-1.0`, so a
 WebKit app that declares the GStreamer packages above actually finds their elements (they are

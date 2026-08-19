@@ -4290,15 +4290,24 @@ fn apply_prebuilt_libs(
             ));
             continue;
         }
-        let (valid, invalid): (Vec<String>, Vec<String>) = raw
-            .libs
-            .iter()
-            .cloned()
-            .partition(|attr| is_valid_attr(attr));
-        for attr in invalid {
-            warnings.push(format!(
-                "{source}: ignoring invalid library attribute `{attr}` in [{label}.{name}]"
-            ));
+        // Two reasons to drop one, and they do not read alike to whoever wrote the field: a
+        // character that has no business in an attribute at all, and one that is legal in an
+        // attribute but not where this list is written.
+        let mut valid = Vec::with_capacity(raw.libs.len());
+        for attr in raw.libs.iter().cloned() {
+            if !is_valid_attr(&attr) {
+                warnings.push(format!(
+                    "{source}: ignoring invalid library attribute `{attr}` in [{label}.{name}]"
+                ));
+            } else if !is_bare_nix_attr(&attr) {
+                warnings.push(format!(
+                    "{source}: ignoring library attribute `{attr}` in [{label}.{name}] — this list \
+                     is written into the generated derivation, where nix reads its `+` as the \
+                     addition operator rather than as part of a name"
+                ));
+            } else {
+                valid.push(attr);
+            }
         }
         slot.libs = valid;
     }
@@ -5848,6 +5857,22 @@ pub(crate) fn is_valid_attr(attr: &str) -> bool {
         && attr
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+'))
+}
+
+/// An attribute that can be written **bare into a nix expression**, as opposed to one handed to nix
+/// positionally as `<flakeref>#<attr>`.
+///
+/// [`is_valid_attr`] admits `+`, and that is right for the callers that pass an attribute as an
+/// argument: a flake output name carrying one reaches nix as argv and never meets its grammar. It
+/// is wrong for a caller that *interpolates*, because inside an expression `+` is the addition
+/// operator: `with pkgs; [ libstdc++ ]` is a syntax error rather than a lookup, and the failure
+/// surfaces from inside a derivation instead of from the field that caused it.
+///
+/// Nothing reachable is refused by the distinction. No attribute of the pinned nixpkgs carries a
+/// `+`, at the top level or in the sets a library entry names in practice, so the character can be
+/// rejected where it would break an expression without taking away a package anyone can install.
+pub(crate) fn is_bare_nix_attr(attr: &str) -> bool {
+    is_valid_attr(attr) && !attr.contains('+')
 }
 
 /// A mise backend token (the part after `mise:`), e.g. `aqua:example/demo-tool`, `bare-tool`,

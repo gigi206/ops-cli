@@ -5502,6 +5502,31 @@ fn an_invalid_library_attribute_is_dropped_on_its_own() {
 }
 
 #[test]
+fn a_library_attribute_nix_would_read_as_an_operator_is_dropped() {
+    // `libstdc++` clears the attribute charset — the charset test lists it among the valid ones —
+    // and would be written bare into `buildInputs = with pkgs; [ ... ]`, where nix answers
+    // `syntax error, unexpected '++'` from inside the derivation, naming neither the field nor the
+    // value that caused it. Dropped at the field instead, with the reason said there.
+    let r = resolve_no_plugins(
+        raw_deb_libs(
+            "app",
+            "deb:https://example.com/app.deb",
+            &["webkitgtk_4_1", "libstdc++"],
+        ),
+        None,
+    );
+    // The neighbour survives, so this cannot pass by dropping the whole list.
+    assert_eq!(pkg(&r.packages, "app").unwrap().libs, vec!["webkitgtk_4_1"]);
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("libstdc++") && w.contains("addition operator")),
+        "the drop names the character and where it breaks: {:?}",
+        r.warnings
+    );
+}
+
+#[test]
 fn libs_on_a_non_prebuilt_package_are_ignored_with_a_warning() {
     // `libs` feeds an autoPatchelf that only the prebuilt backends run. Naming a `nix:` package
     // silently would leave the user believing a library set was applied somewhere.
@@ -5752,6 +5777,11 @@ fn package_name_and_attribute_validators() {
     ] {
         assert!(!is_valid_attr(a), "{a:?} should be rejected");
     }
+    // The `+` above is admitted on purpose, and the two rules part company here: an attribute
+    // handed to nix as `<flakeref>#<attr>` rides argv and never meets nix's grammar, while one
+    // *interpolated* into an expression does, and there `+` is the addition operator.
+    assert!(is_valid_attr("libstdc++") && !is_bare_nix_attr("libstdc++"));
+    assert!(is_bare_nix_attr("gst_all_1.gst-plugins-base"));
     // mise tokens: the everyday forms plus PEP 508 extras (`pkg[web]`, `pkg[web,messaging]`)
     // admitted so a Python install can select optional dependency groups, and the
     // whitespace/control characters that a real token never carries still refused.

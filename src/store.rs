@@ -1600,6 +1600,16 @@ pub(crate) fn provision_unfree(
     attr: &str,
     marker: &str,
 ) -> io::Result<PathBuf> {
+    // The licensed path is the one that *interpolates* the attribute into an expression rather than
+    // handing it to nix positionally, so it answers to the same rule as a prebuilt package's
+    // library list. Refused here rather than left to fail as a syntax error from inside the
+    // derivation, which names neither the attribute nor the field that carried it.
+    if !crate::config::is_bare_nix_attr(attr) {
+        return Err(io::Error::other(format!(
+            "cannot build `{attr}` with its licence allowed: this attribute is written into a nix \
+             expression, where a `+` reads as the addition operator rather than as part of a name"
+        )));
+    }
     provision_licensed(nix, layout, gcroot, flake_ref, attr, marker, true)
 }
 
@@ -1630,9 +1640,10 @@ fn provision_command(
         // `builtins.currentSystem` is consulted; and the allowance is confined to this one import,
         // not a global eval switch. The derivation is byte-identical to the `flake_ref#attr` build
         // (same `.drv`), so nothing is unpinned — only the licence gate opens. `attr` is a dotted
-        // attr-path (`python3Packages.foo` → nested access, matching the flakeref `#attr` form); a
-        // segment containing `+` (which `is_valid_attr` admits) would parse here as the addition
-        // operator and fail the build — vanishingly rare for an unfree package, and fail-closed.
+        // attr-path (`python3Packages.foo` → nested access, matching the flakeref `#attr` form),
+        // and it has passed `is_bare_nix_attr` at the entry point: a segment carrying the `+` that
+        // `is_valid_attr` admits would parse here as the addition operator, so it is refused where
+        // the caller can be told why rather than left to fail inside the derivation.
         let system = format!("{}-linux", std::env::consts::ARCH);
         cmd.arg("--expr").arg(format!(
             "(import (builtins.getFlake \"{flake_ref}\").outPath \
@@ -2020,6 +2031,28 @@ mod tests {
     use super::*;
     use crate::testutil::TmpDir;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn an_unfree_attribute_nix_would_read_as_an_operator_is_refused_before_the_build() {
+        // The free path hands `<flakeref>#<attr>` to nix positionally, where a `+` is just a
+        // character. The licensed path interpolates the same attribute into an expression, where it
+        // is the addition operator, so the two do not accept the same names.
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let e = provision_unfree(
+            Path::new("/nonexistent-nix"),
+            &layout,
+            &data.path().join("root"),
+            "github:NixOS/nixpkgs/abc",
+            "demoPackages.libstdc++",
+            "marker",
+        )
+        .expect_err("an attribute that cannot be interpolated must not reach nix");
+        assert!(
+            e.to_string().contains("addition operator"),
+            "the refusal says why: {e}"
+        );
+    }
 
     #[test]
     fn the_witness_asks_about_the_revision_it_was_handed() {
