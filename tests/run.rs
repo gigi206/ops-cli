@@ -1137,6 +1137,76 @@ fn cache_reachable() -> bool {
     })
 }
 
+/// Whether GitHub's API will still answer, which for a `mise:aqua:` tool is not the same question
+/// as whether it is reachable.
+///
+/// The unauthenticated quota is sixty requests an hour **per address**, and it is shared with
+/// everything else on the host: another suite, a `nix flake metadata`, a person probing by hand. A
+/// tool declared `mise:aqua:` resolves its release through that API, so a spent quota fails the
+/// install while `cache.nixos.org` stays perfectly reachable. That is a red no code change can
+/// clear, and it belongs to the same family as an unreachable cache.
+///
+/// Read from `rate_limit`, whose own request costs nothing and whose `remaining` is a documented
+/// field, rather than from an upstream error message that is part of no contract. Best effort in
+/// one direction only: no `curl`, no answer, or an answer that will not parse all say the quota is
+/// fine, so this can only ever turn a failure into a counted skip, never the reverse.
+fn github_api_has_quota() -> bool {
+    let Ok(out) = std::process::Command::new("curl")
+        .args([
+            "-s",
+            "--max-time",
+            "10",
+            "https://api.github.com/rate_limit",
+        ])
+        .output()
+    else {
+        return true;
+    };
+    quota_remaining(&String::from_utf8_lossy(&out.stdout)).is_none_or(|remaining| remaining > 0)
+}
+
+/// The `core` budget left, read out of a `rate_limit` body. `None` when the body says nothing this
+/// can be read from, which the caller treats as "fine" rather than as an accusation.
+///
+/// Its own function so the rule is held by a test rather than by the endpoint: a probe that has to
+/// spend the very budget it reports, to prove it reads it correctly, is not a test.
+fn quota_remaining(body: &str) -> Option<u32> {
+    // Keyed on `core` and not on the payload's first `remaining`: the resources are serialised in
+    // alphabetical order, so the first one is `code_search`, which carries a budget of its own.
+    let after_key = body
+        .split("\"core\"")
+        .nth(1)?
+        .split("\"remaining\"")
+        .nth(1)?;
+    after_key
+        .trim_start()
+        .trim_start_matches(':')
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse::<u32>()
+        .ok()
+}
+
+#[test]
+fn the_quota_probe_reads_the_budget_that_governs_a_tool_install() {
+    // A body in the shape the endpoint returns, with `code_search` ahead of `core` as the
+    // alphabetical serialisation puts it and a *different* number in each, so reading the first
+    // `remaining` in the payload cannot pass for reading the right one.
+    let body = r#"{"resources":{"code_search":{"limit":30,"remaining":29,"reset":1,"used":1},
+        "core":{"limit":60,"remaining":0,"reset":2,"used":60},
+        "graphql":{"limit":0,"remaining":17,"reset":3,"used":0}},"rate":{"remaining":41}}"#;
+    assert_eq!(quota_remaining(body), Some(0));
+    assert_eq!(
+        quota_remaining(r#"{"resources":{"core":{"remaining":44}}}"#),
+        Some(44)
+    );
+    // Nothing to read is not evidence of an empty budget, and must never skip a test on its own.
+    assert_eq!(quota_remaining("not json at all"), None);
+    assert_eq!(quota_remaining(r#"{"message":"Bad credentials"}"#), None);
+}
+
 /// Whether the public `grpcb.in` gRPC test server is reachable — the HTTP/2 secret e2e depends on it
 /// (an external service), so an outage skips that test rather than reddening the suite.
 fn grpcb_in_reachable() -> bool {
@@ -5427,6 +5497,13 @@ fn a_fresh_mise_package_app_runs_under_its_own_allowlist() {
         skip_incapable!("skipping fresh `mise:` package app e2e: the network is unreachable");
         return;
     }
+    if !github_api_has_quota() {
+        skip_unreachable!(
+            "skipping fresh `mise:` package app e2e: github's api quota is spent, and the `mise:aqua:` tool \
+             resolves its release through it"
+        );
+        return;
+    }
 
     // trust so the app's `[packages] mise:` and its allowlist are honored (otherwise the package
     // is withheld and the allowlist degrades, and the MITM path under test is never exercised).
@@ -5570,6 +5647,13 @@ fn a_global_app_splits_mise_pools_across_two_projects() {
         skip_incapable!("skipping mise-split two-project e2e: the network is unreachable");
         return;
     }
+    if !github_api_has_quota() {
+        skip_unreachable!(
+            "skipping mise-split two-project e2e: github's api quota is spent, and the `mise:aqua:` tool \
+             resolves its release through it"
+        );
+        return;
+    }
 
     // trust both projects so their `[packages]` (a trusted-only field) is honored — otherwise the
     // app package is withheld and Lane 1 never runs.
@@ -5676,6 +5760,13 @@ fn a_global_apps_project_mise_tool_lands_in_the_per_project_pool() {
         skip_incapable!("skipping Lane-2 pool e2e: the network is unreachable");
         return;
     }
+    if !github_api_has_quota() {
+        skip_unreachable!(
+            "skipping Lane-2 pool e2e: github's api quota is spent, and the `mise:aqua:` tool \
+             resolves its release through it"
+        );
+        return;
+    }
 
     // Lane-2 auto-equip is open (no trust needed); the inline app is the project's own.
     let out = app_in(project.path(), data.path(), "ag");
@@ -5769,6 +5860,13 @@ fn sbx_upgrade_mise_rolls_a_mise_package_in_cage() {
         skip_incapable!("skipping mise: package upgrade e2e: the network is unreachable");
         return;
     }
+    if !github_api_has_quota() {
+        skip_unreachable!(
+            "skipping mise: package upgrade e2e: github's api quota is spent, and the `mise:aqua:` tool \
+             resolves its release through it"
+        );
+        return;
+    }
 
     // Declare the package only now, so nothing equipped it before the upgrade; trust so the
     // `mise:` package (a trusted-only field) is admitted.
@@ -5857,6 +5955,13 @@ fn sbx_upgrade_mise_rolls_a_global_apps_app_global_tool() {
     }
     if !cache_reachable() {
         skip_incapable!("skipping global-app mise upgrade e2e: the network is unreachable");
+        return;
+    }
+    if !github_api_has_quota() {
+        skip_unreachable!(
+            "skipping global-app mise upgrade e2e: github's api quota is spent, and the `mise:aqua:` tool \
+             resolves its release through it"
+        );
         return;
     }
 
