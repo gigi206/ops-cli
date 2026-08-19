@@ -118,17 +118,76 @@ pub(crate) fn read_pointer(default_data_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Whether the pointer file can name `image` — the one rule [`write_pointer`] writes by and the
+/// command that parses `--image` refuses by, so a path that cannot be recorded is rejected before a
+/// volume is mounted rather than after.
+///
+/// The value goes into the file as a TOML basic string on one line, and [`read_pointer`] takes it
+/// back with `trim`/`trim_matches('"')` and no unescaping at all. Three kinds of character break
+/// that, each in its own way, and none of them loudly:
+///
+/// - a **line break** ends the line, so what comes back is the *prefix* before it and sbx follows a
+///   path that is not the one recorded. The reader keeps the first `image` line it can read, so a
+///   second one written past the break is dead — except where the break is the value's first
+///   character, which leaves that first line empty and hands the reader the injected one instead;
+/// - a **quote** is eaten by `trim_matches`, which strips every one it finds at either end, so a
+///   path that begins or ends with one comes back short;
+/// - a **backslash**, and any other control character, leaves the file no longer valid TOML, which
+///   the file promises to be for anything that reads it as such. This hand parser would return the
+///   backslash unharmed; the promise is what it breaks.
+///
+/// A fourth is not a character at all. A Linux path is bytes, and one that is not valid UTF-8 is a
+/// path like any other, which `--image` takes from argv unchanged; but the file is text, written
+/// through `Display`, so those bytes land as `U+FFFD` and come back as a path that is not the one
+/// adopted. Refused for that reason, and no other: nothing here objects to the bytes.
+///
+/// So the rule is what a basic string carries with no escaping: UTF-8, printable characters, and
+/// neither `"` nor `\`. Refusing is right rather than escaping — an escape needs a decoder, and
+/// [`read_pointer`] runs before everything else sbx does, on the resolution path, where a
+/// round-trip bug would point the whole installation at the wrong data directory in silence.
+pub(crate) fn pointer_can_name(image: &Path) -> Result<(), String> {
+    let refuse = |what: &str| {
+        Err(format!(
+            "the volume image path cannot be recorded: it {what}, and `{POINTER}` cannot carry that \
+             (the path is stored as one quoted line of text, unescaped). Give the image a path that \
+             is valid UTF-8 with no control character, quote or backslash — `--image` takes any \
+             absolute path."
+        ))
+    };
+    let Some(shown) = image.to_str() else {
+        return refuse("is not valid UTF-8");
+    };
+    match shown
+        .chars()
+        .find(|c| c.is_control() || *c == '"' || *c == '\\')
+    {
+        None => Ok(()),
+        Some(c) => refuse(&match c {
+            '"' => "contains a quote".to_string(),
+            '\\' => "contains a backslash".to_string(),
+            '\n' => "contains a line break".to_string(),
+            other => format!("contains the control character U+{:04X}", other as u32),
+        }),
+    }
+}
+
 /// Record that sbx's data lives in the volume backed by `image`.
+///
+/// Refuses a path [`pointer_can_name`] rules out. That guard is here, and not only at the command
+/// that parses `--image`, because this is the function that owes the file its shape: every caller
+/// reaches the format through it, and one that forgot to ask would otherwise write a file no reader
+/// can take back.
 pub(crate) fn write_pointer(default_data_dir: &Path, image: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
+    pointer_can_name(image).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(default_data_dir)?;
     let path = default_data_dir.join(POINTER);
     let tmp = default_data_dir.join(format!(".{POINTER}.tmp"));
-    // The image path is sbx's own and validated absolute, so it carries nothing needing
-    // escaping; quoting it keeps the file valid TOML for anyone who reads it as such.
+    // The value needs no escaping — `pointer_can_name` is what makes that true — and quoting it
+    // keeps the file valid TOML for anyone who reads it as such.
     std::fs::write(
         &tmp,
         format!(
@@ -1685,6 +1744,56 @@ this line has no separator at all
         assert_eq!(read_pointer(&dir), None);
         // Clearing what is not there is not an error: `unuse` must be safe to repeat.
         clear_pointer(&dir).expect("idempotent");
+    }
+
+    /// The pointer names the data directory of the whole installation, and it is read back with no
+    /// unescaping at all — so a path the one line cannot carry is refused when it is given, not
+    /// written and misread later. Each refused character is shown here alongside what it would have
+    /// cost, since none of them fails loudly on their own.
+    #[test]
+    fn a_path_the_pointer_cannot_carry_is_refused_rather_than_misread() {
+        let base = crate::testutil::TmpDir::new();
+        let dir = base.path().join("sbx");
+
+        for bad in [
+            // A line break: what comes back is the prefix before it, so sbx would follow
+            // `/vol/a.btrfs` — a volume nobody adopted.
+            "/vol/a.btrfs\nimage = \"/vol/elsewhere.btrfs\"",
+            // A quote at either end is eaten by `trim_matches`, so the path comes back short.
+            "/vol/a.btrfs\"",
+            "\"/vol/a.btrfs",
+            // A backslash leaves the file no longer valid TOML, which it promises to be.
+            "/vol/a\\b.btrfs",
+            // Any other control character, for the same reason.
+            "/vol/a\u{7}b.btrfs",
+        ] {
+            let err = write_pointer(&dir, Path::new(bad))
+                .expect_err(&format!("{bad:?} must be refused, not recorded"));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert!(
+                !dir.join(POINTER).exists(),
+                "a refused path still left a pointer behind: {bad:?}"
+            );
+        }
+
+        // Not a character but a byte: a Linux path need not be UTF-8, and `--image` takes one from
+        // argv unchanged. It carries no quote, no backslash and no control character, so only an
+        // encoding check catches it — the file is text, and `Display` would put `U+FFFD` where the
+        // bytes were, handing back a path that is not the one adopted.
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw = PathBuf::from(std::ffi::OsString::from_vec(b"/vol/a\xffb.btrfs".to_vec()));
+            let err = write_pointer(&dir, &raw).expect_err("a non-UTF-8 path must be refused");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("UTF-8"), "{err}");
+            assert!(!dir.join(POINTER).exists());
+        }
+
+        // The rule refuses what the format cannot carry, and nothing else: spaces, accents and the
+        // rest of an ordinary path still round-trip exactly.
+        let ok = PathBuf::from("/vol/mes données/sbx storage (2).btrfs");
+        write_pointer(&dir, &ok).expect("an ordinary path is recordable");
+        assert_eq!(read_pointer(&dir).as_deref(), Some(ok.as_path()));
     }
 
     #[test]

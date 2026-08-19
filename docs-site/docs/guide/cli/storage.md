@@ -145,6 +145,12 @@ The image is created **beside** the data directory (`<xdg-data>/sbx-storage.btrf
 inside it, the volume is what that directory becomes. `--image <path>` puts it elsewhere, on
 another disk for instance.
 
+Adopting a volume records its path as one quoted line in `storage.toml`, which is read back
+without unescaping. So the path may be anything absolute that carries no quote, no backslash and
+no control character; spaces and accents are fine. A path that carries one is refused the moment
+you pass it, with a message saying which character, rather than being written and read back later
+as a different path.
+
 ## Choosing the size
 
 `--size` is **optional**: `init` defaults to **200 GiB**. Whatever you pass, it is a *logical

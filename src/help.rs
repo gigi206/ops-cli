@@ -1764,7 +1764,10 @@ const PAGES: &[Page] = &[
             from it: sbx records the volume and mounts it whenever it needs it, including after a\n\
             reboot, with no variable to carry and nothing to run by hand. `up` exists for the rare\n\
             time you want the mount without waiting for the next command. `unuse` reverses the\n\
-            adoption and leaves the volume untouched.\n\
+            adoption and leaves the volume untouched. The record is one quoted line naming the\n\
+            image, so `--image` takes any absolute path that carries no quote, backslash or\n\
+            control character; one that does is refused when you give it, rather than written and\n\
+            read back as a different path later.\n\
             \n\
             `use` refuses when the data directory already holds a store, projects or app homes:\n\
             adopting a volume does not move them, it hides them. `migrate` is the command that\n\

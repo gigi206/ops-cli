@@ -27,20 +27,30 @@ fn default_dir() -> Result<PathBuf, String> {
 
 /// Resolve the image path: an explicit `--image`, else the default beside the data directory.
 fn image_path(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
-    if let Some(p) = explicit {
-        if !p.is_absolute() {
-            return Err(format!(
-                "--image must be an absolute path (got {})",
-                p.display()
-            ));
+    let image = match explicit {
+        Some(p) => {
+            if !p.is_absolute() {
+                return Err(format!(
+                    "--image must be an absolute path (got {})",
+                    p.display()
+                ));
+            }
+            p
         }
-        return Ok(p);
-    }
-    let dir = default_dir()?;
-    let base = dir
-        .parent()
-        .ok_or_else(|| "cannot locate the data directory's parent".to_string())?;
-    Ok(storage::default_image(base))
+        None => {
+            let dir = default_dir()?;
+            let base = dir
+                .parent()
+                .ok_or_else(|| "cannot locate the data directory's parent".to_string())?;
+            storage::default_image(base)
+        }
+    };
+    // Checked here, where every subcommand resolves its image, so a path the pointer file cannot
+    // carry is refused before anything is created or mounted — `storage::write_pointer` holds the
+    // same rule, and would otherwise only reach it once a volume was already up. The default path is
+    // checked too: it is built from the data directory, which `$HOME` or `SBX_DATA_DIR` decides.
+    storage::pointer_can_name(&image)?;
+    Ok(image)
 }
 
 /// The subtrees whose presence means the default data directory holds real data — exactly what
@@ -1090,6 +1100,23 @@ fn adopt_empty(default_dir: &Path) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every subcommand resolves its image through one function, so the check that the pointer file
+    /// can name the path belongs there: `use` mounts the volume before it records it, and a refusal
+    /// discovered at the recording would leave the user with a volume up and an adoption that failed.
+    #[test]
+    fn an_image_path_the_pointer_cannot_carry_is_refused_before_anything_is_mounted() {
+        let err = image_path(Some(PathBuf::from("/vol/a\"b.btrfs")))
+            .expect_err("a quote in the path must be refused");
+        assert!(err.contains("quote"), "{err}");
+        assert!(
+            image_path(Some(PathBuf::from("/vol/mes données/a (2).btrfs"))).is_ok(),
+            "an ordinary path must still be accepted"
+        );
+        // The absolute-path rule still comes first, and says its own thing.
+        let err = image_path(Some(PathBuf::from("relative.btrfs"))).expect_err("not absolute");
+        assert!(err.contains("absolute"), "{err}");
+    }
 
     #[test]
     fn status_next_step_always_points_at_use_never_up() {
