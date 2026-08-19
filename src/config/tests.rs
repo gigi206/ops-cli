@@ -9878,6 +9878,94 @@ fn a_runtime_staged_out_of_the_store_is_restaged_once_it_stops_running() {
 }
 
 #[test]
+fn a_launch_that_installs_from_its_own_command_survives_an_absent_override_and_a_reclaimed_shim() {
+    // `open-design` is the shipped profile that installs from its own `cmd` instead of a bundle's
+    // step, so everything a launch repairs is written in that script and nothing else selects it.
+    // Two of its properties are pinned here by RUNNING the shipped script, unmodified:
+    //
+    //   1. The refresh override is read with a default. The script runs under `set -u`, and the
+    //      variable that arms the refresh is set by nothing but the `--env` of the launch that asks
+    //      for it, so an undefended read aborts an ordinary launch before its first line of work.
+    //   2. Corepack's shims are symlinks into the store, so reclaiming the revision that wrote them
+    //      leaves them dangling. Corepack resolves a `yarn` shim before it compares targets, which
+    //      fails on a dangling one and takes the whole `enable` down; the shim survives that
+    //      failure, so the next launch fails identically. The script must hand Corepack a directory
+    //      holding no dangling shim.
+    //
+    // `git`, `corepack` and `pnpm` are stood in for, because the launch otherwise clones from the
+    // network and walks a workspace. The Corepack stand-in REPORTS what it was handed rather than
+    // reproducing the upstream failure, so the assertion is on the state the script produces.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let profile = root.join("examples/app/open-design.toml");
+    let raw = schema::parse_app(&std::fs::read(&profile).expect("read the profile")).unwrap();
+    let argv = raw.cmd.expect("open-design ships a command").into_argv();
+    let script = argv.last().expect("the wrapper script").clone();
+    assert!(
+        script.contains("corepack enable"),
+        "`examples/app/open-design.toml` no longer installs Corepack's shims; this guard now \
+         asserts nothing and must be retargeted or removed"
+    );
+
+    let tmp = TmpDir::new();
+    let (home, bin) = (tmp.path().join("home"), tmp.path().join("bin"));
+    let shims = home.join(".local/bin");
+    // The checkout the script would otherwise clone. Its `.git` is what makes the clone branch skip.
+    std::fs::create_dir_all(home.join(".local/share/open-design/.git")).unwrap();
+    std::fs::create_dir_all(&shims).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let stub = |name: &str, body: &str| {
+        use std::os::unix::fs::PermissionsExt;
+        let path = bin.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    stub(
+        "git",
+        "#!/bin/sh\ncase \"$1 $2\" in \"rev-parse HEAD\") echo 1111111111111111111111111111111111111111 ;; esac\nexit 0\n",
+    );
+    stub("pnpm", "#!/bin/sh\nexit 0\n");
+    stub(
+        "corepack",
+        "#!/bin/sh\n: > \"$HOME/corepack-saw\"\nfor e in \"$3\"/*; do\n    if [ -L \"$e\" ] && [ ! -e \"$e\" ]; then basename \"$e\" >> \"$HOME/corepack-saw\"; fi\ndone\nexit 0\n",
+    );
+
+    // A shim left by a launch whose Corepack has since been reclaimed: a symlink that resolves
+    // nowhere, which is the state `sbx gc --prune` produces and the one Corepack cannot repair.
+    for name in ["pnpm", "pnpx", "yarn", "yarnpkg"] {
+        std::os::unix::fs::symlink(
+            format!("/nix/store/0000000000000000-reclaimed/corepack/dist/{name}.js"),
+            shims.join(name),
+        )
+        .unwrap();
+    }
+    assert!(
+        !shims.join("yarn").exists() && shims.join("yarn").is_symlink(),
+        "the dangling-shim state was not reproduced"
+    );
+
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .env("HOME", &home)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        // The override is what a refresh launch sets and an ordinary one does not.
+        .env_remove("OPEN_DESIGN_SBX_UPDATE")
+        .output()
+        .expect("run the shipped wrapper");
+    assert!(
+        out.status.success(),
+        "an ordinary launch failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let saw = std::fs::read_to_string(home.join("corepack-saw"))
+        .expect("the wrapper did not reach Corepack at all");
+    assert!(
+        saw.is_empty(),
+        "Corepack was handed shims that resolve nowhere: {saw}"
+    );
+}
+
+#[test]
 fn every_shipped_bundle_matches_the_agent_profile_it_was_derived_from() {
     // The shipped bundles under `examples/bundle/` are the single source of truth for what each
     // agent needs: the namesake profile under `examples/app/` no longer restates any of it — it

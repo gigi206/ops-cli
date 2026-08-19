@@ -57,8 +57,10 @@ cd "$ROOT"
 #     sbx app run open-design --env OPEN_DESIGN_SBX_UPDATE=1
 # `--env` is an authoritative one-shot override read on the HOST, so the version moves only
 # when you ask.  `reset --hard` discards in-tree edits; your designs and app-config.json live
-# under $OD_DATA_DIR, outside the checkout, and are untouched.
-if [ -n "$OPEN_DESIGN_SBX_UPDATE" ]; then
+# under $OD_DATA_DIR, outside the checkout, and are untouched.  The variable is READ WITH A
+# DEFAULT because that override is the only thing that ever sets it: this wrapper runs under
+# `set -u`, where an undefended read of an unset name aborts the launch before any work starts.
+if [ -n "${OPEN_DESIGN_SBX_UPDATE:-}" ]; then
     echo "sbx: refreshing the Open Design checkout (OPEN_DESIGN_SBX_UPDATE is set)" >&2
     git fetch --depth=1 origin main
     git reset --hard FETCH_HEAD
@@ -69,6 +71,16 @@ fi
 # a nested bare `pnpm`, which must also resolve on PATH.  Cheap and offline (it writes shims; the
 # pinned pnpm itself is downloaded on first use), so it is not stamped.
 mkdir -p "$HOME/.local/bin"
+# A shim an earlier launch wrote is a SYMLINK INTO THE NIX STORE, so reclaiming the revision that
+# provided Corepack leaves it dangling.  Corepack rewrites a stale `pnpm` shim by itself, but for
+# `yarn` and `yarnpkg` it resolves the link before it compares targets, which fails on a dangling
+# one and takes the whole `enable` down with it; the offending shim survives that failure, so every
+# later launch fails the same way.  Drop what no longer resolves and let Corepack write it fresh.
+for shim in "$HOME/.local/bin"/*; do
+    if [ -L "$shim" ] && [ ! -e "$shim" ]; then
+        rm -f "$shim"
+    fi
+done
 corepack enable --install-directory "$HOME/.local/bin"
 export PATH="$HOME/.local/bin:$PATH"
 

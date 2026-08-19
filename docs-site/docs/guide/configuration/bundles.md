@@ -187,9 +187,12 @@ not print at all, so the roll closes without a word.
 
 Each repairs itself from the guard in its own `cmd`, but only one of them tells you. `aionui`'s
 guard runs the staged binary, so a store move trips it and it says on stderr that it is restaging.
-`open-design`'s install is keyed on the checked-out commit, which a store move does not change, so
-on that event it says nothing and re-installs nothing; what it does rewrite every launch, it
-rewrites silently. Read the announcement above as bounded by what a step declares.
+`open-design`'s install is keyed on the checked-out commit, which a store move does not change, and
+that key fits what it guards: the workspace it installs carries no store path of its own. What its
+home does carry is Corepack's shims, which are symlinks into the store, and its launch rewrites
+those every time, first dropping any that the reclaimed revision left resolving nowhere. So on a
+store move it re-installs nothing, repairs the one thing that moved, and says nothing about either.
+Read the announcement above as bounded by what a step declares.
 `open-design` also advances deliberately, with
 `sbx app run open-design --env OPEN_DESIGN_SBX_UPDATE=1`.
 

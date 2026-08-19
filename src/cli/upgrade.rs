@@ -781,8 +781,11 @@ fn apps_with_install_steps(cfg: &config::Resolved) -> Vec<&str> {
 /// against the cost of closing it. What bounds that cost is per app, not shared: `aionui`'s guard
 /// runs the staged binary, so a store move trips it and the restage announces itself on stderr,
 /// leaving only the advance notice missing; `open-design`'s install is keyed on the checked-out
-/// commit, which a store move does not change, so on that event it neither re-installs nor says
-/// anything, and what its `cmd` does rewrite unconditionally it rewrites in silence.
+/// commit, which a store move does not change, and that key is right for what it guards, because
+/// the tree it installs holds no store path of its own. What its home does hold is Corepack's
+/// shims, which are symlinks into the store, and its `cmd` rewrites those on every launch after
+/// dropping any the reclaimed revision left resolving nowhere. So on a store move it re-installs
+/// nothing, repairs the one thing that moved, and says nothing about either.
 /// That self-repair is a property of the guard each one writes, not of the shape: `aionui`'s guard
 /// tested that the staged tree was *there* rather than that it *ran*, and skipped the repair for as
 /// long as the tree existed. Widening this note to cover them would mean detecting staging inside a
