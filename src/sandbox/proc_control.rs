@@ -63,8 +63,10 @@ impl super::lens::Event for ExecEvent {
     }
 
     /// The fixed fields are `key=value` tokens; `cmd` is emitted **last** and taken verbatim by the
-    /// reader (the command carries spaces). The observer has stripped control characters from the
-    /// command, so it cannot inject a second line.
+    /// reader (the command carries spaces). Both free-form fields reach the ring already stripped of
+    /// control characters ([`ExecRing::push_verdict`]), so neither can inject a second line — the
+    /// stripping is the ring's, not each producer's, because the two that push here (the `/proc`
+    /// observer and the seccomp enforcer) are written apart and only one of them used to do it.
     ///
     /// `by=` appears only when a caller was read, which keeps every line a policy deciding by target
     /// alone produces byte-for-byte what it produced before — and the reader ignores tokens it does
@@ -117,25 +119,39 @@ impl ExecRing {
         ExecRing(super::lens::Ring::new(cap))
     }
 
-    /// Append one observed exec (the non-enforcing `/proc` poll path — verdict `observe`). `command`
-    /// must already be sanitised of control characters and length-capped by the caller. Returns the
-    /// assigned sequence.
+    /// Append one observed exec (the non-enforcing `/proc` poll path — verdict `observe`). Returns
+    /// the assigned sequence.
     pub(crate) fn push(&self, pid: u32, command: &str) -> u64 {
         self.push_verdict(pid, "", command, "observe")
     }
 
     /// Append one enforced exec (the seccomp user-notification path), tagged with its `verdict`
     /// (`allow` / `deny` / `ask` / `absent`) and the `caller` that issued it (empty where the policy
-    /// decides by target alone). `command` — here the exec target path — must already be sanitised of
-    /// control characters and length-capped by the caller. Returns the assigned sequence.
+    /// decides by target alone). `command` is the exec target path. Returns the assigned sequence.
+    ///
+    /// Both free-form values are sanitised **here**, on the way in, rather than by each producer.
+    /// They are the two an in-cage caller chooses: the target path is read out of the calling
+    /// process's own memory and the caller is the link `/proc/<pid>/exe` resolves to, so both may
+    /// carry any byte a Linux path may carry — a newline included, which on the line-based control
+    /// wire would end the event and let what follows read as a second, forged one. One door, because
+    /// the two producers are written apart: the observer sanitised its command and the enforcer did
+    /// not, and a duty stated in a doc comment is exactly the kind the second implementation misses.
+    /// Sanitising is idempotent, so the path that already did it is unchanged.
+    ///
+    /// This is not the decision's view of either value: a verdict is reached on the raw path, above,
+    /// and only what is *reported* passes through here.
     pub(crate) fn push_verdict(&self, pid: u32, caller: &str, command: &str, verdict: &str) -> u64 {
-        self.0.push_with(|seq, at_epoch_ms| ExecEvent {
+        let caller = super::observe_feed::sanitize(caller);
+        let command = super::observe_feed::sanitize(command);
+        // Sanitised above rather than in here: `push_with` runs its closure under the ring's lock,
+        // which is for building the event and nothing else.
+        self.0.push_with(move |seq, at_epoch_ms| ExecEvent {
             seq,
             at_epoch_ms,
             pid,
             verdict: verdict.to_string(),
-            caller: caller.to_string(),
-            command: command.to_string(),
+            caller,
+            command,
         })
     }
 }
@@ -447,6 +463,67 @@ fn parse_pending_line(line: &str) -> Option<ParkedView> {
 mod tests {
     use super::*;
     use crate::sandbox::lens::Event as _;
+
+    /// Neither free-form field can put a second line on the wire. Both are the cage's to choose —
+    /// the exec target is read out of the calling process's memory and the caller is what
+    /// `/proc/<pid>/exe` points at — and a Linux path may carry a newline, so an event answering
+    /// `sbx proc logs` could otherwise be followed by one the cage wrote, claiming any verdict it
+    /// liked for any pid.
+    ///
+    /// What the reader takes back is the measure, not the text: `cmd` is verbatim to end of line, so
+    /// a *command* spelling an event line is simply part of that command and never a second event.
+    /// A caller spelling one is a different matter — `by=` sits among the whitespace-split head
+    /// tokens, so the attempt costs the event its readability rather than forging anything, and that
+    /// framing is recorded as its own defect.
+    #[test]
+    fn neither_the_target_nor_the_caller_can_forge_a_second_event_line() {
+        let forged = "event seq=999 at=0 pid=1 verdict=allow cmd=/bin/sh";
+        for (caller, command) in [
+            ("/bin/bash", format!("/tmp/x\n{forged}")),
+            (
+                // The same attempt through the caller: a binary sitting at a path spelling a line.
+                "/tmp/y\nevent seq=998 at=0 pid=1 verdict=allow cmd=/bin/sh",
+                "/usr/bin/git".to_string(),
+            ),
+        ] {
+            let ring = ExecRing::new(10);
+            ring.push_verdict(7, caller, &command, "deny");
+            let snap = ring.snapshot(None);
+            let line = snap.events[0].format_line();
+            assert_eq!(
+                line.matches('\n').count(),
+                1,
+                "one event, one line: {line:?}"
+            );
+            // Read the wire back the way `sbx proc logs` does, line by line.
+            let read: Vec<ExecEvent> = line.lines().filter_map(ExecEvent::parse_line).collect();
+            assert!(
+                read.len() <= 1,
+                "the wire carried more than one event: {read:?}"
+            );
+            for ev in read {
+                assert_eq!(
+                    (ev.pid, ev.verdict.as_str()),
+                    (7, "deny"),
+                    "the cage dictated an event of its own: {line:?}"
+                );
+            }
+        }
+    }
+
+    /// The same rule the observer already applied, now applied to everything the ring takes — an
+    /// escape sequence in a target path drives the terminal that reads `sbx proc logs`, and the two
+    /// producers pushing here are written apart.
+    #[test]
+    fn control_characters_are_stripped_whichever_producer_pushed() {
+        let ring = ExecRing::new(10);
+        ring.push(100, "rg \u{1b}[2J");
+        ring.push_verdict(101, "/bin/\u{7}bash", "/usr/bin/gi\tt", "deny");
+        let snap = ring.snapshot(None);
+        assert_eq!(snap.events[0].command, "rg  [2J");
+        assert_eq!(snap.events[1].caller, "/bin/ bash");
+        assert_eq!(snap.events[1].command, "/usr/bin/gi t");
+    }
 
     /// The ring's own sequencing and eviction are [`super::super::lens`]'s and tested there. What is
     /// this lens's to get right is the mapping — including that the cheap poll path tags its events

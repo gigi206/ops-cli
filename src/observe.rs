@@ -137,6 +137,14 @@ pub(crate) fn render_human(root: &ProcNode) -> String {
     out
 }
 
+/// One line per process, `pid` then command, indented by depth.
+///
+/// The command is sanitised before it is placed on a line, because none of it is ours: `argv` is
+/// whatever the process set, and `comm` is 16 bytes `prctl(PR_SET_NAME)` accepts without inspecting
+/// them. A newline in either would put a second line in this view under a pid and an indent the
+/// process chose, and an escape would drive the terminal reading it. The same treatment the exec and
+/// filesystem feeds give their own free-form field, through the same definition; `to_json` needs
+/// none, since the serialiser escapes what it emits.
 fn render_node(n: &ProcNode, depth: usize, out: &mut String) {
     let indent = "  ".repeat(depth + 1);
     let cmd = if n.args.is_empty() {
@@ -144,6 +152,7 @@ fn render_node(n: &ProcNode, depth: usize, out: &mut String) {
     } else {
         n.args.join(" ")
     };
+    let cmd = crate::sandbox::sanitize(&cmd);
     out.push_str(&format!("{indent}{}  {}\n", n.pid, truncate(&cmd, 120)));
     for c in &n.children {
         render_node(c, depth + 1, out);
@@ -239,6 +248,38 @@ mod tests {
         let kid_line = out.lines().find(|l| l.contains("11  [kthread]")).unwrap();
         let lead = |l: &str| l.len() - l.trim_start().len();
         assert!(lead(kid_line) > lead(root_line));
+    }
+
+    /// A process names itself in this view, so the view holds it to one line. `argv` is whatever it
+    /// passed to `execve` and `comm` is whatever it handed `prctl(PR_SET_NAME)`, neither inspected by
+    /// the kernel: a newline in either would otherwise add a line here, under a pid and an indent of
+    /// the process's choosing, and an escape would reach the terminal reading it.
+    #[test]
+    fn a_process_cannot_add_a_line_to_the_tree_by_naming_itself() {
+        let t = table(&[
+            (
+                10,
+                info(1, "sh", &["sh", "-c", "x\n      4242  /bin/su root"]),
+            ),
+            // The same through `comm`, on the argv-less path that falls back to it.
+            (11, info(10, "a\n      4243  /bin/su root", &[])),
+        ]);
+        let out = render_human(&build_tree(&t, 10).unwrap());
+        assert_eq!(
+            out.lines().count(),
+            2,
+            "one line per process, two processes: {out:?}"
+        );
+        for forged in ["4242", "4243"] {
+            assert!(
+                !out.lines().any(|l| l.trim_start().starts_with(forged)),
+                "a process put itself in the tree under a pid it chose: {out:?}"
+            );
+        }
+        // An escape sequence does not reach the terminal either.
+        let t = table(&[(20, info(1, "sh", &["sh", "\u{1b}[2J"]))]);
+        let out = render_human(&build_tree(&t, 20).unwrap());
+        assert!(!out.contains('\u{1b}'), "an escape survived: {out:?}");
     }
 
     #[test]

@@ -158,9 +158,18 @@ pub(crate) trait Sink: Send {
 ///
 /// A refusal with nothing to add has an empty body, and a launch that is not a session has no
 /// context, so both ends have to disappear cleanly instead of stranding a separator.
+///
+/// One line, and the sanitising here is what keeps it one. Every announcement carries a subject the
+/// cage chose — an exec target read out of a process's memory, a destination host off the wire, a
+/// task name — and this is the sink that puts it on a line, in a terminal or in the log a detached
+/// session leaves behind for `sbx logs`. A newline in a subject would add a line of the cage's
+/// writing there, and an escape would drive the terminal. The desktop sink needs none of this: D-Bus
+/// carries its fields with their lengths, so nothing there is delimited by what it contains.
 fn stderr_line(context: &str, summary: &str, body: &str) -> String {
-    match (context, body) {
-        ("", "") => summary.to_string(),
+    let summary = crate::sandbox::sanitize(summary);
+    let body = crate::sandbox::sanitize(body);
+    match (context, body.as_str()) {
+        ("", "") => summary,
         ("", _) => format!("{summary}: {body}"),
         (ctx, "") => format!("{ctx}: {summary}"),
         (ctx, _) => format!("{ctx}: {summary}: {body}"),
@@ -936,6 +945,27 @@ mod tests {
         assert_eq!(app_name("kiro@ops-cli[4242]"), "sbx · kiro@ops-cli[4242]");
         // No session to name: the bare product name, never a dangling separator.
         assert_eq!(app_name(""), "sbx");
+    }
+
+    /// The subject of an announcement is the cage's: an exec target read out of a process's memory,
+    /// a destination host off the wire, a task name. This sink puts it on a line — a terminal's, or
+    /// the log a detached session leaves for `sbx logs` — so one announcement stays one line.
+    #[test]
+    fn an_announcement_stays_one_line_whatever_the_cage_called_its_subject() {
+        let line = stderr_line(
+            "demo@proj[4242]",
+            "Blocked: /tmp/x\nsbx: warning: Blocked: /bin/su: allowed",
+            "no rule\u{1b}[2J",
+        );
+        assert_eq!(line.matches('\n').count(), 0, "{line:?}");
+        assert!(
+            !line.contains('\u{1b}'),
+            "an escape reached the terminal: {line:?}"
+        );
+        assert!(
+            line.starts_with("demo@proj[4242]: Blocked: /tmp/x sbx: warning:"),
+            "{line:?}"
+        );
     }
 
     #[test]
