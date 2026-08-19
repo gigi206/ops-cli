@@ -2,16 +2,30 @@
 #
 # Read by rust-analyzer as workspace-local config, rather than by one editor's settings, so it does
 # not depend on which client starts the server. What a given setting then reaches is its own
-# question, and the `[files]
+# question, and the `[files]` note below records one that was measured and is narrower than it
+# reads.
+
+[cargo]
+# Give rust-analyzer its own target directory. Without it, its `cargo check` and its
+# initial build-script and proc-macro build lock `Cargo.lock` against the project's own
+# `cargo test` and `mise run build`, and the two starve each other -- measured here, an
+# initial index took ~25 minutes while a cage test suite was running. The cost is a
+# duplicated build tree; `/target` is already git-ignored, so nothing of it is tracked.
+targetDir = "target/rust-analyzer"
+
+[files]
 # Nothing under these is Rust the analyzer needs: the Docusaurus site, the example app
 # profiles (TOML), and the image assets. Paths are relative to the workspace root and
 # globs are not supported.
 #
+# `target/test-tmp` is the fixtures' in-workspace fallback root, listed so a tree a killed run left
+# behind is not analysed as if it were source.
+#
 # WHAT THIS DOES NOT DO. It bounds what is ANALYSED, not what is WATCHED, so it is not a guard
 # against inotify exhaustion and an earlier revision of this file was wrong to present it as one.
-# Measured against this analyzer, comparing the inodes in `/proc/<pid>/fdinfo` — matched on the
-# (inode, device) pair, since inode numbers repeat across filesystems — with the real directories:
-# the watch set is **identical**, to the watch, with no exclusion at all, with `src` excluded, with
+# Measured against this analyzer, comparing the inodes in `/proc/<pid>/fdinfo` -- matched on the
+# (inode, device) pair, since inode numbers repeat across filesystems -- with the real directories:
+# the watch set is identical, to the watch, with no exclusion at all, with `src` excluded, with
 # `target` excluded, and with `docs-site` excluded. The channel is live while that happens: an
 # ill-typed value comes straight back as `invalid config value: /files/exclude`, and the older
 # spelling `excludeDirs` is still accepted as an alias, so neither the name nor the delivery was
@@ -25,9 +39,10 @@
 # systemd loses the cgroup watches a transient scope needs to learn its cage emptied, so the scope is
 # never collected.
 #
-# The remedy therefore is not a setting but a location: the cage suite roots its fixtures through
-# `SBX_TEST_TMPDIR`, and `mise run test` points that outside the workspace, where one run's hundreds
-# of thousands of directories cost nothing to watch because nothing walks them.
+# The remedy therefore is not a setting but a location: the fixtures root themselves outside the
+# workspace, which `fixture_root` decides in `src/testutil.rs` and in each suite, and which
+# `SBX_TEST_TMPDIR` moves. One run's hundreds of thousands of directories then cost nothing to watch
+# because nothing walks them.
 #
 # That subtree only, never `target` itself: `targetDir` above puts the analyzer's own
 # build under `target/`, and four `include!(concat!(env!("OUT_DIR"), ...))` sites read
