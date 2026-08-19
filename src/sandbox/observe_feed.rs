@@ -86,9 +86,29 @@ fn command_of(info: &ProcInfo) -> String {
 }
 
 /// Replace ASCII/Unicode control characters with a space and cap the length (on a char boundary), so
-/// the value is safe on the line-based control wire and the stderr feed. Shared by both observation
-/// lenses — a command (exec) and a path (filesystem) both need it, and a Linux filename may carry a
-/// newline exactly as a hostile argv can.
+/// the value is safe on the line-based control wire, the stderr feed, and any terminal reading
+/// either. A Linux filename may carry a newline exactly as a hostile argv can.
+///
+/// # What now depends on this, and why it must not be narrowed
+///
+/// It began as the exec lens's own and is now the crate's one answer to a value the cage chooses.
+/// Six sinks reach it, and on each one it is the only filter between a name the cage picked and a
+/// line somebody reads:
+///
+/// - [`command_of`], for the exec feed's inline stderr echo;
+/// - [`super::fs_watch`], for a project-relative path;
+/// - [`super::proc_control::ExecRing::push_verdict`], the door every exec event enters by —
+///   including the seccomp supervisor's, whose target path is read out of the calling process's own
+///   memory and whose caller is a `/proc/<pid>/exe` link;
+/// - [`super::notify_sink`], where the stderr fallback composes one line per announcement, the lines
+///   a detached session leaves in the log `sbx logs` reads;
+/// - [`super::egress_stats`], for a destination host in a tab-delimited row;
+/// - and `crate::observe`, outside this module through the [`super::sanitize`] re-export, for the
+///   `sbx proc ls` tree.
+///
+/// Each of those was, at some point, a place a caged process could write a line of its own. Narrowing
+/// what this replaces, or moving it somewhere a caller stops finding it, reopens all of them at once
+/// and nothing will fail to say so — a forged line is well-formed by construction.
 pub(crate) fn sanitize(s: &str) -> String {
     const MAX: usize = 512;
     let cleaned: String = s

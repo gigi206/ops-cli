@@ -213,7 +213,7 @@ pub(crate) struct EgressStats {
 /// project that normalised to the same string. A name the format cannot carry therefore records no
 /// stats at all — the same outcome a project that cannot be canonicalised already gets, and for the
 /// same reason: counters are worth having, never worth a wrong answer.
-pub(crate) fn identity_is_recordable(project: &str, app: Option<&str>) -> bool {
+fn identity_is_recordable(project: &str, app: Option<&str>) -> bool {
     let carries_break = |s: &str| s.contains('\n') || s.contains('\r');
     !carries_break(project) && !app.is_some_and(carries_break)
 }
