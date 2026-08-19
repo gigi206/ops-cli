@@ -900,18 +900,7 @@ fn serve_open(
         // would fail an open that had every right to succeed. Only those fall back, and with them
         // the race, for a window the cage cannot arrange from inside.
         let e = io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        if matches!(
-            e,
-            libc::EROFS
-                | libc::EACCES
-                | libc::EPERM
-                | libc::ENXIO
-                | libc::ELOOP
-                | libc::ENOTDIR
-                | libc::EISDIR
-                | libc::ENOENT
-                | libc::ETXTBSY
-        ) {
+        if errno_describes_the_file(e) {
             respond_errno(notif_fd, req.id, e);
             return true;
         }
@@ -931,6 +920,34 @@ fn serve_open(
     // it at all, and either way this side is done with it.
     unsafe { libc::close(served) };
     ok
+}
+
+/// Whether an `errno` from an open describes the **file** or this **process**.
+///
+/// The distinction decides what may be reported to the cage. An errno about the file is one the cage
+/// would have met itself, reopening the same inode on the same mounts under the same identity, so it
+/// is the answer. An errno about the opener — this process out of descriptors, the machine out of
+/// memory — says nothing about the cage: reporting it fails an open that had every right to succeed,
+/// and tells the caller its own descriptors ran out when they did not.
+///
+/// One definition, because the two places that ask are written apart and only one of them used to
+/// ask. The reopen that *serves* an open carried this list; the `O_PATH` probe that *examines* the
+/// path did not, and passed whatever it got straight back — so a supervisor under descriptor
+/// pressure answered `EMFILE` to a cage that had every descriptor it needed. A rule stated in one
+/// site's comment is a rule the other site misses.
+fn errno_describes_the_file(e: libc::c_int) -> bool {
+    matches!(
+        e,
+        libc::EROFS
+            | libc::EACCES
+            | libc::EPERM
+            | libc::ENXIO
+            | libc::ELOOP
+            | libc::ENOTDIR
+            | libc::EISDIR
+            | libc::ENOENT
+            | libc::ETXTBSY
+    )
 }
 
 /// Reopen the inode behind `probe` with `flags`, without walking a path.
@@ -1499,12 +1516,24 @@ impl OpenOutcome {
     };
 
     /// The open the supervisor's probe could not make, answered with what it met.
+    /// A refusal carrying the errno the cage is told.
+    ///
+    /// The rule is applied here rather than by the caller, because the caller is where it was
+    /// missed: an errno that describes *this* process — out of descriptors, out of memory — is
+    /// replaced by the supervisor's own `EACCES`. The refusal itself stands either way; a path that
+    /// could not be examined is not one to serve, and answering `CONTINUE` instead would let a cage
+    /// walk past the scan by putting the supervisor under descriptor pressure. What is corrected is
+    /// only what the cage is told about *why*, which it would otherwise read as its own failure.
     fn failed(errno: libc::c_int) -> OpenOutcome {
         OpenOutcome {
             refused: false,
             report: None,
             probe: None,
-            errno: Some(errno),
+            errno: Some(if errno_describes_the_file(errno) {
+                errno
+            } else {
+                libc::EACCES
+            }),
         }
     }
 
@@ -2019,15 +2048,46 @@ mod tests {
 
         // A writer for the whole run, so the read side completes rather than waiting for one, and a
         // bounded read so the payload ends rather than following the pipe forever.
+        //
+        // The wait for a reader is bounded the same way the supervisor bounds its own
+        // write-direction open: `O_NONBLOCK` reports `ENXIO` until one arrives, so this asks again
+        // rather than blocking in `open`. A blocking open here would be unbounded, and the `join`
+        // below would then hold the whole test binary — not just this test — on any run where the
+        // payload fails before it reaches the read side. That is a failure reported as a hang
+        // rather than by name, and the deadline that would eventually catch it belongs to whatever
+        // runs the suite.
         let writer = {
             let pipe = pipe.clone();
             std::thread::spawn(move || {
-                if let Ok(mut w) = std::fs::OpenOptions::new().write(true).open(&pipe) {
-                    use std::io::Write;
-                    for _ in 0..200 {
-                        if w.write_all(b"pipebyte").is_err() {
-                            return;
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                let mut w = loop {
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&pipe)
+                    {
+                        Ok(w) => break w,
+                        Err(_) if std::time::Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(10));
                         }
+                        Err(_) => return,
+                    }
+                };
+                // The flag was for the open alone: the writes below are the ordinary blocking ones
+                // the reader is meant to meet.
+                use std::os::unix::io::AsRawFd;
+                // SAFETY: w is this thread's live descriptor; F_SETFL only alters status flags.
+                unsafe {
+                    let cur = libc::fcntl(w.as_raw_fd(), libc::F_GETFL);
+                    if cur >= 0 {
+                        libc::fcntl(w.as_raw_fd(), libc::F_SETFL, cur & !libc::O_NONBLOCK);
+                    }
+                }
+                for _ in 0..200 {
+                    if w.write_all(b"pipebyte").is_err() {
+                        return;
                     }
                 }
             })
@@ -2187,6 +2247,48 @@ mod tests {
             !out.contains("sk-ABC123DEF456GHI789"),
             "no byte of the linked-to content may reach the cage: {out}"
         );
+    }
+
+    /// The errno rule reports the file's failures and never this process's.
+    ///
+    /// Written against literals rather than against the function's own list: a test that asks the
+    /// rule what the rule says would accept any list, including an empty one. The refused half is
+    /// the half that matters — each of these three is a way *this* process can fail to open a path
+    /// the cage had every right to open, and reporting one to the cage would deny that open and
+    /// blame the caller's own descriptors for it.
+    #[test]
+    fn an_errno_about_this_process_is_never_reported_as_the_files() {
+        for e in [
+            libc::EROFS,
+            libc::EACCES,
+            libc::EPERM,
+            libc::ENXIO,
+            libc::ELOOP,
+            libc::ENOTDIR,
+            libc::EISDIR,
+            libc::ENOENT,
+            libc::ETXTBSY,
+        ] {
+            assert!(
+                errno_describes_the_file(e),
+                "errno {e} describes the file and is the cage's answer"
+            );
+        }
+        for e in [libc::EMFILE, libc::ENFILE, libc::ENOMEM] {
+            assert!(
+                !errno_describes_the_file(e),
+                "errno {e} describes the supervisor, and the cage must not be told it"
+            );
+        }
+    }
+
+    /// And the rule reaches the cage through the constructor, so a site that reports a refusal
+    /// cannot skip it by being written later.
+    #[test]
+    fn a_refusal_never_carries_an_errno_about_the_supervisor() {
+        assert_eq!(OpenOutcome::failed(libc::ENOENT).errno, Some(libc::ENOENT));
+        assert_eq!(OpenOutcome::failed(libc::EMFILE).errno, Some(libc::EACCES));
+        assert_eq!(OpenOutcome::failed(libc::ENOMEM).errno, Some(libc::EACCES));
     }
 
     #[test]
