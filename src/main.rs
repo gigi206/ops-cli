@@ -56,6 +56,11 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         Some("help" | "--help" | "-h") => return help::dispatch(rest),
+        // The spellings other tools answer to, resolved to the verb that carries the page rather
+        // than handled here: `version` then reaches the help interception below and the dispatch
+        // like any other command, so `sbx --version --help` renders a page and `sbx -V foo`
+        // refuses its extra argument by the one rule every verb refuses one by.
+        Some("--version" | "-V") => "version",
         Some(name) => name,
     };
 

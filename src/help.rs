@@ -47,6 +47,18 @@ struct Page {
 const PAGES: &[Page] = &[
     // ---- top-level commands -------------------------------------------------------
     Page {
+        path: &["version"],
+        synopsis: "sbx version",
+        summary: "print the version of this sbx build",
+        options: &[],
+        details: "Writes the version to stdout and exits 0. `sbx --version` and `sbx -V` are\n\
+            accepted spellings of the same command, so a script probing for a version finds it\n\
+            under whichever one it tries.\n\n\
+            The version names the sbx build and nothing else. It says nothing about the engines a\n\
+            launch drives: bubblewrap and nix are resolved at run time, and `sbx doctor` is what\n\
+            reports the ones a given host offers.",
+    },
+    Page {
         path: &["doctor"],
         synopsis: "sbx doctor",
         summary: "verify the runtime prerequisites before anything can run",

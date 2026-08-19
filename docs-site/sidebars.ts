@@ -138,6 +138,7 @@ const sidebars: SidebarsConfig = {
         'cli/trust',
         'cli/untrust',
         'cli/upgrade',
+        'cli/version',
       ],
     },
     {

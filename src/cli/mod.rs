@@ -350,6 +350,15 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         // else — never invoked by a user directly, so it carries no page of its own.
         "__complete" => completion::complete_cmd(rest),
         "completion" => completion::completion_cmd(rest),
+        // The version of this build. `--version`/`-V` reach here too: `main` resolves both to
+        // this verb, so the three spellings are one implementation and one page.
+        "version" => match reject_extra(&["version"], &rest) {
+            Err(code) => code,
+            Ok(()) => {
+                println!("sbx {}", env!("CARGO_PKG_VERSION"));
+                ExitCode::SUCCESS
+            }
+        },
         "doctor" => match reject_extra(&["doctor"], &rest) {
             Err(code) => code,
             Ok(()) => doctor::doctor(),

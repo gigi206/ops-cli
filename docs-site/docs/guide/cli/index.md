@@ -58,6 +58,7 @@ See also: [Configuration overview](../configuration/) · [Exit codes](../referen
 | Command | Purpose |
 |---|---|
 | [`sbx doctor`](doctor) | verify the runtime prerequisites |
+| [`sbx version`](version) | print the version of this sbx build |
 
 ## Shell integration
 
@@ -70,5 +71,6 @@ See also: [Configuration overview](../configuration/) · [Exit codes](../referen
 - `sbx help` / `sbx --help`: the top-level command list.
 - `sbx help <command> [subcommand...]`: the page for a command path.
 - `sbx <command> --help`: the same page.
+- `sbx version` / `sbx --version` / `sbx -V`: the version of this build, one line on stdout.
 - A `--` ends `sbx`'s own flags, so `sbx app run <name> -- --help` passes `--help` to the
   launched command.

@@ -395,3 +395,58 @@ fn mise_help_is_sbx_page_and_points_at_mises_own_help() {
         "should point at mise's own help"
     );
 }
+
+/// The three spellings of the version print one identical line and exit 0.
+///
+/// The expected string is built from `CARGO_PKG_VERSION` rather than pinned, so a release bump does
+/// not turn this red for the wrong reason; the shape assertion beside it is the literal that keeps
+/// the check from following the code wherever it goes, since a binary printing an empty version
+/// would satisfy an equality built the same way it was.
+#[test]
+fn every_spelling_of_version_prints_the_build_version() {
+    let expected = format!("sbx {}\n", env!("CARGO_PKG_VERSION"));
+    for spelling in [&["version"][..], &["--version"][..], &["-V"][..]] {
+        let out = sbx(spelling);
+        assert!(out.status.success(), "`sbx {spelling:?}` should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(stdout, expected, "`sbx {spelling:?}` printed {stdout:?}");
+        assert!(out.stderr.is_empty(), "the version goes to stdout alone");
+    }
+    let (name, rest) = expected.trim_end().split_once(' ').expect("two fields");
+    assert_eq!(name, "sbx");
+    assert!(
+        rest.split('.').count() >= 2 && rest.chars().all(|c| c.is_ascii_digit() || c == '.'),
+        "the version should be a dotted number, got {rest:?}"
+    );
+}
+
+/// A help flag on any spelling renders the page instead of printing the version, and an argument
+/// the verb does not take is refused against its own synopsis.
+///
+/// Both are properties of routing `--version` to a page-carrying verb rather than answering it at
+/// the root: the page exists to be reached, and the shared refusal has a synopsis to quote.
+#[test]
+fn version_answers_a_help_flag_with_its_page_and_refuses_an_extra() {
+    for spelling in [&["version"][..], &["--version"][..], &["-V"][..]] {
+        let mut args = spelling.to_vec();
+        args.push("--help");
+        let out = sbx(&args);
+        assert!(out.status.success(), "`sbx {args:?}` should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("sbx version —"),
+            "`sbx {args:?}` should render the page, got {stdout:?}"
+        );
+    }
+    let out = sbx(&["version", "bogus"]);
+    assert_eq!(out.status.code(), Some(2), "an extra argument is refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("version takes no argument 'bogus'"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("usage: sbx version"),
+        "the refusal should quote the verb's own synopsis, got {stderr}"
+    );
+}
