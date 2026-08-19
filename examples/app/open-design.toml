@@ -76,11 +76,19 @@ mkdir -p "$HOME/.local/bin"
 # `yarn` and `yarnpkg` it resolves the link before it compares targets, which fails on a dangling
 # one and takes the whole `enable` down with it; the offending shim survives that failure, so every
 # later launch fails the same way.  Drop what no longer resolves and let Corepack write it fresh.
+dropped=""
 for shim in "$HOME/.local/bin"/*; do
     if [ -L "$shim" ] && [ ! -e "$shim" ]; then
+        dropped="$dropped $(basename "$shim")"
         rm -f "$shim"
     fi
 done
+# Say it, rather than repairing in silence: a reclaimed revision is an event the launch is the only
+# thing in a position to report, and a user who wonders why a launch touched their PATH shims has no
+# other trace of it.
+if [ -n "$dropped" ]; then
+    echo "sbx: dropped the Corepack shims$dropped, which pointed into a store path that has been reclaimed; they are written again below" >&2
+fi
 corepack enable --install-directory "$HOME/.local/bin"
 export PATH="$HOME/.local/bin:$PATH"
 

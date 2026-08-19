@@ -9943,25 +9943,52 @@ fn a_launch_that_installs_from_its_own_command_survives_an_absent_override_and_a
         "the dangling-shim state was not reproduced"
     );
 
-    let out = std::process::Command::new("bash")
-        .arg("-c")
-        .arg(&script)
-        .env("HOME", &home)
-        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-        // The override is what a refresh launch sets and an ordinary one does not.
-        .env_remove("OPEN_DESIGN_SBX_UPDATE")
-        .output()
-        .expect("run the shipped wrapper");
+    let launch = || {
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", &home)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            // The override is what a refresh launch sets and an ordinary one does not.
+            .env_remove("OPEN_DESIGN_SBX_UPDATE")
+            .output()
+            .expect("run the shipped wrapper");
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "an ordinary launch failed: {err}");
+        let saw = std::fs::read_to_string(home.join("corepack-saw"))
+            .expect("the wrapper did not reach Corepack at all");
+        assert!(
+            saw.is_empty(),
+            "Corepack was handed shims that resolve nowhere: {saw}"
+        );
+        err
+    };
+
+    // Reclaimed: the launch repairs, and says so. A repair the user cannot see is one they cannot
+    // tell from their PATH changing under them for no reason.
+    let spoke = launch();
     assert!(
-        out.status.success(),
-        "an ordinary launch failed: {}",
-        String::from_utf8_lossy(&out.stderr)
+        spoke.contains("reclaimed"),
+        "the repair was silent: {spoke}"
     );
-    let saw = std::fs::read_to_string(home.join("corepack-saw"))
-        .expect("the wrapper did not reach Corepack at all");
     assert!(
-        saw.is_empty(),
-        "Corepack was handed shims that resolve nowhere: {saw}"
+        spoke.contains("yarn"),
+        "the repair did not name what it dropped: {spoke}"
+    );
+
+    // Healthy: the same launch says nothing, which is what makes the sentence above a report of an
+    // event rather than a line printed on every launch.
+    for name in ["pnpm", "pnpx", "yarn", "yarnpkg"] {
+        std::os::unix::fs::symlink(bin.join("pnpm"), shims.join(name)).unwrap();
+    }
+    assert!(
+        shims.join("yarn").exists(),
+        "the healthy state was not set up"
+    );
+    let quiet = launch();
+    assert!(
+        !quiet.contains("reclaimed"),
+        "a launch with nothing to repair still announced one: {quiet}"
     );
 }
 
