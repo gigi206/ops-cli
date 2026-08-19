@@ -1,0 +1,33 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Origin: demo-repo
+Label: demo-repo
+Suite: stable
+Codename: stable
+Date: Tue, 18 Aug 2026 23:37:43 UTC
+Valid-Until: Tue, 25 Aug 2026 23:37:43 UTC
+Architectures: amd64
+Components: main
+MD5Sum:
+ e54e07314151df81d320e9020f297ab5 89 main/binary-amd64/Packages
+SHA1:
+ 40bc7327e96265376778c8753f3fb2fc823ff1ba 89 main/binary-amd64/Packages
+SHA256:
+ 0073c862bf90752e4efcac6614d45a22180dc9d6707250575eb17c85cafb8eb5 89 main/binary-amd64/Packages
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCgAdFiEEH/4NdmLdyXR9r+z+sfU0ZUGjzCUFAmqFm7cACgkQsfU0ZUGj
+zCVSohAApZwjJLnZEz2nTb451pRrQbnA/57l2v+TCiibabl59q49aXzVcOC4xKUG
+i3eKPwzanByap4bIKVJgD5AwJ/NCL3gHY0oJWrHpjkO9hZbja79VfCwzZLpfq6Ec
+P/bBN+cS57Xs3r2JywatIfKw04/D5Yv7dATl6PWCGW3pw2uVjamOpy+emp5rJ7Kz
+kFMuD92d60fQueEJLFoOty/UTZ+c69GzBOf5C2q0BrgVQXOZC13jpBtsFPkW1d5G
+V7UUNDhUt4jzhwSPNwit3eEIEagDA/P2q6BjFFteMdj3Djl/YTzQmEqduI8q7nxB
+WeU3lO+4PqkcldZuuZPPYneLnIBuZT+CcodH7JYZBbWTA/qd1dRGFt8/l96aTuN3
+BLYKSG8XtdHxoY1yiaar4kQ88MDJEiXxuYvVvBZUGmaO8j/LI4UTHCghXiTrs+Mo
+CSDF42j/tgJ2LUUlnmbS3b5P6GrNAB7GfQ/kS31jQDfTMSyvYs3d/ekXCdrjGV9O
+yCdwfEhAg9I4OJFqH42FfvDFTnfJIDQ9qtd7Hweug1eypMrCONwj7WTufs2bcrOW
+iHrfcC5+S94MtMyD4cA1uoYtKd+MPgGs7x1xnxi68ZUh6sXpi94sxkyPJcnwCalt
+whcf02QefAC8vKiqXGtdrIOFMtLOgdtvD7/I3HTaMhYyTVhfQXE=
+=3T9r
+-----END PGP SIGNATURE-----

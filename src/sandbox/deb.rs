@@ -27,6 +27,7 @@
 //! declared source forward (re-querying GitHub for the `github:` form, the apt index for the `apt:`
 //! form) and rewrites the lock.
 
+use super::openpgp;
 use super::prebuilt;
 use crate::store::Layout;
 use std::collections::BTreeMap;
@@ -148,7 +149,8 @@ pub(crate) fn resolve_source(
 /// Resolve an `apt:` locator's Packages index to the concrete `.deb` URL of its highest-version
 /// package — the one network+derivation step `deb:apt:` adds over a direct `deb:` URL, kept as a
 /// seam so it is testable against a real index without the heavy `.deb` prefetch. Fetches the index
-/// (fresh past the cache on `sbx upgrade`), selects the newest version, resolves its `Filename:`
+/// (fresh past the cache on `sbx upgrade`), **checks it against the repository's signed `InRelease`**
+/// ([`attest_index`]), selects the newest version, resolves its `Filename:`
 /// against the repo root, and **re-validates that derived URL through [`is_valid_deb_url`](crate::config::is_valid_deb_url)** — the
 /// index is remote-controlled, so this is the injection boundary before the URL is fetched or
 /// interpolated into the generated derivation. Fail-closed at every step.
@@ -159,6 +161,15 @@ fn resolve_apt_deb_url(
     fresh: bool,
 ) -> io::Result<String> {
     let index = super::nixhub::fetch_url_text(nix, layout, packages_url, fresh)?;
+    // Between the fetch and the selection, and over this very buffer: what the signature attests
+    // and what the selection reads are the same bytes, with no second fetch to diverge from.
+    if let Attested::Unpinned(why) = attest_index(nix, layout, packages_url, &index, fresh)? {
+        crate::diag::warn(&format!(
+            "the apt repository at {packages_url} is trusted on TLS alone, because {why}; the \
+             `.deb` it selects is pinned by content hash, but nothing attests that this index is \
+             the one the repository published"
+        ));
+    }
     let (version, filename) = select_latest_apt_deb(&index).map_err(|e| {
         io::Error::other(format!(
             "the apt Packages index at {packages_url} could not be resolved: {e}"
@@ -178,6 +189,367 @@ fn resolve_apt_deb_url(
         )));
     }
     Ok(url)
+}
+
+/// The `InRelease` that attests an apt repository's indexes: the signed file at the root of the
+/// suite whose `Packages` a locator names. Derived from the locator rather than configured, because
+/// the layout is fixed — `<root>/dists/<suite>/<component>/binary-<arch>/Packages` — and a second
+/// place to write the same fact is a second place for it to be wrong.
+fn inrelease_url(packages_url: &str) -> Option<String> {
+    let (root, rest) = packages_url.split_once("/dists/")?;
+    let suite = rest.split('/').next().filter(|s| !s.is_empty())?;
+    Some(format!("{root}/dists/{suite}/InRelease"))
+}
+
+/// The index's path as `InRelease` names it — everything after the suite, which is what the signed
+/// digest lines are keyed by (`main/binary-amd64/Packages`).
+fn index_path(packages_url: &str) -> Option<&str> {
+    let (_, rest) = packages_url.split_once("/dists/")?;
+    let (_, path) = rest.split_once('/')?;
+    Some(path).filter(|p| !p.is_empty())
+}
+
+/// The digest a signed `Release` body attests for one indexed file, as `(algorithm, hex, size)`.
+///
+/// A `Release` lists the same file four times, under `MD5Sum:`, `SHA1:`, `SHA256:` and `SHA512:`.
+/// Only the last two are read, strongest first, and **MD5 and SHA-1 are not fallbacks**: a
+/// repository that publishes only those is treated as publishing nothing, because a digest an
+/// attacker can collide attests nothing about the bytes it names. Sections are recognised by their
+/// header sitting at column zero, so a filename inside a section can never be read as one.
+fn signed_digest(release: &str, path: &str) -> Option<(&'static str, String, u64)> {
+    let mut section: Option<&'static str> = None;
+    let mut found: Option<(&'static str, String, u64)> = None;
+    for line in release.lines() {
+        if !line.starts_with([' ', '\t']) {
+            section = match line.trim_end() {
+                "SHA256:" => Some("SHA256"),
+                "SHA512:" => Some("SHA512"),
+                _ => None,
+            };
+            continue;
+        }
+        let Some(algorithm) = section else { continue };
+        // ` <hex> <size> <path>`, whitespace-separated and padded for alignment.
+        let mut fields = line.split_whitespace();
+        let (Some(hex), Some(size), Some(name)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if name != path || fields.next().is_some() {
+            continue;
+        }
+        let Ok(size) = size.parse::<u64>() else {
+            continue;
+        };
+        if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        // SHA-512 wins when both are published; otherwise take what there is.
+        if algorithm == "SHA512" || found.is_none() {
+            found = Some((algorithm, hex.to_ascii_lowercase(), size));
+        }
+    }
+    found
+}
+
+/// Whether the bytes an index was fetched as are the ones a signed `Release` attests. The digest is
+/// computed over the caller's own buffer — the same `String` the selection then parses — so there
+/// is no arrangement in which the verified bytes and the parsed bytes are two different fetches.
+fn index_matches(index: &str, algorithm: &str, expected: &str, size: u64) -> bool {
+    use crate::plugins::catalogue::to_hex;
+    use sha2::Digest as _;
+    if index.len() as u64 != size {
+        return false;
+    }
+    let digest = match algorithm {
+        "SHA512" => to_hex(&sha2::Sha512::digest(index.as_bytes())),
+        _ => to_hex(&sha2::Sha256::digest(index.as_bytes())),
+    };
+    // Compared as lowercase hex on both sides; `Release` publishes lowercase, but a repository that
+    // published uppercase would otherwise fail for a reason that is not the one being tested.
+    digest == expected.to_ascii_lowercase()
+}
+
+/// Where the signing key of one apt repository is pinned. Named by the digest of the suite the
+/// locator points at rather than by the repository's own name, which nothing publishes: two
+/// locators into the same suite share one pin, and two suites of one vendor pin separately, which
+/// is what signing them separately would mean.
+fn pinned_key_path(layout: &Layout, inrelease_url: &str) -> std::path::PathBuf {
+    use crate::plugins::catalogue::to_hex;
+    use sha2::Digest as _;
+    let name = to_hex(&sha2::Sha256::digest(inrelease_url.as_bytes()));
+    layout.apt_keys_dir().join(format!("{name}.asc"))
+}
+
+/// Where a key is fetched from on a first pin, by the fingerprint the signature claims. A keyserver
+/// attests **nothing** — anyone may upload a key under any identity — which is exactly why the
+/// fingerprint is the anchor and the fetched material is bound back to it before it is used. What
+/// this endpoint provides is availability, not authority.
+/// The URL is interpolated into a `builtins.fetchurl` expression, and it carries no metacharacter
+/// by construction: a fingerprint is a fixed-size byte array, so its rendering is always forty hex
+/// digits. Nothing remote reaches this string.
+fn keyserver_url(fingerprint: &openpgp::Fingerprint) -> String {
+    format!(
+        "https://keys.openpgp.org/vks/v1/by-fingerprint/{}",
+        openpgp::hex(fingerprint)
+    )
+}
+
+/// Read a key and say what fingerprint it must answer to.
+///
+/// `claim` is `Some` only on a **first pin**, carrying the fingerprint the signature named. The key
+/// then comes from a keyserver, which serves whatever it is asked for and vouches for nothing, so
+/// the anchor is the claim and not the material: a keyserver answering with a different key is
+/// refused by the comparison rather than tried against the signature. With no claim the key is the
+/// one sbx itself pinned, and it answers to its own fingerprint — there the enforcement is the
+/// signature, which a re-keyed repository cannot satisfy.
+fn anchored_key(
+    armored: &str,
+    claim: Option<openpgp::Fingerprint>,
+) -> Result<(openpgp::PublicKey, openpgp::Fingerprint), String> {
+    let key = openpgp::parse_public_key(armored)?;
+    let anchor = claim.unwrap_or(key.fingerprint);
+    Ok((key, anchor))
+}
+
+/// The verdict of checking an index against its repository's signature, so the caller can tell a
+/// repository that failed its own attestation from one that never had a pin to enforce.
+enum Attested {
+    /// The index is the one a signature by the pinned key attests.
+    Yes,
+    /// No key is pinned for this repository and none could be learned, so nothing was enforced.
+    /// This is the trust level a `deb:` URL has always had, reached only on a first pin.
+    Unpinned(String),
+}
+
+/// Check an apt index against the `InRelease` its repository publishes, pinning the signing key on
+/// a first encounter and enforcing that pin ever after.
+///
+/// The chain this closes runs signature -> index digest -> the `.deb` hash the caller already pins,
+/// and it is only a chain if every link is checked against the artefact the next one consumes.
+/// So `index` is the caller's own buffer, and the digest is taken over it rather than over a
+/// second fetch.
+///
+/// **Trust on first use, deliberately.** A first pin has no authenticity: the fingerprint is read
+/// from the signature itself and the key is fetched by it, so whoever served the index chose both.
+/// Its value is the pin it establishes — every later `sbx upgrade deb` must present a signature by
+/// that same key, so a repository that is re-keyed, or an index served by someone else, is refused
+/// rather than resolved. This is the trust model [`crate::plugins::stores`] already applies to a
+/// plugin store, for the same reason.
+///
+/// A first pin that cannot be established — no `InRelease`, no reachable key, a signature this
+/// module does not read — leaves the resolve at the trust level it has always had and says so. It
+/// does not fail the launch: the repository's own availability, and a keyserver's, would otherwise
+/// decide whether a project can be provisioned. Once a key is pinned that latitude ends.
+fn attest_index(
+    nix: &Path,
+    layout: &Layout,
+    packages_url: &str,
+    index: &str,
+    fresh: bool,
+) -> io::Result<Attested> {
+    let Some(url) = inrelease_url(packages_url) else {
+        return Ok(Attested::Unpinned(
+            "its URL names no `/dists/<suite>/` to find an `InRelease` under".to_string(),
+        ));
+    };
+    let path = index_path(packages_url).ok_or_else(|| {
+        io::Error::other(format!(
+            "the apt Packages URL names no index path under its suite: {packages_url}"
+        ))
+    })?;
+    let pin = pinned_key_path(layout, &url);
+    let pinned = std::fs::read_to_string(&pin).ok();
+    let signed = match super::nixhub::fetch_url_text(nix, layout, &url, fresh) {
+        Ok(text) => text,
+        Err(e) if pinned.is_none() => {
+            return Ok(Attested::Unpinned(format!(
+                "it publishes no `InRelease` sbx could fetch ({e})"
+            )));
+        }
+        // A repository whose key is pinned has published an `InRelease` before. Its disappearance
+        // is the shape of an attacker removing the attestation, not of a repository that never had
+        // one, so it is refused rather than downgraded.
+        Err(e) => {
+            return Err(io::Error::other(format!(
+                "the apt repository at {url} no longer publishes the `InRelease` whose signing key \
+                 sbx pinned, so the index it serves cannot be attested: {e}"
+            )));
+        }
+    };
+    // Three things travel together on purpose: the key, the armor to pin if it attests, and the
+    // fingerprint the key must answer to. On a first pin that fingerprint is the one the SIGNATURE
+    // claims, not the fetched key's own — a keyserver serves whatever it is asked for, so binding
+    // the material back to the claim is what makes the fetch safe to use at all.
+    let (key, armored, expected) = match pinned {
+        Some(armored) => {
+            let (key, anchor) = anchored_key(&armored, None).map_err(|e| {
+                io::Error::other(format!(
+                    "the signing key pinned for {url} cannot be read ({e}); remove {} to pin it \
+                     again from the repository",
+                    pin.display()
+                ))
+            })?;
+            (key, None, anchor)
+        }
+        None => {
+            let claimed = match openpgp::issuer_fingerprint(&signed) {
+                Ok(fingerprint) => fingerprint,
+                Err(e) => {
+                    return Ok(Attested::Unpinned(format!(
+                        "its `InRelease` carries no signature sbx can read ({e})"
+                    )));
+                }
+            };
+            let armored =
+                match super::nixhub::fetch_url_text(nix, layout, &keyserver_url(&claimed), fresh) {
+                    Ok(armored) => armored,
+                    Err(e) => {
+                        return Ok(Attested::Unpinned(format!(
+                            "the key {} its `InRelease` is signed with is published nowhere sbx \
+                             could fetch it ({e})",
+                            openpgp::hex(&claimed)
+                        )));
+                    }
+                };
+            match anchored_key(&armored, Some(claimed)) {
+                Ok((key, anchor)) => (key, Some(armored), anchor),
+                Err(e) => {
+                    return Ok(Attested::Unpinned(format!(
+                        "the key {} its `InRelease` names cannot be read ({e})",
+                        openpgp::hex(&claimed)
+                    )));
+                }
+            }
+        }
+    };
+    // The comparison happens inside `verify_clearsigned`, before the key reaches the verifier, so a
+    // key that is not the expected one is refused rather than tried. On a first pin that rejects a
+    // keyserver answering with something other than what was asked for; afterwards `expected` is the
+    // pinned key's own, and it is the signature that has to hold.
+    let release = openpgp::verify_clearsigned(&signed, &key, &expected)
+        .map_err(|e| io::Error::other(format!("the `InRelease` at {url} is not valid: {e}")))?;
+    let (algorithm, digest, size) = signed_digest(&release, path).ok_or_else(|| {
+        io::Error::other(format!(
+            "the signed `InRelease` at {url} attests no SHA-256 or SHA-512 digest for `{path}`, so \
+             the index it serves is not covered by its signature"
+        ))
+    })?;
+    if !index_matches(index, algorithm, &digest, size) {
+        // Fail closed, and name both causes rather than only the alarming one: the index and the
+        // attestation are two fetches, so a repository that published between them mismatches for a
+        // reason that is not an attack. Retrying on a mismatch is deliberately not done, since it
+        // would let whoever controls the index decide how many attempts a refusal costs.
+        return Err(io::Error::other(format!(
+            "the apt index at {packages_url} is not the one its signed `InRelease` attests \
+             ({algorithm} mismatch). Either the repository published between the two fetches, in \
+             which case resolving again succeeds, or the index served is not the one it signed"
+        )));
+    }
+    if let Some(armored) = armored {
+        // Pinned only now, so a key is recorded when it has actually attested an index and never
+        // merely because it parsed.
+        write_pinned_key(&pin, &armored)?;
+        crate::diag::note(&format!(
+            "pinned the signing key of the apt repository at {url} ({}); every later `sbx upgrade \
+             deb` must present a signature by this key",
+            openpgp::hex(&key.fingerprint)
+        ));
+    }
+    if let Some(until) = valid_until(&release)
+        && expired(until)
+    {
+        // A warning, not a refusal. `Valid-Until` is a staleness signal, and this check runs on a
+        // first pin and on `sbx upgrade deb`, never on the launch hot path — so a machine that has
+        // been offline past the window still resolves, while a repository that has stopped being
+        // republished is named.
+        crate::diag::warn(&format!(
+            "the signed `InRelease` at {url} expired on {until}; its signature still holds, but the \
+             repository has not republished it, so what it attests may have been superseded"
+        ));
+    }
+    Ok(Attested::Yes)
+}
+
+/// Write a pinned key with the directory it lives in, owner-only, so what sbx verified cannot be
+/// replaced by anything a project can reach.
+fn write_pinned_key(path: &Path, armored: &str) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    if let Some(parent) = path.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    std::fs::write(path, armored)
+}
+
+/// The `Valid-Until` a signed `Release` carries, verbatim. Returned as the repository wrote it so a
+/// message can quote it, rather than reformatted into a shape the user would then have to match
+/// against the file.
+fn valid_until(release: &str) -> Option<&str> {
+    release
+        .lines()
+        .find_map(|l| l.strip_prefix("Valid-Until:"))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
+/// Whether an apt `Valid-Until` stamp is in the past. The format is fixed by the Debian repository
+/// specification (`Tue, 25 Aug 2026 23:37:43 UTC`), so it is read directly rather than by pulling in
+/// a date parser for one field. An unparseable stamp is **not** expired: this drives a warning, and
+/// a warning that fires on a format sbx failed to read would train the user to ignore it.
+fn expired(stamp: &str) -> bool {
+    expired_at(stamp, now_seconds())
+}
+
+/// The comparison itself, against a caller-supplied clock, so the rule is testable without one.
+fn expired_at(stamp: &str, now: u64) -> bool {
+    parse_valid_until(stamp).is_some_and(|until| until < now)
+}
+
+/// Seconds since the epoch, as the only reading of the clock this file makes.
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Parse `[Day, ]DD Mon YYYY HH:MM:SS UTC` into seconds since the epoch. Only UTC is accepted — the
+/// specification requires it — so a stamp in another zone reads as unparseable rather than as a
+/// time shifted by an unknown offset.
+fn parse_valid_until(stamp: &str) -> Option<u64> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let stamp = stamp.split_once(", ").map_or(stamp, |(_, rest)| rest);
+    let mut fields = stamp.split_whitespace();
+    let day: u64 = fields.next()?.parse().ok()?;
+    let name = fields.next()?;
+    let month = MONTHS.iter().position(|m| *m == name)? as u64 + 1;
+    let year: u64 = fields.next()?.parse().ok()?;
+    let mut time = fields.next()?.split(':');
+    let (h, m, sec): (u64, u64, u64) = (
+        time.next()?.parse().ok()?,
+        time.next()?.parse().ok()?,
+        time.next()?.parse().ok()?,
+    );
+    if time.next().is_some() || fields.next()? != "UTC" || fields.next().is_some() {
+        return None;
+    }
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || (h, m, sec) >= (24, 60, 60) {
+        return None;
+    }
+    // Days from the civil epoch, by the shift-the-year-to-March algorithm: it makes the leap day the
+    // last day of the shifted year, so no month-length table is needed and no leap rule is special.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y / 400;
+    let year_of_era = y - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era;
+    Some((days - 719_468) * 86_400 + h * 3_600 + m * 60 + sec)
 }
 
 /// Select the newest package's `.deb` from an apt `Packages` index. The index is RFC822-style
@@ -854,5 +1226,189 @@ Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
             Some("https://apt.example.com/demo-app/apt/stable")
         );
         assert_eq!(apt_repo_root("https://h/no-dists/Packages"), None);
+    }
+
+    /// The exact bytes the clearsigned fixture attests, so a digest computed here can be compared
+    /// against one a signature covers rather than against one this test computed for itself.
+    const ATTESTED_INDEX: &str = concat!(
+        "Package: demo-app\n",
+        "Version: 1.2.3\n",
+        "Filename: pool/main/d/demo-app/demo-app_1.2.3_amd64.deb\n"
+    );
+    const ATTESTED_PATH: &str = "main/binary-amd64/Packages";
+
+    /// The signed `Release` body, obtained the way production obtains it: by verifying, not by
+    /// reading the file past its signature.
+    fn attested_release() -> String {
+        let armored = include_str!("openpgp/clearsigned.txt");
+        let key = openpgp::parse_public_key(include_str!("openpgp/key.asc")).expect("key parses");
+        openpgp::verify_clearsigned(armored, &key, &key.fingerprint).expect("fixture verifies")
+    }
+
+    #[test]
+    fn a_pin_that_no_longer_signs_the_repository_refuses_instead_of_resolving() {
+        let Some(nix) = store::resolve_nix(None) else {
+            skip_incapable!("skipping deb:apt pin enforcement: no nix on PATH");
+            return;
+        };
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        const INDEX: &str = "https://downloads.claude.ai/claude-desktop/apt/stable/dists/stable/main/binary-amd64/Packages";
+        // Pin a key that did not sign this repository — the shape of a repository that was re-keyed,
+        // or of an index served by someone else. Everything else about the resolve is unchanged, so
+        // what the refusal is about is the pin and nothing else.
+        let pin = pinned_key_path(&layout, &inrelease_url(INDEX).unwrap());
+        write_pinned_key(&pin, include_str!("openpgp/key.asc")).expect("the pin is written");
+        let err = match resolve_apt_deb_url(&nix, &layout, INDEX, true) {
+            Err(e) => e.to_string(),
+            Ok(url) => panic!("a repository whose pinned key no longer signs it resolved to {url}"),
+        };
+        // Refused at the signature, which is the enforcement: this is the whole value of pinning,
+        // and a resolve that merely warned here would leave the TOFU open at every upgrade.
+        assert!(err.contains("is not valid"), "{err}");
+        assert!(err.contains("signature verification failed"), "{err}");
+        // And with the pin removed the same call resolves, so the refusal is not the network or the
+        // index failing under another name.
+        std::fs::remove_file(&pin).expect("the pin is removed");
+        match resolve_apt_deb_url(&nix, &layout, INDEX, true) {
+            Ok(url) => assert!(url.ends_with("_amd64.deb"), "{url}"),
+            Err(e) => skip_unreachable!("skipping deb:apt pin enforcement (network/nix): {e}"),
+        }
+    }
+
+    #[test]
+    fn a_first_pin_holds_a_fetched_key_to_the_fingerprint_the_signature_claimed() {
+        let armored = include_str!("openpgp/key.asc");
+        let signed = include_str!("openpgp/clearsigned.txt");
+        let other = openpgp::parse_public_key(include_str!("openpgp/key_other.asc")).unwrap();
+
+        // With no claim the key is one sbx pinned itself, so it answers to its own fingerprint and
+        // the signature is what enforces.
+        let (key, anchor) = anchored_key(armored, None).expect("the pinned key reads");
+        assert_eq!(anchor, key.fingerprint);
+        assert!(openpgp::verify_clearsigned(signed, &key, &anchor).is_ok());
+
+        // On a first pin the anchor is the CLAIM, not the material. A keyserver that answered with
+        // some other key is then refused by the comparison instead of being tried against the
+        // signature — which is the only thing that makes fetching a key by fingerprint safe.
+        let (fetched, anchor) =
+            anchored_key(armored, Some(other.fingerprint)).expect("the fetched key reads");
+        assert_eq!(anchor, other.fingerprint);
+        assert_ne!(anchor, fetched.fingerprint);
+        let err = openpgp::verify_clearsigned(signed, &fetched, &anchor)
+            .expect_err("a key that is not the one claimed must be refused");
+        assert!(err.contains("not the pinned one"), "{err}");
+        // And when the keyserver answers with the key that was asked for, the anchor is satisfied
+        // and the resolve proceeds, so the refusal above is about the mismatch and nothing else.
+        let (fetched, anchor) =
+            anchored_key(armored, Some(key.fingerprint)).expect("the fetched key reads");
+        assert_eq!(anchor, fetched.fingerprint);
+        assert!(openpgp::verify_clearsigned(signed, &fetched, &anchor).is_ok());
+    }
+
+    #[test]
+    fn a_signed_release_attests_an_index_by_a_digest_an_attacker_cannot_collide() {
+        let release = attested_release();
+        let (algorithm, hex, size) =
+            signed_digest(&release, ATTESTED_PATH).expect("the fixture attests the index");
+        // A `Release` lists the same file under MD5Sum and SHA1 as well, and lists them FIRST. A
+        // lookup that scanned for the filename would take the MD5 line — which is why sections are
+        // recognised by their header and only the strong two are read.
+        assert_eq!(algorithm, "SHA256");
+        assert_eq!(hex.len(), 64);
+        assert_eq!(size, ATTESTED_INDEX.len() as u64);
+        assert!(
+            release.contains("MD5Sum:"),
+            "the fixture must carry the weak sections"
+        );
+        assert!(release.contains("SHA1:"));
+        // Neither weak digest may be reachable as the answer, whatever the file is called.
+        let md5 = release
+            .lines()
+            .find(|l| l.starts_with(' ') && l.ends_with(ATTESTED_PATH))
+            .expect("the MD5 line exists");
+        assert!(
+            !md5.contains(&hex),
+            "the answer must not come from the MD5 section"
+        );
+    }
+
+    #[test]
+    fn an_index_the_signature_does_not_cover_is_refused_though_the_signature_is_valid() {
+        let release = attested_release();
+        let (algorithm, hex, size) = signed_digest(&release, ATTESTED_PATH).unwrap();
+        // The chain closes: these bytes are the ones the signature covers.
+        assert!(index_matches(ATTESTED_INDEX, algorithm, &hex, size));
+        // And this is the property that separates a chain from a signature check that then trusts
+        // the pin it already held. The signature over the `Release` is untouched and still verifies;
+        // only the index was swapped, for one of the same length so the size check is not what
+        // catches it.
+        let swapped = ATTESTED_INDEX.replacen("1.2.3_amd64", "9.9.9_amd64", 1);
+        assert_eq!(swapped.len(), ATTESTED_INDEX.len());
+        assert_ne!(swapped, ATTESTED_INDEX);
+        assert!(!index_matches(&swapped, algorithm, &hex, size));
+        // A truncation is caught too, and by the digest rather than only by the length.
+        assert!(!index_matches(
+            &ATTESTED_INDEX[..ATTESTED_INDEX.len() - 1],
+            algorithm,
+            &hex,
+            size
+        ));
+    }
+
+    #[test]
+    fn a_stronger_digest_wins_and_an_unattested_path_has_no_answer() {
+        let release = "SHA256:\n abcd 10 main/x\nSHA512:\n ef01 10 main/x\n";
+        let (algorithm, hex, _) = signed_digest(release, "main/x").expect("attested");
+        assert_eq!((algorithm, hex.as_str()), ("SHA512", "ef01"));
+        // A path the signature says nothing about must not fall back to anything.
+        assert!(signed_digest(release, "main/y").is_none());
+        // A file named inside a section, but under a weak header, is not an answer either.
+        assert!(signed_digest("MD5Sum:\n abcd 10 main/x\n", "main/x").is_none());
+        // An indented line under no section at all is ignored rather than adopted by the last one.
+        assert!(signed_digest(" ef01 10 main/x\n", "main/x").is_none());
+    }
+
+    #[test]
+    fn the_attestation_is_looked_for_where_the_layout_puts_it() {
+        let index = "https://apt.example.com/demo/stable/dists/stable/main/binary-amd64/Packages";
+        assert_eq!(
+            inrelease_url(index).as_deref(),
+            Some("https://apt.example.com/demo/stable/dists/stable/InRelease")
+        );
+        // The path the signed digests are keyed by is everything under the suite — the same string
+        // `signed_digest` is then asked about, so the two cannot drift.
+        assert_eq!(index_path(index), Some("main/binary-amd64/Packages"));
+        assert_eq!(inrelease_url("https://h/no-dists/Packages"), None);
+        assert_eq!(index_path("https://h/x/dists/stable"), None);
+    }
+
+    #[test]
+    fn an_expiry_is_read_only_in_the_form_the_specification_fixes() {
+        let release = "Valid-Until: Tue, 25 Aug 2026 23:37:43 UTC\n";
+        assert_eq!(valid_until(release), Some("Tue, 25 Aug 2026 23:37:43 UTC"));
+        let stamp = "Tue, 25 Aug 2026 23:37:43 UTC";
+        // One second either side of the stamp, so the comparison is the boundary and not a window.
+        let at = parse_valid_until(stamp).expect("the specification's form parses");
+        assert!(!expired_at(stamp, at));
+        assert!(expired_at(stamp, at + 1));
+        assert!(!expired_at(stamp, at - 1));
+        // A known instant, so the epoch arithmetic is held to a value and not to itself.
+        assert_eq!(parse_valid_until("Thu, 01 Jan 1970 00:00:00 UTC"), Some(0));
+        // Both sides of a leap-year boundary, checked against `date -u -d ... +%s`.
+        assert_eq!(
+            parse_valid_until("Sat, 01 Mar 2036 00:00:00 UTC"),
+            Some(2_087_942_400)
+        );
+        assert_eq!(
+            parse_valid_until("Fri, 29 Feb 2036 00:00:00 UTC"),
+            Some(2_087_856_000)
+        );
+        // Anything sbx cannot read is NOT expired: a warning that fired on an unread format would
+        // teach the user to ignore it.
+        assert!(!expired_at("Tue, 25 Aug 2026 23:37:43 CEST", u64::MAX));
+        assert!(!expired_at("whenever", u64::MAX));
+        assert!(!expired_at("Tue, 25 Foo 2026 23:37:43 UTC", u64::MAX));
+        assert!(valid_until("Origin: demo\n").is_none());
     }
 }

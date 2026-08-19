@@ -47,6 +47,7 @@ The important subtrees:
 | `mise/`, `mise-plugin/` | the host-side mise home and the embedded `nix:` backend plugin |
 | `plugins/` | installed [resolver plugins](../secrets/plugins) |
 | `stores/<name>/` | cached, verified remote [plugin stores](../secrets/plugins) |
+| `apt-keys/` | signing keys pinned for [`deb:apt:` repositories](../configuration/packages#signed-apt-indexes), one per repository |
 | `nixpkgs.lock` | the global base channel revision (see [Upgrading](../concepts/upgrade)) |
 | `mise-engine.lock` | the mise engine revision, independent of the base channel |
 

@@ -71,6 +71,12 @@ const DATA_ENTRIES: &[Entry] = &[
         enumerate: Enumerate::None,
     },
     Entry {
+        label: "apt-keys/",
+        rel: "apt-keys",
+        desc: "pinned apt repository signing keys (one per repository)",
+        enumerate: Enumerate::None,
+    },
+    Entry {
         label: "sessions/",
         rel: "sessions",
         desc: "session registry read by `sbx session ls`",

@@ -41,6 +41,7 @@ mod flake_inline;
 mod mise;
 mod miseplugin;
 pub(crate) mod nixhub;
+mod openpgp;
 mod packages;
 mod prebuilt;
 mod projectstore;

@@ -212,10 +212,10 @@ Three source forms:
 
 For `deb:github:` and `deb:apt:` the URL sbx derives from the remote index/release is
 **re-validated** by the same `https://`-and-`.deb` charset check a hand-written `deb:` URL passes,
-so a compromised index cannot inject a URL. `deb:apt:` reads the **uncompressed** `Packages` only,
-does **no** `InRelease`/GPG signature check, and expects a **single-application** repo: the same
-TLS-plus-unpack trust level as a direct `deb:` URL, not a general Debian mirror; its version order
-is plain dotted-decimal (a non-numeric version is refused rather than mis-ordered).
+so a compromised index cannot inject a URL. `deb:apt:` reads the **uncompressed** `Packages` only
+and expects a **single-application** repo, not a general Debian mirror; its version order is plain
+dotted-decimal (a non-numeric version is refused rather than mis-ordered). The index it reads is
+checked against the repository's signed `InRelease`; see [Signed apt indexes](#signed-apt-indexes).
 
 Pairs with [`gui = "wayland"`](gui) for the display; sbx seeds its MITM CA into the cage's NSS
 store so the Chromium app trusts a filtering posture's proxy.
@@ -489,7 +489,7 @@ backends do not, and each stops at a different place:
 |---|---|---|
 | `nix:` | the revision is pinned and realised as a **locked** flake, its sources fetched under nix's own integrity checks, and the revision is checked against nixpkgs history before it is pinned | the build is reproducible from that revision, and the revision is one the repository's history actually contains. *Which* revision answers your `(package, version)` still comes from the [nixhub](../reference/glossary) index, and `sbx` validates its **shape** (40 lowercase hex characters) |
 | `deb:`, `appimage:`, `tarball:`, `binary:` | the URL charset, then a hash **recorded on the first fetch** and re-checked on every later one | the artefact has not changed since `sbx` first saw it. It does **not** prove that first fetch was the publisher's: the hash is whatever the download returned, and `sbx upgrade` re-resolves from the same place |
-| `deb:apt:` | the above, plus the `Packages` index it reads | as stated with that backend: no `InRelease` or GPG check, so the vendor's own signature is never consulted |
+| `deb:apt:` | the above, plus the `Packages` index checked against the repository's signed `InRelease`, under a signing key pinned on first use | the index is the one the holder of that key published. The **first** pin is trust on first use and proves nothing on its own; from then on a re-keyed repository, or an index served by someone else, is refused |
 
 **Why the revision is checked.** Pinning `github:NixOS/nixpkgs/<rev>` reads like a guarantee that the
 revision belongs to nixpkgs, and on its own it is not one. GitHub keeps pull request heads in the
@@ -504,6 +504,56 @@ Nothing is refused on this ground, for two reasons. A fix backported to a releas
 branch was cut belongs to no `master` history either, so an ordinary stable pin can read like a
 hostile one. And when GitHub answers nothing at all, because you are offline or over its rate limit,
 the launch goes on in silence: no answer is not evidence.
+
+### Signed apt indexes
+
+An apt repository signs the list of what it publishes. `deb:apt:` reads that signature.
+
+Alongside the `Packages` index, an apt repository publishes an `InRelease`: a signed file that
+carries the digest of every index under the same suite. `sbx` fetches it, verifies the signature,
+looks up the digest it attests for the very index just downloaded, and compares it against those
+bytes before a single line of the index is read. The chain runs from the signature to the index
+digest to the `.deb` content hash already in the lock, so what the resolve selects is what the
+repository signed.
+
+The signing key is learned once and enforced afterwards. On a first encounter `sbx` reads the
+fingerprint the signature names, fetches the matching key **from `keys.openpgp.org`**, checks that
+the key really is the one that fingerprint names, and pins it under its data directory. That request
+is made by `sbx` on the host, not from inside a cage, and it is the only third party involved: a
+keyserver vouches for nothing, which is precisely why the fingerprint is the anchor and the material
+it returns is checked against it. Once a key is pinned no keyserver is consulted again. `sbx` reports
+the fingerprint when it pins:
+
+```
+sbx: note: pinned the signing key of the apt repository at https://example.com/apt/dists/stable/InRelease
+(A1B2C3...); every later `sbx upgrade deb` must present a signature by this key
+```
+
+That first pin proves nothing by itself, and it is not meant to. Whoever served the index chose both
+the signature and the fingerprint in it, so a repository that was already hostile stays hostile. What
+the pin buys is everything after: each later resolve, and every `sbx upgrade deb`, has to present a
+signature by that same key. A repository that is re-keyed, or an index served by somebody else, is
+**refused** rather than resolved. It is the trust model `sbx` already applies to a
+[signed plugin store](../secrets/stores), for the same reason.
+
+Two behaviours are worth knowing before you meet them.
+
+A repository that publishes no `InRelease`, or one signed in a form `sbx` does not read, keeps the
+plain TLS trust level a direct `deb:` URL has and **says so** on the resolve. Nothing is pinned, so
+nothing is enforced later, and the warning returns the first time each project resolves that
+locator, since that is each time the question is actually asked. Once a key has been pinned that
+latitude ends: an `InRelease` that then disappears is refused, because a missing attestation on a
+repository that used to carry one is not the same event as one that never did. The pin itself is not
+per project, so a key learned while working on one project is enforced in all of them.
+
+An `InRelease` carries a `Valid-Until`, usually a week out. Past it, `sbx` **warns** and goes on. The
+signature still holds; what has lapsed is the repository's promise to keep republishing, and refusing
+there would strand a machine that has merely been offline for a fortnight. What does refuse is a
+signature that fails, a key that is not the pinned one, and an index the signature does not cover.
+
+To pin a repository again from scratch, delete its key file under `apt-keys/` in the `sbx` data
+directory. The next resolve pins whatever the repository is serving then, with the same first-use
+caveat as before.
 
 This is a deliberate stopping point rather than an oversight, and for most of these vendors there is
 nothing published to verify against. Where it matters to you, the containment is the one the model

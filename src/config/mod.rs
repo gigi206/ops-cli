@@ -4677,10 +4677,12 @@ pub(crate) fn is_valid_deb_github_locator(s: &str) -> bool {
 /// `builtins.fetchurl`), but it points at the index, not a `.deb`, so the `.deb` suffix is **not**
 /// required. sbx fetches the index, selects the highest version's `.deb`, and **re-validates that
 /// derived URL through [`is_valid_deb_url`]** before it is fetched or built — so the remote index
-/// cannot inject a bad URL. Scope (documented, not a gap): the index must be the **uncompressed**
-/// `Packages` (no `.gz`/`.xz` decompression), sbx does **no** `InRelease`/GPG signature check, and it
-/// expects a **single-application** repo — the same TLS-plus-unpack trust level as a direct `deb:`
-/// URL, not a general Debian mirror.
+/// cannot inject a bad URL. The index is then checked against the repository's signed `InRelease`,
+/// whose signing key sbx pins the first time it verifies one, so a later index must be attested by
+/// that same key or the resolve is refused. Scope (documented, not a gap): the index must be the
+/// **uncompressed** `Packages` (no `.gz`/`.xz` decompression) and sbx expects a
+/// **single-application** repo, not a general Debian mirror; a repository that publishes no
+/// `InRelease` keeps the TLS-plus-unpack trust level of a direct `deb:` URL, and says so.
 pub(crate) fn is_valid_deb_apt_locator(s: &str) -> bool {
     let Some(url) = s.strip_prefix("apt:") else {
         return false;

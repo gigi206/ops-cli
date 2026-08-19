@@ -23,6 +23,12 @@
 # index (their pool publishes versioned filenames with no `latest` alias), sbx picks the newest
 # version's `.deb` and pins it per project, and `sbx upgrade deb` re-reads the index.
 #
+# THE INDEX IS ATTESTED. That pool publishes a signed `InRelease` covering the index, so sbx verifies
+# it and pins the signing key the first time, naming the fingerprint on stderr. The first pin is
+# trust on first use and proves nothing by itself; every later resolve and `sbx upgrade deb` must
+# present a signature by that same key, and a re-keyed pool is refused rather than resolved. To pin
+# again from scratch, delete the repository's file under `apt-keys/` in sbx's data directory.
+#
 # THE `{WS}` GRANTS ARE DELIBERATE. Three hosts carry WebSockets the app depends on (voice
 # speech-to-text, the real-time session channel, Cowork's browser bridge). sbx gates a WebSocket
 # behind an explicit `WS` opt-in that a plain `{*}` does NOT cover, because a bidirectional channel

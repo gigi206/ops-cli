@@ -177,6 +177,15 @@ impl Layout {
         self.data_dir.join("stores")
     }
 
+    /// Where the signing key of an apt repository is pinned once sbx has verified an `InRelease`
+    /// against it, one armored key per repository. Trusted by location like the plugins and stores
+    /// trees: a project cannot write here, so what is pinned is what sbx itself verified. The pin is
+    /// deliberately **not** per project — a repository's signing key is a property of that
+    /// repository, so a key that changes under one project is caught in every other.
+    pub(crate) fn apt_keys_dir(&self) -> PathBuf {
+        self.data_dir.join("apt-keys")
+    }
+
     /// The cache directory of one named remote store: `<stores>/<name>/`, holding its
     /// `store.toml` (url + public key), `checkout/` (the verified git clone), and
     /// `catalogue.lock` (the catalogue revision last accepted).
