@@ -350,6 +350,82 @@ pub(crate) fn assert_nix_parses(instantiate: &Path, emitter: &str, expr: &str) {
     );
 }
 
+/// A skip must promise only what it can keep: an off-host condition is counted, never enforced.
+///
+/// The enforceable macro is the one `SBX_REQUIRE_CAPABLE` turns into a failure, and `mise run
+/// test-cage` sets exactly that over the suites meant to prove the cage ran. A site that spells an
+/// **off-host** reason with it hands that lever a condition no host setting can make dependable: a
+/// network hiccup then reads as "this host cannot sandbox", which is the single distinction the
+/// task exists to make.
+///
+/// The exception is real and stays mechanical: a reason may name an off-host condition when it also
+/// names the host capability, because several sites fail for either and say so ("host cannot
+/// sandbox (no userns/bwrap, or the base cache is unreachable)"). Those are enforceable on their
+/// host half, so they keep the enforceable macro.
+#[test]
+fn an_off_host_skip_is_never_written_with_the_enforceable_macro() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Built at runtime, so this file does not match its own needle.
+    let needle = format!("skip_{}!(", "incapable");
+    const OFF_HOST: [&str; 3] = ["is unreachable", "download fault", "flake upstream"];
+    const HOST: &str = "cannot sandbox";
+    let mut offenders = Vec::new();
+    let mut scanned = 0;
+    let mut stack = vec![root.join("src"), root.join("tests")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .expect("read a source directory")
+            .flatten()
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read a source file");
+            let mut from = 0;
+            while let Some(at) = text[from..].find(&needle) {
+                let call = from + at + needle.len();
+                from = call;
+                // The reason is the first string literal of the call, which rustfmt may have put on
+                // the next line. Read it raw: an escaped quote inside it would end it early, and a
+                // reason that quotes a command's own error is exactly where that happens.
+                let Some(open) = text[call..].find('"') else {
+                    continue;
+                };
+                let start = call + open + 1;
+                let mut end = start;
+                let bytes = text.as_bytes();
+                while end < bytes.len() && (bytes[end] != b'"' || bytes[end - 1] == b'\\') {
+                    end += 1;
+                }
+                let reason = &text[start..end.min(text.len())];
+                scanned += 1;
+                if OFF_HOST.iter().any(|o| reason.contains(o)) && !reason.contains(HOST) {
+                    let rel = path.strip_prefix(root).unwrap_or(&path).display();
+                    let line = text[..start].lines().count();
+                    offenders.push(format!("{rel}:{line}: {reason}"));
+                }
+            }
+        }
+    }
+    // The sweep is worth nothing if it found nothing to read, which a moved macro or a renamed
+    // directory would produce in silence.
+    assert!(
+        scanned > 50,
+        "the sweep read only {scanned} enforceable skips: it is looking in the wrong place"
+    );
+    assert!(
+        offenders.is_empty(),
+        "these skips name a condition outside the host, so they must not be enforceable \
+         (use the counted macro instead):\n{}",
+        offenders.join("\n")
+    );
+}
+
 /// No test may give up in silence: a skip has to go through the macros, never through a bare
 /// print.
 ///

@@ -1340,7 +1340,7 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
         return;
     }
     if !postman_echo_reachable() {
-        skip_incapable!("skipping signer e2e: postman-echo.com is unreachable");
+        skip_unreachable!("skipping signer e2e: postman-echo.com is unreachable");
         return;
     }
 
@@ -1850,7 +1850,7 @@ fn a_signer_that_asked_for_a_body_digest_is_told_it_and_the_body_still_arrives()
         return;
     }
     if !postman_echo_reachable() {
-        skip_incapable!("skipping body digest e2e: postman-echo.com is unreachable");
+        skip_unreachable!("skipping body digest e2e: postman-echo.com is unreachable");
         return;
     }
 
@@ -3567,7 +3567,7 @@ fn a_secret_is_injected_masked_and_stripped_on_the_http2_grpc_path() {
         return;
     }
     if !grpcb_in_reachable() {
-        skip_incapable!("skipping h2 grpc secret e2e: grpcb.in is unreachable");
+        skip_unreachable!("skipping h2 grpc secret e2e: grpcb.in is unreachable");
         return;
     }
 
@@ -4765,7 +4765,7 @@ fn a_usr_bin_env_shebang_resolves_in_the_cage() {
         return;
     }
     if !cache_reachable() {
-        skip_incapable!("skipping usr-bin-env e2e: the network is unreachable");
+        skip_unreachable!("skipping usr-bin-env e2e: the network is unreachable");
         return;
     }
 
@@ -4831,7 +4831,7 @@ fn a_tarball_resolve_command_runs_in_a_hermetic_cage_and_its_output_is_validated
         return;
     }
     if !cache_reachable() {
-        skip_incapable!("skipping tarball-resolve e2e: the network is unreachable");
+        skip_unreachable!("skipping tarball-resolve e2e: the network is unreachable");
         return;
     }
 
@@ -4905,7 +4905,7 @@ fn a_deb_resolve_command_runs_in_a_hermetic_cage_and_its_output_is_validated() {
         return;
     }
     if !cache_reachable() {
-        skip_incapable!("skipping deb-resolve e2e: the network is unreachable");
+        skip_unreachable!("skipping deb-resolve e2e: the network is unreachable");
         return;
     }
 
@@ -4980,7 +4980,7 @@ fn sbx_upgrade_deb_runs_a_deb_resolve_command_through_the_upgrade_cage() {
         return;
     }
     if !cache_reachable() {
-        skip_incapable!("skipping deb-upgrade-resolve e2e: the network is unreachable");
+        skip_unreachable!("skipping deb-upgrade-resolve e2e: the network is unreachable");
         return;
     }
 
@@ -5055,7 +5055,7 @@ fn an_appimage_resolve_command_runs_in_a_hermetic_cage_and_its_output_is_validat
         return;
     }
     if !cache_reachable() {
-        skip_incapable!("skipping appimage-resolve e2e: the network is unreachable");
+        skip_unreachable!("skipping appimage-resolve e2e: the network is unreachable");
         return;
     }
 
@@ -5124,7 +5124,7 @@ fn sbx_upgrade_appimage_runs_an_appimage_resolve_command_through_the_upgrade_cag
         return;
     }
     if !cache_reachable() {
-        skip_incapable!("skipping appimage-upgrade-resolve e2e: the network is unreachable");
+        skip_unreachable!("skipping appimage-upgrade-resolve e2e: the network is unreachable");
         return;
     }
 
@@ -5231,7 +5231,7 @@ fn a_bin_bash_shebang_resolves_in_the_cage() {
         return;
     }
     if !cache_reachable() {
-        skip_incapable!("skipping bin-bash e2e: the network is unreachable");
+        skip_unreachable!("skipping bin-bash e2e: the network is unreachable");
         return;
     }
 
@@ -5370,7 +5370,7 @@ fn the_cage_auto_equips_a_non_nix_mise_tool_at_launch() {
         return;
     }
     if !cache_reachable() {
-        skip_incapable!("skipping auto-equip e2e: the network is unreachable");
+        skip_unreachable!("skipping auto-equip e2e: the network is unreachable");
         return;
     }
 
@@ -5422,7 +5422,7 @@ fn the_cage_auto_equips_a_non_nix_tool_under_a_network_allowlist() {
         return;
     }
     if !cache_reachable() {
-        skip_incapable!("skipping auto-equip allowlist e2e: the network is unreachable");
+        skip_unreachable!("skipping auto-equip allowlist e2e: the network is unreachable");
         return;
     }
 
@@ -5494,7 +5494,7 @@ fn a_fresh_mise_package_app_runs_under_its_own_allowlist() {
         return;
     }
     if !cache_reachable() {
-        skip_incapable!("skipping fresh `mise:` package app e2e: the network is unreachable");
+        skip_unreachable!("skipping fresh `mise:` package app e2e: the network is unreachable");
         return;
     }
     if !github_api_has_quota() {
@@ -5644,7 +5644,7 @@ fn a_global_app_splits_mise_pools_across_two_projects() {
         return;
     }
     if !cache_reachable() {
-        skip_incapable!("skipping mise-split two-project e2e: the network is unreachable");
+        skip_unreachable!("skipping mise-split two-project e2e: the network is unreachable");
         return;
     }
     if !github_api_has_quota() {
@@ -5757,7 +5757,7 @@ fn a_global_apps_project_mise_tool_lands_in_the_per_project_pool() {
         return;
     }
     if !cache_reachable() {
-        skip_incapable!("skipping Lane-2 pool e2e: the network is unreachable");
+        skip_unreachable!("skipping Lane-2 pool e2e: the network is unreachable");
         return;
     }
     if !github_api_has_quota() {
@@ -5857,7 +5857,7 @@ fn sbx_upgrade_mise_rolls_a_mise_package_in_cage() {
         return;
     }
     if !cache_reachable() {
-        skip_incapable!("skipping mise: package upgrade e2e: the network is unreachable");
+        skip_unreachable!("skipping mise: package upgrade e2e: the network is unreachable");
         return;
     }
     if !github_api_has_quota() {
@@ -5954,7 +5954,7 @@ fn sbx_upgrade_mise_rolls_a_global_apps_app_global_tool() {
         return;
     }
     if !cache_reachable() {
-        skip_incapable!("skipping global-app mise upgrade e2e: the network is unreachable");
+        skip_unreachable!("skipping global-app mise upgrade e2e: the network is unreachable");
         return;
     }
     if !github_api_has_quota() {
@@ -6059,7 +6059,7 @@ fn a_flake_package_builds_host_side_into_the_shared_store_and_a_fresh_project_re
         return;
     }
     if !cache_reachable() {
-        skip_incapable!("skipping host-side `flake:` e2e: the network is unreachable");
+        skip_unreachable!("skipping host-side `flake:` e2e: the network is unreachable");
         return;
     }
 
@@ -6082,7 +6082,7 @@ fn a_flake_package_builds_host_side_into_the_shared_store_and_a_fresh_project_re
         String::from_utf8_lossy(&a.stdout)
     );
     if !a.status.success() && transient_fetch_failure(&a_log) {
-        skip_incapable!("skipping host-side `flake:` e2e: transient nix download fault: {a_log}");
+        skip_unreachable!("skipping host-side `flake:` e2e: transient nix download fault: {a_log}");
         return;
     }
     assert!(
@@ -6183,7 +6183,7 @@ fn an_inline_flake_builds_in_cage_and_an_edit_rebuilds() {
         return;
     }
     if !cache_reachable() {
-        skip_incapable!("skipping inline-flake e2e: the network is unreachable");
+        skip_unreachable!("skipping inline-flake e2e: the network is unreachable");
         return;
     }
 
@@ -6215,7 +6215,7 @@ fn an_inline_flake_builds_in_cage_and_an_edit_rebuilds() {
         String::from_utf8_lossy(&cold.stdout)
     );
     if !cold.status.success() && transient_fetch_failure(&cold_log) {
-        skip_incapable!("skipping inline-flake e2e: transient nix download fault: {cold_log}");
+        skip_unreachable!("skipping inline-flake e2e: transient nix download fault: {cold_log}");
         return;
     }
     assert!(
@@ -6231,7 +6231,7 @@ fn an_inline_flake_builds_in_cage_and_an_edit_rebuilds() {
     let edited_out = String::from_utf8_lossy(&edited.stdout).into_owned();
     let edited_log = format!("{}{edited_out}", String::from_utf8_lossy(&edited.stderr));
     if !edited.status.success() && transient_fetch_failure(&edited_log) {
-        skip_incapable!(
+        skip_unreachable!(
             "skipping inline-flake e2e: transient nix download fault on rebuild: {edited_log}"
         );
         return;
@@ -6292,7 +6292,7 @@ fn a_locked_flake_package_builds_the_pinned_ref_host_side() {
         return;
     }
     if !cache_reachable() {
-        skip_incapable!("skipping locked `flake:` e2e: the network is unreachable");
+        skip_unreachable!("skipping locked `flake:` e2e: the network is unreachable");
         return;
     }
 
@@ -6322,7 +6322,7 @@ fn a_locked_flake_package_builds_the_pinned_ref_host_side() {
         String::from_utf8_lossy(&pinned.stdout)
     );
     if !pinned.status.success() || pin_log.contains("re-resolve failed") {
-        skip_incapable!(
+        skip_unreachable!(
             "skipping locked `flake:` e2e: cannot resolve the flake upstream: {pin_log}"
         );
         return;
@@ -6345,7 +6345,7 @@ fn a_locked_flake_package_builds_the_pinned_ref_host_side() {
         String::from_utf8_lossy(&out.stdout)
     );
     if !out.status.success() && transient_fetch_failure(&log) {
-        skip_incapable!("skipping locked `flake:` e2e: transient nix download fault: {log}");
+        skip_unreachable!("skipping locked `flake:` e2e: transient nix download fault: {log}");
         return;
     }
     assert!(
@@ -6516,7 +6516,7 @@ fn sbx_gc_keeps_a_current_flake_build_and_reclaims_a_rolled_away_one() {
         return;
     }
     if !cache_reachable() {
-        skip_incapable!("skipping sbx gc e2e: the network is unreachable");
+        skip_unreachable!("skipping sbx gc e2e: the network is unreachable");
         return;
     }
 
@@ -6543,7 +6543,7 @@ fn sbx_gc_keeps_a_current_flake_build_and_reclaims_a_rolled_away_one() {
         String::from_utf8_lossy(&built.stdout)
     );
     if !built.status.success() && transient_fetch_failure(&built_log) {
-        skip_incapable!("skipping sbx gc e2e: transient nix download fault: {built_log}");
+        skip_unreachable!("skipping sbx gc e2e: transient nix download fault: {built_log}");
         return;
     }
     if !built.status.success() || !String::from_utf8_lossy(&built.stdout).contains("Hello, world!")
@@ -6618,7 +6618,7 @@ fn sbx_gc_keeps_a_current_flake_build_and_reclaims_a_rolled_away_one() {
         String::from_utf8_lossy(&relaunch.stdout)
     );
     if !relaunch.status.success() && transient_fetch_failure(&relaunch_log) {
-        skip_incapable!(
+        skip_unreachable!(
             "skipping sbx gc e2e: transient nix download fault on the roll: {relaunch_log}"
         );
         return;
@@ -6697,7 +6697,7 @@ fn sbx_projects_rm_dead_reaps_a_deleted_projects_tree() {
         return;
     }
     if !cache_reachable() {
-        skip_incapable!("skipping sbx projects rm --dead e2e: the network is unreachable");
+        skip_unreachable!("skipping sbx projects rm --dead e2e: the network is unreachable");
         return;
     }
 
