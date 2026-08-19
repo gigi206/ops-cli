@@ -1,7 +1,9 @@
 # rust-analyzer configuration for this repository.
 #
-# Read natively by rust-analyzer as workspace-local config, so it applies to every
-# client alike -- the editor's server and Claude Code's LSP plugin.
+# Read by rust-analyzer as workspace-local config, rather than by one editor's settings, so it does
+# not depend on which client starts the server. What a given setting then reaches is its own
+# question, and the `[files]` note below records one that was measured and is narrower than it
+# reads.
 
 [cargo]
 # Give rust-analyzer its own target directory. Without it, its `cargo check` and its
@@ -16,17 +18,25 @@ targetDir = "target/rust-analyzer"
 # profiles (TOML), and the image assets. Paths are relative to the workspace root and
 # globs are not supported.
 #
-# `target/test-tmp` is the cage suite's scratch root, and it is listed for a different
-# reason than the three above: not that watching it is useless, but that watching it is
-# harmful. Every run leaves a tree holding a copy of a nix store, a tree that outlives a
-# panic or an interrupted suite, and inotify spends one watch per DIRECTORY -- so the
-# analyzer walks into millions of them and exhausts `fs.inotify.max_user_watches` for the
-# whole machine. What breaks then is not the analyzer: systemd loses the watches it needs
-# to observe a cgroup, so a transient scope never learns its cage emptied, is never
-# collected, and the next invocation asking for that unit name is refused. The suite that
-# fills the directory is the suite the exhaustion breaks.
+# `target/test-tmp` is the cage suite's fallback scratch root, listed so a leftover tree is not
+# analysed as if it were source.
+#
+# WHAT THIS DOES NOT DO, measured rather than assumed. It bounds what is ANALYSED, not what is
+# WATCHED. Crossing the inodes in `/proc/<pid>/fdinfo` against the real trees, every one of 3000
+# sampled directories under `target/test-tmp` is watched with this list in place, and so are
+# directories under `docs-site` and `examples`, which it also names. The same holds with the setting
+# spelled `excludeDirs` (its old name, absent from this version's config schema), with it spelled
+# `exclude`, and with it delivered through the client's `initializationOptions` rather than this
+# file. So do not read the entry above as a guard against inotify exhaustion: it is not one, and an
+# earlier revision of this file claimed it was.
+#
+# What actually avoids that exhaustion is keeping the fixtures out of the workspace, which
+# `SBX_TEST_TMPDIR` does and `mise run test` sets. A language server watching the workspace spends
+# one inotify watch per directory, one suite leaves hundreds of thousands of them, and the machine's
+# `max_user_watches` goes; what breaks then is systemd, which loses the cgroup watches a transient
+# scope needs to learn its cage emptied.
 #
 # That subtree only, never `target` itself: `targetDir` above puts the analyzer's own
 # build under `target/`, and four `include!(concat!(env!("OUT_DIR"), ...))` sites read
 # generated sources from it. Excluding the parent would hide them and break the crate.
-excludeDirs = ["docs-site", "examples", "assets", "target/test-tmp"]
+exclude = ["docs-site", "examples", "assets", "target/test-tmp"]

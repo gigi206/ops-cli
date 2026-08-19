@@ -122,6 +122,19 @@ mkdir -p "$(dirname "$LOG")"
 : > "$LOG"
 export SBX_SKIP_LOG="$LOG"
 
+# Root the fixtures OUTSIDE the workspace. Every suite reads `SBX_TEST_TMPDIR`, and the default it
+# falls back to is inside `target/`, where one run leaves hundreds of thousands of directories. A
+# language server watching the workspace spends one inotify watch per directory and exhausts the
+# machine's `max_user_watches`; what breaks then is not the analyzer but systemd, which loses the
+# cgroup watches a transient scope needs to learn its cage emptied. No analyzer setting avoids it:
+# an exclude bounds what is analysed, not what is watched. Still on disk rather than a tmpfs, whose
+# fixed inode budget a nix-store seed exhausts, and the same filesystem as `$HOME` so a fixture's
+# reflink and rename semantics are the ones production sees. Reclaim a killed run's leftovers with
+# `chmod -R u+w "$SBX_TEST_TMPDIR" && rm -rf "$SBX_TEST_TMPDIR"` — a bare `rm -rf` walks into a
+# store's `0555` directories and silently leaves most of the tree behind.
+export SBX_TEST_TMPDIR="${SBX_TEST_TMPDIR:-${XDG_CACHE_HOME:-$HOME/.cache}/sbx/test-tmp}"
+mkdir -p "$SBX_TEST_TMPDIR"
+
 rc=0
 cargo test --no-fail-fast || rc=$?
 
