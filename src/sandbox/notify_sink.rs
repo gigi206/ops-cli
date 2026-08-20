@@ -1153,6 +1153,51 @@ mod tests {
         }
     }
 
+    /// A bus is not a daemon. `connect` answers `None` on a session bus nobody serves
+    /// notifications on, and that `None` is what makes a launch fall back to stderr and say so
+    /// instead of going quiet — the posture a headless host, an `ssh` session or a hosted CI runner
+    /// actually gets, and the one no other test covers: the two nearby ones drive a daemon that
+    /// answers and then a daemon that disappears, never a bus where none ever was.
+    ///
+    /// The pair is the point. `None` alone is also what a bad address, a missing `dbus-daemon` or a
+    /// build that cannot reach zbus would produce, so the same bus is then given a daemon and must
+    /// answer `Some`. What is pinned is the difference between the two, which is the only thing
+    /// that depends on who owns the name.
+    #[test]
+    fn a_session_bus_nobody_serves_notifications_on_yields_no_desktop_sink() {
+        let Ok(bus) = std::process::Command::new("dbus-daemon")
+            .args(["--session", "--print-address", "--nofork"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+        else {
+            skip_incapable!("skipping: no dbus-daemon on PATH");
+            return;
+        };
+        let mut bus = ChildGuard(bus);
+        let address = {
+            use std::io::BufRead as _;
+            let out = bus.0.stdout.take().expect("piped stdout");
+            let mut line = String::new();
+            std::io::BufReader::new(out)
+                .read_line(&mut line)
+                .expect("the bus prints its address");
+            line.trim().to_string()
+        };
+
+        assert!(
+            DesktopSink::connect_to(Some(&address), app_name("kiro@demo-app[4242]")).is_none(),
+            "a reachable bus with no notification daemon must not yield a desktop sink"
+        );
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen: Arc<RwLock<Vec<Served>>> = Arc::new(RwLock::new(Vec::new()));
+        let _server = serve_fake(&address, Arc::clone(&calls), Arc::clone(&seen));
+        assert!(
+            DesktopSink::connect_to(Some(&address), app_name("kiro@demo-app[4242]")).is_some(),
+            "the same bus, once a daemon owns the name, must yield one"
+        );
+    }
+
     /// The desktop sink against a **real** bus and a real daemon that goes away mid-session.
     ///
     /// This is the path no recording sink can stand in for: the zbus call itself, and what happens
