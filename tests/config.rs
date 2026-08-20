@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+// The fixtures' root, one definition shared with the unit tests.
+include!("../src/testroot.rs");
+
 /// A unique temp dir removed on drop.
 struct TmpDir(PathBuf);
 
@@ -16,13 +19,12 @@ impl TmpDir {
     fn new() -> Self {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        // Root the throwaway dirs under the build tree, not the system `/tmp`. `/tmp` is one of the
-        // cage's structural mounts, so a bind canonicalized under it would (correctly) trip the
-        // bind-nesting warning — an artifact of where the temp dir lives, not of the test's intent.
-        // The build tree (`<repo>/target/test-tmp`) nests with no structural mount, matching the
-        // other e2e suites. This one is fixed on purpose — the sibling suites honour a
-        // `SBX_TEST_TMPDIR` override, but here the location is what the assertions rest on, and
-        // pointing it at `/tmp` would reintroduce the very nesting the tests must not see.
+        // What this suite needs of its root is that nothing it binds nests with one of the cage's
+        // structural mounts, `/tmp` among them: such a bind trips the bind-nesting warning, and
+        // several assertions here rest on not seeing one. The shared root satisfies that — it sits
+        // under the cache home, which is no structural mount — so this suite takes it like every
+        // other, and its trees stop being watched by whatever language server is open on the
+        // checkout.
         //
         // The name is kept short for a measured reason: one of these dirs becomes
         // `$XDG_DATA_HOME`, and a data directory over 74 bytes is refused outright (it could not
@@ -30,8 +32,7 @@ impl TmpDir {
         // 7-digit pid, this suite sat *at* that cap — a four-digit counter, an eight-digit pid or
         // a longer checkout path would have taken the store away from every test in it, without
         // any test saying so.
-        let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        d.push("target/test-tmp");
+        let mut d = fixture_root();
         d.push(format!("cfg-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         TmpDir(d)

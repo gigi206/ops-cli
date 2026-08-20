@@ -5250,8 +5250,8 @@ fn the_cage_self_equips_via_mise_under_a_network_allowlist() {
     // fail. Teeth: jq installs through the empty-netns proxy into the project's own store. Skips
     // (never fails) when the host cannot sandbox or the cache is unreachable.
     // Short tags: the egress proxy's Unix socket lives under the data dir, and its full path
-    // must fit a `sockaddr_un` (~108 bytes). The test tree (`target/test-tmp/…`) is already
-    // deep, so a long tag would overflow `SUN_LEN`. (Production's `~/.local/share/sbx` is short.)
+    // must fit a `sockaddr_un` (~108 bytes). The tree `fixture_root()` returns is already deep, so
+    // a long tag would overflow `SUN_LEN`. (Production's `~/.local/share/sbx` is short.)
     let project = TmpDir::new("ma-proj");
     let data = TmpDir::new("ma-data");
     let state = TmpDir::new("ma-state");

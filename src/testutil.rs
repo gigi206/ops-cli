@@ -483,3 +483,119 @@ fn no_test_gives_up_through_a_bare_print() {
         "only {macro_uses} skip macro uses — has the sweep gone stale?"
     );
 }
+
+/// Every fixture tree is rooted outside the workspace, and stays there.
+///
+/// The root moved out for a reason that is invisible from inside a test: a language server watching
+/// the repository spends one inotify watch per directory, one run of the cage suites leaves hundreds
+/// of thousands of them, and what runs out of `max_user_watches` first is systemd — which then loses
+/// the cgroup watches a transient scope needs to learn its cage emptied, so the scope is never
+/// collected. Nothing in a suite fails when its fixtures land in the workspace instead; the cost
+/// arrives later, somewhere else, as scopes that will not die.
+///
+/// That is the shape this sweep exists for. The hole was closed once by moving twenty-one roots to
+/// one definition, and closing it took editing a single file — so re-opening it takes editing a
+/// single file too.
+///
+/// Two shapes are refused. A suite that declares its own `TmpDir` without reaching [`fixture_root`]
+/// has a root of its own, wherever it points today; and a line of code naming the in-workspace tree
+/// outright has one whether or not it declares a type. Prose may still name it — a comment
+/// explaining where fixtures used to live is not a fixture.
+///
+/// A third refusal points the other way, at this test rather than at the tree: an exception that no
+/// longer excuses anything fails too. The list is empty today because the last entry on it was
+/// measured rather than assumed — the reason it carried had gone stale, and the suite it named
+/// takes the shared root with every one of its tests still green.
+#[test]
+fn every_fixture_root_is_the_shared_one() {
+    // Empty, and meant to stay so. A suite that must root its fixtures in the workspace is named
+    // here rather than exempted by a pattern, so an entry is a decision someone writes down — and
+    // the sweep below refuses an entry that no longer excuses anything, because a rule about a file
+    // that has since been fixed is one the next reader trusts.
+    const ROOTED_IN_THE_WORKSPACE: &[&str] = &[];
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Assembled at runtime, so this file does not match its own needle.
+    let in_workspace = format!("target/{}", "test-tmp");
+    let (mut own_root, mut hardcoded, mut declaring, mut files) = (Vec::new(), Vec::new(), 0, 0);
+    let mut used_exception = std::collections::BTreeSet::new();
+
+    let mut stack = vec![root.join("src"), root.join("tests")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .expect("read a source directory")
+            .flatten()
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read a source file");
+            files += 1;
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            let excused = ROOTED_IN_THE_WORKSPACE.contains(&rel.as_str());
+
+            if text.contains("struct TmpDir") {
+                declaring += 1;
+                if !text.contains("fixture_root()") {
+                    if excused {
+                        used_exception.insert(rel.clone());
+                    } else {
+                        own_root.push(rel.clone());
+                    }
+                }
+            }
+            for (n, line) in text.lines().enumerate() {
+                // Prose may name the old location; code may not.
+                if line.trim_start().starts_with("//") || !line.contains(&in_workspace) {
+                    continue;
+                }
+                if excused {
+                    used_exception.insert(rel.clone());
+                } else {
+                    hardcoded.push(format!("{rel}:{}", n + 1));
+                }
+            }
+        }
+    }
+
+    assert!(
+        own_root.is_empty(),
+        "these suites declare a fixture directory without reaching `fixture_root()`, so their trees \
+         land wherever that declaration points — and a tree inside the workspace is watched by \
+         whatever language server is open on it: {own_root:?} — `include!(\"../src/testroot.rs\")` \
+         and build the root from `fixture_root()`"
+    );
+    assert!(
+        hardcoded.is_empty(),
+        "these lines build a fixture path inside the workspace by name, which no `SBX_TEST_TMPDIR` \
+         can move: {hardcoded:?} — root them at `fixture_root()` instead"
+    );
+    // An exception that no longer excuses anything is worse than none: it reads as a rule about a
+    // file that has since been fixed, and the next reader trusts it.
+    let stale: Vec<&str> = ROOTED_IN_THE_WORKSPACE
+        .iter()
+        .copied()
+        .filter(|named| !used_exception.contains(*named))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "these files are excused from rooting their fixtures outside the workspace but no longer \
+         need it: {stale:?} — drop them from the list"
+    );
+    // The preconditions, asserted rather than assumed: a sweep that read nothing, or one that
+    // stopped recognising how a fixture directory is declared, would pass while guarding nothing.
+    assert!(files > 100, "the sweep read only {files} source files");
+    assert!(
+        declaring >= 20,
+        "only {declaring} files declare a fixture directory — has the sweep gone stale?"
+    );
+}
