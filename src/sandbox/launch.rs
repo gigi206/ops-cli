@@ -772,17 +772,18 @@ pub(crate) fn app(
     ov: crate::config::Override,
     net_learn: Option<super::Granularity>,
 ) -> AppOutcome {
-    // The app's name reaches `prepare_with` because the channel is chosen there, and an app
-    // resolves against its own lock. Nothing of the app's *configuration* is read that early — the
-    // overlay is merged below — so this is the launch's identity, not its content.
-    let mut prep = match prepare_with(&ov, Some(name)) {
+    // The configuration is read before the engines are probed, because both refusals below are
+    // answers about the *project*, not about the host: an app the project does not declare is
+    // undeclared on a machine with no bubblewrap too, and saying so is more use to the caller than
+    // being told to install a sandbox engine they were not about to reach.
+    let mut pc = match launch_cwd().and_then(|cwd| prepare_config(cwd, &ov)) {
         Ok(p) => p,
         Err(code) => return AppOutcome::plain(code),
     };
-    let Some(app) = prep.cfg.apps.remove(name) else {
+    let Some(app) = pc.cfg.apps.remove(name) else {
         crate::diag::error(&format!(
             "sbx: no app named `{name}`.{}",
-            available_apps(&prep.cfg)
+            available_apps(&pc.cfg)
         ));
         return AppOutcome::plain(ExitCode::from(2));
     };
@@ -822,6 +823,12 @@ pub(crate) fn app(
     let runtime = match app.home_scope {
         crate::config::AppHomeScope::Global => binds::Runtime::GlobalApp(name),
         crate::config::AppHomeScope::Project => binds::Runtime::ProjectApp(name),
+    };
+    // The host's half, now that every answer that belongs to the project has been given: the
+    // engines, the user namespace, and the channel this app's own lock resolves against.
+    let mut prep = match prepare_engines(pc, Some(name)) {
+        Ok(p) => p,
+        Err(code) => return AppOutcome::plain(code),
     };
     crate::diag::hint(&format!("sbx: launching app `{name}`"));
     prep.cfg.merge_app(app);
@@ -3670,14 +3677,15 @@ fn prepare() -> Result<Prepared, ExitCode> {
 /// its own lock ([`effective_lock_target`]). It is only ever the *identity* of the launch: nothing
 /// of the app's configuration is read at this point, and nothing here can be influenced by it.
 fn prepare_with(ov: &crate::config::Override, app: Option<&str>) -> Result<Prepared, ExitCode> {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("sbx: cannot read the current directory: {e}");
-            return Err(ExitCode::FAILURE);
-        }
-    };
-    prepare_in(cwd, ov, app)
+    prepare_in(launch_cwd()?, ov, app)
+}
+
+/// The project directory a launch invoked without an explicit one is built from.
+fn launch_cwd() -> Result<PathBuf, ExitCode> {
+    std::env::current_dir().map_err(|e| {
+        eprintln!("sbx: cannot read the current directory: {e}");
+        ExitCode::FAILURE
+    })
 }
 
 /// [`prepare_with`] against an explicit project directory instead of the process's current
@@ -3689,14 +3697,62 @@ fn prepare_in(
     ov: &crate::config::Override,
     app: Option<&str>,
 ) -> Result<Prepared, ExitCode> {
+    prepare_engines(prepare_config(cwd, ov)?, app)
+}
+
+/// The half of a launch's preparation that needs no engine: where sbx keeps its data, and the
+/// project's configuration with the one-shot override applied and validated.
+///
+/// It is a separate step because **the answers it gives do not depend on the host being able to
+/// sandbox**. A mistyped `--config network=…` is the caller's own error whether or not bubblewrap
+/// is installed, and it exits 2 either way; an app the project does not declare is not declared on
+/// a host with no engines either. Deciding those before [`prepare_engines`] is what keeps the
+/// diagnosis pointed at what the caller can fix, and keeps the documented exit code from depending
+/// on what the machine happens to have installed.
+struct PreparedConfig {
+    layout: Layout,
+    cwd: PathBuf,
+    cfg: crate::config::Resolved,
+}
+
+fn prepare_config(cwd: PathBuf, ov: &crate::config::Override) -> Result<PreparedConfig, ExitCode> {
     // The data directory is resolved first: it is where sbx looks for (and, under the
-    // bundled features, materializes) the engines it owns, so `resolve_bwrap` below needs it.
+    // bundled features, materializes) the engines it owns, so `resolve_bwrap` needs it.
     let Some(layout) = Layout::from_env() else {
         eprintln!(
             "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
         );
         return Err(ExitCode::FAILURE);
     };
+    let mut cfg = crate::config::load(&cwd);
+    // The override's nixpkgs channel must land before the lock target is chosen. A set-but-invalid
+    // channel is a hard error (no safe baseline fallback for a supply-chain field).
+    if let Err(e) = cfg.apply_override_channel(ov) {
+        eprintln!("sbx: {e}");
+        return Err(ExitCode::from(2));
+    }
+    // Reject a mistyped scalar security value (network/gui/limits) now — before the engines are
+    // probed and before the expensive channel/userland resolution — so a typo aborts fast rather
+    // than after a provision. The full override (this plus the additive fields) is applied at the
+    // launch's final point.
+    if let Err(errs) = cfg.validate_override(ov) {
+        for e in errs {
+            eprintln!("sbx: {e}");
+        }
+        return Err(ExitCode::from(2));
+    }
+    Ok(PreparedConfig { layout, cwd, cfg })
+}
+
+/// The half that needs the host to be able to sandbox: the engines, the user namespace, and the
+/// channel/userland resolution they drive.
+///
+/// `app` is the launch's identity only — it selects which lock the resolution runs against
+/// ([`effective_lock_target`]), and nothing of the app's configuration is read here. A caller that
+/// has already taken the app out of the configuration (as [`app`] does, to refuse an undeclared one
+/// before reaching this point) therefore loses nothing by doing so.
+fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, ExitCode> {
+    let PreparedConfig { layout, cwd, cfg } = pc;
     let Some(bwrap) = crate::store::resolve_bwrap(Some(&layout)).map(|c| c.path) else {
         return Err(missing("bubblewrap (the sandbox engine)"));
     };
@@ -3715,22 +3771,6 @@ fn prepare_in(
     let Some(nix_store) = crate::store::resolve_nix_store(Some(&layout)) else {
         return Err(missing("nix-store (the store database tool)"));
     };
-    let mut cfg = crate::config::load(&cwd);
-    // The override's nixpkgs channel must land before the lock target is chosen below. A set-but-
-    // invalid channel is a hard error (no safe baseline fallback for a supply-chain field).
-    if let Err(e) = cfg.apply_override_channel(ov) {
-        eprintln!("sbx: {e}");
-        return Err(ExitCode::from(2));
-    }
-    // Reject a mistyped scalar security value (network/gui/limits) now — before the expensive
-    // channel/userland resolution below — so a typo aborts fast rather than after a provision. The
-    // full override (this plus the additive fields) is applied at the launch's final point.
-    if let Err(errs) = cfg.validate_override(ov) {
-        for e in errs {
-            eprintln!("sbx: {e}");
-        }
-        return Err(ExitCode::from(2));
-    }
 
     let nixpkgs = match effective_lock_target(&cwd, &layout, &cfg, app)
         .and_then(|t| t.resolve(&nix, &layout))

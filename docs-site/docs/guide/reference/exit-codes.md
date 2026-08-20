@@ -36,6 +36,14 @@ error (a `--limit` with no `=`, a `--bind` with an empty path) is a **hard error
 no launch**, because silently keeping the baseline could leave a wider posture than the
 mistyped intent. See [One-shot overrides](../configuration/overrides#fail-closed-on-an-invalid-value).
 
+The code does not depend on what the host has installed. `sbx` reads and validates the
+project's configuration, and resolves which app a launch names, *before* it looks for
+bubblewrap or nix. A mistyped override therefore exits 2 on a machine with no sandbox
+engine exactly as it does on a capable one, and an undeclared app is reported as
+undeclared rather than as a missing engine. The engine's own "not found" message is a
+different failure and comes after: it is reported once there is nothing left in the
+request itself to refuse.
+
 ## A refused operation exits 125
 
 [`sbx task run`](../cli/task#run) exits **125** when it refuses the invocation and runs

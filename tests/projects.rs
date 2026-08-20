@@ -1,13 +1,20 @@
 //! Integration tests for `sbx projects`: the built binary lists and removes the per-project
-//! runtime trees under `<data>/projects/<id>`. Pure host-side filesystem work — no sandbox, no
-//! nix, no network — so the tests run everywhere against redirected XDG dirs and fabricated trees
-//! (a directory with a `project` marker whose recorded path is present = `idle`, absent = `dead`,
-//! or no marker = `markerless`). They never touch the shared store, so `--gc` is exercised only in
-//! its no-op branch here; its real shared-store collection is proven end-to-end in `run.rs`.
+//! runtime trees under `<data>/projects/<id>`. Host-side filesystem work — no sandbox and no
+//! network — against redirected XDG dirs and fabricated trees (a directory with a `project` marker
+//! whose recorded path is present = `idle`, absent = `dead`, or no marker = `markerless`). They
+//! never touch the shared store, so `--gc` is exercised only in its no-op branch here; its real
+//! shared-store collection is proven end-to-end in `run.rs`.
+//!
+//! One test does read the *order* of `sbx gc --all`'s two passes, and the second of those passes
+//! needs `nix-store` to run at all. It skips where the tool is absent rather than reading the
+//! collection's own "skipping" line as a missing report.
 //!
 //! The same host-side-only harness also covers `sbx gc`'s sweep of the per-launch **runtime files**
 //! (fabricated under a redirected data dir and keyed by a reaped pid), including the dry run's
 //! must-touch-nothing contract.
+
+#[macro_use]
+mod common;
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -628,6 +635,17 @@ fn the_current_project_sweep_runs_before_the_shared_collection() {
         return;
     };
     let Some(shared) = stdout.find("shared store") else {
+        // The mirror of the branch above, for the other pass. The collection needs `nix-store` to
+        // read the store database at all and says so when it is absent; with only one of the two
+        // passes able to run there is again no order to observe. The run reports this itself, so
+        // the skip is keyed on its words rather than on the test probing the host separately.
+        if text(&out).contains("nix-store not found") {
+            skip_incapable!(
+                "skipping the gc pass-ordering check: nix-store is not installed, so the \
+                 shared-store collection cannot run"
+            );
+            return;
+        }
         panic!(
             "the shared-store collection should report itself:\n{}",
             text(&out)
