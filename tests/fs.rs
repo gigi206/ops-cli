@@ -394,7 +394,10 @@ fn fs_scan_leaves_the_cage_its_own_proc_self() {
             "--",
             "sh",
             "-c",
-            "cat /proc/self/comm; head -1 /proc/thread-self/comm",
+            // Named outright, and reached through the links `/dev` carries — `/dev/stdout` and
+            // `/dev/fd` point into `/proc/self/fd`, so nothing in those names says `self` at all.
+            "cat /proc/self/comm; head -1 /proc/thread-self/comm; echo viadev > /dev/stdout; \
+             echo viafd > /dev/fd/1",
         ])
         .current_dir(project.path())
         .env("XDG_DATA_HOME", data.path())
@@ -405,9 +408,11 @@ fn fs_scan_leaves_the_cage_its_own_proc_self() {
 
     assert_eq!(
         stdout.lines().collect::<Vec<_>>(),
-        vec!["cat", "head"],
+        vec!["cat", "head", "viadev", "viafd"],
         "each program must read its own name under both spellings — `cat` for the one that named \
-         `self` and `head` for the one that named `thread-self`.\nstdout: {stdout}\nstderr: {stderr}"
+         `self` and `head` for the one that named `thread-self` — and a write aimed at the cage's \
+         own output through `/dev` has to land in it rather than anywhere else.\nstdout: {stdout}\n\
+         stderr: {stderr}"
     );
 }
 

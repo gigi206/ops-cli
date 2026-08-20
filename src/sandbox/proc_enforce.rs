@@ -1021,7 +1021,9 @@ fn serve_creation(
     let parent = unsafe { std::fs::File::from_raw_fd(parent) };
     // The same vouching a read gets: a directory reached through a walk that left the cage's mounts
     // is not one to create in, whatever it holds.
-    let Ok(parent) = vouched_probe(lens, req.pid, parent) else {
+    // Never `own`: a file is created in a directory a mount vouches for, and no anonymous inode is
+    // a directory to create in.
+    let Ok(parent) = vouched_probe(lens, req.pid, parent, false) else {
         return Creation::Declined;
     };
     let Ok(cbase) = std::ffi::CString::new(base) else {
@@ -1712,6 +1714,7 @@ fn vouched_probe(
     lens: &OpenLens,
     pid: u32,
     probe: std::fs::File,
+    own: bool,
 ) -> Result<std::fs::File, libc::c_int> {
     use std::os::unix::io::{AsRawFd, FromRawFd};
     if let Some(id) = mount_id(probe.as_raw_fd())
@@ -1722,6 +1725,14 @@ fn vouched_probe(
     let Ok(landed) = std::fs::read_link(format!("/proc/self/fd/{}", probe.as_raw_fd())) else {
         return Err(libc::ENOENT);
     };
+    // A pipe, a socket or an anonymous inode sits on no mount any `mountinfo` lists, and the kernel
+    // names it `pipe:[…]` rather than with a path — so no mount can ever vouch for one. Reached
+    // through the caller's **own** `/proc` entry it needs none: what `/proc/self/fd` holds is what
+    // the caller already holds, and handing a copy back grants nothing. Reached any other way it is
+    // refused below, which is what keeps `/dev/stdout` from arriving as this process's descriptor.
+    if own && landed.to_str().is_some_and(|named| !named.starts_with('/')) {
+        return Ok(probe);
+    }
     let fd = probe_in_cage_root(pid, &landed)?;
     // SAFETY: fd is a fresh owned descriptor; the File takes sole ownership and closes it.
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
@@ -1766,6 +1777,92 @@ impl OpenLens {
     }
 }
 
+/// Take the `O_PATH` probe for `target` and confirm it describes what the cage's own walk reaches.
+///
+/// Opened `O_PATH`, which never blocks whatever sits at the path. Opening for reading straight away
+/// would hang on a FIFO with no writer — and this is the one thread every other open in the cage is
+/// queued behind, so that hang would be the whole cage's.
+///
+/// Deliberately **without** `O_NOFOLLOW`: the kernel is about to follow the cage's symlinks, and a
+/// scan that stopped at the link would be walked around with one `ln -s`.
+///
+/// The errno on failure is the one the cage's own open would have met. `O_PATH` is the most
+/// permissive open there is, succeeding even without read permission, so a probe that fails
+/// describes a path the cage was going to fail on too — which is what lets the answer be given
+/// without a second walk, and closes the last way a `CONTINUE` could be reached by naming something
+/// absent while the answer is formed and putting the secret behind it afterwards.
+fn probe_and_vouch(
+    lens: &OpenLens,
+    pid: u32,
+    target: &Path,
+    own: bool,
+) -> Result<std::fs::File, libc::c_int> {
+    use std::os::unix::io::FromRawFd;
+    let Ok(cpath) = std::ffi::CString::new(target.as_os_str().as_encoded_bytes()) else {
+        return Err(libc::EINVAL);
+    };
+    // SAFETY: cpath is a live NUL-terminated path for the duration of the call.
+    let probe = unsafe { libc::open(cpath.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if probe < 0 {
+        return Err(io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::ENOENT));
+    }
+    // SAFETY: probe is a fresh owned descriptor; the File takes sole ownership and closes it.
+    let probe = unsafe { std::fs::File::from_raw_fd(probe) };
+    // Before a byte is read from it or it is handed over: is this what the *cage's* walk would have
+    // reached? Asked before the type test below, because a device and a FIFO are served from the
+    // probe without ever being scanned — and `/dev/stdout` is exactly such a device.
+    vouched_probe(lens, pid, probe, own)
+}
+
+/// Replace the shortest prefix of `path` that is a symlink with what it points at.
+///
+/// Left to right rather than whole-path, because the link is not always the last component:
+/// `/dev/fd/1` is not one, `/dev/fd` is. Reading the whole path would leave that intermediate link
+/// to the kernel, which resolves what it points at against *this* process.
+///
+/// Only an absolute target ends the search with an answer. A relative one names something the
+/// ordinary walk already reaches correctly, and stopping there keeps this from turning into a
+/// resolution of its own.
+fn splice_first_link(pid: u32, dirfd: libc::c_int, path: &str) -> Option<String> {
+    let cuts = path
+        .match_indices('/')
+        .map(|(at, _)| at)
+        .filter(|&at| at > 0)
+        .chain(std::iter::once(path.len()));
+    for cut in cuts {
+        let Ok(target) = std::fs::read_link(open_target_path(pid, dirfd, &path[..cut])) else {
+            continue;
+        };
+        let target = target.to_str()?;
+        if !target.starts_with('/') {
+            return None;
+        }
+        return Some(format!("{target}{}", &path[cut..]));
+    }
+    None
+}
+
+/// The caller's own `/proc` entry, when a path arrives there through a link rather than naming it.
+///
+/// `/dev/stdout`, `/dev/stderr`, `/dev/stdin` and `/dev/fd` are links into `/proc/self/fd`. Nothing
+/// in the name the cage wrote says `self`, so the rewriting that handles the spelled-out form cannot
+/// act on them, and a kernel asked to follow them resolves `self` against whoever is asking — this
+/// process. The links are therefore read here rather than followed.
+///
+/// The hop count only has to outlast what a `/dev` entry uses; the kernel gives up at forty.
+fn proc_self_behind_a_link(pid: u32, dirfd: libc::c_int, path: &str) -> Option<String> {
+    let mut here = splice_first_link(pid, dirfd, path)?;
+    for _ in 0..8 {
+        if caller_proc_path(pid, &here).is_some() {
+            return Some(here);
+        }
+        here = splice_first_link(pid, dirfd, &here)?;
+    }
+    None
+}
+
 /// Decide one notified open: does the file it names carry a configured shape?
 ///
 /// Returns `true` when the open must be refused. The supervisor reads the bytes **outside** the
@@ -1780,43 +1877,28 @@ impl OpenLens {
 fn open_is_refused(lens: &OpenLens, pid: u32, dirfd: libc::c_int, path: &str) -> OpenOutcome {
     let (policy, cache) = (&lens.policy, &lens.cache);
     use std::io::Read;
-    use std::os::unix::io::FromRawFd;
-    let target = open_target_path(pid, dirfd, path);
-    let Ok(cpath) = std::ffi::CString::new(target.as_os_str().as_encoded_bytes()) else {
-        return OpenOutcome::ALLOWED;
-    };
-    // Opened `O_PATH` first, which never blocks whatever sits at the path. Opening for reading
-    // straight away would hang on a FIFO with no writer — and this is the one thread every other
-    // open in the cage is queued behind, so that hang would be the whole cage's.
-    //
-    // Deliberately **without** `O_NOFOLLOW`: the kernel is about to follow the cage's symlinks, and
-    // a scan that stopped at the link would be walked around with one `ln -s`.
-    // SAFETY: cpath is a live NUL-terminated path for the duration of the call.
-    let probe = unsafe { libc::open(cpath.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
-    if probe < 0 {
-        // The last way a `CONTINUE` could still be reached, and as cheap to walk as the others were:
-        // name something that is not there while the answer is formed, then put the secret behind it.
-        //
-        // `O_PATH` is the most permissive open there is, succeeding even without read permission, so
-        // a probe that fails describes a path the cage's own open was going to fail on too, with
-        // this very errno. Replying with it is the same answer, reached without a second walk.
-        let e = io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::ENOENT);
-        return OpenOutcome::failed(e);
-    }
-    // SAFETY: probe is a fresh owned descriptor; the File takes sole ownership and closes it.
-    let probe = unsafe { std::fs::File::from_raw_fd(probe) };
-    // Before a byte is read from it or it is handed over: is this what the *cage's* walk would have
-    // reached? Asked here rather than below the type test, because a device and a FIFO are served
-    // from the probe without ever being scanned — and `/dev/stdout` is exactly such a device.
-    let probe = match vouched_probe(lens, pid, probe) {
+    // A path that names the caller's own `/proc` entry is one whose object the caller already holds,
+    // which is what lets an anonymous inode behind it be accepted where no mount could vouch for it.
+    let own = caller_proc_path(pid, path).is_some();
+    let probe = match probe_and_vouch(lens, pid, &open_target_path(pid, dirfd, path), own) {
         Ok(probe) => probe,
-        // The errno of the resolution the cage would have made, which is the answer. An errno about
-        // this process rather than about the file is normalised to `EACCES` by `OpenOutcome::failed`
-        // — so a kernel that cannot resolve on the cage's behalf refuses the open instead of serving
-        // one steered by this process's root.
-        Err(e) => return OpenOutcome::failed(e),
+        // Nothing was reached, or what was reached is not what the cage's walk would have found.
+        // Before answering with that, one more question: does the path arrive at the caller's own
+        // `/proc` entry through a link? `/dev/stdout` is `/proc/self/fd/1`, and its neighbours are
+        // the same shape — names that say nothing about `self`, so the rewriting that handles the
+        // spelled-out form cannot see them, while the kernel following them resolves `self` against
+        // this process. Asked only here, so an open that resolved normally pays nothing for it.
+        Err(e) => {
+            let Some(reached) = proc_self_behind_a_link(pid, dirfd, path) else {
+                return OpenOutcome::failed(e);
+            };
+            match probe_and_vouch(lens, pid, &open_target_path(pid, dirfd, &reached), true) {
+                Ok(probe) => probe,
+                // The first answer, not the second: the link was a guess at what the path meant, and
+                // a guess that led nowhere says nothing about the open.
+                Err(_) => return OpenOutcome::failed(e),
+            }
+        }
     };
     use std::os::unix::io::AsRawFd;
     // What the kernel actually resolved, which is what the project bound is applied to.
@@ -2657,6 +2739,66 @@ mod tests {
         // A caller whose ids cannot be read leaves the path as it was, rather than being rewritten
         // against a number guessed for it.
         assert_eq!(caller_proc_path(u32::MAX, "/proc/self/maps"), None);
+    }
+
+    #[test]
+    fn a_link_is_spliced_where_it_sits_and_not_only_at_the_end() {
+        // `/dev/fd/1` is not a link; `/dev/fd` is. A chase that only read the last component would
+        // leave that one to the kernel, which resolves what it points at against this process — the
+        // very resolution being avoided.
+        let me = std::process::id();
+        let at = libc::AT_FDCWD;
+        assert_eq!(
+            splice_first_link(me, at, "/dev/fd/1").as_deref(),
+            Some("/proc/self/fd/1"),
+            "the link is the directory, and what follows it rides along"
+        );
+        assert_eq!(
+            splice_first_link(me, at, "/dev/stdout").as_deref(),
+            Some("/proc/self/fd/1"),
+            "a link that is the whole path is spliced too"
+        );
+
+        let dir = TmpDir::new();
+        std::fs::write(dir.join("plain.txt"), b"x").expect("write the fixture");
+        assert_eq!(
+            splice_first_link(me, at, dir.join("plain.txt").to_str().expect("utf-8")),
+            None,
+            "a path with no link on it has nothing to splice"
+        );
+        // A relative target names something the ordinary walk already reaches, and following it here
+        // would make this a resolution of its own.
+        std::os::unix::fs::symlink("plain.txt", dir.join("near")).expect("plant the near link");
+        assert_eq!(
+            splice_first_link(me, at, dir.join("near").to_str().expect("utf-8")),
+            None,
+            "a relative target is left to the ordinary walk"
+        );
+    }
+
+    #[test]
+    fn the_dev_links_arrive_at_the_callers_own_entry() {
+        // What the chase exists for: none of these names says `self`, so the rewriting that handles
+        // the spelled-out form cannot see them, and every one of them ends at `/proc/self/fd`.
+        let me = std::process::id();
+        let at = libc::AT_FDCWD;
+        for (named, wanted) in [
+            ("/dev/stdout", "/proc/self/fd/1"),
+            ("/dev/stderr", "/proc/self/fd/2"),
+            ("/dev/stdin", "/proc/self/fd/0"),
+            ("/dev/fd/1", "/proc/self/fd/1"),
+        ] {
+            assert_eq!(
+                proc_self_behind_a_link(me, at, named).as_deref(),
+                Some(wanted),
+                "`{named}` names the caller's own descriptor"
+            );
+        }
+        assert_eq!(
+            proc_self_behind_a_link(me, at, "/dev/null"),
+            None,
+            "a device that is not a link to `self` is left where it is"
+        );
     }
 
     #[test]
