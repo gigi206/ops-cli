@@ -1,0 +1,112 @@
+name: Build the self-contained static sbx
+description: >
+  Build the static musl `sbx` with its own `nix` and `bwrap` bundled in, and write it to the
+  workspace as `sbx-linux-x86_64` beside `sbx-linux-x86_64.sha256`.
+
+# WHY THIS IS AN ACTION AND NOT THREE COPIES.
+#
+# `release`, `nightly` and `latest` publish different things — a tagged asset, and two rolling
+# tags that are force-moved — but they build the SAME artifact, and they used to say so three
+# times. That is not a tidiness complaint: the toolchain versions live in these steps, and three
+# copies is how they drift. One of them once carried a zig three major versions from the one the
+# repository resolved locally, and nothing failed to report it, because a differently built binary
+# is still a binary. The build is written once here; what each workflow keeps is its own publish.
+#
+# The contract with the caller is the two files named above, left in the workspace. The caller
+# checks out first (this action does not, so a workflow that needs `fetch-depth: 0` for a tag push
+# can ask for it) and publishes after.
+
+inputs:
+  nixpkgs-rev:
+    description: >
+      The nixpkgs revision the bundled engines are realised from. Passed rather than read from the
+      environment so the value a workflow uses is visible at its call site.
+    required: true
+  skip-test:
+    description: >
+      The one unit test excluded from the pre-build gate. It asserts the behaviour of the host's
+      `systemd-run`, which differs across systemd versions and fails on a hosted runner while
+      passing locally.
+    required: false
+    default: sandbox::cgroup::tests::an_escaped_dollar_argument_reaches_the_program_verbatim
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust (with the musl target)
+      uses: dtolnay/rust-toolchain@1.97.1
+      with:
+        targets: x86_64-unknown-linux-musl
+
+    - name: Install zig (linker for the musl target)
+      uses: mlugg/setup-zig@v2
+      with:
+        version: 0.13.0
+
+    - name: Install cargo-zigbuild
+      # Pinned to the version `mise.toml` names, so the local musl build and the published one go
+      # through the same wrapper. Bump the two together.
+      shell: bash
+      run: cargo install cargo-zigbuild@0.23.0 --locked
+
+    - name: Install Nix
+      uses: cachix/install-nix-action@v31
+      with:
+        extra_conf: |
+          experimental-features = nix-command flakes
+
+    - name: Realise the pinned static nix engine
+      id: nix
+      shell: bash
+      env:
+        NIXPKGS_REV: ${{ inputs.nixpkgs-rev }}
+      run: |
+        set -euo pipefail
+        ref="github:NixOS/nixpkgs/${NIXPKGS_REV}#pkgsStatic.nix"
+        for out in $(nix build "$ref" --no-link --print-out-paths); do
+          if [ -e "$out/bin/nix" ]; then
+            echo "path=$out/bin/nix" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+        done
+        echo "no bin/nix in the pkgsStatic.nix outputs" >&2; exit 1
+
+    - name: Realise the pinned static bwrap engine
+      id: bwrap
+      shell: bash
+      env:
+        NIXPKGS_REV: ${{ inputs.nixpkgs-rev }}
+      run: |
+        set -euo pipefail
+        ref="github:NixOS/nixpkgs/${NIXPKGS_REV}#pkgsStatic.bubblewrap"
+        for out in $(nix build "$ref" --no-link --print-out-paths); do
+          if [ -e "$out/bin/bwrap" ]; then
+            echo "path=$out/bin/bwrap" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+        done
+        echo "no bin/bwrap in the pkgsStatic.bubblewrap outputs" >&2; exit 1
+
+    # Sanity gate: the default-feature unit suite must pass before minutes are spent bundling
+    # engines. The sandbox e2e skip on a hosted runner, so this proves the unit surface only.
+    # `-D warnings` here matches what `ci.yml` compiles under: the three publish paths previously
+    # disagreed about it, and the loosest of them decided what shipped.
+    - name: Unit tests (default features)
+      shell: bash
+      env:
+        SKIP_TEST: ${{ inputs.skip-test }}
+      run: |
+        set -euo pipefail
+        RUSTFLAGS="-D warnings" cargo test --bins -- --skip "$SKIP_TEST"
+
+    - name: Build the bundled static musl binary
+      shell: bash
+      env:
+        SBX_BUNDLED_NIX: ${{ steps.nix.outputs.path }}
+        SBX_BUNDLED_BWRAP: ${{ steps.bwrap.outputs.path }}
+      run: |
+        set -euo pipefail
+        cargo zigbuild --release --target x86_64-unknown-linux-musl \
+          --features bundled-nix,bundled-bwrap
+        cp target/x86_64-unknown-linux-musl/release/sbx sbx-linux-x86_64
+        sha256sum sbx-linux-x86_64 | cut -d' ' -f1 > sbx-linux-x86_64.sha256

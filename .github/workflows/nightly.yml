@@ -38,70 +38,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install Rust (with the musl target)
-        uses: dtolnay/rust-toolchain@1.97.1
+      - name: Build the self-contained static musl binary
+        uses: ./.github/actions/build-static-sbx
         with:
-          targets: x86_64-unknown-linux-musl
-
-      - name: Install zig (linker for the musl target)
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.13.0
-
-      - name: Install cargo-zigbuild
-        # Pinned to the version `mise.toml` names, so the local musl build and the published one go
-        # through the same wrapper. Bump the two together.
-        run: cargo install cargo-zigbuild@0.23.0 --locked
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@v31
-        with:
-          extra_conf: |
-            experimental-features = nix-command flakes
-
-      - name: Realise the pinned static nix engine
-        id: nix
-        run: |
-          set -euo pipefail
-          ref="github:NixOS/nixpkgs/${NIXPKGS_REV}#pkgsStatic.nix"
-          for out in $(nix build "$ref" --no-link --print-out-paths); do
-            if [ -e "$out/bin/nix" ]; then
-              echo "path=$out/bin/nix" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          done
-          echo "no bin/nix in the pkgsStatic.nix outputs" >&2; exit 1
-
-      - name: Realise the pinned static bwrap engine
-        id: bwrap
-        run: |
-          set -euo pipefail
-          ref="github:NixOS/nixpkgs/${NIXPKGS_REV}#pkgsStatic.bubblewrap"
-          for out in $(nix build "$ref" --no-link --print-out-paths); do
-            if [ -e "$out/bin/bwrap" ]; then
-              echo "path=$out/bin/bwrap" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          done
-          echo "no bin/bwrap in the pkgsStatic.bubblewrap outputs" >&2; exit 1
-
-      # Sanity gate: the default-feature unit suite must pass before we spend
-      # minutes bundling engines. (The sandbox e2e skip on a hosted runner.)
-      # The systemd `systemd-run` dollar-escape test is host-dependent and fails
-      # on this runner, so it is skipped here; it stays enabled in local runs.
-      - name: Unit tests (default features)
-        run: cargo test --bins -- --skip sandbox::cgroup::tests::an_escaped_dollar_argument_reaches_the_program_verbatim
-
-      - name: Build the bundled static musl binary
-        env:
-          SBX_BUNDLED_NIX: ${{ steps.nix.outputs.path }}
-          SBX_BUNDLED_BWRAP: ${{ steps.bwrap.outputs.path }}
-        run: |
-          set -euo pipefail
-          cargo zigbuild --release --target x86_64-unknown-linux-musl \
-            --features bundled-nix,bundled-bwrap
-          cp target/x86_64-unknown-linux-musl/release/sbx sbx-linux-x86_64
-          sha256sum sbx-linux-x86_64 | cut -d' ' -f1 > sbx-linux-x86_64.sha256
+          nixpkgs-rev: ${{ env.NIXPKGS_REV }}
 
       - name: Force-move the nightly tag onto this commit
         run: |
