@@ -11,13 +11,21 @@
 # sysctl; nix is already installed by the publish workflows. What was missing was a workflow that
 # asks for them.
 #
-# IT ENFORCES, AND THE RIGHT TO WAS MEASURED. `SBX_REQUIRE_CAPABLE=1` turns every capability skip
-# into a failure. That was not switched on by argument: the first run of this workflow reported 312
-# tests across the fourteen suites with ZERO skips, where the same suites on a host without the
-# engines skip 166 times. Even the systemd `pids` delegation that was the reason for doubting a
-# hosted runner turned out to be there. A skip here is therefore a prerequisite that went missing,
-# which is the finding this run exists to make, and `allow-skips` turns it off for one run when the
-# question is what broke rather than that something did.
+# WHAT IT DOES NOT ENFORCE, AND WHY THAT IS NAMED RATHER THAN ASSUMED. `SBX_REQUIRE_CAPABLE=1`
+# turns every capability skip into a failure. It was armed once and measured, and the measurement
+# is why it is an input rather than the default: this runner offers the cage its engines, but not
+# zsh, not a Wayland compositor, not a PulseAudio socket, and not a systemd user session delegating
+# `pids`. The suites that need those four report ok without running. Three are installable and the
+# fourth is a property of how the runner's session is set up, so enforcing by default would fail
+# every run on the host's shape rather than on a regression. `require-capable` arms it for a run
+# that has been given what it needs.
+#
+# THE SKIP COUNT IS THE MEASUREMENT, NOT THE PASS COUNT. `skip_incapable!` (`src/testskip.rs`)
+# prints its reason and returns, so `cargo test` counts a skipped test as PASSED and never as
+# ignored: by the line `cargo` prints, a suite that ran nothing is indistinguishable from one that
+# ran everything. `SBX_SKIP_LOG` is what counts them, and the report below is where that number
+# appears. Reading `0 ignored` answers a different question than the one this workflow exists to
+# ask, and answers it the reassuring way.
 #
 # WHEN IT RUNS. `schedule` and `workflow_dispatch` only exist once a workflow is on the repository's
 # DEFAULT branch, so on a development branch neither fires. The `push` trigger below is narrowed to
@@ -29,10 +37,10 @@ name: Cage
 on:
   workflow_dispatch:
     inputs:
-      allow-skips:
+      require-capable:
         description: >
-          Let a capability skip pass instead of failing the run. For debugging a runner that has
-          lost a prerequisite; the default demands them.
+          Turn every capability skip into a failure (SBX_REQUIRE_CAPABLE=1). For a runner that has
+          been given the prerequisites; the default reports the skips instead of failing on them.
         type: boolean
         default: false
   schedule:
@@ -110,18 +118,15 @@ jobs:
       - name: Run the sandbox suites
         env:
           SBX_SKIP_LOG: ${{ github.workspace }}/target/test-skips.log
-          # Enforcing, and the right to be was earned by measurement rather than assumed. The
-          # first run of this workflow reported 312 tests across the fourteen suites with ZERO
-          # capability skips, against 166 for the same suites on a host without the engines: this
-          # runner really does give the cage what it needs, including the systemd delegation that
-          # was the reason for doubting it. A skip here is therefore a prerequisite that went
-          # missing, which is a finding and not noise.
+          # Off by default, because the four prerequisites this runner does not offer are named in
+          # the header: enforcing would fail every run on the host's shape rather than on a
+          # regression, which is the opposite of a finding. The report below names each skip
+          # instead, so a prerequisite that goes missing is still visible.
           #
-          # `allow-skips` turns it back off for a run. On a push or a schedule there is no
-          # `inputs`, so this resolves to `1` — and when it does resolve to the empty string the
-          # skip macro reads that as unset, since `src/testskip.rs` requires a value that is
-          # neither empty nor `0`.
-          SBX_REQUIRE_CAPABLE: ${{ inputs.allow-skips && '' || '1' }}
+          # `require-capable` arms it for a run. On a push or a schedule there is no `inputs`, so
+          # this resolves to the empty string, which the skip macro reads as unset since
+          # `src/testskip.rs` requires a value that is neither empty nor `0`.
+          SBX_REQUIRE_CAPABLE: ${{ inputs.require-capable && '1' || '' }}
         run: |
           set -uo pipefail
           mkdir -p "$(dirname "$SBX_SKIP_LOG")"
