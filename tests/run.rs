@@ -2671,6 +2671,16 @@ fn a_trusted_in_cage_notifications_relay_attaches_and_forwards() {
         skip_incapable!("skipping in-cage relay e2e: no host D-Bus session bus");
         return;
     }
+    // And a bus is not a daemon. What this asserts is that a call made inside the cage reaches the
+    // daemon on the host, so a session bus that nobody serves notifications on makes the forward
+    // fail on the host's furniture rather than on the relay under test.
+    if !host_serves_notifications() {
+        skip_incapable!(
+            "skipping in-cage relay e2e: nothing owns org.freedesktop.Notifications on the host \
+             session bus"
+        );
+        return;
+    }
     if !cache_reachable() {
         skip_unreachable!("skipping in-cage relay e2e: the binary cache is unreachable");
         return;
@@ -7974,6 +7984,32 @@ fn a_typed_one_shot_limit_flag_lands_in_the_cage_scope() {
              user manager delegates no `pids` controller is the usual reason"
         );
     }
+}
+
+/// Whether a daemon on the host session bus owns `org.freedesktop.Notifications`.
+///
+/// Asked of the bus rather than inferred from the desktop: a session bus exists on hosts that serve
+/// no notifications at all, and the two are what separate a relay that cannot forward from a host
+/// that has nothing to forward to. Answered through `gdbus`, which ships with the same GLib stack
+/// as any daemon that would own the name; where it is absent the question cannot be put, and an
+/// unanswerable question is treated as a no.
+fn host_serves_notifications() -> bool {
+    Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.DBus",
+            "--object-path",
+            "/org/freedesktop/DBus",
+            "--method",
+            "org.freedesktop.DBus.NameHasOwner",
+            "org.freedesktop.Notifications",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| String::from_utf8_lossy(&o.stdout).contains("true"))
 }
 
 /// The `pids.max` of the transient scope a launch was placed in, or `None` while no such scope is

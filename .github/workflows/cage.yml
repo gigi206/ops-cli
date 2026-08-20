@@ -72,8 +72,22 @@ env:
 
 jobs:
   cage:
-    name: exercise the cage
-    runs-on: ubuntu-latest
+    name: exercise the cage (${{ matrix.image }})
+    # Both images, pinned, and neither cancels the other. `ubuntu-latest` is not a version: GitHub
+    # migrates the label to the next LTS over a month or two, so a run pinned to nothing would have
+    # moved from 24.04 to 26.04 on its own -- and the dollar-doubling defect below, which shows only
+    # on the older systemd, would have stopped reproducing without anyone deciding it was fixed.
+    #
+    # 24.04 is the witness: it is where a launch through `systemd-run` breaks, and it is what an LTS
+    # user runs. 26.04 is the host this repository is developed on. Running both is what makes a
+    # disagreement between them a standing measurement rather than an accident someone stumbles on,
+    # which is exactly how this one was found. `fail-fast: false` so the red arm never hides the
+    # other's report.
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.image }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -207,6 +221,7 @@ jobs:
             echo "# wrapped argument so systemd's own substitution restores the byte. Where the"
             echo "# doubling is not undone, the argument reaches the program with both dollars and a"
             echo "# shell preamble dies on it. Expected: A"
+            echo "systemd:          $(systemd-run --version 2>/dev/null | head -1 || echo absent)"
             printf 'doubled dollar:   '
             systemd-run --user --scope -q --collect --unit="probe-dollar-$$" -- \
               bash -c 'echo "A$$B"' 2>&1 | head -1
