@@ -10194,6 +10194,212 @@ fn every_shipped_install_step_yields_to_the_upgrade_signal() {
 }
 
 #[test]
+fn every_shipped_install_step_is_named_in_the_bundles_table() {
+    // The bundles table's third column is what a reader consults to know what folding a bundle in
+    // will bring, and a `provision` is the one entry there that *runs a command in their cage* —
+    // the item least safe to leave unsaid. Nothing failed when a bundle gained one, so the column
+    // drifted: when this guard was written ten bundles carried a step and five rows named it.
+    //
+    // A row is required rather than a bare mention. The words "install step" appear in the page's
+    // own prose describing the field, so a search over the whole page would pass on a table that
+    // lists none of them. And the step is read with sbx's parser rather than grepped: one named
+    // only in a comment is not one a launch runs, and one written under a sub-table would vanish
+    // the way a misplaced `allow` does.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let page = std::fs::read_to_string(root.join("docs-site/docs/guide/configuration/bundles.md"))
+        .expect("the bundles page exists");
+    let mut missing = Vec::new();
+    let mut carriers = 0;
+    for entry in std::fs::read_dir(root.join("examples/bundle"))
+        .expect("examples/bundle/ dir exists")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+        let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
+        if raw
+            .bundle
+            .get(&name)
+            .and_then(|bundle| bundle.provision.as_ref())
+            .is_none()
+        {
+            continue;
+        }
+        carriers += 1;
+        let row = page
+            .lines()
+            .find(|line| line.starts_with(&format!("| `{name}` |")));
+        if !row.is_some_and(|line| line.contains("install step")) {
+            missing.push(name);
+        }
+    }
+    assert!(
+        carriers > 0,
+        "no shipped bundle carries an install step, so this guard now asserts nothing"
+    );
+    missing.sort();
+    assert!(
+        missing.is_empty(),
+        "these bundles carry an install step the bundles table does not name in their row: \
+         {missing:?}"
+    );
+}
+
+/// The shipped `provision` of `<bundle>`, as the script a shell would run.
+fn shipped_install_step(name: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/bundle")
+        .join(format!("{name}.toml"));
+    let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
+    let argv = raw
+        .bundle
+        .get(name)
+        .and_then(|bundle| bundle.provision.clone())
+        .unwrap_or_else(|| panic!("`examples/bundle/{name}.toml` ships a provision step"))
+        .into_argv();
+    argv.last()
+        .expect("the step's script is its last element")
+        .clone()
+}
+
+#[test]
+fn the_hermes_desktop_install_step_writes_its_marker_and_yields_to_a_roll() {
+    // Runs the SHIPPED step, unmodified, against a stand-in home — the two guards above read the
+    // step's text, and text is not behaviour. What has to hold is a pair: an ordinary launch writes
+    // the marker once and then leaves it alone, and `sbx upgrade provision` (which is `SBX_UPGRADE`
+    // in the cage, nothing more) writes it again. A step that only ever wrote would pass the first
+    // half; one that only ever skipped would pass the second.
+    let script = shipped_install_step("hermes-desktop");
+    let tmp = TmpDir::new();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let marker = home.join(".hermes/.install_method");
+
+    let run = |upgrade: bool| {
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", &home)
+            .env("SBX_UPGRADE", if upgrade { "1" } else { "" })
+            .output()
+            .expect("run the shipped step");
+        assert!(out.status.success(), "the step failed: {out:?}");
+    };
+
+    // 1. A first launch declares the install method.
+    run(false);
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("the marker was written"),
+        "nixos\n"
+    );
+
+    // 2. An ordinary relaunch leaves what it finds. Asserted by tampering rather than by a
+    //    timestamp: a write of the same bytes is indistinguishable from a skip otherwise.
+    std::fs::write(&marker, "pip\n").unwrap();
+    run(false);
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        "pip\n",
+        "an ordinary launch overwrote a marker it should have left alone"
+    );
+
+    // 3. A roll writes it again, which is what keeps `re-installed` from being a lie.
+    run(true);
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        "nixos\n",
+        "the roll left the marker as it found it, so the channel is inert for this app"
+    );
+}
+
+#[test]
+fn the_kiro_install_step_states_the_preference_once_and_then_says_what_it_did() {
+    // Runs the SHIPPED step against a stand-in home with a stand-in `kiro-cli` that records being
+    // called. This step is the one shipped `provision` that must NOT re-do its work on a roll — it
+    // states a user preference, and re-imposing one the user has since changed would undo their
+    // edit. So what is asserted is the pair the text cannot show: the writer is invoked exactly
+    // when the preference is unset, and on a roll that finds it set the step SAYS so instead of
+    // going quiet, which is the honesty `sbx upgrade provision` reports on.
+    let script = shipped_install_step("kiro");
+    let tmp = TmpDir::new();
+    let (home, bin) = (tmp.path().join("home"), tmp.path().join("bin"));
+    std::fs::create_dir_all(home.join(".kiro/settings")).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let called = tmp.path().join("called");
+
+    let stub = |ok: bool| {
+        use std::os::unix::fs::PermissionsExt;
+        let path = bin.join("kiro-cli");
+        let code = i32::from(!ok);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit {code}\n",
+                called.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let run = |upgrade: bool| {
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", &home)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("SBX_UPGRADE", if upgrade { "1" } else { "" })
+            .output()
+            .expect("run the shipped step");
+        assert!(out.status.success(), "the step failed: {out:?}");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let invocations = || std::fs::read_to_string(&called).unwrap_or_default();
+
+    // 1. Nothing stated yet: the CLI's own settings writer is invoked, with the preference.
+    stub(true);
+    let quiet = run(false);
+    assert!(
+        invocations().contains("settings telemetry.enabled false"),
+        "the step did not state the preference through the CLI's own writer: {:?}",
+        invocations()
+    );
+    assert_eq!(
+        quiet, "",
+        "a first launch that succeeded should say nothing"
+    );
+
+    // 2. The preference is now stated. A roll must not restate it — and must not go quiet either.
+    std::fs::write(
+        home.join(".kiro/settings/cli.json"),
+        "{\"telemetry.enabled\": true}\n",
+    )
+    .unwrap();
+    let before = invocations();
+    let said = run(true);
+    assert_eq!(
+        invocations(),
+        before,
+        "the roll called the settings writer again, overriding a preference the user may have set"
+    );
+    assert!(
+        said.contains("leaving it as it is"),
+        "the roll skipped silently, so `re-installed` would be a lie: {said:?}"
+    );
+
+    // 3. A writer that fails is reported rather than swallowed — the same silence, other branch.
+    std::fs::remove_file(home.join(".kiro/settings/cli.json")).unwrap();
+    stub(false);
+    let complained = run(false);
+    assert!(
+        complained.contains("could not state"),
+        "a failed write said nothing: {complained:?}"
+    );
+}
+
+#[test]
 fn every_shipped_profile_resolves_the_egress_groups_it_references() {
     // Invariant 3 of the bundle test above reaches a profile only through its namesake bundle, so
     // the profiles that have none — the desktop and web builds, and the agents packaged by a

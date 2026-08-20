@@ -13,7 +13,8 @@
 # while the app keeps its own command, posture and credential choices. A test pins the two
 # artifacts together, so they cannot drift apart.
 #
-# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# It carries the telemetry opt-out that finishes the install (`provision`, below) but no `cmd`
+# and no posture: the consuming app keeps its own command, network mode,
 # `gui`/`gpu`/`audio`/`dbus`, limits and home scope. That split matters here — the sign-in browser
 # needs `gui = "wayland"`, `gpu = true` and `dbus = true`, which a bundle may never grant. A
 # consuming app that wants the in-cage login states those itself, and supplies the `xdg-open` shim
@@ -76,7 +77,7 @@ allow = [
 # still counted by `sbx net stats`); it only keeps the refusal out of the default `sbx net log`.
 # One telemetry call cannot be muted at all — the AWS SDK's absolute-form request inside the
 # CONNECT tunnel is refused by a pre-verdict security guard, which `mute` does not cover; the
-# consuming app's `cmd` disables telemetry at the source instead (see `examples/app/kiro.toml`).
+# `provision` step below disables telemetry at the source instead, which stops all of them.
 mute = [
     "telemetry.us-east-1.kiro.dev",
     "telemetry.eu-central-1.kiro.dev",
@@ -97,6 +98,34 @@ mute = [
     # profile that embeds a browser engine.
     "@chromium-background",
     "translate.googleapis.com",
+]
+
+# Telemetry OFF by default, written once into a fresh app home.
+#
+# This is the CLI's own settings writer (a proper merge, local-only, no auth), so it states the
+# preference the way the tool itself would. It is gated on the key being absent, which means it
+# never fights a user who later turns telemetry back on.
+#
+# WHAT `SBX_UPGRADE` DOES HERE, AND WHY IT IS NOT THE USUAL THING. An install step yields to the
+# roll by re-installing; this one must not, because re-imposing a preference the user has since
+# changed would undo their edit rather than advance an install. What the roll must never do is
+# report `re-installed` while the step silently did nothing — so the step reads the signal and
+# SAYS which of the two happened. The variable is honoured by being answered, not by being
+# obeyed. A failed write is reported for the same reason: swallowing it would put the silence
+# back on the other branch.
+provision = [
+    "bash",
+    "-c",
+    '''
+set -e
+if ! grep -q 'telemetry.enabled' "$HOME/.kiro/settings/cli.json" 2>/dev/null; then
+  if ! kiro-cli settings telemetry.enabled false >/dev/null 2>&1; then
+    echo "sbx: could not state kiro's telemetry preference; it stays at the CLI's own default" >&2
+  fi
+elif [ -n "${SBX_UPGRADE:-}" ]; then
+  echo "sbx: kiro's telemetry preference is already stated in this app home; leaving it as it is" >&2
+fi
+''',
 ]
 
 [bundle.kiro.packages]

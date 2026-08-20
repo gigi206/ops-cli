@@ -56,30 +56,23 @@
 # also BYOK/multi-provider: uncomment the [env] placeholder + the [secret] block below and provide
 # $OPENROUTER_API_KEY on the host to have the egress proxy inject an OpenRouter key on the wire
 # instead (the plaintext never enters the cage).
-cmd = [
-    "bash",
-    "-c",
-    '''
-set -e
-# Declare a Nix install so Hermes stops warning "Unsupported install method". The backend
-# self-detects its platform from the code layout; the flake's uv2nix venv looks like a pip
-# site-packages tree, so it falls through to "pip" (an unsupported platform) and shows the banner on
-# every launch. A `.install_method` marker in HERMES_HOME is read *before* that fallback and names the
-# real method — `nixos`, a supported Tier-2 platform (and it also yields the correct nix update
-# hint). Unlike `HERMES_MANAGED=nixos`, this marker has NO managed-mode side effect (which would block
-# the app from writing its own config). Harmless regardless: sbx manages updates via `sbx upgrade
-# flake`, so Hermes' own self-updater never runs here.
-HERMES_HOME_DIR="${HERMES_HOME:-$HOME/.hermes}"
-mkdir -p "$HERMES_HOME_DIR"
-printf 'nixos\n' > "$HERMES_HOME_DIR/.install_method"
-
-# Launch the flake-built Electron app. `hermes-desktop` (from flake:#desktop) is nixpkgs' Electron
-# wrapped around the built renderer, with HERMES_DESKTOP_HERMES already pointing at the flake's own
+# The flake-built Electron app. `hermes-desktop` (from flake:#desktop) is nixpkgs' Electron wrapped
+# around the built renderer, with HERMES_DESKTOP_HERMES already pointing at the flake's own
 # fully-equipped `hermes` — so the Python backend is wired natively (no venv, no
 # HERMES_DESKTOP_HERMES_ROOT). --no-sandbox is mandatory (Electron's own Chromium sandbox needs a
 # userns clone that seccomp blocks in the cage); the Wayland flags map the window through the gui hole.
-exec hermes-desktop --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage "$@"
-'''
+#
+# The `.install_method` marker this profile used to write here now lives in the `hermes-desktop`
+# bundle as its `provision` step: it finishes the install rather than launching anything, so it
+# belongs with the tool. Writing it here also cost a `bash -c` wrapper, and this list needs none:
+# `sbx app run hermes-desktop -- <args>` appends the arguments to this array, so they reach the
+# program directly instead of travelling through a script's `"$@"` behind a `$0` filler sbx has
+# to supply.
+cmd = [
+    "hermes-desktop",
+    "--no-sandbox",
+    "--ozone-platform=wayland",
+    "--disable-dev-shm-usage",
 ]
 
 # The native desktop window: the Wayland socket (gui), the GPU render node + scoped /sys (gpu), and

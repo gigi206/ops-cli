@@ -79,30 +79,16 @@
 # 4649 and others have been seen; do not assume 3128). Under `--net shared` this is the HOST
 # loopback — fine unless something already listens on the chosen port; under the strict default the
 # cage has its own empty-netns loopback, so any candidate is free and there is never a clash.
-cmd = [
-    "bash",
-    "-c",
-    '''
-set -e
-# Telemetry OFF by default. kiro-cli's anonymous metrics hit hosts the allowlist denies; one of them
-# (cognito-identity.us-east-1.amazonaws.com) arrives as `blocked (bad-request)` — a pre-verdict
-# security guard the egress `mute` cannot silence (see the [network] mute note). Disabling telemetry
-# at the source stops all of them. Uses kiro-cli's own settings writer (a proper merge, local-only,
-# no auth) and is gated so it runs once on a fresh app home and never fights a user who later flips
-# it back on.
-if ! grep -q 'telemetry.enabled' "$HOME/.kiro/settings/cli.json" 2>/dev/null; then
-  kiro-cli settings telemetry.enabled false >/dev/null 2>&1 || true
-fi
+# The telemetry opt-out this profile used to carry here now lives in the `kiro` bundle as its
+# `provision` step: it is an install-shaped act, it belongs with the tool rather than with the
+# command, and `sbx upgrade` can reach it there — a step written into `cmd` is replayed at every
+# launch but can never be rolled.
+#
 # Tip: to diagnose a login stall, kiro-cli's `login` writes NO log file of its own (only `chat`
 # does) — its trace goes to stdout only when enabled. Capture it without disturbing the interactive
 # method menu (which is on stderr) by redirecting just stdout:
 #     sbx app run kiro --env KIRO_LOG_LEVEL=trace --env KIRO_LOG_STDOUT=1 -- login --license free >trace.log
-exec kiro-cli "$@"
-''',
-    # `$0` placeholder: `sbx app run kiro -- <args>` appends <args> to this cmd array, so they
-    # arrive as `$1 $2 …` (this element fills `$0`) and reach kiro-cli verbatim via `exec … "$@"`.
-    "kiro-cli",
-]
+cmd = ["kiro-cli"]
 
 # DISPLAY + GPU + DBUS for the in-cage login browser. `gui = "wayland"` binds the host Wayland
 # socket (read-only) so the in-cage Chromium can map a window; `gpu = true` opens hardware-

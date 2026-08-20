@@ -297,7 +297,7 @@ The 64 shipped bundles, and what each carries:
 | `cortex` | 2 (`mise:`, `nix:`) | 6 egress entries | none |
 | `crush` | 1 (`mise:`) | 4 egress entries, 2 env vars | `github-install` |
 | `cursor` | 2 (`deb:`, `nix:`) | 31 egress entries, 1 env var, a `deb:` resolver | `chromium-background` |
-| `cursor-agent` | 2 (`nix:`) | 5 egress entries, 1 env var | none |
+| `cursor-agent` | 2 (`nix:`) | 5 egress entries, 1 env var, an install step | none |
 | `deepagents-code` | 3 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
 | `deepseek-harness` | 5 (`mise:`, `nix:`) | 3 egress entries, an install step | `npm-audit`, `npm-registry` |
 | `devin` | 1 (`tarball:`) | 4 egress entries, a `tarball:` resolver | none |
@@ -309,15 +309,15 @@ The 64 shipped bundles, and what each carries:
 | `goose-desktop` | 1 (`deb:`) | 2 env vars | none |
 | `grok` | 1 (`mise:`) | 3 egress entries, 1 env var | none |
 | `hermes` | 2 (`flake:`, `nix:`) | 10 egress entries, 1 env var | `models-catalog`, `npm-audit`, `npm-registry` |
-| `hermes-desktop` | 4 (`flake:`, `mise:`, `nix:`) | 21 egress entries, 1 env var | `chromium-background`, `google-signin-incage`, `models-catalog`, `npm-audit`, `npm-registry` |
+| `hermes-desktop` | 4 (`flake:`, `mise:`, `nix:`) | 21 egress entries, 1 env var, an install step | `chromium-background`, `google-signin-incage`, `models-catalog`, `npm-audit`, `npm-registry` |
 | `jcode` | 1 (`mise:`) | 1 egress entry, 2 env vars | none |
 | `junie` | 2 (`mise:`, `nix:`) | 7 egress entries, an install step | `npm-audit`, `npm-registry` |
 | `kilocode` | 1 (`mise:`) | 4 egress entries | `models-catalog` |
 | `kimi` | 2 (`mise:`, `nix:`) | 7 egress entries | `models-catalog`, `npm-registry` |
-| `kiro` | 2 (`nix:`) | 34 egress entries | `chromium-background`, `google-signin-incage` |
+| `kiro` | 2 (`nix:`) | 34 egress entries, an install step | `chromium-background`, `google-signin-incage` |
 | `kiro-desktop` | 2 (`nix:`, `tarball:`) | 36 egress entries, 1 env var, a `tarball:` resolver | `chromium-background` |
 | `mimo` | 2 (`mise:`, `nix:`) | 6 egress entries | `models-catalog`, `npm-registry` |
-| `muse` | 1 (`nix:`) | 4 egress entries, 1 env var | none |
+| `muse` | 1 (`nix:`) | 4 egress entries, 1 env var, an install step | none |
 | `nanobot` | 3 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
 | `nova` | 2 (`mise:`, `nix:`) | 5 egress entries | `npm-audit`, `npm-registry` |
 | `odysseus` | 6 (`nix:`) | 6 egress entries, 3 env vars, an install step | `npm-audit`, `npm-registry`, `pypi` |
@@ -330,7 +330,7 @@ The 64 shipped bundles, and what each carries:
 | `openwork` | 1 (`appimage:`) | 12 egress entries, an `appimage:` resolver | `models-catalog`, `npm-runtime` |
 | `pi` | 1 (`mise:`) | 1 egress entry | none |
 | `pool` | 1 (`tarball:`) | 1 egress entry, a `tarball:` resolver | none |
-| `prime-agent` | 5 (`nix:`) | 4 egress entries, 1 env var | `npm-registry`, `pypi` |
+| `prime-agent` | 5 (`nix:`) | 4 egress entries, 1 env var, an install step | `npm-registry`, `pypi` |
 | `qoder` | 3 (`mise:`, `nix:`) | 6 egress entries | `npm-audit`, `npm-registry` |
 | `qwen-code` | 2 (`mise:`, `nix:`) | 3 egress entries | `npm-registry` |
 | `reasonix` | 2 (`mise:`, `nix:`) | 4 egress entries | `npm-audit`, `npm-registry` |

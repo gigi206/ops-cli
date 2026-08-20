@@ -16,8 +16,9 @@
 # egress, while the profile keeps its own command, posture and credential choices. A test pins the
 # two artifacts together, so they cannot drift apart.
 #
-# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
-# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. Two of those are load-bearing here — the
+# It carries the marker step that finishes the install (`provision`, below) but no `cmd` and no
+# posture: the consuming app keeps its own command, network mode, `gui`/`gpu`/`audio`/`dbus`,
+# limits and home scope. Two of those are load-bearing here — the
 # Electron window needs `gui = "wayland"` plus `gpu = true`, and the voice features need the audio
 # hole; a bundle may never grant either.
 #
@@ -92,6 +93,32 @@ mute = [
     "@chromium-background",
     # Tag-manager analytics on the login page (not a browser background service).
     "www.googletagmanager.com",
+]
+
+# Declare a Nix install so Hermes stops warning "Unsupported install method".
+#
+# The backend self-detects its platform from the code layout; the flake's uv2nix venv looks like a
+# pip site-packages tree, so it falls through to "pip" (an unsupported platform) and shows the
+# banner on every launch. A `.install_method` marker in HERMES_HOME is read *before* that fallback
+# and names the real method — `nixos`, a supported Tier-2 platform, which also yields the correct
+# nix update hint. Unlike `HERMES_MANAGED=nixos`, this marker has NO managed-mode side effect (which
+# would block the app from writing its own config). Harmless regardless: sbx manages updates via
+# `sbx upgrade flake`, so Hermes' own self-updater never runs here.
+#
+# The step is gated on the marker being absent, and yields to `SBX_UPGRADE` so that
+# `sbx upgrade provision` genuinely rewrites it rather than reporting a re-install that did
+# nothing. Rewriting is safe: the content is a constant, so a roll lands on the same two lines.
+provision = [
+    "bash",
+    "-c",
+    '''
+set -e
+HERMES_HOME_DIR="${HERMES_HOME:-$HOME/.hermes}"
+if [ ! -f "$HERMES_HOME_DIR/.install_method" ] || [ -n "${SBX_UPGRADE:-}" ]; then
+  mkdir -p "$HERMES_HOME_DIR"
+  printf 'nixos\n' > "$HERMES_HOME_DIR/.install_method"
+fi
+''',
 ]
 
 [bundle.hermes-desktop.packages]
