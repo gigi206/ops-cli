@@ -267,6 +267,107 @@ fn detached_observe_records_fs_writes_for_fs_logs() {
 }
 
 #[test]
+fn fs_scan_lets_the_cage_make_files_inside_it_and_nowhere_else() {
+    // The probe that examines a path opens it `O_PATH`, which creates nothing, so a creating open
+    // finds its name absent and was told so — measured against a control arm, a cage under
+    // `[fs] scan` could not write a single new file, which is most of what a build does.
+    //
+    // Both halves have teeth. Creating has to work, `..` included; and it must not become a way out,
+    // since a file made through a walk that left the cage's mounts would land on the host.
+    let (project, data, outside) = (TmpDir::new(), TmpDir::new(), TmpDir::new());
+    if !host_can_sandbox(project.path(), data.path()) {
+        skip_incapable!("skipping `[fs] scan` creation e2e: host cannot sandbox");
+        return;
+    }
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[fs]\nscan = [\"sk-[A-Za-z0-9]{12,}\"]\n",
+    )
+    .expect("write the project config");
+    std::fs::write(
+        project.path().join("carries.txt"),
+        "API key: sk-ABC123DEF456GHI789\n",
+    )
+    .expect("write the matching fixture");
+    std::fs::create_dir(project.path().join("sub")).expect("make the subdirectory");
+
+    let elsewhere = outside
+        .path()
+        .to_str()
+        .expect("utf-8 fixture path")
+        .to_string();
+    let script = format!(
+        "echo un > made.txt; echo made=$?; cat made.txt; \
+         echo deux >> made.txt; echo appended=$?; \
+         (cd sub && echo trois > ../over.txt); echo dotdot=$?; \
+         ls {elsewhere} >/dev/null 2>&1; echo sees_outside=$?; \
+         ln -s {elsewhere} out; echo quatre > out/escaped.txt; echo escape=$?; \
+         cat carries.txt 2>&1; echo done"
+    );
+    let out = sbx_isolated()
+        .args(["run", "--", "sh", "-c", &script])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("run the cage");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let said = |key: &str| -> Option<&str> {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .map(str::trim)
+    };
+
+    assert_eq!(
+        said("made="),
+        Some("0"),
+        "a name that is not there yet must be made rather than reported absent.\nstdout: {stdout}\n\
+         stderr: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("made.txt")).ok(),
+        Some("un\ndeux\n".to_string()),
+        "the file served to the cage has to be the one that appeared on disk, and an append after \
+         it has to reach the same file.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        said("appended="),
+        Some("0"),
+        "appending to what was just made must work too.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        said("dotdot="),
+        Some("0"),
+        "a name reached through `..` is inside the cage as much as any other.\nstdout: {stdout}\n\
+         stderr: {stderr}"
+    );
+    // The premise of the arm below, asserted rather than assumed: a directory the cage can already
+    // see would make "nothing was created there" true for a reason that has nothing to do with the
+    // guard.
+    assert_ne!(
+        said("sees_outside="),
+        Some("0"),
+        "this fixture only means something while the cage cannot reach it by name.\nstdout: \
+         {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !outside.path().join("escaped.txt").exists(),
+        "the cage made a file outside itself by naming a directory through an absolute symlink.\n\
+         stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("sk-ABC123DEF456GHI789"),
+        "creating must not have become a way to read: the matching file is still refused.\nstdout: \
+         {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("done"),
+        "the payload must reach its last line.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
 fn fs_scan_leaves_the_cage_its_own_proc_self() {
     // `/proc/self` is answered with the number of whoever performs the lookup, in the namespace the
     // `/proc` being walked belongs to. The supervisor is in neither of the cage's, so a path it

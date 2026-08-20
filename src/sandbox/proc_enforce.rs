@@ -531,40 +531,61 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
     // filter should not have produced is still answered as an open.
     if let Some((dirfd, path_addr)) = open_args(req.data.nr, &req.data.args) {
         let named = read_exec_path(req.pid, path_addr).unwrap_or_default();
-        let outcome = match cx.open {
-            // An unreadable path is allowed, like an unreadable exec target: the lens takes away
-            // what it can prove, and a cage whose undecidable opens all failed would not run.
-            Some(lens) if !named.is_empty() => open_is_refused(lens, req.pid, dirfd, &named),
-            _ => OpenOutcome::ALLOWED,
-        };
-        if let Some(report) = &outcome.report {
-            if report.partial {
-                crate::diag::warn(&format!(
-                    "`{}` is longer than the {} bytes the content scan reads, so it is open to the \
+        // Twice at most, and the second pass only when the first found nothing there and the open
+        // asked for the name to be created. Creating it is what makes the second pass meaningful:
+        // the file exists by then, so the ordinary decision has something to examine.
+        for pass in 0..2 {
+            let outcome = match cx.open {
+                // An unreadable path is allowed, like an unreadable exec target: the lens takes away
+                // what it can prove, and a cage whose undecidable opens all failed would not run.
+                Some(lens) if !named.is_empty() => open_is_refused(lens, req.pid, dirfd, &named),
+                _ => OpenOutcome::ALLOWED,
+            };
+            if let Some(report) = &outcome.report {
+                if report.partial {
+                    crate::diag::warn(&format!(
+                        "`{}` is longer than the {} bytes the content scan reads, so it is open to the \
                      cage on the strength of its start alone — anything past that was not examined",
-                    report.path,
-                    policy_scan_ceiling(cx.open)
-                ));
-            } else {
-                // Named rather than merely counted: a refusal a person cannot attribute to a pattern
-                // is one they will turn the lens off to escape.
-                let shapes = report.shapes.join("`, `");
-                crate::diag::warn(&format!(
-                    "closed `{}` to the cage: its content matches `{shapes}`",
-                    report.path
-                ));
+                        report.path,
+                        policy_scan_ceiling(cx.open)
+                    ));
+                } else {
+                    // Named rather than merely counted: a refusal a person cannot attribute to a pattern
+                    // is one they will turn the lens off to escape.
+                    let shapes = report.shapes.join("`, `");
+                    crate::diag::warn(&format!(
+                        "closed `{}` to the cage: its content matches `{shapes}`",
+                        report.path
+                    ));
+                }
             }
-        }
-        if outcome.refused {
-            respond_errno(notif_fd, req.id, libc::EACCES);
-        } else if let Some(errno) = outcome.errno {
-            respond_errno(notif_fd, req.id, errno);
-        } else if !serve_open(notif_fd, req, dirfd, &named, outcome.probe) {
-            // Nothing sound to serve it from, so the open runs the way it always did — and with it
-            // the re-resolution a sibling thread can redirect. The cases that land here are named
-            // where each is decided: a target whose type would make a reopen block, flags that
-            // cannot be carried onto a descriptor, and a kernel without `ADDFD`.
-            respond_continue(notif_fd, req.id);
+            if outcome.refused {
+                respond_errno(notif_fd, req.id, libc::EACCES);
+            } else if let Some(errno) = outcome.errno {
+                // A name that is not there is the answer to a plain open and not to a creating one, and
+                // the probe that looked for it creates nothing. Rather than report the absence the
+                // probe met, make what the open asked for.
+                if pass == 0
+                    && errno == libc::ENOENT
+                    && let Some(lens) = cx.open
+                {
+                    match serve_creation(notif_fd, req, lens, dirfd, &named) {
+                        Creation::Served => return,
+                        // The name is there after all — it appeared while this was being decided, so it
+                        // carries content nothing has examined and belongs to the ordinary decision.
+                        Creation::Exists => continue,
+                        Creation::Declined => {}
+                    }
+                }
+                respond_errno(notif_fd, req.id, errno);
+            } else if !serve_open(notif_fd, req, dirfd, &named, outcome.probe) {
+                // Nothing sound to serve it from, so the open runs the way it always did — and with it
+                // the re-resolution a sibling thread can redirect. The cases that land here are named
+                // where each is decided: a target whose type would make a reopen block, flags that
+                // cannot be carried onto a descriptor, and a kernel without `ADDFD`.
+                respond_continue(notif_fd, req.id);
+            }
+            return;
         }
         return;
     }
@@ -924,6 +945,121 @@ fn serve_open(
     ok
 }
 
+/// What came of trying to make the file an open named and the probe could not find.
+enum Creation {
+    /// The file was made and its descriptor handed over; the notification is answered.
+    Served,
+    /// The name is there after all, so the ordinary decision applies to it.
+    Exists,
+    /// Nothing was made, and nothing was answered.
+    Declined,
+}
+
+/// Make, on the cage's behalf, the file its open named and the supervisor's probe could not find.
+///
+/// The probe that examines a path opens it `O_PATH`, which creates nothing — so a name that is not
+/// there yet makes it fail, and the `ENOENT` it met is not the answer to an open carrying `O_CREAT`.
+/// Measured against a control arm, that left a cage under `[fs] scan` unable to write a single new
+/// file, which is most of what a build does.
+///
+/// Answering `CONTINUE` would be worse than the failure it fixes. Naming a file that is not there is
+/// something a cage can do whenever it likes, so that answer would be a trigger in its hands — and
+/// behind the answer sits the re-resolution a re-pointed path walks through.
+///
+/// So the file is made here, inside a directory this supervisor has vouched for by the same walk a
+/// read goes through, and the descriptor is handed over. `O_EXCL` is added whether or not the cage
+/// asked for it: it is what makes the served descriptor certainly empty, and an empty file certainly
+/// carries no content a scan has not examined. Its `EEXIST` says the name appeared while this was
+/// being decided, and such a file belongs to the ordinary decision rather than to this path.
+///
+/// A name that is a dangling symlink also answers `EEXIST`, so it takes the ordinary decision too
+/// and is reported absent. The cage's own open would have created the link's target instead; making
+/// it here would mean resolving that target on the cage's behalf, which is the walk this module
+/// declines to make on anything it has not vouched for.
+fn serve_creation(
+    notif_fd: libc::c_int,
+    req: &libc::seccomp_notif,
+    lens: &OpenLens,
+    dirfd: libc::c_int,
+    path: &str,
+) -> Creation {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let (Some(flags), Some(mode)) = (
+        open_flags(req.pid, req.data.nr, &req.data.args),
+        open_mode(req.pid, req.data.nr, &req.data.args),
+    ) else {
+        return Creation::Declined;
+    };
+    let flags = flags as libc::c_int;
+    if flags & libc::O_CREAT == 0 {
+        return Creation::Declined;
+    }
+    // The directory that will hold the name, and the name itself. The separator stays with the
+    // directory so that `/x` asks for `/` rather than for the empty string.
+    let (dir, base) = match path.rfind('/') {
+        Some(cut) => (&path[..=cut], &path[cut + 1..]),
+        None => (".", path),
+    };
+    if base.is_empty() || base == "." || base == ".." {
+        return Creation::Declined;
+    }
+    let target = open_target_path(req.pid, dirfd, dir);
+    let Ok(cdir) = std::ffi::CString::new(target.as_os_str().as_encoded_bytes()) else {
+        return Creation::Declined;
+    };
+    // SAFETY: cdir is a live NUL-terminated path for the duration of the call.
+    let parent = unsafe {
+        libc::open(
+            cdir.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if parent < 0 {
+        return Creation::Declined;
+    }
+    // SAFETY: parent is a fresh owned descriptor; the File takes sole ownership and closes it.
+    let parent = unsafe { std::fs::File::from_raw_fd(parent) };
+    // The same vouching a read gets: a directory reached through a walk that left the cage's mounts
+    // is not one to create in, whatever it holds.
+    let Ok(parent) = vouched_probe(lens, req.pid, parent) else {
+        return Creation::Declined;
+    };
+    let Ok(cbase) = std::ffi::CString::new(base) else {
+        return Creation::Declined;
+    };
+    // `O_PATH` is dropped because this descriptor is the one the cage receives and has to be usable;
+    // ours is always close-on-exec, and what the cage's copy carries is set on the response.
+    let asked = (flags & !libc::O_PATH) | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC;
+    // SAFETY: parent is a live directory descriptor and cbase a live NUL-terminated name.
+    let made = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            cbase.as_ptr(),
+            asked,
+            mode as libc::c_uint,
+        )
+    };
+    if made < 0 {
+        let e = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        return if e == libc::EEXIST {
+            Creation::Exists
+        } else {
+            Creation::Declined
+        };
+    }
+    let ok = respond_with_fd(notif_fd, req.id, made, flags & libc::O_CLOEXEC != 0);
+    // SAFETY: made is a fresh owned descriptor; the kernel copied it into the target if it took it
+    // at all, and either way this side is done with it.
+    unsafe { libc::close(made) };
+    if ok {
+        Creation::Served
+    } else {
+        // The file was made but could not be handed over. It is there now, and empty, so the
+        // ordinary decision reaches the same place by the ordinary route.
+        Creation::Exists
+    }
+}
+
 /// Whether an `errno` from an open describes the **file** or this **process**.
 ///
 /// The distinction decides what may be reported to the cage. An errno about the file is one the cage
@@ -1094,6 +1230,28 @@ fn open_flags(pid: u32, nr: libc::c_int, args: &[u64; 6]) -> Option<u64> {
             return None;
         }
         return read_u64(pid, args[2]);
+    }
+    None
+}
+
+/// The mode a creating open asks its file to land with, read from wherever its own ABI puts it.
+///
+/// The mirror of [`open_flags`], and needed for the same reason: a file made on the cage's behalf
+/// has to arrive with the permissions the cage asked for rather than with a guess.
+fn open_mode(pid: u32, nr: libc::c_int, args: &[u64; 6]) -> Option<u64> {
+    if nr as libc::c_long == libc::SYS_open {
+        return Some(args[2]);
+    }
+    if nr as libc::c_long == libc::SYS_openat {
+        return Some(args[3]);
+    }
+    if nr as libc::c_long == libc::SYS_openat2 {
+        // `struct open_how { __u64 flags; __u64 mode; __u64 resolve; }`. The mode is the second
+        // word, so the struct has to be long enough to carry one.
+        if args[3] < 16 {
+            return None;
+        }
+        return read_u64(pid, args[2].wrapping_add(8));
     }
     None
 }
@@ -1831,7 +1989,15 @@ struct OpenReport {
 /// field is the one the cage's own `/proc` uses. Both are needed: `self` names the thread group and
 /// `thread-self` names the thread inside it.
 fn caller_ids_in_cage(pid: u32) -> Option<(u32, u32)> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    innermost_ids(&std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?)
+}
+
+/// The innermost `NStgid`/`NSpid` a `status` file carries.
+///
+/// Apart from the read so that the shape it parses can be pinned on a literal. The line a cage
+/// produces carries two numbers and the file this process reads carries one, so the case that
+/// matters here is the one a host cannot show by reading its own.
+fn innermost_ids(status: &str) -> Option<(u32, u32)> {
     let innermost = |field: &str| -> Option<u32> {
         status
             .lines()
@@ -2491,6 +2657,118 @@ mod tests {
         // A caller whose ids cannot be read leaves the path as it was, rather than being rewritten
         // against a number guessed for it.
         assert_eq!(caller_proc_path(u32::MAX, "/proc/self/maps"), None);
+    }
+
+    #[test]
+    fn the_innermost_number_is_the_one_the_cage_uses() {
+        // A cage's `status` names its tasks once per namespace it is in, outermost first. Reading
+        // the first would name the task the way the *host* does, which is a number the cage's own
+        // `/proc` has never heard of — so the last field is the one, and a file with a single field
+        // has to keep working because that is what an uncaged process shows.
+        assert_eq!(
+            innermost_ids("Name:\tsh\nNStgid:\t2559290\t1\nNSpid:\t2559290\t1\n"),
+            Some((1, 1)),
+            "two namespaces: the cage's own numbers come last"
+        );
+        assert_eq!(
+            innermost_ids("NStgid:\t4242\t17\t3\nNSpid:\t4242\t17\t5\n"),
+            Some((3, 5)),
+            "nested deeper, the innermost is still the last"
+        );
+        assert_eq!(
+            innermost_ids("NStgid:\t4242\nNSpid:\t4242\n"),
+            Some((4242, 4242)),
+            "one namespace names the task once"
+        );
+        assert_eq!(
+            innermost_ids("Name:\tsh\nNSpid:\t7\n"),
+            None,
+            "a file missing either line answers nothing rather than half"
+        );
+    }
+
+    #[test]
+    fn each_open_form_keeps_its_mode_where_its_own_abi_puts_it() {
+        // The mirror of the flags test, for the argument a creating open carries. Reading the wrong
+        // register would make a file land with permissions the cage never asked for.
+        let mut args = [0u64; 6];
+        args[2] = 0o600;
+        args[3] = 0o640;
+        assert_eq!(
+            open_mode(std::process::id(), libc::SYS_open as libc::c_int, &args),
+            Some(0o600),
+            "`open` keeps its mode in the third argument"
+        );
+        assert_eq!(
+            open_mode(std::process::id(), libc::SYS_openat as libc::c_int, &args),
+            Some(0o640),
+            "`openat` leads with the descriptor, so its mode sits one along"
+        );
+        assert_eq!(
+            open_mode(std::process::id(), libc::SYS_read as libc::c_int, &args),
+            None,
+            "a syscall that is not an open has no mode to read"
+        );
+        // `openat2` carries the mode in the struct, and a `size` too small to reach it describes a
+        // call the kernel refuses anyway.
+        let how: [u64; 3] = [libc::O_CREAT as u64, 0o600, 0];
+        let mut args2 = [0u64; 6];
+        args2[2] = how.as_ptr() as u64;
+        args2[3] = 8;
+        assert_eq!(
+            open_mode(std::process::id(), libc::SYS_openat2 as libc::c_int, &args2),
+            None,
+            "a struct too short to hold the mode word carries no mode"
+        );
+        args2[3] = std::mem::size_of_val(&how) as u64;
+        assert_eq!(
+            open_mode(std::process::id(), libc::SYS_openat2 as libc::c_int, &args2),
+            Some(0o600),
+            "the mode is the second field of `struct open_how`"
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_not_there_yet_is_made_rather_than_reported_absent() {
+        // The probe that examines a path creates nothing, so a creating open finds its name absent
+        // and would be told so. Both halves are asserted: the file has to appear with the bytes the
+        // cage wrote, and a file that already carries a secret must still be refused — a lens that
+        // answered every creating open by making the file would satisfy the first alone.
+        let dir = TmpDir::new();
+        let secret = dir.join("carries.txt");
+        std::fs::write(&secret, b"API key: sk-ABC123DEF456GHI789\n").expect("write the fixture");
+
+        let made = dir.join("made.txt");
+        let script = format!(
+            // The refused read is not last: its own failure is the point, and the exit code
+            // asserted below is about the payload reaching its end rather than about that read.
+            "echo neuf > {0}; echo made=$?; cat {0}; cat {1} 2>&1; echo fin",
+            made.to_str().expect("utf-8 fixture path"),
+            secret.to_str().expect("utf-8 fixture path"),
+        );
+        let (code, out) = run_with_open_lens(
+            &["/bin/sh", "-c", &script],
+            &[r"sk-[A-Za-z0-9]{12,}"],
+            &dir.join("."),
+        );
+        assert_eq!(code, Some(0), "the payload must run to the end: {out}");
+        assert!(
+            out.contains("fin"),
+            "the payload must reach its last line: {out}"
+        );
+        assert!(
+            out.contains("made=0") && out.contains("neuf"),
+            "the file must be created and carry what was written to it: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&made).expect("the file exists on this side too"),
+            "neuf\n",
+            "the file the cage was served has to be the one that appeared on disk"
+        );
+        assert!(
+            !out.contains("sk-ABC123DEF456GHI789"),
+            "a file that already carries a secret is still refused: {out}"
+        );
     }
 
     #[test]
