@@ -267,6 +267,81 @@ fn detached_observe_records_fs_writes_for_fs_logs() {
 }
 
 #[test]
+fn fs_scan_never_serves_the_cage_an_object_from_outside_it() {
+    // The supervisor resolves a notified open through `/proc/<pid>/root`, which starts the walk on
+    // the cage's own mounts. A symlink whose target begins with `/` ends it somewhere else: such a
+    // target restarts resolution at the root of whoever is resolving, and that is the supervisor.
+    // A cage that plants one therefore names a path and receives the host's object at it — its
+    // `/proc/self/comm` is the supervisor's, and `/dev/stdout` is the supervisor's descriptor.
+    //
+    // Teeth on both sides. The first arm fails if anything from outside crosses; the second fails if
+    // the fix bought that by refusing more, since a secret named through an absolute link must still
+    // be scanned and refused rather than quietly let past on a second, unexamined resolution.
+    let (project, data) = (TmpDir::new(), TmpDir::new());
+    if !host_can_sandbox(project.path(), data.path()) {
+        skip_incapable!("skipping `[fs] scan` boundary e2e: host cannot sandbox");
+        return;
+    }
+
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[fs]\nscan = [\"sk-[A-Za-z0-9]{12,}\"]\n",
+    )
+    .expect("write the project config");
+    std::fs::write(
+        project.path().join("carries.txt"),
+        "API key: sk-ABC123DEF456GHI789\n",
+    )
+    .expect("write the matching fixture");
+    std::fs::write(project.path().join("ordinary.txt"), "no credential here\n")
+        .expect("write the clean fixture");
+
+    let inside = project
+        .path()
+        .join("carries.txt")
+        .to_str()
+        .expect("utf-8 fixture path")
+        .to_string();
+    let script = format!(
+        "ln -s /proc/self/comm outside; cat outside; \
+         ln -s {inside} named_absolutely; cat named_absolutely; \
+         cat ordinary.txt"
+    );
+    let out = sbx_isolated()
+        .args(["run", "--", "sh", "-c", &script])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("run the cage");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !stdout.contains("sbx"),
+        "the cage read the supervisor's own `/proc/self/comm` through a link it planted, so an \
+         absolute symlink target is still being resolved against the supervisor's root.\nstdout: \
+         {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("sk-ABC123DEF456GHI789"),
+        "the matching file reached the cage when named through an absolute symlink, so the second \
+         resolution served what the first had not examined.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("its content matches") && stderr.contains("named_absolutely"),
+        "the refusal must name the link the cage opened and the pattern that closed it, which is \
+         what tells a refusal apart from an open that failed for some other reason.\nstdout: \
+         {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("no credential here"),
+        "a file that matches nothing must still be readable — a guard that closed everything would \
+         satisfy the assertions above without enforcing anything.\nstdout: {stdout}\nstderr: \
+         {stderr}"
+    );
+}
+
+#[test]
 fn fs_scan_closes_a_matching_file_inside_a_real_cage() {
     // The one property the whole content lens rests on: the supervisor lives **outside** the cage's
     // mount namespace, so every path a notified open names has to be resolved through the target's

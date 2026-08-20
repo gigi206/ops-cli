@@ -69,7 +69,7 @@
 //! (refusing is not — the syscall never runs). It is a guardrail with real teeth on the exec channel,
 //! layered on the cage's actual boundaries (confinement by absence, the read-only store, the netns).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -793,8 +793,10 @@ fn respond_with_fd(notif_fd: libc::c_int, id: u64, srcfd: libc::c_int, cloexec: 
 /// free to have rewritten them meanwhile.
 ///
 /// Serving carries no authority the cage did not have: the probe was taken through
-/// `/proc/<pid>/root`, so it sits on the cage's own mounts, and a read-only bind refuses a write
-/// reopen with `EROFS` exactly as it would have refused the cage.
+/// `/proc/<pid>/root` and then vouched for by [`vouched_probe`], so it sits on the cage's own
+/// mounts, and a read-only bind refuses a write reopen with `EROFS` exactly as it would have refused
+/// the cage. The prefix alone does not carry that far — a symlink target beginning with `/` restarts
+/// the walk at this process's root — which is what the vouching is for.
 ///
 /// Returns `false` when the call cannot be served this way, leaving the caller to answer `CONTINUE`
 /// — which is the pre-existing behaviour, and with it the pre-existing race.
@@ -1317,6 +1319,255 @@ impl ScanCache {
     }
 }
 
+/// How many mount namespaces a launch remembers the mount set of.
+///
+/// One is the common case: the cage's own. A cage that puts a descendant in a mount namespace of its
+/// own adds one per namespace, and the ceiling bounds the supervisor's memory rather than naming a
+/// limit anyone should meet.
+const CAGE_MOUNTS_MAX: usize = 64;
+
+/// The mounts a cage can see, remembered per mount namespace.
+///
+/// The set answers one question: did the supervisor's own path walk stay on the mounts the *cage*
+/// has? A walk that left them reached its object through this process's root rather than the cage's,
+/// and what it found cannot be handed over on the cage's behalf.
+///
+/// Keyed by the namespace rather than by the pid, because a cage may put a descendant in a mount
+/// namespace of its own and that descendant's opens have to be judged against the mounts *it* sees.
+///
+/// Never refreshed. A set older than a mount the cage made since only sends that open down the
+/// slower path, which resolves inside the cage's root and reaches the same answer — so staleness
+/// costs time, never correctness, and a refresh on every miss would let a cage spend the
+/// supervisor's time by opening paths that miss on purpose.
+#[derive(Default)]
+struct CageMounts {
+    seen: Mutex<BTreeMap<u64, BTreeSet<u64>>>,
+}
+
+impl CageMounts {
+    /// The inode of `pid`'s mount namespace, which is what `/proc/<pid>/ns/mnt` names.
+    fn namespace_of(pid: u32) -> Option<u64> {
+        let link = std::fs::read_link(format!("/proc/{pid}/ns/mnt")).ok()?;
+        link.to_str()?
+            .strip_prefix("mnt:[")?
+            .strip_suffix(']')?
+            .parse()
+            .ok()
+    }
+
+    /// The mount ids `pid` can see, as its own `mountinfo` numbers them.
+    fn read(pid: u32) -> Option<BTreeSet<u64>> {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/mountinfo")).ok()?;
+        let ids: BTreeSet<u64> = text
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .filter_map(|id| id.parse().ok())
+            .collect();
+        (!ids.is_empty()).then_some(ids)
+    }
+
+    /// Whether `id` names one of the mounts `pid` can see.
+    ///
+    /// `false` when the question cannot be answered at all — an unreadable `mountinfo`, a target
+    /// already reaped — because an unknown mount must not be taken for a known one. The caller pays
+    /// for that with a second resolution, which is the safe direction.
+    fn holds(&self, pid: u32, id: u64) -> bool {
+        let Some(ns) = Self::namespace_of(pid) else {
+            return false;
+        };
+        if let Ok(seen) = self.seen.lock()
+            && let Some(ids) = seen.get(&ns)
+        {
+            return ids.contains(&id);
+        }
+        let Some(fresh) = Self::read(pid) else {
+            return false;
+        };
+        let holds = fresh.contains(&id);
+        if let Ok(mut seen) = self.seen.lock() {
+            if seen.len() >= CAGE_MOUNTS_MAX {
+                seen.clear();
+            }
+            seen.insert(ns, fresh);
+        }
+        holds
+    }
+}
+
+/// The bit that asks `statx` for the mount number, and the one it sets when it answered.
+const STATX_MNT_ID: libc::c_uint = 0x1000;
+
+/// The kernel's `struct statx`, of which this module reads two fields.
+///
+/// Declared here rather than taken from `libc`, which carries the type for some targets and not for
+/// the static one this ships as. The layout is the kernel's ABI, fixed by it and pinned by
+/// [`the_statx_layout_matches_the_kernels`](tests::the_statx_layout_matches_the_kernels).
+#[repr(C)]
+struct Statx {
+    mask: u32,
+    blksize: u32,
+    attributes: u64,
+    nlink: u32,
+    uid: u32,
+    gid: u32,
+    mode: u16,
+    spare0: u16,
+    ino: u64,
+    size: u64,
+    blocks: u64,
+    attributes_mask: u64,
+    /// Four `statx_timestamp`, sixteen bytes each, none of which this call asks for.
+    times: [u64; 8],
+    rdev_major: u32,
+    rdev_minor: u32,
+    dev_major: u32,
+    dev_minor: u32,
+    mnt_id: u64,
+    /// The remainder of the 256 bytes the kernel is free to write into.
+    tail: [u64; 13],
+}
+
+/// The mount the object behind `fd` sits on, numbered the way `mountinfo` numbers mounts.
+///
+/// `None` is a refusal to answer rather than an answer: a kernel that does not carry the field
+/// leaves the caller to resolve inside the cage's root instead of taking an unknown mount for one
+/// the cage has.
+fn mount_id(fd: libc::c_int) -> Option<u64> {
+    let mut buf: Statx = unsafe { std::mem::zeroed() };
+    // SAFETY: buf is a live, correctly-sized statx buffer, and the empty path with `AT_EMPTY_PATH`
+    // asks about the descriptor itself — the one question an `O_PATH` probe can answer.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            fd,
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH,
+            STATX_MNT_ID,
+            std::ptr::addr_of_mut!(buf),
+        )
+    };
+    (rc == 0 && buf.mask & STATX_MNT_ID != 0).then_some(buf.mnt_id)
+}
+
+/// Set once the kernel has refused `openat2`, so a host without it pays one failed syscall for the
+/// whole session rather than one per open that has to be resolved again.
+static OPENAT2_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// Reach `absolute` from **inside the cage's root**, the way the cage's own kernel would.
+///
+/// `RESOLVE_IN_ROOT` is what makes this faithful. A symlink whose target begins with `/` restarts
+/// the resolution at the root of whoever is resolving, and a walk this process makes is resolved
+/// against *its* root — so the target is taken relative to the cage's root instead. That is the
+/// whole difference between reaching the cage's `/etc/hostname` and reaching ours, and it also means
+/// the walk from here cannot leave the cage whatever it meets.
+///
+/// `absolute` is the path the supervisor's own walk ended on, which for the case that brings a
+/// caller here — a symlink target beginning with `/` — is the path the cage's kernel resolves too.
+/// The limit that leaves: an object the cage reaches under a *different* path than this process does
+/// is not found, and the open is refused rather than served. That case needs both an absolute
+/// symlink and a bind whose two sides sit at different paths; it fails closed, and the alternative
+/// would be serving an object from a walk the cage did not make.
+///
+/// Returns the errno the cage's own open would have met, so the caller has an answer either way.
+fn probe_in_cage_root(pid: u32, absolute: &Path) -> Result<libc::c_int, libc::c_int> {
+    if OPENAT2_UNAVAILABLE.load(Ordering::Relaxed) {
+        return Err(libc::ENOSYS);
+    }
+    // `/proc/<pid>/fd/<n>` is rendered by the kernel against *this* process's root, so a target it
+    // cannot name from there comes back marked rather than absolute — and a path that is not
+    // absolute is not one this walk can start from.
+    let Some(rest) = absolute.to_str().and_then(|p| p.strip_prefix('/')) else {
+        return Err(libc::ENOENT);
+    };
+    // An empty remainder names the root itself, which `openat2` spells `.`.
+    let rest = if rest.is_empty() { "." } else { rest };
+    let (Ok(cstart), Ok(crest)) = (
+        std::ffi::CString::new(format!("/proc/{pid}/root")),
+        std::ffi::CString::new(rest),
+    ) else {
+        return Err(libc::EINVAL);
+    };
+    // SAFETY: cstart is a live NUL-terminated path for the duration of the call.
+    let start = unsafe { libc::open(cstart.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if start < 0 {
+        return Err(io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::ENOENT));
+    }
+    // Zeroed and then filled: the struct is non-exhaustive, and a zero in a field this call does
+    // not use is what the kernel reads as "unset" anyway.
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
+    how.resolve = libc::RESOLVE_IN_ROOT;
+    // SAFETY: start is this call's live descriptor, crest a live NUL-terminated path, and how a
+    // live correctly-sized `open_how` for the kernel to read.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            start,
+            crest.as_ptr(),
+            std::ptr::addr_of!(how),
+            std::mem::size_of::<libc::open_how>(),
+        )
+    };
+    let err = io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::ENOENT);
+    // SAFETY: start is this call's owned descriptor, closed exactly once.
+    unsafe { libc::close(start) };
+    if fd >= 0 {
+        return Ok(fd as libc::c_int);
+    }
+    if err == libc::ENOSYS && !OPENAT2_UNAVAILABLE.swap(true, Ordering::Relaxed) {
+        // Said at all, because it is the difference between a guard that holds and one that only
+        // looks like it does, and nothing else in a launch mentions it. Said once, from whichever
+        // thread learns it first: a parked open answers from its own.
+        //
+        // This is not covered by a test: reproducing it needs a kernel that lacks the operation.
+        crate::diag::warn(
+            "this kernel does not offer `openat2` (it landed in 5.6), which is what lets the \
+             supervisor resolve a path the way the cage would; under `[fs] scan` an open whose walk \
+             leaves the cage's own mounts is refused rather than answered from a resolution this \
+             process's root steered",
+        );
+    }
+    Err(err)
+}
+
+/// The probe, once it is known to describe what the **cage's** own walk would have reached.
+///
+/// The supervisor resolves through `/proc/<pid>/root`, which puts the walk on the cage's mounts —
+/// but only until it meets a symlink whose target begins with `/`. Such a target restarts the
+/// resolution at the resolving process's root, and that is this one's: `/dev/stdout` is a link to
+/// `/proc/self/fd/1`, where `self` names the supervisor. Measured, a cage that opens it receives the
+/// supervisor's own descriptor, and a link the cage plants itself reaches the host's copy of any
+/// file it names.
+///
+/// So the walk is checked rather than trusted. Either the probe landed on a mount the cage can see,
+/// and the walk stayed inside; or it did not, and the path it landed on is reached again from inside
+/// the cage's root, which is the resolution the cage's own kernel performs for such a target. The
+/// second form is exact for a bind of the same file — the cage reaches that inode under that name —
+/// so a secret named through an absolute link is still scanned and still refused, and a store path
+/// named through one is still served.
+fn vouched_probe(
+    lens: &OpenLens,
+    pid: u32,
+    probe: std::fs::File,
+) -> Result<std::fs::File, libc::c_int> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    if let Some(id) = mount_id(probe.as_raw_fd())
+        && lens.mounts.holds(pid, id)
+    {
+        return Ok(probe);
+    }
+    let Ok(landed) = std::fs::read_link(format!("/proc/self/fd/{}", probe.as_raw_fd())) else {
+        return Err(libc::ENOENT);
+    };
+    let fd = probe_in_cage_root(pid, &landed)?;
+    // SAFETY: fd is a fresh owned descriptor; the File takes sole ownership and closes it.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
 /// The scan ceiling of the lens in force, for a message that has to say how far it looked.
 fn policy_scan_ceiling(open: Option<&OpenLens>) -> usize {
     open.map(|l| l.policy.max_scan()).unwrap_or(0)
@@ -1340,6 +1591,9 @@ pub(crate) struct OpenLens {
     /// a symlink pointing out of the tree cannot smuggle a scan-worthy file past it — nor one
     /// pointing in be scanned twice under two names.
     root: PathBuf,
+    /// The mounts each cage namespace can see, which is what tells a walk that stayed inside from
+    /// one that left through an absolute symlink.
+    mounts: CageMounts,
 }
 
 impl OpenLens {
@@ -1348,6 +1602,7 @@ impl OpenLens {
             policy,
             cache: ScanCache::default(),
             root,
+            mounts: CageMounts::default(),
         }
     }
 }
@@ -1393,6 +1648,17 @@ fn open_is_refused(lens: &OpenLens, pid: u32, dirfd: libc::c_int, path: &str) ->
     }
     // SAFETY: probe is a fresh owned descriptor; the File takes sole ownership and closes it.
     let probe = unsafe { std::fs::File::from_raw_fd(probe) };
+    // Before a byte is read from it or it is handed over: is this what the *cage's* walk would have
+    // reached? Asked here rather than below the type test, because a device and a FIFO are served
+    // from the probe without ever being scanned — and `/dev/stdout` is exactly such a device.
+    let probe = match vouched_probe(lens, pid, probe) {
+        Ok(probe) => probe,
+        // The errno of the resolution the cage would have made, which is the answer. An errno about
+        // this process rather than about the file is normalised to `EACCES` by `OpenOutcome::failed`
+        // — so a kernel that cannot resolve on the cage's behalf refuses the open instead of serving
+        // one steered by this process's root.
+        Err(e) => return OpenOutcome::failed(e),
+    };
     use std::os::unix::io::AsRawFd;
     // What the kernel actually resolved, which is what the project bound is applied to.
     let Ok(resolved) = std::fs::read_link(format!("/proc/self/fd/{}", probe.as_raw_fd())) else {
@@ -2093,10 +2359,25 @@ mod tests {
             })
         };
 
+        // The two output files exist before the payload runs. Creating one from inside would be a
+        // different subject: the supervisor examines a path with a probe that does not create, so a
+        // name that is not there yet is a question it cannot answer on the open's behalf.
+        //
+        // Each `dd` is given an `of=`, and what it wrote is read back from there. Without one, `dd`
+        // examines its output by opening `/dev/stdout` — a link into `/proc/self/fd`, which names
+        // whichever process resolves it. That would make the arm depend on what the suite's own
+        // output happens to be rather than on the property asserted here; `/dev/stdout` across the
+        // cage boundary is a subject of its own, and belongs to a test that has a boundary to cross.
+        for name in ["device.bin", "fifo.bin"] {
+            std::fs::write(dir.join(name), b"").expect("place the output fixture");
+        }
         let script = format!(
-            "/bin/cat /dev/null; /bin/dd if=/dev/urandom bs=4 count=1 2>/dev/null | /bin/wc -c; \
-             /bin/dd if={} bs=8 count=1 2>/dev/null",
-            pipe.to_str().expect("utf-8 fixture path")
+            "/bin/cat /dev/null; \
+             /bin/dd if=/dev/urandom bs=4 count=1 of={1} 2>/dev/null; /bin/wc -c < {1}; \
+             /bin/dd if={0} bs=8 count=1 of={2} 2>/dev/null; /bin/cat {2}",
+            pipe.to_str().expect("utf-8 fixture path"),
+            dir.join("device.bin").to_str().expect("utf-8 fixture path"),
+            dir.join("fifo.bin").to_str().expect("utf-8 fixture path"),
         );
         let (code, out) = run_with_open_lens(
             &["/bin/sh", "-c", &script],
@@ -2112,6 +2393,130 @@ mod tests {
             out.trim_end(),
             "4\npipebyte",
             "a device must still deliver its four bytes and a pipe what its writer sent"
+        );
+    }
+
+    #[test]
+    fn the_statx_layout_matches_the_kernels() {
+        // The struct is filled by the kernel, so a field at the wrong offset would be read as
+        // whatever sits there — silently, and with a plausible value. The two offsets that matter
+        // are the mask the answer is confirmed with and the number it carries.
+        assert_eq!(
+            std::mem::size_of::<Statx>(),
+            256,
+            "`struct statx` is 256 bytes, and the kernel writes all of them"
+        );
+        assert_eq!(std::mem::offset_of!(Statx, mask), 0, "the mask leads");
+        assert_eq!(
+            std::mem::offset_of!(Statx, mnt_id),
+            144,
+            "the mount number sits after the device numbers"
+        );
+    }
+
+    #[test]
+    fn a_mount_this_process_cannot_see_is_never_taken_for_one_it_can() {
+        // The gate that decides whether a walk stayed inside the cage. Both directions matter: a
+        // mount the process has must be recognised, or every open pays a second resolution; and one
+        // it does not have must not be, or the check passes what it exists to catch.
+        let here = std::fs::File::open(".").expect("open the working directory");
+        use std::os::unix::io::AsRawFd;
+        let id = mount_id(here.as_raw_fd()).expect("this kernel carries the mount id");
+        let mounts = CageMounts::default();
+        let me = std::process::id();
+        assert!(
+            mounts.holds(me, id),
+            "the mount this process's own directory sits on is one it can see"
+        );
+        // `u64::MAX` is not a mount number the kernel hands out, so nothing can make this one true.
+        assert!(
+            !mounts.holds(me, u64::MAX),
+            "a mount number that names nothing must not be taken for one the process has"
+        );
+    }
+
+    #[test]
+    fn a_process_that_cannot_be_read_answers_no_rather_than_yes() {
+        // The fail direction, which is the branch no host here exercises by accident. A target
+        // already reaped, or a `/proc` entry that cannot be read, leaves the question unanswered —
+        // and an unanswered question must send the open down the second resolution, never past it.
+        let mounts = CageMounts::default();
+        // A pid one past the maximum the kernel can allocate: `/proc/<it>` never exists.
+        let absent = u32::MAX;
+        assert!(
+            CageMounts::namespace_of(absent).is_none(),
+            "no namespace can be read for a process that is not there"
+        );
+        assert!(
+            !mounts.holds(absent, 1),
+            "a mount cannot be vouched for against a process that cannot be read"
+        );
+    }
+
+    #[test]
+    fn the_second_resolution_reaches_the_same_inode_and_refuses_a_marked_path() {
+        // What the second resolution is for: reaching a path from inside a root rather than from
+        // this process's own. With this process as its own target the two roots coincide, so what is
+        // pinned here is that it reaches the file it names — and that a path the kernel *marked*
+        // rather than named is refused, since such a string is not one a walk can start from.
+        use std::os::unix::io::FromRawFd;
+        let me = std::process::id();
+        let dir = TmpDir::new();
+        let file = dir.join("target.txt");
+        std::fs::write(&file, b"contents\n").expect("write the fixture");
+
+        let fd = probe_in_cage_root(me, &file).expect("the path resolves from inside the root");
+        // SAFETY: fd is a fresh owned descriptor; the File takes sole ownership and closes it.
+        let reached = unsafe { std::fs::File::from_raw_fd(fd) };
+        let (want, got) = (
+            FileId::of(&std::fs::metadata(&file).expect("stat the fixture")),
+            FileId::of(&reached.metadata().expect("stat what was reached")),
+        );
+        assert_eq!(
+            (want.dev, want.ino),
+            (got.dev, got.ino),
+            "the second resolution must reach the very file it names"
+        );
+
+        assert_eq!(
+            probe_in_cage_root(me, Path::new("(unreachable)/etc/hostname")),
+            Err(libc::ENOENT),
+            "a path the kernel marked rather than named is not one a walk can start from"
+        );
+        assert_eq!(
+            probe_in_cage_root(me, &dir.join("absent.txt")),
+            Err(libc::ENOENT),
+            "a name that is not there is answered with the errno the cage's own open would meet"
+        );
+    }
+
+    #[test]
+    fn a_secret_named_from_a_subdirectory_is_still_scanned() {
+        // The fast path exists so that an ordinary relative open keeps resolving exactly as it did,
+        // `..` included. Pinning it here because the alternative once considered — resolving every
+        // open inside the cage's root — would rebase `..` onto the starting directory and let this
+        // very open through unscanned.
+        let dir = TmpDir::new();
+        let secret = dir.join("carries.txt");
+        std::fs::write(&secret, b"API key: sk-ABC123DEF456GHI789\n").expect("write the fixture");
+        std::fs::create_dir(dir.join("sub")).expect("make the subdirectory");
+
+        let script = format!(
+            "cd {} && /bin/cat ../carries.txt 2>&1",
+            dir.join("sub").to_str().expect("utf-8 fixture path")
+        );
+        let (_, out) = run_with_open_lens(
+            &["/bin/sh", "-c", &script],
+            &[r"sk-[A-Za-z0-9]{12,}"],
+            &dir.join("."),
+        );
+        assert!(
+            !out.contains("sk-ABC123DEF456GHI789"),
+            "a secret named through `..` reached the cage, so the open was not scanned: {out}"
+        );
+        assert!(
+            out.contains("Permission denied") || out.contains("Permission non accord"),
+            "the open must be refused rather than fail for some other reason: {out}"
         );
     }
 
