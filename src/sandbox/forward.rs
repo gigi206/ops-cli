@@ -330,19 +330,44 @@ mod tests {
     use crate::testutil::TmpDir;
     use std::io::{Read, Write};
 
+    /// Starts a forwarder on ports the OS has just handed out. A port is chosen by binding and
+    /// releasing it, so between the release and the forwarder's own bind there is a window
+    /// anything else on the machine can win — including a sibling test, since the binary runs them
+    /// in parallel. Losing that race says nothing about what any of these tests assert, so a taken
+    /// port is retried with a fresh set; a bind that fails for any other reason still fails.
+    fn start_on_free_ports(
+        layout: &Layout,
+        count: usize,
+        wire: impl Fn(&[u16]) -> Vec<ForwardPort>,
+    ) -> (Forwarder, Wiring, Vec<u16>) {
+        let mut left = 5;
+        loop {
+            let held: Vec<TcpListener> = (0..count)
+                .map(|_| TcpListener::bind(("127.0.0.1", 0)).expect("an ephemeral port"))
+                .collect();
+            let picked: Vec<u16> = held
+                .iter()
+                .map(|l| l.local_addr().expect("the bound address").port())
+                .collect();
+            drop(held);
+
+            match start(layout, wire(&picked)) {
+                Ok((guard, wiring)) => break (guard, wiring, picked),
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse && left > 0 => left -= 1,
+                Err(e) => panic!("start binds the ports it was given: {e:?}"),
+            }
+        }
+    }
+
     /// `start` binds a host loopback listener and a per-launch dir per port, and returns exactly
     /// one writable `ExtraBind` at the cage forward dir plus one forward per declared entry.
     #[test]
     fn start_binds_host_listeners_and_wires_the_cage() {
         let data = TmpDir::new();
         let layout = Layout::under(data.path());
-        // Port 0 lets the OS pick a free port so the test never collides.
-        let free = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = free.local_addr().unwrap().port();
-        drop(free);
-
-        let (guard, wiring) =
-            start(&layout, vec![ForwardPort::same(port)]).expect("start binds the port");
+        let (guard, wiring, picked) =
+            start_on_free_ports(&layout, 1, |p| vec![ForwardPort::same(p[0])]);
+        let port = picked[0];
         // One directory bind, writable, at the fixed cage path — it carries every per-port socket.
         assert_eq!(wiring.binds.len(), 1);
         assert_eq!(wiring.binds[0].dest, PathBuf::from(CAGE_FORWARD_DIR));
@@ -369,11 +394,9 @@ mod tests {
     fn a_dropped_guard_frees_the_host_port() {
         let data = TmpDir::new();
         let layout = Layout::under(data.path());
-        let free = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = free.local_addr().unwrap().port();
-        drop(free);
-
-        let (guard, _wiring) = start(&layout, vec![ForwardPort::same(port)]).expect("start");
+        let (guard, _wiring, picked) =
+            start_on_free_ports(&layout, 1, |p| vec![ForwardPort::same(p[0])]);
+        let port = picked[0];
         assert!(
             TcpListener::bind(("127.0.0.1", port)).is_err(),
             "the port is held while the guard lives"
@@ -429,33 +452,14 @@ mod tests {
     fn a_remap_binds_the_host_side_and_wires_the_cage_side() {
         let data = TmpDir::new();
         let layout = Layout::under(data.path());
-        // Two distinct free ports: one to publish on, one standing in for the caged service. A
-        // port is chosen by binding and releasing it, so between the release and the forwarder's
-        // own bind there is a window anything else on the machine can win — including a sibling
-        // test, since the binary runs them in parallel. Losing it says nothing about the wiring
-        // this test is for, so a taken port is retried with a fresh pair instead of reported as a
-        // failure; a bind that fails for any other reason still is one.
-        let mut left = 5;
-        let (guard, wiring, host_port, cage_port) = loop {
-            let a = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            let b = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            let host_port = a.local_addr().unwrap().port();
-            let cage_port = b.local_addr().unwrap().port();
-            drop(a);
-            drop(b);
-
-            match start(
-                &layout,
-                vec![ForwardPort {
-                    host: host_port,
-                    cage: cage_port,
-                }],
-            ) {
-                Ok((g, w)) => break (g, w, host_port, cage_port),
-                Err(e) if e.kind() == io::ErrorKind::AddrInUse && left > 0 => left -= 1,
-                Err(e) => panic!("start binds the remapped host port: {e:?}"),
-            }
-        };
+        // Two distinct free ports: one to publish on, one standing in for the caged service.
+        let (guard, wiring, picked) = start_on_free_ports(&layout, 2, |p| {
+            vec![ForwardPort {
+                host: p[0],
+                cage: p[1],
+            }]
+        });
+        let (host_port, cage_port) = (picked[0], picked[1]);
 
         // The cage side is the cage port — on the forward, and on the socket path that names it.
         assert_eq!(wiring.forwards.len(), 1);
@@ -564,11 +568,9 @@ mod tests {
 
         let data = TmpDir::new();
         let layout = Layout::under(data.path());
-        let free = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = free.local_addr().unwrap().port();
-        drop(free);
-
-        let (guard, _wiring) = start(&layout, vec![ForwardPort::same(port)]).expect("start");
+        let (guard, _wiring, picked) =
+            start_on_free_ports(&layout, 1, |p| vec![ForwardPort::same(p[0])]);
+        let port = picked[0];
         // Stand in for the in-cage socat: bind the host-side socket path (the same inode the cage
         // would bind through the dir bind) and echo one line back, uppercased.
         let sock_path = wiring_host_socket(&layout, port);
