@@ -3601,7 +3601,19 @@ mod tests {
         );
         assert_eq!(code, Some(126), "the payload must have been refused");
 
-        let announced = seen.lock().expect("recorder lock").clone();
+        // The refusal and its announcement are not the same moment: what returns above is the
+        // payload's exit status, while the notification is recorded on the supervisor's own
+        // thread. Reading the recorder once therefore reads it before the writer reached it
+        // whenever the machine is busy, so the read waits for the first announcement instead. The
+        // deadline is what keeps a genuinely lost announcement a failure rather than a hang.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let announced = loop {
+            let now = seen.lock().expect("recorder lock").clone();
+            if !now.is_empty() || std::time::Instant::now() >= deadline {
+                break now;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         let (summary, body) = announced
             .first()
             .unwrap_or_else(|| panic!("a denied exec announced nothing: {announced:?}"));

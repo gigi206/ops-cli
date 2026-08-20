@@ -316,11 +316,22 @@ mod tests {
             .expect("spawn test shell");
         let root_pid = child.id();
 
-        // Wait for the child `sleep` to appear under the shell.
+        // The wait asks the question the assertion asks: not "does the shell have a child" but
+        // "is that child `sleep`". The two are not the same moment — a forked child carries its
+        // parent's argv until it execs — so a loop that stops at the weaker condition can hand
+        // the assertion a child still showing the shell's own command line. Stopping only on the
+        // stronger one makes any such transient state something the deadline absorbs rather than
+        // something the assertion reads.
+        let execed = |n: &ProcNode| {
+            n.children
+                .first()
+                .and_then(|c| c.args.first())
+                .is_some_and(|a| a.contains("sleep"))
+        };
         let deadline = Instant::now() + Duration::from_secs(5);
         let found = loop {
             if let Some(node) = tree(root_pid)
-                && !node.children.is_empty()
+                && execed(&node)
             {
                 break Some(node);
             }

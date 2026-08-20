@@ -429,22 +429,33 @@ mod tests {
     fn a_remap_binds_the_host_side_and_wires_the_cage_side() {
         let data = TmpDir::new();
         let layout = Layout::under(data.path());
-        // Two distinct free ports: one to publish on, one standing in for the caged service.
-        let a = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let b = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let host_port = a.local_addr().unwrap().port();
-        let cage_port = b.local_addr().unwrap().port();
-        drop(a);
-        drop(b);
+        // Two distinct free ports: one to publish on, one standing in for the caged service. A
+        // port is chosen by binding and releasing it, so between the release and the forwarder's
+        // own bind there is a window anything else on the machine can win — including a sibling
+        // test, since the binary runs them in parallel. Losing it says nothing about the wiring
+        // this test is for, so a taken port is retried with a fresh pair instead of reported as a
+        // failure; a bind that fails for any other reason still is one.
+        let mut left = 5;
+        let (guard, wiring, host_port, cage_port) = loop {
+            let a = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let b = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let host_port = a.local_addr().unwrap().port();
+            let cage_port = b.local_addr().unwrap().port();
+            drop(a);
+            drop(b);
 
-        let (guard, wiring) = start(
-            &layout,
-            vec![ForwardPort {
-                host: host_port,
-                cage: cage_port,
-            }],
-        )
-        .expect("start binds the remapped host port");
+            match start(
+                &layout,
+                vec![ForwardPort {
+                    host: host_port,
+                    cage: cage_port,
+                }],
+            ) {
+                Ok((g, w)) => break (g, w, host_port, cage_port),
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse && left > 0 => left -= 1,
+                Err(e) => panic!("start binds the remapped host port: {e:?}"),
+            }
+        };
 
         // The cage side is the cage port — on the forward, and on the socket path that names it.
         assert_eq!(wiring.forwards.len(), 1);
