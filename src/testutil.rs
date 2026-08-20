@@ -599,3 +599,90 @@ fn every_fixture_root_is_the_shared_one() {
         "only {declaring} files declare a fixture directory — has the sweep gone stale?"
     );
 }
+
+/// A path whose first component is `..`, joined onto another, reaches outside it.
+///
+/// Everywhere this codebase takes such a name from a caller it refuses it: `reap_one` answers
+/// `NotFound` for `../victim` rather than delete a sibling of `projects/`, and a `[cage] timezone`
+/// of `../escaped` falls back to the default rather than become a link target. The one place the
+/// shape survived was the *writing* side of a test, where nothing refuses anything — and a test
+/// that writes through `..` writes outside its own fixture.
+///
+/// What that leaves behind is not swept by [`TmpDir`]'s drop, which removes only the directory it
+/// made. It carries no pid, so nothing reclaiming a killed run's trees can tell it from a live
+/// one's. And every process running the suite writes that one absolute path at the same moment.
+///
+/// The rule is narrow, and worth stating as exactly what it is: **no line of code joins or pushes a
+/// literal component beginning with `..`**. A traversal assembled any other way — through
+/// [`Path::parent`], a `format!`, or a `PathBuf` built up piece by piece — walks past this sweep
+/// untouched. Prose may still name the shape; a comment describing a traversal is not one.
+#[test]
+fn nothing_joins_a_path_that_traverses_out_of_the_one_it_is_joined_to() {
+    // Assembled at runtime, so this file does not match its own needles.
+    let (join, push) = (format!(".join(\"{}", ".."), format!(".push(\"{}", ".."));
+    let offends = |line: &str| {
+        !line.trim_start().starts_with("//") && (line.contains(&join) || line.contains(&push))
+    };
+
+    // The predicate answers both ways before it is trusted on the tree: one that recognised nothing,
+    // and one that flagged the prose as well, both report an empty list from a clean sweep.
+    let joined = format!(
+        "std::fs::write(db.path().join(\"{}/escaped\"), b\"x\").unwrap();",
+        ".."
+    );
+    let pushed = format!("let mut d = base.clone(); d.push(\"{}\");", "..");
+    let prose = format!(
+        "// a sibling of the base that `p.join(\"{}/victim\")` would reach",
+        ".."
+    );
+    assert!(
+        offends(&joined),
+        "the sweep no longer sees the shape it exists for"
+    );
+    assert!(
+        offends(&pushed),
+        "the sweep sees only one of the two spellings"
+    );
+    assert!(!offends(&prose), "prose naming the shape is not the shape");
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let (mut traversing, mut files) = (Vec::new(), 0);
+    let mut stack = vec![root.join("src"), root.join("tests")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .expect("read a source directory")
+            .flatten()
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read a source file");
+            files += 1;
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            for (n, line) in text.lines().enumerate() {
+                if offends(line) {
+                    traversing.push(format!("{rel}:{}", n + 1));
+                }
+            }
+        }
+    }
+
+    assert!(
+        traversing.is_empty(),
+        "these lines build a path that begins by leaving the directory it is joined to: \
+         {traversing:?} — in a test that means writing outside its own fixture, into a tree every \
+         other process running the suite shares and no cleanup owns. Give the traversal a target \
+         the fixture holds, the way `gc.rs` gives `../victim` a sibling of its own `projects/`"
+    );
+    // The precondition, asserted rather than assumed: a sweep that read nothing passes silently.
+    assert!(files > 100, "the sweep read only {files} source files");
+}

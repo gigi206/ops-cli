@@ -6694,28 +6694,28 @@ mod tests {
     /// on a file existing.
     #[test]
     fn a_zone_the_database_does_not_carry_falls_back_to_the_default() {
-        let db = TmpDir::new();
-        std::fs::create_dir_all(db.path().join("Europe")).unwrap();
-        std::fs::write(db.path().join("Europe/Paris"), b"TZif").unwrap();
-        std::fs::write(db.path().join("UTC"), b"TZif").unwrap();
+        // The database sits one level inside the fixture, so the traversal case below resolves to a
+        // sibling the fixture owns rather than to a name outside the tree this test may write.
+        let base = TmpDir::new();
+        let db = base.path().join("zoneinfo");
+        std::fs::create_dir_all(db.join("Europe")).unwrap();
+        std::fs::write(db.join("Europe/Paris"), b"TZif").unwrap();
+        std::fs::write(db.join("UTC"), b"TZif").unwrap();
 
         // Nothing declared: the built-in zone, which is a zone and not an absence.
-        assert_eq!(cage_timezone(None, db.path()), "UTC");
+        assert_eq!(cage_timezone(None, &db), "UTC");
         // Declared and present: taken.
-        assert_eq!(
-            cage_timezone(Some("Europe/Paris"), db.path()),
-            "Europe/Paris"
-        );
+        assert_eq!(cage_timezone(Some("Europe/Paris"), &db), "Europe/Paris");
         // Declared and absent: the default, not a refused launch — a misspelled zone costs a wrong
         // clock, never the session.
-        assert_eq!(cage_timezone(Some("Europe/Pariss"), db.path()), "UTC");
+        assert_eq!(cage_timezone(Some("Europe/Pariss"), &db), "UTC");
         // A directory inside the database is not a zone: `Europe` resolves to something that
         // exists, so only the is-a-file test tells the two apart.
-        assert_eq!(cage_timezone(Some("Europe"), db.path()), "UTC");
+        assert_eq!(cage_timezone(Some("Europe"), &db), "UTC");
         // The shape rule is applied here too, at the join site: a traversal that would otherwise
         // resolve to a real file outside the database never becomes a link target.
-        std::fs::write(db.path().join("../escaped"), b"x").unwrap();
-        assert_eq!(cage_timezone(Some("../escaped"), db.path()), "UTC");
+        std::fs::write(base.path().join("escaped"), b"x").unwrap();
+        assert_eq!(cage_timezone(Some("../escaped"), &db), "UTC");
         // And a database that is not there at all still yields a launchable cage.
         assert_eq!(
             cage_timezone(Some("Europe/Paris"), Path::new("/nonexistent-zoneinfo")),

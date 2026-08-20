@@ -151,9 +151,11 @@ description = "Report unit-test coverage with cargo-llvm-cov (fast, deterministi
 # sink the whole report. For the complete picture on a sandbox-capable host — the e2e spawn the
 # instrumented binary, so they add real coverage of the launch/proxy paths — run:
 # `cargo llvm-cov --ignore-run-fail -- --test-threads=6` (bounded threads bound the peak disk the
-# concurrent stores take under `target/test-tmp`). A killed run leaks its fixtures there; reclaim
-# them with `chmod -R u+w target/test-tmp && rm -rf target/test-tmp` — a bare `rm -rf` walks into a
-# store's `0555` directories and silently leaves most of the tree behind.
+# concurrent stores take). The fixtures land under the root `fixture_root()` returns — outside the
+# workspace, `$XDG_CACHE_HOME/sbx/test-tmp` or `~/.cache/sbx/test-tmp`, and `SBX_TEST_TMPDIR` moves
+# it. A killed run leaks its trees there; reclaim them with `chmod -R u+w "$dir" && rm -rf "$dir"`,
+# since a bare `rm -rf` walks into a store's `0555` directories and silently leaves most of the tree
+# behind.
 run = "cargo llvm-cov --bins"
 
 [tasks.build]
