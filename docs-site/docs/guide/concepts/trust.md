@@ -130,3 +130,11 @@ success no launch would honour. The one verb that still opens such a file is
 reads it itself, so a file that has not been vetted stays repairable. Recording trust
 afterwards is a separate step and still goes through the gate: `sbx config edit --trust`
 opens and saves normally, then warns that it could not trust a file the gate refuses.
+
+One further refusal has nothing to do with the file's bytes and everything to do with its
+name. A recorded trust is stored under a name derived from the config's own path, so that
+derivation has to tell apart every pair of paths the filesystem tells apart. A path that is
+not valid UTF-8 cannot be turned into a distinguishing name without losing exactly the bytes
+that distinguish it, and two projects differing only in those bytes would then share one
+record. `sbx trust` refuses such a path and says so; reading a verdict for one answers
+untrusted, and revoking one answers that it was not trusted.

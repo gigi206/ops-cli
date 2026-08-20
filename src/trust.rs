@@ -176,12 +176,16 @@ fn store_dir_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> 
     None
 }
 
-/// Canonicalized path string used as the marker key. When the file itself cannot
-/// be canonicalized (typically: it no longer exists), its parent is canonicalized
-/// and the file name re-appended, so `sbx trust` (file present) and a later
-/// `sbx untrust` (file deleted) still derive the same key. Only when even the
-/// parent is gone does it fall back to the raw path. Never panics.
-fn canonical_string(config_path: &Path) -> String {
+/// Canonicalized path string used as the marker key, or `None` when that path is not valid UTF-8.
+///
+/// When the file itself cannot be canonicalized (typically: it no longer exists), its parent is
+/// canonicalized and the file name re-appended, so `sbx trust` (file present) and a later
+/// `sbx untrust` (file deleted) still derive the same key. Only when even the parent is gone does
+/// it fall back to the raw path. Never panics.
+///
+/// The conversion is `into_string`, not `to_string_lossy`: this string is what tells one config
+/// apart from another, and a lossy one does not — see [`marker_path`] for what that costs.
+fn canonical_string(config_path: &Path) -> Option<String> {
     let resolved = config_path.canonicalize().unwrap_or_else(|_| {
         match (config_path.parent(), config_path.file_name()) {
             (Some(parent), Some(name)) => parent
@@ -191,13 +195,22 @@ fn canonical_string(config_path: &Path) -> String {
             _ => config_path.to_path_buf(),
         }
     });
-    resolved.to_string_lossy().into_owned()
+    resolved.into_os_string().into_string().ok()
 }
 
-/// Marker file path: `store_dir/<sha256 of the canonical config-path string>`.
-pub(crate) fn marker_path(store_dir: &Path, config_path: &Path) -> PathBuf {
-    let key = hash_bytes(canonical_string(config_path).as_bytes());
-    store_dir.join(key)
+/// Marker file path: `store_dir/<sha256 of the canonical config-path string>`, or `None` when that
+/// path is not valid UTF-8.
+///
+/// The marker's *name* is what identifies which config a recorded trust belongs to, so the string
+/// it is derived from has to distinguish paths the filesystem distinguishes. A lossy conversion
+/// does not: every invalid byte becomes the same U+FFFD, so two projects whose paths differ only in
+/// bytes the encoding cannot represent hash to one name — and a trust granted to the first is read
+/// back for the second. Refusing is the only answer that stays sound, and it is the same rule this
+/// repository applies to every other path gate: convert with `to_str`, and treat the `None` as the
+/// refusal rather than as a value to repair.
+pub(crate) fn marker_path(store_dir: &Path, config_path: &Path) -> Option<PathBuf> {
+    let key = hash_bytes(canonical_string(config_path)?.as_bytes());
+    Some(store_dir.join(key))
 }
 
 /// Trust verdict for a config whose current content hash is already known.
@@ -209,7 +222,12 @@ pub(crate) fn verdict_for_hash(
     config_path: &Path,
     current_hash: &str,
 ) -> TrustState {
-    let marker = marker_path(store_dir, config_path);
+    // No representable marker name means no marker can have been written for this path, so the
+    // verdict is the one a missing marker gets. Fail-closed either way: a path sbx cannot name is
+    // never trusted.
+    let Some(marker) = marker_path(store_dir, config_path) else {
+        return TrustState::Untrusted;
+    };
     let contents = match std::fs::read_to_string(&marker) {
         Ok(c) => c,
         Err(_) => return TrustState::Untrusted,
@@ -291,15 +309,49 @@ pub(crate) fn trust(store_dir: &Path, config_path: &Path) -> io::Result<()> {
             .map_err(&store_err)?;
         std::fs::set_permissions(store_dir, Permissions::from_mode(0o700)).map_err(&store_err)?;
     }
-    let body = format!("{}\n{}\n", canonical_string(config_path), hash);
-    std::fs::write(marker_path(store_dir, config_path), body).map_err(&store_err)
+    // A path sbx cannot name is refused rather than recorded under a name it shares with another
+    // path — see `marker_path`. This is the only branch that reports it, because it is the only one
+    // where the user asked for something and must be told it did not happen: reading a verdict for
+    // such a path answers `Untrusted`, and revoking answers "was not trusted".
+    let (Some(canonical), Some(marker)) = (
+        canonical_string(config_path),
+        marker_path(store_dir, config_path),
+    ) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{}: cannot record trust for a path that is not valid UTF-8",
+                config_path.display()
+            ),
+        ));
+    };
+    let body = format!("{canonical}\n{hash}\n");
+    // Written through a temporary and renamed, like every other record this repository keeps: a
+    // crash mid-write would otherwise leave a marker carrying its path line and no hash line, which
+    // reads as `Changed` — safe, but it makes a trusted config ask for re-approval for a reason the
+    // user cannot see. The temporary is a dotfile beside the marker so a listing of the store shows
+    // markers only, and it lands in the same 0o700 directory, on the same filesystem.
+    let tmp = marker.with_file_name(format!(
+        ".{}.tmp",
+        marker.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    std::fs::write(&tmp, body).map_err(&store_err)?;
+    std::fs::rename(&tmp, &marker).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        store_err(e)
+    })
 }
 
 /// Remove any trust marker for `config_path`. Returns whether one existed, so the
 /// caller can tell "revoked" from "was not trusted". A missing marker is success,
 /// not an error.
 pub(crate) fn untrust(store_dir: &Path, config_path: &Path) -> io::Result<bool> {
-    match std::fs::remove_file(marker_path(store_dir, config_path)) {
+    // A path with no representable marker name never had one written: nothing to revoke, and
+    // saying so is the same answer as for a path that was simply never trusted.
+    let Some(marker) = marker_path(store_dir, config_path) else {
+        return Ok(false);
+    };
+    match std::fs::remove_file(marker) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e),
@@ -400,6 +452,84 @@ mod tests {
     }
 
     #[test]
+    fn two_paths_that_differ_only_in_invalid_bytes_do_not_share_a_trust() {
+        // The marker's name is derived from the config's path, so that derivation has to tell apart
+        // every pair of paths the filesystem tells apart. A lossy conversion does not: both of the
+        // directories below render as the same `p\u{FFFD}`. If the derivation collapsed them,
+        // approving the first would silently approve the second — and the two configs here carry
+        // the SAME bytes, so their content hashes match too and nothing downstream would notice.
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = TmpDir::new();
+        let store = tmp.path().join("store");
+        let mut made = Vec::new();
+        for raw in [b"p\xff".as_slice(), b"p\xfe".as_slice()] {
+            let dir = tmp.path().join(OsStr::from_bytes(raw));
+            std::fs::create_dir_all(&dir).unwrap();
+            let cfg = dir.join(".sbx.toml");
+            std::fs::write(&cfg, b"network = \"none\"\n").unwrap();
+            made.push(cfg);
+        }
+        let (first, second) = (&made[0], &made[1]);
+        assert_ne!(first, second, "the two fixtures must be distinct paths");
+        assert_eq!(
+            first.to_string_lossy(),
+            second.to_string_lossy(),
+            "the fixture is only meaningful if the two paths collide under a lossy conversion"
+        );
+
+        // Refused, and told: this is the one caller that asked for something and did not get it.
+        let refused = trust(&store, first).expect_err("a path sbx cannot name is not recorded");
+        assert!(
+            refused.to_string().contains("not valid UTF-8"),
+            "the refusal must name its reason: {refused}"
+        );
+        // And the verdict for BOTH is the fail-closed one, whichever way the marker went.
+        for cfg in [first, second] {
+            assert_eq!(
+                state(&store, cfg),
+                TrustState::Untrusted,
+                "{} must not read as trusted",
+                cfg.display()
+            );
+        }
+        assert!(
+            !store.exists() || std::fs::read_dir(&store).unwrap().next().is_none(),
+            "a refused trust must leave no marker behind"
+        );
+    }
+
+    #[test]
+    fn a_recorded_trust_leaves_the_marker_and_nothing_beside_it() {
+        // The marker is written through a temporary and renamed. What a test can hold is the
+        // aftermath: the store carries the marker and no leftover, so a reader listing it never
+        // sees a half-written record, and a failed rename does not accumulate debris.
+        let tmp = TmpDir::new();
+        let store = tmp.path().join("store");
+        let cfg = tmp.path().join(".sbx.toml");
+        std::fs::write(&cfg, b"network = \"none\"\n").unwrap();
+
+        trust(&store, &cfg).expect("the fixture path is representable");
+        let entries: Vec<_> = std::fs::read_dir(&store)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the store should hold the marker alone, found {entries:?}"
+        );
+        let marker = marker_path(&store, &cfg).expect("a UTF-8 fixture path");
+        assert_eq!(
+            entries[0],
+            marker.file_name().unwrap().to_string_lossy(),
+            "the surviving entry is the marker, not the temporary"
+        );
+        assert_eq!(state(&store, &cfg), TrustState::Trusted);
+    }
+
+    #[test]
     fn untrust_reports_whether_a_marker_existed_and_reverts_to_untrusted() {
         let store = TmpDir::new();
         let proj = TmpDir::new();
@@ -444,7 +574,8 @@ mod tests {
 
         // a marker with only the path line (hash line lost to a truncated write)
         std::fs::create_dir_all(store.path()).unwrap();
-        std::fs::write(marker_path(store.path(), &cfg), b"/some/path\n").unwrap();
+        let marker = marker_path(store.path(), &cfg).expect("a UTF-8 fixture path");
+        std::fs::write(marker, b"/some/path\n").unwrap();
         assert_eq!(state(store.path(), &cfg), TrustState::Changed);
     }
 
