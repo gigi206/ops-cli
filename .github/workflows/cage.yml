@@ -18,14 +18,17 @@
 # a real user session -- which is what creates `/run/user/<uid>`, where the compositor and the sound
 # server publish the sockets the GUI and audio suites resolve.
 #
-# THE FOURTH IS NOT PROVIDED, AND THAT IS A FINDING RATHER THAN A GAP. A hosted job runs under the
-# runner's own system service, so `sbx` finds no `user@<uid>.service` to ask for a capped scope and
-# applies no limits. Placing the suites in a user scope does give it one -- and every launch then
-# goes through `systemd-run`, where this runner does not undo the dollar-doubling `escape_dollars`
-# relies on. The egress preamble every networked cage carries dies on a syntax error, and the skip
-# count goes from 14 to 110, all of them reading "host cannot sandbox". So the scope is not taken,
-# the report below measures the dollar behaviour every run, and the four resource-limit tests skip
-# for a reason that is now true.
+# THE FOURTH IS NOT PROVIDED, AND WHAT IT UNCOVERED IS FIXED. A hosted job runs under the runner's
+# own system service, so `sbx` finds no `user@<uid>.service` to ask for a capped scope and applies
+# no limits. Placing the suites in a user scope does give it one -- and every launch then went
+# through `systemd-run`, where the older systemd does not undo a dollar-doubling the launch used to
+# rely on: the egress preamble every networked cage carries died on a syntax error, and the skip
+# count went from 14 to 110, all of them reading "host cannot sandbox". The launch no longer
+# doubles; it asks for no substitution at all. The scope is still not taken here, because a run
+# placing its own processes in one measures a host this runner is not, and the four resource-limit
+# tests skip for a reason that is true of it. What the disagreement produced is kept: the report
+# below measures the dollar behaviour every run, and `--bin sbx` carries the guard that asserts
+# it.
 #
 # It still does not enforce by default. `require-capable` arms it for a run, and arming it as the
 # default is a decision for a run whose skip count below actually reads zero -- read from that
@@ -247,14 +250,12 @@ jobs:
           # The fourteen suites that carry a cage skip, named rather than globbed so a new one is a
           # deliberate addition. Kept in step with `mise run test-cage`, which runs the same list.
           # NOT run inside a user scope, deliberately. Placing the suites under
-          # `user@<uid>.service` gives `sbx` the delegation root it looks for, so every launch then
-          # goes through `systemd-run` -- and on this runner that path is broken: the dollars
-          # `escape_dollars` doubles arrive at the shell still doubled, so the egress preamble every
-          # networked cage carries dies on a syntax error. It took the skip count from 14 to 110,
-          # every one of them reported as "host cannot sandbox". The dollar-doubling report below
-          # measures the behaviour each run, so the day it changes is visible here; until the
-          # launch stops depending on it, exercising that path would only mean testing a host this
-          # runner is not.
+          # `user@<uid>.service` gives `sbx` the delegation root it looks for, so every launch would
+          # then go through `systemd-run`. That path is no longer broken -- the launch asks for no
+          # variable substitution rather than escaping for one -- but a run that puts its own
+          # processes in a scope measures a host this runner is not, and the guard in `--bin sbx`
+          # already asserts the behaviour that mattered. The dollar report above keeps measuring it
+          # each run, so the day a systemd default moves again, this says so.
           rc=0
           for suite in attach completion config detach doctor fs netns plugins proc run sessions shell stop upgrade; do
             cargo test --test "$suite" --no-fail-fast || rc=$?
