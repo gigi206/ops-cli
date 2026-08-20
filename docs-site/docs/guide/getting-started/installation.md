@@ -31,6 +31,13 @@ cargo build
 cargo run -- doctor      # preflight: user namespaces, bwrap, nix, …
 ```
 
+The compiler is pinned by `rust-toolchain.toml`, so the first `cargo` command in a
+fresh clone may download that exact toolchain before it builds anything. That is
+deliberate rather than incidental: linting here denies warnings, and each compiler
+release adds lints, so a floating compiler turns unchanged code red from one week to
+the next. `mise install` provisions the same version, along with the pinned zig that
+links the musl build.
+
 ## Release build (static musl)
 
 Some dependencies carry C/asm, so the musl target is built with

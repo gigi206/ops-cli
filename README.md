@@ -77,6 +77,11 @@ cargo build
 cargo run -- doctor   # preflight: user namespaces, bwrap, …
 ```
 
+The compiler is pinned by `rust-toolchain.toml` and the rest of the chain by
+`mise.toml`, so a fresh clone may download the pinned toolchain on its first `cargo`
+command. Linting denies warnings and every compiler release adds lints: without the
+pin, unchanged code goes red from one week to the next.
+
 ## Usage
 
 ```sh

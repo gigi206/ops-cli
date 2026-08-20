@@ -11,27 +11,48 @@
 
 min_version = "2024.12.0"
 
+# WHAT IS PINNED HERE, AND WHY IT IS NOT ALL OF IT.
+#
+# A tool that decides what gets built — or whether the build is even accepted — carries an exact
+# version. A tool that only serves the editor floats. The line is drawn at the artifact: a compiler
+# bump changes the binary and can turn `clippy -D warnings` red with no change to the code, so two
+# clones a week apart must not disagree about it; a language server bump changes neither.
+#
+# Every pinned version below is also written in a GitHub workflow, and the two have to be bumped
+# together — the same rule the pinned nixpkgs revision already lives by further down. A version that
+# drifts apart here and there does not fail: it ships a differently-built binary and says nothing.
 [tools]
-rust                            = "latest"
-# The Rust language server (LSP). Pinned so every `git clone` + `mise install`
-# contributor gets a working LSP out of the box (rustup does not ship it by default).
+# `rust-toolchain.toml` is the source of truth for the compiler: rustup honours it for every entry
+# point, including a bare `cargo` that never goes through mise. This line exists so `mise install`
+# provisions that exact toolchain on a fresh clone rather than a floating one, and it must name the
+# same version as the `channel` there.
+rust                            = "1.97.1"
+# The Rust language server (LSP). Floats: it is provisioned so every `git clone` + `mise install`
+# contributor gets a working LSP out of the box (rustup does not ship it by default), and it reads
+# the crate rather than building it — no version of it can change what CI accepts.
 "github:rust-lang/rust-analyzer" = "latest"
 # The shipping binary is a static musl build; some dependencies carry C/asm, so
 # the musl target needs a musl-targeting C compiler. zig provides a self-contained
 # musl cross-cc and cargo-zigbuild wires it into cargo — no system musl-gcc package
 # required. Build with:
 #   mise run build   # == cargo zigbuild --release --target x86_64-unknown-linux-musl
-zig                             = "latest"
-"github:rust-cross/cargo-zigbuild" = "latest"
+#
+# zig is the linker of the published artifact, so it is pinned to the version the release,
+# nightly and latest workflows already pass to `mlugg/setup-zig` — bump the four together.
+zig                             = "0.13.0"
+"github:rust-cross/cargo-zigbuild" = "0.23.0"
 # Source-based code coverage. Prebuilt + checksum-verified via aqua. On its first run it
 # provisions the `llvm-tools-preview` rustup component (llvm-cov / llvm-profdata) itself, so
 # nothing else is needed. Run `mise run coverage`.
-"aqua:taiki-e/cargo-llvm-cov"      = "latest"
+"aqua:taiki-e/cargo-llvm-cov"      = "0.8.7"
 # Docs site (Docusaurus) runs on Node. Its dependencies are pinned in
 # docs-site/package.json (the lockfile source of truth); `mise run docs-install`
 # materialises them into docs-site/node_modules via `npm install`. Keep the two in
 # sync when bumping a version. `pagefind` (the search indexer) is a dev dep too.
-node                            = "latest"
+#
+# The major is pinned to the one `docs.yml` builds the published site with: a site that builds
+# here and not there is the failure this closes.
+node                            = "24"
 # The TS/JS language server for the Docusaurus docs-site. `typescript` is capped at
 # the 5.x line because it is the last to ship tsserver (typescript 7/tsgo does not,
 # and typescript-language-server needs it); docs-site keeps its own
@@ -39,6 +60,7 @@ node                            = "latest"
 # Keep the `tsserver.path` in the omp LSP config (~/.omp/agent/lsp.json) in sync
 # with the resolved typescript version when it bumps.
 "npm:typescript"                = "5"
+# Floats, for the same reason as rust-analyzer: it serves the editor and builds nothing.
 "npm:typescript-language-server" = "latest"
 
 # ============================================================================

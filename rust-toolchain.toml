@@ -1,0 +1,22 @@
+# The compiler this repository is built, linted and documented with.
+#
+# rustup reads this file for every `cargo`, `rustc`, `clippy` and `rustfmt` invoked anywhere in the
+# tree — whether or not it went through mise — and installs what it names if it is missing. That is
+# why the compiler is pinned here rather than only in `mise.toml`: a contributor with a system
+# rustup and no mise still compiles with the same one, and so does a CI runner.
+#
+# What floats without it is not only codegen. `clippy -D warnings` is a moving target: each release
+# adds lints and occasionally changes an existing one's verdict, so a clone made a week later can
+# fail the same check on identical code. Pinning turns that into a bump someone makes on purpose.
+#
+# `minimal` carries rustc, cargo and the standard library; `rustdoc` ships inside the rustc
+# component, so `mise run rustdoc` needs nothing more. The two components named below are what
+# `mise run fmt` and `mise run lint` invoke, and the target is the shipping musl build's.
+#
+# Bump this together with `rust` in `mise.toml` and the `dtolnay/rust-toolchain@<version>` refs in
+# `.github/workflows/`.
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-musl"]
