@@ -300,6 +300,7 @@ fn fs_scan_lets_the_cage_make_files_inside_it_and_nowhere_else() {
         "echo un > made.txt; echo made=$?; cat made.txt; \
          echo deux >> made.txt; echo appended=$?; \
          (cd sub && echo trois > ../over.txt); echo dotdot=$?; \
+         (umask 077; echo k > keyed.txt); echo keyed=$?; \
          ls {elsewhere} >/dev/null 2>&1; echo sees_outside=$?; \
          ln -s {elsewhere} out; echo quatre > out/escaped.txt; echo escape=$?; \
          cat carries.txt 2>&1; echo done"
@@ -341,6 +342,21 @@ fn fs_scan_lets_the_cage_make_files_inside_it_and_nowhere_else() {
         Some("0"),
         "a name reached through `..` is inside the cage as much as any other.\nstdout: {stdout}\n\
          stderr: {stderr}"
+    );
+    // A file is made by the supervisor, so the kernel subtracts *its* umask unless the caller's is
+    // applied — and a cage that tightened its own is one writing something it means to keep.
+    assert_eq!(
+        said("keyed="),
+        Some("0"),
+        "the masked creation must work.\nstdout: {stdout}"
+    );
+    assert_eq!(
+        std::fs::metadata(project.path().join("keyed.txt"))
+            .map(|at| std::os::unix::fs::PermissionsExt::mode(&at.permissions()) & 0o777)
+            .ok(),
+        Some(0o600),
+        "a file made under `umask 077` has to land at `0600`, or what the cage meant to keep to \
+         itself arrives readable by anyone.\nstdout: {stdout}\nstderr: {stderr}"
     );
     // The premise of the arm below, asserted rather than assumed: a directory the cage can already
     // see would make "nothing was created there" true for a reason that has nothing to do with the

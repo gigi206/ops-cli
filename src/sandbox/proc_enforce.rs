@@ -1029,18 +1029,20 @@ fn serve_creation(
     let Ok(cbase) = std::ffi::CString::new(base) else {
         return Creation::Declined;
     };
+    // The kernel subtracts the *creating* process's umask from the mode, and the creating process
+    // here is the supervisor rather than the cage. The two part company the moment the cage sets its
+    // own — which is what a script writing a key does — so the caller's is applied here instead.
+    // Measured under `[fs] scan` before this: a cage asking for `0600` under `umask 077` received
+    // `0664`, group-readable and group-writable.
+    let Some(umask) = caller_umask(req.pid) else {
+        return Creation::Declined;
+    };
+    let wanted = mode as libc::c_uint & !umask;
     // `O_PATH` is dropped because this descriptor is the one the cage receives and has to be usable;
     // ours is always close-on-exec, and what the cage's copy carries is set on the response.
     let asked = (flags & !libc::O_PATH) | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC;
     // SAFETY: parent is a live directory descriptor and cbase a live NUL-terminated name.
-    let made = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            cbase.as_ptr(),
-            asked,
-            mode as libc::c_uint,
-        )
-    };
+    let made = unsafe { libc::openat(parent.as_raw_fd(), cbase.as_ptr(), asked, wanted) };
     if made < 0 {
         let e = io::Error::last_os_error().raw_os_error().unwrap_or(0);
         return if e == libc::EEXIST {
@@ -1049,6 +1051,12 @@ fn serve_creation(
             Creation::Declined
         };
     }
+    // The supervisor's own umask was subtracted by the kernel a moment ago, so the file may have
+    // landed narrower than the cage asked. `fchmod` is not umask-governed and settles it exactly.
+    // Widening rather than narrowing, and only after `O_EXCL` proved the file is this call's, so the
+    // window before it is the narrower mode and never a wider one.
+    // SAFETY: made is this call's live descriptor, and fchmod only alters its mode bits.
+    unsafe { libc::fchmod(made, wanted as libc::mode_t) };
     let ok = respond_with_fd(notif_fd, req.id, made, flags & libc::O_CLOEXEC != 0);
     // SAFETY: made is a fresh owned descriptor; the kernel copied it into the target if it took it
     // at all, and either way this side is done with it.
@@ -2074,6 +2082,25 @@ fn caller_ids_in_cage(pid: u32) -> Option<(u32, u32)> {
     innermost_ids(&std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?)
 }
 
+/// The umask the caller creates files under, as its own `status` reports it.
+fn caller_umask(pid: u32) -> Option<u32> {
+    umask_of(&std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?)
+}
+
+/// The `Umask` line of a `status` file, read as the octal it is written in.
+///
+/// Apart from the read so the parse can be pinned on a literal, like [`innermost_ids`] next door.
+fn umask_of(status: &str) -> Option<u32> {
+    u32::from_str_radix(
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("Umask:"))?
+            .trim(),
+        8,
+    )
+    .ok()
+}
+
 /// The innermost `NStgid`/`NSpid` a `status` file carries.
 ///
 /// Apart from the read so that the shape it parses can be pinned on a literal. The line a cage
@@ -2798,6 +2825,65 @@ mod tests {
             proc_self_behind_a_link(me, at, "/dev/null"),
             None,
             "a device that is not a link to `self` is left where it is"
+        );
+    }
+
+    #[test]
+    fn the_umask_line_is_read_as_the_octal_it_is_written_in() {
+        // `status` writes the mask in octal without a prefix, so reading it as decimal turns `0022`
+        // into eighteen — a mask that clears bits nobody asked to clear, silently.
+        assert_eq!(umask_of("Name:\tsh\nUmask:\t0022\nTgid:\t1\n"), Some(0o022));
+        assert_eq!(umask_of("Umask:\t0077\n"), Some(0o077));
+        assert_eq!(umask_of("Umask:\t0000\n"), Some(0));
+        assert_eq!(
+            umask_of("Name:\tsh\nTgid:\t1\n"),
+            None,
+            "a file without the line answers nothing rather than a mask of zero, which would be the \
+             most permissive answer there is"
+        );
+    }
+
+    #[test]
+    fn a_made_file_lands_with_the_masks_the_cage_asked_for() {
+        // The file is made by the supervisor, so the kernel subtracts the *supervisor's* umask — and
+        // the two part company the moment the cage sets its own, which is what a script writing a key
+        // does. Both directions are pinned: a mask stricter than this process's has to be honoured,
+        // and a mask looser than it must not be quietly narrowed by ours.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TmpDir::new();
+        let (tight, wide) = (dir.join("tight.txt"), dir.join("wide.txt"));
+        let script = format!(
+            "umask 077; echo k > {}; umask 000; echo w > {}; echo done",
+            tight.to_str().expect("utf-8 fixture path"),
+            wide.to_str().expect("utf-8 fixture path"),
+        );
+        let (_, out) = run_with_open_lens(
+            &["/bin/sh", "-c", &script],
+            &[r"sk-[A-Za-z0-9]{12,}"],
+            &dir.join("."),
+        );
+        assert!(
+            out.contains("done"),
+            "the payload must reach its last line: {out}"
+        );
+        let mode = |at: &std::path::Path| {
+            std::fs::metadata(at)
+                .unwrap_or_else(|e| panic!("the file must exist: {e}: {out}"))
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(
+            mode(&tight),
+            0o600,
+            "a mask the cage tightened has to reach the file, or a key it meant to keep to itself \
+             arrives readable: {out}"
+        );
+        assert_eq!(
+            mode(&wide),
+            0o666,
+            "and a mask the cage widened must not be narrowed by this process's own, which the \
+             kernel would otherwise subtract on top: {out}"
         );
     }
 
