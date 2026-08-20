@@ -21,6 +21,23 @@
 //! mask from inside: `umount2`, `mount`, `unshare` and the rest of that family are refused by the
 //! mandatory seccomp filter, and it holds no capability in its user namespace.
 //!
+//! **Why the mid-session gap is not closed by re-masking a live cage.** Applying a mask after
+//! launch is reachable — a launcher that creates its own user namespace before `execve`ing
+//! bubblewrap leaves the cage's namespaces joinable, and that shape is already built for another
+//! purpose. It is not done because of what it would be racing. The mask would have to be in place
+//! before the first open, and anything waiting for the file wins that moment reliably: the guard
+//! would hold against a path created by accident, never against one created by something that
+//! wanted it. A boundary that only holds when nobody is trying is not the class of boundary this
+//! table claims to be.
+//!
+//! What remains useful of the idea is served without joining anything. A path that exists at launch
+//! is masked here; a file whose *contents* become sensitive during a session is answered by the
+//! `[fs] scan` lens, which examines each open on the supervisor already in place and refuses the
+//! next one — no relaunch, and a different question asked at a different moment. What neither
+//! covers is closing a path by name when a file appears mid-session and `scan` does not recognise
+//! it: a denied *directory* seals that case outright, and a `deny` entry costs a relaunch. That
+//! residue is the trigger for reopening this, and the only one.
+//!
 //! The task plane is the deliberate exception. A masked path is closed in **every** cage the
 //! session builds, the agent's and each task's, and a task that legitimately needs the file names
 //! it in its own `unmask` — so the credential-bearing operation reads the key while the agent that
