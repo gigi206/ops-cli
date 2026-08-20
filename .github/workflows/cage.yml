@@ -13,15 +13,19 @@
 #
 # WHAT THE RUN PROVIDES, AND WHY. Arming `SBX_REQUIRE_CAPABLE=1` once turned every capability skip
 # into a failure and so named what this runner was missing: zsh, a Wayland compositor, a PulseAudio
-# socket, and a cgroup delegation root. The steps below provide them rather than working around
-# them, because a suite that reports ok without running is coverage that exists only on someone's
-# machine.
+# socket, and a cgroup delegation root. The steps below provide the first three, because a suite
+# that reports ok without running is coverage that exists only on someone's machine. They also open
+# a real user session -- which is what creates `/run/user/<uid>`, where the compositor and the sound
+# server publish the sockets the GUI and audio suites resolve.
 #
-# The fourth is the one that shaped the others. A hosted job runs under the runner's own system
-# service, so its cgroup sits outside `user.slice` and `sbx` finds no `user@<uid>.service` to ask
-# for a capped scope. Opening a real user session fixes that -- and the same session is what
-# creates `/run/user/<uid>`, where the compositor and the sound server publish the sockets the GUI
-# and audio suites look for. One missing thing, not four.
+# THE FOURTH IS NOT PROVIDED, AND THAT IS A FINDING RATHER THAN A GAP. A hosted job runs under the
+# runner's own system service, so `sbx` finds no `user@<uid>.service` to ask for a capped scope and
+# applies no limits. Placing the suites in a user scope does give it one -- and every launch then
+# goes through `systemd-run`, where this runner does not undo the dollar-doubling `escape_dollars`
+# relies on. The egress preamble every networked cage carries dies on a syntax error, and the skip
+# count goes from 14 to 110, all of them reading "host cannot sandbox". So the scope is not taken,
+# the report below measures the dollar behaviour every run, and the four resource-limit tests skip
+# for a reason that is now true.
 #
 # It still does not enforce by default. `require-capable` arms it for a run, and arming it as the
 # default is a decision for a run whose skip count below actually reads zero -- read from that
@@ -108,13 +112,12 @@ jobs:
           extra_conf: |
             experimental-features = nix-command flakes
 
-      - name: Open a real user session, so the cage has a delegation root
-        # A hosted job runs under the runner's own system service, so its cgroup sits outside
-        # `user.slice` and there is no user manager to delegate a controller. `sbx` looks for
-        # `/user@<uid>` or `/user-<uid>.slice` in its own cgroup and, finding neither, applies no
-        # limit at all -- which is why the cage landed under the host's `pids.max` rather than a
-        # capped scope. `enable-linger` starts `user@<uid>.service` without anyone logging in,
-        # which is what creates `/run/user/<uid>`.
+      - name: Open a real user session, so the desktop sockets have somewhere to live
+        # `/run/user/<uid>` is created by `user@<uid>.service`, and a hosted job has no login to
+        # start one. `enable-linger` starts it without anyone logging in, which is what gives the
+        # compositor and the sound server a runtime directory to publish into -- and what lets the
+        # report below read the delegated controllers at all, even though the suites do not run
+        # inside the session (see the note on the suites step).
         #
         # The session bus is a separate unit from the manager, and `sbx` gates its limiter on that
         # socket existing rather than on the runtime directory being named: a manager without a bus
@@ -199,6 +202,14 @@ jobs:
             echo "own cgroup:       $(cut -d: -f3 /proc/self/cgroup | head -1)"
             printf 'delegated:        '
             cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers" 2>/dev/null || echo "no delegation root"
+            echo
+            echo "# whether a doubled dollar survives systemd-run: \`sbx\` doubles every dollar in a"
+            echo "# wrapped argument so systemd's own substitution restores the byte. Where the"
+            echo "# doubling is not undone, the argument reaches the program with both dollars and a"
+            echo "# shell preamble dies on it. Expected: A"
+            printf 'doubled dollar:   '
+            systemd-run --user --scope -q --collect --unit="probe-dollar-$$" -- \
+              bash -c 'echo "A$$B"' 2>&1 | head -1
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -220,26 +231,20 @@ jobs:
           : > "$SBX_SKIP_LOG"
           # The fourteen suites that carry a cage skip, named rather than globbed so a new one is a
           # deliberate addition. Kept in step with `mise run test-cage`, which runs the same list.
-          # Run inside a transient user scope so the suites sit under `user@<uid>.service`, which
-          # is the delegation root `sbx` looks for before it will ask systemd for a capped scope.
-          # No limit properties are set on this outer scope: it exists to place the processes, and
-          # a `TasksMax` here would be inherited by the cage and read as the wrong cap rather than
-          # as no cap at all.
-          cat > "$RUNNER_TEMP/suites.sh" <<'SH'
-          #!/usr/bin/env bash
+          # NOT run inside a user scope, deliberately. Placing the suites under
+          # `user@<uid>.service` gives `sbx` the delegation root it looks for, so every launch then
+          # goes through `systemd-run` -- and on this runner that path is broken: the dollars
+          # `escape_dollars` doubles arrive at the shell still doubled, so the egress preamble every
+          # networked cage carries dies on a syntax error. It took the skip count from 14 to 110,
+          # every one of them reported as "host cannot sandbox". The dollar-doubling report below
+          # measures the behaviour each run, so the day it changes is visible here; until the
+          # launch stops depending on it, exercising that path would only mean testing a host this
+          # runner is not.
           rc=0
           for suite in attach completion config detach doctor fs netns plugins proc run sessions shell stop upgrade; do
             cargo test --test "$suite" --no-fail-fast || rc=$?
           done
           exit $rc
-          SH
-          chmod +x "$RUNNER_TEMP/suites.sh"
-          if systemd-run --user --scope --quiet -- true >/dev/null 2>&1; then
-            systemd-run --user --scope --quiet -- "$RUNNER_TEMP/suites.sh"
-          else
-            echo "::warning::no user scope available -- the resource-limit tests will report rather than run"
-            "$RUNNER_TEMP/suites.sh"
-          fi
 
       - name: Report what still skipped
         if: always()
