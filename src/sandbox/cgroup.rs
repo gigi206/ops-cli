@@ -23,8 +23,7 @@
 //! or a controller is not delegated, the cage launches **without** limits rather
 //! than failing — `doctor` is where availability is surfaced.
 
-use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Memory pressure threshold: above this fraction of RAM the kernel reclaims and
@@ -263,11 +262,11 @@ fn limiter(limits: &Limits) -> Option<(PathBuf, Vec<String>)> {
 /// command in a transient scope carrying the enforceable limits, or `None` when no
 /// limit can be applied on this host (graceful degradation).
 ///
-/// Nothing in this prefix is dollar-escaped the way the wrapped command is ([`escape_dollars`]):
-/// every value here is built from a charset that cannot contain a `$` — [`super::naming::cage_slug`]
-/// sanitizes to `[a-z0-9-]`, and a limit value has already passed [`is_valid_memory_value`] /
-/// [`is_valid_tasks_value`], neither of which admits one. Loosening either charset would open a
-/// substitution site before the `--`, so escape here too if that ever happens.
+/// Nothing here is dollar-escaped, and nothing needs to be: every value in the prefix is built from
+/// a charset that cannot contain a `$` — [`super::naming::cage_slug`] sanitizes to `[a-z0-9-]`, and
+/// a limit value has already passed [`is_valid_memory_value`] / [`is_valid_tasks_value`], neither of
+/// which admits one — while the command past `--` is protected by asking the launcher not to
+/// substitute at all.
 fn scope_wrapper(limits: &Limits, cage_slug: &str) -> Option<(PathBuf, Vec<OsString>)> {
     let (systemd_run, props) = limiter(limits)?;
     let mut prefix = vec![
@@ -295,6 +294,21 @@ fn scope_wrapper(limits: &Limits, cage_slug: &str) -> Option<(PathBuf, Vec<OsStr
             super::naming::scope_unit(cage_slug, std::process::id())
         )),
     ];
+    // Say what to do with the dollars rather than assume it. `systemd-run` substitutes variable
+    // references in the command line it is handed, against the **host's** environment, which would
+    // rewrite a cage argument before bwrap ever saw it. Whether it does so with `--scope` is not a
+    // fixed thing: systemd 254 made it an option and left it *off* for `--scope` "for backward
+    // compatibility reasons", and a later systemd turned it on. A launch that doubles its dollars
+    // to survive the substitution is therefore correct on exactly one of those, and broken on the
+    // other — measured, as a preamble arriving at the shell with `$$` still in it.
+    //
+    // Asking for it off makes the question moot: nothing substitutes, so nothing needs escaping.
+    // Where the option does not exist the systemd predates it, and that is precisely the era whose
+    // behaviour it was kept compatible with — no substitution with `--scope` — so passing the
+    // arguments through untouched is right there too.
+    if expansion_can_be_disabled(&systemd_run) {
+        prefix.push(OsString::from("--expand-environment=no"));
+    }
     for p in props {
         prefix.push(OsString::from("-p"));
         prefix.push(OsString::from(p));
@@ -425,33 +439,23 @@ pub(crate) fn sweep_stale_scopes() {
     });
 }
 
-/// Double every `$` in `arg`, the escape that makes systemd pass a dollar sign through literally.
+/// Whether this `systemd-run` understands `--expand-environment=`, probed once per process.
 ///
-/// systemd substitutes variable references in the command line of the unit it runs, resolving them
-/// against **its own** environment — the host's. Left alone, a cage argument would silently change
-/// before bwrap ever sees it. Measured against a real launcher: a braced reference is parsed
-/// anywhere in an argument once it opens with a character that can start a name, so a shell
-/// expansion systemd cannot read as a name (`${v%/}`, `${VAR:-default}`) collapses to an **empty
-/// string**; a bare `$VAR` is substituted when it opens the argument, replacing it with the host's
-/// value — which would carry a host environment value *into* the cage, the exact direction the
-/// deliberately narrow environment passthrough exists to prevent. Doubling the dollar restores the
-/// byte for byte, uniformly, so nothing here depends on which of those shapes an argument has.
-///
-/// Byte-wise on purpose: an argument (a bind path, an environment value) need not be valid UTF-8,
-/// and `$` is ASCII, so it can never be a continuation byte of a multi-byte character.
-fn escape_dollars(arg: &OsStr) -> OsString {
-    let bytes = arg.as_bytes();
-    if !bytes.contains(&b'$') {
-        return arg.to_owned();
-    }
-    let mut out = Vec::with_capacity(bytes.len() + 8);
-    for &b in bytes {
-        if b == b'$' {
-            out.push(b'$');
-        }
-        out.push(b);
-    }
-    OsString::from_vec(out)
+/// Asked of the binary rather than derived from a version number, because a version is a second
+/// source of truth that can disagree with the program actually on `PATH` — a backport, a container
+/// image, a `systemd-run` provided by nix. Reasoning about behaviour from a version is what made a
+/// launch depend on a default that is not the same everywhere.
+fn expansion_can_be_disabled(systemd_run: &Path) -> bool {
+    static PROBED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBED.get_or_init(|| {
+        std::process::Command::new(systemd_run)
+            .arg("--help")
+            .output()
+            .is_ok_and(|o| {
+                String::from_utf8_lossy(&o.stdout).contains("--expand-environment")
+                    || String::from_utf8_lossy(&o.stderr).contains("--expand-environment")
+            })
+    })
 }
 
 /// Pure composition of a launch from an optional scope wrapper: with `Some` the
@@ -459,11 +463,11 @@ fn escape_dollars(arg: &OsStr) -> OsString {
 /// with `None` (limits unavailable) the bwrap invocation is returned unchanged.
 /// Split out from [`wrap`] so the host-independent degraded branch is testable.
 ///
-/// Only the wrapped branch escapes dollars ([`escape_dollars`]), and only in bwrap's *arguments*:
-/// the launcher substitutes variables in the command line it is handed, but it does neither
-/// substitution nor unescaping on the **program** — an escaped program path would be looked up with
-/// the doubled dollars still in it and not be found. The degraded branch execs bwrap directly, with
-/// nothing in between to interpret a dollar, so it must pass the argv through untouched.
+/// Neither branch touches a dollar. The degraded one execs bwrap directly, with nothing in between
+/// to interpret one; the wrapped one asks the launcher not to substitute at all
+/// ([`expansion_can_be_disabled`]), so an argument reaches bwrap as it was written. Escaping here
+/// instead — doubling each `$` for the launcher to undo — is what an earlier version did, and it
+/// bound every launch to a systemd default that is not the same on every host.
 fn compose(
     wrapper: Option<(PathBuf, Vec<OsString>)>,
     bwrap: &Path,
@@ -472,7 +476,7 @@ fn compose(
     match wrapper {
         Some((launcher, mut argv)) => {
             argv.push(bwrap.as_os_str().to_owned());
-            argv.extend(bwrap_argv.iter().map(|a| escape_dollars(a)));
+            argv.extend(bwrap_argv);
             (launcher, argv)
         }
         None => (bwrap.to_path_buf(), bwrap_argv),
@@ -746,10 +750,10 @@ mod tests {
     }
 
     #[test]
-    fn only_the_wrapped_branch_escapes_dollars_and_never_the_program() {
-        // A dollar in an argument is doubled so the launcher hands it to bwrap unchanged; the bwrap
-        // path stays verbatim, since the launcher neither substitutes nor unescapes the program and
-        // would look the doubled form up literally.
+    fn neither_branch_rewrites_a_dollar_in_the_program_or_its_arguments() {
+        // Composition hands every byte through as written, program and arguments alike: the wrapped
+        // branch keeps the launcher from substituting rather than pre-escaping for it, so there is
+        // no longer a form that differs between what is composed and what bwrap receives.
         let bwrap = Path::new("/opt/pre$fix/bwrap");
         let argv = vec![
             OsString::from("--setenv"),
@@ -776,69 +780,58 @@ mod tests {
             &[
                 OsString::from("--setenv"),
                 OsString::from("X"),
-                OsString::from("$${HOME}"),
+                OsString::from("${HOME}"),
                 OsString::from("--bind"),
-                OsString::from("/data/a$$b"),
+                OsString::from("/data/a$b"),
                 OsString::from("/bin/sh"),
             ][..]
         );
     }
 
+    /// An argument carrying a dollar must reach the program byte-identical, or cage arguments are
+    /// silently rewritten on their way in.
+    ///
+    /// Driven through the production composition — [`scope_wrapper`] builds the prefix and
+    /// [`compose`] splices the command in — rather than through an invocation assembled here. They
+    /// have to be the same one: a hand-written prefix goes on agreeing with itself while the launch
+    /// it stands for breaks, and that is precisely how a doubled dollar shipped, on every host
+    /// whose launcher did not undo the doubling.
+    ///
+    /// Skips (does not fail) where no user session can create a scope, so it is silent on a
+    /// headless host yet has teeth on a session.
     #[test]
-    fn escaping_doubles_every_dollar_and_leaves_everything_else_alone() {
-        let esc = |s: &str| escape_dollars(OsStr::new(s)).into_string().unwrap();
-        assert_eq!(esc("plain"), "plain");
-        assert_eq!(esc("${v%/}"), "$${v%/}");
-        assert_eq!(esc("$HOME"), "$$HOME");
-        assert_eq!(esc("a$b$c"), "a$$b$$c");
-        assert_eq!(esc("$"), "$$");
-        assert_eq!(esc(""), "");
-        // Bytes that are not valid UTF-8 pass through untouched around the escaped dollar.
-        let raw = OsString::from_vec(vec![0xff, b'$', 0xfe]);
-        assert_eq!(
-            escape_dollars(&raw).into_vec(),
-            vec![0xff, b'$', b'$', 0xfe]
-        );
-    }
-
-    /// The escape has to be the one the real launcher understands: an argument carrying a dollar
-    /// must reach the program byte-identical, or cage arguments are silently rewritten. Drive a
-    /// throwaway scope and read the arguments back. Skips (does not fail) where no user session can
-    /// create a scope, so it is silent in headless CI yet has teeth on a session.
-    #[test]
-    fn an_escaped_dollar_argument_reaches_the_program_verbatim() {
-        let (Some(systemd_run), Some(printf)) = (
-            crate::pathfind::find_on_path("systemd-run"),
-            crate::pathfind::find_on_path("printf"),
-        ) else {
-            skip_incapable!("skipping dollar-escape test: no systemd-run or printf");
+    fn a_dollar_argument_reaches_the_program_verbatim() {
+        let Some(printf) = crate::pathfind::find_on_path("printf") else {
+            skip_incapable!("skipping dollar test: no printf on PATH");
             return;
         };
-        let run = |args: &[String]| {
-            let mut cmd = Command::new(&systemd_run);
-            cmd.args(["--user", "--scope", "-q", "--collect", "--"]);
-            cmd.arg(&printf).arg("%s\n").args(args);
-            cmd.output().ok().filter(|o| o.status.success())
+        let run = |slug: &str, args: &[&str]| -> Option<std::process::Output> {
+            let wrapper = scope_wrapper(&Limits::default(), slug)?;
+            let mut argv: Vec<OsString> = vec![OsString::from("%s\n")];
+            argv.extend(args.iter().map(|a| OsString::from(*a)));
+            let (prog, argv) = compose(Some(wrapper), &printf, argv);
+            Command::new(prog)
+                .args(argv)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
         };
         // A baseline scope must work here, or there is no usable session — then a failure would be
-        // the host rather than a drift in the escape, so skip.
-        if run(&["baseline".to_string()]).is_none() {
-            skip_incapable!("skipping dollar-escape test: cannot create a user scope here");
+        // the host rather than a drift in what reaches the program, so skip. Its own slug, because
+        // a scope is named after the launcher pid and both calls come from this one process.
+        if run("dollar-baseline", &["baseline"]).is_none() {
+            skip_incapable!("skipping dollar test: cannot create a user scope here");
             return;
         }
 
         let raw = ["${v%/}", "$HOME", "a$b", "plain"];
-        let escaped: Vec<String> = raw
-            .iter()
-            .map(|s| escape_dollars(OsStr::new(s)).into_string().unwrap())
-            .collect();
-        let out = run(&escaped).expect("the escaped scope launches");
+        let out = run("dollar-probe", &raw).expect("the scope launches");
         let got: Vec<String> = String::from_utf8_lossy(&out.stdout)
             .lines()
             .map(str::to_string)
             .collect();
         let want: Vec<String> = raw.iter().map(|s| s.to_string()).collect();
-        assert_eq!(got, want, "escaped arguments must arrive unchanged");
+        assert_eq!(got, want, "arguments must arrive unchanged");
     }
 
     #[test]
