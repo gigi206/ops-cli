@@ -11,14 +11,21 @@
 # sysctl; nix is already installed by the publish workflows. What was missing was a workflow that
 # asks for them.
 #
-# WHAT IT DOES NOT ENFORCE, AND WHY THAT IS NAMED RATHER THAN ASSUMED. `SBX_REQUIRE_CAPABLE=1`
-# turns every capability skip into a failure. It was armed once and measured, and the measurement
-# is why it is an input rather than the default: this runner offers the cage its engines, but not
-# zsh, not a Wayland compositor, not a PulseAudio socket, and not a systemd user session delegating
-# `pids`. The suites that need those four report ok without running. Three are installable and the
-# fourth is a property of how the runner's session is set up, so enforcing by default would fail
-# every run on the host's shape rather than on a regression. `require-capable` arms it for a run
-# that has been given what it needs.
+# WHAT THE RUN PROVIDES, AND WHY. Arming `SBX_REQUIRE_CAPABLE=1` once turned every capability skip
+# into a failure and so named what this runner was missing: zsh, a Wayland compositor, a PulseAudio
+# socket, and a cgroup delegation root. The steps below provide them rather than working around
+# them, because a suite that reports ok without running is coverage that exists only on someone's
+# machine.
+#
+# The fourth is the one that shaped the others. A hosted job runs under the runner's own system
+# service, so its cgroup sits outside `user.slice` and `sbx` finds no `user@<uid>.service` to ask
+# for a capped scope. Opening a real user session fixes that -- and the same session is what
+# creates `/run/user/<uid>`, where the compositor and the sound server publish the sockets the GUI
+# and audio suites look for. One missing thing, not four.
+#
+# It still does not enforce by default. `require-capable` arms it for a run, and arming it as the
+# default is a decision for a run whose skip count below actually reads zero -- read from that
+# report, never inferred from what the steps here appear to have installed.
 #
 # THE SKIP COUNT IS THE MEASUREMENT, NOT THE PASS COUNT. `skip_incapable!` (`src/testskip.rs`)
 # prints its reason and returns, so `cargo test` counts a skipped test as PASSED and never as
@@ -71,11 +78,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
-      - name: Install bubblewrap
+      - name: Install the engines and the desktop pieces the suites look for
+        # `bubblewrap` is what a cage is built from. The other three are what the suites probe for
+        # before deciding to run: `zsh` for the completion drives, `weston` for a compositor whose
+        # socket the GUI tests bind into a cage, `pulseaudio` for the socket the audio posture
+        # binds. `dbus-user-session` brings the user manager's own bus, which the resource-limit
+        # path gates on -- see the session step below.
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends bubblewrap
+          sudo apt-get install -y --no-install-recommends \
+            bubblewrap zsh weston pulseaudio dbus-user-session
 
       - name: Allow unprivileged user namespaces
         # Ubuntu 24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1`, which refuses the
@@ -95,6 +108,64 @@ jobs:
           extra_conf: |
             experimental-features = nix-command flakes
 
+      - name: Open a real user session, so the cage has a delegation root
+        # A hosted job runs under the runner's own system service, so its cgroup sits outside
+        # `user.slice` and there is no user manager to delegate a controller. `sbx` looks for
+        # `/user@<uid>` or `/user-<uid>.slice` in its own cgroup and, finding neither, applies no
+        # limit at all -- which is why the cage landed under the host's `pids.max` rather than a
+        # capped scope. `enable-linger` starts `user@<uid>.service` without anyone logging in,
+        # which is what creates `/run/user/<uid>`.
+        #
+        # The session bus is a separate unit from the manager, and `sbx` gates its limiter on that
+        # socket existing rather than on the runtime directory being named: a manager without a bus
+        # would leave the limits off while every other sign said the session was there.
+        #
+        # Exported through `$GITHUB_ENV` because each `run:` is a fresh shell; an export here would
+        # not reach the suites.
+        run: |
+          set -euo pipefail
+          uid=$(id -u)
+          sudo loginctl enable-linger "$USER"
+          runtime="/run/user/$uid"
+          for _ in $(seq 1 50); do [ -d "$runtime" ] && break; sleep 0.2; done
+          export XDG_RUNTIME_DIR="$runtime"
+          systemctl --user enable --now dbus.socket || true
+          for _ in $(seq 1 50); do [ -S "$runtime/bus" ] && break; sleep 0.2; done
+          {
+            echo "XDG_RUNTIME_DIR=$runtime"
+            echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$runtime/bus"
+          } >> "$GITHUB_ENV"
+
+      - name: Stand up a headless compositor and a sound server
+        # Neither needs a screen or a card. What the suites read is the socket: `wayland_socket()`
+        # in `tests/run.rs` resolves `WAYLAND_DISPLAY` under `XDG_RUNTIME_DIR` and requires the
+        # file to exist, and the audio posture looks for `$XDG_RUNTIME_DIR/pulse/native`. Both are
+        # started in the background and waited for, so a failure to come up is reported here rather
+        # than as a skip five minutes later.
+        env:
+          WAYLAND_DISPLAY: wayland-1
+        run: |
+          set -uo pipefail
+          # Weston 13 spells the headless backend `headless`; earlier releases want the module
+          # file name. Try the current spelling first and fall back, so the image moving under us
+          # is a slower start rather than a missing compositor.
+          for backend in headless headless-backend.so; do
+            weston --backend="$backend" --socket="$WAYLAND_DISPLAY" --idle-time=0 \
+              >"$RUNNER_TEMP/weston.log" 2>&1 &
+            for _ in $(seq 1 50); do [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] && break; sleep 0.2; done
+            [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] && break
+          done
+          if [ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+            echo "::warning::no compositor came up -- the GUI suites will report rather than run"
+            tail -20 "$RUNNER_TEMP/weston.log" || true
+          fi
+          pulseaudio --start --exit-idle-time=-1 || true
+          for _ in $(seq 1 50); do [ -S "$XDG_RUNTIME_DIR/pulse/native" ] && break; sleep 0.2; done
+          if [ ! -S "$XDG_RUNTIME_DIR/pulse/native" ]; then
+            echo "::warning::no sound server came up -- the audio suites will report rather than run"
+          fi
+          echo "WAYLAND_DISPLAY=$WAYLAND_DISPLAY" >> "$GITHUB_ENV"
+
       - name: Report what this runner can do
         # Measured before the suites run, and kept whatever they do: when a cage test fails, the
         # first question is whether the host could have run it, and the answer belongs in the same
@@ -108,10 +179,26 @@ jobs:
             echo "bwrap:     $(command -v bwrap || echo absent)"
             echo "nix:       $(command -v nix || echo absent)"
             echo "nix-store: $(command -v nix-store || echo absent)"
+            echo "zsh:       $(command -v zsh || echo absent)"
             printf 'userns:    '
             if unshare --user --map-root-user true 2>/dev/null; then echo "usable"; else echo "REFUSED"; fi
             printf 'systemd:   '
             if systemctl --user show-environment >/dev/null 2>&1; then echo "user session present"; else echo "no user session"; fi
+            echo
+            echo "# the sockets the suites resolve, at the paths they resolve them"
+            echo "XDG_RUNTIME_DIR:  ${XDG_RUNTIME_DIR:-unset}"
+            printf 'session bus:      '
+            if [ -S "${XDG_RUNTIME_DIR:-/nonexistent}/bus" ]; then echo present; else echo ABSENT; fi
+            echo "WAYLAND_DISPLAY:  ${WAYLAND_DISPLAY:-unset}"
+            printf 'wayland socket:   '
+            if [ -S "${XDG_RUNTIME_DIR:-/nonexistent}/${WAYLAND_DISPLAY:-none}" ]; then echo present; else echo ABSENT; fi
+            printf 'pulse socket:     '
+            if [ -S "${XDG_RUNTIME_DIR:-/nonexistent}/pulse/native" ]; then echo present; else echo ABSENT; fi
+            echo
+            echo "# what decides the four resource-limit tests"
+            echo "own cgroup:       $(cut -d: -f3 /proc/self/cgroup | head -1)"
+            printf 'delegated:        '
+            cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers" 2>/dev/null || echo "no delegation root"
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -133,11 +220,26 @@ jobs:
           : > "$SBX_SKIP_LOG"
           # The fourteen suites that carry a cage skip, named rather than globbed so a new one is a
           # deliberate addition. Kept in step with `mise run test-cage`, which runs the same list.
+          # Run inside a transient user scope so the suites sit under `user@<uid>.service`, which
+          # is the delegation root `sbx` looks for before it will ask systemd for a capped scope.
+          # No limit properties are set on this outer scope: it exists to place the processes, and
+          # a `TasksMax` here would be inherited by the cage and read as the wrong cap rather than
+          # as no cap at all.
+          cat > "$RUNNER_TEMP/suites.sh" <<'SH'
+          #!/usr/bin/env bash
           rc=0
           for suite in attach completion config detach doctor fs netns plugins proc run sessions shell stop upgrade; do
             cargo test --test "$suite" --no-fail-fast || rc=$?
           done
           exit $rc
+          SH
+          chmod +x "$RUNNER_TEMP/suites.sh"
+          if systemd-run --user --scope --quiet -- true >/dev/null 2>&1; then
+            systemd-run --user --scope --quiet -- "$RUNNER_TEMP/suites.sh"
+          else
+            echo "::warning::no user scope available -- the resource-limit tests will report rather than run"
+            "$RUNNER_TEMP/suites.sh"
+          fi
 
       - name: Report what still skipped
         if: always()
