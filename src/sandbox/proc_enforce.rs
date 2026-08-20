@@ -74,7 +74,7 @@ use std::ffi::OsString;
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -223,6 +223,11 @@ pub(crate) struct ProcEnforce {
     notif_socket: PathBuf,
     control_socket: Option<PathBuf>,
     ring: Arc<ExecRing>,
+    /// Shared with the supervisor thread; read here once that thread has been joined.
+    undecidable: Arc<Undecidable>,
+    /// What this policy's mode does with a decision that had nothing to match, in the words the
+    /// teardown report needs. Captured at start-up because the policy itself moves into the thread.
+    unmatched: &'static str,
 }
 
 impl ProcEnforce {
@@ -272,6 +277,10 @@ impl Drop for ProcEnforce {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
+        }
+        // After the join: nothing counts any more, so these totals are the run's.
+        for line in self.undecidable.report(self.unmatched) {
+            crate::diag::warn(&line);
         }
         let _ = std::fs::remove_file(&self.notif_socket);
         if let Some(s) = &self.control_socket {
@@ -382,6 +391,10 @@ fn start_inner(
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
     let kept = ring.clone();
+    // Captured before the policy moves into the thread below.
+    let unmatched = unmatched_word(&policy);
+    let undecidable = Arc::new(Undecidable::default());
+    let counted = undecidable.clone();
     let lens = open.map(|(policy, root)| OpenLens::new(policy, root));
     let lens_armed = lens.is_some();
     let handle = std::thread::spawn(move || {
@@ -395,6 +408,7 @@ fn start_inner(
                 pending: &pending,
                 notifier: &notifier,
                 open: lens.as_ref(),
+                undecidable: &counted,
             },
         );
     });
@@ -418,6 +432,8 @@ fn start_inner(
             notif_socket,
             control_socket,
             ring: kept,
+            undecidable,
+            unmatched,
         },
         Wiring {
             binds,
@@ -445,9 +461,140 @@ pub(crate) fn wrap_command(cmd: Vec<OsString>, open_lens: bool) -> Vec<OsString>
     out
 }
 
-/// The supervisor thread: wait (with a stop-checking poll) for the shim's one connection, receive the
-/// listener fd, close the listening socket (no second connection is accepted), then run the receive
-/// loop until the cage's filter is gone.
+/// The decisions a supervisor could not base on what it was deciding about, counted by kind.
+///
+/// Each of those decisions reads the parked target through `/proc/<pid>/…`, and each has a fallback
+/// that keeps the cage running rather than bricking it on a read that did not work. That fallback
+/// is right for one failure and wrong for a thousand: one is a process reaped between the
+/// notification and the read, a thousand is the ancestor invariant of the module header not holding
+/// on this host — and then the policy decides nothing by name. Nothing already recorded tells those
+/// two apart. The exec ring notes an undecidable target as `<unreadable>`, but it is bounded, so a
+/// collapse evicts every real entry and leaves a tail that reads like ordinary traffic; the open
+/// lens records refusals rather than decisions, so an open it could not name leaves no entry at
+/// all; and an unreadable caller is recorded as no caller, which is also what a policy that does
+/// not decide by caller records.
+///
+/// So the count is the finding, and it is said twice. The first of each kind warns while the run is
+/// still going. A kind that happened more than once is totalled at teardown — more than once and
+/// not once, because the first already warned, and a second line that only ever repeats it teaches
+/// a reader to skip the place the number appears.
+///
+/// Counted at the read and not by its caller, deliberately: a call site can be dropped and nothing
+/// downstream would notice, while a return value cannot. That shape is what a test can hold, because
+/// the two call sites in [`handle_notif`] are out of reach — getting there needs a read that fails
+/// while a real target is parked in its syscall, and a parked target's memory is precisely what is
+/// readable. Making it fail means raising the host's `ptrace_scope`, which is machine-wide and not a
+/// test's to change. Revisit if a way appears to close one process's memory to another without
+/// touching that sysctl.
+#[derive(Default)]
+struct Undecidable {
+    /// An `execve` whose target path could not be read.
+    exec: AtomicU64,
+    /// An open whose path could not be read, so the content lens examined nothing.
+    open: AtomicU64,
+    /// An `execve` whose calling program could not be read, or is not a name a policy can hold.
+    caller: AtomicU64,
+}
+
+impl Undecidable {
+    /// What a finished run owes its user about the decisions it could not base on a name, given the
+    /// word for what its mode does with a decision that matched nothing.
+    ///
+    /// Read after the supervisor thread has been joined, so the counts are final. A kind that
+    /// happened once is left out: it already warned when it happened, and a teardown line that only
+    /// ever says `1` is one a reader learns to skip — including on the run where it says `8412`.
+    /// Each line carries what the fallback did, because that is the part its reader acts on.
+    fn report(&self, unmatched: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        let n = self.exec.load(Ordering::Relaxed);
+        if n > 1 {
+            lines.push(format!(
+                "`[proc]`: {n} `execve`s were decided without reading what they would run — each \
+                 was {unmatched} by the mode's default rather than by a rule. A supervisor that \
+                 cannot read a parked target decides nothing by name"
+            ));
+        }
+        let n = self.open.load(Ordering::Relaxed);
+        if n > 1 {
+            lines.push(format!(
+                "`[proc]`: {n} opens were allowed without the content lens reading what they asked \
+                 for. A supervisor that cannot read a parked caller examines nothing"
+            ));
+        }
+        let n = self.caller.load(Ordering::Relaxed);
+        if n > 1 {
+            lines.push(format!(
+                "`[proc]`: {n} `execve`s were decided without reading which program issued them — \
+                 each was {unmatched} by the mode's default rather than by that caller's own rules"
+            ));
+        }
+        lines
+    }
+}
+
+/// What a mode's default does with a decision that had nothing to match, in the words a warning
+/// needs: what a reader has to know is what happened to the syscall, not which arm answered.
+fn unmatched_word(policy: &ProcPolicy) -> &'static str {
+    match policy.unmatched() {
+        Verdict::Allow => "allowed",
+        Verdict::Deny => "refused",
+        Verdict::Ask => "parked for a decision",
+    }
+}
+
+/// Decide one notified `execve` by the name written at `addr` in the target's memory, and say what
+/// to record for it.
+///
+/// The verdict and the record travel together because one read produces both: a target that could
+/// not be read is decided by the mode's default and recorded as `<unreadable>`, and splitting them
+/// across two reads would let a supervisor record a decision it did not take.
+///
+/// The fallback is deliberate and stays: one that refused every target it could not read would
+/// brick a whole cage on a single process reaped mid-decision. What it must not be is unremarked,
+/// so the read that did not work is counted here — at the read, where the failure is known — and
+/// the first of them is said out loud.
+fn exec_verdict(cx: &Deciding<'_>, caller: &[String], pid: u32, addr: u64) -> (Verdict, String) {
+    if let Some(path) = read_exec_path(pid, addr).filter(|p| !p.is_empty()) {
+        // Decide against the config policy folded with the live `--session` overlay (deny wins
+        // across both). The overlay read-lock is held only for this decision.
+        let verdict = cx.overlay.decide(cx.policy, caller, &path);
+        return (verdict, path);
+    }
+    // Fall back to the mode's unmatched default rather than guess a name match — allow under a
+    // denylist, park under ask, refuse under an allowlist, where an undecidable target is exactly
+    // the one that must not run.
+    if cx.undecidable.exec.fetch_add(1, Ordering::Relaxed) == 0 {
+        crate::diag::warn(&format!(
+            "could not read what an `execve` was about to run, so the `[proc]` policy had no name \
+             to match and the mode's default decided it: {}. That read needs this supervisor to be \
+             the target's ancestor; where that does not hold, nothing is decided by name",
+            unmatched_word(cx.policy)
+        ));
+    }
+    (cx.policy.unmatched(), "<unreadable>".to_string())
+}
+
+/// The path an open asked for, or the empty string when it could not be read.
+///
+/// The read is where an unnameable open is counted, because it is the only step that knows it
+/// happened: the decision downstream allows it, and this lens records the refusals it decided rather
+/// than the decisions it could not take, so nothing afterwards would remember. Counted only where a
+/// lens is armed — with none there was nothing to decide and nothing was given up, and a number on
+/// those cages would be a number on a lens they never asked for.
+fn open_name(cx: &Deciding<'_>, pid: u32, path_addr: u64) -> String {
+    if let Some(named) = read_exec_path(pid, path_addr).filter(|p| !p.is_empty()) {
+        return named;
+    }
+    if cx.open.is_some() && cx.undecidable.open.fetch_add(1, Ordering::Relaxed) == 0 {
+        crate::diag::warn(
+            "could not read the path an open asked for, so the content lens examined nothing and \
+             the open was allowed. That read needs this supervisor to be the caller's ancestor; \
+             where that does not hold, the lens examines nothing at all",
+        );
+    }
+    String::new()
+}
+
 /// What one supervisor needs to decide a notification, carried together because every step of the
 /// receive path needs the same set.
 struct Deciding<'a> {
@@ -458,8 +605,14 @@ struct Deciding<'a> {
     notifier: &'a crate::sandbox::notify_sink::Notifier,
     /// The content lens, when this launch asked for one.
     open: Option<&'a OpenLens>,
+    /// Shared with the [`ProcEnforce`] that owns this supervisor, which reports the totals once the
+    /// thread has been joined.
+    undecidable: &'a Undecidable,
 }
 
+/// The supervisor thread: wait (with a stop-checking poll) for the shim's one connection, receive the
+/// listener fd, close the listening socket (no second connection is accepted), then run the receive
+/// loop until the cage's filter is gone.
 fn supervise(listener: UnixListener, stop: &AtomicBool, cx: &Deciding<'_>) {
     let notif_fd = match accept_handoff(&listener, stop) {
         Some(fd) => fd,
@@ -530,7 +683,7 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
     // Checked on the syscall number rather than on the lens being present, so a notification the
     // filter should not have produced is still answered as an open.
     if let Some((dirfd, path_addr)) = open_args(req.data.nr, &req.data.args) {
-        let named = read_exec_path(req.pid, path_addr).unwrap_or_default();
+        let named = open_name(cx, req.pid, path_addr);
         // Twice at most, and the second pass only when the first found nothing there and the open
         // asked for the name to be created. Creating it is what makes the second pass meaningful:
         // the file exists by then, so the ordinary decision has something to examine.
@@ -589,23 +742,9 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
         }
         return;
     }
-    let path = read_exec_path(req.pid, req.data.args[0]).unwrap_or_default();
-    let caller = caller_chain(cx.policy, req.pid);
-    let verdict = if path.is_empty() {
-        // Could not read the path: fall back to the mode's unmatched default rather than guessing a
-        // name match — allow under a denylist, park under ask, refuse under an allowlist (where an
-        // undecidable target is exactly the one that must not run).
-        cx.policy.unmatched()
-    } else {
-        // Decide against the config policy folded with the live `--session` overlay (deny wins across
-        // both). The overlay read-lock is held only for this decision.
-        cx.overlay.decide(cx.policy, &caller, &path)
-    };
-    let shown = if path.is_empty() {
-        "<unreadable>"
-    } else {
-        &path
-    };
+    let caller = caller_chain(cx, req.pid);
+    let (verdict, shown) = exec_verdict(cx, &caller, req.pid, req.data.args[0]);
+    let shown = shown.as_str();
     let by = caller.last().map(String::as_str).unwrap_or_default();
     match verdict {
         Verdict::Allow => {
@@ -676,14 +815,32 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
 /// Small in absolute terms — but there is one receive loop for the whole cage, so per-notification
 /// work is a throughput ceiling and not merely a latency; and a syscall issued for an answer nobody
 /// reads is not a small cost, it is a wrong one.
-fn caller_chain(policy: &ProcPolicy, pid: u32) -> Vec<String> {
-    if policy.graph.is_none() {
+fn caller_chain(cx: &Deciding<'_>, pid: u32) -> Vec<String> {
+    if cx.policy.graph.is_none() {
         return Vec::new();
     }
-    std::fs::read_link(format!("/proc/{pid}/exe"))
+    // `into_string` and not `to_string_lossy`: this string is matched against the policy's caller
+    // nodes and recorded as who reached, and a lossy one is neither. Every byte the encoding cannot
+    // carry becomes the same replacement character, so two callers that are different programs
+    // arrive here under one name — the same collapse a trust marker's key must not make. A name
+    // that cannot be carried is not a name, and joins the reads that did not work.
+    let named = std::fs::read_link(format!("/proc/{pid}/exe"))
         .ok()
-        .map(|p| vec![p.to_string_lossy().into_owned()])
-        .unwrap_or_default()
+        .and_then(|p| p.into_os_string().into_string().ok());
+    let Some(program) = named else {
+        // An empty chain matches no node, so the mode's default decides — and the ring records this
+        // `execve` with no caller, exactly as it records one under a policy that does not decide by
+        // caller at all. Nothing in the log separates those, so the count does.
+        if cx.undecidable.caller.fetch_add(1, Ordering::Relaxed) == 0 {
+            crate::diag::warn(&format!(
+                "could not read the program that issued an `execve`, so the per-caller policy had \
+                 no node to match and the mode's default decided it: {}",
+                unmatched_word(cx.policy)
+            ));
+        }
+        return Vec::new();
+    };
+    vec![program]
 }
 
 /// Which errno a refusal answers with: `ENOENT` when the target does not exist, `EPERM` otherwise.
@@ -2408,6 +2565,7 @@ mod tests {
                         pending: &pending,
                         notifier: &crate::sandbox::notify_sink::Notifier::disabled(),
                         open: Some(&lens),
+                        undecidable: &Undecidable::default(),
                     },
                 );
             }
@@ -3551,6 +3709,7 @@ mod tests {
                         pending: &pending,
                         notifier,
                         open: None,
+                        undecidable: &Undecidable::default(),
                     },
                 );
             }
@@ -3804,5 +3963,243 @@ mod tests {
             !marker.exists(),
             "the payload ran unenforced — the shim must never fall back to executing it"
         );
+    }
+
+    /// The pieces a [`Deciding`] borrows, owned by the caller so the context has something to point
+    /// at. Only the policy is left out: it is what each test below varies.
+    struct DecidingParts {
+        overlay: ProcOverlay,
+        ring: ExecRing,
+        pending: PendingExec,
+        notifier: crate::sandbox::notify_sink::Notifier,
+        undecidable: Undecidable,
+        lens: Option<OpenLens>,
+    }
+
+    impl DecidingParts {
+        fn new() -> DecidingParts {
+            DecidingParts {
+                overlay: ProcOverlay::new(),
+                ring: ExecRing::new(8),
+                pending: PendingExec::new(),
+                notifier: crate::sandbox::notify_sink::Notifier::disabled(),
+                undecidable: Undecidable::default(),
+                lens: None,
+            }
+        }
+
+        /// The same pieces with a content lens armed. What it looks for does not matter to the tests
+        /// below — they are about the opens it never gets to look at.
+        fn with_lens() -> DecidingParts {
+            let policy = crate::open_policy::OpenPolicy::compile(&["secret".to_string()], 4096)
+                .expect("a valid pattern")
+                .expect("a non-empty policy");
+            DecidingParts {
+                lens: Some(OpenLens::new(policy, PathBuf::from("/"))),
+                ..DecidingParts::new()
+            }
+        }
+
+        fn cx<'a>(&'a self, policy: &'a ProcPolicy) -> Deciding<'a> {
+            Deciding {
+                policy,
+                overlay: &self.overlay,
+                ring: &self.ring,
+                pending: &self.pending,
+                notifier: &self.notifier,
+                open: self.lens.as_ref(),
+                undecidable: &self.undecidable,
+            }
+        }
+    }
+
+    /// An address mapped in no process, in a process this one is not the ancestor of: between them
+    /// they refuse both halves of the read, whichever the host's `ptrace_scope` allows. This is how
+    /// the tests below reach the branch a hardened host would reach for every decision.
+    const UNREADABLE: (u32, u64) = (1, 0);
+
+    #[test]
+    fn an_execve_whose_target_cannot_be_read_takes_the_modes_default_and_every_one_is_counted() {
+        // The fallback itself is deliberate and stays: a supervisor that refused every read it could
+        // not make would brick a cage on one process reaped mid-decision. What must not stay is that
+        // it passes unremarked. The exec ring notes such a target as `<unreadable>`, but the ring is
+        // bounded, so a run where every read fails evicts the real entries and leaves a tail that
+        // reads like ordinary traffic. The count is what separates one race from a policy that is
+        // deciding nothing by name, so every occurrence counts and not only the one that warned.
+        for (mode, expected) in [
+            (ProcMode::Enforce, Verdict::Allow),
+            (ProcMode::Confine, Verdict::Deny),
+            (ProcMode::Ask, Verdict::Ask),
+        ] {
+            let policy = ProcPolicy::new(mode, &[], &[]);
+            let parts = DecidingParts::new();
+            let cx = parts.cx(&policy);
+            let (pid, addr) = UNREADABLE;
+            for _ in 0..3 {
+                assert_eq!(
+                    exec_verdict(&cx, &[], pid, addr),
+                    (expected, "<unreadable>".to_string()),
+                    "under {mode:?}"
+                );
+            }
+            assert_eq!(
+                parts.undecidable.exec.load(Ordering::Relaxed),
+                3,
+                "under {mode:?}: every undecidable exec counts, not only the first"
+            );
+        }
+    }
+
+    #[test]
+    fn an_open_the_lens_cannot_name_is_counted_because_it_leaves_nothing_else_behind() {
+        // Unlike an exec, an open the lens could not name leaves no trace at all: this lens records
+        // the refusals it decided, never the decisions it could not take. The counter is the only
+        // thing that remembers it happened, which is the whole reason it exists.
+        let policy = ProcPolicy::new(ProcMode::Enforce, &[], &[]);
+        let (pid, addr) = UNREADABLE;
+
+        let armed = DecidingParts::with_lens();
+        for _ in 0..2 {
+            assert!(
+                open_name(&armed.cx(&policy), pid, addr).is_empty(),
+                "an open whose path cannot be read has no name to decide against"
+            );
+        }
+        assert_eq!(armed.undecidable.open.load(Ordering::Relaxed), 2);
+        assert!(
+            armed.ring.snapshot(None).events.is_empty(),
+            "the open lens leaves no entry for a name it never read — hence the counter"
+        );
+
+        // And a cage that never asked for the lens is not told it lost something it never had.
+        let bare = DecidingParts::new();
+        assert!(open_name(&bare.cx(&policy), pid, addr).is_empty());
+        assert_eq!(bare.undecidable.open.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_caller_whose_program_is_not_a_name_a_policy_can_hold_is_counted_rather_than_flattened() {
+        // `/proc/<pid>/exe` is bytes and a policy's caller nodes are text. A lossy conversion bridges
+        // the two by mapping every byte it cannot carry onto one replacement character, so callers
+        // that are different programs would arrive under a single name and a rule written for one
+        // would answer for the other. The fixture is a real process launched from a directory whose
+        // name is not valid UTF-8: the read succeeds, and it is the conversion that cannot.
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        // Runs the payload and reports the caller chain the policy would decide against.
+        fn chain_for(payload: &Path, parts: &DecidingParts, policy: &ProcPolicy) -> Vec<String> {
+            let mut cmd = std::process::Command::new(payload);
+            cmd.arg("30");
+            // Freshly written, so it meets `ETXTBSY` the same way the shim does — see `spawn_shim`.
+            let mut child = spawn_shim(&mut cmd);
+            // Wait for the exec to land. Before it does, `/proc/<pid>/exe` still reports this test
+            // binary — whose path is perfectly good UTF-8 — so the wait stops on the condition the
+            // assertion rests on rather than on time having passed.
+            let exe = format!("/proc/{}/exe", child.id());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::fs::read_link(&exe).ok().as_deref() != Some(payload) {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("the payload never became `{}`", payload.display());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let chain = caller_chain(&parts.cx(policy), child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            chain
+        }
+
+        let dir = TmpDir::new();
+        let policy = ProcPolicy::confined(crate::proc_policy::CallerGraph::default());
+        let mut payloads = Vec::new();
+        for name in [b"plain".as_slice(), b"p\xff".as_slice()] {
+            let sub = dir.path().join(OsStr::from_bytes(name));
+            std::fs::create_dir_all(&sub).expect("the fixture directory");
+            let payload = sub.join("sleep");
+            // A payload that stays alive long enough to be read, and that the kernel reports back at
+            // this path. Canonicalised because `/proc/<pid>/exe` is, and the fixture root may not be.
+            std::fs::copy("/bin/sleep", &payload).expect("copy the payload");
+            payloads.push(std::fs::canonicalize(&payload).expect("canonical payload"));
+        }
+
+        // The control arm first: with a path that IS a name, the chain carries it and nothing counts.
+        // Without this the empty chain below would equally be explained by a harness that never ran.
+        let plain = DecidingParts::new();
+        let chain = chain_for(&payloads[0], &plain, &policy);
+        assert_eq!(
+            chain,
+            vec![
+                payloads[0]
+                    .to_str()
+                    .expect("a UTF-8 control path")
+                    .to_string()
+            ],
+            "the caller a policy can name is the one it decides against"
+        );
+        assert_eq!(plain.undecidable.caller.load(Ordering::Relaxed), 0);
+
+        let odd = DecidingParts::new();
+        let chain = chain_for(&payloads[1], &odd, &policy);
+        assert!(
+            chain.is_empty(),
+            "a name that cannot be carried is not a name: {chain:?}"
+        );
+        assert_eq!(
+            odd.undecidable.caller.load(Ordering::Relaxed),
+            1,
+            "and it joins the reads that did not work, rather than passing as a caller"
+        );
+    }
+
+    #[test]
+    fn the_teardown_report_names_a_kind_that_happened_more_than_once_and_not_one_that_happened_once()
+     {
+        let counts = Undecidable::default();
+        counts.exec.store(1, Ordering::Relaxed);
+        assert!(
+            counts.report("allowed").is_empty(),
+            "the single occurrence already warned when it happened; repeating it teaches a reader \
+             to skip the line that one day says 8412"
+        );
+
+        counts.exec.store(8412, Ordering::Relaxed);
+        counts.caller.store(2, Ordering::Relaxed);
+        let lines = counts.report("allowed");
+        assert_eq!(
+            lines.len(),
+            2,
+            "one line per kind that happened more than once: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("8412") && lines[0].contains("allowed"),
+            "the count and what the default did with each: {}",
+            lines[0]
+        );
+        assert!(lines[1].contains(" 2 "), "{}", lines[1]);
+        assert!(
+            counts
+                .report("refused")
+                .iter()
+                .all(|l| !l.contains("allowed")),
+            "the report says what THIS mode's default did, which is what its reader acts on"
+        );
+    }
+
+    #[test]
+    fn a_parked_target_this_supervisor_cannot_read_reads_as_no_path_at_all() {
+        // The branch guarded above is only worth guarding if production can reach it. It can: the
+        // read is an ordinary open-and-read of another process's memory, and both halves refuse
+        // here — the open because pid 1 is not this process's descendant, or, where it opens at all,
+        // the read because address 0 is mapped in no process. Both `/proc/<pid>/mem` readers are
+        // held, since the flag word is read the same careful way the path is.
+        //
+        // What this cannot show is how OFTEN production reaches it. That depends on the host's
+        // `ptrace_scope`, a machine-wide setting no test may raise on its way past.
+        let (pid, addr) = UNREADABLE;
+        assert!(read_exec_path(pid, addr).is_none());
+        assert!(read_u64(pid, addr).is_none());
     }
 }

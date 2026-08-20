@@ -75,7 +75,14 @@ channel, for three honest reasons:
   the path argument after the check, so *refusing* a path is hard, but *approving* a specific one is
   a guardrail;
 - the x32 ABI shares x86-64's architecture value with distinct syscall numbers: a narrow blind spot
-  shared with the base denylist, and the base toolset is x86-64.
+  shared with the base denylist, and the base toolset is x86-64;
+- deciding by **name** means reading the target out of the process that is parked in the `execve`,
+  which the kernel grants only to that process's ancestor. A launch is one, so this holds in the
+  ordinary case; on a host that restricts `ptrace` further than the usual scope, nothing can be read
+  and every decision falls to the mode's default, which under the denylist posture is an allow. sbx
+  does not go quiet about it: the first such decision warns, and the total is reported when the run
+  ends, so a policy that decided nothing by name says so instead of reading like a run in which
+  nothing needed refusing.
 
 So the cage's real confidentiality/integrity boundaries stay what they always were: confinement by
 absence (a secret that isn't mounted can't be read), the read-only store, and the
