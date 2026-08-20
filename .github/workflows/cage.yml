@@ -253,9 +253,12 @@ jobs:
           # `user@<uid>.service` gives `sbx` the delegation root it looks for, so every launch would
           # then go through `systemd-run`. That path is no longer broken -- the launch asks for no
           # variable substitution rather than escaping for one -- but a run that puts its own
-          # processes in a scope measures a host this runner is not, and the guard in `--bin sbx`
-          # already asserts the behaviour that mattered. The dollar report above keeps measuring it
-          # each run, so the day a systemd default moves again, this says so.
+          # processes in a scope measures a host this runner is not. The behaviour that mattered is
+          # asserted instead by `a_dollar_argument_reaches_the_program_verbatim` in `--bin sbx`,
+          # which raises a throwaway scope of its own and needs no delegation root to do it: tying
+          # it to one made it skip here, on a runner where a scope creates fine, and a skip reads as
+          # a pass. The dollar report above keeps measuring the same thing without asserting it, so
+          # the day a systemd default moves again, this says so either way.
           rc=0
           for suite in attach completion config detach doctor fs netns plugins proc run sessions shell stop upgrade; do
             cargo test --test "$suite" --no-fail-fast || rc=$?
