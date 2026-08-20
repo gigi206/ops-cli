@@ -638,7 +638,7 @@ pub(super) fn relay_upgrade(
     // Read the upstream's response head. A BufReader may read past it into the server's first frames;
     // those buffered bytes are drained below so none is lost.
     let mut up_br = BufReader::new(upstream);
-    let resp_head = read_head_buffered(&mut up_br, HEAD_MAX)?;
+    let resp_head = read_head_buffered(&mut up_br, HEAD_MAX, head_deadline(ctx))?;
 
     if parse_status_code(&resp_head) != Some(101) {
         // The upstream declined the upgrade — relay its response as a normal one, then close. The

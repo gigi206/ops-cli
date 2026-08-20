@@ -244,6 +244,24 @@ must be a tab, visible ASCII, or above ASCII. Without it a single carriage retur
 a header value reaches a lenient upstream as a header of the caller's own choosing,
 including one placed in front of a credential the proxy strips and replaces.
 
+**Where a head ends, and how long it may take to get there.** A head ends at a blank
+line, and a recipient accepts a bare line feed as a line terminator, so that blank line
+has four spellings. All four end a head, on every plane that reads one. That matters most
+at the entrance, which reads the first head a byte at a time so the stream is left sitting
+exactly on the first byte of the TLS handshake: a byte-wise reader has to name the four
+spellings, where a line-wise one gets them from testing each line.
+
+A head also carries a deadline, and it is one budget for the whole head rather than one
+per read of it. A socket's receive timeout bounds a single read, and a head is read a byte
+or a line at a time, so a caller that sends one byte just inside that timeout resets it on
+every byte: bounded only by the 16 KiB head ceiling, such a connection would occupy one of
+`max_connections` for as long as it cared to, and the thread it holds is host-side, outside
+the cage's own memory and CPU limits. The budget is the launch's socket timeout, spent
+once. A head that is truncated, oversized, past its budget or not valid UTF-8 is answered
+`400 bad-request:head` and recorded in [`sbx net logs`](observability#sbx-net-logs); a
+caller that connects and closes without sending a byte is not an attempt, and leaves
+nothing behind.
+
 **Inbound, the rule is fail-open.** The proxy reads the response head, then applies the
 standard delimitation rules in order:
 
@@ -437,7 +455,8 @@ policy refusal from a host that does not respond from a name that does not resol
 The categories surface in [`sbx net logs`](observability#sbx-net-logs) as the
 per-event reason: `denied-default`, `denied-by-rule` (categorical: the rule text is
 never disclosed, so a global-config rule the cage cannot read does not leak),
-`denied-method`, `ssrf-blocked`, `host-mismatch`, `ip-literal`, `bad-request`,
+`denied-method`, `ssrf-blocked`, `host-mismatch`, `ip-literal`, `bad-request` (including
+`bad-request:head`, a head that never arrived whole),
 `outbound-secret`, `signer-refused`, `signer-body-too-large`, `body-buffer-cap`,
 `connection-cap`, `injected-header-invalid`, and the transport-side `dns-failure`, `upstream-unreachable`,
 `upstream-cert-rejected`, `upstream-http2-unsupported`, and `upstream-closed`. A genuine

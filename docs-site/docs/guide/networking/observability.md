@@ -126,9 +126,11 @@ For each destination host it reports how many requests this project's launches:
 
 Each request is counted once. Counters accrue while a filtering posture
 (`deny`/`allow`/`ask`) runs and **persist after the session** (owner-only, under the
-data dir). Transport/protocol failures (DNS, an unreachable upstream, a malformed
-request) are **not** a policy verdict and are not counted: that is the axis
-`sbx net logs` adds with its `error` verdict.
+data dir). Transport/protocol failures are **not** a policy verdict and are not counted:
+that is the axis `sbx net logs` adds. A host that did not resolve, one that could not be
+reached, and one whose certificate was rejected land there under the `error` verdict; a
+request the proxy refused as malformed lands there too, under `blocked`, which is the
+verdict for a request a protocol or security check refused rather than the policy.
 
 Recording is **on by default**; a trusted `[network] stats = false` turns it off
 (`true` re-enables it). `--reset` clears the recorded files of *ended* sessions; a

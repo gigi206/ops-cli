@@ -77,7 +77,7 @@ pub(super) fn serve_tunneled_request(
 
     // 4. Read this request's head (on the first turn that also drives the handshake to completion,
     //    so the SNI is known afterwards); keep the SAME buffered reader for the body.
-    let inner_bytes = read_head_buffered(&mut br, HEAD_MAX)?;
+    let inner_bytes = read_head_buffered(&mut br, HEAD_MAX, head_deadline(ctx))?;
     let sni = br.get_ref().conn.server_name().map(|s| s.to_string());
 
     // CONNECT-host == SNI: the leaf was minted for the SNI, so a CONNECT to a different host is a

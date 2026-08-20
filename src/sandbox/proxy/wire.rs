@@ -244,6 +244,64 @@ impl<W: Write> Write for CountingWriter<W> {
     }
 }
 
+/// What a read that ran out of its wall-clock budget is reported as. One sentence for every plane
+/// that reads a head, so an operator reading a log line and a caller reading a refusal body see the
+/// same words.
+pub(super) const READ_DEADLINE_PASSED: &str =
+    "a message head did not arrive in full before the read deadline";
+
+/// A `Read`/`BufRead` adapter that gives everything read through it **one** wall-clock budget,
+/// where a socket timeout gives one budget per `read`.
+///
+/// Those are not the same bound, and the gap between them is reachable from inside the cage. A
+/// socket's receive timeout bounds a single `read`; a head is read one byte ([`read_head_raw`]) or
+/// one line ([`read_head_buffered`]) at a time, so a client that sends a byte just inside the
+/// timeout resets it on every byte and the read ends only when the head reaches [`HEAD_MAX`]. At
+/// the launch's own timeout that is on the order of a hundred hours spent on one host thread, which
+/// holds one of `[network] max_connections` slots for the whole of it. That many such connections
+/// close the cage's egress on the connection cap, and the threads they park live outside the cage's
+/// cgroup — so the host pays for them where the sandbox's own limits do not reach. It is the shape
+/// the accept loop already guards on its write side, with `CAP_REFUSAL_WRITE_TIMEOUT`.
+///
+/// The budget is checked *before* each read rather than after, so what it bounds is the budget plus
+/// at most one socket timeout, and a reader holding enough buffered bytes never blocks on it at all.
+pub(super) struct Deadlined<'a, R> {
+    inner: &'a mut R,
+    deadline: Instant,
+}
+
+impl<'a, R> Deadlined<'a, R> {
+    pub(super) fn new(inner: &'a mut R, deadline: Instant) -> Self {
+        Deadlined { inner, deadline }
+    }
+
+    /// The budget, asked before every read: past it nothing more is read.
+    fn budget_left(&self) -> io::Result<()> {
+        if Instant::now() >= self.deadline {
+            return Err(invalid(READ_DEADLINE_PASSED));
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for Deadlined<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.budget_left()?;
+        self.inner.read(buf)
+    }
+}
+
+impl<R: BufRead> BufRead for Deadlined<'_, R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.budget_left()?;
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.inner.consume(n);
+    }
+}
+
 /// How much the relay moves per read/write on the inspected path.
 ///
 /// Sized by measurement rather than by habit. On a loopback upstream the inspected relay moved

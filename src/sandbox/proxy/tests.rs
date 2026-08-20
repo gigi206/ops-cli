@@ -13,6 +13,11 @@ use rustls::{
     ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
 };
 
+/// A head deadline far enough out that a test which is not about the deadline never meets it.
+fn far_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(3600)
+}
+
 #[test]
 fn counting_reader_and_writer_tally_bytes() {
     // The building block the relay uses to feed `sbx net live`'s byte counters: every byte read
@@ -4308,11 +4313,176 @@ fn a_denied_host_is_refused_with_403() {
 fn read_head_buffered_bounds_a_line_with_no_terminator() {
     // a single oversized line with no terminator must error (bounded), not buffer unboundedly
     let mut flood = std::io::Cursor::new(vec![b'a'; 64 * 1024]);
-    let err = read_head_buffered(&mut flood, 16 * 1024).unwrap_err();
+    let err = read_head_buffered(&mut flood, 16 * 1024, far_deadline()).unwrap_err();
     assert!(err.to_string().contains("request head too large"), "{err}");
     // a normal head within the bound still parses
     let mut ok = std::io::Cursor::new(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec());
-    assert!(read_head_buffered(&mut ok, 16 * 1024).is_ok());
+    assert!(read_head_buffered(&mut ok, 16 * 1024, far_deadline()).is_ok());
+}
+
+/// A client that sends its head one byte at a time, each byte inside the socket's read timeout, is
+/// bounded by the head's own wall-clock budget rather than by `HEAD_MAX`.
+///
+/// The gap this closes: a receive timeout bounds one `read`, and every byte resets it, so without a
+/// budget on the whole head the read ends only at `HEAD_MAX` — sixteen thousand pauses on one host
+/// thread, holding one of `max_connections` slots for all of them.
+///
+/// Teeth: with the budget removed, the reader below serves all 16385 bytes and the error becomes
+/// `request head too large`; both assertions fail.
+#[test]
+fn a_head_dripped_a_byte_at_a_time_is_bounded_by_its_deadline() {
+    /// A client that never finishes a head: one byte per read, with a pause its deadline outlives.
+    struct Drip {
+        served: usize,
+    }
+    impl Read for Drip {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            thread::sleep(Duration::from_millis(1));
+            self.served += 1;
+            buf[0] = b'x';
+            Ok(1)
+        }
+    }
+
+    let mut drip = Drip { served: 0 };
+    let mut head = Vec::new();
+    let err = read_head_raw(
+        &mut drip,
+        HEAD_MAX,
+        Instant::now() + Duration::from_millis(20),
+        &mut head,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains(READ_DEADLINE_PASSED),
+        "the budget must be what ends the read: {err}"
+    );
+    assert!(
+        drip.served < HEAD_MAX,
+        "the read must stop on its budget, not on HEAD_MAX: {} bytes served",
+        drip.served
+    );
+}
+
+/// The same budget bounds the line-wise reader, where a drip inside a *single* line would otherwise
+/// pass between two line boundaries untouched.
+///
+/// Teeth: a budget checked only between lines never fires here, because the whole flood is one line;
+/// the read then ends on the line bound and the error becomes `request head too large`.
+#[test]
+fn a_head_dripped_inside_one_line_is_bounded_by_its_deadline() {
+    struct DripLine;
+    impl Read for DripLine {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            thread::sleep(Duration::from_millis(1));
+            buf[0] = b'x';
+            Ok(1)
+        }
+    }
+
+    let mut drip = BufReader::new(DripLine);
+    let err = read_head_buffered(
+        &mut drip,
+        HEAD_MAX,
+        Instant::now() + Duration::from_millis(20),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains(READ_DEADLINE_PASSED),
+        "the budget must be what ends the read: {err}"
+    );
+}
+
+/// Every spelling of the blank line that ends a head ends one on the byte-wise reader the entrance
+/// uses, as they already did on the line-wise reader inside a tunnel — and none of them reads a byte
+/// past the head, which on the entrance is the first byte of the TLS ClientHello.
+///
+/// Teeth: with `\r\n\r\n` as the only terminator, the three bare-LF spellings never terminate, so
+/// the reader runs to its deadline and the `unwrap` fails.
+#[test]
+fn every_spelling_of_the_blank_line_ends_a_head() {
+    for head in [
+        b"CONNECT h:443 HTTP/1.1\r\nHost: h\r\n\r\n".as_slice(),
+        b"CONNECT h:443 HTTP/1.1\nHost: h\n\n",
+        b"CONNECT h:443 HTTP/1.1\r\nHost: h\r\n\n",
+        b"CONNECT h:443 HTTP/1.1\nHost: h\n\r\n",
+    ] {
+        // 0x16 is the TLS record type the handshake starts with: it must still be in the stream.
+        let mut stream = io::Cursor::new([head, b"\x16"].concat());
+        let mut got = Vec::new();
+        read_head_raw(&mut stream, HEAD_MAX, far_deadline(), &mut got).unwrap();
+        assert_eq!(got, head, "the head ends at its blank line, and there");
+        let parsed = parse_head(&got).unwrap();
+        assert_eq!(parsed.request_line, "CONNECT h:443 HTTP/1.1");
+        assert_eq!(parsed.headers, vec![("Host".to_string(), "h".to_string())]);
+    }
+}
+
+/// A first head that began and never finished leaves a line in `sbx net logs` and tells the caller
+/// why. A client that connected and closed without sending a byte leaves nothing: that is how a
+/// probe ends, and there is no attempt in it to see.
+///
+/// Teeth: with the two reads before the request line propagating their error as they did, the first
+/// half finds an empty log and no response at all; with the emptiness test dropped, the second half
+/// finds a logged event for a connection that said nothing.
+#[test]
+fn a_first_head_that_never_finished_is_logged_and_answered() {
+    let log = Arc::new(crate::sandbox::control::LogRing::new(
+        crate::sandbox::control::LOG_RING_CAP,
+    ));
+    let ctx = Arc::new(
+        ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[]))
+            .unwrap()
+            .with_log(log.clone()),
+    );
+
+    // A head that starts and stops: no blank line ever arrives, and the client keeps the connection
+    // open, exactly as the accept loop would hand it over.
+    let (mut test_end, cage_end) = UnixStream::pair().unwrap();
+    cage_end
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    test_end
+        .write_all(b"CONNECT h:443 HTTP/1.1\r\nHost: h\r\n")
+        .unwrap();
+    let c = ctx.clone();
+    let served = thread::spawn(move || handle_client(cage_end, &c));
+
+    let mut answer = String::new();
+    BufReader::new(&mut test_end)
+        .read_to_string(&mut answer)
+        .unwrap();
+    served.join().unwrap().unwrap();
+
+    assert!(
+        answer.contains("400 Bad Request"),
+        "a truncated head must be answered, not dropped: {answer:?}"
+    );
+    assert!(
+        answer.contains("X-Sbx-Egress-Reason: bad-request:head"),
+        "the caller must be able to tell this from a policy refusal: {answer:?}"
+    );
+    let events = log.snapshot(None, None, false).events;
+    assert_eq!(events.len(), 1, "one event for the attempt: {events:?}");
+    assert_eq!(
+        events[0].verdict,
+        crate::sandbox::control::LogVerdict::Blocked
+    );
+    assert_eq!(events[0].reason, "bad-request:head");
+    assert_eq!(
+        events[0].host, "",
+        "a head this proxy could not read names no host"
+    );
+
+    // A connection that says nothing at all is not an attempt.
+    let (test_end, cage_end) = UnixStream::pair().unwrap();
+    drop(test_end);
+    handle_client(cage_end, &ctx).unwrap();
+    assert_eq!(
+        log.snapshot(None, None, false).events.len(),
+        1,
+        "a client that connected and closed leaves nothing behind"
+    );
 }
 
 #[test]

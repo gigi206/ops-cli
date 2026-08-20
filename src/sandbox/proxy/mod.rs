@@ -101,7 +101,7 @@
 //! | `503` | `connection-cap`         | the proxy is already serving as many client connections as it will serve at once (`[network] max_connections`). Answered on the accept loop, before anything is read, so the caller's own request is still unread when the connection closes and the refusal arrives followed by a reset |
 //! | `503` | `body-buffer-cap`        | the proxy is already holding as much request-body data as it will hold at one time (retry when one in flight completes). Nothing is wrong with the request: it is a shared ceiling on host memory, since the proxy buffers host-side and the cage's own `MemoryMax` does not reach it |
 //! | `421` | `host-mismatch`          | the TLS SNI or `Host` header disagreed with the CONNECT target (or, on an absolute-form request, with the request-line host) |
-//! | `400` | `bad-request`            | the request was malformed or used ambiguous framing. Every inspected plane reads the framing through one shared check ([`inspect_framing`]), so the same request is refused under the same reason whichever plane it arrived on. The reason is sub-categorized: `bad-request:transfer-encoding` (a coding other than `chunked`), `bad-request:dup-content-length`, `bad-request:dup-host`, `bad-request:invalid-content-length`, `bad-request:control-char` (a byte in the request line or a header that another parser could read as a line break — see [`head_carries_control_byte`]), or `bad-request:chunked` (a `Transfer-Encoding: chunked` body that was malformed or over the proxy cap). A well-formed `chunked` request is de-chunked and re-framed with a synthesized `Content-Length` (not refused) |
+//! | `400` | `bad-request`            | the request was malformed or used ambiguous framing. Every inspected plane reads the framing through one shared check ([`inspect_framing`]), so the same request is refused under the same reason whichever plane it arrived on. The reason is sub-categorized: `bad-request:transfer-encoding` (a coding other than `chunked`), `bad-request:dup-content-length`, `bad-request:dup-host`, `bad-request:invalid-content-length`, `bad-request:control-char` (a byte in the request line or a header that another parser could read as a line break — see [`head_carries_control_byte`]), `bad-request:chunked` (a `Transfer-Encoding: chunked` body that was malformed or over the proxy cap), or `bad-request:head` (a head that never arrived whole: truncated, over [`HEAD_MAX`], past [`head_deadline`], or not UTF-8 — read before there is a request line, so it names no host and no method). A well-formed `chunked` request is de-chunked and re-framed with a synthesized `Content-Length` (not refused) |
 //! | `405` | `method-not-allowed`     | a non-CONNECT request that is neither a routable `http://` nor `https://` absolute-form (a bare origin-form has no destination) |
 //! | `502` | `dns-failure`            | DNS resolution failed for an allowed host |
 //! | `502` | `upstream-unreachable`   | the host is allowed but the TCP connection failed |
@@ -170,7 +170,7 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::{ClientConnection, ServerConnection, StreamOwned};
 
@@ -293,6 +293,21 @@ const CAP_REFUSAL_WRITE_TIMEOUT: Duration = Duration::from_millis(50);
 /// The largest request head (CONNECT or the decrypted inner request) the proxy will buffer.
 const HEAD_MAX: usize = 16 * 1024;
 
+/// How long a head has to arrive in full, counted from the moment its read starts.
+///
+/// The launch's own socket timeout, spent once on the whole head instead of once per read of it —
+/// [`Deadlined`] carries what that difference costs when it is missing. A head is a few hundred
+/// bytes a peer writes in one go, so one that cannot finish inside the time allowed for a single
+/// read is not a slow peer, and this needs no setting of its own.
+fn head_deadline(ctx: &ProxyCtx) -> Instant {
+    Instant::now() + ctx.timeout
+}
+
+/// What a first head that never became a request is logged and refused as. Distinct from the
+/// `bad-request` a malformed request *line* carries, so an operator can tell a head that never
+/// arrived whole from one that arrived and did not parse.
+const UNREADABLE_HEAD: &str = "bad-request:head";
+
 /// What a request refused by [`head_carries_control_byte`] is told, on every plane that reads a head.
 /// It names the byte class rather than the attack, because a client sending one by accident needs to
 /// know what to remove and a client sending one on purpose learns nothing it did not already know.
@@ -316,8 +331,14 @@ const ASK_PENDING_CAP: usize = 256;
 fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     // 1. The CONNECT head, read byte-by-byte so the stream sits exactly at the TLS ClientHello
     //    (a buffered read would swallow the start of the handshake).
-    let head = read_head_raw(&mut client, HEAD_MAX)?;
-    let parsed = parse_head(&head)?;
+    let mut head = Vec::new();
+    if let Err(e) = read_head_raw(&mut client, HEAD_MAX, head_deadline(ctx), &mut head) {
+        return refuse_unreadable_head(&mut client, ctx, &head, &e);
+    }
+    let parsed = match parse_head(&head) {
+        Ok(parsed) => parsed,
+        Err(e) => return refuse_unreadable_head(&mut client, ctx, &head, &e),
+    };
     let Some((method, target)) = request_line_parts(&parsed.request_line) else {
         // A malformed request line carries no destination to attribute — log the attempt so it is
         // not dark, but with no host/method/path (the raw line may hold whitespace the wire format
@@ -800,10 +821,37 @@ fn upstream_spoke(sock: &TcpStream) -> bool {
     matches!(sock.peek(&mut one), Ok(n) if n > 0)
 }
 
+/// Whether these bytes end at the blank line that ends a head.
+///
+/// A head ends at an empty line, and RFC 9112 §2.2 has a recipient accept a bare LF as a line
+/// terminator — so the empty line has four spellings: `\r\n\r\n`, `\n\n`, `\r\n\n` and `\n\r\n`.
+/// [`read_head_buffered`] reads whole lines and tests each against `\r\n` and `\n`, which accepts all
+/// four, and [`parse_head`] splits on both; a byte-wise reader has to name them, or the planes
+/// disagree about where a head ends. The byte-wise one is the entrance, the first head every client
+/// sends, so a plane that recognized fewer spellings there would leave a bare-LF `CONNECT` with no
+/// terminator to find: read to its deadline, then answered by a closed connection.
+///
+/// Two tests cover the four, because every spelling ends either `\n\n` (which `\r\n\n` ends with
+/// too) or `\n\r\n` (which `\r\n\r\n` ends with too).
+fn head_terminated(buf: &[u8]) -> bool {
+    buf.ends_with(b"\n\n") || buf.ends_with(b"\n\r\n")
+}
+
 /// Read a request head byte-by-byte until the blank-line terminator, leaving the stream positioned
-/// exactly after it (so the next bytes — a TLS ClientHello — are untouched). Bounded by `max`.
-fn read_head_raw<R: Read>(r: &mut R, max: usize) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
+/// exactly after it (so the next bytes — a TLS ClientHello — are untouched). Bounded by `max` bytes
+/// and by `deadline` (see [`Deadlined`]).
+///
+/// What arrived is appended to `buf` whether or not the head completes, because the caller has to
+/// tell a client that connected and closed without a word — an ordinary probe, nothing to report —
+/// from one whose head began and never finished, which is an attempt an operator should be able to
+/// see.
+fn read_head_raw<R: Read>(
+    r: &mut R,
+    max: usize,
+    deadline: Instant,
+    buf: &mut Vec<u8>,
+) -> io::Result<()> {
+    let mut r = Deadlined::new(r, deadline);
     let mut one = [0u8; 1];
     loop {
         if r.read(&mut one)? == 0 {
@@ -812,8 +860,8 @@ fn read_head_raw<R: Read>(r: &mut R, max: usize) -> io::Result<Vec<u8>> {
             ));
         }
         buf.push(one[0]);
-        if buf.ends_with(b"\r\n\r\n") {
-            return Ok(buf);
+        if head_terminated(buf) {
+            return Ok(());
         }
         if buf.len() > max {
             return Err(invalid("request head too large"));
@@ -823,7 +871,9 @@ fn read_head_raw<R: Read>(r: &mut R, max: usize) -> io::Result<Vec<u8>> {
 
 /// Read a request head from a buffered reader line by line until the blank-line terminator. Any
 /// bytes the reader buffered past the head (the body) stay in the reader for the caller to consume.
-fn read_head_buffered<R: BufRead>(r: &mut R, max: usize) -> io::Result<Vec<u8>> {
+/// Bounded by `max` bytes and by `deadline` (see [`Deadlined`]).
+fn read_head_buffered<R: BufRead>(r: &mut R, max: usize, deadline: Instant) -> io::Result<Vec<u8>> {
+    let mut r = Deadlined::new(r, deadline);
     let mut buf = Vec::new();
     loop {
         let start = buf.len();
@@ -832,7 +882,7 @@ fn read_head_buffered<R: BufRead>(r: &mut R, max: usize) -> io::Result<Vec<u8>> 
         // an in-cage client could force unbounded host-side allocation here (this proxy runs outside
         // the cage's cgroup). With the cap a no-`\n` flood hits the budget and errors.
         let budget = (max - start + 1) as u64;
-        if (&mut *r).take(budget).read_until(b'\n', &mut buf)? == 0 {
+        if (&mut r).take(budget).read_until(b'\n', &mut buf)? == 0 {
             return Err(invalid(
                 "connection closed before the end of the request head",
             ));
@@ -1601,6 +1651,47 @@ fn write_refusal<W: Write>(
         len = body.len(),
     )?;
     w.flush()
+}
+
+/// A first head that never became a request: log the attempt, tell the caller why, and close.
+///
+/// Every refusal in [`handle_client`] leaves a line in `sbx net logs` and an `X-Sbx-Egress-Reason`
+/// the caller can read, and the two reads that come *before* the request line are no exception: a
+/// head that arrives truncated, over [`HEAD_MAX`], past its deadline or not as UTF-8 is an attempt
+/// an operator must be able to see, and a caller that gets nothing back cannot tell a refusal from
+/// a proxy that died. It is logged with no host and no port, as the malformed request *line* beside
+/// it is: a head this proxy could not read carries no destination to attribute it to.
+///
+/// A client that connected and closed without sending a byte is not that. It is how a probe, a
+/// health check or an abandoned connection ends, there is no attempt in it to see, and it stays
+/// silent.
+fn refuse_unreadable_head(
+    client: &mut UnixStream,
+    ctx: &ProxyCtx,
+    head: &[u8],
+    err: &io::Error,
+) -> io::Result<()> {
+    if head.is_empty() {
+        return Ok(());
+    }
+    ctx.push_log(
+        super::control::Proto::Other,
+        "",
+        0,
+        None,
+        None,
+        super::control::LogVerdict::Blocked,
+        UNREADABLE_HEAD,
+    );
+    // A socket that timed out reports the operating system's own words, which name a condition
+    // rather than what the caller did; every other cause here is one of this module's own sentences.
+    let detail = match err.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+            "the request head stopped arriving and the connection timed out"
+        }
+        _ => &err.to_string(),
+    };
+    write_refusal(client, "400 Bad Request", UNREADABLE_HEAD, detail)
 }
 
 /// Write a literal string and flush — used for the cleartext `200 Connection established`.
