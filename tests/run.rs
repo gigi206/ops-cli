@@ -7070,12 +7070,13 @@ fn an_outbound_secret_is_refused_at_the_proxy() {
 }
 
 /// The cage runs inside a transient systemd scope carrying the anti-DoS resource
-/// limits. `sbx run` exec-replaces, so the spawned child keeps its pid *as* the
-/// bwrap process placed in the scope; reading that pid's cgroup from the host and
-/// finding `pids.max` equal to the configured task cap is conclusive proof the
-/// limit landed through the full launch path — no unrelated process carries that
-/// exact value. Skips (does not fail) where the host cannot sandbox or has no
-/// systemd user session that delegates the pids controller.
+/// limits. The scope is named after the launcher's pid, so the scope that names the
+/// pid this test spawned is the one this launch was placed in; finding `pids.max`
+/// equal to the configured task cap there is conclusive proof the limit landed
+/// through the full launch path — no unrelated process carries that exact value.
+/// Read from the scope and not from the launcher's own cgroup: the supervisor stays
+/// alongside the cage rather than becoming it. Skips (does not fail) where the host
+/// cannot sandbox or has no systemd user session that delegates the pids controller.
 #[test]
 fn the_cage_runs_under_a_resource_limit_scope() {
     const TASK_CAP: &str = "16384"; // mirrors sandbox::cgroup::TASKS_MAX
@@ -7106,11 +7107,11 @@ fn the_cage_runs_under_a_resource_limit_scope() {
 
     // Poll the cage's host-visible cgroup until the scope's task cap appears.
     let mut pids_max = String::new();
-    for _ in 0..50 {
-        if let Some(scope) = host_cgroup_path(pid)
-            && let Ok(v) = std::fs::read_to_string(format!("/sys/fs/cgroup{scope}/pids.max"))
-        {
-            pids_max = v.trim().to_string();
+    // Long enough for a launch to reach the point where its scope exists: the probe above primes
+    // the store, but the cage still has to be assembled before systemd has anything to place.
+    for _ in 0..300 {
+        if let Some(v) = cage_scope_tasks_max(pid) {
+            pids_max = v;
             if pids_max == TASK_CAP {
                 break;
             }
@@ -7125,7 +7126,8 @@ fn the_cage_runs_under_a_resource_limit_scope() {
     if pids_max != TASK_CAP {
         skip_incapable!(
             "skipping resource-limit e2e: the cage is not under a task-capped scope \
-             (pids.max={pids_max:?}); likely no systemd user session delegating pids"
+             (pids.max={pids_max:?}, empty meaning no scope of that name exists); a host whose \
+             user manager delegates no `pids` controller is the usual reason"
         );
     }
 }
@@ -7194,11 +7196,9 @@ fn a_trusted_limits_override_lands_in_the_cage_scope() {
     let pid = child.id();
 
     let mut pids_max = String::new();
-    for _ in 0..50 {
-        if let Some(scope) = host_cgroup_path(pid)
-            && let Ok(v) = std::fs::read_to_string(format!("/sys/fs/cgroup{scope}/pids.max"))
-        {
-            pids_max = v.trim().to_string();
+    for _ in 0..300 {
+        if let Some(v) = cage_scope_tasks_max(pid) {
+            pids_max = v;
             if pids_max == OVERRIDE_CAP {
                 break;
             }
@@ -7219,7 +7219,8 @@ fn a_trusted_limits_override_lands_in_the_cage_scope() {
         );
         skip_incapable!(
             "skipping limits-override e2e: the cage is not under a task-capped scope \
-             (pids.max={pids_max:?}); likely no systemd user session delegating pids"
+             (pids.max={pids_max:?}, empty meaning no scope of that name exists); a host whose \
+             user manager delegates no `pids` controller is the usual reason"
         );
     }
 }
@@ -7878,11 +7879,9 @@ fn a_trusted_app_limits_override_lands_in_the_cage_scope() {
     let pid = child.id();
 
     let mut pids_max = String::new();
-    for _ in 0..50 {
-        if let Some(scope) = host_cgroup_path(pid)
-            && let Ok(v) = std::fs::read_to_string(format!("/sys/fs/cgroup{scope}/pids.max"))
-        {
-            pids_max = v.trim().to_string();
+    for _ in 0..300 {
+        if let Some(v) = cage_scope_tasks_max(pid) {
+            pids_max = v;
             if pids_max == OVERRIDE_CAP {
                 break;
             }
@@ -7900,7 +7899,8 @@ fn a_trusted_app_limits_override_lands_in_the_cage_scope() {
         );
         skip_incapable!(
             "skipping app-limits e2e: the cage is not under a task-capped scope \
-             (pids.max={pids_max:?}); likely no systemd user session delegating pids"
+             (pids.max={pids_max:?}, empty meaning no scope of that name exists); a host whose \
+             user manager delegates no `pids` controller is the usual reason"
         );
     }
 }
@@ -7947,11 +7947,9 @@ fn a_typed_one_shot_limit_flag_lands_in_the_cage_scope() {
     let pid = child.id();
 
     let mut pids_max = String::new();
-    for _ in 0..50 {
-        if let Some(scope) = host_cgroup_path(pid)
-            && let Ok(v) = std::fs::read_to_string(format!("/sys/fs/cgroup{scope}/pids.max"))
-        {
-            pids_max = v.trim().to_string();
+    for _ in 0..300 {
+        if let Some(v) = cage_scope_tasks_max(pid) {
+            pids_max = v;
             if pids_max == OVERRIDE_CAP {
                 break;
             }
@@ -7972,19 +7970,57 @@ fn a_typed_one_shot_limit_flag_lands_in_the_cage_scope() {
         );
         skip_incapable!(
             "skipping typed-limit e2e: the cage is not under a task-capped scope \
-             (pids.max={pids_max:?}); likely no systemd user session delegating pids"
+             (pids.max={pids_max:?}, empty meaning no scope of that name exists); a host whose \
+             user manager delegates no `pids` controller is the usual reason"
         );
     }
 }
 
-/// The real cgroup v2 path of a process, read from the host (`0::<path>`), or
-/// `None` if the process is gone or its cgroup cannot be read.
-fn host_cgroup_path(pid: u32) -> Option<String> {
-    let content = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-    content
-        .lines()
-        .find_map(|l| l.strip_prefix("0::"))
-        .map(str::to_string)
+/// The `pids.max` of the transient scope a launch was placed in, or `None` while no such scope is
+/// there to read.
+///
+/// Read from the scope rather than from the launcher's own cgroup, because `sbx run` does not
+/// become the cage: the supervisor stays alongside it holding the egress proxy and the brokers, so
+/// its cgroup is the one the test itself runs in and carries whatever cap that has. Reading it
+/// reported the host's `pids.max` and the tests concluded the host delegated nothing, on a host
+/// where the scope existed and carried the cap.
+///
+/// The scope is found by name, not by walking for a descendant: `sandbox::naming::scope_unit`
+/// builds it as `sbx-<slug>-<pid>.scope` from the launcher's pid, which is the pid the caller
+/// already holds, while a launch has more than one `bwrap` alive at once and only one of them is
+/// the cage.
+fn cage_scope_tasks_max(launcher: u32) -> Option<String> {
+    fn find(dir: &Path, suffix: &str, depth: usize) -> Option<PathBuf> {
+        if depth == 0 {
+            return None;
+        }
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let path = entry.path();
+            let named = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("sbx-") && n.ends_with(suffix));
+            if named {
+                return Some(path);
+            }
+            if let Some(hit) = find(&path, suffix, depth - 1) {
+                return Some(hit);
+            }
+        }
+        None
+    }
+
+    let scope = find(
+        Path::new("/sys/fs/cgroup"),
+        &format!("-{launcher}.scope"),
+        8,
+    )?;
+    std::fs::read_to_string(scope.join("pids.max"))
+        .ok()
+        .map(|v| v.trim().to_string())
 }
 
 /// True once `session_pid` has a descendant process in a *child* user namespace — i.e. the cage's
