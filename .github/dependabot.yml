@@ -1,0 +1,55 @@
+# Dependabot, matched to what this branch actually contains.
+#
+# WHEN THIS TAKES EFFECT. Dependabot reads its configuration from the repository's DEFAULT branch
+# only, so this file governs nothing while `ops-v2` is not it. It is written here because the
+# configuration that is live today describes a tree this branch no longer has — a `tests.yml`, a
+# Dockerfile, hadolint and trivy — and its open pull request targets a workflow that does not exist
+# here. Leaving that in place to be inherited unchanged is how a stale config outlives the code it
+# was written for.
+#
+# WHY IT MATTERS MORE THAN BEFORE. The workflows now pin every third-party action by commit hash
+# rather than by tag. A hash does not move, which is the point, and it also does not pick up the
+# fix an action publishes: the bump has to be proposed by someone. That someone is this file.
+
+version: 2
+
+updates:
+  # Third-party actions, pinned by commit in `.github/workflows/` and in `.github/actions/`.
+  # Dependabot reads the trailing `# vN` comment beside each hash, and rewrites both together.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    # One pull request per week for the lot: each bump is small, and batching them keeps the queue
+    # readable and costs one CI run instead of N.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  # The crate's own dependencies. Grouped the same way, and separated into the two that deserve
+  # different attention: a patch release of a direct dependency is routine, a major is a decision.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "rust"
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      cargo-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
