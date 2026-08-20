@@ -686,3 +686,54 @@ fn nothing_joins_a_path_that_traverses_out_of_the_one_it_is_joined_to() {
     // The precondition, asserted rather than assumed: a sweep that read nothing passes silently.
     assert!(files > 100, "the sweep read only {files} source files");
 }
+
+/// The cage suites are named in two places, and the two have to agree.
+///
+/// `mise run test-cage` and the `Cage` workflow both run the suites that carry a capability skip,
+/// and both write the list out rather than globbing it, so that a new suite carrying a skip is a
+/// deliberate addition instead of a silent omission. That decision costs a second copy, and a
+/// second copy of a version or a list is how the two drift: the same shape, one level down, once
+/// let a published binary be linked by a toolchain three major versions from the one this
+/// repository resolved, with nothing failing to say so.
+///
+/// So the copy is allowed and the drift is not. What this refuses is the two lists differing, in
+/// either direction: a suite the task runs and the workflow does not is coverage that only exists
+/// on someone's machine, and one the workflow runs and the task does not is a failure nobody can
+/// reproduce locally.
+#[test]
+fn the_cage_suites_are_the_same_list_in_the_task_and_the_workflow() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Assembled at runtime, so this file does not match its own needle.
+    let needle = format!("for {} in ", "suite");
+
+    let listed = |rel: &str| -> Vec<String> {
+        let text =
+            std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        let line = text
+            .lines()
+            .find(|l| l.contains(&needle))
+            .unwrap_or_else(|| panic!("{rel} no longer names the suites with `{needle}`"));
+        let (_, rest) = line.split_once(&needle).expect("the needle is in the line");
+        let names = rest.split(';').next().unwrap_or("");
+        names
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+
+    let task = listed("mise.toml");
+    let workflow = listed(".github/workflows/cage.yml");
+
+    assert_eq!(
+        task, workflow,
+        "`mise run test-cage` and the `Cage` workflow run different suites — the one missing from \
+         either side is coverage that exists in only one place"
+    );
+    // The precondition, asserted rather than assumed: two empty lists are equal, and a sweep that
+    // stopped recognising the shape would report agreement it never checked.
+    assert!(
+        task.len() >= 10,
+        "only {} suites were read — has the list moved?",
+        task.len()
+    );
+}

@@ -1,0 +1,148 @@
+# Cage — the run that makes the sandbox suites prove they ran.
+#
+# WHAT PROBLEM THIS SOLVES. `ci.yml`'s green says, in its own words, that 189 tests reported ok
+# without running: a hosted runner has no user namespace, no bubblewrap and no nix, so everything
+# that needs a cage returns early, and `cargo test` counts an early return as a pass. The check is
+# therefore green precisely where the coverage is absent, and on the file that exercises the cage it
+# means close to the opposite of what it looks like.
+#
+# A hosted runner can in fact provide all three. It has passwordless sudo, so bubblewrap is an
+# apt-get away and the Ubuntu 24.04 apparmor restriction on unprivileged user namespaces is a
+# sysctl; nix is already installed by the publish workflows. What was missing was a workflow that
+# asks for them.
+#
+# WHY IT DOES NOT YET ENFORCE. `SBX_REQUIRE_CAPABLE=1` turns every capability skip into a failure,
+# which is the end state. Turning it on before knowing what this runner actually provides would
+# assert rather than measure: some skips here are about systemd delegating `pids` to a user session,
+# which an Actions runner may not have at all. So this run reports what still skipped, in the run
+# summary, and `workflow_dispatch` carries the switch to demand it. The first runs decide the
+# default.
+#
+# WHEN IT RUNS. `schedule` and `workflow_dispatch` only exist once a workflow is on the repository's
+# DEFAULT branch, so on a development branch neither fires. The `push` trigger below is narrowed to
+# this file so that a change to the run itself is exercised once, which is what makes the first
+# measurement possible at all.
+
+name: Cage
+
+on:
+  workflow_dispatch:
+    inputs:
+      require-capable:
+        description: Turn every capability skip into a failure (SBX_REQUIRE_CAPABLE=1).
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 3 * * *"
+  push:
+    paths:
+      - .github/workflows/cage.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cage-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cage:
+    name: exercise the cage
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Install bubblewrap
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap
+
+      - name: Allow unprivileged user namespaces
+        # Ubuntu 24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1`, which refuses the
+        # namespace a cage is built from. The knob does not exist on every image, and its absence is
+        # not a failure — it means nothing is restricting them.
+        run: |
+          set -euo pipefail
+          knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -e "$knob" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          else
+            echo "no apparmor restriction on this image"
+          fi
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          extra_conf: |
+            experimental-features = nix-command flakes
+
+      - name: Report what this runner can do
+        # Measured before the suites run, and kept whatever they do: when a cage test fails, the
+        # first question is whether the host could have run it, and the answer belongs in the same
+        # place as the failure rather than in a reader's inference.
+        run: |
+          set -uo pipefail
+          {
+            echo "### Host capability"
+            echo
+            echo '```'
+            echo "bwrap:     $(command -v bwrap || echo absent)"
+            echo "nix:       $(command -v nix || echo absent)"
+            echo "nix-store: $(command -v nix-store || echo absent)"
+            printf 'userns:    '
+            if unshare --user --map-root-user true 2>/dev/null; then echo "usable"; else echo "REFUSED"; fi
+            printf 'systemd:   '
+            if systemctl --user show-environment >/dev/null 2>&1; then echo "user session present"; else echo "no user session"; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run the sandbox suites
+        env:
+          SBX_SKIP_LOG: ${{ github.workspace }}/target/test-skips.log
+          # The switch this workflow exists to earn the right to turn on by default. On a push or
+          # a schedule there is no `inputs`, so this resolves to the empty string — which the skip
+          # macro reads as unset (`src/testskip.rs` requires a value that is neither empty nor
+          # `0`), not as enabled.
+          SBX_REQUIRE_CAPABLE: ${{ inputs.require-capable && '1' || '' }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$(dirname "$SBX_SKIP_LOG")"
+          : > "$SBX_SKIP_LOG"
+          # The fourteen suites that carry a cage skip, named rather than globbed so a new one is a
+          # deliberate addition. Kept in step with `mise run test-cage`, which runs the same list.
+          rc=0
+          for suite in attach completion config detach doctor fs netns plugins proc run sessions shell stop upgrade; do
+            cargo test --test "$suite" --no-fail-fast || rc=$?
+          done
+          exit $rc
+
+      - name: Report what still skipped
+        if: always()
+        env:
+          SBX_SKIP_LOG: ${{ github.workspace }}/target/test-skips.log
+        run: |
+          set -uo pipefail
+          n=0
+          [ -f "$SBX_SKIP_LOG" ] && n=$(wc -l < "$SBX_SKIP_LOG" | tr -d ' ')
+          {
+            echo "### Tests that reported ok without running: $n"
+            echo
+            if [ "$n" -gt 0 ]; then
+              echo '```'
+              sort "$SBX_SKIP_LOG" | uniq -c | sort -rn | head -40
+              echo '```'
+              echo
+              echo "Each line is a prerequisite this runner did not offer. Re-run with"
+              echo "\`require-capable\` to make them failures."
+            else
+              echo "None: every selected test ran."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
