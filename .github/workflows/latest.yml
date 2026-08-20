@@ -33,7 +33,10 @@ env:
 jobs:
   build:
     name: build + overwrite latest release
-    runs-on: ubuntu-latest
+    # Pinned rather than `ubuntu-latest`: GitHub migrates that label to the next LTS over a month or
+    # two, so a run pinned to nothing changes host without anyone deciding to. Cage keeps a
+    # `ubuntu-24.04` arm, so the older systemd stays covered.
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
