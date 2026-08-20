@@ -57,6 +57,7 @@ pub(crate) fn sanitize_detail(s: &str) -> String {
     out
 }
 
+use crate::sandbox::locks::locked;
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -145,7 +146,7 @@ impl<E: Event> Ring<E> {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let mut g = self.inner.lock().unwrap();
+        let mut g = locked(&self.inner);
         let seq = g.next_seq;
         g.next_seq += 1;
         g.events.push_back(make(seq, at_epoch_ms));
@@ -160,7 +161,7 @@ impl<E: Event> Ring<E> {
     /// miss); `after = Some(cursor)` is a follow read (events with `seq > cursor`, reporting how
     /// many between the cursor and the retained window were evicted unseen).
     pub(crate) fn snapshot(&self, after: Option<u64>) -> Snapshot<E> {
-        let g = self.inner.lock().unwrap();
+        let g = locked(&self.inner);
         let head = g.next_seq - 1;
         let cursor = after.unwrap_or(0);
         let events: Vec<E> = g
@@ -560,5 +561,56 @@ mod tests {
             read_log(&socket, Some(snap.head)).expect("the follow read");
         assert_eq!(snap.events.iter().map(|e| e.seq).collect::<Vec<_>>(), [2]);
         assert_eq!(snap.events[0].tail, "second");
+    }
+
+    /// A ring a panic has poisoned still reads AND still records.
+    ///
+    /// Both halves, because they fail differently and only one of them is visible. A read that
+    /// panics takes down `sbx … logs` where the user is looking; a *write* that panics takes down
+    /// whichever thread was recording, and the events it would have kept are simply never there —
+    /// so the ring goes quiet at exactly the moment something went wrong on it. `make` runs under
+    /// the lock, which is how a panic gets in here at all.
+    #[test]
+    fn a_ring_a_panic_poisoned_still_reads_and_still_records() {
+        let ring = std::sync::Arc::new(Ring::<TestEvent>::new(8));
+        ring.push_with(|seq, at_epoch_ms| TestEvent {
+            seq,
+            at_epoch_ms,
+            tail: "before".into(),
+        });
+
+        let poisoner = std::sync::Arc::clone(&ring);
+        let panicked = std::thread::spawn(move || {
+            poisoner.push_with(|_seq, _at| -> TestEvent { panic!("the recorder gives up") });
+        })
+        .join();
+        assert!(
+            panicked.is_err(),
+            "the fixture must actually poison the ring"
+        );
+
+        assert_eq!(
+            ring.snapshot(None)
+                .events
+                .iter()
+                .map(|e| e.tail.as_str())
+                .collect::<Vec<_>>(),
+            ["before"],
+            "what the ring held before the panic is what it was worth keeping"
+        );
+        ring.push_with(|seq, at_epoch_ms| TestEvent {
+            seq,
+            at_epoch_ms,
+            tail: "after".into(),
+        });
+        assert_eq!(
+            ring.snapshot(None)
+                .events
+                .iter()
+                .map(|e| e.tail.as_str())
+                .collect::<Vec<_>>(),
+            ["before", "after"],
+            "and it goes on recording, rather than losing every event from here on"
+        );
     }
 }

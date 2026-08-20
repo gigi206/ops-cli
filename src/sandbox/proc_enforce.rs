@@ -82,6 +82,7 @@ use std::time::{Duration, Instant};
 use super::binds::ExtraBind;
 use super::proc_control::ExecRing;
 use crate::proc_policy::{ProcPolicy, ProcRule, Verdict};
+use crate::sandbox::locks::{locked, read_locked, write_locked};
 
 /// The most `ask`-parked `execve`s a session holds at once. Beyond this, a further undecided `execve`
 /// is denied outright (fail-closed) rather than growing the registry without bound — mirroring the
@@ -163,7 +164,7 @@ impl ProcOverlay {
     /// Add a rule to the overlay (a `Deny` verdict to the deny list, else the allow list), deduped on
     /// the exact raw string. Returns whether it was newly added.
     pub(crate) fn remember(&self, verdict: Verdict, rule: &str) -> bool {
-        let mut g = self.inner.write().expect("overlay lock");
+        let mut g = write_locked(&self.inner);
         let list = if verdict == Verdict::Deny {
             &mut g.deny
         } else {
@@ -180,7 +181,7 @@ impl ProcOverlay {
     /// the decision). Fast-pathed when the overlay is empty — the common case — to `base.decide`,
     /// mirroring the egress proxy's borrow-when-empty effective policy.
     pub(crate) fn decide(&self, base: &ProcPolicy, caller: &[String], exec_path: &str) -> Verdict {
-        let g = self.inner.read().expect("overlay lock");
+        let g = read_locked(&self.inner);
         if g.allow.is_empty() && g.deny.is_empty() {
             base.decide(caller, exec_path)
         } else {
@@ -191,7 +192,7 @@ impl ProcOverlay {
     /// Snapshot the overlay as `(verdict-label, raw rule)` pairs (allow first, then deny), for
     /// `sbx proc rules`.
     pub(crate) fn snapshot(&self) -> Vec<(&'static str, String)> {
-        let g = self.inner.read().expect("overlay lock");
+        let g = read_locked(&self.inner);
         let mut out = Vec::with_capacity(g.allow.len() + g.deny.len());
         out.extend(g.allow.iter().map(|r| ("allow", r.as_str().to_string())));
         out.extend(g.deny.iter().map(|r| ("deny", r.as_str().to_string())));
@@ -1472,7 +1473,7 @@ impl PendingExec {
     /// rather than growing the registry without bound.
     fn park(&self, notif_fd: libc::c_int, id: u64, pid: u32, path: &str) {
         {
-            let mut g = self.inner.lock().unwrap();
+            let mut g = locked(&self.inner);
             if g.len() < ASK_PENDING_CAP {
                 g.insert(
                     id,
@@ -1493,14 +1494,14 @@ impl PendingExec {
     /// Answer one parked `execve` by its notification id: allow (`CONTINUE`) or deny (`EPERM`). Returns
     /// the `(pid, path)` decided, or `None` if the id is unknown (already answered / timed out).
     pub(crate) fn answer(&self, id: u64, allow: bool) -> Option<(u32, String)> {
-        let parked = self.inner.lock().unwrap().remove(&id)?;
+        let parked = locked(&self.inner).remove(&id)?;
         answer_parked(&parked, allow);
         Some((parked.pid, parked.path))
     }
 
     /// Answer every parked `execve` at once (the `*` bulk form). Returns each decided `(id, pid, path)`.
     pub(crate) fn answer_all(&self, allow: bool) -> Vec<(u64, u32, String)> {
-        let taken = std::mem::take(&mut *self.inner.lock().unwrap());
+        let taken = std::mem::take(&mut *locked(&self.inner));
         taken
             .into_values()
             .map(|p| {
@@ -1512,9 +1513,7 @@ impl PendingExec {
 
     /// The currently-parked `execve`s: `(id, pid, path, time parked)`, oldest id first.
     pub(crate) fn list(&self) -> Vec<(u64, u32, String, Duration)> {
-        self.inner
-            .lock()
-            .unwrap()
+        locked(&self.inner)
             .values()
             .map(|p| (p.id, p.pid, p.path.clone(), p.since.elapsed()))
             .collect()
@@ -1523,7 +1522,7 @@ impl PendingExec {
     /// Auto-deny (with `EPERM`) any parked `execve` older than [`ASK_TIMEOUT`], so a stalled decision
     /// never hangs a process tree. Called on the receive loop's idle ticks.
     fn sweep(&self) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = locked(&self.inner);
         let expired: Vec<u64> = g
             .values()
             .filter(|p| p.since.elapsed() >= ASK_TIMEOUT)

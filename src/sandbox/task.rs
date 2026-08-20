@@ -41,6 +41,7 @@ use crate::config::{OutputDisposition, TaskSpec};
 use super::proxy::SecretNeedle;
 use super::redact::{Placeholder, redact_named};
 use super::spec::{Mount, NetPolicy, SandboxSpec};
+use crate::sandbox::locks::locked;
 
 /// Where a task's `$HOME` and scratch space live inside its cage: a fresh tmpfs, so nothing it
 /// writes survives the invocation and nothing the agent wrote is visible to it.
@@ -1269,7 +1270,7 @@ impl TaskEngine {
     /// artifact sitting there, indistinguishable from the one it just asked for.
     fn claim_output(&self, task: &TaskSpec) -> Result<OutputClaim, String> {
         {
-            let mut held = self.output_held.lock().expect("the output registry");
+            let mut held = locked(&self.output_held);
             if !held.insert(task.name.clone()) {
                 return Err(format!(
                     "another invocation of `{}` is still writing to its output directory — a task's \
@@ -1281,10 +1282,7 @@ impl TaskEngine {
         let dir = match self.output_root() {
             Ok(root) => root.join(&task.name),
             Err(e) => {
-                self.output_held
-                    .lock()
-                    .expect("the output registry")
-                    .remove(&task.name);
+                locked(&self.output_held).remove(&task.name);
                 return Err(format!("no project tree for this task's output ({e})"));
             }
         };
@@ -1295,10 +1293,7 @@ impl TaskEngine {
             std::fs::create_dir_all(&dir)
         };
         if let Err(e) = prepare() {
-            self.output_held
-                .lock()
-                .expect("the output registry")
-                .remove(&task.name);
+            locked(&self.output_held).remove(&task.name);
             return Err(format!(
                 "cannot prepare the output directory {}: {e}",
                 dir.display()

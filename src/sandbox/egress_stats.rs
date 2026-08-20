@@ -34,6 +34,7 @@
 //!   project+app, which loses nothing and bounds the count. A running session's file is never
 //!   touched, since it is still being written.
 
+use crate::sandbox::locks::locked;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -242,7 +243,7 @@ impl EgressStats {
     /// flush race is at most an off-by-a-few that the next decision corrects.
     pub(crate) fn record(&self, host: &str, kind: StatKind) {
         let snapshot = {
-            let mut tally = self.inner.lock().unwrap();
+            let mut tally = locked(&self.inner);
             tally.bump(host, kind);
             if !self.due_to_write() {
                 self.pending.store(true, Ordering::Relaxed);
@@ -274,7 +275,7 @@ impl EgressStats {
     /// what the proxy decided.
     fn flush_pending(&self) {
         let snapshot = {
-            let tally = self.inner.lock().unwrap();
+            let tally = locked(&self.inner);
             if !self.pending.swap(false, Ordering::Relaxed) {
                 return;
             }
@@ -287,7 +288,7 @@ impl EgressStats {
     /// already keeps the file current; this just guarantees the last state is on disk).
     pub(crate) fn flush_final(&self) {
         let snapshot = {
-            let tally = self.inner.lock().unwrap();
+            let tally = locked(&self.inner);
             self.pending.store(false, Ordering::Relaxed);
             tally.clone()
         };
@@ -298,7 +299,7 @@ impl EgressStats {
     /// without round-tripping through the file.
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> BTreeMap<String, Counts> {
-        self.inner.lock().unwrap().hosts.clone()
+        locked(&self.inner).hosts.clone()
     }
 
     /// Serialise a snapshot to the session file atomically (temp + rename), so a reader never sees a

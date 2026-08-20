@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::sandbox::control::{Capture, CaptureBytes, CaptureRing, LogRing};
+use crate::sandbox::locks::locked;
 
 /// A byte sink with a hard cap, shared between the relay thread that fills it and the guard that
 /// files it. Past the cap it records that more followed and stops copying.
@@ -80,7 +81,13 @@ impl CapBuf {
         if self.cap == 0 {
             return true;
         }
-        let mut g = self.inner.lock().unwrap();
+        // Recovered rather than propagated (see `sandbox::locks`), and safe to recover *here*
+        // because the two writes below cannot be separated: `extend_from_slice` either completes or
+        // aborts the process, so no unwind can leave bytes stored with `truncated` still unset. That
+        // is the only thing keeping a recovered capture from reading as whole when it is not — so a
+        // mutation that ever gains a step between storing bytes and settling their qualifier has to
+        // mark the record on recovery instead of relying on this.
+        let mut g = locked(&self.inner);
         let room = self.cap.saturating_sub(g.bytes.len());
         if room == 0 {
             // The buffer was already full and more arrived: that is the truncation.
@@ -101,7 +108,7 @@ impl CapBuf {
     /// open): each filing is then a superset of the last, and folding one into the other never loses
     /// a byte.
     pub(super) fn snapshot(&self) -> CaptureBytes {
-        let mut out = self.inner.lock().unwrap().clone();
+        let mut out = locked(&self.inner).clone();
         if self.source_open.load(Ordering::SeqCst) && !out.bytes.is_empty() {
             out.truncated = true;
         }
@@ -114,7 +121,7 @@ impl CapBuf {
     /// more was still coming when the exchange was filed. Empty stays empty — a part that never
     /// received a byte is absent, not a phantom truncation.
     fn take(&self) -> CaptureBytes {
-        let mut out = std::mem::take(&mut *self.inner.lock().unwrap());
+        let mut out = std::mem::take(&mut *locked(&self.inner));
         if self.source_open.load(Ordering::SeqCst) && !out.bytes.is_empty() {
             out.truncated = true;
         }
@@ -262,7 +269,7 @@ impl CaptureGuard {
             (down.bytes.len(), down.truncated),
         );
         {
-            let mut last = self.last_frames.lock().unwrap();
+            let mut last = locked(&self.last_frames);
             if *last == shape {
                 return;
             }
@@ -280,13 +287,13 @@ impl CaptureGuard {
     pub(super) fn set_request(&self, head: &[u8], injected: &[(String, String)]) {
         let caps = self.ring.caps();
         let take = caps.head.min(head.len());
-        *self.req_head.lock().unwrap() = CaptureBytes {
+        *locked(&self.req_head) = CaptureBytes {
             bytes: head[..take].to_vec(),
             truncated: take < head.len(),
         };
         if !injected.is_empty() {
             let names: Vec<&str> = injected.iter().map(|(name, _)| name.as_str()).collect();
-            *self.injected.lock().unwrap() = CaptureBytes {
+            *locked(&self.injected) = CaptureBytes {
                 bytes: names.join("\n").into_bytes(),
                 truncated: false,
             };
@@ -341,8 +348,8 @@ impl CaptureGuard {
             return;
         }
         let mut capture = Capture::new(self.seq);
-        capture.req_head = std::mem::take(&mut *self.req_head.lock().unwrap());
-        capture.injected = std::mem::take(&mut *self.injected.lock().unwrap());
+        capture.req_head = std::mem::take(&mut *locked(&self.req_head));
+        capture.injected = std::mem::take(&mut *locked(&self.injected));
         capture.req_body = self.req_body.take();
         let (head, body) = split_response(
             self.response.take(),

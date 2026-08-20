@@ -73,6 +73,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::task::{TaskEngine, TaskOutcome};
+use crate::sandbox::locks::locked;
 
 /// Where the crossing socket is bound **inside** the cage. Under `/tmp`, beside the egress socket,
 /// colliding with no structural mount. Bound as the socket *file* (never its directory), so a caller
@@ -371,7 +372,7 @@ impl TaskLog {
     /// invocation belongs where it *began*, not where it happened to end, or a slow one reads as
     /// having been provoked by whatever ran while it was still going.
     fn push(&self, mut entry: LogEntry) {
-        let mut inner = self.inner.lock().expect("task log");
+        let mut inner = locked(&self.inner);
         entry.at_epoch_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -398,7 +399,7 @@ impl TaskLog {
     /// would never yield the long one. Append order is assigned at the append itself and so cannot
     /// run backwards.
     fn since(&self, after: u64) -> (Vec<LogEntry>, u64, u64) {
-        let inner = self.inner.lock().expect("task log");
+        let inner = locked(&self.inner);
         (
             inner
                 .entries
@@ -419,7 +420,7 @@ impl TaskLog {
 
     /// What the ring kept about one invocation.
     fn entry(&self, id: u64) -> Option<LogEntry> {
-        let inner = self.inner.lock().expect("task log");
+        let inner = locked(&self.inner);
         inner.entries.iter().find(|e| e.seq == id).cloned()
     }
 }
@@ -446,7 +447,7 @@ pub(crate) struct TaskResults {
 impl TaskResults {
     /// Hold one finished invocation's result, evicting the oldest when the ring is full.
     fn store(&self, id: u64, held: Held) {
-        let mut results = self.inner.lock().expect("the detached results");
+        let mut results = locked(&self.inner);
         if results.len() == RESULT_CAPACITY {
             results.pop_front();
         }
@@ -456,7 +457,7 @@ impl TaskResults {
     /// What is held for `id`. A read, not a take: collecting a result must not be the thing that
     /// destroys it, or a caller whose terminal scrolled would have no second look.
     fn get(&self, id: u64) -> Option<Held> {
-        let results = self.inner.lock().expect("the detached results");
+        let results = locked(&self.inner);
         results
             .iter()
             .find(|(held_id, _)| *held_id == id)
