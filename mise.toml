@@ -94,7 +94,7 @@ description = "Build the crate's own rustdoc, denying warnings (a doc reference 
 run = 'RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items'
 
 [tasks.test-cage]
-description = "Run the sandbox e2e with skips turned into failures — the run that proves the cage was exercised"
+description = "Run the sandbox e2e and the unit tests with skips turned into failures — the run that proves the cage was exercised"
 # `mise run test` is honest about what skipped, but honesty is not enforcement: on a host that
 # cannot sandbox, every cage test returns early and the suite is still green. This task is the other
 # half — `SBX_REQUIRE_CAPABLE=1` turns `skip_incapable!` into a panic (`src/testskip.rs`), so a host
@@ -115,6 +115,12 @@ rc=0
 for suite in attach completion config detach doctor fs netns plugins proc run sessions shell stop upgrade; do
   cargo test --test "$suite" --no-fail-fast || rc=$?
 done
+# The unit tests too, and on a capable host they are not a formality: the guards that need a real
+# scope, a real bus or a real store skip everywhere else, so this is the only run where they have
+# teeth. `an_escaped_dollar_argument_reaches_the_program_verbatim` is the one that matters most --
+# it drives a throwaway scope and compares the arguments that arrive, so it measures the behaviour a
+# launch depends on rather than the version of the host it is running on.
+cargo test --bin sbx --no-fail-fast || rc=$?
 exit $rc
 """
 
