@@ -267,6 +267,50 @@ fn detached_observe_records_fs_writes_for_fs_logs() {
 }
 
 #[test]
+fn fs_scan_leaves_the_cage_its_own_proc_self() {
+    // `/proc/self` is answered with the number of whoever performs the lookup, in the namespace the
+    // `/proc` being walked belongs to. The supervisor is in neither of the cage's, so a path it
+    // examines on the cage's behalf finds nothing there — and the cage, whose own open would have
+    // succeeded, is told the file is not there. Every program that reads its own maps, status or
+    // command line meets that.
+    //
+    // Teeth: the answer has to be the *cage's*. A supervisor answering with its own entry satisfies
+    // "the read succeeded" while handing over something from outside the cage entirely.
+    let (project, data) = (TmpDir::new(), TmpDir::new());
+    if !host_can_sandbox(project.path(), data.path()) {
+        skip_incapable!("skipping `[fs] scan` `/proc/self` e2e: host cannot sandbox");
+        return;
+    }
+    std::fs::write(
+        project.path().join(".sbx.toml"),
+        "[fs]\nscan = [\"sk-[A-Za-z0-9]{12,}\"]\n",
+    )
+    .expect("write the project config");
+
+    let out = sbx_isolated()
+        .args([
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "cat /proc/self/comm; head -1 /proc/thread-self/comm",
+        ])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("run the cage");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["cat", "head"],
+        "each program must read its own name under both spellings — `cat` for the one that named \
+         `self` and `head` for the one that named `thread-self`.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
 fn fs_scan_never_serves_the_cage_an_object_from_outside_it() {
     // The supervisor resolves a notified open through `/proc/<pid>/root`, which starts the walk on
     // the cage's own mounts. A symlink whose target begins with `/` ends it somewhere else: such a

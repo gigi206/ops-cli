@@ -1400,8 +1400,9 @@ const STATX_MNT_ID: libc::c_uint = 0x1000;
 /// The kernel's `struct statx`, of which this module reads two fields.
 ///
 /// Declared here rather than taken from `libc`, which carries the type for some targets and not for
-/// the static one this ships as. The layout is the kernel's ABI, fixed by it and pinned by
-/// [`the_statx_layout_matches_the_kernels`](tests::the_statx_layout_matches_the_kernels).
+/// the static one this ships as. The layout is the kernel's ABI, fixed by it: a field read at the
+/// wrong offset would come back as whatever sits there, plausibly and in silence, so the size and
+/// the offsets of the two fields read here are asserted rather than assumed.
 #[repr(C)]
 struct Statx {
     mask: u32,
@@ -1824,6 +1825,56 @@ struct OpenReport {
     partial: bool,
 }
 
+/// The caller's own numbers as its **cage** spells them.
+///
+/// `status` lists a task's id in each pid namespace it belongs to, outermost first, so the last
+/// field is the one the cage's own `/proc` uses. Both are needed: `self` names the thread group and
+/// `thread-self` names the thread inside it.
+fn caller_ids_in_cage(pid: u32) -> Option<(u32, u32)> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let innermost = |field: &str| -> Option<u32> {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(field))?
+            .split_whitespace()
+            .next_back()?
+            .parse()
+            .ok()
+    };
+    Some((innermost("NStgid:")?, innermost("NSpid:")?))
+}
+
+/// Rewrite a path that names `self` or `thread-self` into one that names the caller.
+///
+/// Those two are not ordinary entries: the kernel answers them with the number of whoever is
+/// performing the lookup, in the pid namespace the `/proc` being walked belongs to. A supervisor
+/// walking the cage's `/proc` is in neither, so it finds nothing — and the cage, whose open would
+/// have succeeded, is told the file is not there.
+///
+/// The caller is who the path means, and it can be named outright. The result is spelled the way the
+/// **cage** spells it, so the walk stays on the cage's own `/proc` mount and the descriptor handed
+/// over is one the cage could have opened itself.
+///
+/// Only a path that names them outright is rewritten. A link the cage plants to one of them is
+/// followed by the kernel against this process's root instead, and is refused rather than served —
+/// the same answer, reached by [`vouched_probe`] rather than here.
+fn caller_proc_path(pid: u32, path: &str) -> Option<String> {
+    let (rest, thread) = match path.strip_prefix("/proc/self") {
+        Some(rest) => (rest, false),
+        None => (path.strip_prefix("/proc/thread-self")?, true),
+    };
+    // `/proc/selfish` is not `/proc/self`.
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return None;
+    }
+    let (tgid, tid) = caller_ids_in_cage(pid)?;
+    Some(if thread {
+        format!("/proc/{tgid}/task/{tid}{rest}")
+    } else {
+        format!("/proc/{tgid}{rest}")
+    })
+}
+
 /// The host-side path naming what a cage's `openat(dirfd, path, …)` is about to open.
 ///
 /// The supervisor runs outside the cage's mount namespace, so a path the cage wrote means something
@@ -1842,6 +1893,11 @@ struct OpenReport {
 /// be re-pointed after it is read, which is why only a refusal is sound (module header).
 fn open_target_path(pid: u32, dirfd: libc::c_int, path: &str) -> PathBuf {
     if path.starts_with('/') {
+        // `self` and `thread-self` mean the caller, and mean it only to whoever resolves them; a
+        // walk from here would resolve them to this process, which is in neither of the cage's
+        // namespaces. Named outright instead, so the walk reaches the caller's own entry.
+        let named = caller_proc_path(pid, path);
+        let path = named.as_deref().unwrap_or(path);
         return PathBuf::from(format!("/proc/{pid}/root{path}"));
     }
     let base = if dirfd == libc::AT_FDCWD {
@@ -2394,6 +2450,47 @@ mod tests {
             "4\npipebyte",
             "a device must still deliver its four bytes and a pipe what its writer sent"
         );
+    }
+
+    #[test]
+    fn self_and_thread_self_are_rewritten_to_the_caller_and_nothing_else_is() {
+        // With this process as its own caller the two namespaces coincide, so what is pinned here is
+        // the rewriting itself: which prefixes it claims, which it leaves alone, and that the two
+        // forms differ — `self` names the group, `thread-self` the thread inside it.
+        let me = std::process::id();
+        let (tgid, tid) = caller_ids_in_cage(me).expect("this process has its own ids");
+        assert_eq!(
+            caller_proc_path(me, "/proc/self/maps").as_deref(),
+            Some(format!("/proc/{tgid}/maps").as_str()),
+            "`self` names the caller's thread group"
+        );
+        assert_eq!(
+            caller_proc_path(me, "/proc/thread-self/status").as_deref(),
+            Some(format!("/proc/{tgid}/task/{tid}/status").as_str()),
+            "`thread-self` names the thread inside that group"
+        );
+        assert_eq!(
+            caller_proc_path(me, "/proc/self").as_deref(),
+            Some(format!("/proc/{tgid}").as_str()),
+            "the directory itself is named too, not only what is under it"
+        );
+        // The prefix has to end where the component does, or a neighbouring name is captured with
+        // it and the caller's own entry is served for a file that was never theirs.
+        for untouched in [
+            "/proc/selfish/maps",
+            "/proc/thread-selfish",
+            "/proc/1/maps",
+            "/etc/passwd",
+        ] {
+            assert_eq!(
+                caller_proc_path(me, untouched),
+                None,
+                "`{untouched}` does not name the caller"
+            );
+        }
+        // A caller whose ids cannot be read leaves the path as it was, rather than being rewritten
+        // against a number guessed for it.
+        assert_eq!(caller_proc_path(u32::MAX, "/proc/self/maps"), None);
     }
 
     #[test]
