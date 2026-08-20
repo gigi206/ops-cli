@@ -1117,12 +1117,16 @@ mod tests {
         // for that tree without needing a sandbox.
         let (mut child, s) = spawn_session("sh", &["-c", "sleep 300 & wait"]);
 
-        // Wait for the child `sleep` to appear under the shell.
+        // The wait stops on the condition the assertion below reads — one descendant, not at least
+        // one. A shell that is still assembling its child tree can show a count the assertion would
+        // reject, and stopping at the weaker condition would hand it exactly that; stopping at the
+        // stronger one leaves the deadline to absorb any transient state, so a count that is wrong
+        // for longer than the deadline is still the failure it should be.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut kids = Vec::new();
         while std::time::Instant::now() < deadline {
             kids = descendants(s.pid);
-            if !kids.is_empty() {
+            if kids.len() == 1 {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));

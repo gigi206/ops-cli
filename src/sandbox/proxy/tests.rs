@@ -8801,7 +8801,12 @@ fn a_websocket_transcript_is_captured_in_both_directions_without_disturbing_the_
         "the cage must receive the upstream's frames byte for byte"
     );
 
-    // The frames are filed when the tunnel ends, folded into the handshake's entry.
+    // The frames are filed when the tunnel ends, folded into the handshake's entry. That single
+    // filing is what makes waiting on "both directions non-empty" the same moment as the contents
+    // asserted below: a transcript is also filed early, whenever one direction reaches its capture
+    // cap, and such a filing could show one of the two upstream frames without the other. The cap
+    // is never reached here — these payloads are a few dozen bytes — so the only filing is the
+    // final one, which carries both directions at once.
     let ring = ctx.capture.as_ref().expect("a capturing ctx");
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let cap = loop {
