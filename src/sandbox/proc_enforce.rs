@@ -144,6 +144,17 @@ fn notif_id_valid_code() -> libc::c_ulong {
 /// is shared (`Arc`) between the supervisor's decide path and the control server that writes it,
 /// starts empty, is never persisted, and dies with the session — the proc analogue of the egress
 /// `ManualRules` overlay.
+///
+/// Its lock recovers from a poisoning panic (`sandbox::locks`), and it is the one site there whose
+/// argument is not the module's: this is **live policy**, not a record kept for a reader, and a
+/// verdict rendered against a rule list a panic left incomplete would be a `deny` the user believes
+/// is in force and is not. Two things settle it. The list cannot be left incomplete: every mutation
+/// is a `push` reached through operations that cannot unwind ([`ProcRule::new`] is total by its own
+/// contract, and the read that precedes it only compares strings), so a poisoned overlay holds
+/// exactly what a completed [`remember`](ProcOverlay::remember) put there. And the alternative is
+/// worse in the direction that matters: [`decide`](ProcOverlay::decide) is taken on **every**
+/// notified `execve`, so propagating the panic ends the supervisor thread, and a cage whose
+/// supervisor has stopped deciding is one where no rule applies at all.
 pub(crate) struct ProcOverlay {
     inner: RwLock<OverlayInner>,
 }
@@ -4024,6 +4035,46 @@ mod tests {
     /// they refuse both halves of the read, whichever the host's `ptrace_scope` allows. This is how
     /// the tests below reach the branch a hardened host would reach for every decision.
     const UNREADABLE: (u32, u64) = (1, 0);
+
+    /// A poisoned overlay still decides, and still takes a rule.
+    ///
+    /// This is the lock taken on every notified `execve`, so the cost of propagating a poisoning
+    /// here is not a failed read but a supervisor that stops deciding — after which no rule applies
+    /// to anything. Both halves are held: the decision the overlay was already carrying survives,
+    /// and a rule loaded afterwards still reaches it.
+    #[test]
+    fn a_poisoned_overlay_still_decides_and_still_takes_a_rule() {
+        let overlay = std::sync::Arc::new(ProcOverlay::new());
+        overlay.remember(Verdict::Deny, "curl");
+        let base = ProcPolicy::new(ProcMode::Enforce, &[], &[]);
+
+        let poisoner = std::sync::Arc::clone(&overlay);
+        let panicked = std::thread::spawn(move || {
+            let _g = write_locked(&poisoner.inner);
+            panic!("the writer gives up mid-flight");
+        })
+        .join();
+        assert!(
+            panicked.is_err(),
+            "the fixture must actually poison the overlay"
+        );
+        assert!(
+            overlay.inner.read().is_err(),
+            "…and the standard take must see it poisoned"
+        );
+
+        assert_eq!(
+            overlay.decide(&base, &[], "/usr/bin/curl"),
+            Verdict::Deny,
+            "the rule the session loaded before the panic still refuses"
+        );
+        assert!(overlay.remember(Verdict::Deny, "wget"));
+        assert_eq!(
+            overlay.decide(&base, &[], "/usr/bin/wget"),
+            Verdict::Deny,
+            "and a rule loaded after it still reaches the decision"
+        );
+    }
 
     #[test]
     fn an_execve_whose_target_cannot_be_read_takes_the_modes_default_and_every_one_is_counted() {
