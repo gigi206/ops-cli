@@ -30,6 +30,9 @@ on:
 
 permissions:
   contents: read
+  # Reading this workflow's own past runs, to find the last commit it went green on. See the base
+  # selection in the change-driven job.
+  actions: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -99,6 +102,8 @@ jobs:
           # green check below says nothing about whether the sandbox was ever exercised. Each skip
           # appends one line here, and the summary step reports the total.
           SBX_SKIP_LOG: ${{ github.workspace }}/target/test-skips.log
+          # For the base lookup below.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p "$(dirname "$SBX_SKIP_LOG")"
@@ -108,10 +113,25 @@ jobs:
             git fetch origin "${{ github.base_ref }}" --depth=1
             BASE="origin/${{ github.base_ref }}"
           else
-            BASE="${{ github.event.before }}"
-            # github.event.before can be all-zeros on a first push; fall back to HEAD~1.
-            if [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
-              BASE="HEAD~1"
+            # The base is the last commit this workflow actually went green on, not the previous
+            # push. `cancel-in-progress` above stops a run mid-flight whenever a second push lands,
+            # and with the previous push as the base the next run diffs against a commit nothing
+            # ever measured: a change under `src/` then reads as "no core change" and reaches a
+            # green check having never met the suite. That happened here, to the commit that split
+            # `scope_wrapper`. Standing on the last green instead means a cancelled run leaves the
+            # base where it was, and its delta is picked up by whichever run follows.
+            BASE=$(gh api \
+              "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?branch=${{ github.ref_name }}&status=success&per_page=1" \
+              --jq '.workflow_runs[0].head_sha' 2>/dev/null || true)
+            if [ -z "$BASE" ] || [ "$BASE" = "null" ]; then
+              # Nothing green to stand on -- a new branch, or an API that did not answer. The
+              # previous push is the next best thing, and a base this clone cannot resolve widens
+              # to the full suite below rather than narrowing.
+              echo "::notice::no successful run to diff against — falling back to the previous push"
+              BASE="${{ github.event.before }}"
+              if [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+                BASE="HEAD~1"
+              fi
             fi
           fi
 
