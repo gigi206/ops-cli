@@ -31,6 +31,7 @@ jobs:
   build:
     name: Build Docusaurus docs
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     defaults:
       run:
         working-directory: docs-site
@@ -58,6 +59,7 @@ jobs:
   deploy:
     name: Deploy to GitHub Pages
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: build
     environment:
       name: github-pages

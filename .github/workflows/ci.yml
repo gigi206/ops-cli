@@ -35,6 +35,7 @@ jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.1
@@ -45,6 +46,7 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.1
@@ -56,6 +58,7 @@ jobs:
   rustdoc:
     name: rustdoc
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.1
@@ -69,6 +72,7 @@ jobs:
   test:
     name: test (change-driven)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
@@ -100,10 +104,24 @@ jobs:
             fi
           fi
 
-          mapfile -t CHANGED < <(git diff --name-only "$BASE" HEAD -- '*.rs' 'Cargo.toml' 'Cargo.lock' 'build.rs' || true)
-
+          # A selection that cannot see the diff must widen, never narrow. The old form ended the
+          # pipeline with `|| true`, so a BASE this clone does not carry — a force-push rewrote it
+          # away, or the branch has a single commit and `HEAD~1` does not resolve — left the list
+          # empty and ran the unit tests alone, reporting a green indistinguishable from a full
+          # run. Both ways of not knowing now mean the full suite.
           CORE_CHANGED=0
           TESTS_CHANGED=()
+          CHANGED=()
+          if ! git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null; then
+            echo "::warning::base '$BASE' is not in this clone — running the full test suite"
+            CORE_CHANGED=1
+          elif ! DIFF=$(git diff --name-only "$BASE" HEAD -- '*.rs' 'Cargo.toml' 'Cargo.lock' 'build.rs'); then
+            echo "::warning::cannot diff against '$BASE' — running the full test suite"
+            CORE_CHANGED=1
+          else
+            mapfile -t CHANGED <<< "$DIFF"
+          fi
+
           for f in "${CHANGED[@]:-}"; do
             [ -z "$f" ] && continue
             case "$f" in
@@ -117,6 +135,20 @@ jobs:
                 ;;
             esac
           done
+
+          # The scope goes in the run summary, not only in a `::notice::`. A green whose scope is
+          # buried in the log reads the same as a green over everything, and reading it as the
+          # latter is how a narrow run gets treated as proof it never offered.
+          {
+            echo "### Test scope"
+            if [ "$CORE_CHANGED" -eq 1 ]; then
+              echo "Full suite: a core change, or the diff could not be read."
+            elif [ "${#TESTS_CHANGED[@]}" -gt 0 ]; then
+              echo "Unit tests (\`--bins\`), plus the integration suites that changed: ${TESTS_CHANGED[*]}."
+            else
+              echo "**Unit tests only** (\`--bins\`): no core change. This run does not cover the integration suites."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
           # `--no-fail-fast` throughout: without it cargo stops at the first target that reports a
           # failure, so one red test hides every later binary and the check reports a suite with one
