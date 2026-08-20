@@ -486,6 +486,14 @@ pub(crate) fn wrap_command(cmd: Vec<OsString>, open_lens: bool) -> Vec<OsString>
 /// readable. Making it fail means raising the host's `ptrace_scope`, which is machine-wide and not a
 /// test's to change. Revisit if a way appears to close one process's memory to another without
 /// touching that sysctl.
+///
+/// One step is held by nothing at all: that [`ProcEnforce`]'s own drop calls [`Undecidable::report`].
+/// Driving it needs a supervisor `start_inner` built — sockets, a shim, a thread — and then a run in
+/// which a read fails more than once, which is the unreachable state above; revisit the two
+/// together. What that drop does *not* depend on is the launcher reaching it: every path that ends a
+/// run drops the guard explicitly before leaving, because a bare `process::exit` runs no destructors
+/// and the launcher says so where it exits. So the only teardown that reports nothing is one that
+/// also unlinks no socket.
 #[derive(Default)]
 struct Undecidable {
     /// An `execve` whose target path could not be read.
