@@ -269,6 +269,19 @@ fn limiter(limits: &Limits) -> Option<(PathBuf, Vec<String>)> {
 /// substitute at all.
 fn scope_wrapper(limits: &Limits, cage_slug: &str) -> Option<(PathBuf, Vec<OsString>)> {
     let (systemd_run, props) = limiter(limits)?;
+    let prefix = scope_prefix(&systemd_run, &props, cage_slug);
+    Some((systemd_run, prefix))
+}
+
+/// The argv `systemd-run` is invoked with, up to and including the `--` that ends it: how a scope is
+/// asked for, separate from whether one is worth asking for.
+///
+/// Split from [`scope_wrapper`] so the two questions do not travel together. Whether any limit can
+/// be applied here depends on a delegation root [`limiter`] looks for, and a host without one has
+/// nothing to say about how the arguments past `--` are treated — which is what the dollar guard
+/// asserts. Folded into one function, that guard could only run where limits were also available,
+/// and it went silent on exactly the host whose launcher behaves differently.
+fn scope_prefix(systemd_run: &Path, props: &[String], cage_slug: &str) -> Vec<OsString> {
     let mut prefix = vec![
         OsString::from("--user"),
         OsString::from("--scope"),
@@ -306,7 +319,7 @@ fn scope_wrapper(limits: &Limits, cage_slug: &str) -> Option<(PathBuf, Vec<OsStr
     // Where the option does not exist the systemd predates it, and that is precisely the era whose
     // behaviour it was kept compatible with — no substitution with `--scope` — so passing the
     // arguments through untouched is right there too.
-    if expansion_can_be_disabled(&systemd_run) {
+    if expansion_can_be_disabled(systemd_run) {
         prefix.push(OsString::from("--expand-environment=no"));
     }
     for p in props {
@@ -314,7 +327,7 @@ fn scope_wrapper(limits: &Limits, cage_slug: &str) -> Option<(PathBuf, Vec<OsStr
         prefix.push(OsString::from(p));
     }
     prefix.push(OsString::from("--"));
-    Some((systemd_run, prefix))
+    prefix
 }
 
 /// Wrap a bwrap invocation in the resource-limit scope. Returns the program to run
@@ -805,11 +818,19 @@ mod tests {
             skip_incapable!("skipping dollar test: no printf on PATH");
             return;
         };
+        let Some(systemd_run) = crate::pathfind::find_on_path("systemd-run") else {
+            skip_incapable!("skipping dollar test: no systemd-run on PATH");
+            return;
+        };
+        // The production invocation, with no limit properties: what is under test is how the
+        // arguments past `--` are treated, and that does not depend on whether this host delegates
+        // a controller. Going through `scope_wrapper` instead would tie the guard to a delegation
+        // root, and it would fall silent on precisely the hosts whose launcher differs.
         let run = |slug: &str, args: &[&str]| -> Option<std::process::Output> {
-            let wrapper = scope_wrapper(&Limits::default(), slug)?;
+            let prefix = scope_prefix(&systemd_run, &[], slug);
             let mut argv: Vec<OsString> = vec![OsString::from("%s\n")];
             argv.extend(args.iter().map(|a| OsString::from(*a)));
-            let (prog, argv) = compose(Some(wrapper), &printf, argv);
+            let (prog, argv) = compose(Some((systemd_run.clone(), prefix)), &printf, argv);
             Command::new(prog)
                 .args(argv)
                 .output()
