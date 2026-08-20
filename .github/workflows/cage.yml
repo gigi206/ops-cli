@@ -11,12 +11,13 @@
 # sysctl; nix is already installed by the publish workflows. What was missing was a workflow that
 # asks for them.
 #
-# WHY IT DOES NOT YET ENFORCE. `SBX_REQUIRE_CAPABLE=1` turns every capability skip into a failure,
-# which is the end state. Turning it on before knowing what this runner actually provides would
-# assert rather than measure: some skips here are about systemd delegating `pids` to a user session,
-# which an Actions runner may not have at all. So this run reports what still skipped, in the run
-# summary, and `workflow_dispatch` carries the switch to demand it. The first runs decide the
-# default.
+# IT ENFORCES, AND THE RIGHT TO WAS MEASURED. `SBX_REQUIRE_CAPABLE=1` turns every capability skip
+# into a failure. That was not switched on by argument: the first run of this workflow reported 312
+# tests across the fourteen suites with ZERO skips, where the same suites on a host without the
+# engines skip 166 times. Even the systemd `pids` delegation that was the reason for doubting a
+# hosted runner turned out to be there. A skip here is therefore a prerequisite that went missing,
+# which is the finding this run exists to make, and `allow-skips` turns it off for one run when the
+# question is what broke rather than that something did.
 #
 # WHEN IT RUNS. `schedule` and `workflow_dispatch` only exist once a workflow is on the repository's
 # DEFAULT branch, so on a development branch neither fires. The `push` trigger below is narrowed to
@@ -28,8 +29,10 @@ name: Cage
 on:
   workflow_dispatch:
     inputs:
-      require-capable:
-        description: Turn every capability skip into a failure (SBX_REQUIRE_CAPABLE=1).
+      allow-skips:
+        description: >
+          Let a capability skip pass instead of failing the run. For debugging a runner that has
+          lost a prerequisite; the default demands them.
         type: boolean
         default: false
   schedule:
@@ -102,16 +105,23 @@ jobs:
             printf 'systemd:   '
             if systemctl --user show-environment >/dev/null 2>&1; then echo "user session present"; else echo "no user session"; fi
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Run the sandbox suites
         env:
           SBX_SKIP_LOG: ${{ github.workspace }}/target/test-skips.log
-          # The switch this workflow exists to earn the right to turn on by default. On a push or
-          # a schedule there is no `inputs`, so this resolves to the empty string — which the skip
-          # macro reads as unset (`src/testskip.rs` requires a value that is neither empty nor
-          # `0`), not as enabled.
-          SBX_REQUIRE_CAPABLE: ${{ inputs.require-capable && '1' || '' }}
+          # Enforcing, and the right to be was earned by measurement rather than assumed. The
+          # first run of this workflow reported 312 tests across the fourteen suites with ZERO
+          # capability skips, against 166 for the same suites on a host without the engines: this
+          # runner really does give the cage what it needs, including the systemd delegation that
+          # was the reason for doubting it. A skip here is therefore a prerequisite that went
+          # missing, which is a finding and not noise.
+          #
+          # `allow-skips` turns it back off for a run. On a push or a schedule there is no
+          # `inputs`, so this resolves to `1` — and when it does resolve to the empty string the
+          # skip macro reads that as unset, since `src/testskip.rs` requires a value that is
+          # neither empty nor `0`.
+          SBX_REQUIRE_CAPABLE: ${{ inputs.allow-skips && '' || '1' }}
         run: |
           set -uo pipefail
           mkdir -p "$(dirname "$SBX_SKIP_LOG")"
@@ -145,4 +155,4 @@ jobs:
             else
               echo "None: every selected test ran."
             fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
