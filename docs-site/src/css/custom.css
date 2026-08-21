@@ -832,8 +832,20 @@ pre {
   /* A warm edge a short step off the neutral border, not the accent itself: the
      design marks a card as lit without ruling it in orange. */
   --home-edge: #dbbfad;
-  --home-video-opacity: 0.8;
-  --home-video-filter: saturate(0.3) contrast(1.08) brightness(0.92);
+  --home-video-opacity: 0.34;
+  --home-video-filter: saturate(0.3) contrast(1.06);
+  /* The rail's resting dot. A token rather than a per-theme rule on the dot
+     itself: a `html[data-theme] .home__rail-core` override outranks the state
+     classes that light it, so the lit dot would grow without taking the accent. */
+  --home-rail-off: var(--keep-border-strong);
+  /* The sample panes stay a console in both modes, as the mock draws them. In
+     light that is the stone surface every other code block uses; in dark the
+     stone lands within a shade of the band behind it, so it sinks below it. */
+  --home-code-deep: var(--keep-code-bg);
+  /* The hero's hatch: the ruled tone and the ground it is ruled on, a shade
+     apart so the texture reads without becoming a pattern you look at. */
+  --home-hatch-rule: #ece3d6;
+  --home-hatch-ground: #f8f4ed;
   /* The three stops of the hero veil. The top stop is light on purpose: the bar
      floats over the footage there, and the point is to see through both. It
      thickens towards the copy, which is where the veil earns its contrast. */
@@ -850,8 +862,13 @@ html[data-theme='dark']:root .home {
   --home-deep: #120f0c;
   --home-rule: rgba(232, 137, 95, 0.07);
   --home-edge: #4a3226;
-  --home-video-opacity: 0.8;
-  --home-video-filter: saturate(0.35) contrast(1.05);
+  --home-rail-off: #4a3226;
+  --home-code-deep: var(--home-deep);
+  /* The design's own two tones. */
+  --home-hatch-rule: #211c16;
+  --home-hatch-ground: #1a1611;
+  --home-video-opacity: 0.34;
+  --home-video-filter: saturate(0.3) contrast(1.06);
   --home-veil-top: 0.26;
   --home-veil-mid: 0.4;
   --home-veil-low: 0.76;
@@ -906,7 +923,10 @@ html[data-theme='dark']:root .home {
 .home__hero {
   position: relative;
   display: flex;
-  align-items: flex-end;
+  /* Centred, as the design sets it: the copy is the hero's subject, not a
+     caption sitting on its floor. The copy's own top padding clears the bar the
+     hero runs under, so the block reads centred in the space actually visible. */
+  align-items: center;
   min-height: 100vh;
   min-height: 100svh;
   margin-top: calc(-1 * var(--ifm-navbar-height));
@@ -914,8 +934,8 @@ html[data-theme='dark']:root .home {
 }
 
 /* Drifts slower than the page. Oversized top and bottom so the travel never
-   exposes an edge. Its flat fill backs the footage, which is not opaque: a
-   patterned fill would read as printed across the picture. */
+   exposes an edge. The hatch is its fill as well as its overlay, so the hero is
+   already the drawn surface before a single frame of footage decodes. */
 .home__hero-media {
   position: absolute;
   top: -8%;
@@ -923,13 +943,20 @@ html[data-theme='dark']:root .home {
   width: 100%;
   height: 116%;
   z-index: 0;
-  background: var(--keep-bg);
+  background-color: var(--home-hatch-ground);
+  background-image: repeating-linear-gradient(
+    135deg,
+    var(--home-hatch-rule) 0 2px,
+    var(--home-hatch-ground) 2px 9px
+  );
   will-change: transform;
   pointer-events: none;
 }
 
-/* The veil over it is what makes the text readable, not the video's own
-   brightness. */
+/* Held at the design's own level, which is what lets the hatch behind it read
+   through the picture: the footage is a texture in the surface, not a
+   photograph the surface sits on. The veil over it is what makes the text
+   readable, not the video's own brightness. */
 .home__hero-video {
   position: absolute;
   inset: 0;
@@ -964,21 +991,19 @@ html[data-theme='dark']:root .home {
   /* Above the footage and its veil. */
   z-index: 2;
   width: 100%;
-  /* Clears the bar the hero now runs under. */
-  padding-top: calc(var(--ifm-navbar-height) + 3.5rem);
-  padding-bottom: 5.75rem;
+  /* Clears the bar the hero runs under, so centring the column centres what the
+     reader can actually see rather than what the bar covers. */
+  padding-top: var(--ifm-navbar-height);
   will-change: transform, opacity;
 }
 
+/* At the foot of the copy, on its left edge, where the design puts it: it reads
+   as the last line of the column rather than a marker in the corner. */
 .home__scrollcue {
-  position: absolute;
-  z-index: 2;
-  right: 2.5rem;
-  bottom: 2.5rem;
   display: flex;
-  flex-direction: column;
   align-items: center;
-  gap: 0.625rem;
+  gap: 0.75rem;
+  margin-top: 2rem;
   font-family: var(--ifm-font-family-monospace);
   font-size: 0.6875rem;
   letter-spacing: 0.16em;
@@ -987,18 +1012,18 @@ html[data-theme='dark']:root .home {
 }
 
 .home__scrollcue-line {
-  width: 1px;
-  height: 2.75rem;
-  background: linear-gradient(to bottom, var(--keep-accent), transparent);
+  width: 3.75rem;
+  height: 1px;
+  background: linear-gradient(to right, var(--keep-accent), transparent);
   animation: home-drift 1.6s ease-in-out infinite alternate;
 }
 
 @keyframes home-drift {
   from {
-    transform: translateY(0);
+    transform: translateX(0);
   }
   to {
-    transform: translateY(8px);
+    transform: translateX(8px);
   }
 }
 
@@ -1286,6 +1311,23 @@ html[data-theme='dark']:root .home {
   color: var(--keep-accent);
 }
 
+/* The block's number, set large and low-contrast: it marks the reading order
+   without competing with the heading under it. Decorative, so the markup hides
+   it from assistive technology rather than announcing a bare numeral. */
+.home__ordinal {
+  margin: 0 0 0.5rem;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: clamp(2rem, 4vw, 3.5rem);
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  line-height: 1;
+  color: var(--keep-border-strong);
+}
+
+html[data-theme='dark']:root .home__ordinal {
+  color: var(--home-edge);
+}
+
 .home__section-title {
   margin: 0 0 1.25rem;
   font-size: clamp(1.625rem, 3vw, 2.5rem);
@@ -1293,12 +1335,6 @@ html[data-theme='dark']:root .home {
   letter-spacing: -0.035em;
   line-height: 1.15;
   color: var(--keep-ink);
-}
-
-.home__section-title--sm {
-  font-size: 1.25rem;
-  font-weight: 600;
-  letter-spacing: -0.02em;
 }
 
 /* In a section head the title is one of two columns, so the rhythm below it is
@@ -1336,6 +1372,44 @@ html[data-theme='dark']:root .home {
   font-size: 1rem;
 }
 
+/* The second column of a section head: prose that sits beside the title rather
+   than under it, bottom-aligned with it by the head's own `align-items`. */
+.home__aside--side {
+  max-width: 29rem;
+  margin: 0;
+  font-size: 1rem;
+}
+
+/* The guide page a block was written from, named in the block. A path, not a
+   sentence, so it is set in the mono face and stays quiet until hovered. */
+.home__source {
+  display: inline-block;
+  margin-top: 0.5rem;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.8125rem;
+  color: var(--keep-faint);
+}
+
+.home__source:hover {
+  color: var(--keep-accent);
+  text-decoration: none;
+}
+
+/* When the line carries several pages, each one is its own link and the
+   separator between them is not. */
+.home__source a {
+  color: var(--keep-faint);
+}
+
+.home__source a:hover {
+  color: var(--keep-accent);
+  text-decoration: none;
+}
+
+.home__source-sep {
+  color: var(--keep-border-strong);
+}
+
 /* The :not(pre) guard is load-bearing: without it the chip's tint lands on the
    <code> inside a code block too, washing the whole sample in accent. */
 .home__aside :not(pre) > code,
@@ -1349,8 +1423,22 @@ html[data-theme='dark']:root .home {
   color: var(--keep-chip-ink);
 }
 
-/* 01 — the cage
+/* 01 — the bind layout
    ------------------------------------------------------------------------ */
+
+/* Prose on the left, the two bind lists on the right. The prose sticks while
+   the lists scroll past it, so the claim stays on screen with its evidence. */
+.home__split {
+  display: grid;
+  grid-template-columns: minmax(0, 0.82fr) minmax(0, 1.18fr);
+  gap: 3.5rem;
+  align-items: start;
+}
+
+.home__split-aside {
+  position: sticky;
+  top: calc(var(--ifm-navbar-height) + 2.5rem);
+}
 
 .home__cage {
   display: grid;
@@ -1407,17 +1495,610 @@ html[data-theme='dark']:root .home {
   color: var(--keep-accent);
 }
 
-/* 02 — enforcement
+/* 02 — the trust gate
+   ------------------------------------------------------------------------ */
+
+/* The gate's three states, read left to right. Equal columns rather than a
+   flow: the middle one is the act, and a wrapped row would hide that. */
+.home__steps {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(14.5rem, 100%), 1fr));
+  gap: 0.875rem;
+  margin-top: 2.5rem;
+}
+
+/* The accent edge is the whole marking: no fill, no lift. A step the reader is
+   not standing on keeps the neutral border. */
+.home__step {
+  padding: 1.125rem 1.25rem;
+  border: 1px solid var(--keep-border);
+  border-left: 3px solid var(--keep-border-strong);
+  border-radius: 4px 12px 12px 4px;
+  background: var(--ifm-background-surface-color);
+}
+
+.home__section--tint .home__step {
+  background: var(--keep-bg);
+}
+
+/* The one step that is an act you perform, rather than a state you find. */
+.home__step--now {
+  border-color: var(--home-edge);
+  border-left-color: var(--keep-accent);
+  background: var(--keep-chip-bg);
+}
+
+.home__section--tint .home__step--now {
+  background: var(--keep-chip-bg);
+}
+
+.home__step-head {
+  margin: 0 0 0.625rem;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.8125rem;
+  color: var(--keep-ink);
+}
+
+.home__step--now .home__step-head {
+  color: var(--keep-chip-ink);
+}
+
+.home__step-n {
+  color: var(--keep-faint);
+}
+
+.home__step-detail {
+  margin: 0;
+  font-size: 0.9375rem;
+  line-height: 1.5;
+  color: var(--keep-muted);
+}
+
+/* The path's four steps live in one box, because they are one path. */
+.home__pathbox {
+  margin-top: 2.5rem;
+  padding: 1.125rem;
+  border: 1px solid var(--keep-border);
+  border-radius: 16px;
+  background: var(--ifm-background-surface-color);
+}
+
+.home__section--tint .home__pathbox {
+  background: var(--keep-bg);
+}
+
+.home__steps--flush {
+  margin-top: 0;
+}
+
+/* Two panels of equal weight, for a block whose subject has two halves. */
+.home__panels {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(21rem, 100%), 1fr));
+  gap: 0.875rem;
+  margin-top: 2rem;
+  align-items: start;
+}
+
+.home__panel {
+  padding: 1.5rem 1.625rem;
+  border: 1px solid var(--keep-border);
+  border-radius: 12px;
+  background: var(--ifm-background-surface-color);
+}
+
+.home__section--tint .home__panel {
+  background: var(--keep-bg);
+}
+
+.home__panel-head {
+  margin: 0 0 1.125rem;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: var(--keep-ink);
+}
+
+/* A run of commands with what each one is for, inside a panel. */
+.home__runs {
+  display: flex;
+  flex-direction: column;
+}
+
+.home__run {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem 0.75rem;
+  padding: 0.4375rem 0;
+  transition: opacity 160ms ease;
+}
+
+.home__run:hover {
+  text-decoration: none;
+  opacity: 0.75;
+}
+
+.home__run-cmd {
+  background: transparent;
+  border: none;
+  padding: 0;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.8125rem;
+  color: var(--keep-accent);
+}
+
+.home__run-detail {
+  font-size: 0.875rem;
+  color: var(--keep-muted);
+}
+
+/* The two panels of the split: what applies from anywhere, what the gate holds. */
+.home__groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(15rem, 100%), 1fr));
+  gap: 0.875rem;
+  margin-top: 1.25rem;
+  align-items: start;
+}
+
+.home__group {
+  padding: 1.25rem 1.375rem;
+  border: 1px solid var(--keep-border);
+  border-radius: 12px;
+  background: var(--ifm-background-surface-color);
+}
+
+.home__section--tint .home__group {
+  background: var(--keep-bg);
+}
+
+/* The gated column is the long one, and the one the gate exists for. */
+.home__group--gated {
+  border-color: var(--home-edge);
+}
+
+.home__group-head {
+  margin: 0 0 0.875rem;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: var(--keep-body);
+}
+
+.home__group--gated .home__group-head {
+  color: var(--keep-accent);
+}
+
+.home__group-note {
+  margin: 0.5rem 0 0;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--keep-faint);
+}
+
+/* A panel may hold more than one group: the ungated one carries the free fields
+   and, under its own label, the single closing table, which is neither. */
+.home__group-part + .home__group-part {
+  margin-top: 1.25rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--keep-border);
+}
+
+.home__group-label {
+  margin: 0 0 0.625rem;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.6875rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--keep-faint);
+}
+
+/* A run of field names, syscalls or rule spellings: mono, boxed, wrapping. The
+   one component every block below reaches for. */
+.home__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.home__chip {
+  padding: 0.3125rem 0.625rem;
+  border: 1px solid var(--keep-border);
+  border-radius: 6px;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.8125rem;
+  line-height: 1.4;
+  color: var(--keep-body);
+}
+
+.home__chip--gated {
+  border-color: var(--keep-chip-border);
+  background: var(--keep-chip-bg);
+  color: var(--keep-chip-ink);
+}
+
+/* A run of chips that closes a note, rather than opening a column of its own. */
+.home__chips--tight {
+  margin-top: 0.875rem;
+  gap: 0.375rem;
+}
+
+.home__chips--tight .home__chip {
+  padding: 0.1875rem 0.5rem;
+  font-size: 0.75rem;
+}
+
+/* Reading position, pinned above the bar. Server-rendered at zero width, so a
+   page whose script never runs shows no bar at all rather than one frozen at
+   the start. It reports a position rather than animating one, so it runs under
+   reduced motion like the bar's own frosted/solid state. */
+.home__progress {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  z-index: calc(var(--ifm-z-index-fixed) + 1);
+  pointer-events: none;
+}
+
+.home__progress-fill {
+  width: 0;
+  height: 100%;
+  background: var(--keep-accent);
+}
+
+/* The section rail: one dot per numbered block, in the page's right gutter.
+   The dots are in-page anchors, so the rail navigates with no script at all;
+   the script only adds which one is lit. It lives in the gutter and is hidden
+   as soon as the gutter is too narrow to hold it clear of the copy. */
+.home__rail {
+  position: fixed;
+  top: 50%;
+  right: 1rem;
+  z-index: calc(var(--ifm-z-index-fixed) - 1);
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  align-items: center;
+  transform: translateY(-50%);
+}
+
+.home__rail-dot {
+  position: relative;
+  display: flex;
+  width: 1.875rem;
+  height: 1.375rem;
+  align-items: center;
+  justify-content: center;
+}
+
+.home__rail-dot:hover {
+  text-decoration: none;
+}
+
+.home__rail-core {
+  width: 9px;
+  height: 9px;
+  border-radius: 3px;
+  background: var(--home-rail-off);
+  transition: background 250ms ease, box-shadow 250ms ease,
+    width 280ms cubic-bezier(0.22, 1, 0.36, 1),
+    height 280ms cubic-bezier(0.22, 1, 0.36, 1), border-radius 280ms ease,
+    transform 320ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* Where the reader is: wider than a dot, narrower than a hovered one. */
+.home__rail-dot--on .home__rail-core {
+  width: 14px;
+  height: 11px;
+  border-radius: 6px;
+  background: var(--keep-accent);
+}
+
+.home__rail-dot:hover .home__rail-core,
+.home__rail-dot:focus-visible .home__rail-core {
+  width: 24px;
+  height: 11px;
+  border-radius: 6px;
+  background: var(--keep-accent);
+  box-shadow: 0 0 0 6px var(--home-glow);
+}
+
+/* The two dots either side of a hovered one lean toward it. Pure CSS, with
+   `:has()` reaching backwards for the one above. */
+.home__rail-dot:hover + .home__rail-dot .home__rail-core,
+.home__rail-dot:has(+ .home__rail-dot:hover) .home__rail-core {
+  transform: scale(1.22);
+}
+
+.home__rail-label {
+  position: absolute;
+  right: calc(100% + 0.5rem);
+  padding: 0.3125rem 0.625rem;
+  border: 1px solid var(--keep-border);
+  border-radius: 6px;
+  background: var(--ifm-background-surface-color);
+  box-shadow: 0 6px 20px var(--home-shadow);
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  color: var(--keep-body);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(6px);
+  transition: opacity 200ms ease, transform 280ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.home__rail-dot:hover .home__rail-label,
+.home__rail-dot:focus-visible .home__rail-label {
+  opacity: 1;
+  transform: none;
+}
+
+/* A dot lands its block under the bar, not behind it. */
+.home__section[id] {
+  scroll-margin-top: calc(var(--ifm-navbar-height) + 1rem);
+}
+
+/* 03 — enforcement
+   ------------------------------------------------------------------------ */
+
+.home__layers {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-bottom: 1.25rem;
+}
+
+/* A layer is a row, not a card: its name on the left, what it actually sets on
+   the right. Four rows of chips read as a stack, which is what the stack is. */
+.home__layer {
+  display: grid;
+  grid-template-columns: 11rem minmax(0, 1fr);
+  gap: 1.75rem;
+  align-items: center;
+  padding: 1.375rem 1.625rem;
+  border: 1px solid var(--keep-border);
+  border-radius: 12px;
+  background: var(--ifm-background-surface-color);
+  transition: border-color 200ms ease, background 200ms ease;
+}
+
+.home__section--tint .home__layer {
+  background: var(--keep-bg);
+}
+
+.home__layer:hover {
+  border-color: var(--home-edge);
+  text-decoration: none;
+}
+
+/* The layer that is a choice rather than a given, marked the way the design
+   marks anything provisional: a dashed edge, not a different colour. */
+.home__layer--opt {
+  border-style: dashed;
+  border-color: var(--home-edge);
+}
+
+.home__layer-head {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3125rem;
+}
+
+.home__layer-head .home__layer-n,
+.home__layer-head .home__card-name {
+  margin: 0;
+}
+
+.home__layer-note {
+  margin: 0;
+  font-size: 0.8125rem;
+  line-height: 1.4;
+  color: var(--keep-faint);
+}
+
+/* 05 — egress
+   ------------------------------------------------------------------------ */
+
+/* The egress block runs long enough to need internal signposts. A sub-head is
+   not a heading: it labels the run of cards under it, so it stays in the mono
+   face the kickers use rather than entering the heading scale. */
+.home__subhead {
+  margin: 3.5rem 0 1.25rem;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.8125rem;
+  letter-spacing: 0.08em;
+  color: var(--keep-muted);
+}
+
+/* The five postures, as a table because that is what they are: one row each,
+   compared column by column. It scrolls inside its own box rather than pushing
+   the page sideways on a narrow screen. */
+.home__tablewrap {
+  overflow-x: auto;
+  border: 1px solid var(--keep-border);
+  border-radius: 12px;
+  background: var(--ifm-background-surface-color);
+}
+
+.home__section--tint .home__tablewrap {
+  background: var(--keep-bg);
+}
+
+/* `display: table` is load-bearing: the theme sets `table { display: block }` so
+   a long docs table can scroll on its own, and under that a `width: 100%` table
+   shrink-to-fits its content instead of filling the band. The wrapper above
+   already owns the scrolling here. */
+.home__table {
+  display: table;
+  width: 100%;
+  margin: 0;
+  border-collapse: collapse;
+  font-size: 0.9375rem;
+}
+
+.home__table th {
+  padding: 0.875rem 1.25rem;
+  border-bottom: 1px solid var(--keep-border);
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-align: left;
+  color: var(--keep-faint);
+  white-space: nowrap;
+}
+
+.home__table td {
+  padding: 0.875rem 1.25rem;
+  border-bottom: 1px solid var(--keep-border);
+  color: var(--keep-body);
+  vertical-align: top;
+}
+
+.home__table tr:last-child td {
+  border-bottom: none;
+}
+
+.home__table td:first-child {
+  white-space: nowrap;
+}
+
+.home__table td > code {
+  background: transparent;
+  border: none;
+  padding: 0;
+  font-size: 0.875rem;
+  color: var(--keep-accent);
+}
+
+/* The posture a config that names none falls back to. */
+.home__table-row--now {
+  background: var(--keep-chip-bg);
+}
+
+/* A plane's spelling, set beside the tag that says whether it is the default. */
+.home__plane-spell {
+  margin-left: 0.5rem;
+  font-family: var(--ifm-font-family-monospace);
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--keep-muted);
+}
+
+/* Term and definition, for the guards and anything else shaped like them: a
+   short name, then the sentence that says what it refuses. */
+.home__facts {
+  margin: 0;
+}
+
+.home__fact {
+  padding: 0.75rem 0;
+  border-top: 1px solid var(--keep-border);
+}
+
+.home__fact:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+
+.home__fact dt {
+  margin-bottom: 0.25rem;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.8125rem;
+  color: var(--keep-accent);
+}
+
+.home__fact dd {
+  margin: 0;
+  font-size: 0.9375rem;
+  line-height: 1.55;
+  color: var(--keep-muted);
+}
+
+/* Inside a panel the term runs into its own sentence rather than standing over
+   it: five short entries read as a list, not as five headings. */
+.home__facts--inline .home__fact {
+  padding: 0.4375rem 0;
+  border-top: none;
+}
+
+.home__facts--inline .home__fact dt {
+  display: inline;
+  margin: 0;
+}
+
+.home__facts--inline .home__fact dt::after {
+  content: ':';
+  color: var(--keep-faint);
+}
+
+.home__facts--inline .home__fact dd {
+  display: inline;
+  font-size: 0.875rem;
+}
+
+/* An aside with an edge: the thing worth knowing once the mechanism is clear. */
+.home__notes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(19rem, 100%), 1fr));
+  gap: 0.875rem;
+  margin-top: 2rem;
+}
+
+/* Inside a column, the same notes stack instead of racing for the width. */
+.home__notes--stack {
+  grid-template-columns: minmax(0, 1fr);
+  margin-top: 1.25rem;
+}
+
+.home__note {
+  padding: 1.125rem 1.375rem;
+  border: 1px solid var(--keep-border);
+  border-left: 3px solid var(--keep-accent);
+  border-radius: 4px 12px 12px 4px;
+  background: var(--ifm-background-surface-color);
+}
+
+.home__section--tint .home__note {
+  background: var(--keep-bg);
+}
+
+.home__note-head {
+  margin: 0 0 0.4375rem;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.6875rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--keep-accent);
+}
+
+.home__note-body {
+  margin: 0;
+  font-size: 0.9375rem;
+  line-height: 1.6;
+  color: var(--keep-body);
+}
+
+.home__note-body :not(pre) > code {
+  background: var(--keep-chip-bg);
+  border: 1px solid var(--keep-chip-border);
+  border-radius: 4px;
+  padding: 0.08em 0.34em;
+  font-size: 0.86em;
+  color: var(--keep-chip-ink);
+}
+
+/* Shared: cards and grids
    ------------------------------------------------------------------------ */
 
 .home__grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(16.5rem, 100%), 1fr));
   gap: 0.875rem;
-}
-
-.home__grid--three {
-  grid-template-columns: repeat(auto-fit, minmax(min(14rem, 100%), 1fr));
 }
 
 .home__card {
@@ -1434,25 +2115,6 @@ html[data-theme='dark']:root .home {
 
 .home__section--tint .home__card {
   background: linear-gradient(180deg, var(--home-card-sheen), transparent 55%),
-    var(--keep-bg);
-}
-
-/* The layer cards are links, but they do not lift or grow a rule the way the
-   navigation cards do: on a row of four, that reads as jitter. The border takes
-   the accent and a thin wash rises from the bottom; the name keeps its own. */
-.home__card--layer {
-  transition: border-color 200ms ease, background 200ms ease;
-}
-
-.home__card--layer:hover {
-  border-color: var(--home-edge);
-  background: linear-gradient(0deg, var(--keep-chip-bg), transparent 60%),
-    var(--ifm-background-surface-color);
-  text-decoration: none;
-}
-
-.home__section--tint .home__card--layer:hover {
-  background: linear-gradient(0deg, var(--keep-chip-bg), transparent 60%),
     var(--keep-bg);
 }
 
@@ -1491,6 +2153,59 @@ html[data-theme='dark']:root .home {
   color: var(--keep-muted);
 }
 
+/* A lens is a row, not a card: its name on the left, the question it answers and
+   the reader that answers it on the right. Four rows stack beside the feed they
+   all pour into. */
+.home__lens {
+  display: grid;
+  grid-template-columns: 7rem minmax(0, 1fr);
+  gap: 1rem;
+  align-items: baseline;
+  padding: 1.0625rem 1.25rem;
+  border: 1px solid var(--keep-border);
+  border-radius: 12px;
+  background: var(--ifm-background-surface-color);
+  transition: border-color 200ms ease;
+}
+
+.home__lens + .home__lens {
+  margin-top: 0.75rem;
+}
+
+.home__section--tint .home__lens {
+  background: var(--keep-bg);
+}
+
+.home__lens:hover {
+  border-color: var(--home-edge);
+  text-decoration: none;
+}
+
+.home__lens-name {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.8125rem;
+  color: var(--keep-faint);
+}
+
+.home__lens-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.home__lens-q {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: var(--keep-ink);
+}
+
+.home__lens-reader {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.8125rem;
+  color: var(--keep-accent);
+}
+
 /* 03 — app profiles
    ------------------------------------------------------------------------ */
 
@@ -1501,8 +2216,95 @@ html[data-theme='dark']:root .home {
   align-items: start;
 }
 
+/* A two-column block that follows a run of steps needs the same air between
+   them as between two bands of cards. */
+.home__steps + .home__profile {
+  margin-top: 2rem;
+}
+
+/* When the sample is the left column it takes the wider half: a config line is
+   as long as it is, and prose wraps where the column ends. */
+.home__profile--code-left {
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+}
+
 .home__profile-code [class*='codeBlockContainer'] {
   margin-bottom: 0;
+}
+
+/* A sample pane: the label bar owns the top edge, the code the rest. The pane
+   carries the border and the corners, so the block inside gives up both rather
+   than drawing a second rim inside the first. */
+.home__pane {
+  overflow: hidden;
+  border: 1px solid var(--keep-border);
+  border-radius: 12px;
+  background: var(--home-code-deep);
+}
+
+.home__pane-bar {
+  margin: 0;
+  padding: 0.625rem 0.875rem;
+  border-bottom: 1px solid rgba(230, 221, 209, 0.1);
+  background: rgba(230, 221, 209, 0.04);
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.75rem;
+  color: var(--keep-accent);
+}
+
+.home__pane [class*='codeBlockContainer'] {
+  border: none;
+  border-radius: 0;
+}
+
+/* The invocation, closing the pane its declaration opened. */
+.home__pane-run {
+  margin: 0;
+  padding: 0 1.375rem 1.375rem;
+  overflow-x: auto;
+  background: transparent;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.8125rem;
+  line-height: 1.8;
+  color: var(--keep-code-fg);
+  white-space: pre;
+}
+
+.home__pane-sigil {
+  color: var(--keep-accent);
+}
+
+.home__pane-out {
+  color: rgba(230, 221, 209, 0.5);
+}
+
+/* The interleaved feed, in the reference page's own columns. */
+.home__feed {
+  margin: 0;
+  padding: 1.375rem;
+  overflow-x: auto;
+  background: transparent;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.75rem;
+  line-height: 1.9;
+  color: var(--keep-code-fg);
+  white-space: pre;
+}
+
+.home__feed-head {
+  color: rgba(230, 221, 209, 0.45);
+}
+
+.home__feed-at {
+  color: rgba(230, 221, 209, 0.4);
+}
+
+.home__feed-name {
+  color: var(--keep-accent);
+}
+
+.home__feed-token {
+  color: #c9bfaf;
 }
 
 .home__arrows {
@@ -1568,32 +2370,8 @@ html[data-theme='dark']:root .home {
   color: var(--keep-muted);
 }
 
-/* sbx is / is not, and the closer
+/* The closer
    ------------------------------------------------------------------------ */
-
-.home__is {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(19rem, 100%), 1fr));
-  gap: 1.25rem;
-}
-
-.home__is-card {
-  padding: 1.75rem;
-  border: 1px solid var(--keep-border);
-  border-radius: 12px;
-  background: var(--home-deep);
-}
-
-/* The affirmative side is the one lit up: a warm face, and an edge a step off
-   the neutral one rather than a rule in full accent. */
-.home__is-card--yes {
-  border-color: var(--home-edge);
-  background: var(--keep-accent-soft);
-}
-
-.home__is-card--yes .home__section-title--sm {
-  color: var(--keep-ink);
-}
 
 .home__closer {
   text-align: center;
@@ -1630,32 +2408,40 @@ html[data-theme='dark']:root .home {
   color: var(--keep-ink);
 }
 
-/* File tabs over the sample, in the theme's own voice. */
+/* File tabs over the sample. They are this pane's label bar, so they sit on the
+   console surface like `.home__pane-bar` does, in both modes: a page-coloured
+   strip over dark code reads as a lid from another object. */
 .home__profile-code .tabs {
   gap: 0.25rem;
   padding: 0.625rem 0.875rem 0;
   border: 1px solid var(--keep-border);
   border-bottom: none;
   border-radius: 12px 12px 0 0;
-  background: var(--ifm-background-surface-color);
+  background-color: var(--home-code-deep);
+  background-image: linear-gradient(
+    rgba(230, 221, 209, 0.04),
+    rgba(230, 221, 209, 0.04)
+  );
 }
 
+/* Legible on that surface, which the page's own muted ink is not. */
 .home__profile-code .tabs__item {
   padding: 0.4375rem 0.75rem;
   border-radius: 6px 6px 0 0;
   border-bottom: none;
   font-family: var(--ifm-font-family-monospace);
   font-size: 0.75rem;
-  color: var(--keep-faint);
+  color: rgba(230, 221, 209, 0.62);
 }
 
-/* On this band the sample sits on the deepest surface, as the mock does: the
-   standard code brown lands within a shade of the tinted band behind it, which
-   reads as one warm mass instead of a panel. The inline style Prism writes on
-   the <pre> is why this has to be forced. */
+/* The sample sits on a console surface, as the mock draws it, in both modes:
+   dark type on stone, never a pale panel on a pale band. In dark the standard
+   code brown lands within a shade of the tinted band behind it, which reads as
+   one warm mass instead of a panel, so there the token sinks a step deeper. The
+   inline style Prism writes on the <pre> is why this has to be forced. */
 .home__profile-code [class*='codeBlockContainer'],
 .home__profile-code pre[class*='codeBlock'] {
-  background: var(--home-deep) !important;
+  background: var(--home-code-deep) !important;
 }
 
 .home__profile-code pre[class*='codeBlock'] code[class*='codeBlockLines'] {
@@ -1672,8 +2458,8 @@ html[data-theme='dark']:root .home {
 }
 
 .home__profile-code .tabs__item:not(.tabs__item--active):hover {
-  background: transparent;
-  color: var(--keep-body);
+  background: rgba(230, 221, 209, 0.07);
+  color: rgba(230, 221, 209, 0.92);
 }
 
 .home__profile-code [class*='codeBlockContainer'] {
@@ -1721,25 +2507,41 @@ html[data-theme='dark']:root .home {
 /* Responsive
    ------------------------------------------------------------------------ */
 
+/* The rail needs a gutter wide enough to hold it clear of the copy: the band's
+   own measure plus room for a 30px column. Below that it would sit on the text,
+   so it goes rather than crowds. */
+@media (max-width: 1340px) {
+  .home__rail {
+    display: none;
+  }
+}
+
 @media (max-width: 996px) {
   .home__preflight,
-  .home__profile {
+  .home__profile,
+  .home__split {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* Sticking is only worth it while there is a second column to stick beside. */
+  .home__split-aside {
+    position: static;
+  }
+
+  /* The label column becomes a row of its own, so the chips keep the width. */
+  .home__layer {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1rem;
+    align-items: start;
   }
 
   .home__lede {
     max-width: none;
   }
 
-  /* Nothing to point at once the hero is taller than the window anyway, and at
-     this width it would sit on the copy. */
-  .home__scrollcue {
-    display: none;
-  }
-
   .home__hero-copy {
     padding-top: calc(var(--ifm-navbar-height) + 2.5rem);
-    padding-bottom: 4rem;
+    padding-bottom: 2.5rem;
   }
 }
 
@@ -1777,11 +2579,20 @@ html[data-theme='dark']:root .home {
   .home__cta,
   .home__verb,
   .home__ghost,
+  .home__rail-core,
+  .home__rail-label,
   .rv {
     transition: none;
   }
 
   .home__cta:hover {
+    transform: none;
+  }
+
+  /* The rail stays: it is navigation, and which dot is lit is a state. Only the
+     neighbours' lean is motion for its own sake, so that is what goes. */
+  .home__rail-dot:hover + .home__rail-dot .home__rail-core,
+  .home__rail-dot:has(+ .home__rail-dot:hover) .home__rail-core {
     transform: none;
   }
 
