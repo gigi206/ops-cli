@@ -306,6 +306,108 @@ fn parse_logs_args(args: &[OsString]) -> Result<LogsArgs, String> {
     })
 }
 
+/// How much of a log is read from its end before falling back to a forward pass.
+///
+/// A session's log is whatever the agent printed, which is not a size sbx chooses: a verbose build
+/// leaves hundreds of megabytes. `sbx session logs` used to `read` the whole file to print twenty
+/// lines of it, so the memory the command needed was the memory the agent had spent, and asking a
+/// question about a long-running agent cost as much as the agent's own output.
+///
+/// This window is what a question is normally answered from. It is generous because the point is
+/// not to be small, it is to be **bounded**: a log ten times this size costs the same here.
+const TAIL_WINDOW_MAX: u64 = 8 * 1024 * 1024;
+
+/// How much of the file is read at a time, in either direction.
+const LOG_CHUNK: u64 = 64 * 1024;
+
+/// The last `want` bytes of `path`, or the whole file when it is shorter — plus whether the window
+/// does reach the start, which is what tells the caller its answer is complete.
+fn tail_bytes(path: &Path, want: u64) -> std::io::Result<(Vec<u8>, bool)> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let from = len.saturating_sub(want);
+    file.seek(SeekFrom::Start(from))?;
+    let mut buf = Vec::with_capacity((len - from) as usize);
+    file.take(len - from).read_to_end(&mut buf)?;
+    Ok((buf, from == 0))
+}
+
+/// Grow a window back from the end of `path` until it holds what the caller has to see, and no
+/// further.
+///
+/// `want_lines` is the `-n` limit when there is one: a window holding that many line breaks holds
+/// the answer, whatever the rest of the file weighs. `stop_at_header` says whether reaching the last
+/// session's header also ends the search — true for the ordinary reading, which is about that
+/// session alone, and false under `--all`, where a line limit counts back across every session.
+///
+/// Returns the window and whether it is a **complete** answer: it reached the start of the file, or
+/// it holds the header the reading is bounded by. A `false` there is not a failure. It says the
+/// last session is longer than [`TAIL_WINDOW_MAX`], and the caller answers that by streaming from
+/// the header rather than holding the file.
+fn tail_window(
+    path: &Path,
+    want_lines: Option<usize>,
+    stop_at_header: bool,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut want = LOG_CHUNK;
+    loop {
+        let (buf, whole) = tail_bytes(path, want)?;
+        let has_header = stop_at_header && last_session(&buf).0.is_some();
+        // More breaks than the limit means the window already holds every byte `tail_lines` will
+        // count back over, so growing it further would read what is not going to be printed.
+        let enough_lines =
+            want_lines.is_some_and(|n| buf.iter().filter(|&&b| b == b'\n').count() > n);
+        if whole || has_header || enough_lines || want >= TAIL_WINDOW_MAX {
+            return Ok((buf, whole || has_header));
+        }
+        want = (want * 4).min(TAIL_WINDOW_MAX);
+    }
+}
+
+/// Where the last session's body starts in `path`, and the header that opens it — found by reading
+/// the file in fixed chunks rather than holding it.
+///
+/// The fallback for a session whose output is longer than [`TAIL_WINDOW_MAX`]: the body being asked
+/// for is genuinely that long, so it is streamed from here rather than truncated or buffered. A
+/// line longer than [`LOG_CHUNK`] cannot be a header, so the carry is dropped and the scan picks up
+/// at the next break — which keeps this pass bounded whatever the log holds.
+fn last_header_at(path: &Path) -> std::io::Result<(Option<sandbox::SessionHeader>, u64)> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut chunk = vec![0u8; LOG_CHUNK as usize];
+    let (mut at, mut carry, mut dropping) = (0u64, Vec::new(), false);
+    let mut found = (None, 0u64);
+    loop {
+        let n = file.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        let mut rest = &chunk[..n];
+        while let Some(i) = rest.iter().position(|&b| b == b'\n') {
+            let line_end = at + (n - rest.len()) as u64 + i as u64;
+            if !dropping {
+                carry.extend_from_slice(&rest[..i]);
+                if let Some(h) = sandbox::parse_session_header(&carry) {
+                    found = (Some(h), line_end + 1);
+                }
+            }
+            carry.clear();
+            dropping = false;
+            rest = &rest[i + 1..];
+        }
+        if !dropping {
+            carry.extend_from_slice(rest);
+            if carry.len() > LOG_CHUNK as usize {
+                carry.clear();
+                dropping = true;
+            }
+        }
+        at += n as u64;
+    }
+    Ok(found)
+}
+
 /// Split a log into its most recent session's header and body.
 ///
 /// The log is append-only and keyed by pid, so a pid the kernel reuses writes into the file its
@@ -395,8 +497,29 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
     let data_dir = layout.data_dir();
     let path = sandbox::detach_log_path(data_dir, parsed.id);
 
-    let log = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
+    // What has to be held to answer is not what the file holds. A session's log is as long as its
+    // agent was talkative, so reading all of it to print twenty lines of it made the command cost
+    // whatever the agent had spent. Everything is answered from a window at the end of the file;
+    // the two cases a window cannot answer are streamed instead.
+    let stream_from = |at: u64| -> ExitCode {
+        use std::io::Seek as _;
+        let Ok(mut f) = std::fs::File::open(&path) else {
+            diag::error(&format!(
+                "sbx: cannot read the session log {}",
+                path.display()
+            ));
+            return ExitCode::FAILURE;
+        };
+        if at > 0 && f.seek(std::io::SeekFrom::Start(at)).is_err() {
+            return ExitCode::FAILURE;
+        }
+        let mut out = std::io::stdout();
+        let _ = std::io::copy(&mut f, &mut out);
+        ExitCode::SUCCESS
+    };
+
+    let (window, complete) = match tail_window(&path, parsed.limit, !parsed.all) {
+        Ok(w) => w,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return explain_missing_log(data_dir, parsed.id, &path);
         }
@@ -411,12 +534,7 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
 
     // Sample liveness before printing, so the note describes the state the output belongs to.
     let live = session_is_live(data_dir, parsed.id);
-    let (header, body) = last_session(&log);
-    let body = if parsed.all { &log[..] } else { body };
-    let body = match parsed.limit {
-        Some(n) => tail_lines(body, n),
-        None => body,
-    };
+    let (header, session_body) = last_session(&window);
 
     diag::note(&format!(
         "session {} — {}, started {}{}",
@@ -431,10 +549,39 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
         if parsed.all { ", all sessions" } else { "" },
     ));
 
+    // The end of the file now, which is where a `--follow` picks up: the window is a tail, so its
+    // length says nothing about where the file ends.
+    let end = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
     use std::io::Write as _;
-    let mut out = std::io::stdout();
-    let _ = out.write_all(body);
-    let _ = out.flush();
+    match (parsed.limit, parsed.all, complete) {
+        // Every session, unlimited: the whole file is what was asked for, so it is copied rather
+        // than held.
+        (None, true, _) => {
+            if stream_from(0) == ExitCode::FAILURE {
+                return ExitCode::FAILURE;
+            }
+        }
+        // One session, unlimited, and longer than the window: stream it from its own header. The
+        // forward pass that finds the header holds nothing either.
+        (None, false, false) => {
+            let at = last_header_at(&path).map(|(_, at)| at).unwrap_or(0);
+            if stream_from(at) == ExitCode::FAILURE {
+                return ExitCode::FAILURE;
+            }
+        }
+        // Everything else fits in the window by construction.
+        (limit, all, _) => {
+            let body = if all { &window[..] } else { session_body };
+            let body = match limit {
+                Some(n) => tail_lines(body, n),
+                None => body,
+            };
+            let mut out = std::io::stdout();
+            let _ = out.write_all(body);
+            let _ = out.flush();
+        }
+    }
 
     if !parsed.follow {
         return ExitCode::SUCCESS;
@@ -445,7 +592,7 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
         diag::hint("       session has exited — nothing further will be written.");
         return ExitCode::SUCCESS;
     }
-    follow_log(&path, log.len() as u64, data_dir, parsed.id)
+    follow_log(&path, end, data_dir, parsed.id)
 }
 
 /// Explain an absent log, distinguishing the two reasons it can be missing.
@@ -523,6 +670,103 @@ fn drain_log(path: &Path, pos: &mut u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A log of two sessions with a body far larger than one read chunk, written to a real file:
+    /// the readers under test are about where they stop reading, which a slice cannot show.
+    fn big_log(dir: &crate::testutil::TmpDir) -> (std::path::PathBuf, Vec<u8>) {
+        let mut log = String::new();
+        log.push_str(&header_line(111, 1_000));
+        for i in 0..40_000 {
+            log.push_str(&format!("old line {i}\n"));
+        }
+        log.push_str(&header_line(222, 2_000));
+        for i in 0..200 {
+            log.push_str(&format!("new line {i}\n"));
+        }
+        let path = dir.join("222.log");
+        std::fs::write(&path, &log).unwrap();
+        (path, log.into_bytes())
+    }
+
+    /// A window from the end answers exactly what reading the whole file answered, and stops well
+    /// short of it.
+    ///
+    /// Both halves matter, and neither implies the other. Reading the tail is only worth doing if
+    /// the answer is the same one, and a window that quietly grew to the whole file would give the
+    /// same answer while changing nothing. The reference is the previous implementation: the same
+    /// two pure functions, over every byte.
+    #[test]
+    fn a_window_gives_the_whole_files_answer_without_reading_the_whole_file() {
+        let dir = crate::testutil::TmpDir::new();
+        let (path, full) = big_log(&dir);
+        let size = full.len();
+
+        // The ordinary reading: the last session, whole.
+        let (window, complete) = tail_window(&path, None, true).unwrap();
+        assert!(complete, "the last session's header is inside the window");
+        assert_eq!(
+            last_session(&window).1,
+            last_session(&full).1,
+            "the body must be the one the full read gave"
+        );
+        assert_eq!(last_session(&window).0.map(|h| h.started), Some(2_000));
+        assert!(
+            window.len() < size / 4,
+            "a window that reads most of the file has bounded nothing ({} of {size})",
+            window.len()
+        );
+
+        // `-n`: the same answer, from a window that stops as soon as it holds the lines.
+        for n in [1usize, 5, 50] {
+            let (window, _) = tail_window(&path, Some(n), true).unwrap();
+            assert_eq!(
+                tail_lines(last_session(&window).1, n),
+                tail_lines(last_session(&full).1, n),
+                "-n {n} must give what the full read gave"
+            );
+            assert!(
+                window.len() < size / 4,
+                "-n {n} read {} bytes",
+                window.len()
+            );
+        }
+
+        // `--all -n`: the limit counts back across sessions, so a header must not end the search.
+        // The count is far larger than the last session is long, which is what makes this test
+        // separate the two: a window that stopped at the header would hold neither the lines nor
+        // the answer, while one that stops on the header *and* the count would look identical.
+        let (window, _) = tail_window(&path, Some(5_000), false).unwrap();
+        assert_eq!(
+            tail_lines(&window, 5_000),
+            tail_lines(&full, 5_000),
+            "under --all the count crosses the header"
+        );
+        assert!(
+            tail_lines(&window, 5_000).starts_with(b"old line"),
+            "five thousand lines back from the end reaches into the session above"
+        );
+    }
+
+    /// The fallback for a session longer than any window: find where its body starts without
+    /// holding the file, so it can be streamed from there rather than buffered or truncated.
+    #[test]
+    fn the_last_headers_offset_is_found_without_holding_the_file() {
+        let dir = crate::testutil::TmpDir::new();
+        let (path, full) = big_log(&dir);
+        let (header, at) = last_header_at(&path).unwrap();
+        assert_eq!(header.map(|h| h.started), Some(2_000));
+        assert_eq!(
+            &full[at as usize..],
+            last_session(&full).1,
+            "the offset must name the same body the full read splits out"
+        );
+
+        // A log with no header at all is not an error: there is no offset, and the caller falls
+        // back to the start, which is what `last_session` does with the same file.
+        let plain = dir.join("plain.log");
+        std::fs::write(&plain, b"just output\nno header\n").unwrap();
+        assert_eq!(last_header_at(&plain).unwrap(), (None, 0));
+    }
 
     /// A header line for `pid`, built through the same writer/parser format the launch uses.
     fn header_line(pid: u32, started: u64) -> String {
