@@ -229,9 +229,11 @@ does that from the message itself rather than from the socket, in both direction
 the two directions are deliberately not symmetric.
 
 **Outbound, the rule is fail-closed.** Ambiguous framing is the classic
-request-smuggling vector, so a request that carries a duplicated `Content-Length` or
-`Host`, or a `Transfer-Encoding` whose coding is anything but `chunked`, is refused
-outright (`400 bad-request`, sub-categorized in the logs). A well-formed `chunked`
+request-smuggling vector, so a request that carries a duplicated `Content-Length`,
+`Host` or `Transfer-Encoding`, or a `Transfer-Encoding` whose coding is anything but
+`chunked`, is refused outright (`400 bad-request`, sub-categorized in the logs). A
+framing stated twice is an ambiguity whichever coding it names, so counting the header
+is what refuses it rather than reading the first of the two. A well-formed `chunked`
 request is not refused: it is de-chunked into a bounded buffer and re-framed with a
 synthesized `Content-Length`, so exactly one unambiguous framing reaches the upstream.
 

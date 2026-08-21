@@ -118,6 +118,19 @@ pub(super) fn inspect_framing(
             detail: super::CONTROL_BYTE_DETAIL,
         });
     }
+    // Counted before the first value is read, on the same terms as `Content-Length` and `Host`
+    // below. RFC 9112 6.1 has a sender apply the chunked coding at most once, so two of these
+    // headers is a framing the request states twice and this proxy would answer from one of them.
+    // Nothing desyncs today, because an inspected request is de-chunked and re-framed with a
+    // synthesized `Content-Length` and neither header is forwarded: the reason to refuse it is that
+    // this function is the one place a framing ambiguity is named, and reading the first of two is
+    // not naming it. `count` is already what the two neighbours use.
+    if head.count("transfer-encoding") > 1 {
+        return Err(FramingRefusal {
+            reason: "bad-request:dup-transfer-encoding",
+            detail: "the request carries a duplicated Transfer-Encoding header",
+        });
+    }
     let chunked = match head.header("transfer-encoding").map(str::trim) {
         Some(v) if forwards_chunked && v.eq_ignore_ascii_case("chunked") => true,
         Some(_) => {

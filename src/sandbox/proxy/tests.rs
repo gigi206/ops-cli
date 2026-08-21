@@ -5414,9 +5414,10 @@ fn read_chunked_body_bounds_a_no_newline_size_line_flood() {
 /// All three are refused **before** policy and resolution — the resolver panics if reached — because
 /// a request whose framing is ambiguous has no single meaning to apply a policy to.
 ///
-/// `Transfer-Encoding: chunked` is deliberately absent: it is de-chunked and re-framed rather than
-/// refused (see `a_chunked_request_body_is_dechunked_and_reframed_with_content_length`), which is
-/// what makes the *other* codings a refusal rather than a blanket rule.
+/// One `Transfer-Encoding: chunked` is deliberately absent: it is de-chunked and re-framed rather
+/// than refused (see `a_chunked_request_body_is_dechunked_and_reframed_with_content_length`), which
+/// is what makes the *other* codings a refusal rather than a blanket rule. Two of them are here,
+/// because a framing stated twice is an ambiguity whichever coding it names.
 #[test]
 fn duplicated_framing_headers_are_refused_with_400_before_the_policy_check() {
     for (reason, req) in [
@@ -5435,6 +5436,19 @@ fn duplicated_framing_headers_are_refused_with_400_before_the_policy_check() {
         (
             "bad-request:transfer-encoding",
             &b"POST / HTTP/1.1\r\nHost: allowed.test\r\nTransfer-Encoding: gzip\r\nConnection: close\r\n\r\n"[..],
+        ),
+        // Two of them, the coding this plane does forward: the framing is stated twice, and
+        // reading the first is not naming the ambiguity. Its neighbours have been counted from
+        // the start, and this one is counted on the same terms.
+        (
+            "bad-request:dup-transfer-encoding",
+            &b"POST / HTTP/1.1\r\nHost: allowed.test\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"[..],
+        ),
+        // ...and the classic pair, where reading the first would have called it chunked and the
+        // second names a coding this proxy refuses outright.
+        (
+            "bad-request:dup-transfer-encoding",
+            &b"POST / HTTP/1.1\r\nHost: allowed.test\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\nConnection: close\r\n\r\n"[..],
         ),
     ] {
         let proxy_ca = Arc::new(Ca::ephemeral().unwrap());

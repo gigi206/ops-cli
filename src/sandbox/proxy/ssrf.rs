@@ -21,8 +21,16 @@ use crate::sandbox::control::{LogVerdict, Proto};
 enum IpClass {
     /// A routable public address — reachable subject to the policy.
     Public,
-    /// A loopback / RFC1918 / ULA / CGNAT address — reachable only when the policy explicitly
-    /// named this exact host (an intentional internal target).
+    /// An address that is not the public Internet's: loopback, RFC1918, ULA, CGNAT, and the ranges
+    /// IANA set aside for something else (TEST-NET, benchmarking, documentation, reserved).
+    /// Reachable only when the policy explicitly named this exact host (an intentional internal
+    /// target).
+    ///
+    /// The set-aside ranges sit here rather than under [`Self::Blocked`] because a lab or a VPN does put
+    /// them on a local interface — 198.18.0.0/15 is what several VPN and DNS clients route
+    /// internally — so refusing them outright would deny a destination a user deliberately
+    /// configured, with no way to say otherwise. This class is exactly the bargain that case wants:
+    /// a wildcard or a regex cannot reach them, and a rule naming the host can.
     Private,
     /// Link-local (incl. cloud metadata `169.254.169.254` / `fe80::/10`), multicast, or the
     /// unspecified address — never reachable, even if explicitly listed.
@@ -79,6 +87,19 @@ fn classify_v4(v4: Ipv4Addr) -> IpClass {
     if v4.is_loopback() || v4.is_private() || (o[0] == 100 && (64..=127).contains(&o[1])) {
         return IpClass::Private;
     }
+    // The ranges IANA set aside for something other than the public Internet: TEST-NET-1/2/3
+    // (RFC 5737), the RFC 2544 benchmarking range 198.18.0.0/15, and the reserved 240.0.0.0/4.
+    // Falling through to `Public` said they were ordinary destinations, which is a wrong answer in
+    // the one place a wrong answer is read out loud: `sbx test net` shares this decision, so it
+    // predicted `198.18.0.0/15` reachable while a real request to it dies at the dial with
+    // `502 upstream-unreachable`. The broadcast address is a member of the last range and was
+    // already refused above, which is why that check comes first.
+    //
+    // Written by octets, like the CGNAT range beside it, because `is_benchmarking` and
+    // `is_reserved` are still unstable; `is_documentation` is not, so TEST-NET uses it.
+    if v4.is_documentation() || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) || o[0] >= 240 {
+        return IpClass::Private;
+    }
     IpClass::Public
 }
 
@@ -88,8 +109,9 @@ fn classify_v6(v6: Ipv6Addr) -> IpClass {
     if v6.is_unspecified() || v6.is_multicast() || (s[0] & 0xffc0) == 0xfe80 {
         return IpClass::Blocked;
     }
-    // loopback ::1 and unique-local fc00::/7
-    if v6.is_loopback() || (s[0] & 0xfe00) == 0xfc00 {
+    // loopback ::1, unique-local fc00::/7, and the documentation prefix 2001:db8::/32 — the v6
+    // half of the same rule the v4 classifier applies to TEST-NET.
+    if v6.is_loopback() || (s[0] & 0xfe00) == 0xfc00 || (s[0] == 0x2001 && s[1] == 0x0db8) {
         return IpClass::Private;
     }
     IpClass::Public
@@ -308,5 +330,55 @@ mod tests {
         assert!(matches!(c("2606:4700:4700::1111"), IpClass::Public));
         // the pre-existing v4-mapped case still folds to its v4 class
         assert!(matches!(c("::ffff:127.0.0.1"), IpClass::Private));
+    }
+
+    /// The ranges IANA set aside for something other than the public Internet are not public
+    /// addresses, and the classification is what `sbx test net` reads to predict a destination.
+    ///
+    /// They are `Private` rather than `Blocked` on purpose: a lab or a VPN does put them on a local
+    /// interface, so a rule that names the host reaches them and a wildcard does not.
+    ///
+    /// Teeth: with them falling through to `Public`, every assertion below reads `Public`, and the
+    /// tester tells an operator that `198.18.0.1` is reachable while the request dies at the dial.
+    #[test]
+    fn the_ranges_iana_set_aside_are_not_public_addresses() {
+        let c = |s: &str| classify_ip(s.parse::<IpAddr>().unwrap());
+        for set_aside in [
+            "192.0.2.1",          // TEST-NET-1
+            "198.51.100.7",       // TEST-NET-2
+            "203.0.113.9",        // TEST-NET-3
+            "198.18.0.1",         // RFC 2544 benchmarking, low half
+            "198.19.255.254",     // ...and its high half
+            "240.0.0.1",          // reserved
+            "255.255.255.254",    // reserved, one below the broadcast address
+            "2001:db8::1",        // the v6 documentation prefix
+            "::ffff:203.0.113.9", // and a set-aside v4 wearing a v6 spelling
+        ] {
+            assert!(
+                matches!(c(set_aside), IpClass::Private),
+                "{set_aside} is not a public destination"
+            );
+        }
+        // The broadcast address is in the last range and stays refused outright, because the
+        // never-reachable test runs first.
+        assert!(matches!(c("255.255.255.255"), IpClass::Blocked));
+        // The neighbours of each range are ordinary public addresses and must stay that way.
+        for public in [
+            "198.17.255.255",
+            "198.20.0.1",
+            "192.0.3.1",
+            "203.0.114.1",
+            "2001:db9::1",
+        ] {
+            assert!(
+                matches!(c(public), IpClass::Public),
+                "{public} is an ordinary destination and must not be swept in"
+            );
+        }
+        // 240.0.0.0/4 has no ordinary neighbour below it: 224.0.0.0/4 is multicast, so every
+        // address just under the reserved range is already refused outright and the boundary
+        // between the two cannot be observed from here. It is written as the range's own, from
+        // RFC 1112, rather than as whatever number happens to be indistinguishable.
+        assert!(matches!(c("239.255.255.254"), IpClass::Blocked));
     }
 }

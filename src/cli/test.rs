@@ -398,8 +398,8 @@ fn render_addr_refusal(
     let (n, err, r) = (pal.name, pal.err, pal.reset);
     let why = match refusal {
         sandbox::AddrRefusal::PrivateWithoutExactHost => {
-            "a private or loopback address is reachable only when the deciding rule names that \
-             exact host"
+            "an address that is not the public Internet's (loopback, private, or a range IANA \
+             set aside) is reachable only when the deciding rule names that exact host"
         }
         sandbox::AddrRefusal::NeverReachable => {
             "a link-local (the cloud metadata address among them), multicast or unspecified \
@@ -584,8 +584,9 @@ mod tests {
         assert_eq!(
             out,
             "DENIED   https://127.0.0.1/\n  the policy allows it (allow rule: re:.*), but the \
-             proxy refuses the address at connect time: a private or loopback address is reachable \
-             only when the deciding rule names that exact host\n"
+             proxy refuses the address at connect time: an address that is not the public \
+             Internet's (loopback, private, or a range IANA set aside) is reachable only when the \
+             deciding rule names that exact host\n"
         );
         let colored = render_addr_refusal(
             "https://127.0.0.1/",
