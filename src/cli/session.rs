@@ -408,6 +408,19 @@ fn last_header_at(path: &Path) -> std::io::Result<(Option<sandbox::SessionHeader
     Ok(found)
 }
 
+/// The header the note names: from the window when it holds one, and from a forward pass when it
+/// does not.
+///
+/// A window sized by a line limit stops as soon as it holds the lines, which for any session larger
+/// than one chunk is well before the header. Left at that, the note would print `started ?` exactly
+/// for the long-running agent this verb exists to read — the population it is least acceptable for.
+/// The forward pass is paid only in that case, and it holds a chunk at a time.
+fn session_header(path: &Path, window: &[u8]) -> Option<sandbox::SessionHeader> {
+    last_session(window)
+        .0
+        .or_else(|| last_header_at(path).ok().and_then(|(h, _)| h))
+}
+
 /// Split a log into its most recent session's header and body.
 ///
 /// The log is append-only and keyed by pid, so a pid the kernel reuses writes into the file its
@@ -518,7 +531,17 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
         ExitCode::SUCCESS
     };
 
-    let (window, complete) = match tail_window(&path, parsed.limit, !parsed.all) {
+    // `--all` with no limit copies the whole file, so it needs no window at all — only the header
+    // for the note, which the fallback below reads without holding anything. Asking for one anyway
+    // would grow it to `TAIL_WINDOW_MAX` hunting a header these bytes are not used for.
+    let windowed = parsed.limit.is_some() || !parsed.all;
+    let read = if windowed {
+        tail_window(&path, parsed.limit, !parsed.all)
+    } else {
+        // Still touch the file, so a log that is not there is explained rather than printed empty.
+        std::fs::metadata(&path).map(|_| (Vec::new(), false))
+    };
+    let (window, complete) = match read {
         Ok(w) => w,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return explain_missing_log(data_dir, parsed.id, &path);
@@ -534,7 +557,8 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
 
     // Sample liveness before printing, so the note describes the state the output belongs to.
     let live = session_is_live(data_dir, parsed.id);
-    let (header, session_body) = last_session(&window);
+    let session_body = last_session(&window).1;
+    let header = session_header(&path, &window);
 
     diag::note(&format!(
         "session {} — {}, started {}{}",
@@ -709,7 +733,11 @@ mod tests {
             last_session(&full).1,
             "the body must be the one the full read gave"
         );
-        assert_eq!(last_session(&window).0.map(|h| h.started), Some(2_000));
+        assert_eq!(
+            last_session(&window).0.map(|h| h.started),
+            Some(2_000),
+            "and the window itself holds the header, no fallback needed"
+        );
         assert!(
             window.len() < size / 4,
             "a window that reads most of the file has bounded nothing ({} of {size})",
@@ -744,6 +772,34 @@ mod tests {
         assert!(
             tail_lines(&window, 5_000).starts_with(b"old line"),
             "five thousand lines back from the end reaches into the session above"
+        );
+    }
+
+    /// The note names when the session started, and that has to survive a session bigger than the
+    /// window: it is the ordinary case for the agent this verb exists to read.
+    #[test]
+    fn the_started_date_survives_a_session_larger_than_the_window() {
+        let dir = crate::testutil::TmpDir::new();
+        let mut log = String::new();
+        log.push_str(&header_line(111, 1_000));
+        log.push_str(&header_line(222, 2_000));
+        // A last session comfortably past one read chunk, so a window that stops on the line count
+        // stops well short of the header above it.
+        for i in 0..20_000 {
+            log.push_str(&format!("chatty line {i}\n"));
+        }
+        let path = dir.join("222.log");
+        std::fs::write(&path, &log).unwrap();
+
+        let (window, complete) = tail_window(&path, Some(5), true).unwrap();
+        assert!(
+            !complete,
+            "this fixture only says something while the header is out of reach"
+        );
+        assert_eq!(
+            session_header(&path, &window).map(|h| h.started),
+            Some(2_000),
+            "the note must still name when the session started"
         );
     }
 
