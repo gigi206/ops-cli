@@ -1841,11 +1841,40 @@ mod tests {
     /// names the cage's shell and `socat`, and here it names the host's, because that is what a test
     /// process can execute. That the launcher passes the cage's own is a separate, static fact.
     fn plane_and_client(tasks: Vec<TaskSpec>) -> Option<(TmpDir, TaskPlane, PathBuf)> {
+        plane_and_client_inner(tasks, None)
+    }
+
+    /// [`plane_and_client`] whose engine launches `launcher` instead of `/nonexistent/bwrap`.
+    ///
+    /// The script is written into the plane's own `TmpDir`, so it lives exactly as long as the
+    /// fixture and needs no cleanup of its own.
+    fn plane_and_client_with_launcher(
+        tasks: Vec<TaskSpec>,
+        launcher: &str,
+    ) -> Option<(TmpDir, TaskPlane, PathBuf)> {
+        plane_and_client_inner(tasks, Some(launcher))
+    }
+
+    fn plane_and_client_inner(
+        tasks: Vec<TaskSpec>,
+        launcher: Option<&str>,
+    ) -> Option<(TmpDir, TaskPlane, PathBuf)> {
         let bash = crate::pathfind::find_on_path("bash")?;
         let socat = crate::pathfind::find_on_path("socat")?;
         let head = crate::pathfind::find_on_path("head")?;
         let data = TmpDir::new();
-        let engine = super::super::task::TaskEngine::inventory_only(tasks);
+        let engine = match launcher {
+            None => super::super::task::TaskEngine::inventory_only(tasks),
+            Some(body) => {
+                use std::os::unix::fs::PermissionsExt as _;
+                let path = data.path().join("launcher");
+                std::fs::write(&path, format!("#!{}\n{body}\n", bash.display()))
+                    .expect("write the launcher");
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("make the launcher executable");
+                super::super::task::TaskEngine::inventory_with_launcher(tasks, path)
+            }
+        };
         let programs = ClientPrograms {
             bash: &bash,
             socat: &socat,
@@ -2693,7 +2722,15 @@ mod tests {
     // its declared choice. A desynchronised stream would instead come back as a protocol complaint.
     #[test]
     fn an_awkward_parameter_crosses_the_wire_byte_identical() {
-        let Some((_data, _plane, script)) = plane_and_client(vec![probe_task()]) else {
+        // A launcher that exists and writes a marker of its own, because the subject below is what
+        // the command wrote and not how a failed exec is worded. See
+        // [`super::super::task::TaskEngine::inventory_with_launcher`]: with `/nonexistent/bwrap` the
+        // wording is the host's -- `systemd-run` names the program under a scope, a bare
+        // `Command::spawn` names nothing without one -- so the assertion measured the user manager.
+        let Some((_data, _plane, script)) = plane_and_client_with_launcher(
+            vec![probe_task()],
+            "echo '<<STDERR-MARKER>>' >&2; exit 7",
+        ) else {
             return;
         };
         let out = run_client(
@@ -2716,12 +2753,15 @@ mod tests {
         // ordinary outcome — so this also pins the return path: the captured stderr crossed as a
         // length-framed stream and reached the caller's own descriptor.
         assert!(
-            err.contains("/nonexistent/bwrap"),
+            err.contains("<<STDERR-MARKER>>"),
             "the command's stderr must reach the caller verbatim: {err}"
         );
-        assert_ne!(
+        // The command's own status, not a refusal (125) and not a launch failure: it crossed the
+        // wire beside its stderr. Pinning the exact code is what the previous `assert_ne!` could
+        // not do, having no command that chose one.
+        assert_eq!(
             out.status.code(),
-            Some(125),
+            Some(7),
             "the invocation ran, so this is the command's status and not a refusal: {err}"
         );
     }

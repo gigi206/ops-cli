@@ -2191,6 +2191,27 @@ impl TaskEngine {
     /// It is enough to serve the listing verbs and to validate an invocation's parameters — so the
     /// wire protocol is exercisable end to end without provisioning a cage, which is what lets the
     /// in-cage client be tested against the real plane rather than a stand-in for it.
+    /// [`Self::inventory_only`] with a launcher that exists, for the one test whose subject is the
+    /// **return path** rather than the refusal.
+    ///
+    /// `inventory_only` points `bwrap` at `/nonexistent/bwrap`, which is right for every test that
+    /// only needs a launch to fail. It is wrong for a test asserting on what the command wrote,
+    /// because an exec failure is reported by *whoever spawned it*: under a scope wrapper
+    /// `systemd-run` names the program it could not run, and with no delegation root
+    /// ([`crate::sandbox::cgroup::limiter`] returning `None`) the launch is a bare
+    /// `Command::spawn`, whose `ENOENT` names nothing at all. A test reading that wording measures
+    /// the host's user manager instead of the stream it means to pin, and passes or fails by where
+    /// it runs.
+    pub(crate) fn inventory_with_launcher(
+        tasks: Vec<crate::config::TaskSpec>,
+        bwrap: PathBuf,
+    ) -> Self {
+        Self {
+            bwrap,
+            ..Self::inventory_only(tasks)
+        }
+    }
+
     pub(crate) fn inventory_only(tasks: Vec<crate::config::TaskSpec>) -> Self {
         Self {
             fs_masks: None,
