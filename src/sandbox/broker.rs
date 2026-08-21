@@ -1104,6 +1104,22 @@ impl<T: Read + Write + Send> ReadWrite for T {}
 /// allowed to take a slot nothing bounds — the rule the ssh-agent broker already applies.
 const MAX_CONCURRENT_CONNS: usize = 32;
 
+/// The longest the cage may stay silent on a connection it opened before saying its first word.
+///
+/// A ceiling of its own rather than `host_deadline` alone, because the two answer different
+/// questions. `host_deadline` asks how long the *host resource* may take, and a manifest raises it
+/// as far as ten minutes for the one reason that a pinentry waits on a person to type. How long a
+/// cage may say nothing after connecting has no such reason behind it: the client connected because
+/// it had something to send. Taking that ten minutes as the silence budget too would let a
+/// passphrase prompt's allowance become ten minutes of holding a plugin process and a host
+/// connection for a caller that never spoke.
+///
+/// Applied as the *lower* of the two, so a protocol that answers faster than this keeps its own
+/// tighter number and none can exceed this one. Fixed rather than configurable because nothing has
+/// asked: a protocol whose cage side genuinely pauses before its first frame would be the reason to
+/// make it a manifest field, and there is none among those sbx serves.
+const CAGE_FIRST_FRAME: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A running broker's host-side resources. The accept loop is detached and dies with sbx; this
 /// guard owns the socket file and unlinks it when the launch ends.
 pub(crate) struct Broker {
@@ -1323,8 +1339,9 @@ fn serve_exchanges(
     // byte per timeout does not extend the wait a frame's length at a time. Both are lifted once the
     // frame is in — a broker connection that sits idle *between* requests is the ordinary case, not
     // a fault.
-    let mut first_deadline = Some(std::time::Instant::now() + spec.host_deadline);
-    let _ = cage_w.set_read_timeout(Some(spec.host_deadline));
+    let silence = spec.host_deadline.min(CAGE_FIRST_FRAME);
+    let mut first_deadline = Some(std::time::Instant::now() + silence);
+    let _ = cage_w.set_read_timeout(Some(silence));
 
     loop {
         let read = match first_deadline {
@@ -1339,9 +1356,9 @@ fn serve_exchanges(
                 // exactly the thing an operator would otherwise have no way to see.
                 if out.is_err() && std::time::Instant::now() >= deadline {
                     return Err(format!(
-                        "a connection said nothing for {}s and was closed; it was holding a plugin \
+                        "a connection said nothing for {:?} and was closed; it was holding a plugin \
                          process and a connection to the host resource",
-                        spec.host_deadline.as_secs()
+                        silence
                     ));
                 }
                 out
