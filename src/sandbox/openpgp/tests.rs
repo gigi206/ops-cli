@@ -181,6 +181,11 @@ fn trailing_whitespace_is_stripped_before_hashing_so_a_padded_line_still_verifie
     assert_ne!(padded, CLEARSIGNED, "the fixture must contain the line");
     assert!(verify_clearsigned(&padded, &key, &pinned()).is_ok());
     // The message handed back is the line as transmitted; only the hash input is canonicalised.
+    // That is correct, and it is also half a contract: the padding is reachable by anyone who can
+    // rewrite the document in flight, so what keeps it harmless is that every consumer of the
+    // returned message ignores it. The other half is asserted where the only such consumer lives,
+    // in `deb::tests::a_release_padded_where_the_signature_does_not_look_attests_the_very_same_digest`,
+    // and a second consumer would need its own.
     let doc = split_clearsigned(&padded).unwrap();
     assert!(doc.plain.contains("Suite: stable \t "));
     assert!(!doc.signed.windows(4).any(|w| w == b"le \t"));

@@ -1399,6 +1399,94 @@ Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
         );
     }
 
+    /// Pad every message line of a clearsigned document on the right, the way an attacker can.
+    ///
+    /// Only the message is padded, never the armor: a padded blank line in the armor header block
+    /// would stop `\n\n` from being found and the document would be refused for the wrong reason,
+    /// which is a harness that measures its own mistake rather than the property.
+    fn padded_on_the_right(armored: &str) -> String {
+        const SIG: &str = "-----BEGIN PGP SIGNATURE-----";
+        let body_at = armored
+            .find("\n\n")
+            .expect("the fixture has an armor header block")
+            + 2;
+        let sig_at = armored.find(SIG).expect("the fixture carries a signature");
+        // The message ends with the newline that belongs to the armor below it, so splitting leaves
+        // a final empty piece. Padding THAT one would append a whitespace line to the canonical text
+        // rather than pad an existing one, and the signature would fail — a harness editing the
+        // structure it means to leave alone.
+        let pieces: Vec<&str> = armored[body_at..sig_at].split('\n').collect();
+        let last = pieces.len() - 1;
+        let padded: Vec<String> = pieces
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                if i == last {
+                    (*l).to_string()
+                } else {
+                    format!("{l} \t ")
+                }
+            })
+            .collect();
+        format!(
+            "{}{}{}",
+            &armored[..body_at],
+            padded.join("\n"),
+            &armored[sig_at..]
+        )
+    }
+
+    #[test]
+    fn a_release_padded_where_the_signature_does_not_look_attests_the_very_same_digest() {
+        // An OpenPGP canonical text signature is computed over lines trimmed on the RIGHT only, so
+        // trailing whitespace added after signing still verifies while leading whitespace does not.
+        // The asymmetry is why this guard is one-sided: a right-pad is reachable by anyone who can
+        // rewrite the document in flight, a left-pad is not.
+        //
+        // `openpgp::verify_clearsigned` hands back the message **as transmitted**, padding included
+        // (its own test pins that, and it is the correct behaviour: only the hash input is
+        // canonicalised). So the padding an attacker adds reaches this module intact, and what makes
+        // it harmless is here rather than there — `signed_digest` splits on whitespace and trims its
+        // section headers, `valid_until` trims its value. Nothing tested that until this test, and
+        // the two halves of the property live in two files, which is how one of them gets
+        // "simplified" away. Measured against GnuPG on 2026-08-21: gpg strips the padding from its
+        // output and sbx keeps it, so the two disagree about the message and agree about what it
+        // attests. This asserts the second half.
+        let armored = include_str!("openpgp/clearsigned.txt");
+        let key = openpgp::parse_public_key(include_str!("openpgp/key.asc")).expect("key parses");
+        let padded = padded_on_the_right(armored);
+        assert_ne!(
+            padded, armored,
+            "the padding must actually change the document"
+        );
+
+        // First: the padded document still verifies. Without this the rest would be asserting
+        // whitespace handling on a document no attacker could get past the signature.
+        let release = openpgp::verify_clearsigned(&padded, &key, &key.fingerprint)
+            .expect("a right-padded document still verifies, which is what makes this reachable");
+        assert!(
+            release.contains(" \t \n"),
+            "the padding must survive into the message the caller acts on"
+        );
+
+        // Then: every answer this module draws from that message is unchanged.
+        assert_eq!(
+            signed_digest(&release, ATTESTED_PATH),
+            signed_digest(&attested_release(), ATTESTED_PATH),
+            "a padded `InRelease` must attest exactly what the unpadded one attests"
+        );
+        assert_eq!(
+            valid_until(&release),
+            valid_until(&attested_release()),
+            "padding must not change the staleness stamp either"
+        );
+        // And the chain still closes on the real index, so the property is asserted end to end
+        // rather than only on the parse.
+        let (algorithm, hex, size) =
+            signed_digest(&release, ATTESTED_PATH).expect("the padded release still attests");
+        assert!(index_matches(ATTESTED_INDEX, algorithm, &hex, size));
+    }
+
     #[test]
     fn an_index_the_signature_does_not_cover_is_refused_though_the_signature_is_valid() {
         let release = attested_release();
