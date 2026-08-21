@@ -880,7 +880,13 @@ fn persist_proc_rule(
 
 /// A short revision for display — the first seven hex characters, like git.
 fn short_rev(rev: &str) -> &str {
-    &rev[..rev.len().min(7)]
+    // Cut at a character boundary rather than at byte seven. A revision is hex today, so the two
+    // are the same cut; the function takes any `&str`, and a byte slice landing inside a multi-byte
+    // character is a panic where this is only ever asked for a shorter string.
+    match rev.char_indices().nth(7) {
+        Some((at, _)) => &rev[..at],
+        None => rev,
+    }
 }
 
 /// Seconds since boot, from `/proc/uptime` (its first field). Used only to show a
@@ -1025,6 +1031,10 @@ mod tests {
             "9ae611a"
         );
         assert_eq!(short_rev("abc"), "abc"); // shorter than seven is returned whole
+        // Not a revision, but the signature admits it: cutting by byte would panic here rather
+        // than answer, and this is the shape that would reach it (a branch or tag name).
+        assert_eq!(short_rev("naïve-branché-x"), "naïve-b");
+        assert_eq!(short_rev("héllo"), "héllo");
     }
 
     #[test]

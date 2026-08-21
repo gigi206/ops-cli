@@ -270,7 +270,7 @@ fn bundle_export(args: &[OsString]) -> ExitCode {
     };
     match out_file {
         Some(path) => {
-            if let Err(e) = std::fs::write(&path, &fragment) {
+            if let Err(e) = config::manage::write_text(&path, &fragment) {
                 diag::error(&format!(
                     "sbx: bundle export: cannot write {}: {e}",
                     path.display()

@@ -1203,6 +1203,14 @@ fn read_or_empty(path: &Path) -> Result<DocumentMut, ManageError> {
 /// write always passes its safety gate (a world-writable config is later refused); an existing
 /// file keeps its mode. The temp name carries the pid so two concurrent writers do not collide.
 fn write_doc(path: &Path, doc: &DocumentMut) -> Result<(), ManageError> {
+    write_text(path, &doc.to_string())
+}
+
+/// Write `text` to `path` on the terms [`write_doc`] describes — the body of it, shared with the
+/// one other place sbx writes a config file it composed: `sbx bundle export --out`. A fragment
+/// written straight through leaves a truncated file at a destination whose whole purpose is to be
+/// imported back, which is the half-write this function exists to prevent for the config itself.
+pub(crate) fn write_text(path: &Path, text: &str) -> Result<(), ManageError> {
     use std::os::unix::fs::PermissionsExt as _;
     let err = |e: std::io::Error| ManageError::Write(path.to_path_buf(), e.to_string());
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1215,7 +1223,7 @@ fn write_doc(path: &Path, doc: &DocumentMut) -> Result<(), ManageError> {
         .map(|m| m.permissions().mode() & 0o777)
         .unwrap_or(0o600);
     let tmp = dir.join(format!(".{name}.sbx-tmp.{}", std::process::id()));
-    std::fs::write(&tmp, doc.to_string()).map_err(err)?;
+    std::fs::write(&tmp, text).map_err(err)?;
     if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(err(e));
@@ -1408,6 +1416,49 @@ mod tests {
         let p = dir.join(".sbx.toml");
         std::fs::write(&p, body).unwrap();
         p
+    }
+
+    /// Everything sbx composes and writes to a config file goes through one atomic write, whatever
+    /// composed it: a document the config layer edited, and the fragment `sbx bundle export --out`
+    /// hands to a file the user is going to import back. A straight `write` leaves a truncated file
+    /// at that destination if the process dies mid-write.
+    ///
+    /// Injecting a crash mid-`write` is not reachable from a test, so what is asserted is what the
+    /// write leaves behind. "No temp sibling remains" alone would not do it: a straight
+    /// `fs::write` leaves none either, so an assertion satisfied by the defect is no assertion.
+    /// The rename is observable in the **inode**: it installs a fresh one, where a straight write
+    /// truncates the file in place and keeps it. That identity is not incidental — it is what lets
+    /// a cage already bound to the prior inode keep its own view of a file a later launch
+    /// rewrites.
+    #[test]
+    fn a_composed_fragment_is_written_atomically_and_leaves_no_temp() {
+        let dir = crate::testutil::TmpDir::new();
+        let out = dir.join("exported.toml");
+        write_text(&out, "[bundle.demo]\nallow = []\n").expect("the fragment is written");
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "[bundle.demo]\nallow = []\n"
+        );
+        let strays: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "exported.toml")
+            .collect();
+        assert!(strays.is_empty(), "a temp sibling was left: {strays:?}");
+
+        // Overwriting keeps the same rule, and the same single entry — and installs a new inode,
+        // which is the half of "atomic" that survives into something a test can read.
+        use std::os::unix::fs::MetadataExt as _;
+        let before = std::fs::metadata(&out).unwrap().ino();
+        write_text(&out, "[bundle.demo]\nallow = [\"{*} https://x.test\"]\n").expect("rewritten");
+        assert!(std::fs::read_to_string(&out).unwrap().contains("x.test"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_ne!(
+            std::fs::metadata(&out).unwrap().ino(),
+            before,
+            "the rewrite must arrive by rename, which is a new inode, not by truncating in place"
+        );
     }
 
     #[test]
