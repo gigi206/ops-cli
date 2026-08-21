@@ -5409,10 +5409,6 @@ fn build(
         ));
     }
 
-    // Every wrap this launch contributed, nested by `WrapLayer` rather than by the order the blocks
-    // above happened to run in.
-    let cmd = wrap_cage_command(cmd, wraps);
-
     // The launcher's extra binds, emitted after the structural mounts: the egress machinery
     // (socket + CA) and the GUI socket. Their destinations are sbx's or the host's, never a
     // project path, so they neither shadow nor are shadowed by a structural mount.
@@ -5607,6 +5603,23 @@ fn build(
     } else {
         compose_startup_cmd(&prep.cfg.provisions, &prep.cfg.service, &extra_env, cmd)
     };
+
+    // Every wrap this launch contributed, nested by `WrapLayer` rather than by the order the blocks
+    // above happened to run in — and nested **around the composed startup**, which is the whole
+    // point of doing it here rather than before the composition.
+    //
+    // An install step is not a peer of the command; it is the thing that finishes making the command
+    // runnable, so it needs everything the command needs. Wrapped the other way round the step ran
+    // *outside* every layer: before the mise equip lanes, so a step asking `mise where` about a
+    // package found nothing and failed the launch before the equip that would have installed it; and
+    // before the egress forwarder, so a step that downloads got its `https_proxy` pointed at a port
+    // with nothing listening yet. `provision`'s own documentation already says a step runs "in the
+    // same cage, under the same posture and allowlist" as the command, and this is what makes that
+    // true.
+    //
+    // `WrapLayer`'s ordering is unchanged: this moves the composed startup to where the app's bare
+    // command already was, so every pairwise constraint the enum documents holds exactly as before.
+    let startup_cmd = wrap_cage_command(startup_cmd, wraps);
     let spec = binds::build_spec(
         prep.layout.data_dir(),
         &prep.cwd,
@@ -7921,6 +7934,50 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
     /// Each marker wrap prepends its own name, so the composed argv reads outermost first — which is
     /// also the order the preambles run in. Registering them shuffled and still getting that order
     /// is what the layer tag buys: the four constraints below used to hold only because their blocks
+    /// The composed startup is what the wraps nest around, not a peer of it.
+    ///
+    /// `build` takes a `&Prepared`, so no unit test can reach it, and this ordering lives nowhere
+    /// else: [`wrap_cage_command`] cannot tell a bare command from a composed one, and every test of
+    /// [`compose_startup_cmd`] hands it a `cmd` directly. So the check is on the source, the way the
+    /// cage-suite and docs guards are, because the alternative is no check at all.
+    ///
+    /// What it protects is not a style preference. An install step finishes making the command
+    /// runnable, so it needs everything the command needs. Composed *after* the wraps it ran outside
+    /// every layer: before the mise equip lanes, so a step asking `mise where` about a package found
+    /// nothing and aborted the launch before the equip that would have installed it; and before the
+    /// egress forwarder, so a step that downloads got `https_proxy` pointed at a port with nothing
+    /// listening. Measured on three shipped bundles whose step does exactly that.
+    #[test]
+    fn the_wraps_nest_around_the_composed_startup_and_not_the_bare_command() {
+        let source = include_str!("launch.rs");
+        // The test module below calls both helpers too, so only `build`'s own body is read.
+        // Anchored on the test module itself, not on the first `#[cfg(test)]`: this file carries a
+        // test-only helper thousands of lines above it, and cutting there yields a body that ends
+        // before `build` begins. That mistake fails loudly here — the `expect` below fires — but it
+        // fails for the wrong reason, reporting a missing call where the real fault is the reader.
+        let body = &source[..source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the test module is where this file's non-production code ends")];
+        let compose = body
+            .find("compose_startup_cmd(&prep.cfg.provisions")
+            .expect("`build` composes the startup from the resolved provisions");
+        let wrap = body
+            .find("wrap_cage_command(startup_cmd, wraps)")
+            .expect("`build` nests the wraps around the composed startup, by that name");
+        assert!(
+            compose < wrap,
+            "`build` applies its wraps at byte {wrap} and composes the startup at {compose}: the \
+             composition has moved back outside the nesting, so every bundle's install step runs \
+             before the mise equip lanes and before the egress forwarder is up"
+        );
+        // The bare command must no longer be wrapped anywhere: a second call site would reinstate
+        // the old order for whichever branch reached it first.
+        assert!(
+            !body.contains("wrap_cage_command(cmd, wraps)"),
+            "`build` still wraps the bare command somewhere, so a launch can take the old order"
+        );
+    }
+
     /// sat in the right places, hundreds of lines apart, and nothing checked it.
     #[test]
     fn the_wraps_nest_by_layer_however_the_blocks_registered_them() {
