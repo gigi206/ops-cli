@@ -21,6 +21,17 @@ carries its own rationale and its own limits; what cuts across all of them is ga
 - [`sbx doctor` and prerequisites](getting-started/doctor): the runtime requirements and how to check them.
 - [Troubleshooting](getting-started/troubleshooting): the symptoms you may hit first, and the page that owns each fix.
 
+## How-to
+
+Task-oriented walkthroughs, commands in order, from nothing to a working setup.
+
+- [Run an agent on an untrusted project](how-to/run-agent-safely): launch first, declare
+  tools, shape the egress posture, keep credentials out of the cage, vouch last.
+- [Give a project a reproducible toolchain](how-to/reproducible-toolchain): `packages`,
+  pins, deliberate upgrades, reclaiming space.
+- [Restrict what a tool reaches](how-to/restrict-network): modes, rule grammar,
+  learning the rule set live, proving it before a launch.
+
 ## Concepts
 
 - [What sbx is (and is not)](concepts/overview): the reference class, the two actor modes.
@@ -32,6 +43,52 @@ carries its own rationale and its own limits; what cuts across all of them is ga
 - [Observability](concepts/observability): the process and filesystem lenses on a running cage.
 - [Provisioning model](concepts/provisioning): the rolling nix channel, the per-project store, self-equip.
 - [Directory layout](concepts/directory-layout): where the config, data, and trust state live.
+
+## Apps and profiles
+
+- [The app framework](apps/): named, reusable agent launchers.
+- [Per-app isolated `$HOME`](apps/home): persistent identity, `home_scope`.
+- [Portable profiles](apps/profiles): import, export, and the shipped starter profiles.
+- [Profile catalog](apps/catalog): the profiles shipped in this repository.
+
+## Networking (egress)
+
+- [Egress overview](networking/): the Model-B architecture (empty netns + host proxy).
+- [Architecture: Model B](networking/architecture): how a filtering posture works under the hood.
+- [Network modes](networking/modes): `none` / `shared` / `deny` / `allow` / `ask`.
+- [Rule grammar](networking/rules): hosts, `*.domain`, URLs, `re:`, `tcp://`, ports, `{VERB}`.
+- [Egress groups](networking/groups): reusable `[network.groups]` referenced by `@name`.
+- [Ask mode](networking/ask): park-and-confirm requests with `sbx net pending`.
+- [Inbound forwarding](networking/forward): `forward`, host loopback ports into the cage.
+- [Observability](networking/observability): `sbx net rules` / `stats` / `logs` / `live`, `sbx test net`.
+
+## Declared operations
+
+- [Declared operations](tasks/): a fixed command run with a credential the caller never holds.
+- [Parameters](tasks/parameters): `params`, the bounds that hold a caller, and `env_allow`.
+- [Credentials](tasks/credentials): `secret`, `encode`, and wire-injected credentials.
+- [What a task may run](tasks/execution): `spawn`, `[exec.<program>]`, and the task tool pool.
+- [What a task returns](tasks/output): substitution, and the `output` directory.
+- [Reaching a non-HTTP service](tasks/network): `tcp://` rules, in-cage listeners, ssh.
+
+## Secrets
+
+- [Secrets architecture](secrets/): the never-in-cage invariant, resolver × broker.
+- [Resolvers](secrets/resolvers): the source layer: `env://` / `file://` / `sops://`.
+- [Injection](secrets/injection): the http-header broker.
+- [Redaction](secrets/redaction): the outbound and inbound tripwires.
+- [OAuth sessions](secrets/oauth): taking the token out of the cage.
+- [Plugins](secrets/plugins): third-party resolvers, brokers and signers.
+- [Signed plugin stores](secrets/stores): distributing and installing them from a verified remote.
+
+## Housekeeping
+
+- [Sessions](housekeeping/sessions): `ls`, `attach`, `stop`, and `--detach`.
+- [Garbage collection](housekeeping/gc): `sbx gc`.
+- [Upgrading toolchains](housekeeping/upgrade): `sbx upgrade` and the lock model.
+
+The three sections below form the **reference** half of the site, which has its own
+navbar entry: they are for looking things up, not reading through.
 
 ## Configuration (`.sbx.toml`)
 
@@ -90,48 +147,6 @@ carries its own rationale and its own limits; what cuts across all of them is ga
 | [`store`](cli/store) | report what sbx occupies on disk |
 | [`path`](cli/path) | where the config, data, and state roots live |
 
-## Apps and profiles
-
-- [The app framework](apps/): named, reusable agent launchers.
-- [Per-app isolated `$HOME`](apps/home): persistent identity, `home_scope`.
-- [Portable profiles](apps/profiles): import, export, and the shipped starter profiles.
-- [Profile catalog](apps/catalog): the profiles shipped in this repository.
-
-## Networking (egress)
-
-- [Egress overview](networking/): the Model-B architecture (empty netns + host proxy).
-- [Architecture: Model B](networking/architecture): how a filtering posture works under the hood.
-- [Network modes](networking/modes): `none` / `shared` / `deny` / `allow` / `ask`.
-- [Rule grammar](networking/rules): hosts, `*.domain`, URLs, `re:`, `tcp://`, ports, `{VERB}`.
-- [Egress groups](networking/groups): reusable `[network.groups]` referenced by `@name`.
-- [Ask mode](networking/ask): park-and-confirm requests with `sbx net pending`.
-- [Inbound forwarding](networking/forward): `forward`, host loopback ports into the cage.
-- [Observability](networking/observability): `sbx net rules` / `stats` / `logs` / `live`, `sbx test net`.
-
-## Declared operations
-
-- [Declared operations](tasks/): a fixed command run with a credential the caller never holds.
-- [Parameters](tasks/parameters): `params`, the bounds that hold a caller, and `env_allow`.
-- [Credentials](tasks/credentials): `secret`, `encode`, and wire-injected credentials.
-- [What a task may run](tasks/execution): `spawn`, `[exec.<program>]`, and the task tool pool.
-- [What a task returns](tasks/output): substitution, and the `output` directory.
-- [Reaching a non-HTTP service](tasks/network): `tcp://` rules, in-cage listeners, ssh.
-
-## Secrets
-
-- [Secrets architecture](secrets/): the never-in-cage invariant, resolver × broker.
-- [Resolvers](secrets/resolvers): the source layer: `env://` / `file://` / `sops://`.
-- [Injection](secrets/injection): the http-header broker.
-- [Redaction](secrets/redaction): the outbound and inbound tripwires.
-- [Plugins](secrets/plugins): third-party resolvers, brokers and signers.
-- [Signed plugin stores](secrets/stores): distributing and installing them from a verified remote.
-
-## Housekeeping
-
-- [Sessions](concepts/sessions): `ls`, `attach`, `stop`, and `--detach`.
-- [Garbage collection](concepts/gc): `sbx gc`.
-- [Upgrading toolchains](concepts/upgrade): `sbx upgrade` and the lock model.
-
 ## Reference
 
 - [Environment variables](reference/environment-variables): `SBX_*` and the cage environment.
@@ -142,15 +157,17 @@ carries its own rationale and its own limits; what cuts across all of them is ga
 
 ## Reading paths
 
+The first three questions have a recipe that walks the whole path in commands
+([How-to](how-to/)); the links beside each are where to go deeper.
+
 - **"I want to run an agent on an untrusted project safely."**
-  [Security model](concepts/security-model) → [Apps](apps/) →
-  [Network modes](networking/modes) → [Secrets](secrets/).
+  [Recipe](how-to/run-agent-safely), then [Security model](concepts/security-model)
+  and [Secrets](secrets/).
 - **"I want to give my project a reproducible toolchain."**
-  [Provisioning](concepts/provisioning) → [`packages`](configuration/packages) /
-  [`[tools]`](configuration/tools) → [`sbx upgrade`](concepts/upgrade).
+  [Recipe](how-to/reproducible-toolchain), then [Provisioning](concepts/provisioning).
 - **"I want to lock down what a tool can reach on the network."**
-  [Network modes](networking/modes) → [Rule grammar](networking/rules) →
-  [Ask mode](networking/ask) → [Observability](networking/observability).
+  [Recipe](how-to/restrict-network), then [Network modes](networking/modes) and
+  [Rule grammar](networking/rules).
 - **"I just want the CLI."** [Command index](cli/).
 
 ---

@@ -30,7 +30,7 @@ you want. To advance a single app without working that out first, use
 the two channels whose unit of work is that app's own cage, and names the project-wide
 ones rather than rolling them.
 
-See also: [Upgrading toolchains](../concepts/upgrade) · [Provisioning](../concepts/provisioning) · [`nixpkgs`](../configuration/nixpkgs) · [`packages`](../configuration/packages).
+See also: [Upgrading toolchains](../housekeeping/upgrade) · [Provisioning](../concepts/provisioning) · [`nixpkgs`](../configuration/nixpkgs) · [`packages`](../configuration/packages).
 
 ## Behavior
 
@@ -152,5 +152,5 @@ sbx upgrade --project ~/work/api   # roll everything for another project
 sbx upgrade deb --project ~/work/api   # just its deb: packages
 ```
 
-See [Upgrading toolchains](../concepts/upgrade) for the lock model and the
+See [Upgrading toolchains](../housekeeping/upgrade) for the lock model and the
 "seeded not baked" contract.

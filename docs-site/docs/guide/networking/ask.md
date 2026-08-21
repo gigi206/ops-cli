@@ -34,7 +34,7 @@ blocks inside the cage while it waits for your live decision.
    ```
 
    This lists every request parked across every live `ask`-mode session, each with a
-   `<pid>.<seq>` id (the PID is the one [`sbx session ls`](../concepts/sessions)
+   `<pid>.<seq>` id (the PID is the one [`sbx session ls`](../housekeeping/sessions)
    shows). Identical retries of one URL collapse to a single `×N` line, so a tool
    that retries does not flood the list. Add `--json` for scripts, `-a <app>` to
    scope to one app's session(s).
@@ -178,7 +178,7 @@ that omits them leaves the inherited value unchanged).
 - [Network modes](modes#ask): where `ask` sits among the five postures.
 - [Rule grammar](rules): what `allow`/`deny` entries decide *before* a request
   reaches the park.
-- [Observability](observability): `sbx net rules --source session` (the rules a
+- [Egress observability](observability): `sbx net rules --source session` (the rules a
   session remembered), `sbx net logs` (watch every decision live).
 - [`sbx net pending` CLI reference](../cli/net)
 - [The trust gate](../concepts/trust): what `--save` re-trusts.

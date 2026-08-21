@@ -8,7 +8,7 @@ Run `<command>` inside the project sandbox and propagate its exit status, or, wi
 command, open the project's sandboxed shell. A `--` separates `sbx`'s flags from the
 command's, so `sbx run -- --detach` runs the literal `--detach`.
 
-See also: [Quick start](../getting-started/quickstart) · [`sbx app`](app) · [One-shot overrides](../configuration/overrides) · [Sessions](../concepts/sessions).
+See also: [Quick start](../getting-started/quickstart) · [`sbx app`](app) · [One-shot overrides](../configuration/overrides) · [Sessions](../housekeeping/sessions).
 
 ## Options
 

@@ -97,7 +97,7 @@ versions, and prints the exact declaration lines:
 sbx search ast-grep    # versions + [tools] / [packages] declaration lines
 ```
 
-Versions move only on [`sbx upgrade nix`](../concepts/upgrade): the base
+Versions move only on [`sbx upgrade nix`](../housekeeping/upgrade): the base
 userland, the channel pin and these packages advance together. Prefer `nix:` for
 the recommended set because presence must not depend on the cage's
 [`network`](network) posture: a `mise:` tool is fetched upstream-direct at

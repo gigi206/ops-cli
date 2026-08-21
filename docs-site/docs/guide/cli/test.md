@@ -7,7 +7,7 @@ sbx test net [--app <name>] [-X|--method <verb>] <url|tcp://host:port>
 A diagnostic surface that reports whether an access would be allowed, and why. No
 launch, no nix, no network: it reports a verdict against the resolved policy.
 
-See also: [`sbx net`](net) · [Network modes](../networking/modes) · [Rule grammar](../networking/rules) · [Observability](../networking/observability).
+See also: [`sbx net`](net) · [Network modes](../networking/modes) · [Rule grammar](../networking/rules) · [Egress observability](../networking/observability).
 
 ## `sbx test net`
 

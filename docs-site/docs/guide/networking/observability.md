@@ -1,4 +1,4 @@
-# Observability
+# Egress observability
 
 Five host-side surfaces let you see the egress policy and what it decided. None of
 them launches a sandbox or touches nix or the network: they read the resolved

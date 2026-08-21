@@ -159,7 +159,7 @@ sbx net deny  @telemetry -g           # to the global config's deny list
 ```
 
 `sbx net allow`/`deny` validate the reference name and write it like any other rule.
-See [Observability](observability#persisting-rules) for the write scopes.
+See [Egress observability](observability#persisting-rules) for the write scopes.
 
 ---
 
@@ -168,5 +168,5 @@ See [Observability](observability#persisting-rules) for the write scopes.
 - [Rule grammar](rules): what a group entry may contain, and how `@name` is
   parsed within a list.
 - [Network modes](modes): where the referencing `allow`/`deny` lists live.
-- [Observability](observability): `sbx net groups`, `sbx net rules --expand`.
+- [Egress observability](observability): `sbx net groups`, `sbx net rules --expand`.
 - [`sbx net` CLI reference](../cli/net)

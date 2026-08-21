@@ -201,7 +201,7 @@ flowchart LR
 The shared store is written only while sbx itself provisions into it, and is never bound
 into a cage. The per-project copy is what the agent gets, so self-equipping is real without
 being able to corrupt what other projects consume. Versions move only when
-[`sbx upgrade`](upgrade) rewrites a lock, never because the binary was updated. See
+[`sbx upgrade`](../housekeeping/upgrade) rewrites a lock, never because the binary was updated. See
 [Provisioning](provisioning) for the store model, and
 [`packages`](../configuration/packages) for the backend syntax.
 

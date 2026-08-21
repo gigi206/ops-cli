@@ -598,7 +598,7 @@ and an overlapping L7 rule. Test any rule set with
 - [Network modes](modes): where these lists live and how a mode is chosen.
 - [Egress groups](groups): the `@name` references above.
 - [Ask mode](ask): how an *undecided* request (matching neither list) is handled.
-- [Observability](observability): `sbx test net <url>` to check a rule, and
+- [Egress observability](observability): `sbx test net <url>` to check a rule, and
   `sbx net rules` to see the effective, expanded set.
 - [Secrets: injection](../secrets/injection) · [redaction](../secrets/redaction)
  : what rides the L7 path (and why L4 bypasses it).

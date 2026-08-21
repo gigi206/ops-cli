@@ -536,7 +536,7 @@ network alone, is what keeps host secrets out of the cage.
 - [Egress overview](../networking/): the one-paragraph summary and the mode table.
 - [Network modes](modes): the postures this architecture serves.
 - [Rule grammar](rules): L7 vs L4, and what the MITM path enforces.
-- [Observability](observability): the `blocked`/`error` verdicts and reason
+- [Egress observability](observability): the `blocked`/`error` verdicts and reason
   categories this page's guards produce.
 - [Secrets architecture](../secrets/): injection and redaction over this
   same proxy.

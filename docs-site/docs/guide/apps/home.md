@@ -125,7 +125,7 @@ sbx attach <id>     # join the running app's cage and open a shell inside it
 
 `sbx session attach` enters the live cage (its processes, its real `/tmp`, its network, and the
 app's isolated home as the agent currently sees it): not a fresh cage. See
-[`sbx session attach`](../cli/session#attach) and [Sessions](../concepts/sessions).
+[`sbx session attach`](../cli/session#attach) and [Sessions](../housekeeping/sessions).
 
 ## Removing an app's home
 

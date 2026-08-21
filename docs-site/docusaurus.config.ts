@@ -88,7 +88,10 @@ const config: Config = {
         height: 26,
       },
       items: [
-        { type: 'docSidebar', sidebarId: 'guideSidebar', position: 'left', label: 'Docs' },
+        // One navbar entry per sidebar half: the guide you read, the reference you
+        // look things up in (see sidebars.ts for the partition principle).
+        { type: 'docSidebar', sidebarId: 'guideSidebar', position: 'left', label: 'Guide' },
+        { type: 'docSidebar', sidebarId: 'referenceSidebar', position: 'left', label: 'Reference' },
         // The theme's own search slot, filled by src/theme/SearchBar. Declared
         // before the repository link so the bar reads: search, repository, mode.
         { type: 'search', position: 'right' },

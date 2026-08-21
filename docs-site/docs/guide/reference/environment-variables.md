@@ -202,7 +202,7 @@ cage. The one worth knowing:
 
 | Variable | Effect |
 |---|---|
-| `MISE_MINIMUM_RELEASE_AGE` | overrides mise's built-in 24 h fresh-release hold; `"0"` installs the newest upstream release immediately. See [Upgrading toolchains](../concepts/upgrade#installing-the-newest-release-immediately). |
+| `MISE_MINIMUM_RELEASE_AGE` | overrides mise's built-in 24 h fresh-release hold; `"0"` installs the newest upstream release immediately. See [Upgrading toolchains](../housekeeping/upgrade#installing-the-newest-release-immediately). |
 
 Set it in the **global** config to apply to every app: edit `sbx/sbx.toml` or run
 `sbx config set --global env.MISE_MINIMUM_RELEASE_AGE 0` (`--local` for one project). A

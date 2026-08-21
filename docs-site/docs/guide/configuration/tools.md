@@ -6,7 +6,7 @@ This is distinct from the trusted-only [`[packages]`](packages) field: `[tools]`
 is the **open, local, self-equip** path, the way an agent equips a project's tools
 from inside the cage.
 
-See also: [`packages`](packages) · [Provisioning](../concepts/provisioning) · [`sbx mise`](../cli/mise) · [`sbx upgrade mise`](../concepts/upgrade).
+See also: [`packages`](packages) · [Provisioning](../concepts/provisioning) · [`sbx mise`](../cli/mise) · [`sbx upgrade mise`](../housekeeping/upgrade).
 
 ## The `nix:` prefix: an exact, pinned dev toolchain
 

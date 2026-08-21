@@ -76,7 +76,7 @@ pasta NAT) are in [architecture](architecture) (the section above).
   reference it from any allow/deny list with `@name`.
 - **[Ask mode](ask)**: the park-and-confirm workflow end to end, with
   `sbx net pending` and `sbx net pending watch`.
-- **[Observability](observability)**: inspect and audit egress with
+- **[Egress observability](observability)**: inspect and audit egress with
   `sbx net rules`, `sbx net stats`, `sbx net logs`, `sbx net live`, and
   `sbx test net`.
 - **[Architecture](architecture)**: how Model B works under the hood, and why

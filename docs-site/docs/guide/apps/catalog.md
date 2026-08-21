@@ -194,7 +194,7 @@ tool **fetches at first launch**, so a profile's *first* launch in a given proje
 the network; a `nix:` tool is seeded and reusable offline. The `deb:`, `appimage:` and
 `tarball:` backends fetch a published upstream artifact the same way; see
 [Packages](../configuration/packages). Advancing an already-installed version via
-`sbx upgrade` is supported: see [Upgrading](../concepts/upgrade).
+`sbx upgrade` is supported: see [Upgrading](../housekeeping/upgrade).
 
 ## Adjusting the allowlist
 

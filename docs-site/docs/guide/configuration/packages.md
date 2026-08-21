@@ -13,7 +13,7 @@ The **name** is a free label: the merge key across layers and the on-disk root n
 The **value carries a mandatory backend prefix**. `packages` is a **security field**:
 honored only from a trusted source (all three backends).
 
-See also: [Provisioning](../concepts/provisioning) · [`[tools]` (mise)](tools) · [`sbx search`](../cli/search) · [`sbx upgrade`](../concepts/upgrade).
+See also: [Provisioning](../concepts/provisioning) · [`[tools]` (mise)](tools) · [`sbx search`](../cli/search) · [`sbx upgrade`](../housekeeping/upgrade).
 
 ## The mandatory backend prefix
 
@@ -42,7 +42,7 @@ jq   = "nix:jq"
 Provisioned **host-side** from the pinned nixpkgs channel into `sbx`'s store, its
 `bin/` prepended to the cage `PATH`. Durable and offline-reusable (seeded into the
 per-project store). Use [`sbx search <query>`](../cli/search) to find attribute
-names. Advances with [`sbx upgrade nix`](../concepts/upgrade).
+names. Advances with [`sbx upgrade nix`](../housekeeping/upgrade).
 
 #### Unfree packages build without asking
 
@@ -94,7 +94,7 @@ tool  = "mise:npm:some-cli"
 Equipped **in-cage** with `mise use -g --pin <token>` at launch, fetched upstream-direct
 (so it is fresher than nixpkgs but the first launch needs network). Any mise backend
 works: `aqua:`, `github:`, `npm:`, `cargo:`, a plain registry token, etc. Advances
-with [`sbx upgrade mise`](../concepts/upgrade).
+with [`sbx upgrade mise`](../housekeeping/upgrade).
 
 **The equip pins; the roll is what moves the pin.** `--pin` writes the version it actually
 installed into the cage's own mise config, in place of the floating request you wrote. This
@@ -102,7 +102,7 @@ matters because the tool on the cage's `PATH` is a mise *shim*, which re-resolve
 that config says on every exec. Left floating, an app launches only for as long as
 upstream's current version is the one already in the pool, and stops launching the day a new
 one is published, with nothing about the cage having changed.
-[`sbx upgrade mise`](../concepts/upgrade) is the other half of the pair: it advances the pin
+[`sbx upgrade mise`](../housekeeping/upgrade) is the other half of the pair: it advances the pin
 when you ask it to, and only then.
 
 **The pin covers the tools the profile declares today.** A launch rewrites the entry for
@@ -135,7 +135,7 @@ mise holds a release back until it has been public for a while. That delay is a 
 protection: an artefact replaced minutes ago has had no time to be noticed, and a roll that always
 took the newest build would carry a compromised one the moment it appeared. sbx does not set the
 delay and does not override it, so whatever mise's default is, is what governs every `mise:` package
-here. One consequence is worth stating plainly: [`sbx upgrade mise`](../concepts/upgrade) advances a
+here. One consequence is worth stating plainly: [`sbx upgrade mise`](../housekeeping/upgrade) advances a
 pin to the newest **eligible** release, which is not always the newest release.
 
 The delay has a failure mode, and it is silent. A vendor that publishes several times a day never
@@ -176,7 +176,7 @@ config cannot aim the build at a host path. The build fetches its inputs over th
 network (not the cage allowlist), so a flake whose build self-fetches with its own HTTP
 client (e.g. `bun install`) builds fine: the cage allowlist governs only the app's
 **runtime** egress. Pins advance with
-[`sbx upgrade flake`](../concepts/upgrade).
+[`sbx upgrade flake`](../housekeeping/upgrade).
 
 ## `[flakes]`: an inline nix flake
 

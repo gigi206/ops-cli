@@ -41,14 +41,14 @@ The important subtrees:
 | `projects/<id>/apps/<name>/mise/` | a global app's **per-project mise pool**: its `nix:`-via-mise self-equips, kept `/nix`-aligned |
 | `apps/<name>/home/` | an app's persistent isolated `$HOME` (`home_scope = "global"`) |
 | `apps/<name>/nixpkgs.lock` | that app's own base channel revision, rolled by [`sbx upgrade nix --app <name>`](../cli/upgrade#an-apps-base-channel) |
-| `sessions/` | the daemonless session registry ([`sbx session ls`](../concepts/sessions)) |
+| `sessions/` | the daemonless session registry ([`sbx session ls`](../housekeeping/sessions)) |
 | `egress/` | per-launch egress proxy sockets and CA material |
 | `fs/` | per-launch filesystem plumbing: the observation socket, and `mask-<pid>/` holding the two decoys an [`[fs]`](../configuration/fs) policy mounts |
 | `mise/`, `mise-plugin/` | the host-side mise home and the embedded `nix:` backend plugin |
 | `plugins/` | installed [resolver plugins](../secrets/plugins) |
 | `stores/<name>/` | cached, verified remote [plugin stores](../secrets/plugins) |
 | `apt-keys/` | signing keys pinned for [`deb:apt:` repositories](../configuration/packages#signed-apt-indexes), one per repository |
-| `nixpkgs.lock` | the global base channel revision (see [Upgrading](../concepts/upgrade)) |
+| `nixpkgs.lock` | the global base channel revision (see [Upgrading](../housekeeping/upgrade)) |
 | `mise-engine.lock` | the mise engine revision, independent of the base channel |
 
 The **per-project** directory `projects/<id>/` holds the project's own writable nix

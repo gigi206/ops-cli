@@ -164,7 +164,7 @@ worded to prevent.
 - Byte-exact and per message, with the same honest scope as the rest of this page: a
   re-encoded value, or one split across two separate messages, is not caught.
 
-See [Observability](../networking/observability#a-secret-crossing-a-websocket) for the
+See [Egress observability](../networking/observability#a-secret-crossing-a-websocket) for the
 `--json` shape. And as everywhere on this page, the structural controls below are what
 actually bound the damage.
 

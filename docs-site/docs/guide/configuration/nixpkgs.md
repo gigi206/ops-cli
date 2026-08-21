@@ -11,7 +11,7 @@ nixpkgs = "nixos-23.11"                                   # a branch/channel
 project, ignored from an untrusted one: because the source of your toolchain is a
 supply-chain-relevant choice.
 
-See also: [Provisioning](../concepts/provisioning) · [`sbx upgrade`](../concepts/upgrade) · [`packages`](packages).
+See also: [Provisioning](../concepts/provisioning) · [`sbx upgrade`](../housekeeping/upgrade) · [`packages`](packages).
 
 ## What it accepts
 
@@ -46,7 +46,7 @@ OS-substrate layer.)
 ## Source-aware locks
 
 The resolved revision is recorded in a lock so versions do not move on an `sbx` binary
-update, only on an explicit [`sbx upgrade`](../concepts/upgrade):
+update, only on an explicit [`sbx upgrade`](../housekeeping/upgrade):
 
 - A **global** override records to the shared `<data>/nixpkgs.lock`.
 - A trusted **project** pin records to a per-project
@@ -68,7 +68,7 @@ A **channel** pin (`nixos-23.11`) advances *within itself* only via `sbx upgrade
 in that project, a global upgrade would not touch a project's own pin. A **revision**
 pin refreshes to itself (a no-op). An app is the same shape one level down:
 `sbx upgrade nix` does not move it, `sbx upgrade nix --app <name>` does. See
-[Upgrading](../concepts/upgrade).
+[Upgrading](../housekeeping/upgrade).
 
 ## Viewing the effective channel
 

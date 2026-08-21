@@ -1,4 +1,4 @@
-# Observability
+# Observability: the four lenses
 
 The **observability stack** lets you inspect and stream the activity of a running
 agent's cage. It is host-side, read-only, unprivileged, and entirely separate from
@@ -177,6 +177,6 @@ lens uses.
 - [`sbx fs`](../cli/fs): `logs` (the filesystem lens reader)
 - [Egress observability](../networking/observability): the third lens, in full
 - [`sbx ssh-agent`](../cli/ssh-agent): the fourth, and what its record is worth
-- [Sessions](sessions): the registry the shared `<id>` comes from
+- [Sessions](../housekeeping/sessions): the registry the shared `<id>` comes from
 - [The trust gate](trust): observation is a host-side lens, not a security field
 - Design rationale is recorded in this page (process tree + filesystem lens, host-side only, no new attack surface).

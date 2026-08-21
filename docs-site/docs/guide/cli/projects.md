@@ -14,7 +14,7 @@ removes them. Bare `sbx projects` prints this page. `sbx project` is an alias.
 Removing a tree is host-side only (no sandbox, no nix). Its nix store closures are left for
 [`sbx gc`](gc) to reclaim, or add `--gc` to do both at once.
 
-See also: [`sbx gc`](gc) · [`sbx path`](path) · [Garbage collection](../concepts/gc) · [Directory layout](../concepts/directory-layout).
+See also: [`sbx gc`](gc) · [`sbx path`](path) · [Garbage collection](../housekeeping/gc) · [Directory layout](../concepts/directory-layout).
 
 ## `list`
 

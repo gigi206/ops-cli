@@ -13,7 +13,7 @@ or a command inside one, and `sbx session stop` ends them.
 Host-side: reads the on-disk session registry (daemonless), launches nothing. `sbx sessions`
 is an alias.
 
-See also: [Sessions](../concepts/sessions) · [`sbx projects`](projects) · [`sbx gc`](gc).
+See also: [Sessions](../housekeeping/sessions) · [`sbx projects`](projects) · [`sbx gc`](gc).
 
 ## `ls`
 
@@ -29,7 +29,7 @@ can tell which sessions are agents. `sbx session list` is an accepted alias.
 Sessions are created by [`sbx run --detach`](run), [`sbx app run --detach`](app), and
 interactive [`sbx run`](run) / [`sbx app`](app) launches. The registry is
 liveness-validated by `(pid, start_time)` to defeat pid reuse. See
-[Sessions](../concepts/sessions).
+[Sessions](../housekeeping/sessions).
 
 ```sh
 sbx session ls

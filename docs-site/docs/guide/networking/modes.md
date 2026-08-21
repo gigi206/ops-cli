@@ -362,7 +362,7 @@ by invocation.
 - [Rule grammar](rules): what goes in the `allow`/`deny` lists.
 - [Ask mode](ask): the `ask` posture's workflow.
 - [Egress groups](groups): reuse a set of hosts across apps.
-- [Observability](observability): inspect the effective mode and rules.
+- [Egress observability](observability): inspect the effective mode and rules.
 - [`network` configuration reference](../configuration/network)
 - [The trust gate](../concepts/trust): what "trusted" means and how to grant it.
 - [Apps](../apps/): Mode B and `default_methods` in context.

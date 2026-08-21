@@ -7,7 +7,7 @@ sbx net <subcommand> [args...]
 The egress-policy surface. Host-side: no launch, no nix. (Distinct from
 [`sbx test net <url>`](test), which tests one URL against the policy.)
 
-See also: [The four lenses](../concepts/observability#the-four-lenses) · [Networking overview](../networking/) · [Rule grammar](../networking/rules) · [Ask mode](../networking/ask) · [Observability](../networking/observability) · [Egress groups](../networking/groups).
+See also: [The four lenses](../concepts/observability#the-four-lenses) · [Networking overview](../networking/) · [Rule grammar](../networking/rules) · [Ask mode](../networking/ask) · [Egress observability](../networking/observability) · [Egress groups](../networking/groups).
 
 ## Subcommands
 
@@ -35,7 +35,7 @@ rule shows `tcp://`; a `[network.groups]` group shows as one `@<name>` row (`--e
 unfolds it). `--app <name>` shows what `sbx app run <name>` would launch with. `--source
 session` queries live `ask`-session rules remembered from `--session` answers (`manual`
 is accepted as an alias). Under
-`shared`/`none` there are no rules. See [Observability](../networking/observability).
+`shared`/`none` there are no rules. See [Egress observability](../networking/observability).
 
 A rule that matches **every** host is tagged as such: `allow re:.* (config, matches
 every host)`, and `"catch_all": true` under `--json`. The reach of a `re:` rule lives in
@@ -192,7 +192,7 @@ Per destination host, how many requests this project's launches **allowed**, **d
 (by a rule or an `ask` decision), or had **blocked** by a security guard (SSRF, an
 outbound-secret tripwire, a host mismatch). Persist after the session (owner-only);
 recording is on by default (a trusted `[network] stats = false` disables it). See
-[Observability](../networking/observability).
+[Egress observability](../networking/observability).
 
 ## `sbx net logs`
 
@@ -213,7 +213,7 @@ rule suppressed (tagged `muted`; still counted in `stats`).
 heads, then the leading bytes of each body), for a session launched with
 [`[network] capture`](../networking/observability#seeing-the-traffic-network-capture)
 on. Secrets are masked and an sbx-injected credential is named, never valued. See
-[Observability](../networking/observability).
+[Egress observability](../networking/observability).
 
 A `!` line under an event reports a configured secret **seen crossing that exchange's
 WebSocket**, by name and direction. It needs no flag, and it is a report rather than a
@@ -238,7 +238,7 @@ WebSockets, and large L7 transfers in progress. Byte counts are application byte
 inspected `https`/`http` flow, encrypted bytes on a raw `tcp` splice. The redraw needs a
 terminal; `--json` emits one snapshot object per tick (NDJSON) for a pipe. Only a filtering
 posture (`deny`/`allow`/`ask`) runs a proxy, so only those sessions have flows. See
-[Observability](../networking/observability).
+[Egress observability](../networking/observability).
 
 ## Examples
 

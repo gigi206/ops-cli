@@ -6,7 +6,7 @@ declares, and the tools an agent installs for itself) is provisioned by
 **daemonless [nix](https://nixos.org/)** into a store `sbx` owns, and bound into the
 cage. This page explains that store model and how it stays reproducible.
 
-See also: [Directory layout](../concepts/directory-layout) · [`packages`](../configuration/packages) · [Upgrading](../concepts/upgrade).
+See also: [Directory layout](../concepts/directory-layout) · [`packages`](../configuration/packages) · [Upgrading](../housekeeping/upgrade).
 
 ## nix as a rolling OS on a channel
 
@@ -21,7 +21,7 @@ The consequence is the property the design calls **"seeded, not baked"**:
 
 `sbx upgrade [all|nix|mise|flake]` re-resolves the relevant channel and rewrites its
 lock; a launch reads the lock that `upgrade` wrote. See
-[Upgrading](../concepts/upgrade) and the [`sbx upgrade` reference](../cli/upgrade).
+[Upgrading](../housekeeping/upgrade) and the [`sbx upgrade` reference](../cli/upgrade).
 
 ## The shared store
 
@@ -184,6 +184,6 @@ The two engines differ in how complete the independence is:
 - [`packages` configuration](../configuration/packages): declaring `nix:` / `mise:` / `flake:` tools
 - [`nixpkgs` configuration](../configuration/nixpkgs): pinning the channel
 - [`tools` configuration](../configuration/tools): mise `[tools]` and self-equip
-- [Upgrading](../concepts/upgrade): how versions actually move
+- [Upgrading](../housekeeping/upgrade): how versions actually move
 - [`sbx mise` reference](../cli/mise) · [`sbx upgrade` reference](../cli/upgrade)
 - [Enforcement stack](enforcement): the always-on layers the cage runs behind

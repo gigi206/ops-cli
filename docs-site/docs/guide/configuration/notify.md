@@ -13,7 +13,7 @@ task    = "off"          # never
 ```
 
 See also: [`[network]`](network) · [`[proc]`](proc) · [Declared operations](../tasks/) ·
-[Observability](../concepts/observability) · [One-shot overrides](overrides#--notify-how-loudly-one-launch-speaks).
+[Observability lenses](../concepts/observability) · [One-shot overrides](overrides#--notify-how-loudly-one-launch-speaks).
 
 A refusal is invisible by design. When the network policy turns a request down, the agent gets a
 `403` it is under no obligation to mention; when the exec policy stops a program, the `execve`

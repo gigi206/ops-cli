@@ -17,7 +17,7 @@ store. Reclamation is irreversible, so the destructive form is opt-in: without
 Removing whole per-project runtime **trees** (a project whose directory is gone, or a
 markerless legacy tree) is a separate command: [`sbx projects rm`](projects).
 
-See also: [`sbx store`](store) · [`sbx projects`](projects) · [Garbage collection](../concepts/gc) · [Directory layout](../concepts/directory-layout) · [Provisioning](../concepts/provisioning).
+See also: [`sbx store`](store) · [`sbx projects`](projects) · [Garbage collection](../housekeeping/gc) · [Directory layout](../concepts/directory-layout) · [Provisioning](../concepts/provisioning).
 
 ## Behavior
 
@@ -66,7 +66,7 @@ sbx gc --all --prune      # also collect the shared store
 To reclaim a removed project tree's store closures, run `sbx gc --all --prune` after
 `sbx projects rm`, or do both at once with `sbx projects rm <id> --gc`.
 
-See [Garbage collection](../concepts/gc) for the details.
+See [Garbage collection](../housekeeping/gc) for the details.
 
 ## Deduplication
 

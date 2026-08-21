@@ -1,9 +1,20 @@
 import type { SidebarsConfig } from '@docusaurus/plugin-content-docs';
 
-// The navigation is listed explicitly rather than derived from the directory tree: the
-// guide's pages carry no frontmatter, and a section's order is a choice. Most sections
-// are ordered editorially, by reading order; `Command reference` alone is alphabetical,
-// since a reader arrives there already knowing the verb's name.
+// The site has two halves, each with its own sidebar and its own navbar entry:
+//
+//   guideSidebar     what you read: start, recipes, concepts, workflows, operations.
+//                    Ordered editorially, by reading order; a linear reader meets the
+//                    product before its knobs.
+//   referenceSidebar what you look up: configuration fields, CLI verbs, env vars,
+//                    exit codes, glossary. Nobody reads these linearly, so they are
+//                    grouped for scanning instead: Configuration by subject (a reader
+//                    knows what they want the cage to do, not which field does it),
+//                    Command reference alphabetically (a reader already has the
+//                    verb's name). The thematic view of the verbs lives in
+//                    `cli/index`, where it costs nothing.
+//
+// The navigation is listed explicitly rather than derived from the directory tree:
+// the guide's pages carry no frontmatter, and a section's order is a choice.
 // A new page therefore has to be listed here, or it ships reachable only by URL
 // and by search.
 const sidebars: SidebarsConfig = {
@@ -21,6 +32,16 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
+      label: 'How-to',
+      items: [
+        'how-to/index',
+        'how-to/run-agent-safely',
+        'how-to/reproducible-toolchain',
+        'how-to/restrict-network',
+      ],
+    },
+    {
+      type: 'category',
       label: 'Concepts',
       items: [
         'concepts/overview',
@@ -30,19 +51,64 @@ const sidebars: SidebarsConfig = {
         'concepts/trust',
         'concepts/enforcement',
         'concepts/observability',
-        'concepts/sessions',
         'concepts/provisioning',
-        'concepts/upgrade',
-        'concepts/gc',
         'concepts/directory-layout',
       ],
     },
-    // Configuration and Command reference carry roughly half the guide between them, so
-    // each is grouped rather than listed flat — on different principles, because they
-    // are read differently. Configuration groups by subject: a reader knows what they
-    // want the cage to do, not which field does it. The command reference is
-    // alphabetical: a reader already has the verb's name and wants its page. The
-    // thematic view of the verbs lives in `cli/index` instead, where it costs nothing.
+    {
+      type: 'category',
+      label: 'Apps and profiles',
+      items: ['apps/index', 'apps/home', 'apps/profiles', 'apps/catalog'],
+    },
+    {
+      type: 'category',
+      label: 'Networking',
+      items: [
+        'networking/index',
+        'networking/architecture',
+        'networking/modes',
+        'networking/rules',
+        'networking/groups',
+        'networking/forward',
+        'networking/ask',
+        'networking/observability',
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Declared operations',
+      items: [
+        'tasks/index',
+        'tasks/parameters',
+        'tasks/credentials',
+        'tasks/execution',
+        'tasks/output',
+        'tasks/network',
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Secrets',
+      items: [
+        'secrets/index',
+        'secrets/resolvers',
+        'secrets/injection',
+        'secrets/redaction',
+        'secrets/oauth',
+        'secrets/plugins',
+        'secrets/stores',
+      ],
+    },
+    // Operations rather than model: sessions, gc and upgrade are commands a user runs
+    // over a project's lifetime, not ideas the rest of the guide builds on, so they
+    // leave Concepts for their own section, under docs/housekeeping/.
+    {
+      type: 'category',
+      label: 'Housekeeping',
+      items: ['housekeeping/sessions', 'housekeeping/gc', 'housekeeping/upgrade'],
+    },
+  ],
+  referenceSidebar: [
     {
       type: 'category',
       label: 'Configuration',
@@ -139,50 +205,6 @@ const sidebars: SidebarsConfig = {
         'cli/untrust',
         'cli/upgrade',
         'cli/version',
-      ],
-    },
-    {
-      type: 'category',
-      label: 'Apps and profiles',
-      items: ['apps/index', 'apps/home', 'apps/profiles', 'apps/catalog'],
-    },
-    {
-      type: 'category',
-      label: 'Networking',
-      items: [
-        'networking/index',
-        'networking/architecture',
-        'networking/modes',
-        'networking/rules',
-        'networking/groups',
-        'networking/forward',
-        'networking/ask',
-        'networking/observability',
-      ],
-    },
-    {
-      type: 'category',
-      label: 'Declared operations',
-      items: [
-        'tasks/index',
-        'tasks/parameters',
-        'tasks/credentials',
-        'tasks/execution',
-        'tasks/output',
-        'tasks/network',
-      ],
-    },
-    {
-      type: 'category',
-      label: 'Secrets',
-      items: [
-        'secrets/index',
-        'secrets/resolvers',
-        'secrets/injection',
-        'secrets/redaction',
-        'secrets/oauth',
-        'secrets/plugins',
-        'secrets/stores',
       ],
     },
     {
