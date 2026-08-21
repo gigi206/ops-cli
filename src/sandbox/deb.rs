@@ -665,7 +665,7 @@ fn github_asset_url(
     Ok(url)
 }
 
-fn select_deb_asset(json: &serde_json::Value, system: &str) -> Option<String> {
+pub(super) fn select_deb_asset(json: &serde_json::Value, system: &str) -> Option<String> {
     let (accept, reject) = prebuilt::arch_tokens(system);
     let mut native: Vec<(String, String)> = json
         .get("assets")?

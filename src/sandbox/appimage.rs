@@ -157,7 +157,7 @@ pub(crate) fn resolve_source(
 /// asset whose name names a *foreign* arch is dropped, then one positively naming this arch is chosen
 /// (deterministic by name); a single unambiguous `.AppImage` with no arch token is the fallback for a
 /// single-arch repo. Pure, so selection is testable against captured release JSON.
-fn select_appimage_asset(json: &serde_json::Value, system: &str) -> Option<String> {
+pub(super) fn select_appimage_asset(json: &serde_json::Value, system: &str) -> Option<String> {
     let (accept, reject) = prebuilt::arch_tokens(system);
     let mut native: Vec<(String, String)> = json
         .get("assets")?

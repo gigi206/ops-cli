@@ -33,6 +33,8 @@ pub(crate) mod taskpool;
 // Provisioning & packaging: the nix/mise engines, the package backends, the store.
 mod appimage;
 mod binary;
+#[cfg(test)]
+mod catalogue_freshness;
 // The wire a broker plugin is driven over: sbx asks about one frame, the plugin answers a verdict.
 // Kept apart from the declaration it serves (`crate::plugins::broker`) exactly as the resolver
 // runner is kept apart from the manifest it runs.

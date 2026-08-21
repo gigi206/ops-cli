@@ -19,7 +19,7 @@ mod load;
 pub(crate) mod manage;
 pub(crate) mod overrides;
 pub(crate) mod safety;
-mod schema;
+pub(crate) mod schema;
 mod secrets;
 pub(crate) mod tasks;
 mod types;

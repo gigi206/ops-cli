@@ -1,0 +1,92 @@
+# Catalogue — asks the shipped profiles' vendors whether their packages can still be found.
+#
+# WHAT PROBLEM THIS SOLVES, AND WHAT IT COST TO NOT HAVE IT. `aionui` named
+# `deb:github:iOfficeAI/AionUi`, which resolves through the latest release's linux-amd64 asset.
+# Upstream stopped attaching assets on 2026-08-05 and the app could be neither launched nor upgraded
+# from that day. It was found on 2026-08-21, by launching it. Nothing in this repository asked a
+# vendor anything: the `every_shipped_*` guards read files, and a file cannot say that the thing it
+# points at is gone. Sixteen days of green over an app that could not start.
+#
+# WHY IT IS NOT PART OF `ci.yml`. Every check is a network call to a third party. `cargo test` runs
+# offline, on contributors' machines and in a hosted job that has no business being red because a
+# vendor is having an afternoon. `src/sandbox/catalogue_freshness.rs` is therefore inert unless
+# `SBX_CATALOGUE_CHECK=1` arms it — this workflow is the thing that arms it, and the only one.
+#
+# WHAT A RED MEANS. A vendor briefly unreachable fails this run, and that is deliberate rather than
+# papered over: retrying until green would hide exactly the outage worth knowing about, and the
+# finding this exists for is durable by nature — a vendor that stopped publishing stays stopped.
+# Read a red as "go look at the named package", never as "the tree is broken".
+#
+# WHAT IT DOES NOT CATCH. Resolution only. On the day it was written, three of the seven broken apps
+# would have survived it: `deepseek-harness`, `sigit` and `reasonix` resolved their version and
+# failed at *install*; `junie` and `openfox` resolved and installed and failed at *launch*. Catching
+# those means launching 71 apps, which is a different run with a different budget. The module's
+# header carries the same limit, so neither can be read as the wider claim.
+#
+# THE MISE IS THE PINNED ONE, NOT A CONVENIENT ONE. `mise:` packages are the largest population
+# here, and what a `mise latest` answers depends on the mise asked: a version that resolves under
+# one client can return nothing under another. sbx equips its cages with the nixpkgs mise of the
+# revision its engine lock names, so this run realises that same revision instead of installing
+# whatever the runner offers.
+#
+# ACTIONS ARE PINNED BY COMMIT, as everywhere in this repository: a tag is a mutable pointer and a
+# third-party action runs with more of this repository's trust than an apt index does.
+
+name: Catalogue
+
+on:
+  schedule:
+    # Daily, off the hour: nothing here is urgent to the minute, and a vendor's own publish window is
+    # what this is watching rather than racing.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: catalogue
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The same revision the publish workflows pin, so the mise asked here is the mise a cage equips.
+  NIXPKGS_REV: "89570f24e97e614aa34aa9ab1c927b6578a43775"
+
+jobs:
+  freshness:
+    name: every shipped package still resolves at its vendor
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          extra_conf: |
+            experimental-features = nix-command flakes
+
+      - name: Realise the pinned mise
+        id: mise
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$(nix build "github:NixOS/nixpkgs/${NIXPKGS_REV}#mise" --no-link --print-out-paths)"
+          test -x "$out/bin/mise" || { echo "no bin/mise in the realised output" >&2; exit 1; }
+          echo "path=$out/bin/mise" >> "$GITHUB_OUTPUT"
+          "$out/bin/mise" --version
+
+      - name: Ask every vendor
+        shell: bash
+        env:
+          SBX_CATALOGUE_CHECK: "1"
+          SBX_CATALOGUE_MISE: ${{ steps.mise.outputs.path }}
+          # Lifts the 60/hour anonymous cap the GitHub-backed entries and the resolvers share. Read
+          # only: this job publishes nothing.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo test --bin sbx every_shipped_package_still_resolves_at_its_vendor -- --nocapture
