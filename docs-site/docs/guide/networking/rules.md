@@ -397,11 +397,21 @@ splice, use a **host-level** deny: `deny evil.com:*` (or a port-agnostic
 it is refused. `udp://` is not supported; any other scheme in a rule is rejected
 with a pointer.
 
-A **deny wins across layers**: a host-level deny (`deny evil.com:80`,
-`deny http://evil.com`, or a port-agnostic `deny evil.com:*`) suppresses a matching
-`http://` allow, just as it suppresses a `tcp://` splice. As with a splice, a deny
-scoped to the wrong port does not block a host outright: a bare `deny evil.com`
-(port 443) does not stop `http://evil.com` (port 80); name the port or use `:*`.
+A **deny wins across layers**: a host-level deny (`deny evil.com:80`, or a
+port-agnostic `deny evil.com:*`) suppresses a matching `http://` allow, just as it
+suppresses a `tcp://` splice. As with a splice, a deny scoped to the wrong port does not
+block a host outright: a bare `deny evil.com` (port 443) does not stop
+`http://evil.com` (port 80); name the port or use `:*`.
+
+**A deny that names a scheme names a plane.** `deny tcp://evil.com:443` is about the raw
+splice and `deny http://evil.com:443` about the cleartext path; neither decides an
+inspected HTTPS request, which is the default plane. That direction is one-way: the
+splice and the cleartext plane are opt-in, so each only ever opens on a rule that names
+it, and a deny arriving from another layer can shut one but never open one. The
+inspected plane is where every request goes by default, and scoping its denies is what
+stops a rule about raw TCP from quietly governing every HTTPS request to that host. So
+if what you mean is "not this host, by any route", write the host-level form and leave
+the scheme off: that is the spelling with no plane to be scoped to.
 
 ---
 

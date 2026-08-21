@@ -1382,9 +1382,20 @@ impl EgressPolicy {
     /// rule admits every verb), so a `{GET,HEAD} host` allow does not match a POST. The request is
     /// canonicalized once (host lowercased, path percent-decoded / `.`/`..` resolved / query
     /// dropped) so every rule sees the same evasion-proof view; `method` is uppercased here so the
-    /// caller need not. Only [`Layer::L7`] (inspected) rules participate — a `tcp://` (L4) rule
-    /// governs the raw-splice decision at CONNECT time ([`Self::l4_decision`]), never the inspected
-    /// HTTP verdict, so the two layers stay cleanly partitioned.
+    /// caller need not.
+    ///
+    /// Only [`Layer::L7`] (inspected) rules participate, **denies included**: a scheme names a
+    /// plane, and naming one plane is not naming another. A `tcp://` rule governs the raw-splice
+    /// decision at CONNECT time ([`Self::l4_decision`]) and an `http://` rule the cleartext verdict
+    /// ([`Self::explain_clear`]); neither decides an inspected request.
+    ///
+    /// This plane is the only one that scopes its denies, and the asymmetry is deliberate rather
+    /// than an oversight in the other two. The splice and the cleartext plane are **opt-in**: each
+    /// opens only on a rule that names it, so a deny reaching in from another layer can shut one
+    /// but never open one. The inspected plane is the default, where scoping a deny to its own
+    /// layer is what keeps a `tcp://` deny from silently governing every HTTPS request to that
+    /// host. What reaches every plane is a host-level deny, which carries no scheme and therefore
+    /// scopes to none — the spelling the guide points an operator at.
     pub(crate) fn explain(&self, host: &str, port: u16, path: &str, method: &str) -> Decision<'_> {
         let req = Request::new(host, port, path);
         let method = method.to_ascii_uppercase();
@@ -3579,6 +3590,64 @@ mod tests {
         assert!(matches!(
             l4.l4_decision("api.example.com", 443),
             L4Decision::Splice(_)
+        ));
+    }
+
+    /// The partition holds for **deny** as well as for allow, and the two other planes do not
+    /// share it. Pinned because nothing else states it and the three planes disagree on purpose.
+    ///
+    /// The inspected plane consults only its own layer's denies: a `tcp://` or `http://` deny names
+    /// a plane, and naming one plane is not naming another. The cleartext and splice planes match a
+    /// deny by host and port whatever layer wrote it, which is what makes a **host-level** deny the
+    /// one spelling that reaches everywhere — the spelling the guide tells an operator to use.
+    ///
+    /// So the asymmetry is real and it is one-way, and a reader who does not know which way round
+    /// it goes cannot work it out from the rules: that is what this test is for.
+    #[test]
+    fn a_scheme_qualified_deny_names_a_plane_and_only_binds_that_plane() {
+        let inspected_allow = || vec![rule("api.example.com:443")];
+
+        // A `tcp://` deny does not reach the inspected verdict...
+        let by_tcp = EgressPolicy::new(inspected_allow(), vec![rule("tcp://api.example.com:443")]);
+        assert!(
+            matches!(
+                by_tcp.explain("api.example.com", 443, "/", "GET"),
+                Decision::AllowedBy(_)
+            ),
+            "a tcp:// deny governs the splice decision, not the inspected one"
+        );
+        // ...nor does an `http://` one, on the port it would have to name to match at all.
+        let by_http =
+            EgressPolicy::new(inspected_allow(), vec![rule("http://api.example.com:443")]);
+        assert!(matches!(
+            by_http.explain("api.example.com", 443, "/", "GET"),
+            Decision::AllowedBy(_)
+        ));
+
+        // The spelling that does reach it is the host-level one, which is what the guide shows.
+        let bare = EgressPolicy::new(inspected_allow(), vec![rule("api.example.com:443")]);
+        assert!(matches!(
+            bare.explain("api.example.com", 443, "/", "GET"),
+            Decision::DeniedBy(_)
+        ));
+
+        // And the other two planes take that same `tcp://` deny, whatever layer wrote it: the
+        // inspected plane is the one that scopes, not the schemes that are scoped.
+        let clear = EgressPolicy::new(
+            vec![rule("http://api.example.com:443")],
+            vec![rule("tcp://api.example.com:443")],
+        );
+        assert!(matches!(
+            clear.explain_clear("api.example.com", 443, "/", "GET"),
+            Decision::DeniedBy(_)
+        ));
+        let spliced = EgressPolicy::new(
+            vec![rule("tcp://api.example.com:443")],
+            vec![rule("http://api.example.com:443")],
+        );
+        assert!(matches!(
+            spliced.l4_decision("api.example.com", 443),
+            L4Decision::Suppressed(_)
         ));
     }
 
