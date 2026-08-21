@@ -505,6 +505,45 @@ branch was cut belongs to no `master` history either, so an ordinary stable pin 
 hostile one. And when GitHub answers nothing at all, because you are offline or over its rate limit,
 the launch goes on in silence: no answer is not evidence.
 
+### Plaintext sources, and the one switch that admits them
+
+Everything in the table above assumes the bytes arrived over TLS. Six source forms require it:
+`deb:`, `appimage:`, `tarball:`, `binary:`, the `apt:` index a `deb:` locator tracks, and a remote
+`flake:` reference. A `http://` URL in any of them is refused when the config is read, before
+anything is fetched.
+
+That refusal has one exception, and it is deliberate: an internal server that publishes over
+plaintext. Nothing in the shipped catalogue needs it, and a public vendor URL has no reason to be
+plaintext, so the switch is off unless you write it:
+
+```toml
+# sbx.toml
+allow_insecure_http = true
+
+[packages]
+internal-tool = "tarball:http://packages.corp.internal/tool.tar.gz"
+```
+
+One switch covers all six, because the property it names belongs to the network your host sits on
+and not to a backend. It is honored from the global config, from an imported app profile, and from a
+**trusted** project; an untrusted project setting it is ignored with a warning, since a layer you
+have not approved must not be able to downgrade how its own artefacts arrive.
+
+An app can carry its own posture, which is the narrower and usually better choice: the internal
+server serves one application, not every launch on the machine.
+
+```toml
+[app.internal-tool]
+allow_insecure_http = true
+```
+
+Be clear about what you give up. Over plaintext, anyone on the network path can replace the artefact
+in flight, and the replacement is what gets pinned, unpacked and put on the cage's `PATH`. The
+content hash still does its job, and its job is narrower than it looks: it binds the pin to whatever
+arrived first, which is not the same as binding it to your publisher. `sbx config show` reports the
+effective value and the layer that set it, so a project that opened plaintext fetching is visible
+without reading three files.
+
 ### Signed apt indexes
 
 An apt repository signs the list of what it publishes. `deb:apt:` reads that signature.

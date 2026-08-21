@@ -95,6 +95,11 @@ pub(crate) struct ConfigView {
     pub(crate) gpu: bool,
     /// Which layer supplied the GPU posture (`Default` when neither config set it).
     pub(crate) gpu_origin: ProvenanceView,
+    /// Whether a package source may be fetched over plaintext `http://`
+    /// (`allow_insecure_http = true`).
+    pub(crate) allow_insecure_http: bool,
+    /// Which layer opened plaintext fetching (`Default` when none did).
+    pub(crate) allow_insecure_http_origin: ProvenanceView,
     /// Whether audio (microphone + playback) is open (`audio = true`).
     pub(crate) audio: bool,
     /// Which layer supplied the audio posture (`Default` when neither config set it).
@@ -796,6 +801,9 @@ pub(crate) struct AppView {
     /// The app's own GPU posture, when it set one (`Some(true)`/`Some(false)`); `None` inherits the
     /// baseline. Mirrors the app's `gui`.
     pub(crate) gpu: Option<bool>,
+    /// The app's own plaintext-fetch posture, when it set one; `None` inherits the baseline.
+    /// Mirrors the app's `gpu`.
+    pub(crate) allow_insecure_http: Option<bool>,
     /// The app's own audio posture, when it set one; `None` inherits the baseline. Mirrors the
     /// app's `gpu`.
     pub(crate) audio: Option<bool>,
@@ -877,6 +885,9 @@ pub(crate) struct AppDetailView {
     /// The effective GPU posture (the app's own, else the baseline's).
     pub(crate) gpu: bool,
     pub(crate) gpu_origin: ProvenanceView,
+    /// The effective plaintext-fetch posture (the app's own, else the baseline's).
+    pub(crate) allow_insecure_http: bool,
+    pub(crate) allow_insecure_http_origin: ProvenanceView,
     /// The effective audio posture (the app's own, else the baseline's).
     pub(crate) audio: bool,
     pub(crate) audio_origin: ProvenanceView,
@@ -1124,6 +1135,8 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         timezone_origin: resolved.timezone_origin.into(),
         gpu: resolved.gpu,
         gpu_origin: resolved.gpu_origin.into(),
+        allow_insecure_http: resolved.allow_insecure_http,
+        allow_insecure_http_origin: resolved.allow_insecure_http_origin.into(),
         audio: resolved.audio,
         audio_origin: resolved.audio_origin.into(),
         dbus: resolved.dbus,
@@ -1482,6 +1495,7 @@ fn app_view(
             super::GuiPolicy::None => GuiView::None,
         }),
         gpu: app.gpu,
+        allow_insecure_http: app.allow_insecure_http,
         audio: app.audio,
         dbus: app.dbus,
         forward: app.forward.clone(),
@@ -1598,6 +1612,14 @@ fn app_detail_view(
     let gui_origin = origin_or_inherited(app.gui.is_some(), app.gui_origin, baseline.gui_origin);
     let eff_gpu = app.gpu.unwrap_or(baseline.gpu);
     let gpu_origin = origin_or_inherited(app.gpu.is_some(), app.gpu_origin, baseline.gpu_origin);
+    let eff_allow_insecure_http = app
+        .allow_insecure_http
+        .unwrap_or(baseline.allow_insecure_http);
+    let allow_insecure_http_origin = origin_or_inherited(
+        app.allow_insecure_http.is_some(),
+        app.allow_insecure_http_origin,
+        baseline.allow_insecure_http_origin,
+    );
     let eff_audio = app.audio.unwrap_or(baseline.audio);
     let audio_origin =
         origin_or_inherited(app.audio.is_some(), app.audio_origin, baseline.audio_origin);
@@ -1747,6 +1769,8 @@ fn app_detail_view(
         gui_origin,
         gpu: eff_gpu,
         gpu_origin,
+        allow_insecure_http: eff_allow_insecure_http,
+        allow_insecure_http_origin,
         audio: eff_audio,
         audio_origin,
         dbus: eff_dbus,
@@ -2039,9 +2063,11 @@ mod tests {
             gui: GuiView::Wayland,
             gui_origin: ProvenanceView::Global,
             gpu: true,
+            allow_insecure_http: false,
             audio: true,
             dbus: true,
             gpu_origin: ProvenanceView::Project,
+            allow_insecure_http_origin: ProvenanceView::Default,
             audio_origin: ProvenanceView::Project,
             dbus_origin: ProvenanceView::Project,
             forward: vec![ForwardPort::same(1455)],
@@ -2093,6 +2119,7 @@ mod tests {
                 }),
                 gui: None,
                 gpu: None,
+                allow_insecure_http: None,
                 audio: None,
                 dbus: None,
                 forward: vec![ForwardPort::same(1455)],
@@ -2267,6 +2294,7 @@ mod tests {
             proc: None,
             proc_origin: Default::default(),
             gpu: None,
+            allow_insecure_http: None,
             audio: None,
             dbus: None,
             limits: Default::default(),
@@ -2278,6 +2306,7 @@ mod tests {
             network_origin: Default::default(),
             gui_origin: Default::default(),
             gpu_origin: Default::default(),
+            allow_insecure_http_origin: Default::default(),
             audio_origin: Default::default(),
             dbus_origin: Default::default(),
             forward_origin: Default::default(),
@@ -2365,9 +2394,11 @@ mod tests {
             gui: GuiPolicy::Wayland,
             gui_origin: Provenance::Global,
             gpu: false,
+            allow_insecure_http: false,
             audio: false,
             dbus: false,
             gpu_origin: Provenance::Default,
+            allow_insecure_http_origin: Provenance::Default,
             audio_origin: Provenance::Default,
             dbus_origin: Provenance::Default,
             forward: vec![ForwardPort::same(9090)],
@@ -2421,6 +2452,7 @@ mod tests {
             network: Some(NetworkPolicy::Isolated),
             gui: None,
             gpu: None,
+            allow_insecure_http: None,
             audio: None,
             dbus: None,
             limits: sandbox::cgroup::Limits {
@@ -2439,6 +2471,7 @@ mod tests {
             network_origin: Provenance::Global,
             gui_origin: Provenance::Default,
             gpu_origin: Provenance::Default,
+            allow_insecure_http_origin: Provenance::Default,
             audio_origin: Provenance::Default,
             dbus_origin: Provenance::Default,
             forward_origin: Provenance::Global,

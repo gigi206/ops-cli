@@ -474,7 +474,13 @@ pub(crate) trait Kind {
     /// The charset barrier a resolve command's URL must pass before sbx fetches it or interpolates it
     /// into a generated derivation, so an arbitrary command cannot point sbx at a non-`https` or
     /// injecting source.
-    fn url_validator(&self) -> fn(&str) -> bool;
+    ///
+    /// The `bool` the returned validator takes is the launch's resolved `allow_insecure_http`. It is
+    /// carried rather than baked in because the URL checked here is the one a *resolve command*
+    /// printed — a value that did not exist when the config was read, so it gets the same answer the
+    /// declared locator got, from the same definition
+    /// ([`crate::config`]'s `strip_fetch_scheme`), instead of a second rule that could drift.
+    fn url_validator(&self) -> fn(&str, bool) -> bool;
 
     /// Resolve a declared locator to `(concrete artefact url, SRI content hash)`. A direct URL
     /// resolves to itself; a `github:`/`apt:` locator queries its source and re-validates what comes
@@ -489,6 +495,7 @@ pub(crate) trait Kind {
         locator: &str,
         system: &str,
         fresh: bool,
+        allow_insecure_http: bool,
     ) -> io::Result<(String, String)>;
 
     /// The generated nix expression that fetches the pinned artefact, unpacks it this backend's own
@@ -597,6 +604,9 @@ pub(crate) struct Ctx<'a> {
     pub(crate) layout: &'a Layout,
     pub(crate) project: &'a Path,
     pub(crate) nixpkgs: &'a str,
+    /// The launch's resolved `allow_insecure_http`, carried so the URL a resolve command prints is
+    /// judged by the same rule the declared locator was.
+    pub(crate) allow_insecure_http: bool,
 }
 
 /// One declared reference of a prebuilt backend, in the form it was declared. Both forms end up at
@@ -754,7 +764,14 @@ pub(crate) fn provision(
         Some(pin) => (pin.url.clone(), pin.hash.clone()),
         None => {
             let system = super::current_system();
-            let (u, h) = kind.resolve_source(ctx.nix, ctx.layout, locator, &system, false)?;
+            let (u, h) = kind.resolve_source(
+                ctx.nix,
+                ctx.layout,
+                locator,
+                &system,
+                false,
+                ctx.allow_insecure_http,
+            )?;
             lock.insert(
                 locator.to_string(),
                 Pin {
@@ -794,6 +811,7 @@ pub(crate) fn provision_resolve(
                 name,
                 command,
                 kind.url_validator(),
+                ctx.allow_insecure_http,
                 kind.artefact(),
             )?;
             let h = prefetch_hash(ctx.nix, ctx.layout, &u, false)?;
@@ -916,7 +934,9 @@ pub(crate) fn upgrade(
         let resolved = match reference {
             // A locator: always re-resolve, since its source can move (a `latest` alias, a new
             // release, a new apt index entry) and even a fixed URL's content can change.
-            Ref::Locator(locator) => kind.resolve_source(nix, layout, locator, &system, true),
+            Ref::Locator(locator) => {
+                kind.resolve_source(nix, layout, locator, &system, true, cfg.allow_insecure_http)
+            }
             // A resolver: re-run its command for the concrete URL. If it equals the stored pin's URL,
             // reuse the pinned hash rather than prefetching the (large) artefact again.
             Ref::Resolve { name, command } => match cage {
@@ -928,6 +948,7 @@ pub(crate) fn upgrade(
                     name,
                     command,
                     kind.url_validator(),
+                    cfg.allow_insecure_http,
                     kind.artefact(),
                 ) {
                     Ok(url) => match &previous {
@@ -1017,7 +1038,7 @@ mod tests {
         fn artefact(&self) -> &'static str {
             "`.tar.gz`"
         }
-        fn url_validator(&self) -> fn(&str) -> bool {
+        fn url_validator(&self) -> fn(&str, bool) -> bool {
             crate::config::is_valid_tarball_url
         }
         fn resolve_source(
@@ -1027,6 +1048,7 @@ mod tests {
             locator: &str,
             _system: &str,
             fresh: bool,
+            _allow_insecure_http: bool,
         ) -> io::Result<(String, String)> {
             self.fresh.set(Some(fresh));
             Ok((locator.to_string(), RECORDED_HASH.to_string()))

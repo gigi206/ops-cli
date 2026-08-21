@@ -104,6 +104,7 @@ fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
         network: None,
         gui: None,
         gpu: None,
+        allow_insecure_http: None,
         audio: None,
         dbus: None,
         forward: None,
@@ -782,6 +783,7 @@ fn raw_app(
         network,
         gui: None,
         gpu: None,
+        allow_insecure_http: None,
         audio: None,
         dbus: None,
         forward: None,
@@ -3389,6 +3391,7 @@ fn merge_app_overlays_the_baseline_with_app_precedence() {
         network: Some(NetworkPolicy::Isolated),
         gui: None,
         gpu: Some(true),
+        allow_insecure_http: None,
         audio: Some(true),
         dbus: Some(true),
         limits: crate::sandbox::cgroup::Limits {
@@ -3402,6 +3405,7 @@ fn merge_app_overlays_the_baseline_with_app_precedence() {
         network_origin: Default::default(),
         gui_origin: Default::default(),
         gpu_origin: Default::default(),
+        allow_insecure_http_origin: Default::default(),
         audio_origin: Default::default(),
         dbus_origin: Default::default(),
         forward: vec![],
@@ -3473,6 +3477,7 @@ fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
         network: None, // inherits the baseline's shared posture
         gui: None,
         gpu: None,
+        allow_insecure_http: None,
         audio: None,
         dbus: None,
         limits: Default::default(),
@@ -3482,6 +3487,7 @@ fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
         network_origin: Default::default(),
         gui_origin: Default::default(),
         gpu_origin: Default::default(),
+        allow_insecure_http_origin: Default::default(),
         audio_origin: Default::default(),
         dbus_origin: Default::default(),
         forward: vec![],
@@ -3530,6 +3536,7 @@ fn merge_app_keeps_secrets_under_an_allowlist_the_app_declares() {
         )),
         gui: None,
         gpu: None,
+        allow_insecure_http: None,
         audio: None,
         dbus: None,
         limits: Default::default(),
@@ -3539,6 +3546,7 @@ fn merge_app_keeps_secrets_under_an_allowlist_the_app_declares() {
         network_origin: Default::default(),
         gui_origin: Default::default(),
         gpu_origin: Default::default(),
+        allow_insecure_http_origin: Default::default(),
         audio_origin: Default::default(),
         dbus_origin: Default::default(),
         forward: vec![],
@@ -3581,6 +3589,7 @@ fn merge_app_applies_the_apps_default_methods_to_its_effective_allowlist() {
         network,
         gui: None,
         gpu: None,
+        allow_insecure_http: None,
         audio: None,
         dbus: None,
         limits: Default::default(),
@@ -3591,6 +3600,7 @@ fn merge_app_applies_the_apps_default_methods_to_its_effective_allowlist() {
         network_origin: Default::default(),
         gui_origin: Default::default(),
         gpu_origin: Default::default(),
+        allow_insecure_http_origin: Default::default(),
         audio_origin: Default::default(),
         dbus_origin: Default::default(),
         forward: vec![],
@@ -3737,6 +3747,7 @@ fn merge_app_dedups_a_secret_the_app_redeclares_for_the_same_host_and_header() {
         network: None,
         gui: None,
         gpu: None,
+        allow_insecure_http: None,
         audio: None,
         dbus: None,
         limits: Default::default(),
@@ -3746,6 +3757,7 @@ fn merge_app_dedups_a_secret_the_app_redeclares_for_the_same_host_and_header() {
         network_origin: Default::default(),
         gui_origin: Default::default(),
         gpu_origin: Default::default(),
+        allow_insecure_http_origin: Default::default(),
         audio_origin: Default::default(),
         dbus_origin: Default::default(),
         forward: vec![],
@@ -3800,6 +3812,7 @@ fn merge_app_inherits_a_baseline_secret_when_the_app_opens_a_filtering_posture()
         )),
         gui: None,
         gpu: None,
+        allow_insecure_http: None,
         audio: None,
         dbus: None,
         limits: Default::default(),
@@ -3810,6 +3823,7 @@ fn merge_app_inherits_a_baseline_secret_when_the_app_opens_a_filtering_posture()
         network_origin: Default::default(),
         gui_origin: Default::default(),
         gpu_origin: Default::default(),
+        allow_insecure_http_origin: Default::default(),
         audio_origin: Default::default(),
         dbus_origin: Default::default(),
         forward: vec![],
@@ -5020,15 +5034,16 @@ fn a_deb_prefixed_package_parses_as_a_deb_backend_and_requires_https_dot_deb() {
         );
     }
     assert!(is_valid_deb_url(
-        "https://github.com/o/r/releases/latest/download/app-linux-amd64.deb"
+        "https://github.com/o/r/releases/latest/download/app-linux-amd64.deb",
+        false
     ));
-    assert!(!is_valid_deb_url("http://example.com/x.deb"));
-    assert!(!is_valid_deb_url("https://example.com/x.tar.gz"));
-    assert!(!is_valid_deb_url("https://example.com/a b.deb"));
+    assert!(!is_valid_deb_url("http://example.com/x.deb", false));
+    assert!(!is_valid_deb_url("https://example.com/x.tar.gz", false));
+    assert!(!is_valid_deb_url("https://example.com/a b.deb", false));
     // the bare `deb:resolve` sentinel is not a locator: it is bound to its `[deb.<name>]` table
     // by `apply_tools`, so parsing it as a backend locator is refused (checked before the `deb:`
     // strip, or it would parse as a `deb:` URL `resolve` and be rejected for the wrong reason).
-    assert!(parse_backend("deb:resolve").is_err());
+    assert!(parse_backend("deb:resolve", false).is_err());
 }
 
 #[test]
@@ -5105,7 +5120,7 @@ fn a_deb_apt_locator_parses_as_a_deb_backend_and_is_charset_validated() {
     }
     // the validator directly: an https Packages URL (no `.deb` suffix) is accepted; a plaintext,
     // metacharacter-bearing, non-`apt:`, or empty value is rejected.
-    assert!(is_valid_deb_apt_locator(idx));
+    assert!(is_valid_deb_apt_locator(idx, false));
     for bad in [
         "https://h/x/Packages",    // no apt: prefix
         "apt:http://h/x/Packages", // plaintext
@@ -5113,7 +5128,10 @@ fn a_deb_apt_locator_parses_as_a_deb_backend_and_is_charset_validated() {
         "apt:",                    // empty url
         "apt:https://",            // empty host
     ] {
-        assert!(!is_valid_deb_apt_locator(bad), "{bad} should be rejected");
+        assert!(
+            !is_valid_deb_apt_locator(bad, false),
+            "{bad} should be rejected"
+        );
     }
 }
 
@@ -5153,15 +5171,18 @@ fn an_appimage_prefixed_package_parses_as_an_appimage_backend() {
         );
     }
     // the validator directly: `.AppImage` and lowercase `.appimage` both accepted.
-    assert!(is_valid_appimage_url("https://e/App-1.0-x86_64.AppImage"));
-    assert!(is_valid_appimage_url("https://e/app.appimage"));
-    assert!(!is_valid_appimage_url("http://e/x.AppImage")); // not https
-    assert!(!is_valid_appimage_url("https://e/x.deb")); // wrong extension
-    assert!(!is_valid_appimage_url("https://e/a b.AppImage")); // whitespace
+    assert!(is_valid_appimage_url(
+        "https://e/App-1.0-x86_64.AppImage",
+        false
+    ));
+    assert!(is_valid_appimage_url("https://e/app.appimage", false));
+    assert!(!is_valid_appimage_url("http://e/x.AppImage", false)); // not https
+    assert!(!is_valid_appimage_url("https://e/x.deb", false)); // wrong extension
+    assert!(!is_valid_appimage_url("https://e/a b.AppImage", false)); // whitespace
     // the bare `appimage:resolve` sentinel is not a locator: it is bound to its
     // `[appimage.<name>]` table by `apply_tools`, so parsing it as a backend locator is refused
     // (checked before the `appimage:` strip, or it would parse as an `appimage:` URL `resolve`).
-    assert!(parse_backend("appimage:resolve").is_err());
+    assert!(parse_backend("appimage:resolve", false).is_err());
 }
 
 #[test]
@@ -5169,28 +5190,31 @@ fn tarball_backend_parses_and_validates() {
     // a direct `.tar.gz`/`.tgz` https URL routes to Backend::Tarball; the percent-encoded space
     // a vendor filename can carry (`My%20App.tar.gz`) is accepted.
     assert_eq!(
-        parse_backend("tarball:https://example.com/x/1.0/linux-x64/My%20App.tar.gz"),
+        parse_backend(
+            "tarball:https://example.com/x/1.0/linux-x64/My%20App.tar.gz",
+            false
+        ),
         Ok(Backend::Tarball(
             "https://example.com/x/1.0/linux-x64/My%20App.tar.gz".into()
         ))
     );
     assert!(matches!(
-        parse_backend("tarball:https://e/app.tgz"),
+        parse_backend("tarball:https://e/app.tgz", false),
         Ok(Backend::Tarball(_))
     ));
     // the validator directly.
-    assert!(is_valid_tarball_url("https://e/app.tar.gz"));
-    assert!(is_valid_tarball_url("https://e/APP.TGZ")); // extension is case-insensitive
-    assert!(is_valid_tarball_url("https://e/My%20App.tar.gz")); // %-encoded space
-    assert!(!is_valid_tarball_url("http://e/app.tar.gz")); // not https
-    assert!(!is_valid_tarball_url("https://e/app.deb")); // wrong extension
-    assert!(!is_valid_tarball_url("https://e/app.tar")); // not gz-compressed
-    assert!(!is_valid_tarball_url("https://e/a b.tar.gz")); // raw whitespace
+    assert!(is_valid_tarball_url("https://e/app.tar.gz", false));
+    assert!(is_valid_tarball_url("https://e/APP.TGZ", false)); // extension is case-insensitive
+    assert!(is_valid_tarball_url("https://e/My%20App.tar.gz", false)); // %-encoded space
+    assert!(!is_valid_tarball_url("http://e/app.tar.gz", false)); // not https
+    assert!(!is_valid_tarball_url("https://e/app.deb", false)); // wrong extension
+    assert!(!is_valid_tarball_url("https://e/app.tar", false)); // not gz-compressed
+    assert!(!is_valid_tarball_url("https://e/a b.tar.gz", false)); // raw whitespace
     // a mistyped form is refused up front; the bare `tarball:resolve` sentinel is refused here
     // too (it is bound to its table by `apply_tools`, not parsed as a locator).
-    assert!(parse_backend("tarball:https://e/app.zip").is_err());
-    assert!(parse_backend("tarball:not-a-url").is_err());
-    assert!(parse_backend("tarball:resolve").is_err());
+    assert!(parse_backend("tarball:https://e/app.zip", false).is_err());
+    assert!(parse_backend("tarball:not-a-url", false).is_err());
+    assert!(parse_backend("tarball:resolve", false).is_err());
 }
 
 /// `binary:` accepts a URL to the program itself, and the sentinel is bound to its table elsewhere.
@@ -5201,31 +5225,34 @@ fn tarball_backend_parses_and_validates() {
 #[test]
 fn a_binary_backend_takes_a_url_to_the_program_itself() {
     assert!(matches!(
-        parse_backend("binary:https://e/cli/demo-1.2.3-linux-x86_64"),
+        parse_backend("binary:https://e/cli/demo-1.2.3-linux-x86_64", false),
         Ok(Backend::Binary(_))
     ));
 
     // No extension is required, and that is the point of this backend.
-    assert!(is_valid_binary_url("https://e/cli/demo-1.2.3-linux-x86_64"));
-    assert!(is_valid_binary_url("https://e/d/My%20Program")); // %-encoded space
-    assert!(is_valid_binary_url("https://e/cli/demo.tar.gz")); // an extension is not forbidden either
+    assert!(is_valid_binary_url(
+        "https://e/cli/demo-1.2.3-linux-x86_64",
+        false
+    ));
+    assert!(is_valid_binary_url("https://e/d/My%20Program", false)); // %-encoded space
+    assert!(is_valid_binary_url("https://e/cli/demo.tar.gz", false)); // an extension is not forbidden either
 
     // What IS refused: a plaintext scheme (the file is executed after autoPatchelf), anything
     // carrying a shell/nix metacharacter (the value is interpolated into a generated derivation and
     // a prefetch argument), and a locator naming no path — a program is never the bare host.
-    assert!(!is_valid_binary_url("http://e/cli/demo")); // not https
-    assert!(!is_valid_binary_url("https://e/cli/de mo")); // raw whitespace
-    assert!(!is_valid_binary_url("https://e/cli/$(id)")); // command substitution
-    assert!(!is_valid_binary_url("https://e/cli/demo\";x")); // quote + separator
-    assert!(!is_valid_binary_url("https://e")); // no path at all
-    assert!(!is_valid_binary_url("https://e/")); // a directory, not a program
-    assert!(!is_valid_binary_url("https://")); // no host
-    assert!(!is_valid_binary_url("ftp://e/cli/demo")); // wrong scheme entirely
+    assert!(!is_valid_binary_url("http://e/cli/demo", false)); // not https
+    assert!(!is_valid_binary_url("https://e/cli/de mo", false)); // raw whitespace
+    assert!(!is_valid_binary_url("https://e/cli/$(id)", false)); // command substitution
+    assert!(!is_valid_binary_url("https://e/cli/demo\";x", false)); // quote + separator
+    assert!(!is_valid_binary_url("https://e", false)); // no path at all
+    assert!(!is_valid_binary_url("https://e/", false)); // a directory, not a program
+    assert!(!is_valid_binary_url("https://", false)); // no host
+    assert!(!is_valid_binary_url("ftp://e/cli/demo", false)); // wrong scheme entirely
 
     // A mistyped form is refused up front; the bare sentinel is refused here too, since it is bound
     // to its `[binary.<name>]` table by `apply_tools` rather than parsed as a locator.
-    assert!(parse_backend("binary:not-a-url").is_err());
-    assert!(parse_backend("binary:resolve").is_err());
+    assert!(parse_backend("binary:not-a-url", false).is_err());
+    assert!(parse_backend("binary:resolve", false).is_err());
 }
 
 /// A `RawConfig` declaring one `tarball:resolve` package: the `[packages]` sentinel plus its
@@ -11313,4 +11340,273 @@ fn a_set_but_invalid_override_notify_mode_is_a_hard_error_and_mutates_nothing() 
         NotifyMode::Off
     );
     assert_eq!(resolved.notify_origin, Provenance::Global);
+}
+
+// ---------------------------------------------------------------------------
+// `allow_insecure_http`: plaintext package sources, refused unless opted into.
+// ---------------------------------------------------------------------------
+
+/// The six source forms that fetch an artefact, each spelled over plaintext. Every one of them is
+/// refused unless `allow_insecure_http` is set, and the list is written out rather than derived so a
+/// backend that quietly stops consulting the shared scheme rule shows up as a failure here.
+const PLAINTEXT_SOURCES: &[&str] = &[
+    "deb:http://host/app.deb",
+    "appimage:http://host/App.AppImage",
+    "tarball:http://host/app.tar.gz",
+    "binary:http://host/bin/app",
+    "deb:apt:http://host/dists/stable/main/binary-amd64/Packages",
+    "flake:git+http://host/repo#tool",
+];
+
+/// The same six over TLS, so a test that shows plaintext refused also shows the refusal is about the
+/// scheme and not about the rest of the value.
+const TLS_SOURCES: &[&str] = &[
+    "deb:https://host/app.deb",
+    "appimage:https://host/App.AppImage",
+    "tarball:https://host/app.tar.gz",
+    "binary:https://host/bin/app",
+    "deb:apt:https://host/dists/stable/main/binary-amd64/Packages",
+    "flake:git+https://host/repo#tool",
+];
+
+#[test]
+fn every_fetching_backend_refuses_plaintext_by_default() {
+    for value in PLAINTEXT_SOURCES {
+        assert!(
+            parse_backend(value, false).is_err(),
+            "`{value}` was admitted over plaintext with no opt-in"
+        );
+    }
+    for value in TLS_SOURCES {
+        assert!(
+            parse_backend(value, false).is_ok(),
+            "`{value}` was refused over TLS, so the refusal above is not about the scheme"
+        );
+    }
+}
+
+#[test]
+fn the_opt_in_admits_plaintext_on_every_fetching_backend() {
+    for value in PLAINTEXT_SOURCES {
+        assert!(
+            parse_backend(value, true).is_ok(),
+            "`{value}` stayed refused under `allow_insecure_http`, so the switch does not cover it"
+        );
+    }
+}
+
+#[test]
+fn the_opt_in_widens_the_scheme_and_nothing_else() {
+    // The switch is about transport. Everything the validators refused for another reason stays
+    // refused with it on, or it would be a general loosening wearing a narrow name.
+    for value in [
+        "flake:path:/srv/local#tool",   // local content never builds host-side
+        "flake:file:///srv/local#tool", //   "
+        "flake:git+file:///srv/local#tool", //   "
+        "tarball:https://host/app.zip", // wrong archive suffix
+        "deb:https://host/app.rpm",     // wrong package suffix
+        "binary:https://host",          // a host is not a program path
+        "deb:https://host/a b.deb",     // outside the injection-free charset
+    ] {
+        assert!(
+            parse_backend(value, true).is_err(),
+            "`{value}` was admitted once plaintext was allowed, which is not what the switch names"
+        );
+    }
+}
+
+#[test]
+fn a_plaintext_source_is_dropped_on_every_layer_that_declares_tools() {
+    // Four layers reach `apply_tools`, and the threading is asymmetric: a site that wrongly passed
+    // `false` gives a spurious refusal, which is loud, while one that wrongly passed `true` admits
+    // plaintext in silence. So the guard is the default refusal on each of the four, not the switch.
+    const HTTP: &str = "tarball:http://host/app.tar.gz";
+    let named = |r: &Resolved| r.packages.iter().any(|p| p.name == "tool");
+
+    // 1. the global baseline
+    let r = resolve_no_plugins(raw_packages(&[("tool", HTTP)]), None);
+    assert!(
+        !named(&r),
+        "the global baseline admitted a plaintext source"
+    );
+
+    // 2. the project baseline, trusted (so trust is not what is being measured)
+    let r = resolve_no_plugins(
+        RawConfig::default(),
+        Some((raw_packages(&[("tool", HTTP)]), TrustState::Trusted)),
+    );
+    assert!(!named(&r), "a trusted project admitted a plaintext source");
+
+    // 3. the global app overlay
+    let global: RawConfig = toml::from_str(&format!(
+        "[app.demo]\ncmd = \"demo\"\n[app.demo.packages]\ntool = \"{HTTP}\"\n"
+    ))
+    .expect("the global config parses");
+    let r = resolve_no_plugins(global, None);
+    let app = r.apps.get("demo").expect("the app resolves");
+    assert!(
+        !app.packages.iter().any(|p| p.name == "tool"),
+        "a global app overlay admitted a plaintext source"
+    );
+
+    // 4. the project app overlay, trusted
+    let project: RawConfig = toml::from_str(&format!(
+        "[app.demo]\ncmd = \"demo\"\n[app.demo.packages]\ntool = \"{HTTP}\"\n"
+    ))
+    .expect("the project config parses");
+    let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Trusted)));
+    let app = r.apps.get("demo").expect("the app resolves");
+    assert!(
+        !app.packages.iter().any(|p| p.name == "tool"),
+        "a project app overlay admitted a plaintext source"
+    );
+}
+
+#[test]
+fn the_opt_in_reaches_packages_declared_by_a_lower_layer() {
+    // The ordering guard, and the reason `allow_insecure_http` resolves ahead of the first
+    // `apply_tools` rather than beside the other scalar postures. The global layer's packages are
+    // parsed before any project field is read, so a flag resolved in the scalar block below would
+    // reach `self` after the value it governs and this admission would not happen.
+    let global = raw_packages(&[("tool", "tarball:http://host/app.tar.gz")]);
+    let project: RawConfig =
+        toml::from_str("allow_insecure_http = true\n").expect("the project config parses");
+    let r = resolve_no_plugins(global, Some((project, TrustState::Trusted)));
+    assert!(
+        r.allow_insecure_http,
+        "the project's opt-in did not reach the resolved config"
+    );
+    assert!(
+        r.packages.iter().any(|p| p.name == "tool"),
+        "the global layer's plaintext source was refused against a flag the project had supplied"
+    );
+}
+
+#[test]
+fn an_untrusted_project_may_not_open_plaintext_fetching() {
+    let project: RawConfig = toml::from_str(
+        "allow_insecure_http = true\n[packages]\ntool = \"tarball:http://host/app.tar.gz\"\n",
+    )
+    .expect("the project config parses");
+    let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
+    assert!(
+        !r.allow_insecure_http,
+        "an untrusted project downgraded the transport its own artefacts arrive over"
+    );
+    assert!(
+        !r.packages.iter().any(|p| p.name == "tool"),
+        "the plaintext source survived the refused opt-in"
+    );
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("allow_insecure_http") && w.contains("untrusted")),
+        "the drop was silent; warnings were {:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn an_app_inherits_the_baseline_posture_and_may_widen_it() {
+    // An app that says nothing takes the baseline's answer; one that says `true` takes its own,
+    // and the app that stays silent is not dragged along with it.
+    let global: RawConfig = toml::from_str(
+        "[app.opted]\ncmd = \"demo\"\nallow_insecure_http = true\n\
+         [app.opted.packages]\ntool = \"tarball:http://host/app.tar.gz\"\n\
+         [app.silent]\ncmd = \"demo\"\n\
+         [app.silent.packages]\ntool = \"tarball:http://host/app.tar.gz\"\n",
+    )
+    .expect("the global config parses");
+    let r = resolve_no_plugins(global, None);
+
+    let opted = r.apps.get("opted").expect("the app resolves");
+    assert_eq!(opted.allow_insecure_http, Some(true));
+    assert!(
+        opted.packages.iter().any(|p| p.name == "tool"),
+        "the app's own opt-in did not reach its own packages"
+    );
+
+    let silent = r.apps.get("silent").expect("the app resolves");
+    assert_eq!(silent.allow_insecure_http, None);
+    assert!(
+        !silent.packages.iter().any(|p| p.name == "tool"),
+        "an app that declared nothing inherited another app's opt-in"
+    );
+    assert!(
+        !r.allow_insecure_http,
+        "an app's opt-in leaked into the baseline"
+    );
+
+    // The other direction, and the one the assertions above cannot reach: with the baseline open,
+    // an app that declares nothing must be open too. Without this arm a resolution that started
+    // every app at `false` instead of at the baseline would satisfy every check made so far.
+    let global: RawConfig = toml::from_str(
+        "allow_insecure_http = true\n\
+         [app.silent]\ncmd = \"demo\"\n\
+         [app.silent.packages]\ntool = \"tarball:http://host/app.tar.gz\"\n\
+         [app.shut]\ncmd = \"demo\"\nallow_insecure_http = false\n\
+         [app.shut.packages]\ntool = \"tarball:http://host/app.tar.gz\"\n",
+    )
+    .expect("the global config parses");
+    let r = resolve_no_plugins(global, None);
+    let silent = r.apps.get("silent").expect("the app resolves");
+    assert_eq!(silent.allow_insecure_http, None);
+    assert!(
+        silent.packages.iter().any(|p| p.name == "tool"),
+        "an app that declared nothing did not inherit the baseline's opt-in"
+    );
+    // And an app may narrow as well as widen: inheriting is a default, not a floor.
+    let shut = r.apps.get("shut").expect("the app resolves");
+    assert_eq!(shut.allow_insecure_http, Some(false));
+    assert!(
+        !shut.packages.iter().any(|p| p.name == "tool"),
+        "an app that closed plaintext fetching still admitted a plaintext source"
+    );
+}
+
+#[test]
+fn a_one_shot_override_opens_plaintext_for_the_packages_it_carries() {
+    // The override's `allow_insecure_http` is applied ahead of its `[packages]`, not with the other
+    // scalar postures it sits among. A single `--config` blob naming both a plaintext locator and
+    // the flag that admits it has to work, and it only does if the flag reaches `self` first.
+    let base = resolve_no_plugins(RawConfig::default(), None);
+    assert!(!base.allow_insecure_http, "the default is a refusal");
+
+    let raw: RawConfig = toml::from_str(
+        "allow_insecure_http = true\n[packages]\ntool = \"tarball:http://host/app.tar.gz\"\n",
+    )
+    .expect("the override blob parses");
+    let r = with_override(base, raw);
+    assert!(r.allow_insecure_http);
+    assert_eq!(r.allow_insecure_http_origin, Provenance::Override);
+    assert!(
+        r.packages.iter().any(|p| p.name == "tool"),
+        "the override's own plaintext source was refused against its own flag"
+    );
+}
+
+#[test]
+fn a_plaintext_refusal_names_the_switch_and_a_shape_refusal_does_not() {
+    // The hint is conditional on the opt-in being sufficient, which is what keeps it honest: a
+    // value refused for its *shape* would not be admitted by the switch, so pointing at the switch
+    // would send its author down a path that ends in the same refusal.
+    for value in PLAINTEXT_SOURCES {
+        let err = parse_backend(value, false).expect_err("plaintext is refused by default");
+        assert!(
+            err.contains("allow_insecure_http"),
+            "`{value}` was refused for its scheme without naming the switch: {err}"
+        );
+    }
+    for value in [
+        "tarball:http://host/app.zip",  // plaintext *and* the wrong suffix
+        "tarball:https://host/app.zip", // the wrong suffix alone
+        "deb:https://host/a b.deb",     // outside the injection-free charset
+        "flake:path:/srv/local#tool",   // local content, which the switch never admits
+    ] {
+        let err = parse_backend(value, false).expect_err("refused");
+        assert!(
+            !err.contains("allow_insecure_http"),
+            "`{value}` is not admitted by the switch, yet the refusal offered it: {err}"
+        );
+    }
 }

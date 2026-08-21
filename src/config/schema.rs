@@ -173,6 +173,23 @@ pub(crate) struct RawConfig {
     /// declare one (it does not know where its user is). A name the provisioned database does not
     /// carry falls back to `UTC` with a warning rather than failing the launch.
     pub(crate) timezone: Option<String>,
+    /// Whether a package source may be fetched over plaintext `http://`
+    /// (`allow_insecure_http = true`). Unset, every backend that fetches an artefact requires
+    /// `https://`: `deb:`, `appimage:`, `tarball:`, `binary:`, the `apt:` index a `deb:` locator
+    /// tracks, and a remote `flake:` reference. Set, all six accept plaintext — one switch, because
+    /// the property it names belongs to the network the host sits on, not to a backend.
+    ///
+    /// It exists for the one case the refusal cannot serve: an internal server that publishes over
+    /// http. Nothing in the shipped catalogue uses it, and nothing should — a public vendor URL has
+    /// no reason to be plaintext.
+    ///
+    /// **A security field**, honored from the global config, an imported app profile (both trusted
+    /// by location) or a trusted project, ignored from an untrusted one. What it gives up is what
+    /// TLS was giving: an artefact fetched over http can be replaced in flight by anyone on the
+    /// path, and the replacement is what gets pinned, unpacked and put on the cage's PATH. The
+    /// content hash still pins whatever arrived first — it binds the pin to one artefact, it does
+    /// not tell you that artefact is the vendor's.
+    pub(crate) allow_insecure_http: Option<bool>,
     /// Whether to open hardware-accelerated GPU rendering for the cage (`gpu = true`). sbx
     /// provisions mesa's DRI drivers into its own store and points the cage's libgbm/libEGL at
     /// them, grants the render node(s) under `/dev/dri`, and read-only-binds the minimal `/sys`
@@ -819,6 +836,13 @@ pub(crate) struct RawApp {
     /// security field, like the baseline `gpu`. An unset `Option` is omitted on export, so an
     /// app with no GPU need carries no `gpu` line.
     pub(crate) gpu: Option<bool>,
+    /// The app's plaintext-fetch posture, overriding the baseline's when set (see
+    /// `RawConfig.allow_insecure_http`). A security field, like the baseline field — and reachable
+    /// per-app for the reason the baseline one exists: an app that lives on an internal http server
+    /// is the case, and it is one app rather than every launch on the machine. An imported profile
+    /// is trusted by location, exactly like the global config, so honoring it here and refusing it
+    /// there would be an asymmetry rather than a guard. An unset `Option` is omitted on export.
+    pub(crate) allow_insecure_http: Option<bool>,
     /// The app's audio posture, overriding the baseline's when set (see `RawConfig.audio`). A
     /// security field, like the baseline `audio`. An unset `Option` is omitted on export, so an
     /// app with no audio need carries no `audio` line.

@@ -742,6 +742,17 @@ fn desktop_sections(view: &config::view::ConfigView, pal: &style::Palette) -> Op
             provenance_tag(view.gpu_origin, pal)
         );
     }
+    // Only when it is on. Off is the default and says nothing; on is a posture the reader has to
+    // be able to see without opening three files, since it is what stands between a package source
+    // and anyone on the network path.
+    if view.allow_insecure_http {
+        let _ = writeln!(
+            o,
+            "  {h}allow_insecure_http:{r} enabled {dim}(package sources may be fetched over \
+             plaintext http){r}{}",
+            provenance_tag(view.allow_insecure_http_origin, pal)
+        );
+    }
     if view.audio {
         let _ = writeln!(
             o,
@@ -1450,6 +1461,16 @@ fn apps_section(
             }
             None => {}
         }
+        // The plaintext-fetch posture the overlay sets; `None` inherits the baseline's.
+        match app.allow_insecure_http {
+            Some(true) => {
+                let _ = writeln!(o, "      {dim}allow_insecure_http:{r} enabled");
+            }
+            Some(false) => {
+                let _ = writeln!(o, "      {dim}allow_insecure_http:{r} disabled");
+            }
+            None => {}
+        }
         // The GPU posture the overlay sets (`Some(true)`/`Some(false)`); `None` inherits.
         match app.gpu {
             Some(true) => {
@@ -1915,6 +1936,27 @@ fn render_app_detail(
             o,
             "  {h}gpu:{r}     {}{gpu_tag}",
             if view.gpu { "enabled" } else { "disabled" }
+        );
+    }
+
+    // The effective plaintext-fetch posture — shown either way whenever somebody set it, like the
+    // postures around it: an app that turned it *off* against an open baseline is as worth seeing as
+    // one that turned it on.
+    if posture_shown(
+        details,
+        untouched(view.allow_insecure_http_origin),
+        "allow_insecure_http",
+        &mut folded,
+    ) {
+        let tag = app_provenance_tag(view.allow_insecure_http_origin, pal);
+        let _ = writeln!(
+            o,
+            "  {h}allow_insecure_http:{r} {}{tag}",
+            if view.allow_insecure_http {
+                "enabled"
+            } else {
+                "disabled"
+            }
         );
     }
 
@@ -3227,9 +3269,11 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            allow_insecure_http: false,
             audio: false,
             dbus: false,
             gpu_origin: ProvenanceView::Default,
+            allow_insecure_http_origin: ProvenanceView::Default,
             audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],
@@ -3773,9 +3817,11 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Inherited,
             gpu: false,
+            allow_insecure_http: false,
             audio: false,
             dbus: false,
             gpu_origin: ProvenanceView::Inherited,
+            allow_insecure_http_origin: ProvenanceView::Default,
             audio_origin: ProvenanceView::Inherited,
             dbus_origin: ProvenanceView::Inherited,
             forward: vec![],
@@ -3982,6 +4028,7 @@ mod tests {
             network: None,
             gui: None,
             gpu: None,
+            allow_insecure_http: None,
             audio: None,
             dbus: None,
             forward: vec![],
@@ -4088,9 +4135,11 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            allow_insecure_http: false,
             audio: false,
             dbus: false,
             gpu_origin: ProvenanceView::Default,
+            allow_insecure_http_origin: ProvenanceView::Default,
             audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],
@@ -4129,6 +4178,7 @@ mod tests {
                 network: None,
                 gui: None,
                 gpu: None,
+                allow_insecure_http: None,
                 audio: None,
                 dbus: None,
                 forward: vec![],
@@ -4209,9 +4259,11 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            allow_insecure_http: false,
             audio: false,
             dbus: false,
             gpu_origin: ProvenanceView::Default,
+            allow_insecure_http_origin: ProvenanceView::Default,
             audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],
@@ -4249,6 +4301,7 @@ mod tests {
                 }),
                 gui: None,
                 gpu: None,
+                allow_insecure_http: None,
                 audio: None,
                 dbus: None,
                 forward: vec![],
@@ -4321,6 +4374,7 @@ mod tests {
             network,
             gui,
             gpu: None,
+            allow_insecure_http: None,
             audio: None,
             dbus: None,
             forward: vec![],
@@ -4371,9 +4425,11 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            allow_insecure_http: false,
             audio: false,
             dbus: false,
             gpu_origin: ProvenanceView::Default,
+            allow_insecure_http_origin: ProvenanceView::Default,
             audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],
@@ -4460,9 +4516,11 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            allow_insecure_http: false,
             audio: false,
             dbus: false,
             gpu_origin: ProvenanceView::Default,
+            allow_insecure_http_origin: ProvenanceView::Default,
             audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],
@@ -4493,6 +4551,7 @@ mod tests {
                 network: None,
                 gui: None,
                 gpu: None,
+                allow_insecure_http: None,
                 audio: None,
                 dbus: None,
                 forward: vec![],
@@ -4592,9 +4651,11 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            allow_insecure_http: false,
             audio: false,
             dbus: false,
             gpu_origin: ProvenanceView::Default,
+            allow_insecure_http_origin: ProvenanceView::Default,
             audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],
@@ -4638,6 +4699,7 @@ mod tests {
                 network: None,
                 gui: None,
                 gpu: None,
+                allow_insecure_http: None,
                 audio: None,
                 dbus: None,
                 forward: vec![],
@@ -4724,9 +4786,11 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             gpu: false,
+            allow_insecure_http: false,
             audio: false,
             dbus: false,
             gpu_origin: ProvenanceView::Default,
+            allow_insecure_http_origin: ProvenanceView::Default,
             audio_origin: ProvenanceView::Default,
             dbus_origin: ProvenanceView::Default,
             forward: vec![],
@@ -4785,6 +4849,7 @@ mod tests {
                 network: None,
                 gui: None,
                 gpu: None,
+                allow_insecure_http: None,
                 audio: None,
                 dbus: None,
                 forward: vec![],

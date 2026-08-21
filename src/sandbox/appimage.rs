@@ -124,6 +124,7 @@ pub(crate) fn resolve_source(
     locator: &str,
     system: &str,
     fresh: bool,
+    allow_insecure_http: bool,
 ) -> io::Result<(String, String)> {
     let url = match parse_source(locator) {
         AppImageSource::Url(url) => url,
@@ -136,7 +137,7 @@ pub(crate) fn resolve_source(
                     prebuilt::arch_label(system)
                 ))
             })?;
-            if !crate::config::is_valid_appimage_url(&url) {
+            if !crate::config::is_valid_appimage_url(&url, allow_insecure_http) {
                 return Err(io::Error::other(format!(
                     "the latest release of {owner}/{repo} selected an asset URL that is not a \
                      valid `.AppImage` URL: {url}"
@@ -251,7 +252,7 @@ impl prebuilt::Kind for AppImage {
         "`.AppImage`"
     }
 
-    fn url_validator(&self) -> fn(&str) -> bool {
+    fn url_validator(&self) -> fn(&str, bool) -> bool {
         crate::config::is_valid_appimage_url
     }
 
@@ -262,8 +263,9 @@ impl prebuilt::Kind for AppImage {
         locator: &str,
         system: &str,
         fresh: bool,
+        allow_insecure_http: bool,
     ) -> io::Result<(String, String)> {
-        resolve_source(nix, layout, locator, system, fresh)
+        resolve_source(nix, layout, locator, system, fresh, allow_insecure_http)
     }
 
     fn derivation_expr(

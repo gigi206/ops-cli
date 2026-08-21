@@ -194,7 +194,7 @@ impl prebuilt::Kind for Tarball {
         "`.tar.gz`"
     }
 
-    fn url_validator(&self) -> fn(&str) -> bool {
+    fn url_validator(&self) -> fn(&str, bool) -> bool {
         is_valid_tarball_url
     }
 
@@ -205,6 +205,9 @@ impl prebuilt::Kind for Tarball {
         locator: &str,
         _system: &str,
         fresh: bool,
+        // This backend's locator *is* its URL, validated when the config was read; there is no
+        // second, command-chosen URL here to re-judge.
+        _allow_insecure_http: bool,
     ) -> io::Result<(String, String)> {
         resolve_source(nix, layout, locator, fresh)
     }

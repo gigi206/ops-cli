@@ -122,6 +122,7 @@ pub(crate) fn resolve_source(
     locator: &str,
     system: &str,
     fresh: bool,
+    allow_insecure_http: bool,
 ) -> io::Result<(String, String)> {
     let url = match parse_source(locator) {
         DebSource::Url(url) => url,
@@ -134,7 +135,7 @@ pub(crate) fn resolve_source(
                     prebuilt::arch_label(system)
                 ))
             })?;
-            if !crate::config::is_valid_deb_url(&url) {
+            if !crate::config::is_valid_deb_url(&url, allow_insecure_http) {
                 return Err(io::Error::other(format!(
                     "the latest release of {owner}/{repo} selected an asset URL that is not a \
                      valid `.deb` URL: {url}"
@@ -142,7 +143,9 @@ pub(crate) fn resolve_source(
             }
             url
         }
-        DebSource::Apt { packages_url } => resolve_apt_deb_url(nix, layout, &packages_url, fresh)?,
+        DebSource::Apt { packages_url } => {
+            resolve_apt_deb_url(nix, layout, &packages_url, fresh, allow_insecure_http)?
+        }
     };
     // A re-resolve (`fresh`) is an `sbx upgrade` step — capture nix's output and fold the cause
     // into the error; a first launch streams the download progress live.
@@ -163,6 +166,7 @@ fn resolve_apt_deb_url(
     layout: &Layout,
     packages_url: &str,
     fresh: bool,
+    allow_insecure_http: bool,
 ) -> io::Result<String> {
     let index = super::nixhub::fetch_url_text(nix, layout, packages_url, fresh)?;
     // Between the fetch and the selection, and over this very buffer: what the signature attests
@@ -186,7 +190,7 @@ fn resolve_apt_deb_url(
         ))
     })?;
     let url = format!("{root}/{}", filename.trim_start_matches('/'));
-    if !crate::config::is_valid_deb_url(&url) {
+    if !crate::config::is_valid_deb_url(&url, allow_insecure_http) {
         return Err(io::Error::other(format!(
             "the apt index at {packages_url} selected a `.deb` URL (version {version}) that is not \
              a valid `.deb` URL: {url}"
@@ -745,7 +749,7 @@ impl prebuilt::Kind for Deb {
         "`.deb`"
     }
 
-    fn url_validator(&self) -> fn(&str) -> bool {
+    fn url_validator(&self) -> fn(&str, bool) -> bool {
         crate::config::is_valid_deb_url
     }
 
@@ -756,8 +760,9 @@ impl prebuilt::Kind for Deb {
         locator: &str,
         system: &str,
         fresh: bool,
+        allow_insecure_http: bool,
     ) -> io::Result<(String, String)> {
-        resolve_source(nix, layout, locator, system, fresh)
+        resolve_source(nix, layout, locator, system, fresh, allow_insecure_http)
     }
 
     fn derivation_expr(
@@ -1181,7 +1186,7 @@ Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
         let data = TmpDir::new();
         let layout = Layout::under(data.path());
         const INDEX: &str = "https://downloads.claude.ai/claude-desktop/apt/stable/dists/stable/main/binary-amd64/Packages";
-        let url = match resolve_apt_deb_url(&nix, &layout, INDEX, true) {
+        let url = match resolve_apt_deb_url(&nix, &layout, INDEX, true, false) {
             Ok(u) => u,
             Err(e) => {
                 skip_unreachable!("skipping deb:apt live resolve (network/nix): {e}");
@@ -1191,7 +1196,7 @@ Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
         // The derived URL passed the same charset validation a hand-written `deb:` URL does, and
         // names the claude-desktop pool.
         assert!(
-            crate::config::is_valid_deb_url(&url),
+            crate::config::is_valid_deb_url(&url, false),
             "derived URL invalid: {url}"
         );
         assert!(
@@ -1263,7 +1268,7 @@ Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
         // what the refusal is about is the pin and nothing else.
         let pin = pinned_key_path(&layout, &inrelease_url(INDEX).unwrap());
         write_pinned_key(&pin, include_str!("openpgp/key.asc")).expect("the pin is written");
-        let err = match resolve_apt_deb_url(&nix, &layout, INDEX, true) {
+        let err = match resolve_apt_deb_url(&nix, &layout, INDEX, true, false) {
             Err(e) => e.to_string(),
             Ok(url) => panic!("a repository whose pinned key no longer signs it resolved to {url}"),
         };
@@ -1274,7 +1279,7 @@ Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
         // And with the pin removed the same call resolves, so the refusal is not the network or the
         // index failing under another name.
         std::fs::remove_file(&pin).expect("the pin is removed");
-        match resolve_apt_deb_url(&nix, &layout, INDEX, true) {
+        match resolve_apt_deb_url(&nix, &layout, INDEX, true, false) {
             Ok(url) => assert!(url.ends_with("_amd64.deb"), "{url}"),
             Err(e) => skip_unreachable!("skipping deb:apt pin enforcement (network/nix): {e}"),
         }

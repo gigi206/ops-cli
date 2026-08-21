@@ -504,6 +504,7 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
     // someone remembered to write. A field the override deliberately does not carry is bound to `_`
     // with its reason, never omitted.
     let RawConfig {
+        allow_insecure_http,
         env,
         binds,
         packages,
@@ -572,6 +573,9 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
     }
     if notify.is_some() {
         base.notify = notify;
+    }
+    if allow_insecure_http.is_some() {
+        base.allow_insecure_http = allow_insecure_http;
     }
     if gpu.is_some() {
         base.gpu = gpu;

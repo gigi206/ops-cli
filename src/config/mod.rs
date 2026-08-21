@@ -359,6 +359,14 @@ pub(crate) struct Resolved {
     pub(crate) gpu: bool,
     /// Which layer supplied the winning `gpu` posture (`Default` when neither config set it).
     pub(crate) gpu_origin: Provenance,
+    /// Whether a package source may be fetched over plaintext `http://` (the default `false`
+    /// unless the global config, an app profile or a trusted project set `allow_insecure_http`).
+    /// A security field — an untrusted project may not downgrade the transport its artefacts
+    /// arrive over. Read by the six source validators in this module and by the two prebuilt
+    /// re-validation sites, so one answer serves the declared locator and the resolved URL alike.
+    pub(crate) allow_insecure_http: bool,
+    /// Which layer supplied the winning `allow_insecure_http` (`Default` when none set it).
+    pub(crate) allow_insecure_http_origin: Provenance,
     /// Whether audio (microphone + playback) is open (the default `false` unless the global config
     /// or a trusted project set `audio = true`). A security field, gated like `gui`/`gpu` — an
     /// untrusted project may not open the PulseAudio bus (which exposes the microphone and every
@@ -544,6 +552,9 @@ pub(crate) struct ResolvedApp {
     /// The app's own GPU posture, set only when a trusted source declared one. `Some` overrides
     /// the baseline; `None` leaves the baseline posture in place. Gated like the app's `gui`.
     pub(crate) gpu: Option<bool>,
+    /// The app's own plaintext-fetch posture, `None` when it declares none and inherits the
+    /// baseline's. Its own contribution, like `gpu` — the effective value is folded by `merge_app`.
+    pub(crate) allow_insecure_http: Option<bool>,
     /// The app's own audio posture, set only when a trusted source declared one. `Some` overrides
     /// the baseline; `None` leaves the baseline posture in place. Gated like the app's `gpu`.
     pub(crate) audio: Option<bool>,
@@ -603,6 +614,7 @@ pub(crate) struct ResolvedApp {
     pub(crate) notify_origin: Provenance,
     pub(crate) gui_origin: Provenance,
     pub(crate) gpu_origin: Provenance,
+    pub(crate) allow_insecure_http_origin: Provenance,
     pub(crate) audio_origin: Provenance,
     pub(crate) dbus_origin: Provenance,
     pub(crate) limits_origin: LimitsOrigin,
@@ -695,6 +707,9 @@ impl Resolved {
         }
         if let Some(gui) = app.gui {
             self.gui = gui;
+        }
+        if let Some(allow) = app.allow_insecure_http {
+            self.allow_insecure_http = allow;
         }
         if let Some(gpu) = app.gpu {
             self.gpu = gpu;
@@ -818,6 +833,7 @@ impl Resolved {
     pub(crate) fn apply_override(&mut self, ov: Override) -> Result<(), Vec<String>> {
         let Override { raw, .. } = ov;
         let RawConfig {
+            allow_insecure_http,
             env,
             binds,
             packages,
@@ -968,6 +984,17 @@ impl Resolved {
             }
         }
 
+        // `allow_insecure_http` — applied BEFORE `packages`, not with the other scalar postures
+        // below, and for the same reason it resolves ahead of `apply_tools` in `resolve`: it decides
+        // how the package values on this very invocation are validated. Ordered with its siblings it
+        // would reach `self` one statement too late, and `--config` naming both a plaintext locator
+        // and the flag that admits it would see the locator refused. Trusted by invocation, like
+        // every other override — the person typing the command line is the top authority.
+        if let Some(value) = allow_insecure_http {
+            self.allow_insecure_http = value;
+            self.allow_insecure_http_origin = Provenance::Override;
+        }
+
         // `packages` — trusted by invocation; upsert by name over the resolved set.
         if !packages.is_empty() {
             apply_packages(
@@ -977,6 +1004,7 @@ impl Resolved {
                 packages,
                 TrustState::Trusted,
                 false,
+                self.allow_insecure_http,
             );
         }
 
@@ -1613,6 +1641,41 @@ fn resolve(
         .keys()
         .map(|name| (name.clone(), Provenance::Global))
         .collect();
+    // `allow_insecure_http` resolves HERE, ahead of every `apply_tools`, and the ordering is the
+    // substance rather than a detail. This flag decides how a package *value* is validated, so both
+    // operands — the flag and the locator — have to be in hand before the first layer's tools are
+    // parsed. The scalar postures further down resolve *after* the global layer's tools, which is
+    // harmless for a value the cage merely displays and would be a silent hole here: a global
+    // `[packages]` entry would be checked against a flag the project had not yet supplied, and the
+    // layer that wrote `allow_insecure_http = true` would find it applied to its own packages and
+    // not to the ones it inherited.
+    //
+    // A security field: taken from the global config (trusted by location) and from a *trusted*
+    // project, refused with a warning from an untrusted or changed one — an untrusted layer must not
+    // be able to downgrade the transport its own artefacts arrive over.
+    let mut allow_insecure_http_origin = Provenance::Default;
+    let mut allow_insecure_http = match global.allow_insecure_http {
+        Some(value) => {
+            allow_insecure_http_origin = Provenance::Global;
+            value
+        }
+        None => false,
+    };
+    if let Some((proj, state)) = project.as_ref()
+        && let Some(value) = proj.allow_insecure_http
+    {
+        if *state == TrustState::Trusted {
+            allow_insecure_http = value;
+            allow_insecure_http_origin = Provenance::Project;
+        } else {
+            refuse_untrusted(
+                &mut warnings,
+                PROJECT_CONFIG,
+                "`allow_insecure_http`",
+                *state,
+            );
+        }
+    }
     apply_tools(
         &mut packages,
         &mut warnings,
@@ -1625,6 +1688,7 @@ fn resolve(
         global.binary,
         TrustState::Trusted,
         false,
+        allow_insecure_http,
     );
     let nixpkgs_global = global
         .nixpkgs
@@ -1984,6 +2048,7 @@ fn resolve(
             proj.binary,
             state,
             false,
+            allow_insecure_http,
         );
         // `nixpkgs` is a security field — a trusted project may pin its tools'
         // source; an untrusted or changed one may not point the catalogue elsewhere.
@@ -2290,6 +2355,7 @@ fn resolve(
         &network,
         &proc,
         &notify,
+        allow_insecure_http,
         plugins,
     );
 
@@ -2321,6 +2387,8 @@ fn resolve(
     );
 
     Resolved {
+        allow_insecure_http,
+        allow_insecure_http_origin,
         env,
         env_layer,
         binds,
@@ -2926,6 +2994,7 @@ fn resolve_apps(
     baseline_network: &NetworkPolicy,
     baseline_proc: &crate::proc_policy::ProcPolicy,
     baseline_notify: &crate::notify::NotifyPolicy,
+    baseline_allow_insecure_http: bool,
     plugins: &PluginRegistry,
 ) -> BTreeMap<String, ResolvedApp> {
     let (mut project_apps, project_state) = match project_apps {
@@ -2959,6 +3028,7 @@ fn resolve_apps(
             baseline_network,
             baseline_proc,
             baseline_notify,
+            baseline_allow_insecure_http,
             plugins,
         );
         out.insert(name, resolved);
@@ -3000,6 +3070,7 @@ fn resolve_app(
     baseline_network: &NetworkPolicy,
     baseline_proc: &crate::proc_policy::ProcPolicy,
     baseline_notify: &crate::notify::NotifyPolicy,
+    baseline_allow_insecure_http: bool,
     plugins: &PluginRegistry,
 ) -> ResolvedApp {
     let mut warnings = Vec::new();
@@ -3079,6 +3150,39 @@ fn resolve_app(
     let mut limits_origin = LimitsOrigin::default();
     let mut home_scope_origin: Option<Provenance> = None;
 
+    // The app's own `allow_insecure_http`, resolved ahead of its `apply_tools` calls for exactly
+    // the reason the baseline one is (see `resolve`): it decides how this app's package values are
+    // validated, so reading it after them would validate against a flag not yet supplied. Unset at
+    // both layers, the app inherits the baseline — an app that says nothing does not quietly
+    // re-tighten what the machine already opened, nor open what it did not.
+    let mut own_allow_insecure_http: Option<bool> = None;
+    let mut allow_insecure_http_origin = Provenance::Default;
+    if let Some(app) = global.as_ref()
+        && let Some(value) = app.allow_insecure_http
+    {
+        own_allow_insecure_http = Some(value);
+        allow_insecure_http_origin = Provenance::Global;
+    }
+    if let Some((app, state)) = project.as_ref()
+        && let Some(value) = app.allow_insecure_http
+    {
+        if *state == TrustState::Trusted {
+            own_allow_insecure_http = Some(value);
+            allow_insecure_http_origin = Provenance::Project;
+        } else {
+            refuse_untrusted(
+                &mut warnings,
+                &project_app_source(name),
+                "`allow_insecure_http`",
+                *state,
+            );
+        }
+    }
+    // Derived once from the app's own answer rather than tracked beside it: two variables assigned
+    // in lockstep are two variables that can stop agreeing, and the `None` here is exactly what the
+    // per-app view reports as inherited.
+    let allow_insecure_http = own_allow_insecure_http.unwrap_or(baseline_allow_insecure_http);
+
     // The global layer — trusted by location, honored in full.
     if let Some(app) = global {
         let source = global_app_source(name);
@@ -3102,6 +3206,7 @@ fn resolve_app(
             app.binary,
             TrustState::Trusted,
             false,
+            allow_insecure_http,
         );
         if let Some(field) = app.network {
             warn_if_app_sets_stats(&mut warnings, &source, &field);
@@ -3302,6 +3407,7 @@ fn resolve_app(
             app.binary,
             state,
             !trusted,
+            allow_insecure_http,
         );
         if let Some(field) = app.network {
             gate.take_validated(
@@ -3547,6 +3653,8 @@ fn resolve_app(
     }
 
     ResolvedApp {
+        allow_insecure_http: own_allow_insecure_http,
+        allow_insecure_http_origin,
         cmd,
         provisions,
         home_scope,
@@ -3918,6 +4026,7 @@ fn apply_packages(
     packages: BTreeMap<String, String>,
     state: TrustState,
     protect_trusted: bool,
+    allow_insecure_http: bool,
 ) {
     for (name, value) in packages {
         if !is_valid_package_name(&name) {
@@ -3945,7 +4054,7 @@ fn apply_packages(
             );
             continue;
         }
-        let backend = match parse_backend(&value) {
+        let backend = match parse_backend(&value, allow_insecure_http) {
             Ok(b) => b,
             Err(reason) => {
                 warnings.push(format!("{source}: ignoring package `{name}`: {reason}"));
@@ -3977,6 +4086,7 @@ fn apply_tools(
     binary: BTreeMap<String, RawResolve>,
     state: TrustState,
     protect_trusted: bool,
+    allow_insecure_http: bool,
 ) {
     // A `<name> = "tarball:resolve"` / `"deb:resolve"` / `"appimage:resolve"` entry is a sentinel, not
     // a real backend locator: pull each out of the ordinary packages before `apply_packages` (which
@@ -4009,7 +4119,15 @@ fn apply_tools(
             ));
         }
     }
-    apply_packages(out, warnings, source, packages, state, protect_trusted);
+    apply_packages(
+        out,
+        warnings,
+        source,
+        packages,
+        state,
+        protect_trusted,
+        allow_insecure_http,
+    );
     apply_flakes(out, warnings, source, flakes, state, protect_trusted);
     apply_resolvers(
         out,
@@ -4279,12 +4397,32 @@ fn apply_flakes(
 
 /// Parse a `[packages]` value into its [`Backend`] from the mandatory prefix. `nix:<attr>`
 /// routes to host-side nixpkgs provisioning, `mise:<token>` to the in-cage mise equip,
-/// `flake:<ref>` to an in-cage `nix build` of an arbitrary flake; a value with no recognized
+/// `flake:<ref>` to a host-side `nix build` of an arbitrary flake; a value with no recognized
 /// prefix is rejected (there is no bare form, so the backend is always explicit). The part
 /// after `mise:` is the full mise token — including a `nix:`-prefixed nixhub token
 /// (`mise:nix:<pkg>`), which is mise's concern, not a third nix code path here. `flake:` is
 /// matched before `nix:` only by being a distinct prefix; the two never overlap.
-fn parse_backend(value: &str) -> Result<Backend, String> {
+fn parse_backend(value: &str, allow_insecure_http: bool) -> Result<Backend, String> {
+    match classify_backend(value, allow_insecure_http) {
+        Ok(backend) => Ok(backend),
+        // The refusal names its remedy, but only when that remedy would actually have worked.
+        // Each backend's message covers several causes at once (a wrong suffix, a character outside
+        // the injection-free set, a plaintext scheme), so appending the hint unconditionally would
+        // point a mistyped `.zip` at a switch that does not fix it. Re-asking with the opt-in on
+        // answers exactly the question worth answering: was the transport the *only* thing wrong?
+        Err(reason) if !allow_insecure_http && classify_backend(value, true).is_ok() => {
+            Err(format!(
+                "{reason}. This source is plaintext `http://`, which sbx refuses by default; \
+                 set `allow_insecure_http = true` to admit it"
+            ))
+        }
+        Err(reason) => Err(reason),
+    }
+}
+
+/// [`parse_backend`] without the plaintext hint: the prefix match and per-backend validation.
+/// Split out so the hint can be decided by asking this function the same question twice.
+fn classify_backend(value: &str, allow_insecure_http: bool) -> Result<Backend, String> {
     if let Some(attr) = value.strip_prefix("nix:") {
         if !is_valid_attr(attr) {
             return Err(format!("invalid nix attribute `{attr}`"));
@@ -4296,7 +4434,7 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
         }
         Ok(Backend::Mise(token.to_string()))
     } else if let Some(reference) = value.strip_prefix("flake:") {
-        if !is_valid_flake_ref(reference) {
+        if !is_valid_flake_ref(reference, allow_insecure_http) {
             return Err(format!("invalid flake reference `{reference}`"));
         }
         Ok(Backend::Flake(reference.to_string()))
@@ -4309,9 +4447,9 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
              `resolve` command"
         ))
     } else if let Some(rest) = value.strip_prefix("deb:") {
-        if !is_valid_deb_url(rest)
+        if !is_valid_deb_url(rest, allow_insecure_http)
             && !is_valid_deb_github_locator(rest)
-            && !is_valid_deb_apt_locator(rest)
+            && !is_valid_deb_apt_locator(rest, allow_insecure_http)
         {
             return Err(format!(
                 "invalid deb reference `{rest}` — use an `https://` URL ending in `.deb`, \
@@ -4330,7 +4468,7 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
              `resolve` command"
         ))
     } else if let Some(rest) = value.strip_prefix("appimage:") {
-        if !is_valid_appimage_url(rest) && !is_valid_deb_github_locator(rest) {
+        if !is_valid_appimage_url(rest, allow_insecure_http) && !is_valid_deb_github_locator(rest) {
             return Err(format!(
                 "invalid appimage reference `{rest}` — use an `https://` URL ending in `.AppImage`, \
                  or `github:<owner>/<repo>` to track the latest release's `.AppImage`"
@@ -4346,7 +4484,7 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
              `resolve` command"
         ))
     } else if let Some(rest) = value.strip_prefix("tarball:") {
-        if !is_valid_tarball_url(rest) {
+        if !is_valid_tarball_url(rest, allow_insecure_http) {
             return Err(format!(
                 "invalid tarball reference `{rest}` — use an `https://` URL ending in `.tar.gz` \
                  or `.tgz`, or `tarball:resolve` with a `[tarball.<name>]` table"
@@ -4359,7 +4497,7 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
              `resolve` command"
         ))
     } else if let Some(rest) = value.strip_prefix("binary:") {
-        if !is_valid_binary_url(rest) {
+        if !is_valid_binary_url(rest, allow_insecure_http) {
             return Err(format!(
                 "invalid binary reference `{rest}` — use an `https://` URL to the program itself, \
                  or `binary:resolve` with a `[binary.<name>]` table"
@@ -4400,20 +4538,48 @@ const APPIMAGE_RESOLVE_SENTINEL: &str = "appimage:resolve";
 /// version-stamped by construction, so the direct form cannot roll on its own.
 const BINARY_RESOLVE_SENTINEL: &str = "binary:resolve";
 
+/// The injection-free URL charset every fetched source is held to: the unreserved set plus the
+/// sub-delims a real release URL uses, `%` included so a percent-encoded path segment (a vendor's
+/// `My%20App.tar.gz`) is accepted. Nothing here can end or escape a shell word or a nix expression,
+/// which is what the value is interpolated into: a generated derivation and a
+/// `nix store prefetch-file` argument.
+///
+/// **One definition, five validators**, for the reason [`is_valid_attr`] states about its own
+/// charset: two byte-identical copies are how a charset drifts on one path and not the other. It was
+/// written out five times before, once per prebuilt backend, so widening it for one of them would
+/// have been a change no reader of the other four could see.
+fn is_injection_free_url(url: &str) -> bool {
+    url.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_' | '~' | '%'))
+}
+
+/// The transport a fetched package source may carry, returning the URL past its scheme so a caller
+/// keeps checking the rest exactly as it did. `https://` is always admissible; `http://` only when
+/// the resolved config opted in with [`Resolved::allow_insecure_http`].
+///
+/// **One definition, six validators.** Each of them used to spell `strip_prefix("https://")` itself,
+/// which is how a rule drifts on one path and not the others: `is_valid_flake_ref` never had the
+/// check at all and accepted `git+http://` while its five siblings refused plaintext. A single entry
+/// point is what makes the opt-in mean the same thing everywhere it is honored — and what makes
+/// widening it a decision taken once rather than five times.
+fn strip_fetch_scheme(url: &str, allow_insecure_http: bool) -> Option<&str> {
+    url.strip_prefix("https://").or_else(|| {
+        allow_insecure_http
+            .then(|| url.strip_prefix("http://"))
+            .flatten()
+    })
+}
+
 /// A `deb:` URL: an `https://` URL to a prebuilt `.deb`. Required to be HTTPS (the fetch is not
 /// authenticated beyond TLS, and a `.deb` is executed after autoPatchelf, so a plaintext source is
-/// refused) and to end in `.deb` (so a mistyped value is caught, not silently built). The character
+/// refused — unless [`Resolved::allow_insecure_http`] opted in, see [`strip_fetch_scheme`]) and to
+/// end in `.deb` (so a mistyped value is caught, not silently built). The character
 /// set is the unreserved URL set plus the sub-delims a release URL uses, so the value carries no
 /// shell/nix metacharacter — it is interpolated into a generated nix expression and a
 /// `nix store prefetch-file` argument, both of which must stay injection-free.
-pub(crate) fn is_valid_deb_url(url: &str) -> bool {
-    url.strip_prefix("https://").is_some_and(|rest| {
-        !rest.is_empty()
-            && url.ends_with(".deb")
-            && url.chars().all(|c| {
-                c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_' | '~' | '%')
-            })
-    })
+pub(crate) fn is_valid_deb_url(url: &str, allow_insecure_http: bool) -> bool {
+    strip_fetch_scheme(url, allow_insecure_http)
+        .is_some_and(|rest| !rest.is_empty() && url.ends_with(".deb") && is_injection_free_url(url))
 }
 
 /// An `appimage:` URL: an `https://` URL to a prebuilt `.AppImage`. The sibling of [`is_valid_deb_url`]
@@ -4422,13 +4588,11 @@ pub(crate) fn is_valid_deb_url(url: &str) -> bool {
 /// a `.appimage` spelling is accepted; a mistyped value is caught, not silently built). The character
 /// set is the same injection-free URL set, so the value carries no shell/nix metacharacter — it is
 /// interpolated into a generated nix expression and a `nix store prefetch-file` argument.
-pub(crate) fn is_valid_appimage_url(url: &str) -> bool {
-    url.strip_prefix("https://").is_some_and(|rest| {
+pub(crate) fn is_valid_appimage_url(url: &str, allow_insecure_http: bool) -> bool {
+    strip_fetch_scheme(url, allow_insecure_http).is_some_and(|rest| {
         !rest.is_empty()
             && url.to_ascii_lowercase().ends_with(".appimage")
-            && url.chars().all(|c| {
-                c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_' | '~' | '%')
-            })
+            && is_injection_free_url(url)
     })
 }
 
@@ -4452,25 +4616,21 @@ pub(crate) fn is_valid_appimage_url(url: &str) -> bool {
 /// injection-free character set (including `%`, for a percent-encoded path segment), because the
 /// value is interpolated into a generated nix expression and a `nix store prefetch-file` argument.
 /// A URL that is only a host is refused: the program is a path on it, never the root.
-pub(crate) fn is_valid_binary_url(url: &str) -> bool {
-    url.strip_prefix("https://").is_some_and(|rest| {
+pub(crate) fn is_valid_binary_url(url: &str, allow_insecure_http: bool) -> bool {
+    strip_fetch_scheme(url, allow_insecure_http).is_some_and(|rest| {
         rest.split('/').next().is_some_and(|host| !host.is_empty())
             && rest.contains('/')
             && !rest.ends_with('/')
-            && url.chars().all(|c| {
-                c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_' | '~' | '%')
-            })
+            && is_injection_free_url(url)
     })
 }
 
-pub(crate) fn is_valid_tarball_url(url: &str) -> bool {
-    url.strip_prefix("https://").is_some_and(|rest| {
+pub(crate) fn is_valid_tarball_url(url: &str, allow_insecure_http: bool) -> bool {
+    strip_fetch_scheme(url, allow_insecure_http).is_some_and(|rest| {
         let lower = url.to_ascii_lowercase();
         !rest.is_empty()
             && (lower.ends_with(".tar.gz") || lower.ends_with(".tgz"))
-            && url.chars().all(|c| {
-                c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_' | '~' | '%')
-            })
+            && is_injection_free_url(url)
     })
 }
 
@@ -4512,16 +4672,12 @@ pub(crate) fn is_valid_deb_github_locator(s: &str) -> bool {
 /// **uncompressed** `Packages` (no `.gz`/`.xz` decompression) and sbx expects a
 /// **single-application** repo, not a general Debian mirror; a repository that publishes no
 /// `InRelease` keeps the TLS-plus-unpack trust level of a direct `deb:` URL, and says so.
-pub(crate) fn is_valid_deb_apt_locator(s: &str) -> bool {
+pub(crate) fn is_valid_deb_apt_locator(s: &str, allow_insecure_http: bool) -> bool {
     let Some(url) = s.strip_prefix("apt:") else {
         return false;
     };
-    url.strip_prefix("https://").is_some_and(|rest| {
-        !rest.is_empty()
-            && url.chars().all(|c| {
-                c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_' | '~' | '%')
-            })
-    })
+    strip_fetch_scheme(url, allow_insecure_http)
+        .is_some_and(|rest| !rest.is_empty() && is_injection_free_url(url))
 }
 
 /// Set the package named `name` to `backend` with the supplying layer's trust,
@@ -5040,7 +5196,7 @@ fn is_valid_mise_token(token: &str) -> bool {
 /// ref starting with `/`, `.`, or `~` as a local path — and an ambiguous registry-indirect ref
 /// (`nixpkgs`), by *requiring an explicit scheme* (a `:`). A real remote ref always carries one
 /// (`github:`, `git+https:`, `gitlab:`, …).
-fn is_valid_flake_ref(reference: &str) -> bool {
+fn is_valid_flake_ref(reference: &str, allow_insecure_http: bool) -> bool {
     if reference.is_empty()
         || reference.starts_with("path:")
         || reference.starts_with("file:")
@@ -5049,6 +5205,18 @@ fn is_valid_flake_ref(reference: &str) -> bool {
         || reference.starts_with('.')
         || reference.starts_with('~')
         || !reference.contains(':')
+    {
+        return false;
+    }
+    // Plaintext transport, refused in the same shape the local schemes above are — a bare
+    // `http://…` ref and the `+http://` composed forms (`git+http:`, `tarball+http:`). `https://`
+    // and `+https://` do not match either test, the `s` sitting where the `:` must be. Measured
+    // rather than assumed: nix accepts both composed http forms and fetches them, so this refusal
+    // is what stands between an approved config and a source anyone on the path can rewrite.
+    // The five sibling backends have required HTTPS since they were written; this validator is the
+    // one that never did, which is why the opt-in below arrives here as a widening rather than as
+    // the removal of a check it already had.
+    if !allow_insecure_http && (reference.starts_with("http://") || reference.contains("+http://"))
     {
         return false;
     }

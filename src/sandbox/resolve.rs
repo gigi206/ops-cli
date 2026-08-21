@@ -182,11 +182,16 @@ fn resolve_cage_spec(
 /// output, or output that `validate` rejects is a hard error. `validate` is the backend's URL check
 /// (so an arbitrary command still cannot point sbx at a non-`https` or shell/nix-injecting source) and
 /// `kind` names the expected shape (e.g. `` `.tar.gz` `` / `` `.deb` ``) in the error message.
+///
+/// `allow_insecure_http` is the launch's resolved posture, handed to `validate` so this URL — which
+/// the command chose, and which therefore never passed through config validation — is judged by the
+/// same rule a declared locator is. Without it the two would answer differently on the same value.
 pub(crate) fn resolve_url(
     cage: &ResolveCage,
     name: &str,
     command: &[String],
-    validate: fn(&str) -> bool,
+    validate: fn(&str, bool) -> bool,
+    allow_insecure_http: bool,
     kind: &str,
 ) -> io::Result<String> {
     let spec = resolve_cage_spec(cage, command).map_err(|e| {
@@ -217,7 +222,7 @@ pub(crate) fn resolve_url(
             }
         )));
     }
-    validate_download_url(name, out.stdout, validate, kind)
+    validate_download_url(name, out.stdout, validate, allow_insecure_http, kind)
 }
 
 /// Validate a resolve command's captured stdout as a download URL: valid UTF-8, non-empty after
@@ -226,7 +231,8 @@ pub(crate) fn resolve_url(
 fn validate_download_url(
     name: &str,
     stdout: Vec<u8>,
-    validate: fn(&str) -> bool,
+    validate: fn(&str, bool) -> bool,
+    allow_insecure_http: bool,
     kind: &str,
 ) -> io::Result<String> {
     let url = String::from_utf8(stdout)
@@ -242,7 +248,7 @@ fn validate_download_url(
             "the `{name}` resolve command printed no download URL"
         )));
     }
-    if !validate(&url) {
+    if !validate(&url, allow_insecure_http) {
         return Err(io::Error::other(format!(
             "the `{name}` resolve command printed a URL that is not a valid {kind} source: {url}"
         )));
@@ -334,22 +340,51 @@ mod tests {
     #[test]
     fn validate_download_url_enforces_utf8_nonempty_and_the_backend_validator() {
         // The backend supplies the URL shape; here a stand-in `.tar.gz` validator (https + `.tar.gz`).
-        fn is_targz(u: &str) -> bool {
-            u.starts_with("https://") && u.ends_with(".tar.gz")
+        fn is_targz(u: &str, allow_insecure_http: bool) -> bool {
+            (u.starts_with("https://") || (allow_insecure_http && u.starts_with("http://")))
+                && u.ends_with(".tar.gz")
         }
         // a valid URL passes (trimmed of the trailing newline a command prints)
-        let ok = validate_download_url("app", b"https://e/App.tar.gz\n".to_vec(), is_targz, "x")
-            .unwrap();
+        let ok = validate_download_url(
+            "app",
+            b"https://e/App.tar.gz\n".to_vec(),
+            is_targz,
+            false,
+            "x",
+        )
+        .unwrap();
         assert_eq!(ok, "https://e/App.tar.gz");
         // empty output, a validator-rejected URL, and a plaintext/non-URL are each fail-closed
-        assert!(validate_download_url("app", b"  \n".to_vec(), is_targz, "x").is_err());
+        assert!(validate_download_url("app", b"  \n".to_vec(), is_targz, false, "x").is_err());
         assert!(
-            validate_download_url("app", b"https://e/app.zip".to_vec(), is_targz, "x").is_err()
+            validate_download_url("app", b"https://e/app.zip".to_vec(), is_targz, false, "x")
+                .is_err()
         );
-        assert!(validate_download_url("app", b"not-a-url".to_vec(), is_targz, "x").is_err());
+        assert!(validate_download_url("app", b"not-a-url".to_vec(), is_targz, false, "x").is_err());
         // a non-https (injecting/plaintext) URL is refused before any fetch
         assert!(
-            validate_download_url("app", b"http://e/App.tar.gz".to_vec(), is_targz, "x").is_err()
+            validate_download_url("app", b"http://e/App.tar.gz".to_vec(), is_targz, false, "x")
+                .is_err()
+        );
+        // ...and admitted only under the launch's `allow_insecure_http`, which is the point of
+        // carrying it here: this URL was chosen by the resolve command, so it never passed through
+        // config validation, and it has to get the same answer a declared locator would get. The
+        // `false` arm above and this one are the same call differing in that one bit.
+        assert_eq!(
+            validate_download_url(
+                "app",
+                b"http://e/App.tar.gz\n".to_vec(),
+                is_targz,
+                true,
+                "x"
+            )
+            .unwrap(),
+            "http://e/App.tar.gz"
+        );
+        // The opt-in widens the scheme and nothing else: the shape check still refuses.
+        assert!(
+            validate_download_url("app", b"http://e/app.zip".to_vec(), is_targz, true, "x")
+                .is_err()
         );
     }
 }

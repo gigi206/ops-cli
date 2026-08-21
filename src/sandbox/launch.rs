@@ -2952,6 +2952,7 @@ fn prebuilt_ctx(prep: &Prepared) -> super::prebuilt::Ctx<'_> {
         layout: &prep.layout,
         project: &prep.cwd,
         nixpkgs: &prep.nixpkgs,
+        allow_insecure_http: prep.cfg.allow_insecure_http,
     }
 }
 
@@ -7380,6 +7381,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             network: None,
             gui: None,
             gpu: None,
+            allow_insecure_http: None,
             audio: None,
             dbus: None,
             limits: Default::default(),
@@ -7391,6 +7393,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             network_origin: Default::default(),
             gui_origin: Default::default(),
             gpu_origin: Default::default(),
+            allow_insecure_http_origin: Default::default(),
             audio_origin: Default::default(),
             dbus_origin: Default::default(),
             forward_origin: Default::default(),
