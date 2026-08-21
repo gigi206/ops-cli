@@ -108,6 +108,13 @@ It is **fail-closed** in the direction that matters. A shim that cannot install 
 reach the supervisor, exits without running your command: enforcement that could not be established
 means the command does not run, never that it runs unenforced.
 
+The socket the descriptor crosses is reachable from inside the sandbox, so the first thing to
+connect to it is not necessarily the shim. The supervisor asks the kernel whether what it was handed
+is a notification descriptor at all, and a connection that hands over anything else is refused and
+reported, without ending the wait: the shim's own handoff, arriving behind it, is still served. What
+that check cannot supply is a bound on how often something may connect, so a caller determined to
+occupy the socket for the second the shim spends retrying can still cost itself its own launch.
+
 ## Watching and deciding
 
 - [`sbx proc logs [<id>] [-f]`](../cli/proc#logs): the exec feed, each line carrying its verdict

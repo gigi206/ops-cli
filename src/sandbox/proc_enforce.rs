@@ -647,16 +647,39 @@ fn supervise(listener: UnixListener, stop: &AtomicBool, cx: &Deciding<'_>) {
     unsafe { libc::close(notif_fd) };
 }
 
-/// Poll the listening socket in short slices (honouring `stop`), accept the shim's connection, and
-/// receive the listener fd it sends. Returns `None` if stopped first or the handoff fails.
+/// Poll the listening socket in short slices (honouring `stop`), accept a connection, and receive
+/// the listener fd it sends. Returns `None` if stopped first.
+///
+/// A connection that does not hand over a notification listener does **not** end the wait. The
+/// socket is reachable from inside the cage, so the first connection is not necessarily the shim's,
+/// and treating a bad handoff as the end of the story would let anything in the cage refuse its own
+/// launch by connecting first. Refused and announced, the loop goes back to waiting, and the shim —
+/// which retries its connect for a second — is still served. What this does not defend against is a
+/// caller that floods the backlog for the whole of that second; that is a different bound, and not
+/// one a check on the descriptor can supply.
 fn accept_handoff(listener: &UnixListener, stop: &AtomicBool) -> Option<libc::c_int> {
     use std::os::unix::io::AsRawFd;
+    let mut announced = false;
     while !stop.load(Ordering::Relaxed) {
         if !poll_readable(listener.as_raw_fd(), 250) {
             continue;
         }
         match listener.accept() {
-            Ok((stream, _)) => return recv_fd(&stream).ok(),
+            Ok((stream, _)) => match recv_fd(&stream) {
+                Ok(fd) => return Some(fd),
+                Err(why) => {
+                    // Once: a caller that keeps trying would otherwise fill the session's output
+                    // with the same line, and the first is the one that says something new.
+                    if !announced {
+                        announced = true;
+                        crate::diag::warn(&format!(
+                            "exec supervision: a connection to the handoff socket was refused \
+                             ({why}); still waiting for the shim's"
+                        ));
+                    }
+                    continue;
+                }
+            },
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
             Err(_) => return None,
         }
@@ -888,6 +911,27 @@ fn refusal_errno(pid: u32, path: &str) -> libc::c_int {
     } else {
         libc::ENOENT
     }
+}
+
+/// Whether `fd` is a seccomp notification listener at all — asked of the kernel, not assumed.
+///
+/// The handoff socket is bound read-write into the cage, so whatever connects to it first is who
+/// the supervisor hears from, and that need not be the shim. A descriptor that is not a listener
+/// makes the first `NOTIF_RECV` fail and takes the whole launch with it, which is a refusal the
+/// cage can trigger against itself; refused here instead, while the answer is still "that handoff
+/// was not the shim's".
+///
+/// `ID_VALID` is the question that can be asked without consequence. `NOTIF_RECV` — the obvious
+/// probe, and the one this reading of the code first reached for — **blocks** on a listener with
+/// nothing pending, so probing with it would hang the supervisor on the ordinary path. Ids are
+/// drawn from a counter that starts at one, so zero is never pending: a listener answers `ENOENT`
+/// and anything else answers `ENOTTY`. A `0` return is accepted too rather than treated as
+/// impossible — it would still mean the fd answered the seccomp ioctl.
+fn is_notif_listener(fd: libc::c_int) -> bool {
+    let id: u64 = 0;
+    // SAFETY: passes the address of a live local to the ID_VALID ioctl, which only reads it.
+    let rc = unsafe { libc::ioctl(fd, notif_id_valid_code() as libc::Ioctl, &id as *const u64) };
+    rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
 }
 
 /// Whether a seccomp notification id is still valid (the target has not been reaped).
@@ -2412,6 +2456,12 @@ fn recv_fd(stream: &UnixStream) -> io::Result<libc::c_int> {
         if fd < 0 {
             return Err(io::Error::other("invalid fd in the handoff message"));
         }
+        if !is_notif_listener(fd) {
+            libc::close(fd);
+            return Err(io::Error::other(
+                "the handoff carried a descriptor that is not a seccomp notification listener",
+            ));
+        }
         Ok(fd)
     }
 }
@@ -3576,6 +3626,95 @@ mod tests {
     /// Lay the embedded shim down as an executable file and return its path. The tests below run
     /// **this** binary — the one a launch binds into a cage — so a change to the shim's protocol or
     /// its exit codes fails here rather than in a sandbox.
+    /// Hand one descriptor over a connected stream, the way the shim does — the impostor's half of
+    /// the handoff, so a test can be the thing the supervisor must not believe.
+    fn send_fd(stream: &UnixStream, fd: libc::c_int) {
+        use std::os::unix::io::AsRawFd;
+        let mut dummy: u8 = b'x';
+        let mut iov = libc::iovec {
+            iov_base: &mut dummy as *mut u8 as *mut libc::c_void,
+            iov_len: 1,
+        };
+        let mut cbuf = [0u8; 32];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) } as _;
+        // SAFETY: the control buffer is live and sized for one cmsg header plus one descriptor.
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
+            std::ptr::copy_nonoverlapping(
+                &fd as *const libc::c_int as *const u8,
+                libc::CMSG_DATA(cmsg),
+                std::mem::size_of::<libc::c_int>(),
+            );
+            assert!(
+                libc::sendmsg(stream.as_raw_fd(), &msg, 0) >= 0,
+                "the impostor's handoff must reach the socket"
+            );
+        }
+    }
+
+    /// The handoff socket is bound into the cage, so the first connection is not necessarily the
+    /// shim's. A descriptor that is not a notification listener is refused, and refusing it does
+    /// not end the wait: the shim's own handoff, right behind it, is still served.
+    ///
+    /// Both halves matter. Without the check the supervisor takes the impostor's descriptor,
+    /// fails on its first `NOTIF_RECV` and brings the launch down — a refusal anything in the cage
+    /// could trigger against its own session. With the check but without the loop, the refusal
+    /// itself ends the wait, which is the same outcome by a shorter route.
+    #[test]
+    fn a_handoff_that_is_not_the_shims_is_refused_without_ending_the_wait() {
+        let dir = TmpDir::new();
+        let shim = materialized_shim(&dir);
+        let sock_path = dir.join("notif.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind the handoff socket");
+
+        // What the cage can do: connect first, and hand over a descriptor of its choosing.
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: a two-element array is what `pipe` writes into.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "make a pipe");
+        let (read_end, write_end) = (fds[0], fds[1]);
+        assert!(
+            !is_notif_listener(read_end),
+            "a pipe is not a notification listener, which is the whole premise"
+        );
+        let impostor = UnixStream::connect(&sock_path).expect("connect to the handoff socket");
+        send_fd(&impostor, read_end);
+
+        // ...and the real shim, queued right behind it.
+        let mut cmd = std::process::Command::new(&shim);
+        cmd.arg(&sock_path)
+            .arg("--")
+            .arg("/bin/true")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = spawn_shim(&mut cmd);
+
+        let stop = AtomicBool::new(false);
+        let notif = accept_handoff(&listener, &stop).expect("the shim's handoff must be served");
+        assert!(
+            is_notif_listener(notif),
+            "what the supervisor kept must be the shim's listener, not the impostor's pipe"
+        );
+
+        // The payload is parked in its `execve` notification with nobody answering; it is the
+        // handoff this test is about, not the decision.
+        let _ = child.kill();
+        let _ = child.wait();
+        // SAFETY: all three are this test's own descriptors, each closed once.
+        unsafe {
+            libc::close(notif);
+            libc::close(read_end);
+            libc::close(write_end);
+        }
+    }
+
     fn materialized_shim(dir: &TmpDir) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("proc-shim");
