@@ -364,7 +364,7 @@ fn tail_lines(body: &[u8], n: usize) -> &[u8] {
 /// nothing will ever append to.
 fn session_is_live(data_dir: &Path, id: u32) -> bool {
     session::Registry::at(data_dir)
-        .list()
+        .live()
         .map(|sessions| sessions.iter().any(|s| s.pid == id))
         .unwrap_or(false)
 }
@@ -455,7 +455,7 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
 /// file that was never meant to exist.
 fn explain_missing_log(data_dir: &Path, id: u32, path: &Path) -> ExitCode {
     let record = session::Registry::at(data_dir)
-        .list()
+        .live()
         .ok()
         .and_then(|sessions| sessions.into_iter().find(|s| s.pid == id));
     match record {

@@ -489,7 +489,7 @@ fn egress_data_dir() -> Result<PathBuf, String> {
 /// carries, so the two line up.
 fn pending_session_context(data_dir: &Path) -> Vec<(u32, PathBuf, String)> {
     session::Registry::at(data_dir)
-        .list()
+        .live()
         .unwrap_or_default()
         .into_iter()
         .map(|s| {
@@ -505,7 +505,7 @@ fn pending_session_context(data_dir: &Path) -> Vec<(u32, PathBuf, String)> {
 /// sessions the registry confirms are that app.
 fn session_pids_for_app(data_dir: &Path, name: &str) -> std::collections::HashSet<u32> {
     session::Registry::at(data_dir)
-        .list()
+        .live()
         .unwrap_or_default()
         .into_iter()
         .filter(|s| s.app() == Some(name))
@@ -518,7 +518,7 @@ fn session_pids_for_app(data_dir: &Path, name: &str) -> std::collections::HashSe
 /// the user scoped with `--app` really belongs to that app.
 fn session_app_of(data_dir: &Path, pid: u32) -> Option<String> {
     session::Registry::at(data_dir)
-        .list()
+        .live()
         .unwrap_or_default()
         .into_iter()
         .find(|s| s.pid == pid)
@@ -532,7 +532,7 @@ fn session_app_of(data_dir: &Path, pid: u32) -> Option<String> {
 /// registry has no known project, so under a filter it is excluded.
 fn session_pids_for_project(data_dir: &Path, project: &Path) -> std::collections::HashSet<u32> {
     session::Registry::at(data_dir)
-        .list()
+        .live()
         .unwrap_or_default()
         .into_iter()
         .filter(|s| s.project == project)

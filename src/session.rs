@@ -522,6 +522,22 @@ impl Registry {
         self.housekeep().map(|(live, _)| live)
     }
 
+    /// The same answer, without touching the directory: for a caller that is *asking*, not tidying.
+    ///
+    /// The two are separated because most callers only ever wanted the question. `sbx net pending`
+    /// cross-references a pid against the registry; `sbx session logs --follow` asks whether the
+    /// session it is following is still there, four times a second for the whole of an agent's run.
+    /// Going through [`list`](Self::list) made each of those a full reclamation pass — a readdir, a
+    /// parse, a `kill` and a `/proc` read per record, and an unlink for every record that had died —
+    /// which is not what the caller asked for and not what `FOLLOW_POLL` was costed against. It also
+    /// quietly took the work `sbx gc` reports, so the count gc prints was whatever a concurrent
+    /// reader had left it.
+    ///
+    /// Reclaiming stays with the verbs that mean it: `sbx session ls`, `sbx session stop`, `sbx gc`.
+    pub(crate) fn live(&self) -> io::Result<Vec<Session>> {
+        self.scan(false).map(|(live, _)| live)
+    }
+
     /// Re-validate every record against its running process: return the live sessions (sorted for
     /// stable display) and the count of dead or unparseable records reaped. Pruning happens only
     /// here, so the directory is bounded by how often this runs: an interactive `sbx run` self-cleans on exit via
@@ -529,6 +545,14 @@ impl Registry {
     /// `sbx gc` reaps it. `sbx gc` calls this directly to report the prune; `sbx session ls` and the gc
     /// reaper take the live half through [`list`](Self::list).
     pub(crate) fn housekeep(&self) -> io::Result<(Vec<Session>, usize)> {
+        self.scan(true)
+    }
+
+    /// One walk over the records, with `prune` deciding whether a dead or unparseable one is
+    /// removed or merely left out of the answer. Written once so the two readings can never
+    /// disagree on what "live" means — which is the whole reason a caller that only asks is allowed
+    /// to skip the tidying.
+    fn scan(&self, prune: bool) -> io::Result<(Vec<Session>, usize)> {
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(e) => e,
             // No sessions directory yet means no sessions — not an error.
@@ -555,9 +579,9 @@ impl Registry {
             }
             match parse_record(&path) {
                 Some(session) if is_alive(&session) => live.push(session),
-                // Dead or corrupt: reclaim it.
+                // Dead or corrupt: reclaim it, if reclaiming is what this walk is for.
                 _ => {
-                    if std::fs::remove_file(&path).is_ok() {
+                    if prune && std::fs::remove_file(&path).is_ok() {
                         pruned += 1;
                     }
                 }
@@ -971,13 +995,15 @@ mod tests {
         // same pid, deliberately wrong start time
         me.start_ticks = me.start_ticks.wrapping_add(1);
         me.project = PathBuf::from("/work/stale");
-        reg.register(&me).unwrap();
+        let stale = reg.register(&me).unwrap();
 
         let listed = reg.list().unwrap();
         assert_eq!(listed.len(), 1, "only the matching incarnation is live");
         assert_eq!(listed[0].project, PathBuf::from("/work/live"));
-        // the stale record file is gone
-        assert!(!dir.path().join(me.file_name()).exists());
+        // the stale record file is gone — asked of the path `register` returned, since a path
+        // rebuilt from the record's name misses the `sessions/` directory it actually lives in and
+        // would read as absent however the walk behaves.
+        assert!(!stale.exists());
     }
 
     #[test]
@@ -987,10 +1013,41 @@ mod tests {
         // A pid that cannot exist (above the kernel's pid ceiling): no /proc entry,
         // kill -> ESRCH.
         let dead = session_at("/work/gone", PID_ABOVE_CEILING, 1, Kind::Run);
-        reg.register(&dead).unwrap();
+        let record = reg.register(&dead).unwrap();
 
         assert!(reg.list().unwrap().is_empty());
-        assert!(!dir.path().join(dead.file_name()).exists());
+        assert!(!record.exists(), "the dead record is reclaimed");
+    }
+
+    /// Asking is not tidying: a read that only wants to know leaves the directory as it found it.
+    ///
+    /// The distinction is load-bearing in two places. `sbx session logs --follow` asks this
+    /// question four times a second for as long as an agent runs, and a reclamation pass on every
+    /// poll is not what that interval was costed against. And `sbx gc` reports how many records it
+    /// reclaimed, which is only true of gc if a reader has not silently done it first.
+    #[test]
+    fn a_read_that_only_asks_leaves_the_dead_record_for_a_verb_that_reclaims() {
+        let dir = TmpDir::new();
+        let reg = Registry::at(dir.path());
+        let dead = session_at("/work/gone", PID_ABOVE_CEILING, 1, Kind::Run);
+        // The path comes from `register` rather than being rebuilt here: the registry keeps its
+        // records in a `sessions/` subdirectory, so a rebuilt path names a file that never existed
+        // and an assertion on its absence holds whatever the code does.
+        let record = reg.register(&dead).unwrap();
+
+        assert!(
+            reg.live().unwrap().is_empty(),
+            "a dead record is not a live session under either reading"
+        );
+        assert!(record.exists(), "...but asking must not be what removes it");
+
+        let (live, pruned) = reg.housekeep().unwrap();
+        assert!(live.is_empty());
+        assert_eq!(
+            pruned, 1,
+            "the verb that reclaims still gets the work to do"
+        );
+        assert!(!record.exists());
     }
 
     #[test]
