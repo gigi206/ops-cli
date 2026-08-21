@@ -1,7 +1,8 @@
 //! Pinning `flake:` `[packages]` to a fixed revision for `sbx upgrade`.
 //!
-//! A `flake:<ref>` package is built in-cage at launch with `nix build`. By default the ref
-//! *floats* — each cold launch resolves the flake's latest revision. `sbx upgrade flake` pins
+//! A `flake:<ref>` package is a remote reference, so it is built **host-side** into sbx's store
+//! and seeded per project, the way a `nix:` tool is; only an inline `[flakes.<name>]` builds in
+//! the cage. By default the ref *floats* — each cold launch resolves the flake's latest revision. `sbx upgrade flake` pins
 //! it: it resolves each declared ref to its current immutable revision with `nix flake
 //! metadata` and records `(declared ref → revision, locked ref)` in a per-project lock. A launch
 //! then builds the *locked* ref into an out-link keyed by that revision (`<name>-<rev>`), so a

@@ -4111,7 +4111,8 @@ fn build(
     bin_paths.extend(packages.bins);
 
     // The prebuilt backends — `deb:`, `appimage:`, `tarball:` — are provisioned host-side (like
-    // `nix:`, not in-cage like `flake:`): sbx resolves each declared locator to a hash (pinned in the
+    // `nix:` and a remote `flake:`, not in-cage like an inline `[flakes.<name>]`): sbx resolves
+    // each declared locator to a hash (pinned in the
     // per-project lock), builds the generated unpack+autoPatchelf derivation into sbx's store,
     // prepends its bin to PATH, and seeds its closure (its root joins `packages.roots`). All three
     // unpack at *build* time — an AppImage's squashfs is never self-mounted at runtime, which the
@@ -4181,17 +4182,15 @@ fn build(
         }
     }
 
-    // `flake:` packages are built in-cage at launch (below), not host-provisioned, but their
-    // out-link `bin` directories join PATH now — ahead of the base, like every other declared
-    // tool. The out-link need not exist yet: the in-cage `nix build` creates it before the
-    // command runs, exactly as the mise shims dir is on PATH before mise populates it. Each
-    // out-link is keyed by the (validated) package name under the persistent home.
     // A remote `flake:` package is built host-side into the shared store and seeded per project (see
     // `packages::provision`), so it lands once and is reused everywhere like a `nix:` tool — its `bin/`
     // is already on PATH via the provisioned package bins. Only inline `[flakes.<name>]` flakes still
     // build in-cage here: an inline flake is local content the user staged, and building local content
     // host-side is exactly what `is_valid_flake_ref` refuses for a remote ref, so the inline case stays
-    // contained in the cage. Each quad carries the build ref, the content-hash-keyed build *target*
+    // contained in the cage. Their out-link `bin` directories join PATH now, ahead of the base like
+    // every other declared tool, and need not exist yet: the in-cage `nix build` creates each one
+    // before the command runs, exactly as the mise shims dir is on PATH before mise populates it.
+    // Each quad carries the build ref, the content-hash-keyed build *target*
     // out-link, the stable *good* out-link PATH resolves through (kept at the last good build on a
     // failure), and the flake name.
     let mut flake_pairs: Vec<(String, PathBuf, PathBuf, String)> = Vec::new();

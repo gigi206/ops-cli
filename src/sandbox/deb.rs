@@ -16,10 +16,14 @@
 //!     asset, so even a project whose asset name embeds the version rolls forward.
 //!   * `deb:apt:<https Packages-index url>` — track an apt repository's highest-version `.deb`, for a
 //!     vendor pool that publishes versioned filenames with no `latest` alias (so a hand-pinned URL
-//!     goes stale). sbx fetches the uncompressed `Packages` index, picks the newest version, and
-//!     **re-validates the derived `.deb` URL** through the same charset check a hand-written `deb:`
-//!     URL passes. Scope, not a gap: uncompressed index only, no `InRelease`/GPG check, a
-//!     single-application repo — the same TLS-plus-unpack trust level as a direct `deb:` URL.
+//!     goes stale). sbx fetches the uncompressed `Packages` index, **checks those very bytes
+//!     against the repository's clearsigned `InRelease`** ([`attest_index`]), picks the newest
+//!     version, and **re-validates the derived `.deb` URL** through the same charset check a
+//!     hand-written `deb:` URL passes. The signing key is pinned on first encounter, and a
+//!     repository that is later re-keyed, or whose `InRelease` disappears once pinned, is refused
+//!     rather than downgraded. Scope, not a gap: uncompressed index only, a single-application
+//!     repo, and a first encounter that has nothing but TLS to judge the key by — which warns,
+//!     naming what is and is not attested, rather than failing.
 //!
 //! Update model: pin-on-first-use. A launch resolves the source to a concrete `.deb` URL and its
 //! content hash, records both in a per-project lock (`deb-packages.lock`), and later launches reuse
