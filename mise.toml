@@ -104,7 +104,7 @@ description = "Run the sandbox e2e and the unit tests with skips turned into fai
 # means `kernel.apparmor_restrict_unprivileged_userns=0`), plus `nix` and `bwrap` reachable. On a
 # host without them this task is *meant* to fail — that failure is the finding, not a flake.
 #
-# Scoped to the fourteen suites that carry a cage skip rather than to the whole tree: those are the
+# Scoped to the fifteen suites that carry a cage skip rather than to the whole tree: those are the
 # ones a hosted runner silently skips, and they are what "the cage was exercised" has to mean. The
 # list is written out rather than globbed so that a new suite carrying a skip is a deliberate
 # addition here, not a silent omission.
@@ -112,7 +112,7 @@ run = """
 set -uo pipefail
 export SBX_REQUIRE_CAPABLE=1
 rc=0
-for suite in attach completion config detach doctor fs netns plugins proc run sessions shell stop upgrade; do
+for suite in attach completion config detach doctor fs netns plugins proc projects run sessions shell stop upgrade; do
   cargo test --test "$suite" --no-fail-fast || rc=$?
 done
 # The unit tests too, and on a capable host they are not a formality: the guards that need a real

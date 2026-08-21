@@ -15,6 +15,8 @@
 mod testskip;
 
 mod allowlist;
+#[cfg(test)]
+mod cage_coverage;
 mod cli;
 mod config;
 mod diag;

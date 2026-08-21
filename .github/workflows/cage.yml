@@ -271,7 +271,7 @@ jobs:
           set -uo pipefail
           mkdir -p "$(dirname "$SBX_SKIP_LOG")"
           : > "$SBX_SKIP_LOG"
-          # The fourteen suites that carry a cage skip, named rather than globbed so a new one is a
+          # The fifteen suites that carry a cage skip, named rather than globbed so a new one is a
           # deliberate addition. Kept in step with `mise run test-cage`, which runs the same list.
           # NOT run inside a user scope, deliberately. Placing the suites under
           # `user@<uid>.service` gives `sbx` the delegation root it looks for, so every launch would
@@ -284,7 +284,7 @@ jobs:
           # a pass. The dollar report above keeps measuring the same thing without asserting it, so
           # the day a systemd default moves again, this says so either way.
           rc=0
-          for suite in attach completion config detach doctor fs netns plugins proc run sessions shell stop upgrade; do
+          for suite in attach completion config detach doctor fs netns plugins proc projects run sessions shell stop upgrade; do
             cargo test --test "$suite" --no-fail-fast || rc=$?
           done
           # The unit tests too, and on a capable host they are not a formality: the guards that need a real
