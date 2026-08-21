@@ -176,6 +176,13 @@ mean "never told about this", which is the exact failure this field exists to pr
   one"; honouring that for the log while still raising a toast would defeat the point.
 - **An `ask` you already answered.** Under the interactive posture you were asked about that exact
   request; a second, after-the-fact "it was denied" would be pure noise.
+- **Anything past a thousand distinct problems in one session.** Which problem a notification is
+  about includes its subject, and the subject is chosen by the code in the cage: a loop reaching for
+  a thousand different hostnames is a thousand different problems, under `once` exactly as under
+  `always`, because a problem never seen before is not a repeat. A session therefore announces at
+  most a thousand distinct problems and says at the end how many more it stopped announcing. The
+  cap is on the announcing only: `sbx net logs` and `sbx proc logs` hold every event either way, so
+  a flood cannot bury what it is hiding.
 
 ## When a fix is suggested
 

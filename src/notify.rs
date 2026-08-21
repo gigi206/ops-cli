@@ -344,6 +344,19 @@ pub(crate) enum Speak {
     Say { replaces: Option<u32> },
 }
 
+/// How many distinct problems one session's repeat memory holds.
+///
+/// Bounded because a key carries a **subject** the agent chooses — the host it tried to reach, the
+/// program it tried to run — so how many distinct keys exist is the agent's decision, not the
+/// session's. A loop over unique hostnames would otherwise grow this map for as long as the session
+/// lives, and announce one desktop notification per name: the repeat memory is what makes a repeat
+/// cheap, and a never-seen key is not a repeat under any mode.
+///
+/// What the cap bounds is the *announcing*, never the record. `sbx net logs` and `sbx proc logs`
+/// hold every event whether or not it was announced, so a flood cannot erase what it is hiding —
+/// and how many were not announced is reported at teardown rather than swallowed.
+pub(crate) const SEEN_MAX: usize = 1024;
+
 /// The per-session repeat memory: which problems have been announced, and under which notification id.
 ///
 /// In RAM, for the session's lifetime, and deliberately never persisted — a problem silenced by
@@ -351,8 +364,12 @@ pub(crate) enum Speak {
 /// information.
 #[derive(Debug, Default)]
 pub(crate) struct Coalescer {
-    /// Key → what is known about that problem's last announcement.
+    /// Key → what is known about that problem's last announcement. Never more than [`SEEN_MAX`]
+    /// entries.
     seen: HashMap<String, Announced>,
+    /// Distinct problems that arrived with the memory full, and were therefore not announced.
+    /// Reported once at teardown.
+    unannounced: u64,
 }
 
 /// What a problem's last announcement left behind.
@@ -395,6 +412,13 @@ impl Coalescer {
                 Speak::Say { replaces: prior.id }
             }
             None => {
+                // Full, and this problem is a new one. Announcing without recording would make
+                // `once` mean *always* for everything past the cap, which is the flood rather than
+                // a defence against it, so it is counted and left for the teardown advisory.
+                if self.seen.len() >= SEEN_MAX {
+                    self.unannounced += 1;
+                    return Speak::Stay;
+                }
                 self.seen.insert(
                     key,
                     Announced {
@@ -410,11 +434,26 @@ impl Coalescer {
     /// Record the id the daemon returned for `block`'s notification, so the next repeat of that problem
     /// replaces this toast rather than adding one. A no-op for a sink with no ids (stderr).
     pub(crate) fn record_id(&mut self, block: &Block, id: u32) {
-        let entry = self
-            .seen
-            .entry(block.key())
-            .or_insert(Announced { id: None, at: None });
-        entry.id = Some(id);
+        let key = block.key();
+        if let Some(entry) = self.seen.get_mut(&key) {
+            entry.id = Some(id);
+        } else if self.seen.len() < SEEN_MAX {
+            // A key with no entry cannot arrive from the delivery path (an id follows a `Say`, and
+            // a `Say` recorded the key), so this is the shape rather than a case: an insert here is
+            // still an insert, and it observes the same bound as the one in `decide`.
+            self.seen.insert(
+                key,
+                Announced {
+                    id: Some(id),
+                    at: None,
+                },
+            );
+        }
+    }
+
+    /// How many distinct problems arrived with the memory full and were therefore not announced.
+    pub(crate) fn unannounced(&self) -> u64 {
+        self.unannounced
     }
 }
 
@@ -524,6 +563,59 @@ mod tests {
         );
         assert_eq!(c.decide(policy, &b, Instant::now()), Speak::Stay);
         assert_eq!(c.decide(policy, &b, Instant::now()), Speak::Stay);
+    }
+
+    /// The repeat memory is bounded, and what it stops doing when it fills is *announcing*, not
+    /// remembering the record.
+    ///
+    /// The subject in a key is the agent's to choose — a hostname it reached for, a program it
+    /// tried to run — so an unbounded map is an agent-sized allocation in the supervisor, and one
+    /// desktop notification per distinct name whatever the mode: a never-seen problem is not a
+    /// repeat, so `once` announces it exactly as `always` does. Past the cap the answer is silence
+    /// plus a count, never an announcement that goes unrecorded, which would turn `once` into
+    /// `always` for everything above the line.
+    #[test]
+    fn the_repeat_memory_is_bounded_and_says_how_much_it_did_not_announce() {
+        let policy = NotifyPolicy::uniform(NotifyMode::Once);
+        let mut c = Coalescer::default();
+        let subject = |i: usize| format!("host{i}.example.com:443");
+
+        for i in 0..SEEN_MAX {
+            assert_eq!(
+                c.decide(
+                    policy,
+                    &block(NotifyEvent::Network, &subject(i), "denied-default"),
+                    Instant::now()
+                ),
+                Speak::Say { replaces: None },
+                "a distinct problem is announced while there is room to remember it"
+            );
+        }
+        assert_eq!(c.unannounced(), 0, "nothing was refused up to the cap");
+
+        for i in SEEN_MAX..SEEN_MAX + 5 {
+            let b = block(NotifyEvent::Network, &subject(i), "denied-default");
+            assert_eq!(c.decide(policy, &b, Instant::now()), Speak::Stay);
+            // An id arriving for a key that was never recorded must not be the way in either.
+            c.record_id(&b, 99);
+        }
+        assert_eq!(c.unannounced(), 5, "and each one past it is counted");
+        assert_eq!(
+            c.seen.len(),
+            SEEN_MAX,
+            "the memory holds its bound whichever door is tried"
+        );
+
+        // A problem already known is still coalesced, which is the whole point of the memory: the
+        // cap must not cost the repeats it exists to suppress.
+        assert_eq!(
+            c.decide(
+                policy,
+                &block(NotifyEvent::Network, &subject(0), "denied-default"),
+                Instant::now()
+            ),
+            Speak::Stay
+        );
     }
 
     #[test]

@@ -463,6 +463,10 @@ pub(crate) struct Notifier {
     tx: Option<SyncSender<Block>>,
     /// Announcements dropped because the queue was full, reported once at teardown.
     dropped: Arc<AtomicU64>,
+    /// Distinct problems the repeat memory had no room for, and so did not announce. Reported once
+    /// at teardown, beside `dropped` and separately from it: one is a delivery that could not keep
+    /// up, the other a session that has already said as many different things as it remembers.
+    unannounced: Arc<AtomicU64>,
     /// Set at teardown; the delivery thread drains what is queued and then exits.
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -476,6 +480,7 @@ impl Notifier {
             policy: NotifyPolicy::uniform(crate::notify::NotifyMode::Off),
             tx: None,
             dropped: Arc::new(AtomicU64::new(0)),
+            unannounced: Arc::new(AtomicU64::new(0)),
             stop: Arc::new(AtomicBool::new(false)),
             handle: None,
         }
@@ -520,6 +525,10 @@ impl Notifier {
         // summary, which happens nowhere else.
         let (tx, rx) = sync_channel::<Block>(QUEUE_CAP);
         let dropped = Arc::new(AtomicU64::new(0));
+        // Filled by the delivery thread, which is where the repeat memory lives, and read by
+        // teardown on whichever thread calls it.
+        let unannounced = Arc::new(AtomicU64::new(0));
+        let thread_unannounced = Arc::clone(&unannounced);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let handle = std::thread::spawn(move || {
@@ -554,9 +563,9 @@ impl Notifier {
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
                 };
-                let Speak::Say { replaces } =
-                    coalescer.decide(policy, &block, std::time::Instant::now())
-                else {
+                let speak = coalescer.decide(policy, &block, std::time::Instant::now());
+                thread_unannounced.store(coalescer.unannounced(), Ordering::Relaxed);
+                let Speak::Say { replaces } = speak else {
                     continue;
                 };
                 let (summary, body) = block.render();
@@ -596,6 +605,7 @@ impl Notifier {
             policy,
             tx: Some(tx),
             dropped,
+            unannounced,
             stop,
             handle: Some(handle),
         }
@@ -635,6 +645,21 @@ fn drop_report(n: u64) -> Option<String> {
     })
 }
 
+/// The teardown advisory for `n` distinct problems the repeat memory had no room to announce, or
+/// `None` when there were none. Pure, like [`drop_report`], and separate from it: a reader told
+/// only that "notifications were dropped" would look for a slow desktop rather than for an agent
+/// producing more distinct problems than a session announces.
+fn forget_report(n: u64) -> Option<String> {
+    (n > 0).then(|| {
+        format!(
+            "{n} further distinct blocked-request notification(s) were not announced: this \
+             session had already announced {} different problems, which is as many as it \
+             remembers (the logs — `sbx net logs`, `sbx proc logs` — are complete)",
+            crate::notify::SEEN_MAX,
+        )
+    })
+}
+
 impl Notifier {
     /// Stop delivering, drain what is queued, and report anything the queue could not hold.
     ///
@@ -645,7 +670,15 @@ impl Notifier {
     /// never fires. Idempotent, so the `Drop` below stays a safety net.
     pub(crate) fn finish(&self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.report();
+    }
+
+    /// Both teardown advisories, each swapped to zero so the pair below stays idempotent.
+    fn report(&self) {
         if let Some(msg) = drop_report(self.dropped.swap(0, Ordering::Relaxed)) {
+            crate::diag::warn(&msg);
+        }
+        if let Some(msg) = forget_report(self.unannounced.swap(0, Ordering::Relaxed)) {
             crate::diag::warn(&msg);
         }
     }
@@ -663,9 +696,7 @@ impl Drop for Notifier {
         }
         // A safety net for a path that never called `finish`; `swap` makes the pair idempotent, so
         // whichever runs second reports nothing rather than repeating the advisory.
-        if let Some(msg) = drop_report(self.dropped.swap(0, Ordering::Relaxed)) {
-            crate::diag::warn(&msg);
-        }
+        self.report();
     }
 }
 
@@ -918,6 +949,16 @@ mod tests {
 
     #[test]
     fn the_teardown_advisory_reports_only_what_was_actually_dropped() {
+        assert_eq!(forget_report(0), None, "nothing forgotten, nothing said");
+        let msg = forget_report(4).expect("four unannounced problems are worth a line");
+        assert!(
+            msg.contains("were not announced") && msg.contains("as many as it remembers"),
+            "the advisory must send its reader to the cause it actually has: {msg}"
+        );
+        assert!(
+            msg.contains("the logs"),
+            "and say the record is still complete: {msg}"
+        );
         assert_eq!(drop_report(0), None, "nothing dropped, nothing said");
         let msg = drop_report(7).expect("a drop is reported");
         assert!(msg.starts_with("7 blocked-request notification(s) were dropped"));
