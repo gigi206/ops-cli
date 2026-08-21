@@ -45,3 +45,22 @@ mute = [
 [bundle.reasonix.packages]
 nodejs = "nix:nodejs"      # the `bin/reasonix.js` shim is what launches — needed at RUNTIME
 reasonix = "mise:npm:reasonix"  # upstream's own npm scope; binary via the platform optional dep
+
+[bundle.reasonix.env]
+# mise picks the client that performs an `npm:` install itself (`npm.package_manager = "auto"`), and
+# the one it picks refuses this package: the install ends in
+# `aube install failed: failed to resolve dependencies`, with no prompt a caller could answer,
+# so the tool is never equipped and the app cannot start from a clean home. The reference client
+# installs it without complaint, so this bundle names it rather than leaving the choice to be made
+# for it.
+#
+# The failure is not the same one `sigit` and `deepseek-harness` hit — that client aborts on those
+# two and fails to resolve dependencies here — but the remedy is, which is what makes naming the
+# client the fix rather than working around one vendor's tree.
+#
+# Scoped to this bundle on purpose. The setting governs every `npm:` package in a cage, and the cage
+# this bundle builds carries exactly one. Measured cost on a package that works either way: 22 s
+# instead of 18 s, once, when the app home is first filled.
+#
+# THE TRIGGER THAT REMOVES THIS: the default client installs `npm:reasonix` without failing.
+MISE_NPM_PACKAGE_MANAGER = "npm"

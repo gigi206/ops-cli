@@ -37,3 +37,18 @@ mute = [
 [bundle.sigit.packages]
 nodejs = "nix:nodejs"                # the npm entry point is a JS shim
 sigit = "mise:npm:@smbcloud/sigit"   # upstream's documented npm package
+
+[bundle.sigit.env]
+# mise picks the client that performs an `npm:` install itself (`npm.package_manager = "auto"`), and
+# the one it picks refuses this package: the install ends in
+# `aube install failed: user aborted `mise add @smbcloud/sigit``, with no prompt a caller could answer,
+# so the tool is never equipped and the app cannot start from a clean home. The reference client
+# installs it without complaint, so this bundle names it rather than leaving the choice to be made
+# for it.
+#
+# Scoped to this bundle on purpose. The setting governs every `npm:` package in a cage, and the cage
+# this bundle builds carries exactly one. Measured cost on a package that works either way: 22 s
+# instead of 18 s, once, when the app home is first filled.
+#
+# THE TRIGGER THAT REMOVES THIS: the default client installs `npm:@smbcloud/sigit` without failing.
+MISE_NPM_PACKAGE_MANAGER = "npm"

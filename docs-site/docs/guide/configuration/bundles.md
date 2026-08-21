@@ -299,7 +299,7 @@ The 64 shipped bundles, and what each carries:
 | `cursor` | 2 (`deb:`, `nix:`) | 31 egress entries, 1 env var, a `deb:` resolver | `chromium-background` |
 | `cursor-agent` | 2 (`nix:`) | 5 egress entries, 1 env var, an install step | none |
 | `deepagents-code` | 3 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
-| `deepseek-harness` | 5 (`mise:`, `nix:`) | 3 egress entries, an install step, a freshness exemption | `npm-audit`, `npm-registry` |
+| `deepseek-harness` | 5 (`mise:`, `nix:`) | 3 egress entries, 1 env var, an install step, a freshness exemption | `npm-audit`, `npm-registry` |
 | `devin` | 1 (`tarball:`) | 4 egress entries, a `tarball:` resolver | none |
 | `dirac` | 3 (`mise:`, `nix:`) | 5 egress entries | `npm-audit`, `npm-registry` |
 | `droid` | 2 (`mise:`, `nix:`) | 9 egress entries | `npm-audit`, `npm-registry` |
@@ -333,10 +333,10 @@ The 64 shipped bundles, and what each carries:
 | `prime-agent` | 5 (`nix:`) | 4 egress entries, 1 env var, an install step | `npm-registry`, `pypi` |
 | `qoder` | 3 (`mise:`, `nix:`) | 6 egress entries | `npm-audit`, `npm-registry` |
 | `qwen-code` | 2 (`mise:`, `nix:`) | 3 egress entries | `npm-registry` |
-| `reasonix` | 2 (`mise:`, `nix:`) | 4 egress entries | `npm-audit`, `npm-registry` |
+| `reasonix` | 2 (`mise:`, `nix:`) | 4 egress entries, 1 env var | `npm-audit`, `npm-registry` |
 | `reasonix-desktop` | 1 (`deb:`) | 2 egress entries, 4 env vars, a `deb:` resolver | none |
 | `rovo` | 1 (`nix:`) | 12 egress entries | none |
-| `sigit` | 2 (`mise:`, `nix:`) | 5 egress entries | `npm-audit`, `npm-registry` |
+| `sigit` | 2 (`mise:`, `nix:`) | 5 egress entries, 1 env var | `npm-audit`, `npm-registry` |
 | `snow` | 2 (`mise:`, `nix:`) | 2 egress entries | `npm-audit`, `npm-registry` |
 | `stakpak` | 1 (`mise:`) | 4 egress entries | none |
 | `trae` | 2 (`nix:`) | 2 egress entries, an install step | `github`, `pypi` |
