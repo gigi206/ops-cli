@@ -4567,9 +4567,25 @@ fn reserved_key_predicate_covers_the_ld_family_and_startup_hooks() {
         // lowercase variant), so an off-case spelling is reserved too.
         "ssl_cert_file",
         "Curl_CA_Bundle",
-        // the signal `sbx upgrade provision` raises for a bundle's install step: sbx sets it, so
-        // an untrusted project may not, or every launch would re-run the install as a download.
+        // sbx's own control namespace, whole: everything the override layer reads from the
+        // ambient environment lives under this prefix, so an untrusted project may plant none of
+        // it. `SBX_UPGRADE` is the concrete case (sbx sets it, and a project raising it on every
+        // launch would turn each one into a re-download); the rest is what a per-name list would
+        // have had to be extended with, once per control variable added.
         "SBX_UPGRADE",
+        "SBX_CONFIG",
+        "SBX_NET",
+        "SBX_BIND",
+        "SBX_SECCOMP",
+        "SBX_DATA_DIR",
+        "SBX_BWRAP_BIN",
+        // the indirect form, which is the one that would otherwise carry a name reserved just
+        // above: the override layer strips the prefix and materializes the suffix as-is.
+        "SBX_ENV_LD_PRELOAD",
+        "SBX_LIMIT_TASKS_MAX",
+        "SBX_PACKAGE_ripgrep",
+        // and a name sbx has not defined yet, which is the point of reserving the prefix.
+        "SBX_SOMETHING_ADDED_LATER",
     ] {
         assert!(is_reserved_env_key(k), "{k} should be reserved");
     }
@@ -4584,6 +4600,12 @@ fn reserved_key_predicate_covers_the_ld_family_and_startup_hooks() {
         "LDFLAGS",
         "NIX_PATH",
         "PROXY_HOST",
+        // a prefix, not a substring: these are apps' own variables, spelled by profiles sbx
+        // ships, and reserving the substring would take them with it.
+        "TRAE_SBX_UPDATE",
+        "OPEN_DESIGN_SBX_UPDATE",
+        "HERMES_WEBUI_SBX_GATEWAY",
+        "MY_SBX_TOKEN",
     ] {
         assert!(!is_reserved_env_key(k), "{k} should be allowed");
     }

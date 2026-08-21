@@ -123,6 +123,11 @@ const PROFILES_DIR: &str = "apps";
 /// `NIX_CONFIG` applies, and the keys sbx *sets* are exactly the keys it protects.
 /// Also the barrier a broker plugin's `cage_env` passes, so the list of names that load code in
 /// the cage is written once and both callers refuse exactly the same set.
+///
+/// Finally the whole `SBX_*` prefix, which is sbx's own control namespace rather than any one
+/// variable: everything [`overrides`] reads from the ambient environment lives under it, and so do
+/// the few names sbx sets into a cage. Reserved as a prefix because a per-name list has to be
+/// extended for every control variable added later and one missed name is the whole hole.
 pub(crate) fn is_reserved_env_key(key: &str) -> bool {
     key.starts_with("LD_")
         || is_proxy_env_key(key)
@@ -162,12 +167,20 @@ pub(crate) fn is_reserved_env_key(key: &str) -> bool {
                 | "LIBGL_DRIVERS_PATH"
                 | "GBM_BACKENDS_PATH"
                 | "__EGL_VENDOR_LIBRARY_DIRS"
-                // The signal `sbx upgrade provision` raises for a bundle's install step: set, it
-                // tells the step to re-install rather than honor its own "already there" guard. sbx
-                // sets it, so sbx protects it — an untrusted project could otherwise raise it on
-                // every launch and turn each one into a re-download.
-                | "SBX_UPGRADE"
         )
+        // sbx's own namespace, whole. The rule above is that the keys sbx sets are the keys it
+        // protects, and `SBX_*` is the larger half of that: sbx *reads* this prefix as its override
+        // channel (`SBX_NET`, `SBX_BIND`, `SBX_SECCOMP`, `SBX_CONFIG`, `SBX_ENV_<name>`, …, see
+        // [`overrides`]) and *sets* parts of it into the cage (`SBX_SANDBOX`,
+        // `SBX_UPGRADE`, `SBX_TASK_CLI`). Reserving one name at a time would have to be redone
+        // for every control variable added later, and a single missed one is the whole hole; the
+        // prefix cannot fall behind. `SBX_UPGRADE` is the concrete case that motivated it: set, it
+        // tells a bundle's install step to re-install rather than honor its own "already there"
+        // guard, so an untrusted project could turn every launch into a re-download.
+        //
+        // A prefix, not a substring: `TRAE_SBX_UPDATE` and `HERMES_WEBUI_SBX_GATEWAY` are an app's
+        // own variables and stay free.
+        || key.starts_with("SBX_")
 }
 
 /// The proxy-control variables, matched case-insensitively (tools honor both

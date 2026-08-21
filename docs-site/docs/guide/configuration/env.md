@@ -60,6 +60,12 @@ few structural keys:
 - GPU driver-load paths: `LIBGL_DRIVERS_PATH`, `GBM_BACKENDS_PATH`,
   `__EGL_VENDOR_LIBRARY_DIRS` (mesa's libgbm/libEGL `dlopen` a `<driver>_dri.so` /
   gbm backend from these).
+- Anything starting with `SBX_`. That prefix is sbx's own control namespace: it is what
+  the [one-shot overrides](overrides) read from the environment (`SBX_NET`, `SBX_BIND`,
+  `SBX_ENV_<KEY>` and the rest) and what sbx sets into a cage. It is reserved as a
+  prefix rather than name by name so a control variable added later is covered the day
+  it exists. A variable that merely contains the letters, like `MY_TOOL_SBX_UPDATE`,
+  is an app's own and stays free.
 
 The denylist is **untrusted-only** by design: a *trusted* config overriding `PATH` or
 `LD_PRELOAD` harms only itself, so the schema stays symmetric. The denylist's job is
