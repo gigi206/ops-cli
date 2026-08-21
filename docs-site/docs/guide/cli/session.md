@@ -128,8 +128,8 @@ only show sessions that are still alive. Failing that, list the directory:
 sbx session attach <id> [-- command [args...]]
 ```
 
-Join a **running** session's cage: the agent's live processes, its real `/tmp`, and its
-the real-time cage state: the host-side join of the running cage (via `setns`)
+Join a **running** session's cage the way `docker exec` does: the agent's live processes, its
+real `/tmp`, and its network: the host-side join of the running cage (via `setns`),
 not a fresh cage that merely shares the home. With no command it opens an **interactive shell**
 (an interactive attach); with `-- command` it **runs that command** inside the cage.
 
@@ -146,8 +146,8 @@ command is run via the cage's own `bash` so it resolves on the cage `PATH`, and 
 positionally: no argument is ever interpreted as shell syntax.
 
 A `-- command` runs in the agent's **environment as the cage was launched**: its `PATH`, proxy,
-and CA settings, read from the live agent process, the same path the interactive shell inherits,
-shell it does not carry any host secret). Unlike the interactive shell, it does **not** source the
+and CA settings, read from the live agent process, the same path the interactive shell inherits
+(so it does not carry any host secret). Unlike the interactive shell, it does **not** source the
 in-cage rc, so it does not re-run `mise activate`; declared tools and the base toolset are on the
 launch `PATH` and resolve, but a tool the agent activated purely at runtime may not be.
 

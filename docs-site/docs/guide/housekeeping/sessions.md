@@ -32,15 +32,15 @@ derives its runtime id from: so the registry and the runtime never disagree.
 ## Listing, attaching, stopping
 
 ```sh
-sbx ls                 # the live sessions (app sessions show their app name)
-sbx attach <id>        # open a shell inside a session's live cage
-sbx stop <id>          # SIGTERM, then SIGKILL after the grace delay
-sbx stop --all         # every session
+sbx session ls          # the live sessions (app sessions show their app name)
+sbx session attach <id> # open a shell inside a session's live cage
+sbx session stop <id>   # SIGTERM, then SIGKILL after the grace delay
+sbx session stop --all  # every session
 ```
 
 - [`sbx session attach <id>`](../cli/session#attach) joins the running cage and opens a shell **inside**
   it (the agent's live processes, its real `/tmp`, its network): a host-side join of the cage's namespaces,
-  shell re-applies the cage's confinement (seccomp denylist, `no_new_privs`, dropped
+  and the shell re-applies the cage's confinement (seccomp denylist, `no_new_privs`, dropped
   capabilities), so it is never a wider hole than the agent.
 - [`sbx session stop`](../cli/session#stop) tears down the whole cage subtree (SIGTERM → SIGKILL after
   `--delay`, default 10s).
@@ -55,9 +55,9 @@ another terminal:
 
 ```sh
 sbx app run claude-code --detach
-sbx ls
-sbx attach <id>       # look in
-sbx stop <id>         # done
+sbx session ls
+sbx session attach <id>   # look in
+sbx session stop <id>     # done
 ```
 
 ## The "second terminal"

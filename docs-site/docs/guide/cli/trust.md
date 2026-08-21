@@ -28,7 +28,9 @@ bytes it parses:
 - **Untrusted**: no record; security fields are dropped.
 
 The global config and app profiles are **trusted by location**: they need no `sbx
-trust`. Only a project `.sbx.toml` uses content trust. See
+trust`. Only a project `.sbx.toml` uses content trust. One exception: [`[fs]`](../configuration/fs)
+is the one table this does not govern, since it can only close project paths off inside
+the cage, so it applies whether or not the file is trusted. See
 [The trust gate](../concepts/trust).
 
 ## Examples

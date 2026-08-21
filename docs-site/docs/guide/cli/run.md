@@ -26,11 +26,11 @@ See also: [Quick start](../getting-started/quickstart) · [`sbx app`](app) · [O
 | `--package <name>=<backend:locator>` | one-shot package (e.g. `hello=nix:hello`); repeatable |
 | `--proc <off\|observe\|enforce\|ask>` | one-shot process/exec posture (bare mode); `--config` sets the allow/deny lists |
 | `--notify <off\|once\|always>` | one-shot refusal-notification mode for every event; `--config` sets the per-event table |
-| `--forward <port[,port…]>` | one-shot host loopback forward port(s) into the cage (e.g. `1455`, or `1455,8080`); repeatable, unions with config |
+| `--forward <port\|host:cage[,…]>` | one-shot host loopback forward into the cage: a port (`1455`, an OAuth callback) or a `host:cage` remap (`9200:9119`); repeatable, folds onto the config by cage port |
 | `--seccomp <token[,token…]>` | one-shot relaxation of the syscall denylist (e.g. `ptrace`, `clone:newuser`); repeatable |
 | `--device <path>` | one-shot host device grant, one path per flag (e.g. `/dev/kvm`); repeatable |
 | `--gpu[=true\|false]` | one-shot GPU posture (bare `--gpu` = true; `=false` disables) |
-| `--audio[=true\|false]` | one-shot audio posture (bare `--audio` = true) |
+| `--audio[=true\|false]` | one-shot audio posture (bare `--audio` = true; `=false` disables) |
 | `--dbus[=true\|false]` | one-shot in-cage desktop portal (bare `--dbus` = true) |
 | `--` | end `sbx`'s own flags; everything after runs literally |
 

@@ -42,6 +42,7 @@ The important subtrees:
 | `apps/<name>/home/` | an app's persistent isolated `$HOME` (`home_scope = "global"`) |
 | `apps/<name>/nixpkgs.lock` | that app's own base channel revision, rolled by [`sbx upgrade nix --app <name>`](../cli/upgrade#an-apps-base-channel) |
 | `sessions/` | the daemonless session registry ([`sbx session ls`](../housekeeping/sessions)) |
+| `logs/` | detached sessions' captured output, read by [`sbx session logs <id>`](../cli/session#logs) |
 | `egress/` | per-launch egress proxy sockets and CA material |
 | `fs/` | per-launch filesystem plumbing: the observation socket, and `mask-<pid>/` holding the two decoys an [`[fs]`](../configuration/fs) policy mounts |
 | `mise/`, `mise-plugin/` | the host-side mise home and the embedded `nix:` backend plugin |

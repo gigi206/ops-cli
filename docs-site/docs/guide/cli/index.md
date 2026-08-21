@@ -44,6 +44,7 @@ See also: [Configuration overview](../configuration/) · [Exit codes](../referen
 | [`sbx session`](session) | list, attach to, and stop the live sandbox sessions |
 | [`sbx proc`](proc) | observe a running session's process tree |
 | [`sbx fs`](fs) | observe the files a running session writes in its project |
+| [`sbx logs`](logs) | every feed of one running session, interleaved in time |
 | [`sbx ssh-agent`](ssh-agent) | what a running session asked your ssh keys to sign |
 | [`sbx task`](task) | list and invoke a session's [declared operations](../tasks/) |
 | [`sbx projects`](projects) | list and remove per-project runtime trees |

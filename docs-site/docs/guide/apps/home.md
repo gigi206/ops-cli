@@ -120,7 +120,7 @@ a remote flake, prefer a `flake:<ref>` (host-side, seeded like `nix:`).
 ## Inspecting a running app
 
 ```sh
-sbx attach <id>     # join the running app's cage and open a shell inside it
+sbx session attach <id>     # join the running app's cage and open a shell inside it
 ```
 
 `sbx session attach` enters the live cage (its processes, its real `/tmp`, its network, and the

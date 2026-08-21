@@ -95,11 +95,12 @@ is no per-bundle file to keep. A re-import that declares exactly what is already
 no copy and reports no loss.
 
 Because an import is the one moment you consciously take in another author's data, a
-bundle that would grant **egress or a credential** is named right after the import:
+bundle that would grant **egress, a credential or an install step** is named right after
+the import:
 
 ```
 imported 1 bundle(s) into ~/.config/sbx/sbx.toml — added claude-code
-sbx: warning: an app that names these gains their egress and credentials:
+sbx: warning: an app that names these gains their egress, credentials and install steps:
      claude-code (6 egress rule(s), 1 credential(s)) — inspect with `sbx bundle <name>`
 ```
 

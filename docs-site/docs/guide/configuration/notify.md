@@ -62,13 +62,13 @@ sbx · kiro@ops-cli[48213]
 - `kiro`, the app, when the launch is one (absent for a bare `sbx run`);
 - `ops-cli`: the project's directory name;
 - `48213`, the launching sbx **pid**, the same one [`sbx session ls`](../cli/session) lists and
-  that [`sbx attach`](../cli/session) and [`sbx stop`](../cli/session) take.
+  that [`sbx session attach`](../cli/session#attach) and [`sbx session stop`](../cli/session#stop) take.
 
 It names the application rather than riding the summary because a desktop **truncates the summary
 to one line** and shows the application name whole. With two or three sandboxes running at once,
 "which one was that?" is the first question a toast has to answer, and putting the answer in the
 summary meant it was the first thing cut off. The pid is what makes it actionable: from the toast
-you can go straight to `sbx attach <pid>` or `sbx net logs` for that session.
+you can go straight to `sbx session attach <pid>` or `sbx net logs` for that session.
 
 The project's **full path** is deliberately not there, no toast is wide enough, and lives in
 `sbx session ls`.

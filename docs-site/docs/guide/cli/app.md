@@ -3,7 +3,7 @@
 ```
 sbx app run <name> [--detach] [--observe] [--net-learn[=level] [--global|--local] [--dry-run]] [override flags] [-- <args>...]
 sbx app upgrade <name>
-sbx app import <file> [--as <name>] [--force]
+sbx app import <file> [--as <name>] [--force] [--with-deps]
 sbx app export <name> [--out <file>]
 sbx app rm <name>... [--purge] [--gc]
 sbx app list
@@ -22,7 +22,7 @@ See also: [The app framework](../apps/) · [`[app.<name>]`](../configuration/app
 | Option | Meaning |
 |---|---|
 | `--detach` | launch in the background as a session [`sbx session`](session) can see |
-| `--observe` | record what the app does, its processes ([`sbx proc logs`](proc#logs), also streamed inline to stderr on a non-interactive foreground run) and its file writes ([`sbx fs logs`](fs#logs)); works for interactive and detached launches too, see [`sbx run`](run#observing-a-run---observe) |
+| `--observe` | record what the app does, its processes ([`sbx proc logs`](proc#logs), also streamed inline to stderr on a non-interactive foreground run under a non-enforcing `[proc]` mode) and its file writes ([`sbx fs logs`](fs#logs)); works for interactive and detached launches too, see [`sbx run`](run#observing-a-run---observe) |
 | `--net-learn[=domain\|path\|exact]` | run under the app's real posture, then add the egress rules it was refused for lack of one to the app's profile (default level `domain`); see [Learning an app's egress](#learning-an-apps-egress---net-learn) |
 | `-g, --global` / `-l, --local` | with `--net-learn`: write the learned rules to the global app profile / the project config (default local) |
 | `--dry-run` | with `--net-learn`: print the rules that would be added without writing them |
@@ -82,22 +82,27 @@ scope, not in importance.
 |---|---|
 | `mise:` packages | rolls them, in the app's own cage |
 | a bundle [install step](../configuration/bundles#the-install-step) | re-runs it, in the app's own cage |
-| `nix:` / `flake:` / `deb:` / `appimage:` / `tarball:` / `binary:` packages | names the channel that rolls them, and rolls none |
+| `flake:` / `deb:` / `appimage:` / `tarball:` / `binary:` packages | names the channel that rolls them, and rolls none |
+| `nix:` packages | names the channel too: they ride the app's own nixpkgs lock, which only [`sbx upgrade nix --app <name>`](upgrade#an-apps-base-channel) advances |
 | an inline [`[flakes.<name>]`](../configuration/packages#flakes-an-inline-nix-flake) | names it as floating: no channel advances it |
 
 The first two are rolled here because their unit of work is already one app's cage. The
-rest are pinned in a lock that belongs to the **project**, so rolling one from a per-app
-verb would advance every app that rides it, under a command that reads as though it
-touched only this one. Those are named with the channel command instead:
+rest are named rather than rolled. A `flake:` / `deb:` / `appimage:` / `tarball:` /
+`binary:` package is pinned in a lock that belongs to the **project**, so rolling one
+from a per-app verb would advance every app that rides it, under a command that reads as
+though it touched only this one. A `nix:` package has the opposite shape: it resolves
+against the **app's own** nixpkgs lock, and advancing that lock re-resolves the channel
+and rebuilds the base userland, a download this verb does not take on unasked. Either way
+the roll belongs to the channel command:
 
 ```
-sbx app upgrade — reader
   `deb:`, `nix:` packages advance with the project, not with one app: `sbx upgrade deb`, `sbx upgrade nix`.
 ```
 
 That is the honest limit of the verb: what it removes is the question "which channel?",
-not the project-wide scope of the locks. See [`sbx upgrade`](upgrade) for the channels
-themselves.
+not the scope of the locks behind each answer. See [`sbx upgrade`](upgrade) for the
+channels themselves, and [an app's base channel](upgrade#an-apps-base-channel) for the
+per-app roll.
 
 An inline flake is named apart because it has no channel at all. It pins its inputs
 inside its own `flake.nix` source and rebuilds when that source changes, and
@@ -137,7 +142,7 @@ of is not sent to it.
 
 | Subcommand | Purpose |
 |---|---|
-| `import <file> [--as <name>] [--force]` | place a portable profile (trusted by location); the granted posture is printed |
+| `import <file> [--as <name>] [--force] [--with-deps]` | place a portable profile (trusted by location); the granted posture is printed |
 | `export <name> [--out <file>]` | write a named app out as a portable profile (stdout by default) |
 | `rm <name>` | remove an **imported** profile (a project `[app.<name>]` lives in that project's `.sbx.toml`) |
 | `rm <name> --purge` | also remove the app's isolated **home(s)**, the tools its `mise:` backends installed, its config, and its login state |

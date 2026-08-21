@@ -20,6 +20,7 @@ A project's base userland and tools are pinned by **locks** in the data director
 - `<data>/projects/<id>/deb-packages.lock`, pinned `deb:` packages (declared source → content hash, plus the resolved download URL for a `deb:resolve` package).
 - `<data>/projects/<id>/appimage-packages.lock`, pinned `appimage:` packages (declared source → content hash, plus the resolved download URL for an `appimage:resolve` package).
 - `<data>/projects/<id>/tarball-packages.lock`, pinned `tarball:` packages (declared source → content hash, plus the resolved download URL for a `tarball:resolve` package).
+- `<data>/projects/<id>/binary-packages.lock`, pinned `binary:` packages (declared source → content hash, plus the resolved download URL for a `binary:resolve` package).
 
 A launch reads these locks; it does not re-resolve. So updating the `sbx` binary leaves
 your versions exactly where they were. `sbx upgrade` is the one place that rewrites a
@@ -28,18 +29,23 @@ lock.
 ## The upgrade targets
 
 ```sh
-sbx upgrade [all|nix|mise|flake|deb|appimage|tarball]
+sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|binary|provision]
 ```
 
 | Target | Rolls forward |
 |---|---|
 | `nix` | the nixpkgs channel: the base userland and native `nix:` packages |
-| `mise` | the mise engine, the project's `nix:` tools, and `mise:` packages |
+| `mise` | the mise engine, the project's `nix:` tools, `mise:` packages, and the declared operations' tool pool |
 | `flake` | the project's and apps' `flake:` packages |
 | `deb` | the project's and apps' `deb:` packages |
 | `appimage` | the project's and apps' `appimage:` packages |
 | `tarball` | the project's and apps' `tarball:` packages |
-| `all` | all of the above (the default) |
+| `binary` | the project's and apps' `binary:` packages |
+| `all` | every lock-rewriting target above (the default); `provision` is not part of it |
+| `provision` | re-runs the apps' bundle install steps in-cage, one cage per app |
+
+See [`sbx upgrade`](../cli/upgrade) for the flags (`-a <name>`, `--project <path>`) and
+the per-target behavior.
 
 The three are **decoupled**: `sbx upgrade nix` leaves `mise-engine.lock` untouched, and
 `sbx upgrade mise` leaves `nixpkgs.lock` intact.
