@@ -42,9 +42,21 @@
 # ask, and answers it the reassuring way.
 #
 # WHEN IT RUNS. `schedule` and `workflow_dispatch` only exist once a workflow is on the repository's
-# DEFAULT branch, so on a development branch neither fires. The `push` trigger below is narrowed to
-# this file so that a change to the run itself is exercised once, which is what makes the first
-# measurement possible at all.
+# DEFAULT branch, so on a development branch neither fires. That left `push` as the only live
+# trigger, and it was narrowed to this file alone -- enough to measure the run while it was being
+# built, and nothing after. Measured on 2026-08-21: nine runs, all of them on 2026-08-20, none
+# since. A run that never fires provides no coverage, whatever it would provide if it did, and the
+# suites it exists for were being exercised on exactly one machine: the author's.
+#
+# So `push` now names the paths that can change what these suites measure, and it names the SAME set
+# `ci.yml` calls a core change (`src/**`, `proc-shim/**`, `Cargo.toml`, `Cargo.lock`, `build.rs`).
+# One definition of "a change that can alter behaviour", not two that drift: a push wide enough to
+# make `ci.yml` run its full selection is wide enough to deserve a cage run. `concurrency` above
+# cancels a superseded run, so a burst of pushes costs one run and not one per commit.
+#
+# What that costs, measured rather than estimated: a green run took 31 to 37 minutes (2026-08-20,
+# both arms). This is a signal, not a gate -- nothing waits on it, and its value is the skip count
+# it reports, which is the only place in this repository where that number is measured at all.
 
 name: Cage
 
@@ -62,6 +74,11 @@ on:
   push:
     paths:
       - .github/workflows/cage.yml
+      - src/**
+      - proc-shim/**
+      - Cargo.toml
+      - Cargo.lock
+      - build.rs
 
 permissions:
   contents: read
@@ -100,16 +117,23 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Install the engines and the desktop pieces the suites look for
-        # `bubblewrap` is what a cage is built from. The other three are what the suites probe for
+        # `bubblewrap` is what a cage is built from. The rest are what the suites probe for
         # before deciding to run: `zsh` for the completion drives, `weston` for a compositor whose
         # socket the GUI tests bind into a cage, `pulseaudio` for the socket the audio posture
         # binds. `dbus-user-session` brings the user manager's own bus, which the resource-limit
         # path gates on -- see the session step below.
+        #
+        # `socat` was added on 2026-08-21, and it is the cheapest line in this file: the previous
+        # green run reported 25 tests that returned without running, and **15 of them named this one
+        # tool** (`task_control.rs`, the task-plane client fixture, which wants `bash`, `socat` and
+        # `head` together -- only `socat` is absent from a runner image). Read from that run's own
+        # skip report, not guessed: the report exists so a number like that is visible instead of
+        # being carried in someone's head.
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            bubblewrap zsh weston pulseaudio dbus-user-session
+            bubblewrap zsh weston pulseaudio dbus-user-session socat
 
       - name: Allow unprivileged user namespaces
         # Ubuntu 24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1`, which refuses the
