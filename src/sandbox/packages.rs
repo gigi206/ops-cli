@@ -158,6 +158,35 @@ pub(crate) fn provision(
     })
 }
 
+/// The `mise:` tokens of the packages a trusted layer named in `accepts_fresh_releases`.
+///
+/// Maps declared package **names** to the tokens mise is asked about, so the locator stays written
+/// once (in `packages`) and the exemption cannot drift from it. Trusted-only and `mise:`-only, on
+/// the same filter as [`mise_packages`]: a name that resolves to a `nix:` or prebuilt package is
+/// dropped, because no freshness delay governs those and pretending otherwise would put a token in
+/// front of mise that names nothing it equips.
+///
+/// A name matching no declared package yields nothing. That is deliberate rather than an error: the
+/// list is unioned across a project, an app and its bundles, so a name is routinely declared beside
+/// a package another layer contributes, and a bundle that stops shipping a package should not fail
+/// the launch of every app that named it.
+pub(crate) fn fresh_release_tokens(packages: &[Package], named: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for name in named {
+        for pkg in packages {
+            if pkg.name != *name || pkg.state != TrustState::Trusted {
+                continue;
+            }
+            if let Backend::Mise(token) = &pkg.backend
+                && !out.contains(token)
+            {
+                out.push(token.clone());
+            }
+        }
+    }
+    out
+}
+
 /// The mise tokens of the *admitted* `mise:` packages — the ones the launcher equips
 /// in-cage globally with `mise use -g`. Trusted-only, exactly like the host-side `nix:`
 /// path: an untrusted project's `mise:` package is dropped here (its withholding is
@@ -350,6 +379,34 @@ mod tests {
             )],
             "only the trusted inline flake, carrying its content and attr"
         );
+    }
+
+    #[test]
+    fn fresh_release_tokens_maps_declared_names_and_drops_what_no_delay_governs() {
+        let pkgs = [
+            mise_package("amp", "npm:@ampcode/cli", TrustState::Trusted),
+            package("nodejs", "nodejs", TrustState::Trusted), // a nix package: no freshness delay
+            mise_package("evil", "npm:attacker", TrustState::Untrusted), // untrusted: dropped
+            mise_package("dsh", "npm:@deepseek-ai/dsh", TrustState::Trusted),
+        ];
+        // The name is what a bundle writes; the token is what mise is asked about. Naming a package
+        // twice must not put its token in front of mise twice, and a name nothing declares must not
+        // put a phantom entry there at all.
+        let named = [
+            "amp".to_string(),
+            "nodejs".to_string(),
+            "evil".to_string(),
+            "amp".to_string(),
+            "absent".to_string(),
+            "dsh".to_string(),
+        ];
+        assert_eq!(
+            fresh_release_tokens(&pkgs, &named),
+            ["npm:@ampcode/cli", "npm:@deepseek-ai/dsh"]
+        );
+        // Nothing named yields nothing, which is what keeps the variable absent for almost every
+        // cage rather than present and empty.
+        assert!(fresh_release_tokens(&pkgs, &[]).is_empty());
     }
 
     #[test]

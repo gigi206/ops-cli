@@ -539,6 +539,11 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
         deb: _,
         appimage: _,
         binary: _,
+        // Lifting a vendor's freshness delay is a standing decision about that vendor, weighed
+        // once where the package is declared and read by whoever audits the profile. A one-shot
+        // `--config` blob is the wrong place to assert it, for the same reason the inline
+        // package tables above are dropped here.
+        accepts_fresh_releases: _,
         task: _,
         plugin: _,
         // Not carried, like `plugin`: a broker's `socket` names a host resource to stand in front

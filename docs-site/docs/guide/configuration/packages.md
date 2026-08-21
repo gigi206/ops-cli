@@ -129,6 +129,37 @@ durable, network-independent store path. If you want a tool that is present rega
 of the cage's network, and it exists in nixpkgs, declare it as [`nix:`](#nix-a-nixpkgs-attribute)
 instead.
 
+#### `accepts_fresh_releases`: when the vendor publishes faster than the delay
+
+mise holds a release back until it has been public for a while. That delay is a supply chain
+protection: an artefact replaced minutes ago has had no time to be noticed, and a roll that always
+took the newest build would carry a compromised one the moment it appeared. sbx does not set the
+delay and does not override it, so whatever mise's default is, is what governs every `mise:` package
+here. One consequence is worth stating plainly: [`sbx upgrade mise`](../concepts/upgrade) advances a
+pin to the newest **eligible** release, which is not always the newest release.
+
+The delay has a failure mode, and it is silent. A vendor that publishes several times a day never
+has a release old enough to clear it, so resolution returns **no version at all** rather than an
+older one. The package cannot be equipped at first launch and cannot be rolled afterwards, and
+nothing in the output says why. Naming the package lifts the delay for that package only:
+
+```toml
+[packages]
+amp = "mise:npm:@ampcode/cli"
+
+accepts_fresh_releases = ["amp"]
+```
+
+The values are package names as written in `packages`, never backend locators, so the locator stays
+written once and the two cannot drift. A name matching no declared package is ignored, which is what
+lets a project, an app and its bundles each carry their own list.
+
+This is a security field, [trusted-only](#why-the-tool-sources-are-trusted-only) like `packages`
+itself, and it is a real trade: it accepts a build the vendor published moments ago. Declare it per
+package with the reason written beside it, never as a blanket, and remove it once the vendor's
+cadence slows enough for the delay to clear on its own. A [bundle](bundles) may carry the line for
+the tool it ships, which is where it belongs when the package belongs there too.
+
 ### `flake:`: a nix flake output
 
 ```toml

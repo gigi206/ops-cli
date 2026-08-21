@@ -2274,6 +2274,7 @@ mod tests {
 
         // App projection: the compact list carries the same pin, keyed identically.
         let app = ResolvedApp {
+            accepts_fresh_releases: Default::default(),
             provisions: Vec::new(),
             open: Default::default(),
             service: Default::default(),
@@ -2354,6 +2355,7 @@ mod tests {
         // A baseline credential the app inherits — and that the app's narrowed network drops, the
         // residual this pins: the detail view's secret count must equal merge_app's.
         let baseline = Resolved {
+            accepts_fresh_releases: Default::default(),
             timezone: None,
             timezone_origin: Provenance::Default,
             plugin: Default::default(),
@@ -2424,6 +2426,7 @@ mod tests {
         };
         // The app overrides the network and the task cap, leaves the GUI and the throttle alone.
         let app = ResolvedApp {
+            accepts_fresh_releases: Default::default(),
             provisions: Vec::new(),
             open: Default::default(),
             service: Default::default(),

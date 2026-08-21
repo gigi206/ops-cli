@@ -161,6 +161,7 @@ pub(crate) fn resolved(
     apps: Vec<(&str, crate::config::ResolvedApp)>,
 ) -> crate::config::Resolved {
     crate::config::Resolved {
+        accepts_fresh_releases: Default::default(),
         timezone: None,
         timezone_origin: crate::config::Provenance::Default,
         open: Default::default(),
@@ -221,6 +222,7 @@ pub(crate) fn resolved(
 /// own layer combine. `cmd` is a placeholder -- the overlay is never launched.
 pub(crate) fn app_with(packages: Vec<crate::config::Package>) -> crate::config::ResolvedApp {
     crate::config::ResolvedApp {
+        accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         open: Default::default(),
         service: Default::default(),

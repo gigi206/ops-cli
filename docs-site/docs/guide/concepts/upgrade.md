@@ -78,6 +78,23 @@ For every backend but `mise:`, a changed hash **rebuilds host-side at the next l
 re-pointing the package's name-keyed out-link at the new build. Nothing is rebuilt during
 `upgrade` itself.
 
+### The newest eligible release, not the newest release
+
+For `mise:` packages there is one more filter between "what upstream published" and "what the roll
+pins". mise holds a release back until it has been public for a while, a supply chain protection
+against an artefact replaced moments ago. sbx neither sets that delay nor overrides it, so a roll
+advances a pin to the newest release that has cleared it. When a newer one exists but is still
+inside the window, mise says so and the pin stays where it is:
+
+```
+newer npm:cline release 3.0.56 ignored by minimum_release_age; latest eligible release is 3.0.55
+```
+
+That is the roll working, not failing. It has one sharp edge: a vendor that publishes several times
+a day never has an eligible release at all, so the package resolves to no version and can be neither
+equipped nor rolled. The cure is per package and is declared where the package is, in
+[`accepts_fresh_releases`](../configuration/packages#accepts_fresh_releases-when-the-vendor-publishes-faster-than-the-delay).
+
 ### `mise:` and the allowlist
 
 The fetch rides the app's [egress allowlist](../networking/modes), so a home whose

@@ -78,6 +78,7 @@ fn validate_network(
 
 fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
     RawConfig {
+        accepts_fresh_releases: Default::default(),
         timezone: None,
         plugin: Default::default(),
         broker: Default::default(),
@@ -750,6 +751,7 @@ fn raw_app(
     network: Option<NetworkField>,
 ) -> RawApp {
     RawApp {
+        accepts_fresh_releases: Default::default(),
         rest: Default::default(),
         open: Default::default(),
         service: Default::default(),
@@ -3373,6 +3375,7 @@ fn merge_app_overlays_the_baseline_with_app_precedence() {
     // Baseline D-Bus off, so the app turning it on is an observable *replace* too.
     base.dbus = false;
     let app = ResolvedApp {
+        accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         fs: Default::default(),
         fs_origin: crate::config::Provenance::Default,
@@ -3458,6 +3461,7 @@ fn merge_app_overlays_the_baseline_with_app_precedence() {
 fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
     let mut base = resolve_no_plugins(raw_network("shared"), None);
     let app = ResolvedApp {
+        accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         fs: Default::default(),
         fs_origin: crate::config::Provenance::Default,
@@ -3515,6 +3519,7 @@ fn merge_app_clears_secrets_when_the_effective_posture_is_not_an_allowlist() {
 fn merge_app_keeps_secrets_under_an_allowlist_the_app_declares() {
     let mut base = resolve_no_plugins(raw_network("shared"), None);
     let app = ResolvedApp {
+        accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         fs: Default::default(),
         fs_origin: crate::config::Provenance::Default,
@@ -3571,6 +3576,7 @@ fn merge_app_applies_the_apps_default_methods_to_its_effective_allowlist() {
     use crate::allowlist::{EgressPolicy, Methods, classify};
     let read_default = Methods::Only(vec!["GET".to_string(), "HEAD".to_string()]);
     let app_with = |network: Option<NetworkPolicy>, default_methods: Methods| ResolvedApp {
+        accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         fs: Default::default(),
         fs_origin: crate::config::Provenance::Default,
@@ -3728,6 +3734,7 @@ fn merge_app_dedups_a_secret_the_app_redeclares_for_the_same_host_and_header() {
     base.declared_secrets = vec![a_header_secret()];
     base.secrets = vec![a_header_secret()];
     let app = ResolvedApp {
+        accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         fs: Default::default(),
         fs_origin: crate::config::Provenance::Default,
@@ -3792,6 +3799,7 @@ fn merge_app_inherits_a_baseline_secret_when_the_app_opens_a_filtering_posture()
         "the baseline-effective set is cleared under a shared posture"
     );
     let app = ResolvedApp {
+        accepts_fresh_releases: Default::default(),
         provisions: Vec::new(),
         fs: Default::default(),
         fs_origin: crate::config::Provenance::Default,
@@ -10186,6 +10194,67 @@ fn every_shipped_bundle_matches_the_agent_profile_it_was_derived_from() {
 }
 
 #[test]
+fn every_shipped_exemption_names_a_mise_package_its_own_layer_declares() {
+    // `accepts_fresh_releases` names packages, and a name that matches nothing is ignored by
+    // design: the list is unioned across a project, an app and its bundles, so a name routinely
+    // sits beside a package another layer contributes. That tolerance is right at runtime and
+    // useless here, because it makes a TYPO indistinguishable from a correct declaration: the
+    // launch proceeds, no warning is printed, and the package it was meant to exempt resolves to no
+    // version — the very failure the line was added to remove.
+    //
+    // So for what this repository ships, the stricter rule holds: a shipped layer names only its
+    // own packages, and only `mise:` ones, since no freshness delay governs a `nix:` attribute or a
+    // content-hashed prebuilt and exempting one would be a line that cannot do anything.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut checked = 0;
+    for dir in ["examples/bundle", "examples/app"] {
+        for entry in std::fs::read_dir(root.join(dir))
+            .expect("the examples directory is readable")
+            .flatten()
+        {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let raw = schema::parse(&std::fs::read(&path).expect("read the profile")).unwrap();
+            let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+            // A bundle file carries its declarations under `[bundle.<name>]`; an app profile
+            // carries them at the root. Both are checked against the packages of the same layer.
+            let layers: Vec<(Vec<String>, std::collections::BTreeMap<String, String>)> =
+                match raw.bundle.get(&name) {
+                    Some(bundle) => vec![(
+                        bundle.accepts_fresh_releases.clone(),
+                        bundle.packages.clone(),
+                    )],
+                    None => vec![(raw.accepts_fresh_releases.clone(), raw.packages.clone())],
+                };
+            for (named, packages) in layers {
+                for pkg_name in named {
+                    let declared = packages.get(&pkg_name).unwrap_or_else(|| {
+                        panic!(
+                            "`{}` names `{pkg_name}` in `accepts_fresh_releases`, but declares no \
+                             package by that name — the line would be silently inert",
+                            path.display()
+                        )
+                    });
+                    assert!(
+                        declared.starts_with("mise:"),
+                        "`{}` exempts `{pkg_name}`, which is `{declared}` — no freshness delay \
+                         governs that backend, so the line cannot do anything",
+                        path.display()
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        checked >= 2,
+        "expected the shipped exemptions to be checked, saw {checked}"
+    );
+}
+
+#[test]
 fn every_shipped_install_step_yields_to_the_upgrade_signal() {
     // `sbx upgrade provision` re-runs a bundle's install step in the app's cage with
     // `SBX_UPGRADE=1` set. The step's own "already installed" guard is what keeps an ordinary
@@ -10239,6 +10308,59 @@ fn every_shipped_install_step_yields_to_the_upgrade_signal() {
     assert!(
         checked >= 8,
         "expected the shipped install steps to be checked, saw {checked}"
+    );
+}
+
+#[test]
+fn every_shipped_freshness_exemption_is_named_in_the_bundles_table() {
+    // The sibling of the install-step guard above, and for the same reason it exists: the third
+    // column is what a reader consults before folding a bundle in, and an `accepts_fresh_releases`
+    // belongs there for the sharpest version of that reason. It relaxes a supply-chain protection —
+    // the bundle's tool will be installed from a build its vendor published moments ago — which is
+    // exactly the kind of thing a reader must not have to open the file to discover.
+    //
+    // Written as its own guard rather than folded into that one: the two watch different fields,
+    // and a single test failing for either would name the wrong fact half the time.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let page = std::fs::read_to_string(root.join("docs-site/docs/guide/configuration/bundles.md"))
+        .expect("the bundles page exists");
+    let mut missing = Vec::new();
+    let mut carriers = 0;
+    for entry in std::fs::read_dir(root.join("examples/bundle"))
+        .expect("examples/bundle/ dir exists")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+        let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
+        // Read with sbx's own parser, like the step above: a name written under a sub-table folds
+        // into it and never reaches the launch, and grepping the file would not tell.
+        if raw
+            .bundle
+            .get(&name)
+            .is_none_or(|bundle| bundle.accepts_fresh_releases.is_empty())
+        {
+            continue;
+        }
+        carriers += 1;
+        let row = page
+            .lines()
+            .find(|line| line.starts_with(&format!("| `{name}` |")));
+        if !row.is_some_and(|line| line.contains("freshness exemption")) {
+            missing.push(name);
+        }
+    }
+    assert!(
+        carriers > 0,
+        "no shipped bundle names a freshness exemption, so this guard now asserts nothing"
+    );
+    assert!(
+        missing.is_empty(),
+        "these bundles lift the freshness delay for one of their packages and the bundles table \
+         does not say so in their row: {missing:?}"
     );
 }
 

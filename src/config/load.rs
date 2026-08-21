@@ -1048,6 +1048,8 @@ fn shadowed_task_note(name: &str, dropped: &RawTask, kept: &RawTask) -> String {
 /// earlier one" half of the fold.
 fn absorb_bundle(acc: &mut RawBundle, higher: RawBundle, notes: &mut Vec<String>) {
     acc.packages.extend(higher.packages);
+    acc.accepts_fresh_releases
+        .extend(higher.accepts_fresh_releases);
     acc.env.extend(higher.env);
     acc.allow.extend(higher.allow);
     acc.deny.extend(higher.deny);
@@ -1097,6 +1099,9 @@ fn fold_bundle_into_app(app: &mut RawApp, acc: RawBundle, notes: &mut Vec<String
     for (k, v) in acc.packages {
         app.packages.entry(k).or_insert(v);
     }
+    // Unioned rather than shadowed, unlike the maps above: this list has no key to override, and an
+    // app naming a package its bundle already named would otherwise silently drop one of the two.
+    extend_deduped(&mut app.accepts_fresh_releases, acc.accepts_fresh_releases);
     for (k, v) in acc.env {
         app.env.entry(k).or_insert(v);
     }

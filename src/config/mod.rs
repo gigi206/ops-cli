@@ -271,6 +271,11 @@ pub(crate) struct Resolved {
     /// Declared tools, in declaration order, each tagged with its source's trust.
     /// Admission (and the nix work it implies) is the launcher's, not decided here.
     pub(crate) packages: Vec<Package>,
+    /// Packages whose vendor publishes faster than a freshness delay tolerates, named by a trusted
+    /// layer so their equip and their roll accept a release with no cooling-off period. Package
+    /// names, deduplicated, in declaration order; see [`schema::RawConfig::accepts_fresh_releases`]
+    /// for what the delay is and why lifting it is a trade.
+    pub(crate) accepts_fresh_releases: Vec<String>,
     /// Per-plugin settings for the installed resolver plugins, keyed by plugin name: where to get
     /// a program the manifest declares when `PATH` does not have it, and values for the variables
     /// it reads. Layered global-under-project and gated by trust, like `[packages]`.
@@ -531,6 +536,11 @@ pub(crate) struct ResolvedApp {
     pub(crate) binds: Vec<Bind>,
     /// Extra tools, each tagged with its source's trust; override a baseline tool by name.
     pub(crate) packages: Vec<Package>,
+    /// Packages whose vendor publishes faster than a freshness delay tolerates, named by a trusted
+    /// layer so their equip and their roll accept a release with no cooling-off period. Package
+    /// names, deduplicated, in declaration order; see [`schema::RawConfig::accepts_fresh_releases`]
+    /// for what the delay is and why lifting it is a trade.
+    pub(crate) accepts_fresh_releases: Vec<String>,
     /// This app's URI handlers, its bundles' folded in beneath its own; override a baseline
     /// handler by scheme. A security field, gated like the app's `binds`.
     pub(crate) open: BTreeMap<String, OpenHandler>,
@@ -654,6 +664,14 @@ impl Resolved {
     pub(crate) fn merge_app(&mut self, app: ResolvedApp) {
         for (key, val) in app.env {
             upsert(&mut self.env, key, val);
+        }
+        // Unioned, not overridden: the baseline and the app each speak for the packages they
+        // declared, and a name only ever means "lift the delay", so there is nothing for one layer
+        // to take back from the other.
+        for name in app.accepts_fresh_releases {
+            if !self.accepts_fresh_releases.contains(&name) {
+                self.accepts_fresh_releases.push(name);
+            }
         }
         for pkg in app.packages {
             upsert_package(
@@ -882,6 +900,11 @@ impl Resolved {
             deb: _,
             appimage: _,
             binary: _,
+            // Lifting a vendor's freshness delay is a standing decision about that vendor, weighed
+            // once where the package is declared and read by whoever audits the profile. A one-shot
+            // `--config` blob is the wrong place to assert it, for the same reason the inline
+            // package tables above are dropped here.
+            accepts_fresh_releases: _,
             // Reported per blob when the override was collected, which is the only place it can
             // be: the merge that builds this overlay carries the fields it understands and drops
             // the bag with them, so by here there is nothing left to name.
@@ -1581,6 +1604,7 @@ fn resolve(
     let mut binds: Vec<Bind> = Vec::new();
     let mut bind_layer: BTreeMap<PathBuf, Provenance> = BTreeMap::new();
     let mut packages: Vec<Package> = Vec::new();
+    let mut accepts_fresh_releases: Vec<String> = Vec::new();
     let mut secrets: Vec<HeaderSecret> = Vec::new();
 
     // Reusable egress groups are defined only in the global config (trusted by location) and
@@ -1689,6 +1713,13 @@ fn resolve(
         TrustState::Trusted,
         false,
         allow_insecure_http,
+    );
+    apply_fresh_releases(
+        &mut accepts_fresh_releases,
+        &mut warnings,
+        GLOBAL_CONFIG,
+        global.accepts_fresh_releases,
+        TrustState::Trusted,
     );
     let nixpkgs_global = global
         .nixpkgs
@@ -2050,6 +2081,13 @@ fn resolve(
             false,
             allow_insecure_http,
         );
+        apply_fresh_releases(
+            &mut accepts_fresh_releases,
+            &mut warnings,
+            PROJECT_CONFIG,
+            proj.accepts_fresh_releases,
+            state,
+        );
         // `nixpkgs` is a security field — a trusted project may pin its tools'
         // source; an untrusted or changed one may not point the catalogue elsewhere.
         if let Some(value) = proj.nixpkgs {
@@ -2394,6 +2432,7 @@ fn resolve(
         binds,
         bind_layer,
         packages,
+        accepts_fresh_releases,
         plugin: plugin_cfg,
         open,
         service,
@@ -3077,6 +3116,7 @@ fn resolve_app(
     let mut env: Vec<(String, String)> = Vec::new();
     let mut binds: Vec<Bind> = Vec::new();
     let mut packages: Vec<Package> = Vec::new();
+    let mut accepts_fresh_releases: Vec<String> = Vec::new();
     let mut secrets: Vec<HeaderSecret> = Vec::new();
     let mut tasks: Vec<TaskSpec> = Vec::new();
     let mut open: BTreeMap<String, OpenHandler> = BTreeMap::new();
@@ -3207,6 +3247,13 @@ fn resolve_app(
             TrustState::Trusted,
             false,
             allow_insecure_http,
+        );
+        apply_fresh_releases(
+            &mut accepts_fresh_releases,
+            &mut warnings,
+            &source,
+            app.accepts_fresh_releases,
+            TrustState::Trusted,
         );
         if let Some(field) = app.network {
             warn_if_app_sets_stats(&mut warnings, &source, &field);
@@ -3408,6 +3455,13 @@ fn resolve_app(
             state,
             !trusted,
             allow_insecure_http,
+        );
+        apply_fresh_releases(
+            &mut accepts_fresh_releases,
+            &mut warnings,
+            &source,
+            app.accepts_fresh_releases,
+            state,
         );
         if let Some(field) = app.network {
             gate.take_validated(
@@ -3661,6 +3715,7 @@ fn resolve_app(
         env,
         binds,
         packages,
+        accepts_fresh_releases,
         open,
         service,
         network,
@@ -4062,6 +4117,36 @@ fn apply_packages(
             }
         };
         upsert_package(out, name, backend, state, Vec::new());
+    }
+}
+
+/// Absorb one layer's `accepts_fresh_releases` into the accumulating list, trusted-only.
+///
+/// Separate from [`apply_tools`] rather than a thirteenth parameter on it: that function turns declared
+/// locators into [`Package`]s, and this list names packages instead of declaring them. Gated the way
+/// every security field is, because lifting a freshness delay is a supply-chain decision and an
+/// untrusted layer may not make it for the layers above.
+///
+/// Deduplicated on the way in, so an app and the bundle it consumes may name the same package
+/// without the value reaching mise twice.
+fn apply_fresh_releases(
+    into: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    source: &str,
+    names: Vec<String>,
+    state: TrustState,
+) {
+    if names.is_empty() {
+        return;
+    }
+    if state != TrustState::Trusted {
+        refuse_untrusted(warnings, source, "`accepts_fresh_releases`", state);
+        return;
+    }
+    for name in names {
+        if !into.contains(&name) {
+            into.push(name);
+        }
     }
 }
 

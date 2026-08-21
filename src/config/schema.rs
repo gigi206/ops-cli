@@ -31,6 +31,26 @@ pub(crate) struct RawConfig {
     /// A value with no recognized prefix is dropped with a warning — there is no bare form.
     #[serde(default)]
     pub(crate) packages: BTreeMap<String, String>,
+    /// Packages whose vendor publishes faster than a freshness delay tolerates, named so their
+    /// equip and their roll accept a release with no cooling-off period.
+    ///
+    /// A package manager may hold a release back until it has been public for a while, which is a
+    /// supply-chain protection: an artifact replaced minutes ago has had no time to be noticed. The
+    /// protection has a failure mode, and it is silent. A vendor that publishes several times a day
+    /// never has a release old enough to clear the delay, so resolution returns *no version at all*
+    /// — not a stale one — and the tool can be neither equipped at first launch nor rolled
+    /// afterwards. Naming the package here lifts the delay **for that package only**; every other
+    /// package keeps it.
+    ///
+    /// The values are package names as declared in `packages`, not backend locators: the locator is
+    /// already written there, and repeating it would let the two drift. A name that matches no
+    /// declared package is ignored.
+    ///
+    /// **A security field**, honored only from a trusted source, and a real trade: it accepts an
+    /// artifact this vendor published moments ago. Declare it per package, with the reason, and
+    /// never as a blanket.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) accepts_fresh_releases: Vec<String>,
     /// Inline nix flakes, declared as `[flakes.<name>]` tables. Each carries a full `flake.nix`
     /// written directly in the config (the `flake` field, a multiline string) plus an optional
     /// output `attr` (default `"default"`); sbx stages it, binds it read-only into the cage, and
@@ -366,6 +386,11 @@ pub(crate) struct RawBundle {
     /// form as [`RawConfig::packages`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) packages: BTreeMap<String, String>,
+    /// Packages of this bundle whose vendor publishes faster than a freshness delay tolerates, so a
+    /// consuming app's cage accepts a release with no cooling-off period for them. Same meaning,
+    /// gating and trade as [`RawConfig::accepts_fresh_releases`]; unioned onto the app's own list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) accepts_fresh_releases: Vec<String>,
     /// Environment this bundle's tool reads (its configuration, telemetry opt-outs, …).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) env: BTreeMap<String, String>,
@@ -787,6 +812,11 @@ pub(crate) struct RawApp {
     /// same name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) packages: BTreeMap<String, String>,
+    /// Packages of this app whose vendor publishes faster than a freshness delay tolerates, so its
+    /// cage accepts a release with no cooling-off period for them. Same meaning, gating and trade as
+    /// [`RawConfig::accepts_fresh_releases`]; unioned onto whatever its bundles name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) accepts_fresh_releases: Vec<String>,
     /// Inline nix flakes for this app, declared as `[app.<name>.flakes.<tool>]` (or a top-level
     /// `[flakes.<tool>]` in an imported profile). Same shape and gating as the baseline `flakes`
     /// (see [`RawConfig::flakes`]); folded into the app's tool set beside its `packages`. Skipped

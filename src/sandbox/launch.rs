@@ -5571,11 +5571,17 @@ fn build(
         declared_zone(&extra_env, prep.cfg.timezone.as_deref()),
         &prep.userland.zoneinfo_src,
     );
+    // Resolved from the post-`merge_app` config, so the app's names and its bundles' are already
+    // unioned onto the baseline's and each is held against the package set this cage actually
+    // equips — a name whose package another project declares resolves to nothing here.
+    let fresh_release_tokens =
+        super::packages::fresh_release_tokens(&prep.cfg.packages, &prep.cfg.accepts_fresh_releases);
     let overlay = binds::Overlay {
         env: &extra_env,
         binds: &prep.cfg.binds,
         bin_paths: &bin_paths,
         timezone: &timezone,
+        fresh_release_tokens: &fresh_release_tokens,
     };
     // Generate the in-cage contract from the resolved (post-`merge_app`) config, so a process
     // inside the cage can see which hosts it can reach, why a direct connection or `ping` fails,
@@ -7363,6 +7369,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         packages: Vec<crate::config::Package>,
     ) -> crate::config::ResolvedApp {
         crate::config::ResolvedApp {
+            accepts_fresh_releases: Default::default(),
             provisions: Vec::new(),
             open: Default::default(),
             service: Default::default(),

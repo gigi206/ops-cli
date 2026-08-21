@@ -2374,6 +2374,7 @@ mod smoke {
             binds: &[],
             bin_paths: &[],
             timezone: super::super::binds::DEFAULT_ZONE,
+            fresh_release_tokens: &[],
         };
         let nix_mount = super::super::binds::NixMount {
             src: crate::store::physical_path(&layout, Path::new("/nix")),

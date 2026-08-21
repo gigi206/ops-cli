@@ -282,7 +282,7 @@ The 64 shipped bundles, and what each carries:
 | `agy` | 1 (`mise:`) | 9 egress entries | none |
 | `atomic-agent` | 1 (`tarball:`) | 7 egress entries, 2 env vars, a `tarball:` resolver | none |
 | `aider` | 3 (`mise:`, `nix:`) | 2 egress entries | `pypi` |
-| `amp` | 2 (`mise:`, `nix:`) | 4 egress entries, 1 env var | `npm-audit`, `npm-registry` |
+| `amp` | 2 (`mise:`, `nix:`) | 4 egress entries, 1 env var, a freshness exemption | `npm-audit`, `npm-registry` |
 | `ante` | 1 (`mise:`) | 4 egress entries | none |
 | `antigravity` | 2 (`nix:`, `tarball:`) | 27 egress entries, a `tarball:` resolver | `chromium-background` |
 | `auggie` | 2 (`mise:`, `nix:`) | 6 egress entries, 1 env var | `npm-audit`, `npm-registry` |
@@ -299,7 +299,7 @@ The 64 shipped bundles, and what each carries:
 | `cursor` | 2 (`deb:`, `nix:`) | 31 egress entries, 1 env var, a `deb:` resolver | `chromium-background` |
 | `cursor-agent` | 2 (`nix:`) | 5 egress entries, 1 env var, an install step | none |
 | `deepagents-code` | 3 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
-| `deepseek-harness` | 5 (`mise:`, `nix:`) | 3 egress entries, an install step | `npm-audit`, `npm-registry` |
+| `deepseek-harness` | 5 (`mise:`, `nix:`) | 3 egress entries, an install step, a freshness exemption | `npm-audit`, `npm-registry` |
 | `devin` | 1 (`tarball:`) | 4 egress entries, a `tarball:` resolver | none |
 | `dirac` | 3 (`mise:`, `nix:`) | 5 egress entries | `npm-audit`, `npm-registry` |
 | `droid` | 2 (`mise:`, `nix:`) | 9 egress entries | `npm-audit`, `npm-registry` |

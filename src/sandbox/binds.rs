@@ -238,6 +238,10 @@ pub(crate) struct Overlay<'a> {
     /// reaching here is one the database carries). It is interpolated into the [`CAGE_LOCALTIME`]
     /// link target and into `TZ`.
     pub(crate) timezone: &'a str,
+    /// The `mise:` tokens whose vendor a trusted layer declared as publishing continuously, so the
+    /// cage's mise accepts a release with no cooling-off period for them. Empty for almost every
+    /// cage; when it is empty no variable is set at all, so mise keeps its own default.
+    pub(crate) fresh_release_tokens: &'a [String],
 }
 
 /// Host-side paths backing one project's sandbox. The writable home and the
@@ -706,7 +710,11 @@ fn assemble(
         ("TZDIR".to_string(), CAGE_ZONEINFO.to_string()),
         ("TZ".to_string(), overlay.timezone.to_string()),
     ];
-    env.extend(mise_env(paths.mise_project_src.is_some(), nix.on_btrfs));
+    env.extend(mise_env(
+        paths.mise_project_src.is_some(),
+        nix.on_btrfs,
+        overlay.fresh_release_tokens,
+    ));
     for (key, val) in overlay.env {
         upsert_env(&mut env, key, val);
     }
@@ -993,7 +1001,11 @@ command -v mise >/dev/null 2>&1 && eval \"$(mise activate bash)\"\n";
 /// `per_project_primary` selects the split: `true` for a global app (primary moves
 /// per-project, app-global installs become the read-only fallback), `false` otherwise
 /// (single app-global-home pool, the historical wiring).
-fn mise_env(per_project_primary: bool, store_on_btrfs: bool) -> Vec<(String, String)> {
+fn mise_env(
+    per_project_primary: bool,
+    store_on_btrfs: bool,
+    fresh_release_tokens: &[String],
+) -> Vec<(String, String)> {
     let mut nix_config = "extra-experimental-features = nix-command flakes\n\
                           sandbox = false\n\
                           filter-syscalls = false"
@@ -1018,6 +1030,23 @@ fn mise_env(per_project_primary: bool, store_on_btrfs: bool) -> Vec<(String, Str
         env.push((
             "MISE_SHARED_INSTALL_DIRS".to_string(),
             format!("{SANDBOX_HOME}/{MISE_DATA_REL}/installs"),
+        ));
+    }
+    // Set here, in the cage's ambient environment, rather than in either of the two scripts that
+    // invoke mise: the delay governs the **equip** (`mise use -g --pin`, at first launch) as much as
+    // the roll (`mise upgrade --bump`), and those are built by different functions. One definition
+    // is what makes a package that needs the exemption get it on both paths; putting it beside the
+    // roll's own `MISE_DATA_DIR` prefix would have fixed the upgrade and left the launch failing.
+    //
+    // The separator is a comma, which mise is specific about: a space-, colon- or semicolon-joined
+    // list is read as one unmatchable entry, so a cage exempting two packages would exempt neither.
+    //
+    // Absent rather than empty when nothing is named, so mise applies its own default instead of
+    // being handed a list that excludes nothing.
+    if !fresh_release_tokens.is_empty() {
+        env.push((
+            "MISE_MINIMUM_RELEASE_AGE_EXCLUDES".to_string(),
+            fresh_release_tokens.join(","),
         ));
     }
     env
@@ -1600,6 +1629,7 @@ mod tests {
             binds: &[],
             bin_paths: &[],
             timezone: DEFAULT_ZONE,
+            fresh_release_tokens: &[],
         };
         assemble(
             &paths,
@@ -1914,6 +1944,7 @@ mod tests {
             binds: &[],
             bin_paths: &[],
             timezone: DEFAULT_ZONE,
+            fresh_release_tokens: &[],
         };
         let devices = [PathBuf::from("/dev/dri"), PathBuf::from("/dev/kvm")];
         let spec = assemble(
@@ -2176,6 +2207,7 @@ mod tests {
             binds: &[],
             bin_paths: &[],
             timezone: DEFAULT_ZONE,
+            fresh_release_tokens: &[],
         };
         let extra = [
             ExtraBind {
@@ -2266,6 +2298,7 @@ mod tests {
             binds: extra_binds,
             bin_paths: extra_bin_paths,
             timezone: zone,
+            fresh_release_tokens: &[],
         };
         assemble(
             &paths,
@@ -2677,6 +2710,7 @@ mod tests {
             binds: &[],
             bin_paths: &[],
             timezone: DEFAULT_ZONE,
+            fresh_release_tokens: &[],
         };
         let spec = assemble(
             &paths,
@@ -2813,6 +2847,47 @@ mod tests {
     }
 
     #[test]
+    fn a_named_package_lifts_the_freshness_delay_and_an_unnamed_cage_carries_no_setting() {
+        let get = |env: &[(String, String)], k: &str| {
+            env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone())
+        };
+        // Absent, not empty: an empty list would be handed to mise as a set excluding nothing,
+        // which reads in `mise settings` as a value sbx chose. Saying nothing leaves mise's own
+        // default in place, which is what almost every cage wants.
+        assert_eq!(
+            get(
+                &mise_env(false, false, &[]),
+                "MISE_MINIMUM_RELEASE_AGE_EXCLUDES"
+            ),
+            None
+        );
+        // The separator is a comma, and the expectation is written out rather than joined by the
+        // same code the subject uses. mise is specific here: a space-, colon- or semicolon-joined
+        // list is read as ONE entry that matches no tool, so a cage exempting two packages would
+        // exempt neither and the failure would be silent — the package simply resolves to no
+        // version, exactly as it did before the exemption was declared.
+        let two = [
+            "npm:@ampcode/cli".to_string(),
+            "npm:@deepseek-ai/dsh".to_string(),
+        ];
+        assert_eq!(
+            get(
+                &mise_env(false, false, &two),
+                "MISE_MINIMUM_RELEASE_AGE_EXCLUDES"
+            ),
+            Some("npm:@ampcode/cli,npm:@deepseek-ai/dsh".to_string())
+        );
+        // The setting rides the ambient environment, so it reaches the equip and the roll alike
+        // rather than only whichever script it was written beside.
+        assert!(
+            mise_env(true, false, &two)
+                .iter()
+                .any(|(k, _)| k == "MISE_MINIMUM_RELEASE_AGE_EXCLUDES"),
+            "the per-project primary cage must carry it too"
+        );
+    }
+
+    #[test]
     fn mise_env_moves_the_primary_and_adds_a_shared_fallback_for_a_global_app() {
         // A global app splits mise storage: the primary data dir moves to the per-project pool
         // (installs align with the per-project /nix store) while the app-global home's installs
@@ -2822,7 +2897,7 @@ mod tests {
             env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone())
         };
 
-        let single = mise_env(false, false);
+        let single = mise_env(false, false, &[]);
         assert_eq!(
             get(&single, "MISE_DATA_DIR"),
             Some(format!("{SANDBOX_HOME}/{MISE_DATA_REL}"))
@@ -2832,7 +2907,7 @@ mod tests {
             "a single-pool cage has no shared-install fallback"
         );
 
-        let split = mise_env(true, false);
+        let split = mise_env(true, false, &[]);
         assert_eq!(
             get(&split, "MISE_DATA_DIR"),
             Some(MISE_PROJECT_INCAGE.to_string()),
@@ -2861,7 +2936,7 @@ mod tests {
         // The flag adds the ignore line; elsewhere the attribute cannot exist and the
         // line stays out.
         let nix_config = |on_btrfs: bool| {
-            mise_env(false, on_btrfs)
+            mise_env(false, on_btrfs, &[])
                 .into_iter()
                 .find(|(k, _)| k == "NIX_CONFIG")
                 .map(|(_, v)| v)
@@ -2956,6 +3031,7 @@ mod tests {
             binds: &[],
             bin_paths: &[],
             timezone: DEFAULT_ZONE,
+            fresh_release_tokens: &[],
         };
         let spec = assemble(
             &paths,
@@ -3054,6 +3130,7 @@ mod tests {
             binds: &[],
             bin_paths: &[],
             timezone: DEFAULT_ZONE,
+            fresh_release_tokens: &[],
         };
         let spec = build_spec(
             data.path(),
@@ -3175,6 +3252,7 @@ mod smoke {
             binds: &[],
             bin_paths: &[],
             timezone: DEFAULT_ZONE,
+            fresh_release_tokens: &[],
         };
         // this smoke exercises the userland against the shared store, read-only — the
         // writable per-project store is the launcher's concern.
@@ -3345,6 +3423,7 @@ mod smoke {
             binds: &[],
             bin_paths: &[],
             timezone: DEFAULT_ZONE,
+            fresh_release_tokens: &[],
         };
         let foreign_spec = build_spec(
             data.path(),
@@ -3392,6 +3471,7 @@ mod smoke {
             binds: &[],
             bin_paths: &bin_paths,
             timezone: DEFAULT_ZONE,
+            fresh_release_tokens: &[],
         };
         let cross_spec = build_spec(
             data.path(),
@@ -3530,6 +3610,7 @@ mod smoke {
             binds: &[],
             bin_paths: &[],
             timezone: DEFAULT_ZONE,
+            fresh_release_tokens: &[],
         };
         // the cage reads the base userland AND writes into `/nix` — proving the rw bind
         // through the wired path. The write succeeding is itself proof `/nix` is
@@ -3706,6 +3787,7 @@ mod smoke {
             binds: &[],
             bin_paths: &[],
             timezone: DEFAULT_ZONE,
+            fresh_release_tokens: &[],
         };
         let cmd = vec![
             userland.shell_bin.clone().into_os_string(),
@@ -3877,6 +3959,7 @@ mod smoke {
             binds: &[],
             bin_paths: &[],
             timezone: DEFAULT_ZONE,
+            fresh_release_tokens: &[],
         };
         let cmd = vec![
             userland.shell_bin.clone().into_os_string(),
@@ -4008,6 +4091,7 @@ mod smoke {
                 binds: &[],
                 bin_paths: &[],
                 timezone: DEFAULT_ZONE,
+                fresh_release_tokens: &[],
             };
             let cmd = vec![
                 userland.shell_bin.clone().into_os_string(),
@@ -4143,6 +4227,7 @@ mod smoke {
             binds: &[],
             bin_paths: &[],
             timezone: DEFAULT_ZONE,
+            fresh_release_tokens: &[],
         };
         let nix_mount = NixMount {
             src: crate::store::physical_path(&layout, Path::new("/nix")),

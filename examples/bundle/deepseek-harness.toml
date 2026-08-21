@@ -83,6 +83,15 @@ mute = [
     "@npm-audit",  # npm's audit endpoint: POSTed by the install, irrelevant to whether it succeeded
 ]
 
+# THE VENDOR PUBLISHES FASTER THAN mise's FRESHNESS DELAY, so the package resolves to no version
+# and neither the first launch's equip nor `sbx app upgrade deepseek-harness` can proceed. The
+# `provision` below is downstream of that: it starts with `mise where` under `set -eu`, so it fails
+# at its first line whenever the package is not installed. Naming the package here lifts the delay
+# for it alone, at the cost of accepting a build this vendor published moments ago.
+# THE TRIGGER THAT REMOVES THE LINE: `dsh` starts publishing at a cadence slower than the delay,
+# which for a package still on `-rc` tags most likely means its first stable release.
+accepts_fresh_releases = ["dsh"]
+
 [bundle.deepseek-harness.packages]
 dsh = "mise:npm:@deepseek-ai/dsh"  # the harness itself, from npm
 nodejs = "nix:nodejs"              # runs dsh, installs it, and supplies the headers the addon build reads

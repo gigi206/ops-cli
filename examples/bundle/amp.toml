@@ -39,6 +39,16 @@ mute = [
     "@npm-audit",  # npm's audit endpoint: POSTed by the install, irrelevant to whether it succeeded
 ]
 
+# THE VENDOR PUBLISHES CONTINUOUSLY, AND WITHOUT THIS LINE THE TOOL CANNOT BE INSTALLED AT ALL.
+# mise holds a release back until it has been public for a while, which is a supply-chain
+# protection worth keeping. `@ampcode/cli` publishes several times a day, so no release is ever old
+# enough to clear that delay: resolution returns no version whatsoever, and the package can be
+# neither equipped at first launch nor rolled by `sbx app upgrade amp`. Naming it here lifts the
+# delay for this package only, at the cost of accepting a build this vendor published moments ago.
+# THE TRIGGER THAT REMOVES THE LINE: Amp starts publishing versioned releases at a human cadence,
+# at which point the delay clears on its own and the exemption becomes dead weight.
+accepts_fresh_releases = ["amp"]
+
 [bundle.amp.packages]
 amp = "mise:npm:@ampcode/cli"  # the tool itself, from npm
 nodejs = "nix:nodejs"          # mise's npm backend needs a node runtime, and the wrapper runs the package's JS fallback

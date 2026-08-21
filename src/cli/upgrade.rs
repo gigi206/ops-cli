@@ -2225,6 +2225,7 @@ mod tests {
         let rev_a = "a".repeat(40);
         let rev_b = "b".repeat(40);
         let cfg = |global: &str| config::Resolved {
+            accepts_fresh_releases: Default::default(),
             timezone: None,
             timezone_origin: config::Provenance::Default,
             plugin: Default::default(),
