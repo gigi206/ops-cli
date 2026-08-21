@@ -552,6 +552,28 @@ arrived first, which is not the same as binding it to your publisher. `sbx confi
 effective value and the layer that set it, so a project that opened plaintext fetching is visible
 without reading three files.
 
+#### What the refusal covers, and what it does not
+
+The check runs on the URL you wrote, which makes it a check on the **first hop**. If the server that
+URL names answers with a redirect to `http://`, the fetch follows it and the bytes arrive in
+plaintext, whatever the switch says. `sbx` cannot see this: the fetching is done by `nix`, which
+offers no setting to restrict the protocols a redirect may reach and does not report the URL that
+finally answered. So the lock file records the address `sbx` asked for, never the one that replied.
+
+This is worth knowing but it is not a reason to distrust your lock. It needs a publisher whose own
+redirect chain leaves TLS, which is a misconfiguration on their side rather than something an
+attacker can introduce, and it costs nothing after the first fetch: the pin is a content hash, and
+every later build refuses anything that does not match it. Redirects are ordinary here and are not
+themselves the problem: a GitHub `latest/download` URL is one, and it stays on `https://`. The
+exposure is the first fetch of a source whose publisher has that flaw, and the
+`https://` requirement stays worth having, because it keeps that from being the ordinary case rather
+than the rare one.
+
+One source form is unaffected. A `deb:apt:` repository signs an `InRelease` covering the digest of
+its index, and `sbx` checks the bytes it received against that signature, so how those bytes
+travelled does not decide whether they are accepted. See [Signed apt indexes](#signed-apt-indexes)
+below.
+
 ### Signed apt indexes
 
 An apt repository signs the list of what it publishes. `deb:apt:` reads that signature.

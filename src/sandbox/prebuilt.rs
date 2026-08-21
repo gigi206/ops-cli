@@ -362,6 +362,18 @@ pub(crate) fn prefetch_name(url: &str) -> String {
 /// percent-decodes to an illegal store name (e.g. an encoded space) still resolves — see
 /// [`prefetch_name`]. Pure fetch — no code runs.
 ///
+/// **The declared scheme governs the first hop only.** nix's downloader follows a redirect out of
+/// `https://` into `http://` and reports nothing, so a URL this function was handed as TLS can be
+/// answered in plaintext by a later hop, and the hash pinned is then the hash of bytes an on-path
+/// observer could have chosen. Nothing here can see it: nix exposes no setting constraining the
+/// protocols a redirect may reach, and `prefetch-file --json` returns the hash and store path
+/// without the URL that finally answered. What the `https://` requirement on a declared locator
+/// buys is therefore real but bounded — it keeps a config author from naming plaintext outright,
+/// which is a different actor at a different moment from a vendor whose own redirect leaves TLS.
+/// Closing the rest means carrying the fetch over a transport sbx controls rather than nix's, which
+/// is why it is written here rather than worked around: the lock records the URL sbx **asked for**,
+/// never the one that answered.
+///
 /// `quiet` governs nix's own download output. A first launch (`quiet = false`) downloads the
 /// asset — often a large `.deb` — so nix's progress is streamed live (`stderr` inherited) as
 /// feedback. An `sbx upgrade` re-resolve (`quiet = true`) instead **captures** stderr and folds

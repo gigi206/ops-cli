@@ -639,6 +639,16 @@ pub(crate) fn fetch_url_text(
 /// cleanly. `url` must already be safe to place in a nix string literal: callers build it from a
 /// validated package name, a percent-encoded query, or a charset-validated URL, so it carries no
 /// quote, `$`, or backslash to escape the expression.
+///
+/// "HTTP+TLS" describes the request, not a guarantee about every hop: nix follows a redirect out of
+/// `https://` into `http://` silently, so a body reaching this function may have been served in
+/// plaintext by a later hop. What each caller does with that differs, and the difference is the
+/// point. The apt index is unaffected in substance, because `deb::attest_index` checks the bytes
+/// against the digest an `InRelease` signature covers, and substituted bytes fail that check. The
+/// metadata callers have no such backstop: the nixhub answer selects a `nixpkgs` revision and
+/// attribute, and the GitHub release document selects an asset URL, so for those the transport is
+/// the whole of the trust. This is the same limit [`super::prebuilt::prefetch_hash`] carries, for
+/// the same reason, and it is nix's downloader rather than either call site that decides it.
 fn fetch_url_bytes(nix: &Path, layout: &Layout, url: &str, fresh: bool) -> io::Result<Vec<u8>> {
     let expr = fetch_expr(url);
     let mut cmd = store::nix_command(nix, layout);

@@ -84,8 +84,8 @@ fn write_pins(
 }
 
 /// Resolve a declared `tarball:` locator to `(concrete .tar.gz url, SRI content hash)`. A direct URL
-/// resolves to itself; the hash is fetched via `nix store prefetch-file`, which follows redirects and
-/// adds the file to sbx's store. `fresh` marks an `sbx upgrade` re-resolve: with no source query of
+/// resolves to itself; the hash is fetched via [`prebuilt::prefetch_hash`], which follows redirects
+/// and adds the file to sbx's store, and whose docstring carries what following them costs. `fresh` marks an `sbx upgrade` re-resolve: with no source query of
 /// its own, this backend has no metadata cache to bypass, so it uses the flag only to keep nix's
 /// download output out of the upgrade summary. The locator
 /// was already validated injection-free by `config::parse_backend`, so it is safe to fetch and later
