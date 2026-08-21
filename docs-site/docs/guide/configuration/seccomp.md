@@ -104,6 +104,11 @@ reach a denied syscall by another route. Most kernels are built without it, whic
 precisely why the refusal is unconditional rather than conditional on finding one that
 is not.
 
+That refusal is not itself a denylist entry, so an `allow` list cannot empty it out. A
+configuration that re-permits every denied syscall still launches with one filter loaded,
+carrying the architecture check and the x32 refusal and nothing else. What relaxes is
+which calls a cage may make, never which calling conventions it may make them under.
+
 ## Per-app relaxation
 
 An `[app.<name>.seccomp]` table (or a `[seccomp]` table in an imported profile) relaxes

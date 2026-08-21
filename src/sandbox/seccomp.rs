@@ -342,10 +342,22 @@ fn serialize(program: &BpfProgram) -> Vec<u8> {
 }
 
 /// The compiled filters in load order for a given relaxation policy: the EPERM denylist, then the
-/// ENOSYS denylist. Pure. A filter whose rule set the policy has fully emptied is **omitted** —
-/// seccompiler rejects an empty filter, and an empty denylist is a no-op anyway — so the result has
-/// two entries for the default (mandatory) policy and fewer only if a trusted config lifts an entire
-/// filter's worth of syscalls.
+/// ENOSYS denylist. Pure. A filter whose rule set the policy has fully emptied is **omitted**, an
+/// empty denylist being a no-op — so the result has two entries for the default (mandatory) policy
+/// and fewer only if a trusted config lifts an entire filter's worth of syscalls.
+///
+/// **Never none, though.** A denylist is not all a compiled filter carries: each one opens with the
+/// x32 refusal [`refuse_x32`] prepends and the architecture check seccompiler emits ahead of the
+/// rules, and *that* pair is not a denylist entry a config can lift — it is what keeps a foreign
+/// ABI from presenting call numbers this cage's supervision was never written against. A policy
+/// that lifts every denied syscall would, with no filter left to carry it, hand the cage an
+/// `int 0x80` `execve` that the proc-shim's notification filter — native numbers, no `arch` load —
+/// never matches, so the exec would run unsupervised. So a policy that empties both rule sets still
+/// gets one filter: no rules, and the guard alone.
+///
+/// An empty rule set compiles: seccompiler's `validate` rejects only identical match and mismatch
+/// actions, and its code generator short-circuits an empty rule map to the architecture check plus
+/// the default action.
 fn programs(policy: &SeccompPolicy) -> Vec<Vec<u8>> {
     let mut out = Vec::with_capacity(2);
     let eperm = eperm_rules(policy);
@@ -355,6 +367,12 @@ fn programs(policy: &SeccompPolicy) -> Vec<Vec<u8>> {
     let enosys = enosys_rules(policy);
     if !enosys.is_empty() {
         out.push(compile(enosys, SeccompAction::Errno(libc::ENOSYS as u32)));
+    }
+    if out.is_empty() {
+        out.push(compile(
+            Rules::new(),
+            SeccompAction::Errno(libc::ENOSYS as u32),
+        ));
     }
     out
 }
@@ -614,20 +632,27 @@ mod tests {
     /// against does not exist on a kernel built without `CONFIG_X86_X32_ABI` — most of them, this
     /// machine included. The constants are spelled out so they can be compared by eye against
     /// `seccomp(2)` instead of trusted through a name.
+    /// One instruction, decoded from the serialized `struct sock_filter` bwrap reads.
+    fn insn(bytes: &[u8], at: usize) -> (u16, u8, u8, u32) {
+        let w = &bytes[at * 8..at * 8 + 8];
+        (
+            u16::from_ne_bytes([w[0], w[1]]),
+            w[2],
+            w[3],
+            u32::from_ne_bytes([w[4], w[5], w[6], w[7]]),
+        )
+    }
+
+    /// Where the architecture check sits in an emitted program: behind the three instructions
+    /// [`refuse_x32`] prepends on x86_64, and first on an architecture that has no second ABI.
+    #[cfg(target_arch = "x86_64")]
+    const ARCH_CHECK_AT: usize = 3;
+    #[cfg(not(target_arch = "x86_64"))]
+    const ARCH_CHECK_AT: usize = 0;
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn every_filter_refuses_the_x32_abi_before_it_looks_at_anything_else() {
-        /// One instruction, decoded from the serialized `struct sock_filter` bwrap reads.
-        fn insn(bytes: &[u8], at: usize) -> (u16, u8, u8, u32) {
-            let w = &bytes[at * 8..at * 8 + 8];
-            (
-                u16::from_ne_bytes([w[0], w[1]]),
-                w[2],
-                w[3],
-                u32::from_ne_bytes([w[4], w[5], w[6], w[7]]),
-            )
-        }
-
         let compiled = programs(&SeccompPolicy::default());
         assert_eq!(compiled.len(), 2, "the default policy emits both filters");
         for program in &compiled {
@@ -641,11 +666,11 @@ mod tests {
 
             // ...and the compiler's own prologue is intact behind it: load the architecture, and
             // kill anything that is not the one this filter was built for.
-            assert_eq!(insn(program, 3), (0x20, 0, 0, 4));
-            assert_eq!(insn(program, 4).0, 0x15);
-            assert_eq!(insn(program, 4).3, 0xc000_003e);
+            assert_eq!(insn(program, ARCH_CHECK_AT), (0x20, 0, 0, 4));
+            assert_eq!(insn(program, ARCH_CHECK_AT + 1).0, 0x15);
+            assert_eq!(insn(program, ARCH_CHECK_AT + 1).3, 0xc000_003e);
             assert_eq!(
-                insn(program, 5),
+                insn(program, ARCH_CHECK_AT + 2),
                 (0x06, 0, 0, 0x8000_0000),
                 "an architecture this filter does not know is killed, not allowed"
             );
@@ -732,6 +757,57 @@ mod tests {
                 "carve-out {nr} must stay allowed"
             );
         }
+    }
+
+    /// A `[seccomp] allow` that names every denied syscall empties both rule sets — and a filter
+    /// carries more than its rules. The architecture check and the x32 refusal are not denylist
+    /// entries a config can lift: they are what stops a second ABI from presenting call numbers
+    /// this cage's supervision was never written against, and with no filter emitted at all an
+    /// `int 0x80` `execve` would reach the proc-shim's notification filter, which compares native
+    /// numbers and never matches it — an exec neither denied nor announced.
+    ///
+    /// The lift is built from the same name tables the filter denies from, so it cannot fall
+    /// behind a syscall added to the denylist later; that both rule sets really are empty is
+    /// asserted first, or the rest of this test would be about a policy that lifts nothing.
+    #[test]
+    fn a_policy_that_lifts_every_denied_syscall_still_carries_the_abi_guard() {
+        let mut policy = SeccompPolicy::default();
+        for (name, _) in eperm_unconditional_named()
+            .into_iter()
+            .chain(enosys_named())
+        {
+            let (allow, _) = resolve_allow(name).expect("a name the denylist itself spells");
+            policy.allow(allow);
+        }
+        for name in ["clone", "ioctl"] {
+            let (allow, _) = resolve_allow(name).expect("the argument-filtered pair, wholesale");
+            policy.allow(allow);
+        }
+        assert!(
+            eperm_rules(&policy).is_empty() && enosys_rules(&policy).is_empty(),
+            "the lift must be total, or this test measures nothing"
+        );
+
+        let compiled = programs(&policy);
+        assert_eq!(
+            compiled.len(),
+            1,
+            "a fully lifted policy still ships the guard, and only the guard"
+        );
+        let program = &compiled[0];
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(insn(program, 0), (0x20, 0, 0, 0));
+            assert_eq!(insn(program, 1), (0x35, 0, 1, 0x4000_0000));
+            assert_eq!(insn(program, 2), (0x06, 0, 0, 0x0005_0000 | 38));
+        }
+        assert_eq!(insn(program, ARCH_CHECK_AT), (0x20, 0, 0, 4));
+        assert_eq!(insn(program, ARCH_CHECK_AT + 1).0, 0x15);
+        assert_eq!(
+            insn(program, ARCH_CHECK_AT + 2),
+            (0x06, 0, 0, 0x8000_0000),
+            "a foreign ABI is killed here too, not allowed through an empty denylist"
+        );
     }
 
     #[test]
@@ -1113,6 +1189,46 @@ mod tests {
         assert!(
             stdout.contains("afunix ok"),
             "AF_UNIX carve-out broke: {stdout}"
+        );
+    }
+
+    /// The guard-only filter is a program the kernel accepts, not just bytes that decode.
+    ///
+    /// A fully lifted policy emits one filter with no rules — three instructions of x32 refusal,
+    /// three of architecture check, one `ALLOW` — and nothing short of a real launch proves bwrap
+    /// loads it and the kernel takes it. The lift is read back through `clone3`: denied it answers
+    /// `ENOSYS` (the filter's own action), lifted it reaches the kernel and answers `EFAULT` for
+    /// the zero-sized argument struct the probe passes. That distinction is the kernel's own —
+    /// `clone3` rejects a size below its first version before it ever reads the pointer — so it
+    /// cannot be produced by a filter that quietly refused to load.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_fully_lifted_policy_loads_in_a_real_cage() {
+        let probe = "import ctypes\n\
+             l=ctypes.CDLL(None,use_errno=True)\n\
+             def e(nr,*a):\n \
+              ctypes.set_errno(0); l.syscall(nr,*[ctypes.c_long(x) for x in a]); return ctypes.get_errno()\n\
+             print('clone3',e(435,0,0))\n";
+
+        let mut policy = SeccompPolicy::default();
+        for (name, _) in eperm_unconditional_named()
+            .into_iter()
+            .chain(enosys_named())
+        {
+            policy.allow(resolve_allow(name).unwrap().0);
+        }
+        for name in ["clone", "ioctl"] {
+            policy.allow(resolve_allow(name).unwrap().0);
+        }
+        assert_eq!(programs(&policy).len(), 1, "one filter, the guard alone");
+
+        let Some(stdout) = run_probe(&policy, probe) else {
+            return;
+        };
+        assert!(
+            stdout.contains("clone3 22"),
+            "a lifted clone3 must reach the kernel and be refused on its zero-sized argument \
+             (EINVAL), not answer the filter's own ENOSYS: {stdout}"
         );
     }
 

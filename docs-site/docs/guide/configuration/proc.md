@@ -74,8 +74,6 @@ channel, for three honest reasons:
 - `allow`/approval re-runs the real syscall, which is **TOCTOU-racy** against an adversary that swaps
   the path argument after the check, so *refusing* a path is hard, but *approving* a specific one is
   a guardrail;
-- the x32 ABI shares x86-64's architecture value with distinct syscall numbers: a narrow blind spot
-  shared with the base denylist, and the base toolset is x86-64;
 - deciding by **name** means reading the target out of the process that is parked in the `execve`,
   which the kernel grants only to that process's ancestor. A launch is one, so this holds in the
   ordinary case; on a host that restricts `ptrace` further than the usual scope, nothing can be read

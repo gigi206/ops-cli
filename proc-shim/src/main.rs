@@ -139,10 +139,18 @@ fn install_notif_filter(open_lens: bool) -> io::Result<libc::c_int> {
         return Err(io::Error::last_os_error());
     }
     // Opcodes (asm-generic/bpf_common.h): LD|W|ABS = 0x20, JMP|JEQ|K = 0x15, RET|K = 0x06. `nr` is
-    // the first field of `seccomp_data`, at offset 0.
+    // the first field of `seccomp_data`, at offset 0, and `arch` the second, at offset 4.
     const LD_ABS_W: u16 = 0x20;
     const JEQ_K: u16 = 0x15;
     const RET_K: u16 = 0x06;
+    const ARCH_OFFSET: u32 = 4;
+    // `AUDIT_ARCH_*` from linux/audit.h, spelled out because libc does not carry them.
+    #[cfg(target_arch = "x86_64")]
+    const NATIVE_ARCH: u32 = 0xc000_003e;
+    #[cfg(target_arch = "aarch64")]
+    const NATIVE_ARCH: u32 = 0xc000_00b7;
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    compile_error!("the shim's notification filter is written for x86_64 and aarch64");
 
     let mut notified: Vec<libc::c_long> = vec![libc::SYS_execve, libc::SYS_execveat];
     if open_lens {
@@ -154,7 +162,32 @@ fn install_notif_filter(open_lens: bool) -> io::Result<libc::c_int> {
     // (1-based) therefore jumps `n + 1 - i` forward, which is the arithmetic the two-syscall filter
     // this generalises was written out by hand.
     let n = notified.len();
-    let mut filter = Vec::with_capacity(n + 3);
+    let mut filter = Vec::with_capacity(n + 6);
+    // The architecture first, in a three-instruction block placed entirely ahead of the rest so the
+    // comparisons below keep the offsets they were computed with. A call number only means anything
+    // within the ABI it was numbered in — `execve` is 59 here and 11 under i386's `int 0x80` — so a
+    // syscall arriving through a foreign ABI would match nothing below and be allowed through
+    // unannounced. sbx's own denylist filter opens with this same check, and under the shipped
+    // configuration it fires first; this is here for the same reason `no_new_privs` is set again
+    // above, so that what enforces exec supervision holds on its own terms.
+    filter.push(libc::sock_filter {
+        code: LD_ABS_W,
+        jt: 0,
+        jf: 0,
+        k: ARCH_OFFSET,
+    });
+    filter.push(libc::sock_filter {
+        code: JEQ_K,
+        jt: 1,
+        jf: 0,
+        k: NATIVE_ARCH,
+    });
+    filter.push(libc::sock_filter {
+        code: RET_K,
+        jt: 0,
+        jf: 0,
+        k: libc::SECCOMP_RET_KILL_PROCESS,
+    });
     filter.push(libc::sock_filter {
         code: LD_ABS_W,
         jt: 0,
