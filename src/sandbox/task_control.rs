@@ -1518,7 +1518,23 @@ pub(crate) mod client {
                     if len < 0 {
                         continue; // the declaration hides this stream
                     }
-                    let len = (len as usize).min(rest.len());
+                    let len = len as usize;
+                    // A declared length longer than what arrived is an error, not a shorter
+                    // stream. The whole answer is already in hand (`read_to_end`), so this is a
+                    // plane that died mid-write or miscounted, and the two are indistinguishable
+                    // from here. Taking what there is would hand the caller a partial output that
+                    // reads exactly like a complete one — the ambiguity the length prefix and the
+                    // `truncated` flag exist to keep apart, and the same short payload the server
+                    // side of this protocol refuses outright (`read_exact` in `read_payloads`).
+                    if len > rest.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "the task plane declared {len} bytes of {key} and sent {}",
+                                rest.len()
+                            ),
+                        ));
+                    }
                     let text = String::from_utf8_lossy(&rest[..len]).into_owned();
                     rest = &rest[len..];
                     if rest.first() == Some(&b'\n') {
@@ -3241,6 +3257,31 @@ mod tests {
 
     // The nonce must survive the socket: a `${NAME@nonce}` in the text is unforgeable only because
     // the nonce arrives out of band. Computing it and dropping it here would remove the property.
+    /// A declared payload longer than what arrived is an error, on the same terms the server side
+    /// of this protocol already holds a short payload to (`read_exact` in `read_payloads`).
+    ///
+    /// The whole answer is read to EOF before it is parsed, so a short one is a plane that died
+    /// mid-write or miscounted. Taking what there is would hand back a partial command output that
+    /// reads exactly like a complete one, which is what the length prefix and the `truncated` flag
+    /// exist to keep apart.
+    ///
+    /// Teeth: clamping the length to what remains returns `Ok` with two of the five bytes, and the
+    /// caller cannot tell that from a command that printed two.
+    #[test]
+    fn a_declared_output_longer_than_the_answer_is_an_error() {
+        let short = client::parse_run(b"exit 0\nstdout 5\nab\n").unwrap_err();
+        assert_eq!(short.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            short
+                .to_string()
+                .contains("declared 5 bytes of stdout and sent"),
+            "the refusal names both counts: {short}"
+        );
+        // Exactly as many bytes as declared is the ordinary case and still parses.
+        let exact = client::parse_run(b"exit 0\nstdout 2\nab\nstderr -1\nok\n").unwrap();
+        assert_eq!(exact.stdout.as_deref(), Some("ab"));
+    }
+
     #[test]
     fn the_nonce_crosses_the_wire_out_of_band() {
         let raw =

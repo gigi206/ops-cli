@@ -165,6 +165,16 @@ pub(crate) struct BrokerSpec {
     /// The largest frame this protocol admits, capped at [`MAX_FRAME_CEILING`]. Required, never
     /// defaulted: a plugin author knows their protocol's bound, and a default here would be a
     /// number sbx invented and the manifest appeared to have chosen.
+    ///
+    /// It bounds what sbx **reads**, which is the direction an unbounded frame is a weapon in: the
+    /// length prefix is written by the other side, so without a ceiling a peer names a number and
+    /// sbx allocates it. On the way out it is not re-checked, and deliberately: a frame that
+    /// carried a secret marker is larger once the marker is replaced by the secret, and a plugin
+    /// author sizes this number for the frames the *plugin* writes. Refusing the grown frame would
+    /// break a working broker over an arithmetic the manifest was never asked about. The growth is
+    /// bounded — at most `max_frame / 43` markers, each becoming one secret — and the frame goes to
+    /// the host resource, which has its own limits; the marker is drawn per connection and never
+    /// written toward the cage, so what produces one is the plugin, not the caller.
     pub(crate) max_frame: usize,
     /// The protocol's refusal frame, if it has one that does not depend on the request refused.
     ///

@@ -218,6 +218,15 @@ host_greets     = true
 inspect_replies = true
 ```
 
+`max_frame` bounds what sbx **reads** on the channel, which is the direction an
+unbounded frame is a weapon in: the length is written by the other side, so
+without a ceiling a peer names a number and sbx allocates it. It is not
+re-checked on the way out, because a frame that carried a secret marker is
+larger once sbx replaces the marker with the secret, and the number in the
+manifest describes the frames the plugin writes. The growth is bounded by the
+frame's own size, and what goes out goes to the host resource, which has limits
+of its own.
+
 `host_deadline` is the other thing that manifest is saying, and it belongs to the same protocol
 rather than to any machine: a key with a passphrase makes the agent stop mid-exchange and open a
 pinentry, and it answers when the person does. The default `sbx` waits on a host resource is thirty

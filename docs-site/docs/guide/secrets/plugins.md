@@ -599,7 +599,7 @@ cage_env_dir = []                  # …or at the directory holding it (libpq's 
 socket_name  = "agent.sock"        # the file name inside it; the directory is sbx's
 at_host_path = false               # true = stand at the host resource's own address instead
 framing   = "line"                 # `line`, `length-u32-be` or `pgwire`
-max_frame = 2048                   # the largest frame this protocol admits
+max_frame = 2048                   # the largest frame sbx reads on this channel
 host_deadline = 30                 # seconds sbx waits on the host resource for one exchange
 deny_frame = [5]                   # optional: a refusal frame that needs no request context
 uses_secret = true                 # may be handed a marker standing in for a credential
