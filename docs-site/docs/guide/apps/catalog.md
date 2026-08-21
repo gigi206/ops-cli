@@ -95,9 +95,16 @@ whole login closes inside the cage. `openwork` needs one step more: its sign-in 
 custom-scheme deep link, so its wrapper registers the app itself as that scheme's handler and
 the grant reaches the running instance.
 
+One entry in this table does not track upstream. `aionui` names a fixed release asset instead of the
+repository, because upstream stopped attaching assets to its releases after `v2.1.47-final`: the
+repository form resolves through the latest release, finds nothing to select, and the app can be
+neither launched nor upgraded. The pin keeps it runnable and freezes it there. The profile carries
+the trigger that removes the pin, which is upstream attaching a linux-amd64 `.deb` to a release
+again.
+
 | Profile | Tool (fresh, upstream) | Provider / egress |
 |---|---|---|
-| `aionui` | `deb:github:iOfficeAI/AionUi` (+ `nix:chromium`) | multi-provider (BYOK) |
+| `aionui` | `deb:` pinned to `v2.1.47-final` (+ `nix:chromium`) | multi-provider (BYOK) |
 | `antigravity` | `tarball:resolve` (+ `nix:chromium`) | `cloudcode-pa.googleapis.com` (Google account) |
 | `claude-desktop` | `deb:apt:downloads.claude.ai/…` (+ `nix:chromium`) | `api.anthropic.com` / `claude.ai` (Anthropic account) |
 | `cursor` | `deb:resolve` (+ `nix:chromium`) | `*.cursor.com` (Cursor account) |

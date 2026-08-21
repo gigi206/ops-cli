@@ -29,20 +29,27 @@
 # without a bundle (desktop/web builds) stay one-step imports.
 # With `use` empty you Cowork with AionUi's BUILT-IN agent alone, which needs no CLI.
 #
-# THE `deb:github:` BACKEND (no third party, tracks upstream automatically). Upstream distributes
-# AionUi for Linux only as a `.deb`/`.AppImage`/`.rpm`, none of which install in the hermetic cage.
-# AionUi's release ASSET NAMES embed the version (`AionUi-<v>-linux-amd64.deb`), so there is no
-# stable `releases/latest/download/…` URL to hard-code. Instead this profile names the GitHub repo
-# — `deb:github:iOfficeAI/AionUi` — and sbx queries the repo's LATEST release, selects its
-# linux-amd64 `.deb` asset, resolves it to a content hash (both pinned in the per-project deb lock),
-# and builds a generated derivation that `dpkg-deb -x`-unpacks it and `autoPatchelfHook`s the
-# Electron binaries against a curated library set — no from-source build. The build is HOST-SIDE
-# (a `.deb` runs no maintainer script, so evaluating it host-side is safe), seeded into the store,
-# and offline-reusable after the first launch.
+# THE `deb:` BACKEND. Upstream distributes AionUi for Linux only as a `.deb`/`.AppImage`/`.rpm`,
+# none of which install in the hermetic cage. sbx fetches the `.deb`, resolves it to a content hash
+# (URL and hash both pinned in the per-project deb lock), and builds a generated derivation that
+# `dpkg-deb -x`-unpacks it and `autoPatchelfHook`s the Electron binaries against a curated library
+# set — no from-source build. The build is HOST-SIDE (a `.deb` runs no maintainer script, so
+# evaluating it host-side is safe), seeded into the store, and offline-reusable after the first
+# launch.
 #
-# UPGRADES — automatic, like the other `deb:` apps. `sbx upgrade deb` re-queries GitHub and rolls
-# the pin forward to the newest release (the rebuilt app lands at the next launch); the launch hot
-# path never touches GitHub — it reuses the pinned asset offline. No manual version bump.
+# THE PIN IS A HARD ONE, AND THIS IS THE LIMIT IT CARRIES. Every other `deb:` app in this catalogue
+# rolls forward on its own. This one cannot: the profile named the repository
+# (`deb:github:iOfficeAI/AionUi`), which resolves through the LATEST release's linux-amd64 asset,
+# and upstream stopped attaching assets to its releases. `v2.1.47-final` (2026-08-05) is the newest
+# release that carries a `.deb`; the eleven published since carry none at all, so the repository
+# form resolves to nothing and neither a launch nor an upgrade can provision the app. The direct
+# asset URL below is what keeps it runnable, at the cost of freezing it at that release.
+#
+# UPGRADES — none, until upstream resumes. `sbx upgrade deb` re-resolves this URL and finds the same
+# bytes, so the pin never moves. THE TRIGGER THAT REMOVES THE HARD PIN: upstream attaches a
+# linux-amd64 `.deb` to a release again, at which point the declaration goes back to
+# `deb:github:iOfficeAI/AionUi` and rolls forward on its own with no other change. Check with
+# `curl -s https://api.github.com/repos/iOfficeAI/AionUi/releases/latest | grep -c '\.deb'`.
 #
 # CA TRUST (why `--use-system-ca`). Under the allowlist sbx runs a TLS-terminating proxy with a
 # per-session CA. Electron/Chromium ignores the CA-file env vars sbx sets and trusts its own NSS
@@ -191,9 +198,9 @@ http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-stor
 https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
 
 [packages]
-# Track the latest GitHub release's linux-amd64 `.deb` automatically (see "THE `deb:github:` BACKEND"
-# above). `sbx upgrade deb` rolls it forward; no manual version to bump.
-aionui = "deb:github:iOfficeAI/AionUi"
+# Pinned to the newest release that still carries a linux-amd64 `.deb` — see "THE PIN IS A HARD ONE"
+# above for why, and for the trigger that puts `deb:github:iOfficeAI/AionUi` back here.
+aionui = "deb:https://github.com/iOfficeAI/AionUi/releases/download/v2.1.47-final/AionUi-2.1.47-linux-amd64.deb"
 
 # In-cage Chromium for the OAuth/login flow (see the `[open]` table above). HEAVY — pulls a large
 # nixpkgs closure into the project store on first launch. Drop this (and the table) if you only use
