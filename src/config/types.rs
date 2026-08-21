@@ -21,17 +21,20 @@ pub(crate) enum Backend {
     /// is passed to mise verbatim — sbx adds no per-backend logic of its own.
     Mise(String),
     /// `flake:<ref>` — an arbitrary nix flake reference (e.g.
-    /// `github:owner/repo#attr`), built **in-cage** with `nix build --out-link` into
-    /// the project's own writable store. A third-party flake is uncurated, so unlike
-    /// `nix:` it is *not* built host-side: its eval + build are contained by the cage
-    /// (the same posture as the in-cage `mise:nix:` self-equip). On PATH at launch and
-    /// later launches via a persistent out-link under the home.
+    /// `github:owner/repo#attr`), provisioned **host-side** into sbx's shared store and
+    /// seeded per project, exactly like `nix:` (see [`crate::store::provision_flake`]).
+    /// It lands once and is reused everywhere, and its `bin/` reaches PATH through the
+    /// provisioned package bins. The build itself runs in nix's own sandbox. Only local
+    /// content is refused this route — `is_valid_flake_ref` rejects `path:`/`file:`
+    /// references, which is what [`Backend::FlakeInline`] exists to carry instead.
     Flake(String),
     /// A `[flakes.<name>]` inline flake — the full `flake.nix` source written directly in the
     /// config, plus the output attribute to build. Unlike [`Backend::Flake`] (a reference to an
     /// external flake) the source is ours: sbx stages it, binds it read-only into the cage, and
-    /// builds `path:<dir>#<attr>` **in-cage**, so the same containment as `flake:` applies to
-    /// arbitrary inline build code. The out-link is keyed by the source's content hash, so editing
+    /// builds `path:<dir>#<attr>` **in-cage**. That is the opposite side of the split from
+    /// [`Backend::Flake`], and for the reason `is_valid_flake_ref` encodes: building local content
+    /// host-side is what a remote ref is refused, so local content is built where the cage contains
+    /// it. The out-link is keyed by the source's content hash, so editing
     /// the flake in the config rebuilds at the next launch. It floats — no persisted lock, no
     /// `sbx upgrade` — so inputs are pinned inside the `flake.nix` for reproducibility.
     FlakeInline { content: String, attr: String },
