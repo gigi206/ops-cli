@@ -183,6 +183,17 @@ pub(crate) struct RawConfig {
     /// http. Nothing in the shipped catalogue uses it, and nothing should — a public vendor URL has
     /// no reason to be plaintext.
     ///
+    /// **What would take it back out**, written here because this repository argues its refusals and
+    /// almost never its acceptances, and a field that arrives with no exit condition never leaves.
+    /// Two triggers, either one sufficient. *(a)* Artefact signature verification lands for the
+    /// prebuilt backends: once a source authenticates itself, the transport stops being what proves
+    /// anything, and the honest control becomes per-source ("this one is signed by that key") rather
+    /// than one machine-wide switch that says only "check nothing here". *(b)* A shipped profile
+    /// sets it. That would mean the default is wrong for a case the catalogue actually serves, and
+    /// the switch has become a workaround standing in for a fix — the guard
+    /// `every_shipped_app_profile_is_in_the_catalogue` will not catch that, so it is a thing to look
+    /// for by hand when a profile is added.
+    ///
     /// **A security field**, honored from the global config, an imported app profile (both trusted
     /// by location) or a trusted project, ignored from an untrusted one. What it gives up is what
     /// TLS was giving: an artefact fetched over http can be replaced in flight by anyone on the
