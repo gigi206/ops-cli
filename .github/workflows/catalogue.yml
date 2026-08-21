@@ -29,6 +29,14 @@
 # revision its engine lock names, so this run realises that same revision instead of installing
 # whatever the runner offers.
 #
+# IT DOES NOT FIRE FROM THIS BRANCH, AND THAT IS GITHUB'S RULE, NOT AN OVERSIGHT. A
+# `workflow_dispatch` against `ops-v2` is refused outright — `workflow catalogue.yml not found on
+# the default branch`, measured — and GitHub schedules `cron` workflows from the default branch
+# alone. So the daily run starts the day this file reaches `main`, and until then the module it arms
+# has been exercised only by hand (`SBX_CATALOGUE_CHECK=1 SBX_CATALOGUE_MISE=<path> cargo test
+# --bin sbx every_shipped_package_still_resolves_at_its_vendor`). Anyone reading this on a feature
+# branch should not take the file's presence for a guard that is running.
+#
 # ACTIONS ARE PINNED BY COMMIT, as everywhere in this repository: a tag is a mutable pointer and a
 # third-party action runs with more of this repository's trust than an apt index does.
 
