@@ -32,6 +32,15 @@ allow = [
 mute = [
     "@npm-audit",
     "html.duckduckgo.com",
+    # siGit asks its vendor's MCP server for tools at every start, and this profile refuses that
+    # host on purpose: a local-model agent whose code never leaves the cage is what it is for. A
+    # refusal the profile intends is not a finding, so it belongs here beside the search backend.
+    #
+    # What the mute does here was NOT observed, and the reason is worth leaving written: the egress
+    # log is live only, and siGit exits as soon as it finds no ACP client on stdin, so the session
+    # is gone before `sbx net log` can be asked. What was measured is the refusal itself, on two
+    # clean homes, in siGit's own log — which the mute does not touch and cannot.
+    "sigit.si",
 ]
 
 [bundle.sigit.packages]

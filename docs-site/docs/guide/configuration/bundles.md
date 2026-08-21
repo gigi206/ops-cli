@@ -336,7 +336,7 @@ The 64 shipped bundles, and what each carries:
 | `reasonix` | 2 (`mise:`, `nix:`) | 4 egress entries, 1 env var | `npm-audit`, `npm-registry` |
 | `reasonix-desktop` | 1 (`deb:`) | 2 egress entries, 4 env vars, a `deb:` resolver | none |
 | `rovo` | 1 (`nix:`) | 12 egress entries | none |
-| `sigit` | 2 (`mise:`, `nix:`) | 5 egress entries, 1 env var | `npm-audit`, `npm-registry` |
+| `sigit` | 2 (`mise:`, `nix:`) | 6 egress entries, 1 env var | `npm-audit`, `npm-registry` |
 | `snow` | 2 (`mise:`, `nix:`) | 2 egress entries | `npm-audit`, `npm-registry` |
 | `stakpak` | 1 (`mise:`) | 4 egress entries | none |
 | `trae` | 2 (`nix:`) | 2 egress entries, an install step | `github`, `pypi` |

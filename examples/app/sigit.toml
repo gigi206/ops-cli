@@ -34,6 +34,16 @@
 # `code.sigit.si` for people who would rather not run a model locally; that is a different posture
 # (a service account), not what this profile does.
 #
+# WHAT YOU WILL SEE AT THE FIRST START, and why it is not a fault. siGit asks `sigit.si` for its
+# vendor's MCP tool server before anything else, this profile refuses that host, and siGit says so
+# in its own log: `server 'sigit' unavailable … returned 403 … not allowed by the network policy`.
+# That is the posture working. The agent starts and edits normally; what it loses is that one
+# remote toolset. The line comes from siGit, not from sbx, so it is printed whatever sbx does; the
+# bundle mutes the host so that sbx's own egress log does not ALSO report a refusal the profile
+# intends, the way it already mutes the search backend. To take the other
+# posture, `sbx net allow sigit.si --app sigit` — and read the paragraph above first, since the
+# point of this profile is that nothing leaves the cage.
+#
 # UNVERIFIED (like every profile until run for real): the model download and the first inference in
 # the cage. The two rules below were measured against the shapes Hugging Face redirects to — both
 # `cdn-lfs-us-1.hf.co` and `cas-bridge.xethub.hf.co` are covered — but whether a real download stays
