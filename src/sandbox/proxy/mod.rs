@@ -1585,21 +1585,11 @@ fn pump_redacting<R: Read, W: Write>(
 /// A needle already complete inside the window was masked before this is asked, so the suffix
 /// considered here is only ever an incomplete one.
 fn needle_prefix_suffix(window: &[u8], needles: &[SecretNeedle]) -> usize {
-    let mut hold = 0;
-    for needle in needles {
-        let bytes = needle.as_bytes();
-        // A whole needle is not held: it would already have been masked.
-        let longest = (bytes.len().saturating_sub(1)).min(window.len());
-        // Longest first, and never below what another needle already requires: the answer is the
-        // maximum, so a shorter candidate cannot change it.
-        for k in (hold + 1..=longest).rev() {
-            if window[window.len() - k..] == bytes[..k] {
-                hold = k;
-                break;
-            }
-        }
-    }
-    hold
+    needles
+        .iter()
+        .map(|needle| needle.prefix_suffix_len(window))
+        .max()
+        .unwrap_or(0)
 }
 
 /// Replace every occurrence of every needle in `buf` with an equal-length run of `*`, in place.

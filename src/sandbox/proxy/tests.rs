@@ -8114,6 +8114,60 @@ fn a_streaming_response_is_not_held_back_by_the_secret_scan() {
     );
 }
 
+/// The carry decision, checked against the definition it implements rather than against itself.
+///
+/// [`SecretNeedle::prefix_suffix_len`] walks a failure table where the definition tries every
+/// candidate length; the two agree on every pair below, self-similar needles included, which are
+/// exactly the shapes a table gets wrong when its fallbacks are off by one. The needle's value is
+/// chosen by whoever holds the credential, so a shape that answers wrongly is a shape that either
+/// leaks a secret across a read boundary or holds a stream forever.
+#[test]
+fn the_carry_decision_agrees_with_its_own_definition() {
+    /// The definition: the longest proper prefix of `pattern` that ends `window`.
+    fn naive(window: &[u8], pattern: &[u8]) -> usize {
+        (1..pattern.len())
+            .rev()
+            .find(|&k| k <= window.len() && window[window.len() - k..] == pattern[..k])
+            .unwrap_or(0)
+    }
+
+    let patterns: [&[u8]; 7] = [
+        b"SECRET",
+        b"a",
+        b"aa",
+        b"aaaaaaaa",
+        b"ababab",
+        b"aabaabaaa",
+        b"sk-proj-0123456789abcdef",
+    ];
+    let windows: [&[u8]; 12] = [
+        b"",
+        b"a",
+        b"aaaaaaa",
+        b"aaaaaaaaaaaaaaaa",
+        b"xxaaaaaaa",
+        b"ababababa",
+        b"xxabab",
+        b"aabaabaa",
+        b"aabaabaabaabaa",
+        b"data: {\"delta\":\"Hello\"}\n\n",
+        b"xxSEC",
+        b"nothing here at all",
+    ];
+    for pattern in patterns {
+        let needle = SecretNeedle::named("n", pattern.to_vec());
+        for window in windows {
+            assert_eq!(
+                needle.prefix_suffix_len(window),
+                naive(window, pattern),
+                "pattern {:?} window {:?}",
+                String::from_utf8_lossy(pattern),
+                String::from_utf8_lossy(window)
+            );
+        }
+    }
+}
+
 /// What a streaming scan must hold back, stated on its own: the tail that spells the start of a
 /// needle, and nothing else.
 #[test]

@@ -352,6 +352,17 @@ pub(crate) struct SecretNeedle {
     /// magnitude, which is the difference between the scan being invisible next to the relay's own
     /// copy and being the thing that caps its throughput.
     finder: memchr::memmem::Finder<'static>,
+    /// The Knuth-Morris-Pratt failure table for `bytes`: `fail[i]` is the length of the longest
+    /// proper prefix of `bytes[..=i]` that is also a suffix of it.
+    ///
+    /// It answers one question, [`Self::prefix_suffix_len`], and it is built with the needle for
+    /// the same reason the searcher is: that question is asked once per read for as long as a
+    /// response streams. Answering it by testing each candidate length in turn is quadratic in the
+    /// needle, and the needle's *value* is chosen by the cage — an `Authorization` of 16 KiB of one
+    /// repeated byte made the decision cost 1.4 ms per 64 KiB read against 22 us for the masking
+    /// beside it, on a host thread outside the cage's own limits. With this table the walk is linear
+    /// in the needle and there is no shape of value that is worse than another.
+    fail: Vec<u32>,
     /// Whether this needle was **learned from traffic** rather than derived from a declaration.
     ///
     /// It decides what survives a re-resolution. A declared needle is replaced by the re-resolved
@@ -375,10 +386,12 @@ impl SecretNeedle {
     /// A needle whose name is the credential's logical name — for a value a declaration produced.
     pub(crate) fn named(name: impl Into<String>, bytes: Vec<u8>) -> Self {
         let finder = memchr::memmem::Finder::new(&bytes).into_owned();
+        let fail = failure_table(&bytes);
         Self {
             name: name.into(),
             bytes,
             finder,
+            fail,
             observed: false,
             dest: None,
         }
@@ -393,6 +406,37 @@ impl SecretNeedle {
             dest: Some(host_key(dest)),
             ..Self::named(name, bytes)
         }
+    }
+
+    /// The length of the longest suffix of `window` that is a **proper prefix** of this needle.
+    ///
+    /// What a streaming scan must hold back, and no more: a tail that spells the beginning of this
+    /// needle may turn out to be it once the next read arrives, while a tail that spells no
+    /// beginning cannot become one however the stream continues. Ordinary traffic ends in neither,
+    /// so the usual answer is zero.
+    ///
+    /// Only the last `len - 1` bytes are walked, because the answer cannot be longer than that and a
+    /// suffix of the window that short is a suffix of them too. Walking exactly that many is also
+    /// what makes the result a *proper* prefix without testing for it: each byte advances the match
+    /// by at most one from a start of zero, so `len - 1` bytes cannot reach `len`, and no full match
+    /// is there to fall back from.
+    pub(crate) fn prefix_suffix_len(&self, window: &[u8]) -> usize {
+        let p = &self.bytes;
+        if p.len() < 2 {
+            // A single byte has no proper prefix, so nothing about it can straddle a read.
+            return 0;
+        }
+        let from = window.len().saturating_sub(p.len() - 1);
+        let mut matched = 0usize;
+        for &b in &window[from..] {
+            while matched > 0 && p[matched] != b {
+                matched = self.fail[matched - 1] as usize;
+            }
+            if p[matched] == b {
+                matched += 1;
+            }
+        }
+        matched
     }
 
     /// Whether this needle was learned from traffic rather than declared.
@@ -641,6 +685,22 @@ impl Credentials {
         }
         kept
     }
+}
+
+/// The Knuth-Morris-Pratt failure table for `pattern` — see [`SecretNeedle::fail`].
+fn failure_table(pattern: &[u8]) -> Vec<u32> {
+    let mut fail = vec![0u32; pattern.len()];
+    let mut matched = 0usize;
+    for i in 1..pattern.len() {
+        while matched > 0 && pattern[matched] != pattern[i] {
+            matched = fail[matched - 1] as usize;
+        }
+        if pattern[matched] == pattern[i] {
+            matched += 1;
+        }
+        fail[i] = matched as u32;
+    }
+    fail
 }
 
 /// The request headers whose value is a credential worth remembering when the cage sends one of its
