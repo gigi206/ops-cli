@@ -129,19 +129,7 @@ pub(crate) fn resolve_source(
         DebSource::Github { owner, repo } => {
             let api = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
             let json = super::nixhub::fetch_url_json(nix, layout, &api, fresh)?;
-            let url = select_deb_asset(&json, system).ok_or_else(|| {
-                io::Error::other(format!(
-                    "no linux {} `.deb` asset in the latest release of {owner}/{repo}",
-                    prebuilt::arch_label(system)
-                ))
-            })?;
-            if !crate::config::is_valid_deb_url(&url, allow_insecure_http) {
-                return Err(io::Error::other(format!(
-                    "the latest release of {owner}/{repo} selected an asset URL that is not a \
-                     valid `.deb` URL: {url}"
-                )));
-            }
-            url
+            github_asset_url(&json, system, &owner, &repo)?
         }
         DebSource::Apt { packages_url } => {
             resolve_apt_deb_url(nix, layout, &packages_url, fresh, allow_insecure_http)?
@@ -645,6 +633,38 @@ fn apt_repo_root(packages_url: &str) -> Option<&str> {
 /// name names a *foreign* arch is dropped, then one positively naming this arch is chosen
 /// (deterministic by name); a single unambiguous `.deb` with no arch token is the fallback for a
 /// single-arch repo. Pure, so selection is testable against captured release JSON.
+/// The `.deb` asset URL a `github:<owner>/<repo>` locator's newest release names, validated.
+///
+/// **`allow_insecure_http` deliberately does not reach here, and the `apt:` sibling is the contrast
+/// that argues it.** An `apt:` locator names its own repository root, so a user who wrote
+/// `apt:http://…` chose plaintext and the `.deb` URL derived from that root inherits the choice; the
+/// flag must follow it there or the opt-in would not work at all. A `github:` locator names no
+/// scheme. This URL is a field in a JSON document fetched from `api.github.com` over TLS, chosen by
+/// GitHub and not by the config, so a plaintext value in it is an anomaly in a third party's answer
+/// rather than a posture anyone here asked for. Opting into plaintext for your own server is not
+/// opting into following whatever scheme a remote API hands back, and one switch cannot honestly
+/// mean both.
+fn github_asset_url(
+    json: &serde_json::Value,
+    system: &str,
+    owner: &str,
+    repo: &str,
+) -> io::Result<String> {
+    let url = select_deb_asset(json, system).ok_or_else(|| {
+        io::Error::other(format!(
+            "no linux {} `.deb` asset in the latest release of {owner}/{repo}",
+            prebuilt::arch_label(system)
+        ))
+    })?;
+    if !crate::config::is_valid_deb_url(&url, false) {
+        return Err(io::Error::other(format!(
+            "the latest release of {owner}/{repo} selected an asset URL that is not a \
+             valid `https://` `.deb` URL: {url}"
+        )));
+    }
+    Ok(url)
+}
+
 fn select_deb_asset(json: &serde_json::Value, system: &str) -> Option<String> {
     let (accept, reject) = prebuilt::arch_tokens(system);
     let mut native: Vec<(String, String)> = json
@@ -971,6 +991,43 @@ mod tests {
           "browser_download_url": "https://github.com/example/demo-app/releases/download/v2.1.35/demo-app-2.1.35-win-x64.exe" }
       ]
     }"#;
+
+    #[test]
+    fn a_github_release_asset_is_held_to_tls_whatever_the_launch_allows() {
+        // The seventh path the plaintext switch could have reached, and the one it deliberately does
+        // not. This URL is GitHub's answer over TLS, not the config's choice, so it stays https-only
+        // even when the launch opted into plaintext for its own sources.
+        let http_asset = serde_json::json!({
+            "assets": [
+                { "name": "demo-app_1.0_amd64.deb",
+                  "browser_download_url": "http://e/demo-app_1.0_amd64.deb" }
+            ]
+        });
+        // The selection itself is scheme-agnostic: it finds the asset, and the refusal is the
+        // validation, so this test is about the gate and not about a failure to find anything.
+        assert_eq!(
+            select_deb_asset(&http_asset, "x86_64-linux").as_deref(),
+            Some("http://e/demo-app_1.0_amd64.deb")
+        );
+        let err = github_asset_url(&http_asset, "x86_64-linux", "o", "r")
+            .expect_err("a plaintext asset URL is refused");
+        assert!(
+            err.to_string().contains("https://"),
+            "the refusal does not say what it wanted: {err}"
+        );
+        // The `apt:` sibling is the contrast: there the flag *does* follow the declared root, which
+        // is why this one has to be argued rather than assumed. See `github_asset_url`'s docstring.
+        let https_asset = serde_json::json!({
+            "assets": [
+                { "name": "demo-app_1.0_amd64.deb",
+                  "browser_download_url": "https://e/demo-app_1.0_amd64.deb" }
+            ]
+        });
+        assert_eq!(
+            github_asset_url(&https_asset, "x86_64-linux", "o", "r").expect("TLS asset passes"),
+            "https://e/demo-app_1.0_amd64.deb"
+        );
+    }
 
     #[test]
     fn select_deb_asset_picks_the_native_arch_and_rejects_the_foreign_one() {

@@ -537,6 +537,14 @@ server serves one application, not every launch on the machine.
 allow_insecure_http = true
 ```
 
+One path the switch deliberately does not reach: the asset URL a `deb:github:<owner>/<repo>`
+locator picks. That URL is a field in a release document `sbx` fetched from `api.github.com` over
+TLS, so it was chosen by GitHub and not by your config, and a plaintext value in it is an anomaly in
+someone else's answer rather than a posture you asked for. It stays refused whatever the switch says.
+The `apt:` index is the opposite case and shows why the two are separated: there you named the
+repository root yourself, so a `.deb` URL derived from a root you wrote as `http://` follows the
+choice you already made.
+
 Be clear about what you give up. Over plaintext, anyone on the network path can replace the artefact
 in flight, and the replacement is what gets pinned, unpacked and put on the cage's `PATH`. The
 content hash still does its job, and its job is narrower than it looks: it binds the pin to whatever

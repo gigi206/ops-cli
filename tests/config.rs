@@ -2340,8 +2340,9 @@ fn config_show_app_shows_the_effective_config_with_inheritance() {
         "a posture nobody configured must not crowd the default view:\n{stdout}"
     );
     assert!(
-        stdout.contains("at their default: proc, notify, gui, gpu, audio, dbus, forward")
-            && stdout.contains("— see --details"),
+        stdout.contains(
+            "at their default: proc, notify, gui, gpu, allow_insecure_http, audio, dbus, forward"
+        ) && stdout.contains("— see --details"),
         "the fold must name what it hid and the flag that shows it:\n{stdout}"
     );
     let detailed = String::from_utf8_lossy(
@@ -5153,7 +5154,10 @@ fn a_posture_nobody_configured_folds_and_one_a_layer_set_stays() {
     // Named, not silently dropped — and `notify` is absent from the list precisely because it was
     // configured, which is what makes this line load-bearing rather than decorative.
     assert!(
-        stdout.contains("at their default: proc, gui, gpu, audio, dbus, limits, forward, seccomp, devices — see --details"),
+        stdout.contains(
+            "at their default: proc, gui, gpu, allow_insecure_http, audio, dbus, limits, forward, \
+             seccomp, devices — see --details"
+        ),
         "the summary must name every folded posture, in order, and exclude the configured one:\n{stdout}"
     );
 
@@ -5174,7 +5178,7 @@ fn a_posture_nobody_configured_folds_and_one_a_layer_set_stays() {
         "nothing is folded under --details, so the summary line must not appear:\n{detailed}"
     );
 
-    // The whole set, on a profile that declares nothing but its command: all ten fold, in order.
+    // The whole set, on a profile that declares nothing but its command: all eleven fold, in order.
     // This is the guard for the wiring itself — a posture added to the view without its fold would
     // print at its default forever, and only a test that pins the complete list would notice.
     let fx = Fixture::new();
@@ -5183,8 +5187,8 @@ fn a_posture_nobody_configured_folds_and_one_a_layer_set_stays() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains(
-            "at their default: proc, notify, gui, gpu, audio, dbus, limits, forward, seccomp, \
-             devices — see --details"
+            "at their default: proc, notify, gui, gpu, allow_insecure_http, audio, dbus, limits, \
+             forward, seccomp, devices — see --details"
         ),
         "with nothing configured, every posture folds and every one is named:\n{stdout}"
     );
