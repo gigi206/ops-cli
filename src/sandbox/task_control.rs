@@ -885,25 +885,39 @@ fn serve_detach(
         }
     };
 
-    // The admission moves into the thread with everything it holds — the registry entry that makes
-    // the invocation visible to `status` and stoppable by `stop`, and the output directory's claim —
+    // The admission moves into the thread with everything it holds — the output directory's claim,
+    // and the registry entry that makes the invocation visible to `status` and stoppable by `stop` —
     // so both are released when the command ends rather than when this connection closes.
+    //
+    // The registry entry is taken out of the admission first, and held here until the result is
+    // stored. Left inside, it would be released the moment the run returns, two statements before
+    // the result exists: an invocation in that window reads as neither running nor holding a
+    // result, and `RESULT <id>` answers "no invocation" or "its result is no longer held", which
+    // are both false and both terminal to a caller that asks once. Held, the worst answer in the
+    // window is "still running".
+    let mut admitted = admitted;
+    let live = admitted.hold_registration();
     {
         let engine = Arc::clone(engine);
         let log = Arc::clone(log);
         let results = Arc::clone(results);
         let name = name.to_string();
-        std::thread::spawn(move || match engine.run_admitted(&name, admitted) {
-            Ok(outcome) => {
-                log.push(finished(id, &name, &outcome, true));
-                results.store(id, Ok(outcome));
-            }
-            Err(e) => {
-                let reason = e.to_string();
-                let mut entry = refusal(id, &name, &reason);
-                entry.detached = true;
-                log.push(entry);
-                results.store(id, Err(reason));
+        std::thread::spawn(move || {
+            // Bound first so it drops last: locals are released in reverse order of declaration,
+            // which puts this after the store below.
+            let _live = live;
+            match engine.run_admitted(&name, admitted) {
+                Ok(outcome) => {
+                    log.push(finished(id, &name, &outcome, true));
+                    results.store(id, Ok(outcome));
+                }
+                Err(e) => {
+                    let reason = e.to_string();
+                    let mut entry = refusal(id, &name, &reason);
+                    entry.detached = true;
+                    log.push(entry);
+                    results.store(id, Err(reason));
+                }
             }
         });
     }
@@ -2152,6 +2166,59 @@ mod tests {
         );
         assert_eq!(result.exit, 0, "and its own exit code");
         assert_eq!(result.id, started.id, "one id, whichever verb reports it");
+    }
+
+    /// An invocation that is finishing is never reported as one that never existed.
+    ///
+    /// The run releases its registry entry and stores its result at two different moments, and the
+    /// reader consults both. Caught in between, `RESULT <id>` falls through to branches that say
+    /// "no invocation" or "its result is no longer held" — a caller that asks once believes either.
+    /// So the only answer this loop tolerates before the result is that the invocation is still
+    /// running, which is the answer a caller retries on.
+    ///
+    /// It polls without sleeping and runs the shortest command there is, because the window it is
+    /// looking for is two statements wide, and it repeats the whole invocation because landing in
+    /// those two statements is a matter of chance. One attempt catches the defect often enough to
+    /// prove it exists and rarely enough to be no guard at all; the repetition is what turns that
+    /// into a test. It cannot fail the other way: while the registration is held, "still running"
+    /// is a true answer, so a correct tree has nothing here to trip on.
+    #[test]
+    fn a_finishing_invocation_is_never_reported_as_one_that_never_ran() {
+        let Some((_data, plane, _script)) = plane_with_launcher("printf 'done\n'\n") else {
+            skip_incapable!("skipping: bash, socat or head is not on PATH");
+            return;
+        };
+        let host = plane.log_socket.clone();
+        for _ in 0..10 {
+            let started = client::run_detached(
+                &host,
+                "probe",
+                &BTreeMap::from([("sql".to_string(), AWKWARD.to_string())]),
+                &BTreeMap::new(),
+            )
+            .expect("the detached start");
+            assert_eq!(
+                started.error, None,
+                "the invocation must have been admitted"
+            );
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let answer = client::result(&host, started.id).expect("an answer");
+                let Some(why) = answer.error.as_deref() else {
+                    break;
+                };
+                assert!(
+                    why.contains("is still running"),
+                    "an invocation between its last statement and its stored result is still \
+                     running, and nothing else is true of it — answered instead: {why:?}"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the invocation never produced a result"
+                );
+            }
+        }
     }
 
     /// Reading a result does not consume it: a caller whose terminal scrolled gets a second look.

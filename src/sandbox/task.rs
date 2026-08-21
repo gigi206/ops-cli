@@ -636,7 +636,7 @@ impl TaskEngine {
         }
         Ok(Admission {
             id: invocation,
-            live,
+            live: Some(live),
             values,
             caller_env,
             output,
@@ -1952,7 +1952,10 @@ pub(crate) struct RunningView {
 /// and in nothing else.
 pub(crate) struct Admission {
     id: u64,
-    live: RunGuard,
+    /// An `Option` only so a caller can take it out with [`Admission::hold_registration`]; an
+    /// admission that keeps it releases the entry when the run ends, which is what the attached
+    /// path wants.
+    live: Option<RunGuard>,
     /// The parameter values, checked against their declared bounds, with `{out}` already resolved.
     values: BTreeMap<String, String>,
     /// The caller-supplied variables, checked against `env_allow`.
@@ -1960,11 +1963,29 @@ pub(crate) struct Admission {
     output: Option<OutputClaim>,
 }
 
+impl Admission {
+    /// Take the registry entry out, so the caller decides when this invocation stops reading as
+    /// running rather than having that decided by [`TaskEngine::run_admitted`] returning.
+    ///
+    /// The detached path needs it: the entry is what `RESULT <id>` consults to answer "still
+    /// running", and the result it will answer with instead is stored two statements after the run
+    /// returns. Released in between, the invocation reads as neither running nor holding a result,
+    /// and the reader's remaining branches say "no invocation" or "its result is no longer held" —
+    /// both false, and both terminal to a caller that asked once. Held until the result is stored,
+    /// the worst answer in that window is "still running", which is the direction a caller retries
+    /// on.
+    ///
+    /// Returns `None` on a second call: there is one entry, and the first caller has it.
+    pub(crate) fn hold_registration(&mut self) -> Option<RunGuard> {
+        self.live.take()
+    }
+}
+
 /// One invocation's presence in the live registry, removed when it ends — by return, by error, or by
 /// panic. A guard rather than a pair of calls for the same reason as [`OutputClaim`]: an entry left
 /// behind would be an invocation `sbx task status` reports forever and `sbx task stop` can never
 /// stop.
-struct RunGuard {
+pub(crate) struct RunGuard {
     id: u64,
     registry: Arc<Mutex<BTreeMap<u64, Running>>>,
 }
@@ -2943,6 +2964,47 @@ mod tests {
         engine
             .enter(901, "probe", false)
             .expect("an attached invocation with the detached slate full");
+    }
+
+    /// The registry entry an admission holds can be taken out of it, and the invocation keeps
+    /// reading as running until whoever took it lets go.
+    ///
+    /// That is what the detached path rests on. Left inside the admission, the entry is released
+    /// the moment the run returns, and the result it will answer with is stored two statements
+    /// later; an invocation caught in between reads as neither running nor holding a result, and
+    /// the reader's remaining branches call it unknown or evicted. Both are false, and a caller
+    /// that asks once acts on them.
+    #[test]
+    fn a_taken_registration_keeps_the_invocation_visible_until_it_is_dropped() {
+        let engine = TaskEngine::inventory_only(vec![task()]);
+        let mut admitted = engine
+            .admit(
+                "db-query",
+                &values(&[("sql", "SELECT one")]),
+                &values(&[]),
+                7,
+                true,
+            )
+            .expect("the admission");
+
+        let live = admitted.hold_registration().expect("the entry, once");
+        assert!(
+            admitted.hold_registration().is_none(),
+            "there is one entry, and the first caller has it"
+        );
+
+        // Everything else the admission holds goes; the entry does not.
+        drop(admitted);
+        assert!(
+            engine.running().iter().any(|row| row.id == 7),
+            "the invocation must still read as running while its registration is held"
+        );
+
+        drop(live);
+        assert!(
+            !engine.running().iter().any(|row| row.id == 7),
+            "and stop reading as running once it is let go"
+        );
     }
 
     fn task() -> TaskSpec {
