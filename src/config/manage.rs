@@ -1235,12 +1235,7 @@ pub(crate) fn write_text(
         .ok()
         .or(fresh_mode);
     let tmp = dir.join(format!(".{name}.sbx-tmp.{}", std::process::id()));
-    std::fs::write(&tmp, text).map_err(err)?;
-    // No mode to state means the temp keeps the one its creation gave it, which is the umask's:
-    // the same file a shell redirect would have made at this path.
-    if let Some(mode) = mode
-        && let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
-    {
+    if let Err(e) = write_restricted(&tmp, text, mode) {
         let _ = std::fs::remove_file(&tmp);
         return Err(err(e));
     }
@@ -1248,6 +1243,53 @@ pub(crate) fn write_text(
         let _ = std::fs::remove_file(&tmp);
         err(e)
     })
+}
+
+/// Fill `path` with `text`, never leaving the bytes in a file more readable than `mode` allows.
+///
+/// The order matters: a file is created owner-only and *widened* afterwards, because widening a
+/// mode has no window while tightening one does. `std::fs::write` creates at the umask's mode —
+/// `0644` under the common one — so writing first and tightening after would publish the content,
+/// briefly, to every reader of a directory sbx does not own (`~/.config/sbx`, a project tree).
+///
+/// `mode` of `None` is the caller asking for the umask's own answer, and then there is nothing to
+/// restrict: the transient mode and the final one are the same file a shell redirect would leave.
+fn write_restricted(path: &Path, text: &str, mode: Option<u32>) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut file = create_restricted(path, mode)?;
+    file.write_all(text.as_bytes())?;
+    if let Some(mode) = mode {
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+/// Create `path` empty, owner-only when `mode` states one, ready to be written into.
+///
+/// Two steps, not one, because they answer two different situations and neither covers the other.
+/// `OpenOptions::mode` applies only when the open creates the file, so it says nothing about one
+/// that already exists — the temp a crashed predecessor holding this pid left behind; the `fchmod`
+/// on the descriptor covers that case, and lands before any byte does either way. Conversely the
+/// `fchmod` alone would leave a gap the mode on the open closes: a descriptor another reader opened
+/// while the file was still `0644` keeps the access it was granted, and a later `chmod` does not
+/// revoke it — so the empty file would be tightened while that reader waits to read what is about
+/// to be written into it.
+///
+/// Split out from [`write_restricted`] because the property is about the file *while it is still
+/// empty*, which is the only moment a test can read it.
+fn create_restricted(path: &Path, mode: Option<u32>) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    if mode.is_some() {
+        opts.mode(0o600);
+    }
+    let file = opts.open(path)?;
+    if mode.is_some() {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
 }
 
 /// The result of [`import_net_groups`]: the group names newly added and those overwritten (only
@@ -1520,6 +1562,60 @@ mod tests {
             0o640,
             "a mode the user set is not reset by a rewrite"
         );
+    }
+
+    /// A config sbx writes can carry a token, and it lands in a directory sbx does not own — the
+    /// project tree, or `~/.config/sbx` under a `0755` `~/.config`. So the moment that matters is
+    /// not the mode the finished file carries but the mode it carries *while the content is going
+    /// into it*: writing at the umask's `0644` and tightening afterwards publishes the bytes to
+    /// every reader of that directory for the length of the write.
+    ///
+    /// Asserting the final mode would not catch it — tightening after the fact reaches the same
+    /// `0600` the fix does. What is read here is the file while it is still empty, and the
+    /// pre-existing sibling is what makes the reading independent of the umask this test happens
+    /// to run under: `OpenOptions::mode` says nothing about a file it did not create, so a mode
+    /// stated only there leaves this one at `0666`.
+    ///
+    /// What this does not reach is the composition: a `write_restricted` that went back to writing
+    /// through the path would still pass, since the file it leaves behind is the same one. That
+    /// half is held by the build instead — the helper would then have no caller outside this
+    /// module, and `clippy -D warnings` refuses an unused function.
+    #[test]
+    fn the_content_never_lands_in_a_file_wider_than_its_caller_asked_for() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::testutil::TmpDir::new();
+        let mode_of = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        // What a crashed predecessor holding this pid leaves behind, at a mode the umask never
+        // would have given it.
+        let stale = dir.join("stale");
+        std::fs::write(&stale, "left over").unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let file = create_restricted(&stale, Some(0o600)).expect("the temp is created");
+        assert_eq!(
+            mode_of(&stale),
+            0o600,
+            "owner-only before any byte is written"
+        );
+        assert_eq!(file.metadata().unwrap().len(), 0, "and still empty");
+        drop(file);
+
+        // The fresh-file half is asserted but does not separate the two steps: the `fchmod`
+        // reaches `0600` on its own, and what the mode on the open adds is a race no test can
+        // reach — a reader that opened the file in the gap and holds a descriptor the tightening
+        // does not revoke.
+        let fresh = dir.join("fresh");
+        drop(create_restricted(&fresh, Some(0o600)).expect("created"));
+        assert_eq!(mode_of(&fresh), 0o600);
+
+        // A caller that states no mode wants the umask's answer, and gets the same file a shell
+        // redirect at that path would leave — there is nothing to restrict and no window to close.
+        let plain = dir.join("plain");
+        let control = dir.join("control");
+        std::fs::write(&control, "").unwrap();
+        drop(create_restricted(&plain, None).expect("created"));
+        assert_eq!(mode_of(&plain), mode_of(&control));
     }
 
     #[test]

@@ -3528,7 +3528,7 @@ packages = { demo = "mise:aqua:example/demo" }
     assert_eq!(
         mode(&flagged),
         mode(&redirected),
-        "...and the same file: a fragment meant to be handed on takes the umask, not sbx's          own config mode"
+        "...and the same file: a fragment meant to be handed on takes the umask, not the config mode sbx keeps for itself"
     );
     assert!(
         std::fs::read_to_string(&flagged)
