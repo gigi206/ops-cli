@@ -3491,6 +3491,54 @@ fn the_shipped_profiles_import_and_resolve() {
     }
 }
 
+/// `sbx bundle export > file` and `sbx bundle export --out file` are one command spelled two ways,
+/// and the guide prints them side by side. They must therefore make the same file, contents and
+/// mode alike: the fragment is an artifact to hand to someone else, not a config of sbx's own, so
+/// it carries no permission policy sbx invented for itself.
+///
+/// Teeth: the flag is what states that, at its call site, and no unit test reaches a call site's
+/// argument. Handing the fragment the config writer's owner-only default passes every test in
+/// `config::manage` and fails here.
+#[test]
+fn bundle_export_writes_the_same_file_through_the_flag_as_through_a_redirect() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fx = Fixture::new();
+    fx.write_global(
+        r#"
+[bundle.demo]
+packages = { demo = "mise:aqua:example/demo" }
+"#,
+    );
+
+    let redirected = fx.proj.path().join("redirected.toml");
+    let out = fx.run(&["bundle", "export"]);
+    assert!(out.status.success(), "export to stdout failed: {out:?}");
+    std::fs::write(&redirected, &out.stdout).unwrap();
+
+    let flagged = fx.proj.path().join("flagged.toml");
+    let out = fx.run(&["bundle", "export", "--out", flagged.to_str().unwrap()]);
+    assert!(out.status.success(), "export to a file failed: {out:?}");
+
+    assert_eq!(
+        std::fs::read_to_string(&flagged).unwrap(),
+        std::fs::read_to_string(&redirected).unwrap(),
+        "the two spellings must write the same fragment"
+    );
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode(&flagged),
+        mode(&redirected),
+        "...and the same file: a fragment meant to be handed on takes the umask, not sbx's          own config mode"
+    );
+    assert!(
+        std::fs::read_to_string(&flagged)
+            .unwrap()
+            .contains("[bundle.demo"),
+        "the fragment must actually carry the bundle: {:?}",
+        std::fs::read_to_string(&flagged).unwrap()
+    );
+}
+
 #[test]
 fn install_steps_arrive_in_use_order_and_name_the_bundle_that_declared_them() {
     // A `provision` is not merged like a key: two bundles each finish their own tool, so both are

@@ -1203,14 +1203,25 @@ fn read_or_empty(path: &Path) -> Result<DocumentMut, ManageError> {
 /// write always passes its safety gate (a world-writable config is later refused); an existing
 /// file keeps its mode. The temp name carries the pid so two concurrent writers do not collide.
 fn write_doc(path: &Path, doc: &DocumentMut) -> Result<(), ManageError> {
-    write_text(path, &doc.to_string())
+    write_text(path, &doc.to_string(), Some(0o600))
 }
 
 /// Write `text` to `path` on the terms [`write_doc`] describes — the body of it, shared with the
 /// one other place sbx writes a config file it composed: `sbx bundle export --out`. A fragment
 /// written straight through leaves a truncated file at a destination whose whole purpose is to be
 /// imported back, which is the half-write this function exists to prevent for the config itself.
-pub(crate) fn write_text(path: &Path, text: &str) -> Result<(), ManageError> {
+///
+/// `fresh_mode` is what a file that does not exist yet is given; an existing one keeps its own
+/// either way. The two callers want different answers and neither should inherit the other's:
+/// sbx's config is `0600` so its own write always passes the safety gate that later refuses a
+/// world-writable config, while an exported fragment is an artifact meant to be handed to someone
+/// else, and the guide shows `sbx bundle export > bundles.toml` beside `--out`. `None` leaves the
+/// umask to decide, which is what makes those two spellings produce the same file.
+pub(crate) fn write_text(
+    path: &Path,
+    text: &str,
+    fresh_mode: Option<u32>,
+) -> Result<(), ManageError> {
     use std::os::unix::fs::PermissionsExt as _;
     let err = |e: std::io::Error| ManageError::Write(path.to_path_buf(), e.to_string());
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1221,10 +1232,15 @@ pub(crate) fn write_text(path: &Path, text: &str) -> Result<(), ManageError> {
         .unwrap_or("sbx.toml");
     let mode = std::fs::metadata(path)
         .map(|m| m.permissions().mode() & 0o777)
-        .unwrap_or(0o600);
+        .ok()
+        .or(fresh_mode);
     let tmp = dir.join(format!(".{name}.sbx-tmp.{}", std::process::id()));
     std::fs::write(&tmp, text).map_err(err)?;
-    if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)) {
+    // No mode to state means the temp keeps the one its creation gave it, which is the umask's:
+    // the same file a shell redirect would have made at this path.
+    if let Some(mode) = mode
+        && let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
+    {
         let _ = std::fs::remove_file(&tmp);
         return Err(err(e));
     }
@@ -1434,7 +1450,7 @@ mod tests {
     fn a_composed_fragment_is_written_atomically_and_leaves_no_temp() {
         let dir = crate::testutil::TmpDir::new();
         let out = dir.join("exported.toml");
-        write_text(&out, "[bundle.demo]\nallow = []\n").expect("the fragment is written");
+        write_text(&out, "[bundle.demo]\nallow = []\n", None).expect("the fragment is written");
         assert_eq!(
             std::fs::read_to_string(&out).unwrap(),
             "[bundle.demo]\nallow = []\n"
@@ -1451,13 +1467,58 @@ mod tests {
         // which is the half of "atomic" that survives into something a test can read.
         use std::os::unix::fs::MetadataExt as _;
         let before = std::fs::metadata(&out).unwrap().ino();
-        write_text(&out, "[bundle.demo]\nallow = [\"{*} https://x.test\"]\n").expect("rewritten");
+        write_text(
+            &out,
+            "[bundle.demo]\nallow = [\"{*} https://x.test\"]\n",
+            None,
+        )
+        .expect("rewritten");
         assert!(std::fs::read_to_string(&out).unwrap().contains("x.test"));
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         assert_ne!(
             std::fs::metadata(&out).unwrap().ino(),
             before,
             "the rewrite must arrive by rename, which is a new inode, not by truncating in place"
+        );
+    }
+
+    /// Which mode a *fresh* file gets is the caller's to say, and the two callers want different
+    /// answers. sbx's own config is owner-only, so its write always passes the gate that later
+    /// refuses a world-writable config. An exported fragment is an artifact to hand to someone
+    /// else, and the guide shows `sbx bundle export > bundles.toml` beside `--out <file>`: two
+    /// spellings of one command must not produce two different files.
+    ///
+    /// Teeth: giving the fragment the config's `0600` makes the redirect and the flag disagree,
+    /// and the first assertion fails on any ordinary umask.
+    #[test]
+    fn a_fresh_file_gets_the_mode_its_caller_states_and_not_the_other_callers() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::testutil::TmpDir::new();
+        let mode_of = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        // The control is the redirect itself: a plain create at the same path, under this
+        // process's umask, which is what `sbx bundle export > file` produces.
+        let redirected = dir.join("redirected.toml");
+        std::fs::write(&redirected, "x").unwrap();
+        let exported = dir.join("exported.toml");
+        write_text(&exported, "x", None).unwrap();
+        assert_eq!(
+            mode_of(&exported),
+            mode_of(&redirected),
+            "`--out` must make the same file the redirect beside it in the guide makes"
+        );
+
+        let config = dir.join("sbx.toml");
+        write_text(&config, "x", Some(0o600)).unwrap();
+        assert_eq!(mode_of(&config), 0o600, "sbx's own config is owner-only");
+
+        // An existing file keeps its own mode, whatever the caller would have asked for a fresh one.
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o640)).unwrap();
+        write_text(&config, "y", Some(0o600)).unwrap();
+        assert_eq!(
+            mode_of(&config),
+            0o640,
+            "a mode the user set is not reset by a rewrite"
         );
     }
 

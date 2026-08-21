@@ -2246,6 +2246,49 @@ mod tests {
         assert!(p.contains("host:port only"), "got: {p}");
     }
 
+    /// A `tcp://` host reaches a **shell script**: the cage preamble writes a `socat` clause per
+    /// destination, interpolating the host as written. `sandbox::egress::wrap_command` says out loud
+    /// that it rests on this grammar for that, and names the one place it re-checks instead
+    /// (`ssh_config_host_ok`, where a `Host` line is a pattern rather than a name). This is the
+    /// property it rests on, kept here rather than only in a sentence there.
+    ///
+    /// The charset is ASCII letters, digits, `-` and `.`, so no byte a shell reads as syntax can be
+    /// in a host that reaches a listener. An address literal is the other admissible spelling, and
+    /// it parses as one or it is not admitted.
+    #[test]
+    fn a_tcp_host_cannot_carry_a_byte_a_shell_would_read() {
+        for hostile in [
+            "tcp://a;rm -rf ~:22",
+            "tcp://$(id):22",
+            "tcp://`id`:22",
+            "tcp://a|b:22",
+            "tcp://a&b:22",
+            "tcp://a b:22",
+            "tcp://a\nb:22",
+            "tcp://a'b:22",
+            "tcp://a\"b:22",
+            "tcp://a<b:22",
+            "tcp://a*b:22",
+            "tcp://a$b:22",
+        ] {
+            assert!(
+                classify(hostile).is_err(),
+                "`{hostile}` must not become a host a socat clause is written around"
+            );
+        }
+        // ...while the spellings a real destination uses are admitted.
+        for fine in [
+            "tcp://db.internal:5432",
+            "tcp://10.0.0.5:5432",
+            "tcp://a-b.c:22",
+        ] {
+            assert!(
+                classify(fine).is_ok(),
+                "`{fine}` is an ordinary destination"
+            );
+        }
+    }
+
     #[test]
     fn a_tcp_rule_requires_an_explicit_port() {
         // a raw splice must name the port it opens — a port-less `tcp://` rule is rejected (unlike a

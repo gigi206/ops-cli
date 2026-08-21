@@ -592,6 +592,32 @@ pub(crate) fn reclaimable_bytes(
 /// Reported because deleting files does not shrink the image immediately: the kernel returns
 /// freed extents to the host in the background, and a reservation it has not yet released
 /// still counts. Showing both figures makes that gap visible instead of implying it is zero.
+/// How many block groups the space ioctl's header reports, refused when it is not a number a
+/// buffer can be sized from.
+///
+/// The whole of [`space`]'s second call rests on this: the buffer it writes into is
+/// `HEADER + count * ENTRY` bytes, and that call's SAFETY argument is that the kernel writes
+/// within it. Multiplying an unchecked `u64` would make the argument depend on arithmetic that
+/// wraps, and a wrapped size is a small buffer the ioctl then writes past. The ceiling is generous
+/// on purpose — a volume with a million block groups is far beyond anything btrfs builds — and what
+/// it is for is refusing an implausible number rather than trying to allocate it.
+///
+/// Split out from [`space`] so the refusal can be reached without a filesystem: the value it guards
+/// against comes from an ioctl, and a test cannot make one lie.
+fn reported_count(header: &[u8; 16]) -> io::Result<usize> {
+    /// Block groups a volume may report before the answer is treated as nonsense.
+    const MAX_SPACES: u64 = 1 << 20;
+
+    let count = u64::from_ne_bytes(header[8..16].try_into().unwrap());
+    if count > MAX_SPACES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the btrfs space ioctl reported {count} block groups, which is not a count"),
+        ));
+    }
+    Ok(count as usize)
+}
+
 pub(crate) fn space(mount_point: &Path) -> io::Result<Space> {
     use std::os::unix::io::AsRawFd;
 
@@ -609,7 +635,7 @@ pub(crate) fn space(mount_point: &Path) -> io::Result<Space> {
     if unsafe { libc::ioctl(fd, BTRFS_IOC_SPACE_INFO as libc::Ioctl, header.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let count = u64::from_ne_bytes(header[8..16].try_into().unwrap()) as usize;
+    let count = reported_count(&header)?;
 
     // Second call: room for every space, requested by writing the slot count back.
     let mut buf = vec![0u8; HEADER + count * ENTRY];
@@ -1621,6 +1647,48 @@ this line has no separator at all
         // The logical sums, which counting a mirror once (or adding the reservation) would give.
         assert_ne!(space.used, 13_618_003_968);
         assert_ne!(space.allocated, 19_387_695_104);
+
+        // A payload that does not divide into whole entries drops its tail rather than reading a
+        // half-written slot: `chunks_exact` is what makes every index inside the loop bounded by
+        // the chunk's own length, so no answer from the kernel can shorten a slice under them.
+        let mut ragged = block_group(DATA, 4096, 4096);
+        ragged.extend_from_slice(&[0u8; ENTRY - 1]);
+        assert_eq!(
+            tally(&ragged).allocated,
+            4096,
+            "the partial entry is dropped"
+        );
+        assert_eq!(tally(&[]).allocated, 0);
+    }
+
+    /// The number of block groups is the kernel's, and the buffer the second ioctl writes into is
+    /// sized from it: a count that cannot size a buffer is refused instead of multiplied.
+    ///
+    /// Teeth: `count as usize * ENTRY` on `u64::MAX` panics in a debug build and, in the release
+    /// build that ships, wraps to a small number — a buffer the ioctl then writes past, under a
+    /// SAFETY comment claiming it writes within it.
+    #[test]
+    fn a_block_group_count_a_buffer_cannot_be_sized_from_is_refused() {
+        let header = |count: u64| {
+            let mut h = [0u8; 16];
+            h[8..16].copy_from_slice(&count.to_ne_bytes());
+            h
+        };
+        assert_eq!(reported_count(&header(0)).unwrap(), 0);
+        assert_eq!(reported_count(&header(7)).unwrap(), 7);
+        assert_eq!(
+            reported_count(&header(1 << 20)).unwrap(),
+            1 << 20,
+            "the ceiling itself is admissible"
+        );
+        for absurd in [(1u64 << 20) + 1, u64::MAX, u64::MAX / 24] {
+            let err = reported_count(&header(absurd)).expect_err("refused");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(
+                err.to_string().contains("which is not a count"),
+                "the refusal says what it refused: {err}"
+            );
+        }
     }
 
     #[test]

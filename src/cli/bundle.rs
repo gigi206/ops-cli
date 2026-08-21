@@ -270,7 +270,9 @@ fn bundle_export(args: &[OsString]) -> ExitCode {
     };
     match out_file {
         Some(path) => {
-            if let Err(e) = config::manage::write_text(&path, &fragment) {
+            // No mode of sbx's own: `sbx bundle export > bundles.toml` and `--out <file>` are
+            // the same command spelled two ways, and a fragment is an artifact to hand on.
+            if let Err(e) = config::manage::write_text(&path, &fragment, None) {
                 diag::error(&format!(
                     "sbx: bundle export: cannot write {}: {e}",
                     path.display()
