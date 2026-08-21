@@ -286,32 +286,64 @@ pub(crate) struct Signature {
 ///
 /// Every refusal here is a refusal of the request: there is no partial answer, because a request
 /// carrying some of a signature is not a less-signed request, it is a malformed one.
+/// Why a signer's answer was refused, and whether the two sides have lost each other.
+///
+/// Both forms refuse the request; what they differ on is what becomes of the *plugin*. A malformed
+/// answer is about this exchange, and the next one starts clean. An answer carrying another
+/// request's `seq` is not: it says the plugin is reading one question behind, and the channel is a
+/// sequence of question-and-answer lines, so it stays behind for every request after this one. That
+/// is the same condition [`SignerProcess::sign`] already buries a plugin for when the channel itself
+/// fails, arrived at by a different route, and a plugin that has lost its place should say so once
+/// rather than refuse every request under a sentence about this one.
+pub(crate) struct AnswerRefused {
+    /// What to tell the caller.
+    pub(crate) why: String,
+    /// Whether the answer proves the two sides disagree about which request is being signed.
+    pub(crate) desynced: bool,
+}
+
+impl From<String> for AnswerRefused {
+    fn from(why: String) -> Self {
+        AnswerRefused {
+            why,
+            desynced: false,
+        }
+    }
+}
+
+impl From<&str> for AnswerRefused {
+    fn from(why: &str) -> Self {
+        AnswerRefused::from(why.to_string())
+    }
+}
+
 pub(crate) fn parse_signature(
     line: &str,
     expect_seq: u64,
     sets: &[String],
-) -> Result<Signature, String> {
-    let raw: RawAnswer =
-        serde_json::from_str(line.trim_end()).map_err(|e| format!("unreadable answer: {e}"))?;
+) -> Result<Signature, AnswerRefused> {
+    let raw: RawAnswer = serde_json::from_str(line.trim_end())
+        .map_err(|e| AnswerRefused::from(format!("unreadable answer: {e}")))?;
     match raw.seq {
         Some(seq) if seq == expect_seq => {}
         Some(seq) => {
-            return Err(format!(
-                "the plugin answered request {seq} while {expect_seq} was asked"
-            ));
+            return Err(AnswerRefused {
+                why: format!("the plugin answered request {seq} while {expect_seq} was asked"),
+                desynced: true,
+            });
         }
-        None => return Err("the answer carries no `seq`".to_string()),
+        None => return Err("the answer carries no `seq`".into()),
     }
     // A plugin that cannot sign says so, and that is a refusal like any other: the request does not
     // go out unsigned.
     if let Some(why) = raw.error.filter(|w| !w.is_empty()) {
-        return Err(format!("the plugin refused to sign: {why}"));
+        return Err(format!("the plugin refused to sign: {why}").into());
     }
-    let headers = raw
-        .headers
-        .ok_or("the answer carries neither `headers` nor `error`")?;
+    let headers = raw.headers.ok_or(AnswerRefused::from(
+        "the answer carries neither `headers` nor `error`",
+    ))?;
     if headers.is_empty() {
-        return Err("the answer sets no header, so nothing would authenticate it".to_string());
+        return Err("the answer sets no header, so nothing would authenticate it".into());
     }
 
     let mut out = Vec::with_capacity(headers.len());
@@ -326,7 +358,7 @@ pub(crate) fn parse_signature(
             continue;
         };
         seen += 1;
-        check_value(name, value)?;
+        check_value(name, value).map_err(AnswerRefused::from)?;
         // The manifest's spelling wins: it is the one that was reviewed, and it keeps two runs of
         // one plugin from differing by case alone.
         out.push((declared.clone(), value.clone()));
@@ -342,7 +374,8 @@ pub(crate) fn parse_signature(
             crate::plugins::quoted_list(
                 &extra.iter().map(|s| (*s).to_string()).collect::<Vec<_>>()
             )
-        ));
+        )
+        .into());
     }
     Ok(Signature {
         headers: out,
@@ -529,8 +562,17 @@ impl Signing for SignerProcess {
             Err(e) => return Err(bury(self, format!("no signature from the plugin: {e}"))),
         };
         // A malformed or out-of-bounds answer refuses this request without burying the plugin: it
-        // answered the question asked, and the next request is a fresh one.
-        parse_signature(&line, seq, &self.sets)
+        // answered the question asked, and the next request is a fresh one. An answer carrying
+        // another request's number is the exception, and belongs with the channel failures above:
+        // the two sides have lost each other, and nothing in a sequence of question-and-answer
+        // lines brings them back.
+        parse_signature(&line, seq, &self.sets).map_err(|refused| {
+            if refused.desynced {
+                bury(self, refused.why)
+            } else {
+                refused.why
+            }
+        })
     }
 }
 
@@ -553,7 +595,56 @@ mod tests {
     }
 
     fn answer(json: serde_json::Value) -> Result<Signature, String> {
-        parse_signature(&format!("{json}\n"), 7, &sets())
+        parse_signature(&format!("{json}\n"), 7, &sets()).map_err(|refused| refused.why)
+    }
+
+    /// An answer carrying another request's number says the plugin has lost its place, and nothing
+    /// in a stream of question-and-answer lines gives it back: it is buried, like the channel
+    /// failures it belongs with. A malformed answer is not that, and the next request starts clean.
+    ///
+    /// Teeth: refusing both the same way leaves a desynced plugin answering one question behind
+    /// forever, refusing every later request under a sentence about that request rather than about
+    /// the plugin, and writing a question down the channel each time to do it.
+    #[test]
+    fn an_answer_to_another_question_buries_the_plugin_where_a_malformed_one_does_not() {
+        let desynced = parse_signature(
+            &format!(
+                "{}\n",
+                serde_json::json!({"seq": 6, "headers": {"Authorization": "x"}})
+            ),
+            7,
+            &sets(),
+        )
+        .expect_err("another request's number is refused");
+        assert!(desynced.desynced, "{}", desynced.why);
+        assert!(
+            desynced
+                .why
+                .contains("answered request 6 while 7 was asked"),
+            "the refusal names both numbers: {}",
+            desynced.why
+        );
+
+        for (line, what) in [
+            ("not json at all", "an unreadable answer"),
+            (
+                r#"{"seq": 7, "headers": {"X-Nope": "v"}}"#,
+                "a header the manifest does not declare",
+            ),
+            (
+                r#"{"seq": 7, "headers": {}}"#,
+                "an answer that sets nothing",
+            ),
+            (r#"{"headers": {"Authorization": "x"}}"#, "no seq at all"),
+        ] {
+            let refused =
+                parse_signature(&format!("{line}\n"), 7, &sets()).expect_err("still refused");
+            assert!(
+                !refused.desynced,
+                "{what} is about this exchange, not about the plugin's place: {}",
+                refused.why
+            );
+        }
     }
 
     #[test]
