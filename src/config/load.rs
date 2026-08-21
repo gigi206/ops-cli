@@ -176,8 +176,15 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     // launch will use): a bind that nests with a structural mount will not behave as declared (a
     // descendant is shadowed, an ancestor over-exposes). Trusted-only field, so this warns
     // without dropping the bind.
+    // Compared against the *canonical* project, because the bind paths above are canonical: a
+    // symlinked project root would otherwise never match its own binds.
+    let project = cwd.canonicalize().ok();
     for bind in &canon_binds {
-        if let Some(w) = crate::sandbox::structural_nesting_warning(&bind.path, bind.writable) {
+        if let Some(w) = crate::sandbox::structural_nesting_warning(
+            &bind.path,
+            bind.writable,
+            project.as_deref(),
+        ) {
             resolved.warnings.push(w);
         }
     }
@@ -188,7 +195,7 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     // app overlay also advertises only the binds the launch would actually make.
     for app in resolved.apps.values_mut() {
         let declared = std::mem::take(&mut app.binds);
-        app.binds = canonicalize_binds(declared, &sbx_roots, &mut app.warnings);
+        app.binds = canonicalize_binds(declared, &sbx_roots, project.as_deref(), &mut app.warnings);
     }
 
     // I/O-level notes (unsafe/unparseable files) come first, then the gating notes.
@@ -231,6 +238,7 @@ fn canonicalize_one(p: &Path, warnings: &mut Vec<String>) -> Option<PathBuf> {
 pub(super) fn canonicalize_binds(
     binds: Vec<Bind>,
     roots: &[PathBuf],
+    project: Option<&Path>,
     warnings: &mut Vec<String>,
 ) -> Vec<Bind> {
     let mut out: Vec<Bind> = Vec::with_capacity(binds.len());
@@ -249,7 +257,9 @@ pub(super) fn canonicalize_binds(
         }
     }
     for bind in &out {
-        if let Some(w) = crate::sandbox::structural_nesting_warning(&bind.path, bind.writable) {
+        if let Some(w) =
+            crate::sandbox::structural_nesting_warning(&bind.path, bind.writable, project)
+        {
             warnings.push(w);
         }
     }

@@ -789,7 +789,35 @@ fn structural_nesting_conflict(dest: &Path) -> Option<(&'static str, Nesting)> {
 /// host files around the structural mount. The `binds` field is trusted-only, so this is an
 /// ergonomics tripwire (the launch does not drop the bind), not a security control — it tells the
 /// user their bind will not behave as a naive reading suggests.
-pub(crate) fn structural_nesting_warning(dest: &Path, writable: bool) -> Option<String> {
+pub(crate) fn structural_nesting_warning(
+    dest: &Path,
+    writable: bool,
+    project: Option<&Path>,
+) -> Option<String> {
+    // The project is a structural mount too — it is emitted with them, after every config bind —
+    // but its path is a per-launch value rather than a constant, so it cannot live in the list
+    // above. Only the shadowed direction is worth a word. A bind that *contains* the project is
+    // the ordinary case (a bind of `$HOME`), and the project still lands correctly inside it.
+    //
+    // An exact collision warns here where it does not for the constants, and that difference is
+    // the point: `[[binds]] path = "<project>", mode = "ro"` reads as making the project
+    // read-only, and what actually happens is that the project's own read-write mount replaces it.
+    // A bind that does the opposite of what it says is worth more than a bind that does nothing.
+    if let Some(project) = project
+        && dest.starts_with(project)
+    {
+        let what = if dest == project {
+            "is the project itself".to_string()
+        } else {
+            "sits inside the project".to_string()
+        };
+        return Some(format!(
+            "bind `{}` {what}, which the cage mounts after it and over it — the bind has no \
+             effect, whatever its mode. To narrow a path inside the project, use an `[fs] deny` \
+             mask: those are applied after the project rather than before it",
+            dest.display()
+        ));
+    }
     structural_nesting_conflict(dest).map(|(structural, nesting)| match nesting {
         Nesting::Shadowed => {
             // A `/dev/*` path is the common case worth steering: a plain bind of a device node is
@@ -1764,8 +1792,8 @@ mod tests {
     #[test]
     fn structural_nesting_warning_flags_only_a_nesting_overlap() {
         // A descendant of a structural mount is shadowed by it.
-        let w =
-            structural_nesting_warning(Path::new("/tmp/secrets"), false).expect("descendant warns");
+        let w = structural_nesting_warning(Path::new("/tmp/secrets"), false, None)
+            .expect("descendant warns");
         assert!(w.contains("shadowed"), "descendant message: {w}");
         assert!(w.contains("/tmp"));
         // A non-`/dev` shadowed bind carries no device hint.
@@ -1773,7 +1801,8 @@ mod tests {
 
         // A `/dev/*` bind is shadowed AND steered to `[devices]` (the field that actually exposes a
         // device with device access — a plain bind would be visible but `nodev`).
-        let w = structural_nesting_warning(Path::new("/dev/dri"), false).expect("/dev/* warns");
+        let w =
+            structural_nesting_warning(Path::new("/dev/dri"), false, None).expect("/dev/* warns");
         assert!(w.contains("shadowed"), "/dev message: {w}");
         assert!(
             w.contains("[devices]"),
@@ -1781,7 +1810,7 @@ mod tests {
         );
 
         // An ancestor of structural files over-exposes the directory around them.
-        let w = structural_nesting_warning(Path::new("/etc"), false).expect("ancestor warns");
+        let w = structural_nesting_warning(Path::new("/etc"), false, None).expect("ancestor warns");
         assert!(w.contains("contains"), "ancestor message: {w}");
         // A read-only ancestor says nothing about writing.
         assert!(
@@ -1790,21 +1819,22 @@ mod tests {
         );
 
         // A read-write ancestor additionally flags the host write-through.
-        let w = structural_nesting_warning(Path::new("/etc"), true).expect("rw ancestor warns");
+        let w =
+            structural_nesting_warning(Path::new("/etc"), true, None).expect("rw ancestor warns");
         assert!(
             w.contains("write through"),
             "a rw ancestor bind must flag host write-through: {w}"
         );
 
         // An exact match is reconciled by `assemble` (the structural mount wins) — not a footgun.
-        assert!(structural_nesting_warning(Path::new("/nix"), false).is_none());
-        assert!(structural_nesting_warning(Path::new("/etc/passwd"), true).is_none());
+        assert!(structural_nesting_warning(Path::new("/nix"), false, None).is_none());
+        assert!(structural_nesting_warning(Path::new("/etc/passwd"), true, None).is_none());
 
         // A path that neither contains nor sits under any structural mount is fine. `/etcdata`
         // shares a textual prefix with `/etc/...` but not a path lineage, so it must not warn.
-        assert!(structural_nesting_warning(Path::new("/srv/data"), true).is_none());
-        assert!(structural_nesting_warning(Path::new("/etcdata"), false).is_none());
-        assert!(structural_nesting_warning(Path::new("/home/u/proj"), false).is_none());
+        assert!(structural_nesting_warning(Path::new("/srv/data"), true, None).is_none());
+        assert!(structural_nesting_warning(Path::new("/etcdata"), false, None).is_none());
+        assert!(structural_nesting_warning(Path::new("/home/u/proj"), false, None).is_none());
     }
 
     #[test]
@@ -2043,6 +2073,81 @@ mod tests {
             argv[src + 1],
             super::super::contract::EGRESS_CONTRACT_INCAGE,
             "contract bound at the in-cage contract path"
+        );
+    }
+
+    /// A bind inside the project is not a bind: the project is mounted over it. The launch says
+    /// so, because the alternative is a config line that reads as doing something and does nothing.
+    ///
+    /// Asserted against the assembled mount list as well as against the warning, so the two cannot
+    /// drift: what makes the bind pointless is the *order* the mounts come out in, and a warning
+    /// that survived a changed order would be a confident statement of something untrue.
+    #[test]
+    fn a_bind_the_project_covers_is_named_rather_than_silently_lost() {
+        // The project this fixture assembles for.
+        let project = Path::new("/home/u/proj");
+        let bind = |p: &str| crate::config::Bind {
+            path: PathBuf::from(p),
+            writable: false,
+        };
+        let binds = [
+            bind("/home/u/proj/vendor"),
+            bind("/home/u/proj"),
+            bind("/home/u/other"),
+            // A sibling whose name merely starts with the same letters is not inside it: the test
+            // is about path components, not about a prefix of the string.
+            bind("/home/u/proj-2/src"),
+        ];
+
+        let named: Vec<&Path> = binds
+            .iter()
+            .filter(|b| structural_nesting_warning(&b.path, b.writable, Some(project)).is_some())
+            .map(|b| b.path.as_path())
+            .collect();
+        assert_eq!(
+            named,
+            vec![Path::new("/home/u/proj/vendor"), project],
+            "only the ones the project's own mount lands on"
+        );
+        // The two are told apart, because the remedy differs: one bind does nothing, the other
+        // says read-only and gets read-write.
+        let inside =
+            structural_nesting_warning(Path::new("/home/u/proj/vendor"), false, Some(project))
+                .expect("a bind inside the project is named");
+        assert!(inside.contains("sits inside the project") && inside.contains("`[fs] deny`"));
+        let itself = structural_nesting_warning(project, false, Some(project))
+            .expect("a bind of the project itself is named");
+        assert!(itself.contains("is the project itself"));
+        // With no project to compare against, the constant list is all that is checked.
+        assert!(
+            structural_nesting_warning(Path::new("/home/u/proj/vendor"), false, None).is_none()
+        );
+
+        // And what makes them pointless is really the order assembly emits: the project comes
+        // after them. Read off the argv, so a reordering has to be a deliberate edit here too.
+        let argv = argv_strings(&assemble_with(&[], &binds, &[]));
+        let first = |p: &str| {
+            argv.iter()
+                .position(|s| s == p)
+                .unwrap_or_else(|| panic!("no mount at {p} in {argv:?}"))
+        };
+        // The project's own mount is the *last* mention of that path: the config bind of the same
+        // path is emitted earlier, which is the whole point.
+        let project_mount = argv
+            .iter()
+            .rposition(|s| s == "/home/u/proj")
+            .expect("the project is mounted");
+        assert!(
+            first("/home/u/proj/vendor") < project_mount,
+            "the project must be emitted after the bind it covers, or this warning is wrong"
+        );
+        assert!(
+            first("/home/u/proj") < project_mount,
+            "and after a config bind naming the project itself"
+        );
+        assert!(
+            first("/home/u/other") < project_mount,
+            "a bind outside it is emitted in the same place, and simply is not covered"
         );
     }
 

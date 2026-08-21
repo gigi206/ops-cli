@@ -69,6 +69,15 @@ with a tmpfs) may be listed by `sbx config show` yet dropped by the launch; an
 *ancestor* (e.g. `/etc`) would over-expose that directory. `sbx` warns when a config
 bind's destination nests with a structural mount.
 
+**The project is one of those mounts.** A bind at a path inside your project, or at the
+project itself, is emitted before the project and then covered by it, so it does nothing
+at all. `sbx` names it, because the failure is silent otherwise and because a bind of the
+project itself reads as changing its mode when it does not: the project's own read-write
+mount is what the cage ends up with. To narrow a path inside the project, use an
+[`[fs] deny`](fs) mask, which is applied after the project rather than before it. A bind
+that *contains* your project is the ordinary case and is not remarked on: the project
+still lands correctly inside it.
+
 ## The control plane is protected
 
 `sbx`'s own state, its data, trust, and config directories, all under your `$HOME`: is protected regardless of what a bind requests:

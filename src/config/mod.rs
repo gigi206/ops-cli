@@ -951,7 +951,13 @@ impl Resolved {
                 binds,
             );
             let roots = sbx_control_plane_roots();
-            for bind in canonicalize_binds(resolved_binds, &roots, &mut self.warnings) {
+            // No project here: a `Resolved` does not carry the root it was resolved for, and an
+            // override is applied to one that already exists. So a `--bind` inside the project
+            // goes unremarked where the same line in a config file is named. The asymmetry is
+            // deliberate rather than overlooked — an override is typed for one launch by someone
+            // watching it, and a config line is what sits there unremarked for months. Threading
+            // the root through is the fix if that ever stops being true.
+            for bind in canonicalize_binds(resolved_binds, &roots, None, &mut self.warnings) {
                 self.bind_layer
                     .insert(bind.path.clone(), Provenance::Override);
                 if let Some(existing) = self.binds.iter_mut().find(|b| b.path == bind.path) {
