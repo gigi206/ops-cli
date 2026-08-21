@@ -321,8 +321,13 @@ const TAIL_WINDOW_MAX: u64 = 8 * 1024 * 1024;
 const LOG_CHUNK: u64 = 64 * 1024;
 
 /// The last `want` bytes of `path`, or the whole file when it is shorter — plus whether the window
-/// does reach the start, which is what tells the caller its answer is complete.
-fn tail_bytes(path: &Path, want: u64) -> std::io::Result<(Vec<u8>, bool)> {
+/// does reach the start, which tells the caller its answer is complete, and the length the file had
+/// when it was looked at.
+///
+/// That length is returned rather than asked for again later because a `--follow` resumes from it: a
+/// second `metadata` after this read would name a different end for a session still writing, and the
+/// bytes in between would be printed by nobody and followed by nobody.
+fn tail_bytes(path: &Path, want: u64) -> std::io::Result<(Vec<u8>, bool, u64)> {
     use std::io::{Read as _, Seek as _, SeekFrom};
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
@@ -330,7 +335,7 @@ fn tail_bytes(path: &Path, want: u64) -> std::io::Result<(Vec<u8>, bool)> {
     file.seek(SeekFrom::Start(from))?;
     let mut buf = Vec::with_capacity((len - from) as usize);
     file.take(len - from).read_to_end(&mut buf)?;
-    Ok((buf, from == 0))
+    Ok((buf, from == 0, len))
 }
 
 /// Grow a window back from the end of `path` until it holds what the caller has to see, and no
@@ -349,17 +354,17 @@ fn tail_window(
     path: &Path,
     want_lines: Option<usize>,
     stop_at_header: bool,
-) -> std::io::Result<(Vec<u8>, bool)> {
+) -> std::io::Result<(Vec<u8>, bool, u64)> {
     let mut want = LOG_CHUNK;
     loop {
-        let (buf, whole) = tail_bytes(path, want)?;
+        let (buf, whole, len) = tail_bytes(path, want)?;
         let has_header = stop_at_header && last_session(&buf).0.is_some();
         // More breaks than the limit means the window already holds every byte `tail_lines` will
         // count back over, so growing it further would read what is not going to be printed.
         let enough_lines =
             want_lines.is_some_and(|n| buf.iter().filter(|&&b| b == b'\n').count() > n);
         if whole || has_header || enough_lines || want >= TAIL_WINDOW_MAX {
-            return Ok((buf, whole || has_header));
+            return Ok((buf, whole || has_header, len));
         }
         want = (want * 4).min(TAIL_WINDOW_MAX);
     }
@@ -406,19 +411,6 @@ fn last_header_at(path: &Path) -> std::io::Result<(Option<sandbox::SessionHeader
         at += n as u64;
     }
     Ok(found)
-}
-
-/// The header the note names: from the window when it holds one, and from a forward pass when it
-/// does not.
-///
-/// A window sized by a line limit stops as soon as it holds the lines, which for any session larger
-/// than one chunk is well before the header. Left at that, the note would print `started ?` exactly
-/// for the long-running agent this verb exists to read — the population it is least acceptable for.
-/// The forward pass is paid only in that case, and it holds a chunk at a time.
-fn session_header(path: &Path, window: &[u8]) -> Option<sandbox::SessionHeader> {
-    last_session(window)
-        .0
-        .or_else(|| last_header_at(path).ok().and_then(|(h, _)| h))
 }
 
 /// Split a log into its most recent session's header and body.
@@ -514,8 +506,15 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
     // agent was talkative, so reading all of it to print twenty lines of it made the command cost
     // whatever the agent had spent. Everything is answered from a window at the end of the file;
     // the two cases a window cannot answer are streamed instead.
-    let stream_from = |at: u64| -> ExitCode {
-        use std::io::Seek as _;
+    // Copies `[at, until)`, and no further: the file is append-only and may be growing, so an
+    // unbounded copy would print past the point a `--follow` then resumes from and repeat it.
+    // `until` is the length the read that produced this answer saw, never a second `metadata` — two
+    // looks at a file being written name two different ends, and the bytes between them are printed
+    // by nobody and followed by nobody. Neither half is reachable from a test: both need a writer
+    // appending inside the microseconds between two statements. What is asserted is the ordinary
+    // output; this is the reasoning, stated where the bound is.
+    let stream_range = |at: u64, until: u64| -> ExitCode {
+        use std::io::{Read as _, Seek as _};
         let Ok(mut f) = std::fs::File::open(&path) else {
             diag::error(&format!(
                 "sbx: cannot read the session log {}",
@@ -527,7 +526,7 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
             return ExitCode::FAILURE;
         }
         let mut out = std::io::stdout();
-        let _ = std::io::copy(&mut f, &mut out);
+        let _ = std::io::copy(&mut f.take(until.saturating_sub(at)), &mut out);
         ExitCode::SUCCESS
     };
 
@@ -539,9 +538,9 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
         tail_window(&path, parsed.limit, !parsed.all)
     } else {
         // Still touch the file, so a log that is not there is explained rather than printed empty.
-        std::fs::metadata(&path).map(|_| (Vec::new(), false))
+        std::fs::metadata(&path).map(|m| (Vec::new(), false, m.len()))
     };
-    let (window, complete) = match read {
+    let (window, complete, end) = match read {
         Ok(w) => w,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return explain_missing_log(data_dir, parsed.id, &path);
@@ -557,15 +556,22 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
 
     // Sample liveness before printing, so the note describes the state the output belongs to.
     let live = session_is_live(data_dir, parsed.id);
-    let session_body = last_session(&window).1;
-    let header = session_header(&path, &window);
+    let (in_window, session_body) = last_session(&window);
+    // At most one forward pass, and only when the window did not bring the header back: the note
+    // needs the header and the streaming arm below needs the offset, and they are the same look.
+    let fallback = match in_window {
+        Some(_) => None,
+        None => last_header_at(&path).ok(),
+    };
+    let header = in_window
+        .as_ref()
+        .or_else(|| fallback.as_ref().and_then(|(h, _)| h.as_ref()));
 
     diag::note(&format!(
         "session {} — {}, started {}{}",
         parsed.id,
         if live { "running" } else { "exited" },
         header
-            .as_ref()
             .map(|h| crate::paths::civil_date(
                 std::time::UNIX_EPOCH + Duration::from_secs(h.started)
             ))
@@ -573,24 +579,20 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
         if parsed.all { ", all sessions" } else { "" },
     ));
 
-    // The end of the file now, which is where a `--follow` picks up: the window is a tail, so its
-    // length says nothing about where the file ends.
-    let end = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-
     use std::io::Write as _;
     match (parsed.limit, parsed.all, complete) {
         // Every session, unlimited: the whole file is what was asked for, so it is copied rather
         // than held.
         (None, true, _) => {
-            if stream_from(0) == ExitCode::FAILURE {
+            if stream_range(0, end) == ExitCode::FAILURE {
                 return ExitCode::FAILURE;
             }
         }
         // One session, unlimited, and longer than the window: stream it from its own header. The
         // forward pass that finds the header holds nothing either.
         (None, false, false) => {
-            let at = last_header_at(&path).map(|(_, at)| at).unwrap_or(0);
-            if stream_from(at) == ExitCode::FAILURE {
+            let at = fallback.as_ref().map(|(_, at)| *at).unwrap_or(0);
+            if stream_range(at, end) == ExitCode::FAILURE {
                 return ExitCode::FAILURE;
             }
         }
@@ -726,7 +728,11 @@ mod tests {
         let size = full.len();
 
         // The ordinary reading: the last session, whole.
-        let (window, complete) = tail_window(&path, None, true).unwrap();
+        let (window, complete, len) = tail_window(&path, None, true).unwrap();
+        assert_eq!(
+            len, size as u64,
+            "the length reported is the one the read saw"
+        );
         assert!(complete, "the last session's header is inside the window");
         assert_eq!(
             last_session(&window).1,
@@ -746,7 +752,7 @@ mod tests {
 
         // `-n`: the same answer, from a window that stops as soon as it holds the lines.
         for n in [1usize, 5, 50] {
-            let (window, _) = tail_window(&path, Some(n), true).unwrap();
+            let (window, _, _) = tail_window(&path, Some(n), true).unwrap();
             assert_eq!(
                 tail_lines(last_session(&window).1, n),
                 tail_lines(last_session(&full).1, n),
@@ -763,7 +769,7 @@ mod tests {
         // The count is far larger than the last session is long, which is what makes this test
         // separate the two: a window that stopped at the header would hold neither the lines nor
         // the answer, while one that stops on the header *and* the count would look identical.
-        let (window, _) = tail_window(&path, Some(5_000), false).unwrap();
+        let (window, _, _) = tail_window(&path, Some(5_000), false).unwrap();
         assert_eq!(
             tail_lines(&window, 5_000),
             tail_lines(&full, 5_000),
@@ -791,15 +797,17 @@ mod tests {
         let path = dir.join("222.log");
         std::fs::write(&path, &log).unwrap();
 
-        let (window, complete) = tail_window(&path, Some(5), true).unwrap();
+        let (window, complete, _) = tail_window(&path, Some(5), true).unwrap();
         assert!(
             !complete,
             "this fixture only says something while the header is out of reach"
         );
+        // What the command composes: the window first, then the forward pass for what it lost.
+        assert_eq!(last_session(&window).0, None, "the window lost the header");
         assert_eq!(
-            session_header(&path, &window).map(|h| h.started),
+            last_header_at(&path).unwrap().0.map(|h| h.started),
             Some(2_000),
-            "the note must still name when the session started"
+            "and the forward pass is what puts the date back in the note"
         );
     }
 
