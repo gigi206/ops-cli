@@ -11,6 +11,7 @@ mod argv;
 mod binds;
 // The ceiling every host-side accept loop applies to the connections it will serve at once.
 mod conncap;
+pub(crate) mod deadline;
 // Which locks recover from a poisoning panic and which degrade, decided in one place.
 mod fhs;
 mod launch;

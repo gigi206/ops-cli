@@ -1311,8 +1311,44 @@ fn serve_exchanges(
     // startup packet); every later one does. Ignored by the other framings.
     let mut cage_typed = false;
 
+    // The cage's **first** frame is the one with a deadline on it. Everything a connection stands
+    // up — the plugin process, the connection to the host resource, a thread, one of
+    // `MAX_CONCURRENT_CONNS` slots — is already standing before the cage has said anything, which is
+    // the reason `host_deadline` gives for bounding the other leg: a wedged resource "holds a
+    // thread, a plugin process and two connections while it waits". It holds exactly the same when
+    // the side saying nothing is the cage, and that side is the one sbx does not trust.
+    //
+    // Both halves are needed, and neither replaces the other: the socket timeout so a connection
+    // that sends nothing at all does not block in `read` for good, the budget so one that trickles a
+    // byte per timeout does not extend the wait a frame's length at a time. Both are lifted once the
+    // frame is in — a broker connection that sits idle *between* requests is the ordinary case, not
+    // a fault.
+    let mut first_deadline = Some(std::time::Instant::now() + spec.host_deadline);
+    let _ = cage_w.set_read_timeout(Some(spec.host_deadline));
+
     loop {
-        let frame = match read_frame(&mut cage_r, spec.framing, spec.max_frame, cage_typed) {
+        let read = match first_deadline {
+            Some(deadline) => {
+                let mut bounded = super::deadline::Deadlined::new(&mut cage_r, deadline);
+                let out = read_frame(&mut bounded, spec.framing, spec.max_frame, cage_typed);
+                first_deadline = None;
+                let _ = cage_w.set_read_timeout(None);
+                // A failed read with the budget spent is a read the budget ended: a fact about the
+                // clock rather than a string to match on. Reported, unlike an ordinary close,
+                // because a broker quietly losing its slots to connections that never spoke is
+                // exactly the thing an operator would otherwise have no way to see.
+                if out.is_err() && std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "a connection said nothing for {}s and was closed; it was holding a plugin \
+                         process and a connection to the host resource",
+                        spec.host_deadline.as_secs()
+                    ));
+                }
+                out
+            }
+            None => read_frame(&mut cage_r, spec.framing, spec.max_frame, cage_typed),
+        };
+        let frame = match read {
             Ok(Some(f)) => f,
             // A clean end, or a frame that is not one: either way the client is done with us.
             Ok(None) | Err(_) => return Ok(()),
@@ -2915,6 +2951,87 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         assert_eq!(a.label.as_deref(), Some("no such key"));
         let a = parse_answer(&answer("deny", ",\"label\":\"\""), 7, 64).unwrap();
         assert_eq!(a.label, None);
+    }
+
+    /// A connection that opens and says nothing is closed, and a trickle does not buy it time.
+    ///
+    /// By the time the cage's first frame is waited on, the connection is already holding a plugin
+    /// process, a connection to the host resource, a thread and one of the broker's connection
+    /// slots. `host_deadline`'s own documentation gives the reason for bounding the other leg in
+    /// exactly those terms; the side that says nothing here is the one sbx does not trust.
+    ///
+    /// Two halves, and the second is the one a socket timeout alone would miss: a timeout bounds
+    /// one `read`, so a sender that produces a byte just inside it resets the bound on every byte
+    /// and the wait becomes as long as the frame it declared is allowed to be. The trickle below
+    /// declares a body it feeds at one byte per interval, which without the budget would hold this
+    /// connection for minutes; what it must cost is the deadline.
+    #[test]
+    fn a_connection_that_says_nothing_is_closed_rather_than_held() {
+        let mut spec = spec(None);
+        spec.host_deadline = std::time::Duration::from_millis(200);
+
+        for trickle in [false, true] {
+            let (cage, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+            // Held for the length of the test in the silent case: a peer that is *dropped* has
+            // closed the connection, which is an ordinary ending and not the case under test.
+            let mut idle = Some(theirs);
+            // The feeder is asked to stop rather than waited out: on a failing run the relay is
+            // still holding the connection, so a feeder that only stops when its write fails would
+            // never be joinable and the failure would read as a hang.
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let feeder_stop = std::sync::Arc::clone(&stop);
+            let feeding = trickle.then(|| {
+                let mut client = idle.take().expect("the peer, handed to the trickle");
+                std::thread::spawn(move || {
+                    use std::io::Write as _;
+                    // A header declaring a body, then the body one byte at a time. Each byte lands
+                    // inside the socket timeout, and there are two thousand of them: on a per-read
+                    // bound alone this connection would be held for minutes.
+                    let _ = client.write_all(&2000u32.to_be_bytes());
+                    for _ in 0..2000 {
+                        if feeder_stop.load(std::sync::atomic::Ordering::Relaxed)
+                            || client.write_all(b"x").is_err()
+                        {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                    }
+                })
+            });
+
+            // Served on a thread so the test asserts on the *bound* rather than inheriting it: a
+            // relay that never returns would otherwise hang the suite with nothing to read, where
+            // this says which half was lost and moves on.
+            let served = spec.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let relaying = std::thread::spawn(move || {
+                let mut plugin = ScriptedPlugin::new(Vec::new());
+                let mut host = FakeHost::with(Vec::new());
+                let ring = super::super::broker_control::BrokerRing::new(8);
+                let out = serve_exchanges(&served, &mut plugin, &mut host, cage, &ring, None, "x");
+                let _ = tx.send((out, host.seen));
+            });
+
+            let outcome = rx.recv_timeout(std::time::Duration::from_secs(5));
+            // Let go of the peer either way, so a relay still parked on it ends and the thread
+            // below is joinable rather than leaked into the rest of the suite.
+            drop(idle);
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(h) = feeding {
+                let _ = h.join();
+            }
+            let (out, seen) = outcome.unwrap_or_else(|_| {
+                panic!("the wait must end on the deadline, not on the sender's schedule (trickle={trickle})")
+            });
+            let _ = relaying.join();
+
+            let why = out.expect_err("a connection that never speaks must not be served");
+            assert!(
+                why.contains("said nothing"),
+                "the refusal must name what was actually wrong: {why}"
+            );
+            assert!(seen.is_empty(), "nothing was ever put to the host resource");
+        }
     }
 
     /// A message the protocol answers with nothing does not end the conversation.

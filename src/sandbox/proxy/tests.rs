@@ -2,6 +2,7 @@ use super::ca::CertResolver;
 use super::splice::{SpliceGuard, splice_copy};
 use super::*;
 use crate::allowlist::{DefaultAction, EgressPolicy, classify};
+use crate::sandbox::deadline::READ_DEADLINE_PASSED;
 use crate::testutil::TmpDir;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

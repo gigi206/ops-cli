@@ -234,6 +234,14 @@ seconds (a typing speed, not a fault), so a protocol that asks a person raises i
 minutes. Past that, whatever is on the other side is wedged rather than thinking, and letting go is
 what keeps a thread, a plugin process and two connections from being held indefinitely.
 
+The same number bounds the *first* thing the cage says on a connection, for the same reason read
+from the other end: by then the plugin is running and the host resource is connected, so a
+connection that opens and then says nothing holds all of it. Once that first frame is in, the bound
+is lifted and the connection may sit idle as long as its protocol likes, which is what a broker
+connection normally does between requests. The bound covers a slow trickle too, not just silence: it
+is a budget for the whole frame rather than a timeout on each read, so feeding one byte at a time
+does not buy more of it.
+
 This is still not a path in a manifest. It says how the protocol locates a socket; the path
 itself comes from the config that named the resource. A `tcp://` target has no such address,
 so the two declarations together are refused rather than one quietly ignoring the other, and
