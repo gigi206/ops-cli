@@ -1683,15 +1683,26 @@ fn refuse_unreadable_head(
         super::control::LogVerdict::Blocked,
         UNREADABLE_HEAD,
     );
-    // A socket that timed out reports the operating system's own words, which name a condition
-    // rather than what the caller did; every other cause here is one of this module's own sentences.
-    let detail = match err.kind() {
+    write_refusal(
+        client,
+        "400 Bad Request",
+        UNREADABLE_HEAD,
+        &unreadable_head_detail(err),
+    )
+}
+
+/// What a caller is told about a head that never arrived whole, on either plane that reads one.
+///
+/// A socket that timed out reports the operating system's own words, which name a condition rather
+/// than anything the caller did; every other cause is one of this module's own sentences, which
+/// already say what is wrong with the head.
+fn unreadable_head_detail(err: &io::Error) -> String {
+    match err.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
-            "the request head stopped arriving and the connection timed out"
+            "the request head stopped arriving and the connection timed out".to_string()
         }
-        _ => &err.to_string(),
-    };
-    write_refusal(client, "400 Bad Request", UNREADABLE_HEAD, detail)
+        _ => err.to_string(),
+    }
 }
 
 /// Write a literal string and flush — used for the cleartext `200 Connection established`.

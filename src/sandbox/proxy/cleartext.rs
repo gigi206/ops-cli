@@ -280,8 +280,11 @@ pub(super) fn handle_cleartext(
     // closes). This is inspected cleartext, so the byte counters reflect application data.
     let flow = ctx.register_flow(&host, port, crate::sandbox::control::Proto::Http);
 
-    // Open the traffic capture. No credential is ever injected on a cleartext request, so the head
-    // recorded here is both what arrived and what is forwarded, and no injected names accompany it.
+    // Open the traffic capture, recording the client's own head. No credential is ever injected on
+    // a cleartext request, so no injected names accompany it. What is forwarded is not this byte for
+    // byte: `reserialize_request` writes out what sbx parsed, which drops the hop-by-hop headers
+    // (`Connection`, `Proxy-Connection`, `Proxy-Authorization`, `Expect`) and states its own
+    // `Connection: close`. What the capture answers is what the client sent.
     let capture = ctx.begin_capture(allow_seq);
     if let Some(c) = &capture {
         c.set_request(head_bytes, &[]);

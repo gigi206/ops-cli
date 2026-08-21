@@ -4485,6 +4485,209 @@ fn a_first_head_that_never_finished_is_logged_and_answered() {
     );
 }
 
+/// A request head *inside a tunnel* that never arrives whole is answered and recorded against the
+/// tunnel's own host, which the entrance's line has none to name. And a tunnel a client is simply
+/// finished with is not an attempt: it leaves nothing behind.
+///
+/// Teeth: with the two reads before the tunneled request line propagating their error, the first
+/// half finds no response for the client to read and an empty log. With the caller's
+/// nothing-arrived test dropped, the second half finds an event for a connection that said nothing.
+#[test]
+fn a_tunneled_head_that_never_finished_is_logged_against_its_host() {
+    // Both reads that come before a tunneled request line: one that never reaches its blank line,
+    // and one that reaches it carrying bytes that are not UTF-8.
+    for turn_two in [
+        b"GET /again HTTP/1.1\r\nHost: upstream.test\r\n".as_slice(),
+        b"GET /\xff HTTP/1.1\r\n\r\n",
+    ] {
+        let (addr, upstream_ca, up) = spawn_upstream(
+            "upstream.test",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let log = Arc::new(crate::sandbox::control::LogRing::new(
+            crate::sandbox::control::LOG_RING_CAP,
+        ));
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_log(log.clone())
+                .with_timeout(Duration::from_millis(200))
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+
+        // Turn one is an ordinary request, so the tunnel is live and keep-alive; turn two is the
+        // head under test, sent on a connection the client holds open.
+        let dir = TmpDir::new();
+        let path = dir.join("proxy.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        thread::spawn(move || {
+            let _ = serve(listener, ctx);
+        });
+        let mut sock = UnixStream::connect(&path).unwrap();
+        write!(
+            sock,
+            "CONNECT upstream.test:{} HTTP/1.1\r\n\r\n",
+            addr.port()
+        )
+        .unwrap();
+        sock.flush().unwrap();
+        assert!(
+            read_until_blank(&mut sock)
+                .unwrap()
+                .contains("200 Connection established"),
+            "the CONNECT must be accepted before the tunnel can be tested"
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(proxy_ca_der).unwrap();
+        let conn = ClientConnection::new(
+            Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            ),
+            ServerName::try_from("upstream.test").unwrap(),
+        )
+        .unwrap();
+        let mut tls = StreamOwned::new(conn, sock);
+        tls.write_all(b"GET /path HTTP/1.1\r\nHost: upstream.test\r\n\r\n")
+            .unwrap();
+        tls.flush().ok();
+        {
+            let mut br = BufReader::new(&mut tls);
+            let first = read_one_response(&mut br, b"GET /path HTTP/1.1\r\n\r\n").unwrap();
+            assert!(
+                first.text.contains("200 OK"),
+                "the first turn must succeed: {:?}",
+                first.text
+            );
+            assert!(
+                br.buffer().is_empty(),
+                "nothing follows the first response, so the reader carries nothing into turn two"
+            );
+        }
+        up.join().unwrap();
+
+        tls.write_all(turn_two).unwrap();
+        tls.flush().ok();
+        // The proxy closes the tunnel after refusing, so reading to the end orders this against the
+        // refusal rather than racing it.
+        let mut rest = Vec::new();
+        let _ = tls.read_to_end(&mut rest);
+        let answer = String::from_utf8_lossy(&rest);
+        assert!(
+            answer.contains("400 Bad Request"),
+            "a tunneled head that never became a request must be answered: {answer:?}"
+        );
+        assert!(
+            answer.contains("X-Sbx-Egress-Reason: bad-request:head"),
+            "and it must say which refusal it is: {answer:?}"
+        );
+        let events = log.snapshot(None, None, false).events;
+        assert_eq!(events.len(), 2, "the allow, then the refusal: {events:?}");
+        assert_eq!(events[1].reason, "bad-request:head");
+        assert_eq!(
+            events[1].verdict,
+            crate::sandbox::control::LogVerdict::Blocked
+        );
+        assert_eq!(
+            events[1].host, "upstream.test",
+            "inside a tunnel the CONNECT already fixed the host, so the line names it"
+        );
+        assert_eq!(events[1].port, addr.port());
+    }
+
+    // The other half: a tunnel whose client is finished with it. Nothing arrives before the first
+    // byte of a head, which is how a persistent connection ends, and it is not an attempt.
+    let (addr2, upstream_ca2, up2) = spawn_upstream(
+        "upstream.test",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+    );
+    let mut roots2 = RootCertStore::empty();
+    roots2.add(upstream_ca2).unwrap();
+    let proxy_ca2 = Arc::new(Ca::ephemeral().unwrap());
+    let proxy_ca_der2 = proxy_ca2.ca_cert_der();
+    let quiet = Arc::new(crate::sandbox::control::LogRing::new(
+        crate::sandbox::control::LOG_RING_CAP,
+    ));
+    let ctx2 = Arc::new(
+        ProxyCtx::new(proxy_ca2, policy(&["upstream.test:*"]))
+            .unwrap()
+            .with_upstream(Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(roots2)
+                    .with_no_client_auth(),
+            ))
+            .with_log(quiet.clone())
+            .with_timeout(Duration::from_millis(200))
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+    );
+    let dir2 = TmpDir::new();
+    let path2 = dir2.join("proxy.sock");
+    let listener2 = UnixListener::bind(&path2).unwrap();
+    thread::spawn(move || {
+        let _ = serve(listener2, ctx2);
+    });
+    let mut sock2 = UnixStream::connect(&path2).unwrap();
+    write!(
+        sock2,
+        "CONNECT upstream.test:{} HTTP/1.1\r\n\r\n",
+        addr2.port()
+    )
+    .unwrap();
+    sock2.flush().unwrap();
+    assert!(
+        read_until_blank(&mut sock2)
+            .unwrap()
+            .contains("200 Connection established"),
+        "the CONNECT must be accepted before the tunnel can be tested"
+    );
+    let conn2 = ClientConnection::new(
+        Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates({
+                    let mut r = RootCertStore::empty();
+                    r.add(proxy_ca_der2).unwrap();
+                    r
+                })
+                .with_no_client_auth(),
+        ),
+        ServerName::try_from("upstream.test").unwrap(),
+    )
+    .unwrap();
+    let mut tls2 = StreamOwned::new(conn2, sock2);
+    tls2.write_all(b"GET /path HTTP/1.1\r\nHost: upstream.test\r\n\r\n")
+        .unwrap();
+    tls2.flush().ok();
+    {
+        let mut br2 = BufReader::new(&mut tls2);
+        let first = read_one_response(&mut br2, b"GET /path HTTP/1.1\r\n\r\n").unwrap();
+        assert!(first.text.contains("200 OK"), "{:?}", first.text);
+        assert!(br2.buffer().is_empty(), "nothing follows the response");
+    }
+    up2.join().unwrap();
+    // Finished: half-close the write side and read the tunnel to its end, so this is ordered after
+    // the turn that finds nothing waiting.
+    tls2.sock.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut tail = Vec::new();
+    let _ = tls2.read_to_end(&mut tail);
+    assert_eq!(
+        quiet.snapshot(None, None, false).events.len(),
+        1,
+        "one allow and nothing for the hangup: {:?}",
+        quiet.snapshot(None, None, false).events
+    );
+}
+
 #[test]
 fn read_chunked_body_dechunks_a_well_formed_body() {
     // one chunk + the terminating zero chunk, with a chunk extension on the size line (ignored).

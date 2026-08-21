@@ -77,7 +77,10 @@ pub(super) fn serve_tunneled_request(
 
     // 4. Read this request's head (on the first turn that also drives the handshake to completion,
     //    so the SNI is known afterwards); keep the SAME buffered reader for the body.
-    let inner_bytes = read_head_buffered(&mut br, HEAD_MAX, head_deadline(ctx))?;
+    let inner_bytes = match read_head_buffered(&mut br, HEAD_MAX, head_deadline(ctx)) {
+        Ok(bytes) => bytes,
+        Err(e) => return refuse_unreadable_inner_head(&mut br, ctx, connect_host, port, &e),
+    };
     let sni = br.get_ref().conn.server_name().map(|s| s.to_string());
 
     // CONNECT-host == SNI: the leaf was minted for the SNI, so a CONNECT to a different host is a
@@ -106,7 +109,10 @@ pub(super) fn serve_tunneled_request(
         );
     }
 
-    let inner = parse_head(&inner_bytes)?;
+    let inner = match parse_head(&inner_bytes) {
+        Ok(inner) => inner,
+        Err(e) => return refuse_unreadable_inner_head(&mut br, ctx, connect_host, port, &e),
+    };
     let Some((imethod, itarget)) = request_line_parts(&inner.request_line) else {
         ctx.push_log(
             crate::sandbox::control::Proto::Https,
@@ -902,6 +908,42 @@ pub(super) fn serve_tunneled_request(
 /// than at the start of the next one. The refusal says so on the wire too ([`write_refusal`] sends
 /// `Connection: close`). Returning the turn rather than `()` is what makes that a property of the
 /// type instead of a rule each of the ~18 refusal sites has to remember.
+/// A request head inside a tunnel that never became a request: log the attempt against the tunnel's
+/// own host, tell the caller why, and close the tunnel.
+///
+/// The reason and the sentence are the entrance's ([`refuse_unreadable_head`]), because this is the
+/// same event: a head that arrived truncated, over [`HEAD_MAX`], past its deadline or not as UTF-8.
+/// What differs is that the CONNECT has already fixed a host and a port here, so the line names them
+/// where the entrance's line cannot.
+///
+/// A client simply finished with the tunnel never reaches this. [`serve_tunneled_request`]
+/// establishes that a byte is waiting before it reads a head at all, and answers a tunnel with
+/// nothing on it with [`Turn::Close`] and no line, which is how a persistent connection is meant to
+/// end.
+fn refuse_unreadable_inner_head(
+    br: &mut ClientTls,
+    ctx: &ProxyCtx,
+    connect_host: &str,
+    port: u16,
+    err: &io::Error,
+) -> io::Result<Turn> {
+    ctx.push_log(
+        crate::sandbox::control::Proto::Https,
+        connect_host,
+        port,
+        None,
+        None,
+        crate::sandbox::control::LogVerdict::Blocked,
+        UNREADABLE_HEAD,
+    );
+    respond_refusal_tls(
+        br,
+        "400 Bad Request",
+        UNREADABLE_HEAD,
+        &unreadable_head_detail(err),
+    )
+}
+
 fn respond_refusal_tls<S: Read + Write>(
     br: &mut BufReader<StreamOwned<ServerConnection, S>>,
     status: &str,
