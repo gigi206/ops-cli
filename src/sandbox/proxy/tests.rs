@@ -8001,6 +8001,159 @@ fn pump_redacting_masks_a_match_straddling_read_boundaries() {
     );
 }
 
+/// A streaming response to a credential-injected host reaches the cage event by event, exactly as it
+/// would with no secret to mask.
+///
+/// The scan has to hold bytes back or a secret split across two reads escapes it; what it holds is
+/// what could still *become* a secret. A server-sent event ends `\n\n`, which begins no credential,
+/// so nothing is held and no event waits for the next one. This is the response a streaming
+/// completion arrives as, and the host it arrives from is the one with the injected key.
+///
+/// Teeth: holding a fixed `max_needle_len - 1` bytes instead delivers the first event one byte at a
+/// time as later events arrive, so the writes stop matching the events and stop matching the control.
+#[test]
+fn a_streaming_response_is_not_held_back_by_the_secret_scan() {
+    /// One server-sent event per read, as a streaming API sends them.
+    struct Events {
+        parts: Vec<Vec<u8>>,
+        at: usize,
+    }
+    impl Read for Events {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let Some(part) = self.parts.get(self.at) else {
+                return Ok(0);
+            };
+            self.at += 1;
+            buf[..part.len()].copy_from_slice(part);
+            Ok(part.len())
+        }
+    }
+    /// Every `write` the relay makes, kept whole: what the cage's socket sees, and when.
+    #[derive(Default)]
+    struct PerWrite(Vec<Vec<u8>>);
+    impl Write for PerWrite {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if !buf.is_empty() {
+                self.0.push(buf.to_vec());
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // A credential of the length an API key actually has, so the fixed-carry behaviour this guards
+    // against would hold back 50 bytes: more than a whole event.
+    let key = b"sk-proj-0123456789abcdef0123456789abcdef0123456789a".to_vec();
+    let events: Vec<Vec<u8>> = vec![
+        b"data: {\"delta\":\"Hello\"}\n\n".to_vec(),
+        [
+            b"data: {\"echo\":\"".as_slice(),
+            &key,
+            b"\"}\n\n".as_slice(),
+        ]
+        .concat(),
+        b"data: [DONE]\n\n".to_vec(),
+    ];
+
+    let mut relayed = PerWrite::default();
+    pump_redacting(
+        &mut Events {
+            parts: events.clone(),
+            at: 0,
+        },
+        &mut relayed,
+        &[SecretNeedle::named("api_key", key.clone())],
+    )
+    .unwrap();
+
+    let mut control = PerWrite::default();
+    pump_redacting(
+        &mut Events {
+            parts: events.clone(),
+            at: 0,
+        },
+        &mut control,
+        &[],
+    )
+    .unwrap();
+
+    assert_eq!(
+        relayed.0.len(),
+        control.0.len(),
+        "the scan must not change how many pieces the stream arrives in: {:?}",
+        relayed
+            .0
+            .iter()
+            .map(|w| String::from_utf8_lossy(w))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        relayed.0[0], events[0],
+        "the first event leaves whole, without waiting for the second"
+    );
+    assert_eq!(
+        relayed.0[2], events[2],
+        "and so does the last, which no further read follows"
+    );
+    // The masking still happens, on the same event, in the same write.
+    let echoed = String::from_utf8_lossy(&relayed.0[1]).into_owned();
+    assert!(
+        echoed.contains(&"*".repeat(key.len())),
+        "the reflected credential is masked in place: {echoed:?}"
+    );
+    assert!(
+        !echoed.contains("sk-proj-"),
+        "and none of it survives: {echoed:?}"
+    );
+    assert_eq!(
+        relayed.0[1].len(),
+        events[1].len(),
+        "equal-length masking, so the framing the head declared still holds"
+    );
+}
+
+/// What a streaming scan must hold back, stated on its own: the tail that spells the start of a
+/// needle, and nothing else.
+#[test]
+fn only_a_tail_that_begins_a_needle_is_held_back() {
+    let needles = vec![
+        SecretNeedle::named("a", b"SECRET".to_vec()),
+        SecretNeedle::named("b", b"tok-abcdef".to_vec()),
+    ];
+    for (window, held, why) in [
+        (
+            b"data: hello\n\n".as_slice(),
+            0,
+            "ordinary bytes begin no needle",
+        ),
+        (
+            b"xxSEC",
+            3,
+            "a partial needle may be completed by the next read",
+        ),
+        (
+            b"xxtok-",
+            4,
+            "the longest suffix that begins one, over every needle",
+        ),
+        (
+            b"xxSECRET",
+            0,
+            "a needle already whole was masked, so nothing is held for it",
+        ),
+        (b"", 0, "an empty window holds nothing"),
+    ] {
+        assert_eq!(needle_prefix_suffix(window, &needles), held, "{why}");
+    }
+    assert_eq!(
+        needle_prefix_suffix(b"xxSEC", &[]),
+        0,
+        "with no needles there is nothing a tail could begin"
+    );
+}
+
 #[test]
 fn pump_redacting_passes_clean_bytes_through_unchanged() {
     let needles = vec![SecretNeedle::named("test-secret", b"SECRET".to_vec())];

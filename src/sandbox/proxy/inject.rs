@@ -151,6 +151,17 @@ impl fmt::Debug for HeaderInjection {
 pub(crate) trait HeaderLookup {
     /// The value of a header by case-insensitive name, if the request carries one.
     fn get(&self, name: &str) -> Option<&str>;
+
+    /// Every value carried under this name, in arrival order.
+    ///
+    /// The two readings answer different questions, and a request that carries the same header
+    /// twice is where they part. A signer is shown one value, because it signs the request the
+    /// upstream will read and a duplicated credential header is not a shape a signature has an
+    /// answer for. [`Credentials::observe_head`] takes them all: what it is asked is whether the
+    /// cage sent a credential, and a client library that adds a default `Authorization` beside an
+    /// explicit one sent two. Keeping only the first leaves the other unmasked in a capture and in
+    /// `sbx net logs --with-headers`, which is the exposure observing exists to close.
+    fn for_each(&self, name: &str, f: &mut dyn FnMut(&str));
 }
 
 impl HeaderLookup for Vec<(String, String)> {
@@ -158,6 +169,12 @@ impl HeaderLookup for Vec<(String, String)> {
         self.iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    fn for_each(&self, name: &str, f: &mut dyn FnMut(&str)) {
+        for (_, value) in self.iter().filter(|(k, _)| k.eq_ignore_ascii_case(name)) {
+            f(value);
+        }
     }
 }
 
@@ -611,12 +628,18 @@ impl Credentials {
         injected: &[&str],
         dest: &str,
     ) -> usize {
-        OBSERVED_AUTH_HEADERS
+        let mut kept = 0;
+        for name in OBSERVED_AUTH_HEADERS
             .iter()
             .filter(|name| !injected.iter().any(|inj| name.eq_ignore_ascii_case(inj)))
-            .filter_map(|name| headers.get(name).map(|value| (*name, value)))
-            .filter(|(name, value)| self.observe(name, value, dest))
-            .count()
+        {
+            headers.for_each(name, &mut |value| {
+                if self.observe(name, value, dest) {
+                    kept += 1;
+                }
+            });
+        }
+        kept
     }
 }
 
@@ -1178,6 +1201,39 @@ mod tests {
         let set = creds.snapshot();
         assert_eq!(set.needles.len(), 1);
         assert_eq!(set.needles[0].as_bytes(), b"tok-0123456789abcdef");
+    }
+
+    /// A request that carries the same credential header twice is observed twice. A client library
+    /// that adds a default `Authorization` beside an explicit one sends two, and the one kept is
+    /// not necessarily the one that authenticates: the other would stay unmasked in a capture and
+    /// in `sbx net logs --with-headers`.
+    ///
+    /// Teeth: reading the first value alone keeps one needle, and the assertion on the second fails.
+    #[test]
+    fn every_occurrence_of_a_credential_header_is_observed() {
+        let creds = default_creds(Vec::new(), Vec::new());
+        let kept = creds.observe_head(
+            &vec![
+                ("Authorization".into(), "Bearer tok-first-0123456789".into()),
+                (
+                    "authorization".into(),
+                    "Bearer tok-second-0123456789".into(),
+                ),
+            ],
+            &[],
+            "host.test",
+        );
+        assert_eq!(kept, 2, "both values are credentials the cage sent");
+        let set = creds.snapshot();
+        let needles: Vec<&[u8]> = set.needles.iter().map(|n| n.as_bytes()).collect();
+        assert!(
+            needles.contains(&b"tok-first-0123456789".as_slice()),
+            "the first is kept: {needles:?}"
+        );
+        assert!(
+            needles.contains(&b"tok-second-0123456789".as_slice()),
+            "and so is the second: {needles:?}"
+        );
     }
 
     /// The interaction that matters most, because it breaks the very setup observing exists to

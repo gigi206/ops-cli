@@ -1520,10 +1520,21 @@ fn pump_to_eof<R: Read, W: Write>(r: &mut R, w: &mut W) -> io::Result<()> {
 /// **body**; a secret reflected in a response *header* is masked by [`relay_response_head`] under
 /// the same decision, since the head is relayed before this runs.
 ///
-/// Streaming-safe: a `carry` of the last `max_needle_len - 1` bytes is retained across reads, so a
-/// secret split across two reads is still caught — every emitted byte was scanned in a window that
-/// held the next `max_needle_len - 1` bytes, and same-length replacement never shifts a position, so
-/// re-scanning the carry is harmless. Memory stays bounded at `carry + one read`.
+/// Streaming-safe **without delaying the stream**: what is held back after each read is the longest
+/// suffix of the window that is a proper prefix of some needle (see [`needle_prefix_suffix`]), which
+/// is exactly the run that could still turn out to be the start of a secret the next read completes.
+/// Every emitted byte was therefore scanned in a window that held everything a needle covering it
+/// could need, and same-length replacement never shifts a position, so re-scanning the carry is
+/// harmless. Memory stays bounded at `carry + one read`.
+///
+/// Holding a *fixed* `max_needle_len - 1` bytes instead would be equally safe and would stall the
+/// response this proxy exists to carry. A streaming completion arrives as small server-sent events,
+/// and an event that does not end in a needle prefix (they end `\n\n`) would still be held: the cage
+/// would see each event only once the *next* one arrived, and the last event before an idle gap not
+/// at all until the gap ended. The HTTP/2 twin, `relay_body_redacting` in `h2mitm.rs`, refuses to
+/// carry bytes across frames at all for a stronger form of the same reason, an interactive RPC
+/// deadlocking rather than lagging; that plane accepts a split secret as the residual, and this one
+/// does not have to.
 ///
 /// A backstop, not a wall (see the module doc): a re-encoded, compressed, or framing-split value
 /// evades the byte match. The load-bearing boundary remains the empty netns plus the allowlist; this
@@ -1538,11 +1549,10 @@ fn pump_redacting<R: Read, W: Write>(
         .map(|n| n.as_bytes().len())
         .max()
         .unwrap_or(0);
-    let keep = max_len.saturating_sub(1);
     // One window, reused for the whole stream: the carry sits at its head and each read is appended
     // behind it, so a body of any length costs the two allocations below and no more. Draining the
     // emitted prefix shifts only the carry, which is shorter than the longest needle.
-    let mut window: Vec<u8> = Vec::with_capacity(keep + RELAY_CHUNK);
+    let mut window: Vec<u8> = Vec::with_capacity(max_len.saturating_sub(1) + RELAY_CHUNK);
     let mut buf = vec![0u8; RELAY_CHUNK];
     loop {
         let n = match r.read(&mut buf) {
@@ -1553,9 +1563,9 @@ fn pump_redacting<R: Read, W: Write>(
         };
         window.extend_from_slice(&buf[..n]);
         redact_in_place(&mut window, needles);
-        // Hold back the last `keep` bytes — a secret could begin there and complete in the next
-        // read; emit everything before them.
-        let split = window.len().saturating_sub(keep);
+        // Hold back only what could still become a secret: the tail that spells the start of one.
+        // Everything before it is finished with, whatever the next read brings.
+        let split = window.len() - needle_prefix_suffix(&window, needles);
         w.write_all(&window[..split])?;
         window.drain(..split);
     }
@@ -1563,6 +1573,33 @@ fn pump_redacting<R: Read, W: Write>(
     w.write_all(&window)?;
     w.flush().ok();
     Ok(())
+}
+
+/// The length of the longest suffix of `window` that is a **proper prefix** of some needle.
+///
+/// This is what a streaming scan must hold back, and no more: a suffix that spells the beginning of
+/// a needle may turn out to be that needle once the next read arrives, while a suffix that spells no
+/// beginning cannot become one however the stream continues. Ordinary traffic ends in neither, so
+/// the usual answer is zero and the stream is passed through untouched.
+///
+/// A needle already complete inside the window was masked before this is asked, so the suffix
+/// considered here is only ever an incomplete one.
+fn needle_prefix_suffix(window: &[u8], needles: &[SecretNeedle]) -> usize {
+    let mut hold = 0;
+    for needle in needles {
+        let bytes = needle.as_bytes();
+        // A whole needle is not held: it would already have been masked.
+        let longest = (bytes.len().saturating_sub(1)).min(window.len());
+        // Longest first, and never below what another needle already requires: the answer is the
+        // maximum, so a shorter candidate cannot change it.
+        for k in (hold + 1..=longest).rev() {
+            if window[window.len() - k..] == bytes[..k] {
+                hold = k;
+                break;
+            }
+        }
+    }
+    hold
 }
 
 /// Replace every occurrence of every needle in `buf` with an equal-length run of `*`, in place.

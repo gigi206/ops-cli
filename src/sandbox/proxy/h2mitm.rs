@@ -699,10 +699,18 @@ async fn relay_body(
 /// leak backstop, used only for a response from an injection-target host.
 ///
 /// Each frame is redacted **independently and emitted whole** — deliberately NOT carrying bytes
-/// across frames. Holding bytes back would deadlock an interactive stream (e.g. gRPC reflection or
-/// any client-streaming RPC): the client must receive a complete response message before it sends
-/// its next request, so a relay that withholds the frame's tail until the stream ends stalls
-/// forever. The residual is a secret split across two DATA frames (a 16 KiB boundary), which is
+/// across frames, where the HTTP/1.1 twin ([`super::pump_redacting`]) does carry a tail across reads. The
+/// two planes answer differently because what a withheld byte costs is not the same on them.
+///
+/// On HTTP/1.1 a response is one message the client reads to its end, so holding a tail costs
+/// latency and the tail is always released by the next read or by the end of the body. On HTTP/2 the
+/// client may have to act on a complete response message before it sends its next request (gRPC
+/// reflection, any client-streaming or bidirectional RPC), and there the tail is released by a next
+/// frame that will never be sent: a stall with no end. Holding only what *begins* a needle, as the
+/// other plane does, does not make that safe either — a frame ends on some needle's first byte often
+/// enough that the stall would be a live risk rather than a corner.
+///
+/// The residual is therefore a secret split across two DATA frames (a 16 KiB boundary), which is
 /// then not masked — rare, and the same best-effort class as the gzip-compressed-body limit; the
 /// real controls are the empty netns, the allowlist, the per-host `to` scoping, and the outbound
 /// tripwire. Equal-length masking keeps every byte count intact.
@@ -1048,6 +1056,15 @@ impl HeaderLookup for H2Headers<'_> {
         // A header whose bytes are not text is not one a signer can be shown: it would have to be
         // spelled to reach a JSON line, and a spelling sbx invented is not what the cage sent.
         self.0.get(name).and_then(|v| v.to_str().ok())
+    }
+
+    fn for_each(&self, name: &str, f: &mut dyn FnMut(&str)) {
+        for value in self.0.get_all(name) {
+            // Same rule as `get`: bytes that are not text are not a value sbx can hand on.
+            if let Ok(text) = value.to_str() {
+                f(text);
+            }
+        }
     }
 }
 
