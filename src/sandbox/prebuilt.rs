@@ -808,6 +808,62 @@ fn build_pinned(
     Ok((logical.join("bin"), logical))
 }
 
+/// The pinned `(url, hash)` for `key`, minting and recording one only when the lock has none.
+///
+/// **`mint` runs only on a miss.** That is the offline invariant a warm launch rests on: once a
+/// package is pinned, provisioning it must not reach the network — no resolve command, no release
+/// query — so the mint is taken lazily and never merely as a fallback value. Returns whether a new
+/// pin was recorded, which is what tells the caller the lock is worth writing back.
+///
+/// Split out from [`provision_pinned`] so the invariant is testable: the caller's real mint builds
+/// a derivation, but this takes any closure.
+fn pinned_or_mint<F>(
+    lock: &mut BTreeMap<String, Pin>,
+    key: &str,
+    mint: F,
+) -> io::Result<((String, String), bool)>
+where
+    F: FnOnce() -> io::Result<(String, String)>,
+{
+    if let Some(pin) = lock.get(key) {
+        return Ok(((pin.url.clone(), pin.hash.clone()), false));
+    }
+    let (url, hash) = mint()?;
+    lock.insert(
+        key.to_string(),
+        Pin {
+            hash: hash.clone(),
+            url: url.clone(),
+        },
+    );
+    Ok(((url, hash), true))
+}
+
+/// Provision one package from its per-project pin, minting the pin on first use — the sequence the
+/// direct and `:resolve` forms share. They differ only in how a missing pin is minted, which is
+/// `mint`, and in the lock key: the locator itself for the direct form, [`resolve_key`] for the
+/// other. The lock is written back only when a pin was actually minted.
+fn provision_pinned<F>(
+    kind: &dyn Kind,
+    ctx: &Ctx,
+    name: &str,
+    key: &str,
+    libs: &[String],
+    mint: F,
+) -> io::Result<(PathBuf, PathBuf)>
+where
+    F: FnOnce() -> io::Result<(String, String)>,
+{
+    let project_id = super::binds::project_runtime_id(ctx.project)?;
+    let lock_file = lock_file(kind);
+    let mut lock = pins(ctx.layout, project_id.as_str(), &lock_file);
+    let ((url, hash), minted) = pinned_or_mint(&mut lock, key, mint)?;
+    if minted {
+        write_pins(ctx.layout, project_id.as_str(), &lock_file, &lock)?;
+    }
+    build_pinned(kind, ctx, project_id.as_str(), name, &url, &hash, libs)
+}
+
 /// Provision one declared package host-side: resolve its locator to a hash (pinning it on first use),
 /// build the generated derivation into sbx's store, and return `(bin directory, store root)` — the
 /// bin dir to prepend to the sandbox `PATH`, the root whose closure the project store seeds. Mirrors
@@ -819,33 +875,17 @@ pub(crate) fn provision(
     locator: &str,
     libs: &[String],
 ) -> io::Result<(PathBuf, PathBuf)> {
-    let project_id = super::binds::project_runtime_id(ctx.project)?;
-    let lock_file = lock_file(kind);
-    let mut lock = pins(ctx.layout, project_id.as_str(), &lock_file);
-    let (url, hash) = match lock.get(locator) {
-        Some(pin) => (pin.url.clone(), pin.hash.clone()),
-        None => {
-            let system = super::current_system();
-            let (u, h) = kind.resolve_source(
-                ctx.nix,
-                ctx.layout,
-                locator,
-                &system,
-                false,
-                ctx.allow_insecure_http,
-            )?;
-            lock.insert(
-                locator.to_string(),
-                Pin {
-                    hash: h.clone(),
-                    url: u.clone(),
-                },
-            );
-            write_pins(ctx.layout, project_id.as_str(), &lock_file, &lock)?;
-            (u, h)
-        }
-    };
-    build_pinned(kind, ctx, project_id.as_str(), name, &url, &hash, libs)
+    provision_pinned(kind, ctx, name, locator, libs, || {
+        let system = super::current_system();
+        kind.resolve_source(
+            ctx.nix,
+            ctx.layout,
+            locator,
+            &system,
+            false,
+            ctx.allow_insecure_http,
+        )
+    })
 }
 
 /// Provision one `<backend>:resolve` package host-side — the auto-upgrade twin of [`provision`]. The
@@ -861,34 +901,18 @@ pub(crate) fn provision_resolve(
     cage: &super::resolve::ResolveCage,
     libs: &[String],
 ) -> io::Result<(PathBuf, PathBuf)> {
-    let project_id = super::binds::project_runtime_id(ctx.project)?;
-    let lock_file = lock_file(kind);
-    let key = resolve_key(name);
-    let mut lock = pins(ctx.layout, project_id.as_str(), &lock_file);
-    let (url, hash) = match lock.get(&key) {
-        Some(pin) => (pin.url.clone(), pin.hash.clone()),
-        None => {
-            let u = super::resolve::resolve_url(
-                cage,
-                name,
-                command,
-                kind.url_validator(),
-                ctx.allow_insecure_http,
-                kind.artefact(),
-            )?;
-            let h = prefetch_hash(ctx.nix, ctx.layout, &u, false)?;
-            lock.insert(
-                key,
-                Pin {
-                    hash: h.clone(),
-                    url: u.clone(),
-                },
-            );
-            write_pins(ctx.layout, project_id.as_str(), &lock_file, &lock)?;
-            (u, h)
-        }
-    };
-    build_pinned(kind, ctx, project_id.as_str(), name, &url, &hash, libs)
+    provision_pinned(kind, ctx, name, &resolve_key(name), libs, || {
+        let url = super::resolve::resolve_url(
+            cage,
+            name,
+            command,
+            kind.url_validator(),
+            ctx.allow_insecure_http,
+            kind.artefact(),
+        )?;
+        let hash = prefetch_hash(ctx.nix, ctx.layout, &url, false)?;
+        Ok((url, hash))
+    })
 }
 
 /// Build a `<backend>:resolve` package from its EXISTING pin only — for the gc keep path, which must
@@ -1077,6 +1101,54 @@ pub(crate) fn upgrade_project(
 
 #[cfg(test)]
 mod tests {
+
+    /// The offline invariant, stated by `provision_resolve`'s docstring and until now pinned by
+    /// nothing: on a warm launch the pinned `(url, hash)` is reused and the mint — the resolve
+    /// command, the release query, the prefetch — is **not run**. A regression here would put a
+    /// network call on every launch of an already-pinned package.
+    #[test]
+    fn a_warm_pin_is_reused_without_running_the_mint() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut lock = BTreeMap::new();
+        lock.insert(
+            "deb:demo".to_string(),
+            Pin {
+                hash: "sha256-AAAA".to_string(),
+                url: "https://e/demo_1.0_amd64.deb".to_string(),
+            },
+        );
+        let ran = AtomicBool::new(false);
+        let ((url, hash), minted) = super::pinned_or_mint(&mut lock, "deb:demo", || {
+            ran.store(true, Ordering::SeqCst);
+            Ok(("https://e/other.deb".to_string(), "sha256-BBBB".to_string()))
+        })
+        .expect("a warm pin resolves");
+        assert!(!ran.load(Ordering::SeqCst), "the mint ran on a warm pin");
+        assert_eq!(url, "https://e/demo_1.0_amd64.deb");
+        assert_eq!(hash, "sha256-AAAA");
+        // Nothing was minted, so the caller must not rewrite the lock.
+        assert!(!minted);
+        assert_eq!(lock.len(), 1);
+    }
+
+    /// The other half: a cold key runs the mint exactly once, records it, and reports that the lock
+    /// is now worth writing back.
+    #[test]
+    fn a_cold_pin_mints_once_and_records_it() {
+        let mut lock: BTreeMap<String, Pin> = BTreeMap::new();
+        let mut calls = 0usize;
+        let ((url, hash), minted) = super::pinned_or_mint(&mut lock, "deb:demo", || {
+            calls += 1;
+            Ok(("https://e/demo.deb".to_string(), "sha256-CCCC".to_string()))
+        })
+        .expect("a cold pin mints");
+        assert_eq!(calls, 1);
+        assert!(minted);
+        assert_eq!(url, "https://e/demo.deb");
+        assert_eq!(hash, "sha256-CCCC");
+        assert_eq!(lock["deb:demo"].url, "https://e/demo.deb");
+        assert_eq!(lock["deb:demo"].hash, "sha256-CCCC");
+    }
     use super::super::appimage::AppImage;
     use super::super::deb::Deb;
     use super::super::tarball::Tarball;
