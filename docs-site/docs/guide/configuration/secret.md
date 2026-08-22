@@ -47,6 +47,10 @@ header = "X-B"
 type = "raw"
 ```
 
+The destination is written **only** as the section key: there is no `to =` field. sbx does
+call it `to` where it has to name it, in a validation refusal (`` `to` must be a concrete
+host ``) and in the `sbx config show --json` view, so the two spellings meet the same thing.
+
 ## A secret entry's fields
 
 | Field | Meaning |
