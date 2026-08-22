@@ -417,6 +417,140 @@ fn the_shipped_counts_the_guide_states_are_the_real_ones() {
     );
 }
 
+/// Every named-table example in the guide uses keys the struct behind it actually has.
+///
+/// A worked example is the part of a page a reader copies, so an example that cannot work is worse
+/// than no example: it fails in the reader's config, not in ours. The schema is additive by design,
+/// unknown keys being ignored rather than refused, which is exactly why nothing else catches this:
+/// `[secret.github] resolver = "env://TOKEN"` parses, loads, and silently declares a credential for
+/// a host named `github` with no header. It sat in the flagship how-to until it was read.
+///
+/// Scoped to the families whose tables are keyed by a name the writer chooses (`[secret."host"]`,
+/// `[task.<name>]`, `[app.<name>]`, `[bundle.<name>]`), because those are the ones a key-name check
+/// cannot reach by looking at the top level alone.
+#[test]
+fn every_named_table_example_uses_real_keys() {
+    let source =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config/schema.rs"))
+            .expect("the config schema source is readable");
+
+    // `struct Name { … }` → the TOML spellings of its fields.
+    let struct_fields = |name: &str| -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let Some(rest) = source.split_once(&format!("struct {name} {{")) else {
+            return out;
+        };
+        let body = rest.1.split("\n}").next().unwrap_or("");
+        let mut renamed: Option<String> = None;
+        for line in body.lines() {
+            let line = line.trim();
+            if line.starts_with("#[") {
+                if let Some(rest) = line.split("rename = \"").nth(1)
+                    && let Some(name) = rest.split('"').next()
+                {
+                    renamed = Some(name.to_string());
+                }
+                continue;
+            }
+            if let Some((name, _)) = line.strip_prefix("pub(crate) ").and_then(field_decl) {
+                out.insert(renamed.take().unwrap_or(name));
+            } else if !line.is_empty() && !line.starts_with("//") {
+                renamed = None;
+            }
+        }
+        out
+    };
+
+    // (the table family, the struct its named entries deserialize into, extra keys it reserves)
+    let families: Vec<(&str, BTreeSet<String>)> = vec![
+        (
+            "secret",
+            struct_fields("RawHostSecret")
+                .into_iter()
+                .chain(struct_fields("RawSecretDefaults"))
+                .chain(["defaults".to_string()])
+                .collect(),
+        ),
+        (
+            "task",
+            struct_fields("RawTask")
+                .into_iter()
+                .chain(struct_fields("RawTaskDefaults"))
+                .chain(["defaults".to_string()])
+                .collect(),
+        ),
+        ("app", struct_fields("RawApp")),
+        ("bundle", struct_fields("RawBundle")),
+    ];
+    for (family, fields) in &families {
+        assert!(
+            fields.len() > 3,
+            "the field scan for `{family}` found {} field(s), so it has stopped matching the \
+             schema's shape and would pass vacuously",
+            fields.len()
+        );
+    }
+
+    let mut offenders = Vec::new();
+    for (path, page) in guide_pages() {
+        for block in toml_blocks(&page) {
+            let Ok(doc) = block.parse::<toml::Table>() else {
+                // A fragment that is not a whole document (two forms in one fence, an
+                // elided body) is not this test's business; the site build reads them as prose.
+                continue;
+            };
+            for (family, fields) in &families {
+                let Some(toml::Value::Table(named)) = doc.get(*family) else {
+                    continue;
+                };
+                for (entry_name, entry) in named {
+                    // `[[secret."host"]]` is an array of the same shape.
+                    let rows: Vec<&toml::Value> = match entry {
+                        toml::Value::Array(rows) => rows.iter().collect(),
+                        other => vec![other],
+                    };
+                    for row in rows {
+                        let Some(row) = row.as_table() else { continue };
+                        for key in row.keys() {
+                            // A sub-table is a nested family of its own (`[task.x.secret]`,
+                            // `[app.x.network]`), named by the parent struct's own field.
+                            if !fields.contains(key) && !row[key].is_table() {
+                                let at = path.display().to_string();
+                                offenders.push(format!("{at}: [{family}.{entry_name}] `{key}`"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these worked examples name keys the schema has no field for, so a reader who copies one \
+         gets a declaration that parses and does nothing: {offenders:?}"
+    );
+}
+
+/// Every fenced `toml` block of a page, as its own string.
+fn toml_blocks(page: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current: Option<String> = None;
+    for line in page.lines() {
+        match (&mut current, line.trim_start()) {
+            (None, "```toml") => current = Some(String::new()),
+            (Some(_), fence) if fence.starts_with("```") => {
+                out.push(current.take().unwrap_or_default());
+            }
+            (Some(buf), _) => {
+                buf.push_str(line);
+                buf.push('\n');
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Every shipped app profile appears in the catalogue page.
 ///
 /// The catalogue is the only place a reader can discover a profile by name, so one that is shipped

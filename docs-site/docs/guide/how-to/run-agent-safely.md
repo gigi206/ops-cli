@@ -52,7 +52,7 @@ Filtering modes route every egress through a host-side proxy that decides per
 request. Start narrow and admit what the agent genuinely needs:
 
 ```sh
-sbx net rules -a claude            # what the current policy admits
+sbx net rules                      # what the current policy admits
 sbx net allow api.anthropic.com    # admit a host for this project
 sbx run --net none -- ./offline.sh # any launch can override the posture
 ```
@@ -67,10 +67,14 @@ Declare secrets by name; the proxy injects them into matching requests at egress
 time, so the token value never enters the filesystem or environment:
 
 ```toml
-[secret.github]
-resolver = "env://GITHUB_TOKEN"
-hosts    = ["api.github.com"]
+[secret."api.github.com"]
+from   = "env://GITHUB_TOKEN"
+header = "Authorization"
+type   = "bearer"
 ```
+
+The section key is the destination host, and `from` names a *source* rather than a value:
+sbx reads it host-side and the proxy puts the header on the request.
 
 Two conditions matter: injection is **effective only under a filtering network
 posture** (`deny` / `allow` / `ask`), because the proxy performs it, and the field is
