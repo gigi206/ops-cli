@@ -374,20 +374,7 @@ fn render_live(
         }
         // A per-session header from the registry, so with several agents the user can tell which one
         // each flow belongs to.
-        match context.iter().find(|(pid, _, _)| *pid == session.pid) {
-            Some((_, project, label)) => {
-                let _ = writeln!(
-                    o,
-                    "  {dim}session {} [{}] {}{r}",
-                    session.pid,
-                    label,
-                    project.display()
-                );
-            }
-            None => {
-                let _ = writeln!(o, "  {dim}session {} (unregistered){r}", session.pid);
-            }
-        }
+        write_session_header(&mut o, session.pid, context, pal);
         for f in &session.flows {
             // Age from the passed-in clock; saturate against any skew between the proxy and this reader
             // (a flow's start is never really in the future).
@@ -593,20 +580,7 @@ fn render_pending(
     for session in sessions {
         // A per-session header from the registry, so with several agents the user can tell which one
         // each request belongs to (the literal reason the control plane is multi-session).
-        match context.iter().find(|(pid, _, _)| *pid == session.pid) {
-            Some((_, project, label)) => {
-                let _ = writeln!(
-                    o,
-                    "  {dim}session {} [{}] {}{r}",
-                    session.pid,
-                    label,
-                    project.display()
-                );
-            }
-            None => {
-                let _ = writeln!(o, "  {dim}session {} (unregistered){r}", session.pid);
-            }
-        }
+        write_session_header(&mut o, session.pid, context, pal);
         // Collapse identical destinations: a tool that retries one URL re-parks it many times, and
         // they are a single decision. `×N` is itself a signal — an agent hammering one endpoint.
         for group in group_pending(&session.rows) {
@@ -632,6 +606,88 @@ fn render_pending(
         "  {dim}        sbx net pending allow|deny --all  (drain every parked request at once){r}"
     );
     o
+}
+
+/// Answer every parked request in each session `keep` accepts, and report what happened.
+///
+/// Returns the hosts answered per session (in `session_pids` order, sessions with nothing parked
+/// omitted) and the pids of sessions running an sbx too old to understand the command — those keep
+/// their requests parked, so they are named rather than folded into a misleading "nothing parked".
+/// A dead or stale socket is a session that went away and is skipped.
+///
+/// `keep` is evaluated **before** the drain, never after: this writes, and answering a parked
+/// request cannot be undone, so a session the caller meant to skip must not be drained first and
+/// filtered afterwards. Written once for that reason — `sbx net pending allow/deny` and the
+/// drain-and-save path differ only in which scopes they compose into `keep`.
+fn drain_sessions(
+    data_dir: &Path,
+    verdict: sandbox::control::Verdict,
+    session: bool,
+    keep: impl Fn(u32) -> bool,
+) -> (Vec<(u32, Vec<String>)>, Vec<u32>) {
+    let mut answered: Vec<(u32, Vec<String>)> = Vec::new();
+    let mut unsupported: Vec<u32> = Vec::new();
+    for pid in sandbox::control::session_pids(data_dir) {
+        if !keep(pid) {
+            continue;
+        }
+        match sandbox::control::drain_session(data_dir, pid, verdict, session) {
+            Ok(sandbox::control::DrainOutcome::Drained(hosts)) if !hosts.is_empty() => {
+                answered.push((pid, hosts))
+            }
+            Ok(sandbox::control::DrainOutcome::Drained(_)) => {}
+            Ok(sandbox::control::DrainOutcome::Unsupported) => unsupported.push(pid),
+            Err(_) => {}
+        }
+    }
+    (answered, unsupported)
+}
+
+/// One session's header line: `session <pid> [<agent>] <project>`, or `session <pid>
+/// (unregistered)` when the registry does not know it.
+///
+/// Every `sbx net` listing that spans sessions prints this line, and it must read the same in all
+/// of them — it is what tells the user which agent a flow, a parked request or a grant belongs to,
+/// which is the literal reason the control plane is multi-session. Written once so the six listings
+/// cannot come to disagree about the shape of the identifier they share.
+fn write_session_header_line(
+    o: &mut String,
+    pid: u32,
+    ctx: Option<(&str, &str)>,
+    pal: &style::Palette,
+) {
+    use std::fmt::Write as _;
+    let (dim, r) = (pal.dim, pal.reset);
+    match ctx {
+        Some((label, project)) => {
+            let _ = writeln!(o, "  {dim}session {pid} [{label}] {project}{r}");
+        }
+        None => {
+            let _ = writeln!(o, "  {dim}session {pid} (unregistered){r}");
+        }
+    }
+}
+
+/// [`write_session_header_line`] for a caller holding the registry snapshot rather than an
+/// already-resolved entry: the pid is looked up in `context`, and an absent one reads as
+/// unregistered.
+fn write_session_header(
+    o: &mut String,
+    pid: u32,
+    context: &[(u32, PathBuf, String)],
+    pal: &style::Palette,
+) {
+    let found = context.iter().find(|(p, _, _)| *p == pid);
+    let project = found.map(|(_, project, _)| project.display().to_string());
+    write_session_header_line(
+        o,
+        pid,
+        match (&found, &project) {
+            (Some((_, _, label)), Some(project)) => Some((label.as_str(), project.as_str())),
+            _ => None,
+        },
+        pal,
+    );
 }
 
 /// `sbx net pending allow|deny <id> [--save --local|--global|--app <name>]`: answer one parked
@@ -848,27 +904,9 @@ fn net_pending_answer_all(
     // `--app <name>` scopes the drain to that app's session pids (from the registry); an unregistered
     // session has no known app, so it is excluded under a filter.
     let app_pids = app.map(|name| session_pids_for_app(&data_dir, name));
-    let mut answered: Vec<(u32, Vec<String>)> = Vec::new();
-    let mut unsupported: Vec<u32> = Vec::new();
-    for pid in sandbox::control::session_pids(&data_dir) {
-        if let Some(pids) = &app_pids
-            && !pids.contains(&pid)
-        {
-            continue;
-        }
-        match sandbox::control::drain_session(&data_dir, pid, verdict, session) {
-            Ok(sandbox::control::DrainOutcome::Drained(hosts)) if !hosts.is_empty() => {
-                answered.push((pid, hosts))
-            }
-            // A healthy session with nothing parked — nothing to report.
-            Ok(sandbox::control::DrainOutcome::Drained(_)) => {}
-            // A session launched by an older sbx that does not understand `--all` — its requests stay
-            // parked, so name it rather than fold it into a misleading "nothing parked".
-            Ok(sandbox::control::DrainOutcome::Unsupported) => unsupported.push(pid),
-            // A dead/stale socket (the session went away) — skip it.
-            Err(_) => {}
-        }
-    }
+    let (answered, unsupported) = drain_sessions(&data_dir, verdict, session, |pid| {
+        app_pids.as_ref().is_none_or(|pids| pids.contains(&pid))
+    });
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     print!(
         "{}",
@@ -945,14 +983,7 @@ fn render_drain(
     for (pid, hosts) in answered {
         // A per-session header from the registry, so with several agents the user can tell which one
         // each grant belongs to — the cross-agent reach made visible, not silent.
-        match context.iter().find(|(p, _, _)| p == pid) {
-            Some((_, project, label)) => {
-                let _ = writeln!(o, "  {dim}session {pid} [{label}] {}{r}", project.display());
-            }
-            None => {
-                let _ = writeln!(o, "  {dim}session {pid} (unregistered){r}");
-            }
-        }
+        write_session_header(&mut o, *pid, context, pal);
         // One parked request emits one host, so a burst of retries (or several paths) to one
         // destination would print that host once per request. Fold the repeats into `host ×N`.
         for (host, count) in collapse_hosts(hosts) {
@@ -1577,16 +1608,13 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
                         // A session header only when the stream switches sessions, so a single-session
                         // follow does not repeat it every event.
                         if last_pid != Some(pid) {
-                            match &c {
-                                Some((proj, label)) => {
-                                    let _ =
-                                        writeln!(tick, "  {dim}session {pid} [{label}] {proj}{r}");
-                                }
-                                None => {
-                                    let _ =
-                                        writeln!(tick, "  {dim}session {pid} (unregistered){r}");
-                                }
-                            }
+                            write_session_header_line(
+                                &mut tick,
+                                pid,
+                                c.as_ref()
+                                    .map(|(proj, label)| (label.as_str(), proj.as_str())),
+                                pal,
+                            );
                             last_pid = Some(pid);
                         }
                         let _ = writeln!(tick, "{}", render_log_line(e, pid, view, pal));
@@ -1678,20 +1706,7 @@ fn render_logs(
         if events.is_empty() {
             continue;
         }
-        match context.iter().find(|(pid, _, _)| *pid == session.pid) {
-            Some((_, project, label)) => {
-                let _ = writeln!(
-                    o,
-                    "  {dim}session {} [{}] {}{r}",
-                    session.pid,
-                    label,
-                    project.display()
-                );
-            }
-            None => {
-                let _ = writeln!(o, "  {dim}session {} (unregistered){r}", session.pid);
-            }
-        }
+        write_session_header(&mut o, session.pid, context, pal);
         // The ring is bounded; if it evicted older events, say so rather than truncate silently.
         let evicted = snapshot_evicted(&session.snapshot);
         if evicted > 0 {
@@ -3157,14 +3172,7 @@ fn render_inject(
             )
         );
         for pid in loaded {
-            match context.iter().find(|(p, _, _)| p == pid) {
-                Some((_, project, label)) => {
-                    let _ = writeln!(o, "  {dim}session {pid} [{label}] {}{r}", project.display());
-                }
-                None => {
-                    let _ = writeln!(o, "  {dim}session {pid} (unregistered){r}");
-                }
-            }
+            write_session_header(&mut o, *pid, context, pal);
         }
         // The rule is live-only, never written to config — so plain `sbx net rules` (the config
         // policy) will not show it. Point at where it *is* visible.
@@ -3282,30 +3290,18 @@ fn net_pending_drain_and_save(
         .map(|canon| session_pids_for_project(&data_dir, canon));
 
     let context = pending_session_context(&data_dir);
-    let mut answered: Vec<(u32, Vec<String>)> = Vec::new();
-    let mut hosts: Vec<String> = Vec::new();
-    let mut unsupported: Vec<u32> = Vec::new();
-    for pid in sandbox::control::session_pids(&data_dir) {
-        if app_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
-            continue;
-        }
-        if project_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
-            continue;
-        }
-        match sandbox::control::drain_session(&data_dir, pid, verdict, session) {
-            Ok(sandbox::control::DrainOutcome::Drained(answered_hosts))
-                if !answered_hosts.is_empty() =>
-            {
-                hosts.extend(answered_hosts.iter().cloned());
-                answered.push((pid, answered_hosts));
-            }
-            Ok(sandbox::control::DrainOutcome::Drained(_)) => {}
-            // A session launched by an older sbx that does not understand `--all` — nothing was
-            // answered, so nothing is saved for it either; name it so the user knows why.
-            Ok(sandbox::control::DrainOutcome::Unsupported) => unsupported.push(pid),
-            Err(_) => {}
-        }
-    }
+    // Both filters must pass: `--app` and `--local` compose rather than override, so a session is
+    // drained only when every active scope accepts it.
+    let (answered, unsupported) = drain_sessions(&data_dir, verdict, session, |pid| {
+        app_pids.as_ref().is_none_or(|p| p.contains(&pid))
+            && project_pids.as_ref().is_none_or(|p| p.contains(&pid))
+    });
+    // The flat host list the rule-writing below dedupes, derived from what was answered rather
+    // than accumulated a second time, so the two can never disagree about order.
+    let hosts: Vec<String> = answered
+        .iter()
+        .flat_map(|(_, h)| h.iter().cloned())
+        .collect();
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let total: usize = answered.iter().map(|(_, h)| h.len()).sum();
