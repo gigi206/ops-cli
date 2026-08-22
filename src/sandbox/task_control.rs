@@ -1209,7 +1209,13 @@ fn ask_host(socket: &Path, command: &str) -> io::Result<Vec<String>> {
     Ok(text.lines().map(str::to_string).collect())
 }
 
-/// Read one session's invocation log, host-side. The counterpart of [`serve_host`]; it only reads.
+/// The raw `LOG` reply, line by line — for the tests that assert on the **wire format itself**.
+///
+/// Not a reader for anything else. Every consumer of the log goes through [`read_entries`], which
+/// parses with [`LogEntry::from_line`], the function [`LogEntry::to_line`] is round-tripped
+/// against. A second hand-rolled reader is the drift that round-trip cannot catch: it does not fail
+/// loudly, it drops entries or files them wrongly, in the record whose whole job is to miss nothing.
+#[cfg(test)]
 pub(crate) fn read_log(socket: &Path) -> io::Result<Vec<String>> {
     ask_host(socket, "LOG")
 }

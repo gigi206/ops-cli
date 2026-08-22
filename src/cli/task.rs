@@ -1344,38 +1344,46 @@ fn task_logs(args: &[OsString]) -> ExitCode {
         Ok(p) => p,
         Err(code) => return code,
     };
-    let lines = match gather(&planes, "logs", |p| {
-        sandbox::task_control::read_log(&p.socket)
+    // Read through the typed reader the writer is pinned against, never by re-parsing the wire:
+    // `LogEntry::to_line`/`from_line` are round-tripped by a test, and a second hand-rolled reader
+    // is exactly the drift that test cannot catch — it would drop entries, or file them wrongly, in
+    // the record whose whole job is to miss nothing.
+    let dropped: std::cell::RefCell<Vec<(String, u64)>> = std::cell::RefCell::new(Vec::new());
+    let entries = match gather(&planes, "logs", |p| {
+        let (entries, _head, fell_out) = sandbox::task_control::read_entries(&p.socket, None)?;
+        if fell_out > 0 {
+            dropped.borrow_mut().push((p.cell(), fell_out));
+        }
+        Ok(entries)
     }) {
-        Ok(lines) => lines,
+        Ok(entries) => entries,
         Err(code) => return code,
     };
     for plane in &planes {
         plane.announce();
     }
+    for (session, fell_out) in dropped.borrow().iter() {
+        diag::warn(&format!(
+            "{fell_out} older invocation(s) fell out of session {session}'s log ring"
+        ));
+    }
     let mut rows = Vec::new();
     let mut sessions = Vec::new();
-    for (session, line) in &lines {
-        if let Some(dropped) = line.strip_prefix("dropped=") {
-            diag::warn(&format!(
-                "{dropped} older invocation(s) fell out of session {session}'s log ring"
-            ));
-            continue;
-        }
+    for (session, entry) in &entries {
         // An id or an operation name, the same way `status` and `stop` take either — the id in a
         // result is what a reader has in front of them, and the log is where a finished invocation
-        // went. The id is the first cell and the operation the third; narrowing here rather than in
-        // the log keeps the wire one shape and the filter one place.
-        let Some(row) = log_row(line) else { continue };
+        // went. Narrowing here rather than in the log keeps the wire one shape and the filter one
+        // place; asking the entry rather than its rendered cells is what lets the filter say `seq
+        // 0 matches nothing` directly, since no invocation stands behind such an entry.
         let keeps = match listing.operation.as_deref() {
             None => true,
-            Some(target) => match target.parse::<u64>().is_ok() {
-                true => row.first().map(String::as_str) == Some(target),
-                false => row.get(2).map(String::as_str) == Some(target),
+            Some(target) => match target.parse::<u64>() {
+                Ok(id) => entry.seq != 0 && entry.seq == id,
+                Err(_) => entry.task == target,
             },
         };
         if keeps {
-            rows.push(row);
+            rows.push(log_row(entry));
             sessions.push(session.clone());
         }
     }
@@ -1415,72 +1423,54 @@ fn task_logs(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// One recorded invocation as a table row, or `None` for a line that is not an event.
+/// One recorded invocation as a table row.
 ///
-/// The refusal reason is free text and always last, so it is split off *before* the fixed fields are
-/// read — a reason containing a space (most of them do) would otherwise be parsed as more fields.
-fn log_row(line: &str) -> Option<Vec<String>> {
-    let event = line.strip_prefix("event ")?;
-    let (head, refused) = match event.split_once(" refused=") {
-        Some((head, reason)) => (head, Some(reason)),
-        None => (event, None),
-    };
-    let fields: BTreeMap<&str, &str> = head
-        .split_whitespace()
-        .filter_map(|f| f.split_once('='))
-        .collect();
-    let get = |key: &str| fields.get(key).copied().unwrap_or_default();
-    let flag = |key: &str| get(key) == "1";
-
+/// Takes the typed entry, not the wire line: the refusal reason is free text and always last on the
+/// wire, and reading it back by hand is what let a reason containing a space be parsed as more
+/// fields. [`sandbox::task_control::LogEntry::from_line`] owns that rule for every reader.
+fn log_row(e: &sandbox::task_control::LogEntry) -> Vec<String> {
     // What is worth saying about an invocation beyond its exit code — a refusal first, since then
     // nothing ran and the other fields describe nothing.
-    let note = match refused {
+    let note = match &e.refused {
         Some(reason) => format!("refused: {reason}"),
         None => {
             let mut notes = Vec::new();
             // First, because it says who was there to see the rest: nobody waited for this one, so
             // whatever it printed went to the result ring rather than to a terminal.
-            if flag("detached") {
+            if e.detached {
                 notes.push("detached".to_string());
             }
-            if flag("stopped") {
+            if e.stopped {
                 notes.push("stopped".to_string());
             }
-            if flag("timed_out") {
+            if e.timed_out {
                 notes.push("timed out".to_string());
             }
-            if flag("truncated") {
+            if e.truncated {
                 notes.push("output truncated".to_string());
             }
-            match get("redacted").parse::<usize>() {
-                Ok(n) if n > 0 => notes.push(format!("{n} credential value(s) substituted")),
-                _ => {}
+            if e.redacted > 0 {
+                notes.push(format!("{} credential value(s) substituted", e.redacted));
             }
             notes.join(", ")
         }
     };
-    Some(vec![
-        match get("seq") {
+    vec![
+        match e.seq {
             // The one entry no invocation stands behind: refused before it was ever admitted.
-            "0" => NONE.to_string(),
+            0 => NONE.to_string(),
             seq => seq.to_string(),
         },
-        get("at")
-            .parse::<u128>()
-            .map(|v| crate::format_log_time(sandbox::task_control::epoch_ms(v)))
-            .unwrap_or_else(|_| NONE.to_string()),
-        get("task").to_string(),
-        match refused.is_some() {
+        crate::format_log_time(sandbox::task_control::epoch_ms(e.at_epoch_ms)),
+        e.task.clone(),
+        match e.refused.is_some() {
             // A refusal's `-1` is a sentinel, not an exit code; the note already says what happened.
             true => NONE.to_string(),
-            false => get("exit").to_string(),
+            false => e.exit.to_string(),
         },
-        get("elapsed_ms")
-            .parse()
-            .map(format_elapsed)
-            .unwrap_or_else(|_| NONE.to_string()),
+        format_elapsed(e.elapsed_ms),
         note,
-    ])
+    ]
 }
 
 /// What every listing verb takes: which operation to narrow to, and which session to ask.
@@ -1755,11 +1745,16 @@ mod tests {
     /// last — is not mistaken for more fields.
     #[test]
     fn a_log_line_becomes_a_row_and_its_reason_survives_its_spaces() {
+        // The wire strings stay here and are read by the one reader the writer is pinned against,
+        // so this keeps testing the format end to end rather than a second parser's idea of it.
+        let entry = |line: &str| sandbox::task_control::LogEntry::from_line(line);
         let ran = log_row(
-            "event seq=4 cur=1 at=1785445489000 exit=137 redacted=2 truncated=0 timed_out=0 \
-             stopped=1 elapsed_ms=3021 task=slow-count",
-        )
-        .expect("an event is a row");
+            &entry(
+                "event seq=4 cur=1 at=1785445489000 exit=137 redacted=2 truncated=0 timed_out=0 \
+                 stopped=1 elapsed_ms=3021 task=slow-count",
+            )
+            .expect("an event parses"),
+        );
         assert_eq!(ran[0], "4");
         // `at=` is epoch milliseconds, as every feed's stamp is. Read as seconds it would land tens
         // of thousands of years out, so pinning that it renders a time of day at all is what keeps
@@ -1775,11 +1770,13 @@ mod tests {
         );
 
         let refused = log_row(
-            "event seq=0 cur=2 at=1785445489000 exit=-1 redacted=0 truncated=0 timed_out=0 \
-             stopped=0 elapsed_ms=0 task=db-query refused=parameter `sql` does not match its \
-             declared pattern",
-        )
-        .expect("a refusal is a row too");
+            &entry(
+                "event seq=0 cur=2 at=1785445489000 exit=-1 redacted=0 timed_out=0 truncated=0 \
+                 stopped=0 elapsed_ms=0 task=db-query refused=parameter `sql` does not match its \
+                 declared pattern",
+            )
+            .expect("a refusal parses too"),
+        );
         assert_eq!(ran.len(), refused.len(), "one shape for every row");
         assert_eq!(refused[0], NONE, "nothing was admitted, so no id names it");
         assert_eq!(refused[3], NONE, "and -1 is a sentinel, not an exit code");
@@ -1788,7 +1785,7 @@ mod tests {
             "the reason keeps its spaces"
         );
 
-        assert!(log_row("ok").is_none(), "only events are rows");
+        assert!(entry("ok").is_none(), "only events are entries");
     }
 
     /// `ls` is the word this product uses for what is live (`sbx session ls`), so the inventory says
