@@ -1,3 +1,7 @@
+---
+description: "The importable starter profiles in the repository, what each one launches, and what it requires."
+---
+
 # Profile catalog
 
 The repository's `examples/app/` directory ships **71 importable

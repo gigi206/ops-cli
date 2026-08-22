@@ -1,3 +1,7 @@
+---
+description: "Vouch for a project config's current contents, so its security fields are honored until the file changes."
+---
+
 # `sbx trust`
 
 ```

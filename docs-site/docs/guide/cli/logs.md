@@ -1,3 +1,7 @@
+---
+description: "One running session's feeds in a single column of time, including the two plugin feeds."
+---
+
 # `sbx logs`
 
 ```

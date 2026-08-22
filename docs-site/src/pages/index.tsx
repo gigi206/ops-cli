@@ -1385,7 +1385,7 @@ export default function Home(): ReactNode {
               <div data-reveal data-delay="120">
                 <p className="home__aside home__aside--lead">
                   Resolvers are the open-ended half, installed as plugins from{' '}
-                  <Link to="/docs/secrets/stores">signed stores</Link>, as are the signers
+                  <Link to="/docs/plugins/stores">signed stores</Link>, as are the signers
                   that form a credential per request and the brokers that stand in front of a
                   host socket. The one that puts a header on the wire stays first-party.
                 </p>

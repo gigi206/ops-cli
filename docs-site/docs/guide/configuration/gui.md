@@ -1,3 +1,8 @@
+---
+sidebar_label: "gui"
+description: "The display posture: whether and how a cage reaches a Wayland compositor."
+---
+
 # `gui`: the display posture
 
 The sandbox's GUI posture: what a cage that draws is given. The three postures are

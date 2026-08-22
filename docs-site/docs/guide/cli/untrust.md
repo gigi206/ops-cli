@@ -1,3 +1,7 @@
+---
+description: "Revoke a config's trust, so its security fields stop applying until it is trusted again."
+---
+
 # `sbx untrust`
 
 ```

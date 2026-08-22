@@ -1,3 +1,8 @@
+---
+sidebar_label: "[task]"
+description: "The field reference for a declared operation: every key of a `[task.<name>]` table."
+---
+
 # `[task]`: declared operations
 
 A **declared operation** is a fixed command sbx runs *on a caller's behalf*, in an ephemeral sibling

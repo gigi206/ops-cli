@@ -3,8 +3,9 @@
 # Triggered on every push to `main` and `ops-v2`, and on every `v*` tag, so the
 # published documentation always matches the shipping release.
 #
-# The build is the same as `mise run docs-build` (docusaurus build + pagefind),
-# so broken links, missing anchors and markdown errors fail here exactly as they
+# The build is the same as `mise run docs-build` (check-docs + docusaurus build +
+# pagefind), so broken links, missing anchors, a page nothing links to, a stale
+# imported recipe and markdown errors fail here exactly as they
 # do locally. The static output is uploaded with `actions/upload-pages-artifact`
 # and deployed with `actions/deploy-pages`.
 
@@ -50,6 +51,12 @@ jobs:
 
       - name: Install the docs-site dependencies
         run: npm ci
+
+      # Also run by `npm run build` as its prebuild step; named here so a stale
+      # generated page or a page nothing links to reads as its own failed step
+      # rather than as a build that died before webpack started.
+      - name: Check the docs navigation and the imported recipes
+        run: npm run check-docs
 
       - name: Build the static site (+ pagefind search index)
         run: npm run build

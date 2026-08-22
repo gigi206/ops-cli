@@ -1,8 +1,13 @@
+---
+sidebar_label: "[broker]"
+description: "Binding a broker plugin in front of a host resource, so the cage uses it without ever holding it."
+---
+
 # `[broker]`: putting a plugin in front of a host resource
 
 `[ssh_agent]` fences one protocol with code `sbx` ships. `[broker.<name>]` does the same
 for a protocol it does not implement, by putting an installed
-[broker plugin](../secrets/plugins#the-broker-type) between the cage and a host socket.
+[broker plugin](../plugins/broker) between the cage and a host socket.
 
 ```toml
 # global config only: which host resource is being brokered
@@ -22,7 +27,7 @@ one. The plugin answers a verdict and holds nothing: no listening socket, no net
 access to the resource. What it can grant is therefore bounded by what binding the host
 socket into the cage would have granted, and it exists to grant far less.
 
-See also: [Broker plugins](../secrets/plugins#the-broker-type) ·
+See also: [Broker plugins](../plugins/broker) ·
 [`[ssh_agent]`](ssh-agent) · [The trust gate](../concepts/trust) ·
 [Secrets](../secrets/).
 
@@ -251,7 +256,7 @@ a manifest that declares `at_host_path` needs no `cage_env` at all.
 
 ## Giving a resolver plugin the fence
 
-A [resolver plugin](../secrets/plugins) can be put behind a broker instead of being handed
+A [resolver plugin](../plugins/) can be put behind a broker instead of being handed
 the host resource. This is the one grant in `sbx` that only ever **takes something away**:
 
 ```toml

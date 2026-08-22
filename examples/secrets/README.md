@@ -1,82 +1,39 @@
 # Secrets — injecting credentials without letting them into the cage
 
-One provider per subdirectory. What is common to all of them lives **here**;
-each provider's page only carries what is specific to it (host, variable, its
-motivation, how to verify against *that* service). Read this page first.
+One provider per subdirectory, each carrying what is specific to it: the host, the
+variable, why you would want it, and how to verify against *that* service. What they
+all share is not repeated here, it is linked below.
 
-## The invariant
+## The mechanics live in the guide
 
-A cage inherits exactly `TERM`, `LANG`, `LC_ALL` from the host — a token set in
-your shell is correctly invisible inside the sandbox, on purpose. The real key
-is read **host-side** by sbx and injected by the filtering egress proxy **on
-the wire** into the matching outbound request; the agent at most sees the
-request it was going to make anyway, with no token anywhere in its environment
-or filesystem. A credential therefore belongs in `[secret]`, **not** in `[env]`
-(which is visible inside the cage).
+Everything these recipes share — the never-in-cage invariant, the shape of a `[secret]`
+block, the `bearer`/`basic`/`raw` value types, the filtering posture injection needs,
+what happens when a source produces nothing, and how to scope a declaration to one app
+— is documented once, in the guide:
 
-## The block
+- **[Secrets](https://gigi206.github.io/ops-cli/docs/secrets/)** — the model: resolver ×
+  broker, and what the invariant does and does not cover.
+- **[`[secret]`](https://gigi206.github.io/ops-cli/docs/configuration/secret)** — the
+  field reference: every key of the block below.
+- **[Give an agent a credential it can use but never read](https://gigi206.github.io/ops-cli/docs/how-to/inject-a-credential)**
+  — the same six steps as these recipes, walked once end to end.
 
-Every provider page here is a `[secret]` table keyed by the **destination
-host** — the section name *is* the destination:
+The block every page here declares:
 
 ```toml
 [secret."<host>"]
-from   = "env://<VARIABLE_NAME>"
-header = "Authorization"
-type   = "bearer"
+from   = "env://<VARIABLE_NAME>"   # resolved host-side; never inside the cage
+header = "Authorization"           # the header the proxy sets on the request
+type   = "bearer"                  # bearer | basic | raw
 ```
 
-| Line | Meaning |
-|---|---|
-| `[secret."<host>"]` | the section is the destination host; a credential bound to exactly that host (a wildcard is rejected as an injection target) |
-| `from = "env://<VARIABLE_NAME>"` | the **source**: resolved host-side from sbx's own environment, never inside the cage |
-| `header = "<name>"` | the header the proxy sets on the matching outbound request |
-| `type = "bearer"` | how to shape the value (below) |
+Two things worth repeating because a recipe fails silently without them: injection is
+done by the egress proxy, so the cage needs a **filtering posture** (`deny`/`allow`/`ask`)
+whose allowlist reaches the host; and a credential belongs in `[secret]`, never in
+`[env]`, which *is* visible inside the cage.
 
-The `header` and `type` are the only two things that vary per provider —
-look at the provider page for which set to use.
-
-## The `type` shapes
-
-| `type` | Header value | Use when |
-|---|---|---|
-| `bearer` | `Authorization: Bearer <token>` | the service accepts a token in `Authorization` (most providers) |
-| `basic` | `Authorization: Basic <base64(user:pass)>` | the credential is a `user:pass` pair (sbx base64-encodes it — the agent never pre-encodes) |
-| `raw` | `<header>: <token>` | a non-`Authorization` header or a non-standard scheme (`token `, `ApiKey `, … via `prefix`) |
-
-`header` and `type` are required — sbx refuses a secret that names neither
-rather than silently defaulting. sbx's value is **authoritative**: any
-client-supplied copy of the header is stripped and replaced.
-
-## When it injects (and what sbx refuses to do)
-
-Injection is performed by the filtering egress proxy, so it is **effective
-only** under a **filtering network posture** (`deny`/`allow`/`ask`); under
-`shared`/`none` there is no proxy on the wire and the `[secret]` injects
-nothing. The destination must also be reachable under the cage's egress
-allowlist — each provider page states its host.
-
-If the source cannot produce a value (`env://` variable unset, …) sbx **fails
-closed**: the launch is refused naming the source, never sent unauthenticated.
-
-## Scoping it deliberately
-
-Injection keys a request *as you* within what the cage's egress allowlist
-already permits. Declared in the global `sbx.toml`, every cage that can reach
-the host gets its requests authenticated as you; declared under
-`[app.<name>.secret]`, the block stays that one app's. Egress remains an
-allowlist either way.
-
-## Verifying
-
-```sh
-sbx config show            # "secrets: N injected host-side" (values never shown)
-sbx config show --details  # each credential by destination host and source
-sbx secret list            # inventory, by name and destination
-```
-
-Plus, from inside a cage, call an authenticated endpoint of the service — each
-provider page says which one to read and what proves the header arrived.
+These examples deliberately use `env://` only. `file://`, `sops://` and the resolver
+plugins are in [Resolvers](https://gigi206.github.io/ops-cli/docs/secrets/resolvers).
 
 ## Providers
 
@@ -125,7 +82,6 @@ provider page says which one to read and what proves the header arrived.
 | [Z.AI](zai/) | `api.z.ai/api/paas/v4/*` · `/api/coding/paas/v4/*` | `env://ZHIPU_API_KEY` | `Authorization` / `bearer` |
 | [ZhipuAI](zhipuai/) | `open.bigmodel.cn/api/paas/v4/*` | `env://ZHIPU_API_KEY` | `Authorization` / `bearer` |
 
-Other secret sources exist than `env://` (`file://`, `sops://`, resolver
-plugins) — these examples deliberately use `env://` only. See the full
-reference: [`[secret]`](../../docs-site/docs/guide/configuration/secret.md)
-and [injection](../../docs-site/docs/guide/secrets/injection.md).
+Each page above is published as well, under
+[Provider recipes](https://gigi206.github.io/ops-cli/docs/secrets/providers/): the site
+generates that section from these files, so the two never disagree.

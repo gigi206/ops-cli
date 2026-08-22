@@ -1,3 +1,8 @@
+---
+sidebar_label: "Injection"
+description: "The SINK layer: how a resolved credential lands on an outbound request as a header, and what sbx refuses to do."
+---
+
 # Injection: the HTTP-header broker
 
 A **broker** is the SINK half of a secret: it consumes the resolved plaintext
@@ -145,7 +150,7 @@ mean launching a sandboxed plugin:
 A `401` from a host carrying no injection is never a signal. Otherwise any
 allowed destination, including one the agent chose, could drive the resolver.
 
-A credential formed by a [signer plugin](plugins#the-signer-type) is not
+A credential formed by a [signer plugin](../plugins/signer) is not
 refreshed at all: there is no token to renew, only a key the plugin computes
 with, so a `401` from its destination says nothing a re-resolution could fix. It
 also survives a re-resolution triggered by some *other* declaration's `401`: the

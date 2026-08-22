@@ -1,3 +1,7 @@
+---
+description: "What each exit status means, and which of them a script may branch on."
+---
+
 # Exit codes
 
 `sbx` follows conventional Unix exit-code semantics.

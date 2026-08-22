@@ -1,3 +1,7 @@
+---
+description: "The complete task-oriented documentation for sbx, a sandbox launcher for tools and encapsulated AI agents."
+---
+
 # sbx: user guide
 
 `sbx` is a **sandbox launcher**: a single static Rust binary that runs tools, including **encapsulated AI agents**, inside a [bubblewrap](https://github.com/containers/bubblewrap)
@@ -9,12 +13,14 @@ cross-linked pages so you can start anywhere and follow the links. Each subsyste
 carries its own rationale and its own limits; what cuts across all of them is gathered in
 [Decisions and limits](concepts/decisions).
 
-> New to `sbx`? Start with [What sbx is](concepts/overview), then
+> New to `sbx`? Start with [What sbx is](concepts/), then
 > [Quick start](getting-started/quickstart).
 
 ---
 
 ## Getting started
+
+[The section](getting-started/) in four pages:
 
 - [Installation](getting-started/installation): build the static binary, or a dev build.
 - [Quick start](getting-started/quickstart): your first sandboxed command in five minutes.
@@ -23,7 +29,7 @@ carries its own rationale and its own limits; what cuts across all of them is ga
 
 ## How-to
 
-Task-oriented walkthroughs, commands in order, from nothing to a working setup.
+Task-oriented walkthroughs, commands in order, from nothing to a working setup: [all six](how-to/).
 
 - [Run an agent on an untrusted project](how-to/run-agent-safely): launch first, declare
   tools, shape the egress posture, keep credentials out of the cage, vouch last.
@@ -31,10 +37,16 @@ Task-oriented walkthroughs, commands in order, from nothing to a working setup.
   pins, deliberate upgrades, reclaiming space.
 - [Restrict what a tool reaches](how-to/restrict-network): modes, rule grammar,
   learning the rule set live, proving it before a launch.
+- [Give an agent a credential it can use but never read](how-to/inject-a-credential):
+  a `[secret]` block from nothing to a verified injection.
+- [Run an agent in the background and check on it](how-to/background-agent): `--detach`,
+  the four observation feeds, attach, stop.
+- [Choose the tools an agent cage needs](how-to/recommended-tools): the recommended set
+  and where to declare each tier.
 
 ## Concepts
 
-- [What sbx is (and is not)](concepts/overview): the reference class, the two actor modes.
+- [What sbx is (and is not)](concepts/): the reference class, the two actor modes.
 - [Architecture](concepts/architecture): the map: the boundary, the launch pipeline, the control planes, the plugin chain.
 - [Security model](concepts/security-model): same-uid, confidentiality by absence, the bind layout.
 - [Decisions and limits](concepts/decisions): what sbx does not do, and what would reopen each structural choice.
@@ -78,10 +90,31 @@ Task-oriented walkthroughs, commands in order, from nothing to a working setup.
 - [Injection](secrets/injection): the http-header broker.
 - [Redaction](secrets/redaction): the outbound and inbound tripwires.
 - [OAuth sessions](secrets/oauth): taking the token out of the cage.
-- [Plugins](secrets/plugins): third-party resolvers, brokers and signers.
-- [Signed plugin stores](secrets/stores): distributing and installing them from a verified remote.
+- [Plugins](plugins/): third-party resolvers, brokers and signers.
+- [Signed plugin stores](plugins/stores): distributing and installing them from a verified remote.
+
+## Plugins
+
+The three plugin kinds, [as a section](plugins/): what each may do, and what none of
+them can.
+
+- [The resolver type](plugins/resolvers): a new `scheme://` a secret's `from` routes to,
+  the execution contract, and the published resolvers.
+- [The `plugin.toml` manifest](plugins/manifest): the field reference all three types
+  share, and the `[sandbox]` grant that bounds each.
+- [`[plugin.<name>]`](plugins/configuring): what this machine supplies to an installed
+  plugin.
+- [The broker type](plugins/broker): standing in front of a host socket the cage never
+  holds.
+- [The signer type](plugins/signer): forming a credential that depends on the request.
+- [Managing plugins](plugins/managing): installing, the registry, drift detection,
+  scheme conflicts, tests.
+- [Signed plugin stores](plugins/stores): distributing and installing from a verified
+  remote.
 
 ## Housekeeping
+
+[The section](housekeeping/), three operations over a project's lifetime:
 
 - [Sessions](housekeeping/sessions): `ls`, `attach`, `stop`, and `--detach`.
 - [Garbage collection](housekeeping/gc): `sbx gc`.
@@ -94,6 +127,7 @@ navbar entry: they are for looking things up, not reading through.
 
 - [Configuration overview](configuration/): layering, the trust gate, free vs security fields.
 - [`env`](configuration/env): extra environment variables (a free field).
+- [`timezone`](configuration/timezone): the cage's clock (a free field).
 - [`binds`](configuration/binds): extra host paths, read-only or read-write.
 - [`packages`](configuration/packages): tools by backend: `nix:` / `mise:` / `flake:`.
 - [`[tools]` (mise)](configuration/tools): a project's mise toolchain, auto-equipped in-cage.
@@ -108,11 +142,16 @@ navbar entry: they are for looking things up, not reading through.
 - [`dbus`](configuration/dbus): a private in-cage desktop portal (file chooser + theme + notifications).
 - [`network`](configuration/network): the egress posture (links to [Networking](networking/)).
 - [`[proc]`](configuration/proc): observe or block what the agent execs (trusted-only).
+- [`[fs]`](configuration/fs): close a project path off inside the cage (the one ungated field).
+- [`[service]`](configuration/service): what else runs in the cage alongside the command.
+- [`[open]`](configuration/open): what a link opens with, inside the cage.
+- [`[broker.<name>]`](configuration/broker): putting a plugin in front of a host resource.
 - [`[notify]`](configuration/notify): be told when something was blocked (trusted-only).
 - [`[secret]`](configuration/secret): credential injection (links to [Secrets](secrets/)).
 - [`[task.<name>]`](configuration/task): the field reference for a declared operation,
   trusted-only (links to [Declared operations](tasks/)).
 - [`[app.<name>]`](configuration/apps): named launch profiles (links to [Apps](apps/)).
+- [`[plugin.<name>]`](plugins/configuring): what this machine supplies to an installed plugin.
 - [`[network.groups]`](networking/groups): reusable egress groups.
 - [`[bundle.<name>]`](configuration/bundles): reusable tool bundles an app names with `use`.
 - [One-shot overrides](configuration/overrides): `--config`/`--env`/`--net`/… and `SBX_*`.
@@ -139,15 +178,21 @@ navbar entry: they are for looking things up, not reading through.
 | [`plugins`](cli/plugins) | manage resolver plugins and plugin stores |
 | [`projects`](cli/projects) | list and remove the per-project runtime trees |
 | [`session`](cli/session) | list, attach to, and stop the live sessions |
-| [`trust` / `untrust`](cli/trust) | vouch for a project config |
+| [`trust`](cli/trust) | vouch for a project config |
 | [`config`](cli/config) | inspect and edit the configuration |
 | [`upgrade`](cli/upgrade) | roll managed toolchains forward |
 | [`gc`](cli/gc) | reclaim per-project store space |
 | [`storage`](cli/storage) | manage a compressed, self-growing volume for the data directory |
 | [`store`](cli/store) | report what sbx occupies on disk |
 | [`path`](cli/path) | where the config, data, and state roots live |
+| [`logs`](cli/logs) | the launch's own structured feeds, including the plugin ones |
+| [`completion`](cli/completion) | the shell completion scripts |
+| [`untrust`](cli/untrust) | withdraw a project's vouch |
+| [`version`](cli/version) | the binary's version |
 
 ## Reference
+
+[The section](reference/), three lookup tables that belong to no single subsystem:
 
 - [Environment variables](reference/environment-variables): `SBX_*` and the cage environment.
 - [Exit codes](reference/exit-codes): what each exit status means.

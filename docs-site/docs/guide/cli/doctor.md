@@ -1,3 +1,7 @@
+---
+description: "Verify the runtime prerequisites, and report the store location and channel revision."
+---
+
 # `sbx doctor`
 
 ```

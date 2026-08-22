@@ -5,6 +5,9 @@
   "scripts": {
     "docusaurus": "docusaurus",
     "start": "docusaurus start",
+    "import-examples": "node scripts/import-examples.mjs",
+    "check-docs": "node scripts/import-examples.mjs --check && node scripts/check-navigation.mjs",
+    "prebuild": "npm run check-docs",
     "build": "docusaurus build",
     "postbuild": "pagefind --site build",
     "clear": "docusaurus clear",

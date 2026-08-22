@@ -1,3 +1,8 @@
+---
+sidebar_label: "Run an agent safely"
+description: "Launch first, declare tools, shape the egress posture, keep credentials out of the cage, and vouch last."
+---
+
 # Run an agent on an untrusted project, safely
 
 The goal: an AI agent works inside this project with the tools it needs, reaches only

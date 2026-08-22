@@ -1,3 +1,8 @@
+---
+sidebar_label: "packages"
+description: "Tools provisioned into the cage, declared by backend: `nix:`, `mise:`, `flake:` and the prebuilt resolvers."
+---
+
 # `packages`: tools by backend
 
 Tools to provision into the sandbox, declared as `name = "<backend>:<locator>"`.
@@ -512,7 +517,7 @@ sbx config edit --trust               # opens $EDITOR; re-trusts on save
 Trusted-only says **who may declare** a tool. It says nothing about **what proves the artefact came
 from its publisher**, and the two are worth keeping apart.
 
-One provisioning path in `sbx` carries a real signature: the [plugin catalogue](../secrets/plugins)
+One provisioning path in `sbx` carries a real signature: the [plugin catalogue](../plugins/)
 is signed and verified fail-closed, so an absent or wrong signature refuses the install. The tool
 backends do not, and each stops at a different place:
 
@@ -634,7 +639,7 @@ the signature and the fingerprint in it, so a repository that was already hostil
 the pin buys is everything after: each later resolve, and every `sbx upgrade deb`, has to present a
 signature by that same key. A repository that is re-keyed, or an index served by somebody else, is
 **refused** rather than resolved. It is the trust model `sbx` already applies to a
-[signed plugin store](../secrets/stores), for the same reason.
+[signed plugin store](../plugins/stores), for the same reason.
 
 Two behaviours are worth knowing before you meet them.
 

@@ -1,3 +1,8 @@
+---
+sidebar_label: "Overview"
+description: "How `.sbx.toml` is layered and trusted, the split between free and security fields, and a map of every field."
+---
+
 # Configuration overview
 
 A project is configured by an optional `.sbx.toml` in its root. There is also a
@@ -95,11 +100,14 @@ The global config and imported app profiles are **trusted by location**; a proje
 | `[proc]` | security | [proc](proc) |
 | `forward` | security | [forward](../networking/forward) |
 | `[notify]` | security | [notify](notify) |
+| `[service]` | security | [service](service) |
+| `[open]` | security | [open](open) |
+| `[broker.<name>]` | security (global-only) | [broker](broker) |
 | `[secret]` | security | [secret](secret) |
 | `[redact]` | security | [redaction](../secrets/redaction#the-length-floor) |
 | `[task.<name>]` | security | [task](task), and [Declared operations](../tasks/) |
 | `[app.<name>]` | security overlay | [apps](apps) |
-| `[plugin.<name>]` | security | [resolver plugins](../secrets/plugins#configuring-a-plugin-from-your-own-config) |
+| `[plugin.<name>]` | security | [`[plugin.<name>]`](../plugins/configuring) |
 | `[network.groups]` | security (global-only) | [Egress groups](../networking/groups) |
 | `[bundle.<name>]` | security (global-only) | [bundles](bundles) |
 | `use` | security | [bundles](bundles) |

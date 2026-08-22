@@ -1,3 +1,8 @@
+---
+sidebar_label: "Inbound forwarding"
+description: "Reaching a port inside the cage from the host, under an empty network namespace."
+---
+
 # Inbound loopback forwarding: `forward`
 
 A cage runs in an **empty network namespace** (Model B): its `127.0.0.1` is *its own*

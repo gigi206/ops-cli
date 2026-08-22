@@ -1,3 +1,7 @@
+---
+description: "Observe, and under `[proc]` enforcement block, what a running sandbox executes inside its cage."
+---
+
 # `sbx proc`
 
 ```

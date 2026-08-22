@@ -1,3 +1,8 @@
+---
+sidebar_label: "[proc]"
+description: "The process and exec lens: observing what the agent runs, and blocking it."
+---
+
 # `[proc]`: process/exec observation and enforcement
 
 ```toml

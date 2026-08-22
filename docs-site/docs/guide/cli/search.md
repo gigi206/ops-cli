@@ -1,3 +1,7 @@
+---
+description: "Discover `nix:` tools through nixhub, before declaring one in `packages`."
+---
+
 # `sbx search`
 
 ```

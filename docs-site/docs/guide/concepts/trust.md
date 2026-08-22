@@ -1,3 +1,7 @@
+---
+description: "The content-hash trust gate on a project's config, and the split between free fields and security fields."
+---
+
 # The trust gate
 
 Security-relevant fields in a project's `.sbx.toml` apply only once you have

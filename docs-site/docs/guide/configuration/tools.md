@@ -1,3 +1,8 @@
+---
+sidebar_label: "[tools]"
+description: "Honoring a project's mise configuration as its per-project dev toolchain, auto-equipped at launch."
+---
+
 # `[tools]`: a project's mise toolchain
 
 `sbx` honors a project's [mise](https://mise.jdx.dev/) configuration

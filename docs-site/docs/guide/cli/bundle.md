@@ -1,3 +1,7 @@
+---
+description: "List, export and import the reusable tool bundles an app names with `use`."
+---
+
 # `sbx bundle`
 
 ```

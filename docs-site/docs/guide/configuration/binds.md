@@ -1,3 +1,8 @@
+---
+sidebar_label: "binds"
+description: "Extra host paths exposed inside the cage, read-only by default or read-write with the table form."
+---
+
 # `binds`: extra host paths
 
 Extra host paths to expose inside the sandbox, **read-only by default**, or

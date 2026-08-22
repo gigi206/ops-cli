@@ -1,3 +1,7 @@
+---
+description: "The park-and-confirm posture: a request waits while you decide, and the answer can be remembered."
+---
+
 # Ask mode
 
 `ask` is the **park-and-confirm** [egress posture](modes#ask). It is the

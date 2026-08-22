@@ -1,3 +1,7 @@
+---
+description: "Reclaim the space sbx's per-project nix stores leave behind."
+---
+
 # `sbx gc`
 
 ```

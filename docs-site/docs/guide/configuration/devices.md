@@ -1,3 +1,8 @@
+---
+sidebar_label: "[devices]"
+description: "Exposing a host device node inside the otherwise minimal `/dev` a cage carries."
+---
+
 # `[devices]`: exposing host device nodes
 
 Every cage gets a **minimal, hostless `/dev`**: `null`, `zero`, `full`, `random`,

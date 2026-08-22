@@ -1,3 +1,8 @@
+---
+sidebar_label: "gpu"
+description: "Hardware-accelerated rendering inside the cage, on Intel, AMD and nouveau."
+---
+
 # `gpu`: hardware-accelerated GPU rendering
 
 A hermetic cage carries no GPU driver, no `/sys` (which the driver reads to enumerate a

@@ -1,3 +1,7 @@
+---
+description: "Every variable sbx reads on the host, and every one it sets inside the cage."
+---
+
 # Environment variables
 
 The environment variables `sbx` reads (on the host) and sets (inside the cage).

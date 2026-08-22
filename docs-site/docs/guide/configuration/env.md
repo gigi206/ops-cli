@@ -1,3 +1,8 @@
+---
+sidebar_label: "env"
+description: "Extra environment variables for the cage, and the reserved keys no project may set."
+---
+
 # `env`: environment variables
 
 Extra environment variables for the sandbox.

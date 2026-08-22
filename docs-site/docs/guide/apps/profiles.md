@@ -1,3 +1,7 @@
+---
+description: "Importing, exporting and sharing an app as a standalone file, and the starter profiles sbx ships."
+---
+
 # Portable profiles
 
 An app **profile** is a standalone, portable file that defines one app. `sbx` ships

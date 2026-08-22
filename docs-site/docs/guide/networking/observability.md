@@ -1,3 +1,7 @@
+---
+description: "Which surface answers which question about egress, what each can and cannot see, and the settings that change what there is to see."
+---
+
 # Egress observability
 
 Five host-side surfaces let you see the egress policy and what it decided. None of
@@ -16,6 +20,13 @@ They form a natural progression: `rules`/`test net` are the *static* view (the
 policy as authored), `stats`/`logs`/`live` are the *dynamic* view (what actually
 happened). `stats` persists aggregate counters; `logs` is an ephemeral, per-request
 record you watch live; `live` shows the connections open at this very instant.
+
+:::note This page and `sbx net`
+This page is the tour: which surface answers which question, what each one can and
+cannot see, and the `[network]` settings that change what there is to see. The
+per-flag reference for the same verbs is [`sbx net`](../cli/net), which is where a
+flag's exact spelling and effect are authoritative. Nothing below repeats a synopsis.
+:::
 
 ---
 
@@ -263,17 +274,14 @@ no," which is the log's whole job: answering *why did it fail just now?*
 
 ### `--with-status` and `--with-query`
 
-- **`--with-status`** adds the upstream HTTP status (200/404/5xx) the server
-  answered, for a completed **L7** (inspected `https://`) request only; an L4
-  (`tcp://`) splice, a refusal, or an `error` shows `-` (no HTTP response to read).
-  This is the server's answer to a *delivered* request, distinct from the egress
-  verdict: an allowed request can still get a 404. Under `--follow --with-status`, an
-  event whose response has not yet returned first appears with no status, then
-  reappears once carrying its status (a live tail cannot un-print a line); the
-  one-shot listing shows each status directly.
-- **`--with-query`** keeps the URL query in the shown path (dropped by default, since
-  a token can ride in a query). It is already redacted: the proxy masks configured
-  secret values before an event enters the log.
+Two flags worth knowing before you need them, because what they add is a *different
+kind of fact* rather than more of the same one. **`--with-status`** adds the answer the
+server gave (200/404/5xx), which is distinct from the egress verdict: an allowed
+request can still get a 404, and a refused one has no status at all. **`--with-query`**
+keeps the URL query, dropped by default because a token can ride in one.
+
+Their exact behaviour, including what each shows on an L4 splice and under `--follow`,
+is in [`sbx net logs`](../cli/net#sbx-net-logs).
 
 ### Seeing the traffic: `[network] capture`
 

@@ -1,3 +1,7 @@
+---
+description: "Launch, import, export and inspect the named application profiles."
+---
+
 # `sbx app`
 
 ```

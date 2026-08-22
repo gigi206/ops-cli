@@ -1,3 +1,7 @@
+---
+description: "Report what sbx occupies on disk, per project and in the shared store."
+---
+
 # `sbx store`
 
 ```

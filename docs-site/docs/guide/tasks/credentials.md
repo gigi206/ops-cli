@@ -1,3 +1,7 @@
+---
+description: "`secret` and `encode`: giving an operation a credential its caller never sees."
+---
+
 # Task credentials
 
 A [declared operation](./) exists to run a command with a credential its caller never

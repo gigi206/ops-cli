@@ -1,3 +1,7 @@
+---
+description: "Print where sbx keeps its config, data and state on this machine."
+---
+
 # `sbx path`
 
 ```

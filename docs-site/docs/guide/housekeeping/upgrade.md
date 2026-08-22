@@ -1,3 +1,7 @@
+---
+description: "Why a binary update moves no version, what each backend does on `sbx upgrade`, and the lock model behind it."
+---
+
 # Upgrading toolchains
 
 `sbx` treats the versions of your toolchain as **data-directory state**, not something

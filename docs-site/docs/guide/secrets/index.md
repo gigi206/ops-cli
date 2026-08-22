@@ -1,3 +1,8 @@
+---
+sidebar_label: "Overview"
+description: "Authenticating to a host without handing the agent the credential: the never-in-cage invariant, and the resolver × broker split."
+---
+
 # Secrets
 
 `sbx` lets an agent *authenticate* to a host without ever handing it the
@@ -93,10 +98,10 @@ flowchart LR
 ```
 
 The two layers compose freely: any source with any broker. Resolvers are the
-open-ended, pluggable half (see [Plugins](plugins)); the broker that puts a
+open-ended, pluggable half (see [Plugins](../plugins/)); the broker that puts a
 secret on the wire touches the security boundary, so it stays first-party. A broker
 that terminates nothing and only stands in front of a host socket is pluggable under
-its own contract, described in [The broker type](plugins#the-broker-type).
+its own contract, described in [The broker type](../plugins/broker).
 
 ## Injection is effective only under a filtering network
 
@@ -153,7 +158,12 @@ that a credential is bound to *one* destination host. See
 - [Injection](injection): the HTTP-header broker: how a credential lands
   on the wire.
 - [Redaction](redaction): the outbound and inbound secret tripwires.
-- [Plugins](plugins): the three plugin kinds, and signed plugin stores.
+- [OAuth sessions](oauth): taking a refresh token out of the cage, and the
+  per-application traps of doing so.
+- [Provider recipes](providers/): a ready-made block for around forty services, each
+  with the request that proves the header arrived.
+- [Plugins](../plugins/): the three plugin kinds, the manifest they share, and signed
+  plugin stores.
 
 ## See also
 

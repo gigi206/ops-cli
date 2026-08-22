@@ -1,3 +1,8 @@
+---
+sidebar_label: "audio"
+description: "Microphone and playback in a cage that otherwise carries no audio."
+---
+
 # `audio`: microphone and playback
 
 A hermetic cage carries no audio: no PulseAudio/PipeWire socket and no PulseAudio client

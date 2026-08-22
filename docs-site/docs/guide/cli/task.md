@@ -1,3 +1,7 @@
+---
+description: "List and invoke the declared operations a session offers, and read what each invocation returned."
+---
+
 # `sbx task`
 
 ```

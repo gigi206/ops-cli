@@ -1,3 +1,7 @@
+---
+description: "List, inspect and remove the per-project runtime trees."
+---
+
 # `sbx projects`
 
 ```

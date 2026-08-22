@@ -1,3 +1,8 @@
+---
+sidebar_label: "nixpkgs"
+description: "Pinning the nixpkgs channel or revision the base userland and tools resolve against."
+---
+
 # `nixpkgs`: pin the channel or revision
 
 Override the nixpkgs reference the base userland and tools resolve against.

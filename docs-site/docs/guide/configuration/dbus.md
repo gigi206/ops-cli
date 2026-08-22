@@ -1,3 +1,8 @@
+---
+sidebar_label: "dbus"
+description: "A private desktop portal for the cage: file chooser, theme and notifications, without the host session bus."
+---
+
 # `dbus`: a private desktop portal for the cage
 
 A hermetic cage carries no D-Bus session bus, so a graphical app cannot open a **file chooser**

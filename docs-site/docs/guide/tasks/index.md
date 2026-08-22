@@ -1,3 +1,8 @@
+---
+sidebar_label: "Overview"
+description: "A fixed command sbx runs on a caller's behalf, in an ephemeral sibling cage, with a credential the caller never holds."
+---
+
 # Declared operations (`[task]`)
 
 A **declared operation** is a fixed command sbx runs *on a caller's behalf*, in an ephemeral sibling

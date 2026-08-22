@@ -1,3 +1,7 @@
+---
+description: "Roll managed toolchains forward by re-resolving and rewriting their locks."
+---
+
 # `sbx upgrade`
 
 ```

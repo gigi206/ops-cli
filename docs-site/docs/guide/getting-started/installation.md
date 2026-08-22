@@ -1,3 +1,7 @@
+---
+description: "Build or fetch the single static binary, or a dev build, and what the install script places where."
+---
+
 # Installation
 
 `sbx` is a single binary. The shipping artifact is a **static musl binary** with no

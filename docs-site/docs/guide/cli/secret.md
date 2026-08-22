@@ -1,3 +1,7 @@
+---
+description: "The credential inventory this configuration declares, by name and destination, never by value."
+---
+
 # `sbx secret`
 
 ```

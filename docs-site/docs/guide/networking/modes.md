@@ -1,3 +1,7 @@
+---
+description: "The five egress postures, `none` / `shared` / `deny` / `allow` / `ask`, and what each one permits."
+---
+
 # Network modes
 
 The `network` field chooses the sandbox's egress posture. There are five values:

@@ -1,3 +1,8 @@
+---
+sidebar_label: "[seccomp]"
+description: "Relaxing the mandatory syscall denylist, from a trusted source only, and what it will never relax."
+---
+
 # `[seccomp]`: relaxing the syscall denylist
 
 Every cage runs behind a mandatory **seccomp denylist** that refuses a set of syscalls

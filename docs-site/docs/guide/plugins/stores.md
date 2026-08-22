@@ -1,15 +1,19 @@
+---
+description: "A git repository of plugins verified against a pinned Ed25519 key, with anti-rollback on the revision."
+---
+
 # Signed plugin stores
 
 This page covers configuring a store, installing from it, and what happens when it
 changes; for the plugins themselves, and for installing one from a local directory, see
-[Plugins](plugins).
+[Managing plugins](managing).
 
-See also: [Plugins](plugins) · [`sbx plugins store`](../cli/plugins#stores) ·
-[Resolvers](resolvers) · [The trust gate](../concepts/trust).
+See also: [Plugins](./) · [`sbx plugins store`](../cli/plugins#stores) ·
+[The resolver type](resolvers) · [The trust gate](../concepts/trust).
 
 A **remote plugin store** is a git repository of plugins that `sbx` fetches on your
-behalf. One store serves **every kind** ([resolvers](plugins),
-[brokers](plugins#the-broker-type) and [signers](plugins#the-signer-type)), under one key
+behalf. One store serves **every kind** ([resolvers](resolvers),
+[brokers](broker) and [signers](signer)), under one key
 and one catalogue: the store is not what fences a broker, since installing one grants
 nothing until a global [`[broker.<name>] socket`](../configuration/broker) binds it to a
 host resource. A second store would ask you to pin a second key where nothing is decided. Because you do not inspect what is fetched, authenticity
@@ -218,7 +222,7 @@ step still to come. Until then, a store you add today uses **trust-on-first-use*
 
 ## See also
 
-- [Plugins](plugins): what a store distributes, and the manifest each
+- [Plugins](./): what a store distributes, and the manifest each
   plugin carries.
 - [`sbx plugins`](../cli/plugins): the command reference, including every `store`
   subcommand.

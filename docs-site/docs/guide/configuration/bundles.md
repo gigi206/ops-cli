@@ -1,3 +1,8 @@
+---
+sidebar_label: "[bundle.<name>]"
+description: "Everything one tool needs to be installed and to reach its services, declared once and named with `use`."
+---
+
 # `[bundle.<name>]`: reusable tool bundles
 
 A bundle is **everything one tool needs to be installed and to reach its own

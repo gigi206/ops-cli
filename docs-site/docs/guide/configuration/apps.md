@@ -1,3 +1,8 @@
+---
+sidebar_label: "[app.<name>]"
+description: "A named, reusable launcher: a command plus the overlay it runs under."
+---
+
 # `[app.<name>]`: named launch profiles
 
 A `[app.<name>]` table declares a named, reusable launcher: a command plus a
@@ -155,7 +160,7 @@ trusted app's package.
 
 ## Every app is Mode B
 
-An app is the locked-down [agent posture](../concepts/overview#the-two-actor-modes):
+An app is the locked-down [agent posture](../concepts/#the-two-actor-modes):
 its egress allowlist defaults to read-only verbs (see
 [`default_methods`](network#default_methods-apps)), its home is isolated, and its
 credentials are injected host-side. There is no per-app "interactive mode" field.

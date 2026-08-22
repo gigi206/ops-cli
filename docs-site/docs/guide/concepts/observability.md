@@ -1,3 +1,8 @@
+---
+sidebar_label: "Observability"
+description: "The process and filesystem lenses on a running cage, what they record, and what they cannot see."
+---
+
 # Observability: the four lenses
 
 The **observability stack** lets you inspect and stream the activity of a running

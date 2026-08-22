@@ -1,3 +1,7 @@
+---
+description: "The daemonless registry a launch writes, listing and attaching to and stopping what runs, and the background-agent posture."
+---
+
 # Sessions
 
 `sbx` keeps a **daemonless** on-disk registry of live sandbox sessions. There is no
@@ -59,6 +63,31 @@ sbx session ls
 sbx session attach <id>   # look in
 sbx session stop <id>     # done
 ```
+
+[Run an agent in the background and check on it](../how-to/background-agent) walks the
+whole path once, feeds included.
+
+## What survives the session, and what does not
+
+Four feeds report on a live session, and they do not have the same lifetime. The
+distinction decides whether you can answer a question after the fact or only while the
+agent is still running:
+
+| Feed | Reads | Lives in | After the session exits |
+|---|---|---|---|
+| [`sbx session logs`](../cli/session#logs) | what the agent **printed** | on disk, under the session's runtime tree | still there, for a detached session |
+| [`sbx proc logs`](../cli/proc) | what it **executed** | the supervisor's memory (needs `--observe`) | gone |
+| [`sbx fs logs`](../cli/fs) | what it **wrote** | the supervisor's memory (needs `--observe`) | gone |
+| [`sbx net logs`](../cli/net) | where it **went** | the running proxy's memory | gone |
+
+So a record of what an agent *did*, rather than what it said, has to be taken while it
+runs: pipe a `--json` feed to a file. What persists on its own is the printed output,
+plus the aggregate egress counters [`sbx net stats`](../cli/net) keeps per host.
+
+`--observe` is the other thing that cannot be added later: the process and filesystem
+lenses are switched on at launch, cost nothing while nobody reads them, and are simply
+absent from a session that started without them. See
+[Observability](../concepts/observability).
 
 ## The "second terminal"
 

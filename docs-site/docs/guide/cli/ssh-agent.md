@@ -1,3 +1,7 @@
+---
+description: "What a running sandbox asked your ssh keys to sign, and what the filtering agent answered."
+---
+
 # `sbx ssh-agent`
 
 ```

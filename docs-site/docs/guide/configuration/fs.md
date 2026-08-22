@@ -1,3 +1,8 @@
+---
+sidebar_label: "[fs]"
+description: "Closing a project path off inside the cage: the one field that applies from an untrusted source, because it only takes away."
+---
+
 # `[fs]`: closing project paths off inside the cage
 
 A project usually holds a few files the agent working in it has no business reading: a

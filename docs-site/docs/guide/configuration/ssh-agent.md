@@ -1,3 +1,8 @@
+---
+sidebar_label: "[ssh_agent]"
+description: "Signing with one of your keys through a filtering agent, so the cage gets signatures and never the key."
+---
+
 # `[ssh_agent]`: signing with a key the cage never holds
 
 A cage that must `git push` over ssh needs a **signature** from one of your keys. It must

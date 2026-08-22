@@ -1,3 +1,7 @@
+---
+description: "The complete grammar of an allow or deny entry: hosts, wildcards, URLs, regexes, ports, methods and layers."
+---
+
 # Rule grammar
 
 Under a [filtering posture](modes) (`deny`, `allow`, or `ask`), the `allow` and
@@ -6,7 +10,16 @@ config is resolved: into one of a few kinds by its syntax. A malformed rule
 (including an uncompilable regex) is rejected up front with a warning naming the
 list it was in, never silently mis-read at request time.
 
-This page is the complete reference. The one law that governs everything below:
+:::note Where this page sits
+The grammar is reference material that lives in the guide on purpose: a rule is read
+and written far more often than the `[network]` table around it, and the two halves of
+the same subject would be worse apart. The **field** reference, what `[network]`
+accepts and how a table composes, is [`network`](../configuration/network); the
+**verbs** that print, test and edit these rules are [`sbx net`](../cli/net).
+:::
+
+This page is the complete reference for the grammar itself. The one law that governs
+everything below:
 
 > **Deny always wins.** A request is permitted only when it matches some `allow`
 > rule *and* matches no `deny` rule. A `deny` entry carves a hole out of any allow,

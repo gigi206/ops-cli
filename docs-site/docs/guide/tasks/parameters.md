@@ -1,3 +1,7 @@
+---
+description: "`params` and `env_allow`: what a caller may supply, and the bounds that hold it."
+---
+
 # Task parameters
 
 Everything a caller supplies to a [declared operation](./) passes through one of two

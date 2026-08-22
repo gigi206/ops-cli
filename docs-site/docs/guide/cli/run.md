@@ -1,3 +1,7 @@
+---
+description: "Run a command inside the project sandbox, or open the project's sandboxed shell."
+---
+
 # `sbx run`
 
 ```

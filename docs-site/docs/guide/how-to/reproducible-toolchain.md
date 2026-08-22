@@ -1,3 +1,8 @@
+---
+sidebar_label: "Reproducible toolchain"
+description: "Declare a project's tools with `packages` and mise, pin them, upgrade deliberately, and reclaim the space."
+---
+
 # Give a project a reproducible toolchain
 
 The goal: every launch of this project gets the same tools at the same versions,

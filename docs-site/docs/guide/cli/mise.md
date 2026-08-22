@@ -1,3 +1,7 @@
+---
+description: "Pass arguments through to the in-cage mise, so an agent can self-equip a project's tools."
+---
+
 # `sbx mise`
 
 ```

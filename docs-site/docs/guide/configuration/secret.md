@@ -1,3 +1,8 @@
+---
+sidebar_label: "[secret]"
+description: "Credentials the egress proxy injects into matching outbound requests, keyed by destination host."
+---
+
 # `[secret]`: credential injection
 
 Credentials the [egress proxy](../networking/architecture) injects into matching
@@ -54,7 +59,7 @@ type = "raw"
 | `header` | the header name to set (e.g. `Authorization`, `x-api-key`) |
 | `type` | how to shape the value: `bearer`, `basic`, or `raw` |
 | `prefix` | override the type's default prefix (`Bearer ` / `Basic ` / empty) |
-| `sign` | a [signer plugin](../secrets/plugins#the-signer-type) that forms the credential **per request** |
+| `sign` | a [signer plugin](../plugins/signer) that forms the credential **per request** |
 
 A secret must have **exactly one** of `key` or `from`. It must have a `header` and a
 `type`, either on itself or from `[secret.defaults]`: a secret that names neither is
@@ -67,7 +72,7 @@ plaintext. That covers every auth point whose value is a constant: a bearer toke
 Basic pair, an API key. It cannot cover one whose value depends on the request itself,
 such as a signature over the method, the path and the query.
 
-`sign` names an installed [signer plugin](../secrets/plugins#the-signer-type) instead,
+`sign` names an installed [signer plugin](../plugins/signer) instead,
 and the plugin is asked once per request:
 
 ```toml
@@ -129,7 +134,7 @@ key = "github_token"       # → env://GITHUB_TOKEN, else sops://secrets/prod.ya
 
 Because `defaults` is reserved, a host cannot be named `defaults`.
 
-A [resolver plugin](../secrets/plugins) is bound the same way, under `resolver`, keyed by the
+A [resolver plugin](../plugins/) is bound the same way, under `resolver`, keyed by the
 **scheme** it claims rather than by its name (the two differ for a plugin whose name says what it
 is while its scheme says what it addresses):
 
@@ -160,7 +165,7 @@ the same secret.
   per-resolver bindings, optionally pinned to a resolver with `key@resolver`.
 
 Built-in resolvers are `env://`, `file://`, `sops://`; more come from
-[resolver plugins](../secrets/plugins). See [Resolvers](../secrets/resolvers).
+[resolver plugins](../plugins/). See [Resolvers](../secrets/resolvers).
 
 ## Worked example: authenticating the GitHub API
 

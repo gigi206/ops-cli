@@ -1,3 +1,8 @@
+---
+sidebar_label: "OAuth sessions"
+description: "Holding a refresh token host-side so an application that signs in for itself no longer has to, and the traps of doing so."
+---
+
 # OAuth sessions: taking the token out of the cage
 
 An agent that signs in for itself ends up holding an OAuth token in its
@@ -41,7 +46,7 @@ from   = ["pass://mistral/api-key"]
 Which one you are looking at is decided by what the application saved. Two values
 and an expiry mean an OAuth session, and the rest of this page applies. One value
 that never changes is an ordinary secret, and every resolver listed on
-[Plugins](plugins) already covers it, with none of the care below: no
+[Plugins](../plugins/) already covers it, with none of the care below: no
 seeding, no single-use token to lose, and a revoke-and-reissue that costs nothing
 more than editing your vault.
 
@@ -174,6 +179,6 @@ engineering that breaks at the next release.
 
 ## See also
 
-- [Plugins](plugins): the manifest, the grant, and `state = true`
+- [Plugins](../plugins/): the manifest, the grant, and `state = true`
 - [Injection](injection): strip-and-replace, and the `401` re-resolution
 - [Redaction](redaction): what happens to a credential the cage obtained anyway

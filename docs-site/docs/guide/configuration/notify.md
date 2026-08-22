@@ -1,3 +1,8 @@
+---
+sidebar_label: "[notify]"
+description: "Being told when something was blocked, since a refusal is invisible by design."
+---
+
 # `[notify]`: being told when something was blocked
 
 ```toml

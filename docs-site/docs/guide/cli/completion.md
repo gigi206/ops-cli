@@ -1,3 +1,7 @@
+---
+description: "Print the shell completion script for a shell, on stdout."
+---
+
 # `sbx completion`
 
 ```

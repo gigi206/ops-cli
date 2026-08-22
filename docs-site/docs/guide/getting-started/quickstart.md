@@ -1,9 +1,13 @@
+---
+description: "Your first sandboxed command, a project's toolchain, and a first agent launch, in about five minutes."
+---
+
 # Quick start
 
 This walks through the first things you will do with `sbx`. It assumes you have a
 binary on your `PATH` (see [Installation](installation)).
 
-See also: [What sbx is](../concepts/overview) · [Configuration overview](../configuration/).
+See also: [What sbx is](../concepts/) · [Configuration overview](../configuration/).
 
 ## Check the prerequisites
 

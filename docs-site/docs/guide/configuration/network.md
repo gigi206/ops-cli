@@ -1,3 +1,8 @@
+---
+sidebar_label: "network"
+description: "The config shape of the egress posture: the two forms, every table field, and how a table composes across layers."
+---
+
 # `network`: the egress posture
 
 The sandbox's network posture. This page documents the **config shape**; for what each

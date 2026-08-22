@@ -1,3 +1,8 @@
+---
+sidebar_label: "Egress groups"
+description: "Named sets of egress entries, declared once in the global config and referenced from any list with `@name`."
+---
+
 # Egress groups (`[network.groups]`)
 
 A `[network.groups]` group is a **named set of egress entries**, declared once and

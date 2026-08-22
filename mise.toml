@@ -253,8 +253,18 @@ description = "Serve the Docusaurus docs site locally with live reload (http://l
 depends = ["docs-install"]
 run = "npm --prefix docs-site run start"
 
+[tasks.docs-check]
+description = "Check the docs navigation is complete and the imported provider recipes are current (runs before docs-build)"
+depends = ["docs-install"]
+run = "npm --prefix docs-site run check-docs"
+
+[tasks.docs-import]
+description = "Regenerate docs-site/docs/guide/secrets/providers/ from examples/secrets/*/README.md"
+depends = ["docs-install"]
+run = "npm --prefix docs-site run import-examples"
+
 [tasks.docs-build]
-description = "Build the Docusaurus docs site into docs-site/build/ (broken links fail the build)"
+description = "Build the Docusaurus docs site into docs-site/build/ (broken links, a page nothing links to, and stale imported recipes all fail the build)"
 depends = ["docs-install"]
 run = "npm --prefix docs-site run build"
 

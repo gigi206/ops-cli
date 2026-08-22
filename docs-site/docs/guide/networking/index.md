@@ -1,3 +1,8 @@
+---
+sidebar_label: "Overview"
+description: "How sbx controls what a sandbox reaches on the network, and the pages that cover each part of it."
+---
+
 # Networking (egress)
 
 `sbx` controls what the sandbox can reach on the network. This is the

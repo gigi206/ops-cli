@@ -1,3 +1,7 @@
+---
+description: "Install, inspect, verify and remove plugins, and manage the signed stores they come from."
+---
+
 # `sbx plugins`
 
 ```
@@ -9,7 +13,7 @@ Inspect and manage **resolver plugins** and **plugin stores**. Host-level: reads
 data directory, not a project's config. A resolver plugin declares a `scheme://`
 `sbx` can route a secret [`from`](../configuration/secret) reference to.
 
-See also: [Plugins](../secrets/plugins) · [Signed plugin stores](../secrets/stores) · [Resolvers](../secrets/resolvers) · [Secrets architecture](../secrets/).
+See also: [Plugins](../plugins/) · [Signed plugin stores](../plugins/stores) · [Resolvers](../secrets/resolvers) · [Secrets architecture](../secrets/).
 
 ## Plugins
 
@@ -29,10 +33,10 @@ A resolver is named by the `scheme://` it claims. A [broker](../configuration/br
 claims none, so `info` takes the name `[broker.<name>]` binds, and its page adds the
 protocol facts a launch acts on (the framing, the frame ceiling, how long `sbx` waits
 on the host resource, how the cage finds the socket) plus whether the global config
-binds it at all. A [signer](../secrets/plugins#the-signer-type) is named the same way,
+binds it at all. A [signer](../plugins/signer) is named the same way,
 and its page states its auth point: the headers it may set, what of the request it is
 shown, whether it is handed the credential's plaintext or a marker standing in for one,
-and whether sbx [holds the request body](../secrets/plugins#what-a-signer-is-told-about-the-body)
+and whether sbx [holds the request body](../plugins/signer#what-a-signer-is-told-about-the-body)
 to tell it a digest.
 
 A plugin's name is one namespace across the kinds reached by name, so a broker and a
@@ -48,7 +52,7 @@ reads as unknown.
 Every install records the **digest of the tree it placed**. `verify` re-hashes and
 compares, `list` marks a changed plugin `[modified since install]`, and `info` states
 it on an `integrity:` line. This is **drift detection, not a security control**: see
-[Plugins](../secrets/plugins#a-plugin-edited-after-it-was-installed).
+[Plugins](../plugins/managing#a-plugin-edited-after-it-was-installed).
 
 A `scheme://` belongs to **one** plugin. Every install path refuses a scheme that is
 already claimed, so the only way to two claimants is to place a plugin directory by
@@ -109,7 +113,7 @@ tree is in place. Comparisons read the *cached* catalogue: run
 
 `publish` is the producing counterpart of `add`; the signing key is the store's secret
 and never leaves the operator's host. See
-[Signed plugin stores](../secrets/stores).
+[Signed plugin stores](../plugins/stores).
 
 ## Examples
 

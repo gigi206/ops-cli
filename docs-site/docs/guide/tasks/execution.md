@@ -1,3 +1,7 @@
+---
+description: "`spawn`, `[exec.<program>]` and the task tool pool: what program a declared operation may run."
+---
+
 # What a task may run
 
 sbx fixes the program a [declared operation](./) runs. These fields bound what that

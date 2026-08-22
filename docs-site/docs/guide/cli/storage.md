@@ -1,3 +1,7 @@
+---
+description: "Give sbx's data directory a compressed, self-growing filesystem of its own."
+---
+
 # `sbx storage`
 
 ```

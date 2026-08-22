@@ -1,3 +1,7 @@
+---
+description: "List, attach to and stop the live sandbox sessions, and read what each printed."
+---
+
 # `sbx session`
 
 ```

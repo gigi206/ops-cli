@@ -1,3 +1,7 @@
+---
+description: "`tcp://` rules, in-cage listeners and ssh: giving a declared operation the reach it needs, and no more."
+---
+
 # Reaching a non-HTTP service
 
 A [declared operation](./) gets no network at all unless `network` declares one. For an

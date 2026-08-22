@@ -1,3 +1,7 @@
+---
+description: "Bubblewrap, seccomp, cgroups and the egress firewall: which layer refuses what, and in which order."
+---
+
 # Enforcement stack
 
 The **primary** security control in `sbx` is the bind layout. Because the cage

@@ -1,3 +1,8 @@
+---
+sidebar_label: "Prerequisites"
+description: "The kernel features and host tools a cage needs, and how `sbx doctor` checks them before the first launch."
+---
+
 # `sbx doctor` and prerequisites
 
 ```

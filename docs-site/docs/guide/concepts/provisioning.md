@@ -1,3 +1,7 @@
+---
+description: "The rolling nix channel, the per-project store, and how a cage equips itself without touching the host."
+---
+
 # Provisioning
 
 `sbx` runs tools inside a hermetic cage that has **no host `/usr`** and **no host

@@ -1,9 +1,13 @@
+---
+description: "The boundary, the launch pipeline from a command to a cage, the control planes, and where each decision is made."
+---
+
 # Architecture
 
 Every other page in this guide owns one subsystem. This page is the map: what the parts
 are, which side of the boundary each one runs on, and what is allowed to cross.
 
-See also: [What sbx is](overview) · [Security model](security-model) ·
+See also: [What sbx is](./) · [Security model](security-model) ·
 [Enforcement stack](enforcement) · [Directory layout](directory-layout).
 
 ## One process, no daemon
@@ -149,7 +153,7 @@ flowchart TB
     class A,L,TL,REG hs
 ```
 
-The split is not stylistic. Under the [agent posture](overview), the process inside the
+The split is not stylistic. Under the [agent posture](./), the process inside the
 cage is the adversary: a reachable ask queue would let it answer its own requests, and a
 reachable lens would let it read or amend the record of what it did. So the sockets on the
 right live beside the data directory, which the cage never sees, and answering one is
@@ -384,8 +388,8 @@ exit with output is a resolved secret, a clean exit with none is an *absent* val
 falls through to the next source in a chain, and a failure is hard and fail-closed, so a
 broken resolver can never silently downgrade to a weaker source.
 
-The full manifest reference is in [Plugins](../secrets/plugins), and the store
-workflow in [Signed plugin stores](../secrets/stores).
+The full manifest reference is in [Plugins](../plugins/), and the store
+workflow in [Signed plugin stores](../plugins/stores).
 
 ## Declared operations
 

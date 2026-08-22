@@ -1,3 +1,7 @@
+---
+description: "The symptoms you are most likely to meet first, each pointing at the page that owns the fix."
+---
+
 # Troubleshooting
 
 A place to start when something is already broken. Each symptom below shows the **exact
@@ -77,7 +81,7 @@ unknown secret resolver scheme
 
 Either the built-in scheme is mistyped (`env://`, `file://`, `sops://`) or a resolver
 plugin that provides the scheme is not installed. See
-[Resolvers](../secrets/resolvers) and [Plugins](../secrets/plugins).
+[Resolvers](../secrets/resolvers) and [Plugins](../plugins/).
 
 ## A program will not run / exec is blocked
 

@@ -1,3 +1,7 @@
+---
+description: "What `sbx gc` reclaims, what it refuses to touch, and why a dry run is the default."
+---
+
 # Garbage collection
 
 `sbx` provisions a per-project nix store and, over time, leaves reclaimable residue, superseded closures and the builds of removed packages. `sbx gc` reclaims the nix

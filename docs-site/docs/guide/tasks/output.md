@@ -1,3 +1,7 @@
+---
+description: "The exit status, the captured streams, and the artifact directory an invocation returns."
+---
+
 # What a task returns
 
 An invocation returns an exit status, its captured streams, and, when the declaration

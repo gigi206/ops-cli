@@ -1,3 +1,8 @@
+---
+sidebar_label: "Per-app `$HOME`"
+description: "Every app gets a dedicated, persistent, isolated `$HOME`, so login state never bleeds between apps or into your shell."
+---
+
 # Per-app isolated `$HOME`
 
 Each `sbx app run <name>` gets a **dedicated, persistent, isolated `$HOME`**, so the app's

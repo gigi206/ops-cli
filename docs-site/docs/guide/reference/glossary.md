@@ -1,8 +1,12 @@
+---
+description: "The terms this guide uses in a specific sense: cage, posture, broker, resolver, the trust gate."
+---
+
 # Glossary
 
 The terms this guide uses.
 
-See also: [What sbx is](../concepts/overview) · [Security model](../concepts/security-model).
+See also: [What sbx is](../concepts/) · [Security model](../concepts/security-model).
 
 **Bind**, a host path exposed inside the cage, read-only by default. The set of binds
 *is* the security control. See [`binds`](../configuration/binds).
@@ -31,7 +35,7 @@ opposite of a security field. See [The trust gate](../concepts/trust).
 
 **Mode A / Mode B**: the two actor modes. Mode A is an interactive user shell
 ([`sbx run`](../cli/run)); Mode B is an autonomous agent
-([`sbx app`](../cli/app)) and is the default posture. See [Overview](../concepts/overview#the-two-actor-modes).
+([`sbx app`](../cli/app)) and is the default posture. See [Overview](../concepts/#the-two-actor-modes).
 
 **Model B**, the egress architecture: an empty network namespace whose only exit is an
 in-cage forwarder bridging to a host-side allowlisting proxy. See

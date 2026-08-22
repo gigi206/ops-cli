@@ -1,3 +1,8 @@
+---
+sidebar_label: "Overview"
+description: "An app is a named, reusable agent launcher: a command plus the security and tooling overlay it runs under."
+---
+
 # The app framework
 
 An **app** is a named, reusable agent launcher: the flagship surface of `sbx`. It
@@ -35,7 +40,7 @@ overlay, as the final word.
 
 ## Every app is Mode B
 
-An app is the locked-down [agent posture](../concepts/overview#the-two-actor-modes):
+An app is the locked-down [agent posture](../concepts/#the-two-actor-modes):
 
 - Its own **persistent isolated `$HOME`**: the agent's config, login state, and
   history never bleed into your project shell or another app. See [Per-app home](home).

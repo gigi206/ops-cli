@@ -1,3 +1,8 @@
+---
+sidebar_label: "Redaction"
+description: "The outbound and inbound tripwires that watch a declared value, their scope, and what they honestly cannot catch."
+---
+
 # Redaction: the secret tripwires
 
 The never-in-cage invariant keeps a secret's plaintext on the host. But a secret

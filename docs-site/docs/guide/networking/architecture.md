@@ -1,3 +1,8 @@
+---
+sidebar_label: "Architecture (Model B)"
+description: "How a filtering egress posture works under the hood: empty netns, in-cage forwarder, host proxy, and why it holds."
+---
+
 # Architecture: Model B
 
 This page explains how a [filtering egress posture](modes) works under the hood, the
@@ -491,7 +496,7 @@ and this request declares a `Content-Length` larger than the buffer it holds. It
 answers `413`, from the head, before the client is invited to send. An over-cap
 `chunked` body declares no length and is discovered while being read, so it keeps the
 `bad-request:chunked` above. See
-[what a signer is told about the body](../secrets/plugins#what-a-signer-is-told-about-the-body).
+[what a signer is told about the body](../plugins/signer#what-a-signer-is-told-about-the-body).
 
 `body-buffer-cap` says nothing is wrong with the request. Some requests have their body
 read into memory before being forwarded: a `chunked` one, which is de-chunked and re-framed,

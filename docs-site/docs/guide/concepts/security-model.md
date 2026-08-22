@@ -1,3 +1,7 @@
+---
+description: "Same-uid confinement, confidentiality by absence, the bind layout, and where the protection stops."
+---
+
 # Security model
 
 `sbx`'s security rests on one central idea: the cage runs **as your uid**

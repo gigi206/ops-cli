@@ -1,3 +1,7 @@
+---
+description: "Report whether an access would be allowed, and why, without launching anything."
+---
+
 # `sbx test`
 
 ```

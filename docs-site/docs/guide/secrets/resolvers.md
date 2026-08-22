@@ -1,3 +1,8 @@
+---
+sidebar_label: "Resolvers"
+description: "The SOURCE layer: `env://`, `file://` and `sops://`, terse keys, and fallback chains."
+---
+
 # Resolvers: the SOURCE layer
 
 A **resolver** answers one question: *where does this secret's plaintext come
@@ -9,7 +14,7 @@ cage file, a cage environment variable, or a cage bind.
 This page covers the three built-in resolver schemes and the two ways to name a
 source: the verbose `from` ref and the terse `key` form expanded through
 `[secret.defaults]`. Additional schemes come from [resolver
-plugins](plugins).
+plugins](../plugins/).
 
 ## Built-in schemes
 
@@ -119,7 +124,7 @@ terse-only. A per-entry `header`/`type` always overrides the default.
 
 ### Binding a resolver plugin
 
-A [resolver plugin](plugins) is named in `order` and pinned with `@` exactly as a
+A [resolver plugin](../plugins/) is named in `order` and pinned with `@` exactly as a
 built-in is, under the **scheme** it claims. That is what a `from` ref writes
 before `://`, and it is not always the plugin's name: a plugin whose name says
 what it is may claim a scheme that says what it addresses.
@@ -209,7 +214,7 @@ before the cage exists. The plaintext lives briefly in host memory, is consumed
 by the broker, and is discarded. It is never an argument to a cage process, never
 a cage file, never a cage variable. A resolver *plugin* also runs host-side (in
 the trusted computing base, sandboxed under bubblewrap): see
-[Plugins](plugins). That sandbox is the one difference that shows: the
+[Plugins](../plugins/). That sandbox is the one difference that shows: the
 built-in resolvers run in `sbx`'s own process and therefore see your `PATH` and
 your `HOME`, while a plugin gets the cage's minimal `PATH` and a private `HOME`,
 and reaches only what its manifest binds. A tool `sops://` finds on your `PATH`
@@ -220,7 +225,7 @@ is not automatically within a plugin's reach.
 - [Secrets architecture](../secrets/): the never-in-cage invariant and the resolver × broker
   split.
 - [Injection](injection): the broker that consumes the resolved value.
-- [Plugins](plugins): additional resolver schemes from installed plugins.
-- [Signed plugin stores](stores): where those plugins can come from.
+- [Plugins](../plugins/): additional resolver schemes from installed plugins.
+- [Signed plugin stores](../plugins/stores): where those plugins can come from.
 - [`[secret]`](../configuration/secret): the full `[secret]`
   config reference.

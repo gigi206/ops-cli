@@ -1,3 +1,7 @@
+---
+description: "Observe the files a running sandbox writes in its project tree."
+---
+
 # `sbx fs`
 
 ```

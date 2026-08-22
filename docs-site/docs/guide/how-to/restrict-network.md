@@ -1,3 +1,8 @@
+---
+sidebar_label: "Restrict the network"
+description: "Pick a mode, write the rules, learn the rule set from a live session, and prove it before a launch."
+---
+
 # Restrict what a tool reaches on the network
 
 The goal: a filtering posture where every request is decided against an explicit

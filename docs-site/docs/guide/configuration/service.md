@@ -1,3 +1,8 @@
+---
+sidebar_label: "[service]"
+description: "Running something alongside the command in the same cage, and waiting for it to be ready."
+---
+
 # `[service]`: what else runs in the cage
 
 Some applications are not one process. An agent workbench wants a vector database beside it; a web

@@ -1,3 +1,8 @@
+---
+sidebar_label: "[limits]"
+description: "Overriding the cage's cgroup v2 resource limits, the anti-DoS control."
+---
+
 # `[limits]`: cgroup resource limits
 
 Override the cage's cgroup v2 resource limits (the anti-DoS control), which otherwise

@@ -1,3 +1,7 @@
+---
+description: "Changing any configuration field for a single launch, with `--config`, `--env`, `--net` and the `SBX_*` variables."
+---
+
 # One-shot overrides
 
 A one-shot override changes **any** configuration field for a **single launch**,

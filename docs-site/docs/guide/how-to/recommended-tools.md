@@ -1,4 +1,9 @@
-# Recommended tools for an agent cage
+---
+sidebar_label: "Recommended tools"
+description: "The tools worth putting in an agent cage, which tier to declare each in, and how to pin their versions."
+---
+
+# Choose the tools an agent cage needs
 
 The base userland already carries a small, everyday toolset (`curl`, `git`,
 `less`, `grep`, `rg`, `sed`, `awk`, `find`, `fd`, `jq`, `yq`, `which`),
@@ -9,7 +14,7 @@ worth declaring is what the base deliberately leaves out: anything tied to a
 language or to a particular harness. This page is that add-on set, what each tool
 gives an agent, and where to declare it.
 
-See also: [`packages`](packages) · [`tools`](tools) · [Provisioning](../concepts/provisioning) · [`sbx search`](../cli/search) · the [profile catalog](../apps/catalog).
+See also: [`packages`](../configuration/packages) · [`tools`](../configuration/tools) · [Provisioning](../concepts/provisioning) · [`sbx search`](../cli/search) · the [profile catalog](../apps/catalog).
 
 ## The recommended set
 
@@ -100,9 +105,9 @@ sbx search ast-grep    # versions + [tools] / [packages] declaration lines
 Versions move only on [`sbx upgrade nix`](../housekeeping/upgrade): the base
 userland, the channel pin and these packages advance together. Prefer `nix:` for
 the recommended set because presence must not depend on the cage's
-[`network`](network) posture: a `mise:` tool is fetched upstream-direct at
+[`network`](../configuration/network) posture: a `mise:` tool is fetched upstream-direct at
 launch, so under `network = "none"` it is absent, while a seeded `nix:` tool is
-there regardless. See the [`packages`](packages) backend table for the full
+there regardless. See the [`packages`](../configuration/packages) backend table for the full
 trade-off.
 
 ## Already in the base, and why this list stops here

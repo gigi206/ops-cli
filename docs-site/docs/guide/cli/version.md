@@ -1,3 +1,7 @@
+---
+description: "Print the version of this sbx build."
+---
+
 # `sbx version`
 
 ```

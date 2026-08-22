@@ -1,3 +1,8 @@
+---
+sidebar_label: "timezone"
+description: "The cage's clock: which IANA zone `/etc/localtime` points at."
+---
+
 # `timezone`: the cage's clock
 
 Every sbx cage carries the **IANA zone database** and an `/etc/localtime` pointing into it.

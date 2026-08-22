@@ -1,3 +1,7 @@
+---
+description: "What sbx deliberately does not do, and what would reopen each structural choice."
+---
+
 # Decisions and limits
 
 This page carries the two questions the rest of the guide answers only per subject: what
@@ -77,7 +81,7 @@ same way.
 
 The class question, why this is a sandbox and not a container manager or an environment
 manager, is answered with a comparison table in [What it is
-not](overview#what-it-is-not). Three more, which that table does not cover:
+not](./#what-it-is-not). Three more, which that table does not cover:
 
 - **Not multi-user.** The store is single-user and daemonless, and the cage runs as your
   uid. Nothing here isolates one human from another on a shared machine.
@@ -189,7 +193,7 @@ something you can point at.
 
 **What it costs** is the pull of that shape on everything else: a new capability is cheapest
 to add **inside**, so that is where each one has gone. Meanwhile the extension model that
-already works, [plugins](../secrets/plugins), is a separate process with its own cage, a
+already works, [plugins](../plugins/), is a separate process with its own cage, a
 signed manifest and a verified store, and it has never been used outside secrets, although
 the four prebuilt package backends do the same three things as each other and already share
 a common trait.

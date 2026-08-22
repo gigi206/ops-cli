@@ -1,3 +1,7 @@
+---
+description: "Inspect and edit the configuration for the current project, with each value tagged by the layer it came from."
+---
+
 # `sbx config`
 
 ```

@@ -1,3 +1,8 @@
+---
+sidebar_label: "What sbx is"
+description: "What sbx is, the reference class it belongs to, and the two actor modes it runs in."
+---
+
 # What sbx is (and is not)
 
 `sbx` is a **sandbox launcher**: a single static Rust binary that runs tools, including **encapsulated AI agents**, inside a [bubblewrap](https://github.com/containers/bubblewrap)
@@ -64,3 +69,25 @@ code. See [the app framework](../apps/).
   [trust gate](trust) binds approval to the file's content hash.
 
 Continue with the [security model](security-model).
+
+## The rest of this section
+
+Each page below argues one subject and states its own limits; what cuts across all of
+them is gathered in [Decisions and limits](decisions).
+
+- [Architecture](architecture): the boundary, the launch pipeline from a command to a
+  cage, the control planes, and where each decision is made.
+- [Security model](security-model): same-uid confinement, confidentiality by absence,
+  the bind layout, and where the protection stops.
+- [Decisions and limits](decisions): what sbx does not do, and what would reopen each
+  structural choice.
+- [The trust gate](trust): the content-hash model, and free fields versus security
+  fields.
+- [Enforcement stack](enforcement): bubblewrap, seccomp, cgroups and the egress
+  firewall, and which one refuses what.
+- [Observability](observability): the process and filesystem lenses on a running cage,
+  and what they cannot see.
+- [Provisioning](provisioning): the rolling nix channel, the per-project store, and
+  self-equipping.
+- [Directory layout](directory-layout): where the config, data, state and trust records
+  live.

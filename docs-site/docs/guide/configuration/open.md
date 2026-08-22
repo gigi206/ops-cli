@@ -1,3 +1,8 @@
+---
+sidebar_label: "[open]"
+description: "What a link opens with inside a cage that has no browser, no file manager and no desktop."
+---
+
 # `[open]`: what a link opens with, inside the cage
 
 A hermetic cage has no browser, no file manager and no desktop. So when a tool asks to open a URI,

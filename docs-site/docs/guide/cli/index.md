@@ -1,3 +1,8 @@
+---
+sidebar_label: "Overview"
+description: "Every sbx command at a glance, grouped by what you are trying to do."
+---
+
 # Command reference
 
 Every `sbx` command, at a glance. Run `sbx help <command>` (or `sbx <command> --help`)
