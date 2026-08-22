@@ -3,7 +3,6 @@
 //! running cage, `stop` ends sessions.
 
 use std::ffi::OsString;
-use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -85,8 +84,6 @@ fn list_sessions() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    let (h, n, r) = (pal.head, pal.name, pal.reset);
     let uptime = uptime_seconds();
     let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     // Each row is materialized first so the column widths can flex to the widest value: an
@@ -113,36 +110,42 @@ fn list_sessions() -> ExitCode {
         })
         .collect();
 
-    // NAME/KIND/MODE are left-aligned, PID/AGE right-aligned; each width is the wider of its
-    // header label and the widest value. Cage slugs and app/label names are ASCII, so a byte
-    // length equals the display width.
-    let name_w = rows.iter().map(|r| r.name.len()).chain([4]).max().unwrap();
-    let kind_w = rows.iter().map(|r| r.kind.len()).chain([4]).max().unwrap();
-    let mode_w = rows.iter().map(|r| r.mode.len()).chain([4]).max().unwrap();
-    let pid_w = rows.iter().map(|r| r.pid.len()).chain([3]).max().unwrap();
-    let age_w = rows.iter().map(|r| r.age.len()).chain([3]).max().unwrap();
-
-    // The header is padded first, then wrapped in color, so the color spans never count toward
-    // the column widths and the alignment is identical with or without color.
-    let header = format!(
-        "{:<name_w$}  {:<kind_w$}  {:<mode_w$}  {:>pid_w$}  {:>age_w$}  PROJECT",
-        "NAME", "KIND", "MODE", "PID", "AGE"
+    // NAME is the cage's own name — the same `sbx-<slug>` its systemd scope and in-cage hostname
+    // show — so a session cross-references with the host tooling. An app session's KIND is
+    // `app:<name>`, so the user can tell which sessions are agents (and that `sbx session
+    // attach`/`sbx session stop` act on that app's isolated environment). MODE says where the
+    // session's output went, which is the one thing the other columns cannot convey: only a
+    // `detached` session has a log for `sbx session logs` to read.
+    //
+    // Rendered by the shared table renderer rather than by a local width calculation, because a
+    // listing that reads differently from verb to verb is one the reader has to re-learn each
+    // time — and because that renderer measures a cell in characters. This one measured bytes,
+    // on the assumption that cage slugs and app names are ASCII, so a non-ASCII app label
+    // mis-padded every following column.
+    style::print_table(
+        &["NAME", "KIND", "MODE", "PID", "AGE", "PROJECT"],
+        &[
+            style::Align::Left,
+            style::Align::Left,
+            style::Align::Left,
+            style::Align::Right,
+            style::Align::Right,
+            style::Align::Left,
+        ],
+        &rows
+            .iter()
+            .map(|r| {
+                vec![
+                    r.name.clone(),
+                    r.kind.clone(),
+                    r.mode.clone(),
+                    r.pid.clone(),
+                    r.age.clone(),
+                    r.project.clone(),
+                ]
+            })
+            .collect::<Vec<_>>(),
     );
-    println!("{h}{header}{r}");
-    for row in &rows {
-        // NAME is the cage's own name — the same `sbx-<slug>` its systemd scope and in-cage
-        // hostname show — so a session cross-references with the host tooling. An app session's
-        // KIND is `app:<name>`, so the user can tell which sessions are agents (and that
-        // `sbx session attach`/`sbx session stop` act on that app's isolated environment). MODE
-        // says where the session's output went, which is the one thing the other columns cannot
-        // convey: only a `detached` session has a log for `sbx session logs` to read. NAME is
-        // padded before coloring so the color span does not disturb the width.
-        let name = format!("{:<name_w$}", row.name);
-        println!(
-            "{n}{name}{r}  {:<kind_w$}  {:<mode_w$}  {:>pid_w$}  {:>age_w$}  {}",
-            row.kind, row.mode, row.pid, row.age, row.project
-        );
-    }
     ExitCode::SUCCESS
 }
 

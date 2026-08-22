@@ -3,6 +3,8 @@
 //! pipe, a captured test). Every span is empty when color is off, so the render code stays
 //! unconditional and a non-terminal is byte-for-byte plain text.
 
+use std::io::IsTerminal;
+
 /// ANSI styling for one output stream. Empty strings when color is off, so the render code is
 /// unconditional and a non-terminal (a pipe, a captured test) is plain text.
 pub(crate) struct Palette {
@@ -138,9 +140,94 @@ pub(crate) fn dim_prose(text: &str, pal: &Palette) -> String {
     )
 }
 
+/// Print an aligned table: `headers` over `rows`, columns as wide as their widest cell.
+///
+/// The last column is never padded (it is the free-text one and padding it would trail spaces to the
+/// end of every line), and the first is colored — the same shape `sbx session ls` prints, because a
+/// listing that reads differently from verb to verb is one the reader has to re-learn each time.
+///
+/// The header is padded *before* it is colored so the escape sequences never count toward a column's
+/// width and the alignment is identical with and without color.
+pub(crate) fn print_table(headers: &[&str], align: &[Align], rows: &[Vec<String>]) {
+    let pal = Palette::for_stream(std::io::stdout().is_terminal());
+    let (lines, first) = render_table(headers, align, rows);
+    for (i, line) in lines.iter().enumerate() {
+        // The header in the header color, and each row's first cell in the name color — the same
+        // reading order `sbx session ls` gives, where the eye lands on the identifier. The span is
+        // the *rendered* first column, padding included, so a right-aligned id is colored where it
+        // sits rather than where its digits would start.
+        //
+        // `first` counts **characters**, which is what the padding is measured in; the byte index is
+        // then looked up rather than assumed equal to it. An operation name with an accent in it
+        // would otherwise split the line mid-character — which does not merely misplace the color,
+        // it panics.
+        let split = line
+            .char_indices()
+            .nth(first)
+            .map_or(line.len(), |(i, _)| i);
+        let (head, rest) = line.split_at(split);
+        match i {
+            0 => println!("{}{line}{}", pal.head, pal.reset),
+            _ => println!("{}{head}{}{rest}", pal.name, pal.reset),
+        }
+    }
+}
+
+/// The table's lines, header first, and the width of the first column — the layout with none of the
+/// printing, so the alignment is something a test can read rather than something a person eyeballs.
+pub(crate) fn render_table(
+    headers: &[&str],
+    align: &[Align],
+    rows: &[Vec<String>],
+) -> (Vec<String>, usize) {
+    let widths: Vec<usize> = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            rows.iter()
+                .filter_map(|r| r.get(i).map(|c| c.chars().count()))
+                .chain([h.chars().count()])
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let last = headers.len().saturating_sub(1);
+    let line = |cells: &dyn Fn(usize) -> String| -> String {
+        (0..headers.len())
+            .map(|i| {
+                let cell = cells(i);
+                match (i == last, align.get(i)) {
+                    // The last column is never padded: it is the free-text one, and padding it
+                    // would trail spaces to the end of every line.
+                    (true, _) => cell,
+                    (_, Some(Align::Right)) => format!("{cell:>w$}", w = widths[i]),
+                    _ => format!("{cell:<w$}", w = widths[i]),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    let mut out = vec![line(&|i| headers[i].to_string()).trim_end().to_string()];
+    for row in rows {
+        out.push(
+            line(&|i| row.get(i).cloned().unwrap_or_default())
+                .trim_end()
+                .to_string(),
+        );
+    }
+    (out, widths.first().copied().unwrap_or(0))
+}
+
+/// Which way a column's cells sit against their width.
+#[derive(Clone, Copy)]
+pub(crate) enum Align {
+    Left,
+    Right,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Palette;
+    use super::{Align, Palette, render_table};
 
     #[test]
     fn plain_spans_are_all_empty_so_captured_output_is_byte_for_byte_plain() {
@@ -210,5 +297,115 @@ mod tests {
         let out = super::paint_spans("a `real` span then a lone ` tick", p.name, "", &p);
         assert!(out.contains(&format!("{}real{}", p.name, p.reset)));
         assert!(out.contains("` tick"));
+    }
+    /// `sbx session ls`'s six-column shape, rendered here rather than by a per-verb width
+    /// calculation. It had its own, which measured a cell in bytes and so mis-padded a non-ASCII
+    /// app label; this pins the layout the shared renderer gives it, non-ASCII cell included.
+    #[test]
+    fn a_session_listing_aligns_on_a_non_ascii_name_like_every_other_listing() {
+        let rows = vec![
+            vec![
+                "sbx-café".to_string(),
+                "app:café".to_string(),
+                "detached".to_string(),
+                "42".to_string(),
+                "3m".to_string(),
+                "/home/u/p".to_string(),
+            ],
+            vec![
+                "sbx-x".to_string(),
+                "shell".to_string(),
+                "attached".to_string(),
+                "7".to_string(),
+                "10s".to_string(),
+                "/home/u/q".to_string(),
+            ],
+        ];
+        let (lines, first) = render_table(
+            &["NAME", "KIND", "MODE", "PID", "AGE", "PROJECT"],
+            &[
+                Align::Left,
+                Align::Left,
+                Align::Left,
+                Align::Right,
+                Align::Right,
+                Align::Left,
+            ],
+            &rows,
+        );
+        // `sbx-café` is 8 characters and 9 bytes: the width is the character count, so the
+        // columns after NAME line up in both rows.
+        assert_eq!(first, 8);
+        // NAME is 8 wide plus the two-space gutter, so every line's KIND column starts at
+        // character 10 — the header's included, and the accented row's with it.
+        let kind_at = |l: &str| {
+            let i = l.char_indices().nth(10).map(|(i, _)| i).unwrap();
+            l[i..].split("  ").next().unwrap().to_string()
+        };
+        assert_eq!(kind_at(&lines[0]), "KIND");
+        assert_eq!(kind_at(&lines[1]), "app:café");
+        assert_eq!(kind_at(&lines[2]), "shell");
+        // No line trails whitespace, in either row.
+        assert!(lines.iter().all(|l| l == l.trim_end()));
+    }
+
+    /// The columns are as wide as their widest cell, and the last one is not padded — a listing
+    /// whose columns shift with the data is the one a reader gives up on.
+    #[test]
+    fn a_table_aligns_on_its_widest_cell_and_leaves_no_trailing_space() {
+        let (lines, first) = render_table(
+            &["NAME", "N", "NOTE"],
+            &[Align::Left, Align::Right, Align::Left],
+            &[
+                vec!["a".into(), "1000".into(), "one".into()],
+                vec!["longer-name".into(), "7".into(), String::new()],
+            ],
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "NAME            N  NOTE",
+                "a            1000  one",
+                "longer-name     7",
+            ],
+            "each column takes the width of its widest cell, right-aligned where asked"
+        );
+        assert_eq!(
+            first,
+            "longer-name".len(),
+            "the first column's rendered width"
+        );
+        for line in &lines {
+            assert_eq!(line.trim_end(), line, "no line may trail spaces: {line:?}");
+        }
+    }
+
+    /// Widths are counted in characters and the color span is sliced in bytes, so a first cell that
+    /// is not ASCII must not be able to split the line mid-character — that is a panic, not a
+    /// cosmetic slip. An operation name is config text, so it can hold anything.
+    #[test]
+    fn a_non_ascii_first_cell_neither_misaligns_nor_splits_a_character() {
+        let rows = vec![
+            vec!["opération".into(), "1".into()],
+            vec!["ab".into(), "2".into()],
+        ];
+        let (lines, first) = render_table(&["NAME", "N"], &[Align::Left, Align::Left], &rows);
+        assert_eq!(
+            first,
+            "opération".chars().count(),
+            "widths count characters"
+        );
+        assert_eq!(lines, vec!["NAME       N", "opération  1", "ab         2"]);
+        for line in &lines {
+            // What `print_table` does with the width — it must land on a character boundary.
+            let split = line
+                .char_indices()
+                .nth(first)
+                .map_or(line.len(), |(i, _)| i);
+            assert!(
+                line.is_char_boundary(split),
+                "the color span must not split a character: {line:?}"
+            );
+        }
     }
 }
