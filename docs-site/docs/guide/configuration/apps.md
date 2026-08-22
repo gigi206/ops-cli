@@ -18,8 +18,8 @@ See also: [The app framework](../apps/) · [Per-app home](../apps/home) · [Port
 ## Two ways to declare an app
 
 - **Inline** in a project `.sbx.toml` (or the global `sbx.toml`) as `[app.<name>]`.
-- **As a profile file** under [`~/.config/sbx/apps/<name>.toml`](../concepts/directory-layout)
- , a standalone top-level app definition (its fields directly, no `[app.<name>]`
+- **As a profile file** under [`~/.config/sbx/apps/<name>.toml`](../concepts/directory-layout),
+  a standalone top-level app definition (its fields directly, no `[app.<name>]`
   wrapper), the filename being the app name. Imported with
   [`sbx app import`](../cli/app). A global app lives **only** as a profile file, not
   inline in the global `sbx.toml`.

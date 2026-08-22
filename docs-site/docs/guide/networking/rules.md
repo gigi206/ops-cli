@@ -394,8 +394,8 @@ Key properties of a raw splice:
   `tcp://host:*` opens every port. There is no default port and no path.
 - It is **strictly opt-in**: only an explicit `tcp://` allow enables a splice for
   that host:port. A host with no `tcp://` rule is always inspected.
-- Its only controls are the host:port match and the [SSRF guard](architecture#the-ssrf-guard)
- : there is no path, no method, no Host/SNI anti-fronting.
+- Its only controls are the host:port match and the [SSRF guard](architecture#the-ssrf-guard):
+  there is no path, no method, no Host/SNI anti-fronting.
 - The [credential machinery is bypassed](../secrets/injection) wholesale on a
   spliced host, there is no request head to inspect, so a `[secret]` injection, the
   response redaction, and the outbound-secret tripwire are all inert for a
@@ -613,6 +613,6 @@ and an overlapping L7 rule. Test any rule set with
 - [Ask mode](ask): how an *undecided* request (matching neither list) is handled.
 - [Egress observability](observability): `sbx test net <url>` to check a rule, and
   `sbx net rules` to see the effective, expanded set.
-- [Secrets: injection](../secrets/injection) · [redaction](../secrets/redaction)
- : what rides the L7 path (and why L4 bypasses it).
+- [Secrets: injection](../secrets/injection) · [redaction](../secrets/redaction):
+  what rides the L7 path (and why L4 bypasses it).
 - [`network` configuration reference](../configuration/network)

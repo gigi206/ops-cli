@@ -133,8 +133,8 @@ fail-closed:
 
 - `--key <hex|@file>` **pins a public key you obtained out of band**: the strong
   form.
-- `--trust` accepts the key the store ships **on first use** (trust-on-first-use)
- , weaker; `sbx` prints the pinned key so you can compare it afterward against a
+- `--trust` accepts the key the store ships **on first use** (trust-on-first-use),
+  weaker; `sbx` prints the pinned key so you can compare it afterward against a
   source the store does not control.
 
 Run `store add` with **neither** flag and sbx fetches the store into a throwaway

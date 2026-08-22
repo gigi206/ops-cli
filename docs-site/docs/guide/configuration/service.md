@@ -25,7 +25,7 @@ not started for `sbx doctor`, `sbx test`, or any other verb that does not run a 
 from an untrusted one. An entry runs a program of its choosing at every launch, before anything
 else, which is the same grant `cmd` carries.
 
-See also: [`[network]`](network) · [`forward`](../networking/forward) · [`[bundle.<name>`](bundles) ·
+See also: [`[network]`](network) · [`forward`](../networking/forward) · [`[bundle.<name>]`](bundles) ·
 [`[open]`](open) · [The trust gate](../concepts/trust)
 
 ## What it is, and what it is not

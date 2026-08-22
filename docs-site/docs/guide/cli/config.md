@@ -219,8 +219,8 @@ Every field of the schema, and the verb that edits it. `<name>` is yours to choo
 | `binds` | host paths; `add` writes the read-only form, and a read-write one goes through `set binds '[{ path = "/opt/data", mode = "rw" }]'` |
 | `network.groups.<name>` | egress entries of a reusable group |
 | `network.http2`, `network.default_methods` | hosts, HTTP verbs |
-| `app.<name>.uses` | bundle names the app folds in |
-| `task.<name>.cmd`, `.unmask`, `.env_allow`, `.allow`, `.deny`, `.network`, `.packages` | the operation's own lists |
+| `app.<name>.use` | bundle names the app folds in |
+| `task.<name>.cmd`, `.unmask`, `.env_allow`, `.network`, `.packages`, `.spawn` | the operation's own lists (`allow` and `deny` are [not task controls](../configuration/task) and a declaration carrying either is refused) |
 | `bundle.<name>.allow`, `.deny`, `.mute` | the bundle's egress entries |
 
 **Lists with a posture, added through their own verb:**

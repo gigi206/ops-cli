@@ -30,7 +30,7 @@ application rather than at your host desktop.
 an untrusted one. A handler runs a program every time a link is opened, including a sign-in link a
 person clicked, so a project that could declare one could answer that click with a page of its own.
 
-See also: [`dbus`](dbus) · [`gui`](gui) · [`[network]`](network) · [`[bundle.<name>`](bundles) ·
+See also: [`dbus`](dbus) · [`gui`](gui) · [`[network]`](network) · [`[bundle.<name>]`](bundles) ·
 [The trust gate](../concepts/trust)
 
 ## The shape of an entry
