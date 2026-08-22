@@ -18,8 +18,9 @@ dependencies and execute. `sbx` gives that agent a real boundary: it runs as you
 user, but the **bind layout is the security control**: the host filesystem and your
 secrets are absent from the cage unless explicitly and trustedly granted. The agent
 self-equips a per-project Nix store it cannot use to escape, behind an always-on
-[seccomp filter](enforcement) and best-effort resource limits; egress is the host
-network by default and can be narrowed to a [deny-by-default allowlist](../networking/modes).
+[seccomp filter](enforcement) and best-effort resource limits; egress is a
+[deny-by-default allowlist](../networking/modes) carrying no rules of its own, so only the
+hosts you name, and the built-in self-equip set, are reachable at all.
 
 ## What it is not
 
@@ -67,8 +68,6 @@ code. See [the app framework](../apps/).
   **absent**, not merely read-only.
 - An untrusted project's `.sbx.toml` **cannot** touch security-relevant fields; the
   [trust gate](trust) binds approval to the file's content hash.
-
-Continue with the [security model](security-model).
 
 ## The rest of this section
 

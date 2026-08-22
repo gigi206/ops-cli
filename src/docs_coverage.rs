@@ -349,6 +349,74 @@ fn every_root_config_field_has_a_row_in_the_field_map() {
     );
 }
 
+/// The counts the guide writes for the shipped profiles and bundles are the real ones.
+///
+/// Three pages state how many profiles and bundles the repository ships, and a reader takes those
+/// numbers as the shape of the catalogue: "all 71 name a bundle" is an argument, not decoration.
+/// Adding one profile makes every one of them wrong, silently, because prose does not fail to
+/// compile. The catalogue guard below proves each profile is *listed*; this one proves the guide
+/// still knows how many there are.
+#[test]
+fn the_shipped_counts_the_guide_states_are_the_real_ones() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let count = |dir: &str| {
+        std::fs::read_dir(root.join(dir))
+            .unwrap_or_else(|e| panic!("{dir} must be readable: {e}"))
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "toml"))
+            .count()
+    };
+    let (profiles, bundles) = (count("examples/app"), count("examples/bundle"));
+    assert!(
+        profiles > 20 && bundles > 20,
+        "the example scan found {profiles} profile(s) and {bundles} bundle(s), so it has stopped \
+         matching the tree's shape and would pass vacuously"
+    );
+
+    // A number reads as a count only next to `shipped` or `importable`, so `1-64 characters` and
+    // `4 per host` are not mistaken for one. The phrasings in use are `71 shipped profiles`,
+    // `71 importable starter profiles`, `64 shipped bundles` and, on the bundles page, `64 of the
+    // 71` — the last one stated as a fraction of the profiles rather than of anything else.
+    let mut wrong: Vec<String> = Vec::new();
+    for (path, page) in guide_pages() {
+        let flat = page.split_whitespace().collect::<Vec<_>>().join(" ");
+        let at = path.display().to_string();
+        for (noun, want) in [("profiles", profiles), ("bundles", bundles)] {
+            for (i, _) in flat.match_indices(noun) {
+                let head = &flat[i.saturating_sub(40)..i];
+                if !head.contains("shipped") && !head.contains("importable") {
+                    continue;
+                }
+                let Some(num) = head
+                    .split(|c: char| !c.is_ascii_digit())
+                    .rfind(|t| !t.is_empty())
+                else {
+                    continue;
+                };
+                if num.parse::<usize>() != Ok(want) {
+                    wrong.push(format!("{at}: `{num} ... {noun}` (there are {want})"));
+                }
+            }
+        }
+        if at.ends_with("bundles.md")
+            && let Some(rest) = flat.split("of the ").nth(1)
+            && let Some(claimed) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse::<usize>().ok())
+            && claimed != profiles
+        {
+            wrong.push(format!(
+                "{at}: `of the {claimed}` (there are {profiles} profiles)"
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the guide states counts the repository no longer has: {wrong:?}"
+    );
+}
+
 /// Every shipped app profile appears in the catalogue page.
 ///
 /// The catalogue is the only place a reader can discover a profile by name, so one that is shipped

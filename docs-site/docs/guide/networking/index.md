@@ -66,7 +66,7 @@ method, regex), resolves DNS **host-side** (so the cage never sees a name to
 exfiltrate through), validates the upstream certificate against the system trust
 store, and only then relays the bytes. Deny-by-construction, filtered by an
 allowlist you author. The full evidence and the rejected alternative (Model P,
-pasta NAT) are in [architecture](architecture) (the section above).
+pasta NAT) are in [Architecture](architecture).
 
 ---
 

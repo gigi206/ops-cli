@@ -290,12 +290,14 @@ while keeping its own `allow`/`deny` rules. This lets a project add rules withou
 restating the posture, and lets an app narrow the baseline's rule set:
 
 ```toml
-# global sbx.toml
+# ~/.config/sbx/sbx.toml
 [network]
 mode  = "deny"
 allow = ["*.nixos.org"]
+```
 
-# project .sbx.toml: no `mode`, inherits "deny", adds a host
+```toml
+# .sbx.toml: no `mode`, so it inherits "deny", and adds a host
 [network]
 allow = ["api.anthropic.com"]
 ```

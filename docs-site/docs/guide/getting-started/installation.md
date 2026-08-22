@@ -121,9 +121,27 @@ Mermaid diagrams render in the browser, from `@docusaurus/theme-mermaid`.
 ```sh
 mise run docs-install   # Node + the pinned npm packages, into docs-site/node_modules
 mise run docs           # local preview at http://localhost:3000 (live reload)
-mise run docs-build     # strict build into docs-site/build/ (a broken link fails it)
+mise run docs-check     # the navigation and imported-recipe checks, without a build
+mise run docs-import    # regenerate secrets/providers/ from examples/secrets/
+mise run docs-build     # strict build into docs-site/build/ (runs docs-check first)
 mise run docs-serve     # build, then serve it; the only way to exercise search
 ```
+
+The build is strict on purpose, and refuses to finish on any of four things:
+
+- a **broken internal link or anchor**: a page or a heading that does not exist. A link
+  to a file *outside* the guide directory (`README.md`, the build config, anything under
+  `src/`) has to be a full GitHub URL rather than a relative path, since the site is
+  built from `docs-site/docs/guide/` alone.
+- a **page nothing routes to**: every page must be named in `sidebars.ts`, sit in a
+  directory with an `index.md`, and be linked from both its section index and the guide
+  index.
+- a **stale imported recipe**: `docs/guide/secrets/providers/` is generated from
+  `examples/secrets/*/README.md`. Edit the README, run `mise run docs-import`, and commit
+  both.
+- **markdown that MDX cannot parse**, most often a bare `<` in prose.
+
+Each error names the page and what it could not resolve.
 
 Search is [Pagefind](https://pagefind.app/), which indexes the built HTML in a
 `postbuild` step. There is therefore **no search index under `mise run docs`**:

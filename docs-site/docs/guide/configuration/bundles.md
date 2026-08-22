@@ -353,12 +353,12 @@ None of them carries a `cmd` or a posture (`network` mode, `gui`, `gpu`, …): a
 what a tool *needs*, and the consuming app keeps its own command and its own posture. See
 [What a bundle may carry](#what-a-bundle-may-carry-and-what-it-may-not).
 
-Every shipped profile now names a bundle with `use`: 64 of the 71 name their own, and the
+Every shipped profile names a bundle with `use`: 64 of the 71 name their own, and the
 other 7 consume **another** agent's, because nothing would ever compose them in turn:
 `t3code` names `claude-code`; `aionui`, `opencode-web`, `open-design` and `orca-desktop`
 name `opencode`; `hermes-web` and `hermes-webui` name `hermes`. No shipped profile is a
-one-step import any more: importing one alone leaves its bundle (and any group that
-bundle REQUIRES) undeclared, and the launch warns.
+one-step import: importing one alone leaves its bundle (and any group that bundle
+REQUIRES) undeclared, and the launch warns.
 
 Eight bundles carry an **install step** (`provision`) beside their packages, because their agent is
 finished by a command rather than by unpacking: `deepseek-harness`, `junie`, `odysseus`, `openfox`
