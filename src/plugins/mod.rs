@@ -1211,9 +1211,6 @@ pub(crate) fn replace_from_store(
     install_inner(layout, source, Some(claim), origin, Placement::Replace)
 }
 
-/// The shared body of [`install`] and [`install_from_store`]. `expect` is `Some((name, scheme))`
-/// only for a store install, where the catalogue's advertised identity is reconciled against the
-/// manifest before anything is placed; a local-directory or built-in install passes `None`.
 /// `origin` is where the plugin came from, recorded once it is in place — passed in rather than
 /// inferred from `source`, since a built-in install stages into a temp tree whose path says
 /// nothing about its provenance.
@@ -1229,6 +1226,9 @@ enum Placement {
     Replace,
 }
 
+/// The shared body of [`install`] and [`install_from_store`]. `expect` is `Some((name, scheme))`
+/// only for a store install, where the catalogue's advertised identity is reconciled against the
+/// manifest before anything is placed; a local-directory or built-in install passes `None`.
 fn install_inner(
     layout: &crate::store::Layout,
     source: &Path,
@@ -2713,10 +2713,6 @@ mod tests {
         assert!(p.check_exec().unwrap_err().contains("group or other"));
     }
 
-    /// Build a source plugin directory (a `plugin.toml` and an owner-owned `resolve` executable at
-    /// `mode`) under `root`, returning its path — the kind of directory `sbx plugins install` takes.
-    /// The provenance a store install carries, for the tests that exercise the store path. The
-    /// store subsystem builds the real one from the configured store and the catalogue entry.
     /// The claim a store makes about a resolver, as its catalogue would carry it.
     fn resolver_claim<'a>(name: &'a str, scheme: &'a str) -> StoreClaim<'a> {
         StoreClaim {
@@ -2726,6 +2722,8 @@ mod tests {
         }
     }
 
+    /// The provenance a store install carries, for the tests that exercise the store path. The
+    /// store subsystem builds the real one from the configured store and the catalogue entry.
     fn store_origin() -> origin::Origin {
         origin::Origin::Store {
             store: "mine".to_string(),
@@ -2734,6 +2732,8 @@ mod tests {
         }
     }
 
+    /// Build a source plugin directory (a `plugin.toml` and an owner-owned `resolve` executable at
+    /// `mode`) under `root`, returning its path — the kind of directory `sbx plugins install` takes.
     fn source_plugin(root: &Path, dirname: &str, manifest: &str, exec_mode: u32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let dir = root.join(dirname);

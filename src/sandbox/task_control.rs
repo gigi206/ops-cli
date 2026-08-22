@@ -425,17 +425,18 @@ impl TaskLog {
     }
 }
 
+/// What a detached invocation left behind: what it produced, or why it never produced anything. Both
+/// are held, because an invocation can still fail *after* it was admitted — a credential that will not
+/// resolve, a proxy that will not start — and the caller that would have been told is already gone.
+type Held = Result<TaskOutcome, String>;
+
 /// The finished detached invocations a session is holding for collection.
 ///
 /// In RAM and never on disk, for the same reason as [`TaskLog`]: this holds a command's own output,
 /// which is exactly the class of data the log ring is careful not to leave behind. It dies with the
 /// session, which is also the longest a detached invocation can live — the plane runs in the session's
 /// process, so nothing is ever waiting for a result whose session is gone.
-/// What a detached invocation left behind: what it produced, or why it never produced anything. Both
-/// are held, because an invocation can still fail *after* it was admitted — a credential that will not
-/// resolve, a proxy that will not start — and the caller that would have been told is already gone.
-type Held = Result<TaskOutcome, String>;
-
+///
 /// Its lock cannot be poisoned either, by the same enumeration and for the same reason: the two
 /// critical sections below hold it for a `VecDeque` push, pop and scan, and nothing else. See
 /// [`TaskLog`] for the invariant and what would break it.

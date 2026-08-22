@@ -1156,9 +1156,6 @@ fn hold_request_body<R: BufRead>(
     Ok(body)
 }
 
-/// The credential injections (`header`, `value`) whose host/path rule matches this request,
-/// canonicalized through the same matcher the verdict used. Borrowed from the context, so no
-/// secret is copied beyond the forwarded head.
 /// The **positions** in the credential set of the injections this request receives.
 ///
 /// This is what identifies a credential set without carrying one: the upstream-connection pool is
@@ -1642,15 +1639,6 @@ fn print_egress_notice(head: &str, actions: &[(&str, &str)]) {
     eprintln!("{}", egress_notice_line(&p, head, actions));
 }
 
-/// Write an sbx-originated refusal: the status line, an `X-Sbx-Egress-Reason` header carrying a
-/// stable machine-readable category, and a short `text/plain` body repeating the human detail.
-/// A tool (and the agent it serves) can then tell an explicit policy refusal (`403`, category
-/// `denied-default`/`denied-by-rule`) from an unreachable host (`502`, `upstream-unreachable`/
-/// `dns-failure`) — these are the proxy's *own* statuses, distinct from a real upstream response
-/// it relays verbatim (a genuine `404` reaches the agent unchanged). The category is a fixed
-/// token, so it is safe in a header; the detail is sbx-authored and only ever echoes what the
-/// agent already sent (its own host/port) or a category — never the injected credential, any
-/// host-side secret, or the policy's internal rule text (for which `sbx test net` is the tool).
 /// The body of a written refusal, in one place because two planes write it.
 ///
 /// The HTTP/1.1 planes serialize it themselves and the HTTP/2 plane sends it as a DATA frame, so
@@ -1661,6 +1649,15 @@ pub(super) fn refusal_body(detail: &str) -> String {
     format!("sbx egress refused this request: {detail}\n")
 }
 
+/// Write an sbx-originated refusal: the status line, an `X-Sbx-Egress-Reason` header carrying a
+/// stable machine-readable category, and a short `text/plain` body repeating the human detail.
+/// A tool (and the agent it serves) can then tell an explicit policy refusal (`403`, category
+/// `denied-default`/`denied-by-rule`) from an unreachable host (`502`, `upstream-unreachable`/
+/// `dns-failure`) — these are the proxy's *own* statuses, distinct from a real upstream response
+/// it relays verbatim (a genuine `404` reaches the agent unchanged). The category is a fixed
+/// token, so it is safe in a header; the detail is sbx-authored and only ever echoes what the
+/// agent already sent (its own host/port) or a category — never the injected credential, any
+/// host-side secret, or the policy's internal rule text (for which `sbx test net` is the tool).
 fn write_refusal<W: Write>(
     w: &mut W,
     status: &str,

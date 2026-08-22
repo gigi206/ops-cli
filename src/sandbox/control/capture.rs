@@ -307,8 +307,6 @@ impl Capture {
 pub(crate) struct CaptureRing {
     inner: Mutex<CaptureInner>,
     caps: CaptureCaps,
-    /// The secret values masked out of every capture on the way in. Held here rather than passed per
-    /// call so masking cannot be skipped at a call site.
     /// The live credential state, shared with the proxy rather than copied from it. A capture is
     /// filed after the exchange it describes, and a credential can be re-resolved in between, so a
     /// private copy would eventually mask against a superseded value — which is the one failure

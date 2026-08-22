@@ -22,9 +22,6 @@ use super::{Backend, ForwardPort, NetworkPolicy, Resolved};
 use crate::trust::TrustState;
 use crate::{sandbox, store};
 
-/// A serializable projection of the resolved configuration for a directory — the model both the
-/// `sbx config` CLI and a future management front-end render. Field order mirrors the CLI's
-/// long-standing display order so a presenter can walk it top to bottom.
 /// One `[plugin.<name>]` table as the layers resolved it, for `sbx config show`. Values are
 /// shown: they are configuration (an address, a namespace, a path), never a credential — a
 /// secret belongs in `[secret]`, which this view prints by locator and never by value.
@@ -40,6 +37,9 @@ pub(crate) struct PluginView {
     pub(crate) programs: Vec<String>,
 }
 
+/// A serializable projection of the resolved configuration for a directory — the model both the
+/// `sbx config` CLI and a future management front-end render. Field order mirrors the CLI's
+/// long-standing display order so a presenter can walk it top to bottom.
 #[derive(Serialize)]
 pub(crate) struct ConfigView {
     /// The directory this configuration was resolved for.

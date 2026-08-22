@@ -621,17 +621,6 @@ impl SeccompPolicy {
 mod tests {
     use super::*;
 
-    /// Every compiled filter opens by refusing the x32 ABI, and the architecture check it was
-    /// already opening with still follows.
-    ///
-    /// Decoded from what [`programs`] actually emits — the bytes bwrap is handed — rather than by
-    /// calling the guard and checking the guard. A filter that forgot to apply it would pass the
-    /// second and fail this.
-    ///
-    /// It has to be read out of the instructions rather than exercised, because the ABI it defends
-    /// against does not exist on a kernel built without `CONFIG_X86_X32_ABI` — most of them, this
-    /// machine included. The constants are spelled out so they can be compared by eye against
-    /// `seccomp(2)` instead of trusted through a name.
     /// One instruction, decoded from the serialized `struct sock_filter` bwrap reads.
     fn insn(bytes: &[u8], at: usize) -> (u16, u8, u8, u32) {
         let w = &bytes[at * 8..at * 8 + 8];
@@ -650,6 +639,17 @@ mod tests {
     #[cfg(not(target_arch = "x86_64"))]
     const ARCH_CHECK_AT: usize = 0;
 
+    /// Every compiled filter opens by refusing the x32 ABI, and the architecture check it was
+    /// already opening with still follows.
+    ///
+    /// Decoded from what [`programs`] actually emits — the bytes bwrap is handed — rather than by
+    /// calling the guard and checking the guard. A filter that forgot to apply it would pass the
+    /// second and fail this.
+    ///
+    /// It has to be read out of the instructions rather than exercised, because the ABI it defends
+    /// against does not exist on a kernel built without `CONFIG_X86_X32_ABI` — most of them, this
+    /// machine included. The constants are spelled out so they can be compared by eye against
+    /// `seccomp(2)` instead of trusted through a name.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn every_filter_refuses_the_x32_abi_before_it_looks_at_anything_else() {

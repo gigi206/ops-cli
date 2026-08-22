@@ -586,3 +586,249 @@ fn the_guide_writes_no_em_dash_outside_the_output_it_quotes() {
         offenders.join("\n")
     );
 }
+
+/// The module-level items in `src/` that carry no doc comment today.
+///
+/// A grandfather list, not a permission: every entry is a gap this guard was switched on around,
+/// and the test fails just as loudly on an entry that no longer applies, so the list can only
+/// shrink. Keyed by `(file under `src/`, item name)` rather than by line so it survives every edit
+/// that does not change what is documented.
+const UNDOCUMENTED_MODULE_ITEMS: &[(&str, &str)] = &[
+    ("allowlist/mod.rs", "EgressPolicy"),
+    ("cli/app.rs", "merged"),
+    ("cli/app.rs", "nothing_written"),
+    ("cli/app.rs", "parse_app_rm"),
+    ("cli/completion.rs", "completion_cmd"),
+    ("cli/gc.rs", "run"),
+    ("cli/logs.rs", "read_broker_rows"),
+    ("cli/logs.rs", "read_fs_rows"),
+    ("cli/logs.rs", "read_net_rows"),
+    ("cli/logs.rs", "read_proc_rows"),
+    ("cli/logs.rs", "read_signer_rows"),
+    ("cli/logs.rs", "read_ssh_rows"),
+    ("cli/logs.rs", "read_task_rows"),
+    ("cli/projects.rs", "projects_list_cmd"),
+    ("cli/projects.rs", "projects_rm_cmd"),
+    ("cli/search.rs", "run"),
+    ("cli/storage.rs", "StatusView"),
+    ("cli/storage.rs", "down"),
+    ("cli/storage.rs", "fail"),
+    ("cli/storage.rs", "init"),
+    ("cli/storage.rs", "parse_opts"),
+    ("cli/storage.rs", "render"),
+    ("cli/storage.rs", "status"),
+    ("cli/storage.rs", "status_next_step"),
+    ("cli/storage.rs", "storage_cmd"),
+    ("cli/storage.rs", "up"),
+    ("cli/task.rs", "RunOutputView"),
+    ("cli/task.rs", "layout_or_fail"),
+    ("cli/task.rs", "listing_args"),
+    ("cli/task.rs", "no_sessions"),
+    ("cli/task.rs", "one_plane"),
+    ("cli/task.rs", "resolve_named"),
+    ("config/fspolicy.rs", "glob_walk"),
+    ("config/mod.rs", "warn_mise_nix_packages"),
+    ("config/schema.rs", "NetworkField"),
+    ("config/view.rs", "NetworkView"),
+    ("main.rs", "main"),
+    ("main.rs", "read_sysctl"),
+    ("observe.rs", "node"),
+    ("pathfind.rs", "is_executable"),
+    ("paths.rs", "BaseView"),
+    ("paths.rs", "ChildView"),
+    ("paths.rs", "EntryView"),
+    ("plugins/catalogue.rs", "RawCatalogue"),
+    ("plugins/catalogue.rs", "RawEntry"),
+    ("plugins/catalogue.rs", "collect_files"),
+    ("plugins/stores.rs", "RawStoreToml"),
+    ("sandbox/argv.rs", "lit"),
+    ("sandbox/argv.rs", "path"),
+    ("sandbox/binds.rs", "build_spec"),
+    ("sandbox/broker.rs", "hex_digit"),
+    ("sandbox/control/capture.rs", "CaptureInner"),
+    ("sandbox/control/mod.rs", "FlowEntry"),
+    ("sandbox/control/mod.rs", "FlowInner"),
+    ("sandbox/control/mod.rs", "Inner"),
+    ("sandbox/control/mod.rs", "LogInner"),
+    ("sandbox/control/mod.rs", "ManualInner"),
+    ("sandbox/gc.rs", "accumulate_usage"),
+    ("sandbox/launch.rs", "missing"),
+    ("sandbox/launch.rs", "prepare_config"),
+    ("sandbox/lens.rs", "Inner"),
+    ("sandbox/netns.rs", "die"),
+    ("sandbox/netns.rs", "to_cstring"),
+    ("sandbox/notify_relay.rs", "HostNotifications"),
+    ("sandbox/proc_enforce.rs", "OverlayInner"),
+    ("sandbox/proc_enforce.rs", "Parked"),
+    ("sandbox/proc_enforce.rs", "notif_id_valid_code"),
+    ("sandbox/proc_enforce.rs", "notif_recv_code"),
+    ("sandbox/proc_enforce.rs", "notif_send_code"),
+    ("sandbox/proc_enforce.rs", "seccomp_ioc"),
+    ("sandbox/proc_enforce.rs", "start_inner"),
+    ("sandbox/proc_enforce.rs", "wrap_command"),
+    ("sandbox/projectstore.rs", "acquire_shared_gc_lock"),
+    ("sandbox/proxy/bench.rs", "signing_injection"),
+    ("sandbox/proxy/dns.rs", "default_resolve"),
+    ("sandbox/proxy/inject.rs", "RefreshState"),
+    ("sandbox/proxy/ssrf.rs", "classify_ip"),
+    ("sandbox/proxy/ssrf.rs", "classify_v4"),
+    ("sandbox/proxy/ssrf.rs", "classify_v6"),
+    ("sandbox/proxy/websocket.rs", "relay_websocket"),
+    ("sandbox/seccomp.rs", "write_to_memfd"),
+    ("sandbox/task_control.rs", "Inner"),
+    ("sandbox/theme_relay.rs", "HostSettings"),
+    ("session.rs", "close_fd"),
+    ("storage.rs", "lock_image"),
+];
+
+/// One module-level item declaration: the file it is in, its name, and whether a doc comment sits
+/// directly above it.
+struct ItemDoc {
+    file: String,
+    name: String,
+    documented: bool,
+}
+
+/// Every module-level `fn`/`struct`/`enum`/`trait`/`union` in `src/`, with whether it is documented.
+///
+/// Deliberately a line scanner and not a parse: the question is "does a `///` sit above this
+/// declaration", which is exactly what a reader sees, and a real parser would answer a subtly
+/// different question (a doc *attribute*, wherever it came from). Three regions are skipped because
+/// nothing in them is expected to carry prose of its own — a `impl Trait for Type` body, whose
+/// methods inherit the trait's documentation; anything under `mod tests`; and any item attributed
+/// `#[test]` or `#[cfg(test)]`. Files named `tests.rs` / `*_tests.rs` are skipped whole, being
+/// test-only modules.
+fn module_level_items() -> Vec<ItemDoc> {
+    let item = regex::Regex::new(
+        r#"^(?:pub(?:\([a-z(): ]+\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+"[^"]*"\s+)?(?:fn|struct|enum|trait|union)\s+([A-Za-z_][A-Za-z0-9_]*)"#,
+    )
+    .expect("the item pattern compiles");
+    let trait_impl = regex::Regex::new(r"^\s*impl(?:<[^>]*>)?\s+.*\s+for\s+")
+        .expect("the impl pattern compiles");
+    let mod_tests = regex::Regex::new(r"^\s*(?:#\[cfg\(test\)\]\s*)?mod\s+tests\s*\{")
+        .expect("the tests pattern compiles");
+
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut paths = Vec::new();
+    walk(&root, &mut paths);
+    paths.sort();
+
+    let is_attr = |l: &str| l.trim_start().starts_with("#[") || l.trim_start().starts_with("#![");
+    let is_doc = |l: &str| l.trim_start().starts_with("///");
+
+    let mut out = Vec::new();
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if name == "tests.rs" || name.ends_with("_tests.rs") {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        let mut depth: i32 = 0;
+        let mut skip: Vec<i32> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if (trait_impl.is_match(line) && line.trim_end().ends_with('{'))
+                || mod_tests.is_match(line)
+            {
+                skip.push(depth);
+            }
+            if skip.is_empty()
+                && !line.starts_with([' ', '\t'])
+                && let Some(caps) = item.captures(line)
+            {
+                let mut j = i;
+                let mut in_test = false;
+                while j > 0 && is_attr(lines[j - 1]) {
+                    if lines[j - 1].contains("#[test") || lines[j - 1].contains("#[cfg(test)") {
+                        in_test = true;
+                    }
+                    j -= 1;
+                }
+                if !in_test {
+                    out.push(ItemDoc {
+                        file: rel.clone(),
+                        name: caps[1].to_string(),
+                        documented: j > 0 && is_doc(lines[j - 1]),
+                    });
+                }
+            }
+            depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+            while skip.last().is_some_and(|d| depth <= *d) {
+                skip.pop();
+            }
+        }
+    }
+    out
+}
+
+/// Every module-level item carries a doc comment, or is a named pre-existing gap.
+///
+/// This closes a failure mode nothing else here catches. A doc comment belongs to whatever item
+/// follows it, so when a refactor moves, renames or deletes an item and leaves its `///` block
+/// behind, the block silently becomes the *next* item's documentation — and the compiler, clippy
+/// and `mise run rustdoc` all stay green, because the block still parses and its intra-doc links
+/// still resolve. Only a reader notices, and only if they happen to read that item's prose against
+/// its code. Forty-seven such blocks had accumulated when this test was written.
+///
+/// What makes it catchable is the other half of the same event: the severed block leaves its
+/// rightful owner with no documentation at all. So this checks presence, in the spirit of the rest
+/// of the module — it cannot tell whether prose is true, only that an item which had prose still
+/// has some.
+#[test]
+fn every_module_level_item_carries_a_doc_comment() {
+    let allowed: BTreeSet<(&str, &str)> = UNDOCUMENTED_MODULE_ITEMS.iter().copied().collect();
+    let items = module_level_items();
+
+    let mut undocumented = Vec::new();
+    let mut seen = BTreeSet::new();
+    for it in &items {
+        let key = (it.file.as_str(), it.name.as_str());
+        if it.documented {
+            continue;
+        }
+        seen.insert((it.file.clone(), it.name.clone()));
+        if !allowed.contains(&key) {
+            undocumented.push(format!("{}: {}", it.file, it.name));
+        }
+    }
+    assert!(
+        undocumented.is_empty(),
+        "these module-level items carry no doc comment. If a refactor moved one, its `///` block \
+         is most likely still sitting above whichever item now follows it — where it reads as that \
+         item's documentation. Move the block back rather than writing a new one:\n{}",
+        undocumented.join("\n")
+    );
+
+    let stale: Vec<String> = UNDOCUMENTED_MODULE_ITEMS
+        .iter()
+        .filter(|(f, n)| !seen.contains(&((*f).to_string(), (*n).to_string())))
+        .map(|(f, n)| format!("{f}: {n}"))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "`UNDOCUMENTED_MODULE_ITEMS` names items that are now documented or gone. Drop these \
+         entries so the list keeps shrinking:\n{}",
+        stale.join("\n")
+    );
+}

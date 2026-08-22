@@ -3088,9 +3088,6 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         );
     }
 
-    /// A protocol whose clients compute the socket path is stood at the address of the resource it
-    /// fences — the only placement a GnuPG client can find, since it derives the path from the uid
-    /// and the home rather than reading any variable.
     /// A broker's socket and the session's record share one `0700` directory, and a plugin name is
     /// whatever a plugin was installed as. Without a namespace of its own, a broker named `control`
     /// would bind the very path `sbx logs --feed broker` connects to — and `start` unlinks before
@@ -3118,6 +3115,9 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         }
     }
 
+    /// A protocol whose clients compute the socket path is stood at the address of the resource it
+    /// fences — the only placement a GnuPG client can find, since it derives the path from the uid
+    /// and the home rather than reading any variable.
     #[test]
     fn a_broker_stands_where_its_protocols_clients_look_for_it() {
         let mut spec = crate::plugins::broker::BrokerSpec {

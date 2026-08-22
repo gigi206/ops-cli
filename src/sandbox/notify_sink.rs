@@ -148,11 +148,6 @@ pub(crate) trait Sink: Send {
     ) -> Result<Option<u32>, ()>;
 }
 
-/// The fallback sink: one stderr line per announcement, in the diagnostic family's shape.
-///
-/// Used when there is no session bus to reach. It has no ids and no replacement, so an `always` event
-/// prints a line per occurrence — on a terminal that is the expected behaviour, and the desktop
-/// sink's in-place update has no meaning here.
 /// One stderr line for an announcement: `session: summary: body`, dropping whichever part is
 /// absent. Pure, so the empty cases are pinned by tests rather than read off a terminal.
 ///
@@ -176,6 +171,11 @@ fn stderr_line(context: &str, summary: &str, body: &str) -> String {
     }
 }
 
+/// The fallback sink: one stderr line per announcement, in the diagnostic family's shape.
+///
+/// Used when there is no session bus to reach. It has no ids and no replacement, so an `always` event
+/// prints a line per occurrence — on a terminal that is the expected behaviour, and the desktop
+/// sink's in-place update has no meaning here.
 struct StderrSink {
     /// The session this sink speaks for. A terminal has no application header to carry it, so what
     /// the desktop shows beside the icon is prefixed onto the line here — otherwise falling back to

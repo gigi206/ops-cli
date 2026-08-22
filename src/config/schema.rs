@@ -697,10 +697,6 @@ pub(crate) struct RawSshAgent {
     pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
-/// One `[app.<name>]` entry: the command to run plus an overlay over the sandbox
-/// baseline. The overlay fields reuse the baseline shapes and gate identically — an
-/// untrusted project's app may add `env`/`packages` and choose the command, but its
-/// `binds`/`network`/`secret` are dropped, exactly as for the baseline.
 /// One `[plugin.<name>]` table: what this host supplies to the named resolver plugin.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -771,6 +767,10 @@ pub(crate) struct RawBrokerConfig {
     pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
+/// One `[app.<name>]` entry: the command to run plus an overlay over the sandbox
+/// baseline. The overlay fields reuse the baseline shapes and gate identically — an
+/// untrusted project's app may add `env`/`packages` and choose the command, but its
+/// `binds`/`network`/`secret` are dropped, exactly as for the baseline.
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawApp {
     /// The command to run, as an argv. A bare string is taken as a single-element argv

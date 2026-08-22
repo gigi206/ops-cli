@@ -476,7 +476,7 @@ pub(crate) struct Resolved {
     pub(crate) tasks: Vec<TaskSpec>,
     /// Named application launch profiles, each a gated overlay over this baseline. Keyed
     /// by name; `sbx app <name>` looks one up and folds it on with [`Resolved::merge_app`].
-    /// `sbx run` ignore them.
+    /// `sbx run` ignores them.
     pub(crate) apps: BTreeMap<String, ResolvedApp>,
     /// Human-readable notes about what was dropped or ignored and why.
     pub(crate) warnings: Vec<String>,
@@ -2748,10 +2748,6 @@ fn union_forward(base: &mut Vec<ForwardPort>, extra: Vec<ForwardPort>) {
     sort_forward(base);
 }
 
-/// Union `extra` device paths into `base`, deduped and sorted — the same additive model as
-/// [`union_forward`]: a layer (a trusted project overlay, an app) adds device grants, never removes
-/// another layer's. A path already present is kept (idempotent); the result is sorted so two
-/// equivalent layers produce one canonical set.
 /// Report every key a layer wrote that sbx does not know.
 ///
 /// Unknown keys stay **ignored**: that is what lets a config written for a newer sbx load on an
@@ -2885,6 +2881,10 @@ fn union_ssh_agent(base: &mut Vec<String>, extra: Vec<String>) {
     base.sort();
 }
 
+/// Union `extra` device paths into `base`, deduped and sorted — the same additive model as
+/// [`union_forward`]: a layer (a trusted project overlay, an app) adds device grants, never removes
+/// another layer's. A path already present is kept (idempotent); the result is sorted so two
+/// equivalent layers produce one canonical set.
 fn union_devices(base: &mut Vec<PathBuf>, extra: Vec<PathBuf>) {
     for dev in extra {
         if !base.contains(&dev) {
@@ -4681,13 +4681,6 @@ pub(crate) fn is_valid_appimage_url(url: &str, allow_insecure_http: bool) -> boo
     })
 }
 
-/// A `tarball:` URL: an `https://` URL to a prebuilt application `.tar.gz`/`.tgz`. The sibling of
-/// [`is_valid_deb_url`] — required to be HTTPS (the fetch is unauthenticated beyond TLS and the
-/// bundle is executed after autoPatchelf, so a plaintext source is refused) and to end in `.tar.gz`
-/// or `.tgz` (case-insensitively; a mistyped value is caught, not silently built). The character set
-/// is the same injection-free URL set (including `%`, so a percent-encoded space like a vendor's
-/// `My%20App.tar.gz` is accepted), so the value carries no shell/nix metacharacter — it is
-/// interpolated into a generated nix expression and a `nix store prefetch-file` argument.
 /// A `binary:` URL: an `https://` URL to the program itself, with no archive around it.
 ///
 /// The sibling of [`is_valid_tarball_url`], minus the extension requirement, and the difference is
@@ -4710,6 +4703,13 @@ pub(crate) fn is_valid_binary_url(url: &str, allow_insecure_http: bool) -> bool 
     })
 }
 
+/// A `tarball:` URL: an `https://` URL to a prebuilt application `.tar.gz`/`.tgz`. The sibling of
+/// [`is_valid_deb_url`] — required to be HTTPS (the fetch is unauthenticated beyond TLS and the
+/// bundle is executed after autoPatchelf, so a plaintext source is refused) and to end in `.tar.gz`
+/// or `.tgz` (case-insensitively; a mistyped value is caught, not silently built). The character set
+/// is the same injection-free URL set (including `%`, so a percent-encoded space like a vendor's
+/// `My%20App.tar.gz` is accepted), so the value carries no shell/nix metacharacter — it is
+/// interpolated into a generated nix expression and a `nix store prefetch-file` argument.
 pub(crate) fn is_valid_tarball_url(url: &str, allow_insecure_http: bool) -> bool {
     strip_fetch_scheme(url, allow_insecure_http).is_some_and(|rest| {
         let lower = url.to_ascii_lowercase();
@@ -4793,10 +4793,6 @@ fn upsert_package(
     }
 }
 
-/// The actionable reason a project's security-relevant value is held back, phrased
-/// for the action it implies: a since-*changed* project points at re-approval, a
-/// never-trusted one at first approval. Shared by the package launcher and
-/// `sbx config` so the two never phrase the same verdict differently.
 /// The trust verdict one configuration layer is subject to, and what names that layer when it has
 /// to refuse a field.
 ///
@@ -4912,6 +4908,10 @@ fn refuse_untrusted(warnings: &mut Vec<String>, source: &str, what: &str, state:
     ));
 }
 
+/// The actionable reason a project's security-relevant value is held back, phrased
+/// for the action it implies: a since-*changed* project points at re-approval, a
+/// never-trusted one at first approval. Shared by the package launcher and
+/// `sbx config` so the two never phrase the same verdict differently.
 pub(crate) fn untrusted_reason(state: TrustState) -> &'static str {
     match state {
         TrustState::Changed => "changed since it was trusted — re-run `sbx trust`",
@@ -5014,15 +5014,6 @@ fn parse_duration(raw: &str) -> Result<Option<std::time::Duration>, String> {
 /// when a `[network]` `allow`/`deny` list references a group with `@<name>`.
 type NetGroups = BTreeMap<String, Vec<crate::allowlist::Rule>>;
 
-/// Classify the entries of one egress list (`allow`, `deny`, or `mute`), expanding a leading
-/// `@<name>` into the rules of that named group (from `[network.groups]`). A malformed entry is dropped
-/// with a warning that names which list it was in, and it is classified *as* that list, so a
-/// refusal that offers a way out (the bare `*` catch-all) offers the one this list's author wanted.
-/// An unknown `@<name>` reference is dropped with a *loud* warning — a miss in a `deny` list
-/// silently drops a carve-out (the host would no longer be blocked), the one case where a typo fails
-/// open in intent, so an unresolved reference must never pass unnoticed. Only a leading `@` is a
-/// reference: a `@` anywhere else (a URL path like `host/@user`, a `re:` pattern) is a legitimate
-/// part of the entry and is classified as written.
 /// The group an egress entry references, or `None` when the entry is a rule of its own. **Only a
 /// leading `@` is a reference**: a `@` anywhere else (a URL path like `host/@user`, a `re:` pattern)
 /// is a legitimate part of the entry and must classify as written.
@@ -5047,6 +5038,15 @@ pub(crate) fn group_refs<'a>(entries: impl Iterator<Item = &'a String>) -> Vec<S
     names
 }
 
+/// Classify the entries of one egress list (`allow`, `deny`, or `mute`), expanding a leading
+/// `@<name>` into the rules of that named group (from `[network.groups]`). A malformed entry is dropped
+/// with a warning that names which list it was in, and it is classified *as* that list, so a
+/// refusal that offers a way out (the bare `*` catch-all) offers the one this list's author wanted.
+/// An unknown `@<name>` reference is dropped with a *loud* warning — a miss in a `deny` list
+/// silently drops a carve-out (the host would no longer be blocked), the one case where a typo fails
+/// open in intent, so an unresolved reference must never pass unnoticed. Only a leading `@` is a
+/// reference: a `@` anywhere else (a URL path like `host/@user`, a `re:` pattern) is a legitimate
+/// part of the entry and is classified as written.
 fn classify_entries(
     warnings: &mut Vec<String>,
     source_label: &str,
@@ -5152,11 +5152,6 @@ fn build_net_groups(warnings: &mut Vec<String>, raw: BTreeMap<String, Vec<String
     groups
 }
 
-/// Whether a `[network.groups]` name is a safe, referenceable identifier. A group name is not a path
-/// component (unlike an app name), so `.`/`..` are harmless; it is charset- and length-bounded so
-/// a reference `@<name>` is unambiguous and the name renders cleanly in warnings and `sbx net`.
-/// Shared with the `sbx net allow/deny` write path so a persisted `@<name>` reference is validated
-/// by the same rule the resolver uses to name a group.
 /// A URI scheme usable as an `[open]` key: RFC 3986's `scheme` production — an ASCII letter
 /// followed by letters, digits, `+`, `-` or `.`.
 ///
@@ -5172,6 +5167,11 @@ fn is_valid_uri_scheme(s: &str) -> bool {
         && s.len() <= 64
 }
 
+/// Whether a `[network.groups]` name is a safe, referenceable identifier. A group name is not a path
+/// component (unlike an app name), so `.`/`..` are harmless; it is charset- and length-bounded so
+/// a reference `@<name>` is unambiguous and the name renders cleanly in warnings and `sbx net`.
+/// Shared with the `sbx net allow/deny` write path so a persisted `@<name>` reference is validated
+/// by the same rule the resolver uses to name a group.
 pub(crate) fn is_valid_group_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64

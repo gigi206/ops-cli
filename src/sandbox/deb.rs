@@ -628,11 +628,6 @@ fn apt_repo_root(packages_url: &str) -> Option<&str> {
     packages_url.split_once("/dists/").map(|(root, _)| root)
 }
 
-/// Select the linux `.deb` asset URL matching `system` from a GitHub release's JSON. A `.deb` is a
-/// Linux package by definition, so the discriminant is CPU architecture, not the OS: an asset whose
-/// name names a *foreign* arch is dropped, then one positively naming this arch is chosen
-/// (deterministic by name); a single unambiguous `.deb` with no arch token is the fallback for a
-/// single-arch repo. Pure, so selection is testable against captured release JSON.
 /// The `.deb` asset URL a `github:<owner>/<repo>` locator's newest release names, validated.
 ///
 /// **`allow_insecure_http` deliberately does not reach here, and the `apt:` sibling is the contrast

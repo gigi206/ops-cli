@@ -1645,10 +1645,6 @@ mod tests {
         }
     }
 
-    /// The load-bearing security property of the `ask` posture: the control socket — over which a
-    /// request is answered — is created host-side but **never** bound into the cage. In Mode B the
-    /// in-cage agent is the adversary; if it could reach this socket it could answer its own asks.
-    /// Only the proxy socket and the CA cross in.
     /// What the cage's trust anchor holds answers to two things, and the test keeps them apart.
     ///
     /// The default is a full, ordinary bundle: with every rule inspected the public roots verify
@@ -2067,6 +2063,10 @@ mod tests {
         );
     }
 
+    /// The load-bearing security property of the `ask` posture: the control socket — over which a
+    /// request is answered — is created host-side but **never** bound into the cage. In Mode B the
+    /// in-cage agent is the adversary; if it could reach this socket it could answer its own asks.
+    /// Only the proxy socket and the CA cross in.
     #[test]
     fn the_ask_control_socket_is_created_but_never_bound_into_the_cage() {
         let data = TmpDir::new();

@@ -1030,11 +1030,6 @@ fn run_as_json(name: &str, result: &client::RunResult) -> ExitCode {
     }
 }
 
-/// The session's **host-only** socket — the log, what is running, and the stop.
-///
-/// Refuses outright when the environment says this sbx is talking to a plane rather than owning one:
-/// these verbs are host-side by construction (the socket is never bound into a cage), and the
-/// explicit refusal is what makes that a message instead of a connection error.
 /// `sbx task status [<invocation>|<operation>] [--session <id>]`: the invocations running right now,
 /// across every session offering operations unless one is named.
 fn task_status(args: &[OsString]) -> ExitCode {

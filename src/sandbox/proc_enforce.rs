@@ -2252,7 +2252,6 @@ impl OpenOutcome {
         errno: None,
     };
 
-    /// The open the supervisor's probe could not make, answered with what it met.
     /// A refusal carrying the errno the cage is told.
     ///
     /// The rule is applied here rather than by the caller, because the caller is where it was
@@ -3623,9 +3622,6 @@ mod tests {
         );
     }
 
-    /// Lay the embedded shim down as an executable file and return its path. The tests below run
-    /// **this** binary — the one a launch binds into a cage — so a change to the shim's protocol or
-    /// its exit codes fails here rather than in a sandbox.
     /// Hand one descriptor over a connected stream, the way the shim does — the impostor's half of
     /// the handoff, so a test can be the thing the supervisor must not believe.
     fn send_fd(stream: &UnixStream, fd: libc::c_int) {
@@ -3715,6 +3711,9 @@ mod tests {
         }
     }
 
+    /// Lay the embedded shim down as an executable file and return its path. Its callers run
+    /// **this** binary — the one a launch binds into a cage — so a change to the shim's protocol or
+    /// its exit codes fails here rather than in a sandbox.
     fn materialized_shim(dir: &TmpDir) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("proc-shim");

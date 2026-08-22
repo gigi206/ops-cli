@@ -302,12 +302,6 @@ fn scheme_of(s: &str) -> Option<(usize, u16)> {
     }
 }
 
-/// Split an optional `:port-spec` suffix off a host-level entry, returning the host and its
-/// port set. A bare entry (`github.com`) gets the default HTTPS port {443}; `:*` admits
-/// any port; a comma list of single ports and/or `lo-hi` ranges (`:80,443,8000-8100`) pins
-/// exactly those. An IPv6 literal carrying a port is **bracketed** (`[::1]:443`,
-/// `[2001:db8::1]:*`) so its own colons do not confuse the split; bare, it needs no brackets
-/// (`::1`), taken whole at the default ports.
 /// Whether a host-level rule body (no scheme, no `/path`) carries an explicit `:port` spec, as
 /// opposed to taking the default. Mirrors [`split_host_ports`]'s split exactly: a bracketed IPv6
 /// has a port iff something follows the `]`; a bare IP literal (incl. `::1`, whose colons are the
@@ -325,6 +319,12 @@ fn has_explicit_port(body: &str) -> bool {
     body.contains(':')
 }
 
+/// Split an optional `:port-spec` suffix off a host-level entry, returning the host and its
+/// port set. A bare entry (`github.com`) gets the default HTTPS port {443}; `:*` admits
+/// any port; a comma list of single ports and/or `lo-hi` ranges (`:80,443,8000-8100`) pins
+/// exactly those. An IPv6 literal carrying a port is **bracketed** (`[::1]:443`,
+/// `[2001:db8::1]:*`) so its own colons do not confuse the split; bare, it needs no brackets
+/// (`::1`), taken whole at the default ports.
 fn split_host_ports(s: &str, default_port: u16) -> Result<(&str, Ports), String> {
     // a bracketed IPv6 literal, optionally `:port-spec` after the `]`
     if let Some(rest) = s.strip_prefix('[') {

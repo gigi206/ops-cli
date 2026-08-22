@@ -915,11 +915,6 @@ fn net_pending_answer_all(
     ExitCode::SUCCESS
 }
 
-/// Render a bulk `--all` drain: a per-session breakdown of the hosts it answered (so the user sees
-/// exactly what was granted/refused, across which agents), then a total. An empty drain says nothing
-/// was parked (naming the `--app` filter when one narrowed the scope, so an empty result is not
-/// mistaken for "nothing anywhere"). A pure presenter — its palette comes from the caller (plain on a
-/// captured stream).
 /// Collapse a session's answered-host list — one entry per parked request, so a host repeats once per
 /// request — into first-seen order paired with an occurrence count. A burst of retries (or several
 /// paths) to one destination then reads as a single `host ×N` line instead of N identical lines. The
@@ -936,6 +931,11 @@ fn collapse_hosts(hosts: &[String]) -> Vec<(&str, usize)> {
     order
 }
 
+/// Render a bulk `--all` drain: a per-session breakdown of the hosts it answered (so the user sees
+/// exactly what was granted/refused, across which agents), then a total. An empty drain says nothing
+/// was parked (naming the `--app` filter when one narrowed the scope, so an empty result is not
+/// mistaken for "nothing anywhere"). A pure presenter — its palette comes from the caller (plain on a
+/// captured stream).
 fn render_drain(
     past: &str,
     session: bool,

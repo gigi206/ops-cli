@@ -216,9 +216,6 @@ pub(crate) fn one_file(
     }
 }
 
-/// Fold a name repeated in one multi-name removal (`sbx app rm`, `sbx plugins rm`) down to a single
-/// removal, keeping the order the user typed. Without this the second pass over a name finds
-/// nothing left to remove and reports a phantom failure over work that in fact succeeded.
 /// The settings a replaced file carried that the incoming one does not — what a `--force` import
 /// drops, whether the file is an app profile or a bundle fragment.
 ///
@@ -241,6 +238,9 @@ pub(crate) fn settings_dropped_by(previous: &str, incoming: &str) -> Vec<String>
     out
 }
 
+/// Fold a name repeated in one multi-name removal (`sbx app rm`, `sbx plugins rm`) down to a single
+/// removal, keeping the order the user typed. Without this the second pass over a name finds
+/// nothing left to remove and reports a phantom failure over work that in fact succeeded.
 pub(crate) fn dedupe_names(names: &mut Vec<&str>) {
     let mut seen = std::collections::HashSet::new();
     names.retain(|name| seen.insert(*name));

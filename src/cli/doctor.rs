@@ -25,9 +25,6 @@ const BWRAP_LAUNCH_REMEDIATION: &str = "bubblewrap is installed and user namespa
 but launching a sandbox failed — check that bubblewrap is built to use unprivileged user \
 namespaces (not a setuid helper) and review the messages above";
 
-/// Report the runtime prerequisites and fail hard if a load-bearing one is
-/// missing. Each failing check contributes its own remediation hint, so the
-/// summary never points at the wrong cause.
 /// A colored `[ ok ]` status tag (green when the stream is a terminal, plain otherwise).
 fn tag_ok(p: &style::Palette) -> String {
     format!("{}[ ok ]{}", p.ok, p.reset)
@@ -43,6 +40,9 @@ fn tag_fail(p: &style::Palette) -> String {
     format!("{}[FAIL]{}", p.err, p.reset)
 }
 
+/// Report the runtime prerequisites and fail hard if a load-bearing one is
+/// missing. Each failing check contributes its own remediation hint, so the
+/// summary never points at the wrong cause.
 pub(crate) fn doctor() -> ExitCode {
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, r) = (pal.head, pal.reset);

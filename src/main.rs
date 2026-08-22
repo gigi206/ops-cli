@@ -270,11 +270,6 @@ fn config_cwd() -> Result<PathBuf, ExitCode> {
     })
 }
 
-/// `sbx config path`: with no scope flag, show the config files a launch resolves, in order, each
-/// with whether it exists — so it is clear where sbx looks (and that a default project `.sbx.toml`
-/// need not exist). With an explicit scope (`-l`/`-g`/`-c`), print the single bare path that scope
-/// targets — the file `set`/`unset`/`edit` would touch, for scripting and for finding the global
-/// config.
 /// `sbx path [--json]`: show every on-disk location sbx uses, grouped by XDG base
 /// (data, config, state), marking which exist and enumerating the per-project /
 /// per-app / per-profile entries actually on disk. Read-only, no trust gate, no
@@ -563,11 +558,6 @@ fn format_log_time(at_epoch_ms: u128) -> String {
     format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
-/// Pre-flight the trust gate for a `--local` save at `cwd`, *before* any irreversible action (a bulk
-/// drain unblocks agents and cannot be undone). Mirrors [`persist_egress_rule`]'s gate exactly — same
-/// `scope_path`, same trust-store, same "existing config must be trusted" rule — so a save that would
-/// later refuse refuses here instead, with nothing answered. Absent or already-trusted is fine (sbx's
-/// append is then the sole delta).
 /// The write-side trust gate for a save that blesses what it writes: an existing-but-untrusted (or
 /// changed) config must not be silently blessed, the user reviews and re-trusts it first. An absent
 /// config (bootstrap) or an already-trusted one is fine, so sbx's edit is the sole delta from the
@@ -585,6 +575,11 @@ pub(crate) fn local_save_permitted(exists: bool, state: trust::TrustState) -> bo
     !exists || state == trust::TrustState::Trusted
 }
 
+/// Pre-flight the trust gate for a `--local` save at `cwd`, *before* any irreversible action (a bulk
+/// drain unblocks agents and cannot be undone). Mirrors [`persist_egress_rule`]'s gate exactly — same
+/// `scope_path`, same trust-store, same "existing config must be trusted" rule — so a save that would
+/// later refuse refuses here instead, with nothing answered. Absent or already-trusted is fine (sbx's
+/// append is then the sole delta).
 fn precheck_local_save(cwd: &Path) -> Result<(), (u8, String)> {
     use config::manage::{self, Scope};
     let store = trust::default_store_dir().ok_or((

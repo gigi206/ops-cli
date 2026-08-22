@@ -59,9 +59,6 @@ pub(crate) fn config_cmd(args: Vec<OsString>) -> ExitCode {
     }
 }
 
-/// `sbx config show [--json]`: show the resolved configuration for the current project — the
-/// layered, trust-gated view a launch would use. The human render is colored when stdout is a
-/// terminal; `--json` emits the whole resolved model for tooling.
 /// Record a chosen single-source `config show` view flag (`--global`/`--local`/`--default`),
 /// rejecting a second, conflicting one — two different sources is a user error, not last-wins. The
 /// same flag repeated is harmless. On conflict, prints the usage and returns the usage exit code.
@@ -89,6 +86,9 @@ fn set_show_source(
     }
 }
 
+/// `sbx config show [--json]`: show the resolved configuration for the current project — the
+/// layered, trust-gated view a launch would use. The human render is colored when stdout is a
+/// terminal; `--json` emits the whole resolved model for tooling.
 fn config_show(args: &[OsString]) -> ExitCode {
     let mut json = false;
     let mut details = false;
@@ -237,10 +237,6 @@ fn config_show_app(cwd: &Path, name: &str, json: bool, details: bool) -> ExitCod
     ExitCode::SUCCESS
 }
 
-/// Render the resolved configuration for display — a pure presenter over [`config::view`]. It
-/// adds only color and layout, so the management core stays presentation-agnostic and a future
-/// front-end can render the same model differently. Every color span is empty under a
-/// non-terminal, so captured output is byte-for-byte the plain text the integration tests pin.
 /// The ` (default)` / ` (global)` / ` (project)` / ` (inherited)` provenance tag a line carries,
 /// hued by level so a configured source stands out (global cyan, project green) while a built-in
 /// default or an inherited baseline value stays dim. The *label text* is always emitted — color is
@@ -315,6 +311,18 @@ fn bind_mode_tag(writable: bool, pal: &style::Palette) -> String {
     }
 }
 
+/// The transport settings of a filtering launch: how a permitted request is *carried*, none of them
+/// a verdict. Grouped rather than passed one by one because they are reported together and grow
+/// together.
+struct NetTransport {
+    pool: bool,
+    ca_roots: bool,
+    dns_cache_ttl: Option<u64>,
+    idle_timeout: Option<u64>,
+    max_connections: Option<usize>,
+    body_max_mb: Option<u64>,
+}
+
 /// The two `[network]` settings that decide how a permitted request is carried rather than whether
 /// it is carried: connection reuse and the resolver cache.
 ///
@@ -330,18 +338,6 @@ fn bind_mode_tag(writable: bool, pal: &style::Palette) -> String {
 /// means "reuse is on and the cache is the built-in one", which is exactly what someone asking for
 /// details wants spelled out. Only the resolver cache can say *which* of the two it is, because the
 /// view keeps its unset state (`None`) while `pool` arrives already collapsed to a `bool`.
-/// The transport settings of a filtering launch: how a permitted request is *carried*, none of them
-/// a verdict. Grouped rather than passed one by one because they are reported together and grow
-/// together.
-struct NetTransport {
-    pool: bool,
-    ca_roots: bool,
-    dns_cache_ttl: Option<u64>,
-    idle_timeout: Option<u64>,
-    max_connections: Option<usize>,
-    body_max_mb: Option<u64>,
-}
-
 fn write_net_transport(o: &mut String, t: NetTransport, details: bool, pal: &style::Palette) {
     use std::fmt::Write as _;
     let NetTransport {
@@ -1621,6 +1617,10 @@ fn apps_section(
     Some(o)
 }
 
+/// Render the resolved configuration for display — a pure presenter over [`config::view`]. It
+/// adds only color and layout, so the management core stays presentation-agnostic and a future
+/// front-end can render the same model differently. Every color span is empty under a
+/// non-terminal, so captured output is byte-for-byte the plain text the integration tests pin.
 fn render_config(view: &config::view::ConfigView, pal: &style::Palette, details: bool) -> String {
     use std::fmt::Write as _;
     let (h, n, r) = (pal.head, pal.name, pal.reset);
@@ -2733,6 +2733,11 @@ fn config_unset(args: &[OsString]) -> ExitCode {
     }
 }
 
+/// `sbx config path`: with no scope flag, show the config files a launch resolves, in order, each
+/// with whether it exists — so it is clear where sbx looks (and that a default project `.sbx.toml`
+/// need not exist). With an explicit scope (`-l`/`-g`/`-c`), print the single bare path that scope
+/// targets — the file `set`/`unset`/`edit` would touch, for scripting and for finding the global
+/// config.
 fn config_path_cmd(args: &[OsString]) -> ExitCode {
     let ScopeArgs {
         positionals,

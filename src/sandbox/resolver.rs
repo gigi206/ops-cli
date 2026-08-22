@@ -875,9 +875,6 @@ fn nix_closure(program: &Path, layout: Option<&crate::store::Layout>) -> io::Res
     Ok(text.lines().map(PathBuf::from).collect())
 }
 
-/// The path a declared program resolves to, or `None` when nothing usable is on `PATH`. Shared
-/// with `sbx plugins info`, so what a user is shown is what a launch would bind — a second
-/// lookup would be a second chance to disagree.
 /// Whether the cage will hold what a binary at this path needs to *load*, not merely the file.
 ///
 /// The runner binds the host userland read-only and computes a closure for anything in the nix
@@ -894,6 +891,9 @@ fn cage_can_load(path: &Path) -> bool {
         .any(|prefix| path.starts_with(prefix))
 }
 
+/// The path a declared program resolves to, or `None` when nothing usable is on `PATH`. Shared
+/// with `sbx plugins info`, so what a user is shown is what a launch would bind — a second
+/// lookup would be a second chance to disagree.
 pub(crate) fn locate_program(name: &str) -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt;
     let euid = unsafe { libc::geteuid() };
@@ -1139,8 +1139,6 @@ mod tests {
     use crate::testutil::{EnvVar, TmpDir, env_lock};
     use std::os::unix::fs::PermissionsExt;
 
-    /// The plan `cage_spec` takes, built from a resolver the way `run` builds it — so a test
-    /// exercises the very composition a launch does.
     /// A plugin's cage carries the same mandatory syscall denylist an agent's cage does.
     ///
     /// It did not, and the asymmetry ran the wrong way. This is the cage that runs code sbx did not
@@ -1191,6 +1189,8 @@ mod tests {
         }
     }
 
+    /// The plan `cage_spec` takes, built from a resolver the way `run` builds it — so a test
+    /// exercises the very composition a launch does.
     fn plan_for<'a>(p: &'a ResolverPlugin, reff: &str) -> CagePlan<'a> {
         CagePlan {
             kind: crate::plugins::PluginKind::Resolver,

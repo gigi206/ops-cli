@@ -216,8 +216,6 @@ impl SandboxSpec {
         self
     }
 
-    /// Set the cage's readable name slug (see [`SandboxSpec::cage_slug`]). The launch path
-    /// derives it from the app or project via [`super::naming::cage_slug`].
     /// Set the variables whose values must stay out of the argument list — see
     /// [`SandboxSpec::secret_env`]. Only [`super::launch::seccomp_argv`] can turn such a spec into a
     /// runnable argv, because only it can create the descriptor they travel on.
@@ -226,6 +224,8 @@ impl SandboxSpec {
         self
     }
 
+    /// Set the cage's readable name slug (see [`SandboxSpec::cage_slug`]). The launch path
+    /// derives it from the app or project via [`super::naming::cage_slug`].
     pub(crate) fn with_cage_slug(mut self, slug: String) -> Self {
         self.cage_slug = slug;
         self

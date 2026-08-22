@@ -587,11 +587,6 @@ pub(crate) fn reclaimable_bytes(
     }
 }
 
-/// Read the volume's own space accounting.
-///
-/// Reported because deleting files does not shrink the image immediately: the kernel returns
-/// freed extents to the host in the background, and a reservation it has not yet released
-/// still counts. Showing both figures makes that gap visible instead of implying it is zero.
 /// How many block groups the space ioctl's header reports, refused when it is not a number a
 /// buffer can be sized from.
 ///
@@ -618,6 +613,11 @@ fn reported_count(header: &[u8; 16]) -> io::Result<usize> {
     Ok(count as usize)
 }
 
+/// Read the volume's own space accounting.
+///
+/// Reported because deleting files does not shrink the image immediately: the kernel returns
+/// freed extents to the host in the background, and a reservation it has not yet released
+/// still counts. Showing both figures makes that gap visible instead of implying it is zero.
 pub(crate) fn space(mount_point: &Path) -> io::Result<Space> {
     use std::os::unix::io::AsRawFd;
 

@@ -148,7 +148,7 @@ pub(super) fn handle_cleartext(
     //     planes put it: after the verdict (a refused request must not seed the scan set), after the
     //     outbound scan (a request is never refused by the value it just taught sbx), and after the
     //     SSRF guard, which is the last refusal before the wire. The names to exclude are empty here,
-    //     and that is a property of this plane rather than a shortcut: it skips `matching_injections`
+    //     and that is a property of this plane rather than a shortcut: it skips `matching_injection_ids`
     //     entirely because a bearer must not travel in the clear, so no header is being replaced and
     //     none has to be held back from observation.
     //
