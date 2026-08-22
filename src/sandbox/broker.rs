@@ -40,6 +40,7 @@ use std::io::{self, Read, Write};
 use serde::Deserialize;
 
 use crate::plugins::broker::{BrokerSpec, Framing, MAX_FRAME_CEILING};
+use crate::plugins::catalogue::to_hex;
 
 /// The protocol version sbx speaks. A plugin that cannot handle it should fail its handshake
 /// rather than guess: this number changes only when the meaning of a message changes.
@@ -1669,16 +1670,6 @@ pub(crate) fn start(
                 .collect(),
         },
     ))
-}
-
-/// Lowercase hex, the spelling every `data` field uses.
-fn to_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
 }
 
 /// Decode a `data` field. Strict on purpose: an odd length or a stray character is a plugin

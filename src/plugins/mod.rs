@@ -1683,7 +1683,13 @@ fn canonicalize_modes(dir: &Path) -> Result<(), String> {
 /// Create `dir` (and any missing parents) owner-only, tightening it if it already existed with
 /// looser permissions — the same fail-closed bootstrap the store root uses, applied to the
 /// trust-by-location plugins tree.
-fn ensure_owner_only(dir: &Path) -> Result<(), String> {
+///
+/// The whole trusted-by-location premise rests on this gate, so the plugins tree states it once and
+/// every module in it calls this one: [`stores`] for the store roots and staging directories,
+/// [`origin`] for the provenance records, and this module for the install and trash trees. A copy
+/// per module would mean a hardening change here protecting some of those trees and not others,
+/// with nothing to say which.
+pub(super) fn ensure_owner_only(dir: &Path) -> Result<(), String> {
     use std::fs::DirBuilder;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     DirBuilder::new()

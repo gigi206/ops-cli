@@ -15,6 +15,7 @@
 //! and places nothing. Authenticity rests entirely on the signature: git moves bytes and
 //! checks their integrity, never their origin, so the transport is not a trust boundary.
 
+use super::ensure_owner_only;
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::path::{Path, PathBuf};
@@ -1218,20 +1219,6 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
     f.write_all(bytes)
         .map_err(|e| format!("cannot write {}: {e}", path.display()))
-}
-
-/// Create `dir` (and any missing parents) owner-only, tightening it if it already existed with
-/// looser permissions — the same fail-closed bootstrap the store and plugins trees use.
-fn ensure_owner_only(dir: &Path) -> Result<(), String> {
-    use std::fs::DirBuilder;
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("cannot secure {}: {e}", dir.display()))
 }
 
 /// A per-call-unique suffix for the staging directory, so two adds in one process never

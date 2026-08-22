@@ -929,21 +929,28 @@ fn brokers_section(brokers: &[config::view::BrokerView], pal: &style::Palette) -
     Some(o)
 }
 
-/// The network posture — a security field. `shared` keeps the host network; `none` cuts it off; a
-/// filtering posture (`deny`/`allow`/`ask`) routes egress through the proxy — `deny` permits only
-/// what is listed (deny wins over allow), plus the always-allowed built-in set so the self-equip
-/// allowance is never silent.
+/// The `network:` line and the posture preamble that precedes any rule listing: the mode word and
+/// its provenance tag, the ask-timeout and ask-notice lines, the capture and websocket-secret
+/// statements, and the transport block.
 ///
-/// The largest section by far, and the one whose sub-lines carry the most: the tuning knobs under
-/// `--details`, the rule lists, the mute and http2 sets, and the egress-stats toggle, which is
-/// meaningful only here because the proxy runs only under a filtering posture.
-fn network_section(view: &config::view::ConfigView, pal: &style::Palette, details: bool) -> String {
-    use config::view::{NetDefaultView, NetworkView};
+/// Written once because both views state the same posture and only their *rule listing* differs —
+/// `sbx config show` groups rules by default action, the per-app view lists them flat. Keeping the
+/// preamble in one place is what stops the two from drifting: they already had, on `ask timeout:
+/// none`, where this view explained the value and the app view printed it bare.
+///
+/// `net_tag` is the caller's, because the provenance tag is rendered differently in the two views
+/// (`provenance_tag` vs `app_provenance_tag`).
+fn write_net_posture_head(
+    o: &mut String,
+    network: &config::view::NetworkView,
+    net_tag: &str,
+    details: bool,
+    pal: &style::Palette,
+) {
+    use config::view::NetworkView;
     use std::fmt::Write as _;
-    let (h, n, warn, dim, r) = (pal.head, pal.name, pal.warn, pal.dim, pal.reset);
-    let mut o = String::new();
-    let net_tag = provenance_tag(view.network_origin, pal);
-    match &view.network {
+    let (h, dim, r) = (pal.head, pal.dim, pal.reset);
+    match network {
         NetworkView::Shared => {
             let _ = writeln!(o, "  {h}network:{r} shared {dim}(host network){r}{net_tag}");
         }
@@ -957,10 +964,6 @@ fn network_section(view: &config::view::ConfigView, pal: &style::Palette, detail
             default_action,
             ask_timeout,
             ask_notice,
-            allow,
-            deny,
-            mute,
-            http2,
             capture,
             capture_max_kb,
             websocket_secret,
@@ -970,7 +973,7 @@ fn network_section(view: &config::view::ConfigView, pal: &style::Palette, detail
             idle_timeout,
             max_connections,
             body_max_mb,
-            builtin,
+            ..
         } => {
             let _ = writeln!(
                 o,
@@ -1025,7 +1028,7 @@ fn network_section(view: &config::view::ConfigView, pal: &style::Palette, detail
                 );
             }
             write_net_transport(
-                &mut o,
+                o,
                 NetTransport {
                     pool: *pool,
                     ca_roots: *ca_roots,
@@ -1037,122 +1040,150 @@ fn network_section(view: &config::view::ConfigView, pal: &style::Palette, detail
                 details,
                 pal,
             );
-            match default_action {
-                // Allowlist: only the listed (and built-in) hosts reach; everything else is denied.
-                NetDefaultView::Deny => {
-                    if allow.is_empty() {
-                        let _ = writeln!(
-                            o,
-                            "    {dim}allow: (none declared beyond the built-in set){r}"
-                        );
-                    } else {
-                        for rule in allow {
-                            let _ = writeln!(o, "    allow {n}{rule}{r}");
-                        }
+        }
+    }
+}
+
+/// The network posture — a security field. `shared` keeps the host network; `none` cuts it off; a
+/// filtering posture (`deny`/`allow`/`ask`) routes egress through the proxy — `deny` permits only
+/// what is listed (deny wins over allow), plus the always-allowed built-in set so the self-equip
+/// allowance is never silent.
+///
+/// The largest section by far, and the one whose sub-lines carry the most: the tuning knobs under
+/// `--details`, the rule lists, the mute and http2 sets, and the egress-stats toggle, which is
+/// meaningful only here because the proxy runs only under a filtering posture.
+fn network_section(view: &config::view::ConfigView, pal: &style::Palette, details: bool) -> String {
+    use config::view::{NetDefaultView, NetworkView};
+    use std::fmt::Write as _;
+    let (n, warn, dim, r) = (pal.name, pal.warn, pal.dim, pal.reset);
+    let mut o = String::new();
+    let net_tag = provenance_tag(view.network_origin, pal);
+    write_net_posture_head(&mut o, &view.network, &net_tag, details, pal);
+    if let NetworkView::Allowlist {
+        default_action,
+        allow,
+        deny,
+        mute,
+        http2,
+        builtin,
+        ..
+    } = &view.network
+    {
+        match default_action {
+            // Allowlist: only the listed (and built-in) hosts reach; everything else is denied.
+            NetDefaultView::Deny => {
+                if allow.is_empty() {
+                    let _ = writeln!(
+                        o,
+                        "    {dim}allow: (none declared beyond the built-in set){r}"
+                    );
+                } else {
+                    for rule in allow {
+                        let _ = writeln!(o, "    allow {n}{rule}{r}");
                     }
-                    // Deny wins over allow, so the keyword takes the caution hue.
+                }
+                // Deny wins over allow, so the keyword takes the caution hue.
+                for rule in deny {
+                    let _ = writeln!(o, "    {warn}deny{r}  {n}{rule}{r}");
+                }
+                let _ = writeln!(
+                    o,
+                    "    {dim}built-in (always allowed, so self-equip works):{r}"
+                );
+                for host in builtin {
+                    let _ = writeln!(o, "      allow {n}{host}{r}");
+                }
+                let _ = writeln!(o, "    {dim}(deny wins; an unlisted host is denied){r}");
+            }
+            // Denylist: every public host reaches except the deny carve-outs; the proxy stays
+            // active. The allow rules only relax the SSRF private-host guard here (every public
+            // host is already permitted), and the built-in set is moot, so neither is led with.
+            NetDefaultView::Allow => {
+                let _ = writeln!(o, "    {dim}every public host is reachable except:{r}");
+                if deny.is_empty() {
+                    let _ = writeln!(o, "    {dim}deny: (none declared){r}");
+                } else {
                     for rule in deny {
                         let _ = writeln!(o, "    {warn}deny{r}  {n}{rule}{r}");
                     }
-                    let _ = writeln!(
-                        o,
-                        "    {dim}built-in (always allowed, so self-equip works):{r}"
-                    );
-                    for host in builtin {
-                        let _ = writeln!(o, "      allow {n}{host}{r}");
-                    }
-                    let _ = writeln!(o, "    {dim}(deny wins; an unlisted host is denied){r}");
                 }
-                // Denylist: every public host reaches except the deny carve-outs; the proxy stays
-                // active. The allow rules only relax the SSRF private-host guard here (every public
-                // host is already permitted), and the built-in set is moot, so neither is led with.
-                NetDefaultView::Allow => {
-                    let _ = writeln!(o, "    {dim}every public host is reachable except:{r}");
-                    if deny.is_empty() {
-                        let _ = writeln!(o, "    {dim}deny: (none declared){r}");
-                    } else {
-                        for rule in deny {
-                            let _ = writeln!(o, "    {warn}deny{r}  {n}{rule}{r}");
-                        }
-                    }
-                    if !allow.is_empty() {
-                        let _ = writeln!(o, "    {dim}allow (private-host exceptions only):{r}");
-                        for rule in allow {
-                            let _ = writeln!(o, "      allow {n}{rule}{r}");
-                        }
-                    }
-                }
-                // Ask: an unlisted host parks for a live decision; allow rules still auto-pass and
-                // deny rules still auto-fail, so list those (and the built-in set) as pre-decided.
-                NetDefaultView::Ask => {
-                    let _ = writeln!(
-                        o,
-                        "    {}",
-                        style::dim_prose(
-                            "an unlisted host parks for a live `sbx net pending` decision; \
-                             these are pre-decided:",
-                            pal
-                        )
-                    );
-                    if !allow.is_empty() {
-                        let _ = writeln!(o, "    {dim}auto-allow:{r}");
-                        for rule in allow {
-                            let _ = writeln!(o, "      allow {n}{rule}{r}");
-                        }
-                    }
-                    for rule in deny {
-                        let _ = writeln!(o, "    {warn}deny{r}  {n}{rule}{r}");
-                    }
-                    let _ = writeln!(
-                        o,
-                        "    {dim}built-in (always allowed, so self-equip works):{r}"
-                    );
-                    for host in builtin {
-                        let _ = writeln!(o, "      allow {n}{host}{r}");
+                if !allow.is_empty() {
+                    let _ = writeln!(o, "    {dim}allow (private-host exceptions only):{r}");
+                    for rule in allow {
+                        let _ = writeln!(o, "      allow {n}{rule}{r}");
                     }
                 }
             }
-            // Mute (`dontaudit`) rules apply under every filtering posture — they suppress a denied
-            // request's log line (never a verdict), so they are surfaced here (dimmed) whenever any
-            // are declared, so the suppression is never silent.
-            if !mute.is_empty() {
+            // Ask: an unlisted host parks for a live decision; allow rules still auto-pass and
+            // deny rules still auto-fail, so list those (and the built-in set) as pre-decided.
+            NetDefaultView::Ask => {
                 let _ = writeln!(
                     o,
                     "    {}",
                     style::dim_prose(
-                        "mute (refusals kept out of `sbx net log`; see `--all`):",
+                        "an unlisted host parks for a live `sbx net pending` decision; \
+                             these are pre-decided:",
                         pal
                     )
                 );
-                for rule in mute {
-                    let _ = writeln!(o, "      {dim}mute{r}  {n}{rule}{r}");
+                if !allow.is_empty() {
+                    let _ = writeln!(o, "    {dim}auto-allow:{r}");
+                    for rule in allow {
+                        let _ = writeln!(o, "      allow {n}{rule}{r}");
+                    }
                 }
-            }
-            // http2 hosts: spoken to as HTTP/2 (gRPC) instead of HTTP/1.1. A transport choice —
-            // orthogonal to the verdict (the host is still allow-gated and every stream inspected) —
-            // so surfaced under the filtering posture whenever any is declared.
-            if !http2.is_empty() {
+                for rule in deny {
+                    let _ = writeln!(o, "    {warn}deny{r}  {n}{rule}{r}");
+                }
                 let _ = writeln!(
                     o,
-                    "    {dim}http2 (gRPC over HTTP/2; still allow-gated and inspected):{r}"
+                    "    {dim}built-in (always allowed, so self-equip works):{r}"
                 );
-                for host in http2 {
-                    let _ = writeln!(o, "      http2 {n}{host}{r}");
+                for host in builtin {
+                    let _ = writeln!(o, "      allow {n}{host}{r}");
                 }
             }
-            // The egress-stats toggle is meaningful only under a filtering posture (the proxy runs
-            // only then), so it rides the network section. Shown both ways — an audit knob is worth
-            // surfacing — naming the reader command when on.
+        }
+        // Mute (`dontaudit`) rules apply under every filtering posture — they suppress a denied
+        // request's log line (never a verdict), so they are surfaced here (dimmed) whenever any
+        // are declared, so the suppression is never silent.
+        if !mute.is_empty() {
             let _ = writeln!(
                 o,
-                "    {dim}stats: {}{r}",
-                if view.egress_stats {
-                    "recording (sbx net stats)"
-                } else {
-                    "off"
-                }
+                "    {}",
+                style::dim_prose(
+                    "mute (refusals kept out of `sbx net log`; see `--all`):",
+                    pal
+                )
             );
+            for rule in mute {
+                let _ = writeln!(o, "      {dim}mute{r}  {n}{rule}{r}");
+            }
         }
+        // http2 hosts: spoken to as HTTP/2 (gRPC) instead of HTTP/1.1. A transport choice —
+        // orthogonal to the verdict (the host is still allow-gated and every stream inspected) —
+        // so surfaced under the filtering posture whenever any is declared.
+        if !http2.is_empty() {
+            let _ = writeln!(
+                o,
+                "    {dim}http2 (gRPC over HTTP/2; still allow-gated and inspected):{r}"
+            );
+            for host in http2 {
+                let _ = writeln!(o, "      http2 {n}{host}{r}");
+            }
+        }
+        // The egress-stats toggle is meaningful only under a filtering posture (the proxy runs
+        // only then), so it rides the network section. Shown both ways — an audit knob is worth
+        // surfacing — naming the reader command when on.
+        let _ = writeln!(
+            o,
+            "    {dim}stats: {}{r}",
+            if view.egress_stats {
+                "recording (sbx net stats)"
+            } else {
+                "off"
+            }
+        );
     }
 
     o
@@ -1730,138 +1761,58 @@ fn render_app_detail(
 
     // The effective network posture + provenance; the allowlist's rules expand under `--details`.
     let net_tag = app_provenance_tag(view.network_origin, pal);
-    match &view.network {
-        NetworkView::Shared => {
-            let _ = writeln!(o, "  {h}network:{r} shared {dim}(host network){r}{net_tag}");
+    write_net_posture_head(&mut o, &view.network, &net_tag, details, pal);
+    if let NetworkView::Allowlist {
+        allow,
+        deny,
+        mute,
+        http2,
+        builtin,
+        ..
+    } = &view.network
+    {
+        // The policy itself is listed either way: which hosts this app may reach is the
+        // answer someone opens this view to find, and a count sends them to a second command
+        // to read it. A rule is a whole clause (verbs, scheme, host pattern), so one per line
+        // rather than joined — nineteen of them on one line would be unreadable.
+        for rule in allow {
+            let _ = writeln!(o, "    allow {n}{rule}{r}");
         }
-        NetworkView::Isolated => {
+        for rule in deny {
+            let _ = writeln!(o, "    {warn}deny{r}  {n}{rule}{r}");
+        }
+        if details {
+            for rule in mute {
+                let _ = writeln!(o, "    {dim}mute{r}  {n}{rule}{r}");
+            }
+            for host in http2 {
+                let _ = writeln!(o, "    {dim}http2{r} {n}{host}{r}");
+            }
             let _ = writeln!(
                 o,
-                "  {h}network:{r} none {dim}(isolated — no network){r}{net_tag}"
+                "    {dim}built-in (always allowed, so self-equip works):{r}"
             );
-        }
-        NetworkView::Allowlist {
-            default_action,
-            ask_timeout,
-            ask_notice,
-            allow,
-            deny,
-            mute,
-            http2,
-            capture,
-            capture_max_kb,
-            websocket_secret,
-            pool,
-            ca_roots,
-            dns_cache_ttl,
-            idle_timeout,
-            max_connections,
-            body_max_mb,
-            builtin,
-        } => {
-            let _ = writeln!(
-                o,
-                "  {h}network:{r} {}{net_tag}",
-                net_mode_word(*default_action)
-            );
-            if let Some(t) = ask_timeout {
-                let _ = writeln!(o, "    {dim}ask timeout: {t}{r}");
+            for host in builtin {
+                let _ = writeln!(o, "      allow {n}{host}{r}");
             }
-            if matches!(ask_notice, Some(false)) {
-                let _ = writeln!(
-                    o,
-                    "    {}",
-                    style::dim_prose(
-                        "ask notice: off (parked requests are silent — answer via \
-                         `sbx net pending`)",
-                        pal
-                    )
-                );
+            let _ = writeln!(o, "    {dim}(deny wins over allow){r}");
+        } else {
+            // What stays behind the flag decides nothing about reachability: `mute` only
+            // silences an already-permitted request in the log, `http2` picks a transport, and
+            // the built-in set is the same for every app. Counted, not listed — and only when
+            // non-zero, so an app that uses neither reads as if the line were not there.
+            let mut extra = String::new();
+            if !mute.is_empty() {
+                extra.push_str(&format!("{} mute", mute.len()));
             }
-            // A traffic capture retains the plaintext of every inspected exchange, so it is always
-            // stated — never a silent property of a launch.
-            if capture != "off" {
-                let cap = match capture_max_kb {
-                    Some(kb) => format!("capture: {capture} (up to {kb} KiB per body)"),
-                    None => format!("capture: {capture}"),
-                };
-                let _ = writeln!(
-                    o,
-                    "    {}",
-                    style::dim_prose(
-                        &format!("{cap} — read it with `sbx net logs --with-body`"),
-                        pal
-                    )
-                );
-            }
-            // Stated for the same reason, and only when it is not the default: a tunnel closed on a
-            // sighting looks from inside the cage exactly like one its peer closed.
-            if websocket_secret != "warn" {
-                let _ = writeln!(
-                    o,
-                    "    {}",
-                    style::dim_prose(
-                        "websocket secret: block (a tunnel carrying one out is closed)",
-                        pal
-                    )
-                );
-            }
-            write_net_transport(
-                &mut o,
-                NetTransport {
-                    pool: *pool,
-                    ca_roots: *ca_roots,
-                    dns_cache_ttl: *dns_cache_ttl,
-                    idle_timeout: *idle_timeout,
-                    max_connections: *max_connections,
-                    body_max_mb: *body_max_mb,
-                },
-                details,
-                pal,
-            );
-            // The policy itself is listed either way: which hosts this app may reach is the
-            // answer someone opens this view to find, and a count sends them to a second command
-            // to read it. A rule is a whole clause (verbs, scheme, host pattern), so one per line
-            // rather than joined — nineteen of them on one line would be unreadable.
-            for rule in allow {
-                let _ = writeln!(o, "    allow {n}{rule}{r}");
-            }
-            for rule in deny {
-                let _ = writeln!(o, "    {warn}deny{r}  {n}{rule}{r}");
-            }
-            if details {
-                for rule in mute {
-                    let _ = writeln!(o, "    {dim}mute{r}  {n}{rule}{r}");
-                }
-                for host in http2 {
-                    let _ = writeln!(o, "    {dim}http2{r} {n}{host}{r}");
-                }
-                let _ = writeln!(
-                    o,
-                    "    {dim}built-in (always allowed, so self-equip works):{r}"
-                );
-                for host in builtin {
-                    let _ = writeln!(o, "      allow {n}{host}{r}");
-                }
-                let _ = writeln!(o, "    {dim}(deny wins over allow){r}");
-            } else {
-                // What stays behind the flag decides nothing about reachability: `mute` only
-                // silences an already-permitted request in the log, `http2` picks a transport, and
-                // the built-in set is the same for every app. Counted, not listed — and only when
-                // non-zero, so an app that uses neither reads as if the line were not there.
-                let mut extra = String::new();
-                if !mute.is_empty() {
-                    extra.push_str(&format!("{} mute", mute.len()));
-                }
-                if !http2.is_empty() {
-                    if !extra.is_empty() {
-                        extra.push_str(", ");
-                    }
-                    extra.push_str(&format!("{} http2", http2.len()));
-                }
+            if !http2.is_empty() {
                 if !extra.is_empty() {
-                    let _ = writeln!(o, "    {dim}({extra} — see --details){r}");
+                    extra.push_str(", ");
                 }
+                extra.push_str(&format!("{} http2", http2.len()));
+            }
+            if !extra.is_empty() {
+                let _ = writeln!(o, "    {dim}({extra} — see --details){r}");
             }
         }
     }
