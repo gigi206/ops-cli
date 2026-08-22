@@ -1718,6 +1718,35 @@ fn roll_task_pool(
     }
 }
 
+/// Provision one optional host-side layer, or degrade to `None` with a warning.
+///
+/// The five GUI/hardware holes — fonts, GUI data, mesa, the audio userspace, certutil — share one
+/// doctrine and one shape: each is wanted only under some posture, each is fetched by a
+/// `provision(nix, layout, nixpkgs)` of the same signature, and none of them may fail a launch. A
+/// hole that cannot be provisioned costs the feature it serves, never the process the user asked
+/// for; `explain` says which feature, in the terms of the posture that asked for it.
+///
+/// Written once so that doctrine is stated once. The desktop portal is deliberately not routed
+/// through here: it shares the callee signature but not the shape, since its site also creates a
+/// host directory, starts two relays, and warns on a second condition of its own.
+fn optional_layer<T>(
+    prep: &Prepared,
+    wanted: bool,
+    provision: fn(&Path, &Layout, &str) -> io::Result<T>,
+    explain: impl FnOnce(&io::Error) -> String,
+) -> Option<T> {
+    if !wanted {
+        return None;
+    }
+    match provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
+        Ok(layer) => Some(layer),
+        Err(e) => {
+            crate::diag::warn(&explain(&e));
+            None
+        }
+    }
+}
+
 /// `sbx gc [--all] [--prune]`: reclaim sbx's store space.
 ///
 /// By default it sweeps the **current** project's store (see [`sweep_current`]). With `--all` it
@@ -3515,20 +3544,12 @@ fn build(
     // project store and the cage reads the fonts through `/nix`. Best-effort, like the display
     // socket below: a font fetch that fails (no network on a first launch) warns and the app
     // runs without fonts rather than failing the launch.
-    let font_layer = if prep.cfg.gui.renders() {
-        match super::fonts::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
-            Ok(layer) => Some(layer),
-            Err(e) => {
-                crate::diag::warn(&format!(
-                    "this `gui` posture renders but the font set could not be provisioned \
-                     ({e}) — text may not render"
-                ));
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let font_layer = optional_layer(prep, prep.cfg.gui.renders(), super::fonts::provision, |e| {
+        format!(
+            "this `gui` posture renders but the font set could not be provisioned \
+                 ({e}) — text may not render"
+        )
+    });
     let font_roots: &[PathBuf] = font_layer.as_ref().map_or(&[], |l| l.roots.as_slice());
 
     // Under `gui = "wayland"`, provision the GUI data set (GSettings schemas + GTK themes)
@@ -3537,20 +3558,17 @@ fn build(
     // in-cage portal's file dialog render in the host light/dark theme. Provisioned here — before
     // the seed — so its store root joins the project store. Best-effort like the fonts: a fetch
     // that fails warns and the app runs (a GTK dialog will still crash, but the rest is unaffected).
-    let guidata_layer = if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
-        match super::guidata::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
-            Ok(layer) => Some(layer),
-            Err(e) => {
-                crate::diag::warn(&format!(
-                    "`gui = \"wayland\"` but the GUI data (GSettings schemas + themes) could not \
-                     be provisioned ({e}) — a GTK dialog (file chooser) may crash"
-                ));
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let guidata_layer = optional_layer(
+        prep,
+        matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland),
+        super::guidata::provision,
+        |e| {
+            format!(
+                "`gui = \"wayland\"` but the GUI data (GSettings schemas + themes) could not \
+                 be provisioned ({e}) — a GTK dialog (file chooser) may crash"
+            )
+        },
+    );
 
     // In-cage desktop portal: under `gui = "wayland"` AND `dbus = true`, provision the portal
     // stack (dbus + xdg-desktop-portal + the GTK backend) host-side — before the seed, so its roots
@@ -3636,63 +3654,43 @@ fn build(
     // tool needs nothing (its env-reading TLS already trusts the CA), and `shared`/`none` has no
     // MITM CA. Best-effort: a provisioning failure warns and the app runs (and fails its own
     // HTTPS) rather than blocking the launch.
-    let ca_trust = if prep.cfg.gui.renders()
-        && matches!(prep.cfg.network, crate::config::NetworkPolicy::Allowlist(_))
-    {
-        match super::catrust::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
-            Ok(ct) => Some(ct),
-            Err(e) => {
-                crate::diag::warn(&format!(
-                    "this `gui` posture renders under a network allowlist but certutil could not \
-                     be provisioned ({e}) — a Chromium/Electron engine will not trust the egress \
-                     proxy"
-                ));
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let ca_trust = optional_layer(
+        prep,
+        prep.cfg.gui.renders()
+            && matches!(prep.cfg.network, crate::config::NetworkPolicy::Allowlist(_)),
+        super::catrust::provision,
+        |e| {
+            format!(
+                "this `gui` posture renders under a network allowlist but certutil could not \
+                 be provisioned ({e}) — a Chromium/Electron engine will not trust the egress \
+                 proxy"
+            )
+        },
+    );
 
     // Under `gpu = true`, provision mesa's DRI drivers host-side so the cage can render with
     // hardware acceleration. Provisioned here — before the seed — so mesa's store root joins the
     // project store and the cage reads the drivers through `/nix`; the env pointing libgbm/libEGL
     // at them is applied in the launch block below. Best-effort, like the fonts: a fetch that fails
     // warns and the app runs (falling back to software rendering) rather than failing the launch.
-    let gpu_layer = if prep.cfg.gpu {
-        match super::gpu::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
-            Ok(layer) => Some(layer),
-            Err(e) => {
-                crate::diag::warn(&format!(
-                    "`gpu = true` but the mesa drivers could not be provisioned \
-                     ({e}) — rendering may fall back to software"
-                ));
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let gpu_layer = optional_layer(prep, prep.cfg.gpu, super::gpu::provision, |e| {
+        format!(
+            "`gpu = true` but the mesa drivers could not be provisioned \
+                 ({e}) — rendering may fall back to software"
+        )
+    });
 
     // Under `audio = true`, provision the PulseAudio client library (`libpulse.so.0`) host-side so
     // the cage can open capture/playback streams. Provisioned here — before the seed — so its store
     // root joins the project store and the cage reads the library through `/nix`; the env pointing
     // the app's loader at it (and the socket bind) is applied in the launch block below. Best-effort,
     // like the fonts and mesa: a fetch that fails warns and the app runs (without audio).
-    let audio_layer = if prep.cfg.audio {
-        match super::audio::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
-            Ok(layer) => Some(layer),
-            Err(e) => {
-                crate::diag::warn(&format!(
-                    "`audio = true` but the audio userspace could not be provisioned \
-                     ({e}) — the app runs without audio"
-                ));
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let audio_layer = optional_layer(prep, prep.cfg.audio, super::audio::provision, |e| {
+        format!(
+            "`audio = true` but the audio userspace could not be provisioned \
+                 ({e}) — the app runs without audio"
+        )
+    });
 
     // The GUI-hole store roots to seed: the fonts plus (when present) certutil, mesa, and
     // libpulseaudio, so the cage reads them all through `/nix`.
