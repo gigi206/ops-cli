@@ -5,7 +5,7 @@ description: "One running session's feeds in a single column of time, including 
 # `sbx logs`
 
 ```
-sbx logs [<id>] [--feed <a,b,...>] [-n <N>] [-f|--follow] [--json]
+sbx logs [<id>] [--feed <a,b,...>] [-n|--lines <N>] [-f|--follow] [--json]
 ```
 
 One running session's **seven feeds in one column of time**: what it execs, where it goes, what it

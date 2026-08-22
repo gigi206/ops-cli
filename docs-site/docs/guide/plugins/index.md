@@ -68,7 +68,7 @@ trigger is one nobody should move on a hunch.
   attachment point exists, and a general layer-7 decider was considered. What shipped instead is
   the signer, named by a `[secret]` and bounded to the one concrete host that declaration names.
   Two reasons the general form did not follow. HTTP is not framed, it is *parsed*, so the closed
-  framing set below does not apply and what a plugin would see is a request sbx already took apart.
+  framing set [a broker](broker) is held to does not apply and what a plugin would see is a request sbx already took apart.
   And the bound would have to be invented: a signer inherits its host bound from the declaration
   that reaches it, while a general decider would need one written from scratch. What would justify
   it: a protocol under TLS needing a credential injected that cannot be expressed as a signer on a
@@ -92,7 +92,7 @@ trigger is one nobody should move on a hunch.
   rules. What would justify one: a setting that cannot be a string, or one whose validation belongs
   to sbx because getting it wrong is a security matter rather than a failure the plugin reports.
 
-- **Nothing outside this page is pluggable.** Package backends, the store layer, the seccomp
+- **Nothing outside this section is pluggable.** Package backends, the store layer, the seccomp
   policy, app profiles and redaction are all first-party. Each decides what a sandbox may do, so a
   plugin there would be pluggable *policy*, and the argument that admits a resolver, that it holds
   a value and reaches nothing else, does not transfer to something that decides the reaching.

@@ -149,7 +149,7 @@ lists) restores it immediately.
 
 The other way a plugin arrives is a **signed store**: a git repository whose catalogue
 is verified against a pinned Ed25519 key, with anti-rollback on the revision. Everything
-on this page still applies to a plugin that came from one, since a store install
+in this section still applies to a plugin that came from one, since a store install
 re-validates the manifest exactly as a local install does; what a store adds is where
 the tree came from and how its authenticity is established. See
 [Signed plugin stores](stores).

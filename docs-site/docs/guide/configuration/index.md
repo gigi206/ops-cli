@@ -85,7 +85,9 @@ The global config and imported app profiles are **trusted by location**; a proje
 | `binds` | security | [binds](binds) |
 | `packages` | security | [packages](packages) |
 | `[flakes.<name>]` | security | [packages](packages#flakes-an-inline-nix-flake) |
-| `[tarball.<name>]`, `[deb.<name>]`, `[appimage.<name>]` (auto-upgrade resolvers) | security | [packages](packages#tarball-a-prebuilt-application-tarball) |
+| `[tarball.<name>]`, `[deb.<name>]`, `[appimage.<name>]`, `[binary.<name>]` (auto-upgrade resolvers) | security | [packages](packages#tarball-a-prebuilt-application-tarball) |
+| `accepts_fresh_releases` | security | [packages](packages#accepts_fresh_releases-when-the-vendor-publishes-faster-than-the-delay) |
+| `allow_insecure_http` | security | [packages](packages#plaintext-sources-and-the-one-switch-that-admits-them) |
 | `nixpkgs` | security | [nixpkgs](nixpkgs) |
 | `[limits]` | security | [limits](limits) |
 | `[seccomp]` | security | [seccomp](seccomp) |

@@ -164,6 +164,11 @@ its own scope, so it is not bounded by the agent's OOM ceiling. It needs a live 
 the session has exited, `attach` says so (run `sbx session ls` to list live ones). Type
 `exit` to leave a bare shell: the agent keeps running.
 
+The status `attach` returns is the joined command's own, and `128 + N` for one a signal
+ended. Three codes are the join itself failing rather than the command: `125` the
+confinement could not be re-applied, `126` the cage could not be joined, `127` the cage
+has no such program. See [Exit codes](../reference/exit-codes#sbx-session-attach-has-three-failures-of-its-own).
+
 ```sh
 sbx session ls                        # find the id
 sbx session attach 12345              # drop into a shell inside that running agent's cage

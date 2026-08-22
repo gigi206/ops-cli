@@ -28,7 +28,7 @@ Both are exactly what the base excludes. `python` is a language runtime, and
 languages rather than the task. A cage that never runs either should not pay for
 them, which is why they are declared rather than provisioned everywhere.
 
-Search and structured data are no longer on this list: `rg`, `fd` and `yq` are in
+Search and structured data are not on this list: `rg`, `fd` and `yq` are in
 the base userland, alongside `grep`, `find` and `jq`. A profile that declares
 `nix:ripgrep` or `nix:fd` still works and is occasionally kept for
 self-documentation, but it adds nothing to `PATH`.
@@ -120,3 +120,13 @@ there. Everything else is either language-specific or harness-dependent, and
 belongs in the tiers above rather than the base: runtimes such as `nodejs` and
 `uv` when your harness needs them, and LSP servers when it drives them. The two
 tools above are the line where the base stops and an agent starts to benefit.
+
+## Where to go next
+
+- [Give a project a reproducible toolchain](reproducible-toolchain): pinning what you
+  declared here, and rolling it forward deliberately.
+- [`packages`](../configuration/packages): the backend prefixes, and what attests each
+  provisioned artefact.
+- [`[bundle.<name>]`](../configuration/bundles): declaring a tool's requirements once and
+  naming them from every profile that needs them.
+

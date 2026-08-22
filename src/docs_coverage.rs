@@ -184,22 +184,19 @@ fn is_section_family(ty: &str) -> bool {
     !container && value.starts_with(|c: char| c.is_ascii_uppercase())
 }
 
-/// Every config field the schema accepts is *shown* in the guide, in the form a reader writes it.
+/// Every field the config schema accepts, as `(toml name, type, is declared at the root)`.
 ///
-/// The field names are read out of the schema source, because a Rust struct carries no runtime
-/// list of its fields. Three serde attributes decide what a reader would actually write: `rename`
-/// gives the TOML spelling (so `value_type` is written `type`), `skip` marks a field that is never
-/// read from a file at all, and `flatten` marks one whose *name is never written* — the reader
-/// types the inner keys directly (`[task.db-query]`, not `tasks`), so the Rust name is an
-/// implementation detail with nothing to document.
+/// The names are read out of the schema source, because a Rust struct carries no runtime list of
+/// its fields. Three serde attributes decide what a reader would actually write: `rename` gives the
+/// TOML spelling (so `value_type` is written `type`), `skip` marks a field that is never read from
+/// a file at all, and `flatten` marks one whose *name is never written* — the reader types the
+/// inner keys directly (`[task.db-query]`, not `tasks`), so the Rust name is an implementation
+/// detail with nothing to document.
 ///
-/// What this does **not** check: a field name is not unique across the schema, so a field of one
-/// table is satisfied by the same name documented under another (`env` appears both as the
-/// top-level table and inside `[plugin.<name>]`). Closing that would need each field's full TOML
-/// path, which the struct nesting alone does not give. The check is presence in the right *form*,
-/// which is what makes the common-word hole harmless, not presence in the right *place*.
-#[test]
-fn every_config_field_is_shown_in_the_guide() {
+/// The root flag is what lets a caller hold a top-level field to a stricter rule than a nested one:
+/// the root of the file is the surface a reader scans, and the one they cannot reconstruct from a
+/// worked example somewhere else.
+fn schema_fields() -> BTreeSet<(String, String, bool)> {
     let source =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config/schema.rs"))
             .expect("the config schema source is readable");
@@ -246,7 +243,19 @@ fn every_config_field_is_shown_in_the_guide() {
          and would pass vacuously",
         fields.len()
     );
+    fields
+}
 
+/// Every config field the schema accepts is *shown* in the guide, in the form a reader writes it.
+///
+/// What this does **not** check: a field name is not unique across the schema, so a field of one
+/// table is satisfied by the same name documented under another (`env` appears both as the
+/// top-level table and inside `[plugin.<name>]`). Closing that would need each field's full TOML
+/// path, which the struct nesting alone does not give. The check is presence in the right *form*,
+/// which is what makes the common-word hole harmless, not presence in the right *place*.
+#[test]
+fn every_config_field_is_shown_in_the_guide() {
+    let fields = schema_fields();
     let pages = guide_pages();
     let guide = pages
         .iter()
@@ -294,6 +303,49 @@ fn every_config_field_is_shown_in_the_guide() {
         missing.is_empty(),
         "these config fields are never shown in a code block or a field table in the guide, so a \
          reader is never told how to write them: {missing:?}"
+    );
+}
+
+/// Every root-level config field has a row in the configuration overview's field map.
+///
+/// A field documented only in the prose of the page that owns it is reachable by search and by
+/// nothing else. The map in `configuration/index.md` is the one surface that answers "what can this
+/// file contain", so a field missing from it is invisible to the reader who is scanning rather than
+/// looking a name up: `allow_insecure_http` sat in a code block on the packages page for exactly
+/// that reason, a security field nobody could find.
+///
+/// Held to the root only. A nested field belongs to the table above it and is documented on that
+/// table's own page, which the map already points at.
+#[test]
+fn every_root_config_field_has_a_row_in_the_field_map() {
+    let page = std::fs::read_to_string(guide().join("configuration/index.md"))
+        .expect("docs-site/docs/guide/configuration/index.md must exist");
+    let map = page
+        .split_once("## The fields")
+        .and_then(|(_, rest)| rest.split_once("\n## "))
+        .map(|(map, _)| map.to_string())
+        .expect("the configuration overview must carry a `## The fields` map");
+
+    let missing: Vec<String> = schema_fields()
+        .iter()
+        .filter(|(_, _, at_root)| *at_root)
+        .map(|(name, _, _)| name.clone())
+        // The map names a family of sections by its header form, and a scalar by its bare name.
+        .filter(|name| {
+            ![
+                format!("`{name}`"),
+                format!("`[{name}]`"),
+                format!("`[{name}."),
+            ]
+            .iter()
+            .any(|form| map.contains(form))
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these root-level fields have no row in the field map of \
+         docs-site/docs/guide/configuration/index.md, so a reader scanning the schema never meets \
+         them: {missing:?}"
     );
 }
 

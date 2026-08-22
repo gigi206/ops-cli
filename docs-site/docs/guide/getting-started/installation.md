@@ -83,8 +83,10 @@ To install it permanently, and for what does and does not complete, see
 cargo build && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
-The heavy sandbox end-to-end tests skip (rather than fail) when the host lacks user
-namespaces, nix, or network: so the suite is green on a constrained CI runner.
+The heavy sandbox end-to-end tests skip, rather than fail, when the host lacks user
+namespaces, nix, or network, so a constrained runner reports skips instead of failures.
+`mise run test-cage` turns those skips into failures, for a host that is supposed to be
+able to sandbox.
 
 ## Development tasks
 

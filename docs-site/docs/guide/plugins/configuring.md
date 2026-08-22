@@ -40,7 +40,7 @@ configuration.
 `sbx plugins info <name>` prints the table under the grant, marking any variable that will be
 ignored, so the answer to "why is my setting not applying" is in the same place as the setting.
 
-#### `programs`: where to get a tool this machine does not have
+## `programs`: where to get a tool this machine does not have
 
 A manifest names the tools its resolver runs and `sbx` finds each on its own `PATH`, which is
 what makes a published plugin work whatever installed them. `programs` is the answer for the

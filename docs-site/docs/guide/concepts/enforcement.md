@@ -251,8 +251,8 @@ host-wide guarantee is the **task cap**; the memory ceiling is per-cage protecti
 Resource limits are hardening, not the security boundary: so unlike the
 namespace / seccomp / egress layers, they **never hard-fail**. Where there is no
 cgroup v2, no reachable systemd user session, no `systemd-run`, or an
-undelegated controller, the cage launches **without** limits rather than regressing
-where it previously worked. `sbx doctor` reports whether it could create a limited
+undelegated controller, the cage launches **without** limits rather than refusing a
+launch the host can otherwise run. `sbx doctor` reports whether it could create a limited
 scope on this host.
 
 ### Overriding the limits

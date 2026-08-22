@@ -103,3 +103,12 @@ sbx trust
 From then on its security fields apply, and any later edit re-opens the gate by
 design. Reference: [`sbx trust`](../cli/trust); threat analysis:
 [Security model](../concepts/security-model).
+
+
+## Where to go next
+
+- [Give an agent a credential it can use but never read](inject-a-credential): the
+  `[secret]` half of the same setup, end to end.
+- [Run an agent in the background and check on it](background-agent): once the posture
+  is right, let it work without holding a terminal.
+- [Choose the tools an agent cage needs](recommended-tools): what to put on its `PATH`.

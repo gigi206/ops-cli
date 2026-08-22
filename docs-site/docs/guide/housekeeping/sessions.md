@@ -76,7 +76,7 @@ agent is still running:
 | Feed | Reads | Lives in | After the session exits |
 |---|---|---|---|
 | [`sbx session logs`](../cli/session#logs) | what the agent **printed** | on disk, under the session's runtime tree | still there, for a detached session |
-| [`sbx proc logs`](../cli/proc) | what it **executed** | the supervisor's memory (needs `--observe`) | gone |
+| [`sbx proc logs`](../cli/proc) | what it **executed** | the supervisor's memory (needs `--observe`, or a [`[proc]`](../configuration/proc) mode of `observe`, `enforce` or `ask`) | gone |
 | [`sbx fs logs`](../cli/fs) | what it **wrote** | the supervisor's memory (needs `--observe`) | gone |
 | [`sbx net logs`](../cli/net) | where it **went** | the running proxy's memory | gone |
 
@@ -84,10 +84,11 @@ So a record of what an agent *did*, rather than what it said, has to be taken wh
 runs: pipe a `--json` feed to a file. What persists on its own is the printed output,
 plus the aggregate egress counters [`sbx net stats`](../cli/net) keeps per host.
 
-`--observe` is the other thing that cannot be added later: the process and filesystem
-lenses are switched on at launch, cost nothing while nobody reads them, and are simply
-absent from a session that started without them. See
-[Observability](../concepts/observability).
+Observation is the other thing that cannot be added later: `--observe` puts the launch on
+a supervised path, so the two lenses are switched on when the cage starts, cost nothing
+while nobody reads them, and are simply absent from a session that started without them.
+The exec lens has a second door, a [`[proc]`](../configuration/proc) mode, which is also
+read at launch. See [Observability](../concepts/observability).
 
 ## The "second terminal"
 

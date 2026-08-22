@@ -73,3 +73,13 @@ sbx net stats        # per-host allow/deny counters, persisted
 
 Noisy refusals can be muted without changing verdicts. All five surfaces:
 [Egress observability](../networking/observability).
+
+
+## Where to go next
+
+- [Run an agent on an untrusted project, safely](run-agent-safely): the posture above as
+  one step of the whole setup.
+- [Rule grammar](../networking/rules): every kind of rule, and the one law that governs
+  them.
+- [Ask mode](../networking/ask): deciding a host while the request waits, rather than
+  before the launch.

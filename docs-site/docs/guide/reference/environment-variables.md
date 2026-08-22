@@ -186,12 +186,27 @@ finds the operation plane without being told where it is:
 | `SBX_TASK_CLI` | the in-cage path of the task client (`/opt/sbx/bin/sbx`), a [generated script](../cli/task#what-the-cage-actually-holds) that speaks the plane's protocol and refuses every other word |
 | `SBX_TASK_SOCKET` | the in-cage path of the plane's socket (`/tmp/sbx-task.sock`), which is also how `sbx task` knows it is running inside a cage |
 
+A roll of an app's install steps ([`sbx app upgrade`](../cli/app#advancing-an-app),
+[`sbx upgrade --apps`](../cli/upgrade)) adds one, so a step can tell a first install from
+a re-install:
+
+| Variable | Meaning |
+|---|---|
+| `SBX_UPGRADE=1` | the launch is re-running the install steps deliberately. A step whose "already installed" guard would otherwise skip the work reads this and installs anyway; see [`[bundle.<name>]`](../configuration/bundles) |
+
 Inside a **task** cage (the ephemeral sibling an invocation runs in) the set is different:
 
 | Variable | Meaning |
 |---|---|
 | `SBX_TASK` | the name of the operation being run. A task is never interactive, so a tool that would otherwise prompt can fail fast instead of hanging until the timeout |
 | `SBX_TASK_OUT` | the writable [output directory](../tasks/output#producing-a-file-output) (`/opt/sbx/out`), set only when the declaration carries `output = true`. The calling cage reads the same artifacts at `/opt/sbx/task-out/<task>/` |
+
+A [plugin](../plugins/) runs in a cage of its own, and gets one variable no other cage
+sees:
+
+| Variable | Meaning |
+|---|---|
+| `SBX_PLUGIN_STATE` | the in-cage path (`/run/sbx-state`) of the private writable directory a manifest asks for with [`state = true`](../plugins/manifest). `sbx` picks the host location, one per plugin, and a plugin can neither name it nor reach another plugin's |
 
 Under a [filtering network posture](../networking/modes), `sbx` also sets the proxy
 variables (`http_proxy`/`https_proxy`) and the CA-bundle variables so in-cage tools

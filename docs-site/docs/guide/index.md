@@ -224,6 +224,3 @@ carry the *why* across subjects: [Decisions and limits](concepts/decisions), whi
 what `sbx` does not do and what would reopen each structural choice, and [Security
 model](concepts/security-model), which holds the threat analysis and names where the
 protection stops.
-
-There is no separate design-document directory. The four that once sat under `docs/` were
-folded into these pages when the site was built, and the pages are now the only copy.

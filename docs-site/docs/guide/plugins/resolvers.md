@@ -106,7 +106,8 @@ vault reader does not need: seeding the session once, and taking the application
 own copy away from it. Both are on [OAuth sessions](../secrets/oauth), which also carries the
 per-application traps.
 
-Each is also a worked example of the manifest and the execution contract above:
+Each is also a worked example of [the manifest](manifest) and of the execution contract
+above:
 read its `plugin.toml`, its `resolve` script and its README when writing your own.
 They show what the structural cage forces on a resolver (declaring the host tools
 it runs, and restoring the host `HOME` a tool derives its paths from), and each
@@ -123,6 +124,6 @@ before it cannot.
 
 ## See also
 
-- [The `plugin.toml` manifest](manifest): the fields the directory above must declare.
+- [The `plugin.toml` manifest](manifest): the fields a resolver's directory must declare.
 - [`[plugin.<name>]`](configuring): what this machine supplies to it.
 - [Managing plugins](managing): installing one, and what the registry does with it.

@@ -15,7 +15,10 @@ See also: [`sbx run`](../cli/run) · [One-shot overrides](../configuration/overr
 | `0` | success |
 | `1` | a runtime failure, an operation that ran but did not succeed (e.g. `sbx config get` on an unset key, a store/network operation that failed) |
 | `2` | a **usage or fail-closed** error, a bad argument, a missing operand, or a rejected [one-shot override](../configuration/overrides) value |
-| `125` | [`sbx task run`](../cli/task#run) **refused** the invocation and ran nothing |
+| `125` | nothing was run, deliberately: [`sbx task run`](../cli/task#run) refused the invocation, or [`sbx session attach`](../cli/session#attach) could not re-apply the cage's confinement |
+| `126` | [`sbx session attach`](../cli/session#attach) could not join the running cage, or could not reap the shell it started |
+| `127` | [`sbx session attach`](../cli/session#attach) reached the cage but could not start the shell in it |
+| `128 + N` | the launched or attached command was terminated by signal `N` |
 | *other* | for a launch verb, the **launched command's** own exit status |
 
 ## Launch verbs propagate the command's status
@@ -54,6 +57,20 @@ request itself to refuse.
 nothing: an unknown operation, a value outside its declared bound, a variable not in
 `env_allow`, or an exhausted session quota. 125 rather than 2, so a refusal stays
 distinguishable from the wrapped command exiting 2 on its own.
+
+## `sbx session attach` has three failures of its own
+
+[`attach`](../cli/session#attach) joins a live cage and runs a shell inside it, so its
+status is the shell's whenever there is a shell to have one: it propagates the exit
+status like a launch verb, and reports `128 + N` for a shell a signal ended. Three codes
+are the join itself failing, and they are distinguishable because what to do about each
+differs:
+
+| Code | What failed | What it usually means |
+|---|---|---|
+| `125` | the cage's confinement could not be re-applied to the joining shell | the kernel refused the seccomp filters; nothing was started, deliberately, since a shell inside the cage that is not confined like the cage would be a wider hole than the agent |
+| `126` | the namespaces could not be joined, or the shell could not be reaped | the session ended between `sbx session ls` and the join, or the host refused the `setns` |
+| `127` | the join worked, the shell did not start | the cage has no such program: its `/bin/bash` is absent, or the command passed after `--` is not in the cage's `PATH` |
 
 ## `sbx doctor` fails hard on a missing prerequisite
 

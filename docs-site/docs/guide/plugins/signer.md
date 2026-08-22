@@ -178,7 +178,7 @@ record, not the key.
 
 ## The published signer
 
-One plugin in the store is not a resolver at all. Where every resolver above
+One plugin in the store is not a resolver at all. Where [every resolver](resolvers)
 answers *where a value comes from*, `aws-sigv4` answers what no resolved value
 can: what authenticating **this** request looks like. It is reached with
 [`sign`](../configuration/secret#sign-a-credential-computed-from-the-request)

@@ -75,3 +75,13 @@ sbx store         # see what sbx occupies before deciding
 ```
 
 Reference: [`sbx gc`](../cli/gc), [`sbx store`](../cli/store).
+
+
+## Where to go next
+
+- [Choose the tools an agent cage needs](recommended-tools): which tools are worth
+  declaring, and in which tier.
+- [Upgrading toolchains](../housekeeping/upgrade): the lock model behind `sbx upgrade`,
+  and what each backend does.
+- [Garbage collection](../housekeeping/gc): what `sbx gc` reclaims, and what it will not
+  touch.

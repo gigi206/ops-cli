@@ -266,8 +266,8 @@ brokers = ["gpg-agent"]
 ```
 
 The published `pass` resolver is the worked example. Reading a password store means asking
-the GnuPG agent to decrypt, and the only way to ask used to be `allow_paths` on the agent's
-socket, which carries every operation the agent can perform, signing included. Naming the
+the GnuPG agent to decrypt, and without a broker the only way to ask is `allow_paths` on the
+agent's socket, which carries every operation the agent can perform, signing included. Naming the
 broker binds the filtered socket at that same address instead, so `pass(1)` finds what it
 always looked for and the connection carries only what `[broker.gpg-agent] allow` admits.
 

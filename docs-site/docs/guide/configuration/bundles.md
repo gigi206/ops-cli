@@ -268,8 +268,8 @@ dropped silently. Nothing was lost.
 
 The repository ships one bundle per tool (a CLI, a desktop build, a web UI's engine) under
 `examples/bundle/`, each the single source of truth for what that agent needs: the namesake profile in
-`examples/app/` names it with `use` and no longer restates the requirements; a test pins the two
-together, so they cannot drift apart:
+`examples/app/` names it with `use` rather than restating the requirements, and the two are held
+in agreement:
 
 ```sh
 sbx bundle import examples/bundle/opencode.toml
