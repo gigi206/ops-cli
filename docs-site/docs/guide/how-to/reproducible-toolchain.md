@@ -18,7 +18,7 @@ Prerequisites: `sbx` installed ([installation](../getting-started/installation))
 [packages]
 jq       = "nix:jq"                        # host-side nix store, shared across projects
 ripgrep  = "mise:aqua:BurntSushi/ripgrep"  # installed in-cage by mise
-fzf      = "flake:github:nix-community/fzf" # a flake ref
+fzf      = "flake:github:owner/repo#default" # a flake output
 ```
 
 Each backend differs in where it installs and what tracks upstream:
@@ -27,28 +27,38 @@ Each backend differs in where it installs and what tracks upstream:
 ## 2. Pin the base channel
 
 The `nix:` backend builds against a nixpkgs revision recorded in a lock file: global
-by default, one per app when a profile pins its own. Pin it explicitly when
-reproducibility matters more than freshness:
+by default, one per app when a profile pins its own. `nixpkgs` is a scalar, taking either
+a channel name or an exact 40-hex revision. Pin the revision when reproducibility matters
+more than freshness:
 
 ```toml
-[nixpkgs]
-revision = "..."
+# a channel: tracks it, and moves only on `sbx upgrade nix`
+nixpkgs = "nixos-24.11"
+
+# an exact revision: byte-reproducible, and moves for nobody
+# nixpkgs = "3e0ce8c5d4a1f5f6b8a1a1a1a1a1a1a1a1a1a1a1"
 ```
 
-What lives where: [Directory layout](../concepts/directory-layout); the field:
+A pinned project downloads its own base closure on its first launch, which is the whole
+cost. What lives where: [Directory layout](../concepts/directory-layout); the field:
 [`nixpkgs`](../configuration/nixpkgs).
 
 ## 3. Let the project's mise toolchain come along
 
-A project that already carries a `.mise.toml` keeps working: `[tools]` equips that
-toolchain inside the cage on demand:
+A project that already carries a `.mise.toml` keeps working: sbx reads it as the
+project's toolchain and equips it inside the cage. That table is **mise's**, in the mise
+file, not a section of `.sbx.toml`:
 
 ```toml
+# .mise.toml
 [tools]
-this-project-only = true
+"nix:nodejs" = "20"                        # pinned host-side, offline-reusable
+"aqua:BurntSushi/ripgrep" = "latest"       # equipped in-cage at launch
 ```
 
-Reference: [`[tools]`](../configuration/tools); running mise explicitly:
+A `nix:` entry there is trusted-only and pinned in the project's `tools.lock`; every
+other backend is fetched upstream at launch, so it is fresher and needs the network the
+first time. Reference: [`[tools]`](../configuration/tools); running mise explicitly:
 [`sbx mise`](../cli/mise).
 
 ## 4. Upgrade deliberately
