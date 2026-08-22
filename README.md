@@ -1,22 +1,22 @@
-# sbx — a sandbox launcher for tools and AI agents
+# sbx: a sandbox launcher for tools and AI agents
 
 [![CI](https://github.com/gigi206/ops-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/gigi206/ops-cli/actions/workflows/ci.yml)
 
-`sbx` is a **sandbox launcher**: a single static Rust binary that runs tools —
-including **encapsulated AI agents** — inside a [bubblewrap](https://github.com/containers/bubblewrap)
+`sbx` is a **sandbox launcher**: a single static Rust binary that runs tools,
+including **encapsulated AI agents**, inside a [bubblewrap](https://github.com/containers/bubblewrap)
 sandbox where they can install a project's full dependency set via single-user,
 daemonless [Nix](https://nixos.org/) **without mutating the host OS**.
 
-It is **not** a container manager — no OCI runtime wrapping, no image to build,
-no shared host kernel. The reference class is bubblewrap-based sandboxes —
-tools whose job is isolation under namespace boundaries — not environment
-managers that only set variables and isolate nothing.
+It is **not** a container manager: no OCI runtime wrapping, no image to build, no
+registry. The reference class is bubblewrap-based sandboxes, tools whose job is
+isolation under namespace boundaries, not environment managers that only set
+variables and isolate nothing.
 
 ## Why
 
 Running an autonomous coding agent on a project means letting untrusted code
 install dependencies and execute. `sbx` gives that agent a real boundary: it runs
-as your user, but the **bind layout is the security control** — the host
+as your user, but the **bind layout is the security control**, so the host
 filesystem and your secrets are absent from the cage unless explicitly and
 trustedly granted. The agent self-equips a per-project Nix store it cannot use to
 escape, behind an always-on seccomp filter and best-effort resource limits; egress
@@ -39,18 +39,22 @@ is a deny-by-default allowlist and can be opened back up to the host network.
   A cage nobody configured reaches only the built-in self-equip set; `network = "shared"`
   opts back into the unfiltered host network.
 - An untrusted project's `.sbx.toml` **cannot** touch security-relevant fields
-  (binds, network, secrets, packages, app definitions); the trust gate binds
-  approval to the file's content hash — the direnv model (`sbx trust`).
+  (binds, network, secrets, packages, app definitions, …); the trust gate binds
+  approval to the file's content hash, on the direnv model (`sbx trust`).
 
 ## Documentation
 
-The complete, task-oriented **user guide** lives in
-[`docs-site/docs/guide/`](docs-site/docs/guide/index.md) — split into small,
-cross-linked pages covering the concepts, the full `.sbx.toml` configuration reference,
-every command, apps and profiles, networking/egress, and secrets. Start there.
+The complete, task-oriented **user guide** is published at
+[gigi206.github.io/ops-cli](https://gigi206.github.io/ops-cli/), and its sources live
+in [`docs-site/docs/guide/`](docs-site/docs/guide/index.md). It is split into small,
+cross-linked pages covering the concepts, the how-to walkthroughs, the full
+`.sbx.toml` configuration reference, every command, apps and profiles,
+networking/egress, declared operations, secrets, and plugins. Start there.
 
-It is also a Docusaurus site: `mise run docs` serves it locally with live reload, and
-`mise run docs-serve` serves the built site, which is what the search index needs.
+It is a Docusaurus site: `mise run docs` serves it locally with live reload,
+`mise run docs-build` runs the checks the publish job runs (navigation, links,
+anchors, and the provider recipes imported from `examples/`), and `mise run docs-serve`
+serves the built site, which is what the search index needs.
 
 For the design rationale and the limits, see
 [Decisions and limits](docs-site/docs/guide/concepts/decisions.md): what `sbx` does not do,
@@ -66,7 +70,7 @@ C/asm, so the musl target is built with
 musl cross-cc via zig), wired up through [mise](https://mise.jdx.dev/):
 
 ```sh
-mise install        # zig + cargo-zigbuild
+mise install        # the pinned toolchain (rust, zig, cargo-zigbuild, …)
 mise run build      # cargo zigbuild --release --target x86_64-unknown-linux-musl
 ```
 
@@ -91,20 +95,22 @@ sbx run                          # an interactive shell in the sandbox (no comma
 sbx app run <name>               # launch a named agent profile (its own isolated $HOME)
 sbx config show [--details]      # the resolved configuration for the current project
 sbx search <query>               # discover Nix tools to declare
-sbx upgrade [nix|mise|flake]     # roll managed toolchains forward
+sbx upgrade [target]             # roll a managed channel forward (nix, mise, flake, …)
 sbx trust .sbx.toml              # vouch for a project config's security fields
-sbx ls | attach | stop | gc      # session registry + housekeeping
+sbx session ls|attach|stop       # the live session registry
+sbx gc [--prune]                 # reclaim the project's Nix store
 ```
 
-A project is configured by an optional `.sbx.toml`. Free fields (e.g. `env`)
-apply from any project; security fields (`binds`, `network`, `secret`,
-`packages`, `[app.<name>]`, …) apply only once the file is **trusted**
-(`sbx trust`), and the trust is re-armed whenever the file changes.
+A project is configured by an optional `.sbx.toml`. Its two free fields, `env` and
+`timezone`, apply from any project, and so does `[fs]`, which can only close a path off
+inside the cage; the security fields (`binds`, `network`, `secret`, `packages`,
+`[app.<name>]`, …) apply only once the file is **trusted** (`sbx trust`), and the trust
+is re-armed whenever the file changes.
 
 ### App profiles
 
-A `[app.<name>]` table — or a standalone profile file under
-`<config>/sbx/apps/<name>.toml` — defines a named, reusable agent launcher with
+A `[app.<name>]` table, or a standalone profile file under
+`<config>/sbx/apps/<name>.toml`, defines a named, reusable agent launcher with
 its own isolated `$HOME`, package set, network allowlist, and host-side credential
 injection. The [`examples/app/`](examples/app/) directory ships importable starter
 profiles (`sbx app import <file>`); see [`examples/README.md`](examples/README.md).
@@ -120,7 +126,7 @@ mise run ci      # all of the above
 ```
 
 A test whose prerequisites are absent returns early, and `cargo test` counts that as a
-pass — so `mise run test` ends by naming how many of its green tests did nothing, and
+pass, so `mise run test` ends by naming how many of its green tests did nothing, and
 why. It runs `--no-fail-fast` for the same reason a skip is reported: without it cargo
 stops at the first target that fails and the later test binaries never run, so a red
 run says nothing about how much is red. On a host that is supposed to have userns,
@@ -128,6 +134,7 @@ bwrap and nix, make it prove it:
 
 ```sh
 SBX_REQUIRE_CAPABLE=1 mise run test   # a missing host capability fails instead of skipping
+mise run test-cage                    # the same, scoped to the suites that carry a cage skip
 ```
 
 ## License
