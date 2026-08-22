@@ -1097,22 +1097,18 @@ mod tests {
 
     #[test]
     fn a_refused_write_falls_back_to_the_theme_name_rather_than_to_nothing() {
-        // A read-only data directory is the case this must survive: the announcement still has to
-        // go out, carrying the warning icon it carried before the mark existed.
+        // A data directory the mark cannot be written into is the case this must survive: the
+        // announcement still has to go out, carrying the warning icon it carried before the mark
+        // existed.
+        //
+        // The refusal is `ENOTDIR` — the mark's parent is a regular file — rather than a read-only
+        // directory, because root ignores the mode and writes the mark anyway. On a host running
+        // the suite as root the read-only form asserted nothing at all.
         let tmp = crate::testutil::TmpDir::new();
         let dir = tmp.path().join("locked");
-        std::fs::create_dir_all(&dir).expect("the directory");
-        let mut perms = std::fs::metadata(&dir).expect("stat").permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(&dir, perms).expect("lock the directory");
+        std::fs::write(&dir, b"not a directory\n").expect("the blocking file");
 
         let refused = write_mark(&dir.join("sbx.png"), LOGO_LIGHT);
-
-        // Restore before asserting, so a failure does not leave an undeletable directory behind.
-        let mut perms = std::fs::metadata(&dir).expect("stat").permissions();
-        #[allow(clippy::permissions_set_readonly_false)]
-        perms.set_readonly(false);
-        std::fs::set_permissions(&dir, perms).expect("unlock the directory");
 
         assert_eq!(
             refused, None,

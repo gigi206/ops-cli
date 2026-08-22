@@ -2516,6 +2516,10 @@ mod tests {
         // a hard failure (fail-closed), never a silent "absent" that downgrades to a weaker
         // source. (Root bypasses the permission, so the error path is unreachable there — skip.)
         if unsafe { libc::geteuid() } == 0 {
+            skip_incapable!(
+                "skipping the unreadable-sops-parent test: running as root, which searches a \
+                 directory whatever its mode, so `try_exists` answers instead of erroring"
+            );
             return;
         }
         let dir = TmpDir::new();

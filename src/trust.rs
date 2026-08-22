@@ -386,11 +386,15 @@ mod tests {
             "named once: {err}"
         );
 
-        let ro = tmp.join("ro");
-        std::fs::create_dir(&ro).unwrap();
-        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let err = trust(&ro.join("store"), &cfg).unwrap_err().to_string();
-        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The store side fails because its parent is a regular file, so the `mkdir` answers
+        // `ENOTDIR`. A mode-locked directory would say the same thing to an ordinary user and
+        // nothing at all to root, who ignores the mode and writes the marker — leaving this branch
+        // untested on any host that runs the suite as root. What is under test is the *shape* of
+        // the error, not which refusal produced it, so the refusal that holds for every uid is the
+        // one to provoke.
+        let blocked = tmp.join("blocked");
+        std::fs::write(&blocked, b"not a directory\n").unwrap();
+        let err = trust(&blocked.join("store"), &cfg).unwrap_err().to_string();
         assert!(err.starts_with(&*cfg.display().to_string()), "{err}");
         assert!(err.contains("cannot write its trust marker under"), "{err}");
     }
