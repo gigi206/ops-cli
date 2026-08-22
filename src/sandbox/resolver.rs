@@ -313,6 +313,7 @@ fn drain<R: io::Read + Send + 'static>(
 /// whichever source a secret came from.
 ///
 /// **What is bounded is the wait, not the process** — and the difference is the whole design.
+///
 /// Killing what sbx spawned does not end the wait, because a pipe stays open as long as *anything*
 /// holds its write end: a shell that forks a helper, sops that forks gpg. Measured, not assumed —
 /// killing `sh -c 'sleep 30'` and then reading to EOF takes thirty seconds, because `sleep`
@@ -658,6 +659,7 @@ fn resolve_env_paths(keys: &[String]) -> Vec<(String, String)> {
 ///
 /// The path is canonicalized because binding the *symlink* would bind a dangling name: a nix
 /// profile's `bin/x` points into `/nix/store`, which the cage does not have.
+///
 /// Where `PATH` has no answer, a program the host configured under `[plugin.<name>] programs` and
 /// `sbx plugins install` already built is used instead. Only the out-link is read here — a launch
 /// never builds — so the fallback costs one `readlink` and never stalls a secret on a nix build.

@@ -136,6 +136,7 @@ pub(crate) fn parse_one_name<'a>(
 /// [`parse_one_name`] plus the reporting each call site would otherwise repeat: the verb's page for
 /// a help flag, the usage error with its hint otherwise, and the name and switch when the line
 /// parses. `Err` carries the code the handler must return, which for a help flag is a success.
+///
 /// Kept apart from the parsing so the grammar is tested on its values rather than through captured
 /// output.
 pub(crate) fn one_name<'a>(

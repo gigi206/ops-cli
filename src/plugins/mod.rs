@@ -457,6 +457,7 @@ fn claim<T: Claimant>(
 impl PluginRegistry {
     /// Discover and validate every plugin under `<plugins_dir>/<name>/plugin.toml`, reporting
     /// every reason a plugin was dropped — including scheme conflicts — as text in `warnings`.
+    ///
     /// This is the form for a caller that only relays diagnostics (a launch, a config load); a
     /// caller that renders conflicts itself wants [`load_quiet`](Self::load_quiet).
     pub(crate) fn load(plugins_dir: &Path, warnings: &mut Vec<String>) -> Self {

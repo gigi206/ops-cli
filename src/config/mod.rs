@@ -121,6 +121,7 @@ const PROFILES_DIR: &str = "apps";
 /// reserved for the same reason. In-cage a redirected proxy or a swapped CA only
 /// fails closed (empty netns, sbx-minted certs), but the same Mode-A protection as
 /// `NIX_CONFIG` applies, and the keys sbx *sets* are exactly the keys it protects.
+///
 /// Also the barrier a broker plugin's `cage_env` passes, so the list of names that load code in
 /// the cage is written once and both callers refuse exactly the same set.
 ///
@@ -269,6 +270,7 @@ pub(crate) struct Resolved {
     /// path). A display affordance for `sbx config`, recorded only at the baseline.
     pub(crate) bind_layer: BTreeMap<PathBuf, Provenance>,
     /// Declared tools, in declaration order, each tagged with its source's trust.
+    ///
     /// Admission (and the nix work it implies) is the launcher's, not decided here.
     pub(crate) packages: Vec<Package>,
     /// Packages whose vendor publishes faster than a freshness delay tolerates, named by a trusted
@@ -441,6 +443,7 @@ pub(crate) struct Resolved {
     /// `sbx config`; the launcher ignores it.
     pub(crate) ssh_agent_origin: Provenance,
     /// The broker plugins to stand up for this cage, from `[broker.<name>]`, ordered by name.
+    ///
     /// Empty is the common case and means no broker plugin runs.
     pub(crate) brokers: Vec<BrokerBinding>,
     /// Whether every signature must be confirmed on the host desktop before the broker forwards it
@@ -476,6 +479,7 @@ pub(crate) struct Resolved {
     pub(crate) tasks: Vec<TaskSpec>,
     /// Named application launch profiles, each a gated overlay over this baseline. Keyed
     /// by name; `sbx app <name>` looks one up and folds it on with [`Resolved::merge_app`].
+    ///
     /// `sbx run` ignores them.
     pub(crate) apps: BTreeMap<String, ResolvedApp>,
     /// Human-readable notes about what was dropped or ignored and why.
@@ -554,6 +558,7 @@ pub(crate) struct ResolvedApp {
     /// overrides the baseline; `None` leaves the baseline posture in place.
     pub(crate) proc: Option<crate::proc_policy::ProcPolicy>,
     /// The app's own refusal-notification policy, set only when a trusted source declared one.
+    ///
     /// `Some` overrides the baseline; `None` leaves the baseline policy in place.
     pub(crate) notify: Option<crate::notify::NotifyPolicy>,
     /// The app's own GUI posture, set only when a trusted source declared one. `Some` overrides
@@ -798,6 +803,7 @@ impl Resolved {
     /// project-level source rather than "override" — the launched value is correct, only its label
     /// is coarse. The rest of the override is applied by [`Resolved::apply_override`], after any app
     /// overlay merges.
+    ///
     /// A set-but-invalid channel is a **hard error** (`Err`): unlike a config layer, an override has
     /// no safe fallback — keeping the baseline would resolve a *different* source than the user's
     /// (mistyped) explicit one, a silent fail-open on a supply-chain field. The caller aborts the
@@ -2830,6 +2836,7 @@ fn warn_unknown_app_keys(
 /// `SHA256:` fingerprint (a base64 SHA-256 is always 43 characters once its padding is dropped, so a
 /// shorter one is a copy-paste that lost its tail). Everything else is taken as a comment, which is
 /// free-form by nature: `ssh-add -l` prints comments with spaces in them.
+///
 /// Returns the entries **and** whether this layer asked for per-signature confirmation, which the
 /// caller ORs onto what it already has: a layer may turn confirmation on, never off.
 fn apply_ssh_agent(
@@ -4151,6 +4158,7 @@ fn apply_fresh_releases(
 }
 
 /// Fold a layer's `[packages]` and `[flakes]` into `out` as one tool set, upserting by name.
+///
 /// Packages are applied first, then inline flakes, so a name declared in both — a config mistake —
 /// resolves to the `[flakes]` inline source, and the collision is warned rather than silently
 /// last-winning. `state`/`protect_trusted` gate both exactly like [`apply_packages`], so an
@@ -4506,6 +4514,7 @@ fn parse_backend(value: &str, allow_insecure_http: bool) -> Result<Backend, Stri
 }
 
 /// [`parse_backend`] without the plaintext hint: the prefix match and per-backend validation.
+///
 /// Split out so the hint can be decided by asking this function the same question twice.
 fn classify_backend(value: &str, allow_insecure_http: bool) -> Result<Backend, String> {
     if let Some(attr) = value.strip_prefix("nix:") {

@@ -108,6 +108,7 @@ fn host_locales() -> Vec<String> {
 
 /// Pure core of [`host_locales`]: normalize the raw locale values, add the anchor, and dedup +
 /// sort for a stable build expression (so an unchanged host locale re-uses the built archive).
+///
 /// Separated from the environment read so the derivation is unit-testable.
 fn locale_set(raw: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut set: Vec<String> = raw
@@ -168,6 +169,7 @@ fn locale_archive_expr(nixpkgs: &str, system: &str, locales: &[String]) -> Strin
 }
 
 /// Provision the base hermetic userland into sbx's store and report its paths.
+///
 /// The launcher resolves the userland before assembling a spec; on a project's
 /// first launch this fetches the base closure from the binary cache. `nixpkgs` is
 /// the pinned reference for the OS substrate (glibc, stdcpp, bash, coreutils, nix-ld,

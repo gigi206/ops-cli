@@ -39,6 +39,7 @@ pub(super) const LOADER_DEST: &str = "/lib64/ld-linux-x86-64.so.2";
 /// The in-sandbox `/bin/bash`, synthesised as a symlink to the same nix shell as
 /// `/bin/sh`. A great many upstream scripts carry a `#!/bin/bash` shebang (a host
 /// path a hermetic cage lacks), so the kernel cannot exec them without this name.
+///
 /// It is the *same* binary `/bin/sh` already exposes — a second name for an
 /// interpreter already present, not a new mount — so it adds no exposure, only the
 /// name a `#!/bin/bash` shebang assumes. Also the shell `sbx session attach` execs inside a
@@ -981,6 +982,7 @@ pub(crate) const SHELL_RC_INCAGE: &str = "/opt/sbx/bashrc";
 /// `.bashrc` if the agent has written one, then activate mise so its activated tools manage
 /// PATH/env. Static (no per-project data, so the same bytes back every cage), bound read-only
 /// from outside every writable mount, so the agent cannot rewrite what its own shell sources.
+///
 /// The prompt uses `\h`, which resolves to the cage's `sbx-<slug>` hostname, so an interactive `sbx run`
 /// reads `(sbx-<slug>) <cwd>$` instead of the bare `bash-<v>$` default — set *before* the
 /// `.bashrc` source so a home's own `PS1` still wins. The contract `cat` is guarded on the

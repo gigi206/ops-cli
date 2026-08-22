@@ -805,6 +805,7 @@ pub(super) fn validate_service(
 ///
 /// The two ways a condition can be unreadable are the two ways `is`/`not` can be wrong: both
 /// given (which of them was meant is not guessable) or neither (nothing is being compared).
+///
 /// A list is an `and`, so a member that cannot be read takes the WHOLE condition with it
 /// rather than only itself: dropping one conjunct would silently *loosen* what the profile
 /// asked for, and a service running under half a condition is worse than one running under

@@ -59,6 +59,7 @@ pub(crate) enum ManageError {
     /// carry a posture matrix this generic path does not: an `allow` on a config with no posture
     /// bootstraps the restrictive one, a rule that would be inert under the current mode is refused
     /// rather than written, and a deliberate non-filtering choice is never flipped in silence.
+    ///
     /// Writing the entry here would produce a rule that looks set and decides nothing, so the verb
     /// that knows better is named instead. Removal is not redirected: taking a rule out cannot
     /// create an inert one, and neither `sbx net` nor `sbx proc` has a verb that removes one.

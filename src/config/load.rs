@@ -451,6 +451,7 @@ fn groups_of(field: Option<schema::NetworkField>) -> BTreeMap<String, Vec<String
 }
 
 /// The tool bundles declared in the global config (`[bundle.<name>]`), plus any load warnings.
+///
 /// Global-only — matching the fold, which honors bundles only from the global config — so this
 /// lists exactly the set a `use` reference can resolve to. A read-only, network-free view for
 /// `sbx bundle`; each bundle is returned as authored, so the caller displays it as declared.
@@ -509,6 +510,7 @@ pub(crate) fn read_net_groups_fragment(
 ///
 /// Returns the parsed config, its trust verdict, and the validated `(filename,
 /// bytes)` of every sibling mise file — read here, once, through the safety gate.
+///
 /// Threading those bytes out (rather than re-reading them later) means the launcher
 /// maps exactly the content the verdict covers, and the safety gate runs once.
 fn read_project(
@@ -870,6 +872,7 @@ fn describe_secret_source(s: &RawHostSecret) -> String {
 }
 
 /// Read every imported app profile from the profiles directory, keyed by filename stem.
+///
 /// Delegates to [`read_profile_apps_from`] with the resolved [`profiles_dir`]; the split keeps the
 /// directory-reading logic unit-testable against an arbitrary directory, without depending on the
 /// process environment.
@@ -959,6 +962,7 @@ fn read_profile_apps_from(dir: &Path, warnings: &mut Vec<String>) -> BTreeMap<St
 /// `allow`, or absent) baseline a mode-less table falls back to `deny`, so inventing one would
 /// silently narrow a wide-open app into a default-deny allowlist. A bundle must never move a
 /// posture in either direction, so the gap is the safe answer and the warning names the fix.
+///
 /// Under an app that declared `network = "shared"` or `"none"` the entries are simply redundant
 /// (that posture is already wider, or admits nothing at all), so they are dropped silently.
 fn expand_bundles(

@@ -3238,6 +3238,7 @@ fn paint_inline_code(text: &str, pal: &Palette) -> String {
 }
 
 /// Render the top-level command list — the body of `sbx --help` and the no-command usage.
+///
 /// Top-level commands are sorted alphabetically, like each subcommand listing.
 fn top_level(pal: &Palette) -> String {
     let mut out = String::from("sbx — a sandbox launcher (bubblewrap + daemonless nix)\n\n");
@@ -3687,6 +3688,7 @@ mod tests {
 
     /// The half-open line range a top-level `fn` occupies in `text`: its signature through the
     /// closing brace in column 0.
+    ///
     /// A range must end at that brace, not run to the end of the file: an unterminated one would
     /// swallow the arms of every function below it, which turns a real mismatch into a pass.
     fn body_lines(text: &str, func: &str) -> std::ops::Range<usize> {

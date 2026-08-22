@@ -430,6 +430,7 @@ mod tests {
 
     /// NUL is the separator on the descriptor, so a value carrying one ends its own argument and
     /// everything after it becomes further bwrap arguments — a mount of the author's choosing.
+    ///
     /// Measured on a live launch: an untrusted `.sbx.toml` bound the host `$HOME` into the cage.
     ///
     /// Refused, not stripped. Removing the byte would run the cage with a *different* value than the

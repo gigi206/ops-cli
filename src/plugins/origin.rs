@@ -269,6 +269,7 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 /// A per-call-unique suffix for the temp record, so two installs in one process never collide.
+///
 /// A monotonic process-local counter — no clock or RNG.
 fn unique() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};

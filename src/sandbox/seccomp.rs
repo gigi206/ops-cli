@@ -163,6 +163,7 @@ fn eperm_unconditional_named() -> Vec<(&'static str, i64)> {
 
 /// The ENOSYS-denied syscalls as `(name, number)` pairs: `clone3` and the new mount API, so a
 /// caller falls back to the (filtered) old syscalls instead of bypassing the EPERM denylist.
+///
 /// Like [`eperm_unconditional_named`], this is the single source for both the filter and the
 /// allow-token lookup.
 fn enosys_named() -> Vec<(&'static str, i64)> {

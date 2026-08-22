@@ -220,6 +220,7 @@ pub(crate) fn upstream_config_h2() -> Arc<ClientConfig> {
 }
 
 /// A static `ServerName` for a host string, for opening the proxy's upstream connection.
+///
 /// Shared by the serve loop and the tests so they build it identically.
 pub(crate) fn upstream_server_name(host: &str) -> io::Result<ServerName<'static>> {
     ServerName::try_from(host.to_string())

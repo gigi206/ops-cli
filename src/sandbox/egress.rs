@@ -357,6 +357,7 @@ const CAGE_HOSTNAME_PREFIX: &str = "sbx-";
 /// A rule is skipped when it names no single port (`:*`, or a range — sbx will not open a thousand
 /// listeners on a guess), a **privileged** port (below 1024, which a capability-less cage cannot
 /// bind), or a non-loopback IP literal, which the cage's network namespace has no way to hold.
+///
 /// Skipping is reported, never silent: the rule still governs the proxy's verdict, so what the
 /// author loses is the convenience, and they need to know they must tunnel themselves.
 pub(crate) fn tcp_destinations(policy: &crate::allowlist::EgressPolicy) -> TcpPlan {

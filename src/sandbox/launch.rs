@@ -1144,6 +1144,7 @@ fn equip_announcement(tokens: &[String]) -> String {
 /// `--bump` is the other half of the launch's `use -g --pin`. A plain `mise upgrade` keeps whatever
 /// range the config states, and after a pin that range is one exact version: the roll would report
 /// every tool as already up to date and move nothing, which is a shipped command going quiet.
+///
 /// `--bump` takes the latest and rewrites the pin, so the version advances here and only here —
 /// which is the whole contract. Measured against a config still saying `latest` (every app before
 /// its first launch on this code): `--bump` behaves exactly as the plain form did, so the change
@@ -1188,6 +1189,7 @@ fn mise_upgrade_cmd(
 /// `mise upgrade --bump <token>` in the same cage — the equip environment,
 /// so the fetch rides the app's egress allowlist. Generic over [`mise_package_groups`]: the
 /// project baseline (its default home) and each app (its own home), no app special-cased.
+///
 /// Trusted-only by construction. Returns whether every group rolled cleanly; a group that fails
 /// makes this `false` but never aborts the others.
 ///
@@ -6623,6 +6625,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
     }
 
     /// A minimal resolved config carrying only the channel choices the builder reads.
+    ///
     /// A config whose only interesting fields are the two `nixpkgs` pins these tests vary.
     fn resolved(global: Option<&str>, project: Option<&str>) -> crate::config::Resolved {
         let mut cfg = crate::testutil::resolved(vec![], vec![]);

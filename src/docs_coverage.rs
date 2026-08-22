@@ -832,3 +832,120 @@ fn every_module_level_item_carries_a_doc_comment() {
         stale.join("\n")
     );
 }
+
+/// The width doc comments in this crate wrap at, and the discriminator this check rests on.
+///
+/// A doc line that reaches the margin ended *because it wrapped*; a short one ended because its
+/// author ended the paragraph. Both can close a sentence, and only the second is a paragraph break,
+/// so the length is what tells one from the other. Measured rather than guessed: 283 adjacent pairs
+/// in `src/` close a sentence on a full-width line and continue in the same paragraph, against 110
+/// that closed it short. Without this bound the check would flag all 393 and be unusable.
+const DOC_WRAP: usize = 96;
+
+/// Sentence-ending abbreviations, which end in a period without ending a sentence.
+const DOC_ABBREVIATIONS: &[&str] = &["e.g.", "i.e.", "etc.", "vs.", "cf."];
+
+/// Every `.rs` file under `src/` and `tests/`, as its repo-relative path and its contents.
+fn crate_and_test_sources() -> Vec<(String, String)> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut paths = Vec::new();
+    walk(&root.join("src"), &mut paths);
+    walk(&root.join("tests"), &mut paths);
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|p| {
+            let rel = p.strip_prefix(root).unwrap_or(&p).display().to_string();
+            let text = std::fs::read_to_string(&p).unwrap_or_default();
+            (rel, text)
+        })
+        .collect()
+}
+
+/// A doc comment's separator is not decoration: a block that lost its item merges into the next one
+/// exactly here.
+///
+/// The first guard catches the *victim* — the item left with no prose. This one catches the
+/// *merge*, and it reaches where the other cannot: a struct field, an enum variant, a second summary
+/// line on the same function. Two of the forty-seven severed blocks lived below module level, and
+/// nothing but this would see them come back.
+///
+/// What it asserts is that a paragraph break inside a doc block is written as one. A `///` line that
+/// closes a sentence well short of the margin ([`DOC_WRAP`]) ended a paragraph, so a bare `///` has
+/// to follow it before the next paragraph opens. That is already how the crate is written — 1751
+/// separators against the 110 that were missing when this was added — so the rule records existing
+/// practice rather than imposing a new one.
+///
+/// Markdown structure is exempt: list items and their indented continuations, and anything inside a
+/// fenced block, where a blank line changes what renders rather than how it reads.
+///
+/// The bound leaves a gap it cannot close: a severed block whose last line happens to land within a
+/// few characters of the margin reads as a wrapped line and passes. That is roughly one in
+/// twenty-five, and the price of a check that is quiet on the other twenty-four.
+#[test]
+fn a_paragraph_break_inside_a_doc_comment_is_written_as_one() {
+    let list_item = regex::Regex::new(r"^([*+-] |[0-9]+[.)] )").expect("the list pattern compiles");
+    let mut offenders = Vec::new();
+
+    for (path, text) in crate_and_test_sources() {
+        let lines: Vec<&str> = text.lines().collect();
+        let body = |l: &str| -> Option<String> {
+            let t = l.trim_start();
+            t.strip_prefix("/// ").map(|b| b.to_string())
+        };
+        let mut fenced = false;
+        let mut in_fence = Vec::with_capacity(lines.len());
+        for line in &lines {
+            if body(line).is_some_and(|b| b.starts_with("```")) {
+                fenced = !fenced;
+            }
+            in_fence.push(fenced);
+        }
+
+        for i in 0..lines.len().saturating_sub(1) {
+            let (Some(cur), Some(next)) = (body(lines[i]), body(lines[i + 1])) else {
+                continue;
+            };
+            if in_fence[i] || in_fence[i + 1] {
+                continue;
+            }
+            if [&cur, &next]
+                .iter()
+                .any(|b| list_item.is_match(b) || b.starts_with(char::is_whitespace))
+            {
+                continue;
+            }
+            if !cur.ends_with(['.', '!', '?'])
+                || DOC_ABBREVIATIONS.iter().any(|a| cur.ends_with(a))
+                || lines[i].chars().count() >= DOC_WRAP
+            {
+                continue;
+            }
+            if next.starts_with(|c: char| c.is_uppercase() || "`[*".contains(c)) {
+                offenders.push(format!("{path}:{}  {}", i + 1, cur));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "a paragraph ends on each of these lines and the next one opens another, with no `///` \
+         between them. If that is a new paragraph, separate it with a bare `///`. If the block \
+         below it belongs to an item that moved, it is documenting the wrong thing now — put it \
+         back rather than separating it:\n{}",
+        offenders.join("\n")
+    );
+}

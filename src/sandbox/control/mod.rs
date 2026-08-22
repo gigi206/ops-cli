@@ -545,6 +545,7 @@ pub(crate) struct LogEvent {
     /// amended it. It is a SECOND monotonic cursor (distinct from `seq`): a `--follow` reader that
     /// already passed this event's `seq` uses it to pick the event up again once its status (and,
     /// when captured, its traffic) arrives, so `--with-status` is not blank in follow mode.
+    ///
     /// Server-side only — never sent over the wire (the reader tracks the ring's amend cursor from
     /// the `amended=` reply line).
     pub(crate) amend_seq: Option<u64>,

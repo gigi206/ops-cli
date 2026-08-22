@@ -77,6 +77,7 @@ fn parse_source(locator: &str) -> AppImageSource {
 }
 
 /// The outcome of re-resolving one declared `appimage:` reference during `sbx upgrade`.
+///
 /// See [`prebuilt::Upgrade`].
 pub(crate) type AppImageUpgrade = prebuilt::Upgrade;
 

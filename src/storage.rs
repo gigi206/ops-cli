@@ -312,6 +312,7 @@ pub(crate) fn parse_mount(out: &str) -> Option<PathBuf> {
 }
 
 /// Find where a device is mounted, and with which options, by reading a `mountinfo` table.
+///
 /// Pure over the table's text so it is testable without a mount.
 ///
 /// The format is `id parent maj:min root mountpoint options ... - fstype source superopts`;
@@ -1394,6 +1395,7 @@ impl Preflight {
     ///
     /// Kernel btrfs support is deliberately not part of it: a mount autoloads the module, so
     /// gating on a `/proc/filesystems` reading would refuse a volume that would in fact work.
+    ///
     /// The loop device and the daemon, by contrast, are genuinely fatal when absent.
     pub(crate) fn can_mount(&self) -> bool {
         self.loop_control && self.udisks

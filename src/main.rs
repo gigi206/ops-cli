@@ -274,6 +274,7 @@ fn config_cwd() -> Result<PathBuf, ExitCode> {
 /// (data, config, state), marking which exist and enumerating the per-project /
 /// per-app / per-profile entries actually on disk. Read-only, no trust gate, no
 /// network — the layout map that answers "where on disk does sbx put things?".
+///
 /// The counterpart of `sbx config path` (the config files in resolution order)
 /// for the rest of the filesystem.
 fn path_cmd(args: &[OsString]) -> ExitCode {

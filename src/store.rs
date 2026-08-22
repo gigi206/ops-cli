@@ -211,6 +211,7 @@ impl Layout {
 }
 
 /// Follow a volume pointer in `default_dir`, mounting the volume if it is not already.
+///
 /// `None` when there is no pointer — the ordinary case, and the one that must stay free.
 ///
 /// Resolved once per process: the answer cannot change under us, and a single launch asks for
@@ -281,6 +282,7 @@ const LONGEST_SOCKET_SUFFIX: usize = "/forward/fwd-1234567/p-65535.sock".len();
 const DATA_DIR_MAX: usize = SUN_PATH_MAX - LONGEST_SOCKET_SUFFIX;
 
 /// Validate an explicit `$SBX_DATA_DIR`, returning the directory or why it was refused.
+///
 /// One function so the decision and the diagnostic can never disagree.
 ///
 /// The length bound is not cosmetic. Egress filtering, the D-Bus filter, port forwarding and
@@ -361,6 +363,7 @@ fn data_dir_from(
 /// Create the store's directory skeleton if absent and tighten its permissions
 /// to owner-only. Idempotent, and fail-closed: a directory that already existed
 /// with looser permissions is tightened, never left group/world-accessible.
+///
 /// Never touches the host `/nix`. Called lazily, the first time a sandbox
 /// consumes the store or sbx provisions into it.
 pub(crate) fn ensure(layout: &Layout) -> io::Result<()> {
@@ -378,6 +381,7 @@ pub(crate) fn ensure(layout: &Layout) -> io::Result<()> {
 
 /// Environment override naming an explicit `nix` binary for sbx to drive, ahead of
 /// every other source. Lets a power user — or a test — point sbx at a chosen engine.
+///
 /// It names `nix` itself; the sibling commands (`nix-store`, …) are found beside it,
 /// since one multi-call binary backs them all in every nix distribution.
 ///
@@ -585,6 +589,7 @@ enum EngineProbe {
 /// (FIFO/device/dir, which could hang a launch or feed back attacker-controlled bytes) or a
 /// world-writable one (anyone could swap it) is refused; group-writable is tolerated, as for
 /// config files — the owner-only engine directory is the real boundary for the owned tier.
+///
 /// `mode` is the full `st_mode`, type bits included.
 ///
 /// Shared rather than re-derived: a second copy would be a second place for the owned-by-root
@@ -697,6 +702,7 @@ fn engine_sibling(nix: &Path, name: &str) -> PathBuf {
 
 /// Environment override naming an explicit `bwrap` binary, ahead of every other source —
 /// the testing/escape-hatch tier, mirroring [`ENGINE_OVERRIDE_ENV`] for the sandbox engine.
+///
 /// A value that does not point at an existing file is ignored. Once it resolves it wins
 /// unconditionally: the user (or a test) has taken responsibility for the chosen engine,
 /// including that it is AppArmor-profiled where that matters (see [`resolve_bwrap`]).
@@ -843,6 +849,7 @@ fn ensure_owned_bwrap(dir: &Path, bytes: &[u8], sha256: &str) -> io::Result<()> 
 /// the owned engine leads, then `PATH`; restricted ⇒ the host `PATH` engine leads (the same
 /// bwrap sbx uses today — on a standard host the path-profiled `/usr/bin/bwrap`, the only one
 /// able to create a namespace under the restriction), then the owned engine as a last resort.
+///
 /// An untrusted owned or `PATH` engine is skipped (with a warning) in favour of the next tier.
 fn pick_bwrap(
     restricted: bool,
@@ -916,6 +923,7 @@ pub(crate) fn nix_command(nix: &Path, layout: &Layout) -> Command {
 /// a store path, and removing that attribute from a file a builder already made
 /// read-only fails with `Permission denied`, aborting the build (substitutions
 /// survive only because their files are still writable at that instant).
+///
 /// Ignoring the attribute costs nothing: compression is decided when the data is
 /// written, so the store stays compressed either way. `extra-` appends to nix's
 /// compiled default set rather than replacing it.
@@ -1666,6 +1674,7 @@ fn provision_command(
 
 /// Shared body of [`provision`] / [`provision_unfree`]: build `<flake_ref>#<attr>` into the
 /// user-owned store, rooted at `gcroot`, selecting the output that contains `marker`.
+///
 /// `allow_unfree` opts the one build into the unfree-permitting invocation described on
 /// [`provision_unfree`].
 fn provision_licensed(

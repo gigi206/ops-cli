@@ -30,6 +30,7 @@ use crate::config::{NetworkPolicy, ParamBound, TaskSpec};
 
 /// Where the generated contract is bound read-only inside the cage. Also the value of
 /// the `SBX_EGRESS_CONTRACT` environment variable, so a tool need not hard-code the path.
+///
 /// Under `/opt/sbx`, beside the mise plugin and the shell rc, colliding with no
 /// structural mount.
 pub(crate) const EGRESS_CONTRACT_INCAGE: &str = "/opt/sbx/egress-contract.md";

@@ -75,6 +75,7 @@ fn parse_source(locator: &str) -> DebSource {
 }
 
 /// The outcome of re-resolving one declared `deb:` reference during `sbx upgrade`.
+///
 /// See [`prebuilt::Upgrade`].
 pub(crate) type DebUpgrade = prebuilt::Upgrade;
 
@@ -281,6 +282,7 @@ fn pinned_key_path(layout: &Layout, inrelease_url: &str) -> std::path::PathBuf {
 /// attests **nothing** — anyone may upload a key under any identity — which is exactly why the
 /// fingerprint is the anchor and the fetched material is bound back to it before it is used. What
 /// this endpoint provides is availability, not authority.
+///
 /// The URL is interpolated into a `builtins.fetchurl` expression, and it carries no metacharacter
 /// by construction: a fingerprint is a fixed-size byte array, so its rendering is always forty hex
 /// digits. Nothing remote reaches this string.
@@ -323,6 +325,7 @@ enum Attested {
 ///
 /// The chain this closes runs signature -> index digest -> the `.deb` hash the caller already pins,
 /// and it is only a chain if every link is checked against the artefact the next one consumes.
+///
 /// So `index` is the caller's own buffer, and the digest is taken over it rather than over a
 /// second fetch.
 ///

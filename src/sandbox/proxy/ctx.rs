@@ -280,6 +280,7 @@ impl ProxyCtx {
     }
 
     /// Attach the session's per-host decision counters, so each request's outcome is recorded.
+    ///
     /// Set once by the launch ([`crate::sandbox::egress::start`]) when stats are enabled.
     pub(crate) fn with_stats(mut self, stats: Arc<EgressStats>) -> Self {
         self.stats = Some(stats);

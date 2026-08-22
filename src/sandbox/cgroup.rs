@@ -45,6 +45,7 @@ const MEMORY_MAX: &str = "90%";
 const TASKS_MAX: u32 = 16384;
 
 /// Overrides for the cage's resource limits, supplied by a trusted `[limits]` config table.
+///
 /// Each field, when `Some`, replaces the corresponding built-in default; `None` keeps the
 /// default. The values are systemd-syntax tokens already validated by [`is_valid_memory_value`]
 /// / [`is_valid_tasks_value`] at config-resolution time, so anything here is a value `systemd-run
@@ -474,6 +475,7 @@ fn expansion_can_be_disabled(systemd_run: &Path) -> bool {
 /// Pure composition of a launch from an optional scope wrapper: with `Some` the
 /// program becomes the launcher and bwrap is spliced in after its prefix;
 /// with `None` (limits unavailable) the bwrap invocation is returned unchanged.
+///
 /// Split out from [`wrap`] so the host-independent degraded branch is testable.
 ///
 /// Neither branch touches a dollar. The degraded one execs bwrap directly, with nothing in between
@@ -1027,6 +1029,7 @@ mod tests {
     /// `systemd-run`, which exits non-zero before bwrap on a rejected property). Drive a throwaway
     /// scope per form and assert it launches. Memory forms are tried on `MemoryHigh`, which has no
     /// minimum-value floor, so this proves grammar compatibility without a magnitude confound.
+    ///
     /// Skips (does not fail) where no user session can create a scope, so it is silent in headless
     /// CI yet has teeth on a session.
     #[test]

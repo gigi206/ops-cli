@@ -896,6 +896,7 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
 /// The question is deliberately about *where the key came from*, and it never offers the key just
 /// printed as an answer: the point of confirming is a second source, so a prompt that invited a
 /// paste of the store's own key would only make the caution disappear without making it false.
+///
 /// Declining is the default and costs nothing — the same command remains available later.
 fn offer_verification(layout: &store::Layout, name: &str) {
     use std::io::{BufRead, Write};
@@ -1511,6 +1512,7 @@ fn parse_store_list_args(args: &[OsString]) -> Result<(bool, Option<String>), St
 }
 
 /// One listed plugin: the shape `store list` and `store info` both reduce a catalogue to.
+///
 /// Rendering them through one function keeps the two listings identical in what they show and in
 /// what `--installed` means.
 struct Listed<'a> {
@@ -2212,6 +2214,7 @@ fn print_about(
 /// will this plugin find its tool on *this* machine, and which one will it get. A program that
 /// resolves to nothing is flagged rather than merely listed — it is the difference between a
 /// plugin that works and one that fails at the first secret.
+///
 /// Four states are possible and each has a different remedy, so each is said rather than collapsed
 /// into "found" and "missing": on `PATH` (any configured package is inert); not on `PATH` but
 /// already provisioned; not on `PATH`, configured, and **not yet built** — the state a user reaches

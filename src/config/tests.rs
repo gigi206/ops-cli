@@ -7154,6 +7154,7 @@ fn a_baseline_only_field_written_under_an_app_says_so_instead_of_vanishing() {
 // --- one-shot override application (`apply_override` / `apply_override_channel`) ---
 
 /// Apply a one-shot override built from `raw` onto a resolved config, returning the result.
+///
 /// Expects the override to be valid (the hard-error path is covered by its own test).
 fn with_override(mut resolved: Resolved, raw: RawConfig) -> Resolved {
     resolved

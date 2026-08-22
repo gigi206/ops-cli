@@ -141,6 +141,7 @@ pub(crate) struct SandboxSpec {
     /// sets it via [`SandboxSpec::with_cage_slug`].
     pub(super) cage_slug: String,
     /// The relaxation of the mandatory seccomp denylist, from a trusted `[seccomp] allow`.
+    ///
     /// [`SandboxSpec::new`] defaults it to empty — the full mandatory denylist, identical to a
     /// cage with no `[seccomp]` config; the launch path sets a non-empty one via
     /// [`SandboxSpec::with_seccomp`]. Consumed when the seccomp filters are compiled, not by
@@ -256,6 +257,7 @@ impl SandboxSpec {
     }
 
     /// Switch to a private-pty terminal (see [`TerminalPolicy::PrivateTty`]).
+    ///
     /// The caller **must** then launch through the pty supervisor; otherwise the
     /// sandbox would inherit the launching terminal. An interactive `sbx run`
     /// path opts in through this.

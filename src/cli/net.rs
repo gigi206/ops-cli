@@ -1873,6 +1873,7 @@ fn capture_of<'a>(
 
 /// Render one exchange's captured traffic as an indented block under its event line: `>` lines for
 /// what the cage sent, `<` lines for what came back — the direction convention `curl -v` uses.
+///
 /// Bodies appear only under `--with-body`; a part that was cut is marked, never trimmed in silence.
 /// The marker names the fact rather than a cause: a part is cut when it reached its cap, and also
 /// when the exchange was filed while more was still arriving (an HTTP/2 request body whose pump is

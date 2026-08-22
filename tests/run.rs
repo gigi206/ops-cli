@@ -5806,6 +5806,7 @@ fn a_global_apps_project_mise_tool_lands_in_the_per_project_pool() {
 }
 
 /// The path to a mise shim in the single project's default home under `data`, if present.
+///
 /// `sbx upgrade mise`/`sbx run` equip a baseline `mise:` tool into this home, where mise creates
 /// a per-tool shim (its non-interactive PATH entry). Used as the teeth that the in-cage roll
 /// touched the right home.
@@ -7084,6 +7085,7 @@ fn an_outbound_secret_is_refused_at_the_proxy() {
 /// pid this test spawned is the one this launch was placed in; finding `pids.max`
 /// equal to the configured task cap there is conclusive proof the limit landed
 /// through the full launch path — no unrelated process carries that exact value.
+///
 /// Read from the scope and not from the launcher's own cgroup: the supervisor stays
 /// alongside the cage rather than becoming it. Skips (does not fail) where the host
 /// cannot sandbox or has no systemd user session that delegates the pids controller.
@@ -7391,6 +7393,7 @@ fn a_trusted_devices_grant_binds_a_host_device_into_the_cage() {
 /// the whole gpu→launch→`--dev-bind-try`/`--ro-bind` thread a `build_spec` unit test cannot reach.
 /// The mesa driver env is best-effort (its provisioning may not reach the cache in this env), so it
 /// is reported, not asserted; `driver_env` is unit-tested and the full render is proven live.
+///
 /// Skips if the host has no GPU render node or cannot sandbox.
 #[test]
 fn a_trusted_gpu_posture_grants_the_render_node_and_sys_to_the_cage() {

@@ -105,6 +105,7 @@ pub(crate) fn cage_hostname(slug: &str) -> String {
 }
 
 /// The full display name for a cage — `sbx-<slug>` — straight from its app/project identity.
+///
 /// The one function a session listing (`sbx session ls`, `sbx net … --session`) renders from, so the
 /// name it shows is *identical* to the cage's hostname and systemd scope (they share this
 /// slug), and cannot drift from them.

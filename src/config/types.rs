@@ -23,6 +23,7 @@ pub(crate) enum Backend {
     /// `flake:<ref>` — an arbitrary nix flake reference (e.g.
     /// `github:owner/repo#attr`), provisioned **host-side** into sbx's shared store and
     /// seeded per project, exactly like `nix:` (see [`crate::store::provision_flake`]).
+    ///
     /// It lands once and is reused everywhere, and its `bin/` reaches PATH through the
     /// provisioned package bins. The build itself runs in nix's own sandbox. Only local
     /// content is refused this route — `is_valid_flake_ref` rejects `path:`/`file:`
@@ -66,6 +67,7 @@ pub(crate) enum Backend {
     /// **host-side** into sbx's store exactly like `deb:`/`appimage:` (seeded, offline-reusable): sbx
     /// resolves the URL to a content hash, then builds a generated derivation that `tar -xz`-extracts
     /// it and `autoPatchelfHook`s it against the same curated Electron/Chromium library set.
+    ///
     /// Extraction runs no build script (`dontBuild`) and happens at BUILD time (a plain `tar`, no
     /// runtime namespace op — the FUSE/namespace path is blocked in-cage), so evaluating it host-side
     /// is safe. Meant for a GUI/desktop app distributed only as a plain tarball. One form: a direct

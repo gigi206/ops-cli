@@ -1651,6 +1651,7 @@ pub(super) fn refusal_body(detail: &str) -> String {
 
 /// Write an sbx-originated refusal: the status line, an `X-Sbx-Egress-Reason` header carrying a
 /// stable machine-readable category, and a short `text/plain` body repeating the human detail.
+///
 /// A tool (and the agent it serves) can then tell an explicit policy refusal (`403`, category
 /// `denied-default`/`denied-by-rule`) from an unreachable host (`502`, `upstream-unreachable`/
 /// `dns-failure`) — these are the proxy's *own* statuses, distinct from a real upstream response

@@ -248,6 +248,7 @@ struct ChildView {
 }
 
 /// Build the full layout view, probing existence and enumerating on-disk children.
+///
 /// `layout` is `None` only when the data directory cannot be resolved (no `$HOME`),
 /// in which case the data base reports no root and its entries are all absent.
 pub(crate) fn view(layout: Option<&Layout>) -> PathView {
@@ -322,6 +323,7 @@ fn view_with_roots(
 }
 
 /// The project id of the current working directory, so `sbx path` can mark the tree you're in.
+///
 /// Best-effort: returns `None` when the cwd cannot be read or canonicalized (deleted mid-run, or
 /// no cwd), in which case no tree is marked `current`.
 fn current_project_id() -> Option<String> {
@@ -349,6 +351,7 @@ fn live_project_ids(data_dir: &Path) -> BTreeSet<String> {
 /// enumerated entries) the children found on disk. Best-effort throughout — a
 /// `read_dir` that fails (a race, a permission wall) yields no children rather
 /// than failing the whole overview, since `sbx path` is read-only and advisory.
+///
 /// `live_ids` is the live-session project-id set, consulted only by the `projects/`
 /// enumeration. `current_id` is the cwd's project id, so the matching tree is marked
 /// `current`. Both are ignored by bases that carry no project trees.

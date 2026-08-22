@@ -65,6 +65,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Owner-only mode for the directories the seed creates. The shared store makes
 /// path directories read-only (`0555`); the seed creates owner-writable ones
 /// instead, so it can populate them and the cage's nix can later add new paths.
+///
 /// A path's content hash does not cover directory modes, so this does not affect
 /// `nix-store --verify`; the copied *files* keep their own modes (`std::fs::copy`
 /// and the reflink path both preserve them).

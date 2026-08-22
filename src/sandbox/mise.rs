@@ -129,6 +129,7 @@ fn command(
 }
 
 /// Resolve a trusted project's mise `[env]` into sandbox environment variables.
+///
 /// Binds only the authorized, already-hashed mise files read-only, runs `mise env
 /// --json-extended` from that mount, and keeps a variable only when mise attributes
 /// it to one of those files. A variable mise merely echoes (notably `PATH`) carries

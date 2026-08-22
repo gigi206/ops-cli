@@ -120,6 +120,7 @@ pub(crate) struct Session {
     pub(crate) project: PathBuf,
     pub(crate) pid: u32,
     /// Process start time in clock ticks since boot (`/proc/<pid>/stat` field 22).
+    ///
     /// Pins the pid to one incarnation, defeating pid reuse.
     pub(crate) start_ticks: u64,
     pub(crate) kind: Kind,

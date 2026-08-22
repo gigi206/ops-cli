@@ -23,6 +23,7 @@ enum IpClass {
     Public,
     /// An address that is not the public Internet's: loopback, RFC1918, ULA, CGNAT, and the ranges
     /// IANA set aside for something else (TEST-NET, benchmarking, documentation, reserved).
+    ///
     /// Reachable only when the policy explicitly named this exact host (an intentional internal
     /// target).
     ///
@@ -51,6 +52,7 @@ fn classify_ip(ip: IpAddr) -> IpClass {
 }
 
 /// The IPv4 address an IPv6 address embeds through a translation/transition form, or `None`.
+///
 /// Covers IPv4-mapped (`::ffff:a.b.c.d`), NAT64 well-known (`64:ff9b::/96`, the v4 in the low 32
 /// bits), 6to4 (`2002:AABB:CCDD::/16`), and Teredo (`2001:0::/32`, the client v4 in the last two
 /// segments, bit-inverted). The host's stack actually routing these is what makes the SSRF real;

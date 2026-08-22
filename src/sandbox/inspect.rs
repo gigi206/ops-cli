@@ -342,6 +342,7 @@ fn flake_built_in(dir: &Path, name: &str) -> Option<String> {
 /// project's **shared** store content: the roots accrue from the project baseline *and* every app
 /// launched in it (they share one per-project store). A `deb-<name>` / `appimage-<name>` name is a
 /// prebuilt build output; every other name is a `nix:` package (or a hole provision). Sorted.
+///
 /// Read-only; an absent gcroot dir is simply no roots.
 pub(crate) fn gcroot_names(data_dir: &Path, tree_id: &str) -> Vec<String> {
     let dir = data_dir.join("gcroots").join("projects").join(tree_id);

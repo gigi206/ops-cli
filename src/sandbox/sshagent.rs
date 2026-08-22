@@ -726,6 +726,7 @@ pub(crate) fn admission(host_sock: &Path, filter: &Filter) -> io::Result<Admissi
 
 /// Stand up the broker: bind its socket under the data directory, serve it, and return what the
 /// cage needs to reach it.
+///
 /// `confirm_with` is the askpass helper to prompt through when `[ssh_agent] confirm` is on; the
 /// caller resolves it before standing anything up, so a host without one refuses the grant instead
 /// of running a broker whose promised confirmation would never appear.

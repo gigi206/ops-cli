@@ -44,6 +44,7 @@ use std::path::Path;
 type BinaryPin = prebuilt::Pin;
 
 /// The outcome of re-resolving one declared `binary:` reference during `sbx upgrade`.
+///
 /// See [`prebuilt::Upgrade`].
 pub(crate) type BinaryUpgrade = prebuilt::Upgrade;
 
@@ -68,6 +69,7 @@ pub(crate) fn pinned_hashes(cwd: &Path) -> BTreeMap<String, String> {
 }
 
 /// Write the per-project binary lock atomically, for the tests that assert the on-disk format.
+///
 /// Production writes it through [`prebuilt::upgrade`].
 #[cfg(test)]
 fn write_pins(

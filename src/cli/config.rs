@@ -333,6 +333,7 @@ struct NetTransport {
 ///
 /// The baseline view names only what a layer moved off its default, in the same spirit as the
 /// capture line — never a silent property of a launch, never noise for the common posture.
+///
 /// `--details` names the **effective** posture instead, defaults included, because the baseline's
 /// silence is ambiguous to a reader who does not already know the product defaults: nothing printed
 /// means "reuse is on and the cache is the built-in one", which is exactly what someone asking for
@@ -1290,6 +1291,7 @@ fn tasks_section(tasks: &[config::view::TaskView], pal: &style::Palette) -> Opti
 
 /// Named application profiles, each a gated overlay over the baseline: the command it runs, what
 /// its overlay adds, and its own dropped-field notes (so `sbx app <name>` holds no surprises).
+///
 /// Security fields appear only when their source was trusted, exactly as at launch.
 fn apps_section(
     apps: &[config::view::AppView],

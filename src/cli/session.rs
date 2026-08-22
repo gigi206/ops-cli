@@ -12,6 +12,7 @@ use crate::{diag, format_age, help, sandbox, session, store, style, uptime_secon
 /// `sbx session <subcommand>` (alias `sbx sessions`): the namespace grouping every operation on a
 /// live sandbox session — `ls` lists them, `attach` runs a shell or a command inside one, `stop`
 /// ends them.
+///
 /// A `--help` at any depth is intercepted by [`help::maybe_help`], which resolves the deepest
 /// subcommand named — under its own name or an accepted alias — and shows that page. A bare
 /// `sbx session` prints the namespace page; an unknown subcommand is a usage error.
@@ -186,6 +187,7 @@ const STOP_DEFAULT_DELAY: Duration = Duration::from_secs(10);
 /// `sbx session stop <id>... [--delay <secs>]` / `sbx session stop --all [--delay <secs>]`: stop
 /// running sessions. With ids, stop the named ones (the pids `sbx session ls` shows); with `--all`,
 /// stop every live session.
+///
 /// Sends SIGTERM, then SIGKILL after the grace delay (default 10s; `--delay 0` escalates at once).
 /// Either ids or `--all` is required (not both); a non-UTF-8 operand or a malformed `--delay` value
 /// is a usage error.

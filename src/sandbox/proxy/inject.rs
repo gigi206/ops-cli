@@ -662,6 +662,7 @@ impl Credentials {
     /// outbound leak. That is the exact shape of the intended setup, where an application holds a
     /// worthless value and sbx substitutes the real one on every request: observing the placeholder
     /// would break the design it exists to protect.
+    ///
     /// Reads through a [`HeaderLookup`] so every plane can call it with what it already holds: the
     /// HTTP/1.1 planes' parsed pairs, and the HTTP/2 plane's decoded header map. The alternative was
     /// a signature only one plane could satisfy, which is how this ended up running on one plane out
