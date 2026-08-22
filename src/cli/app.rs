@@ -1549,65 +1549,7 @@ fn build_app_show(
                 .map(|pkg| {
                     let backend = pkg.backend.label();
                     let locator = pkg.backend.locator().to_string();
-                    let installed = if pkg.state != trust::TrustState::Trusted {
-                        PackageInstalled::Withheld
-                    } else if let Backend::Mise(token) = &pkg.backend {
-                        match installed_tools.iter().find(|t| t.is(token)) {
-                            Some(t) => {
-                                let versions = sandbox::inspect::concrete_versions(t).join(", ");
-                                PackageInstalled::Installed {
-                                    detail: if versions.is_empty() {
-                                        "installed".to_string()
-                                    } else {
-                                        format!("installed {versions}")
-                                    },
-                                }
-                            }
-                            None => PackageInstalled::NotInstalled,
-                        }
-                    } else if matches!(pkg.backend, Backend::FlakeInline { .. }) {
-                        // An inline `[flakes.<name>]` is built in-cage and lands a warm out-link in the
-                        // cage home (keyed `<name>-<hash>`, matched by the same name), whose target
-                        // store path is in the per-project store. A remote `flake:` is built host-side
-                        // instead — handled with `nix:` below.
-                        match homes
-                            .iter()
-                            .find_map(|h| sandbox::inspect::flake_built(&h.dir, &pkg.name))
-                        {
-                            Some(detail) => PackageInstalled::Installed {
-                                detail: format!("built {detail}"),
-                            },
-                            None => PackageInstalled::NotInstalled,
-                        }
-                    } else if let Some(lockfile) = sandbox::inspect::prebuilt_lockfile(&pkg.backend)
-                    {
-                        // A `*:resolve` package's pin is keyed `resolve:<name>`, not by the `resolve`
-                        // sentinel `locator` carries — look it up by that key so a built one is found.
-                        let key = sandbox::inspect::prebuilt_pin_key(&pkg.backend, &pkg.name);
-                        let hits = sandbox::inspect::prebuilt_pin_trees(data_dir, &lockfile, &key);
-                        match hits.first() {
-                            Some((_, short)) => PackageInstalled::Installed {
-                                detail: format!("pinned in {} ({short})", plural_trees(hits.len())),
-                            },
-                            None => PackageInstalled::NotInstalled,
-                        }
-                    } else if matches!(pkg.backend, Backend::Nix(_) | Backend::Flake(_)) {
-                        // A `nix:` package — and now a remote `flake:` package — builds host-side into
-                        // the shared store and is seeded into each project's per-project store, gcrooted
-                        // per tree (bare `<name>`), so its realized signal is which trees built it,
-                        // mirroring the deb:/appimage: per-tree report above.
-                        let trees = sandbox::inspect::nix_built_trees(data_dir, &pkg.name);
-                        match trees.len() {
-                            0 => PackageInstalled::NotInstalled,
-                            n => PackageInstalled::Installed {
-                                detail: format!("built in {}", plural_trees(n)),
-                            },
-                        }
-                    } else {
-                        // A backend with no specific realized-signal reader falls back here; its build
-                        // is in the per-project store, which `sbx projects show` details per tree.
-                        PackageInstalled::PerProject
-                    };
+                    let installed = package_installed(pkg, &installed_tools, homes, data_dir);
                     PackageShow {
                         backend,
                         locator,
@@ -1691,6 +1633,78 @@ fn plural_trees(n: usize) -> String {
         "1 tree".to_string()
     } else {
         format!("{n} trees")
+    }
+}
+
+/// Whether one declared package is realized on this host, and how to say so.
+///
+/// `installed_tools` is passed in rather than derived here on purpose: the caller builds it once by
+/// flat-mapping `mise_installed` over every app home, and computing it inside would re-walk the
+/// filesystem once per declared package.
+fn package_installed(
+    pkg: &config::Package,
+    installed_tools: &[sandbox::inspect::InstalledTool],
+    homes: &[sandbox::inspect::AppHome],
+    data_dir: &Path,
+) -> PackageInstalled {
+    use crate::config::Backend;
+    if pkg.state != trust::TrustState::Trusted {
+        PackageInstalled::Withheld
+    } else if let Backend::Mise(token) = &pkg.backend {
+        match installed_tools.iter().find(|t| t.is(token)) {
+            Some(t) => {
+                let versions = sandbox::inspect::concrete_versions(t).join(", ");
+                PackageInstalled::Installed {
+                    detail: if versions.is_empty() {
+                        "installed".to_string()
+                    } else {
+                        format!("installed {versions}")
+                    },
+                }
+            }
+            None => PackageInstalled::NotInstalled,
+        }
+    } else if matches!(pkg.backend, Backend::FlakeInline { .. }) {
+        // An inline `[flakes.<name>]` is built in-cage and lands a warm out-link in the
+        // cage home (keyed `<name>-<hash>`, matched by the same name), whose target
+        // store path is in the per-project store. A remote `flake:` is built host-side
+        // instead — handled with `nix:` below.
+        match homes
+            .iter()
+            .find_map(|h| sandbox::inspect::flake_built(&h.dir, &pkg.name))
+        {
+            Some(detail) => PackageInstalled::Installed {
+                detail: format!("built {detail}"),
+            },
+            None => PackageInstalled::NotInstalled,
+        }
+    } else if let Some(lockfile) = sandbox::inspect::prebuilt_lockfile(&pkg.backend) {
+        // A `*:resolve` package's pin is keyed `resolve:<name>`, not by the `resolve`
+        // sentinel `locator` carries — look it up by that key so a built one is found.
+        let key = sandbox::inspect::prebuilt_pin_key(&pkg.backend, &pkg.name);
+        let hits = sandbox::inspect::prebuilt_pin_trees(data_dir, &lockfile, &key);
+        match hits.first() {
+            Some((_, short)) => PackageInstalled::Installed {
+                detail: format!("pinned in {} ({short})", plural_trees(hits.len())),
+            },
+            None => PackageInstalled::NotInstalled,
+        }
+    } else if matches!(pkg.backend, Backend::Nix(_) | Backend::Flake(_)) {
+        // A `nix:` package — and now a remote `flake:` package — builds host-side into
+        // the shared store and is seeded into each project's per-project store, gcrooted
+        // per tree (bare `<name>`), so its realized signal is which trees built it,
+        // mirroring the deb:/appimage: per-tree report above.
+        let trees = sandbox::inspect::nix_built_trees(data_dir, &pkg.name);
+        match trees.len() {
+            0 => PackageInstalled::NotInstalled,
+            n => PackageInstalled::Installed {
+                detail: format!("built in {}", plural_trees(n)),
+            },
+        }
+    } else {
+        // A backend with no specific realized-signal reader falls back here; its build
+        // is in the per-project store, which `sbx projects show` details per tree.
+        PackageInstalled::PerProject
     }
 }
 
