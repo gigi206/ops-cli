@@ -781,126 +781,8 @@ pub(super) fn validate_service(
             ));
             continue;
         }
-        // The condition is dropped alone when it cannot be read, rather than taking the service with
-        // it, on the same rule as the readiness gate: a qualifier sbx cannot understand must not
-        // cost the process the profile is for. The direction of the drop is the safe one — the
-        // service starts, which is what the profile asks for when nothing says otherwise.
-        //
-        // The two ways a condition can be unreadable are the two ways `is`/`not` can be wrong: both
-        // given (which of them was meant is not guessable) or neither (nothing is being compared).
-        // A list is an `and`, so a member that cannot be read takes the WHOLE condition with it
-        // rather than only itself: dropping one conjunct would silently *loosen* what the profile
-        // asked for, and a service running under half a condition is worse than one running under
-        // none, which at least matches what an absent `enable` means.
-        let enable = match enable {
-            None => Vec::new(),
-            Some(spec) => {
-                let raw = match spec {
-                    schema::RawEnable::One(cond) => vec![cond],
-                    schema::RawEnable::All(conds) => conds,
-                };
-                let reason = if raw.is_empty() {
-                    Some("it lists no condition".to_string())
-                } else {
-                    raw.iter().find_map(|c| {
-                        if c.env.is_empty() {
-                            Some("a condition names no variable".to_string())
-                        } else {
-                            match (&c.is, &c.not) {
-                                (Some(_), Some(_)) => Some(format!(
-                                    "the condition on `{}` sets both `is` and `not`, which cannot \
-                                     both be it",
-                                    c.env
-                                )),
-                                (None, None) => Some(format!(
-                                    "the condition on `{}` sets neither `is` nor `not`, so it \
-                                     compares nothing",
-                                    c.env
-                                )),
-                                (Some(schema::RawValues::Any(v)), None)
-                                | (None, Some(schema::RawValues::Any(v)))
-                                    if v.is_empty() =>
-                                {
-                                    Some(format!(
-                                        "the condition on `{}` lists no value, so it compares \
-                                         nothing",
-                                        c.env
-                                    ))
-                                }
-                                _ => None,
-                            }
-                        }
-                    })
-                };
-                match reason {
-                    Some(reason) => {
-                        warnings.push(format!(
-                            "{source}: ignoring `enable` of `[service]` entry `{name}` — {reason}; \
-                             the service starts unconditionally"
-                        ));
-                        Vec::new()
-                    }
-                    None => raw
-                        .into_iter()
-                        .map(|c| {
-                            let (equals, values) = match (c.is, c.not) {
-                                (Some(values), _) => (true, values.into_vec()),
-                                (_, Some(values)) => (false, values.into_vec()),
-                                // Refused above.
-                                (None, None) => unreachable!(),
-                            };
-                            EnvCondition {
-                                var: c.env,
-                                equals,
-                                values,
-                            }
-                        })
-                        .collect(),
-                }
-            }
-        };
-        let ready = match ready {
-            None => None,
-            Some(gate) => {
-                if gate.tcp == 0 {
-                    warnings.push(format!(
-                        "{source}: ignoring `ready` of `[service]` entry `{name}` — port 0 is not \
-                         a port a service can listen on"
-                    ));
-                    None
-                } else {
-                    let timeout = match gate.timeout.as_deref() {
-                        None => Some(READY_TIMEOUT_DEFAULT),
-                        Some(raw) => match parse_duration(raw) {
-                            Ok(d) => d,
-                            Err(reason) => {
-                                warnings.push(format!(
-                                    "{source}: `ready.timeout` of `[service]` entry `{name}` is \
-                                     invalid — {reason}; using the default"
-                                ));
-                                Some(READY_TIMEOUT_DEFAULT)
-                            }
-                        },
-                    };
-                    // `parse_duration` reads `0` as "no bound"; a readiness gate that never gives up
-                    // would hang the launch on a service that never binds, which is the one outcome
-                    // the gate exists to avoid.
-                    match timeout {
-                        Some(timeout) => Some(ServiceReady {
-                            tcp: gate.tcp,
-                            timeout,
-                        }),
-                        None => {
-                            warnings.push(format!(
-                                "{source}: ignoring `ready` of `[service]` entry `{name}` — a \
-                                 timeout of 0 would wait forever on a service that never binds"
-                            ));
-                            None
-                        }
-                    }
-                }
-            }
-        };
+        let enable = service_enable(warnings, source, &name, enable);
+        let ready = service_ready(warnings, source, &name, ready);
         out.insert(
             name,
             ServiceSpec {
@@ -911,4 +793,148 @@ pub(super) fn validate_service(
         );
     }
     out
+}
+
+/// The environment conditions that must all hold for one `[service]` entry to start. Empty starts
+/// it unconditionally, which is both the default and where an unreadable condition lands.
+///
+/// The condition is dropped alone when it cannot be read, rather than taking the service with
+/// it, on the same rule as the readiness gate: a qualifier sbx cannot understand must not
+/// cost the process the profile is for. The direction of the drop is the safe one — the
+/// service starts, which is what the profile asks for when nothing says otherwise.
+///
+/// The two ways a condition can be unreadable are the two ways `is`/`not` can be wrong: both
+/// given (which of them was meant is not guessable) or neither (nothing is being compared).
+/// A list is an `and`, so a member that cannot be read takes the WHOLE condition with it
+/// rather than only itself: dropping one conjunct would silently *loosen* what the profile
+/// asked for, and a service running under half a condition is worse than one running under
+/// none, which at least matches what an absent `enable` means.
+fn service_enable(
+    warnings: &mut Vec<String>,
+    source: &str,
+    name: &str,
+    enable: Option<schema::RawEnable>,
+) -> Vec<EnvCondition> {
+    match enable {
+        None => Vec::new(),
+        Some(spec) => {
+            let raw = match spec {
+                schema::RawEnable::One(cond) => vec![cond],
+                schema::RawEnable::All(conds) => conds,
+            };
+            let reason = if raw.is_empty() {
+                Some("it lists no condition".to_string())
+            } else {
+                raw.iter().find_map(|c| {
+                    if c.env.is_empty() {
+                        Some("a condition names no variable".to_string())
+                    } else {
+                        match (&c.is, &c.not) {
+                            (Some(_), Some(_)) => Some(format!(
+                                "the condition on `{}` sets both `is` and `not`, which cannot \
+                             both be it",
+                                c.env
+                            )),
+                            (None, None) => Some(format!(
+                                "the condition on `{}` sets neither `is` nor `not`, so it \
+                             compares nothing",
+                                c.env
+                            )),
+                            (Some(schema::RawValues::Any(v)), None)
+                            | (None, Some(schema::RawValues::Any(v)))
+                                if v.is_empty() =>
+                            {
+                                Some(format!(
+                                    "the condition on `{}` lists no value, so it compares \
+                                 nothing",
+                                    c.env
+                                ))
+                            }
+                            _ => None,
+                        }
+                    }
+                })
+            };
+            match reason {
+                Some(reason) => {
+                    warnings.push(format!(
+                        "{source}: ignoring `enable` of `[service]` entry `{name}` — {reason}; \
+                     the service starts unconditionally"
+                    ));
+                    Vec::new()
+                }
+                None => raw
+                    .into_iter()
+                    .map(|c| {
+                        let (equals, values) = match (c.is, c.not) {
+                            (Some(values), _) => (true, values.into_vec()),
+                            (_, Some(values)) => (false, values.into_vec()),
+                            // Refused above.
+                            (None, None) => unreachable!(),
+                        };
+                        EnvCondition {
+                            var: c.env,
+                            equals,
+                            values,
+                        }
+                    })
+                    .collect(),
+            }
+        }
+    }
+}
+
+/// The readiness gate of one `[service]` entry, or `None` to start the app without waiting.
+///
+/// Every way the gate can be unreadable — a port of 0, an unparseable timeout, a timeout outside
+/// the accepted range — drops the gate with a warning rather than failing the config, matching how
+/// [`service_enable`] treats an unreadable condition.
+fn service_ready(
+    warnings: &mut Vec<String>,
+    source: &str,
+    name: &str,
+    ready: Option<schema::RawServiceReady>,
+) -> Option<ServiceReady> {
+    match ready {
+        None => None,
+        Some(gate) => {
+            if gate.tcp == 0 {
+                warnings.push(format!(
+                    "{source}: ignoring `ready` of `[service]` entry `{name}` — port 0 is not \
+                 a port a service can listen on"
+                ));
+                None
+            } else {
+                let timeout = match gate.timeout.as_deref() {
+                    None => Some(READY_TIMEOUT_DEFAULT),
+                    Some(raw) => match parse_duration(raw) {
+                        Ok(d) => d,
+                        Err(reason) => {
+                            warnings.push(format!(
+                                "{source}: `ready.timeout` of `[service]` entry `{name}` is \
+                             invalid — {reason}; using the default"
+                            ));
+                            Some(READY_TIMEOUT_DEFAULT)
+                        }
+                    },
+                };
+                // `parse_duration` reads `0` as "no bound"; a readiness gate that never gives up
+                // would hang the launch on a service that never binds, which is the one outcome
+                // the gate exists to avoid.
+                match timeout {
+                    Some(timeout) => Some(ServiceReady {
+                        tcp: gate.tcp,
+                        timeout,
+                    }),
+                    None => {
+                        warnings.push(format!(
+                            "{source}: ignoring `ready` of `[service]` entry `{name}` — a \
+                         timeout of 0 would wait forever on a service that never binds"
+                        ));
+                        None
+                    }
+                }
+            }
+        }
+    }
 }
