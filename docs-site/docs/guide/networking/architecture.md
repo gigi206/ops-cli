@@ -66,8 +66,8 @@ curl https://cache.nixos.org → Could not resolve host
 curl https://1.2.3.4/        → Could not connect
 ```
 
-The one **GUI-only nuance**: under `gui = "offscreen"` or `gui = "wayland"`,
-[`configuration/gui.md#offscreen`](../configuration/gui#offscreen) shows how a small
+The one **GUI-only nuance**: under `gui = "offscreen"` or `gui = "wayland"`, as
+[`gui`](../configuration/gui#offscreen) describes, a small
 host-side `__netns-holder` binary (`src/sandbox/netns.rs`) adds a `dummy0`
 interface (a kernel black hole, no peer, no route, drops everything) before exec'ing bwrap.
 Chromium/Electron decide `navigator.onLine` from the **presence of a non-loopback

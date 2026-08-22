@@ -541,5 +541,4 @@ a pipe (one snapshot per tick, since a live view is a *state*, not an event stre
 - [Ask mode](ask): `sbx net rules --source session` and the parked-request flow.
 - [Architecture](architecture): the SSRF guard and anti-fronting checks behind
   the `blocked` verdicts.
-- The egress event log's live-only design + rationale now lives in this page and in [`architecture.md`](architecture).
 - [`sbx net` CLI reference](../cli/net) · [`sbx test` CLI reference](../cli/test)

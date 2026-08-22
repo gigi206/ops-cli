@@ -31,7 +31,7 @@ target reads at a glance:
 
 ```toml
 [secret."api.github.com"]
-from   = "sops://secrets.enc.yaml#github.token"   # SOURCE (see resolvers.md)
+from   = "sops://secrets.enc.yaml#github.token"   # SOURCE (see Resolvers)
 kind   = "http-header"                             # SINK (the broker)
 header = "Authorization"
 type   = "bearer"
