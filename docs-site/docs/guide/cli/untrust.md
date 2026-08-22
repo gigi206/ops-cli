@@ -25,5 +25,6 @@ sbx untrust path/to/.sbx.toml
 ```
 
 After `untrust`, the project's [security fields](../concepts/trust#free-fields-vs-security-fields)
-(binds, network, secrets, packages, …) are dropped from a launch; the free `env` field
-still applies. Re-approve with [`sbx trust`](trust).
+(binds, network, secrets, packages, …) are dropped from a launch; the free `env` and
+`timezone` fields still apply, and so does `[fs]`, which can only close a path.
+Re-approve with [`sbx trust`](trust).

@@ -34,8 +34,8 @@ immediately. See [Deduplication](../cli/gc#deduplication).
 
 ### The build of a removed package
 
-Delete a `nix:`/`flake:`/`deb:`/`appimage:`/`tarball:` entry from a project's (or an app's)
-`[packages]` and the per-project sweep drops its data-directory out-link and reclaims its
+Delete a `nix:`/`flake:`/`deb:`/`appimage:`/`tarball:`/`binary:` entry from a project's (or an
+app's) `[packages]` and the per-project sweep drops its data-directory out-link and reclaims its
 per-project store copy (a full closure on a filesystem without reflink support), which was
 otherwise held until the whole project tree was removed.
 

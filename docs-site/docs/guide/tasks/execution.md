@@ -14,9 +14,9 @@ See also: [Declared operations](./) · [Output](output) · [`[proc]`](../configu
 
 A task's program must come from a tree **no cage can write**, or "sbx fixes the program" is a
 fiction. Most `[packages]` backends already satisfy that with nothing to declare here: `nix:`, a
-remote `flake:`, `deb:`, `appimage:` and `tarball:` (`deb:`/`appimage:` are the two prebuilt
-desktop-package backends) all build **host-side into the
-shared store**, which a task cage mounts read-only, so their binaries are on a task's path already.
+remote `flake:`, and the four prebuilt ones (`deb:`, `appimage:`, `tarball:`, `binary:`) all build
+**host-side into the shared store**, which a task cage mounts read-only, so their binaries are on a
+task's path already.
 
 Two are different:
 

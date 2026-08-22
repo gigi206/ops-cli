@@ -9,9 +9,11 @@ sbx plugins <subcommand> [args...]
 sbx plugins store <subcommand> [args...]
 ```
 
-Inspect and manage **resolver plugins** and **plugin stores**. Host-level: reads the
-data directory, not a project's config. A resolver plugin declares a `scheme://`
-`sbx` can route a secret [`from`](../configuration/secret) reference to.
+Inspect and manage **plugins** of all three kinds and the **stores** they come from.
+Host-level: reads the data directory, not a project's config. A
+[resolver](../plugins/resolvers) declares a `scheme://` `sbx` can route a secret
+[`from`](../configuration/secret) reference to; a [broker](../plugins/broker) and a
+[signer](../plugins/signer) are reached by name instead.
 
 See also: [Plugins](../plugins/) · [Signed plugin stores](../plugins/stores) · [Resolvers](../secrets/resolvers) · [Secrets architecture](../secrets/).
 
@@ -22,7 +24,7 @@ See also: [Plugins](../plugins/) · [Signed plugin stores](../plugins/stores) ·
 | `list` (alias `ls`) | list installed plugins of every kind (with their origin) and the built-in schemes |
 | `info <scheme\|name>` | show a plugin's manifest, sandbox grant, and origin |
 | `install <dir>` | install a local plugin directory (`<data>/plugins/<name>`); the built-in schemes are always present, not installed |
-| `rm <name>...` | remove installed resolver plugins; several names may be given, each removed on its own |
+| `rm <name>...` | remove installed plugins of any kind; several names may be given, each removed on its own |
 | `verify [name]` | check installed plugins against the digest recorded at install |
 | `upgrade [name] [--dry-run]` | replace installed plugins with what their store lists now |
 

@@ -124,8 +124,9 @@ for the details and [The trust gate](trust) for why it matters.
 ## What the trust gate protects
 
 An untrusted project's `.sbx.toml` **cannot** touch security-relevant fields: binds,
-network, secrets, packages, GUI, limits, app definitions. Only the free `env` field
-applies from an untrusted project (minus a reserved-key denylist). Trust is bound to
+network, secrets, packages, GUI, limits, app definitions. The two free fields, `env` (minus a
+reserved-key denylist) and `timezone`, apply from an untrusted project, and so does
+[`[fs]`](../configuration/fs), which can only close a path. Trust is bound to
 the file's content hash on the direnv model, so any edit re-arms the gate. See
 [The trust gate](trust).
 

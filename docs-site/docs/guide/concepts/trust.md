@@ -86,8 +86,8 @@ flowchart TB
     class CLOSED,UNTRUSTED,CHANGED hs
 ```
 
-Only the `trusted` outcome applies a security field. The free `env` field applies on
-all three, minus its reserved keys under the two that are not trusted.
+Only the `trusted` outcome applies a security field. The free fields apply on all three,
+`env` minus its reserved keys under the two that are not trusted.
 
 Because the hash covers the *whole file*, any edit, even to a free field, re-arms
 the gate. This is deliberate: after editing a trusted file, its security fields stop

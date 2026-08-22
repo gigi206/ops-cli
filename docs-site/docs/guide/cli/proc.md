@@ -103,9 +103,11 @@ sbx proc logs [<id>] [-f|--follow] [--json]
 
 The **exec-event feed**, the processes an agent spawns inside its cage, in order, each stamped
 with the time it was first seen. Where `ls`/`live` snapshot the *current* tree of any session,
-`logs` reads a recorded event stream, so the session must have been launched with **observation
-on**: [`sbx run --observe`](run#observing-a-run---observe) or
-[`sbx app run <name> --observe`](app). A session without it is reported as *unobserved*, not
+`logs` reads a recorded event stream, so the session must have been launched with the exec lens
+**on**. Two things turn it on, and both are read at launch: `--observe`
+([`sbx run`](run#observing-a-run---observe), [`sbx app run`](app)), which polls, and a
+[`[proc]`](../configuration/proc) mode of `observe`, `enforce` or `ask`, which reads every exec
+exactly through the seccomp supervisor. A session with neither is reported as *unobserved*, not
 shown empty. `sbx proc log` is an accepted alias.
 
 | Operand / option | Meaning |

@@ -262,7 +262,7 @@ read whole than assemble field by field.
 
 Writing a trusted project file re-arms its [trust gate](../concepts/trust); pass
 `--trust` to re-trust in one step. The global config and app profiles are trusted by
-location, so a write there needs no trust; a free `env` value needs no trust.
+location, so a write there needs no trust; a free `env` or `timezone` value needs none either.
 
 `--trust` blesses the **whole current file**, which is why these four verbs refuse it on
 a file that was never trusted, or that changed since you trusted it. Blessing it would
