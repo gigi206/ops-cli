@@ -66,7 +66,7 @@ Groups are a security-relevant input, they expand into egress rules, so they are
 honored **only from the top-level `[network]` of the global config** (trusted by its
 location). A project's `[network.groups]` is **ignored** with a warning; a project may
 *reference* a global group with `@name`, but it cannot *define* one. This is why the
-[`sbx net groups`](observability) command has no scope flag: it always reads the
+[`sbx net groups`](../cli/net#sbx-net-groups) command has no scope flag: it always reads the
 global config.
 
 The same holds for every other layer that has a `[network]` of its own. An
@@ -173,5 +173,6 @@ See [Egress observability](observability#persisting-rules) for the write scopes.
 - [Rule grammar](rules): what a group entry may contain, and how `@name` is
   parsed within a list.
 - [Network modes](modes): where the referencing `allow`/`deny` lists live.
-- [Egress observability](observability): `sbx net groups`, `sbx net rules --expand`.
+- [`sbx net`](../cli/net#sbx-net-groups): the `groups` verb, its `export`/`import` and its flags.
+- [Egress observability](observability): `sbx net rules --expand`, which shows a rule's `@name` origin.
 - [`sbx net` CLI reference](../cli/net)

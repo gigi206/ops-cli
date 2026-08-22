@@ -183,7 +183,7 @@ flowchart LR
         direction TB
         N["<b>nix:</b><br/><i>a nixpkgs attribute</i>"]
         FL["<b>flake:</b><br/><i>a remote flake output</i>"]
-        PRE["<b>tarball: · deb: · appimage:</b><br/><i>a prebuilt upstream bundle</i>"]
+        PRE["<b>tarball: · deb: · appimage: · binary:</b><br/><i>a prebuilt upstream artefact</i>"]
         M["<b>mise:</b><br/><i>a mise backend token</i>"]
         IN["<b>an inline flake</b><br/><i>written in the config itself</i>"]
     end

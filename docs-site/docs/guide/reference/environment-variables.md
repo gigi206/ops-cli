@@ -186,9 +186,9 @@ finds the operation plane without being told where it is:
 | `SBX_TASK_CLI` | the in-cage path of the task client (`/opt/sbx/bin/sbx`), a [generated script](../cli/task#what-the-cage-actually-holds) that speaks the plane's protocol and refuses every other word |
 | `SBX_TASK_SOCKET` | the in-cage path of the plane's socket (`/tmp/sbx-task.sock`), which is also how `sbx task` knows it is running inside a cage |
 
-A roll of an app's install steps ([`sbx app upgrade`](../cli/app#advancing-an-app),
-[`sbx upgrade --apps`](../cli/upgrade)) adds one, so a step can tell a first install from
-a re-install:
+A roll of an app's install steps ([`sbx app upgrade <name>`](../cli/app#advancing-an-app),
+[`sbx upgrade provision`](../cli/upgrade)) adds one, so a step can tell a first install
+from a re-install:
 
 | Variable | Meaning |
 |---|---|
