@@ -129,7 +129,8 @@ navbar entry: they are for looking things up, not reading through.
 - [`env`](configuration/env): extra environment variables (a free field).
 - [`timezone`](configuration/timezone): the cage's clock (a free field).
 - [`binds`](configuration/binds): extra host paths, read-only or read-write.
-- [`packages`](configuration/packages): tools by backend: `nix:` / `mise:` / `flake:`.
+- [`packages`](configuration/packages): tools by backend: `nix:` / `mise:` / `flake:`, and the
+  four prebuilt ones.
 - [`[tools]` (mise)](configuration/tools): a project's mise toolchain, auto-equipped in-cage.
 - [`nixpkgs`](configuration/nixpkgs): pin the channel or revision.
 - [`[limits]`](configuration/limits): cgroup resource limits.

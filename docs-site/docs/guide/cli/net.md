@@ -156,7 +156,7 @@ sbx net mute <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all
 `mute` adds a [`[network] mute`](../networking/observability#muting-noisy-refusals-network-mute-selinux-dontaudit)
 rule (SELinux `dontaudit`): a **denied** request matching it is still refused and still
 counted in [`stats`](#sbx-net-stats), but its line is kept out of the default
-[`sbx net log`](#sbx-net-logs) (see it with `--all`). It is a log filter, never a verdict, it
+[`sbx net logs`](#sbx-net-logs) (see it with `--all`). It is a log filter, never a verdict, it
 cannot open egress. Same scope vocabulary as `allow`/`deny`: a config write needs an existing
 filtering posture (nothing to suppress under `shared`/`none`) and re-trusts the project
 config; the global config and `-a <name>` app profile are trusted by location. Take one back

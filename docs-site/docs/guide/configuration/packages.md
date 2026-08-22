@@ -237,7 +237,7 @@ curated library set, **host-side** (like `nix:`, seeded and offline-reusable), b
 runs no build script so evaluating it host-side is safe. The build uses the **host** network (not
 the cage allowlist), and `sbx upgrade deb` re-resolves each source forward.
 
-Three source forms:
+Four source forms:
 
 | Form | Tracks |
 | --- | --- |
@@ -689,7 +689,8 @@ sbx run --package jq=nix:jq -- ./tool
 SBX_PACKAGE_ripgrep=mise:aqua:BurntSushi/ripgrep sbx run
 ```
 
-The value carries the same mandatory backend prefix as the field
-(`nix:`/`mise:`/`flake:`/`deb:`/`appimage:`). A one-shot package *adds* to whatever the config declares.
+The value carries the same mandatory backend prefix as the field, any of the seven
+[above](#the-mandatory-backend-prefix). A one-shot package *adds* to whatever the config
+declares.
 The command line beats the environment, and both beat the config file. See
 [One-shot overrides](overrides).

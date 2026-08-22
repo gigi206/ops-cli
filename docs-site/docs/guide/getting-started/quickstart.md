@@ -63,7 +63,7 @@ sbx run -- jq --version
 
 Use [`sbx search <query>`](../cli/search) to discover the attribute names, and
 see [`packages`](../configuration/packages) for the `nix:` / `mise:` / `flake:`
-backends.
+backends and the four prebuilt ones.
 
 ## Launch an AI agent as an app
 

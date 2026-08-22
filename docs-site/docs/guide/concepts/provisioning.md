@@ -185,7 +185,8 @@ The two engines differ in how complete the independence is:
 ## See also
 
 - [Directory layout](../concepts/directory-layout): where the stores and locks live
-- [`packages` configuration](../configuration/packages): declaring `nix:` / `mise:` / `flake:` tools
+- [`packages` configuration](../configuration/packages): declaring `nix:` / `mise:` / `flake:` tools,
+  and the four prebuilt backends
 - [`nixpkgs` configuration](../configuration/nixpkgs): pinning the channel
 - [`tools` configuration](../configuration/tools): mise `[tools]` and self-equip
 - [Upgrading](../housekeeping/upgrade): how versions actually move

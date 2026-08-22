@@ -65,7 +65,7 @@ for the full semantics.
 | `mode` | the egress mode; **absent** = inherit a filtering mode from the parent layer |
 | `allow` | egress rules that may reach (under `deny`) / auto-pass (under `ask`) |
 | `deny` | egress rules that may not reach (under `allow`) / auto-fail (under `ask`) |
-| `mute` | egress rules whose **denied** requests are kept out of the default [`sbx net log`](../networking/observability#muting-noisy-refusals-network-mute-selinux-dontaudit) (SELinux `dontaudit`): a log filter, never a verdict change; still counted in `stats`, shown by `sbx net log --all` |
+| `mute` | egress rules whose **denied** requests are kept out of the default [`sbx net logs`](../networking/observability#muting-noisy-refusals-network-mute-selinux-dontaudit) (SELinux `dontaudit`): a log filter, never a verdict change; still counted in `stats`, shown by `sbx net logs --all` |
 | `ask_timeout` | a duration (`"90s"`, `"5m"`) bounding a parked `ask` request; absent = indefinite |
 | `ask_notice` | `false` silences the inline stderr park alert (the request still parks) |
 | `stats` | `false` turns off the per-host decision counters ([`sbx net stats`](../networking/observability)) |
@@ -109,7 +109,7 @@ sbx run --config '[network] capture = "bodies"'
 
 Every inspected path is captured: HTTPS, inspected cleartext,
 [HTTP/2 and gRPC](#http2-and-grpc) per stream, and a WebSocket (its handshake, then
-the messages each direction carried, unmasked. A raw [`tcp://`](../networking/rules)
+the messages each direction carried, unmasked). A raw [`tcp://`](../networking/rules)
 splice has no head to read and is the one exception.
 
 Three properties, covered in full on the [observability page](../networking/observability#seeing-the-traffic-network-capture):
@@ -402,7 +402,7 @@ Notes:
 
 - **`{POST}` is required.** gRPC uses `POST`, but a bare `allow = ["grpc.example.com"]` is
   read-by-default (`{GET,HEAD}`) for an **app**, so every RPC would be refused. Prefix the rule with
-  `{POST}` (or `{*}`). (`sbx run` are all-verbs, so the baseline is less strict, but be
+  `{POST}` (or `{*}`). (`sbx run` is all-verbs, so the baseline is less strict, but be
   explicit.)
 - **`http2` selects the transport, not the verdict.** A host must still be permitted by an `allow`
   rule; `http2` only decides HTTP/2-vs-HTTP/1.1. It is `host` or `host:port` (a bare host matches any
@@ -487,7 +487,7 @@ A Mode-B app's unscoped (`{...}`-less) `allow` rules default to `["GET", "HEAD"]
 agent reads but does not write unless a rule opts a host out with `{*}`/`{VERB}`. This
 field overrides that default for the app (e.g. `["GET", "POST"]`, or `["*"]` for all
 verbs). It is **ignored on the baseline `[network]`**: `sbx run` (Mode A)
-stay all-verbs.
+stays all-verbs.
 
 ## Editing
 
