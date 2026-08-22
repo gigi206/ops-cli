@@ -52,95 +52,26 @@ pub(super) fn handle_https_forward(
     // the needle scanned for can never come from two different resolutions, even if a refresh
     // lands mid-request. A later exchange picks up the newer state.
     let creds = ctx.credentials.snapshot();
-    // 1. Parse the absolute-form `https://host[:port]/path` target into (host, port=443 default, path).
-    //    The host is canonicalized by the parser; the path is canonicalized inside `explain`.
-    let (host, port, path) = match allowlist::parse_url_target(target) {
-        Ok(t) => t,
-        Err(_) => {
-            ctx.push_log(
-                crate::sandbox::control::Proto::Https,
-                "",
-                0,
-                Some(method),
-                Some(target),
-                crate::sandbox::control::LogVerdict::Blocked,
-                "bad-request",
-            );
-            return write_refusal(
-                &mut client,
-                "400 Bad Request",
-                "bad-request",
-                "the absolute-form request target is not a valid `https://` URL",
-            );
-        }
+    let Some(AbsoluteForm {
+        host,
+        port,
+        path,
+        framing: Framing { chunked, body_len },
+    }) = admit_absolute_form(
+        &mut client,
+        ctx,
+        Plane::HttpsForward,
+        RawRequest {
+            head,
+            head_bytes,
+            method,
+            target,
+        },
+        &creds.needles,
+    )?
+    else {
+        return Ok(());
     };
-
-    // 2. Anti request-smuggling, fail-closed, through the check every inspected plane shares. Like
-    //    the tunneled path this one de-chunks and re-frames, so `chunked` is forwardable here.
-    let Framing { chunked, body_len } = match inspect_framing(head, true) {
-        Ok(framing) => framing,
-        Err(refusal) => {
-            ctx.push_log(
-                crate::sandbox::control::Proto::Https,
-                &host,
-                port,
-                Some(method),
-                Some(&path),
-                crate::sandbox::control::LogVerdict::Blocked,
-                refusal.reason,
-            );
-            return write_refusal(
-                &mut client,
-                "400 Bad Request",
-                refusal.reason,
-                refusal.detail,
-            );
-        }
-    };
-
-    // 3. Anti-fronting: the absolute-form URL host must equal the `Host` header, so a request cannot
-    //    claim one host in the line and another in the header (the URL host is what the policy checks).
-    if head
-        .header("host")
-        .map(|h| allowlist::canonical_host(&strip_port(h)) != host)
-        .unwrap_or(true)
-    {
-        ctx.outcome(
-            crate::sandbox::control::Proto::Https,
-            &host,
-            port,
-            Some(method),
-            Some(&path),
-            StatKind::Blocked,
-            "host-mismatch",
-        );
-        return write_refusal(
-            &mut client,
-            "421 Misdirected Request",
-            "host-mismatch",
-            "the Host header does not match the request-line host",
-        );
-    }
-
-    // 4. Outbound leak tripwire on the raw head — refuse (block, never strip) a request re-sending a
-    //    configured secret verbatim, scanned before sbx's own injection so it cannot self-trip.
-    if carries_secret(head_bytes, &creds.needles, &host) {
-        ctx.outcome(
-            crate::sandbox::control::Proto::Https,
-            &host,
-            port,
-            Some(method),
-            Some(&path),
-            StatKind::Blocked,
-            "outbound-secret",
-        );
-        return write_refusal(
-            &mut client,
-            "403 Forbidden",
-            "outbound-secret",
-            "the request carries a configured secret value (outbound credential leak refused)",
-        );
-    }
 
     // 5. The verdict — the SAME `https` decision a `CONNECT` to this host gets ([`decide_https`]):
     //    same rules, same denial shapes, same parking for an undecided host. Only the answer differs,

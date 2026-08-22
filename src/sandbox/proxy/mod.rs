@@ -1738,6 +1738,187 @@ fn write_all_str<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
     w.flush()
 }
 
+/// One absolute-form request as it arrives, before any of it is trusted: the parsed head, the raw
+/// head bytes the secret tripwire scans byte-exactly, and the request line's method and target.
+/// The four already travel together — `handle_client` passes them as a group to whichever plane
+/// handles the request — so naming them keeps [`admit_absolute_form`] readable at its call sites.
+struct RawRequest<'a> {
+    head: &'a Head,
+    head_bytes: &'a [u8],
+    method: &'a str,
+    target: &'a str,
+}
+
+/// Which inspected plane an absolute-form request arrived on. The two differ in exactly three
+/// observable ways, and this names them so [`admit_absolute_form`] can be written once.
+#[derive(Clone, Copy)]
+enum Plane {
+    /// `http://` — strictly opt-in, and forwards no chunked framing at all.
+    Cleartext,
+    /// `https://` — de-chunks and re-frames like the tunneled path, so chunked is forwardable.
+    HttpsForward,
+}
+
+impl Plane {
+    /// The protocol this plane logs and counts under.
+    fn proto(self) -> crate::sandbox::control::Proto {
+        match self {
+            Plane::Cleartext => crate::sandbox::control::Proto::Http,
+            Plane::HttpsForward => crate::sandbox::control::Proto::Https,
+        }
+    }
+
+    /// The scheme a malformed target is named against, so the refusal says which URL was expected.
+    fn scheme(self) -> &'static str {
+        match self {
+            Plane::Cleartext => "http://",
+            Plane::HttpsForward => "https://",
+        }
+    }
+
+    /// Whether this plane may forward chunked framing — the one thing the smuggling check is told
+    /// differently per plane.
+    fn forwards_chunked(self) -> bool {
+        matches!(self, Plane::HttpsForward)
+    }
+}
+
+/// What an admitted absolute-form request carries into the exchange that follows.
+struct AbsoluteForm {
+    host: String,
+    port: u16,
+    path: String,
+    framing: Framing,
+}
+
+/// The four checks every absolute-form request passes before any policy verdict is reached: parse
+/// the target, reject request smuggling, reject request fronting, and refuse an outbound credential
+/// leak. `Ok(None)` means the request was refused and the refusal already written.
+///
+/// Written once for both inspected planes on purpose. The per-plane copy is precisely the mistake
+/// [`wire::inspect_framing`] exists to have fixed — its own header records that a bare CR reached
+/// two planes after being refused on the third, and that the reason tokens diverged for years,
+/// because the check was written per plane. Step 2 here is the call to that fix; steps 1, 3 and 4
+/// were still copied, and now are not.
+///
+/// The `push_log` / `outcome` split is deliberate and load-bearing: steps 1 and 2 log without
+/// counting, steps 3 and 4 log and count. It is the part most likely to drift under copying, which
+/// is the other reason this is one function.
+fn admit_absolute_form(
+    client: &mut UnixStream,
+    ctx: &ProxyCtx,
+    plane: Plane,
+    req: RawRequest<'_>,
+    needles: &[SecretNeedle],
+) -> io::Result<Option<AbsoluteForm>> {
+    let RawRequest {
+        head,
+        head_bytes,
+        method,
+        target,
+    } = req;
+    // 1. Parse the absolute-form `<scheme>host[:port]/path` target into (host, port, path). The host
+    //    is canonicalized by the parser; the path is canonicalized inside the plane's explainer.
+    let (host, port, path) = match allowlist::parse_url_target(target) {
+        Ok(t) => t,
+        Err(_) => {
+            ctx.push_log(
+                plane.proto(),
+                "",
+                0,
+                Some(method),
+                Some(target),
+                crate::sandbox::control::LogVerdict::Blocked,
+                "bad-request",
+            );
+            write_refusal(
+                client,
+                "400 Bad Request",
+                "bad-request",
+                &format!(
+                    "the absolute-form request target is not a valid `{}` URL",
+                    plane.scheme()
+                ),
+            )?;
+            return Ok(None);
+        }
+    };
+
+    // 2. Anti request-smuggling, fail-closed, through the check every inspected plane shares.
+    let framing = match inspect_framing(head, plane.forwards_chunked()) {
+        Ok(framing) => framing,
+        Err(refusal) => {
+            ctx.push_log(
+                plane.proto(),
+                &host,
+                port,
+                Some(method),
+                Some(&path),
+                crate::sandbox::control::LogVerdict::Blocked,
+                refusal.reason,
+            );
+            write_refusal(client, "400 Bad Request", refusal.reason, refusal.detail)?;
+            return Ok(None);
+        }
+    };
+
+    // 3. Anti-fronting collapses to one check with no CONNECT/SNI: the absolute-form URL host must
+    //    equal the `Host` header, so a request cannot claim one host in the line and another in the
+    //    header (the destination the policy checks is the URL host).
+    if head
+        .header("host")
+        .map(|h| allowlist::canonical_host(&strip_port(h)) != host)
+        .unwrap_or(true)
+    {
+        ctx.outcome(
+            plane.proto(),
+            &host,
+            port,
+            Some(method),
+            Some(&path),
+            StatKind::Blocked,
+            "host-mismatch",
+        );
+        write_refusal(
+            client,
+            "421 Misdirected Request",
+            "host-mismatch",
+            "the Host header does not match the request-line host",
+        )?;
+        return Ok(None);
+    }
+
+    // 4. Outbound leak tripwire on the raw head — refuse (block, never strip) a request re-sending a
+    //    configured secret verbatim, scanned before sbx's own injection so it cannot self-trip. It
+    //    matters more on the cleartext plane: a leaked secret sent in the clear is exposed on the
+    //    wire, not just to the destination.
+    if carries_secret(head_bytes, needles, &host) {
+        ctx.outcome(
+            plane.proto(),
+            &host,
+            port,
+            Some(method),
+            Some(&path),
+            StatKind::Blocked,
+            "outbound-secret",
+        );
+        write_refusal(
+            client,
+            "403 Forbidden",
+            "outbound-secret",
+            "the request carries a configured secret value (outbound credential leak refused)",
+        )?;
+        return Ok(None);
+    }
+
+    Ok(Some(AbsoluteForm {
+        host,
+        port,
+        path,
+        framing,
+    }))
+}
+
 /// An `InvalidData` error with a static cause, for the proxy's fail-closed paths.
 fn invalid(msg: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)

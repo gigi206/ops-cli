@@ -9968,3 +9968,20 @@ fn the_body_budget_refuses_a_length_that_would_overflow_its_total() {
         "a refused reservation moves nothing"
     );
 }
+
+/// The three things the two inspected planes say differently, now that they share one admission
+/// path. Each was a literal token duplicated per plane before, so a wrong mapping here is exactly
+/// the divergence the shared function exists to prevent — and the `http://`/`https://` detail is
+/// interpolated rather than written out, so nothing else pins it.
+#[test]
+fn each_inspected_plane_keeps_its_own_scheme_proto_and_chunked_rule() {
+    use crate::sandbox::control::Proto;
+    assert_eq!(super::Plane::Cleartext.scheme(), "http://");
+    assert_eq!(super::Plane::HttpsForward.scheme(), "https://");
+    assert!(matches!(super::Plane::Cleartext.proto(), Proto::Http));
+    assert!(matches!(super::Plane::HttpsForward.proto(), Proto::Https));
+    // The cleartext plane forwards no chunked framing at all; the https-forward plane de-chunks
+    // and re-frames like the tunneled path, so chunked is forwardable there.
+    assert!(!super::Plane::Cleartext.forwards_chunked());
+    assert!(super::Plane::HttpsForward.forwards_chunked());
+}

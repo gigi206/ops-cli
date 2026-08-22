@@ -32,97 +32,26 @@ pub(super) fn handle_cleartext(
     // the needle scanned for can never come from two different resolutions, even if a refresh
     // lands mid-request. A later exchange picks up the newer state.
     let creds = ctx.credentials.snapshot();
-    // 1. Parse the absolute-form `http://host[:port]/path` target into (host, port=80 default, path).
-    //    The host is canonicalized by the parser; the path is canonicalized inside `explain_clear`.
-    let (host, port, path) = match allowlist::parse_url_target(target) {
-        Ok(t) => t,
-        Err(_) => {
-            ctx.push_log(
-                crate::sandbox::control::Proto::Http,
-                "",
-                0,
-                Some(method),
-                Some(target),
-                crate::sandbox::control::LogVerdict::Blocked,
-                "bad-request",
-            );
-            return write_refusal(
-                &mut client,
-                "400 Bad Request",
-                "bad-request",
-                "the absolute-form request target is not a valid `http://` URL",
-            );
-        }
+    let Some(AbsoluteForm {
+        host,
+        port,
+        path,
+        framing: Framing { body_len, .. },
+    }) = admit_absolute_form(
+        &mut client,
+        ctx,
+        Plane::Cleartext,
+        RawRequest {
+            head,
+            head_bytes,
+            method,
+            target,
+        },
+        &creds.needles,
+    )?
+    else {
+        return Ok(());
     };
-
-    // 2. Anti request-smuggling, fail-closed, through the check every inspected plane shares. This
-    //    plane forwards no chunked framing at all, which is the one thing it says differently.
-    let Framing { body_len, .. } = match inspect_framing(head, false) {
-        Ok(framing) => framing,
-        Err(refusal) => {
-            ctx.push_log(
-                crate::sandbox::control::Proto::Http,
-                &host,
-                port,
-                Some(method),
-                Some(&path),
-                crate::sandbox::control::LogVerdict::Blocked,
-                refusal.reason,
-            );
-            return write_refusal(
-                &mut client,
-                "400 Bad Request",
-                refusal.reason,
-                refusal.detail,
-            );
-        }
-    };
-
-    // 3. Anti-fronting collapses to one check with no CONNECT/SNI: the absolute-form URL host must
-    //    equal the `Host` header, so a request cannot claim one host in the line and another in the
-    //    header (the destination the policy checks is the URL host).
-    if head
-        .header("host")
-        .map(|h| allowlist::canonical_host(&strip_port(h)) != host)
-        .unwrap_or(true)
-    {
-        ctx.outcome(
-            crate::sandbox::control::Proto::Http,
-            &host,
-            port,
-            Some(method),
-            Some(&path),
-            StatKind::Blocked,
-            "host-mismatch",
-        );
-        return write_refusal(
-            &mut client,
-            "421 Misdirected Request",
-            "host-mismatch",
-            "the Host header does not match the request-line host",
-        );
-    }
-
-    // 4. Outbound leak tripwire on the raw head — refuse (block, never strip) a request re-sending a
-    //    configured secret verbatim. It matters more here than on the TLS path: a leaked secret sent
-    //    in the clear is exposed on the wire, not just to the destination.
-    if carries_secret(head_bytes, &creds.needles, &host) {
-        ctx.outcome(
-            crate::sandbox::control::Proto::Http,
-            &host,
-            port,
-            Some(method),
-            Some(&path),
-            StatKind::Blocked,
-            "outbound-secret",
-        );
-        return write_refusal(
-            &mut client,
-            "403 Forbidden",
-            "outbound-secret",
-            "the request carries a configured secret value (outbound credential leak refused)",
-        );
-    }
 
     // 5. The verdict — cleartext is strictly opt-in, so only an explicit `http://` allow rule permits
     //    it (`explain_clear` never consults the default action or parks; deny wins layer-agnostically).
