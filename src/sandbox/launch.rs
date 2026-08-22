@@ -163,12 +163,6 @@ pub(crate) fn run(
     }
 }
 
-/// Warn that `--observe`'s inline stderr feed is not shown for an interactive terminal (it would
-/// fight a TUI for the screen), pointing at the out-of-band viewers instead. Observation itself still
-/// runs — the ring and its control socket are populated so `sbx proc logs`/`sbx proc live` can watch
-/// this session from another terminal; only the inline echo is suppressed, and that decision is made
-/// per launch path where the observer is started (interactive/detached never echo inline). Shared by
-/// `run`/`app`.
 /// Which observation lenses a launch runs, from its resolved `[proc]` policy and the `--observe` flag.
 /// The poll exec lens runs when observation is asked for but enforcement is **not** in effect — an
 /// enforcing launch (`enforce`/`ask`) uses the seccomp user-notification supervisor as its exec source
@@ -215,6 +209,12 @@ fn observe_feed_absent_reason(
     interactive.then_some("the inline feed is not shown for an interactive terminal")
 }
 
+/// Warn that `--observe`'s inline stderr feed is not shown for an interactive terminal (it would
+/// fight a TUI for the screen), pointing at the out-of-band viewers instead. Observation itself still
+/// runs — the ring and its control socket are populated so `sbx proc logs`/`sbx proc live` can watch
+/// this session from another terminal; only the inline echo is suppressed, and that decision is made
+/// per launch path where the observer is started (interactive/detached never echo inline). Shared by
+/// `run`/`app`.
 fn warn_observe_feed_absent(
     observe: bool,
     interactive: bool,
@@ -714,11 +714,6 @@ fn redirect_to_log(log: &File) {
     }
 }
 
-/// `sbx app <name>`: launch the named application profile — the project sandbox baseline
-/// plus the app's gated overlay, running the command the app declares. Apps run in the same
-/// locked-down posture as `sbx run`; the overlay's security fields took effect only if their
-/// source was trusted (the global config or a trusted project), so launching an app on
-/// untrusted code is as safe as `sbx run` there.
 /// The result of an `sbx app <name>` launch: the exit code, plus — for a `--net-learn` run — the
 /// rules synthesized from the egress the run was refused. The caller (`app_cmd`) writes them to the
 /// chosen profile (or prints them under `--dry-run`); keeping the write in `main` keeps the trust
@@ -763,6 +758,11 @@ fn ends_with_shell_payload(cmd: &[OsString]) -> bool {
     is_shell && is_c_flag
 }
 
+/// `sbx app <name>`: launch the named application profile — the project sandbox baseline
+/// plus the app's gated overlay, running the command the app declares. Apps run in the same
+/// locked-down posture as `sbx run`; the overlay's security fields took effect only if their
+/// source was trusted (the global config or a trusted project), so launching an app on
+/// untrusted code is as safe as `sbx run` there.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn app(
     name: &str,
@@ -1107,23 +1107,6 @@ fn withheld_mise_packages(cfg: &crate::config::Resolved, only: Option<&str>) -> 
     }
 }
 
-/// The `mise upgrade <tokens>` command for one roll group. The rolled tokens are the group's
-/// `[packages] mise:` tools, which for a **global app** live in the app-global home pool (Lane-1
-/// `mise use -g` pins them there). The cage's ambient primary for a global app is the *per-project*
-/// pool, which does not hold them, so a plain `mise upgrade` there would find nothing and silently
-/// roll nothing — a regression of a shipped command. So for a global app the roll is pinned to the
-/// app-global pool via a bash `MISE_DATA_DIR=<app-global>` prefix; the tokens ride `"$@"`
-/// positionally (no shell injection — only the sbx-owned mise path and fixed cage data dir are
-/// interpolated), and `exec` keeps the roll the cage's main process. Other runtimes have a single
-/// pool (the home), already the ambient primary, so the plain command runs unwrapped.
-///
-/// `--bump` is the other half of the launch's `use -g --pin`. A plain `mise upgrade` keeps whatever
-/// range the config states, and after a pin that range is one exact version: the roll would report
-/// every tool as already up to date and move nothing, which is a shipped command going quiet.
-/// `--bump` takes the latest and rewrites the pin, so the version advances here and only here —
-/// which is the whole contract. Measured against a config still saying `latest` (every app before
-/// its first launch on this code): `--bump` behaves exactly as the plain form did, so the change
-/// carries no regression for a pool that has not been pinned yet.
 /// The mise invocation that equips an app's `[packages] mise:` tools, and the one that rolls them.
 ///
 /// They are a pair and are kept side by side because neither is correct alone: `--pin` freezes the
@@ -1148,6 +1131,24 @@ fn equip_announcement(tokens: &[String]) -> String {
     )
 }
 
+/// The `mise upgrade <tokens>` command for one roll group. The rolled tokens are the group's
+/// `[packages] mise:` tools, which for a **global app** live in the app-global home pool (Lane-1
+/// `mise use -g` pins them there). The cage's ambient primary for a global app is the *per-project*
+/// pool, which does not hold them, so a plain `mise upgrade` there would find nothing and silently
+/// roll nothing — a regression of a shipped command. So for a global app the roll is pinned to the
+/// app-global pool via a bash `MISE_DATA_DIR=<app-global>` prefix; the tokens ride `"$@"`
+/// positionally (no shell injection — only the sbx-owned mise path and fixed cage data dir are
+/// interpolated), and `exec` keeps the roll the cage's main process. Other runtimes have a single
+/// pool (the home), already the ambient primary, so the plain command runs unwrapped.
+///
+/// `--bump` is the other half of the launch's `use -g --pin`. A plain `mise upgrade` keeps whatever
+/// range the config states, and after a pin that range is one exact version: the roll would report
+/// every tool as already up to date and move nothing, which is a shipped command going quiet.
+///
+/// `--bump` takes the latest and rewrites the pin, so the version advances here and only here —
+/// which is the whole contract. Measured against a config still saying `latest` (every app before
+/// its first launch on this code): `--bump` behaves exactly as the plain form did, so the change
+/// carries no regression for a pool that has not been pinned yet.
 fn mise_upgrade_cmd(
     runtime: binds::Runtime,
     mise: &Path,
@@ -1188,6 +1189,7 @@ fn mise_upgrade_cmd(
 /// `mise upgrade --bump <token>` in the same cage — the equip environment,
 /// so the fetch rides the app's egress allowlist. Generic over [`mise_package_groups`]: the
 /// project baseline (its default home) and each app (its own home), no app special-cased.
+///
 /// Trusted-only by construction. Returns whether every group rolled cleanly; a group that fails
 /// makes this `false` but never aborts the others.
 ///
@@ -3165,13 +3167,6 @@ pub(crate) fn effective_lock_target(
     }
 }
 
-/// Build the spec for `cmd`, reporting a clean error as an `ExitCode`. The
-/// configuration resolved in [`prepare`] drives this: a trust-gated `.sbx.toml` adds
-/// environment and host binds — read-only, or read-write with `mode = "rw"` (its security
-/// fields honored only once trusted)
-/// and provisions its declared tools onto `PATH`. Whatever the gate dropped or
-/// withheld is surfaced as a warning; a declared tool that fails to realise is fatal,
-/// since it is a stated requirement.
 /// Establish the mountpoint-chain pins that protect sbx's control plane: create each pin's host
 /// path (they are sbx's own directories — creating a not-yet-existent root here is what stops the
 /// agent pre-creating it unpinned) and turn it into the extra bind that freezes it. On the first
@@ -3366,6 +3361,13 @@ fn cage_timezone(declared: Option<&str>, zoneinfo_src: &Path) -> String {
     fallback()
 }
 
+/// Build the spec for `cmd`, reporting a clean error as an `ExitCode`. The
+/// configuration resolved in [`prepare`] drives this: a trust-gated `.sbx.toml` adds
+/// environment and host binds — read-only, or read-write with `mode = "rw"` (its security
+/// fields honored only once trusted)
+/// and provisions its declared tools onto `PATH`. Whatever the gate dropped or
+/// withheld is surfaced as a warning; a declared tool that fails to realise is fatal,
+/// since it is a stated requirement.
 fn build(
     prep: &Prepared,
     runtime: binds::Runtime,
@@ -6623,6 +6625,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
     }
 
     /// A minimal resolved config carrying only the channel choices the builder reads.
+    ///
     /// A config whose only interesting fields are the two `nixpkgs` pins these tests vary.
     fn resolved(global: Option<&str>, project: Option<&str>) -> crate::config::Resolved {
         let mut cfg = crate::testutil::resolved(vec![], vec![]);

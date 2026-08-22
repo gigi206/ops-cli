@@ -2689,10 +2689,6 @@ fn an_ambiguously_framed_response_still_relays_whole() {
     assert!(got.ends_with("hello"), "the body relays whole: {got:?}");
 }
 
-/// A loopback TLS "upstream" that keeps its connections open: it serves request after request on
-/// the same connection, replying `response` to each, and accepts as many connections as it is
-/// given. The returned counter is the figure the reuse tests turn on — how many TCP connections
-/// it had to accept to serve them all.
 /// What a keep-alive upstream reports back: how many TCP connections it had to accept, and the
 /// request heads it served, in order.
 struct UpstreamWitness {
@@ -2710,6 +2706,10 @@ impl UpstreamWitness {
     }
 }
 
+/// A loopback TLS "upstream" that keeps its connections open: it serves request after request on
+/// the same connection, replying `response` to each, and accepts as many connections as it is
+/// given. The returned counter is the figure the reuse tests turn on — how many TCP connections
+/// it had to accept to serve them all.
 fn spawn_keepalive_upstream(
     response: &'static [u8],
 ) -> (SocketAddr, CertificateDer<'static>, UpstreamWitness) {
@@ -4782,6 +4782,7 @@ fn digesting_injection_for(to: &str) -> HeaderInjection {
 /// The second half is the one that has no other witness: a request with no body must reach the
 /// upstream framed exactly as it would have been had no signer asked, because forcing a length is
 /// how a *re-framed* body is made unambiguous and a bodyless request has nothing to re-frame.
+///
 /// Forcing it there put a `Content-Length: 0` on every `GET` to a signed destination.
 #[test]
 fn holding_a_body_to_digest_it_reframes_only_a_request_that_has_one() {

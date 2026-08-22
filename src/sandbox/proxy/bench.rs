@@ -288,6 +288,7 @@ fn one_https_request(
 
 /// The client half of one inspected HTTPS request, over whatever transport already reaches the
 /// proxy: `CONNECT`, handshake against the minted leaf, send the request, read the response.
+///
 /// Returns the number of response bytes read. Split from the socket it rides so the same exchange
 /// can be timed with and without the cage's forwarder in the way.
 fn one_https_exchange<S: Read + Write>(

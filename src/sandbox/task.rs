@@ -2186,11 +2186,6 @@ fn substitute(cmd: &[String], values: &BTreeMap<String, String>) -> Result<Vec<O
 
 #[cfg(test)]
 impl TaskEngine {
-    /// An engine that knows an inventory but can launch nothing.
-    ///
-    /// It is enough to serve the listing verbs and to validate an invocation's parameters — so the
-    /// wire protocol is exercisable end to end without provisioning a cage, which is what lets the
-    /// in-cage client be tested against the real plane rather than a stand-in for it.
     /// [`Self::inventory_only`] with a launcher that exists, for the one test whose subject is the
     /// **return path** rather than the refusal.
     ///
@@ -2212,6 +2207,11 @@ impl TaskEngine {
         }
     }
 
+    /// An engine that knows an inventory but can launch nothing.
+    ///
+    /// It is enough to serve the listing verbs and to validate an invocation's parameters — so the
+    /// wire protocol is exercisable end to end without provisioning a cage, which is what lets the
+    /// in-cage client be tested against the real plane rather than a stand-in for it.
     pub(crate) fn inventory_only(tasks: Vec<crate::config::TaskSpec>) -> Self {
         Self {
             fs_masks: None,

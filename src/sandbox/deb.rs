@@ -75,6 +75,7 @@ fn parse_source(locator: &str) -> DebSource {
 }
 
 /// The outcome of re-resolving one declared `deb:` reference during `sbx upgrade`.
+///
 /// See [`prebuilt::Upgrade`].
 pub(crate) type DebUpgrade = prebuilt::Upgrade;
 
@@ -281,6 +282,7 @@ fn pinned_key_path(layout: &Layout, inrelease_url: &str) -> std::path::PathBuf {
 /// attests **nothing** — anyone may upload a key under any identity — which is exactly why the
 /// fingerprint is the anchor and the fetched material is bound back to it before it is used. What
 /// this endpoint provides is availability, not authority.
+///
 /// The URL is interpolated into a `builtins.fetchurl` expression, and it carries no metacharacter
 /// by construction: a fingerprint is a fixed-size byte array, so its rendering is always forty hex
 /// digits. Nothing remote reaches this string.
@@ -323,6 +325,7 @@ enum Attested {
 ///
 /// The chain this closes runs signature -> index digest -> the `.deb` hash the caller already pins,
 /// and it is only a chain if every link is checked against the artefact the next one consumes.
+///
 /// So `index` is the caller's own buffer, and the digest is taken over it rather than over a
 /// second fetch.
 ///
@@ -628,11 +631,6 @@ fn apt_repo_root(packages_url: &str) -> Option<&str> {
     packages_url.split_once("/dists/").map(|(root, _)| root)
 }
 
-/// Select the linux `.deb` asset URL matching `system` from a GitHub release's JSON. A `.deb` is a
-/// Linux package by definition, so the discriminant is CPU architecture, not the OS: an asset whose
-/// name names a *foreign* arch is dropped, then one positively naming this arch is chosen
-/// (deterministic by name); a single unambiguous `.deb` with no arch token is the fallback for a
-/// single-arch repo. Pure, so selection is testable against captured release JSON.
 /// The `.deb` asset URL a `github:<owner>/<repo>` locator's newest release names, validated.
 ///
 /// **`allow_insecure_http` deliberately does not reach here, and the `apt:` sibling is the contrast

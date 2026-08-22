@@ -14,6 +14,7 @@ use std::path::Path;
 ///
 /// Split out from the I/O so the owner-mismatch branch (`file_uid != euid`) is
 /// unit-testable without a foreign-owned file (which would otherwise need root).
+///
 /// Refuses a non-regular file, one not owned by us, or a world-writable one;
 /// group-writable (`0o020`) is tolerated — only the other-write bit (`0o002`) is
 /// checked. `mode` is the full `st_mode` (type bits included), so the

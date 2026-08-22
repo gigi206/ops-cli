@@ -49,6 +49,7 @@ use std::path::Path;
 type TarballPin = prebuilt::Pin;
 
 /// The outcome of re-resolving one declared `tarball:` reference during `sbx upgrade`.
+///
 /// See [`prebuilt::Upgrade`].
 pub(crate) type TarballUpgrade = prebuilt::Upgrade;
 

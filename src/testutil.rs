@@ -11,6 +11,7 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 ///
 /// The environment is one slot shared by every thread of the test binary, and the tests run
 /// in parallel: `setenv` may reallocate `environ` while another thread is inside `getenv`.
+///
 /// One lock for the whole binary — not one per module — is what makes that impossible, and
 /// what makes the `unsafe` in [`EnvVar`] sound.
 static ENV_LOCK: Mutex<()> = Mutex::new(());

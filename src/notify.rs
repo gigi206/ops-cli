@@ -368,6 +368,7 @@ pub(crate) struct Coalescer {
     /// entries.
     seen: HashMap<String, Announced>,
     /// Distinct problems that arrived with the memory full, and were therefore not announced.
+    ///
     /// Reported once at teardown.
     unannounced: u64,
 }

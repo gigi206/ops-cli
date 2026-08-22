@@ -51,6 +51,7 @@ impl SmokeReport {
 }
 
 /// Launch the minimal hardened probe via `bwrap` and report what the kernel saw.
+///
 /// Errors only when the probe could not be run at all (the spec is constant and
 /// valid, so a failure is bubblewrap not spawning); a launch that runs but is not
 /// hardened is a successful call returning a non-hardened report.

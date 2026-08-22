@@ -313,6 +313,7 @@ fn drain<R: io::Read + Send + 'static>(
 /// whichever source a secret came from.
 ///
 /// **What is bounded is the wait, not the process** — and the difference is the whole design.
+///
 /// Killing what sbx spawned does not end the wait, because a pipe stays open as long as *anything*
 /// holds its write end: a shell that forks a helper, sops that forks gpg. Measured, not assumed —
 /// killing `sh -c 'sleep 30'` and then reading to EOF takes thirty seconds, because `sleep`
@@ -658,6 +659,7 @@ fn resolve_env_paths(keys: &[String]) -> Vec<(String, String)> {
 ///
 /// The path is canonicalized because binding the *symlink* would bind a dangling name: a nix
 /// profile's `bin/x` points into `/nix/store`, which the cage does not have.
+///
 /// Where `PATH` has no answer, a program the host configured under `[plugin.<name>] programs` and
 /// `sbx plugins install` already built is used instead. Only the out-link is read here — a launch
 /// never builds — so the fallback costs one `readlink` and never stalls a secret on a nix build.
@@ -875,9 +877,6 @@ fn nix_closure(program: &Path, layout: Option<&crate::store::Layout>) -> io::Res
     Ok(text.lines().map(PathBuf::from).collect())
 }
 
-/// The path a declared program resolves to, or `None` when nothing usable is on `PATH`. Shared
-/// with `sbx plugins info`, so what a user is shown is what a launch would bind — a second
-/// lookup would be a second chance to disagree.
 /// Whether the cage will hold what a binary at this path needs to *load*, not merely the file.
 ///
 /// The runner binds the host userland read-only and computes a closure for anything in the nix
@@ -894,6 +893,9 @@ fn cage_can_load(path: &Path) -> bool {
         .any(|prefix| path.starts_with(prefix))
 }
 
+/// The path a declared program resolves to, or `None` when nothing usable is on `PATH`. Shared
+/// with `sbx plugins info`, so what a user is shown is what a launch would bind — a second
+/// lookup would be a second chance to disagree.
 pub(crate) fn locate_program(name: &str) -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt;
     let euid = unsafe { libc::geteuid() };
@@ -1139,8 +1141,6 @@ mod tests {
     use crate::testutil::{EnvVar, TmpDir, env_lock};
     use std::os::unix::fs::PermissionsExt;
 
-    /// The plan `cage_spec` takes, built from a resolver the way `run` builds it — so a test
-    /// exercises the very composition a launch does.
     /// A plugin's cage carries the same mandatory syscall denylist an agent's cage does.
     ///
     /// It did not, and the asymmetry ran the wrong way. This is the cage that runs code sbx did not
@@ -1191,6 +1191,8 @@ mod tests {
         }
     }
 
+    /// The plan `cage_spec` takes, built from a resolver the way `run` builds it — so a test
+    /// exercises the very composition a launch does.
     fn plan_for<'a>(p: &'a ResolverPlugin, reff: &str) -> CagePlan<'a> {
         CagePlan {
             kind: crate::plugins::PluginKind::Resolver,

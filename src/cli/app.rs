@@ -612,6 +612,7 @@ fn unresolvable(kind: &str, name: &str, src: &Path) -> String {
 /// Merge a resolved [`DepPlan`] into the global config. Never overwrites: the plan holds only names
 /// nothing declared when it was built, so a collision here means the config gained one in between
 /// (or holds one that is dropped at load, and so invisible to the reader that built the plan).
+///
 /// Refusing by name beats replacing a declaration the user did not offer up.
 fn write_deps(plan: &DepPlan) -> Result<(), ExitCode> {
     if plan.bundles.is_empty() && plan.groups.is_empty() {
@@ -1347,6 +1348,7 @@ fn app_list() -> ExitCode {
 /// pins ("pinned in N tree(s)"); a `nix:` package is built per-project (`sbx projects show` details
 /// it). A package declared by an untrusted layer reads `withheld`, distinct from `not installed`, so
 /// it is not mistaken for a failed provision. Read-only: no trust gate, no launch, no network.
+///
 /// `--json` emits the same model.
 fn app_show(args: &[OsString]) -> ExitCode {
     let (name, json) =

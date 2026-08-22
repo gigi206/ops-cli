@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 /// must contain, gcroot name)`. DejaVu covers the Latin sans/serif/monospace families a
 /// general UI needs; Noto Color Emoji covers the emoji codepoints a modern chat/GUI renders
 /// (without it, a `👋` in a message shows as a tofu box — the hermetic cage has no emoji font).
+///
 /// Adwaita Sans/Mono is the family a GTK4/libadwaita or Electron app styled for a modern GNOME
 /// desktop asks for *by name*: fontconfig cannot alias its way to a face that is absent, so
 /// such an app falls back to a default that is not the one it was designed against. It is a

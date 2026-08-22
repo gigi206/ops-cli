@@ -282,10 +282,6 @@ pub(crate) struct Signature {
     pub(crate) label: Option<String>,
 }
 
-/// Parse and **bound** one answer against the manifest that declared what this plugin may set.
-///
-/// Every refusal here is a refusal of the request: there is no partial answer, because a request
-/// carrying some of a signature is not a less-signed request, it is a malformed one.
 /// Why a signer's answer was refused, and whether the two sides have lost each other.
 ///
 /// Both forms refuse the request; what they differ on is what becomes of the *plugin*. A malformed
@@ -317,6 +313,10 @@ impl From<&str> for AnswerRefused {
     }
 }
 
+/// Parse and **bound** one answer against the manifest that declared what this plugin may set.
+///
+/// Every refusal here is a refusal of the request: there is no partial answer, because a request
+/// carrying some of a signature is not a less-signed request, it is a malformed one.
 pub(crate) fn parse_signature(
     line: &str,
     expect_seq: u64,

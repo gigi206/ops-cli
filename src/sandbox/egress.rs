@@ -357,6 +357,7 @@ const CAGE_HOSTNAME_PREFIX: &str = "sbx-";
 /// A rule is skipped when it names no single port (`:*`, or a range — sbx will not open a thousand
 /// listeners on a guess), a **privileged** port (below 1024, which a capability-less cage cannot
 /// bind), or a non-loopback IP literal, which the cage's network namespace has no way to hold.
+///
 /// Skipping is reported, never silent: the rule still governs the proxy's verdict, so what the
 /// author loses is the convenience, and they need to know they must tunnel themselves.
 pub(crate) fn tcp_destinations(policy: &crate::allowlist::EgressPolicy) -> TcpPlan {
@@ -1645,10 +1646,6 @@ mod tests {
         }
     }
 
-    /// The load-bearing security property of the `ask` posture: the control socket — over which a
-    /// request is answered — is created host-side but **never** bound into the cage. In Mode B the
-    /// in-cage agent is the adversary; if it could reach this socket it could answer its own asks.
-    /// Only the proxy socket and the CA cross in.
     /// What the cage's trust anchor holds answers to two things, and the test keeps them apart.
     ///
     /// The default is a full, ordinary bundle: with every rule inspected the public roots verify
@@ -2067,6 +2064,10 @@ mod tests {
         );
     }
 
+    /// The load-bearing security property of the `ask` posture: the control socket — over which a
+    /// request is answered — is created host-side but **never** bound into the cage. In Mode B the
+    /// in-cage agent is the adversary; if it could reach this socket it could answer its own asks.
+    /// Only the proxy socket and the CA cross in.
     #[test]
     fn the_ask_control_socket_is_created_but_never_bound_into_the_cage() {
         let data = TmpDir::new();
@@ -2516,6 +2517,10 @@ mod tests {
         // a hard failure (fail-closed), never a silent "absent" that downgrades to a weaker
         // source. (Root bypasses the permission, so the error path is unreachable there — skip.)
         if unsafe { libc::geteuid() } == 0 {
+            skip_incapable!(
+                "skipping the unreadable-sops-parent test: running as root, which searches a \
+                 directory whatever its mode, so `try_exists` answers instead of erroring"
+            );
             return;
         }
         let dir = TmpDir::new();

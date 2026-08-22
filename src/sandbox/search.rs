@@ -178,6 +178,7 @@ fn parse_versions(metadata: &serde_json::Value, system: &str) -> Vec<VersionRow>
 /// Render the report. When the query names a package exactly, lead with that package's
 /// versions and the lines to declare it (what the user came for), then a compact footer
 /// of the sibling hits; otherwise list the fuzzy matches and nudge toward an exact name.
+///
 /// Pure, so the exact layout is asserted in a test.
 fn render(
     query: &str,

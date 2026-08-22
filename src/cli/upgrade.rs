@@ -349,6 +349,7 @@ enum ClosingNote {
 ///
 /// Pure, so the choice is unit-tested without nix — and the three cases are **mutually exclusive
 /// by construction**, which is what keeps one run from printing two notes about the same apps.
+///
 /// The scope is enforced twice over: only [`upgrade_nix_channel`] and [`upgrade_flake_packages`]
 /// return a [`Roll`] at all, so no other channel can set `moved_store_paths`, and the `all` arm
 /// takes precedence over it here.
@@ -786,6 +787,7 @@ fn apps_with_install_steps(cfg: &config::Resolved) -> Vec<&str> {
 /// shims, which are symlinks into the store, and its `cmd` rewrites those on every launch after
 /// dropping any the reclaimed revision left resolving nowhere. So on a store move it re-installs
 /// nothing, repairs the one thing that moved, and says nothing about either.
+///
 /// That self-repair is a property of the guard each one writes, not of the shape: `aionui`'s guard
 /// tested that the staged tree was *there* rather than that it *ran*, and skipped the repair for as
 /// long as the tree existed. Widening this note to cover them would mean detecting staging inside a

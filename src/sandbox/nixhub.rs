@@ -356,6 +356,7 @@ pub(crate) enum ToolUpgrade {
 
 /// Re-resolve a trusted project's declared `nix:` tools against nixhub and rewrite the
 /// per-project resolution lock — the explicit roll-forward `sbx upgrade mise` performs.
+///
 /// Only the lock is rewritten; the new pins are realised on the next launch, exactly as a
 /// channel roll downloads its base on the next launch.
 ///
@@ -554,6 +555,7 @@ impl ResolutionLock {
 
 /// Resolve a `nix:` tool to its nixpkgs pin via nixhub. Fetches the package's metadata
 /// with nix's own fetcher and selects the release matching `tool.version` on `system`.
+///
 /// `Err` when the package is unknown to nixhub, the fetch fails, or no release matches.
 pub(crate) fn resolve(
     nix: &Path,
@@ -684,7 +686,9 @@ fn fetch_expr(url: &str) -> String {
 /// them newest-first). `latest`/`stable`/empty take the newest; otherwise an exact
 /// version match wins, falling back to the newest whose version extends the request at
 /// a component boundary (so `20` selects the newest `20.x`, `1.6` selects `1.6-bin`).
+///
 /// The commit and attribute are validated before they can flow into a flake reference.
+///
 /// Pure, so selection is testable against captured metadata.
 fn select_release(metadata: &serde_json::Value, version_req: &str, system: &str) -> Option<Pin> {
     let releases = metadata.get("releases")?.as_array()?;

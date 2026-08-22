@@ -197,14 +197,6 @@ fn add_watch(fd: libc::c_int, dir: &Path) -> io::Result<i32> {
     }
 }
 
-/// Add watches over the subtree rooted at `start`, recording each in `wd_paths`. Iterative (an explicit
-/// stack, so a deep tree cannot overflow the thread stack). With `emit`, a synthetic `create` event is
-/// pushed for every entry found — used when a directory appears *after* start, so a file created in it
-/// before its watch was installed is still reported (the inotify create race); the initial walk passes
-/// `false` so the pre-existing project is not replayed as writes. Symlinks are not followed (an entry's
-/// type is read without traversing it), so the watch set cannot loop or escape the project tree. On a
-/// watch-descriptor exhaustion the walk stops and warns once; the directories already watched keep
-/// working.
 /// The inotify watch set for one project tree: the fd, the root every event is reported relative to,
 /// the watch-descriptor map the kernel's ids resolve through, the ring events land in, and the
 /// one-time warning latches.
@@ -229,6 +221,14 @@ impl Watcher {
         self.add_tree(&start, emit);
     }
 
+    /// Add watches over the subtree rooted at `start`, recording each in `wd_paths`. Iterative (an explicit
+    /// stack, so a deep tree cannot overflow the thread stack). With `emit`, a synthetic `create` event is
+    /// pushed for every entry found — used when a directory appears *after* start, so a file created in it
+    /// before its watch was installed is still reported (the inotify create race); the initial walk passes
+    /// `false` so the pre-existing project is not replayed as writes. Symlinks are not followed (an entry's
+    /// type is read without traversing it), so the watch set cannot loop or escape the project tree. On a
+    /// watch-descriptor exhaustion the walk stops and warns once; the directories already watched keep
+    /// working.
     fn add_tree(&mut self, start: &Path, emit: bool) {
         let mut stack = vec![start.to_path_buf()];
         while let Some(dir) = stack.pop() {
@@ -351,14 +351,14 @@ impl Watcher {
                 continue; // timeout or EINTR — loop back and re-check the stop flag
             }
             if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-                break; // the inotify self.fd is unusable — end the loop
+                break; // the inotify fd is unusable — end the loop
             }
             if pfd.revents & libc::POLLIN == 0 {
                 continue;
             }
             // Drain every buffered event before polling again.
             loop {
-                // SAFETY: read into our owned buffer; the self.fd is non-blocking, so an empty queue returns
+                // SAFETY: read into our owned buffer; the fd is non-blocking, so an empty queue returns
                 // EAGAIN (n < 0) and ends the drain.
                 let n = unsafe {
                     libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
@@ -369,7 +369,7 @@ impl Watcher {
                 self.parse_buffer(&buf[..n as usize]);
             }
         }
-        // SAFETY: closing our own inotify self.fd; removes every watch with it.
+        // SAFETY: closing our own inotify fd; removes every watch with it.
         unsafe { libc::close(self.fd) };
     }
 }

@@ -657,6 +657,7 @@ mod tests {
     }
 
     /// The path a task gets is the shims directory, whatever the backend did with its files.
+    ///
     /// Observed from a real `aqua:` install: the executable lands at
     /// `installs/<tool>/<version>/<vendor-archive-name>/<binary>` — no `bin/` anywhere — so a rule
     /// that guessed install directories would put a directory holding no executable on `PATH` and

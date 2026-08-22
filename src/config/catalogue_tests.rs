@@ -215,17 +215,44 @@ fn a_runtime_staged_out_of_the_store_is_restaged_once_it_stops_running() {
     assert!(!marker.exists(), "the tree was not replaced");
 
     // 4. A stage that never got its write bits: the repair must be able to remove what it replaces,
-    //    which `rm -rf` cannot do inside directories it may not write.
-    for p in [dest.join("bin"), dest.clone()] {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o555)).unwrap();
-    }
-    write_exec(&node, "#!/bin/sh\necho v24.0.0\n", 0o555);
+    //    which `rm -rf` cannot do inside directories it may not write. Reached here through the
+    //    guard's exec test, so the removal is exercised whatever the uid.
+    let lock_the_stage = || {
+        for p in [dest.join("bin"), dest.clone()] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+    };
+    write_exec(
+        &node,
+        "#!/nix/store/0000000000000000-reclaimed/bin/sh\n",
+        0o555,
+    );
+    lock_the_stage();
     launch();
     assert!(runs(), "a read-only stage was not repaired");
     assert!(
         !node.metadata().unwrap().permissions().readonly(),
         "still read-only"
+    );
+
+    // 5. The write bits on their own: a stage that RUNS but cannot be written to must restage all
+    //    the same, because AionCore rewrites files inside the copy and exec never sees the mode.
+    //    That is the guard's `-w` test, and it is the one thing here root cannot observe — `[ -w ]`
+    //    asks whether *this* process could write, and for root the answer is yes whatever the mode.
+    if unsafe { libc::geteuid() } == 0 {
+        skip_incapable!(
+            "skipping the aionui stage guard's write-bit test: running as root, where `[ -w ]` is \
+             true whatever the mode, so a read-only stage is indistinguishable from a healthy one"
+        );
+        return;
+    }
+    write_exec(&node, "#!/bin/sh\necho v24.0.0\n", 0o555);
+    lock_the_stage();
+    launch();
+    assert!(
+        !node.metadata().unwrap().permissions().readonly(),
+        "a stage that runs but cannot be written to was left in place"
     );
 }
 

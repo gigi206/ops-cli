@@ -340,9 +340,6 @@ pub(super) fn parse_flow_line(line: &str) -> Option<FlowSnapshot> {
     })
 }
 
-/// Parse one `event seq=… at=… port=… verdict=… reason=… [method=…] host=… [path=…]` line into an
-/// event, or `None` if it is malformed. Each token is split on its first `=`, so a `path` carrying a
-/// query string's `=` round-trips (it is the last field).
 /// Parse one `seen seq=… way=… name=…` line into the event sequence it belongs to and the sighting,
 /// or `None` if it is malformed.
 ///
@@ -370,6 +367,9 @@ fn parse_sighting_line(line: &str) -> Option<(u64, SecretSighting)> {
     ))
 }
 
+/// Parse one `event seq=… at=… port=… verdict=… reason=… [method=…] host=… [path=…]` line into an
+/// event, or `None` if it is malformed. Each token is split on its first `=`, so a `path` carrying a
+/// query string's `=` round-trips (it is the last field).
 fn parse_event_line(line: &str) -> Option<LogEvent> {
     let mut seq = None;
     let mut at = None;

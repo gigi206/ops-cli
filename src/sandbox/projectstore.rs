@@ -65,6 +65,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Owner-only mode for the directories the seed creates. The shared store makes
 /// path directories read-only (`0555`); the seed creates owner-writable ones
 /// instead, so it can populate them and the cage's nix can later add new paths.
+///
 /// A path's content hash does not cover directory modes, so this does not affect
 /// `nix-store --verify`; the copied *files* keep their own modes (`std::fs::copy`
 /// and the reflink path both preserve them).
@@ -672,15 +673,18 @@ mod tests {
         // A writable directory yields a verdict either way — which one depends on the host.
         assert!(reflink_verdict(base.path()).is_some());
 
-        // An unwritable one yields none: nothing was learned, and a caller deciding on the
-        // filesystem's capabilities must not read the failure as "it cannot".
+        // One the probe cannot write into yields none: nothing was learned, and a caller deciding
+        // on the filesystem's capabilities must not read the failure as "it cannot".
+        //
+        // A regular file, so the probe's write answers `ENOTDIR` for every uid. A mode-locked
+        // directory would refuse an ordinary user and admit root, who would then run the probe and
+        // get a real verdict — so on a host running the suite as root this branch would assert
+        // nothing.
         let closed = base.path().join("closed");
-        std::fs::create_dir(&closed).unwrap();
-        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::write(&closed, b"not a directory\n").unwrap();
         assert_eq!(reflink_verdict(&closed), None);
         // The seeding caller, about to copy into it, is right to read it as "no" all the same.
         assert!(!supports_reflink(&closed));
-        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]

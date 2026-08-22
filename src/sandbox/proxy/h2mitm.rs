@@ -808,6 +808,13 @@ fn redact_header_map(headers: &mut http::HeaderMap, needles: &[SecretNeedle]) {
     }
 }
 
+/// The most connections one tunnel keeps. The key is the injected credential set, which follows
+/// from the **path**, and the path is the caller's to choose: with several path-scoped credentials a
+/// stream can ask for a combination no earlier one used, and each combination is a live connection.
+/// Far above any real policy's distinct sets, and past it a stream still gets its connection, the
+/// tunnel simply stops keeping it — the same stance the leaf cache takes.
+const MAX_POOLED: usize = 8;
+
 /// The upstream connections one tunnel has opened, shared by the streams riding it.
 ///
 /// HTTP/2 multiplexes, so this is not the HTTP/1.1 pool's take-and-return: a connection is handed to
@@ -818,13 +825,6 @@ fn redact_header_map(headers: &mut http::HeaderMap, needles: &[SecretNeedle]) {
 /// left once the host and port are fixed by the CONNECT. It is also the half that matters: a
 /// connection that carried a credential is never offered to a stream that does not receive the same
 /// one.
-/// The most connections one tunnel keeps. The key is the injected credential set, which follows
-/// from the **path**, and the path is the caller's to choose: with several path-scoped credentials a
-/// stream can ask for a combination no earlier one used, and each combination is a live connection.
-/// Far above any real policy's distinct sets, and past it a stream still gets its connection, the
-/// tunnel simply stops keeping it — the same stance the leaf cache takes.
-const MAX_POOLED: usize = 8;
-
 #[derive(Default)]
 struct UpstreamPool {
     // A `RefCell` rather than a lock: every stream of a tunnel runs on that tunnel's single
@@ -1827,12 +1827,6 @@ mod tests {
         (addr, ca_der)
     }
 
-    /// One h2 exchange through the real handler and on to whatever upstream `ctx` points at:
-    /// client leg over an in-memory duplex, proxy leg driven exactly as [`serve`] drives it.
-    ///
-    /// Awaiting a stream without polling the connection is the deadlock this shape exists to avoid:
-    /// a queued response is only written while the connection is being polled, so the accept loop
-    /// and the in-flight streams have to advance together.
     /// One exchange, for the tests that send a single stream.
     fn through_h2_proxy(
         ctx: &ProxyCtx,
@@ -1849,6 +1843,13 @@ mod tests {
 
     /// Several streams over **one** tunnel, answered in order — the shape a multiplexing client
     /// actually has, and the only way to see what the tunnel's upstream pool does.
+    ///
+    /// Both legs run through the real handler and on to whatever upstream `ctx` points at: the
+    /// client leg over an in-memory duplex, the proxy leg driven exactly as [`serve`] drives it.
+    ///
+    /// Awaiting a stream without polling the connection is the deadlock this shape exists to avoid:
+    /// a queued response is only written while the connection is being polled, so the accept loop
+    /// and the in-flight streams have to advance together.
     fn through_h2_proxy_streams(
         ctx: &ProxyCtx,
         connect_host: &str,
@@ -1935,18 +1936,6 @@ mod tests {
         })
     }
 
-    /// Two streams of one tunnel that receive the same credential share one upstream connection;
-    /// two that receive different ones do not.
-    ///
-    /// The first half is the point of the pool: HTTP/2 multiplexes, so a client that opens one
-    /// tunnel and many streams was paying a TCP connection, a TLS handshake and an h2 handshake for
-    /// every one of them.
-    ///
-    /// **The second half is the reason the pool is keyed the way it is**, and it is the half worth
-    /// breaking the test over: a connection that carried a credential must never be offered to a
-    /// stream that does not receive the same one. Everything else a stream is checked for happens
-    /// before the pool is consulted at all, per stream, so reuse cannot skip it: the `:authority`
-    /// re-check, the outbound tripwire, the verdict, the resolution and the address guard.
     /// The third plane's share of the observed-credential scan set. A gRPC client that authenticates
     /// with a token of its own teaches sbx that token here, exactly as the two HTTP/1.1 planes do,
     /// and the set is shared — so a plane that never observed would be a hole in all three rather
@@ -1986,6 +1975,18 @@ mod tests {
         );
     }
 
+    /// Two streams of one tunnel that receive the same credential share one upstream connection;
+    /// two that receive different ones do not.
+    ///
+    /// The first half is the point of the pool: HTTP/2 multiplexes, so a client that opens one
+    /// tunnel and many streams was paying a TCP connection, a TLS handshake and an h2 handshake for
+    /// every one of them.
+    ///
+    /// **The second half is the reason the pool is keyed the way it is**, and it is the half worth
+    /// breaking the test over: a connection that carried a credential must never be offered to a
+    /// stream that does not receive the same one. Everything else a stream is checked for happens
+    /// before the pool is consulted at all, per stream, so reuse cannot skip it: the `:authority`
+    /// re-check, the outbound tripwire, the verdict, the resolution and the address guard.
     #[test]
     fn streams_share_an_upstream_only_with_the_credential_set_they_share() {
         use crate::allowlist::classify;

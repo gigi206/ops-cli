@@ -22,9 +22,6 @@ use super::{Backend, ForwardPort, NetworkPolicy, Resolved};
 use crate::trust::TrustState;
 use crate::{sandbox, store};
 
-/// A serializable projection of the resolved configuration for a directory — the model both the
-/// `sbx config` CLI and a future management front-end render. Field order mirrors the CLI's
-/// long-standing display order so a presenter can walk it top to bottom.
 /// One `[plugin.<name>]` table as the layers resolved it, for `sbx config show`. Values are
 /// shown: they are configuration (an address, a namespace, a path), never a credential — a
 /// secret belongs in `[secret]`, which this view prints by locator and never by value.
@@ -40,6 +37,9 @@ pub(crate) struct PluginView {
     pub(crate) programs: Vec<String>,
 }
 
+/// A serializable projection of the resolved configuration for a directory — the model both the
+/// `sbx config` CLI and a future management front-end render. Field order mirrors the CLI's
+/// long-standing display order so a presenter can walk it top to bottom.
 #[derive(Serialize)]
 pub(crate) struct ConfigView {
     /// The directory this configuration was resolved for.
@@ -429,6 +429,7 @@ pub(crate) enum NetworkView {
         capture: String,
         capture_max_kb: Option<u64>,
         /// What a configured secret seen leaving through a WebSocket does (`warn`/`block`).
+        ///
         /// Surfaced for the reason `capture` is: it is a setting only a trusted or global layer can
         /// write, and it is invisible from inside the cage — a tunnel that was closed on a sighting
         /// and one that was closed by its peer look the same from there.
@@ -441,6 +442,7 @@ pub(crate) enum NetworkView {
         /// project with no way to see it.
         pool: bool,
         /// Whether the cage's CA file pairs the session CA with the public roots (`ca_roots`).
+        ///
         /// Surfaced for the diagnostic, not the secrecy: the bundle is readable in the cage, so this
         /// hides from nobody, but a tool that refuses a minimal store fails by accusing the bundle,
         /// and `sbx config` is where that is looked up. A launch that splices shows `true` here
@@ -802,6 +804,7 @@ pub(crate) struct AppView {
     /// baseline. Mirrors the app's `gui`.
     pub(crate) gpu: Option<bool>,
     /// The app's own plaintext-fetch posture, when it set one; `None` inherits the baseline.
+    ///
     /// Mirrors the app's `gpu`.
     pub(crate) allow_insecure_http: Option<bool>,
     /// The app's own audio posture, when it set one; `None` inherits the baseline. Mirrors the

@@ -900,14 +900,6 @@ pub(super) fn serve_tunneled_request(
     Ok(Turn::Close)
 }
 
-/// Write a refusal to the client through the buffered TLS stream (the in-tunnel error paths,
-/// after the CONNECT tunnel is established and TLS is terminated).
-///
-/// It answers with the tunnel's [`Turn`], and that answer is always [`Turn::Close`]: a refused
-/// request's body was never read, so the client's stream is left somewhere inside a message rather
-/// than at the start of the next one. The refusal says so on the wire too ([`write_refusal`] sends
-/// `Connection: close`). Returning the turn rather than `()` is what makes that a property of the
-/// type instead of a rule each of the ~18 refusal sites has to remember.
 /// A request head inside a tunnel that never became a request: log the attempt against the tunnel's
 /// own host, tell the caller why, and close the tunnel.
 ///
@@ -944,6 +936,14 @@ fn refuse_unreadable_inner_head(
     )
 }
 
+/// Write a refusal to the client through the buffered TLS stream (the in-tunnel error paths,
+/// after the CONNECT tunnel is established and TLS is terminated).
+///
+/// It answers with the tunnel's [`Turn`], and that answer is always [`Turn::Close`]: a refused
+/// request's body was never read, so the client's stream is left somewhere inside a message rather
+/// than at the start of the next one. The refusal says so on the wire too ([`write_refusal`] sends
+/// `Connection: close`). Returning the turn rather than `()` is what makes that a property of the
+/// type instead of a rule each of the ~18 refusal sites has to remember.
 fn respond_refusal_tls<S: Read + Write>(
     br: &mut BufReader<StreamOwned<ServerConnection, S>>,
     status: &str,

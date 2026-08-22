@@ -929,6 +929,7 @@ pub(crate) struct EgressPolicy {
     default_action: DefaultAction,
     ask_timeout: Option<std::time::Duration>,
     /// Stored inverted so the derived `Default` (and [`Self::new`]) both mean "notice shown".
+    ///
     /// Read via [`Self::ask_notice`].
     suppress_ask_notice: bool,
     /// DNS cache TTL for the proxy's host-side resolver. `None` means [`DEFAULT_DNS_CACHE_TTL`] is
@@ -1364,6 +1365,7 @@ impl EgressPolicy {
     /// Whether a request to `host`:`port` for `path` is permitted: it must match some
     /// allow rule and no deny rule — **deny always wins**. A thin bool view over
     /// [`Self::explain`], for the verb `GET` (these tests exercise method-agnostic rules).
+    ///
     /// The filtering proxy and the `sbx test net` tester both decide through [`Self::explain`]
     /// (they need the deciding rule and the request's actual method), so this convenience view is
     /// exercised only by tests.
@@ -1650,6 +1652,7 @@ pub(crate) enum Decision<'a> {
     /// rule, so the SSRF guard treats this like an unnamed host (private addresses refused).
     AllowedDefault,
     /// No rule matched, and the policy asks by default: the request parks for a live decision.
+    ///
     /// The proxy blocks until answered or the ask timeout elapses; the `sbx test net` tester
     /// reports it as "would ask" since there is no static verdict.
     Ask,

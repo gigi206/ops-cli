@@ -28,6 +28,7 @@ pub(crate) struct RawConfig {
     /// for a mise backend equipped in-cage (e.g. `mise:aqua:example/demo-tool`), or `flake:<ref>`
     /// for a flake output built host-side into the shared store like `nix:` (e.g.
     /// `flake:github:owner/repo#attr`).
+    ///
     /// A value with no recognized prefix is dropped with a warning — there is no bare form.
     #[serde(default)]
     pub(crate) packages: BTreeMap<String, String>,
@@ -175,6 +176,7 @@ pub(crate) struct RawConfig {
     /// confidentiality and integrity choice (clipboard access, and on some compositors screen
     /// capture or input injection) an untrusted project may not make. `"offscreen"` grants no
     /// host access at all, but rides the same gate so the postures stay one ordered field.
+    ///
     /// X11 is deliberately never offered — an X client can snoop and drive every other window,
     /// which Wayland's per-client isolation prevents on a well-behaved compositor.
     pub(crate) gui: Option<String>,
@@ -252,6 +254,7 @@ pub(crate) struct RawConfig {
     pub(crate) dbus: Option<bool>,
     /// Host loopback TCP ports to forward from the host into the cage — a list of entries, each
     /// a bare port (`forward = [1455]`) or a `"host:cage"` remap (`forward = ["9200:9119"]`).
+    ///
     /// The host side is bound on `127.0.0.1` and bridged, through a bound Unix socket, to the
     /// cage's own loopback at the cage side, so a host process (a browser chasing an OAuth
     /// `localhost:<port>` callback, or a dev opening a cage-run dev server) can reach a service
@@ -533,6 +536,7 @@ pub(crate) struct RawBindTable {
 }
 
 /// The `[limits]` table: optional overrides for the cage's cgroup resource limits.
+///
 /// `memory_high` is the throttle threshold, `memory_max` the hard ceiling — each a systemd
 /// memory value (a percentage like `"80%"`, a byte quantity like `"16G"`, or `"infinity"`);
 /// `tasks_max` is the process/thread cap (a count like `8192`, or `"infinity"`). Each value's
@@ -697,10 +701,6 @@ pub(crate) struct RawSshAgent {
     pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
-/// One `[app.<name>]` entry: the command to run plus an overlay over the sandbox
-/// baseline. The overlay fields reuse the baseline shapes and gate identically — an
-/// untrusted project's app may add `env`/`packages` and choose the command, but its
-/// `binds`/`network`/`secret` are dropped, exactly as for the baseline.
 /// One `[plugin.<name>]` table: what this host supplies to the named resolver plugin.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -771,6 +771,10 @@ pub(crate) struct RawBrokerConfig {
     pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
+/// One `[app.<name>]` entry: the command to run plus an overlay over the sandbox
+/// baseline. The overlay fields reuse the baseline shapes and gate identically — an
+/// untrusted project's app may add `env`/`packages` and choose the command, but its
+/// `binds`/`network`/`secret` are dropped, exactly as for the baseline.
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawApp {
     /// The command to run, as an argv. A bare string is taken as a single-element argv
@@ -1196,6 +1200,7 @@ pub(crate) struct RawResolve {
 }
 
 /// The `[secret]` section: a reserved `defaults` table plus one entry per destination host.
+///
 /// `secret` is a TOML *table* keyed by host (`[secret."api.github.com"]`), not an array — the
 /// host is the section, so a credential's destination reads at a glance. The reserved `defaults`
 /// key holds the resolver order and per-resolver bindings the terse `key` form expands through;

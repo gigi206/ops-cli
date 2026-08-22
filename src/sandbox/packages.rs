@@ -46,6 +46,7 @@ pub(crate) struct Provisioned {
 /// Split declared packages into the ones admitted for provisioning and the warnings
 /// for those withheld. A package is admitted when the layer that supplied its value
 /// is trusted; an untrusted project's tools are held back with an actionable hint.
+///
 /// Pure, so `sbx config` could show the same verdict without touching nix.
 fn admit(packages: &[Package]) -> (Vec<&Package>, Vec<String>) {
     let mut admitted = Vec::new();
