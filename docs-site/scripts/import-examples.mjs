@@ -19,6 +19,29 @@ const BANNER = (name) =>
   `\n---\n\n*This page is generated from \`examples/secrets/${name}/README.md\`. Edit it there:\n` +
   `the file beside the configuration it describes is the copy people import.*\n`;
 
+/**
+ * The guide does not write em dashes (src/docs_coverage.rs enforces it); the READMEs
+ * these pages come from do. Rewriting them at the source would churn 42 files that
+ * read fine where they live, so the punctuation is converted on the way in: a colon
+ * where the dash introduces an explanation, a comma where the sentence already has a
+ * colon or the dash sits inside parentheses. The line wrapping is left alone, so the
+ * generated page stays diffable against its source.
+ */
+function noEmDash(body) {
+  const fences = [];
+  const masked = body.replace(/```[\s\S]*?```/g, (m) => `\u0000${fences.push(m) - 1}\u0000`);
+  const out = masked.replace(/(\s+)—(\s+)/g, (m, ws1, ws2, offset, whole) => {
+    // The sentence so far decides the punctuation: a second colon in one sentence
+    // reads worse than the comma, and so does a colon inside a parenthesis.
+    const sentence = whole.slice(0, offset).split(/(?<=[.!?])\s|\n\n/).pop() ?? '';
+    const open = (sentence.match(/\(/g) ?? []).length > (sentence.match(/\)/g) ?? []).length;
+    const punct = open || sentence.includes(':') ? ',' : ':';
+    const ws = ws1.includes('\n') ? ws1 : ws2.includes('\n') ? ws2 : ' ';
+    return punct + ws;
+  });
+  return out.replace(/\u0000(\d+)\u0000/g, (_, i) => fences[Number(i)]);
+}
+
 /** Strip code spans and fences, to test the prose that is left. */
 function prose(body) {
   return body.replace(/```[\s\S]*?```/g, '').replace(/`[^`]*`/g, '');
@@ -74,7 +97,10 @@ const names = readdirSync(SRC, { withFileTypes: true })
 
 const pages = new Map();
 names.forEach((name, i) => {
-  const { title, label, body, description } = split(readFileSync(join(SRC, name, 'README.md'), 'utf8'), name);
+  // Normalised once, before anything is read out of it, so the title and the
+  // description carry the guide's punctuation too.
+  const source = noEmDash(readFileSync(join(SRC, name, 'README.md'), 'utf8'));
+  const { title, label, body, description } = split(source, name);
   pages.set(`${name}.md`, [
     '---',
     `title: ${JSON.stringify(title)}`,

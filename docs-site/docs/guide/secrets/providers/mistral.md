@@ -1,11 +1,11 @@
 ---
-title: "`mistral` — Mistral AI"
+title: "`mistral`: Mistral AI"
 sidebar_label: "mistral"
 description: "Mistral's hosted API (api.mistral.ai, their @ai-sdk/mistral base)."
 sidebar_position: 25
 ---
 
-# `mistral` — Mistral AI
+# `mistral`: Mistral AI
 
 Mistral's hosted API (api.mistral.ai, their `@ai-sdk/mistral` base). The
 mechanics, posture, and scoping are in [the shared page](../); this
@@ -30,9 +30,9 @@ export MISTRAL_API_KEY=…
   `/v1/models`, …). The `v1/*` subtree covers the API and nothing else.
 - **Trailing `/*` is load-bearing** (same rule as the opencode page): the real
   requests live one segment below `/v1`, and a path rule matches exactly by
-  default — without `/*` the block never matches anything.
+  default, without `/*` the block never matches anything.
 - **Variable:** `MISTRAL_API_KEY`, Mistral's own binding (the one opencode and
-  the docs both use). Mistral also offers an account login — the injected path
+  the docs both use). Mistral also offers an account login: the injected path
   is for the API **key**, not the OAuth account.
 
 ## Verifying
@@ -42,7 +42,7 @@ sbx run -- curl -sS https://api.mistral.ai/v1/models
 ```
 
 A `200` with the model listing means the header arrived; a `401` means it did
-not — check the filtering posture and that the allowlist reaches the host (see
+not: check the filtering posture and that the allowlist reaches the host (see
 the shared page).
 
 ---

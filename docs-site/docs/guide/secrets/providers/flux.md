@@ -1,15 +1,15 @@
 ---
-title: "`flux` — Black Forest Labs (Flux)"
+title: "`flux`: Black Forest Labs (Flux)"
 sidebar_label: "flux"
 description: "Black Forest Labs' image-generation API (the Flux family)."
 sidebar_position: 12
 ---
 
-# `flux` — Black Forest Labs (Flux)
+# `flux`: Black Forest Labs (Flux)
 
 Black Forest Labs' image-generation API (the Flux family). The shared
 mechanics, posture, and scoping are in [the shared page](../); this
-page only adds what is specific to BFL — **including a non-`Authorization`
+page only adds what is specific to BFL: **including a non-`Authorization`
 header, which is the one real twist here**.
 
 ```toml
@@ -27,16 +27,16 @@ export BFL_API_KEY=…
 
 ## Specifics
 
-- **Host:** `api.bfl.ai` — the global endpoint (regional variants
+- **Host:** `api.bfl.ai`, the global endpoint (regional variants
   `api.eu.bfl.ai` / `api.us.bfl.ai`, same header, separate blocks). Generation
   is async: submit `POST /v1/flux-2-…`, then poll the **`polling_url`** given
-  in the response — the same `x-key` applies there.
+  in the response, the same `x-key` applies there.
 - **Header is `x-key`, not `Authorization`:** the official API takes the key
   in the `x-key` request header, so this page uses `header = "x-key"` with
   `type = "raw"` (no `Bearer` prefix is applied). This is the provider-making
-  case for non-standard headers — everything else (`from`, fail-closed,
+  case for non-standard headers: everything else (`from`, fail-closed,
   host-scoping) behaves the same.
-- **Variable:** `BFL_API_KEY` — the env var the official SDK and guide use.
+- **Variable:** `BFL_API_KEY`, the env var the official SDK and guide use.
 - **Reference:** [https://docs.bfl.ai/](https://docs.bfl.ai/)
 
 ## Verifying
@@ -47,8 +47,8 @@ sbx run -- curl -sS -X POST https://api.bfl.ai/v1/flux-2-pro \
   -d '{"prompt":"a red cube","width":256,"height":256}'
 ```
 
-A `200` (or `402`/`429` — the key flowed, quota just not available) means the
-`x-key` reached the wire; a `401` means it did not — check the filtering
+A `200` (or `402`/`429`, the key flowed, quota just not available) means the
+`x-key` reached the wire; a `401` means it did not: check the filtering
 posture and that the allowlist reaches the host (see the shared page).
 
 ---

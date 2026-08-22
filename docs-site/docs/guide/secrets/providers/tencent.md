@@ -1,11 +1,11 @@
 ---
-title: "`tencent` — Tencent (TokenHub Coding Plan)"
+title: "`tencent`: Tencent (TokenHub Coding Plan)"
 sidebar_label: "tencent"
 description: "Tencent Cloud's agent-facing LLM surface (Hunyuan-la family, multi-provider merging)."
 sidebar_position: 35
 ---
 
-# `tencent` — Tencent (TokenHub Coding Plan)
+# `tencent`: Tencent (TokenHub Coding Plan)
 
 Tencent Cloud's agent-facing LLM surface (Hunyuan-la family, multi-provider
 merging). The shared mechanics, posture, and scoping are in [the shared
@@ -29,9 +29,9 @@ export TENCENT_CODING_PLAN_API_KEY=…
 - **Host:** `api.lkeap.cloud.tencent.com`, OpenAI-compatible coding surface at
   `/coding/v3` (a `/coding/anthropic` equivalent exists for Anthropic-format
   clients, same host).
-- **Variable:** `TENCENT_CODING_PLAN_API_KEY` — the Coding Plan **dedicated**
+- **Variable:** `TENCENT_CODING_PLAN_API_KEY`, the Coding Plan **dedicated**
   key, prefix `sk-sp-…`, minted on the Coding Plan page. Do **not** mix it
-  with the pay-as-you-go `sk-…` MaaS key `/tele…` on the same host — Tencent
+  with the pay-as-you-go `sk-…` MaaS key `/tele…` on the same host: Tencent
   refuses the cross-use.
 - **Trailing `/*` is load-bearing** (same rule as the opencode page): without
   it the block never matches beneath the base path.
@@ -44,7 +44,7 @@ sbx run -- curl -sS https://api.lkeap.cloud.tencent.com/coding/v3/models
 ```
 
 A `200` with the model listing means the header arrived; a `401` means it did
-not — check the filtering posture and that the allowlist reaches the host (see
+not: check the filtering posture and that the allowlist reaches the host (see
 the shared page).
 
 ---

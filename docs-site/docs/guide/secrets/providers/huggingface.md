@@ -1,11 +1,11 @@
 ---
-title: "`huggingface` — Hugging Face (Inference Providers)"
+title: "`huggingface`: Hugging Face (Inference Providers)"
 sidebar_label: "huggingface"
 description: "Hugging Face's router for the whole open-model catalog."
 sidebar_position: 17
 ---
 
-# `huggingface` — Hugging Face (Inference Providers)
+# `huggingface`: Hugging Face (Inference Providers)
 
 Hugging Face's router for the whole open-model catalog. The mechanics, posture,
 and scoping are in [the shared page](../); this page only adds what is
@@ -26,14 +26,14 @@ export HF_TOKEN=…
 
 ## Specifics
 
-- **Host:** `router.huggingface.co`, OpenAI-compatible layer at `/v1` — the
+- **Host:** `router.huggingface.co`, OpenAI-compatible layer at `/v1`, the
   server picks the fastest provider for the model you name (a token
   fine-grained to *Inference Providers* permission; account-scoped works too,
   but prefers least privilege).
-- **Variable:** `HF_TOKEN` — the env var the official docs and SDKs use
+- **Variable:** `HF_TOKEN`, the env var the official docs and SDKs use
   (`Authorization: Bearer $HF_TOKEN`).
 - **Scope of `/v1`:** chat completions (and the Responses API) only; embeddings
-  and other tasks stay on the per-provider endpoints — the full
+  and other tasks stay on the per-provider endpoints, the full
   `https://huggingface.co/api/**` surface and the classic
   `api-inference.huggingface.co` are separate hosts, add blocks only if the
   cage needs them.
@@ -49,7 +49,7 @@ sbx run -- curl -sS https://router.huggingface.co/v1/models
 ```
 
 A `200` with the model listing means the header arrived; a `401` means it did
-not — check the filtering posture and that the allowlist reaches the host (see
+not: check the filtering posture and that the allowlist reaches the host (see
 the shared page).
 
 ---

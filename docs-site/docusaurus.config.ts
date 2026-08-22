@@ -57,8 +57,10 @@ const config: Config = {
           // Wraps the number in a span for display (see custom.css
           // `.section-number`); the text is already in the heading.
           beforeDefaultRehypePlugins: [styleHeadingNumbers],
-          editUrl:
-            'https://github.com/gigi206/ops-cli/tree/docs/docusaurus/docs-site/',
+          // The branch the docs workflow publishes from, and the only one that
+          // carries docs-site/. `docs/docusaurus` was an early branch name that no
+          // longer exists, which made every page's "Edit this page" link a 404.
+          editUrl: 'https://github.com/gigi206/ops-cli/tree/ops-v2/docs-site/',
         },
         blog: false,
         theme: {
@@ -135,7 +137,7 @@ const config: Config = {
           items: [
             { label: 'GitHub', href: 'https://github.com/gigi206/ops-cli' },
             { label: 'Releases', href: 'https://github.com/gigi206/ops-cli/releases' },
-            { label: 'License', href: 'https://github.com/gigi206/ops-cli/blob/docs/docusaurus/LICENSE' },
+            { label: 'License', href: 'https://github.com/gigi206/ops-cli/blob/ops-v2/LICENSE' },
           ],
         },
       ],

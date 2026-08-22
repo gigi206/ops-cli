@@ -1,15 +1,15 @@
 ---
-title: "`opencode` — the OpenCode Zen and OpenCode Go gateways"
+title: "`opencode`: the OpenCode Zen and OpenCode Go gateways"
 sidebar_label: "opencode"
 description: "OpenCode's own pay-per-use gateways: one API key for both, giving access to the coding-optimized models on opencode's infrastructure."
 sidebar_position: 30
 ---
 
-# `opencode` — the OpenCode Zen and OpenCode Go gateways
+# `opencode`: the OpenCode Zen and OpenCode Go gateways
 
 OpenCode's own pay-per-use gateways: one API key for both, giving access to the
 coding-optimized models on opencode's infrastructure. Both are OpenAI-compatible
-endpoints that expect `Authorization: Bearer <key>` — the injection mechanics,
+endpoints that expect `Authorization: Bearer <key>`, the injection mechanics,
 posture, and scoping are in [the shared page](../); this page only adds
 what is specific to OpenCode.
 
@@ -40,7 +40,7 @@ export OPENCODE_API_KEY=oc_…
 ## Specifics
 
 - **Two gateways, one key.** Zen (`opencode.ai/zen/v1`) and Go
-  (`opencode.ai/zen/go/v1`) both bind `OPENCODE_API_KEY` — the variable is
+  (`opencode.ai/zen/go/v1`) both bind `OPENCODE_API_KEY`: the variable is
   opencode's own, not an sbx choice, so a single `export` authenticates both.
 - **Path-scoped on purpose.** The blocks target the gateway **paths**, not the
   bare host: the key is injected only into requests to `/zen/v1/*` and
@@ -60,7 +60,7 @@ sbx run -- curl -sS https://opencode.ai/zen/v1/models
 ```
 
 A `200` with the model listing means the header arrived; a `401` means it did
-not — check the filtering posture and that the allowlist carries the path (see
+not: check the filtering posture and that the allowlist carries the path (see
 the shared page). The `models` listing is the standard OpenAI-compatible
 endpoint the gateway exposes.
 

@@ -1,11 +1,11 @@
 ---
-title: "`zai` — Z.AI (GLM, ex-Zhipu)"
+title: "`zai`: Z.AI (GLM, ex-Zhipu)"
 sidebar_label: "zai"
 description: "Z.AI's hosted GLM models: an OpenAI-compatible API (api.z.ai), one key for both plans."
 sidebar_position: 41
 ---
 
-# `zai` — Z.AI (GLM, ex-Zhipu)
+# `zai`: Z.AI (GLM, ex-Zhipu)
 
 Z.AI's hosted GLM models: an OpenAI-compatible API (`api.z.ai`), one key for
 both plans. The mechanics, posture, and scoping are in [the shared
@@ -38,14 +38,14 @@ export ZHIPU_API_KEY=…
 - **Host:** `api.z.ai` (Zhipu AI is the company behind the GLM models; this
   binding is opencode's own, read from its provider table). The host also
   answers on `open.bigmodel.cn` (the CN edition) with the same variable.
-- **Variable:** `ZHIPU_API_KEY` — the name is the company's historical one,
+- **Variable:** `ZHIPU_API_KEY`, the name is the company's historical one,
   not a typo; both routes read it.
 - **One key, two plans.** `api/paas/v4` is the standard API,
   `api/coding/paas/v4` the Coding Plan; both take the same `Authorization:
   Bearer` key, so the two blocks differ only in the path.
 - **Trailing `/*` is load-bearing** (same rule as the opencode page): the real
   requests are `/api/paas/v4/chat/completions` and the like, and a path rule
-  matches exactly by default — without `/*` the block never matches anything.
+  matches exactly by default, without `/*` the block never matches anything.
 
 If you only use one plan, drop the other block.
 
@@ -56,7 +56,7 @@ sbx run -- curl -sS https://api.z.ai/api/paas/v4/models
 ```
 
 A `200` with the model listing means the header arrived; a `401` means it did
-not — check the filtering posture and that the allowlist reaches the host (see
+not: check the filtering posture and that the allowlist reaches the host (see
 the shared page).
 
 ---
