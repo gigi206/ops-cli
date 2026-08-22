@@ -467,6 +467,56 @@ pub(crate) fn arch_label(system: &str) -> &'static str {
     }
 }
 
+/// Select the linux asset URL matching `system` and `ext` from a GitHub release's JSON, where `ext`
+/// is the lowercased artefact suffix (`".deb"`, `".appimage"`). A release names its assets for every
+/// platform it ships, so the discriminant is CPU architecture, not the OS: an asset whose name names
+/// a *foreign* arch is dropped, then the survivors are ranked in three tiers.
+///
+/// The tiers are the whole point, and the first one is a fix rather than a nicety. An architecture
+/// token is preferred where it is **terminal** — `…_amd64.deb`, not `…_amd64-vulkan.deb` /
+/// `…_amd64-cuda.deb` — so a repo shipping GPU or feature variants beside the plain build resolves
+/// to the plain build, which is the sensible default. Without that tier the naive first-match takes
+/// the variant, because `sort()` orders `amd64-vulkan` before `amd64` (`-` sorts before `.`). The
+/// second tier accepts any asset positively naming this architecture (the token appears mid-name),
+/// and the third accepts a single unambiguous artefact with no arch token at all, for a single-arch
+/// repo. `sort()` makes the choice deterministic when several candidates tie within a tier.
+///
+/// One function and not one per backend: this ranking was fixed once for `deb:` and the `appimage:`
+/// copy did not receive the fix, so an AppImage repo publishing a same-arch feature variant selected
+/// the variant. Every backend now asks the same question, and the catalogue freshness check asks it
+/// too, so a catalogue check cannot pass a release whose asset the launch would refuse.
+///
+/// Pure, so selection is testable against captured release JSON.
+pub(crate) fn select_release_asset(
+    json: &serde_json::Value,
+    system: &str,
+    ext: &str,
+) -> Option<String> {
+    let (accept, reject) = arch_tokens(system);
+    let mut native: Vec<(String, String)> = json
+        .get("assets")?
+        .as_array()?
+        .iter()
+        .filter_map(|a| {
+            let name = a.get("name")?.as_str()?.to_ascii_lowercase();
+            let url = a.get("browser_download_url")?.as_str()?;
+            (name.ends_with(ext) && !reject.iter().any(|t| name.contains(t)))
+                .then(|| (name, url.to_string()))
+        })
+        .collect();
+    native.sort();
+    native
+        .iter()
+        .find(|(name, _)| accept.iter().any(|t| name.ends_with(&format!("{t}{ext}"))))
+        .or_else(|| {
+            native
+                .iter()
+                .find(|(name, _)| accept.iter().any(|t| name.contains(t)))
+        })
+        .or_else(|| native.first().filter(|_| native.len() == 1))
+        .map(|(_, url)| url.clone())
+}
+
 /// One prebuilt host-side package backend: `deb:`, `appimage:` or `tarball:`. The three share their
 /// whole lifecycle — pin the source on first use, build offline from that pin ever after, one gcroot
 /// per package — and differ only in where the artefact comes from and how the generated derivation

@@ -131,12 +131,13 @@ pub(crate) fn resolve_source(
         AppImageSource::Github { owner, repo } => {
             let api = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
             let json = super::nixhub::fetch_url_json(nix, layout, &api, fresh)?;
-            let url = select_appimage_asset(&json, system).ok_or_else(|| {
-                io::Error::other(format!(
-                    "no linux {} `.AppImage` asset in the latest release of {owner}/{repo}",
-                    prebuilt::arch_label(system)
-                ))
-            })?;
+            let url =
+                prebuilt::select_release_asset(&json, system, ".appimage").ok_or_else(|| {
+                    io::Error::other(format!(
+                        "no linux {} `.AppImage` asset in the latest release of {owner}/{repo}",
+                        prebuilt::arch_label(system)
+                    ))
+                })?;
             if !crate::config::is_valid_appimage_url(&url, allow_insecure_http) {
                 return Err(io::Error::other(format!(
                     "the latest release of {owner}/{repo} selected an asset URL that is not a \
@@ -150,32 +151,6 @@ pub(crate) fn resolve_source(
     // into the error; a first launch streams the download progress live.
     let hash = prebuilt::prefetch_hash(nix, layout, &url, fresh)?;
     Ok((url, hash))
-}
-
-/// Select the linux `.AppImage` asset URL matching `system` from a GitHub release's JSON. An
-/// AppImage is a Linux bundle by definition, so the discriminant is CPU architecture, not the OS: an
-/// asset whose name names a *foreign* arch is dropped, then one positively naming this arch is chosen
-/// (deterministic by name); a single unambiguous `.AppImage` with no arch token is the fallback for a
-/// single-arch repo. Pure, so selection is testable against captured release JSON.
-pub(super) fn select_appimage_asset(json: &serde_json::Value, system: &str) -> Option<String> {
-    let (accept, reject) = prebuilt::arch_tokens(system);
-    let mut native: Vec<(String, String)> = json
-        .get("assets")?
-        .as_array()?
-        .iter()
-        .filter_map(|a| {
-            let name = a.get("name")?.as_str()?.to_ascii_lowercase();
-            let url = a.get("browser_download_url")?.as_str()?;
-            (name.ends_with(".appimage") && !reject.iter().any(|t| name.contains(t)))
-                .then(|| (name, url.to_string()))
-        })
-        .collect();
-    native.sort();
-    native
-        .iter()
-        .find(|(name, _)| accept.iter().any(|t| name.contains(t)))
-        .or_else(|| native.first().filter(|_| native.len() == 1))
-        .map(|(_, url)| url.clone())
 }
 
 /// The generated nix expression building one `appimage:` package: fetch the pinned `.AppImage`,
@@ -381,7 +356,7 @@ mod tests {
     }
 
     // A trimmed capture of a desktop app's `releases/latest` asset set (the same names + URL shape a
-    // real release carries), the shape [`select_appimage_asset`] must pick from: one linux
+    // real release carries), the shape [`prebuilt::select_release_asset`] must pick from: one linux
     // `.AppImage` beside its update yml.
     const RELEASE_ASSETS: &str = r#"{
       "tag_name": "v0.0.28",
@@ -398,13 +373,16 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(RELEASE_ASSETS).unwrap();
         // x86_64 selects the x86_64 AppImage, never the update yml.
         assert_eq!(
-            select_appimage_asset(&json, "x86_64-linux").as_deref(),
+            prebuilt::select_release_asset(&json, "x86_64-linux", ".appimage").as_deref(),
             Some(
                 "https://github.com/example/demo-app/releases/download/v0.0.28/demo-app-0.0.28-x86_64.AppImage"
             )
         );
         // aarch64 host: no arm64 AppImage in this release → None (fail-closed, no guess).
-        assert_eq!(select_appimage_asset(&json, "aarch64-linux"), None);
+        assert_eq!(
+            prebuilt::select_release_asset(&json, "aarch64-linux", ".appimage"),
+            None
+        );
     }
 
     #[test]
@@ -417,7 +395,7 @@ mod tests {
             ]
         });
         assert_eq!(
-            select_appimage_asset(&multi, "x86_64-linux").as_deref(),
+            prebuilt::select_release_asset(&multi, "x86_64-linux", ".appimage").as_deref(),
             Some("https://e/x86_64.AppImage")
         );
         // a single AppImage with no arch token is taken (x86_64 host).
@@ -428,14 +406,38 @@ mod tests {
             ]
         });
         assert_eq!(
-            select_appimage_asset(&single, "x86_64-linux").as_deref(),
+            prebuilt::select_release_asset(&single, "x86_64-linux", ".appimage").as_deref(),
             Some("https://e/App.AppImage")
         );
         // no `.AppImage` at all → None (the caller turns this into a fail-closed error, no pin).
         let none = serde_json::json!({
             "assets": [ { "name": "app.deb", "browser_download_url": "https://e/app.deb" } ]
         });
-        assert_eq!(select_appimage_asset(&none, "x86_64-linux"), None);
+        assert_eq!(
+            prebuilt::select_release_asset(&none, "x86_64-linux", ".appimage"),
+            None
+        );
+    }
+
+    #[test]
+    fn select_appimage_asset_prefers_the_plain_arch_build_over_a_same_arch_gpu_variant() {
+        // The `deb:` twin of this case was fixed once (see `select_deb_asset_prefers_…` in
+        // `super::super::deb`); this backend shared the rule but not the fix, and selected the
+        // variant. The arch token sorts `x86_64-vulkan.appimage` before `x86_64.appimage`
+        // (`-` < `.`), so a first-contains match takes the variant; the terminal-arch preference in
+        // `prebuilt::select_release_asset` selects the plain build for both backends alike.
+        let json = serde_json::json!({
+            "assets": [
+                { "name": "Demo-App-1.43.0-x86_64-vulkan.AppImage",
+                  "browser_download_url": "https://e/Demo-App-1.43.0-x86_64-vulkan.AppImage" },
+                { "name": "Demo-App-1.43.0-x86_64.AppImage",
+                  "browser_download_url": "https://e/Demo-App-1.43.0-x86_64.AppImage" }
+            ]
+        });
+        assert_eq!(
+            prebuilt::select_release_asset(&json, "x86_64-linux", ".appimage").as_deref(),
+            Some("https://e/Demo-App-1.43.0-x86_64.AppImage")
+        );
     }
 
     #[test]

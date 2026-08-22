@@ -198,13 +198,10 @@ fn latest_release(repo: &str) -> Result<serde_json::Value, String> {
 /// prefers an architecture token that is **terminal** (`…_amd64.deb`, not `…_amd64-cuda.deb`) and
 /// falls back to a mid-name one, so an approximation would pass a release whose only asset the
 /// launch refuses — a green on an app that cannot start. This module exists to catch that class, so
-/// it asks the function the launch asks.
+/// it asks the function the launch asks: [`prebuilt::select_release_asset`], the one selector every
+/// backend resolves through, with this check's `ext` naming the artefact suffix.
 fn launcher_selects(json: &serde_json::Value, ext: &str) -> bool {
-    let system = super::current_system();
-    match ext {
-        ".deb" => super::deb::select_deb_asset(json, &system).is_some(),
-        _ => super::appimage::select_appimage_asset(json, &system).is_some(),
-    }
+    super::prebuilt::select_release_asset(json, &super::current_system(), ext).is_some()
 }
 
 #[test]

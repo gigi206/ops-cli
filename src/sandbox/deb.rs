@@ -650,7 +650,7 @@ fn github_asset_url(
     owner: &str,
     repo: &str,
 ) -> io::Result<String> {
-    let url = select_deb_asset(json, system).ok_or_else(|| {
+    let url = prebuilt::select_release_asset(json, system, ".deb").ok_or_else(|| {
         io::Error::other(format!(
             "no linux {} `.deb` asset in the latest release of {owner}/{repo}",
             prebuilt::arch_label(system)
@@ -663,38 +663,6 @@ fn github_asset_url(
         )));
     }
     Ok(url)
-}
-
-pub(super) fn select_deb_asset(json: &serde_json::Value, system: &str) -> Option<String> {
-    let (accept, reject) = prebuilt::arch_tokens(system);
-    let mut native: Vec<(String, String)> = json
-        .get("assets")?
-        .as_array()?
-        .iter()
-        .filter_map(|a| {
-            let name = a.get("name")?.as_str()?.to_ascii_lowercase();
-            let url = a.get("browser_download_url")?.as_str()?;
-            (name.ends_with(".deb") && !reject.iter().any(|t| name.contains(t)))
-                .then(|| (name, url.to_string()))
-        })
-        .collect();
-    native.sort();
-    native
-        .iter()
-        // Prefer an asset whose architecture token is *terminal* — `…_amd64.deb`, not
-        // `…_amd64-vulkan.deb` / `…_amd64-cuda.deb` — so a repo shipping GPU/feature variants of the
-        // same architecture resolves to the plain build (the sensible default). `sort()` above makes
-        // the choice deterministic when several plain builds somehow tie.
-        .find(|(name, _)| accept.iter().any(|t| name.ends_with(&format!("{t}.deb"))))
-        // Otherwise any asset positively naming this architecture (the arch token appears mid-name).
-        .or_else(|| {
-            native
-                .iter()
-                .find(|(name, _)| accept.iter().any(|t| name.contains(t)))
-        })
-        // Finally, a single unambiguous `.deb` with no arch token, for a single-arch repo.
-        .or_else(|| native.first().filter(|_| native.len() == 1))
-        .map(|(_, url)| url.clone())
 }
 
 /// The generated nix expression building one `deb:` package: fetch the pinned `.deb`, unpack it, and
@@ -976,7 +944,7 @@ mod tests {
     }
 
     // A trimmed capture of a desktop app's `releases/latest` asset set (the same names + URL shape a
-    // real release carries), the shape [`select_deb_asset`] must pick from: two linux `.deb`s (amd64
+    // real release carries), the shape [`prebuilt::select_release_asset`] must pick from: two linux `.deb`s (amd64
     // + arm64) beside mac/win.
     const RELEASE_ASSETS: &str = r#"{
       "tag_name": "v2.1.35",
@@ -1006,7 +974,7 @@ mod tests {
         // The selection itself is scheme-agnostic: it finds the asset, and the refusal is the
         // validation, so this test is about the gate and not about a failure to find anything.
         assert_eq!(
-            select_deb_asset(&http_asset, "x86_64-linux").as_deref(),
+            prebuilt::select_release_asset(&http_asset, "x86_64-linux", ".deb").as_deref(),
             Some("http://e/demo-app_1.0_amd64.deb")
         );
         let err = github_asset_url(&http_asset, "x86_64-linux", "o", "r")
@@ -1034,14 +1002,14 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(RELEASE_ASSETS).unwrap();
         // x86_64 selects the amd64 deb, never the arm64 deb or the mac/win assets.
         assert_eq!(
-            select_deb_asset(&json, "x86_64-linux").as_deref(),
+            prebuilt::select_release_asset(&json, "x86_64-linux", ".deb").as_deref(),
             Some(
                 "https://github.com/example/demo-app/releases/download/v2.1.35/demo-app-2.1.35-linux-amd64.deb"
             )
         );
         // aarch64 selects the arm64 deb from the same release.
         assert_eq!(
-            select_deb_asset(&json, "aarch64-linux").as_deref(),
+            prebuilt::select_release_asset(&json, "aarch64-linux", ".deb").as_deref(),
             Some(
                 "https://github.com/example/demo-app/releases/download/v2.1.35/demo-app-2.1.35-linux-arm64.deb"
             )
@@ -1058,14 +1026,17 @@ mod tests {
             ]
         });
         assert_eq!(
-            select_deb_asset(&single, "x86_64-linux").as_deref(),
+            prebuilt::select_release_asset(&single, "x86_64-linux", ".deb").as_deref(),
             Some("https://e/myapp_1.2.3.deb")
         );
         // no `.deb` at all → None (the caller turns this into a fail-closed error, no pin).
         let none = serde_json::json!({
             "assets": [ { "name": "app.AppImage", "browser_download_url": "https://e/app.AppImage" } ]
         });
-        assert_eq!(select_deb_asset(&none, "x86_64-linux"), None);
+        assert_eq!(
+            prebuilt::select_release_asset(&none, "x86_64-linux", ".deb"),
+            None
+        );
         // two arch-tokened debs but neither native, and >1 survivor → ambiguous → None (no guess).
         let foreign = serde_json::json!({
             "assets": [
@@ -1073,7 +1044,10 @@ mod tests {
                 { "name": "app-armhf.deb", "browser_download_url": "https://e/armhf.deb" }
             ]
         });
-        assert_eq!(select_deb_asset(&foreign, "x86_64-linux"), None);
+        assert_eq!(
+            prebuilt::select_release_asset(&foreign, "x86_64-linux", ".deb"),
+            None
+        );
     }
 
     #[test]
@@ -1090,7 +1064,7 @@ mod tests {
             ]
         });
         assert_eq!(
-            select_deb_asset(&json, "x86_64-linux").as_deref(),
+            prebuilt::select_release_asset(&json, "x86_64-linux", ".deb").as_deref(),
             Some("https://e/demo-app_1.43.0_amd64.deb")
         );
     }
