@@ -42,7 +42,7 @@ host_greets = true                 # the host speaks first, before the cage asks
 inspect_replies = true             # also rule on what the host resource answers
 ```
 
-Four rules a broker manifest is held to, each refused at load rather than at
+Seven rules a broker manifest is held to, each refused at load rather than at
 launch:
 
 - **`network` and `state` are refused.** `sbx` opens the connection for the
