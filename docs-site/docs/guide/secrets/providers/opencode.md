@@ -9,8 +9,8 @@ sidebar_position: 30
 
 OpenCode's own pay-per-use gateways: one API key for both, giving access to the
 coding-optimized models on opencode's infrastructure. Both are OpenAI-compatible
-endpoints that expect `Authorization: Bearer <key>`, the injection mechanics,
-posture, and scoping are in [the shared page](../); this page only adds
+endpoints that expect `Authorization: Bearer <key>`; the injection mechanics,
+posture, and scoping are in [Secrets](../); this page only adds
 what is specific to OpenCode.
 
 ```toml
@@ -60,8 +60,7 @@ sbx run -- curl -sS https://opencode.ai/zen/v1/models
 ```
 
 A `200` with the model listing means the header arrived; a `401` means it did
-not: check the filtering posture and that the allowlist carries the path (see
-the shared page). The `models` listing is the standard OpenAI-compatible
+not: check the filtering posture and that the allowlist carries the path (see [Secrets](../)). The `models` listing is the standard OpenAI-compatible
 endpoint the gateway exposes.
 
 ---

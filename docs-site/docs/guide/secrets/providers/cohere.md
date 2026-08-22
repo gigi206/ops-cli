@@ -7,7 +7,7 @@ sidebar_position: 8
 
 # `cohere`: Cohere
 
-Cohere's hosted API (Command models). The mechanics, posture, and scoping are in [the shared page](../); this page only adds what is specific to Cohere.
+Cohere's hosted API (Command models). The mechanics, posture, and scoping are in [Secrets](../); this page only adds what is specific to Cohere.
 
 ```toml
 [secret."api.cohere.com/v2/*"]
@@ -26,7 +26,7 @@ export COHERE_API_KEY=…
 
 - **Host:** `api.cohere.com`, path `/v2`; the binding opencode ships is `https://api.cohere.com/v2`.
 - **Variable:** `COHERE_API_KEY`, the env var both the SDK and the docs use.
-- **Trailing `/*` is load-bearing** (same rule as the opencode page): the real requests live below the base path, and a path rule matches exactly by default, without `/*` the block never matches anything.
+- **Trailing `/*` is load-bearing** (same rule as the opencode page): the real requests live below the base path, and a path rule matches exactly by default; without `/*` the block never matches anything.
 - **Reference:** [https://docs.cohere.com/docs/models](https://docs.cohere.com/docs/models)
 
 ## Verifying
@@ -35,7 +35,7 @@ export COHERE_API_KEY=…
 sbx run -- curl -sS https://api.cohere.com/v2/models
 ```
 
-A `200` with the model listing means the header arrived; a `401` means it did not: check the filtering posture and that the allowlist reaches the host (see the shared page).
+A `200` with the model listing means the header arrived; a `401` means it did not: check the filtering posture and that the allowlist reaches the host (see [Secrets](../)).
 
 ---
 

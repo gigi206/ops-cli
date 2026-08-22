@@ -1,4 +1,4 @@
-# `github-copilot` — GitHub Copilot (API individuelle)
+# `github-copilot` — GitHub Copilot (individual API)
 
 GitHub's OpenAI-compatible Copilot surface — **individual** subscriptions
 (`api.individual.githubcopilot.com`). The mechanics, posture, and scoping are

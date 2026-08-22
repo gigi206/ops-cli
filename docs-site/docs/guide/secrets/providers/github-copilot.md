@@ -1,15 +1,15 @@
 ---
-title: "`github-copilot`: GitHub Copilot (API individuelle)"
+title: "`github-copilot`: GitHub Copilot (individual API)"
 sidebar_label: "github-copilot"
-description: "GitHub's OpenAI-compatible Copilot surface: individual subscriptions (api.individual.githubcopilot.com)."
+description: "GitHub's OpenAI-compatible Copilot surface; individual subscriptions (api.individual.githubcopilot.com)."
 sidebar_position: 14
 ---
 
-# `github-copilot`: GitHub Copilot (API individuelle)
+# `github-copilot`: GitHub Copilot (individual API)
 
-GitHub's OpenAI-compatible Copilot surface: **individual** subscriptions
+GitHub's OpenAI-compatible Copilot surface; **individual** subscriptions
 (`api.individual.githubcopilot.com`). The mechanics, posture, and scoping are
-in [the shared page](../); this page only adds what is specific to
+in [Secrets](../); this page only adds what is specific to
 GitHub Copilot.
 
 ```toml
@@ -27,7 +27,7 @@ export GITHUB_COPILOT_API_TOKEN=…
 
 ## Specifics
 
-- **Host:** `api.individual.githubcopilot.com`, the OpenAI-compatible layer
+- **Host:** `api.individual.githubcopilot.com`: the OpenAI-compatible layer
   for personal Copilot accounts (`/models`, `/chat/completions`, …).
   Enterprise tenants are `api.{tenant}.githubcopilot.com`: a dynamic host,
   **not** coverable by a `[secret]` block (same rule as Azure).
@@ -36,12 +36,12 @@ export GITHUB_COPILOT_API_TOKEN=…
   exchanging a GitHub token (PAT with `copilot` scope, or `ghu_…`) against
   `GET api.github.com/copilot_internal/v2/token`, host-side. It expires in
   **~30 minutes**, so this example is only livable behind a refresher (or a
-  resolver plugin that re-mints it on each resolution, the exchange is
+  resolver plugin that re-mints it on each resolution: the exchange is
   invisible to the cage, an ideal `oc-oauth`-style target). A plain
   long-lived PAT in this slot gets `401`/`403`: the API does not accept it.
 - **Mandatory companion headers:** the API refuses valid sessions without
   `Copilot-Integration-Id` (plus `User-Agent`, `Editor-…` version headers, and
-  `Accept: text/event-stream` on streaming), *403 « token not authorized*» .
+  `Accept: text/event-stream` on streaming): *403 « token not authorized*» .
   `[secret]` sets only `Authorization`; have the **client** send those (any
   OpenAI-compatible client with extra-headers support).
 - **Trailing `/*` is load-bearing** (same rule as the opencode page): without
@@ -57,7 +57,7 @@ sbx run -- curl -sS https://api.individual.githubcopilot.com/models
 
 A `200` with the model listing means the session header arrived; a `401`/`403`
 means the token in the slot is stale or has no session: re-mint it (or let the
-plugin do it) and check the posture/allowlist (see the shared page).
+plugin do it) and check the posture/allowlist (see [Secrets](../)).
 
 ---
 

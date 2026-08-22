@@ -8,8 +8,7 @@ sidebar_position: 35
 # `tencent`: Tencent (TokenHub Coding Plan)
 
 Tencent Cloud's agent-facing LLM surface (Hunyuan-la family, multi-provider
-merging). The shared mechanics, posture, and scoping are in [the shared
-page](../); this page only adds what is specific to Tencent.
+merging). The shared mechanics, posture, and scoping are in [Secrets](../); this page only adds what is specific to Tencent.
 
 ```toml
 [secret."api.lkeap.cloud.tencent.com/coding/v3/*"]
@@ -44,8 +43,7 @@ sbx run -- curl -sS https://api.lkeap.cloud.tencent.com/coding/v3/models
 ```
 
 A `200` with the model listing means the header arrived; a `401` means it did
-not: check the filtering posture and that the allowlist reaches the host (see
-the shared page).
+not: check the filtering posture and that the allowlist reaches the host (see [Secrets](../)).
 
 ---
 

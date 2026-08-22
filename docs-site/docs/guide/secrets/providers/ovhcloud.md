@@ -8,7 +8,7 @@ sidebar_position: 32
 # `ovhcloud`: OVHcloud (AI Endpoints)
 
 OVHcloud's hosted model API (European, sovereign cloud). The shared mechanics,
-posture, and scoping are in [the shared page](../); this page only
+posture, and scoping are in [Secrets](../); this page only
 adds what is specific to OVHcloud.
 
 ```toml
@@ -45,8 +45,7 @@ sbx run -- curl -sS https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/models
 ```
 
 A `200` with the model listing means the header arrived; a `401` means it did
-not: check the filtering posture and that the allowlist reaches the host (see
-the shared page).
+not: check the filtering posture and that the allowlist reaches the host (see [Secrets](../)).
 
 ---
 

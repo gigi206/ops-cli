@@ -24,9 +24,9 @@ export KLINGAI_API_KEY=…
   shows and make it the block's host).
 - **Variable:** `KLINGAI_API_KEY` — the single-key scheme, which Kuaishou now
   recommends; the legacy scheme (`KLINGAI_ACCESS_KEY`/`KLINGAI_SECRET_KEY`)
-  mints a short-lived JWT **per request** — that is Bedrock-style, not
-  injectable, and the reasons to prefer the single key.
-- **Trailing `/*` is load-bearing** (same rule as theopencode page): without
+  mints a short-lived JWT **per request**, which is Bedrock-style and not
+  injectable, and is the reason to prefer the single key.
+- **Trailing `/*` is load-bearing** (same rule as the opencode page): without
   it the block never matches beneath the base path.
 - **Reference:** <https://kling.ai/document-api/>
 

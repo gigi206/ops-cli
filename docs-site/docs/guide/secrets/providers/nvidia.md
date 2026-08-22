@@ -9,7 +9,7 @@ sidebar_position: 27
 
 NVIDIA's hosted AI models (the NIM API behind build.nvidia.com): an
 OpenAI-compatible endpoint, one key for the whole catalogue. The injection
-mechanics, posture, and scoping are in [the shared page](../); this
+mechanics, posture, and scoping are in [Secrets](../); this
 page only adds what is specific to NVIDIA.
 
 ```toml
@@ -33,7 +33,7 @@ export NVIDIA_API_KEY=nvapi-…
   both use; a key minted on build.nvidia.com (`nvapi-…`).
 - **Tracking headers:** NVIDIA asks clients to send `HTTP-Referer` and
   `X-Title` for attribution; these are application-level headers, not
-  credentials, they belong in the agent's config, not in `[secret]`.
+  credentials: they belong in the agent's config, not in `[secret]`.
 
 ## Verifying
 
@@ -42,8 +42,7 @@ sbx run -- curl -sS https://integrate.api.nvidia.com/v1/models
 ```
 
 A `200` with the model listing means the header arrived; a `401` means it did
-not: check the filtering posture and that the allowlist reaches the host (see
-the shared page).
+not: check the filtering posture and that the allowlist reaches the host (see [Secrets](../)).
 
 ---
 

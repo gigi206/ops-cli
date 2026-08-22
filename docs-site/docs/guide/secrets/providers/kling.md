@@ -8,7 +8,7 @@ sidebar_position: 20
 # `kling`: Kling AI (video)
 
 Kuaishou's video-generation API. The shared mechanics, posture, and scoping are
-in [the shared page](../); this page only adds what is specific to
+in [Secrets](../); this page only adds what is specific to
 Kling.
 
 ```toml
@@ -26,14 +26,14 @@ export KLINGAI_API_KEY=…
 
 ## Specifics
 
-- **Host:** `api-singapore.klingai.com`, the API-key default region prefix
+- **Host:** `api-singapore.klingai.com`: the API-key default region prefix
   (Kuaishou serves regional prefixes per account; pick the one your console
   shows and make it the block's host).
 - **Variable:** `KLINGAI_API_KEY`, the single-key scheme, which Kuaishou now
   recommends; the legacy scheme (`KLINGAI_ACCESS_KEY`/`KLINGAI_SECRET_KEY`)
-  mints a short-lived JWT **per request**, that is Bedrock-style, not
-  injectable, and the reasons to prefer the single key.
-- **Trailing `/*` is load-bearing** (same rule as theopencode page): without
+  mints a short-lived JWT **per request**, which is Bedrock-style and not
+  injectable, and is the reason to prefer the single key.
+- **Trailing `/*` is load-bearing** (same rule as the opencode page): without
   it the block never matches beneath the base path.
 - **Reference:** [https://kling.ai/document-api/](https://kling.ai/document-api/)
 
@@ -45,9 +45,9 @@ sbx run -- curl -sS -X POST https://api-singapore.klingai.com/api/v1/videos/text
   -d '{"model_name":"kling-v1","prompt":"a red cube","duration":"5s"}'
 ```
 
-A non-`401` (generation accepted, or a quota/validation error, the key
+A non-`401` (generation accepted, or a quota/validation error: the key
 flowed) proves the header arrived; a `401` means it did not: check the
-filtering posture and the allowlist (see the shared page).
+filtering posture and the allowlist (see [Secrets](../)).
 
 ---
 

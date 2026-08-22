@@ -29,7 +29,7 @@ export LUMA_API_KEY=…
 - **Verify note:** a `GET …/dream-machine/v1/generations` without the header
   returns `401` — with it, `200` and the (possibly empty) history: a cheap,
   side-effect-free check.
-- **Trailing `/*` is load-bearing** (same rule as theopencode page): without
+- **Trailing `/*` is load-bearing** (same rule as the opencode page): without
   it the block never matches beneath the base path.
 - **Reference:** <https://docs.lumalabs.ai/docs/api>
 

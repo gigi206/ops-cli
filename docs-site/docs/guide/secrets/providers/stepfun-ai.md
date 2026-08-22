@@ -7,7 +7,7 @@ sidebar_position: 34
 
 # `stepfun-ai`: StepFun (Global)
 
-StepFun's hosted API (Step models). The mechanics, posture, and scoping are in [the shared page](../); this page only adds what is specific to StepFun (Global).
+StepFun's hosted API (Step models). The mechanics, posture, and scoping are in [Secrets](../); this page only adds what is specific to StepFun (Global).
 
 ```toml
 [secret."api.stepfun.ai/v1/*"]
@@ -26,7 +26,7 @@ export STEPFUN_API_KEY=…
 
 - **Host:** `api.stepfun.ai`, path `/v1`; the binding opencode ships is `https://api.stepfun.ai/v1`.
 - **Variable:** `STEPFUN_API_KEY`, the env var both the SDK and the docs use.
-- **Trailing `/*` is load-bearing** (same rule as the opencode page): the real requests live below the base path, and a path rule matches exactly by default, without `/*` the block never matches anything.
+- **Trailing `/*` is load-bearing** (same rule as the opencode page): the real requests live below the base path, and a path rule matches exactly by default; without `/*` the block never matches anything.
 - **Reference:** [https://platform.stepfun.ai/docs/en/overview/concept](https://platform.stepfun.ai/docs/en/overview/concept)
 
 ## Verifying
@@ -35,7 +35,7 @@ export STEPFUN_API_KEY=…
 sbx run -- curl -sS https://api.stepfun.ai/v1/models
 ```
 
-A `200` with the model listing means the header arrived; a `401` means it did not: check the filtering posture and that the allowlist reaches the host (see the shared page).
+A `200` with the model listing means the header arrived; a `401` means it did not: check the filtering posture and that the allowlist reaches the host (see [Secrets](../)).
 
 ---
 

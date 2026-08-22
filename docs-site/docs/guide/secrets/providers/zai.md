@@ -8,8 +8,7 @@ sidebar_position: 41
 # `zai`: Z.AI (GLM, ex-Zhipu)
 
 Z.AI's hosted GLM models: an OpenAI-compatible API (`api.z.ai`), one key for
-both plans. The mechanics, posture, and scoping are in [the shared
-page](../); this page only adds what is specific to Z.AI.
+both plans. The mechanics, posture, and scoping are in [Secrets](../); this page only adds what is specific to Z.AI.
 
 ```toml
 # Z.AI — the standard plan.
@@ -45,7 +44,7 @@ export ZHIPU_API_KEY=…
   Bearer` key, so the two blocks differ only in the path.
 - **Trailing `/*` is load-bearing** (same rule as the opencode page): the real
   requests are `/api/paas/v4/chat/completions` and the like, and a path rule
-  matches exactly by default, without `/*` the block never matches anything.
+  matches exactly by default; without `/*` the block never matches anything.
 
 If you only use one plan, drop the other block.
 
@@ -56,8 +55,7 @@ sbx run -- curl -sS https://api.z.ai/api/paas/v4/models
 ```
 
 A `200` with the model listing means the header arrived; a `401` means it did
-not: check the filtering posture and that the allowlist reaches the host (see
-the shared page).
+not: check the filtering posture and that the allowlist reaches the host (see [Secrets](../)).
 
 ---
 

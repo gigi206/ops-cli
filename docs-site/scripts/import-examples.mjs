@@ -30,16 +30,70 @@ const BANNER = (name) =>
 function noEmDash(body) {
   const fences = [];
   const masked = body.replace(/```[\s\S]*?```/g, (m) => `\u0000${fences.push(m) - 1}\u0000`);
-  const out = masked.replace(/(\s+)—(\s+)/g, (m, ws1, ws2, offset, whole) => {
-    // The sentence so far decides the punctuation: a second colon in one sentence
-    // reads worse than the comma, and so does a colon inside a parenthesis.
-    const sentence = whole.slice(0, offset).split(/(?<=[.!?])\s|\n\n/).pop() ?? '';
-    const open = (sentence.match(/\(/g) ?? []).length > (sentence.match(/\)/g) ?? []).length;
-    const punct = open || sentence.includes(':') ? ',' : ':';
-    const ws = ws1.includes('\n') ? ws1 : ws2.includes('\n') ? ws2 : ' ';
-    return punct + ws;
-  });
-  return out.replace(/\u0000(\d+)\u0000/g, (_, i) => fences[Number(i)]);
+
+  // One pass, carrying two facts about the sentence being read: whether the dash sits inside an
+  // unclosed parenthesis, and whether this sentence has already been given a colon. The second is
+  // what a closing dash needs to know: the opening half took the colon, so the closing half is a
+  // comma rather than a second introduction.
+  let out = '';
+  let last = 0;
+  let depth = 0;
+  let colonUsed = false;
+  let colonInParen = false;
+  const dash = /(\s+)—(\s+)/g;
+  for (let i = 0; i < masked.length; i += 1) {
+    const ch = masked[i];
+    if (ch === '(') {
+      depth += 1;
+      if (depth === 1) colonInParen = false;
+    } else if (ch === ')') depth = Math.max(0, depth - 1);
+    // A colon that closes a bold label (`- **Variable:** …`) punctuates the label, not the
+    // sentence, so it leaves the sentence's one colon still available.
+    else if (ch === ':' && masked.slice(i + 1, i + 3) !== '**') {
+      if (depth > 0) colonInParen = true;
+      else colonUsed = true;
+    }
+    else if (ch === '.' || ch === '!' || ch === '?') {
+      depth = 0;
+      colonUsed = false;
+    } else if (ch === '—') {
+      dash.lastIndex = Math.max(0, i - 40);
+      let m;
+      while ((m = dash.exec(masked)) !== null && m.index + m[1].length < i);
+      if (!m || m.index + m[1].length !== i) continue;
+      const [, ws1, ws2] = m;
+      // A sentence gets one colon. After that the closing half of a parenthetical is a comma
+      // when what follows leans on the clause before it (`so`, `and`, `which`), and a semicolon
+      // when what follows stands on its own.
+      const after = masked.slice(i + 1, i + 1 + m[2].length + 12).trimStart().toLowerCase();
+      const leans = /^(so|and|but|or|yet|nor|which|because|since|while|though)\b/.test(after);
+      // `- **Variable:** `X` — the env var …` is apposition after a label, not a new clause:
+      // the label already took a colon, so a second one reads heavy and a semicolon reads wrong.
+      const lineStart = masked.lastIndexOf('\n', i) + 1;
+      const label = /^\s*[-*]\s+\*\*[^*]+:\*\*[^—.]*$/.test(masked.slice(lineStart, i));
+      const punct = label
+        ? ','
+        : depth > 0
+          ? colonInParen
+            ? ','
+            : ':'
+          : colonUsed
+            ? leans
+              ? ','
+              : ';'
+            : ':';
+      if (punct === ':') {
+        if (depth > 0) colonInParen = true;
+        else colonUsed = true;
+      }
+      const ws = ws1.includes('\n') ? ws1 : ws2.includes('\n') ? ws2 : ' ';
+      out += masked.slice(last, m.index) + punct + ws;
+      last = m.index + m[0].length;
+      i = last - 1;
+    }
+  }
+  out += masked.slice(last);
+  return out.replace(/\u0000(\d+)\u0000/g, (_, n) => fences[Number(n)]);
 }
 
 /** Strip code spans and fences, to test the prose that is left. */
@@ -52,6 +106,11 @@ function rewrite(body, name) {
   const out = body
     // MDX v3 parses `<` as JSX, so CommonMark's <https://…> is a syntax error there.
     .replace(/<(https?:\/\/[^>\s]+)>/g, '[$1]($1)')
+    // "the shared page" is `examples/secrets/README.md`, which the site does not have:
+    // on a published page the reader is in the Secrets section, so name it.
+    .replace(/\[the\s+shared\s+page\]\(\.\.\/README\.md\)/g, '[Secrets](../)')
+    .replace(/\(see\s+the\s+shared\s+page\)/g, '(see [Secrets](../))')
+    .replace(/\bthe\s+shared\s+page\b/g, '[Secrets](../)')
     .replace(/\]\(\.\.\/README\.md\)/g, '](../)')
     .replace(/\]\(\.\.\/([a-z0-9-]+)\/README\.md\)/g, ']($1)')
     // a sibling recipe, referenced as its directory in the repository

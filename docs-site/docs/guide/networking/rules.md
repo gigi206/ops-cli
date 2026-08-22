@@ -440,7 +440,7 @@ The bounded `*.domain` subdomain wildcard is unaffected (its host is `*.domain`,
 
 Each list is pointed at the way out **its own author** was reaching for:
 
-| where you wrote `*` | what you probably meant | what the error says |
+| where you wrote `*` | what it was reaching for | what the error says |
 |---|---|---|
 | `allow` | let everything through | `mode = "shared"` (no proxy), or `mode = "allow"` to stay proxied |
 | `deny` | let nothing through | `mode = "none"`, or `mode = "deny"` with the hosts you want in `allow` |

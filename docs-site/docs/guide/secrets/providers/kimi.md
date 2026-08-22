@@ -8,7 +8,7 @@ sidebar_position: 19
 # `kimi`: Kimi (Code)
 
 Kimi's coding lane, dedicated to agentic tooling. The mechanics, posture, and
-scoping are in [the shared page](../); this page only adds what is
+scoping are in [Secrets](../); this page only adds what is
 specific to Kimi.
 
 ```toml
@@ -26,7 +26,7 @@ export KIMI_API_KEY=…
 
 ## Specifics
 
-- **Host:** `api.kimi.com`, coding gateway at `/coding/v1`, model
+- **Host:** `api.kimi.com`, coding gateway at `/coding/v1`: model
   `kimi-for-coding` (`-highspeed` variant available).
 - **Variable:** `KIMI_API_KEY`, the env var the coding integrations use
   (`Authorization: Bearer $KIMI_API_KEY`).
@@ -45,8 +45,7 @@ sbx run -- curl -sS https://api.kimi.com/coding/v1/models
 ```
 
 A `200` with the model list* means the header arrived; a `401` means it did
-not: check the filtering posture and that the allowlist reaches the host (see
-the shared page).
+not: check the filtering posture and that the allowlist reaches the host (see [Secrets](../)).
 
 ---
 

@@ -9,7 +9,7 @@ sidebar_position: 7
 
 Cloudflare's model inference on the edge (Workers AI `@cf/*` models and
 third-party models routed through AI Gateway). The mechanics, posture, and
-scoping are in [the shared page](../); this page only adds what is
+scoping are in [Secrets](../); this page only adds what is
 specific to Cloudflare.
 
 ```toml
@@ -28,14 +28,14 @@ export CLOUDFLARE_API_TOKEN=…
 ## Specifics
 
 - **Host:** `api.cloudflare.com`, OpenAI-compatible surface at
-  `/client/v4/accounts/{account_id}/ai/v1`, the **account ID lives in the
+  `/client/v4/accounts/{account_id}/ai/v1`: the **account ID lives in the
   URL**, so the destination wildcard pins it to the path the client uses, not
   to the credential.
 - **Variable:** `CLOUDFLARE_API_TOKEN`, an API token (never your Global API
   key) with **Account › Workers AI › Read** permission; a token holding only
   AI Gateway permission is refused (`401`, error `10000`).
 - **Routing:** the outer `*` absorbs the account ID segment; requests to
-  `gateway.ai.cloudflare.com` (provider-native endpoints) are a different host,
+  `gateway.ai.cloudflare.com` (provider-native endpoints) are a different host:
   separate block, and there the credential travels as `cf-aig-authorization`
   (`header = "cf-aig-authorization"`, `type = "bearer"`) rather than
   `Authorization`.
@@ -51,7 +51,7 @@ sbx run -- curl -sS https://api.cloudflare.com/client/v4/accounts/YOUR_ACCOUNT_I
 
 A `200` with the model listing means the header arrived; a `401` (error
 `10000`) means it did not: check the filtering posture and that the
-allowlist reaches the host (see the shared page).
+allowlist reaches the host (see [Secrets](../)).
 
 ---
 

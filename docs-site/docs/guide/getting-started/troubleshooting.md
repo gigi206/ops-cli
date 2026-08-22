@@ -28,7 +28,7 @@ user namespace there is no security boundary. Fix the listed item (usually bubbl
 `kernel.apparmor_restrict_unprivileged_userns` sysctl) and re-run. See
 [Prerequisites](doctor).
 
-## `sbx run` refuses to start, and my config is silently ignored
+## The launch works, but the project's config is silently ignored
 
 A brand-new project's `.sbx.toml` is **untrusted**, so its security-relevant fields are
 ignored until you approve it:

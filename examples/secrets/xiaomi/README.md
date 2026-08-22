@@ -22,7 +22,7 @@ export MIMO_API_KEY=…
 - **Host:** `api.xiaomimimo.com`, OpenAI-compatible layer at `/v1` (a
   `/anthropic` variant exists on the same host).
 - **Variable:** `MIMO_API_KEY` — the env var the official docs and SDKs use.
-  Two credential flavours exist, refuse to mix them: pay-as-you-go `sk-…`
+  Two credential flavours exist and must not be mixed: pay-as-you-go `sk-…`
   (`api.xiaomimimo.com`) and Token Plan `tp-…`
   (`token-plan-cn.xiaomimimo.com`, per-plan host — second block if needed).
 - **Either header:** the official API accepts both `api-key: $MIMO_API_KEY`

@@ -269,8 +269,8 @@ The log's verdicts are a **superset** of the `stats` counters:
 
 `error` is the extra one: it is **not** a `stats` counter (stats count policy
 verdicts, not transport failures), so *the log's lines do not reconcile with
-`sbx net stats` totals*. "Allowed but it failed" reads differently from "we said
-no," which is the log's whole job: answering *why did it fail just now?*
+`sbx net stats` totals*. "Allowed but it failed" reads differently from "the policy
+said no", which is the log's whole job: answering *why did it fail just now?*
 
 ### `--with-status` and `--with-query`
 

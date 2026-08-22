@@ -1,4 +1,4 @@
-# `meta-ai` — Meta (Model API) API)
+# `meta-ai` — Meta (Model API)
 
 Meta's paid developer API for its flagship models (Muse Spark) — distinct from
 the Llama API page (`llama/`), which is a different surface and a different
