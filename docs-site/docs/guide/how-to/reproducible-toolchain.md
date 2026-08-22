@@ -76,7 +76,6 @@ sbx store         # see what sbx occupies before deciding
 
 Reference: [`sbx gc`](../cli/gc), [`sbx store`](../cli/store).
 
-
 ## Where to go next
 
 - [Choose the tools an agent cage needs](recommended-tools): which tools are worth

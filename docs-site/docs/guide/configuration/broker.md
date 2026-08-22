@@ -133,7 +133,7 @@ guess which was which.
 On the way back, a reply carrying the credential is **refused, not stripped**: a partial
 strip gives false confidence, and an encoded value defeats it anyway. It is a tripwire, not
 a wall, exactly as on the [egress side](../secrets/redaction). A credential shorter than the
-[`[redact] min_len`](../configuration/network) floor is placed but **not** watched, and the
+[`[redact] min_len`](../secrets/redaction#the-length-floor) floor is placed but **not** watched, and the
 launch says so: a scan that short refuses innocent traffic more often than it catches a leak.
 
 ### What this does and does not cover

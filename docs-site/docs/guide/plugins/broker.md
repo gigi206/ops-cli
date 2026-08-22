@@ -4,7 +4,6 @@ description: "Standing in front of a host socket the cage must use without ever 
 
 # The broker type
 
-
 A resolver answers *where a value comes from*. A **broker** answers *how the cage
 uses a host resource without holding it*: the filtering ssh-agent
 ([`[ssh_agent]`](../configuration/ssh-agent)) is the first-party example, standing

@@ -212,7 +212,6 @@ consumers refuse a rollback). The **signing key is the store's secret and never
 leaves the operator's host**; the public key it prints is what consumers pin with
 `add --key`.
 
-
 ## An honest residual: the default store is not registered yet
 
 An embedded public key for a hosted default store (so it verifies against a baked-in

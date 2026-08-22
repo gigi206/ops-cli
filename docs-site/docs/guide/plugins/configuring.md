@@ -5,7 +5,6 @@ description: "What this machine supplies to an installed plugin, and where to ge
 
 # `[plugin.<name>]`: configuring an installed plugin
 
-
 A manifest says what a resolver *needs*. What this machine *supplies* is declared on your side,
 in a `[plugin.<name>]` table in the global config or a trusted project's:
 

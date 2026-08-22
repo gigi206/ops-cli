@@ -8,7 +8,6 @@ description: "Same-uid confinement, confidentiality by absence, the bind layout,
 (same-uid), so **the bind layout is the security control**. This page explains what
 that means and what it protects.
 
-
 See also: [The trust gate](trust) · [Enforcement stack](enforcement) · [`binds`](../configuration/binds).
 
 ## Same-uid: confidentiality by absence

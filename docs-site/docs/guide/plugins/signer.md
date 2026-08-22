@@ -4,7 +4,6 @@ description: "Forming a credential that depends on the request being made, bound
 
 # The signer type
 
-
 A resolver answers *where a value comes from*. A broker answers *how the cage uses a
 host resource without holding it*. A **signer** answers the question neither can:
 *what does authenticating this request look like?*

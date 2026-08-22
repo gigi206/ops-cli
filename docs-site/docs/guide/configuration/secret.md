@@ -159,8 +159,6 @@ locator (`vault-demo://k`), which is what a vault addressed by host or by entry 
 wants. A template that never writes `{key}` is refused, since every terse key would then resolve
 the same secret.
 
-
-
 ## The source: `key` vs `from`
 
 - **`from`** is explicit: one resolver ref (`from = "env://VAR"`) or a fallback chain

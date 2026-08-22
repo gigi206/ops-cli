@@ -9,7 +9,6 @@ Every plugin is a directory holding this manifest and an executable, whatever it
 The fields below are the resolver's; [a broker](broker) and [a signer](signer) each add
 a table of their own and refuse some of what follows, and each says so on its own page.
 
-
 ```toml
 name        = "vault"          # optional; defaults to the directory name
 type        = "resolver"       # required; "resolver" or "broker" (see below)
