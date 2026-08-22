@@ -108,6 +108,10 @@ mod attach;
 mod gc;
 pub(crate) mod inspect;
 mod observe_feed;
+// The `sbx projects` verb: the per-project runtime trees, listed, shown and reaped. Kept apart from
+// `launch` because it shares no state with the launch pipeline — it reads and removes the durable
+// tree a launch leaves behind, and never builds one.
+mod projects;
 
 pub(crate) use appimage::{
     AppImageUpgrade, pinned_hashes as appimage_pinned_hashes, upgrade_project as upgrade_appimage,
@@ -133,8 +137,8 @@ pub(crate) use gc::{
 };
 pub(crate) use launch::{
     SessionHeader, app, attach, detach_log_path, effective_lock_target, gc, parse_session_header,
-    projects_list, projects_rm, projects_show, rm_apply as projects_rm_apply, run, run_mise, stop,
-    superseded_reclaimable_hint, upgrade_mise_packages, upgrade_provision_steps,
+    run, run_mise, stop, superseded_reclaimable_hint, upgrade_mise_packages,
+    upgrade_provision_steps,
 };
 pub(crate) use naming::cage_name;
 pub(crate) use netlearn::{Granularity, Synthesis};
@@ -157,6 +161,9 @@ pub(crate) use packages::mise_packages;
 /// aliases of it, so a caller matching on outcomes names the variants through this — a `use` path
 /// resolves through modules, and an alias is not one.
 pub(crate) use prebuilt::Upgrade as PrebuiltUpgrade;
+pub(crate) use projects::{
+    projects_list, projects_rm, projects_show, rm_apply as projects_rm_apply,
+};
 #[cfg(test)]
 pub(crate) use projectstore::PROJECT_MARKER;
 pub(crate) use projectstore::{reflink_verdict, supports_reflink};
