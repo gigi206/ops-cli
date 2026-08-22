@@ -102,17 +102,20 @@ impl FsWatcher {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        let warned = Warned::new();
-        let mut wd_paths: HashMap<i32, PathBuf> = HashMap::new();
+        let mut watcher = Watcher {
+            fd,
+            root: root.to_path_buf(),
+            wd_paths: HashMap::new(),
+            ring,
+            warned: Warned::new(),
+        };
         // Initial walk: add watches only, emit no events (the pre-existing project is not "written by
         // the agent"). A new directory *after* start rescans-and-emits to catch the create race.
-        add_tree(fd, root, root, &mut wd_paths, false, &ring, &warned);
+        watcher.walk_root(false);
 
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
-        let root = root.to_path_buf();
-        let handle =
-            std::thread::spawn(move || event_loop(fd, &root, wd_paths, &flag, &ring, &warned));
+        let handle = std::thread::spawn(move || watcher.event_loop(&flag));
         Ok(FsWatcher {
             stop,
             handle: Some(handle),
@@ -202,48 +205,172 @@ fn add_watch(fd: libc::c_int, dir: &Path) -> io::Result<i32> {
 /// type is read without traversing it), so the watch set cannot loop or escape the project tree. On a
 /// watch-descriptor exhaustion the walk stops and warns once; the directories already watched keep
 /// working.
-fn add_tree(
+/// The inotify watch set for one project tree: the fd, the root every event is reported relative to,
+/// the watch-descriptor map the kernel's ids resolve through, the ring events land in, and the
+/// one-time warning latches.
+///
+/// The five travel together through every step of a watch — adding a subtree, resolving one event,
+/// walking a read buffer, running the loop — because they are one thing. Naming it is what retires
+/// the `#[allow(clippy::too_many_arguments)]` the event handler used to need, and all five already
+/// moved into the watch thread together.
+struct Watcher {
     fd: libc::c_int,
-    root: &Path,
-    start: &Path,
-    wd_paths: &mut HashMap<i32, PathBuf>,
-    emit: bool,
-    ring: &FsRing,
-    warned: &Warned,
-) {
-    let mut stack = vec![start.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        match add_watch(fd, &dir) {
-            Ok(wd) => {
-                wd_paths.insert(wd, dir.clone());
+    root: PathBuf,
+    wd_paths: HashMap<i32, PathBuf>,
+    ring: Arc<FsRing>,
+    warned: Warned,
+}
+
+impl Watcher {
+    /// Walk the root itself, at start-up. Separate from [`Watcher::add_tree`] because
+    /// `self.add_tree(&self.root, ..)` would borrow `self` two ways; this clones the root once.
+    fn walk_root(&mut self, emit: bool) {
+        let start = self.root.clone();
+        self.add_tree(&start, emit);
+    }
+
+    fn add_tree(&mut self, start: &Path, emit: bool) {
+        let mut stack = vec![start.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            match add_watch(self.fd, &dir) {
+                Ok(wd) => {
+                    self.wd_paths.insert(wd, dir.clone());
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ENOSPC) => {
+                    self.warned.warn_limit_once();
+                    return;
+                }
+                // The directory vanished between discovery and the watch, or is otherwise unwatchable:
+                // skip it, keep watching the rest.
+                Err(_) => continue,
             }
-            Err(e) if e.raw_os_error() == Some(libc::ENOSPC) => {
-                warned.warn_limit_once();
-                return;
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if is_ignored_name(&name) {
+                    continue;
+                }
+                let path = entry.path();
+                // `file_type` does not traverse a symlink, so a symlink to a directory is not recursed
+                // into — the watch set stays within the real project tree.
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if emit && let Ok(rel) = path.strip_prefix(&self.root) {
+                    push_rel(&self.ring, rel, FsKind::Create);
+                }
+                if is_dir {
+                    stack.push(path);
+                }
             }
-            // The directory vanished between discovery and the watch, or is otherwise unwatchable:
-            // skip it, keep watching the rest.
-            Err(_) => continue,
         }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+    }
+
+    /// Handle one inotify event: update the watch map, add watches for a new directory (and rescan it for
+    /// the create race), and push a reportable change into the ring. `wd_paths` maps a watch descriptor to
+    /// the directory it watches, so the event's `name` (a leaf within that directory) resolves to a full
+    /// path.
+    fn handle_event(&mut self, wd: i32, mask: u32, name: &OsStr) {
+        if mask & libc::IN_Q_OVERFLOW != 0 {
+            self.warned.warn_overflow_once();
+            return;
+        }
+        // The kernel removed this watch (its directory was deleted, moved, or unmounted): forget it.
+        if mask & libc::IN_IGNORED != 0 {
+            self.wd_paths.remove(&wd);
+            return;
+        }
+        // A self-event on the watched directory: the parent directory's own `IN_DELETE`/`IN_MOVED_FROM`
+        // already reports the removal, so nothing extra is emitted here.
+        if mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 {
+            return;
+        }
+        let Some(dir) = self.wd_paths.get(&wd).cloned() else {
+            return;
         };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if is_ignored_name(&name) {
+        if name.is_empty() {
+            return;
+        }
+        let full = dir.join(name);
+        let Ok(rel) = full.strip_prefix(&self.root) else {
+            return;
+        };
+        if is_ignored_path(rel) {
+            return;
+        }
+        match classify(mask) {
+            Class::New { is_dir: true } => {
+                push_rel(&self.ring, rel, FsKind::Create);
+                // A new directory: watch it, and rescan it so a file created between its birth and the
+                // watch is still reported.
+                self.add_tree(&full, true);
+            }
+            Class::New { is_dir: false } => push_rel(&self.ring, rel, FsKind::Create),
+            Class::Write => push_rel(&self.ring, rel, FsKind::Write),
+            Class::Remove => push_rel(&self.ring, rel, FsKind::Remove),
+            Class::Rename => push_rel(&self.ring, rel, FsKind::Rename),
+            Class::Ignore => {}
+        }
+    }
+
+    /// Parse one read buffer of packed inotify events and handle each. The header is copied out with an
+    /// unaligned read, so the buffer's alignment is irrelevant.
+    fn parse_buffer(&mut self, buf: &[u8]) {
+        let mut off = 0;
+        while off + EVENT_HEADER <= buf.len() {
+            // SAFETY: `off + EVENT_HEADER <= buf.len()`, and `read_unaligned` copies the header out
+            // regardless of the buffer's alignment.
+            let ev: libc::inotify_event = unsafe {
+                std::ptr::read_unaligned(buf.as_ptr().add(off) as *const libc::inotify_event)
+            };
+            let len = ev.len as usize;
+            let name_off = off + EVENT_HEADER;
+            if name_off + len > buf.len() {
+                break; // truncated tail — should not happen with a correctly sized read
+            }
+            let name = OsStr::from_bytes(nul_trimmed(&buf[name_off..name_off + len]));
+            self.handle_event(ev.wd, ev.mask, name);
+            off = name_off + len;
+        }
+    }
+
+    /// The background event loop: poll the inotify fd (with a short timeout so a stop is honoured
+    /// promptly), drain and handle every pending event, and repeat until stopped. Closes the fd on exit
+    /// (which removes all watches).
+    fn event_loop(&mut self, stop: &AtomicBool) {
+        let mut buf = vec![0u8; 16 * 1024];
+        while !stop.load(Ordering::Relaxed) {
+            let mut pfd = libc::pollfd {
+                fd: self.fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd, waited up to 250 ms so the stop flag is re-checked promptly.
+            let r = unsafe { libc::poll(&mut pfd, 1, 250) };
+            if r <= 0 {
+                continue; // timeout or EINTR — loop back and re-check the stop flag
+            }
+            if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                break; // the inotify self.fd is unusable — end the loop
+            }
+            if pfd.revents & libc::POLLIN == 0 {
                 continue;
             }
-            let path = entry.path();
-            // `file_type` does not traverse a symlink, so a symlink to a directory is not recursed
-            // into — the watch set stays within the real project tree.
-            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            if emit && let Ok(rel) = path.strip_prefix(root) {
-                push_rel(ring, rel, FsKind::Create);
-            }
-            if is_dir {
-                stack.push(path);
+            // Drain every buffered event before polling again.
+            loop {
+                // SAFETY: read into our owned buffer; the self.fd is non-blocking, so an empty queue returns
+                // EAGAIN (n < 0) and ends the drain.
+                let n = unsafe {
+                    libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                };
+                if n <= 0 {
+                    break;
+                }
+                self.parse_buffer(&buf[..n as usize]);
             }
         }
+        // SAFETY: closing our own inotify self.fd; removes every watch with it.
+        unsafe { libc::close(self.fd) };
     }
 }
 
@@ -288,63 +415,6 @@ fn push_rel(ring: &FsRing, rel: &Path, kind: FsKind) {
     ring.push(kind, &s);
 }
 
-/// Handle one inotify event: update the watch map, add watches for a new directory (and rescan it for
-/// the create race), and push a reportable change into the ring. `wd_paths` maps a watch descriptor to
-/// the directory it watches, so the event's `name` (a leaf within that directory) resolves to a full
-/// path.
-#[allow(clippy::too_many_arguments)]
-fn handle_event(
-    fd: libc::c_int,
-    root: &Path,
-    wd_paths: &mut HashMap<i32, PathBuf>,
-    wd: i32,
-    mask: u32,
-    name: &OsStr,
-    ring: &FsRing,
-    warned: &Warned,
-) {
-    if mask & libc::IN_Q_OVERFLOW != 0 {
-        warned.warn_overflow_once();
-        return;
-    }
-    // The kernel removed this watch (its directory was deleted, moved, or unmounted): forget it.
-    if mask & libc::IN_IGNORED != 0 {
-        wd_paths.remove(&wd);
-        return;
-    }
-    // A self-event on the watched directory: the parent directory's own `IN_DELETE`/`IN_MOVED_FROM`
-    // already reports the removal, so nothing extra is emitted here.
-    if mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 {
-        return;
-    }
-    let Some(dir) = wd_paths.get(&wd).cloned() else {
-        return;
-    };
-    if name.is_empty() {
-        return;
-    }
-    let full = dir.join(name);
-    let Ok(rel) = full.strip_prefix(root) else {
-        return;
-    };
-    if is_ignored_path(rel) {
-        return;
-    }
-    match classify(mask) {
-        Class::New { is_dir: true } => {
-            push_rel(ring, rel, FsKind::Create);
-            // A new directory: watch it, and rescan it so a file created between its birth and the
-            // watch is still reported.
-            add_tree(fd, root, &full, wd_paths, true, ring, warned);
-        }
-        Class::New { is_dir: false } => push_rel(ring, rel, FsKind::Create),
-        Class::Write => push_rel(ring, rel, FsKind::Write),
-        Class::Remove => push_rel(ring, rel, FsKind::Remove),
-        Class::Rename => push_rel(ring, rel, FsKind::Rename),
-        Class::Ignore => {}
-    }
-}
-
 /// The size of the fixed inotify event header; the variable-length name follows it in the read buffer.
 const EVENT_HEADER: usize = std::mem::size_of::<libc::inotify_event>();
 
@@ -354,78 +424,6 @@ fn nul_trimmed(bytes: &[u8]) -> &[u8] {
         Some(i) => &bytes[..i],
         None => bytes,
     }
-}
-
-/// Parse one read buffer of packed inotify events and handle each. The header is copied out with an
-/// unaligned read, so the buffer's alignment is irrelevant.
-fn parse_buffer(
-    fd: libc::c_int,
-    root: &Path,
-    wd_paths: &mut HashMap<i32, PathBuf>,
-    buf: &[u8],
-    ring: &FsRing,
-    warned: &Warned,
-) {
-    let mut off = 0;
-    while off + EVENT_HEADER <= buf.len() {
-        // SAFETY: `off + EVENT_HEADER <= buf.len()`, and `read_unaligned` copies the header out
-        // regardless of the buffer's alignment.
-        let ev: libc::inotify_event = unsafe {
-            std::ptr::read_unaligned(buf.as_ptr().add(off) as *const libc::inotify_event)
-        };
-        let len = ev.len as usize;
-        let name_off = off + EVENT_HEADER;
-        if name_off + len > buf.len() {
-            break; // truncated tail — should not happen with a correctly sized read
-        }
-        let name = OsStr::from_bytes(nul_trimmed(&buf[name_off..name_off + len]));
-        handle_event(fd, root, wd_paths, ev.wd, ev.mask, name, ring, warned);
-        off = name_off + len;
-    }
-}
-
-/// The background event loop: poll the inotify fd (with a short timeout so a stop is honoured
-/// promptly), drain and handle every pending event, and repeat until stopped. Closes the fd on exit
-/// (which removes all watches).
-fn event_loop(
-    fd: libc::c_int,
-    root: &Path,
-    mut wd_paths: HashMap<i32, PathBuf>,
-    stop: &AtomicBool,
-    ring: &FsRing,
-    warned: &Warned,
-) {
-    let mut buf = vec![0u8; 16 * 1024];
-    while !stop.load(Ordering::Relaxed) {
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one valid pollfd, waited up to 250 ms so the stop flag is re-checked promptly.
-        let r = unsafe { libc::poll(&mut pfd, 1, 250) };
-        if r <= 0 {
-            continue; // timeout or EINTR — loop back and re-check the stop flag
-        }
-        if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-            break; // the inotify fd is unusable — end the loop
-        }
-        if pfd.revents & libc::POLLIN == 0 {
-            continue;
-        }
-        // Drain every buffered event before polling again.
-        loop {
-            // SAFETY: read into our owned buffer; the fd is non-blocking, so an empty queue returns
-            // EAGAIN (n < 0) and ends the drain.
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-            if n <= 0 {
-                break;
-            }
-            parse_buffer(fd, root, &mut wd_paths, &buf[..n as usize], ring, warned);
-        }
-    }
-    // SAFETY: closing our own inotify fd; removes every watch with it.
-    unsafe { libc::close(fd) };
 }
 
 #[cfg(test)]
