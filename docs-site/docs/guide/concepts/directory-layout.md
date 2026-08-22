@@ -50,7 +50,8 @@ The important subtrees:
 | `egress/` | per-launch egress proxy sockets and CA material |
 | `fs/` | per-launch filesystem plumbing: the observation socket, and `mask-<pid>/` holding the two decoys an [`[fs]`](../configuration/fs) policy mounts |
 | `mise/`, `mise-plugin/` | the host-side mise home and the embedded `nix:` backend plugin |
-| `plugins/` | installed [resolver plugins](../plugins/) |
+| `plugins/` | installed [plugins](../plugins/), and their recorded origins under `plugins/.origins/` |
+| `plugin-state/<name>/` | the private writable directory a plugin declaring [`state = true`](../plugins/manifest) is given, one per plugin, owner-only and never bound into an agent's cage |
 | `stores/<name>/` | cached, verified remote [plugin stores](../plugins/) |
 | `apt-keys/` | signing keys pinned for [`deb:apt:` repositories](../configuration/packages#signed-apt-indexes), one per repository |
 | `nixpkgs.lock` | the global base channel revision (see [Upgrading](../housekeeping/upgrade)) |
