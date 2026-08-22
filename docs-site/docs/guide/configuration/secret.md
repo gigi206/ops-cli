@@ -89,9 +89,9 @@ host-side exactly as any other.
 
 Three properties hold whatever the plugin does:
 
-- **It sees only this host.** A secret's `to` is one concrete destination, so the plugin
-  is shown the requests of exactly the host its own declaration names, which is the host
-  that already receives that credential.
+- **It sees only this host.** A declaration's destination is its section key, one
+  concrete host, so the plugin is shown the requests of exactly the host its own
+  declaration names, which is the host that already receives that credential.
 - **It sets only the headers its manifest declared.** A header outside `sets_headers`
   refuses the whole answer, and a value carrying a newline is refused too: the request
   head is sbx's to frame.

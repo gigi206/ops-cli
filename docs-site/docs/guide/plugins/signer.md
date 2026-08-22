@@ -31,9 +31,9 @@ body_digest = "sha256"                               # optional: be told a diges
 
 What bounds a signer is not a new argument, it is an inherited one:
 
-- **The window is one host.** A signer is named by a `[[secret]]`, and a secret's
-  `to` is a single concrete destination (a `*.` wildcard or a `re:` regex is refused
-  at validation). So a signer is shown the requests of exactly the host its own
+- **The window is one host.** A signer is named by a `[[secret]]`, and a declaration's
+  destination is its section key: a single concrete host (a `*.` wildcard or a `re:`
+  regex is refused at validation). So a signer is shown the requests of exactly the host its own
   declaration names, which is the host that already receives that credential on
   every request. No spelling of a manifest widens that: the destination comes from
   the config, never from the plugin.
