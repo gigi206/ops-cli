@@ -329,6 +329,25 @@ fn assemble(
     net: NetPolicy,
     cmd: Vec<OsString>,
 ) -> Result<SandboxSpec, SpecError> {
+    let mounts = cage_mounts(paths, userland, nix, overlay, extra_binds, devices);
+    let env = cage_env(paths, userland, nix, overlay);
+    SandboxSpec::new(paths.project.to_path_buf(), mounts, env, net, cmd)
+}
+
+/// The cage's mount plan, in the order bubblewrap will apply it.
+///
+/// **Order is the invariant.** bwrap acts on its argv in sequence, so a later mount shadows an
+/// earlier one at the same target; the config-declared binds are therefore laid down first and every
+/// structural mount below may shadow a colliding one. Nothing here reorders, and the comments at the
+/// individual mounts record which of them depend on that.
+fn cage_mounts(
+    paths: &SandboxPaths,
+    userland: &Userland,
+    nix: &NixMount,
+    overlay: &Overlay,
+    extra_binds: &[ExtraBind],
+    devices: &[PathBuf],
+) -> Vec<Mount> {
     // Config-declared binds come first, so any structural mount below shadows a colliding one —
     // a config bind can never displace `/nix`, the synthetic `/etc/passwd`/`group`, the loader,
     // or the project itself, whether it is read-only or read-write. A `mode = "rw"` bind is a
@@ -614,7 +633,19 @@ fn assemble(
             }
         }
     }));
+    mounts
+}
 
+/// The cage's environment: the sandbox `PATH` and the variables that describe the userland to what
+/// runs inside it. Independent of the mount plan — it reads the same resolved paths but none of
+/// [`cage_mounts`]'s output — which is why the two are assembled separately and joined only in
+/// [`assemble`].
+fn cage_env(
+    paths: &SandboxPaths,
+    userland: &Userland,
+    nix: &NixMount,
+    overlay: &Overlay,
+) -> Vec<(String, String)> {
     // The sandbox PATH: sbx's URL router first, then the project's declared tools, then mise's
     // shims, then the base userland, so a declared tool wins over an agent-activated one, which
     // wins over the base. A tool the in-cage mise has activated (`mise use`) gets a shim in the
@@ -718,8 +749,7 @@ fn assemble(
     for (key, val) in overlay.env {
         upsert_env(&mut env, key, val);
     }
-
-    SandboxSpec::new(paths.project.to_path_buf(), mounts, env, net, cmd)
+    env
 }
 
 /// The fixed in-cage destinations the structural mounts in [`assemble`] occupy — every mount
