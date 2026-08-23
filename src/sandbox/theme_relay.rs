@@ -121,15 +121,20 @@ pub(crate) struct ThemeRelay {
 }
 
 impl ThemeRelay {
-    /// Spawn the relay thread. `keyfile` is the **host** path of the in-cage GSettings keyfile
-    /// (`<home>/<KEYFILE_REL>`), which the cage reads through the home bind. Infallible — any failure
-    /// inside the thread warns and leaves the app on its at-launch theme (best-effort).
-    pub(crate) fn start(keyfile: PathBuf) -> ThemeRelay {
+    /// Spawn the relay thread. `home` is the **host** path of the project home bound into the cage;
+    /// the keyfile it writes is `<home>/<KEYFILE_REL>`, which the cage reads through that bind.
+    ///
+    /// The home rather than the joined keyfile path, because the split is what [`write_keyfile`]
+    /// rests on: everything below `home` is cage-writable and is walked with symlinks refused, and a
+    /// caller that handed over an already-joined path would leave nothing to say where the trusted
+    /// prefix ends. Infallible — any failure inside the thread warns and leaves the app on its
+    /// at-launch theme (best-effort).
+    pub(crate) fn start(home: PathBuf) -> ThemeRelay {
         let (shutdown, rx) = async_channel::bounded::<()>(1);
         let handle = std::thread::Builder::new()
             .name("sbx-theme-relay".to_string())
             .spawn(move || {
-                if let Err(e) = async_io::block_on(run(keyfile, rx)) {
+                if let Err(e) = async_io::block_on(run(home, rx)) {
                     // A connection error is almost always the session ending (the host bus went away)
                     // — a benign teardown race, not worth alarming the user. Only a genuinely
                     // unexpected failure warns.
@@ -162,7 +167,7 @@ impl Drop for ThemeRelay {
 /// The relay body: connect to the host session bus, subscribe to the appearance color-scheme signal,
 /// and mirror each change into the in-cage keyfile until shutdown.
 async fn run(
-    keyfile: PathBuf,
+    home: PathBuf,
     shutdown: async_channel::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Host session bus (ambient $DBUS_SESSION_BUS_ADDRESS) and a proxy onto its desktop portal.
@@ -179,7 +184,7 @@ async fn run(
                         && args.key == "color-scheme"
                         && let Some(n) = extract_u32(&args.value)
                     {
-                        write_keyfile(&keyfile, super::portal::color_scheme_name(n));
+                        write_keyfile(&home, super::portal::color_scheme_name(n));
                     }
                 }
                 None => break,
@@ -198,20 +203,118 @@ fn extract_u32(value: &Value) -> Option<u32> {
     }
 }
 
+/// The temp sibling the rewrite lands on before it is renamed into place. Fixed rather than unique:
+/// one relay per launch owns this directory chain, and [`write_keyfile`] refuses to reuse an entry
+/// that is already there, so a name the cage can predict buys it nothing.
+const TMP_NAME: &str = "keyfile.sbx-tmp";
+
 /// Rewrite the in-cage keyfile atomically (temp + rename) with `scheme`'s GSettings body. Atomic so
 /// the cage never reads a half-written file; the in-cage GSettings keyfile backend watches the parent
 /// directory, so the rename fires its reload. Best-effort — any I/O error is swallowed, leaving the
 /// previous theme in place.
-fn write_keyfile(keyfile: &Path, scheme: &str) {
-    if let Some(parent) = keyfile.parent() {
-        let _ = std::fs::create_dir_all(parent);
+///
+/// **Every component below `home` is resolved with symlinks refused, and this is the security
+/// property of the function rather than a hardening detail.** This write runs host-side, on sbx's own
+/// thread and with the user's full privileges, into `<home>/.config/glib-2.0/settings/` — a directory
+/// the cage holds **read-write** (`binds::assemble` binds `home_src` at `SANDBOX_HOME`, and the
+/// in-cage portal itself does `mkdir -p`/`cat >` there). A path-based write would therefore resolve
+/// through whatever the cage last put at each of those four components: `create_dir_all` is satisfied
+/// by a symlink to a directory, and `fs::write` follows a symlink at the leaf and truncates its
+/// target. That is an arbitrary-file-truncation primitive handed out of the sandbox, against the
+/// module header's claim that the relay "adds no capability".
+///
+/// So the walk starts at `home` — the bind's mount point, which the cage cannot replace — and takes
+/// one component at a time through `openat`, each with `O_NOFOLLOW`, ending at a descriptor for the
+/// real `settings/` directory. The temp file is created `O_CREAT|O_EXCL|O_NOFOLLOW` relative to that
+/// descriptor, so an entry the cage pre-planted is refused rather than followed, and the rename is a
+/// `renameat` within the same descriptor. A cage that plants a symlink now costs itself its own live
+/// theme updates and nothing else.
+fn write_keyfile(home: &Path, scheme: &str) {
+    let _ = write_keyfile_confined(home, scheme);
+}
+
+/// The fallible body of [`write_keyfile`], split out so every step's error can propagate with `?`
+/// while the caller stays best-effort.
+fn write_keyfile_confined(home: &Path, scheme: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let (dirs, leaf) = super::portal::KEYFILE_REL
+        .rsplit_once('/')
+        .expect("KEYFILE_REL names a file inside a directory");
+
+    // The anchor: the project home itself. It is sbx's own directory (created `0700` under the data
+    // dir) and it is the cage's mount point, so it is the one component in this path the cage cannot
+    // have swapped.
+    let mut dir = std::fs::File::open(home).map(OwnedFd::from)?;
+    for comp in dirs.split('/') {
+        let c = std::ffi::CString::new(comp).map_err(std::io::Error::other)?;
+        // Create it if it is missing; an existing entry is fine here, and the `O_NOFOLLOW` open
+        // below is what decides whether it is a directory or a link the cage left.
+        // SAFETY: `dir` is a live descriptor and `c` is a NUL-terminated name valid for the call.
+        unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o700) };
+        // SAFETY: same, and the returned descriptor is taken ownership of immediately below.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a fresh, owned descriptor this thread just opened.
+        dir = unsafe { OwnedFd::from_raw_fd(fd) };
     }
-    let tmp = keyfile.with_extension("sbx-tmp");
-    if std::fs::write(&tmp, super::portal::keyfile_body(scheme)).is_ok() {
-        let _ = std::fs::rename(&tmp, keyfile);
-    } else {
-        let _ = std::fs::remove_file(&tmp);
+
+    let tmp = std::ffi::CString::new(TMP_NAME).map_err(std::io::Error::other)?;
+    // A leftover temp from a killed run would fail the `O_EXCL` below forever, so clear it first.
+    // `unlinkat` removes the entry itself and never follows it, so this cannot reach out of the
+    // directory even when what sits there is a symlink the cage planted.
+    // SAFETY: `dir` is a live directory descriptor and `tmp` is a valid NUL-terminated name.
+    unsafe { libc::unlinkat(dir.as_raw_fd(), tmp.as_ptr(), 0) };
+    // SAFETY: same; the descriptor is owned immediately below.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            tmp.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: `fd` is a fresh, owned descriptor this thread just opened.
+    let mut f = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let write = f
+        .write_all(super::portal::keyfile_body(scheme).as_bytes())
+        .and_then(|()| f.sync_all());
+    drop(f);
+    if let Err(e) = write {
+        // SAFETY: `dir` is live and `tmp` is a valid name; the half-written temp is removed.
+        unsafe { libc::unlinkat(dir.as_raw_fd(), tmp.as_ptr(), 0) };
+        return Err(e);
+    }
+
+    let dest = std::ffi::CString::new(leaf).map_err(std::io::Error::other)?;
+    // SAFETY: both names are valid and `dir` is a live directory descriptor for both ends.
+    let renamed = unsafe {
+        libc::renameat(
+            dir.as_raw_fd(),
+            tmp.as_ptr(),
+            dir.as_raw_fd(),
+            dest.as_ptr(),
+        )
+    };
+    if renamed < 0 {
+        let e = std::io::Error::last_os_error();
+        // SAFETY: as above.
+        unsafe { libc::unlinkat(dir.as_raw_fd(), tmp.as_ptr(), 0) };
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -272,21 +375,89 @@ mod tests {
     #[test]
     fn write_keyfile_writes_the_scheme_body_atomically_and_creates_the_dir() {
         let tmp = crate::testutil::TmpDir::new();
-        let keyfile = tmp.path().join(super::super::portal::KEYFILE_REL);
+        let home = tmp.path().to_path_buf();
+        let keyfile = home.join(super::super::portal::KEYFILE_REL);
 
         // First write creates the nested parent dirs and the file.
-        write_keyfile(&keyfile, super::super::portal::color_scheme_name(1));
+        write_keyfile(&home, super::super::portal::color_scheme_name(1));
         assert_eq!(
             std::fs::read_to_string(&keyfile).unwrap(),
             super::super::portal::keyfile_body("prefer-dark")
         );
 
         // A second write replaces the content and leaves no temp file behind.
-        write_keyfile(&keyfile, super::super::portal::color_scheme_name(2));
+        write_keyfile(&home, super::super::portal::color_scheme_name(2));
         assert_eq!(
             std::fs::read_to_string(&keyfile).unwrap(),
             super::super::portal::keyfile_body("prefer-light")
         );
-        assert!(!keyfile.with_extension("sbx-tmp").exists());
+        assert!(!keyfile.parent().unwrap().join(TMP_NAME).exists());
+    }
+
+    /// The relay writes host-side, with the user's privileges, into a directory the cage holds
+    /// read-write. So the only thing standing between a cage-planted symlink and an arbitrary host
+    /// file being truncated is that this walk refuses to follow one — at the leaf and at every
+    /// directory above it. Both are pinned here, against a real file outside the home that must come
+    /// back untouched.
+    #[test]
+    fn a_symlink_planted_under_the_home_is_refused_and_never_written_through() {
+        let tmp = crate::testutil::TmpDir::new();
+        let home = tmp.path().join("home");
+        let outside = tmp.path().join("outside.txt");
+        let untouched = "the cage must not be able to truncate this\n";
+
+        let settings = home.join(".config/glib-2.0/settings");
+
+        // 1. A link at the temp name, pointing at a host file. The old path-based `fs::write` opened
+        //    it `O_CREAT|O_TRUNC` and followed it, which truncated the target. The temp name is one
+        //    this function owns, so the link is *unlinked* rather than followed — which is also how
+        //    a temp left behind by a killed run is recovered — and the write then goes on normally.
+        std::fs::write(&outside, untouched).unwrap();
+        std::fs::create_dir_all(&settings).unwrap();
+        std::os::unix::fs::symlink(&outside, settings.join(TMP_NAME)).unwrap();
+
+        write_keyfile(&home, super::super::portal::color_scheme_name(1));
+
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            untouched,
+            "a link at the temp name was followed out of the home and its target truncated"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join(super::super::portal::KEYFILE_REL)).unwrap(),
+            super::super::portal::keyfile_body("prefer-dark"),
+            "clearing a stale temp must leave the ordinary write working"
+        );
+
+        // 2. A link standing in for one of the directories on the way down, pointing at a host
+        //    *directory*. This is the shape `create_dir_all` used to accept — it stats through the
+        //    link, finds a directory, and reports the parents as made — after which every write
+        //    below landed in the host directory. Each component is checked separately, because one
+        //    `O_NOFOLLOW` missing from the walk is the whole hole.
+        let elsewhere = tmp.path().join("elsewhere");
+        for (case, plant) in [
+            ("the leaf directory", settings.clone()),
+            ("a middle directory", home.join(".config/glib-2.0")),
+            ("the first directory", home.join(".config")),
+        ] {
+            let _ = std::fs::remove_dir_all(&home);
+            let _ = std::fs::remove_dir_all(&elsewhere);
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::fs::create_dir_all(plant.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &plant).unwrap();
+
+            write_keyfile(&home, super::super::portal::color_scheme_name(1));
+
+            assert_eq!(
+                std::fs::read_dir(&elsewhere).unwrap().count(),
+                0,
+                "{case}: the walk went through the link and wrote outside the home"
+            );
+            assert_eq!(
+                std::fs::read_link(&plant).unwrap(),
+                elsewhere,
+                "{case}: a refused directory link must be left alone, not replaced"
+            );
+        }
     }
 }

@@ -3601,13 +3601,13 @@ fn build(
                     notify_relay = Some(super::notify_relay::NotifyRelay::start(hd.socket()));
                     // Start the live-theme relay: it mirrors later host light/dark switches into the
                     // in-cage GSettings keyfile (through the home bind), so the in-cage portal
-                    // re-emits SettingChanged and the app follows the change live. The keyfile's home
-                    // is derived exactly as `build_spec` binds it, so both target the same file.
+                    // re-emits SettingChanged and the app follows the change live. The home is
+                    // derived exactly as `build_spec` binds it, so both target the same file — and it
+                    // is handed over unjoined because the relay walks the rest of the way itself,
+                    // refusing a symlink at every cage-writable component.
                     // Best-effort: a home path that cannot be resolved just leaves the at-launch theme.
                     if let Ok(home) = binds::home_src(prep.layout.data_dir(), &prep.cwd, runtime) {
-                        theme_relay = Some(super::theme_relay::ThemeRelay::start(
-                            home.join(super::portal::KEYFILE_REL),
-                        ));
+                        theme_relay = Some(super::theme_relay::ThemeRelay::start(home));
                     }
                     portal_host = Some(hd);
                     Some(p)
