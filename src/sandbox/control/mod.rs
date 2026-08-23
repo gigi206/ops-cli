@@ -679,13 +679,29 @@ impl LogRing {
         let mut g = self.inner.lock().unwrap();
         let seq = g.next_seq;
         g.next_seq += 1;
+        // The three free-form values are sanitised **here**, on the way in, for the reason
+        // [`super::proc_control::ExecRing::push_verdict`] states for the exec ring: this is the one
+        // door every log event enters by, and the alternative is a duty spread over the ~30 call
+        // sites that push one. All three are chosen by the cage — a `Host` header, an SNI, a CONNECT
+        // authority, and the raw method and target of a request line, which the two fail-closed
+        // refusals in `handle_client` log *before* `head_carries_control_byte` has run at all. So
+        // they may carry any byte that is not a line break: an ESC, which paints over the operator's
+        // terminal when `sbx net logs` prints the row (`\x1b[1A\x1b[2K` erases the line above, so a
+        // cage can overwrite its own earlier `blocked` rows with forged `allow` ones), and a NUL or a
+        // CR, which on the line-based control wire would end the event and let what follows read as
+        // a second one. `super::egress_stats::Tally::bump` already does exactly this for the host it
+        // counts, from the same values; the log — the audit surface — was the sink that skipped it.
+        //
+        // This is not the decision's view of any of them: every verdict is reached on the raw value,
+        // and only what is *reported* passes through here. Sanitising is idempotent, and it runs
+        // after the caller's secret redaction so a masked query stays masked.
         let event = LogEvent {
             seq,
             at_epoch_ms,
-            host: host.to_string(),
+            host: super::sanitize(host),
             port,
-            method: method.map(str::to_string),
-            path: path.map(str::to_string),
+            method: method.map(super::sanitize),
+            path: path.map(super::sanitize),
             verdict,
             reason: reason.to_string(),
             proto,
@@ -2022,6 +2038,45 @@ mod tests {
         assert_eq!(seqs, vec![3, 4, 5], "the oldest two were evicted");
         assert_eq!(snap.events[0].host, "h2.test");
         assert_eq!(snap.dropped, 0, "a tail read never reports a gap");
+    }
+
+    /// Every free-form field of a log event is chosen by the cage, and the two fail-closed refusals
+    /// in the proxy's `handle_client` push the raw method and target *before* the control-byte check
+    /// has run. So an ESC reaching the ring is an ESC `sbx net logs` prints straight at the
+    /// operator's terminal — `\x1b[1A\x1b[2K` erases the row above, which is how a cage would paint
+    /// over its own refusals — and a CR or NUL is a forged second row on the line-based control
+    /// wire. The door is here, not at the ~30 call sites; this is what says so.
+    #[test]
+    fn a_log_event_carries_no_byte_the_cage_could_frame_or_paint_with() {
+        let ring = LogRing::new(LOG_RING_CAP);
+        ring.push(
+            false,
+            "\x1b[1A\x1b[2Kevil.test",
+            443,
+            Some("GET\r\nX: forged"),
+            Some("/a\npending id=1"),
+            LogVerdict::Blocked,
+            "method-not-allowed",
+            Proto::Other,
+            HttpVer::Unknown,
+            RpcKind::None,
+        );
+        let snap = ring.snapshot(None, None, false);
+        let e = &snap.events[0];
+        for (field, value) in [
+            ("host", &e.host),
+            ("method", e.method.as_ref().expect("method")),
+            ("path", e.path.as_ref().expect("path")),
+        ] {
+            assert!(
+                !value.chars().any(char::is_control),
+                "{field} kept a control byte: {value:?}"
+            );
+        }
+        // Replaced rather than dropped, so what the cage asked for is still legible in the row.
+        assert_eq!(e.host, " [1A [2Kevil.test");
+        assert_eq!(e.method.as_deref(), Some("GET  X: forged"));
+        assert_eq!(e.path.as_deref(), Some("/a pending id=1"));
     }
 
     #[test]

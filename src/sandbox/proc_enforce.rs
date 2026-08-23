@@ -1567,7 +1567,19 @@ impl PendingExec {
 
     /// Register a parked `execve` (non-blocking). Over the flood cap, deny it outright (fail-closed)
     /// rather than growing the registry without bound.
+    ///
+    /// The path is sanitised on the way in, for the reason
+    /// [`super::proc_control::ExecRing::push_verdict`] states about the ring beside it: this registry
+    /// is the **third** producer on that same line-based control wire, and it was the one written
+    /// apart. `dispatch_enforced` renders these as `pending id=… pid=… path={path}` and
+    /// `answered path={path}`, while the client reads the reply with `.lines()` and stops at the
+    /// first bare `ok` — so a newline in a target the cage named (paths may carry one, and this one
+    /// is read out of the cage's own memory) ends the row early and lets what follows read as
+    /// another. A cage could hide a park behind a forged one, or paint rows the operator never had.
+    /// Sanitising is idempotent, so the ring's copy of the same string is unaffected; the verdict
+    /// itself was reached on the raw path, above.
     fn park(&self, notif_fd: libc::c_int, id: u64, pid: u32, path: &str) {
+        let path = super::sanitize(path);
         {
             let mut g = locked(&self.inner);
             if g.len() < ASK_PENDING_CAP {
@@ -1577,7 +1589,7 @@ impl PendingExec {
                         id,
                         notif_fd,
                         pid,
-                        path: path.to_string(),
+                        path,
                         since: Instant::now(),
                     },
                 );
@@ -2562,6 +2574,33 @@ mod open_path_tests {
             "the same receive loop carries `execve`, which must fall through to the exec policy              rather than be read as a path to scan"
         );
         assert_eq!(open_args(libc::SYS_read as libc::c_int, &args), None);
+    }
+
+    /// The parked registry is the third producer on the line-based control wire that
+    /// `ExecRing::push_verdict` guards, and it was the one written apart. `dispatch_enforced` renders
+    /// a park as `pending id=… pid=… path={path}` and the client reads the reply with `.lines()`,
+    /// stopping at the first bare `ok` — so a newline in a target the cage named would end the row
+    /// and let what follows read as another park that never happened, or hide a real one behind it.
+    #[test]
+    fn a_parked_path_carries_no_byte_that_could_forge_a_row_on_the_wire() {
+        let pending = PendingExec::new();
+        // A path may legally carry a newline on Linux, and this one is read out of the cage's own
+        // memory — so this is a name a hostile cage can simply give itself.
+        let forged = "/tmp/a\npending id=99 pid=1 waiting=0 path=/bin/ls\nok";
+        // `-1` is never answered here: the registry is under its cap, so `park` only inserts.
+        pending.park(-1, 1, 4242, forged);
+
+        let listed = pending.list();
+        assert_eq!(listed.len(), 1, "the park is registered");
+        let path = &listed[0].2;
+        assert!(
+            !path.chars().any(char::is_control),
+            "a parked path reached the wire with a control byte: {path:?}"
+        );
+        assert_eq!(
+            path, "/tmp/a pending id=99 pid=1 waiting=0 path=/bin/ls ok",
+            "replaced rather than dropped, so what the cage asked to run is still legible"
+        );
     }
 
     #[test]
