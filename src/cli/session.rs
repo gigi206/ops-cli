@@ -576,10 +576,17 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
         "session {} — {}, started {}{}",
         parsed.id,
         if live { "running" } else { "exited" },
+        // `checked_add`, and it is the untrusted-input form rather than a nicety: `h.started` is a
+        // bare `u64` taken off a line of the session log, and that log holds the caged agent's own
+        // stdout (`parse_session_header` scans every line, and its doc already concedes an agent can
+        // emit a well-formed header). `SystemTime`'s seconds are an `i64` on Linux, so a `started`
+        // at or above 2^63 makes the infix `+` panic — and this is the one command that exists to
+        // find out what a background agent did, against an append-only log, so the panic would be
+        // permanent for that session. An unreadable stamp degrades to the `?` the missing-header
+        // arm below already renders.
         header
-            .map(|h| crate::paths::civil_date(
-                std::time::UNIX_EPOCH + Duration::from_secs(h.started)
-            ))
+            .and_then(|h| std::time::UNIX_EPOCH.checked_add(Duration::from_secs(h.started)))
+            .map(crate::paths::civil_date)
             .unwrap_or_else(|| "?".to_string()),
         if parsed.all { ", all sessions" } else { "" },
     ));

@@ -201,3 +201,37 @@ fn a_session_longer_than_the_window_is_streamed_from_its_own_header() {
         err(&o)
     );
 }
+
+/// The log holds the caged agent's own stdout, so every field of a header line is a value the agent
+/// can choose. `started` is a bare `u64` and the note renders it as a date; `SystemTime`'s seconds
+/// are an `i64` on Linux, so a stamp at or above 2^63 used to abort the command before a byte of the
+/// body was printed. That made `sbx session logs` — the one way to find out what a background agent
+/// did — permanently unusable for that session, the log being append-only.
+///
+/// The body must still be printed and the unreadable stamp must degrade to the `?` a missing header
+/// already renders.
+#[test]
+fn a_header_stamp_the_agent_chose_cannot_stop_the_log_being_read() {
+    let data = Data::new("stamp");
+    // 9.3e18 > i64::MAX (9.223e18), and still inside u64.
+    let head = "=== sbx session 4242 started=9300000000000000000 ===\n";
+    std::fs::write(data.log(4242), format!("{head}{NEW_BODY}")).expect("write the log");
+
+    let o = sbx_in(&data.0, &["session", "logs", "4242"]);
+    assert!(
+        o.status.success(),
+        "an out-of-range stamp must not fail the command: {}",
+        err(&o)
+    );
+    assert_eq!(out(&o), NEW_BODY, "the body is still what was asked for");
+    assert!(
+        err(&o).contains("started ?"),
+        "an unreadable stamp reads as `?`, like a missing header: {}",
+        err(&o)
+    );
+    assert!(
+        !err(&o).contains("panicked"),
+        "and nothing panicked: {}",
+        err(&o)
+    );
+}
