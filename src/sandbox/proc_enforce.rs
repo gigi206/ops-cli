@@ -59,6 +59,15 @@
 //!   guard is not something a `[seccomp] allow` list can empty out. The shim's own notification
 //!   filter opens with the same architecture check, for the same reason it sets `no_new_privs`
 //!   again: what enforces exec supervision holds on its own terms.
+//! - **The other exec form.** `execveat(dirfd, path, argv, envp, flags)` leads with a descriptor
+//!   where `execve(path, …)` leads with the path, so a supervisor reading the first register for
+//!   both reads an integer as an address, fails to name the target, and hands the decision to
+//!   [`ProcPolicy::unmatched`] — `Allow` under the shipped denylist. The shim has always notified on
+//!   both forms; it is the supervisor that read one of them wrong, which is why the target register
+//!   is now chosen by syscall number ([`exec_args`], the exec twin of [`open_args`]) and a call that
+//!   is neither exec nor open is refused rather than decided. `fexecve` is the same route wearing a
+//!   library name: it issues `execveat` with an empty pathname and `AT_EMPTY_PATH`, so the target is
+//!   named through the descriptor's own `/proc` link.
 //! - **Installing its own notification filter** to capture and auto-`CONTINUE` its own `execve`s does
 //!   not work: the kernel permits only one seccomp notification listener per process, so a second
 //!   `SECCOMP_FILTER_FLAG_NEW_LISTENER` fails with `EBUSY`. The shim installs the sole listener before
@@ -576,8 +585,28 @@ fn unmatched_word(policy: &ProcPolicy) -> &'static str {
 /// brick a whole cage on a single process reaped mid-decision. What it must not be is unremarked,
 /// so the read that did not work is counted here — at the read, where the failure is known — and
 /// the first of them is said out loud.
-fn exec_verdict(cx: &Deciding<'_>, caller: &[String], pid: u32, addr: u64) -> (Verdict, String) {
-    if let Some(path) = read_exec_path(pid, addr).filter(|p| !p.is_empty()) {
+fn exec_verdict(
+    cx: &Deciding<'_>,
+    caller: &[String],
+    pid: u32,
+    dirfd: libc::c_int,
+    addr: u64,
+) -> (Verdict, String) {
+    let named = read_exec_path(pid, addr)
+        .filter(|p| !p.is_empty())
+        // `execveat(fd, "", …, AT_EMPTY_PATH)` names its target by the descriptor and passes an
+        // empty pathname — which is exactly what glibc's `fexecve` issues, so this is the ordinary
+        // shape rather than an exotic one. The descriptor's own `/proc` link is the program, read in
+        // the target's namespace like every other path here, so the policy gets a name to match
+        // instead of the mode's unmatched default.
+        .or_else(|| {
+            (dirfd != libc::AT_FDCWD)
+                .then(|| std::fs::read_link(format!("/proc/{pid}/fd/{dirfd}")).ok())
+                .flatten()
+                .map(|p| p.to_string_lossy().into_owned())
+                .filter(|p| !p.is_empty())
+        });
+    if let Some(path) = named {
         // Decide against the config policy folded with the live `--session` overlay (deny wins
         // across both). The overlay read-lock is held only for this decision.
         let verdict = cx.overlay.decide(cx.policy, caller, &path);
@@ -788,8 +817,17 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
         }
         return;
     }
+    // The exec family, read from its own registers for the reason [`exec_args`] states. A
+    // notification that is neither an open nor an exec is refused rather than judged: the shim's
+    // filter produces only these five numbers, so a sixth means the filter and this supervisor
+    // disagree about what is being supervised, and the module's fail-closed doctrine says an
+    // unenforced call must not run in place of an enforced one.
+    let Some((exec_dirfd, path_addr)) = exec_args(req.data.nr, &req.data.args) else {
+        respond_errno(notif_fd, req.id, libc::EPERM);
+        return;
+    };
     let caller = caller_chain(cx, req.pid);
-    let (verdict, shown) = exec_verdict(cx, &caller, req.pid, req.data.args[0]);
+    let (verdict, shown) = exec_verdict(cx, &caller, req.pid, exec_dirfd, path_addr);
     let shown = shown.as_str();
     let by = caller.last().map(String::as_str).unwrap_or_default();
     match verdict {
@@ -1648,6 +1686,29 @@ fn open_args(nr: libc::c_int, args: &[u64; 6]) -> Option<(libc::c_int, u64)> {
     None
 }
 
+/// Where a notified exec keeps its directory descriptor and its path pointer, by syscall number —
+/// the exec half of the mapping [`open_args`] states for the open family, and for the same reason.
+///
+/// The shim notifies on **both** exec forms (`proc-shim`'s filter names `execve` and `execveat`),
+/// and they do not agree on argument order: `execve(path, argv, envp)` leads with the path, while
+/// `execveat(dirfd, path, argv, envp, flags)` leads with a descriptor. Reading the path from the
+/// wrong register does not merely scan an unrelated address here — it makes the target unnameable,
+/// and an unnameable target is decided by [`ProcPolicy::unmatched`], which under the shipped
+/// `enforce` denylist is `Allow`. Every `execveat` therefore used to walk past a `deny` rule that
+/// named it. The mapping is explicit and unit-tested rather than inferred at the call site.
+///
+/// `None` for any other syscall: the receive loop answers such a notification fail-closed rather
+/// than judging it as an exec against a register that means something else.
+fn exec_args(nr: libc::c_int, args: &[u64; 6]) -> Option<(libc::c_int, u64)> {
+    if nr as libc::c_long == libc::SYS_execve {
+        return Some((libc::AT_FDCWD, args[0]));
+    }
+    if nr as libc::c_long == libc::SYS_execveat {
+        return Some((args[0] as libc::c_int, args[1]));
+    }
+    None
+}
+
 /// One file's identity for the scan cache: the same bytes under a different name are the same
 /// answer, and a rewrite changes at least one of these fields.
 ///
@@ -2501,6 +2562,41 @@ mod open_path_tests {
             "the same receive loop carries `execve`, which must fall through to the exec policy              rather than be read as a path to scan"
         );
         assert_eq!(open_args(libc::SYS_read as libc::c_int, &args), None);
+    }
+
+    #[test]
+    fn each_exec_form_is_read_from_its_own_registers() {
+        // The shim notifies on both forms, and they disagree on argument order. Reading `execveat`'s
+        // first register as a path address makes every `execveat` unnameable, and an unnameable
+        // target takes the mode's unmatched default — `Allow` under the shipped denylist. So this is
+        // the mapping a `deny` rests on, not a detail of it.
+        let args: [u64; 6] = [11, 22, 33, 44, 55, 66];
+        assert_eq!(
+            exec_args(libc::SYS_execve as libc::c_int, &args),
+            Some((libc::AT_FDCWD, 11)),
+            "`execve(path, …)` carries no descriptor: the path is the first argument"
+        );
+        assert_eq!(
+            exec_args(libc::SYS_execveat as libc::c_int, &args),
+            Some((11, 22)),
+            "`execveat(dirfd, path, …)` leads with the descriptor, so the path is the second \
+             argument — reading the first would hand the policy a file descriptor as an address"
+        );
+    }
+
+    #[test]
+    fn a_syscall_that_is_neither_an_open_nor_an_exec_is_decided_by_neither() {
+        // The two mappings partition the five numbers the shim's filter notifies on, and agree that
+        // anything else belongs to neither: the receive loop refuses such a notification instead of
+        // judging it as an exec against a register that means something else.
+        let args: [u64; 6] = [11, 22, 33, 44, 55, 66];
+        for nr in [libc::SYS_read, libc::SYS_write, libc::SYS_ioctl] {
+            assert_eq!(open_args(nr as libc::c_int, &args), None, "syscall {nr}");
+            assert_eq!(exec_args(nr as libc::c_int, &args), None, "syscall {nr}");
+        }
+        // And the two families do not overlap: an open is never read as an exec, nor the reverse.
+        assert_eq!(exec_args(libc::SYS_openat as libc::c_int, &args), None);
+        assert_eq!(open_args(libc::SYS_execveat as libc::c_int, &args), None);
     }
 
     #[test]
@@ -4236,7 +4332,7 @@ mod tests {
             let (pid, addr) = UNREADABLE;
             for _ in 0..3 {
                 assert_eq!(
-                    exec_verdict(&cx, &[], pid, addr),
+                    exec_verdict(&cx, &[], pid, libc::AT_FDCWD, addr),
                     (expected, "<unreadable>".to_string()),
                     "under {mode:?}"
                 );
