@@ -367,7 +367,10 @@ fn value_candidates(kind: &ValueKind, prefix: &str) -> Vec<(String, String)> {
 /// prints anything but candidates.
 fn registry_values(kind: &ValueKind) -> Vec<(String, String)> {
     use ValueKind::*;
-    let Some(layout) = crate::store::Layout::from_env() else {
+    // Resolved **without mounting**: this runs on a keystroke, and the ordinary resolution follows
+    // a volume pointer by mounting the volume — so completing an argument attached a loop device
+    // and mounted a filesystem. See [`crate::store::Layout::from_env_without_mounting`].
+    let Some(layout) = crate::store::Layout::from_env_without_mounting() else {
         return Vec::new();
     };
     let mut out: Vec<(String, String)> = Vec::new();

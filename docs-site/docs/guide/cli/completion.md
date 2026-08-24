@@ -139,6 +139,11 @@ runs on every completion request, so a stray diagnostic would land in the middle
 prompt, and a completion that changed state would make pressing Tab a thing you had to
 think about.
 
+A [storage volume](storage) is read the same way: the oracle follows the pointer only as
+far as reading it, so a volume that is already mounted completes normally and one that is
+not simply completes nothing. Pressing Tab is not what attaches a loop device and mounts a
+filesystem; a command you typed is.
+
 A command path answers from the help table alone and reads nothing. A value position reads
 the registry behind it, and does so fresh rather than from a cache, so a session you just
 started completes without a stale list to refresh. Where a registry is another process

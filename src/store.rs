@@ -122,6 +122,33 @@ impl Layout {
         Some(Self { data_dir })
     }
 
+    /// [`Layout::from_env`] for a caller that must **not act**: the same resolution, except that a
+    /// volume pointer is followed only when the volume is already mounted.
+    ///
+    /// The completion oracle is that caller. It runs on a keystroke, and `from_env` mounts, so
+    /// `sbx net pending <TAB>` attached a loop device and mounted a filesystem — work measured in
+    /// seconds, and on a udisks setup a password prompt — because the shell asked what the
+    /// candidates were. A volume that is not mounted completes nothing here, which is the right
+    /// answer for a keystroke that must not be the thing that mounts it.
+    ///
+    /// The refusals stay silent too: a completion oracle writing to stderr would print into the
+    /// user's half-typed command line.
+    pub(crate) fn from_env_without_mounting() -> Option<Self> {
+        let over = std::env::var_os("SBX_DATA_DIR");
+        let mut data_dir = data_dir_from(
+            over.as_deref(),
+            std::env::var_os("XDG_DATA_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        )?;
+        if over.as_deref().is_none_or(|o| o.is_empty())
+            && let Some(mounted) = mounted_volume(&data_dir)
+        {
+            data_dir = mounted;
+        }
+        check_resolved_data_dir(&data_dir).ok()?;
+        Some(Self { data_dir })
+    }
+
     /// The data directory sbx would use with no volume in play — the plain XDG computation.
     ///
     /// This is where the volume's image and pointer live, so it must stay reachable even once
@@ -226,6 +253,23 @@ fn follow_volume(default_dir: &Path) -> Option<Result<PathBuf, String>> {
             Some(crate::storage::ensure_mounted(&image))
         })
         .clone()
+}
+
+/// Follow a volume pointer **only as far as reading it**: the mount point when the volume is
+/// already mounted, and nothing at all when it is not.
+///
+/// For a caller that must not act. [`follow_volume`] mounts, which is right for a command the user
+/// typed and wrong for the completion oracle: that runs on a keystroke, so `sbx net pending <TAB>`
+/// attached a loop device and mounted a filesystem — work measured in seconds, and on a udisks
+/// setup a password prompt — because the shell asked what the candidates were. Reading the mount
+/// table changes nothing, and a volume that is not mounted simply completes nothing, which is the
+/// right answer for a keystroke that must not be the thing that mounts it.
+fn mounted_volume(default_dir: &Path) -> Option<PathBuf> {
+    let image = crate::storage::read_pointer(default_dir)?;
+    match crate::storage::state(&image) {
+        Ok(crate::storage::State::Mounted { mount_point, .. }) => Some(mount_point),
+        _ => None,
+    }
 }
 
 /// True the first time it is called in a process, false ever after — the gate the data-directory
@@ -2049,6 +2093,42 @@ mod tests {
     use super::*;
     use crate::testutil::TmpDir;
     use std::os::unix::fs::PermissionsExt;
+
+    /// The completion oracle runs on a keystroke, so it resolves the layout without acting. The
+    /// ordinary resolution follows a volume pointer by **mounting** the volume: completing an
+    /// argument attached a loop device and mounted a filesystem, which on a udisks setup is a
+    /// password prompt for pressing TAB.
+    ///
+    /// A pointer at an image that is not mounted (here, one that does not exist at all) leaves the
+    /// default directory in place and touches nothing.
+    #[test]
+    fn resolving_without_mounting_follows_a_pointer_no_further_than_reading_it() {
+        use crate::testutil::{EnvVar, env_lock};
+        let _lock = env_lock();
+        let home = TmpDir::new();
+        let data = home.path().join("sbx");
+        std::fs::create_dir_all(&data).unwrap();
+        // A pointer at an image nothing has attached — following it would have to mount.
+        let image = home.path().join("volume.btrfs");
+        std::fs::write(
+            data.join(crate::storage::POINTER),
+            format!("image = \"{}\"\n", image.display()),
+        )
+        .unwrap();
+
+        let _over = EnvVar::unset("SBX_DATA_DIR");
+        let _xdg = EnvVar::set("XDG_DATA_HOME", home.path());
+        let layout = Layout::from_env_without_mounting().expect("the default directory resolves");
+        assert_eq!(
+            layout.data_dir(),
+            data,
+            "an unmounted volume leaves the default directory in place"
+        );
+        assert!(
+            !image.exists(),
+            "and nothing was created on the way: the pointer was read, not followed"
+        );
+    }
 
     #[test]
     fn an_unfree_attribute_nix_would_read_as_an_operator_is_refused_before_the_build() {
