@@ -48,8 +48,12 @@ sbx app import <file> [--as <name>] [--force]
   the profile stays **inert until `sbx app run <name>`** launches it.
 - The **granted posture is printed** (command, home scope, packages, binds, network, each
   credential by destination + source, never a plaintext value, and every grant that widens
-  what the cage reaches of the host: `devices`, `seccomp allow`, and
-  [`ssh_agent`](../configuration/ssh-agent), the one that asks your own agent to sign).
+  what the cage reaches of the host: `devices`, `seccomp allow`,
+  [`ssh_agent`](../configuration/ssh-agent), the one that asks your own agent to sign,
+  `allow_insecure_http`, `gpu`, `audio`, `dbus`, `forward`, and the profile's own
+  `[task]`/`[service]` entries). Any other section the file declares is **named** on a
+  closing `also declares:` line, so a profile never arrives carrying something the report
+  did not mention.
 - The file must have a `cmd` (an empty parse is the tell-tale of a wrongly
   `[app.<name>]`-wrapped file, refused with a hint).
 - `--as` renames the imported app (default: the file's stem); `--force` overwrites an

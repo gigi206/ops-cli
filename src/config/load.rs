@@ -855,7 +855,101 @@ fn describe_app_posture(app: &RawApp) -> Vec<String> {
             );
         }
     }
+    // The host-reach switches, each a plain yes/no the reader must see stated. They are cheap to
+    // omit and expensive to be surprised by: `allow_insecure_http` is the one that turns off the
+    // refusal to speak cleartext, and the three below hand the cage a device or the session bus.
+    for (name, on, what) in [
+        (
+            "allow_insecure_http",
+            app.allow_insecure_http,
+            "this app may speak plain HTTP, unencrypted, to the hosts its rules allow",
+        ),
+        ("gpu", app.gpu, "the host GPU is bound into the cage"),
+        ("audio", app.audio, "the host audio server is reachable"),
+        ("dbus", app.dbus, "the host session bus is reachable"),
+    ] {
+        if on == Some(true) {
+            lines.push(format!("{name}: true — {what}"));
+        }
+    }
+    if let Some(forward) = &app.forward
+        && !forward.is_empty()
+    {
+        lines.push(format!(
+            "forward: {} port(s) — a listener on your host is reachable from inside this cage",
+            forward.len()
+        ));
+    }
+    if let Some(section) = &app.task
+        && !section.tasks.is_empty()
+    {
+        let names: Vec<&str> = section.tasks.keys().map(String::as_str).collect();
+        lines.push(format!(
+            "tasks: {} — declared operations this app may run, each with its own network and \
+             credentials",
+            names.join(", ")
+        ));
+    }
+    if !app.service.is_empty() {
+        let names: Vec<&str> = app.service.keys().map(String::as_str).collect();
+        lines.push(format!(
+            "services: {} — commands started with the cage and kept running",
+            names.join(", ")
+        ));
+    }
+    lines.extend(undescribed_sections(app));
     lines
+}
+
+/// Every top-level key the profile declares that [`describe_app_posture`] does not render a line
+/// for, named as a bare list.
+///
+/// The report's standard is that consent is never given to something unstated, and the way that
+/// standard was broken each time was a field added to [`RawApp`] and not added here — nothing
+/// failed, the profile simply arrived carrying one more thing than it said. This closes that by
+/// construction: the keys come from serializing the profile, so a field this function has never
+/// heard of still reaches the reader. A key that *is* rendered above is listed by name here, and
+/// the two lists are asserted against the schema in the tests.
+///
+/// Deliberately terse. These are the sections a reader should go and look at, not ones this
+/// summary tries to explain; the explained ones are explained above.
+fn undescribed_sections(app: &RawApp) -> Vec<String> {
+    // Rendered in full above, so naming them again would be noise.
+    const DESCRIBED: &[&str] = &[
+        "cmd",
+        "home_scope",
+        "uses",
+        "packages",
+        "binds",
+        "network",
+        "gui",
+        "devices",
+        "seccomp",
+        "ssh_agent",
+        "secret",
+        "allow_insecure_http",
+        "gpu",
+        "audio",
+        "dbus",
+        "forward",
+        "task",
+        "service",
+    ];
+    let Ok(toml::Value::Table(table)) = toml::Value::try_from(app) else {
+        return Vec::new();
+    };
+    let rest: Vec<&str> = table
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !DESCRIBED.contains(k))
+        .collect();
+    if rest.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "also declares: {} — read them in the profile before importing",
+        rest.join(", ")
+    )]
 }
 
 /// A one-line description of where a credential is read from: the terse `key`, or the explicit

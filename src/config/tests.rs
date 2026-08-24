@@ -3384,6 +3384,65 @@ fn validating_a_profile_requires_a_command_and_summarizes_its_posture() {
     );
     assert!(joined.contains("devices: /dev/kvm"), "{joined}");
     assert!(joined.contains("seccomp allow: userfaultfd"), "{joined}");
+
+    // The switches and sections that widen host reach without being a list of paths. Each of these
+    // arrived unstated: the report named the profile's binds and credentials and said nothing about
+    // the cage speaking cleartext, holding the session bus, reaching a listener on the host, or
+    // carrying declared operations of its own.
+    let wider = validate_profile(
+        br#"
+            cmd = "demo-app"
+            allow_insecure_http = true
+            gpu = true
+            audio = true
+            dbus = true
+            forward = [8080]
+            [service.api]
+            cmd = ["serve"]
+            [task.deploy]
+            cmd = ["deploy"]
+            "#,
+    )
+    .unwrap();
+    let joined = wider.summary.join("\n");
+    for expected in [
+        "allow_insecure_http: true",
+        "gpu: true",
+        "audio: true",
+        "dbus: true",
+        "forward: 1 port(s)",
+        "services: api",
+        "tasks: deploy",
+    ] {
+        assert!(
+            joined.contains(expected),
+            "the consent report must state `{expected}`: {joined}"
+        );
+    }
+
+    // And whatever it has no line for is still named, so a field added to the schema without a
+    // line here cannot arrive in silence.
+    let unexplained = validate_profile(
+        br#"
+            cmd = "demo-app"
+            [fs]
+            unmask = ["~/.ssh"]
+            [limits]
+            memory_max = "2G"
+            "#,
+    )
+    .unwrap();
+    let joined = unexplained.summary.join("\n");
+    assert!(
+        joined.contains("also declares:") && joined.contains("fs") && joined.contains("limits"),
+        "a section with no line of its own must still be named: {joined}"
+    );
+    // A profile whose every section is explained carries no catch-all line.
+    assert!(
+        !granting.summary.join("\n").contains("also declares:"),
+        "nothing unexplained, nothing to append: {:?}",
+        granting.summary
+    );
 }
 
 #[test]
