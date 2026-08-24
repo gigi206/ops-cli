@@ -132,9 +132,10 @@ const MAX_CONCURRENT_CONNS: usize = 32;
 /// been validated.
 ///
 /// The per-payload ceiling alone does not bound a request: a caller sending a thousand empty
-/// payloads costs nothing per payload and a map entry each time, and the keys are what grows. So
-/// what is bounded is the whole request, keys included, which bounds the count as a consequence
-/// rather than by a second number.
+/// payloads costs nothing per payload and a map entry each time. So what is bounded is the whole
+/// request — each field's own request line, framing included, plus its payload — which bounds the
+/// count as a consequence rather than by a second number. The line rather than the key, because a
+/// key is only what grows while a caller supplies one, and a field naming nothing is still a field.
 ///
 /// Eight payloads at the ceiling. A choice rather than a derivation, and the trigger for revisiting
 /// it is a task legitimately refused for it: a task declaring eight megabytes of parameters is not
@@ -760,7 +761,11 @@ fn read_payloads(reader: &mut BufReader<UnixStream>) -> io::Result<Result<Payloa
         if len > MAX_PAYLOAD_BYTES {
             return Ok(Err("payload too large"));
         }
-        held = held.saturating_add(key.len()).saturating_add(len);
+        // The **line** is charged, not the key alone. A key is what grows only while a caller
+        // supplies one: `param  0` names nothing and declares nothing, so it cost zero and could be
+        // repeated without end — the count this ceiling is supposed to bound as a consequence was
+        // not bounded at all. Charging the framing gives every field a floor, whatever it carries.
+        held = held.saturating_add(line.len()).saturating_add(len);
         if held > MAX_REQUEST_BYTES {
             return Ok(Err("request too large"));
         }
@@ -1752,6 +1757,30 @@ mod tests {
         let key = "k".repeat(1024);
         for i in 0..(MAX_REQUEST_BYTES / 1024) + 1 {
             request.extend_from_slice(format!("param {key}{i} 0\n\n").as_bytes());
+        }
+        request.extend_from_slice(b"run\n");
+        assert_eq!(
+            read_payloads_of(request).expect("the read itself succeeds"),
+            Err("request too large")
+        );
+    }
+
+    /// The field that names nothing is bounded too, and it is the one the rule missed.
+    ///
+    /// `param  0` declares no key and no payload, so a ceiling counting keys and values saw a cost
+    /// of zero and let it repeat without end: the count this bound is supposed to bound as a
+    /// consequence was not bounded at all, and one cage connection could hold a host thread reading
+    /// eight bytes at a time for as long as it liked. Every field is charged its own framing now,
+    /// so a field that carries nothing still costs something.
+    #[test]
+    fn a_flood_of_fields_that_name_nothing_is_bounded_too() {
+        let mut request = Vec::new();
+        // `param  0`: an empty key, a zero-length payload, and its closing newline. What it is
+        // charged is its request line, eight bytes, so that is what the count has to exceed.
+        let field = b"param  0\n\n";
+        let charged = b"param  0".len();
+        for _ in 0..(MAX_REQUEST_BYTES / charged) + 1 {
+            request.extend_from_slice(field);
         }
         request.extend_from_slice(b"run\n");
         assert_eq!(
