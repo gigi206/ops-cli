@@ -706,12 +706,10 @@ fn collect_reply<H: Read + Write>(
                 }
                 out.push(rewritten);
             }
-            // Refused on the way back: what the host said is not delivered because the plugin was
-            // shown it. The caller turns this into the protocol's refusal.
             // Refused on the way back. The outcome is a refusal, not a forward: what the host
-            // said is not delivered, and a record calling it a forward would be false. The
-            // manifest's constant stands in when the plugin named no bytes, exactly as on the way
-            // up.
+            // said is not delivered because the plugin was shown it, and a record calling it a
+            // forward would be false. The manifest's constant stands in when the plugin named no
+            // bytes, exactly as on the way up — so `refused` is the signal, never the frame count.
             Verdict::Deny(bytes) => {
                 let frame = bytes.or_else(|| spec.deny_frame.clone());
                 if let (Some(marker), Some(frame)) = (marker, frame.as_deref())
@@ -1326,14 +1324,34 @@ fn serve_exchanges(
             .map_err(|e| format!("cannot read the host resource's greeting: {e}"))?
             .ok_or("the host resource closed before greeting")?;
         let greeted = collect_reply(spec, decider, host, 0, Some(greeting), marker)?;
-        let to_cage = greeted.frames;
-        for bytes in &to_cage {
+        for bytes in &greeted.frames {
             if write_frame(&mut cage_w, spec.framing, bytes, true).is_err() {
                 return Ok(());
             }
         }
-        if to_cage.is_empty() {
-            // The plugin refused the greeting: there is no exchange to have.
+        // The plugin's own verdict ends this, not the number of frames it produced. Reading
+        // emptiness as the refusal was right for a manifest with no `deny_frame` and wrong for one
+        // with it: there the refusal came back carrying the protocol's own rejection message, which
+        // is a frame, so the connection went on to serve every request that followed a greeting the
+        // broker had just refused. The record was silent about it for the same reason.
+        if greeted.refused {
+            ring.push(
+                super::broker_control::BrokerKind::Refuse,
+                name,
+                "the host resource's greeting",
+                greeted.label.as_deref(),
+            );
+            crate::diag::note(&format!(
+                "broker `{name}` refused the host resource's greeting{}",
+                match greeted.label.as_deref().map(super::lens::sanitize_detail) {
+                    Some(why) if !why.is_empty() => format!(": {why}"),
+                    _ => String::new(),
+                }
+            ));
+            return Ok(());
+        }
+        if greeted.frames.is_empty() {
+            // Nothing refused and nothing to say: there is no exchange to have either way.
             return Ok(());
         }
     }
@@ -3083,6 +3101,53 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             );
             assert!(seen.is_empty(), "nothing was ever put to the host resource");
         }
+    }
+
+    /// A greeting the plugin refuses ends the connection, whatever the manifest's `deny_frame`
+    /// says. The greeting path read "no frames" as the refusal, which is only the same thing when
+    /// the manifest declares no rejection message: declare one and the refusal came back carrying
+    /// it, the frame count was one, and the connection went on to serve every request that followed
+    /// a greeting the broker had just refused. The record said nothing about it either.
+    #[test]
+    fn a_refused_greeting_ends_the_connection_even_with_a_rejection_frame() {
+        let mut spec = spec(Some(b"NO".to_vec()));
+        spec.host_greets = true;
+        spec.inspect_replies = true;
+
+        let (cage, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let mut client = theirs;
+        // A request the cage sends straight after the greeting, as a real client would.
+        write_frame(&mut client, spec.framing, b"request", false).expect("cage frame");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-close");
+
+        let mut plugin = ScriptedPlugin::new(vec![Answer {
+            verdict: Verdict::Deny(None),
+            expect_reply: false,
+            more: false,
+            label: Some("this greeting names a key I do not fence".to_string()),
+        }]);
+        // The greeting, and nothing else: the host must never be asked about the request below.
+        let mut host = FakeHost::with_runs(vec![vec![b"GREETING".to_vec()]]);
+        host.outbox = Vec::new();
+        write_frame(&mut host.outbox, spec.framing, b"GREETING", true).expect("stage the greeting");
+
+        let ring = super::super::broker_control::BrokerRing::new(8);
+        serve_exchanges(&spec, &mut plugin, &mut host, cage, &ring, None, "x").expect("served");
+
+        assert!(
+            host.seen.is_empty(),
+            "the request must never reach the host resource: {:?}",
+            host.seen
+        );
+        let events = ring.snapshot(None).events;
+        assert_eq!(events.len(), 1, "the refusal is recorded: {events:?}");
+        assert!(
+            events[0].detail.contains("greeting") && events[0].detail.contains("do not fence"),
+            "and says what was refused, with the plugin's own words: {:?}",
+            events[0].detail
+        );
     }
 
     /// A message the protocol answers with nothing does not end the conversation.
