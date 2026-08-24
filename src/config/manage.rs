@@ -640,6 +640,14 @@ fn validate_layer(doc: &DocumentMut) -> Result<(), String> {
 
 /// Remove a dotted key. Returns whether it existed. An absent file or parent is simply "not
 /// present" (returns `false`), never an error.
+///
+/// Validated before it commits, like [`set`], [`add`] and [`remove`] — [`validate_layer`]'s own doc
+/// names "a `set`/`unset` that leaves the layer unparseable" as the thing it exists to prevent, and
+/// this was the one of the four that did not ask. A removal can make a layer unparseable as readily
+/// as a bad value can: several schema tables carry a required field with no `#[serde(default)]`
+/// (`RawServiceTable.cmd`, `RawServiceReady.tcp`, `RawOpenTable.cmd`, `RawInlineFlake.flake`), and
+/// `RawOpen`/`RawService` are `#[serde(untagged)]`, so a table left without its required field
+/// matches no variant at all.
 pub(crate) fn unset(path: &Path, key: &str) -> Result<bool, ManageError> {
     let mut doc = read_or_empty(path)?;
     let segments = split_key(key)?;
@@ -656,6 +664,9 @@ pub(crate) fn unset(path: &Path, key: &str) -> Result<bool, ManageError> {
     }
     let existed = table.remove(leaf[0].as_str()).is_some();
     if existed {
+        if let Err(detail) = validate_layer(&doc) {
+            return Err(ManageError::InvalidValue(key.to_string(), detail));
+        }
         write_doc(path, &doc)?;
     }
     Ok(existed)
@@ -2176,6 +2187,38 @@ mod tests {
         assert!(!unset(&p, "env.FOO").unwrap(), "already gone");
         assert!(!unset(&p, "absent.key").unwrap(), "absent parent");
         assert_eq!(get(&p, "env.BAZ").unwrap().as_deref(), Some("qux"));
+    }
+
+    /// `validate_layer`'s doc names "a `set`/`unset` that leaves the layer unparseable" as the thing
+    /// it exists to prevent — because the loader drops the WHOLE layer with only a warning, silently
+    /// reverting every security field it carried. `set`, `add` and `remove` asked; `unset` did not,
+    /// and a removal invalidates a layer as readily as a bad value does: `RawOpen`/`RawService` are
+    /// `#[serde(untagged)]` and their tables carry required fields with no `#[serde(default)]`.
+    ///
+    /// The CLI reported such a write as a success and exited 0, so the revert was invisible on both
+    /// sides.
+    #[test]
+    fn unset_refuses_a_removal_that_would_make_the_loader_drop_the_layer() {
+        let tmp = crate::testutil::TmpDir::new();
+        let before = "network = \"deny\"\n\n[open.https]\ncmd = [\"firefox\"]\nmode = \"detach\"\n";
+        let p = doc_at(tmp.path(), before);
+
+        // `[open.https]` without `cmd` matches neither `RawOpen` variant, so the whole layer — the
+        // `network = "deny"` posture included — would stop parsing.
+        let err = unset(&p, "open.https.cmd").expect_err("the removal must be refused");
+        assert!(
+            matches!(&err, ManageError::InvalidValue(key, _) if key == "open.https.cmd"),
+            "got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            before,
+            "a refused unset must leave the file exactly as it was"
+        );
+
+        // The ordinary removal still goes through, so the guard is not simply refusing everything.
+        assert!(unset(&p, "open.https.mode").unwrap(), "mode is optional");
+        assert_eq!(get(&p, "network").unwrap().as_deref(), Some("deny"));
     }
 
     #[test]
