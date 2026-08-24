@@ -311,6 +311,12 @@ would go, with sizes) and applies only with `--yes`. The app's declared tools, i
 login/session state, and any `nix:`/`deb:`/`flake:` build are left untouched: to remove the
 whole home instead, use [`sbx app rm --purge`](#removing-an-app).
 
+`--yes` is **refused while a session of that app is running**: the tools are in the home
+that session is using, so deleting them takes an interpreter or a `PATH` entry out from
+under a command in flight, and what the agent then reports looks nothing like what
+happened. Stop it with `sbx stop` and retry. The preview deletes nothing, so it stays
+available either way.
+
 ## Examples
 
 ```sh

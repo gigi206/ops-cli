@@ -14,7 +14,7 @@ use crate::cli::confirm::{render_app_exported, render_app_imported, render_remov
 use crate::cli::import_remedy;
 use crate::{
     build_override, config_cwd, egress_write_target, flag_name, net_mode_word, persist_egress_rule,
-    take_override_flag,
+    session_pids_for_app, take_override_flag,
 };
 use crate::{config, diag, help, sandbox, session, store, style, trust};
 
@@ -1871,6 +1871,32 @@ fn app_prune(args: &[OsString]) -> ExitCode {
                 .collect()
         })
         .unwrap_or_default();
+
+    // A prune deletes trees out of the home a running session of this app is using: its `PATH`
+    // entries and interpreters are in `installs/`, so a build in flight loses the tool mid-command
+    // and reports something that looks nothing like what happened. The preview is always safe, so
+    // only the applying form is refused, and refused rather than flagged: there is no reading of
+    // `sbx app prune <name> --yes` under which deleting a live agent's tools is the intent.
+    if apply {
+        let live = session_pids_for_app(layout.data_dir(), name);
+        if !live.is_empty() {
+            let mut pids: Vec<u32> = live.into_iter().collect();
+            pids.sort_unstable();
+            let listed = pids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            diag::error(&format!(
+                "sbx: app prune: {name} has a live session (pid {listed}) whose home these tools \
+                 are in — refusing to delete them under a running agent"
+            ));
+            diag::hint(
+                "       stop it with `sbx stop`, or re-run without `--yes` to see what would go",
+            );
+            return ExitCode::FAILURE;
+        }
+    }
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, n, ok, dim, r) = (pal.head, pal.name, pal.ok, pal.dim, pal.reset);

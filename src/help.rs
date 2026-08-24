@@ -2080,7 +2080,12 @@ const PAGES: &[Page] = &[
             re-equip it. It previews by default — listing what would go, with sizes — and applies\n\
             only with `--yes`. Every home the app has (the global one and any per-project ones) is\n\
             covered. Declared tools, the app's login/session state, and any `nix:`/`deb:`/`flake:`\n\
-            build are left untouched. To remove the whole home instead, see `sbx app rm --purge`.",
+            build are left untouched. To remove the whole home instead, see `sbx app rm --purge`.\n\
+            \n\
+            `--yes` is refused while a session of that app is running: the tools live in the home\n\
+            that session is using, so deleting them takes an interpreter or a `PATH` entry out from\n\
+            under a command in flight. Stop it with `sbx stop` and retry. The preview deletes\n\
+            nothing and stays available.",
     },
     Page {
         path: &["app", "show"],

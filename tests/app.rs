@@ -4,6 +4,7 @@
 //! package from the project trees that gcrooted it). Read-only: no sandbox, no nix, no network, so a
 //! lightweight fixture of fabricated files is enough.
 
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -505,6 +506,70 @@ fn prune_previews_the_undeclared_tool_by_provider_and_removes_nothing() {
         fx.installs_dir("demo-app").join("pipx-orphan").is_dir(),
         "preview must not delete the install"
     );
+}
+
+/// A prune deletes trees out of the very home a running session of this app is using: its `PATH`
+/// entries and interpreters live in `installs/`, so a build in flight loses its tool mid-command.
+/// The applying form is refused while such a session exists; the preview stays safe and stays
+/// available.
+#[test]
+fn prune_yes_refuses_while_a_session_of_that_app_is_live() {
+    let fx = fixture_with_a_leftover();
+    // A registry record for *this* process, which is alive, so it survives the liveness pruning.
+    let sessions = fx.data_home.path().join("sbx/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let pid = std::process::id();
+    let start = start_ticks(pid).expect("this process's start time");
+    // The record's `project` is hex-encoded raw bytes, as the registry writes it.
+    let project: String = fx
+        .proj
+        .path()
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    std::fs::write(
+        sessions.join(format!("{pid}-{start}")),
+        format!(
+            "kind=run\npid={pid}\nstart={start}\nruntime=global-app:demo-app\ndetached=false\n\
+             project={project}\n"
+        ),
+    )
+    .unwrap();
+
+    let out = fx.sbx(&["app", "prune", "demo-app", "--yes"]);
+    assert!(
+        !out.status.success(),
+        "a prune under a live session must refuse: {}",
+        text(&out)
+    );
+    assert!(
+        text(&out).contains("live session"),
+        "and say why: {}",
+        text(&out)
+    );
+    assert!(
+        fx.installs_dir("demo-app").join("pipx-orphan").is_dir(),
+        "nothing may be deleted under the running agent"
+    );
+
+    // The preview is unaffected: it deletes nothing, so there is nothing to refuse.
+    let preview = fx.sbx(&["app", "prune", "demo-app"]);
+    assert!(
+        preview.status.success()
+            && String::from_utf8_lossy(&preview.stdout).contains("would prune"),
+        "the preview must still work: {}",
+        text(&preview)
+    );
+}
+
+/// This process's start time in clock ticks, as the session registry records it — read from
+/// `/proc/<pid>/stat`'s 22nd field, past the parenthesised comm which may itself contain spaces.
+fn start_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
 }
 
 #[test]
