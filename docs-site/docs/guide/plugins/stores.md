@@ -115,6 +115,11 @@ sbx plugins upgrade --dry-run     # what would change
 sbx plugins upgrade [name]        # every store-installed plugin, or one
 ```
 
+`upgrade` syncs each plugin to what its store **lists**, which is not always forward: a
+store that rolled back lists an older build, and the plugin follows it. That move is
+reported as `downgraded` rather than `upgraded`, with the versions it moved between, so a
+walk back to an earlier version is visible in the output instead of reading like progress.
+
 `upgrade` runs **every gate an install runs**: the checkout must be a real
 directory, its content must reproduce the signed `sha256`, and its manifest must
 agree with the catalogue's advertised name, **kind** and scheme: then stages the new tree

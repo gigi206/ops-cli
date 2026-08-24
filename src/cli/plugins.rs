@@ -161,6 +161,24 @@ fn drift_wording(have: &str, listed: &str) -> String {
     }
 }
 
+/// What a completed move to the store's build is called, in the past tense.
+///
+/// The store's listing is what `sbx plugins upgrade` syncs to, and a store may list an *older*
+/// build than the one installed: a rollback is a thing a store operator does, and a plugin pinned
+/// to a catalogue follows it. The move happens either way, but reporting it as an upgrade would
+/// name something that did not happen and would hide the one case worth seeing — a plugin walked
+/// back to an earlier version, with whatever that version was missing. The pending side already
+/// says "ahead of the store" ([`drift_wording`]); this is the same fact after the fact.
+///
+/// Anything the versions cannot settle (either side unnamed, unorderable, equal-but-rebuilt) keeps
+/// the ordinary word: the digest changed, and nothing says it went backwards.
+fn move_verb(have: &str, listed: &str) -> &'static str {
+    match version_order(have, listed) {
+        Some(std::cmp::Ordering::Greater) => "downgraded",
+        _ => "upgraded",
+    }
+}
+
 /// One installed plugin, as a store listing needs it: where it came from, the version its own
 /// manifest declares (absent when the manifest did not load or declares none), and the scheme it
 /// is disabled over, if any.
@@ -1958,7 +1976,8 @@ fn plugins_upgrade(args: &[OsString]) -> ExitCode {
                 } else {
                     format!("v{have} → v{listed}")
                 };
-                println!("  {n}{dir_name}{r}  {ok}upgraded{r} {dim}({moved}){r}");
+                let verb = move_verb(have, listed);
+                println!("  {n}{dir_name}{r}  {ok}{verb}{r} {dim}({moved}){r}");
             }
             Err(why) => {
                 failed += 1;
@@ -2961,5 +2980,21 @@ mod tests {
             drift_wording("", "1.0.0"),
             "installed, the store lists a different build"
         );
+    }
+
+    /// A store may list an older build than the one installed, and `upgrade` syncs to the listing
+    /// either way. Reporting that as an upgrade would name something that did not happen and hide
+    /// the case worth seeing: a plugin walked back to an earlier version.
+    #[test]
+    fn a_move_back_to_an_older_listing_is_not_called_an_upgrade() {
+        assert_eq!(move_verb("2.0.0", "1.0.0"), "downgraded");
+        assert_eq!(move_verb("1.2.0", "1.2.0-rc1"), "downgraded");
+        assert_eq!(move_verb("1.0.0", "2.0.0"), "upgraded");
+        // Nothing says it went backwards: an unnamed side, an unorderable pair, or the same version
+        // rebuilt all keep the ordinary word.
+        assert_eq!(move_verb("", "1.0.0"), "upgraded");
+        assert_eq!(move_verb("1.0.0", ""), "upgraded");
+        assert_eq!(move_verb("latest", "1.0.0"), "upgraded");
+        assert_eq!(move_verb("1.0", "1.0.0"), "upgraded");
     }
 }
