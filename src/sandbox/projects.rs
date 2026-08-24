@@ -20,16 +20,25 @@ use std::process::ExitCode;
 /// carries a `project` marker, that path is absent while its parent directory still exists (a cheap
 /// guard, not a reliable unmount check — the dry-run default is the backstop there), and no live
 /// session holds it. Markerless trees (their project path unknown) are listed for a manual decision
-/// by default; `prune_unidentified` opts into reaping them without a deadness proof (the
-/// `--markerless` escape hatch). Pure host-side filesystem work — no sandbox, no nix. This drives
-/// the bulk `sbx projects rm --dead` / `--markerless` sweeps.
+/// by default; `markerless` opts into reaping them without a deadness proof (the `--markerless`
+/// escape hatch). Pure host-side filesystem work — no sandbox, no nix. This drives the bulk
+/// `sbx projects rm --dead` / `--markerless` sweeps.
+///
+/// The two selectors arrive as the caller's **intent** and `apply` decides whether it happens, so
+/// the report can tell "you asked for this and it is a preview" from "you did not ask". Folding
+/// each selector into its own already-applied flag at the call site lost that: a preview of
+/// `--markerless` was indistinguishable from a plain listing, so it pointed the reader at a manual
+/// removal instead of at the apply form, while the branch written for it could not be reached at
+/// all — with the flag set, the trees are reaped and the list it reads is empty.
 fn reap_dead_trees(
     layout: &crate::store::Layout,
     live_ids: &std::collections::BTreeSet<String>,
-    prune: bool,
-    prune_unidentified: bool,
+    dead: bool,
+    markerless: bool,
+    apply: bool,
     pal: &crate::style::Palette,
 ) {
+    let (prune, prune_unidentified) = (apply && dead, apply && markerless);
     let (h, n, ok, warn, dim, r) = (pal.head, pal.name, pal.ok, pal.warn, pal.dim, pal.reset);
     let projects_dir = layout.data_dir().join("projects");
     let report = super::gc::reap_dead_projects(&projects_dir, live_ids, prune, prune_unidentified);
@@ -103,7 +112,7 @@ fn reap_dead_trees(
     // hint adapts to whether the user is using the `--markerless` hatch — a dry run of it points
     // at the apply form, the default still points at a by-hand removal (the fail-closed stance).
     for tree in &report.unidentified {
-        let hint = if prune_unidentified {
+        let hint = if markerless {
             "run `sbx projects rm --markerless --yes` to reclaim (no deadness proof)"
         } else {
             "remove by hand if unwanted"
@@ -190,6 +199,10 @@ struct StoreRootsView {
     deb: Vec<String>,
     /// `appimage:` build outputs (the `appimage-` gcroots, prefix stripped).
     appimage: Vec<String>,
+    /// `tarball:` build outputs (the `tarball-` gcroots, prefix stripped).
+    tarball: Vec<String>,
+    /// `binary:` build outputs (the `binary-` gcroots, prefix stripped).
+    binary: Vec<String>,
 }
 
 /// A mise tool realized in the project's own home, for `sbx projects show`.
@@ -286,16 +299,25 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
             per_project,
         });
 
-    // Group the store roots: `deb-`/`appimage-` are prebuilt build outputs; everything else is a
-    // `nix:` package (or a hole provision realized into the shared store).
+    // Group the store roots: a prefixed gcroot is a prebuilt build output of that backend;
+    // everything else is a `nix:` package (or a hole provision realized into the shared store).
+    //
+    // Every prefix the realized-signal match below looks for is listed here. Two of them were not,
+    // so a `tarball:` or `binary:` package's gcroot fell through to the `nix` bucket and `sbx
+    // projects show` reported it as a `nix:` package the project does not declare.
     let mut store_roots = StoreRootsView::default();
     for name in &gcroots {
-        if let Some(rest) = name.strip_prefix("deb-") {
-            store_roots.deb.push(rest.to_string());
-        } else if let Some(rest) = name.strip_prefix("appimage-") {
-            store_roots.appimage.push(rest.to_string());
-        } else {
-            store_roots.nix.push(name.clone());
+        let prefixed = [
+            ("deb-", &mut store_roots.deb),
+            ("appimage-", &mut store_roots.appimage),
+            ("tarball-", &mut store_roots.tarball),
+            ("binary-", &mut store_roots.binary),
+        ]
+        .into_iter()
+        .find_map(|(prefix, into)| name.strip_prefix(prefix).map(|rest| (rest, into)));
+        match prefixed {
+            Some((rest, into)) => into.push(rest.to_string()),
+            None => store_roots.nix.push(name.clone()),
         }
     }
 
@@ -454,7 +476,9 @@ fn render_project_show(v: &ProjectShowView, pal: &crate::style::Palette) -> Stri
     // Store roots realized in the (shared) per-project store.
     let roots_empty = v.store_roots.nix.is_empty()
         && v.store_roots.deb.is_empty()
-        && v.store_roots.appimage.is_empty();
+        && v.store_roots.appimage.is_empty()
+        && v.store_roots.tarball.is_empty()
+        && v.store_roots.binary.is_empty();
     if roots_empty {
         let _ = writeln!(s, "  store roots: {dim}none{r}");
     } else {
@@ -470,6 +494,8 @@ fn render_project_show(v: &ProjectShowView, pal: &crate::style::Palette) -> Stri
         row("nix", &v.store_roots.nix);
         row("deb", &v.store_roots.deb);
         row("appimage", &v.store_roots.appimage);
+        row("tarball", &v.store_roots.tarball);
+        row("binary", &v.store_roots.binary);
     }
     // mise tools in the project's own home.
     if !v.mise_tools.is_empty() {
@@ -682,7 +708,7 @@ pub(crate) fn projects_rm(
     }
 
     if dead || markerless {
-        reap_dead_trees(&layout, &live_ids, apply && dead, apply && markerless, pal);
+        reap_dead_trees(&layout, &live_ids, dead, markerless, apply, pal);
     }
 
     if do_gc {

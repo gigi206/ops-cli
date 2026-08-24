@@ -236,6 +236,31 @@ fn show_reports_store_roots_and_declared_but_not_built() {
     assert_eq!(unbuilt.len(), 1, "one unbuilt package: {v}");
     assert!(unbuilt[0]["locator"].as_str().unwrap().contains("absent"));
     assert_eq!(unbuilt[0]["withheld"], false);
+
+    // A gcroot's prefix says which backend built it, and every prefix the realized-signal check
+    // looks for has to be one this grouping strips. `tarball-` and `binary-` were not, so those
+    // roots fell into the `nix` bucket and were reported as `nix:` packages the project does not
+    // declare.
+    fx.make_gcroot(tree, "tarball-rolled");
+    fx.make_gcroot(tree, "binary-shipped");
+    let out = fx.sbx(&["projects", "show", tree, "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let bucket = |kind: &str| -> Vec<String> {
+        v["store_roots"][kind]
+            .as_array()
+            .unwrap_or_else(|| panic!("no `{kind}` bucket: {v}"))
+            .iter()
+            .map(|x| x.as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    assert_eq!(bucket("tarball"), vec!["rolled".to_string()]);
+    assert_eq!(bucket("binary"), vec!["shipped".to_string()]);
+    let nix = bucket("nix");
+    assert!(
+        !nix.iter()
+            .any(|n| n.contains("rolled") || n.contains("shipped")),
+        "a prebuilt output must not read as a `nix:` package: {nix:?}"
+    );
 }
 
 #[test]
@@ -505,6 +530,48 @@ fn rm_markerless_needs_yes_and_leaves_marked_trees() {
         idle.exists(),
         "a marked tree must survive a --markerless sweep:\n{}",
         text(&out)
+    );
+}
+
+/// The preview of `--markerless` points at the apply form; a listing nobody asked `--markerless`
+/// for points at a manual removal, which is the fail-closed stance.
+///
+/// Both selectors were folded into their own already-applied flag at the call site, so the report
+/// could not tell "you asked for this and it is a preview" from "you did not ask": a preview said
+/// "remove by hand", and the branch written for it could not be reached at all, since with the flag
+/// set the trees are reaped and the list it reads is empty.
+#[test]
+fn a_markerless_preview_points_at_the_apply_form() {
+    let fx = Fixture::new();
+    let markerless = fx.make_tree("nomarkernomarker", None);
+
+    let preview = fx.sbx(&["projects", "rm", "--markerless"]);
+    assert!(
+        preview.status.success(),
+        "preview failed: {}",
+        text(&preview)
+    );
+    assert!(
+        markerless.exists(),
+        "a preview reclaims nothing:\n{}",
+        text(&preview)
+    );
+    let said = text(&preview);
+    assert!(
+        said.contains("--markerless --yes"),
+        "the preview of the opt-in must point at its apply form:\n{said}"
+    );
+
+    // The default listing, where nobody asked for the hatch, still points at a by-hand removal.
+    let plain = fx.sbx(&["projects", "rm", "--dead"]);
+    let said = text(&plain);
+    assert!(
+        said.contains("remove by hand"),
+        "an unasked-for markerless tree keeps the fail-closed hint:\n{said}"
+    );
+    assert!(
+        !said.contains("--markerless --yes"),
+        "and is not pointed at an opt-in it did not ask for:\n{said}"
     );
 }
 
