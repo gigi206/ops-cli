@@ -607,57 +607,20 @@ pub(crate) fn gcroots_dir(store_dir: &Path) -> PathBuf {
     store_dir.join("nix/var/nix/gcroots")
 }
 
-/// Make `store_dir`'s descendant `rel` (slash-separated), one component at a time, refusing any that
-/// already exists and is **not a real directory**.
+/// Make `store_dir`'s `nix/<rel>` chain, refusing a component the cage repointed.
 ///
-/// Everything below `store_dir/nix` is the cage's: it is bound read-write at `/nix`
-/// (`NixMount { writable: true }`), the cage runs same-uid, and the directories are `0700` owned by
-/// that uid — so in-cage code may `mv /nix/store /nix/store.real && ln -s /somewhere /nix/store`, or
-/// do the same to `var`. `store_dir/nix` itself is out of reach (from inside the cage it *is* the
-/// mount point), which is why the walk anchors there and only guards what lies below.
+/// [`super::cagedir::ensure_under`] with `store_dir` as the anchor. Everything under
+/// `store_dir/nix` is bound read-write at `/nix` (`NixMount { writable: true }`), the cage runs
+/// same-uid, and the directories are `0700` owned by that uid — so in-cage code may
+/// `mv /nix/store /nix/store.real && ln -s /somewhere /nix/store`, or do the same to `var`, and
+/// leave it for the next launch. The seed below then copies the whole base closure, gigabytes of
+/// it, into wherever the cage pointed, and `gcroot_roots` writes its symlinks there.
 ///
-/// `create_dir_all` cannot make that distinction: it stats through a link, finds a directory, and
-/// reports the parents as made — after which the host's own seed copies the base closure, gigabytes
-/// of it, into wherever the cage pointed, and `gcroot_roots` writes its symlinks there. So each
-/// component is `symlink_metadata`'d before it is used and a non-directory is a hard error, not
-/// something to repair: a store skeleton that is not what sbx left is a finding the user should see,
-/// and silently re-creating it would destroy the evidence along with whatever the cage had staged.
-///
-/// This closes the shape, not the last instant of it. A *concurrent* same-project launch whose cage
-/// is live could still swap a component between this check and the copy that follows; closing that
-/// too means carrying a descriptor through `copy_recursive` and the `nix-store` invocations, which
-/// take paths. The window here is a live cage racing another launch's seed, where before it was a
-/// cage simply leaving a symlink behind for the next launch to find.
+/// `store_dir` itself sits under `<data>/projects/<id>/`, which the cage never sees, so it is a
+/// sound anchor; `nix` is the bind's own source, which from inside the cage is the mount point and
+/// so cannot be exchanged either.
 fn ensure_dir_chain(store_dir: &Path, rel: &str) -> io::Result<PathBuf> {
-    let mut at = store_dir.join("nix");
-    DirBuilder::new()
-        .recursive(true)
-        .mode(DIR_MODE)
-        .create(&at)?;
-    for component in rel.split('/') {
-        at.push(component);
-        match fs::symlink_metadata(&at) {
-            Ok(meta) if meta.is_dir() => {}
-            Ok(meta) => {
-                let kind = if meta.is_symlink() {
-                    "a symlink"
-                } else {
-                    "not a directory"
-                };
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "`{}` is {kind} — the project store's own `/nix` is writable by the cage, so \
-                         this is what in-cage code leaves behind to redirect the next launch's seed. \
-                         Reclaim the store (`sbx gc`) or remove that entry by hand",
-                        at.display()
-                    ),
-                ));
-            }
-            Err(_) => DirBuilder::new().mode(DIR_MODE).create(&at)?,
-        }
-    }
-    Ok(at)
+    super::cagedir::ensure_under(store_dir, &format!("nix/{rel}"), DIR_MODE)
 }
 
 /// Register each logical `roots` path (`/nix/store/<hash>-name`) as a direct gc root in

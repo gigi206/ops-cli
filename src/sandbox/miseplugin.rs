@@ -75,8 +75,16 @@ pub(crate) fn stage(data_dir: &Path) -> io::Result<PathBuf> {
 /// project (the "second terminal" case) only ever sees the old link or the new one —
 /// never the missing-link window a remove-then-create would open — and two racing
 /// registrations resolve to a last-writer-wins of identical links.
-pub(crate) fn register(plugins_dir: &Path) -> io::Result<()> {
-    std::fs::create_dir_all(plugins_dir)?;
+pub(crate) fn register(root: &Path, rel: &str) -> io::Result<()> {
+    // Walked with symlinks refused, not `create_dir_all`ed. `root` is a bind's mount point — the
+    // cage's `$HOME`, or the per-project mise pool — and every component of `rel` below it is an
+    // ordinary directory in-cage code owns and can replace. Two things here follow such a link:
+    // the placement itself, which would register the plugin outside the pool; and worse, the
+    // `remove_dir_all(&link)` fallback below, which recursively deletes whatever sits at
+    // `<plugins_dir>/nix`. A cage that left `ln -s /home/user/somewhere ~/.local/share/mise/plugins`
+    // behind therefore had the *next* launch delete `/home/user/somewhere/nix` outright.
+    let plugins_dir = super::cagedir::ensure_under(root, rel, 0o700)?;
+    let plugins_dir = plugins_dir.as_path();
     let link = plugins_dir.join(PLUGIN_NAME);
     // The temp name carries the pid (like `stage`): `unique()` is a process-local counter starting
     // at 0, so without the pid two concurrent same-project launches would share `.nix.0.tmp` and one
@@ -218,8 +226,9 @@ mod tests {
     #[test]
     fn register_links_the_backend_to_the_incage_plugin() {
         let home = TmpDir::new();
-        let plugins = home.join(".local/share/mise/plugins");
-        register(&plugins).expect("register the plugin");
+        const REL: &str = ".local/share/mise/plugins";
+        let plugins = home.join(REL);
+        register(home.path(), REL).expect("register the plugin");
 
         let link = plugins.join("nix");
         let target = std::fs::read_link(&link).expect("the registration is a symlink");
@@ -227,8 +236,39 @@ mod tests {
 
         // idempotent: a second registration (e.g. after an sbx upgrade) replaces the
         // link without error
-        register(&plugins).expect("re-register the plugin");
+        register(home.path(), REL).expect("re-register the plugin");
         assert_eq!(std::fs::read_link(&link).unwrap(), Path::new(INCAGE_DIR));
+    }
+
+    /// `plugins_dir` sits under the cage's own `$HOME`, so every component of it is one in-cage
+    /// code can replace with a symlink and leave for the next launch. Two things here used to
+    /// follow such a link: the placement, which would register the plugin outside the pool, and the
+    /// `remove_dir_all(&link)` fallback, which recursively deletes whatever sits at
+    /// `<plugins_dir>/nix` — so `ln -s /home/user/somewhere ~/.local/share/mise/plugins` had the
+    /// next launch delete `/home/user/somewhere/nix` outright.
+    #[test]
+    fn register_refuses_a_plugins_dir_the_cage_pointed_out_of_the_home() {
+        let home = TmpDir::new();
+        const REL: &str = ".local/share/mise/plugins";
+        let outside = home.join("outside");
+        // The shape the fallback would delete: a real `nix` directory at the link's target.
+        std::fs::create_dir_all(outside.join("nix").join("keep")).unwrap();
+        std::fs::create_dir_all(home.path().join(".local/share/mise")).unwrap();
+        std::os::unix::fs::symlink(&outside, home.path().join(REL)).unwrap();
+
+        let err = register(home.path(), REL).expect_err("a repointed plugins dir must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        assert!(
+            outside.join("nix").join("keep").exists(),
+            "the host directory the link pointed at was deleted"
+        );
+        assert!(
+            std::fs::symlink_metadata(home.path().join(REL))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted link must be reported, not replaced"
+        );
     }
 
     #[test]
@@ -237,9 +277,12 @@ mod tests {
         // case): the atomic rename means every one succeeds and the link always
         // resolves — no remove-then-create window leaves a launch with EEXIST/ENOENT.
         let home = TmpDir::new();
-        let plugins = home.join(".local/share/mise/plugins");
+        const REL: &str = ".local/share/mise/plugins";
+        let plugins = home.join(REL);
         std::thread::scope(|s| {
-            let handles: Vec<_> = (0..8).map(|_| s.spawn(|| register(&plugins))).collect();
+            let handles: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| register(home.path(), REL)))
+                .collect();
             for h in handles {
                 h.join().expect("thread did not panic").expect("register");
             }

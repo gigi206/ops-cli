@@ -1479,13 +1479,16 @@ pub(crate) fn build_spec(
     // there too (and the pool created owner-only, so the writable bind has an existing source) —
     // otherwise that mise would find no `nix:` backend and self-equip would break.
     let mise_plugin = super::miseplugin::stage(data_dir)?;
-    let mut mise_plugin_dirs = vec![rt.home_src.join(MISE_DATA_REL).join("plugins")];
+    // Each registration is given its **anchor** and the path below it, rather than one joined path:
+    // everything under a bind's mount point is cage-writable, so `register` has to know where the
+    // trusted prefix ends in order to refuse a component the cage repointed.
+    let mut mise_plugin_dirs = vec![(rt.home_src.clone(), format!("{MISE_DATA_REL}/plugins"))];
     if let Some(pool) = &rt.mise_project_src {
         DirBuilder::new().recursive(true).mode(0o700).create(pool)?;
-        mise_plugin_dirs.push(pool.join("plugins"));
+        mise_plugin_dirs.push((pool.clone(), "plugins".to_string()));
     }
-    for dir in &mise_plugin_dirs {
-        super::miseplugin::register(dir)?;
+    for (root, rel) in &mise_plugin_dirs {
+        super::miseplugin::register(root, rel)?;
     }
 
     // The cage's readable name: the app name for `sbx app <name>`, else the project's own
