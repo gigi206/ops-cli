@@ -2475,6 +2475,49 @@ mod tests {
         assert!(!key.exists());
     }
 
+    /// A catalogue is keyed by the manifest `name`, and the map that builds it would take the last
+    /// of two claimants while the publish confirmation listed both: two plugins reported shipped, one
+    /// in the store, nothing saying which was lost. It never gets that far — the loader's
+    /// name-ambiguity rule disables every claimant and `publish` refuses the tree — and this pins
+    /// that, because the guard is in a different module from the map that depends on it and a
+    /// signer (unlike a resolver, whose `scheme` must be unique on its own account) has no second
+    /// rule standing behind it.
+    #[test]
+    fn publish_refuses_two_plugins_claiming_one_name() {
+        let repo = crate::testutil::TmpDir::new();
+        for dir in ["plugins/first", "plugins/second"] {
+            let plugin = repo.path().join(dir);
+            std::fs::create_dir_all(&plugin).unwrap();
+            // A signer, not a resolver: a resolver's `scheme` must already be unique, so the name
+            // collision would be caught by that rule and never reach this one. A signer claims no
+            // scheme, which is exactly where the name was the only key and nothing checked it.
+            std::fs::write(
+                plugin.join("plugin.toml"),
+                "name = \"shared\"\ntype = \"signer\"\nexec = \"resolve\"\n\
+                 [signer]\nsets_headers = [\"Authorization\"]\n",
+            )
+            .unwrap();
+            let exec = plugin.join("resolve");
+            std::fs::write(&exec, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let key = repo.path().join("store.key");
+
+        let err = publish(repo.path(), &key, Some(1)).unwrap_err();
+        assert!(
+            err.contains("shared") && err.contains("first") && err.contains("second"),
+            "the refusal must name the claim and both claimants: {err}"
+        );
+        assert!(
+            !err.contains("internal error"),
+            "refused before the catalogue is built, not by the round-trip guard: {err}"
+        );
+        assert!(
+            !key.exists(),
+            "nothing is signed for a tree that cannot publish"
+        );
+    }
+
     /// Whether any `.store-stage-` staging tree survives under the data directory.
     fn leaked_stage(data: &Path) -> bool {
         std::fs::read_dir(data)
