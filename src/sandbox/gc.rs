@@ -810,6 +810,24 @@ pub(crate) fn installed_app_homes(data_dir: &Path) -> Vec<InstalledApp> {
         .collect()
 }
 
+/// `candidate`'s real path, or `None` when it does not exist or resolves outside `root`.
+///
+/// The containment rule `super::fsmask::admit` applies to a project-declared path, applied here to a
+/// path under a **cage-owned home**. Every component is resolved (`canonicalize` follows the whole
+/// chain), so a symlink planted at any depth is caught rather than only one at the leaf — which is
+/// the difference that matters, since the callers hand [`force_remove_dir_all`] a root whose last
+/// component is genuine and whose *parent* is the one the cage replaced.
+///
+/// `None` for an absent path is not a refusal: a home with no mise data has nothing to prune, and
+/// that is the ordinary case rather than an error. A path that resolves outside `root` returns
+/// `None` too — the caller then does nothing at all, which is the fail-closed answer for a verb
+/// whose only action is to delete.
+fn contained_in(root: &Path, candidate: &Path) -> Option<PathBuf> {
+    let root = root.canonicalize().ok()?;
+    let real = candidate.canonicalize().ok()?;
+    real.starts_with(&root).then_some(real)
+}
+
 /// One mise tool `sbx app prune` would remove (or removed) from an app home — a tool the app's
 /// config does not declare (a leftover from a former profile, or one pulled in by hand).
 pub(crate) struct PrunedTool {
@@ -826,10 +844,21 @@ pub(crate) struct PrunedTool {
 /// `<home>/.config/mise/config.toml` `[tools]`. With `apply = false` nothing is removed — the return
 /// is the preview of what would go. Read-only when previewing; a targeted cleanup when applying.
 pub(crate) fn prune_app_tools(home: &Path, declared: &[&str], apply: bool) -> Vec<PrunedTool> {
-    let installs = home.join(".local/share/mise/installs");
+    // Resolved and confined before anything is enumerated or removed. `home` is the cage's own
+    // `$HOME` (a plain writable `Mount::Bind`), so `.local`, `.local/share`, `.local/share/mise` and
+    // `installs` are ordinary directories untrusted in-cage code owns and can replace with a
+    // symlink. [`force_remove_dir_all`]'s guard is explicitly about the root it is *handed* — it
+    // lstats that one path — and the root here is `<installs>/<tool>`, whose last component is a
+    // real directory. The link would sit above it, where nothing on this chain looked, and
+    // `read_dir` would then enumerate somebody else's directory as "installed tools" for a
+    // recursive delete. Confining the enumeration root is what makes the containment
+    // [`force_remove_dir_all`] promises reach the whole path rather than its last component.
+    let Some(installs) = contained_in(home, &home.join(".local/share/mise/installs")) else {
+        return Vec::new();
+    };
     let mut pruned = Vec::new();
     let mut removed_any = false;
-    for tool in super::inspect::mise_installed(home) {
+    for tool in super::inspect::mise_installed_in(&installs) {
         if declared.iter().any(|d| tool.is(d)) {
             continue; // declared — keep it.
         }
@@ -844,8 +873,13 @@ pub(crate) fn prune_app_tools(home: &Path, declared: &[&str], apply: bool) -> Ve
         });
     }
     // Drop the pruned tools from the home's mise config so a later launch does not re-equip them.
-    if apply && removed_any {
-        prune_mise_config(&home.join(".config/mise/config.toml"), declared);
+    // Confined for the same reason and by the same rule: `.config/mise/` is the cage's too, and this
+    // one *writes*.
+    if apply
+        && removed_any
+        && let Some(cfg) = contained_in(home, &home.join(".config/mise/config.toml"))
+    {
+        prune_mise_config(&cfg, declared);
     }
     pruned
 }
@@ -1292,6 +1326,71 @@ fn sweep_runtime_dirs_with(
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
+
+    /// `sbx app prune` deletes, and the tree it deletes from is the cage's own `$HOME`. So the
+    /// enumeration root is a path untrusted in-cage code can replace — and it is the *ancestor* that
+    /// matters, because `force_remove_dir_all` lstats only the root it is handed, and the roots this
+    /// verb hands it (`<installs>/<tool>`) end in a component that really is a directory.
+    ///
+    /// A link planted at `installs` therefore used to make `read_dir` enumerate somebody else's
+    /// directory as "installed tools" and delete each entry recursively.
+    #[test]
+    fn prune_refuses_an_app_home_whose_mise_dir_was_pointed_out_of_it() {
+        let tmp = TmpDir::new();
+        let home = tmp.path().join("home");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(outside.join("Documents/notes")).unwrap();
+        std::fs::write(outside.join("Documents/notes/keep.txt"), b"mine").unwrap();
+        std::fs::create_dir_all(home.join(".local/share/mise")).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join(".local/share/mise/installs")).unwrap();
+
+        // Nothing under `outside` is declared, so every entry would have been pruned.
+        let pruned = prune_app_tools(&home, &[], true);
+
+        assert!(
+            pruned.is_empty(),
+            "an installs dir resolving outside the home must yield no prunable tools, got {:?}",
+            pruned.iter().map(|p| &p.token).collect::<Vec<_>>()
+        );
+        assert!(
+            outside.join("Documents/notes/keep.txt").exists(),
+            "the host directory the link pointed at was deleted"
+        );
+        assert!(
+            std::fs::symlink_metadata(home.join(".local/share/mise/installs"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted link itself must be left alone, not removed"
+        );
+    }
+
+    /// The ordinary case still works: a real installs dir under the home prunes what the app does
+    /// not declare and keeps what it does. Without this the guard above could be satisfied by a
+    /// function that always refuses.
+    #[test]
+    fn prune_removes_only_the_undeclared_tools_of_a_real_home() {
+        let tmp = TmpDir::new();
+        let home = tmp.path().join("home");
+        let installs = home.join(".local/share/mise/installs");
+        for tool in ["keep-me", "drop-me"] {
+            std::fs::create_dir_all(installs.join(tool).join("1.0")).unwrap();
+            std::fs::write(installs.join(tool).join("1.0").join("bin"), b"x").unwrap();
+        }
+
+        let pruned = prune_app_tools(&home, &["keep-me"], true);
+
+        assert_eq!(
+            pruned.iter().map(|p| p.token.clone()).collect::<Vec<_>>(),
+            vec!["drop-me".to_string()],
+            "only the undeclared tool is pruned"
+        );
+        assert!(installs.join("keep-me").exists(), "the declared tool stays");
+        assert!(
+            !installs.join("drop-me").exists(),
+            "the undeclared one goes"
+        );
+    }
 
     /// A hardlinked file occupies one inode and one set of blocks however many names point at it,
     /// so the walk must count it once — the property that makes every reported size honest for a
