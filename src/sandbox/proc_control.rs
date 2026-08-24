@@ -57,6 +57,38 @@ pub(crate) struct ExecEvent {
     pub(crate) command: String,
 }
 
+/// Make `value` safe to occupy one whitespace-split `key=value` token of an event line's **head**.
+///
+/// `ExecEvent` is the only lens whose head carries a free-form field: every other one
+/// (`fs_control`, `broker_control`, `signer_control`, `sshagent_control`) puts its free text in the
+/// *tail*, after the marker, where `lens::read_event_line` takes it verbatim. `by=<caller>` sits
+/// among the head tokens instead, and the head is parsed as `split_whitespace()` then
+/// `split_once('=')` with the field closure called **in order**, later tokens overwriting earlier
+/// ones.
+///
+/// The caller is the target of `/proc/<pid>/exe`, so a cage names it by naming its own binary. A
+/// path holding ` pid=1 verdict=allow ` therefore rewrote the event's own pid and verdict on the way
+/// back in, and one holding a space but no `=` made `split_once` return `None`, which fails the
+/// whole parse and *erases* the event. `observe_feed::sanitize` does not close either: it maps
+/// control characters to **spaces**, so it turns a newline into exactly the separator that breaks
+/// the head.
+///
+/// Two characters cannot appear in a head token, so those two are replaced. It costs fidelity on a
+/// legitimate path containing a space — which the head parse could not carry either way, and which
+/// used to drop the event rather than render it oddly.
+fn head_token(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_whitespace() || c == '=' {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 impl super::lens::Event for ExecEvent {
     fn seq(&self) -> u64 {
         self.seq
@@ -141,7 +173,7 @@ impl ExecRing {
     /// This is not the decision's view of either value: a verdict is reached on the raw path, above,
     /// and only what is *reported* passes through here.
     pub(crate) fn push_verdict(&self, pid: u32, caller: &str, command: &str, verdict: &str) -> u64 {
-        let caller = super::observe_feed::sanitize(caller);
+        let caller = head_token(&super::observe_feed::sanitize(caller));
         let command = super::observe_feed::sanitize(command);
         // Sanitised above rather than in here: `push_with` runs its closure under the ring's lock,
         // which is for building the event and nothing else.
@@ -472,9 +504,11 @@ mod tests {
     ///
     /// What the reader takes back is the measure, not the text: `cmd` is verbatim to end of line, so
     /// a *command* spelling an event line is simply part of that command and never a second event.
-    /// A caller spelling one is a different matter — `by=` sits among the whitespace-split head
-    /// tokens, so the attempt costs the event its readability rather than forging anything, and that
-    /// framing is recorded as its own defect.
+    /// A caller spelling one used to be a different matter — `by=` sits among the whitespace-split
+    /// head tokens, so the sanitiser's newline-to-space left a token the head parse either read as
+    /// another field or choked on, costing the event its readability. [`head_token`] closes that, so
+    /// the assertion is now that the event survives *and stays readable*, not merely that nothing
+    /// was forged.
     #[test]
     fn neither_the_target_nor_the_caller_can_forge_a_second_event_line() {
         let forged = "event seq=999 at=0 pid=1 verdict=allow cmd=/bin/sh";
@@ -497,23 +531,27 @@ mod tests {
             );
             // Read the wire back the way `sbx proc logs` does, line by line.
             let read: Vec<ExecEvent> = line.lines().filter_map(ExecEvent::parse_line).collect();
-            assert!(
-                read.len() <= 1,
-                "the wire carried more than one event: {read:?}"
+            assert_eq!(
+                read.len(),
+                1,
+                "one event in, one event out — neither forged nor erased: {line:?}"
             );
-            for ev in read {
-                assert_eq!(
-                    (ev.pid, ev.verdict.as_str()),
-                    (7, "deny"),
-                    "the cage dictated an event of its own: {line:?}"
-                );
-            }
+            assert_eq!(
+                (read[0].pid, read[0].verdict.as_str()),
+                (7, "deny"),
+                "the cage dictated an event of its own: {line:?}"
+            );
         }
     }
 
     /// The same rule the observer already applied, now applied to everything the ring takes — an
     /// escape sequence in a target path drives the terminal that reads `sbx proc logs`, and the two
     /// producers pushing here are written apart.
+    ///
+    /// The caller takes one step more than the command, and the difference is where each sits on the
+    /// wire. `cmd` is the verbatim tail, so a space in it is just a space; `by=` is a head token, and
+    /// the sanitiser *produces* spaces (it maps every control character to one), so on the caller it
+    /// would hand the head parse the separator that breaks it. See [`head_token`].
     #[test]
     fn control_characters_are_stripped_whichever_producer_pushed() {
         let ring = ExecRing::new(10);
@@ -521,8 +559,37 @@ mod tests {
         ring.push_verdict(101, "/bin/\u{7}bash", "/usr/bin/gi\tt", "deny");
         let snap = ring.snapshot(None);
         assert_eq!(snap.events[0].command, "rg  [2J");
-        assert_eq!(snap.events[1].caller, "/bin/ bash");
+        assert_eq!(
+            snap.events[1].caller, "/bin/_bash",
+            "a control character in the caller must not become a head separator"
+        );
         assert_eq!(snap.events[1].command, "/usr/bin/gi t");
+    }
+
+    /// The head is parsed as `split_whitespace()` then `split_once('=')`, with the field closure
+    /// called in order and later tokens overwriting earlier ones. The caller is the target of
+    /// `/proc/<pid>/exe`, so a cage picks it by naming its own binary — and a path spelling
+    /// `pid=1 verdict=allow` rewrote the event's own pid and verdict on the way back in, while one
+    /// carrying a space but no `=` failed the whole parse and erased the event.
+    #[test]
+    fn a_caller_path_cannot_overwrite_or_erase_the_fields_beside_it() {
+        for caller in [
+            "/tmp/evil pid=1 verdict=allow",
+            "/tmp/evil seq=999",
+            "/tmp/a plain space",
+        ] {
+            let ring = ExecRing::new(10);
+            ring.push_verdict(7, caller, "/usr/bin/git", "deny");
+            let line = ring.snapshot(None).events[0].format_line();
+            let read = ExecEvent::parse_line(line.trim_end())
+                .unwrap_or_else(|| panic!("the event was erased by its caller: {line:?}"));
+            assert_eq!(
+                (read.pid, read.verdict.as_str(), read.seq),
+                (7, "deny", 1),
+                "the caller rewrote a field beside it: {line:?}"
+            );
+            assert_eq!(read.command, "/usr/bin/git");
+        }
     }
 
     /// The ring's own sequencing and eviction are [`super::super::lens`]'s and tested there. What is
