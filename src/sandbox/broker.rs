@@ -802,6 +802,21 @@ pub(crate) fn relay_one<H: Read + Write>(
                 let reply = read_frame(host, spec.framing, spec.max_frame, true)
                     .map_err(|e| format!("cannot read the host resource: {e}"))?
                     .ok_or("the host resource closed mid-exchange")?;
+                // The same tripwire `collect_reply` puts on every frame coming back from the host,
+                // on the one other frame that comes back from it. The guard above refuses the
+                // *marker* in a query — the plugin arranging for the answer to carry the secret —
+                // but a host resource can echo the credential for reasons of its own (an API
+                // reflecting the `Authorization` header in an error body is the ordinary one), and
+                // this reply becomes `ask_data`: it is handed straight to the plugin, which is
+                // precisely what the plugin is promised never to see. Block, never strip, as
+                // everywhere else this tripwire is applied.
+                if let Some(marker) = marker
+                    && marker.leaks_in(&reply)
+                {
+                    return Err(
+                        "the host resource sent the credential back toward the cage".to_string()
+                    );
+                }
                 ask_data = reply;
                 ask_dir = Direction::QueryReply;
             }
@@ -2275,6 +2290,34 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             .expect_err("must be refused");
         assert!(err.contains("query"), "{err}");
         assert!(host.seen.is_empty(), "nothing reaches the host");
+    }
+
+    /// The tripwire belongs on a query's answer too, and it was missing there. The guard beside it
+    /// refuses the *marker* in a query — the plugin arranging for the answer to carry the secret —
+    /// but a host resource can echo the credential for reasons of its own (an API reflecting the
+    /// `Authorization` header in an error body is the ordinary one). That reply becomes `ask_data`
+    /// and is handed straight to the plugin, which is exactly what the plugin is promised never to
+    /// see. `collect_reply` has always checked every frame on the way back; this is the one other
+    /// frame that comes back from the host.
+    #[test]
+    fn a_query_answer_carrying_the_credential_is_refused_before_the_plugin_reads_it() {
+        let marker = marker_for("hunter2");
+        // The query itself is clean — no marker in it — so only the answer can trip the guard.
+        let mut host = FakeHost::with(vec![b"YOU SENT hunter2".to_vec()]);
+        let mut plugin = ScriptedPlugin::new(vec![Answer {
+            verdict: Verdict::Query(b"WHOAMI".to_vec()),
+            expect_reply: true,
+            more: false,
+            label: None,
+        }]);
+        let err = relay_with(b"p", &mut plugin, &mut host, &spec(None), &marker)
+            .expect_err("an echoed credential must be refused before the plugin sees it");
+        assert!(err.contains("back toward the cage"), "{err}");
+        assert_eq!(
+            host.seen,
+            vec![b"WHOAMI".to_vec()],
+            "the query still reached the host; it is the answer that was refused"
+        );
     }
 
     /// Guard: the marker never travels toward the cage. Letting it through would teach the cage
