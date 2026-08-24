@@ -162,13 +162,30 @@ pub(super) fn inspect_framing(
     // Known up front only for a Content-Length-framed request; a chunked one's length is discovered
     // by the de-chunker, so nothing is parsed for it here.
     let body_len = match head.header("content-length").filter(|_| !chunked) {
-        Some(v) => v.trim().parse().map_err(|_| FramingRefusal {
+        Some(v) => content_length(v).ok_or(FramingRefusal {
             reason: "bad-request:invalid-content-length",
             detail: "the Content-Length header is not a valid number",
         })?,
         None => 0,
     };
     Ok(Framing { chunked, body_len })
+}
+
+/// A `Content-Length` field value as the grammar defines it: `1*DIGIT`, surrounded by optional
+/// whitespace and nothing else. `None` for everything else, including the forms Rust's integer
+/// parser accepts and HTTP does not.
+///
+/// The sign is the one that matters. `"+5"` parses as `5` in Rust, so the proxy would read a
+/// five-byte body and forward the header **as written**; a server that rejects the sign and reads
+/// the message as bodiless then takes those five bytes as the head of the next request on a
+/// connection the pool may hand to another request. That is request smuggling, from a header the
+/// proxy itself normalized away the ambiguity of everywhere else.
+fn content_length(value: &str) -> Option<u64> {
+    let digits = value.trim();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// The method and target of a request line, requiring all three space-separated tokens
@@ -472,11 +489,8 @@ pub(super) fn response_framing(head: &[u8], request_method: &str) -> BodyFraming
     if cl > 1 {
         return BodyFraming::ToEof;
     }
-    match parsed.header("content-length") {
-        Some(v) => match v.trim().parse::<u64>() {
-            Ok(n) => BodyFraming::Length(n),
-            Err(_) => BodyFraming::ToEof,
-        },
+    match parsed.header("content-length").and_then(content_length) {
+        Some(n) => BodyFraming::Length(n),
         None => BodyFraming::ToEof,
     }
 }
@@ -1387,6 +1401,52 @@ mod tests {
                 .any(|(k, _)| header_name_eq(k, "x-api-key")),
             "the caller's alternate spelling is what the strip has to recognize"
         );
+    }
+
+    /// A `Content-Length` is `1*DIGIT` and nothing else. The sign is the case with teeth: Rust's
+    /// integer parser reads `+5` as five, and a non-chunked request's `Content-Length` is forwarded
+    /// to the upstream exactly as the client wrote it, so the proxy would consume a five-byte body
+    /// while the upstream read a bodiless request and took those bytes as the next request on a
+    /// pooled connection.
+    #[test]
+    fn a_content_length_outside_the_digit_grammar_is_refused() {
+        let framing = |cl: &str| {
+            let head = parse_head(
+                format!("POST / HTTP/1.1\r\nHost: h\r\nContent-Length: {cl}\r\n\r\n").as_bytes(),
+            )
+            .unwrap();
+            inspect_framing(&head, true).map(|f| f.body_len)
+        };
+        for bad in ["+5", "-5", "5 5", "0x5", "５", "5.0", ""] {
+            let got = framing(bad);
+            assert!(
+                matches!(
+                    got,
+                    Err(FramingRefusal {
+                        reason: "bad-request:invalid-content-length",
+                        ..
+                    })
+                ),
+                "`Content-Length: {bad}` must be refused, got {:?}",
+                got.as_ref().ok()
+            );
+        }
+        // The grammar itself, and the whitespace the field value is allowed to carry around it.
+        assert_eq!(framing("5").ok(), Some(5));
+        assert_eq!(framing(" 5 ").ok(), Some(5));
+        assert_eq!(framing("0").ok(), Some(0));
+
+        // The response side reads the same grammar, and answers an unreadable framing the way it
+        // answers every other one it cannot decide: read to EOF, which ends the connection rather
+        // than carrying a guess into the pool.
+        assert!(matches!(
+            response_framing(b"HTTP/1.1 200 OK\r\nContent-Length: +5\r\n\r\n", "GET"),
+            BodyFraming::ToEof
+        ));
+        assert!(matches!(
+            response_framing(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", "GET"),
+            BodyFraming::Length(5)
+        ));
     }
 
     #[test]
