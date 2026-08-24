@@ -1673,7 +1673,18 @@ impl TaskEngine {
         for (program, entries) in &task.exec {
             let incage = self.resolve_spawn_entry(program, &path_dirs, task)?;
             self.warn_if_multicall(program, &incage, task);
-            node(program, &incage, resolve_all(entries)?)?;
+            // Keyed by what the program is **entered as**, exactly like the command's node above
+            // and for the reason stated there: a script's process is its interpreter from its first
+            // instruction, so a node keyed by the script file governs a caller that never exists.
+            // These nodes skipped that step, which made every `[exec."./build.sh"]` a dead entry —
+            // and dead in the direction that refuses, since an unmatched caller under a
+            // `CallerGraph` takes `unmatched()`, which is `Deny` for the `confine` mode a task runs
+            // in. The declaration read as a grant and behaved as a denial.
+            //
+            // `warn_if_multicall` stays on the declared program: its question is whether *that*
+            // name is one of several for one binary, which is not a question about the interpreter.
+            let entered = self.entered_as(&incage, task);
+            node(program, &entered, resolve_all(entries)?)?;
         }
         Ok(crate::proc_policy::ProcPolicy::confined(CallerGraph {
             callers,
@@ -3673,6 +3684,53 @@ mod tests {
             policy.decide(&[task.cmd[0].clone()], "/nix/store/demo/bin/less"),
             Verdict::Deny,
             "and the file itself never runs, so a node on it would be read by nothing"
+        );
+    }
+
+    /// The same rule, for the nodes `[exec.<program>]` declares — which skipped it.
+    ///
+    /// `a_script_commands_node_is_keyed_on_the_interpreter_that_runs_it` holds the property for the
+    /// *command*'s node. Three lines below that in `spawn_policy`, the declared nodes were keyed on
+    /// the resolved script file instead, so a node for a script program governed a caller that never
+    /// exists. And it failed in the direction that refuses: an unmatched caller under a
+    /// `CallerGraph` takes `unmatched()`, which is `Deny` for the `confine` mode a task runs in, so
+    /// the declaration read as a grant and behaved as a denial.
+    #[test]
+    fn a_declared_scripts_node_is_keyed_on_its_interpreter_too() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::testutil::TmpDir::new();
+        let mut task = task();
+        task.cmd = vec!["/bin/sh".to_string()];
+        task.spawn = Some(vec!["build.sh".to_string()]);
+        task.exec = [("build.sh".to_string(), vec!["psql".to_string()])]
+            .into_iter()
+            .collect();
+        let engine =
+            engine_with_store(root.path(), &["sh", "psql", "build.sh"], vec![task.clone()]);
+        let script = root.path().join("nix/store/demo/bin/build.sh");
+        std::fs::write(&script, b"#!/nix/store/demo/bin/sh\npsql\n").expect("the script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("mode");
+
+        let policy = engine
+            .spawn_policy(&task, task.spawn.as_ref().unwrap(), &engine.base_env)
+            .expect("a policy");
+        use crate::proc_policy::Verdict;
+        // What the kernel actually reports as the caller once the script is running.
+        assert_eq!(
+            policy.decide(
+                &["/nix/store/demo/bin/sh".to_string()],
+                "/nix/store/demo/bin/psql"
+            ),
+            Verdict::Allow,
+            "the declared node must govern the interpreter the script is entered as"
+        );
+        // And the file itself is never a running program, so a node on it would be read by nothing.
+        assert_eq!(
+            policy.decide(
+                &["/nix/store/demo/bin/build.sh".to_string()],
+                "/nix/store/demo/bin/psql"
+            ),
+            Verdict::Deny
         );
     }
 
