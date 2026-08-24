@@ -343,7 +343,16 @@ pub(super) fn serve_tunneled_request(
     // A performance decision, not a policy one: a held body is a re-sendable one, and re-sendable is
     // exactly what makes a request eligible for a pooled upstream connection. Streamed, it opened
     // its own connection and paid a handshake for it every time. See [`POOL_HOLD_MAX`].
+    //
+    // `!ws_upgrade` for the same reason the `keep_alive` binding below carries it: an upgrade takes
+    // the connection over entirely, so there is no reuse for a held body to buy. Without it the
+    // bytes were pulled off the client's TLS stream into `held` and then dropped on the floor — the
+    // `if ws_upgrade` branch returns into `relay_upgrade` and never looks at `held` — while the
+    // handshake forwarded to the upstream still declared the `Content-Length` those bytes belonged
+    // to. The relay that follows is a byte-exact pipe, so the upstream sat waiting for a body that
+    // had already been consumed, and the frames the cage then sent were read as the tail of it.
     let hold_for_reuse = ctx.pool.is_some()
+        && !ws_upgrade
         && digest_wanted.is_none()
         && !chunked
         && (1..=POOL_HOLD_MAX).contains(&body_len);
