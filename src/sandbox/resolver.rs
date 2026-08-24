@@ -189,25 +189,13 @@ pub(super) fn compose_cage(plan: &CagePlan<'_>) -> io::Result<(Vec<OsString>, Ve
     // in sbx's environment: a config that names a value is more deliberate than whatever the
     // invoking shell happened to export. Each name was already checked against the manifest by the
     // config layer, so nothing here can introduce a variable the plugin does not read.
-    for (key, value) in &plugin.host.env {
-        allow_env.retain(|(k, _)| k != key);
-        allow_env.push((key.clone(), value.clone()));
-        // A path-valued one is bound as well as passed, exactly as when it comes from the
-        // environment — otherwise configuring a relocated store would aim the tool at a path the
-        // cage does not have, the failure `allow_env_paths` exists to remove.
-        if plugin.grant.allow_env_paths.iter().any(|k| k == key) {
-            env_paths.retain(|(k, _)| k != key);
-            if Path::new(value).is_absolute() {
-                env_paths.push((key.clone(), value.clone()));
-            } else {
-                crate::diag::warn(&format!(
-                    "not binding ${key} for the `{}` plugin — the value `{value}` configured for \
-                     it is not an absolute path",
-                    plugin.called
-                ));
-            }
-        }
-    }
+    apply_host_env(
+        &plugin.host.env,
+        &plugin.grant.allow_env_paths,
+        plugin.called,
+        &mut allow_env,
+        &mut env_paths,
+    );
     let brokers = resolve_brokers(plugin);
     let programs = resolve_programs(plugin)?;
     // A nix-installed program is not a self-contained file, so the paths it needs come with it.
@@ -615,6 +603,46 @@ fn warn_once(message: &str) {
     let mut said = said.lock().unwrap_or_else(|e| e.into_inner());
     if said.insert(message.to_string()) {
         crate::diag::warn(message);
+    }
+}
+
+/// Fold what the host's `[plugin.<name>]` table answers into the variables the plugin will see,
+/// and into the paths the cage will bind.
+///
+/// Applied **last** so it wins over the same name in sbx's environment: a config that names a value
+/// is more deliberate than whatever the invoking shell happened to export. Each name was already
+/// checked against the manifest by the config layer, so nothing here can introduce a variable the
+/// plugin does not read.
+///
+/// A path-valued name is bound as well as passed, or neither. A relative value cannot mean what it
+/// says in a cage sharing no working directory, so it is refused — and the **variable goes with
+/// it**, which is the half this path was missing. [`resolve_env_paths`] already drops both when the
+/// value comes from sbx's environment; the same value named in a config was warned about, not
+/// bound, and passed anyway, handing the plugin a path that is not there instead of leaving it to
+/// read its own default. A refused value does not fall back to the ambient one either: the config
+/// named it, so the ambient answer is not what the operator asked for.
+fn apply_host_env(
+    host_env: &[(String, String)],
+    allow_env_paths: &[String],
+    called: &str,
+    allow_env: &mut Vec<(String, String)>,
+    env_paths: &mut Vec<(String, String)>,
+) {
+    for (key, value) in host_env {
+        let path_valued = allow_env_paths.iter().any(|k| k == key);
+        allow_env.retain(|(k, _)| k != key);
+        if path_valued {
+            env_paths.retain(|(k, _)| k != key);
+            if !Path::new(value).is_absolute() {
+                crate::diag::warn(&format!(
+                    "not passing ${key} to the `{called}` plugin — the value `{value}` configured \
+                     for it is not an absolute path, so there is nothing in the cage for it to name"
+                ));
+                continue;
+            }
+            env_paths.push((key.clone(), value.clone()));
+        }
+        allow_env.push((key.clone(), value.clone()));
     }
 }
 
@@ -1934,6 +1962,125 @@ printf 'run-%s' "$n""#,
         let _var = EnvVar::set(VAR, "relative/store");
         let out = run(&bwrap, &p, "test://x", &[]);
         assert_eq!(out.expect("the resolver should run").trim_end(), "[unset]");
+    }
+
+    /// The rule the cage test below cannot state on a host that cannot sandbox: a configured
+    /// path-valued variable is bound and passed, or neither.
+    ///
+    /// The relative case was warned about, not bound, and passed anyway — so the plugin was handed
+    /// a path the cage does not have instead of being left to read its own default, which is the
+    /// exact failure `allow_env_paths` exists to remove. The sibling rule for a value read from
+    /// sbx's own environment has always dropped both.
+    #[test]
+    fn a_configured_path_that_cannot_be_bound_is_not_passed_either() {
+        let paths = vec!["STORE".to_string()];
+        let ambient = || {
+            (
+                vec![("STORE".to_string(), "/ambient/store".to_string())],
+                vec![("STORE".to_string(), "/ambient/store".to_string())],
+            )
+        };
+
+        // Absolute: both halves are replaced by the configured answer.
+        let (mut allow_env, mut env_paths) = ambient();
+        apply_host_env(
+            &[("STORE".to_string(), "/configured/store".to_string())],
+            &paths,
+            "test",
+            &mut allow_env,
+            &mut env_paths,
+        );
+        assert_eq!(
+            allow_env,
+            vec![("STORE".to_string(), "/configured/store".to_string())]
+        );
+        assert_eq!(
+            env_paths,
+            vec![("STORE".to_string(), "/configured/store".to_string())]
+        );
+
+        // Relative: neither half survives, and the ambient value is not fallen back to — the config
+        // named this variable, so the shell's answer is not what was asked for.
+        let (mut allow_env, mut env_paths) = ambient();
+        apply_host_env(
+            &[("STORE".to_string(), "relative/store".to_string())],
+            &paths,
+            "test",
+            &mut allow_env,
+            &mut env_paths,
+        );
+        assert!(
+            allow_env.is_empty(),
+            "a path that cannot be bound must not be passed: {allow_env:?}"
+        );
+        assert!(env_paths.is_empty(), "and nothing is bound: {env_paths:?}");
+
+        // A variable that is not path-valued is passed as written, relative or not: it names no
+        // path, so there is nothing to bind and nothing to refuse.
+        let mut allow_env = vec![("MODE".to_string(), "ambient".to_string())];
+        let mut env_paths = Vec::new();
+        apply_host_env(
+            &[("MODE".to_string(), "relative/whatever".to_string())],
+            &paths,
+            "test",
+            &mut allow_env,
+            &mut env_paths,
+        );
+        assert_eq!(
+            allow_env,
+            vec![("MODE".to_string(), "relative/whatever".to_string())]
+        );
+        assert!(env_paths.is_empty());
+    }
+
+    /// The same rule for a value that comes from a `[plugin.<name>]` table rather than from sbx's
+    /// environment. That path warned that it was not binding the value and then passed the variable
+    /// anyway, so the plugin was handed a relative path the cage does not have instead of being
+    /// left to read its own default. A refused value does not fall back to the ambient one either:
+    /// the config named it, so the ambient answer is not what was asked for.
+    #[test]
+    fn run_drops_a_relative_configured_path_variable_along_with_its_bind() {
+        let Some(bwrap) = sandbox_prereqs() else {
+            skip_incapable!("skipping resolver run: no bwrap or no capability-bearing userns");
+            return;
+        };
+        const VAR: &str = "SBX_TEST_RESOLVER_CONFIGURED_STORE";
+        let _lock = env_lock();
+        let store = TmpDir::new();
+        let (_dir, mut p) = fake_resolver_with(
+            &format!("echo \"[${{{VAR}-unset}}]\""),
+            SandboxGrant {
+                allow_env_paths: vec![VAR.to_string()],
+                ..SandboxGrant::default()
+            },
+        );
+        // The ambient value is absolute and would be honoured on its own: what is under test is
+        // that the configured one replaces it and is then refused, rather than either being kept.
+        let _var = EnvVar::set(VAR, store.path());
+        p.host.env = vec![(VAR.to_string(), "relative/store".to_string())];
+
+        let out = run(&bwrap, &p, "test://x", &[]).expect("the resolver should run");
+        assert_eq!(
+            out.trim_end(),
+            "[unset]",
+            "a configured path that cannot be bound must not be passed either"
+        );
+
+        // The control: an absolute configured value is both bound and passed.
+        p.host.env = vec![(VAR.to_string(), store.path().display().to_string())];
+        std::fs::write(store.join("entry"), "the-fixture-wrote-this").unwrap();
+        let (_dir2, mut reader) = fake_resolver_with(
+            &format!("cat \"${VAR}/entry\""),
+            SandboxGrant {
+                allow_env_paths: vec![VAR.to_string()],
+                ..SandboxGrant::default()
+            },
+        );
+        reader.host.env = vec![(VAR.to_string(), store.path().display().to_string())];
+        assert_eq!(
+            run(&bwrap, &reader, "test://x", &[]).expect("the resolver should run"),
+            "the-fixture-wrote-this"
+        );
     }
 
     #[test]
