@@ -1778,7 +1778,7 @@ pub(crate) fn gc(prune: bool, all: bool, optimise: bool, pal: &crate::style::Pal
                 // Prune stale session records, then collect the shared store. Reaping whole
                 // per-project runtime *trees* is `sbx projects rm`; `--all` here is purely the
                 // nix-store side — the shared store's orphaned closures across every project.
-                let _ = session_housekeeping(&layout, pal);
+                let _ = session_housekeeping(&layout);
                 runtime_housekeeping(&layout, prune, pal);
                 shared_store_gc(&layout, prune, optimise, pal);
             }
@@ -1810,19 +1810,20 @@ pub(crate) fn gc(prune: bool, all: bool, optimise: bool, pal: &crate::style::Pal
 /// can skip a tree a session still holds without scanning the registry a second time.
 pub(super) fn session_housekeeping(
     layout: &crate::store::Layout,
-    pal: &crate::style::Palette,
 ) -> std::collections::BTreeSet<String> {
     match session::Registry::at(layout.data_dir()).housekeep() {
         Ok((live, pruned)) => {
             if pruned > 0 {
-                println!(
-                    "{}sbx:{} pruned {}{pruned}{} stale session record(s); {} live.",
-                    pal.head,
-                    pal.reset,
-                    pal.name,
-                    pal.reset,
+                // On **stderr**, like every other diagnostic. It used to be a `println!`, and this
+                // function runs first in `sbx projects`, `sbx projects show` and `sbx projects rm`
+                // — including their `--json` forms, where one pruned record put a line of prose
+                // ahead of the document and left `sbx projects --json | jq` with a parse error on a
+                // run that had done nothing wrong. The notice is about sbx's own bookkeeping, not
+                // the answer to the question asked, so it belongs where the other bookkeeping goes.
+                crate::diag::note(&format!(
+                    "pruned {pruned} stale session record(s); {} live.",
                     live.len()
-                );
+                ));
             }
             // Hash the stored path directly rather than re-canonicalise: a live session's recorded
             // path is already canonical, so its hash matches the id its tree is keyed by.

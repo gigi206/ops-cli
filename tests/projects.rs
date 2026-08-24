@@ -114,6 +114,44 @@ fn text(out: &std::process::Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
 }
 
+/// The registry's self-healing pass runs first in every `sbx projects` verb, and it announced its
+/// pruning on **stdout**. One stale record — a session whose process is gone, which is the ordinary
+/// state of a data directory after a crash or a reboot — put a line of prose ahead of the JSON
+/// document, so `sbx projects --json | jq` failed on a run that had done nothing wrong. The notice
+/// belongs on stderr with every other diagnostic.
+#[test]
+fn a_pruned_session_record_does_not_land_in_the_json_document() {
+    let fx = Fixture::new();
+    fx.make_tree("aaaaaaaaaaaaaaaa", Some(fx.proj.path()));
+    // A record for a pid that cannot be live: pid 0 is the scheduler, never a session.
+    let sessions = fx.data_home.path().join("sbx/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join("0-1"),
+        format!(
+            "kind=run\npid=0\nstart=1\nruntime=project\ndetached=false\nproject={}\n",
+            fx.proj.path().display()
+        ),
+    )
+    .unwrap();
+
+    let out = fx.sbx(&["projects", "list", "--json"]);
+    assert!(
+        out.status.success(),
+        "sbx projects --json failed: {}",
+        text(&out)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str::<serde_json::Value>(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be one JSON document ({e}):\n{stdout}"));
+    // The notice itself is not lost, only moved.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("stale session record"),
+        "the pruning must still be reported, on stderr:\n{stderr}"
+    );
+}
+
 #[test]
 fn list_classifies_and_sizes_each_tree() {
     let fx = Fixture::new();

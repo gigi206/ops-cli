@@ -151,11 +151,8 @@ fn current_tree_id() -> Option<String> {
 /// id — the shared core of `sbx projects [list]` (text or JSON). Live ids come from the session
 /// registry (the same self-healing housekeep `sbx session ls` runs), so a tree in use reads `live`. Pure
 /// host-side filesystem work — no sandbox, no nix.
-fn collect_project_trees(
-    layout: &crate::store::Layout,
-    pal: &crate::style::Palette,
-) -> Vec<ProjectTreeView> {
-    let live_ids = super::launch::session_housekeeping(layout, pal);
+fn collect_project_trees(layout: &crate::store::Layout) -> Vec<ProjectTreeView> {
+    let live_ids = super::launch::session_housekeeping(layout);
     let current = current_tree_id();
     let projects_dir = layout.data_dir().join("projects");
     let mut rows: Vec<ProjectTreeView> = match std::fs::read_dir(&projects_dir) {
@@ -267,7 +264,7 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
         return ExitCode::FAILURE;
     }
 
-    let live_ids = super::launch::session_housekeeping(&layout, pal);
+    let live_ids = super::launch::session_housekeeping(&layout);
     let class = super::gc::classify_tree(&dir, &live_ids);
 
     let total_bytes = super::gc::tree_size(&dir);
@@ -520,7 +517,7 @@ pub(crate) fn projects_list(json: bool, pal: &crate::style::Palette) -> ExitCode
         crate::diag::error("sbx projects: cannot locate sbx's data directory.");
         return ExitCode::FAILURE;
     };
-    let rows = collect_project_trees(&layout, pal);
+    let rows = collect_project_trees(&layout);
 
     if json {
         return match serde_json::to_string_pretty(&rows) {
@@ -618,7 +615,7 @@ pub(crate) fn projects_rm(
         crate::diag::error("sbx projects rm: cannot locate sbx's data directory.");
         return ExitCode::FAILURE;
     };
-    let live_ids = super::launch::session_housekeeping(&layout, pal);
+    let live_ids = super::launch::session_housekeeping(&layout);
     let current = current_tree_id();
     let projects_dir = layout.data_dir().join("projects");
     let mut had_error = false;
