@@ -309,12 +309,26 @@ pub(crate) fn epoch_ms(value: u128) -> u128 {
     }
 }
 
-/// Flatten a value into one safe log field: control characters (a newline that would forge a second
-/// event line, an escape that would drive a terminal) become spaces.
+/// Flatten a value into one safe log field.
+///
+/// [`super::sanitize`] itself — the crate's one answer to a value the cage chooses. It maps control
+/// characters (a newline that would forge a second event line, an escape that would drive a
+/// terminal) to spaces **and bounds the result**, and it is the bound this module used to be missing
+/// by having a copy that only did the first half.
+///
+/// The task name arrives as the tail of a `RUN <name>` request line, which `read_bounded_line`
+/// limits only to [`MAX_PAYLOAD_BYTES`] — a mebibyte. A name matching nothing becomes
+/// `TaskError::Unknown(name)`, whose `Display` embeds it again, and `serve_run` stores both the name
+/// and that reason in a `LogEntry`. So one refused request pinned about 2 MiB of caller-chosen host
+/// memory, and [`LOG_CAPACITY`] bounds the ring at 512 *entries* rather than bytes: a cage could
+/// hold roughly a gibibyte in the supervisor by asking for tasks that do not exist, in a log it
+/// cannot read and nothing else evicts.
+///
+/// Applied where an entry is **built** as well as where one is rendered. Sanitising only on the way
+/// out, which is what `to_line` did, leaves the raw bytes sitting in the ring — which is the thing
+/// being bounded.
 fn sanitize(text: &str) -> String {
-    text.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
+    super::sanitize(text)
 }
 
 /// The session's bounded, in-RAM invocation log. Never written to disk and never readable from the
@@ -806,7 +820,7 @@ fn finished(id: u64, name: &str, outcome: &TaskOutcome, detached: bool) -> LogEn
         cursor: 0,
         at_epoch_ms: 0,
         started_epoch_ms: 0,
-        task: name.to_string(),
+        task: sanitize(name),
         exit: outcome.exit,
         redacted: outcome.redacted + outcome.redacted_withheld,
         truncated: outcome.truncated,
@@ -1019,14 +1033,14 @@ fn refusal(id: u64, task: &str, reason: &str) -> LogEntry {
         cursor: 0,
         at_epoch_ms: 0,
         started_epoch_ms: 0,
-        task: task.to_string(),
+        task: sanitize(task),
         exit: -1,
         redacted: 0,
         truncated: false,
         timed_out: false,
         stopped: false,
         elapsed_ms: 0,
-        refused: Some(reason.to_string()),
+        refused: Some(sanitize(reason)),
         detached: false,
     }
 }
@@ -1689,6 +1703,42 @@ mod tests {
             read_payloads_of(request).expect("the read itself succeeds"),
             Err("request too large")
         );
+    }
+
+    /// The log is bounded at 512 *entries*, not bytes, so what one entry may hold is the other half
+    /// of that bound. The task name is the tail of a `RUN <name>` line, capped only at a mebibyte,
+    /// and a name matching nothing is stored twice over — once as the entry's task, once inside the
+    /// `no such task \u{60}{name}\u{60}` reason. A cage asking repeatedly for tasks that do not exist
+    /// could therefore pin roughly a gibibyte of supervisor memory in a log it cannot even read.
+    ///
+    /// Sanitising at render time did not bound it: the raw bytes were already in the ring.
+    #[test]
+    fn one_log_entry_cannot_hold_a_megabyte_the_cage_chose() {
+        let huge = "x".repeat(MAX_PAYLOAD_BYTES);
+        let entry = refusal(1, &huge, &format!("no such task `{huge}`"));
+
+        assert!(
+            entry.task.len() <= 4 * 512,
+            "the stored task name is unbounded: {} bytes",
+            entry.task.len()
+        );
+        let refused = entry
+            .refused
+            .as_deref()
+            .expect("a refusal carries its reason");
+        assert!(
+            refused.len() <= 4 * 512,
+            "the stored reason is unbounded: {} bytes",
+            refused.len()
+        );
+        // Truncated rather than dropped, so the record still says what was asked for.
+        assert!(entry.task.starts_with("xxx"), "{}", entry.task);
+        assert!(refused.starts_with("no such task"), "{refused}");
+
+        // A name of ordinary length is untouched, or the cap would be rewriting real records.
+        let ordinary = refusal(2, "build", "no such task `build`");
+        assert_eq!(ordinary.task, "build");
+        assert_eq!(ordinary.refused.as_deref(), Some("no such task `build`"));
     }
 
     /// A caller sending nothing but keys is bounded too, and by the same rule.
