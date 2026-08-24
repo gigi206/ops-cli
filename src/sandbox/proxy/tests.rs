@@ -3273,6 +3273,30 @@ fn through_one_tunnel(
     requests: &[&[u8]],
     pipelined: bool,
 ) -> io::Result<Vec<String>> {
+    through_one_tunnel_paused(
+        ctx,
+        proxy_ca,
+        connect_host,
+        connect_port,
+        requests,
+        pipelined,
+        Duration::ZERO,
+    )
+}
+
+/// [`through_one_tunnel`] with `pause` waited before each request after the first — the only way to
+/// observe what the tunnel is actually held for between requests, as opposed to what its
+/// `Keep-Alive` announces.
+#[allow(clippy::too_many_arguments)]
+fn through_one_tunnel_paused(
+    ctx: Arc<ProxyCtx>,
+    proxy_ca: CertificateDer<'static>,
+    connect_host: &str,
+    connect_port: u16,
+    requests: &[&[u8]],
+    pipelined: bool,
+    pause: Duration,
+) -> io::Result<Vec<String>> {
     let dir = TmpDir::new();
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
@@ -3308,7 +3332,10 @@ fn through_one_tunnel(
         br.get_mut().flush().ok();
     }
     let mut out = Vec::new();
-    for request in requests {
+    for (i, request) in requests.iter().enumerate() {
+        if i > 0 && !pause.is_zero() {
+            thread::sleep(pause);
+        }
         if !pipelined && (br.get_mut().write_all(request).is_err() || br.get_mut().flush().is_err())
         {
             break;
@@ -3638,6 +3665,66 @@ fn a_configured_idle_bound_is_the_one_the_tunnel_announces() {
         head.contains("keep-alive: timeout=42"),
         "the launch's own bound is what the client is told: {:?}",
         got[0]
+    );
+}
+
+/// The third consumer of the same bound, and the one that had drifted: what the tunnel is actually
+/// held for between requests. It was `min(request timeout, idle_timeout)`, so a launch that asked
+/// for a long idle got the request timeout instead — while the response head kept announcing the
+/// configured number. A client that believes what it was told comes back inside the window it was
+/// given and finds the connection gone, which for a request the proxy must not repeat is a failed
+/// call.
+///
+/// The request timeout is deliberately the *shorter* of the two here: the pause outlives it and
+/// stays well inside the idle bound, so a tunnel that survives can only be one held for the idle
+/// bound.
+#[test]
+fn the_tunnel_is_held_for_the_configured_idle_bound_not_the_request_timeout() {
+    let (addr, upstream_ca, upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+    let proxy_ca_der = proxy_ca.ca_cert_der();
+    let mut roots = RootCertStore::empty();
+    roots.add(upstream_ca).unwrap();
+    let upstream_cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let ctx = Arc::new(
+        ProxyCtx::new(
+            proxy_ca,
+            policy(&["upstream.test:*"])
+                .with_pool(true)
+                .with_idle_timeout(Some(Duration::from_secs(20))),
+        )
+        .unwrap()
+        .with_upstream(upstream_cfg)
+        .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])))
+        .with_timeout(Duration::from_secs(1)),
+    );
+    let got = through_one_tunnel_paused(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        addr.port(),
+        &[
+            b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+            b"GET /two HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+        ],
+        false,
+        Duration::from_millis(2500),
+    )
+    .unwrap();
+    assert_eq!(
+        got.len(),
+        2,
+        "a caller that came back inside the announced window must still be served: {got:?}"
+    );
+    assert_eq!(
+        upstream.connections(),
+        1,
+        "and on the same tunnel, which is what the bound buys"
     );
 }
 

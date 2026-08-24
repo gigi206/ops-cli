@@ -473,13 +473,20 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     let mut reused = false;
     loop {
         if reused {
-            // A tunnel between requests holds a host thread and nothing else, so bound that wait
-            // well under the in-request timeout: a client with another request to send has already
-            // decided to send it. The turn puts the launch's own timeout back once a byte arrives.
-            let _ = br
-                .get_ref()
-                .sock
-                .set_read_timeout(Some(ctx.timeout.min(ctx.idle)));
+            // A tunnel between requests holds a host thread and nothing else, so the wait between
+            // them is bounded by `[network] idle_timeout` rather than by the in-request timeout.
+            // The turn puts the launch's own timeout back once a byte arrives.
+            //
+            // `ctx.idle` alone, not `min` with the request timeout. The two answer different
+            // questions — how long one request may take, against how long a caller may think
+            // between requests — and the `min` silently capped the configured one: with
+            // `idle_timeout = "2m"` the tunnel was closed after 30 seconds while the response head
+            // told the client `Keep-Alive: timeout=120` ([`super::wire::offer_reuse_in_head`] reads
+            // `ctx.idle`). A client that believes what it was told reuses at 60 seconds and finds
+            // the connection gone, which for a request the proxy must not repeat is a failed call.
+            // The cost of honouring it is the one `idle_timeout` is documented to carry, a host
+            // thread and a descriptor per idle connection, bounded by `max_connections`.
+            let _ = br.get_ref().sock.set_read_timeout(Some(ctx.idle));
         }
         match serve_tunneled_request(br, ctx, &connect_host, port)? {
             Turn::Continue(tunnel) => {
