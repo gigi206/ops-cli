@@ -385,25 +385,32 @@ fn refuse_noexec(mount_point: PathBuf, options: &str) -> Result<PathBuf, String>
 
 /// `mountinfo` escapes space, tab, newline and backslash as octal. Only a path containing one
 /// of those is affected, but a data directory may well sit under such a path.
+///
+/// Decoded through bytes rather than chars, and reassembled once at the end. Pushing each input
+/// byte as a `char` re-encoded everything above ASCII: a path under `/media/josé` came back as
+/// `/media/josÃ©`, which matches no mount point, so `state` reported a mounted volume as detached
+/// and `up` would try to mount it again. Only the escapes are ASCII; the rest of the line is UTF-8
+/// that must be carried through untouched.
 fn unescape_mountinfo(s: &str) -> String {
     let b = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
+        // Three octal digits exactly — `u8::from_str_radix` would also take a sign, which is not an
+        // escape the kernel writes and not a byte this should invent.
         if b[i] == b'\\'
-            && i + 3 < b.len()
-            && let Some(c) = std::str::from_utf8(&b[i + 1..i + 4])
-                .ok()
-                .and_then(|o| u8::from_str_radix(o, 8).ok())
+            && let Some(octal) = b.get(i + 1..i + 4)
+            && octal.iter().all(|d| d.is_ascii_digit() && *d < b'8')
+            && let Ok(c) = u8::from_str_radix(&String::from_utf8_lossy(octal), 8)
         {
-            out.push(c as char);
+            out.push(c);
             i += 4;
             continue;
         }
-        out.push(b[i] as char);
+        out.push(b[i]);
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The loop device currently backed by `image`, if any.
@@ -411,10 +418,19 @@ fn unescape_mountinfo(s: &str) -> String {
 /// Discovering an existing attachment is what keeps `up` idempotent. Without it, two launches
 /// racing on the same image would each attach their own loop device to the same bytes — two
 /// writable views of one filesystem, which corrupts it.
+///
+/// Compared canonically as well as literally, because the two sides need not spell the path the
+/// same way: the kernel records the backing file as it resolved it, while `image` is built from
+/// whatever data directory the caller was given, and a single symlink anywhere along it (a data
+/// directory under `/home` where `/home` is a link, a relocated volume) makes the strings differ
+/// for the same bytes. A missed match is not a missed optimization here: it is the second
+/// attachment this function exists to prevent. The literal comparison stays first and answers the
+/// case canonicalization cannot — a backing file the kernel has already marked deleted.
 pub(crate) fn loop_for(image: &Path, sys_block: &Path) -> io::Result<Option<String>> {
     let Ok(entries) = std::fs::read_dir(sys_block) else {
         return Ok(None);
     };
+    let canonical_image = std::fs::canonicalize(image).ok();
     for e in entries.flatten() {
         let name = e.file_name();
         if !name.as_encoded_bytes().starts_with(b"loop") {
@@ -426,14 +442,26 @@ pub(crate) fn loop_for(image: &Path, sys_block: &Path) -> io::Result<Option<Stri
         };
         // The kernel may mark a deleted backing file; compare the path itself.
         let target = target.trim_end_matches('\n').trim_end_matches(" (deleted)");
-        if Path::new(target) == image {
+        if Path::new(target) == image || same_file(Path::new(target), &canonical_image) {
             return Ok(Some(format!("/dev/{}", name.to_string_lossy())));
         }
     }
     Ok(None)
 }
 
-/// Report where the volume stands, without changing anything.
+/// Whether a backing-file path resolves to the same file as `canonical_image`, the image's
+/// already-resolved form. Split out so the image is resolved once per scan rather than once per
+/// loop device, and so a path that cannot be resolved at all (either side gone, either side never
+/// existing) answers `false` rather than a guess — the literal comparison the caller makes first is
+/// what covers that case.
+fn same_file(target: &Path, canonical_image: &Option<PathBuf>) -> bool {
+    let Some(canonical_image) = canonical_image else {
+        return false;
+    };
+    std::fs::canonicalize(target).is_ok_and(|t| &t == canonical_image)
+}
+
+/// Report where the volume stands, without changing anything./// Report where the volume stands, without changing anything.
 pub(crate) fn state(image: &Path) -> io::Result<State> {
     if !image.is_file() {
         return Ok(State::Absent);
@@ -1612,6 +1640,64 @@ this line has no separator at all
         let table = "41 30 7:60 / /run/media/u/my\\040vol rw - btrfs /dev/loop3 rw\n";
         let (mp, _) = mount_of("/dev/loop3", table).expect("present");
         assert_eq!(mp, PathBuf::from("/run/media/u/my vol"));
+    }
+
+    /// The escapes are ASCII; everything else on the line is UTF-8 that must survive untouched.
+    /// A byte-at-a-time `as char` re-encoded every byte above ASCII, so a data directory under an
+    /// accented path never matched its own mount point: `state` called a mounted volume detached,
+    /// and `up` set out to mount it a second time.
+    #[test]
+    fn a_mount_point_outside_ascii_survives_unescaping() {
+        let table = "41 30 7:60 / /run/media/josé/my\\040vol rw - btrfs /dev/loop3 rw\n";
+        let (mp, _) = mount_of("/dev/loop3", table).expect("present");
+        assert_eq!(mp, PathBuf::from("/run/media/josé/my vol"));
+        // Every escape the kernel writes, alongside the multi-byte text.
+        assert_eq!(
+            unescape_mountinfo("/tmp/日本\\040a\\011b\\012c\\134d"),
+            "/tmp/日本 a\tb\nc\\d"
+        );
+        // A backslash that begins no escape is a byte like any other.
+        assert_eq!(unescape_mountinfo("/tmp/a\\9b"), "/tmp/a\\9b");
+        assert_eq!(unescape_mountinfo("/tmp/trailing\\"), "/tmp/trailing\\");
+    }
+
+    /// The kernel records a backing file as *it* resolved it, while the image path is built from
+    /// whatever data directory the caller was handed. One symlink along the way and the two spell
+    /// the same bytes differently — and a `loop_for` that misses the match does not merely miss an
+    /// optimization: it reports no attachment, and `up` attaches a second loop device to the same
+    /// filesystem, which is the corruption this function exists to prevent.
+    #[test]
+    fn loop_for_matches_an_image_reached_through_a_symlink() {
+        let base = crate::testutil::TmpDir::new();
+        let sys = base.path().join("block");
+        let real = base.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let image = real.join("vol.btrfs");
+        std::fs::write(&image, b"").unwrap();
+        // The kernel's side: the resolved path.
+        let d = sys.join("loop7").join("loop");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("backing_file"),
+            format!("{}\n", std::fs::canonicalize(&image).unwrap().display()),
+        )
+        .unwrap();
+        // The caller's side: the same image through a symlinked data directory.
+        let link = base.path().join("data");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(
+            loop_for(&link.join("vol.btrfs"), &sys).unwrap().as_deref(),
+            Some("/dev/loop7"),
+            "an image reached by another spelling of its path is still attached"
+        );
+        // A different image under the same directory is still not this device.
+        let other = real.join("other.btrfs");
+        std::fs::write(&other, b"").unwrap();
+        assert_eq!(
+            loop_for(&other, &sys).unwrap(),
+            None,
+            "resolving the path must not blur two images into one"
+        );
     }
 
     #[test]
