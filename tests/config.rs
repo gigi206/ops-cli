@@ -5285,3 +5285,57 @@ fn the_network_policy_is_listed_but_its_machinery_stays_behind_details() {
         "--details is where the machinery lives:\n{detailed}"
     );
 }
+
+/// `sbx config edit --trust` skips `admit_config_write` on the stated grounds that "`--trust` here
+/// blesses a file the editor just showed". The editor's exit status was discarded, and `Ok(_)` says
+/// only that **`sh`** ran: `$EDITOR` naming a program the host does not have (`code --wait` over
+/// ssh, a container without it installed) makes `sh` exit 127 having shown nothing, and an editor
+/// the user deliberately aborted (`vi`'s `:cq`) exits non-zero on purpose.
+///
+/// Both fell through to the trust branch, so `sbx config edit --trust` on a freshly cloned repo
+/// could print `sh: 1: code: not found` and then `trusted <path> (the whole file is now trusted)` —
+/// after which every launch honoured a config the user never saw a byte of.
+#[test]
+fn config_edit_trusts_nothing_when_the_editor_never_ran() {
+    let fx = Fixture::new();
+    fx.write_project("nixpkgs = \"nixos-23.11\"\n");
+
+    // The state a cloned, never-reviewed project starts in.
+    let before = fx.run(&["trust", "--show", ".sbx.toml"]);
+    assert!(
+        String::from_utf8_lossy(&before.stdout).contains("untrusted")
+            || String::from_utf8_lossy(&before.stderr).contains("untrusted"),
+        "the fixture must start untrusted:\n{}{}",
+        String::from_utf8_lossy(&before.stdout),
+        String::from_utf8_lossy(&before.stderr)
+    );
+
+    let out = fx
+        .sbx(&["config", "edit", "--trust"])
+        .env("EDITOR", "sbx-no-such-editor-by-construction")
+        .env_remove("VISUAL")
+        .output()
+        .expect("spawn sbx");
+
+    assert!(
+        !out.status.success(),
+        "an editor that never ran must not be a success:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("trusted") && !stderr.contains("the whole file is now trusted"),
+        "nothing may be trusted:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // And the trust store agrees — the marker is what a later launch actually reads.
+    let after = fx.run(&["trust", "--show", ".sbx.toml"]);
+    assert!(
+        String::from_utf8_lossy(&after.stdout).contains("untrusted")
+            || String::from_utf8_lossy(&after.stderr).contains("untrusted"),
+        "the project must still be untrusted:\n{}{}",
+        String::from_utf8_lossy(&after.stdout),
+        String::from_utf8_lossy(&after.stderr)
+    );
+}

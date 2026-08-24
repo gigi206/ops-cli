@@ -2901,15 +2901,34 @@ fn config_edit(args: &[OsString]) -> ExitCode {
         .arg("sh")
         .arg(&path)
         .status();
-    match status {
-        // The editor ran (whatever its exit) — the file is now whatever the user saved.
-        Ok(_) => {}
+    let code = match status {
+        Ok(code) => code,
         Err(e) => {
             diag::error(&format!(
                 "sbx: config: could not launch the editor `{editor}`: {e}"
             ));
             return ExitCode::FAILURE;
         }
+    };
+    // `Ok` says **`sh`** ran, not that the editor did. `$VISUAL`/`$EDITOR` naming a program this
+    // host does not have (`code --wait` over ssh, a container without the editor installed) makes
+    // `sh` exit 127 having shown nothing; an editor the user deliberately aborted (`vi`'s `:cq`)
+    // exits non-zero on purpose. Both used to fall through to the `--trust` branch below, which
+    // blessed the whole file — so `sbx config edit --trust` on a cloned repo could print
+    // `sh: 1: code: not found` and then `trusted <path>`, and every later launch honoured a config
+    // the user never saw a byte of. That is the exact inverse of what this verb's skipping of
+    // `admit_config_write` is justified by: "`--trust` here blesses a file the editor just showed".
+    //
+    // So a non-zero exit stops here, before anything is trusted and before a trust state is
+    // reported for an edit that did not happen. It is also the only way this function's own exit
+    // code can mean anything, since it returned SUCCESS whatever the editor did.
+    if !code.success() {
+        diag::error(&format!(
+            "sbx: config: the editor `{editor}` exited {code} — {} was not edited, and nothing was \
+             trusted",
+            path.display()
+        ));
+        return ExitCode::FAILURE;
     }
 
     if !gated {
