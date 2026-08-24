@@ -1316,6 +1316,28 @@ fn apps_section(
                 let _ = writeln!(o, "    {n}{}{r}: {warn}(no command){r}", app.name);
             }
         }
+        // Beside the command, for the reason the per-app view puts it there: an install step is a
+        // command that runs inside this cage before `cmd`, so it belongs where a reader looks for
+        // what this app executes. `AppView` has carried it all along and this section never read
+        // it, so the aggregate listing showed an app's shape with the commands left out.
+        if !app.provisions.is_empty() {
+            if details {
+                let _ = writeln!(o, "      {dim}install:{r}");
+                for step in &app.provisions {
+                    let _ = writeln!(
+                        o,
+                        "        {n}{}{r}  {dim}(from bundle {}){r}",
+                        step.cmd, step.bundle
+                    );
+                }
+            } else {
+                let _ = writeln!(
+                    o,
+                    "      {dim}install:{r} {} step(s) run before cmd",
+                    app.provisions.len()
+                );
+            }
+        }
         let _ = writeln!(o, "      {dim}home:{r} {}", app.home_scope);
         // The environment this overlay adds over the baseline — a count by default, each
         // `KEY=value` under `--details`, mirroring the baseline `env` section. A free field; the
@@ -4004,6 +4026,65 @@ mod tests {
                 p.name, p.reset, p.ok, p.reset
             )),
             "the moved floor names the length and the layer it came from:\n{out}"
+        );
+    }
+
+    /// An install step is a command that runs inside the app's cage before its `cmd`, which is what
+    /// `AppView::provisions` says it is carried for: "someone reading an app's resolved shape is
+    /// entitled to see it here". The aggregate listing never read the field, so it showed an app's
+    /// shape with the commands left out — visible only under `sbx config show --app <name>`.
+    #[test]
+    fn the_apps_section_names_the_install_steps_that_run_before_cmd() {
+        use config::view::*;
+        let p = style::Palette::plain();
+        let app = AppView {
+            open: vec![],
+            service: vec![],
+            provisions: vec![AppProvisionView {
+                bundle: "demo-agent".into(),
+                cmd: "npm install -g demo".into(),
+            }],
+            fs_deny: Vec::new(),
+            fs_readonly: Vec::new(),
+            fs_scan: Vec::new(),
+            ssh_agent: Vec::new(),
+            name: "demo-app".into(),
+            cmd: Some("demo-app".into()),
+            home_scope: "global (shared across projects)".into(),
+            env: vec![],
+            binds: vec![],
+            packages: vec![],
+            network: None,
+            gui: None,
+            gpu: None,
+            allow_insecure_http: None,
+            audio: None,
+            dbus: None,
+            forward: vec![],
+            seccomp: vec![],
+            devices: vec![],
+            limits: None,
+            secrets: vec![],
+            notes: vec![],
+        };
+        let listed = apps_section(std::slice::from_ref(&app), &p, false).expect("one app");
+        assert!(
+            listed.contains("install: 1 step(s) run before cmd"),
+            "the count belongs beside the command:\n{listed}"
+        );
+        let detailed = apps_section(std::slice::from_ref(&app), &p, true).expect("one app");
+        assert!(
+            detailed.contains("npm install -g demo") && detailed.contains("from bundle demo-agent"),
+            "and `--details` names the command and where it came from:\n{detailed}"
+        );
+
+        // An app with no steps says nothing: the line is about what will run, not about a field.
+        let mut quiet = app;
+        quiet.provisions = Vec::new();
+        let out = apps_section(std::slice::from_ref(&quiet), &p, true).expect("one app");
+        assert!(
+            !out.contains("install:"),
+            "nothing to run, nothing to say:\n{out}"
         );
     }
 
