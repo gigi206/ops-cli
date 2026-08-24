@@ -660,6 +660,14 @@ fn decide_https(
             refuse(PolicyRefusal::Http2AskUnsupported)
         }
         Decision::Ask => {
+            // Masked before it is parked, for the reason the logging branch masks before pushing: a
+            // parked request is printed by `sbx net pending` (and by the notice below), so a token
+            // riding in a query would reach the operator's terminal — and a `--json` capture — in
+            // the clear from a path that is careful about it everywhere else. The outbound
+            // tripwire is not a backstop here: `carries_secret` skips a needle whose destination is
+            // the host it was learned on, which is exactly the request that parks instead of being
+            // refused.
+            let path = &ctx.redact_query(path);
             let verdict = ctx.pending.park(
                 host,
                 port,

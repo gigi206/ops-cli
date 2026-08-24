@@ -576,7 +576,12 @@ impl ProxyCtx {
     /// `*`, so a token that rode in a query string never enters the event ring in the clear. Reuses
     /// the same needle set and masking as the outbound/response redaction; `*` is ASCII and
     /// same-length, so the result stays valid UTF-8.
-    fn redact_query(&self, path: &str) -> String {
+    ///
+    /// Reached from the **park** as well as the log ([`super::decide_https`]): a parked request is
+    /// printed by `sbx net pending` and by the park notice, so a path that is masked on its way into
+    /// the ring and unmasked on its way into the pending queue is the same token in the same
+    /// terminal by another route.
+    pub(super) fn redact_query(&self, path: &str) -> String {
         let creds = self.credentials.snapshot();
         if creds.needles.is_empty() {
             return path.to_string();

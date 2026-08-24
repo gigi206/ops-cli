@@ -2142,6 +2142,84 @@ fn an_ask_undecided_host_on_the_https_forward_path_is_refused_when_denied() {
     );
 }
 
+/// A parked request reaches a person's terminal — `sbx net pending`, its `--json` form, and the
+/// park notice all print the path — so it gets the same masking the event ring gets. The needle
+/// here is one the cage's own sign-in taught the proxy for this very host, which is exactly the
+/// case the outbound tripwire waves through (`scanned_for` exempts a learned needle on the host it
+/// was learned on) — a declared secret in the same query never reaches the verdict at all, it is
+/// refused as a leak. So on the one request that *can* park with a live token in its query, the
+/// masking here is the only thing between that token and the operator's screen. The deny half is
+/// used because it needs no upstream: the point is the parked row, not the verdict.
+#[test]
+fn a_parked_request_masks_a_secret_riding_in_its_query() {
+    use crate::allowlist::DefaultAction;
+    use crate::sandbox::control::{PendingState, Verdict};
+    const TOKEN: &str = "topsecretvalue-abcdef";
+    let credentials = Arc::new(Credentials::new(
+        Vec::new(),
+        Vec::new(),
+        crate::sandbox::redact::MIN_LEN_DEFAULT,
+    ));
+    assert!(
+        credentials.observe(
+            "Authorization",
+            &format!("Bearer {TOKEN}"),
+            "undecided.test"
+        ),
+        "the learned needle is the premise of this test"
+    );
+    let state = Arc::new(PendingState::new());
+    let ctx = Arc::new(
+        ProxyCtx::new(
+            Arc::new(Ca::ephemeral().unwrap()),
+            EgressPolicy::default().with_default(DefaultAction::Ask),
+        )
+        .unwrap()
+        .with_resolver(Box::new(|_| {
+            panic!("a denied ask must never resolve the host")
+        }))
+        .with_shared_credentials(credentials)
+        .with_pending_silent(state.clone()),
+    );
+    // The parked row is read *before* it is answered: the answer pops it off the queue.
+    let answerer = {
+        let state = state.clone();
+        thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(row) = state.list().first() {
+                    let path = row.path.clone();
+                    let _ = state.answer_like(row.seq, Verdict::Deny);
+                    return path;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no request parked within the deadline"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+    let request = format!(
+        "GET https://undecided.test/v1/x?token={TOKEN}&page=2 HTTP/1.1\r\n\
+         Host: undecided.test\r\nConnection: close\r\n\r\n"
+    );
+    let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
+    let parked = answerer.join().unwrap();
+    assert!(
+        !parked.contains(TOKEN),
+        "a parked path must not carry the secret in the clear: {parked:?}"
+    );
+    assert!(
+        parked.contains(&format!("token={}", "*".repeat(TOKEN.len()))) && parked.contains("page=2"),
+        "the secret must be masked in place, leaving the rest of the query readable: {parked:?}"
+    );
+    assert!(
+        resp.contains("403") && resp.contains("asked-denied"),
+        "the deny half of the park must still refuse: {resp:?}"
+    );
+}
+
 /// The forwarded origin-form target keeps the **query string, percent-escapes included**,
 /// verbatim — while a *path-scoped* rule still decides it. `parse_url_target` returns
 /// path-including-query and `explain` canonicalizes internally (decoding `%2F`, resolving `..`),
