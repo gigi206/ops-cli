@@ -58,6 +58,13 @@ misspelled field is not left to read as a rule in force.
 `deny` always wins over `allow` within a table. See [Network modes](../networking/modes)
 for the full semantics.
 
+`none` and `shared` stand up no egress proxy, so every other field of the table is
+addressed to something that is not there. A table that pairs one of them with `allow`,
+`capture`, `ask_timeout` or any other field is named in the launch warnings, field by
+field, on the same terms as a misspelled key. The pairing worth knowing about is
+`mode = "shared"` with an `allow` list: it reads as "only these hosts" and means "every
+host, unfiltered".
+
 ## Table fields
 
 | Field | Meaning |

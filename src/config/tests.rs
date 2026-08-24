@@ -6764,6 +6764,63 @@ fn network_posture_validator() {
     assert_eq!(w.len(), 1);
 }
 
+/// A non-filtering posture stands up no egress proxy, so every other field in the table decides
+/// nothing. `shared` with an `allow` list is the case with teeth: it reads as "only these hosts"
+/// and means "every host, unfiltered", and nothing else tells its author so.
+#[test]
+fn a_non_filtering_mode_names_the_fields_it_leaves_inert() {
+    let table = |mode: &str, allow: &[&str], ask_timeout: Option<&str>| NetworkTable {
+        mute: vec![],
+        http2: vec![],
+        capture: None,
+        websocket_secret: None,
+        capture_max_kb: None,
+        groups: Default::default(),
+        rest: Default::default(),
+        mode: Some(mode.to_string()),
+        allow: allow.iter().map(|s| s.to_string()).collect(),
+        deny: vec![],
+        ask_timeout: ask_timeout.map(str::to_string),
+        ask_notice: None,
+        stats: None,
+        default_methods: None,
+        dns_cache_ttl: None,
+        pool: None,
+        idle_timeout: None,
+        max_connections: None,
+        body_max_mb: None,
+        ca_roots: None,
+    };
+    for (mode, policy) in [
+        ("shared", NetworkPolicy::Shared),
+        ("none", NetworkPolicy::Isolated),
+    ] {
+        let mut w = Vec::new();
+        assert_eq!(
+            validate_network(
+                &mut w,
+                "t",
+                NetworkField::Table(table(mode, &["api.example.com"], Some("90s")))
+            ),
+            Some(policy),
+            "the posture itself is unchanged: this is a warning, not a verdict"
+        );
+        assert_eq!(w.len(), 1, "one warning naming every inert field: {w:?}");
+        assert!(
+            w[0].contains("`allow`, `ask_timeout`") && w[0].contains(mode),
+            "the warning must name the fields and the posture that makes them inert: {:?}",
+            w[0]
+        );
+    }
+    // A bare posture table warns about nothing: there is nothing inert in it.
+    let mut w = Vec::new();
+    assert_eq!(
+        validate_network(&mut w, "t", NetworkField::Table(table("shared", &[], None))),
+        Some(NetworkPolicy::Shared)
+    );
+    assert!(w.is_empty(), "nothing inert, nothing to say: {w:?}");
+}
+
 #[test]
 fn a_trusted_project_allowlist_is_classified() {
     let r = resolve_no_plugins(

@@ -464,6 +464,57 @@ pub(super) fn validate_network(
     }
 }
 
+/// Name every `[network]` field a non-filtering posture leaves inert, so a table that reads like a
+/// restriction is not taken for one.
+///
+/// `none` and `shared` stand up no egress proxy: `none` gives the cage no network at all and
+/// `shared` gives it the host's, unfiltered. Every other field in the table is addressed to that
+/// proxy, so under either posture it decides nothing. The dangerous half is `shared` with an
+/// `allow` list, which reads exactly like "only these hosts" and is in fact "every host", and the
+/// author of such a table has no other way to find out.
+fn warn_inert_under_posture(
+    warnings: &mut Vec<String>,
+    source_label: &str,
+    posture: &str,
+    table: &NetworkTable,
+) {
+    let mut inert: Vec<&str> = Vec::new();
+    let mut list = |name: &'static str, present: bool| {
+        if present {
+            inert.push(name);
+        }
+    };
+    list("allow", !table.allow.is_empty());
+    list("deny", !table.deny.is_empty());
+    list("mute", !table.mute.is_empty());
+    list("http2", !table.http2.is_empty());
+    list("dns_cache_ttl", table.dns_cache_ttl.is_some());
+    list("pool", table.pool.is_some());
+    list("idle_timeout", table.idle_timeout.is_some());
+    list("max_connections", table.max_connections.is_some());
+    list("body_max_mb", table.body_max_mb.is_some());
+    list("ca_roots", table.ca_roots.is_some());
+    list("capture", table.capture.is_some());
+    list("capture_max_kb", table.capture_max_kb.is_some());
+    list("websocket_secret", table.websocket_secret.is_some());
+    list("ask_timeout", table.ask_timeout.is_some());
+    list("ask_notice", table.ask_notice.is_some());
+    list("stats", table.stats.is_some());
+    list("default_methods", table.default_methods.is_some());
+    if inert.is_empty() {
+        return;
+    }
+    let named = inert.join("`, `");
+    let what = if posture == "none" {
+        "gives the cage no network at all"
+    } else {
+        "gives the cage the host's network, unfiltered"
+    };
+    warnings.push(format!(
+        "{source_label}: ignoring `{named}` under `[network]` — `mode = \"{posture}\"` {what}, so          there is no egress proxy for these to address; a rule list here restricts nothing. Use          `mode = \"deny\"` or `\"ask\"` to filter."
+    ));
+}
+
 /// Validate the table form of `network`: `none`/`shared` behave as the string form; `deny`/`allow`/
 /// `ask` classify each declared entry (a malformed one is dropped with a warning, fail-closed —
 /// that host simply stays unreachable, never silently allowed); and an **omitted** `mode` inherits
@@ -495,8 +546,14 @@ pub(super) fn validate_network_table(
     // The default action: from an explicit `mode`, or — when omitted — inherited from the parent
     // layer. `none`/`shared` are non-filtering postures that carry no rules, so they return early.
     let action = match table.mode.as_deref() {
-        Some("none") => return Some(NetworkPolicy::Isolated),
-        Some("shared") => return Some(NetworkPolicy::Shared),
+        Some(posture @ ("none" | "shared")) => {
+            warn_inert_under_posture(warnings, source_label, posture, &table);
+            return Some(if posture == "none" {
+                NetworkPolicy::Isolated
+            } else {
+                NetworkPolicy::Shared
+            });
+        }
         // `deny` = deny-by-default (only what `allow` lists reaches). `allow` = the denylist
         // (everything public reaches except the `deny` carve-outs, proxy still active). `ask` parks
         // an unmatched request for a live decision (allow rules auto-pass, deny rules auto-fail).
