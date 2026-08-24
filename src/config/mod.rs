@@ -5077,6 +5077,13 @@ fn parse_http2_hosts(
 /// `"90"`. A zero-valued form (`"0"`, `"0m"`) means no timeout — an indefinite wait, the same as
 /// omitting the field — so it returns `Ok(None)`; a positive value returns `Ok(Some(duration))`.
 /// A malformed value is `Err(reason)` so the caller can warn and fall back to indefinite.
+///
+/// A value above [`DURATION_MAX_SECS`] is malformed too. Every duration parsed here becomes a
+/// deadline somewhere — `Instant::now() + d` in the task runner, the readiness gate, the
+/// connection pool — and that addition *panics* on overflow, so a config naming `18446744073709551615`
+/// would abort the launcher rather than wait a long time. The ceiling is far beyond any duration
+/// a person writes, so refusing it costs nothing and the callers' existing "warn and fall back"
+/// path answers it.
 fn parse_duration(raw: &str) -> Result<Option<std::time::Duration>, String> {
     let s = raw.trim();
     let malformed = || format!("`{raw}` is not a duration (try \"90s\", \"5m\", \"2h\")");
@@ -5092,9 +5099,19 @@ fn parse_duration(raw: &str) -> Result<Option<std::time::Duration>, String> {
     let n: u64 = digits.trim().parse().map_err(|_| malformed())?;
     let secs = n
         .checked_mul(unit)
-        .ok_or_else(|| format!("`{raw}` is too large"))?;
+        .filter(|secs| *secs <= DURATION_MAX_SECS)
+        .ok_or_else(|| {
+            format!(
+                "`{raw}` is too large — a duration may name at most {DURATION_MAX_SECS} seconds"
+            )
+        })?;
     Ok((secs > 0).then(|| std::time::Duration::from_secs(secs)))
 }
+
+/// The largest duration a config may name: one year. Not a policy about how long anything should
+/// wait — every real value is orders of magnitude below it — but the bound that keeps a parsed
+/// duration usable as a deadline (see [`parse_duration`]).
+const DURATION_MAX_SECS: u64 = 365 * 24 * 3600;
 
 /// Pre-classified reusable egress groups: each `[network.groups]` name mapped to the rules its
 /// entries classify to. Built once from the global config (trusted by location) and consulted

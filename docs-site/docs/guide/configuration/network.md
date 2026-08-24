@@ -81,6 +81,13 @@ for the full semantics.
 | `websocket_secret` | what a configured secret seen leaving through a WebSocket does: `"warn"` (default, record it) or `"block"` (record it and close the tunnel): see below |
 | `default_methods` | an **app's** read-by-default verbs (see below) |
 
+Every duration field (`ask_timeout`, `idle_timeout`, a task's `timeout`, a service's
+`ready.timeout`, `[notify] repeat_after`) shares one grammar: a whole number with an
+optional `s`, `m` or `h` suffix, where a bare number is seconds. A value above one year
+(`8760h`) is refused as malformed, alongside `"soon"` and `"9x"`: a duration that long is
+past every deadline sbx can hold, and each field then falls back the way it does for any
+other malformed value.
+
 The `allow`/`deny` entries follow the [rule grammar](../networking/rules): a host,
 `*.domain`, `host/path`, an IP, `re:<regex>`, `http://host` (inspected cleartext),
 `tcp://host:port` (raw), an optional `{GET,POST}` verb prefix, or `@<group>`

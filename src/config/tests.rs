@@ -2108,6 +2108,34 @@ fn parse_duration_handles_units_and_rejects_garbage() {
     assert!(parse_duration("").is_err());
 }
 
+/// Every duration parsed from a config becomes a deadline (`Instant::now() + d`), and that
+/// addition panics on overflow — so a value no deadline can hold is refused at the parse door
+/// rather than aborting the launcher later. The teeth are the `checked_add`: it is `None` for
+/// anything this parser must not return.
+#[test]
+fn a_duration_no_deadline_could_hold_is_refused() {
+    use std::time::Instant;
+    // The value a hostile (or fat-fingered) config would name.
+    let huge = u64::MAX.to_string();
+    assert!(
+        parse_duration(&huge).is_err(),
+        "a duration past every deadline must be refused, not returned"
+    );
+    // The unit forms reach the same ceiling.
+    assert!(parse_duration(&format!("{}h", u64::MAX / 3600)).is_err());
+    assert!(parse_duration("9000h").is_err());
+    // Everything the parser does return is usable as a deadline.
+    for raw in ["1", "90s", "5m", "2h", "8760h"] {
+        let d = parse_duration(raw)
+            .unwrap_or_else(|e| panic!("`{raw}` must parse: {e}"))
+            .expect("positive");
+        assert!(
+            Instant::now().checked_add(d).is_some(),
+            "`{raw}` must be usable as a deadline"
+        );
+    }
+}
+
 #[test]
 fn a_global_apps_network_survives_an_untrusted_projects_override_attempt() {
     // A globally-declared app keeps its posture even when launched under an untrusted
