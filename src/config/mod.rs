@@ -1351,8 +1351,49 @@ fn override_fatal_error(fatal: Vec<String>, notes: Vec<String>) -> Vec<String> {
 /// The fix is a plain `nix:<pkg>`, which is host-provisioned and seeded into each project's store,
 /// per-project-aligned by construction — so this warns rather than rerouting. Trusted-only: a withheld
 /// package never equips, so it stays silent. `source` prefixes the message (e.g. `` `app <name> ` ``).
-/// Attach each `[plugin.<name>]` table to the plugin instances the secrets reference, validating
-/// it against the manifest that instance carries.
+/// Answer the baseline credentials, split from [`apply_plugin_host_config`] so it can run **before**
+/// the posture clear.
+///
+/// `resolve` snapshots `secrets` into `declared_secrets` at that point, and `merge_app` restores
+/// that snapshot wholesale (`self.secrets = self.declared_secrets.clone()`) so an app opening a
+/// filtering posture inherits a baseline credential the baseline posture had cleared. Answering the
+/// whole table afterwards therefore answered a set the app path throws away: every inherited
+/// baseline credential resolved through a plugin reached the launch with an empty `HostConfig`, so
+/// the plugin ran with neither the configured environment nor its `nix:`-provisioned program —
+/// under `sbx app run <name>` but not under `sbx run`, from one declaration.
+///
+/// The rest of the table (tasks, apps, brokers) is answered later because those are resolved after
+/// the clear; `matched` is threaded through both halves so the "no secret uses a plugin by that
+/// name" warning still sees the union.
+fn apply_plugin_host_config_to_secrets(
+    secrets: &mut [HeaderSecret],
+    cfg: &BTreeMap<String, crate::config::schema::RawPluginConfig>,
+    matched: &mut BTreeSet<String>,
+    warnings: &mut Vec<String>,
+) {
+    if cfg.is_empty() {
+        return;
+    }
+    for secret in secrets.iter_mut() {
+        apply_to_sources(&mut secret.sources, cfg, matched, warnings);
+        // A signer is a plugin this table configures too, and it is not one of the secret's
+        // *sources*: it forms the value the sources resolved. Its manifest travels with the
+        // declaration, so unlike a broker it is answered right here.
+        if let Some(plugin) = secret.signer.as_mut()
+            && let Some(raw) = cfg.get(&plugin.name)
+        {
+            matched.insert(plugin.name.clone());
+            plugin.host = host_config_for(&plugin.name, &plugin.sandbox, raw, warnings);
+        }
+    }
+}
+
+/// Attach each `[plugin.<name>]` table to the plugin instances a task, an app or a broker
+/// references, validating it against the manifest that instance carries.
+///
+/// The baseline credentials are answered by [`apply_plugin_host_config_to_secrets`] earlier, for
+/// the reason stated there; these are the parts that are resolved only after the posture clear, and
+/// `matched` is threaded in from that first half so the unmatched-table warning below sees both.
 ///
 /// The manifest states what the plugin reads; the config supplies the values. So a variable the
 /// manifest does not declare is **refused and dropped**, named — a config must not be able to put
@@ -1363,29 +1404,16 @@ fn override_fatal_error(fatal: Vec<String>, notes: Vec<String>) -> Vec<String> {
 /// A table naming no installed plugin is reported too. It is almost always a typo, and staying
 /// silent would leave the user waiting for settings that never applied.
 fn apply_plugin_host_config(
-    secrets: &mut [HeaderSecret],
     tasks: &mut [TaskSpec],
     apps: &mut BTreeMap<String, ResolvedApp>,
     brokers: &mut [BrokerBinding],
     plugins: &crate::plugins::PluginRegistry,
     cfg: &BTreeMap<String, crate::config::schema::RawPluginConfig>,
+    matched: &mut BTreeSet<String>,
     warnings: &mut Vec<String>,
 ) {
     if cfg.is_empty() {
         return;
-    }
-    let mut matched: BTreeSet<String> = BTreeSet::new();
-    for secret in secrets.iter_mut() {
-        apply_to_sources(&mut secret.sources, cfg, &mut matched, warnings);
-        // A signer is a plugin this table configures too, and it is not one of the secret's
-        // *sources*: it forms the value the sources resolved. Its manifest travels with the
-        // declaration, so unlike a broker it is answered right here.
-        if let Some(plugin) = secret.signer.as_mut()
-            && let Some(raw) = cfg.get(&plugin.name)
-        {
-            matched.insert(plugin.name.clone());
-            plugin.host = host_config_for(&plugin.name, &plugin.sandbox, raw, warnings);
-        }
     }
     // A broker is configured by the same table and reached differently: it is not a secret's
     // source, so nothing here would ever see it. Its manifest lives in the registry, which is
@@ -1403,12 +1431,12 @@ fn apply_plugin_host_config(
     // plugin reached only from a `[task.<name>.secret]` needs the table just as much. Missing these
     // left such a plugin running with none of it *and* reported the table as matching no secret,
     // which reads as a typo in a name that was in fact correct.
-    apply_to_tasks(tasks, cfg, &mut matched, warnings);
+    apply_to_tasks(tasks, cfg, matched, warnings);
     for app in apps.values_mut() {
         for secret in app.secrets.iter_mut() {
-            apply_to_sources(&mut secret.sources, cfg, &mut matched, warnings);
+            apply_to_sources(&mut secret.sources, cfg, matched, warnings);
         }
-        apply_to_tasks(&mut app.tasks, cfg, &mut matched, warnings);
+        apply_to_tasks(&mut app.tasks, cfg, matched, warnings);
     }
     for name in cfg.keys() {
         if !matched.contains(name) {
@@ -2381,6 +2409,18 @@ fn resolve(
         }
     }
 
+    // The baseline credentials are answered from `[plugin.*]` **before** the snapshot below, not
+    // with the rest of the table further down. `merge_app` restores this snapshot wholesale, so an
+    // answer applied after it is an answer the app path throws away — see
+    // [`apply_plugin_host_config_to_secrets`]. `plugin_cfg` is final from the project layer
+    // onwards, so nothing is missed by asking here.
+    let mut plugin_matched: BTreeSet<String> = BTreeSet::new();
+    apply_plugin_host_config_to_secrets(
+        &mut secrets,
+        &plugin_cfg,
+        &mut plugin_matched,
+        &mut warnings,
+    );
     // Capture the declared baseline credentials before the posture clear: an app overlay that
     // opens a filtering posture inherits these (re-judged on its effective posture), even when the
     // baseline posture clears them from the baseline-effective `secrets`.
@@ -2421,12 +2461,12 @@ fn resolve(
     // Done here rather than where a `SecretSource::Plugin` is parsed, because the answer must see
     // the FINAL table: a project layer that is read after the secrets would otherwise be missed.
     apply_plugin_host_config(
-        &mut secrets,
         &mut tasks,
         &mut apps,
         &mut brokers,
         plugins,
         &plugin_cfg,
+        &mut plugin_matched,
         &mut warnings,
     );
 

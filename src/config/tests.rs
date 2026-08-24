@@ -8492,6 +8492,57 @@ fn secret_using(scheme: &str) -> RawConfig {
     cfg
 }
 
+/// A baseline credential an app **inherits** must keep the `[plugin.<name>]` answer.
+///
+/// `merge_app` restores the pre-posture snapshot wholesale — `self.secrets =
+/// self.declared_secrets.clone()` — so anything applied to `secrets` after that snapshot was taken
+/// is thrown away on the app path. `apply_plugin_host_config` ran after it, so every inherited
+/// baseline credential resolved through a plugin reached the launch with an empty `HostConfig`:
+/// `resolver`'s `CagePlan` then gave the plugin neither the configured environment nor its
+/// `nix:`-provisioned program.
+///
+/// The asymmetry is the tell: an app's *own* secrets kept their answer (they are mutated in place
+/// through `apps.values_mut()`), so `sbx run` and `sbx app run <name>` resolved one declaration two
+/// different ways.
+#[test]
+fn an_app_inherits_a_baseline_credentials_plugin_host_config() {
+    let reg = PluginRegistry::with([plugin_reading("vault", &["VAULT_ADDR"], &[])]);
+    let mut global = secret_using("vault");
+    global.plugin =
+        raw_plugin_table("vault", &[("VAULT_ADDR", "https://vault.example.com")]).plugin;
+    global.network = Some(net_field("deny", &["api.example.com"], &[]));
+    global.app = [(
+        "agent".to_string(),
+        raw_app(&["agent"], &[], &[], &[], None),
+    )]
+    .into_iter()
+    .collect();
+
+    let mut r = super::resolve(global, None, &reg);
+    let host_of = |secrets: &[HeaderSecret]| match &secrets[0].sources[0] {
+        SecretSource::Plugin { plugin, .. } => plugin.host.env.clone(),
+        other => panic!("expected a plugin source, got {other:?}"),
+    };
+    let expected = vec![(
+        "VAULT_ADDR".to_string(),
+        "https://vault.example.com".to_string(),
+    )];
+    assert_eq!(
+        host_of(&r.secrets),
+        expected,
+        "the baseline itself is answered"
+    );
+
+    // What `sbx app run agent` does: fold the app overlay onto the baseline.
+    let app = r.apps["agent"].clone();
+    r.merge_app(app);
+    assert_eq!(
+        host_of(&r.secrets),
+        expected,
+        "the inherited baseline credential must carry the same answer the baseline had"
+    );
+}
+
 #[test]
 fn a_plugin_table_supplies_only_the_variables_the_manifest_reads() {
     let reg = PluginRegistry::with([plugin_reading("vault", &["VAULT_ADDR"], &["VAULT_CACERT"])]);
