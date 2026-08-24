@@ -52,7 +52,10 @@ type   = "bearer"
 
 An `inject` entry requires `network` reaching that host: the injection happens in the task's proxy,
 which only exists when the task has egress, so the pair is refused rather than silently doing
-nothing.
+nothing. "Reaching" is checked, not assumed: a `network` that names only other hosts, or that
+names this one over `tcp://` or `http://` (neither carries a credential), is refused with the
+stranded destination named. A rule that names a *family* of hosts (`*.example.com`, a `re:`
+pattern, an IP) may well cover it, so nothing is claimed there.
 
 **Each invocation gets its own proxy**, never the session's. That is a requirement, not tidiness:
 with no per-process identity (the cage runs same-uid), a shared proxy could not tell a task's

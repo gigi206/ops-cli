@@ -217,6 +217,13 @@ pub(super) fn validate_task(
                 .to_string(),
         );
     }
+    if let Some(stranded) = stranded_injection(&injections, &network) {
+        return Err(format!(
+            "`inject` names {stranded}, which this task's `network` does not reach over an \
+             inspected TLS rule — the injection happens in the task's own proxy, on a request that \
+             rule admits, so as written the credential is resolved and never sent"
+        ));
+    }
     for var in raw.env.keys().chain(raw.env_allow.iter()) {
         validate_env_name(var)?;
         if secrets.iter().any(|s| &s.var == var) {
@@ -872,7 +879,39 @@ fn validate_task_injections(
     Ok(out)
 }
 
-/// Classify the task's egress entries. The same grammar as `[network] allow`, so a task's rules read
+/// The first injection destination this task's `network` plainly cannot reach, if any.
+///
+/// The neighbouring check catches the empty `network`, and its message has always promised more
+/// than it looked at: a task that declares `network = ["other.test"]` and injects into
+/// `api.test` passed validation, resolved the credential at run time, and sent it nowhere — the
+/// request to `api.test` was refused by the task's own proxy before any header was formed. The
+/// author sees a task that does not work and no statement of why.
+///
+/// **Deliberately narrow.** It reports only a destination that *no* rule could name: the moment any
+/// rule is a wildcard, a regex or an IP, this answers `None` rather than reason about a family of
+/// hosts, because a false refusal here rejects a config that works. The layer is part of the
+/// question — a credential is never injected into a `tcp://` splice or an `http://` cleartext
+/// request (`validate_host_secret` refuses such a `to` for the same reason) — so only an inspected
+/// `Layer::L7` rule counts as reaching it.
+fn stranded_injection(
+    injections: &[HeaderSecret],
+    network: &[crate::allowlist::Rule],
+) -> Option<String> {
+    use crate::allowlist::Layer;
+    // A rule that names no single host may name this one: nothing here is decidable then.
+    if network.iter().any(|r| r.concrete_host().is_none()) {
+        return None;
+    }
+    injections.iter().find_map(|secret| {
+        let to = secret.to.concrete_host()?;
+        let reached = network
+            .iter()
+            .any(|r| r.layer == Layer::L7 && r.concrete_host() == Some(to));
+        (!reached).then(|| to.to_string())
+    })
+}
+
+/// Classify the task's egress entries. The same grammar as `[network] allow`, so a task's rules read/// Classify the task's egress entries. The same grammar as `[network] allow`, so a task's rules read
 /// like any other egress rule.
 fn validate_task_network(raw: &[String]) -> Result<Vec<Rule>, String> {
     raw.iter()
@@ -1520,9 +1559,43 @@ mod tests {
         assert!(e.contains("network"), "{e}");
 
         raw.network = vec!["api.example.com".into()];
-        let task = validate(raw).unwrap();
+        let task = validate(raw.clone()).unwrap();
         assert_eq!(task.injections.len(), 1);
         assert_eq!(task.network.len(), 1);
+
+        // A `network` that reaches somewhere *else* is the same failure with a full-looking config:
+        // the credential resolves and the request it belongs to is refused by this task's own
+        // proxy, so the header is never formed. Refused, and the destination is named.
+        let mut elsewhere = raw.clone();
+        elsewhere.network = vec!["other.example.com".into()];
+        let e = validate(elsewhere).unwrap_err();
+        assert!(
+            e.contains("api.example.com") && e.contains("does not reach"),
+            "the refusal must name the destination that is stranded: {e}"
+        );
+
+        // A rule that reaches the host but carries no injection is stranded too: a credential is
+        // never put on a spliced or cleartext request.
+        for unreachable in ["tcp://api.example.com:443", "http://api.example.com"] {
+            let mut wrong_layer = raw.clone();
+            wrong_layer.network = vec![unreachable.into()];
+            let e = validate(wrong_layer).unwrap_err();
+            assert!(
+                e.contains("api.example.com"),
+                "`{unreachable}` carries no injection, so the credential is stranded: {e}"
+            );
+        }
+
+        // Nothing is claimed about a family of hosts: a wildcard or a regex may well name it, and
+        // refusing there would reject a config that works.
+        for wide in ["*.example.com", "re:^https://api\\.example\\.com/"] {
+            let mut family = raw.clone();
+            family.network = vec![wide.into()];
+            assert!(
+                validate(family).is_ok(),
+                "`{wide}` may name the destination, so it must not be refused"
+            );
+        }
     }
 
     /// `secrets::upsert_secret` keeps one secret per (target, header) for the session path, and says
