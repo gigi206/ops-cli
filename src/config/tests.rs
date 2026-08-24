@@ -8636,6 +8636,89 @@ fn secret_using(scheme: &str) -> RawConfig {
     cfg
 }
 
+/// A signer plugin declaring the variables it reads, so a `[plugin.<name>]` table has something to
+/// be validated against and somewhere for its answer to land.
+fn signer_reading(name: &str, env: &[&str]) -> crate::plugins::signer::SignerPlugin {
+    crate::plugins::signer::SignerPlugin {
+        name: name.to_string(),
+        dir: PathBuf::from(format!("/data/plugins/{name}")),
+        exec: PathBuf::from(format!("/data/plugins/{name}/sign")),
+        sandbox: crate::plugins::SandboxGrant {
+            allow_env: env.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        },
+        signer: crate::plugins::signer::SignerSpec {
+            sets_headers: vec!["Authorization".to_string()],
+            sees_headers: Vec::new(),
+            reads_secret: false,
+            body_digest: None,
+        },
+        version: None,
+        description: None,
+        host: Default::default(),
+    }
+}
+
+/// A credential formed by a signer, for the host-config tests.
+fn secret_signed_by(name: &str) -> RawHostSecret {
+    RawHostSecret {
+        name: None,
+        description: None,
+        kind: Some("http-header".into()),
+        key: None,
+        from: Some(SecretFrom::One("env://K".into())),
+        header: None,
+        value_type: None,
+        prefix: None,
+        sign: Some(name.to_string()),
+    }
+}
+
+/// The `[plugin.<name>]` table has to reach a signer wherever the credential naming it is declared.
+/// The signer half of the walk was written for the baseline's credentials and nowhere else, so an
+/// app's own credential and a declared operation's `[inject]` reached the launch with an empty
+/// `HostConfig`: the plugin ran with neither the configured environment nor its provisioned
+/// program, from a table that was correct. The same walk then reported that table as matching no
+/// secret, which reads as a typo in a name that was right.
+#[test]
+fn a_signer_named_by_an_app_or_a_task_gets_its_plugin_table() {
+    let reg = PluginRegistry::with_signers([signer_reading("aws-sigv4", &["AWS_REGION"])]);
+    let mut global = raw_plugin_table("aws-sigv4", &[("AWS_REGION", "eu-west-1")]);
+    global.network = Some(net_field("deny", &["api.example.com"], &[]));
+    // An app with a credential of its own, and a declared operation that injects one.
+    let mut app = raw_app(&["agent"], &[], &[], &[], None);
+    app.secret = Some(raw_secret_section(vec![(
+        "api.example.com".to_string(),
+        secret_signed_by("aws-sigv4"),
+    )]));
+    app.network = Some(net_field("deny", &["api.example.com"], &[]));
+    global.app = [("agent".to_string(), app)].into_iter().collect();
+
+    let r = super::resolve(global, None, &reg);
+    let expected = vec![("AWS_REGION".to_string(), "eu-west-1".to_string())];
+    let signer_env = |secrets: &[HeaderSecret]| {
+        secrets[0]
+            .signer
+            .as_ref()
+            .expect("the credential names a signer")
+            .host
+            .env
+            .clone()
+    };
+    assert_eq!(
+        signer_env(&r.apps["agent"].secrets),
+        expected,
+        "an app's own credential must reach its signer's plugin table"
+    );
+    assert!(
+        !r.warnings
+            .iter()
+            .any(|w| w.contains("no secret uses a plugin by that name")),
+        "and the table must not be reported as matching nothing: {:?}",
+        r.warnings
+    );
+}
+
 /// A baseline credential an app **inherits** must keep the `[plugin.<name>]` answer.
 ///
 /// `merge_app` restores the pre-posture snapshot wholesale — `self.secrets =

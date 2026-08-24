@@ -1374,6 +1374,24 @@ fn apply_plugin_host_config_to_secrets(
     if cfg.is_empty() {
         return;
     }
+    apply_to_header_secrets(secrets, cfg, matched, warnings);
+}
+
+/// Attach the table to every plugin a wire credential reaches: the chain that resolves its value,
+/// and the signer that forms one per request.
+///
+/// One function for all three sets of them — the baseline's, an app's, and a declared operation's
+/// `[inject]` — because they were not. The signer half was written here for the baseline and
+/// nowhere else, so an app's or a task's signed credential reached the launch with an empty
+/// `HostConfig`: the plugin ran with neither the configured environment nor its `nix:`-provisioned
+/// program, from a `[plugin.<name>]` table that was correct. The table was then reported as
+/// matching no secret, which reads as a typo in a name that was in fact right.
+fn apply_to_header_secrets(
+    secrets: &mut [HeaderSecret],
+    cfg: &BTreeMap<String, crate::config::schema::RawPluginConfig>,
+    matched: &mut BTreeSet<String>,
+    warnings: &mut Vec<String>,
+) {
     for secret in secrets.iter_mut() {
         apply_to_sources(&mut secret.sources, cfg, matched, warnings);
         // A signer is a plugin this table configures too, and it is not one of the secret's
@@ -1433,9 +1451,7 @@ fn apply_plugin_host_config(
     // which reads as a typo in a name that was in fact correct.
     apply_to_tasks(tasks, cfg, matched, warnings);
     for app in apps.values_mut() {
-        for secret in app.secrets.iter_mut() {
-            apply_to_sources(&mut secret.sources, cfg, matched, warnings);
-        }
+        apply_to_header_secrets(&mut app.secrets, cfg, matched, warnings);
         apply_to_tasks(&mut app.tasks, cfg, matched, warnings);
     }
     for name in cfg.keys() {
@@ -1461,9 +1477,7 @@ fn apply_to_tasks(
         for secret in task.secrets.iter_mut() {
             apply_to_sources(&mut secret.sources, cfg, matched, warnings);
         }
-        for injection in task.injections.iter_mut() {
-            apply_to_sources(&mut injection.sources, cfg, matched, warnings);
-        }
+        apply_to_header_secrets(&mut task.injections, cfg, matched, warnings);
     }
 }
 

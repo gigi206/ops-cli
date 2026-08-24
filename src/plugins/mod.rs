@@ -666,6 +666,17 @@ impl PluginRegistry {
             ..Self::default()
         }
     }
+
+    /// The same for signers, for the config tests that check what a `[plugin.<name>]` table
+    /// reaches: a signer is named by a credential's `sign` and configured by that table, so the
+    /// resolver needs one in the registry to attach an answer to.
+    #[cfg(test)]
+    pub(crate) fn with_signers(plugins: impl IntoIterator<Item = signer::SignerPlugin>) -> Self {
+        Self {
+            signers: plugins.into_iter().map(|p| (p.name.clone(), p)).collect(),
+            ..Self::default()
+        }
+    }
 }
 
 /// The raw `plugin.toml` manifest, before validation. Every field is optional so a missing
