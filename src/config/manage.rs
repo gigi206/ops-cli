@@ -1268,29 +1268,37 @@ fn write_restricted(path: &Path, text: &str, mode: Option<u32>) -> std::io::Resu
 
 /// Create `path` empty, owner-only when `mode` states one, ready to be written into.
 ///
-/// Two steps, not one, because they answer two different situations and neither covers the other.
-/// `OpenOptions::mode` applies only when the open creates the file, so it says nothing about one
-/// that already exists — the temp a crashed predecessor holding this pid left behind; the `fchmod`
-/// on the descriptor covers that case, and lands before any byte does either way. Conversely the
-/// `fchmod` alone would leave a gap the mode on the open closes: a descriptor another reader opened
-/// while the file was still `0644` keeps the access it was granted, and a later `chmod` does not
-/// revoke it — so the empty file would be tightened while that reader waits to read what is about
-/// to be written into it.
+/// **Unlinked first, then created exclusively**, and that pairing is what keeps the write inside the
+/// directory it names. The temp is `.{name}.sbx-tmp.{pid}` — a name with no random part — and the
+/// directory it lands in is not always one sbx owns: [`write_restricted`]'s own doc names "a project
+/// tree" beside `~/.config/sbx`, and a project tree is bound **read-write into the cage**. Untrusted
+/// in-cage code can therefore pre-create that name, and pids are a small enough space to simply
+/// cover. Opening `O_CREAT|O_TRUNC` followed the entry it found: a symlink there sent the config
+/// sbx was about to write to whatever it pointed at, and the `rename` then installed the link itself
+/// at the real config path. `remove_file` unlinks the entry rather than following it, and
+/// `create_new` refuses to open anything it did not just make — `O_NOFOLLOW` says the same thing
+/// twice, deliberately, because this one is load-bearing.
+///
+/// A stale temp from a crashed predecessor holding this pid is still recovered; it is removed rather
+/// than reused, which is the same outcome by a route that cannot be redirected. Since the open now
+/// always creates, `OpenOptions::mode` always applies — and it is still the mode on the *open* that
+/// matters rather than a later `fchmod`, because a descriptor another reader opened while the file
+/// was `0644` keeps the access it was granted and a later `chmod` does not revoke it.
 ///
 /// Split out from [`write_restricted`] because the property is about the file *while it is still
 /// empty*, which is the only moment a test can read it.
 fn create_restricted(path: &Path, mode: Option<u32>) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
+    // Not `?`: the ordinary case is that nothing is there, and `NotFound` is not a failure.
+    let _ = std::fs::remove_file(path);
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW);
     if mode.is_some() {
         opts.mode(0o600);
     }
-    let file = opts.open(path)?;
-    if mode.is_some() {
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(file)
+    opts.open(path)
 }
 
 /// The result of [`import_net_groups`]: the group names newly added and those overwritten (only
@@ -1572,10 +1580,11 @@ mod tests {
     /// every reader of that directory for the length of the write.
     ///
     /// Asserting the final mode would not catch it — tightening after the fact reaches the same
-    /// `0600` the fix does. What is read here is the file while it is still empty, and the
-    /// pre-existing sibling is what makes the reading independent of the umask this test happens
-    /// to run under: `OpenOptions::mode` says nothing about a file it did not create, so a mode
-    /// stated only there leaves this one at `0666`.
+    /// `0600` the fix does. What is read here is the file while it is still empty. The pre-existing
+    /// sibling is kept as a case because it is the one a crashed predecessor holding this pid
+    /// leaves: it must come back owner-only, and it must not be *reused* — `create_restricted`
+    /// unlinks it and creates its own, which is what lets the mode on the open apply and what keeps
+    /// a symlink at that name from being followed (pinned separately below).
     ///
     /// What this does not reach is the composition: a `write_restricted` that went back to writing
     /// through the path would still pass, since the file it leaves behind is the same one. That
@@ -1595,6 +1604,11 @@ mod tests {
 
         let file = create_restricted(&stale, Some(0o600)).expect("the temp is created");
         assert_eq!(
+            std::fs::read_to_string(&stale).unwrap(),
+            "",
+            "the stale temp is replaced, not written into"
+        );
+        assert_eq!(
             mode_of(&stale),
             0o600,
             "owner-only before any byte is written"
@@ -1602,10 +1616,10 @@ mod tests {
         assert_eq!(file.metadata().unwrap().len(), 0, "and still empty");
         drop(file);
 
-        // The fresh-file half is asserted but does not separate the two steps: the `fchmod`
-        // reaches `0600` on its own, and what the mode on the open adds is a race no test can
-        // reach — a reader that opened the file in the gap and holds a descriptor the tightening
-        // does not revoke.
+        // The fresh file is the ordinary case, and reaches the same mode by the same route now
+        // that every open creates. What the mode on the open buys over a later `fchmod` is a race
+        // no test can reach: a reader that opened the file in the gap holds a descriptor the
+        // tightening does not revoke.
         let fresh = dir.join("fresh");
         drop(create_restricted(&fresh, Some(0o600)).expect("created"));
         assert_eq!(mode_of(&fresh), 0o600);
@@ -1617,6 +1631,39 @@ mod tests {
         std::fs::write(&control, "").unwrap();
         drop(create_restricted(&plain, None).expect("created"));
         assert_eq!(mode_of(&plain), mode_of(&control));
+    }
+
+    /// The temp is `.{name}.sbx-tmp.{pid}` — no random part — and `write_restricted`'s own doc
+    /// names "a project tree" as a directory it writes into. A project tree is bound **read-write
+    /// into the cage**, so untrusted in-cage code can pre-create that name, and the pid space is
+    /// small enough to simply cover. Following a symlink there sent the config sbx was about to
+    /// write — which can carry a token — to whatever it pointed at, and the `rename` afterwards
+    /// installed the link itself at the real config path.
+    #[test]
+    fn a_symlink_at_the_temp_name_is_replaced_rather_than_written_through() {
+        let dir = crate::testutil::TmpDir::new();
+        let outside = dir.join("outside.txt");
+        let untouched = "the cage must not be able to overwrite this\n";
+        std::fs::write(&outside, untouched).unwrap();
+
+        let planted = dir.join(".sbx.toml.sbx-tmp.1234");
+        std::os::unix::fs::symlink(&outside, &planted).unwrap();
+
+        let file = create_restricted(&planted, Some(0o600)).expect("the temp is created");
+        drop(file);
+
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            untouched,
+            "the open followed the link and truncated the file it pointed at"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&planted)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted link must be replaced by a real file, not opened through"
+        );
     }
 
     #[test]
