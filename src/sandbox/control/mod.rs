@@ -1035,7 +1035,25 @@ pub(crate) fn serve(
     capture: Option<Arc<CaptureRing>>,
 ) -> io::Result<()> {
     for stream in listener.incoming() {
-        let stream = stream?;
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                // The same defence the proxy's accept loop in this very process already carries,
+                // and for the same reason: a transient `accept(2)` error (host fd exhaustion, a
+                // connection aborted between the SYN and the accept) is not this server's death.
+                //
+                // `?` here ended the `for` loop, and this function is the body of a detached thread
+                // — so returning dropped the `UnixListener` and closed the listening fd for the rest
+                // of the launch. Every `sbx net` verb then failed for a session that was otherwise
+                // running fine, while the socket file stayed on disk (only `Egress::drop` unlinks
+                // it) and `session_pids` kept reporting the pid, so nothing said the control plane
+                // was gone. The doc three lines up already stated the rule this broke: "A
+                // per-connection error is that connection's problem, never the server's."
+                crate::diag::error(&format!("sbx: egress control: accept error: {e}"));
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+        };
         let state = state.clone();
         let manual = manual.clone();
         let log = log.clone();
