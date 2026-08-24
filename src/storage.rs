@@ -1073,13 +1073,41 @@ pub(crate) fn init(image: &Path, size_bytes: u64, label: &str, mkfs: &Mkfs) -> R
 
     // The seed directory decides the filesystem root's ownership, so it must be ours and it
     // must be empty — every byte it held would be copied into the new volume.
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
     let seed = image.with_extension("seed");
     let _ = std::fs::remove_dir_all(&seed);
-    std::fs::create_dir(&seed).map_err(|e| format!("cannot create {}: {e}", seed.display()))?;
+    // Owner-only, like every other directory this crate makes: the seed's mode is what the new
+    // filesystem's root carries, and `store::ensure` tightens the *mounted* root to `0700` anyway —
+    // so taking the umask's answer here only opened a window, it never decided anything.
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&seed)
+        .map_err(|e| format!("cannot create {}: {e}", seed.display()))?;
 
     let made = (|| -> Result<(), String> {
         // Sparse: the file declares its size but occupies only what gets written.
-        let f = std::fs::File::create(image).map_err(|e| format!("cannot create image: {e}"))?;
+        //
+        // `create_new` + `mode(0o600)` rather than `File::create`, on two counts. The mode: this one
+        // file *is* the whole data directory once the volume is adopted — the shared nix store,
+        // every project's home and runtime tree, `apt-keys/`, session state — and `File::create`
+        // takes `0666 & ~umask`, so under the near-universal `umask 022` it landed `0644` and any
+        // other local account could read every byte of it by loop-mounting a copy. Every other
+        // creation site here refuses to trust the umask for far less: `lock_image` passes
+        // `mode(0o600)` for a file that holds nothing but an flock, and `store::ensure` builds
+        // `0700` "so a loose umask never leaves a world-readable window between creation and
+        // tightening". Tightening later would not help either — the image is read as raw bytes on
+        // the host, not through the mount.
+        //
+        // And `create_new` is what makes this function's own promise — "Refuses to touch an existing
+        // image, so it can never destroy a store" — hold as stated. The `exists()` check above is a
+        // separate stat, so an image appearing between the two would have been *truncated* by
+        // `File::create`. The check stays for the message it gives; the atomicity is here.
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(image)
+            .map_err(|e| format!("cannot create image: {e}"))?;
         f.set_len(size_bytes)
             .map_err(|e| format!("cannot size image: {e}"))?;
         drop(f);
@@ -2194,6 +2222,58 @@ this line has no separator at all
         let err = init(&image, DEFAULT_SIZE_BYTES, DEFAULT_LABEL, &nowhere).unwrap_err();
         assert!(err.contains("already exists"), "{err}");
         // Untouched.
+        assert_eq!(std::fs::read(&image).unwrap(), b"a store lives here");
+    }
+
+    /// The image *is* the whole data directory once the volume is adopted — the shared nix store,
+    /// every project's home, `apt-keys/`, session state. `File::create` takes `0666 & ~umask`, so
+    /// under the near-universal `umask 022` it landed `0644` and any other local account could read
+    /// every byte by loop-mounting a copy. Tightening it later would not help: the image is read as
+    /// raw bytes on the host, not through the mount.
+    ///
+    /// Asserted under a deliberately loose umask, because the umask is exactly what must not decide
+    /// this. `lock_image` beside it already passes `mode(0o600)` for a file holding nothing but an
+    /// flock.
+    #[test]
+    fn the_image_is_owner_only_whatever_the_umask_says() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = crate::testutil::TmpDir::new();
+        let image = base.path().join("vol.btrfs");
+        // A `mkfs` that succeeds without doing anything, so `init` runs to the end and leaves the
+        // image it created in place to be inspected. What is under test is the open, not the format.
+        let noop = Mkfs::Host(PathBuf::from("/bin/true"));
+
+        // SAFETY: `umask` is a per-process scalar syscall; the previous value is restored below.
+        let previous = unsafe { libc::umask(0o022) };
+        let made = init(&image, DEFAULT_SIZE_BYTES, DEFAULT_LABEL, &noop);
+        // SAFETY: restoring the value the call above returned.
+        unsafe { libc::umask(previous) };
+        made.expect("a no-op mkfs leaves init on its success path");
+
+        let mode = std::fs::metadata(&image).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the image carries the whole data directory and must not take the umask's answer"
+        );
+        assert!(
+            !image.with_extension("seed").exists(),
+            "the seed directory is cleaned up either way"
+        );
+    }
+
+    /// `init` promises it "can never destroy a store". The `exists()` check is a separate stat from
+    /// the create, so the atomicity has to come from the open itself: `create_new` refuses an image
+    /// that appeared in between, where `File::create` would have truncated it.
+    #[test]
+    fn init_never_truncates_an_image_that_appears_after_the_existence_check() {
+        let base = crate::testutil::TmpDir::new();
+        let image = base.path().join("vol.btrfs");
+        let nowhere = Mkfs::Host(PathBuf::from("/nonexistent-by-construction"));
+
+        // Stand in for the racing writer by creating the image the `exists()` check did not see:
+        // calling `init` on a path that already holds a store must fail without writing to it.
+        std::fs::write(&image, b"a store lives here").unwrap();
+        assert!(init(&image, DEFAULT_SIZE_BYTES, DEFAULT_LABEL, &nowhere).is_err());
         assert_eq!(std::fs::read(&image).unwrap(), b"a store lives here");
     }
 
