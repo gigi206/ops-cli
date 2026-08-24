@@ -358,7 +358,27 @@ fn attest_index(
         ))
     })?;
     let pin = pinned_key_path(layout, &url);
-    let pinned = std::fs::read_to_string(&pin).ok();
+    // Only *absent* means "never pinned". `.ok()` collapsed every error to that — a permission
+    // problem, an I/O error, a directory left at the path — and "never pinned" is the branch that
+    // runs trust-on-first-use, taking whatever key the repository's signature names today. So a
+    // pin that merely could not be read re-pinned the repository, silently, which is the one
+    // outcome pinning exists to prevent.
+    //
+    // The refusal beside it, for an `InRelease` that stopped being published, already states the
+    // rule: a repository whose key is pinned has attested before, so the attestation going missing
+    // "is the shape of an attacker removing the attestation, not of a repository that never had
+    // one". An unreadable pin is the same shape one file over.
+    let pinned = match std::fs::read_to_string(&pin) {
+        Ok(armored) => Some(armored),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(io::Error::other(format!(
+                "the signing key sbx pinned for {url} cannot be read ({}): {e} — refusing to \
+                 re-pin, which would trust whatever key the repository names today",
+                pin.display()
+            )));
+        }
+    };
     let signed = match super::nixhub::fetch_url_text(nix, layout, &url, fresh) {
         Ok(text) => text,
         Err(e) if pinned.is_none() => {
@@ -1311,6 +1331,43 @@ Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
         match resolve_apt_deb_url(&nix, &layout, INDEX, true, false) {
             Ok(url) => assert!(url.ends_with("_amd64.deb"), "{url}"),
             Err(e) => skip_unreachable!("skipping deb:apt pin enforcement (network/nix): {e}"),
+        }
+    }
+
+    /// Only an *absent* pin means "never pinned". `.ok()` collapsed every read error to that — and
+    /// "never pinned" is the branch that runs trust-on-first-use, taking whatever key the
+    /// repository's signature names today. A pin that merely could not be read therefore re-pinned
+    /// the repository silently, which is the one outcome pinning exists to prevent.
+    ///
+    /// Offline: the pin is read before anything is fetched, so the refusal lands before the network
+    /// is touched — which is also what this asserts by passing a `nix` that does not exist.
+    #[test]
+    fn a_pin_that_cannot_be_read_refuses_rather_than_re_pinning() {
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        const INDEX: &str = "https://vendor.test/apt/dists/stable/main/binary-amd64/Packages";
+        let nowhere = std::path::Path::new("/nonexistent-by-construction/nix");
+
+        // A directory where the pinned key belongs: unreadable as a file, and not `NotFound`.
+        let pin = pinned_key_path(&layout, &inrelease_url(INDEX).unwrap());
+        std::fs::create_dir_all(&pin).expect("the obstruction is placed");
+
+        let err = match attest_index(nowhere, &layout, INDEX, "", false) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an unreadable pin must refuse, not fall back to first use"),
+        };
+        assert!(
+            err.contains("cannot be read") && err.contains("re-pin"),
+            "the refusal must name what it will not do: {err}"
+        );
+
+        // With nothing at that path the same call reaches the fetch instead — so the refusal above
+        // is about the pin and not about this repository being unreachable.
+        std::fs::remove_dir(&pin).expect("the obstruction is removed");
+        match attest_index(nowhere, &layout, INDEX, "", false) {
+            Ok(Attested::Unpinned(_)) => {}
+            Ok(_) => panic!("a repository that publishes nothing sbx can fetch cannot be attested"),
+            Err(e) => panic!("an absent pin is the ordinary first-use path, not an error: {e}"),
         }
     }
 
