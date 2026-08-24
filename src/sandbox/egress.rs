@@ -101,6 +101,20 @@ impl Egress {
         // live log *view*, it never removes a decision from what `--net-learn` observed.
         self.log.snapshot(None, None, true).events
     }
+
+    /// A handle on this proxy's event ring, for another proxy in the same session to append to
+    /// rather than open a record of its own.
+    ///
+    /// What it is for: a task invocation stands up its own proxy ([`start`] with an `instance`), and
+    /// a ring of its own would be one nothing reads. `sbx net logs` finds a session's events by
+    /// globbing the control sockets and parsing a **pid** out of each name, so a per-invocation
+    /// socket — whose name carries the instance too — is not one of them, and every decision that
+    /// proxy made was invisible for the life of the session. Sharing the session's ring is the same
+    /// answer [`crate::sandbox::task::TaskEngine::with_signer_log`] already gives for what a task's
+    /// proxy signs.
+    pub(crate) fn event_log(&self) -> Arc<super::control::LogRing> {
+        Arc::clone(&self.log)
+    }
 }
 
 impl Drop for Egress {
@@ -635,6 +649,10 @@ pub(crate) fn start(
     // The brokers already standing for this launch, for a resolver plugin whose manifest names one.
     // They are stood up before this call precisely so a credential can be resolved through one.
     brokers: &[super::broker::Reachable],
+    // The event ring this proxy appends its decisions to, or `None` to open one of its own (the
+    // session's proxy, and every test). A task's per-invocation proxy passes the session's, for the
+    // reason [`Egress::event_log`] states: its own control socket is not one `sbx net logs` finds.
+    event_log: Option<Arc<super::control::LogRing>>,
     // Where this proxy records what its signer plugins formed, or `None` when the launch declared
     // none (and in tests). The launch owns it, so a task's per-invocation proxy records into the
     // same session-wide feed the agent's proxy does.
@@ -806,7 +824,8 @@ pub(crate) fn start(
     // The event ring is created here, before the control block, so a clone can be kept on the guard
     // for `--net-learn` to snapshot after the run — the control thread and the proxy get their own
     // clones of the same `Arc`.
-    let log = Arc::new(super::control::LogRing::new(super::control::LOG_RING_CAP));
+    let log = event_log
+        .unwrap_or_else(|| Arc::new(super::control::LogRing::new(super::control::LOG_RING_CAP)));
     let control_uds = {
         let control_uds = dir.join(format!("control-{pid}{instance}.sock"));
         let _ = std::fs::remove_file(&control_uds);
@@ -1515,6 +1534,7 @@ mod tests {
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             &[],
             None,
+            None,
         )
         .expect("start the egress proxy");
 
@@ -1687,6 +1707,7 @@ mod tests {
                 None,
                 crate::sandbox::redact::MIN_LEN_DEFAULT,
                 &[],
+                None,
                 None,
             )
             .expect("start the egress proxy");
@@ -2089,6 +2110,7 @@ mod tests {
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             &[],
             None,
+            None,
         )
         .expect("start the ask egress proxy");
 
@@ -2160,6 +2182,7 @@ mod tests {
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             &[],
             None,
+            None,
         )
         .expect("start with stats off");
         drop(guard);
@@ -2185,6 +2208,7 @@ mod tests {
             None,
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             &[],
+            None,
             None,
         )
         .expect("start with stats on");
@@ -2954,6 +2978,83 @@ mod tests {
         assert!(
             needles.is_empty(),
             "a too-short secret is not redacted — it would refuse benign traffic (self-DoS)"
+        );
+    }
+
+    /// A per-invocation proxy is reached over a control socket whose name carries its instance, and
+    /// every reader of the egress log globs those names for a bare pid — so a ring of its own is one
+    /// nothing opens. Passing the session's ring is what puts a task's requests in front of
+    /// `sbx net logs`, and this is the wiring that does it: an event in the ring handed to `start`
+    /// is an event the proxy's own handle reads.
+    #[test]
+    fn a_proxy_handed_a_ring_records_into_that_one() {
+        use crate::sandbox::control::{HttpVer, LogRing, LogVerdict, Proto, RpcKind};
+        let dir = TmpDir::new();
+        let layout = Layout::under(dir.path());
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+        let shared = std::sync::Arc::new(LogRing::new(crate::sandbox::control::LOG_RING_CAP));
+        let (guard, _w) = start(
+            &layout,
+            EgressPolicy::default(),
+            &[],
+            Path::new("/"),
+            Path::new(UNUSED_BWRAP),
+            None,
+            false,
+            None,
+            "-shared",
+            None,
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            &[],
+            Some(shared.clone()),
+            None,
+        )
+        .expect("start with a shared ring");
+        shared.push(
+            false,
+            "api.test",
+            443,
+            Some("GET"),
+            Some("/v1/x"),
+            LogVerdict::Allow,
+            "allowed-by-rule",
+            Proto::Https,
+            HttpVer::H1,
+            RpcKind::None,
+        );
+        let seen = guard.observed_events();
+        assert_eq!(
+            seen.len(),
+            1,
+            "the proxy must read the ring it was handed, not one of its own"
+        );
+        assert_eq!(seen[0].host, "api.test");
+
+        // The default stays: a proxy handed nothing opens a record of its own, which an event in
+        // someone else's ring never reaches.
+        let other = TmpDir::new();
+        let layout = Layout::under(other.path());
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+        let (own, _w) = start(
+            &layout,
+            EgressPolicy::default(),
+            &[],
+            Path::new("/"),
+            Path::new(UNUSED_BWRAP),
+            None,
+            false,
+            None,
+            "-own",
+            None,
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            &[],
+            None,
+            None,
+        )
+        .expect("start with a ring of its own");
+        assert!(
+            own.observed_events().is_empty(),
+            "a proxy that opened its own ring shares nothing"
         );
     }
 }

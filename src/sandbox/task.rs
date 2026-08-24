@@ -262,6 +262,11 @@ pub(crate) struct TaskEngine {
     /// in a wire injection: one resolver layer, one set of grants, no source that works in one place
     /// and fails in the other.
     brokers: Vec<super::broker::Reachable>,
+    /// The session's egress event ring, shared with every per-invocation proxy this engine stands
+    /// up, for the same reason the signer record below is: a proxy's own ring would be one nothing
+    /// opens. Its control socket carries the instance in its name, and every reader globs those
+    /// names for a bare pid. `None` on an inventory-only or test engine.
+    egress_log: Option<Arc<super::control::LogRing>>,
     /// The session's signer record, shared with every per-invocation proxy this engine stands up.
     /// A task may declare `sign` in its own `[task.<name>.inject]`, and its proxy is gone when the
     /// invocation ends: without the session's ring, what its signer formed would be recorded into
@@ -410,6 +415,7 @@ impl TaskEngine {
             fs_masks: None,
             redact_min_len,
             brokers: Vec::new(),
+            egress_log: None,
             signer_log: None,
         }
     }
@@ -418,6 +424,19 @@ impl TaskEngine {
     /// announced exactly like one the session's own exec policy stops.
     pub(crate) fn with_notifier(mut self, notify: Arc<super::notify_sink::NotifyWiring>) -> Self {
         self.notify = Some(notify);
+        self
+    }
+
+    /// Record what this engine's per-invocation proxies **decide** into the session's own egress
+    /// ring, so `sbx net logs` shows a task's requests beside the agent's.
+    ///
+    /// A per-invocation proxy is reached over a control socket whose name carries its instance, and
+    /// the readers glob those names for a bare pid — so a ring of its own is one nothing opens, and
+    /// every decision it made was invisible for the life of the session. See
+    /// [`crate::sandbox::egress::Egress::event_log`]. Left unset (a test engine, or a launch with no
+    /// proxy of its own) each invocation keeps a private ring, exactly as before.
+    pub(crate) fn with_egress_log(mut self, log: Option<Arc<super::control::LogRing>>) -> Self {
+        self.egress_log = log;
         self
     }
 
@@ -766,6 +785,7 @@ impl TaskEngine {
                 self.notify.as_deref(),
                 self.redact_min_len,
                 &self.brokers,
+                self.egress_log.clone(),
                 self.signer_log.clone(),
             )
             .map_err(TaskError::Io)?;
@@ -2259,6 +2279,7 @@ impl TaskEngine {
             fs_masks: None,
             notify: None,
             brokers: Vec::new(),
+            egress_log: None,
             signer_log: None,
             redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
             bwrap: PathBuf::from("/nonexistent/bwrap"),
@@ -3550,6 +3571,7 @@ mod tests {
             fs_masks: None,
             notify: None,
             brokers: Vec::new(),
+            egress_log: None,
             signer_log: None,
             redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
             bwrap: PathBuf::from("/usr/bin/bwrap"),

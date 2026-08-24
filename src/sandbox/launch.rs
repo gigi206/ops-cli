@@ -4367,6 +4367,8 @@ fn build(
             Some(&notify_wiring),
             prep.cfg.redact_min_len,
             &brokers,
+            // The session's own proxy opens the ring every reader finds; a task's shares it.
+            None,
             signer_ring.clone(),
         )
         .map_err(|e| {
@@ -4989,7 +4991,10 @@ fn build(
             )
             .with_notifier(Arc::clone(&notify_wiring))
             .with_brokers(brokers.clone())
-            .with_signer_log(signer_ring.clone());
+            .with_signer_log(signer_ring.clone())
+            // A task's proxy appends to the session's egress ring rather than opening one of its
+            // own, which nothing would read: see `Egress::event_log`.
+            .with_egress_log(egress_guard.as_ref().map(super::egress::Egress::event_log));
             // Carry the session's `[fs]` masks into every task cage, so a denied path is closed
             // there too unless the task's own `unmask` names it. The decoys are the ones this
             // launch already staged: a task cage is derived from the agent's, and pointing it at a

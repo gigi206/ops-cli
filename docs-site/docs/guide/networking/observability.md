@@ -182,6 +182,10 @@ Each line carries the session id (the PID `sbx session ls` shows), the local `hh
 time, the **transport**, the `host:port`, method, path, an optional **RPC tag**, the
 verdict, and a reason category. `log` is an accepted alias.
 
+A [task](../tasks/) invocation runs behind a proxy of its own, governed by the task's own
+`network` rules, and its decisions appear here under the same session id as the agent's:
+one record per session, whoever made the request.
+
 The **transport** column is `https` (inspected TLS), `http` (inspected cleartext), `tcp`
 (a raw `tcp://` splice), or `-` (refused before it was known). For an inspected request it
 is **suffixed with the HTTP version**, `https/h1` vs `https/h2`, so you can see whether a

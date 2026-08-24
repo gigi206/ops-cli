@@ -628,6 +628,16 @@ pub(crate) struct LogRing {
     cap: usize,
 }
 
+// The same choice [`crate::sandbox::signer_control::SignerRing`] makes, for the same reason: a
+// `Debug` that dumped a session's whole egress record would be noise wherever a holder of this ring
+// renders itself, and the events carry cage-chosen text. The count is what a reader of such a line
+// wants. Taken without the lock, so rendering a holder can never wait on a serve thread.
+impl std::fmt::Debug for LogRing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LogRing(cap {})", self.cap)
+    }
+}
+
 struct LogInner {
     next_seq: u64,
     /// The next amendment sequence [`LogRing::set_status`] will stamp — a second monotonic counter,
