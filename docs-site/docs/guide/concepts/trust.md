@@ -98,6 +98,15 @@ When a project also has mise config files (`.mise.toml`, `mise.toml`,
 so editing either re-arms the gate and a mise `[env]` cannot change under a trusted
 posture without re-trusting.
 
+That is also why a command that **writes and trusts in one step** (`sbx net allow
+--local`, `sbx proc allow --local`, `sbx config set --trust`) declines to create a
+project's first `.sbx.toml` when a mise file is already sitting beside it: the marker
+it would write covers that file too, and sbx will not approve content it did not write
+on your behalf. Create the config yourself (`touch .sbx.toml` is enough), review the
+mise file, run `sbx trust .sbx.toml`, and the command proceeds. A project with no mise
+file bootstraps in one step as before, and so does one whose config you already trust:
+there the mise bytes are the ones your existing marker already covers.
+
 ## Why the whole file
 
 Hashing a parsed subset would let an attacker add a security field a later `sbx`

@@ -559,11 +559,40 @@ fn format_log_time(at_epoch_ms: u128) -> String {
     format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
-/// The write-side trust gate for a save that blesses what it writes: an existing-but-untrusted (or
+/// Why a `--local` save was refused, in the words of the case that refused it.
+///
+/// The two cases read nothing alike and must not be given one sentence. An existing config that is
+/// untrusted (or changed since it was) is a file to review and re-trust. A project with **no**
+/// config and a mise file beside it is a bootstrap sbx declines to complete: writing the config
+/// would bless the mise file with it, and that file is not sbx's to approve on the user's behalf
+/// (see [`local_save_permitted`]). Telling that user their missing file "is not trusted" would name
+/// the wrong file and offer a command they cannot run.
+fn local_save_refusal(path: &Path, exists: bool) -> String {
+    if !exists {
+        let names = trust::mise_files_for(path)
+            .iter()
+            .filter_map(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!(
+            "this project has no {config} yet, and trusting the one a `--local` save would write              also trusts {names} beside it — content sbx did not write and you have not reviewed.              Create the config (`touch {config}` is enough), review {names}, run `sbx trust \
+             {config}`, then retry",
+            config = config::PROJECT_CONFIG,
+        );
+    }
+    format!(
+        "{} is not trusted — review it and run `sbx trust {}`, then retry",
+        path.display(),
+        config::PROJECT_CONFIG
+    )
+}
+
+/// The write-side trust gate for a save that blesses what it writes:/// The write-side trust gate for a save that blesses what it writes: an existing-but-untrusted (or
 /// changed) config must not be silently blessed, the user reviews and re-trusts it first. An absent
 /// config (bootstrap) or an already-trusted one is fine, so sbx's edit is the sole delta from the
-/// trusted bytes. Pure on the `(exists, state)` pair, so the refuse/allow matrix is unit-testable
-/// without a filesystem.
+/// trusted bytes. Pure on its three inputs, so the refuse/allow matrix is unit-testable without a
+/// filesystem.
 ///
 /// **The invariant it states, for every verb that writes and blesses in one step: sbx blesses the
 /// delta it authored, never content the user has not approved.** `sbx net allow --local` and
@@ -572,8 +601,21 @@ fn format_log_time(at_epoch_ms: u128) -> String {
 /// the flag is passed (see `cli::config::admit_config_write`). The one deliberate exception is
 /// `sbx config edit --trust`, where the editor showed the user the file: what you have seen may be
 /// blessed.
-pub(crate) fn local_save_permitted(exists: bool, state: trust::TrustState) -> bool {
-    !exists || state == trust::TrustState::Trusted
+///
+/// `has_mise` is what keeps the bootstrap arm inside that invariant. A project's trust marker
+/// covers the `.sbx.toml` **and every mise file beside it** ([`trust::content_hash`]), because the
+/// launcher reads those too — and a mise file is inert only until a `.sbx.toml` anchors it
+/// (`config::load::mise_status`). So a save into a project that has a mise file and no config yet
+/// would write one line of its own and bless a second file entirely, turning content sbx did not
+/// author and the user never approved into trusted, honored configuration in one command. The
+/// project tree is bound read-write into the cage, which is where such a file can come from, and
+/// bootstrapping stays admitted where there is nothing else to bless.
+pub(crate) fn local_save_permitted(exists: bool, state: trust::TrustState, has_mise: bool) -> bool {
+    match (exists, has_mise) {
+        (true, _) => state == trust::TrustState::Trusted,
+        (false, false) => true,
+        (false, true) => false,
+    }
 }
 
 /// Pre-flight the trust gate for a `--local` save at `cwd`, *before* any irreversible action (a bulk
@@ -590,14 +632,16 @@ fn precheck_local_save(cwd: &Path) -> Result<(), (u8, String)> {
             .to_string(),
     ))?;
     let path = manage::scope_path(&Scope::Local, cwd).map_err(|e| (1, e.to_string()))?;
-    if !local_save_permitted(path.exists(), trust::state(&store, &path)) {
+    if !local_save_permitted(
+        path.exists(),
+        trust::state(&store, &path),
+        !trust::mise_files_for(&path).is_empty(),
+    ) {
         return Err((
             2,
             format!(
-                "{} is not trusted — review it and run `sbx trust {}`, then retry (a `--local` save \
-                 will not silently bless an untrusted project)",
-                path.display(),
-                config::PROJECT_CONFIG
+                "{} (a `--local` save will not silently bless what you have not approved)",
+                local_save_refusal(&path, path.exists())
             ),
         ));
     }
@@ -721,15 +765,12 @@ fn open_rule_write<'a>(
     // under `apps/` are trusted by location.
     let store = if matches!(scope, Scope::Local) {
         let store = trust::default_store_dir().ok_or((1, no_store.to_string()))?;
-        if !local_save_permitted(path.exists(), trust::state(&store, &path)) {
-            return Err((
-                2,
-                format!(
-                    "{} is not trusted — review it and run `sbx trust {}`, then retry",
-                    path.display(),
-                    config::PROJECT_CONFIG
-                ),
-            ));
+        if !local_save_permitted(
+            path.exists(),
+            trust::state(&store, &path),
+            !trust::mise_files_for(&path).is_empty(),
+        ) {
+            return Err((2, local_save_refusal(&path, path.exists())));
         }
         Some(store)
     } else {
@@ -1013,13 +1054,47 @@ mod tests {
     #[test]
     fn local_save_gate_blocks_only_an_existing_untrusted_config() {
         use trust::TrustState::{Changed, Trusted, Untrusted};
-        // absent config → allowed (a `--local` save bootstraps it, then trusts it)
-        assert!(local_save_permitted(false, Untrusted));
-        // already-trusted config → allowed (sbx's append is the sole delta)
-        assert!(local_save_permitted(true, Trusted));
+        // absent config, nothing else beside it → allowed (a `--local` save bootstraps it, then
+        // trusts it: sbx's own line is the whole file).
+        assert!(local_save_permitted(false, Untrusted, false));
+        // already-trusted config → allowed (sbx's append is the sole delta). The mise file beside
+        // it is already covered by the marker the user approved, so it changes nothing here.
+        assert!(local_save_permitted(true, Trusted, false));
+        assert!(local_save_permitted(true, Trusted, true));
         // existing untrusted/changed config → refused (never silently bless it)
-        assert!(!local_save_permitted(true, Untrusted));
-        assert!(!local_save_permitted(true, Changed));
+        assert!(!local_save_permitted(true, Untrusted, false));
+        assert!(!local_save_permitted(true, Changed, false));
+        assert!(!local_save_permitted(true, Untrusted, true));
+    }
+
+    /// The bootstrap arm is the one that blesses a file sbx did not write: a project's marker covers
+    /// every mise file beside the config, and a mise file is inert only until a `.sbx.toml` anchors
+    /// it. So creating the config and trusting it in one step would turn an unreviewed
+    /// `mise.toml` — which the cage can write, the project tree being bound read-write — into
+    /// trusted, honored configuration. Refused, and named as the file it is about.
+    #[test]
+    fn bootstrapping_a_config_does_not_bless_a_mise_file_beside_it() {
+        use trust::TrustState::Untrusted;
+        assert!(
+            !local_save_permitted(false, Untrusted, true),
+            "a save that would bless a mise file the user never approved must be refused"
+        );
+        // The refusal names the bootstrap, not a trust state of a file that is not there.
+        let dir = crate::testutil::TmpDir::new();
+        let config = dir.join(config::PROJECT_CONFIG);
+        std::fs::write(dir.join("mise.toml"), b"[tools]\n").unwrap();
+        let said = local_save_refusal(&config, false);
+        assert!(
+            said.contains("mise.toml") && said.contains("have not reviewed"),
+            "the refusal must name the file it is really about: {said}"
+        );
+        assert!(
+            !said.contains("is not trusted"),
+            "a config that does not exist has no trust state to report: {said}"
+        );
+        // The existing-file arm is unchanged.
+        std::fs::write(&config, b"").unwrap();
+        assert!(local_save_refusal(&config, true).contains("is not trusted"));
     }
 
     #[test]

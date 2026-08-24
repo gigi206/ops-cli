@@ -2462,11 +2462,34 @@ fn admit_config_write(
         return Ok(false);
     };
     let state = trust::state(dir, path);
-    if trust_flag && !crate::local_save_permitted(path.exists(), state) {
+    let has_mise = !trust::mise_files_for(path).is_empty();
+    if trust_flag && !crate::local_save_permitted(path.exists(), state, has_mise) {
+        // A project with no config yet and a mise file beside it is a third case, and it names a
+        // different file: `--trust` there would bless the mise file along with the one line sbx is
+        // about to write. Saying the missing config "is not trusted" would point at the wrong file
+        // and offer a command that cannot run on a file that does not exist.
+        if !path.exists() {
+            let names = trust::mise_files_for(path)
+                .iter()
+                .filter_map(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(", ");
+            diag::error(&format!(
+                "sbx: config {verb}: `--trust` here would also trust {names} beside the config it \
+                 creates — content sbx did not write and you have not reviewed"
+            ));
+            diag::hint(&format!(
+                "       create the config (`touch {}` is enough), review {names}, run \
+                 `sbx trust {}`, then retry",
+                path.display(),
+                path.display()
+            ));
+            return Err(ExitCode::from(2));
+        }
         // The two refused states read very differently to whoever hit them. "Never trusted" is a
         // file you have not vetted; "changed since" is one you *did* vet, whose current bytes are
-        // not the ones you approved — and being told it "is not trusted" there invites the honest
-        // objection that you trusted it yourself. Name the edit instead.
+        // not the ones you approved.
         let why = if state == trust::TrustState::Changed {
             "changed since you trusted it"
         } else {
