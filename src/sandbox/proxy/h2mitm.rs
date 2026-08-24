@@ -645,6 +645,46 @@ fn append_headers(out: &mut String, headers: &http::HeaderMap) {
     out.push_str("\r\n");
 }
 
+/// Send `chunk` downstream under HTTP/2 flow control, in as many DATA frames as the peer's window
+/// grants, and report how many bytes actually left.
+///
+/// **What was granted, not what was asked for** — and that is the difference between relaying and
+/// deadlocking. h2 assigns at most the peer's stream window (`try_assign_capacity` bounds the
+/// assignment by `window_size - available`), so a peer whose `SETTINGS_INITIAL_WINDOW_SIZE` is below
+/// the size of one relayed chunk makes `capacity()` plateau there. Waiting for
+/// `capacity() >= chunk.len()` then waits forever: the proxy will not send until it can send the
+/// whole chunk, and the peer will not enlarge the window until it has read something — which it
+/// cannot, because nothing was sent. Both directions used that spelling, and a cage picks its own
+/// initial window, so an in-cage client advertising a small one wedged the stream and held the
+/// tunnel's thread and its upstream connection with it.
+///
+/// `Ok(0)` with a non-empty chunk means the downstream reset or closed and relaying should stop —
+/// the same signal the `None` arm of `poll_capacity` carried before.
+async fn send_granted(
+    dst: &mut h2::SendStream<Bytes>,
+    mut chunk: Bytes,
+) -> Result<usize, h2::Error> {
+    let mut sent = 0;
+    while !chunk.is_empty() {
+        dst.reserve_capacity(chunk.len());
+        let granted = match dst.capacity() {
+            0 => match std::future::poll_fn(|cx| dst.poll_capacity(cx)).await {
+                Some(Ok(n)) if n > 0 => n,
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => return Err(e),
+                // The downstream reset/closed: stop relaying (dropping `dst` sends a reset).
+                None => return Ok(sent),
+            },
+            n => n,
+        };
+        let take = granted.min(chunk.len());
+        let piece = chunk.split_to(take);
+        dst.send_data(piece, false)?;
+        sent += take;
+    }
+    Ok(sent)
+}
+
 /// Relay one h2 body (DATA frames + trailers) from `src` to `dst`, honoring flow control. Used
 /// for both the request (client → upstream) and the response (upstream → client). The trailers
 /// carry the gRPC status, so they are forwarded when present, else the stream is ended with an
@@ -665,20 +705,9 @@ async fn relay_body(
         if let Some(cap) = &cap {
             cap.push(&chunk);
         }
-        if len > 0 {
-            dst.reserve_capacity(len);
-            loop {
-                if dst.capacity() >= len {
-                    break;
-                }
-                match std::future::poll_fn(|cx| dst.poll_capacity(cx)).await {
-                    Some(Ok(_)) => continue,
-                    Some(Err(e)) => return Err(e),
-                    // The downstream reset/closed: stop relaying (dropping `dst` sends a reset).
-                    None => return Ok(()),
-                }
-            }
-            dst.send_data(chunk, false)?;
+        if len > 0 && send_granted(&mut dst, chunk).await? < len {
+            // The downstream reset/closed part-way: stop relaying.
+            return Ok(());
         }
         // Return the consumed window to the sender so it can keep sending.
         let _ = src.flow_control().release_capacity(len);
@@ -757,19 +786,7 @@ async fn send_masked(dst: &mut h2::SendStream<Bytes>, data: Vec<u8>) -> Result<b
         return Ok(true);
     }
     let len = data.len();
-    dst.reserve_capacity(len);
-    loop {
-        if dst.capacity() >= len {
-            break;
-        }
-        match std::future::poll_fn(|cx| dst.poll_capacity(cx)).await {
-            Some(Ok(_)) => continue,
-            Some(Err(e)) => return Err(e),
-            None => return Ok(false),
-        }
-    }
-    dst.send_data(Bytes::from(data), false)?;
-    Ok(true)
+    Ok(send_granted(dst, Bytes::from(data)).await? == len)
 }
 
 /// Whether the client's decoded request head carries any configured secret value verbatim — the
@@ -1093,6 +1110,93 @@ mod tests {
     // signature; the tests below still spell their own policy imports where they build one.
     use crate::allowlist::EgressPolicy;
     use crate::sandbox::egress_stats::Counts;
+
+    /// A peer whose stream window is smaller than one relayed chunk must still be relayed to.
+    ///
+    /// h2 assigns at most the peer's window, so `capacity()` plateaus there. Both relay directions
+    /// used to wait for `capacity() >= chunk.len()` before sending anything — which never arrives:
+    /// the proxy will not send until it can send the whole chunk, and the peer will not enlarge the
+    /// window until it has read something, which it cannot because nothing was sent. A cage picks
+    /// its own `SETTINGS_INITIAL_WINDOW_SIZE`, so an in-cage client advertising a small one wedged
+    /// the stream and held the tunnel's thread and its upstream connection with it.
+    ///
+    /// Driven over an in-memory duplex against a real h2 client, so what is exercised is h2's own
+    /// capacity assignment rather than a model of it. The old spelling stalls rather than answering
+    /// wrongly, so the timeout is the assertion.
+    #[test]
+    fn a_body_larger_than_the_peers_window_is_relayed_in_pieces_rather_than_deadlocking() {
+        // A window well under the payload, and under h2's 16 KiB default frame size.
+        const WINDOW: u32 = 1024;
+        const PAYLOAD: usize = 8 * 1024;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (sent, received) = rt.block_on(async {
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+            // The cage's leg: a client that advertises a small window and drains what arrives.
+            // Reading is what returns window to the sender, so without it nothing can progress
+            // however the send side is written — which is the point.
+            let client = async {
+                let (mut send, conn) = h2::client::Builder::new()
+                    .initial_window_size(WINDOW)
+                    .handshake::<_, Bytes>(client_io)
+                    .await
+                    .unwrap();
+                let driver = tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                let (response, _) = send
+                    .send_request(Request::builder().body(()).unwrap(), true)
+                    .unwrap();
+                let mut body = response.await.unwrap().into_body();
+                let mut total = 0;
+                while let Some(chunk) = body.data().await {
+                    let chunk = chunk.unwrap();
+                    total += chunk.len();
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                }
+                driver.abort();
+                total
+            };
+
+            // The proxy's leg: the function under test, handed a chunk far larger than that window.
+            // The connection has to be polled *while* the send awaits capacity, or nothing is
+            // written and the stall would be the harness's rather than the code's.
+            let proxy = async {
+                let mut conn = h2::server::handshake(server_io).await.unwrap();
+                let (_req, mut respond) = conn.accept().await.unwrap().unwrap();
+                let mut stream = respond
+                    .send_response(http::Response::new(()), false)
+                    .unwrap();
+                let sent = {
+                    let driver = async { while conn.accept().await.is_some() {} };
+                    tokio::pin!(driver);
+                    tokio::select! {
+                        r = send_granted(&mut stream, Bytes::from(vec![b'x'; PAYLOAD])) => r.unwrap(),
+                        () = &mut driver => panic!("the connection ended before the body was sent"),
+                    }
+                };
+                let _ = stream.send_data(Bytes::new(), true);
+                while conn.accept().await.is_some() {}
+                sent
+            };
+
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                tokio::join!(proxy, client)
+            })
+            .await
+            .expect("the relay stalled: the send is waiting for a window the peer cannot grant")
+        });
+
+        assert_eq!(sent, PAYLOAD, "every byte of the chunk must leave");
+        assert_eq!(
+            received, PAYLOAD,
+            "and arrive, in as many frames as the window takes"
+        );
+    }
 
     /// An SSRF refusal on the HTTP/2 path must be *accounted for* the way the HTTP/1.1 one is, not
     /// merely written into the log: the `blocked` bucket `sbx net stats` reports, and — because
