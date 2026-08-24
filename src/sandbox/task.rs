@@ -818,17 +818,36 @@ impl TaskEngine {
         } else {
             Placeholder::Plain
         };
-        let raw = self.exec(&spec, task, invocation).map_err(|e| {
-            let (text, _) = super::redact::redact_string(&e.to_string(), &needles, &placeholder);
-            TaskError::Io(io::Error::other(text))
-        })?;
+        // One byte less than the longest needle: enough that a credential lying across the output
+        // ceiling is whole when the scan runs. See [`read_capped`].
+        let scan_margin = needles
+            .iter()
+            .map(|n| n.as_bytes().len())
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1);
+        let raw = self
+            .exec(&spec, task, invocation, scan_margin)
+            .map_err(|e| {
+                let (text, _) =
+                    super::redact::redact_string(&e.to_string(), &needles, &placeholder);
+                TaskError::Io(io::Error::other(text))
+            })?;
         let elapsed_ms = started.elapsed().as_millis() as u64;
 
         // Substitution happens before anything is returned or logged, and on the raw bytes: the
         // output is arbitrary, and decoding first could split a value across a replacement
         // character and hide it from the scan.
-        let (out_bytes, out_hits) = redact_named(&raw.stdout, &needles, &placeholder);
-        let (err_bytes, err_hits) = redact_named(&raw.stderr, &needles, &placeholder);
+        let (mut out_bytes, out_hits) = redact_named(&raw.stdout, &needles, &placeholder);
+        let (mut err_bytes, err_hits) = redact_named(&raw.stderr, &needles, &placeholder);
+        // The margin was the scanner's, not the caller's: cut it back off. Only on the truncated
+        // path — an uncut stream held no margin bytes to begin with, and a redaction that grew the
+        // text past the ceiling (a short secret, a long `${name}`) is not this ceiling's business.
+        if raw.truncated {
+            let cap = task.max_output as usize;
+            out_bytes.truncate(cap);
+            err_bytes.truncate(cap);
+        }
         // Which side of the split each stream's count falls on is decided by whether that stream is
         // returned, one stream at a time: a declaration that shows stdout and hides stderr reports
         // what happened in the half the caller is holding, and no more.
@@ -1083,7 +1102,13 @@ impl TaskEngine {
     /// Run the assembled cage, capturing both streams up to the task's ceiling and killing it at the
     /// timeout. Returns the raw (unsubstituted) bytes — substitution is the caller's next step, so
     /// there is exactly one place it can be forgotten.
-    fn exec(&self, spec: &SandboxSpec, task: &TaskSpec, invocation: u64) -> io::Result<RawOutput> {
+    fn exec(
+        &self,
+        spec: &SandboxSpec,
+        task: &TaskSpec,
+        invocation: u64,
+        scan_margin: usize,
+    ) -> io::Result<RawOutput> {
         let (argv, _seccomp) = super::launch::seccomp_argv(spec)?;
         let (prog, args) = super::cgroup::wrap(&self.bwrap, argv, &self.limits, spec.cage_slug());
         // A stop that arrived while the credentials were resolving is honored by not starting the
@@ -1114,8 +1139,8 @@ impl TaskEngine {
         let cap = task.max_output as usize;
         let mut out_pipe = child.stdout.take().expect("stdout piped");
         let mut err_pipe = child.stderr.take().expect("stderr piped");
-        let out_reader = std::thread::spawn(move || read_capped(&mut out_pipe, cap));
-        let err_reader = std::thread::spawn(move || read_capped(&mut err_pipe, cap));
+        let out_reader = std::thread::spawn(move || read_capped(&mut out_pipe, cap, scan_margin));
+        let err_reader = std::thread::spawn(move || read_capped(&mut err_pipe, cap, scan_margin));
 
         let deadline = Instant::now() + task.timeout;
         let mut timed_out = false;
@@ -2022,30 +2047,36 @@ struct RawOutput {
 /// Read a stream up to `cap` bytes, reporting whether it was cut. Reading continues past the cap
 /// (draining the pipe) so the command is never blocked on a full pipe — only the *kept* bytes are
 /// bounded.
-fn read_capped(pipe: &mut impl Read, cap: usize) -> io::Result<(Vec<u8>, bool)> {
+///
+/// `margin` extra bytes are kept **for the scanner, not for the caller**. The redaction that follows
+/// searches for whole needles, so a credential lying across the cap used to be cut in half and its
+/// surviving prefix matched nothing — the caller received it in the clear, from the one path whose
+/// whole job is that it does not. A margin of one byte less than the longest needle guarantees that
+/// any needle *starting* inside the cap is present whole when the scan runs; one starting at or past
+/// the cap is entirely in the discarded tail and never reaches anyone. The caller cuts the redacted
+/// result back to `cap`.
+///
+/// `cut` reports what the **caller** loses, so it is `total > cap` — the margin is not output.
+fn read_capped(pipe: &mut impl Read, cap: usize, margin: usize) -> io::Result<(Vec<u8>, bool)> {
+    let keep = cap.saturating_add(margin);
     let mut kept = Vec::new();
-    let mut cut = false;
+    let mut total = 0usize;
     let mut buf = [0u8; 8192];
     loop {
         match pipe.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if kept.len() < cap {
-                    let room = cap - kept.len();
-                    let take = room.min(n);
+                total = total.saturating_add(n);
+                if kept.len() < keep {
+                    let take = (keep - kept.len()).min(n);
                     kept.extend_from_slice(&buf[..take]);
-                    if take < n {
-                        cut = true;
-                    }
-                } else {
-                    cut = true;
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
     }
-    Ok((kept, cut))
+    Ok((kept, total > cap))
 }
 
 /// Derive a task cage's mounts from the agent cage's: keep the structural skeleton (see
@@ -3430,14 +3461,48 @@ mod tests {
     #[test]
     fn the_capture_cap_truncates_and_reports() {
         let mut src = std::io::Cursor::new(b"0123456789".to_vec());
-        let (kept, cut) = read_capped(&mut src, 4).unwrap();
+        let (kept, cut) = read_capped(&mut src, 4, 0).unwrap();
         assert_eq!(kept, b"0123");
         assert!(cut);
 
         let mut fits = std::io::Cursor::new(b"ab".to_vec());
-        let (kept, cut) = read_capped(&mut fits, 4).unwrap();
+        let (kept, cut) = read_capped(&mut fits, 4, 0).unwrap();
         assert_eq!(kept, b"ab");
         assert!(!cut);
+    }
+
+    /// The scan runs on the kept bytes, and it searches for **whole** needles. So a credential lying
+    /// across the output ceiling was cut in half, its surviving prefix matched nothing, and the
+    /// caller received it in the clear — from the one path whose whole job is that it does not.
+    ///
+    /// The margin is the scanner's, not the caller's: it is read so the needle is present whole when
+    /// the substitution runs, and cut back off afterwards.
+    #[test]
+    fn a_needle_lying_across_the_cap_is_read_whole_for_the_scan() {
+        // `cap` falls in the middle of the secret.
+        let cap = 8;
+        let secret = "SECRETVALUE12345";
+        let text = format!("....{secret}....");
+        let margin = secret.len() - 1;
+
+        let mut src = std::io::Cursor::new(text.clone().into_bytes());
+        let (kept, cut) = read_capped(&mut src, cap, margin).unwrap();
+        assert!(cut, "the caller still loses the tail, so it is still `cut`");
+        assert!(
+            String::from_utf8_lossy(&kept).contains(secret),
+            "the scanner must see the needle whole: {:?}",
+            String::from_utf8_lossy(&kept)
+        );
+
+        // And with no margin — what this used to do — the prefix survives and matches nothing.
+        let mut bare = std::io::Cursor::new(text.into_bytes());
+        let (kept, _) = read_capped(&mut bare, cap, 0).unwrap();
+        let bare = String::from_utf8_lossy(&kept).into_owned();
+        assert!(!bare.contains(secret), "the whole value is not there");
+        assert!(
+            bare.contains("SECR"),
+            "but a plaintext prefix of it is, which is the leak: {bare:?}"
+        );
     }
 
     /// A task that declares `network` must carry the egress forwarder into its cage. Its proxy
