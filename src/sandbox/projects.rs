@@ -268,6 +268,19 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
         crate::diag::error("sbx projects show: cannot locate sbx's data directory.");
         return ExitCode::FAILURE;
     };
+    // The same guard `sbx projects rm` applies before its own `join`, and for the same reason a
+    // read verb still needs it: `Path::join` replaces the base with an absolute argument and walks
+    // out of it for a `../`, so `sbx projects show /etc` sized and read `/etc` and reported it as a
+    // runtime tree. Nothing is written here, which is why this is a guard against answering about
+    // the wrong directory rather than against destroying one — but the two verbs take the same
+    // argument and should not disagree about what it may be.
+    if !super::gc::is_safe_tree_id(id) {
+        crate::diag::error(&format!(
+            "sbx projects show: invalid project id `{id}` — expected a single tree name \
+             (an id `sbx projects` lists), not a path."
+        ));
+        return ExitCode::from(2);
+    }
     let data = layout.data_dir();
     let dir = data.join("projects").join(id);
     if !dir.is_dir() {

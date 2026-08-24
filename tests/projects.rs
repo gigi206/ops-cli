@@ -575,6 +575,33 @@ fn a_markerless_preview_points_at_the_apply_form() {
     );
 }
 
+/// `Path::join` replaces the base with an absolute argument and walks out of it for a `../`, so an
+/// id taken from the caller has to be one ordinary component before it is joined. `rm` checked;
+/// `show` did not, so `sbx projects show /etc` sized and read that directory and reported it as a
+/// runtime tree.
+#[test]
+fn show_refuses_an_id_that_is_a_path() {
+    let fx = Fixture::new();
+    fx.make_tree("aaaaaaaaaaaaaaaa", Some(fx.proj.path()));
+    for bad in ["/etc", "../..", "a/b", "."] {
+        let out = fx.sbx(&["projects", "show", bad]);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`{bad}` must be refused as an id, not joined: {}",
+            text(&out)
+        );
+        assert!(
+            text(&out).contains("invalid project id"),
+            "and named as what it is: {}",
+            text(&out)
+        );
+    }
+    // A real id still works.
+    let ok = fx.sbx(&["projects", "show", "aaaaaaaaaaaaaaaa"]);
+    assert!(ok.status.success(), "{}", text(&ok));
+}
+
 #[test]
 fn rm_with_no_target_is_a_usage_error() {
     let fx = Fixture::new();

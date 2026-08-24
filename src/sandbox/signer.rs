@@ -475,6 +475,10 @@ impl SignerProcess {
         };
         let (argv, env) = super::resolver::compose_cage(&plan)?;
 
+        // Cloned **before** the spawn. After it, a `?` on this line drops a `Child` that nothing
+        // else holds: `Drop for SignerProcess` is what kills and reaps a plugin, and the child is
+        // not inside one yet — so a failure here left a live bwrap process for the session.
+        let reader_side = ours.try_clone()?;
         let child = Command::new(bwrap)
             .args(argv)
             .stdin(Stdio::from(std::os::fd::OwnedFd::from(theirs.try_clone()?)))
@@ -494,7 +498,7 @@ impl SignerProcess {
 
         let mut me = Self {
             child,
-            reader: io::BufReader::new(ours.try_clone()?),
+            reader: io::BufReader::new(reader_side),
             writer: ours,
             sets: plugin.signer.sets_headers.clone(),
             seq: 0,
