@@ -42,6 +42,12 @@ use tokio::io::AsyncWriteExt;
 const MAX_STREAMS: u32 = 256;
 /// The largest decoded header list the proxy accepts on an h2 connection — bounds an HPACK
 /// decompression bomb. 64 KiB is ample for gRPC.
+///
+/// Applied on **both** legs. The cage-facing one is the obvious half, but the proxy is a MITM: it
+/// decodes the upstream's response headers too, and a remote server is untrusted here by the same
+/// rule that makes its certificate worth validating. `h2::client::handshake` uses h2's own default
+/// of `16 << 20` — 16 MiB per connection, kept alive by the tunnel's pool — so leaving the upstream
+/// leg unbounded left the larger of the two doors open.
 const MAX_HEADER_LIST: u32 = 64 * 1024;
 
 /// Entry from the sync [`super::handle_client`]: run the whole HTTP/2 MITM for one CONNECT on a
@@ -979,7 +985,9 @@ async fn open_upstream(
         // gRPC is HTTP/2 end-to-end; the proxy does not translate to HTTP/1.1. Fail closed.
         return Err("upstream-http2-unsupported");
     }
-    let (send_req, connection) = h2::client::handshake(upstream_tls)
+    let (send_req, connection) = h2::client::Builder::new()
+        .max_header_list_size(MAX_HEADER_LIST)
+        .handshake::<_, Bytes>(upstream_tls)
         .await
         .map_err(|_| "upstream-http2-unsupported")?;
     // The connection driver owns only the TLS stream + h2 state (it does not borrow `ctx`), so it is
