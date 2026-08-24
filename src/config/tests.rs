@@ -6371,8 +6371,18 @@ fn a_scan_ceiling_of_zero_is_refused_rather_than_obeyed() {
     );
 }
 
+/// The name this test used to carry — "the tighter ceiling wins" — was the misreading itself, and
+/// it pinned the fold at `min`. `scan_max_kb` is how many bytes of a file the content lens examines
+/// before letting the open through, so the *larger* number is the tighter policy: it closes more
+/// files. The sibling test `a_scan_ceiling_of_zero_is_refused_rather_than_obeyed` says the same
+/// thing from the bottom of the range — a ceiling of zero "would read nothing and call every file
+/// clean" — which is what makes the direction unambiguous.
+///
+/// It matters because `[fs]` carries no trust gate, on the grounds that it "can only take access
+/// away from the cage": under `min`, an untrusted project's `scan_max_kb = 1` shrank the user's own
+/// window and let every credential past the first KiB through.
 #[test]
-fn scan_patterns_union_across_layers_and_the_tighter_ceiling_wins() {
+fn scan_patterns_union_across_layers_and_the_wider_window_wins() {
     let mut base = super::fspolicy::FsPolicy {
         scan: vec!["a".into()],
         scan_max_kb: Some(512),
@@ -6390,8 +6400,9 @@ fn scan_patterns_union_across_layers_and_the_tighter_ceiling_wins() {
     );
     assert_eq!(
         base.scan_max_kb,
-        Some(64),
-        "the tighter ceiling wins: a layer raising it would widen what an inner one narrowed"
+        Some(512),
+        "the wider window wins: it is the one that closes more files, and a layer must never \
+         shrink what another had already set"
     );
 }
 

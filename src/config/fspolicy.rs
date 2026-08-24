@@ -88,10 +88,25 @@ impl FsPolicy {
                 self.scan.push(entry);
             }
         }
-        // The tighter ceiling wins. A layer raising it would widen what an inner one had already
-        // narrowed, and this table is only ever allowed to take access away.
+        // The **larger** window wins, which is the tighter policy for this field however it reads.
+        //
+        // `scan_max_kb` is how many bytes of a file the content lens examines before letting the
+        // open through — so a bigger number closes *more* files and a smaller one closes fewer.
+        // `apply_fs` states the same thing from the other end when it refuses `0`: "a scan that
+        // reads nothing would pass every file", and the supervisor's own warning says a file past
+        // the ceiling "is open to the cage on the strength of its start alone".
+        //
+        // Taking the minimum therefore let a layer widen what another had narrowed — the exact
+        // thing the rule beside it forbids, and the thing this whole table's exemption from the
+        // trust gate rests on ("it can only take access away from the cage"). `[fs]` is honoured
+        // from an untrusted project, so `scan_max_kb = 1` in a cloned repo's `.sbx.toml` used to
+        // shrink the user's own `[fs] scan` window to one KiB and let every credential past the
+        // first line through.
+        //
+        // The cost of the other direction is bounded and falls on the project that asked for it: a
+        // larger window is more bytes read per open in its own cage, never access granted.
         self.scan_max_kb = match (self.scan_max_kb, extra.scan_max_kb) {
-            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), Some(b)) => Some(a.max(b)),
             (None, other) | (other, None) => other,
         };
     }
@@ -385,6 +400,49 @@ mod tests {
     }
 
     /// A mask entry is a pattern from any layer, including a project nobody approved, and the
+    /// `[fs]` is the one table with no trust gate, and the reason given is that "it can only take
+    /// access away from the cage". `scan_max_kb` is the field where the fold decided whether that
+    /// stays true: it is how many bytes of a file the content lens examines before letting the open
+    /// through, so a *larger* number closes more files and a smaller one closes fewer.
+    ///
+    /// Folding by `min` therefore let a layer widen what another had narrowed — and since the table
+    /// is honoured from an untrusted project, `scan_max_kb = 1` in a cloned repo's `.sbx.toml`
+    /// shrank the user's own window to one KiB and let every credential past the first line through.
+    #[test]
+    fn a_union_can_only_ever_widen_the_scan_window_never_shrink_it() {
+        let with_ceiling = |kb: Option<u64>| FsPolicy {
+            scan_max_kb: kb,
+            ..FsPolicy::default()
+        };
+
+        // The hostile direction: a project asking for a tiny window cannot shrink the user's.
+        let mut user = with_ceiling(Some(64));
+        user.union(with_ceiling(Some(1)));
+        assert_eq!(
+            user.scan_max_kb,
+            Some(64),
+            "a layer must not shrink a window another layer had already set"
+        );
+
+        // And the order it arrives in does not change the answer.
+        let mut project_first = with_ceiling(Some(1));
+        project_first.union(with_ceiling(Some(64)));
+        assert_eq!(project_first.scan_max_kb, Some(64));
+
+        // A layer that states nothing keeps whatever was set, from either side.
+        let mut only_one = with_ceiling(Some(32));
+        only_one.union(with_ceiling(None));
+        assert_eq!(only_one.scan_max_kb, Some(32));
+        let mut from_extra = with_ceiling(None);
+        from_extra.union(with_ceiling(Some(32)));
+        assert_eq!(from_extra.scan_max_kb, Some(32));
+
+        // Nothing anywhere leaves the built-in ceiling in force.
+        let mut neither = with_ceiling(None);
+        neither.union(with_ceiling(None));
+        assert_eq!(neither.scan_max_kb, None);
+    }
+
     /// matcher used to backtrack exponentially: measured on this very function before the memo,
     /// `*a*a*a*a*a*a*a*ab` against forty `a`s took **4.1 s**, and every added star multiplies that
     /// against a name the kernel lets run to 255 bytes. The bound here is deliberately loose (a

@@ -159,7 +159,9 @@ system libraries and `/proc` are where the volume is and where your secrets are 
 `scan_max_kb` bounds how much of one file is read, and a file longer than that is judged on its
 start. The launch says so when it happens, rather than presenting a prefix as a whole-file
 result. Leave it unset for the built-in ceiling; `0` is refused, since a scan that reads nothing
-would pass everything while still looking like a scan.
+would pass everything while still looking like a scan. Where two layers both set it, the **larger**
+window is the one that applies: a bigger number closes more files, and `[fs]` is honoured from an
+untrusted project precisely because nothing in it can widen what another layer closed.
 
 **What it costs you.** Every open of a project file goes through the supervisor, so a build is
 slower than it is without a scan. `scan` also brings that supervisor up on its own, without
