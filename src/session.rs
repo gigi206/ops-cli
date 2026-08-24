@@ -353,15 +353,37 @@ pub(crate) fn send_signal(pidfd: libc::c_int, signal: libc::c_int) -> bool {
 
 /// Wait up to `timeout` for the pinned process to terminate. A pidfd is readable once its process
 /// exits, so a positive poll means it is gone; returns `true` in that case.
+///
+/// `EINTR` resumes against the original deadline rather than being reported as "still running".
+/// `poll` is interrupted by any signal the waiting process handles — a `SIGWINCH` from a resized
+/// terminal is enough — and the caller ([`stop_pinned`]) reads a `false` as the grace having run
+/// out, so a single stray signal would cut the shutdown window short and `SIGKILL` an agent that
+/// was still cleaning up. Every other failure still returns `false`: the descriptor is ours and
+/// the process is pinned, so nothing else is recoverable by waiting longer.
 pub(crate) fn wait_for_exit(pidfd: libc::c_int, timeout: Duration) -> bool {
     let mut pfd = libc::pollfd {
         fd: pidfd,
         events: libc::POLLIN,
         revents: 0,
     };
-    let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
-    // SAFETY: polling one fd we own.
-    unsafe { libc::poll(&mut pfd, 1, ms) > 0 }
+    let deadline = std::time::Instant::now() + timeout;
+    let mut remaining = timeout;
+    loop {
+        let ms = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
+        // SAFETY: polling one fd we own.
+        let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if rc > 0 {
+            return true;
+        }
+        if rc == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return false;
+        }
+        // Interrupted: what is left of the original window, or nothing if it elapsed meanwhile.
+        remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+    }
 }
 
 /// SIGTERM the pinned process and the cage subtree, then SIGKILL whatever outlives `grace`. A
@@ -1282,6 +1304,54 @@ mod tests {
         assert!(
             tmp.exists(),
             "an in-flight temp record must be left untouched"
+        );
+    }
+
+    /// A signal arriving while the grace period runs must not be read as the grace having
+    /// expired. The child outlives the interrupts, so a `wait_for_exit` that surrendered on the
+    /// first `EINTR` returns `false` here well before the child is gone — and on the caller's side
+    /// ([`stop_pinned`]) that `false` is what escalates a still-cleaning-up agent to `SIGKILL`.
+    #[test]
+    fn a_signal_during_the_wait_does_not_end_it_early() {
+        // A handler that does nothing: the point is only that the signal is delivered rather than
+        // killing the test process, and that it interrupts the `poll` below.
+        extern "C" fn noop(_: libc::c_int) {}
+        // SAFETY: installing a no-op handler for a signal this test alone sends, and sends only to
+        // the thread it names below.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = noop as *const () as usize;
+            // No `SA_RESTART`: an automatically restarted `poll` would never surface the `EINTR`
+            // this test is about.
+            sa.sa_flags = 0;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
+        }
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 1"])
+            .spawn()
+            .unwrap();
+        let pidfd = open_pidfd(child.id()).unwrap();
+
+        // SAFETY: `pthread_self` on the waiting thread, handed to a signaller thread so the
+        // interrupts land on the `poll` and not on some unrelated harness thread.
+        let waiter = unsafe { libc::pthread_self() };
+        let signaller = std::thread::spawn(move || {
+            for _ in 0..5 {
+                std::thread::sleep(Duration::from_millis(20));
+                // SAFETY: signalling a live thread of this process with an installed handler.
+                unsafe { libc::pthread_kill(waiter, libc::SIGUSR1) };
+            }
+        });
+
+        let exited = wait_for_exit(pidfd, Duration::from_secs(10));
+        signaller.join().unwrap();
+        close_fd(pidfd);
+        let _ = child.wait();
+        assert!(
+            exited,
+            "the wait must resume across signals and observe the child's exit"
         );
     }
 
