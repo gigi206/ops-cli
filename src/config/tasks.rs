@@ -832,14 +832,41 @@ fn validate_task_injections(
     defaults: &SecretDefaults,
     plugins: &PluginRegistry,
 ) -> Result<Vec<HeaderSecret>, String> {
-    let mut out = Vec::new();
+    let mut out: Vec<HeaderSecret> = Vec::new();
     for (host, entry) in raw {
         let list = match entry {
             RawHostSecrets::One(s) => vec![s],
             RawHostSecrets::Many(v) => v,
         };
         for one in list {
-            out.push(validate_host_secret(&host, one, defaults, plugins)?);
+            let secret = validate_host_secret(&host, one, defaults, plugins)?;
+            // The (target, header) uniqueness `secrets::upsert_secret` keeps for the session path,
+            // kept here too — its doc gives the reason: "Two secrets to the same host and header
+            // would otherwise inject two copies of the header upstream." The runtime does not
+            // compensate. `matching_injection_ids` returns *every* injection whose rule matches and
+            // `pairs_for` emits one pair per id, so both copies reach the wire, where a server
+            // either refuses the request or picks one of them — silently, and not necessarily the
+            // one the author meant.
+            //
+            // A map key is not the guard it looks like: `Many` lists several secrets under one host,
+            // and two host spellings that differ only in case or a trailing dot are two keys that
+            // canonicalise to one `to`.
+            //
+            // Refused rather than last-wins-with-a-warning, which is what the session path does,
+            // because this one has nowhere to put a warning — `validate_task` returns `Result` and
+            // every other thing it rejects is an error. A task is validated before it can run, so
+            // the author sees this at the moment they can fix it.
+            if let Some(clash) = out
+                .iter()
+                .find(|s| s.to == secret.to && s.header.eq_ignore_ascii_case(&secret.header))
+            {
+                return Err(format!(
+                    "`inject` declares `{}` twice for {} (as `{}` and `{}`) — two copies of one \
+                     header would reach the upstream; give them different headers or one target",
+                    secret.header, secret.to, clash.name, secret.name
+                ));
+            }
+            out.push(secret);
         }
     }
     Ok(out)
@@ -1496,6 +1523,82 @@ mod tests {
         let task = validate(raw).unwrap();
         assert_eq!(task.injections.len(), 1);
         assert_eq!(task.network.len(), 1);
+    }
+
+    /// `secrets::upsert_secret` keeps one secret per (target, header) for the session path, and says
+    /// why: "Two secrets to the same host and header would otherwise inject two copies of the header
+    /// upstream." The task path pushed straight into its vector instead, and the runtime does not
+    /// compensate — `matching_injection_ids` returns every matching injection and `pairs_for` emits
+    /// one pair per id, so both copies reach the wire and the upstream either refuses the request or
+    /// picks one, silently.
+    ///
+    /// A map key is not the guard it looks like: `Many` lists several secrets under one host, and
+    /// two host spellings differing only in case are two keys that canonicalise to one target.
+    #[test]
+    fn two_injections_of_one_header_to_one_host_are_refused() {
+        let secret = |name: &str, header: &str| RawHostSecret {
+            name: Some(name.to_string()),
+            description: None,
+            kind: None,
+            key: None,
+            from: Some(SecretFrom::One(format!("env://DEMO_{name}"))),
+            header: Some(header.to_string()),
+            value_type: Some("bearer".into()),
+            prefix: None,
+            sign: None,
+        };
+
+        // Two secrets under one host, both defaulting to the same header.
+        let mut raw = raw_task();
+        raw.network = vec!["api.example.com".into()];
+        raw.inject = [(
+            "api.example.com".to_string(),
+            RawHostSecrets::Many(vec![
+                secret("first", "Authorization"),
+                secret("second", "Authorization"),
+            ]),
+        )]
+        .into_iter()
+        .collect();
+        let e = validate(raw).unwrap_err();
+        assert!(
+            e.contains("Authorization") && e.contains("twice"),
+            "the refusal must name the header it would double: {e}"
+        );
+
+        // Two host *spellings* that canonicalise to one target: different map keys, one destination.
+        let mut cased = raw_task();
+        cased.network = vec!["api.example.com".into()];
+        cased.inject = [
+            (
+                "api.example.com".to_string(),
+                RawHostSecrets::One(secret("lower", "Authorization")),
+            ),
+            (
+                "API.Example.COM".to_string(),
+                RawHostSecrets::One(secret("upper", "Authorization")),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        assert!(
+            validate(cased).is_err(),
+            "two spellings of one host must not both inject"
+        );
+
+        // Different headers to one host are legitimate and still accepted.
+        let mut ok = raw_task();
+        ok.network = vec!["api.example.com".into()];
+        ok.inject = [(
+            "api.example.com".to_string(),
+            RawHostSecrets::Many(vec![
+                secret("bearer", "Authorization"),
+                secret("api-key", "X-Api-Key"),
+            ]),
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(validate(ok).unwrap().injections.len(), 2);
     }
 
     #[test]
