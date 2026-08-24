@@ -525,8 +525,11 @@ async fn relay(
         sink.expect_source_end();
         sink
     });
+    // The names sbx injected into the head, carried into the pump so the trailers of the same
+    // request are held to the same strip — see [`relay_body`].
+    let trailer_strip: Vec<String> = injected.iter().map(|(h, _)| h.clone()).collect();
     tokio::spawn(async move {
-        let _ = relay_body(client_body, up_send_body, req_sink).await;
+        let _ = relay_body(client_body, up_send_body, req_sink, Some(trailer_strip)).await;
     });
 
     let resp = match resp_fut.await {
@@ -596,7 +599,7 @@ async fn relay(
     if masks_reflection {
         let _ = relay_body_redacting(up_body, client_send_body, &creds.needles, res_sink).await;
     } else {
-        let _ = relay_body(up_body, client_send_body, res_sink).await;
+        let _ = relay_body(up_body, client_send_body, res_sink, None).await;
     }
 }
 
@@ -698,6 +701,7 @@ async fn relay_body(
     mut src: h2::RecvStream,
     mut dst: h2::SendStream<Bytes>,
     cap: Option<Arc<CapBuf>>,
+    strip: Option<Vec<String>>,
 ) -> Result<(), h2::Error> {
     while let Some(chunk) = src.data().await {
         let chunk = chunk?;
@@ -717,10 +721,53 @@ async fn relay_body(
         cap.mark_source_ended();
     }
     match src.trailers().await? {
-        Some(trailers) => dst.send_trailers(trailers)?,
+        Some(mut trailers) => {
+            // The request head's strip, applied to the trailers of the same request. `Some` marks
+            // the **request** direction and carries the names sbx injected.
+            //
+            // The head rebuild drops a connection-specific header and every name sbx is about to
+            // inject, "so the injected value is the only one the upstream sees". Trailers went
+            // through untouched, so a cage could put its own `authorization` after the body instead
+            // of before it and have it reach the upstream beside sbx's — and this plane exists for
+            // gRPC, where trailers are ordinary traffic rather than an exotic corner. The HTTP/1.1
+            // planes never had the hole: they de-chunk and re-frame, so no trailer is forwarded at
+            // all.
+            //
+            // The response direction passes `None`: nothing is injected that way, and a reflected
+            // secret in a response trailer is `relay_body_redacting`'s to mask.
+            if let Some(strip) = &strip {
+                trailers = strip_request_trailers(trailers, strip);
+            }
+            dst.send_trailers(trailers)?;
+        }
         None => dst.send_data(Bytes::new(), true)?,
     }
     Ok(())
+}
+
+/// Hold a request's trailers to the same strip the request head passed: no connection-specific
+/// header, and none of the names sbx injected.
+///
+/// Split out of [`relay_body`] because it is the decision rather than the plumbing, and because the
+/// pump around it needs a live h2 stream pair while this needs nothing.
+///
+/// `HeaderMap` has no `retain`, so the kept set is rebuilt. Its `into_iter` reports the name only
+/// once per run of repeats, yielding `None` for the rest — `last` carries it, so a repeated header
+/// is judged by the name it belongs to instead of being dropped for having none.
+fn strip_request_trailers(trailers: http::HeaderMap, injected: &[String]) -> http::HeaderMap {
+    let mut kept = http::HeaderMap::with_capacity(trailers.len());
+    let mut last: Option<http::header::HeaderName> = None;
+    for (name, value) in trailers {
+        let Some(name) = name.or_else(|| last.clone()) else {
+            continue;
+        };
+        let n = name.as_str();
+        if !forbidden_request_header(n) && !injected.iter().any(|h| header_name_eq(h, n)) {
+            kept.append(name.clone(), value);
+        }
+        last = Some(name);
+    }
+    kept
 }
 
 /// Relay a response body like [`relay_body`], but mask every configured secret value out of each
@@ -1483,6 +1530,49 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(reason, "http2-ask-unsupported");
         assert_eq!((counts, events), one_denial("http2-ask-unsupported"));
+    }
+
+    /// A request's trailers are held to the same strip its head passed.
+    ///
+    /// The head rebuild drops a connection-specific header and every name sbx injects, "so the
+    /// injected value is the only one the upstream sees". Trailers were forwarded untouched, so a
+    /// cage could send its own `authorization` *after* the body instead of before it and have it
+    /// reach the upstream beside sbx's — and this plane exists for gRPC, where trailers are ordinary
+    /// traffic. The HTTP/1.1 planes never had the hole: they de-chunk and re-frame, forwarding no
+    /// trailer at all.
+    #[test]
+    fn a_requests_trailers_are_stripped_like_its_head() {
+        let injected = vec!["Authorization".to_string(), "X-Api-Key".to_string()];
+        let mut trailers = http::HeaderMap::new();
+        trailers.append("grpc-status", "0".parse().unwrap());
+        // The cage's own copy of a header sbx injects — the whole point of the strip.
+        trailers.append("authorization", "Bearer attacker".parse().unwrap());
+        // The `_`-for-`-` dodge the head closes through `header_name_eq`, closed identically here.
+        trailers.append("x_api_key", "attacker".parse().unwrap());
+        // A connection-specific header, which HTTP/2 forbids in a trailer as in a head.
+        trailers.append("transfer-encoding", "chunked".parse().unwrap());
+        // An ordinary repeated trailer: `HeaderMap`'s iterator names it once for the run, so this
+        // is what a naive rebuild drops.
+        trailers.append("grpc-message", "a".parse().unwrap());
+        trailers.append("grpc-message", "b".parse().unwrap());
+
+        let kept = strip_request_trailers(trailers, &injected);
+
+        assert_eq!(kept.get("grpc-status").unwrap(), "0");
+        assert!(
+            kept.get("authorization").is_none(),
+            "the cage's own copy of an injected header must not reach the upstream"
+        );
+        assert!(kept.get("x_api_key").is_none(), "nor its `_` spelling");
+        assert!(kept.get("transfer-encoding").is_none());
+        assert_eq!(
+            kept.get_all("grpc-message")
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"],
+            "a repeated trailer keeps every value, name-once iteration notwithstanding"
+        );
     }
 
     #[test]
