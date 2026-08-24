@@ -186,17 +186,24 @@ fn add_inner(
 /// Read the public key a store repository ships at its root (`pubkey`, hex-encoded) — the key a
 /// trust-on-first-use add pins. A store that ships none cannot be trusted on first use: refuse and
 /// point at the pinned `--key` alternative.
+///
+/// Through [`read_store_file`], like the catalogue and the signature. This is a root file of a
+/// freshly cloned, entirely untrusted repository, and it is read **earlier than either of them** —
+/// before any signature exists to check — so it is the read that most needs the guard, not the one
+/// that can do without it. A plain `read_to_string` followed the leaf symlink and had no ceiling: a
+/// `pubkey -> /dev/zero` in a store repository read until the host ran out of memory, and a
+/// `pubkey -> /dev/urandom` never returned at all.
 fn read_repo_pubkey(checkout: &Path) -> Result<[u8; 32], String> {
-    let hex = std::fs::read_to_string(checkout.join(REPO_PUBKEY)).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            format!(
-                "this store ships no `{REPO_PUBKEY}` file, so there is no key to trust on first \
-                 use — supply `--key <hex|@file>` to pin a key you obtained out of band"
-            )
-        } else {
-            format!("cannot read the store's `{REPO_PUBKEY}`: {e}")
-        }
-    })?;
+    let bytes = read_store_file(
+        &checkout.join(REPO_PUBKEY),
+        REPO_PUBKEY,
+        &format!(
+            "this store ships no `{REPO_PUBKEY}` file, so there is no key to trust on first use — \
+             supply `--key <hex|@file>` to pin a key you obtained out of band"
+        ),
+    )?;
+    let hex = String::from_utf8(bytes)
+        .map_err(|_| format!("the store's `{REPO_PUBKEY}` is not valid text"))?;
     decode_key(&hex)
 }
 
@@ -1272,6 +1279,35 @@ mod tests {
             read_store_file(&gone, "catalogue.toml", "the-missing-note").unwrap_err(),
             "the-missing-note"
         );
+    }
+
+    /// `pubkey` is a root file of a freshly cloned, entirely untrusted repository, and it is read
+    /// **before** the catalogue and its signature — earlier than anything there is to verify. It was
+    /// the one store-root read that went through a plain `read_to_string`, so it followed a leaf
+    /// symlink and had no ceiling: `pubkey -> /dev/zero` read until the host ran out of memory.
+    #[test]
+    fn the_repo_pubkey_is_read_under_the_same_guard_as_the_catalogue() {
+        let dir = crate::testutil::TmpDir::new();
+        let checkout = dir.path();
+
+        // A symlinked `pubkey` is refused rather than followed, even when its target is a perfectly
+        // good key — the point is that the read itself must not be a lever.
+        let real = dir.path().join("elsewhere.hex");
+        std::fs::write(&real, "00".repeat(32)).unwrap();
+        std::os::unix::fs::symlink(&real, checkout.join(REPO_PUBKEY)).unwrap();
+        let err = read_repo_pubkey(checkout).expect_err("a symlinked pubkey must be refused");
+        assert!(err.contains("symlink"), "{err}");
+
+        // The ordinary case still reads, so the guard is not simply refusing everything.
+        std::fs::remove_file(checkout.join(REPO_PUBKEY)).unwrap();
+        std::fs::write(checkout.join(REPO_PUBKEY), "00".repeat(32)).unwrap();
+        assert_eq!(read_repo_pubkey(checkout).unwrap(), [0u8; 32]);
+
+        // And an absent one still gives the message that points at `--key`, which is the whole
+        // reason `read_store_file` takes a caller-supplied `missing` note.
+        std::fs::remove_file(checkout.join(REPO_PUBKEY)).unwrap();
+        let err = read_repo_pubkey(checkout).expect_err("absent");
+        assert!(err.contains("--key"), "{err}");
     }
 
     fn pubkey_of(kp: &Ed25519KeyPair) -> [u8; 32] {
