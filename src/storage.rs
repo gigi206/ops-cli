@@ -251,8 +251,14 @@ pub(crate) fn mark_offered(default_data_dir: &Path) {
 /// Make sure the volume is mounted, and return where. Idempotent, and cheap when it already
 /// is: the check reads two kernel tables and starts no process.
 pub(crate) fn ensure_mounted(image: &Path) -> Result<PathBuf, String> {
-    if let Ok(State::Mounted { mount_point, .. }) = state(image) {
-        return Ok(mount_point);
+    if let Ok(State::Mounted {
+        mount_point,
+        options,
+        ..
+    }) = state(image)
+    {
+        // Checked on the way out, not only where the mount is made — see [`refuse_noexec`].
+        return refuse_noexec(mount_point, &options);
     }
     up(image)
 }
@@ -354,6 +360,27 @@ pub(crate) fn mount_of(device: &str, mountinfo: &str) -> Option<(PathBuf, String
 /// string [`mount_of`] returns.
 fn mount_is_noexec(options: &str) -> bool {
     options.split(',').any(|o| o == "noexec")
+}
+
+/// Refuse a mount point whose options say `noexec`, or pass it through.
+///
+/// Applied wherever a mount point is **returned**, not only where one is created. The check used to
+/// sit after the `udisksctl mount` in [`up`] alone, which put it behind two early returns that skip
+/// it — `ensure_mounted` hands back `State::Mounted` without looking, and `up` does the same. So it
+/// ran on exactly one call in a volume's life: the one that performed the transition. Worse, it
+/// poisoned itself — a refusal returned `Err` without unmounting, leaving the volume mounted, so the
+/// very next call saw `State::Mounted` and returned that noexec mount point with no complaint at all.
+///
+/// `State::Mounted` has carried `options` all along; both early returns simply discarded it.
+fn refuse_noexec(mount_point: PathBuf, options: &str) -> Result<PathBuf, String> {
+    if mount_is_noexec(options) {
+        return Err(format!(
+            "{} is mounted noexec, so a store there cannot run anything \
+             (check the udisks mount options configured on this host)",
+            mount_point.display()
+        ));
+    }
+    Ok(mount_point)
 }
 
 /// `mountinfo` escapes space, tab, newline and backslash as octal. Only a path containing one
@@ -1135,7 +1162,11 @@ pub(crate) fn up(image: &Path) -> Result<PathBuf, String> {
                 image.display()
             ));
         }
-        State::Mounted { mount_point, .. } => return Ok(mount_point),
+        State::Mounted {
+            mount_point,
+            options,
+            ..
+        } => return refuse_noexec(mount_point, &options),
         State::Attached { loop_dev } => loop_dev,
         State::Detached => {
             let out = run(Command::new(&udisks).arg("loop-setup").arg("-f").arg(image))?;
@@ -1150,15 +1181,20 @@ pub(crate) fn up(image: &Path) -> Result<PathBuf, String> {
 
     // A volume mounted `noexec` would host a store whose binaries cannot run — a failure that
     // surfaces far from its cause, so it is caught here rather than at the first launch.
+    //
+    // Undone before refusing. Returning `Err` on a mount this call had just made left the volume up,
+    // and the two `State::Mounted` arms then handed that same mount point back to every later
+    // call — so the guard fired once and was never reachable again. `down` is best-effort: if it
+    // cannot undo the mount the refusal still stands, and the arms above now refuse it too.
     let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
     if let Some((_, options)) = mount_of(&loop_dev, &mountinfo)
         && mount_is_noexec(&options)
     {
-        return Err(format!(
-            "{} is mounted noexec, so a store there cannot run anything \
-                 (check the udisks mount options configured on this host)",
-            mount_point.display()
-        ));
+        // The lock goes first: `down` takes the same one, and `flock` on a second open of the
+        // file would block against this call's own hold.
+        drop(_lock);
+        let _ = down(image);
+        return refuse_noexec(mount_point, &options);
     }
 
     // Best-effort: an uncompressed volume is a working volume, just a larger one.
@@ -2211,6 +2247,35 @@ this line has no separator at all
             state(&base.path().join("nope.btrfs")).unwrap(),
             State::Absent
         );
+    }
+
+    /// The `noexec` refusal used to live only after the `udisksctl mount` in `up`, which put it
+    /// behind two early returns that skip it: `ensure_mounted` and `up` both hand back
+    /// `State::Mounted` without looking at the options it carries. So it ran on exactly one call in
+    /// a volume's life — and since the refusal returned `Err` without unmounting, the volume it had
+    /// just refused stayed up, and the *next* call took the early return and accepted it.
+    ///
+    /// The decision itself is what is pinned here; the two arms now route through it.
+    #[test]
+    fn a_noexec_mount_point_is_refused_wherever_it_is_handed_back() {
+        let mp = PathBuf::from("/run/media/u/sbx");
+        let err = refuse_noexec(mp.clone(), "rw,noexec,relatime")
+            .expect_err("a noexec volume cannot host a store");
+        assert!(err.contains("noexec"), "{err}");
+        assert!(
+            err.contains("/run/media/u/sbx"),
+            "the refusal must name the mount point: {err}"
+        );
+
+        // An ordinary mount passes through unchanged, options that merely *contain* the word
+        // included — the option list is comma-separated, not a substring search.
+        assert_eq!(refuse_noexec(mp.clone(), "rw,relatime").unwrap(), mp);
+        assert_eq!(
+            refuse_noexec(mp.clone(), "rw,noexecfoo,relatime").unwrap(),
+            mp,
+            "`noexecfoo` is not `noexec`"
+        );
+        assert_eq!(refuse_noexec(mp.clone(), "").unwrap(), mp);
     }
 
     #[test]
