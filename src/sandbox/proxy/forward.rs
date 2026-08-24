@@ -263,7 +263,7 @@ pub(super) fn handle_https_forward(
     //     transport is the absolute form, and the traffic that brought it here was an OAuth token
     //     exchange. A credential acquired that way and never observed is one the tripwires do not
     //     cover afterwards, on any plane.
-    let injected_names = injected_names(&creds, &injected_ids);
+    let injected_names = injected_names(&injected);
     ctx.credentials
         .observe_head(&head.headers, &injected_names, &host);
 

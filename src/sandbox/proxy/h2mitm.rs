@@ -411,7 +411,7 @@ async fn relay(
     // match. The scan set is shared across every plane, so a token a gRPC client acquired here is
     // one the tripwires cover everywhere afterwards — and one this plane never observed would be a
     // hole in all three.
-    let injected_names = super::injected_names(&creds, &injected_ids);
+    let injected_names = super::injected_names(&injected);
     ctx.credentials
         .observe_head(&H2Headers(req.headers()), &injected_names, host);
 

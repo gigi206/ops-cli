@@ -1192,17 +1192,19 @@ fn matching_injection_ids(
         .collect()
 }
 
-/// The header **names** the matched injections will put on this request, answerable before any
-/// value exists.
+/// The header names this request's injections **actually** set, read off the formed pairs.
 ///
-/// Kept apart from forming the values because the two questions have different costs and different
-/// answers: which headers a request will carry is a property of the declarations alone, while what
-/// they contain may take a plugin round trip. Everything that only needs the names — remembering
-/// the cage's own credentials, and the WebSocket refusal — asks this one.
-fn injected_names<'a>(creds: &'a CredentialSet, ids: &[usize]) -> Vec<&'a str> {
-    ids.iter()
-        .flat_map(|&i| creds.injections[i].header_names())
-        .collect()
+/// Read off the answer rather than off the declarations, because for a signer the two differ: a
+/// manifest's `sets_headers` is what the plugin *may* set, and a plugin that declines one on this
+/// request leaves the client's own copy of that header on the wire. Asking the declaration told
+/// `observe_head` to skip a header nothing had replaced, so a credential the cage sent for itself
+/// there was never learned — not redacted in `sbx net logs`, and not covered by the outbound
+/// tripwire afterwards, on any plane.
+///
+/// It is also the list [`reserialize_request`] strips by, so the two now answer with one voice:
+/// exactly the headers sbx replaced are the ones skipped.
+fn injected_names(injected: &[(String, String)]) -> Vec<&str> {
+    injected.iter().map(|(name, _)| name.as_str()).collect()
 }
 
 /// Whether any credential this request carried is one a `401` says something about — the gate on

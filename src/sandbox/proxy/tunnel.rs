@@ -469,7 +469,7 @@ pub(super) fn serve_tunneled_request(
     //     and after the injection match, so a header sbx is about to replace is skipped — its value
     //     never reaches the wire, and remembering it would tripwire the client's own placeholder,
     //     refusing every later request that carries it.
-    let injected_names = injected_names(&creds, &injected_ids);
+    let injected_names = injected_names(&injected);
     ctx.credentials
         .observe_head(&inner.headers, &injected_names, connect_host);
 

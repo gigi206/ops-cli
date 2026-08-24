@@ -101,10 +101,14 @@ impl HeaderInjection {
         matches!(self.form, Form::Fixed { .. })
     }
 
-    /// The header names this injection puts on a request, answerable without running anything.
+    /// The header names this injection **may** put on a request, answerable without running
+    /// anything: the declaration's own, which for a signer is its manifest's `sets_headers`.
     ///
-    /// This is what a caller needs before the value exists: which headers to skip when remembering
-    /// the cage's own credentials, and whether this request carries a credential at all.
+    /// May, not will. A signer decides per request, so what it actually set is read off the formed
+    /// pairs instead ([`super::injected_names`]) wherever the difference matters — skipping a
+    /// header nothing replaced would leave a credential the cage sent for itself unlearned. This
+    /// answers the question that is about the declaration alone: whether two resolutions describe
+    /// the same set of headers ([`same_values`]).
     pub(crate) fn header_names(&self) -> Vec<&str> {
         match &self.form {
             Form::Fixed { header, .. } => vec![header.as_str()],
@@ -1466,6 +1470,71 @@ mod tests {
                 ("X-Demo-Date".to_string(), "20260813".to_string()),
             ]
         );
+    }
+
+    /// What a signer *may* set and what it *did* set are two different lists, and the skip list
+    /// `observe_head` is given has to be the second.
+    ///
+    /// A manifest's `sets_headers` is a ceiling: the plugin decides per request. When it declines
+    /// one, the client's own copy of that header is what goes on the wire — nothing replaced it —
+    /// so a credential the cage sent for itself there is one to remember. Skipping by the
+    /// declaration left it unlearned: unmasked in `sbx net logs`, and outside the outbound tripwire
+    /// afterwards, on every plane. The same list is what `reserialize_request` strips by, so the
+    /// two answer with one voice.
+    ///
+    /// `Authorization` is the header under test because it is one this scan looks at at all: the
+    /// difference is only ever visible on a header a signer's manifest declares *and* the observer
+    /// watches.
+    #[test]
+    fn a_header_the_signer_declined_to_set_is_still_observed() {
+        // The manifest declares two; this plugin sets the other one.
+        let creds = CredentialSet {
+            injections: vec![signed_injection(
+                Ok(vec![("X-Demo-Date", "20260813")]),
+                None,
+            )],
+            needles: Vec::new(),
+        };
+        let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+        let pairs =
+            pairs_for(&creds, &[0], &facts(&headers), None).unwrap_or_else(|e| panic!("{}", e.why));
+
+        let declared = creds.injections[0].header_names();
+        assert_eq!(
+            declared,
+            vec!["Authorization", "X-Demo-Date"],
+            "the declaration names both, which is the ceiling and not the answer"
+        );
+        let actually_set = crate::sandbox::proxy::injected_names(&pairs);
+        assert_eq!(
+            actually_set,
+            vec!["X-Demo-Date"],
+            "what went on the wire is the other one"
+        );
+
+        // The request carries a credential in the header the signer declined, so nothing replaced
+        // it and it reached the upstream as the cage wrote it.
+        let sent = vec![(
+            "Authorization".to_string(),
+            "Bearer cage-token-0123456789".to_string(),
+        )];
+
+        let by_declaration = default_creds(Vec::new(), Vec::new());
+        assert_eq!(
+            by_declaration.observe_head(&sent, &declared, "api.example.com"),
+            0,
+            "the ceiling skips a header nothing replaced"
+        );
+
+        let by_answer = default_creds(Vec::new(), Vec::new());
+        assert_eq!(
+            by_answer.observe_head(&sent, &actually_set, "api.example.com"),
+            1,
+            "the header the signer left alone carries a credential the cage sent for itself"
+        );
+        let set = by_answer.snapshot();
+        assert_eq!(set.needles.len(), 1);
+        assert_eq!(set.needles[0].as_bytes(), b"cage-token-0123456789");
     }
 
     /// A signer records what it was asked, so a test can assert on the question rather than only on
