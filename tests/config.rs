@@ -279,6 +279,47 @@ fn config_show_reflects_and_tags_an_ambient_override() {
     );
 }
 
+/// An override that does not *parse* is the one failure the view used to hide: the collection
+/// errored, the whole fold was skipped, and the baseline was rendered as if the variable were not
+/// set. A launch in that environment refuses before it starts, so the view was reporting a posture
+/// no launch would ever run.
+#[test]
+fn config_show_says_so_when_the_ambient_override_will_not_parse() {
+    let fx = Fixture::new();
+    let out = fx
+        .sbx(&["config", "show"])
+        .env("SBX_CONFIG", "network = [[[")
+        .output()
+        .expect("spawn sbx");
+    let text =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(
+        text.contains("does not parse") && text.contains("would refuse"),
+        "an unparseable ambient override must be surfaced, not skipped:\n{text}"
+    );
+}
+
+/// The per-app view inherits every field the app does not set from the baseline, so an ambient
+/// override decides what it is reporting. It read the raw baseline instead, and named a network the
+/// launch would not use.
+#[test]
+fn config_show_app_reflects_an_ambient_override() {
+    let fx = Fixture::new();
+    fx.write_profile("demo", "cmd = [\"true\"]\n");
+    let out = fx
+        .sbx(&["config", "show", "--app", "demo"])
+        .env("SBX_NET", "none")
+        .output()
+        .expect("spawn sbx");
+    assert!(out.status.success(), "config show --app should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("network: none"),
+        "the app view must report the posture the launch would use, not the untouched \
+         baseline:\n{stdout}"
+    );
+}
+
 #[test]
 fn config_show_reflects_an_ambient_typed_override() {
     // The typed ambient variables (`SBX_NET` here) must reach `sbx config show` too — it reads the

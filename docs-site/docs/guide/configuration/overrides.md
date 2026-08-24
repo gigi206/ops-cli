@@ -286,10 +286,13 @@ named; `env` is free (folded without a word) and `timezone` is not a security fi
 ## What `sbx config show` reflects
 
 `sbx config show` reflects the **ambient** override (the `SBX_*` environment, not the
-CLI flags, which are per-command) in the full view, tagging affected values
-`(override)`. A set-but-invalid ambient override surfaces as an error note (the
-baseline stands for display). So `config show` never lies about what a launch in this
-environment would do.
+CLI flags, which are per-command), tagging affected values `(override)`. A
+set-but-invalid ambient override surfaces as an error note (the baseline stands for
+display), and one that does not parse at all (the case a launch refuses outright)
+says so rather than rendering the baseline as if the variable were not set. The
+per-app view (`--app <name>`) folds it in too: an app inherits every field it does not
+set, so the ambient posture is what that view is reporting. So `config show` never lies
+about what a launch in this environment would do.
 
 ## Residuals
 

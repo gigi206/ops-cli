@@ -971,7 +971,46 @@ pub(crate) fn build(cwd: &Path) -> ConfigView {
     build_scoped(cwd, super::Source::All)
 }
 
-/// Assemble the view restricted to one configuration `source` — the single-source `sbx config show
+/// Fold the ambient one-shot override (`SBX_CONFIG`/`SBX_ENV_*` and the `SBX_*` typed variables)
+/// into a resolved configuration, so a view of it does not lie about what a launch in this
+/// environment would do. Its values then carry the `override` provenance tag.
+///
+/// Every way this can go wrong leaves a note rather than silence, because a view that quietly drops
+/// the override shows a posture the launch would not have. There are three:
+///
+///   - the override does not **parse** (a malformed `SBX_CONFIG`, a bad `SBX_NET`): a launch here
+///     refuses before it starts, so the view says so rather than rendering the baseline as if the
+///     variable were not set — which is what it did, on the one path where the failure is invisible
+///     to the reader and fatal to the launch;
+///   - it parses but a **value** is not one this configuration accepts: the baseline stands and the
+///     error is noted, since pretending a bad value took effect is the other half of the same lie;
+///   - it is **empty**: nothing to fold and nothing to say.
+///
+/// Per-invocation CLI flags are not previewed (run the launch to see them); passing default (empty)
+/// CLI overrides reads only the ambient environment.
+fn apply_ambient_override(resolved: &mut Resolved) {
+    let ov = match super::overrides::collect(&super::CliOverrides::default()) {
+        Ok(ov) => ov,
+        Err(e) => {
+            resolved.warnings.push(format!(
+                "the ambient SBX_* override does not parse, so a launch in this environment would \
+                 refuse before it started: {e}"
+            ));
+            return;
+        }
+    };
+    if ov.is_empty() {
+        return;
+    }
+    if let Err(e) = resolved.apply_override_channel(&ov) {
+        resolved.warnings.push(e);
+    }
+    if let Err(errs) = resolved.apply_override(ov) {
+        resolved.warnings.extend(errs);
+    }
+}
+
+/// Assemble the view restricted to one configuration `source`/// Assemble the view restricted to one configuration `source` — the single-source `sbx config show
 /// --global/--local/--default` views. `build(cwd)` is `build_scoped(cwd, Source::All)`; a
 /// restricted form projects the same model from fewer layers, so each value's provenance tag reads
 /// as what that source contributes over the built-in defaults.
@@ -984,19 +1023,8 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
     // (`All`) view: the single-source `--global/--local/--default` views show what one config *file*
     // contributes, which an override is not. Per-invocation CLI flags are not previewed here (run the
     // launch to see them); passing default (empty) CLI overrides reads only the ambient environment.
-    if matches!(source, super::Source::All)
-        && let Ok(ov) = super::overrides::collect(&super::CliOverrides::default())
-        && !ov.is_empty()
-    {
-        // A set-but-invalid override value would abort a real launch; here (a read-only view)
-        // surface the error as a note and show the untouched baseline, so `sbx config show`
-        // neither lies about the override nor pretends a bad value took effect.
-        if let Err(e) = resolved.apply_override_channel(&ov) {
-            resolved.warnings.push(e);
-        }
-        if let Err(errs) = resolved.apply_override(ov) {
-            resolved.warnings.extend(errs);
-        }
+    if matches!(source, super::Source::All) {
+        apply_ambient_override(&mut resolved);
     }
 
     let env = resolved
@@ -1542,7 +1570,12 @@ fn app_limits_view(limits: &sandbox::cgroup::Limits) -> Option<AppLimitsView> {
 /// <name>` would launch with, annotated with provenance. `None` when no such app is declared (the
 /// CLI then errors, listing the available names). Pure data gathering, like [`build`].
 pub(crate) fn build_app_detail(cwd: &Path, name: &str) -> Option<AppDetailView> {
-    let resolved = super::load(cwd);
+    let mut resolved = super::load(cwd);
+    // The same ambient override the full view folds in, for the same reason: an app inherits every
+    // field it does not set from the baseline, so a `SBX_NET` in the reader's shell decides the
+    // posture this view is reporting. Without it `sbx config show --app <name>` named a network the
+    // launch would not use — the one view where an app's inherited fields are the whole point.
+    apply_ambient_override(&mut resolved);
     let app = resolved.apps.get(name)?;
     // Pinned identities keyed by a package's locator: flake refs → revision, deb/appimage URLs →
     // short content hash. Keys almost never collide across backends (a `.deb` URL, an `.AppImage`
