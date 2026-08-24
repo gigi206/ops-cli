@@ -4272,8 +4272,16 @@ fn apply_tools(
     );
     // After the packages exist, since `libs` decorates a package rather than declaring one: the
     // table it comes from may pair with either declaration form, so both must already be in `out`.
-    apply_prebuilt_libs(out, warnings, source, &tarball, "tarball", protect_trusted);
-    apply_prebuilt_libs(out, warnings, source, &deb, "deb", protect_trusted);
+    apply_prebuilt_libs(
+        out,
+        warnings,
+        source,
+        &tarball,
+        "tarball",
+        protect_trusted,
+        state,
+    );
+    apply_prebuilt_libs(out, warnings, source, &deb, "deb", protect_trusted, state);
     apply_prebuilt_libs(
         out,
         warnings,
@@ -4281,8 +4289,17 @@ fn apply_tools(
         &appimage,
         "appimage",
         protect_trusted,
+        state,
     );
-    apply_prebuilt_libs(out, warnings, source, &binary, "binary", protect_trusted);
+    apply_prebuilt_libs(
+        out,
+        warnings,
+        source,
+        &binary,
+        "binary",
+        protect_trusted,
+        state,
+    );
 }
 
 /// Attach a `[<label>.<name>]` table's `libs` to the package it names — the extra nixpkgs attributes
@@ -4302,6 +4319,7 @@ fn apply_prebuilt_libs(
     tables: &BTreeMap<String, RawResolve>,
     label: &str,
     protect_trusted: bool,
+    state: TrustState,
 ) {
     for (name, raw) in tables {
         if raw.libs.is_empty() {
@@ -4328,6 +4346,26 @@ fn apply_prebuilt_libs(
                 "{source}: ignoring `libs` in [{label}.{name}] — it would override a trusted app's \
                  package"
             ));
+            continue;
+        }
+        // The same rule for the **baseline** layers, which pass `protect_trusted = false` because
+        // they may legitimately decorate a package a lower layer declared. What they may not do is
+        // decorate one from *below their own trust*: every other contribution an untrusted layer
+        // makes is neutralised by being stamped — `apply_packages`/`apply_resolvers` hand
+        // `upsert_package` the layer's `state`, and `Kind::packages`/`Kind::resolve_packages`
+        // withhold anything not `Trusted`. `libs` declares nothing, so it is stamped nowhere: it
+        // mutates `slot.libs` in place and leaves `slot.state` alone, and the package stays trusted,
+        // is provisioned, and `prebuilt::libs_of` reads the attacker's list straight into the
+        // `buildInputs` its ELFs are autoPatchelf'd against. A cloned repo needed only
+        // `[deb.<name>] libs = [...]` — no `[packages]` entry at all, which `apply_resolvers` also
+        // declines to warn about for a libs-only table.
+        if state != TrustState::Trusted && slot.state == TrustState::Trusted {
+            refuse_untrusted(
+                warnings,
+                source,
+                &format!("`libs` in [{label}.{name}] — it decorates a trusted package"),
+                state,
+            );
             continue;
         }
         // Two reasons to drop one, and they do not read alike to whoever wrote the field: a

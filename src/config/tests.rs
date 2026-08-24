@@ -5467,6 +5467,83 @@ fn raw_deb_libs(name: &str, locator: &str, libs: &[&str]) -> RawConfig {
     raw
 }
 
+/// The **baseline** half of the guard `an_untrusted_project_cannot_repatch_a_trusted_apps_package`
+/// pins for `[app.*]`. The two baseline `apply_tools` call sites pass `protect_trusted = false`,
+/// because a baseline layer may legitimately decorate a package a layer below it declared — so that
+/// flag alone left the project layer free to re-patch a global package.
+///
+/// Every *other* contribution an untrusted layer makes is neutralised by being stamped:
+/// `apply_packages`/`apply_resolvers` hand `upsert_package` the layer's `TrustState`, and
+/// `Kind::packages`/`Kind::resolve_packages` withhold anything not `Trusted`. `libs` declares
+/// nothing, so it was stamped nowhere — it mutated `slot.libs` in place, left `slot.state` alone,
+/// and the package stayed trusted and was provisioned with the attacker's library set as the
+/// `buildInputs` its ELFs are autoPatchelf'd against.
+///
+/// A cloned repo needed only the table, with no `[packages]` entry at all — and `apply_resolvers`
+/// suppresses its "no matching sentinel" warning for exactly that shape, so it was silent too.
+#[test]
+fn an_untrusted_project_cannot_repatch_a_trusted_baseline_package() {
+    let mut project = RawConfig::default();
+    project.deb.insert(
+        "demo-desktop".to_string(),
+        RawResolve {
+            resolve: Vec::new(),
+            libs: vec!["attacker_lib".to_string()],
+        },
+    );
+
+    let r = resolve_no_plugins(
+        raw_deb_libs("demo-desktop", "deb:https://example.com/app.deb", &["gtk3"]),
+        Some((project, TrustState::Untrusted)),
+    );
+
+    let p = pkg(&r.packages, "demo-desktop").expect("the global package survives");
+    assert_eq!(
+        p.libs,
+        vec!["gtk3"],
+        "an untrusted project must not choose what a trusted package is patched against"
+    );
+    assert_eq!(
+        p.state,
+        TrustState::Trusted,
+        "and the package itself is untouched — it is the decoration that was refused"
+    );
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("libs") && w.contains("demo-desktop") && w.contains("untrusted")),
+        "the refusal must be visible and actionable: {:?}",
+        r.warnings
+    );
+}
+
+/// The other side of the same guard: a *trusted* project may still decorate a baseline package,
+/// which is the ordinary reason `protect_trusted` is `false` on these call sites. Without this the
+/// fix above could be a blanket refusal.
+#[test]
+fn a_trusted_project_may_still_decorate_a_baseline_package() {
+    let mut project = RawConfig::default();
+    project.deb.insert(
+        "demo-desktop".to_string(),
+        RawResolve {
+            resolve: Vec::new(),
+            libs: vec!["webkitgtk_4_1".to_string()],
+        },
+    );
+
+    let r = resolve_no_plugins(
+        raw_deb_libs("demo-desktop", "deb:https://example.com/app.deb", &["gtk3"]),
+        Some((project, TrustState::Trusted)),
+    );
+
+    let p = pkg(&r.packages, "demo-desktop").expect("the package survives");
+    assert_eq!(
+        p.libs,
+        vec!["webkitgtk_4_1"],
+        "a trusted project's decoration still applies"
+    );
+}
+
 #[test]
 fn a_deb_table_carrying_only_libs_decorates_the_package_without_a_sentinel() {
     // The shape a GTK/WebKit app needs: the package is declared the ordinary way, and its table
