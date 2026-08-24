@@ -117,6 +117,7 @@ enum Side {
 /// invocation. Reading answers no such question, and a reader with two sessions open was being told
 /// to go and pick one before being shown anything at all.
 fn planes_for(id: Option<&str>, verb: &str, side: Side) -> Result<Vec<Plane>, ExitCode> {
+    refuse_host_side_in_a_cage(verb, side)?;
     if let Some(one) = env_plane(id, verb)? {
         return Ok(vec![one]);
     }
@@ -197,12 +198,18 @@ fn no_sessions(verb: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// The one plane a verb that **acts** must be given: exactly one, named when several exist.
+/// Refuse a host-side verb inside a cage, where there is no host plane to speak it to.
 ///
-/// `$SBX_TASK_SOCKET` short-circuits the search, which is how a specific plane can be addressed
-/// without resolving a session. It is also the discovery handle the cage advertises, so a tool that
-/// wants to find the plane looks in one place whichever side it is on.
-fn plane_for(id: Option<&str>, verb: &str, side: Side) -> Result<Plane, ExitCode> {
+/// The socket the cage advertises is the crossing one, which offers the inventory and the
+/// invocations and nothing else: the log, what is running, and the stop are deliberately elsewhere
+/// (`task_control::serve_host` states why). Without this, [`env_plane`] handed those verbs the
+/// crossing socket anyway — `side` is not a thing it looks at — and the caller got `err unknown
+/// command` for a verb that is not missing but withheld. The listing verbs went that way while the
+/// acting ones were refused here, from one rule written twice.
+///
+/// It is the message that changes, not the boundary: the host socket is never bound into a cage, so
+/// nothing in there could reach these verbs however it asked.
+fn refuse_host_side_in_a_cage(verb: &str, side: Side) -> Result<(), ExitCode> {
     if side == Side::Host && std::env::var_os(TASK_SOCKET_ENV).is_some() {
         diag::error(&format!(
             "sbx: task {verb}: this is host-side only — a cage may invoke operations, not watch or \
@@ -210,6 +217,16 @@ fn plane_for(id: Option<&str>, verb: &str, side: Side) -> Result<Plane, ExitCode
         ));
         return Err(ExitCode::from(2));
     }
+    Ok(())
+}
+
+/// The one plane a verb that **acts** must be given: exactly one, named when several exist.
+///
+/// `$SBX_TASK_SOCKET` short-circuits the search, which is how a specific plane can be addressed
+/// without resolving a session. It is also the discovery handle the cage advertises, so a tool that
+/// wants to find the plane looks in one place whichever side it is on.
+fn plane_for(id: Option<&str>, verb: &str, side: Side) -> Result<Plane, ExitCode> {
+    refuse_host_side_in_a_cage(verb, side)?;
     if let Some(one) = env_plane(id, verb)? {
         return Ok(one);
     }
@@ -1645,6 +1662,32 @@ mod tests {
             name: name.to_string(),
             fields: fields.iter().map(|f| (*f).to_string()).collect(),
         }
+    }
+
+    /// A cage reaches one plane, the crossing one, and it offers the inventory and the invocations
+    /// and nothing else. The acting verbs said so; the listing verbs went through a path that does
+    /// not look at `side` at all, so they were handed the crossing socket and the caller got
+    /// `err unknown command` for a verb that is not missing but withheld. Same rule, one function.
+    #[test]
+    fn a_host_side_verb_inside_a_cage_says_which_side_it_belongs_to() {
+        use crate::testutil::{EnvVar, env_lock};
+        let _lock = env_lock();
+        let _sock = EnvVar::set(TASK_SOCKET_ENV, "/run/sbx-task/control.sock");
+
+        // The listing verbs, which took the crossing socket and asked it for a host verb.
+        for verb in ["logs", "status", "show"] {
+            assert!(
+                planes_for(None, verb, Side::Host).is_err(),
+                "`sbx task {verb}` must be refused in a cage, not sent to the wrong socket"
+            );
+        }
+        // The acting verbs, which were already refused.
+        for verb in ["stop", "result"] {
+            assert!(plane_for(None, verb, Side::Host).is_err());
+        }
+        // The crossing side is what a cage may reach, and both entry points still give it.
+        assert!(plane_for(None, "run", Side::Cage).is_ok());
+        assert!(planes_for(None, "ls", Side::Cage).is_ok());
     }
 
     /// A column every row answers the same way is not information. The default case — nothing
