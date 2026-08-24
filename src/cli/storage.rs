@@ -435,10 +435,8 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
     }
 
     println!("  copying (the original is untouched until this succeeds)…");
-    // The volume was verified empty just above, so anything found in it afterwards is this
-    // attempt's own doing — which is what makes it safe to clear on failure. Without that a
-    // failed migration would leave debris that blocks the retry.
-    let volume_was_empty = occupied.is_empty();
+    // Read from the directory, not from `occupied` — see [`volume_is_empty`].
+    let volume_was_empty = volume_is_empty(&mount_point);
     let copied = match storage::copy_tree(&dir, &mount_point, &skip) {
         Ok(c) => c,
         Err(e) => {
@@ -514,6 +512,29 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// Whether the volume holds nothing but sbx's own pointer file — the question the failure sweep in
+/// [`storage_migrate`] must answer before it deletes everything in there.
+///
+/// Asked of the directory rather than of `occupied_subtrees`, which is a different question wearing
+/// a similar name. That one tests exactly three entries (`store`, `projects`, `apps`) because its
+/// job is "would adopting this strand a data directory". A volume holding anything else — `engine/`,
+/// `sessions/`, a `gcroots/` from an older layout, or files with nothing to do with sbx because the
+/// user mounted a filesystem of their own at that path — answered *empty* to it, and the sweep then
+/// cleared the whole volume on a copy failure, on a comment that said "The volume was verified empty
+/// just above".
+///
+/// `storage::POINTER` is the one entry that does not count: it is sbx's own marker rather than data,
+/// which is what lets a previously-adopted volume be re-migrated — the same exemption the refusal
+/// above it states.
+///
+/// A directory that cannot be read answers `false`: the sweep is the destructive branch, so not
+/// knowing must mean not sweeping.
+fn volume_is_empty(mount_point: &Path) -> bool {
+    std::fs::read_dir(mount_point).is_ok_and(|mut entries| {
+        entries.all(|e| e.is_ok_and(|e| e.file_name() == storage::POINTER))
+    })
 }
 
 /// Empty a directory of everything it contains, leaving the directory itself.
@@ -1116,6 +1137,39 @@ mod tests {
         // The absolute-path rule still comes first, and says its own thing.
         let err = image_path(Some(PathBuf::from("relative.btrfs"))).expect_err("not absolute");
         assert!(err.contains("absolute"), "{err}");
+    }
+
+    /// The failure sweep clears the **whole** volume, so what it needs is real emptiness — not the
+    /// three-name check `occupied_subtrees` performs for a different question. A volume holding
+    /// anything outside that list answered "empty" and was wiped on a copy failure, including files
+    /// the user put there themselves.
+    #[test]
+    fn only_a_volume_holding_nothing_but_the_pointer_counts_as_empty() {
+        let tmp = crate::testutil::TmpDir::new();
+        let vol = tmp.path();
+        assert!(volume_is_empty(vol), "a bare directory is empty");
+
+        // sbx's own marker is not data — this is what lets an adopted volume be re-migrated.
+        std::fs::write(vol.join(storage::POINTER), "image = \"/x.btrfs\"\n").unwrap();
+        assert!(volume_is_empty(vol), "the pointer alone is still empty");
+
+        // Anything else is not, including the entries `occupied_subtrees` does not name.
+        for entry in ["engine", "sessions", "gcroots", "my-own-backup"] {
+            std::fs::create_dir(vol.join(entry)).unwrap();
+            assert!(
+                !volume_is_empty(vol),
+                "`{entry}` is content the sweep must not delete"
+            );
+            assert!(
+                occupied_subtrees(vol).is_empty(),
+                "`{entry}` is outside DATA_SUBTREES — which is exactly why that check cannot \
+                 answer this question"
+            );
+            std::fs::remove_dir(vol.join(entry)).unwrap();
+        }
+
+        // A directory that cannot be read is not "empty": not knowing must mean not sweeping.
+        assert!(!volume_is_empty(&vol.join("absent")));
     }
 
     #[test]
