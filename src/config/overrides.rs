@@ -439,38 +439,72 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
              every launch; set it on the command line for a true one-shot"
         ));
     };
+    // `env_side` is destructured **exhaustively**, for the reason [`overlay_into`] gives for doing
+    // the same: this is a hand-written list of fields with nothing above it checking the list is
+    // complete, and it had silently dropped four — `allow_insecure_http`, `ssh_agent`, `[fs]` and
+    // `[open]`, each of them a field an ambient variable can use to widen a launch, and none of
+    // them said out loud. Naming every field makes the compiler refuse the next schema addition
+    // until this function decides what becomes of it. A field deliberately not noted is bound to
+    // `_` with its reason, never omitted.
+    let RawConfig {
+        allow_insecure_http,
+        binds,
+        packages,
+        nixpkgs,
+        network,
+        proc,
+        notify,
+        gui,
+        gpu,
+        audio,
+        dbus,
+        forward,
+        secret,
+        limits,
+        seccomp,
+        devices,
+        ssh_agent,
+        fs,
+        redact,
+        open,
+        service,
+        // `env` is a *free* field: folded without a notice, as this function's own doc says.
+        env: _,
+        // Not a security field: what clock the cage reads changes no boundary.
+        timezone: _,
+        // Refused outright by `apply_override`, or reported per blob before this merge — an
+        // override never carries them, so there is nothing here for an ambient value to have set.
+        app: _,
+        bundle: _,
+        flakes: _,
+        tarball: _,
+        deb: _,
+        appimage: _,
+        binary: _,
+        accepts_fresh_releases: _,
+        task: _,
+        plugin: _,
+        broker: _,
+        rest: _,
+    } = env_side;
     // Replaced scalars: noted when only the environment set them.
     for (field, env_has, cli_has) in [
+        ("nixpkgs", nixpkgs.is_some(), cli_side.nixpkgs.is_some()),
+        ("network", network.is_some(), cli_side.network.is_some()),
+        ("gui", gui.is_some(), cli_side.gui.is_some()),
+        ("proc", proc.is_some(), cli_side.proc.is_some()),
+        ("notify", notify.is_some(), cli_side.notify.is_some()),
+        ("gpu", gpu.is_some(), cli_side.gpu.is_some()),
+        ("audio", audio.is_some(), cli_side.audio.is_some()),
+        ("dbus", dbus.is_some(), cli_side.dbus.is_some()),
+        ("secret", secret.is_some(), cli_side.secret.is_some()),
+        ("redact", redact.is_some(), cli_side.redact.is_some()),
         (
-            "nixpkgs",
-            env_side.nixpkgs.is_some(),
-            cli_side.nixpkgs.is_some(),
+            "allow_insecure_http",
+            allow_insecure_http.is_some(),
+            cli_side.allow_insecure_http.is_some(),
         ),
-        (
-            "network",
-            env_side.network.is_some(),
-            cli_side.network.is_some(),
-        ),
-        ("gui", env_side.gui.is_some(), cli_side.gui.is_some()),
-        ("proc", env_side.proc.is_some(), cli_side.proc.is_some()),
-        (
-            "notify",
-            env_side.notify.is_some(),
-            cli_side.notify.is_some(),
-        ),
-        ("gpu", env_side.gpu.is_some(), cli_side.gpu.is_some()),
-        ("audio", env_side.audio.is_some(), cli_side.audio.is_some()),
-        ("dbus", env_side.dbus.is_some(), cli_side.dbus.is_some()),
-        (
-            "secret",
-            env_side.secret.is_some(),
-            cli_side.secret.is_some(),
-        ),
-        (
-            "redact",
-            env_side.redact.is_some(),
-            cli_side.redact.is_some(),
-        ),
+        ("fs", fs.is_some(), cli_side.fs.is_some()),
     ] {
         if env_has && !cli_has {
             note(field);
@@ -478,12 +512,15 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
     }
     // Unioned collections: noted whenever the environment contributed.
     for (field, env_has) in [
-        ("binds", !env_side.binds.is_empty()),
-        ("packages", !env_side.packages.is_empty()),
-        ("limits", env_side.limits.is_some()),
-        ("forward", env_side.forward.is_some()),
-        ("seccomp", env_side.seccomp.is_some()),
-        ("devices", env_side.devices.is_some()),
+        ("binds", !binds.is_empty()),
+        ("packages", !packages.is_empty()),
+        ("limits", limits.is_some()),
+        ("forward", forward.is_some()),
+        ("seccomp", seccomp.is_some()),
+        ("devices", devices.is_some()),
+        ("ssh_agent", ssh_agent.is_some()),
+        ("open", !open.is_empty()),
+        ("service", !service.is_empty()),
     ] {
         if env_has {
             note(field);
@@ -1492,6 +1529,44 @@ mod tests {
             ov.notices()[0].contains("security field `network`"),
             "{:?}",
             ov.notices()
+        );
+    }
+
+    /// Every security field an ambient blob can carry has to be named, not just the ones someone
+    /// remembered to list. These four were not: a stale `SBX_CONFIG` could turn off the refusal to
+    /// speak cleartext, hand the cage the ssh-agent, rewrite the `[fs]` lens, or give it a handler
+    /// to invoke on the host, and the launch said nothing about where any of it came from.
+    #[test]
+    fn every_security_field_an_ambient_blob_carries_is_named() {
+        let ov = ambient(AmbientOverrides {
+            config: Some(
+                "allow_insecure_http = true\n\
+                 [ssh_agent]\nallow = [\"deploy-key\"]\n\
+                 [fs]\ndeny = [\".env\"]\n\
+                 [open]\nhttps = { cmd = [\"xdg-open\"] }\n\
+                 [service.api]\ncmd = [\"serve\"]\n"
+                    .into(),
+            ),
+            ..Default::default()
+        })
+        .unwrap();
+        let said = ov.notices().join("\n");
+        for field in ["allow_insecure_http", "ssh_agent", "fs", "open", "service"] {
+            assert!(
+                said.contains(&format!("security field `{field}`")),
+                "an ambient `{field}` must be named: {said}"
+            );
+        }
+        // `env` stays free and the clock stays unremarkable — noticing those would be noise.
+        let quiet = ambient(AmbientOverrides {
+            config: Some("timezone = \"UTC\"\n[env]\nK = \"1\"\n".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            quiet.notices().is_empty(),
+            "a free field is folded without a word: {:?}",
+            quiet.notices()
         );
     }
 

@@ -277,6 +277,12 @@ The environment *can* set security fields, but each security field sourced from 
 your shell rc silently widening every launch. The command line is silent (it is
 explicit per-invocation).
 
+Every field an override carries is either noticed or deliberately not, and the two
+lists are exhaustive: `nixpkgs`, `network`, `gui`, `proc`, `notify`, `gpu`, `audio`,
+`dbus`, `secret`, `redact`, `allow_insecure_http`, `fs`, `binds`, `packages`,
+`limits`, `forward`, `seccomp`, `devices`, `ssh_agent`, `open` and `service` are
+named; `env` is free (folded without a word) and `timezone` is not a security field.
+
 ## What `sbx config show` reflects
 
 `sbx config show` reflects the **ambient** override (the `SBX_*` environment, not the
