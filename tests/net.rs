@@ -1070,6 +1070,12 @@ fn a_forced_group_import_names_what_it_dropped_and_keeps_the_group_it_replaced()
     // The kept fragment is portable: importing it back restores the entry.
     let kept = fx.config_home.path().join("sbx").join("ci.group.replaced");
     assert!(kept.exists(), "the previous group must be kept");
+    // Owner-only, like the config it is a copy of: see the bundle test's note.
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the kept fragment must be owner-only");
+    }
     assert!(
         fx.run(&["net", "groups", "import", "--force", kept.to_str().unwrap()])
             .status

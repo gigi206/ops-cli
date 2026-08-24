@@ -3778,6 +3778,17 @@ fn a_forced_bundle_import_names_what_it_dropped_and_keeps_the_bundle_it_replaced
         .join("sbx")
         .join("demo-agent.bundle.replaced");
     assert!(kept.exists(), "the previous bundle must be kept");
+    // Owner-only, like the config it is a verbatim copy of. Written with `std::fs::write` it took
+    // the umask's mode instead, so the original stayed `0600` and its snapshot — carrying the same
+    // `[secret]` locators and per-machine rules — was readable by anyone with the directory.
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the kept fragment must be owner-only, not the umask's answer"
+        );
+    }
     assert!(
         fx.run(&["bundle", "import", "--force", kept.to_str().unwrap()])
             .status

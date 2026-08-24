@@ -332,7 +332,7 @@ fn keep_replaced_bundles(
             continue;
         }
         let kept = dir.join(format!("{name}.bundle.replaced"));
-        std::fs::write(&kept, &before).map_err(|e| {
+        crate::cli::keep_replaced_file(&kept, before.as_bytes()).map_err(|e| {
             format!(
                 "cannot keep the bundle being replaced at {}: {e}",
                 kept.display()

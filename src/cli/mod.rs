@@ -28,7 +28,7 @@ pub(crate) mod upgrade;
 
 use crate::diag;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// Refuse an argument a verb does not take, rather than ignoring it. Silently dropping one is worse
@@ -217,7 +217,52 @@ pub(crate) fn one_file(
     }
 }
 
+/// Keep the bytes a `--force` overwrite is about to drop, at `dest`, beside the file being
+/// replaced.
+///
+/// **Owner-only, whatever the umask says**, and that is the whole reason this exists rather than a
+/// `std::fs::write` at each of the three call sites. What is kept here is a verbatim copy of a
+/// config sbx writes `0600` — an app profile, a bundle fragment, an egress group — carrying the
+/// same `[secret]` locators and per-machine rules. Two of the three copies were being made with
+/// `std::fs::write`, which creates at the umask's mode and leaves the copy `0644` under the common
+/// one: the original stayed owner-only and its replacement snapshot was readable by anyone with the
+/// directory.
+///
+/// Written to a temp and renamed, so a crash mid-write cannot leave a truncated snapshot in place
+/// of the bytes it was meant to preserve — the snapshot is taken *because* the original is about to
+/// go.
+pub(crate) fn keep_replaced_file(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let tmp = dir.join(format!(".replaced-{}.tmp", std::process::id()));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    if let Err(e) = f.write_all(bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    drop(f);
+    // A snapshot left from an earlier overwrite may carry the mode the old write gave it, and a
+    // rename onto it would keep that inode's permissions nowhere — `rename` replaces the entry, so
+    // the new file's `0600` is what remains.
+    if let Err(e) = std::fs::rename(&tmp, dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// The settings a replaced file carried that the incoming one does not — what a `--force` import
+/// drops, whether the file is an app profile or a bundle fragment./// The settings a replaced file carried that the incoming one does not — what a `--force` import
 /// drops, whether the file is an app profile or a bundle fragment.
 ///
 /// Blank lines and comments are skipped: prose is rewritten constantly and reporting it would bury

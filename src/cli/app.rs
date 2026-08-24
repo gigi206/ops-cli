@@ -460,7 +460,7 @@ fn app_import(args: &[OsString]) -> ExitCode {
     let replaced = match std::fs::read(&dest) {
         Ok(previous) if previous != bytes => {
             let kept = dir.join(format!("{name}.toml.replaced"));
-            match write_profile_file(&dir, &kept, &previous) {
+            match crate::cli::keep_replaced_file(&kept, &previous) {
                 Ok(()) => Some((previous, kept)),
                 Err(e) => {
                     diag::error(&format!(
