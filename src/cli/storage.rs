@@ -515,7 +515,7 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
 }
 
 /// Whether the volume holds nothing but sbx's own pointer file — the question the failure sweep in
-/// [`storage_migrate`] must answer before it deletes everything in there.
+/// [`migrate`] must answer before it deletes everything in there.
 ///
 /// Asked of the directory rather than of `occupied_subtrees`, which is a different question wearing
 /// a similar name. That one tests exactly three entries (`store`, `projects`, `apps`) because its
