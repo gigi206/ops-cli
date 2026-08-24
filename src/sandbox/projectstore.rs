@@ -229,11 +229,10 @@ pub(crate) fn prepare(
     roots: &[PathBuf],
 ) -> io::Result<ProjectStore> {
     let store_dir = store_dir_for(layout, project_id);
-    let project_paths = store_dir.join("nix").join("store");
-    DirBuilder::new()
-        .recursive(true)
-        .mode(DIR_MODE)
-        .create(&project_paths)?;
+    // Component-wise rather than `create_dir_all`: everything under `store_dir/nix` is bound
+    // read-write into the cage, so a component may be a symlink the cage left pointing anywhere.
+    // See [`ensure_dir_chain`] — the seed below copies the whole base closure into this directory.
+    let project_paths = ensure_dir_chain(&store_dir, "store")?;
 
     // Enumerate the closure to copy and register. Passing no roots would make
     // `--dump-db` dump the *whole* shared database, so an empty request seeds
@@ -608,6 +607,59 @@ pub(crate) fn gcroots_dir(store_dir: &Path) -> PathBuf {
     store_dir.join("nix/var/nix/gcroots")
 }
 
+/// Make `store_dir`'s descendant `rel` (slash-separated), one component at a time, refusing any that
+/// already exists and is **not a real directory**.
+///
+/// Everything below `store_dir/nix` is the cage's: it is bound read-write at `/nix`
+/// (`NixMount { writable: true }`), the cage runs same-uid, and the directories are `0700` owned by
+/// that uid — so in-cage code may `mv /nix/store /nix/store.real && ln -s /somewhere /nix/store`, or
+/// do the same to `var`. `store_dir/nix` itself is out of reach (from inside the cage it *is* the
+/// mount point), which is why the walk anchors there and only guards what lies below.
+///
+/// `create_dir_all` cannot make that distinction: it stats through a link, finds a directory, and
+/// reports the parents as made — after which the host's own seed copies the base closure, gigabytes
+/// of it, into wherever the cage pointed, and `gcroot_roots` writes its symlinks there. So each
+/// component is `symlink_metadata`'d before it is used and a non-directory is a hard error, not
+/// something to repair: a store skeleton that is not what sbx left is a finding the user should see,
+/// and silently re-creating it would destroy the evidence along with whatever the cage had staged.
+///
+/// This closes the shape, not the last instant of it. A *concurrent* same-project launch whose cage
+/// is live could still swap a component between this check and the copy that follows; closing that
+/// too means carrying a descriptor through `copy_recursive` and the `nix-store` invocations, which
+/// take paths. The window here is a live cage racing another launch's seed, where before it was a
+/// cage simply leaving a symlink behind for the next launch to find.
+fn ensure_dir_chain(store_dir: &Path, rel: &str) -> io::Result<PathBuf> {
+    let mut at = store_dir.join("nix");
+    DirBuilder::new()
+        .recursive(true)
+        .mode(DIR_MODE)
+        .create(&at)?;
+    for component in rel.split('/') {
+        at.push(component);
+        match fs::symlink_metadata(&at) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(meta) => {
+                let kind = if meta.is_symlink() {
+                    "a symlink"
+                } else {
+                    "not a directory"
+                };
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "`{}` is {kind} — the project store's own `/nix` is writable by the cage, so \
+                         this is what in-cage code leaves behind to redirect the next launch's seed. \
+                         Reclaim the store (`sbx gc`) or remove that entry by hand",
+                        at.display()
+                    ),
+                ));
+            }
+            Err(_) => DirBuilder::new().mode(DIR_MODE).create(&at)?,
+        }
+    }
+    Ok(at)
+}
+
 /// Register each logical `roots` path (`/nix/store/<hash>-name`) as a direct gc root in
 /// `store_dir`'s store, so `nix-store --gc` keeps it and its closure. A root is a symlink
 /// `gcroots/<hash-name> -> /nix/store/<hash-name>` — the relocated store interprets that
@@ -620,11 +672,11 @@ pub(crate) fn gcroots_dir(store_dir: &Path) -> PathBuf {
 /// reader never sees a half-made root and the loser of a race overwrites with an identical
 /// link.
 fn gcroot_roots(store_dir: &Path, roots: &[PathBuf]) -> io::Result<()> {
-    let dir = gcroots_dir(store_dir);
-    DirBuilder::new()
-        .recursive(true)
-        .mode(DIR_MODE)
-        .create(&dir)?;
+    // Same guard as the store directory, and for the same reason: `nix/var` is under the cage's
+    // writable `/nix` too, so this walk refuses a component the cage repointed rather than writing
+    // its root symlinks wherever that led.
+    let dir = ensure_dir_chain(store_dir, "var/nix/gcroots")?;
+    debug_assert_eq!(dir, gcroots_dir(store_dir));
     for root in roots {
         let Some(name) = root.file_name() else {
             continue;
@@ -763,6 +815,98 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with(".project.tmp"))
             .collect();
         assert!(leftovers.is_empty(), "a temp placement leaked");
+    }
+
+    /// `store_dir/nix` is bound read-write into the cage at `/nix`, so every directory under it is
+    /// one in-cage code can replace with a symlink and leave behind for the *next* launch. The seed
+    /// then copies the base closure — gigabytes — into wherever that points, and `gcroot_roots`
+    /// writes its symlinks there. `create_dir_all` cannot tell the difference: it stats through the
+    /// link, finds a directory, and reports the parents as made.
+    ///
+    /// Each component the host creates under `nix/` is therefore checked, and a redirected one is a
+    /// hard error rather than something repaired in place.
+    #[test]
+    fn a_store_skeleton_the_cage_repointed_is_refused_rather_than_written_through() {
+        // `store` is the seed's own walk; the other three lie on the gc-roots walk. Both callers go
+        // through the same guard, and each component of each is covered.
+        for (rel, walk) in [
+            ("store", "store"),
+            ("var", "var/nix/gcroots"),
+            ("var/nix", "var/nix/gcroots"),
+            ("var/nix/gcroots", "var/nix/gcroots"),
+        ] {
+            let base = TmpDir::new();
+            let store_dir = base.join("store");
+            let elsewhere = base.join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+
+            // Plant the link exactly where in-cage code could: under the writable `nix/` root.
+            let planted = store_dir.join("nix").join(rel);
+            std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &planted).unwrap();
+
+            let err = ensure_dir_chain(&store_dir, walk)
+                .err()
+                .unwrap_or_else(|| panic!("a symlink at nix/{rel} must be refused"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{rel}");
+            assert!(
+                err.to_string().contains("is a symlink"),
+                "the refusal must name what it found: {err}"
+            );
+
+            // And the caller that walks this chain refuses too, rather than only the helper.
+            if walk == "var/nix/gcroots" {
+                assert!(
+                    gcroot_roots(
+                        &store_dir,
+                        &[PathBuf::from(
+                            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-base"
+                        )],
+                    )
+                    .is_err(),
+                    "nix/{rel}: gcroot_roots wrote its links through the link"
+                );
+            }
+
+            assert_eq!(
+                std::fs::read_dir(&elsewhere).unwrap().count(),
+                0,
+                "nix/{rel}: the host wrote through the link into the directory the cage chose"
+            );
+            assert_eq!(
+                std::fs::read_link(&planted).unwrap(),
+                elsewhere,
+                "nix/{rel}: the planted link must be reported, not silently replaced"
+            );
+        }
+    }
+
+    /// And the ordinary skeleton is still made: a guard that refused everything would pass the test
+    /// above while breaking every launch.
+    #[test]
+    fn a_missing_store_skeleton_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = TmpDir::new();
+        let store_dir = base.join("store");
+
+        let made = ensure_dir_chain(&store_dir, "var/nix/gcroots").unwrap();
+
+        assert_eq!(made, gcroots_dir(&store_dir));
+        assert!(made.is_dir());
+        for dir in [
+            store_dir.join("nix"),
+            store_dir.join("nix/var"),
+            store_dir.join("nix/var/nix"),
+            made.clone(),
+        ] {
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, DIR_MODE, "{} is not owner-only", dir.display());
+        }
+        // Idempotent: a second walk over an existing chain is a no-op, not an error.
+        assert_eq!(
+            ensure_dir_chain(&store_dir, "var/nix/gcroots").unwrap(),
+            made
+        );
     }
 
     #[test]
