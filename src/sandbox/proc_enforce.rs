@@ -1100,6 +1100,19 @@ fn serve_open(
     if flags & libc::O_TMPFILE == libc::O_TMPFILE {
         return false;
     }
+    // An `openat2` may ask for a stricter walk than the one this supervisor performed: the probe
+    // follows symlinks on purpose (a scan that stopped at a link would be walked around with one
+    // `ln -s`), so serving from it would hand a caller that asked for `RESOLVE_NO_SYMLINKS` the
+    // descriptor its own restriction was meant to refuse. The verdict is unaffected — the lens
+    // judged the resolved target either way, and this is only reached for an open it permitted —
+    // but a program inside the cage that hardened its own path walk must not have that hardening
+    // quietly removed by being supervised. So the call is declined here and answered `CONTINUE`,
+    // which runs the real `openat2` with the real `resolve` semantics; it joins the other flags
+    // that cannot be carried onto a descriptor.
+    match open_resolve(req.pid, req.data.nr, &req.data.args) {
+        Some(0) => {}
+        _ => return false,
+    }
     // The file exists — holding a descriptor on it is the proof — so `O_CREAT|O_EXCL` is precisely
     // the case the caller asked to be told about, and the errno it expects is the sound answer.
     if flags & libc::O_CREAT != 0 && flags & libc::O_EXCL != 0 {
@@ -1524,6 +1537,33 @@ fn open_mode(pid: u32, nr: libc::c_int, args: &[u64; 6]) -> Option<u64> {
             return None;
         }
         return read_u64(pid, args[2].wrapping_add(8));
+    }
+    None
+}
+
+/// The `resolve` word of an `openat2`, which names path-walk restrictions the caller wants the
+/// kernel to enforce (`RESOLVE_NO_SYMLINKS`, `RESOLVE_BENEATH`, `RESOLVE_IN_ROOT`,
+/// `RESOLVE_NO_MAGICLINKS`, `RESOLVE_NO_XDEV`). `Some(0)` for the two older forms, which have no
+/// such word and therefore ask for no restriction.
+///
+/// The third word of `struct open_how`, and read for the same reason its siblings are: a caller
+/// that asked for a stricter walk than the supervisor performed must not be handed the result of
+/// the looser one.
+///
+/// `None` means it could not be established, which — like an unreadable flag word — is a call that
+/// must not be served from a descriptor.
+fn open_resolve(pid: u32, nr: libc::c_int, args: &[u64; 6]) -> Option<u64> {
+    if nr as libc::c_long == libc::SYS_open || nr as libc::c_long == libc::SYS_openat {
+        return Some(0);
+    }
+    if nr as libc::c_long == libc::SYS_openat2 {
+        // `struct open_how { __u64 flags; __u64 mode; __u64 resolve; }`. A `size` short of the
+        // third word describes a call that asks for no restriction: the kernel reads the missing
+        // tail as zero.
+        if args[3] < 24 {
+            return Some(0);
+        }
+        return read_u64(pid, args[2].wrapping_add(16));
     }
     None
 }
@@ -3316,6 +3356,94 @@ mod tests {
             open_mode(std::process::id(), libc::SYS_openat2 as libc::c_int, &args2),
             Some(0o600),
             "the mode is the second field of `struct open_how`"
+        );
+    }
+
+    /// An `openat2` may ask the kernel for a stricter path walk than the supervisor performed. The
+    /// probe follows symlinks by design, so a descriptor served from it is the result of the looser
+    /// walk: a caller that asked for `RESOLVE_NO_SYMLINKS` would be handed exactly what its own
+    /// restriction existed to refuse. Reading the third word of `struct open_how` is what lets
+    /// `serve_open` decline those and leave them to the kernel.
+    #[test]
+    fn each_open_form_states_the_path_walk_it_asked_for() {
+        let mut args = [0u64; 6];
+        assert_eq!(
+            open_resolve(std::process::id(), libc::SYS_open as libc::c_int, &args),
+            Some(0),
+            "`open` has no `resolve` word, so it restricts nothing"
+        );
+        assert_eq!(
+            open_resolve(std::process::id(), libc::SYS_openat as libc::c_int, &args),
+            Some(0),
+            "nor does `openat`"
+        );
+        assert_eq!(
+            open_resolve(std::process::id(), libc::SYS_read as libc::c_int, &args),
+            None,
+            "a syscall that is not an open asks for no walk at all"
+        );
+        let how: [u64; 3] = [libc::O_RDONLY as u64, 0, libc::RESOLVE_NO_SYMLINKS];
+        args[2] = how.as_ptr() as u64;
+        args[3] = std::mem::size_of_val(&how) as u64;
+        assert_eq!(
+            open_resolve(std::process::id(), libc::SYS_openat2 as libc::c_int, &args),
+            Some(libc::RESOLVE_NO_SYMLINKS),
+            "the restriction is the third field of `struct open_how`"
+        );
+        // A `size` short of the third word is a call that asks for no restriction: the kernel reads
+        // the missing tail as zero, and so must this.
+        args[3] = 16;
+        assert_eq!(
+            open_resolve(std::process::id(), libc::SYS_openat2 as libc::c_int, &args),
+            Some(0),
+            "a struct that stops before `resolve` restricts nothing"
+        );
+    }
+
+    /// The reader is only half of it: `serve_open` has to act on what it says. A restricted
+    /// `openat2` must be declined *before* any answer is formed, so the kernel performs the walk the
+    /// caller asked for; an unrestricted one must be served exactly as before.
+    ///
+    /// The control is a socket inode, whose answer (`ENXIO`) is formed from the probe's type alone
+    /// and needs no live notification descriptor — so the only difference between the two arms is
+    /// the `resolve` word, which is the point.
+    #[test]
+    fn a_restricted_openat2_is_left_to_the_kernel_to_walk() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = TmpDir::new();
+        let sock_path = dir.join("probe.sock");
+        let _listener = UnixListener::bind(&sock_path).expect("bind the probe socket");
+
+        let serve = |resolve: u64| {
+            // `O_PATH` is the only way to hold a descriptor on a socket inode, and it is how the
+            // lens holds every probe.
+            let probe = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH)
+                .open(&sock_path)
+                .expect("hold the socket inode");
+            let how: [u64; 3] = [libc::O_RDONLY as u64, 0, resolve];
+            let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
+            req.pid = std::process::id();
+            req.data.nr = libc::SYS_openat2 as libc::c_int;
+            req.data.args[2] = how.as_ptr() as u64;
+            req.data.args[3] = std::mem::size_of_val(&how) as u64;
+            // No notification descriptor: the arm under test forms its answer without one, and the
+            // arm being excluded would need one.
+            serve_open(-1, &req, libc::AT_FDCWD, "probe.sock", Some(probe))
+        };
+
+        assert!(
+            serve(0),
+            "an `openat2` asking for no restriction is served the way every other open is"
+        );
+        assert!(
+            !serve(libc::RESOLVE_NO_SYMLINKS),
+            "a caller that asked the kernel not to follow symlinks must not be handed the result of              a walk that did"
+        );
+        assert!(
+            !serve(libc::RESOLVE_BENEATH),
+            "the same holds for every other restriction this supervisor cannot reproduce"
         );
     }
 
