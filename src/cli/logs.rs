@@ -613,7 +613,12 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
             }
         }
     }
-    if feeds.iter().all(|f| f.cursor.is_none()) {
+    // "Recording nothing" is about feeds that did not **answer**, not about feeds that answered
+    // without a cursor. A cursor is what `--follow` polls with; an older session's plane hands back
+    // none and still returns its whole retained window, which the loop above has already collected.
+    // Reading the missing cursor as a missing feed threw those rows away and told the reader the
+    // session was recording nothing while holding its record in hand.
+    if absent.len() == feeds.len() {
         diag::error(&format!(
             "sbx: logs: session {} is recording nothing.",
             target.pid

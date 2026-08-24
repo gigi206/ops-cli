@@ -399,6 +399,69 @@ fn serve_task(data: &Path, pid: u32, events: &[&str]) {
     });
 }
 
+/// Serve the task plane with a reply that carries **no** `head=` line — an older session's plane,
+/// which returns its whole window and has no cursor to follow from.
+fn serve_task_without_a_cursor(data: &Path, pid: u32, events: &[&str]) {
+    let dir = data.join("sbx").join("tasks").join(pid.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    let listener = UnixListener::bind(dir.join("log.sock")).expect("bind the task log socket");
+    let mut reply = String::new();
+    for e in events {
+        reply.push_str(e);
+        reply.push('\n');
+    }
+    reply.push_str("ok\n");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let mut line = String::new();
+            if BufReader::new(&stream).read_line(&mut line).is_err() {
+                continue;
+            }
+            let _ = (&stream).write_all(reply.as_bytes());
+            let _ = (&stream).flush();
+        }
+    });
+}
+
+/// "Recording nothing" is about feeds that did not **answer**. A feed that answered with its whole
+/// window but no cursor still answered, and its rows had already been collected — the merged view
+/// threw them away and told the reader the session was recording nothing while holding its record
+/// in hand. The only feed that can do this is `task`, whose older plane returns rows with no
+/// `head=`.
+#[test]
+fn a_feed_that_answers_without_a_cursor_is_still_a_recording_session() {
+    let dir = TmpDir::new();
+    let data = dir.path();
+    let standin = Standin::new();
+    let pid = standin.pid();
+    write_session_record(data, pid, Path::new("/tmp/demo-app"));
+    // Nothing else bound: every other feed fails its connect, exactly as on a session that
+    // recorded only its declared operations.
+    serve_task_without_a_cursor(
+        data,
+        pid,
+        &[
+            "event seq=1 cur=1 at=1700000000500 started=1700000000200 exit=0 redacted=0 \
+           truncated=0 timed_out=0 stopped=0 detached=0 elapsed_ms=300 task=db-query",
+        ],
+    );
+
+    let out = read_feed(data, &["logs", &pid.to_string()]);
+    assert!(
+        !out.contains("recording nothing"),
+        "a feed that answered is a recording session: {out}"
+    );
+    assert!(
+        out.contains("db-query"),
+        "and the rows it already returned must be shown: {out}"
+    );
+    assert!(
+        out.contains("shown once, not followed"),
+        "with the reason it cannot be followed: {out}"
+    );
+}
+
 /// The merged view is the only one that can be wrong about *order*, and the only one that can lie by
 /// omission. Both are checked here, over several feeds served at once and one left unbound.
 ///
