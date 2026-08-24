@@ -95,6 +95,10 @@ pub(crate) fn complete_cmd(args: Vec<OsString>) -> ExitCode {
 
     let mut out = String::new();
     for (name, desc) in candidates(&words) {
+        // The one gate every candidate passes, whatever produced it — see [`insertable`].
+        if !insertable(&name) {
+            continue;
+        }
         out.push_str(&name);
         out.push('\t');
         out.push_str(&describe(&desc));
@@ -102,6 +106,35 @@ pub(crate) fn complete_cmd(args: Vec<OsString>) -> ExitCode {
     }
     print!("{out}");
     ExitCode::SUCCESS
+}
+
+/// Whether a candidate is a word the shell can insert onto the command line **as typed**.
+///
+/// The emitted scripts insert a candidate verbatim — bash does `COMPREPLY+=("$cand")`, and bash
+/// applies no quoting of its own to a `COMPREPLY` entry unless `compopt -o filenames` is set, which
+/// the script does only for the [`FILES`] branch. `no_page_offers_a_malformed_candidate` states the
+/// resulting requirement ("A value candidate is a single word the shell can insert as typed") and
+/// checks it across every help page — but a page is not the only source. `rule_values` reads egress
+/// and proc rules straight out of the config files a removal would edit, and one of those is the
+/// **project** file, which may have been authored by whoever wrote the repository the user cloned.
+///
+/// A rule is not a bare word by construction: `re:<regex>` admits `(`, `)`, `|`, and `$`. So a
+/// project could put `re:$(…)` on the user's command line, where nothing evaluates it until they
+/// press Enter — and then the shell expands it. That is a short step from a Tab to a shell
+/// substitution the user never typed.
+///
+/// Enforced here rather than at each producer, because this is the single point every candidate
+/// crosses on its way to a shell, and because the invariant was already written down; what was
+/// missing was somewhere to hold it. A candidate that fails is dropped rather than quoted: three
+/// shell dialects would need three quotings, and a rule that cannot be offered as a word is one the
+/// user can still type in full.
+fn insertable(name: &str) -> bool {
+    name == FILES
+        || (!name.is_empty()
+            && !name.contains(char::is_whitespace)
+            && !name
+                .bytes()
+                .any(|b| b < 0x20 || b == 0x7f || br#""'`$\|&;<>()!#"#.contains(&b)))
 }
 
 /// The candidates for the word under the cursor, sorted, already filtered by the prefix
@@ -1540,6 +1573,55 @@ mod tests {
             }
         }
         assert!(checked > 100, "only {checked} documented flags swept");
+    }
+
+    /// The invariant `no_page_offers_a_malformed_candidate` states is checked there against every
+    /// help *page*. A page is not the only source: `rule_values` reads egress and proc rules out of
+    /// the config files a removal would edit, and one of those is the project file — which may have
+    /// been authored by whoever wrote the repository the user cloned. A rule is not a bare word by
+    /// construction (`re:<regex>` admits `(`, `)`, `|`, `$`), and the emitted bash inserts a
+    /// candidate into `COMPREPLY` with no quoting of its own.
+    ///
+    /// So the invariant needed somewhere to hold, not only somewhere to be asserted.
+    #[test]
+    fn a_candidate_the_shell_would_expand_is_never_offered() {
+        for bad in [
+            "re:$(id)",
+            "re:`id`",
+            "re:a|b",
+            "re:(a)",
+            "host.test;reboot",
+            "a b",
+            "quote\"d",
+            "amp&",
+            "redirect>x",
+            "bang!",
+            "hash#",
+            "",
+        ] {
+            assert!(
+                !insertable(bad),
+                "{bad:?} would be inserted onto the user's command line as typed"
+            );
+        }
+        // The shapes a rule legitimately takes still pass, or the gate would silence the feature
+        // for exactly the rules people write. Glob and brace characters run nothing — an unmatched
+        // glob is left as typed — so they stay.
+        for good in [
+            "github.com",
+            "*.example.com",
+            "tcp://db.internal:5432",
+            "tcp://[::1]:22",
+            "http://example.com:8080/path",
+            "{GET,HEAD}example.com",
+            "example.com/v1/*",
+            "1234",
+            "1234.7",
+            "--json",
+            FILES,
+        ] {
+            assert!(insertable(good), "{good:?} must still be offered");
+        }
     }
 
     #[test]
