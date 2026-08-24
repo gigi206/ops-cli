@@ -21,7 +21,9 @@ an ephemeral sibling cage, with a credential the caller never holds. Declared as
 
 `list`, `secrets` and `run` work **both inside the cage** (where the agent uses them, through the
 socket sbx binds there) **and on the host**, so an operation is testable exactly as the agent sees
-it. `status`, `stop`, `result`, `logs` and `run --detach` are **host-only**, and by construction
+it, down to the `<operation>` filter: `sbx task list build` narrows the listing on either side, and
+a name nothing declares is refused on either side with the names that are declared. `--session` is
+host-only, since a cage reaches exactly one plane, its own. `status`, `stop`, `result`, `logs` and `run --detach` are **host-only**, and by construction
 rather than by check: they live on a second socket that is never bound into a cage. The record is not
 for the recorded party to read, and an invocation id is per session: a cage able to stop one could
 stop the invocation *you* started, and same-uid leaves no way to tell the two callers apart. Starting

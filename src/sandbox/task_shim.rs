@@ -108,17 +108,23 @@ safe_word() {{
     return 0
 }}
 
-# `list`/`secrets` take an optional session id on the host; in the cage there is exactly one plane
-# to reach, so an id is accepted and ignored — the same invocation then works unchanged on both
-# sides. A flag is refused: it would name something this client does not do.
+# The bare word `list`/`secrets` take is an **operation name**, exactly as on the host, where it
+# narrows the listing to that one. It was read as a session id here and dropped, so `sbx task list
+# build` showed the whole inventory in the cage and only `build` on the host, from one command,
+# with nothing said. Echoed back through `filter` and applied by `inventory`. A flag is refused: it
+# would name something this client does not do (`--session` among them, which a cage cannot answer:
+# it reaches one plane, its own).
 check_inventory_args() {{
     local verb=$1 arg seen=0
     shift
+    filter=
     for arg in "$@"; do
         case $arg in
             -*) die "task $verb: unexpected argument \"$arg\"" 2 ;;
             *)
                 [ "$seen" = 0 ] || die "task $verb: unexpected argument \"$arg\"" 2
+                safe_word "$arg" || die "task $verb: \"$arg\" is not an operation name" 2
+                filter=$arg
                 seen=1
                 ;;
         esac
@@ -129,7 +135,7 @@ check_inventory_args() {{
 # response is plain text bounded by the inventory's size, so it is read in one go; only `run` needs
 # byte-exact streaming.
 inventory() {{
-    local command=$1 prefix=$2 empty=$3 response line shown=0
+    local command=$1 prefix=$2 empty=$3 verb=$4 response line shown=0 known= name=
     response=$(printf '%s\n' "$command" | "$socat" -t "$wait_for_answer" - "UNIX-CONNECT:$sock" 2>/dev/null) ||
         unreachable
     while IFS= read -r line; do
@@ -137,13 +143,40 @@ inventory() {{
             ok) break ;;
             'err '*) die "task: ${{line#err }}" 1 ;;
             "$prefix "*)
-                shown=1
                 line=${{line#"$prefix "}}
+                # The operation this row is about, for the filter and for the "what IS here" list.
+                # The two answers name it in different places, as the host's own two filters do: a
+                # `LIST` row leads with the name, a `SECRETS` row carries a `task=<name>` field
+                # among the rest.
+                if [ "$command" = LIST ]; then
+                    name=${{line%%$'\t'*}}
+                else
+                    name=
+                    local field
+                    for field in $line; do
+                        case $field in task=*) name=${{field#task=}} ;; esac
+                    done
+                fi
+                case " $known " in
+                    *" $name "*) ;;
+                    *) known="${{known:+$known, }}$name" ;;
+                esac
+                [ -z "$filter" ] || [ "$name" = "$filter" ] || continue
+                shown=1
                 printf '%s\n' "${{line//$'\t'/  }}"
                 ;;
         esac
     done <<< "$response"
-    [ "$shown" = 1 ] || printf '%s\n' "$empty"
+    if [ "$shown" = 0 ]; then
+        # A filter that matched nothing is not the same answer as an empty inventory, and the host
+        # says which: "did I misspell it, or is it not declared?" is answered by the list.
+        if [ -n "$filter" ] && [ -n "$known" ]; then
+            printf 'sbx: task %s: no operation "%s" here\n' "$verb" "$filter" >&2
+            printf '       declared here: %s\n' "$known" >&2
+            exit 2
+        fi
+        printf '%s\n' "$empty"
+    fi
     exit 0
 }}
 
@@ -311,12 +344,12 @@ case ${{1-}} in
     list | ls)
         shift
         check_inventory_args list "$@"
-        inventory LIST task 'no declared operations'
+        inventory LIST task 'no declared operations' list
         ;;
     secrets)
         shift
         check_inventory_args secrets "$@"
-        inventory SECRETS secret 'no credentials are carried by the declared operations'
+        inventory SECRETS secret 'no credentials are carried by the declared operations' secrets
         ;;
     run)
         shift
@@ -460,6 +493,121 @@ mod tests {
     fn an_interpolated_path_cannot_escape_its_quoting() {
         let quoted = quote(&PathBuf::from("/store/it's/bin/socat"));
         assert_eq!(quoted, r"'/store/it'\''s/bin/socat'");
+    }
+
+    /// Render the client with a **stub** in place of `socat` — a script that ignores its arguments
+    /// and prints `reply` — so the parts of this client that are logic rather than plumbing can be
+    /// run rather than only read. Returns the client's path and the directory holding both.
+    fn client_answering(reply: &str) -> (crate::testutil::TmpDir, PathBuf) {
+        let dir = crate::testutil::TmpDir::new();
+        let socat = dir.path().join("socat");
+        std::fs::write(
+            &socat,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\nprintf '%s' {}\n",
+                quote_sh(reply)
+            ),
+        )
+        .expect("write the stub");
+        std::fs::set_permissions(&socat, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let path = dir.path().join("task-client");
+        write(
+            &path,
+            Path::new("/usr/bin/bash"),
+            &socat,
+            Path::new("/usr/bin/head"),
+            "/tmp/sbx-task.sock",
+        )
+        .expect("write the client");
+        (dir, path)
+    }
+
+    /// Single-quote for `/bin/sh`, for the stub above.
+    fn quote_sh(text: &str) -> String {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
+
+    fn run_client(path: &Path, args: &[&str]) -> (i32, String, String) {
+        let out = std::process::Command::new(path)
+            .args(args)
+            .output()
+            .expect("run the client");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// The bare word `list` and `secrets` take is an **operation name**, and on the host it narrows
+    /// the listing to that one. This client read it as a session id and dropped it, so the same
+    /// command showed one operation on the host and the whole inventory in the cage, with nothing
+    /// said about the difference.
+    #[test]
+    fn the_client_narrows_a_listing_to_the_operation_named() {
+        let reply = "task build\tparams=\tstdout=show\ntask deploy\tparams=env\tstdout=hide\nok\n";
+        let (_dir, client) = client_answering(reply);
+
+        let (code, out, _) = run_client(&client, &["task", "list"]);
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("build") && out.contains("deploy"),
+            "unfiltered, every operation is listed: {out}"
+        );
+
+        let (code, out, _) = run_client(&client, &["task", "list", "deploy"]);
+        assert_eq!(code, 0, "a name that is there is not an error");
+        assert!(
+            out.contains("deploy") && !out.contains("build"),
+            "the listing must narrow to the operation named: {out}"
+        );
+
+        // A name that is not there is its own answer, and it says what IS there — the same question
+        // the host answers with the list rather than a bare "no match".
+        let (code, _, err) = run_client(&client, &["task", "list", "nope"]);
+        assert_eq!(code, 2, "a name nothing carries is a usage error");
+        assert!(
+            err.contains("no operation \"nope\"")
+                && err.contains("build")
+                && err.contains("deploy"),
+            "the refusal must name what is declared here: {err}"
+        );
+    }
+
+    /// The other listing verb names its operation in a field rather than in the first column, which
+    /// is how the host's own two filters differ.
+    #[test]
+    fn the_client_narrows_credentials_by_the_operation_that_carries_them() {
+        let reply = "secret TOKEN\ttask=build\tvia=env\nsecret KEY\ttask=deploy\tvia=header\nok\n";
+        let (_dir, client) = client_answering(reply);
+
+        let (code, out, _) = run_client(&client, &["task", "secrets", "deploy"]);
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("KEY") && !out.contains("TOKEN"),
+            "only the named operation's credentials: {out}"
+        );
+
+        let (code, _, err) = run_client(&client, &["task", "secrets", "nope"]);
+        assert_eq!(code, 2);
+        assert!(err.contains("build") && err.contains("deploy"), "{err}");
+    }
+
+    /// An empty inventory and a filter that matched nothing are different answers, and only the
+    /// second is an error.
+    #[test]
+    fn an_empty_inventory_is_not_a_failed_filter() {
+        let (_dir, client) = client_answering("ok\n");
+        let (code, out, _) = run_client(&client, &["task", "list"]);
+        assert_eq!(code, 0);
+        assert!(out.contains("no declared operations"), "{out}");
+
+        let (code, out, _) = run_client(&client, &["task", "list", "build"]);
+        assert_eq!(
+            code, 0,
+            "nothing is declared at all, so there is nothing to have misspelled"
+        );
+        assert!(out.contains("no declared operations"), "{out}");
     }
 
     // The client is executable and not writable: it is bound read-only into the cage, and a host
