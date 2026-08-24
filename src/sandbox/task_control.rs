@@ -363,7 +363,6 @@ pub(crate) struct TaskLog {
 #[derive(Default)]
 struct Inner {
     entries: std::collections::VecDeque<LogEntry>,
-    dropped: u64,
     /// How many entries have ever been appended — the source of every entry's
     /// [`cursor`](LogEntry::cursor), and therefore the head a reader is handed to come back with.
     /// Counted rather than read off the last entry so that an eviction cannot walk it backwards.
@@ -398,8 +397,10 @@ impl TaskLog {
         inner.appended += 1;
         entry.cursor = inner.appended;
         if inner.entries.len() == LOG_CAPACITY {
+            // No lifetime eviction counter is kept: what a reader is told is the gap between its
+            // own cursor and the window it is handed, which `since` computes from the oldest entry
+            // still held. A running total answers a question nobody asks here.
             inner.entries.pop_front();
-            inner.dropped += 1;
         }
         inner.entries.push_back(entry);
     }
@@ -415,6 +416,17 @@ impl TaskLog {
     /// run backwards.
     fn since(&self, after: u64) -> (Vec<LogEntry>, u64, u64) {
         let inner = locked(&self.inner);
+        // What fell out of the ring **between this reader's cursor and the window it is being
+        // handed** — the same question every other feed answers, and the one its reader asks: a
+        // `--follow` tick prints "earlier event(s) evicted from a ring before this poll". The
+        // lifetime counter answered a different question, so once anything had ever been evicted
+        // every later poll reported the same total again, for the rest of the session, over polls
+        // that had lost nothing. Append order is contiguous, so the gap is arithmetic on the oldest
+        // entry still held.
+        let evicted = match inner.entries.front() {
+            Some(oldest) if oldest.cursor > after + 1 => oldest.cursor - after - 1,
+            _ => 0,
+        };
         (
             inner
                 .entries
@@ -422,7 +434,7 @@ impl TaskLog {
                 .filter(|e| e.cursor > after)
                 .cloned()
                 .collect(),
-            inner.dropped,
+            evicted,
             inner.appended,
         )
     }
@@ -3416,15 +3428,37 @@ mod tests {
         assert!(!line.contains("\nevent"), "{line}");
     }
 
+    /// What a reader is told is the gap between **its own cursor** and the window it is handed, on
+    /// the terms every other feed answers on: a `--follow` tick prints "earlier event(s) evicted
+    /// from a ring before this poll". A lifetime total answers a different question, and answering
+    /// it here made every poll after the first eviction report the same number again, for the rest
+    /// of the session, over polls that had lost nothing.
     #[test]
-    fn the_ring_evicts_the_oldest_and_reports_the_drop() {
+    fn the_ring_evicts_the_oldest_and_reports_the_gap_the_reader_missed() {
         let log = TaskLog::new();
         for _ in 0..LOG_CAPACITY + 3 {
             log.push(entry(1, "t", 0));
         }
-        let (entries, dropped, _) = log.since(0);
+        // From the beginning: the three that fell out before the retained window.
+        let (entries, dropped, head) = log.since(0);
         assert_eq!(entries.len(), LOG_CAPACITY);
         assert_eq!(dropped, 3);
+
+        // A reader already at the head has missed nothing, however much the ring has evicted over
+        // its life. This is the poll that used to keep reporting the total.
+        let (nothing, dropped, _) = log.since(head);
+        assert!(nothing.is_empty());
+        assert_eq!(dropped, 0, "a caught-up reader has lost nothing");
+
+        // Two more evictions past that cursor are two, not five.
+        for _ in 0..2 {
+            log.push(entry(1, "t", 0));
+        }
+        let (_, dropped, _) = log.since(head - LOG_CAPACITY as u64);
+        assert_eq!(
+            dropped, 2,
+            "the gap is measured from the reader's own cursor"
+        );
     }
 
     // The response parser reads each stream by byte count, so a payload that happens to contain the
