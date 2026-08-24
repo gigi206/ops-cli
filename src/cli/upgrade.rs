@@ -446,13 +446,20 @@ fn app_selector_refusal(cfg: &config::Resolved, name: &str, what: &str) -> Optio
 /// Whether this app's cage equips any `mise:` package — its own or one the project baseline folds
 /// in, since an app's cage equips both layers.
 ///
-/// Asks the question the roll asks, through the roll's own function: a package an untrusted layer
-/// declared is withheld from the equip, so counting it here would let the selector accept an app,
-/// roll zero groups, and print the "nothing rolled" that the refusals exist to replace with a
-/// reason. The withheld packages are surfaced by the roll's own warning either way.
+/// Asks the question the roll asks, of the set the roll sees: the **merged** one, through
+/// `merge_app` itself. The two layers were tested separately, which is not how they meet — a
+/// package is folded by *name*, so an app re-declaring a baseline `mise:` tool as `nix:` replaces
+/// it, and asking each layer on its own still found the baseline's. The selector then accepted the
+/// app, the roll equipped no mise package, and the run printed the "nothing rolled" these refusals
+/// exist to replace with a reason.
+///
+/// A package an untrusted layer declared is withheld from the equip, so `mise_packages` (the
+/// roll's own filter) is what decides, not the backend alone. The withheld ones are surfaced by
+/// the roll's own warning either way.
 fn declares_mise_package(cfg: &config::Resolved, app: &config::ResolvedApp) -> bool {
-    let equipped = |pkgs: &[config::Package]| !sandbox::mise_packages(pkgs).is_empty();
-    equipped(&cfg.packages) || equipped(&app.packages)
+    let mut merged = cfg.clone();
+    merged.merge_app(app.clone());
+    !sandbox::mise_packages(&merged.packages).is_empty()
 }
 
 /// What advances one declared package, seen from a single app.
@@ -1721,6 +1728,29 @@ mod tests {
         cfg.apps.insert("shady".into(), untrusted);
         let withheld = app_selector_refusal(&cfg, "shady", "mise").expect("withheld-only refused");
         assert!(withheld.contains("no `mise:` package"), "{withheld}");
+
+        // The layers meet by *name*, so an app that re-declares a baseline `mise:` tool under
+        // another backend replaces it — its cage equips no mise package at all. Asking each layer
+        // on its own still found the baseline's, so the selector accepted the app, the roll
+        // equipped nothing, and the run ended in the bare "nothing rolled" these messages replace.
+        let mut baseline = crate::testutil::resolved(vec![], vec![]);
+        baseline.packages = vec![pkg("tool", config::Backend::Mise("aqua:demo/tool".into()))];
+        let mut overrides = crate::testutil::app_with(vec![]);
+        overrides.packages = vec![pkg("tool", config::Backend::Nix("hello".into()))];
+        baseline.apps.insert("swapped".into(), overrides);
+        let shadowed =
+            app_selector_refusal(&baseline, "swapped", "mise").expect("an overridden tool is gone");
+        assert!(shadowed.contains("no `mise:` package"), "{shadowed}");
+
+        // The control, one name apart: an app that adds its own tool beside the baseline's still
+        // has work, and so does one that inherits the baseline's untouched.
+        let mut beside = crate::testutil::app_with(vec![]);
+        beside.packages = vec![pkg("other", config::Backend::Nix("hello".into()))];
+        baseline.apps.insert("beside".into(), beside);
+        assert!(
+            app_selector_refusal(&baseline, "beside", "mise").is_none(),
+            "the baseline's tool is still equipped when the app names a different one"
+        );
     }
 
     /// A package with one backend, trusted unless said otherwise.
