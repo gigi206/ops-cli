@@ -618,9 +618,16 @@ impl Credentials {
             return false;
         }
         let bytes = credential.as_bytes();
+        // The cap counts the **learned** needles only, which is what [`OBSERVE_MAX`] is about: it
+        // bounds what a cage rotating through values can add, and a declared needle is not that.
+        // Counting the whole set turned the ceiling into a switch — `HeaderShape::needles` emits
+        // *two* needles for a `basic`-shaped secret, so four declared credentials filled it and this
+        // function then learned nothing for the rest of the launch, silently leaving every
+        // cage-acquired token outside the redaction and the outbound tripwire.
+        let observed = |set: &CredentialSet| set.needles.iter().filter(|n| n.is_observed()).count();
         {
             let current = self.snapshot();
-            if current.needles.len() >= OBSERVE_MAX
+            if observed(&current) >= OBSERVE_MAX
                 || current.needles.iter().any(|n| n.as_bytes() == bytes)
             {
                 return false;
@@ -631,7 +638,7 @@ impl Credentials {
         };
         // Re-checked under the write lock: two threads can reach the check above with the same new
         // credential, and a duplicate needle would scan the same bytes twice for the same result.
-        if current.needles.len() >= OBSERVE_MAX
+        if observed(&current) >= OBSERVE_MAX
             || current.needles.iter().any(|n| n.as_bytes() == bytes)
         {
             return false;
@@ -1238,6 +1245,49 @@ mod tests {
             creds.snapshot().needles.len(),
             OBSERVE_MAX,
             "the scan set is bounded whatever the cage rotates through"
+        );
+    }
+
+    /// `OBSERVE_MAX` is documented as "The most **observed** credentials kept" — it bounds what a
+    /// cage rotating through values can add to a set that is scanned against every request head and
+    /// every response chunk. The check counted the whole needle set instead, declared needles
+    /// included, which turned a ceiling into a switch: `HeaderShape::needles` emits *two* needles
+    /// for a `basic`-shaped secret, so four declared credentials filled it and nothing was ever
+    /// learned again — every token the cage obtained by its own sign-in stayed outside the
+    /// redaction and the outbound tripwire, silently, on exactly the launches that declare the most.
+    #[test]
+    fn a_launch_full_of_declared_needles_still_observes_what_the_cage_obtains() {
+        let declared: Vec<SecretNeedle> = (0..OBSERVE_MAX)
+            .map(|i| {
+                SecretNeedle::named(
+                    format!("declared-{i}"),
+                    format!("declared-value-{i:0>20}").into_bytes(),
+                )
+            })
+            .collect();
+        let creds = default_creds(Vec::new(), declared);
+        assert_eq!(creds.snapshot().needles.len(), OBSERVE_MAX);
+
+        assert!(
+            creds.observe("authorization", "Bearer tok-0123456789abcdef", "host.test"),
+            "a declared set at the cap must not stop the cage's own credential being learned"
+        );
+
+        // And the cap still binds the population it is about.
+        for i in 0..OBSERVE_MAX + 5 {
+            creds.observe(
+                "authorization",
+                &format!("Bearer tok-{i:0>20}"),
+                "host.test",
+            );
+        }
+        let set = creds.snapshot();
+        let learned = set.needles.iter().filter(|n| n.is_observed()).count();
+        assert_eq!(learned, OBSERVE_MAX, "the learned population is bounded");
+        assert_eq!(
+            set.needles.len(),
+            OBSERVE_MAX * 2,
+            "and the declared ones were never evicted to make room"
         );
     }
 
