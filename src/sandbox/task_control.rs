@@ -423,8 +423,13 @@ impl TaskLog {
         // every later poll reported the same total again, for the rest of the session, over polls
         // that had lost nothing. Append order is contiguous, so the gap is arithmetic on the oldest
         // entry still held.
+        // `saturating_add`, because `after` is whatever the caller put on the wire — and on this
+        // socket the caller is the cage. `after + 1` at `u64::MAX` panics in a debug build and wraps
+        // in a release one (nothing sets `overflow-checks`), and the wrap lands here as a fabricated
+        // eviction count rather than as a failure. Saturating gives the true answer for that cursor
+        // too: nothing can be newer than `u64::MAX`, so nothing was missed.
         let evicted = match inner.entries.front() {
-            Some(oldest) if oldest.cursor > after + 1 => oldest.cursor - after - 1,
+            Some(oldest) if oldest.cursor > after.saturating_add(1) => oldest.cursor - after - 1,
             _ => 0,
         };
         (
@@ -3228,6 +3233,29 @@ mod tests {
     // The log is the trustworthy record: the timestamp is stamped host-side and the substitution
     // count is host-side — none of it is anything a caller can forge. The id is the *invocation's*,
     // carried in rather than counted here, so one number names an invocation everywhere.
+    /// A cursor at `u64::MAX` is answered, not panicked on.
+    ///
+    /// `after` is whatever the caller wrote on the wire, and on the cage-facing socket the caller is
+    /// the adversary. The eviction gap was `oldest.cursor > after + 1`, which at `u64::MAX` panics in
+    /// a debug build — while the ring's lock is held, so it would poison the log for the rest of the
+    /// session — and wraps in a release one into an eviction count that was never true. The `TaskLog`
+    /// doc gives "no arithmetic that can overflow" as a reason the lock cannot be poisoned, so this
+    /// was the one line falsifying its own guarantee.
+    #[test]
+    fn a_cursor_at_the_end_of_the_number_line_is_answered_not_panicked_on() {
+        let log = TaskLog::new();
+        log.push(entry(4, "db-query", 0));
+        let (entries, dropped, _head) = log.since(u64::MAX);
+        assert!(
+            entries.is_empty(),
+            "nothing can be newer than the largest cursor there is"
+        );
+        assert_eq!(
+            dropped, 0,
+            "and nothing was missed reaching it — a wrapped subtraction reported otherwise"
+        );
+    }
+
     #[test]
     fn the_log_keeps_the_invocations_own_id_and_stamps_the_time() {
         let log = TaskLog::new();

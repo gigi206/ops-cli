@@ -3168,6 +3168,32 @@ pub(crate) fn effective_lock_target(
     }
 }
 
+/// The read-write binds a launch pins its control plane against: the config's own, plus the project
+/// root.
+///
+/// The project is the one that used to be missing, and it is the one most likely to contain a
+/// control-plane root. `binds::build_spec` binds it read-write at its own path *structurally* — it
+/// is the work surface, not a configured bind — so it never appeared in `cfg.binds` and never
+/// reached [`crate::config::control_plane_pins`]. A session launched from a directory containing a
+/// root therefore handed the cage sbx's data dir, trust store and global config read-write and
+/// unpinned; `cd ~ && sbx run` is the whole of it, since all three roots live under `$HOME`.
+///
+/// Pure, and separate from the launch it serves, so the containment can be asserted without one.
+///
+/// The project path is canonicalized to match what it is compared against:
+/// `sbx_control_plane_roots` resolves symlinks, so a symlinked `$HOME` component would otherwise
+/// walk straight past the containment test. A path that cannot be canonicalized (it must exist to
+/// be a project, so this is the unusual case) is carried through as written rather than dropped —
+/// pinning on the literal path is worth more than pinning on nothing.
+fn pin_sources(binds: &[crate::config::Bind], project: &Path) -> Vec<crate::config::Bind> {
+    let mut sources = binds.to_vec();
+    sources.push(crate::config::Bind {
+        path: std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf()),
+        writable: true,
+    });
+    sources
+}
+
 /// Establish the mountpoint-chain pins that protect sbx's control plane: create each pin's host
 /// path (they are sbx's own directories — creating a not-yet-existent root here is what stops the
 /// agent pre-creating it unpinned) and turn it into the extra bind that freezes it. On the first
@@ -4747,7 +4773,20 @@ fn build(
     // Interdependency: the protection assumes in-cage code cannot `umount` a pin. That holds because
     // bwrap drops all capabilities (no `CAP_SYS_ADMIN` in the cage's user namespace) and the seccomp
     // filter denies `umount2`/`unshare`/`mount` — a change loosening either would silently break it.
-    match establish_control_plane_pins(&crate::config::control_plane_pins(&prep.cfg.binds)) {
+    // The project counts as one of those read-write binds, and used not to. It is bound read-write
+    // at its own path by `binds::build_spec` structurally rather than as a config bind, so it never
+    // reached this computation — and a session launched from a directory that *contains* a
+    // control-plane root (`cd ~ && sbx run` is the whole of it, since all three roots live under
+    // `$HOME`) handed the cage sbx's data dir, trust store and global config read-write, unpinned.
+    // `build_spec`'s own doc states the contract that closes it — "a caller launching an untrusted
+    // actor must first confine the project root" — and no caller implements it, so pinning is what
+    // this one can do without changing which directories a person may launch from.
+    //
+    // Canonicalized to match: `sbx_control_plane_roots` resolves symlinks, and a bind is compared
+    // against them canonicalized, so a symlinked `$HOME` component would otherwise walk past the
+    // containment test.
+    let sources = pin_sources(&prep.cfg.binds, &prep.cwd);
+    match establish_control_plane_pins(&crate::config::control_plane_pins(&sources)) {
         Ok(pins) => extra_binds.extend(pins),
         Err(e) => {
             // Fail closed: if a pin cannot be established the containing read-write bind would be
@@ -6316,6 +6355,56 @@ mod tests {
         assert!(
             !argv.iter().any(|a| a == "--args"),
             "an unused mechanism must leave no trace in the argv"
+        );
+    }
+
+    /// The project root reaches the control-plane pin computation, which is the whole point: it is
+    /// bound read-write structurally rather than as a config bind, so it used to be invisible here
+    /// — and `cd ~ && sbx run` then handed the cage sbx's own data dir, trust store and global
+    /// config read-write with nothing pinning them.
+    #[test]
+    fn the_project_root_is_one_of_the_binds_the_control_plane_is_pinned_against() {
+        let tmp = crate::testutil::TmpDir::new();
+        let project = tmp.path().join("work");
+        std::fs::create_dir_all(&project).expect("project dir");
+
+        let declared = vec![crate::config::Bind {
+            path: PathBuf::from("/srv/data"),
+            writable: true,
+        }];
+        let sources = pin_sources(&declared, &project);
+
+        assert!(
+            sources.iter().any(|b| b.path == Path::new("/srv/data")),
+            "the declared binds still reach the pins: {sources:?}"
+        );
+        let canon = std::fs::canonicalize(&project).expect("the project exists");
+        let entry = sources
+            .iter()
+            .find(|b| b.path == canon)
+            .expect("the project root is among the pin sources");
+        assert!(
+            entry.writable,
+            "it has to be read-write to be pinned at all — `control_plane_pins` only walks writable binds"
+        );
+    }
+
+    /// And it arrives canonicalized, because the roots it is tested for containment against are.
+    /// A symlinked component would otherwise mean the project never looks like it contains anything.
+    #[test]
+    fn the_project_root_is_canonicalized_before_it_is_pinned_against() {
+        let tmp = crate::testutil::TmpDir::new();
+        let real = tmp.path().join("real-home");
+        std::fs::create_dir_all(&real).expect("real dir");
+        let link = tmp.path().join("via-link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let sources = pin_sources(&[], &link);
+        let only = sources.last().expect("the project is always pushed");
+        assert_eq!(
+            only.path,
+            std::fs::canonicalize(&real).expect("canonical real"),
+            "the symlink was carried through instead of being resolved: {sources:?}"
         );
     }
 

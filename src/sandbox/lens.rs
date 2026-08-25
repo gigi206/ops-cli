@@ -170,8 +170,11 @@ impl<E: Event> Ring<E> {
             .filter(|e| e.seq() > cursor)
             .cloned()
             .collect();
+        // Saturating for the same reason the task feed's twin is: `a` is parsed straight off the
+        // wire with no ceiling, and `a + 1` at `u64::MAX` panics in debug and wraps in release into
+        // a `dropped=` count that was never true.
         let dropped = match (after, g.events.front()) {
-            (Some(a), Some(oldest)) if oldest.seq() > a + 1 => oldest.seq() - a - 1,
+            (Some(a), Some(oldest)) if oldest.seq() > a.saturating_add(1) => oldest.seq() - a - 1,
             _ => 0,
         };
         Snapshot {

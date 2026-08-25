@@ -868,8 +868,11 @@ impl LogRing {
                 }
             }
         }
+        // Saturating: `a` comes off the wire unbounded, and `a + 1` at `u64::MAX` panics in debug
+        // and wraps in release — here while the ring's lock is held, so the debug panic would poison
+        // it for the rest of the launch.
         let dropped = match (after, g.events.front()) {
-            (Some(a), Some(oldest)) if oldest.seq > a + 1 => oldest.seq - a - 1,
+            (Some(a), Some(oldest)) if oldest.seq > a.saturating_add(1) => oldest.seq - a - 1,
             _ => 0,
         };
         LogSnapshot {
