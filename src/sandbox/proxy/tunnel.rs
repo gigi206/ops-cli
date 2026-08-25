@@ -560,11 +560,15 @@ pub(super) fn serve_tunneled_request(
     //
     //     Two known properties of an opened WebSocket, deliberate and bounded to a low-volume agent
     //     stream (documented, not silent):
-    //       - Posture: an upgrade is a `GET`, so it rides a `GET`/`{*}` allow. A read-only `{GET}` rule
-    //         therefore permits opening a *bidirectional* channel to that host/path. This is accepted
-    //         (the handshake is a legitimate GET and the host/path is still gated); a dedicated
-    //         `ws://` opt-in scheme, if a read-only-should-forbid-WS case ever arises, is a future
-    //         refinement, not a gap here.
+    //       - Posture: the upgrade is judged under the `WS` pseudo-verb, not under the handshake's
+    //         literal `GET` — step 4 rewrites `imethod` to `WS` the moment the handshake is
+    //         recognised, so the verdict, the log and the stats all name it. Only a rule naming
+    //         `WS` (`{WS}` or `{…,WS}`) admits it: a bare rule does not, `{GET,HEAD}` does not,
+    //         `{*}` does not, and a `WS` never reaches the default action either (see
+    //         `EgressPolicy::explain`), so a denylist posture does not hand one out. Refused, it
+    //         reads `denied-method` for `WS`, and the log names it that way. A bidirectional,
+    //         unredactable channel is its own capability and is granted deliberately — this is no
+    //         longer the earlier posture, where a read-only `{GET}` allow opened one.
     //       - Once opened, the framed bytes are relayed VERBATIM: they are NOT scanned by the
     //         response-side redaction ([`pump_redacting`]), so a secret a peer reflects inside a
     //         frame reaches the cage as it was sent. The boundary stays the empty netns + the

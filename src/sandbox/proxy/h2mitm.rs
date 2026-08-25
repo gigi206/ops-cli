@@ -547,6 +547,16 @@ async fn relay(
     };
     let (mut rparts, up_body) = resp.into_parts();
     ctx.set_status(seq, rparts.status.as_u16());
+    // A `401` from a host this stream carried a credential to is the destination itself saying the
+    // value is no longer accepted — the one signal worth re-resolving on. Both HTTP/1.1 planes have
+    // always done this beside their own `set_status`; this one only recorded the status, so an
+    // injected token that went stale mid-session stayed stale for every later stream on the h2 plane
+    // while the very same credential refreshed on the other two. Same gate as theirs: a *refreshable*
+    // injection this request actually carried, so a refusal from a host sbx injects nothing into can
+    // never let an in-cage agent drive the resolver.
+    if rparts.status.as_u16() == 401 && super::any_refreshable(&creds, &injected_ids) {
+        ctx.credential_refused();
+    }
     // Stop sharing a connection the upstream has just bound an identity to — see
     // [`binds_identity_to_the_connection`].
     if binds_identity_to_the_connection(&rparts.headers) {
@@ -2523,6 +2533,102 @@ mod tests {
             seen.header("content-type"),
             Some("application/grpc"),
             "the client's other headers are carried through untouched"
+        );
+    }
+
+    /// A `401` from an injection target re-resolves the credential on this plane too.
+    ///
+    /// Both HTTP/1.1 planes have done this since the refresher existed, beside their own
+    /// `set_status`. This one recorded the status and stopped there, so a token that went stale
+    /// mid-session stayed stale for every later h2 stream while the very same credential refreshed
+    /// on the other two. The refused stream itself is already lost — its head reached the cage
+    /// before the status was read — so what is asserted is the credential state, which is what the
+    /// *next* stream would carry.
+    ///
+    /// The two negative arms are what keep the gate from being satisfied by refreshing on
+    /// everything: a `200` says nothing about the credential, and a `401` from a host sbx injects
+    /// nothing into must never let an in-cage agent spend a resolver run.
+    #[test]
+    fn a_401_from_an_injection_target_re_resolves_the_credential_on_the_h2_plane() {
+        use crate::allowlist::classify;
+        use crate::sandbox::proxy::{CredentialRefresh, Credentials, HeaderInjection};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // One exchange against an upstream answering `status`, with a refresher wired and a fixed
+        // `authorization` injection scoped to `inject_host`. Reports how often the resolver ran and
+        // what the credential holds afterwards.
+        fn run(status: StatusCode, inject_host: &str) -> (usize, String) {
+            let trace = Arc::new(H2Trace::default());
+            let (addr, upstream_ca) = spawn_h2_upstream(
+                1,
+                vec![b"h2".to_vec()],
+                UpstreamReply {
+                    status,
+                    ..UpstreamReply::grpc("")
+                },
+                Arc::clone(&trace),
+            );
+            let credentials = Arc::new(Credentials::new(
+                vec![HeaderInjection::fixed(
+                    classify(inject_host).unwrap(),
+                    "authorization".to_string(),
+                    "Bearer stale".to_string(),
+                )],
+                Vec::new(),
+                crate::sandbox::redact::MIN_LEN_DEFAULT,
+            ));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&calls);
+            let scope = inject_host.to_string();
+            let refresh = Arc::new(CredentialRefresh::new(
+                Arc::clone(&credentials),
+                Box::new(move |_| {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Ok((
+                        vec![HeaderInjection::fixed(
+                            classify(&scope).unwrap(),
+                            "authorization".to_string(),
+                            "Bearer refreshed".to_string(),
+                        )],
+                        Vec::new(),
+                    ))
+                }),
+            ));
+            let (ctx, _stats, _log, _dir) = relaying_ctx(upstream_ca);
+            let ctx = ctx
+                .with_shared_credentials(Arc::clone(&credentials))
+                .with_refresh(refresh);
+
+            let answer = through_h2_proxy(
+                &ctx,
+                "grpc.test",
+                addr.port(),
+                grpc_request(&[]),
+                None,
+                &trace,
+            );
+            assert_eq!(
+                answer.status, status,
+                "the upstream's own status reached the cage"
+            );
+            let value = credentials.snapshot().injections[0].value().to_string();
+            (calls.load(Ordering::SeqCst), value)
+        }
+
+        assert_eq!(
+            run(StatusCode::UNAUTHORIZED, "grpc.test:*"),
+            (1, "Bearer refreshed".to_string()),
+            "a 401 from the injection target must re-resolve exactly once"
+        );
+        assert_eq!(
+            run(StatusCode::OK, "grpc.test:*"),
+            (0, "Bearer stale".to_string()),
+            "a successful response is not a signal about the credential"
+        );
+        assert_eq!(
+            run(StatusCode::UNAUTHORIZED, "other.test:*"),
+            (0, "Bearer stale".to_string()),
+            "a 401 from a host sbx injects nothing into must not reach the resolver"
         );
     }
 

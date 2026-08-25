@@ -566,8 +566,13 @@ pub(crate) struct RawLimits {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub(crate) enum RawLimit {
-    /// A bare number: a byte count (memory) or a task count (tasks).
-    Number(u64),
+    /// A bare number: a byte count (memory) or a task count (tasks). Held as an `i64` — like
+    /// [`RawForward::Port`] and for the same reason: a `u64` variant refuses a negative integer at
+    /// the *parse* layer, and since this is an untagged enum whose other variant is a string, a
+    /// `tasks_max = -1` then failed the whole file instead of the one field. Signed values are
+    /// refused downstream by the systemd-grammar checks, which name the limit and fall back to its
+    /// default.
+    Number(i64),
     /// A string form: a percentage (`"80%"`), a suffixed byte size (`"16G"`), or `"infinity"`.
     Text(String),
 }
@@ -652,8 +657,13 @@ pub(crate) struct RawFs {
     /// The scan is bounded so that opening a large artefact costs a bounded read; a file longer than
     /// this is judged on its start, and the launch says so rather than presenting a prefix as a
     /// whole-file result.
+    ///
+    /// Signed, like [`RawForward::Port`]: a `u64` refused a negative value at the *parse* layer,
+    /// which fails the whole file — so `scan_max_kb = -1` cost a config its packages, apps and
+    /// binds over one number. It is range-checked where the rest of `[fs]` is validated, and a
+    /// value that is not a size is dropped there, alone and named.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) scan_max_kb: Option<u64>,
+    pub(crate) scan_max_kb: Option<i64>,
     /// Unknown keys in this table, kept so they can be reported.
     #[serde(flatten)]
     pub(crate) rest: BTreeMap<String, RawIgnored>,
@@ -707,8 +717,14 @@ pub(crate) struct RawSshAgent {
 }
 
 /// One `[plugin.<name>]` table: what this host supplies to the named resolver plugin.
+///
+/// No `deny_unknown_fields`, like every other table here: a config is additive and never a hard
+/// parse wall, and refusing a key at the *parse* layer fails the whole file — one mistyped key
+/// under one plugin would take the packages, apps and credentials written beside it with it. An
+/// unknown key lands in `rest` and is reported instead. The refusals this table does want are
+/// per-name and enforced downstream against the plugin's manifest: a variable it does not read,
+/// a program it never runs.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct RawPluginConfig {
     /// Values for variables the plugin reads, as `<VAR> = "<value>"`.
     ///
@@ -737,12 +753,20 @@ pub(crate) struct RawPluginConfig {
     /// from the global config or a trusted project only.
     #[serde(default)]
     pub(crate) programs: BTreeMap<String, String>,
+    /// Unknown keys in this table, kept so they can be reported.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
 /// One `[broker.<name>]` table: the host resource an installed broker plugin stands in front of,
 /// and the policy it brokers under.
+///
+/// No `deny_unknown_fields`: it fails the whole config file for one mistyped key, and it also
+/// silenced the `rest` bag below — the unknown-key warning `resolve_brokers` emits could never
+/// fire, because the parse had already refused the document. The keys this table refuses by
+/// *provenance* (a `socket` or a `secret` written in a project config) are named where the layer
+/// is known, not here.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct RawBrokerConfig {
     /// The host resource's Unix socket, e.g. `"$XDG_RUNTIME_DIR/gnupg/S.gpg-agent"`. sbx connects
     /// to it and holds that connection; the plugin never receives it.
@@ -1879,6 +1903,14 @@ pub(crate) struct ProcTable {
     pub(crate) allow: Vec<String>,
     #[serde(default)]
     pub(crate) deny: Vec<String>,
+    /// Unknown keys in this table, kept so they can be reported. The sharpest silence in the
+    /// schema was here: a misspelled `deny` left `mode = "enforce"` enforcing an empty list, and
+    /// `config show` printed the mode that did take effect beside the rules that did not.
+    ///
+    /// Reported, never refused at the parse layer — this is an untagged-enum variant
+    /// ([`ProcField`]), so a rejected key fails the variant and drops the whole config layer.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
 /// The two shapes the `notify` field accepts: a bare mode string, or a table for the per-event
@@ -1911,6 +1943,12 @@ pub(crate) struct NotifyTable {
     /// is announced, and `once` ignores it — that mode never repeats at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) repeat_after: Option<String>,
+    /// Unknown keys in this table, kept so they can be reported — a misspelled `events` or
+    /// `repeat_after` otherwise leaves the mode in force and the refinement written beside it
+    /// silently absent. Reported, never refused at the parse layer: this is an untagged-enum
+    /// variant ([`NotifyField`]), so a rejected key fails the variant and drops the whole layer.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
 /// The two shapes `events` accepts, an untagged enum so both TOML forms parse.

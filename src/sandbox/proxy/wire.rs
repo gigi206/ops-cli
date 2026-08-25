@@ -32,8 +32,19 @@ pub(crate) fn header_name_eq(a: &str, b: &str) -> bool {
     norm(a) == norm(b)
 }
 
-/// Parse a request head's bytes into its request line and headers. A non-UTF-8 or empty head is an
-/// error.
+/// Parse a head's bytes into its request (or status) line and headers. A non-UTF-8 or empty head is
+/// an error, and so is a head that opens with an obsolete line fold.
+///
+/// A line beginning with SP or HTAB is a **continuation** of the header above it (the obsolete line
+/// folding of RFC 9112 §5.2), not a header of its own. Splitting it on `:` like any other line —
+/// which is what this did — gave sbx a second view of the same head, and the response side has two
+/// readers that must not disagree: `Content-Length: 5` written as a continuation of the header above
+/// it framed the body for [`response_framing`] while [`rewrite_client_connection`], which already
+/// reads a fold as a fold, relayed it to the cage as text inside that other header. A body two
+/// parsers delimit differently is the response-side desync every other check on this path exists to
+/// prevent — and after it, sbx would park the connection with the rest of the real body still on it.
+/// Unfolded here instead, so every reader of a parsed head sees the one value the fold denotes; the
+/// inspected planes reserialize what they parsed, so the upstream sees that same single line.
 pub(super) fn parse_head(bytes: &[u8]) -> io::Result<Head> {
     let text = std::str::from_utf8(bytes).map_err(|_| invalid("non-UTF-8 request head"))?;
     let mut lines = text.split("\r\n").flat_map(|l| l.split('\n'));
@@ -41,10 +52,23 @@ pub(super) fn parse_head(bytes: &[u8]) -> io::Result<Head> {
     if request_line.is_empty() {
         return Err(invalid("empty request line"));
     }
-    let mut headers = Vec::new();
+    let mut headers: Vec<(String, String)> = Vec::new();
     for line in lines {
         if line.is_empty() {
             break;
+        }
+        if matches!(line.as_bytes().first(), Some(b' ' | b'\t')) {
+            // A fold with nothing above it continues nothing. It is malformed rather than merely
+            // obsolete, so it is refused rather than dropped: dropping it would leave sbx reading a
+            // head some other parser still reads a header out of, which is the disagreement above.
+            let Some((_, value)) = headers.last_mut() else {
+                return Err(invalid("obsolete line fold before any header"));
+            };
+            if !value.is_empty() {
+                value.push(' ');
+            }
+            value.push_str(line.trim());
+            continue;
         }
         if let Some((k, v)) = line.split_once(':') {
             headers.push((k.trim().to_string(), v.trim().to_string()));
@@ -979,6 +1003,53 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nEtag: x\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn a_folded_header_is_unfolded_rather_than_read_as_a_header_of_its_own() {
+        // The two readers of one head have to agree. `rewrite_client_connection` reads a leading
+        // SP/HTAB line as the continuation it is, so what the cage is handed here is an `X-Note`
+        // whose value happens to contain the text `Content-Length: 5`. Framing the body by that
+        // length would leave sbx reading five bytes of a body the cage delimits some other way —
+        // and then parking the connection with the rest of the real body still on it.
+        let folded = &b"HTTP/1.1 200 OK\r\nX-Note: hi\r\n Content-Length: 5\r\n\r\n"[..];
+        assert!(
+            matches!(response_framing(folded, "GET"), BodyFraming::ToEof),
+            "a head whose only length is folded delimits by close, as the head relayed to the \
+             cage does"
+        );
+        let parsed = parse_head(folded).unwrap();
+        assert_eq!(
+            parsed.header("x-note"),
+            Some("hi Content-Length: 5"),
+            "the fold belongs to the value above it"
+        );
+        assert_eq!(
+            parsed.count("content-length"),
+            0,
+            "a folded line is not a header of its own"
+        );
+
+        // Not "refuse every head": an ordinary length still frames the body it declares.
+        assert!(
+            matches!(
+                response_framing(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", "GET"),
+                BodyFraming::Length(5)
+            ),
+            "an unfolded Content-Length frames as it always did"
+        );
+
+        // A fold with nothing above it continues nothing, and both response readers fail closed.
+        let orphan = &b"HTTP/1.1 200 OK\r\n Content-Length: 5\r\n\r\n"[..];
+        assert!(parse_head(orphan).is_err(), "a fold opens no head");
+        assert!(
+            matches!(response_framing(orphan, "GET"), BodyFraming::ToEof),
+            "an unreadable head delimits by close"
+        );
+        assert!(
+            !response_keeps_alive(orphan),
+            "and leaves a connection nothing is known about"
         );
     }
 

@@ -185,6 +185,14 @@ fn net_test(args: &[OsString]) -> ExitCode {
             // the wire). Cleartext is strictly opt-in: only an explicit `http://` allow permits it —
             // the L7 default action above does not open it, so a bare host stays HTTPS-only here too.
             let clear = url.starts_with("http://");
+            // Decided **before** the policy verdict, because that is where the proxy decides it: an
+            // IP-literal CONNECT is answered `403 ip-literal` ahead of the allowlist entirely, so a
+            // rule allowing the address made this command print ALLOWED for a request the wire
+            // refuses — the one answer a tester exists to prevent.
+            if refused_as_ip_literal(&host, clear, &effective.l4_decision(&host, port)) {
+                print!("{}", render_ip_literal_refusal(&url, &host, port, &pal));
+                return ExitCode::SUCCESS;
+            }
             let decision = if clear {
                 effective.explain_clear(&host, port, &path, &method)
             } else {
@@ -210,9 +218,11 @@ fn net_test(args: &[OsString]) -> ExitCode {
             // The policy verdict is only half of what the wire does: the proxy resolves the host and
             // runs the address guard before connecting. Replay that guard here so the tester does not
             // promise a pass the proxy refuses. On an **IP literal** the answer is exact and needs no
-            // resolution, so it replaces the verdict; on a **name** the tester resolves nothing (no
-            // network), so it can only note the condition, and only when the deciding rule does not
-            // name the host exactly (the one shape the guard admits for a private address).
+            // resolution, so it replaces the verdict — which on this path means a cleartext one,
+            // since an inspected IP literal was already answered `ip-literal` above; on a **name**
+            // the tester resolves nothing (no network), so it can only note the condition, and only
+            // when the deciding rule does not name the host exactly (the one shape the guard admits
+            // for a private address).
             let deciding = match &decision {
                 allowlist::Decision::AllowedBy(rule) => Some(*rule),
                 _ => None,
@@ -369,6 +379,56 @@ fn render_l4_decision(target: &str, l4: &allowlist::L4Decision, pal: &style::Pal
             );
         }
     }
+    o
+}
+
+/// Whether the proxy would refuse this target with `ip-literal` before any rule decided it.
+///
+/// The inspected path terminates TLS with a leaf minted for the CONNECT target's name, and an IP
+/// literal carries no name to mint one for — so `src/sandbox/proxy` answers `403 ip-literal` there,
+/// ahead of the allowlist. The one way an address is reached without a name is the **raw splice**,
+/// which inspects nothing and so needs none: a `tcp://host:port` allow rule, checked here through
+/// the same [`allowlist::EgressPolicy::l4_decision`] the proxy consults first. A `Suppressed`
+/// splice is not one — a deny put that connection back on the inspected path, where this refusal is
+/// what meets it.
+///
+/// Cleartext is a different shape and is deliberately not judged here: an `http://` request is
+/// proxied absolute-form with no tunnel to terminate, so an IP literal there is decided by the
+/// address guard alone ([`literal_addr_refusal`]).
+///
+/// Nor is a **proxy-exempt** address, which is a refusal this command must not attribute to the
+/// proxy: a client honoring the cage's `no_proxy` dials its own loopback directly and never asks
+/// the proxy anything, so what is true of `127.0.0.1` is what [`render_loopback_note`] already
+/// says, not `ip-literal`.
+fn refused_as_ip_literal(host: &str, clear: bool, l4: &allowlist::L4Decision) -> bool {
+    !clear
+        && host.parse::<std::net::IpAddr>().is_ok()
+        && !sandbox::egress::proxy_exempt(host)
+        && !matches!(l4, allowlist::L4Decision::Splice(_))
+}
+
+/// Render the wire's answer for an IP-literal target on the inspected path — a pure presenter (its
+/// color is asserted in a test), shaped like [`render_addr_refusal`]: the verdict is the proxy's
+/// (DENIED), and the reason carries the `ip-literal` token it logs and answers with, plus the rule
+/// that would actually reach the address. Every span is empty under a non-terminal, so a capture is
+/// plain text.
+fn render_ip_literal_refusal(target: &str, host: &str, port: u16, pal: &style::Palette) -> String {
+    use std::fmt::Write as _;
+    let (n, err, r) = (pal.name, pal.err, pal.reset);
+    let mut o = String::new();
+    let _ = writeln!(o, "{err}DENIED{r}   {n}{target}{r}");
+    let _ = writeln!(
+        o,
+        "  {}",
+        style::dim_prose(
+            &format!(
+                "the proxy refuses an IP-literal target on the inspected path (`ip-literal`): \
+                 there is no hostname to mint a certificate for, whatever the policy says. Declare \
+                 `tcp://{host}:{port}` to reach the address raw, or name the host"
+            ),
+            pal
+        )
+    );
     o
 }
 
@@ -568,6 +628,89 @@ mod tests {
         ));
         // A public address is the ordinary pass: no refusal to report.
         assert!(literal_addr_refusal("93.184.216.34", Some(&catch_all)).is_none());
+    }
+
+    /// The proxy refuses an IP-literal CONNECT with `ip-literal` **before** it consults the
+    /// allowlist, because the inspected path has no name to mint a leaf certificate for. This
+    /// command read the policy alone and printed ALLOWED for exactly that request: an author who
+    /// wrote `allow = ["10.0.0.5"]` and checked it here was told the address was reachable, and
+    /// every inspected request to it was refused at run time with a token this output never named.
+    #[test]
+    fn an_inspected_ip_literal_is_denied_however_the_policy_reads_it() {
+        // A policy that plainly allows the address on the inspected plane…
+        let exact = allowlist::classify("10.0.0.5").unwrap();
+        let policy = allowlist::EgressPolicy::new(vec![exact], Vec::new());
+        assert!(
+            matches!(
+                policy.explain("10.0.0.5", 443, "/", "GET"),
+                allowlist::Decision::AllowedBy(_)
+            ),
+            "the rule allows it — the refusal below is the proxy's, not the policy's"
+        );
+        // …is still refused, since no `tcp://` rule splices it.
+        assert!(refused_as_ip_literal(
+            "10.0.0.5",
+            false,
+            &policy.l4_decision("10.0.0.5", 443)
+        ));
+
+        // A `tcp://` rule is the way an address is reached, and it must keep working — the guard
+        // cannot be satisfied by refusing every IP.
+        let spliced = allowlist::EgressPolicy::new(
+            vec![allowlist::classify("tcp://10.0.0.5:443").unwrap()],
+            Vec::new(),
+        );
+        assert!(matches!(
+            spliced.l4_decision("10.0.0.5", 443),
+            allowlist::L4Decision::Splice(_)
+        ));
+        assert!(!refused_as_ip_literal(
+            "10.0.0.5",
+            false,
+            &spliced.l4_decision("10.0.0.5", 443)
+        ));
+        // …but only for the host:port it names.
+        assert!(refused_as_ip_literal(
+            "10.0.0.5",
+            false,
+            &spliced.l4_decision("10.0.0.5", 8443)
+        ));
+
+        // A loopback address is exempt from the cage's proxy, so the proxy is not what refuses it:
+        // that verdict stays the address guard's, with the note that names the `tcp://` way in.
+        assert!(!refused_as_ip_literal(
+            "127.0.0.1",
+            false,
+            &policy.l4_decision("127.0.0.1", 443)
+        ));
+
+        // A name is not this shape (it has SNI), and neither is cleartext (no tunnel to terminate).
+        assert!(!refused_as_ip_literal(
+            "api.example.com",
+            false,
+            &policy.l4_decision("api.example.com", 443)
+        ));
+        assert!(!refused_as_ip_literal(
+            "10.0.0.5",
+            true,
+            &policy.l4_decision("10.0.0.5", 80)
+        ));
+
+        // And the verdict a reader sees is the wire's, naming the proxy's own token and the rule
+        // that would reach the address.
+        let out = render_ip_literal_refusal(
+            "https://10.0.0.5/v1",
+            "10.0.0.5",
+            443,
+            &style::Palette::plain(),
+        );
+        assert_eq!(
+            out,
+            "DENIED   https://10.0.0.5/v1\n  the proxy refuses an IP-literal target on the \
+             inspected path (`ip-literal`): there is no hostname to mint a certificate for, \
+             whatever the policy says. Declare `tcp://10.0.0.5:443` to reach the address raw, or \
+             name the host\n"
+        );
     }
 
     #[test]

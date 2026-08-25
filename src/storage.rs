@@ -1076,10 +1076,17 @@ fn mkfs_command(
             c.arg("--tmpfs").arg("/tmp");
             // The seed is read; the image's directory is written. Each is bound at its own
             // path so the arguments below stay valid inside.
-            c.arg("--ro-bind").arg(seed).arg(seed);
+            //
+            // The order is load-bearing, and it used to be the other way round. The seed lives
+            // beside the image (`image.with_extension("seed")`), so it is *inside* the directory
+            // bound below; bwrap applies binds in argv order, and a writable parent emitted after
+            // the seed's read-only bind mounted straight over it — mkfs got a writable seed and the
+            // "the seed is read" above was not true of the cage it built. The narrower mount lands
+            // last.
             if let Some(parent) = image.parent() {
                 c.arg("--bind").arg(parent).arg(parent);
             }
+            c.arg("--ro-bind").arg(seed).arg(seed);
             c.arg("--").arg(bin);
             args(&mut c);
             // Handed back rather than dropped here: the filters' descriptors are not
@@ -2302,6 +2309,14 @@ this line has no separator at all
             .expect("bound");
         assert_eq!(a[seed_at - 1], "--ro-bind");
         assert_eq!(a.iter().filter(|x| *x == "--bind").count(), 1);
+        // And the read-only seed has to survive the writable parent that contains it: bwrap
+        // applies binds in argv order, so the parent must be emitted first or it covers the seed.
+        let parent_at = a.iter().position(|x| x == "/data/vol").expect("bound");
+        assert_eq!(a[parent_at - 1], "--bind");
+        assert!(
+            parent_at < seed_at,
+            "the writable parent bind shadows the seed's read-only bind: {a:?}"
+        );
         // The command still ends with the real invocation, arguments intact.
         assert_eq!(
             &a[a.len() - 6..],

@@ -216,13 +216,27 @@ static WINCH_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
 /// `SIGWINCH` handler: nudge the supervisor by writing one byte to the self-pipe. Async-signal-safe
 /// — it does nothing but a single `write` of a constant byte to a non-blocking fd read from an
-/// atomic (no allocation, no locks). A full pipe (`EAGAIN`) or absent relay is ignored: the
-/// supervisor coalesces, so a dropped nudge only means an already-pending resize is still pending.
+/// atomic (no allocation, no locks). The write's *return value* is ignored, because a full pipe
+/// (`EAGAIN`) or an absent relay costs nothing: the supervisor coalesces, so a dropped nudge only
+/// means an already-pending resize is still pending.
+///
+/// `errno` is saved and restored around it, which the return value being ignored does not cover. A
+/// handler runs on whatever thread the signal interrupted, and the code it interrupts here reads
+/// `errno` a line after its own failing syscall — [`write_all`] and the pump's `poll` loop both
+/// call `io::Error::last_os_error()` on the step after a `-1`. A resize landing in that gap
+/// overwrote the real error with the handler's `EAGAIN`, so a genuine `EIO` on the pty was reported
+/// as a would-block, and an `EINTR` the loops retry on was lost.
 extern "C" fn winch_handler(_sig: libc::c_int) {
     let fd = WINCH_WRITE_FD.load(Ordering::Relaxed);
     if fd >= 0 {
         let byte = [1u8];
-        unsafe { libc::write(fd, byte.as_ptr().cast(), 1) };
+        // SAFETY: `__errno_location` returns this thread's own `errno` slot, and the write is a
+        // single constant byte to a non-blocking descriptor.
+        unsafe {
+            let saved = *libc::__errno_location();
+            libc::write(fd, byte.as_ptr().cast(), 1);
+            *libc::__errno_location() = saved;
+        }
     }
 }
 
@@ -359,6 +373,51 @@ mod tests {
         assert_eq!(classify_ctrl_c(b"\x03\x03", None, now), CtrlC::Escalate);
         // An armed window plus a chunk with no Ctrl+C is still nothing (a real keystroke can pass).
         assert_eq!(classify_ctrl_c(b"y\r", Some(recent), now), CtrlC::None);
+    }
+
+    #[test]
+    fn winch_handler_leaves_errno_to_the_interrupted_call() {
+        // A relay pipe filled to capacity, so the handler's write really fails and really sets
+        // `errno` — the case a resize arriving mid-`write_all` produces.
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+            0
+        );
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let filler = [0u8; 4096];
+        while unsafe { libc::write(write_fd, filler.as_ptr().cast(), filler.len()) } > 0 {}
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::EAGAIN),
+            "the pipe must be full, or the handler's write would not fail at all"
+        );
+
+        let previous = WINCH_WRITE_FD.swap(write_fd, Ordering::Relaxed);
+        // What a failing pty syscall left behind for the line that is about to read it.
+        unsafe { *libc::__errno_location() = libc::EIO };
+        winch_handler(libc::SIGWINCH);
+        let after_failed_write = unsafe { *libc::__errno_location() };
+
+        // And the nudge itself still happens when the pipe has room: the guard must not have
+        // become "do nothing".
+        let mut sink = [0u8; 64];
+        while unsafe { libc::read(read_fd, sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
+        winch_handler(libc::SIGWINCH);
+        let mut one = [0u8; 8];
+        let nudged = unsafe { libc::read(read_fd, one.as_mut_ptr().cast(), one.len()) };
+
+        WINCH_WRITE_FD.store(previous, Ordering::Relaxed);
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+        assert_eq!(
+            after_failed_write,
+            libc::EIO,
+            "the handler overwrote the interrupted call's errno with its own"
+        );
+        assert_eq!(nudged, 1, "the handler stopped writing its nudge byte");
     }
 
     #[test]

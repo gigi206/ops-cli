@@ -102,6 +102,40 @@ fn collect_pending(
     (sessions, context)
 }
 
+/// The rule string that matches the destination just answered, port included. A host-level rule
+/// carries a **port set**, and a bare host is the HTTPS default — port 443 and nothing else — so
+/// saving the bare host for a request answered on 8443 writes a rule that can never match the
+/// request it was saved for. The shaping is the one `netlearn` gives its rule candidates: 443 is the
+/// bare host (the shortest rule that means the same thing), 80 is the cleartext scheme (a `:80` on
+/// an implicitly-TLS host would name the right port at the wrong layer), and any other port is
+/// pinned explicitly.
+///
+/// `None` — the parked row could not be read back before the answer landed — keeps the bare host:
+/// the previous behaviour, and still right for the port almost every ask is on.
+fn egress_rule_for(host: &str, port: Option<u16>) -> String {
+    match port {
+        None | Some(443) => host.to_string(),
+        Some(80) => format!("http://{host}"),
+        // An IPv6 literal is bracketed only when it carries a port — bare otherwise — so the
+        // brackets go on here rather than in the caller.
+        Some(p) if host.contains(':') && !host.starts_with('[') => format!("[{host}]:{p}"),
+        Some(p) => format!("{host}:{p}"),
+    }
+}
+
+/// The port one parked request is waiting on, or `None` when it is no longer parked (already
+/// answered, or timed out) or its session cannot be reached. Read from the same `LIST` the listing
+/// uses, so it sees exactly what `sbx net pending` would show.
+fn pending_port(data_dir: &Path, pid: u32, seq: u64) -> Option<u16> {
+    sandbox::control::list_all(data_dir)
+        .into_iter()
+        .find(|s| s.pid == pid)?
+        .rows
+        .into_iter()
+        .find(|r| r.seq == seq)
+        .map(|r| r.port)
+}
+
 /// `sbx net pending [-a|--app <name>] [--json]`: list every reachable ask-mode session's parked
 /// requests, grouped by session (with its agent/project context); identical retries of one URL
 /// collapse to a single destination carrying the `<pid>.<seq>` id to answer it (and, in `--json`, a
@@ -812,6 +846,10 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
         ));
         return ExitCode::from(2);
     }
+    // With `--save`, the port has to be read **before** the answer: the parked row carries it and is
+    // gone from the queue the moment the answer lands, while the reply names only the host. A rule
+    // saved without it means port 443 alone — see [`egress_rule_for`].
+    let port = save.then(|| pending_port(&data_dir, pid, seq)).flatten();
     let (host, count) = match sandbox::control::answer_request(
         &data_dir, pid, seq, verdict, session,
     ) {
@@ -860,7 +898,8 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
             .map(|(_, project, _)| project)
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
-        match persist_egress_rule(list, &host, &parsed.scope, parsed.app.as_deref(), &base) {
+        let rule = egress_rule_for(&host, port);
+        match persist_egress_rule(list, &rule, &parsed.scope, parsed.app.as_deref(), &base) {
             Ok(message) => println!(
                 "{}",
                 style::prose(
@@ -1324,16 +1363,22 @@ fn parse_log_args(args: &[OsString]) -> Result<LogView, String> {
 /// Query the live control sockets for each session's recent egress events, scoped to one app's
 /// session(s) when `app` is set, and pair them with their registry context. The read-only gather
 /// step behind `sbx net logs` — the log's analogue of [`collect_pending`]. No launch / nix / network.
+///
+/// The muted (`dontaudit`) ring is always folded in, whatever the view shows: a session keeps its
+/// muted refusals in a *separate* ring that shares one sequence counter with the main one, so the
+/// default view's sequence numbers have a hole at every muted event — and [`snapshot_evicted`] reads
+/// the retained window's first sequence number as the count of what fell off. Asking for the merged
+/// view is what makes that sequence contiguous again. What the reader sees is decided in
+/// [`filtered_log_events`], which drops the muted events unless `--all` asked for them.
 fn collect_logs(
     data_dir: &Path,
     app: Option<&str>,
-    include_muted: bool,
     with_capture: bool,
 ) -> (
     Vec<sandbox::control::SessionLog>,
     Vec<(u32, PathBuf, String)>,
 ) {
-    let mut sessions = sandbox::control::log_all(data_dir, include_muted, with_capture);
+    let mut sessions = sandbox::control::log_all(data_dir, true, with_capture);
     if let Some(name) = app {
         let pids = session_pids_for_app(data_dir, name);
         sessions.retain(|s| pids.contains(&s.pid));
@@ -1351,13 +1396,18 @@ fn event_passes_filters(e: &sandbox::control::LogEvent, view: &LogView) -> bool 
 
 /// The events of one session that pass the `--host`/`--verdict` filters, then the `-n` limit (the
 /// most recent N, since the ring is oldest-first). Borrowed, so the render/JSON share one filter.
+///
+/// This is also where a muted (`dontaudit`) refusal is suppressed. [`collect_logs`] asks every
+/// session for its muted ring as well — the eviction count is only derivable from the two merged —
+/// so the gate that keeps those events out of the default view lives here, on the one path the
+/// listing and the `--follow` seed both render through.
 fn filtered_log_events<'a>(
     events: &'a [sandbox::control::LogEvent],
     view: &LogView,
 ) -> Vec<&'a sandbox::control::LogEvent> {
     let mut out: Vec<&sandbox::control::LogEvent> = events
         .iter()
-        .filter(|e| event_passes_filters(e, view))
+        .filter(|e| (view.all || !e.muted) && event_passes_filters(e, view))
         .collect();
     if let Some(n) = view.limit
         && out.len() > n
@@ -1379,9 +1429,16 @@ fn display_log_path(path: &str, with_query: bool) -> &str {
 }
 
 /// How many of a session's oldest events fell off the ring before the retained window. Sequence
-/// numbers start at 1 and the window is contiguous, so the oldest retained event's `seq - 1` is the
-/// evicted count — surfaced (not silently truncated) even for the one-shot listing, distinct from any
-/// `-n`/`--host`/`--verdict` the user applied. Computed from the **unfiltered** snapshot.
+/// numbers start at 1, so the oldest retained event's `seq - 1` is the evicted count — surfaced (not
+/// silently truncated) even for the one-shot listing, distinct from any `-n`/`--host`/`--verdict` the
+/// user applied. Computed from the **unfiltered** snapshot.
+///
+/// That arithmetic only holds while the window is contiguous, which is why [`collect_logs`] always
+/// asks for the muted ring: muted refusals are numbered from the same counter but kept in a ring of
+/// their own, so on the default view every muted event left a hole that read here as an event
+/// evicted. A session with a single `mute` rule and a chatty muted host was told it had lost
+/// hundreds of events it still had. Counted over the merged rings the number is what it claims to
+/// be: how many events the session recorded before the oldest one it still holds.
 fn snapshot_evicted(snapshot: &sandbox::control::LogSnapshot) -> u64 {
     snapshot.events.first().map(|e| e.seq - 1).unwrap_or(0)
 }
@@ -1410,12 +1467,7 @@ fn net_logs(args: &[OsString]) -> ExitCode {
         return net_logs_follow(&data_dir, &view, &pal);
     }
 
-    let (sessions, context) = collect_logs(
-        &data_dir,
-        view.app.as_deref(),
-        view.all,
-        view.wants_capture(),
-    );
+    let (sessions, context) = collect_logs(&data_dir, view.app.as_deref(), view.wants_capture());
 
     if view.json {
         let ctx_of = |pid: u32| context.iter().find(|(p, _, _)| *p == pid);
@@ -1479,12 +1531,7 @@ fn net_logs_follow(data_dir: &Path, view: &LogView, pal: &style::Palette) -> Exi
     // Seed: the current listing (human render, or NDJSON of the retained events), respecting `-n`.
     // Only actual events are written — the one-shot's "nothing to show" line is skipped, so a follow
     // that pipes to `head` on an idle session emits no spurious line then spins.
-    let (sessions, context) = collect_logs(
-        data_dir,
-        view.app.as_deref(),
-        view.all,
-        view.wants_capture(),
-    );
+    let (sessions, context) = collect_logs(data_dir, view.app.as_deref(), view.wants_capture());
     let has_events = sessions
         .iter()
         .any(|s| !filtered_log_events(&s.snapshot.events, view).is_empty());
@@ -3297,8 +3344,8 @@ fn net_pending_drain_and_save(
         app_pids.as_ref().is_none_or(|p| p.contains(&pid))
             && project_pids.as_ref().is_none_or(|p| p.contains(&pid))
     });
-    // The flat host list the rule-writing below dedupes, derived from what was answered rather
-    // than accumulated a second time, so the two can never disagree about order.
+    // The flat host list the rule-writing below turns into rules, derived from what was answered
+    // rather than accumulated a second time, so the two can never disagree about order.
     let hosts: Vec<String> = answered
         .iter()
         .flat_map(|(_, h)| h.iter().cloned())
@@ -3327,9 +3374,15 @@ fn net_pending_drain_and_save(
         return ExitCode::SUCCESS;
     }
 
-    // Persist a rule per *unique* answered host (a host answered in several sessions is one rule),
-    // preserving first-seen order. The base of a `--local` write is the cwd — every drained session is
-    // in this project. The live answers already stuck, so a save failure is a warning, not a rollback.
+    // Persist a rule per *unique* answered host, preserving first-seen order. The base of a
+    // `--local` write is the cwd — every drained session is in this project. The live answers
+    // already stuck, so a save failure is a warning, not a rollback.
+    //
+    // The rule is the bare host, and that is a real limitation of the bulk path: the drain reply
+    // names hosts only, so unlike the by-id answer (which reads the parked row's port first — see
+    // [`egress_rule_for`]) it cannot tell which port each host was answered on, and a bare host is
+    // the HTTPS port set alone. The success line below says so rather than leaving a rule that does
+    // not match to be discovered on the next launch.
     let mut seen = std::collections::HashSet::new();
     let unique: Vec<String> = hosts
         .into_iter()
@@ -3370,6 +3423,11 @@ fn net_pending_drain_and_save(
             println!(
                 "  saved {saved} {verb} rule(s) to {target}{}",
                 if local { " (re-trusted)" } else { "" }
+            );
+            println!(
+                "{}  each rule names its host alone, which covers port 443 — a destination \
+                 answered on another port needs `sbx net {verb} <host>:<port>` as well{}",
+                pal.dim, pal.reset
             );
             if local {
                 println!(
@@ -4664,6 +4722,88 @@ mod tests {
         assert!(
             out.contains("4000 earlier event(s) evicted from the ring"),
             "the ring overflow must be surfaced, not truncated silently:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_saved_rule_carries_the_port_the_request_was_answered_on() {
+        // The finding: `--save` persisted the bare host the answer reply named, and a bare host is
+        // the HTTPS port set — {443} — so answering a request on 8443 wrote a rule that could not
+        // match the request it was saved for, and the next launch parked it again.
+        assert_eq!(
+            egress_rule_for("api.test", Some(8443)),
+            "api.test:8443",
+            "a non-default port must be pinned or the rule matches 443 instead"
+        );
+        // …and the guard still permits the short form where it means the same thing: 443 is the
+        // bare host's own port set, and 80 is the cleartext scheme (`:80` on an implicitly-TLS host
+        // would name the right port at the wrong layer).
+        assert_eq!(egress_rule_for("api.test", Some(443)), "api.test");
+        assert_eq!(egress_rule_for("api.test", None), "api.test");
+        assert_eq!(egress_rule_for("api.test", Some(80)), "http://api.test");
+        // An IPv6 literal is bracketed only when it carries a port.
+        assert_eq!(egress_rule_for("::1", Some(8080)), "[::1]:8080");
+        assert_eq!(egress_rule_for("::1", Some(443)), "::1");
+    }
+
+    #[test]
+    fn a_muted_event_is_neither_shown_nor_counted_as_an_eviction() {
+        use sandbox::control::{LogVerdict::*, SessionLog};
+        let p = style::Palette::plain();
+
+        // The finding: muted (`dontaudit`) refusals live in a ring of their own but draw their
+        // sequence numbers from the same counter, so the default view's numbering has a hole at each
+        // one — and `snapshot_evicted` read the oldest retained `seq - 1` as "this many events fell
+        // off". A session with one `mute` rule was told it had lost events it still held. The reader
+        // now asks for both rings merged (contiguous again) and suppresses the muted lines here.
+        let mut muted = log_event(1, "telemetry.test", None, None, Deny, "denied-default");
+        muted.muted = true;
+        let snapshot = sandbox::control::LogSnapshot {
+            events: vec![
+                muted,
+                log_event(2, "api.test", Some("GET"), Some("/a"), Allow, "allowed"),
+                log_event(3, "api.test", Some("GET"), Some("/b"), Allow, "allowed"),
+            ],
+            dropped: 0,
+            head: 3,
+            amend_head: 0,
+            captures: Vec::new(),
+            capture_evicted: 0,
+        };
+        assert_eq!(
+            snapshot_evicted(&snapshot),
+            0,
+            "nothing was evicted — seq 1 is the muted event, still retained"
+        );
+        let sessions = [SessionLog { pid: 7, snapshot }];
+        let out = render_logs(&sessions, &[], &LogView::default(), &p, true);
+        assert!(
+            !out.contains("telemetry.test"),
+            "a muted refusal stays out of the default view:\n{out}"
+        );
+        assert!(
+            !out.contains("evicted from the ring"),
+            "no eviction happened, so none may be reported:\n{out}"
+        );
+        // The suppression is the `--all` gate, not a blanket drop: what `--all` asks for still
+        // arrives, and both real events show either way.
+        assert!(
+            out.contains("/a") && out.contains("/b"),
+            "the unmuted events are shown:\n{out}"
+        );
+        let all = render_logs(
+            &sessions,
+            &[],
+            &LogView {
+                all: true,
+                ..LogView::default()
+            },
+            &p,
+            true,
+        );
+        assert!(
+            all.contains("telemetry.test"),
+            "`--all` shows the muted refusal:\n{all}"
         );
     }
 

@@ -272,26 +272,44 @@ fn accept_loop(listener: TcpListener, sock: PathBuf, shutdown: Arc<AtomicBool>) 
     }
 }
 
-/// Pump one TCP connection to the in-cage forwarder's Unix socket, both ways, until either side
-/// closes. Two copy threads, each shutting down the other direction's write half on EOF so the
-/// peer sees the close and the second copy terminates — the standard bidirectional bridge.
-fn bridge(mut client: TcpStream, sock: &Path) -> io::Result<()> {
-    let mut uds = UnixStream::connect(sock)?;
-    let mut client_w = client.try_clone()?;
-    let mut uds_w = uds.try_clone()?;
-    let t1 = std::thread::spawn(move || {
-        let _ = std::io::copy(&mut client, &mut uds);
+/// Pump one TCP connection to the in-cage forwarder's Unix socket, both ways, until the cage side
+/// closes, then tear both sockets down so neither copy can hang. The shape is the proxy's raw
+/// tunnel (`proxy::splice::splice_copy`), and for the same reason.
+///
+/// The half-close each direction sends on EOF is what a well-behaved peer needs, and it is not
+/// enough on its own: this used to spawn both copies and join both, so the bridge returned only
+/// when *both* directions had ended. A cage service that goes away (socat dies with the cage) EOFs
+/// the cage→host direction while a host client that is merely idle — a browser holding a keep-alive
+/// connection — sends nothing and closes nothing, so the host→cage copy stayed blocked in `read`
+/// forever, pinning its thread and, through `accept_loop`'s `Dec` guard, one of the
+/// [`MAX_CONCURRENT_CONNS`] slots for the life of the process.
+///
+/// So the cage→host direction runs inline and decides: when it ends, both sockets are shut down
+/// `Both`, which returns the spawned copy's blocked read and makes the join always complete.
+fn bridge(client: TcpStream, sock: &Path) -> io::Result<()> {
+    let uds = UnixStream::connect(sock)?;
+    // Two handles per socket (read + write), plus one each to force the teardown after the inline
+    // copy ends. `try_clone` dups the fd, so every handle refers to the same socket.
+    let mut client_rd = client.try_clone()?;
+    let client_shut = client.try_clone()?;
+    let mut client_wr = client;
+    let mut uds_wr = uds.try_clone()?;
+    let uds_shut = uds.try_clone()?;
+    let mut uds_rd = uds;
+
+    let t = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut client_rd, &mut uds_wr);
         // The browser half closed (or the TCP conn ended) → tell the cage forwarder by shutting
-        // the UDS write half, so it sees EOF and stops responding; the other thread then reads 0.
-        let _ = uds.shutdown(Shutdown::Write);
+        // the UDS write half, so it sees EOF and stops responding; the inline copy then reads 0.
+        let _ = uds_wr.shutdown(Shutdown::Write);
     });
-    let t2 = std::thread::spawn(move || {
-        let _ = std::io::copy(&mut uds_w, &mut client_w);
-        // The cage half closed → tell the browser by shutting the TCP write half.
-        let _ = client_w.shutdown(Shutdown::Write);
-    });
-    let _ = t1.join();
-    let _ = t2.join();
+    let _ = std::io::copy(&mut uds_rd, &mut client_wr);
+    // The cage half closed → tell the browser by shutting the TCP write half, then force both
+    // sockets fully down so the spawned copy's read returns and the join below always completes.
+    let _ = client_wr.shutdown(Shutdown::Write);
+    let _ = client_shut.shutdown(Shutdown::Both);
+    let _ = uds_shut.shutdown(Shutdown::Both);
+    let _ = t.join();
     Ok(())
 }
 
@@ -597,6 +615,45 @@ mod tests {
         );
         let _ = echo.join();
         drop(guard);
+    }
+
+    /// A bridge whose cage side goes away returns, even while the host client sits idle with the
+    /// connection open — the shape at cage teardown, when socat dies and a browser keep-alive
+    /// connection is still parked on the host port. Joining both copy threads (what this did
+    /// before) never returned here: the host→cage copy stayed blocked in `read` on a client that
+    /// sends nothing and closes nothing, pinning the thread and one of the `MAX_CONCURRENT_CONNS`
+    /// slots for the life of the process. `the_host_bridge_round_trips_bytes_through_the_cage_socket`
+    /// is the other half of this: the teardown must not cost the bytes that were in flight.
+    #[test]
+    fn a_bridge_returns_when_the_cage_side_closes_while_the_client_sits_idle() {
+        use std::os::unix::net::UnixListener;
+
+        let tmp = TmpDir::new();
+        let sock = tmp.path().join("p-idle.sock");
+        let cage = UnixListener::bind(&sock).expect("bind the stand-in cage socket");
+        let host = TcpListener::bind("127.0.0.1:0").expect("bind a host listener");
+        let addr = host.local_addr().unwrap();
+        // The idle client: connected, silent, and deliberately kept alive to the end of the test.
+        let client = TcpStream::connect(addr).expect("connect to the host port");
+        let (accepted, _) = host.accept().expect("accept the host connection");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = bridge(accepted, &sock);
+            let _ = tx.send(());
+        });
+        // Stand in for the in-cage socat: accept, then vanish. Dropping the connection EOFs the
+        // cage→host direction while nothing at all happens on the host→cage one.
+        let (conn, _) = cage
+            .accept()
+            .expect("the bridge connects to the cage socket");
+        drop(conn);
+
+        rx.recv_timeout(Duration::from_secs(10)).expect(
+            "the bridge must return once the cage side closes — an idle client that never closes \
+             would otherwise pin the copy thread and its connection slot forever",
+        );
+        drop(client);
     }
 
     /// The host-side socket path `start` creates for `port`, so the round-trip test can bind the

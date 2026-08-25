@@ -145,14 +145,29 @@ pub(crate) fn prune_project_package_roots(
 
 /// The store-path basenames every *current* out-link of a project still points at — the keep-set a
 /// per-project store gc reconciles its accumulated seed roots against. `data_gcroots` is
-/// `<data>/gcroots`; the six root families that can seed a per-project store are all covered so the
+/// `<data>/gcroots`; every root family that can seed a per-project store is covered so the
 /// keep-set is complete by construction: the project's own `projects/<id>/*` (its provisioned
-/// `nix:`/`deb:` tools and the GUI app builds an `sbx app` run from here left), the base userland and
-/// the gui/gpu/audio holes for the project's channel revision `base_rev` (`{base,gui,gpu,audio}/<base_rev>/*`),
-/// and the in-cage mise engine for each live engine revision (`mise/<mise_rev>/*` — mise is rooted on
-/// its *own* revision, not the base one, so omitting it would drop the current mise). Each out-link
-/// points at a `…/nix/store/<hash-name>` build; its basename is the key, matching a seed root's own
-/// file name. A broken or absent out-link simply contributes nothing.
+/// `deb:` tools and the GUI app builds an `sbx app` run from here left) **and** the `nix:` tools
+/// one level down in `projects/<id>/nix-tools/*`, the base userland and the gui/gpu/audio holes for
+/// the project's channel revision `base_rev` (`{base,gui,gpu,audio}/<base_rev>/*`), and the in-cage
+/// mise engine for each live engine revision (`mise/<mise_rev>/*` — mise is rooted on its *own*
+/// revision, not the base one, so omitting it would drop the current mise). Each out-link points
+/// at a `…/nix/store/<hash-name>` build; its basename is the key, matching a seed root's own file
+/// name. A broken or absent out-link simply contributes nothing.
+///
+/// The `nix-tools` sub-directory is named rather than reached by descending:
+/// [`nixhub::provision`](crate::sandbox::nixhub::provision) roots a `nix:` mise tool under
+/// `projects/<id>/nix-tools/<pkg>`, kept apart from the native `[packages]` roots so the two tool
+/// sources cannot collide on a shared name. This reads one directory per family, so a family one
+/// level down has to be listed: without it every `nix:` tool fell out of the keep-set, and
+/// `sbx gc --prune` dropped its seed root and collected the tools the project declares.
+///
+/// Known gap, needing a wider change than this function can make: the base families are keyed on
+/// the project's own `base_rev` alone, while an installed app carries its own
+/// `<data>/apps/<name>/nixpkgs.lock` and has its userland rooted under *that* revision. An app on
+/// another channel therefore has its base collected. The fix is for the callers to pass the live
+/// revision set ([`crate::store::live_base_revisions`]) instead of one revision — this has no
+/// [`crate::store::Layout`] to derive it from.
 pub(crate) fn project_keep_roots(
     data_gcroots: &Path,
     id: &str,
@@ -173,6 +188,7 @@ pub(crate) fn project_keep_roots(
         }
     };
     add_targets(data_gcroots.join("projects").join(id));
+    add_targets(data_gcroots.join("projects").join(id).join("nix-tools"));
     for family in ["base", "gui", "gpu", "audio"] {
         add_targets(data_gcroots.join(family).join(base_rev));
     }
@@ -1809,6 +1825,15 @@ mod tests {
             "mise",
             "h6-mise-2026.7.5",
         );
+        // A `nix:` mise tool is rooted one level down, in its own sub-directory (`nixhub::provision`)
+        // so it cannot collide with a native `[packages]` root on a shared name. A keep-set that
+        // reads only `projects/<id>` misses every one of them, and the prune that follows drops the
+        // seed roots of the tools the project declares.
+        link(
+            gcroots.join("projects").join(id).join("nix-tools"),
+            "ripgrep",
+            "h7-ripgrep-14.1.1",
+        );
         // A revision NOT in the keep set (a stale base rev) must not contribute — its build is exactly
         // what a prune should reclaim.
         link(
@@ -1827,12 +1852,13 @@ mod tests {
             "h4-mesa-26.1",
             "h5-portaudio",
             "h6-mise-2026.7.5",
+            "h7-ripgrep-14.1.1",
         ] {
             assert!(keep.contains(&OsString::from(base)), "missing {base}");
         }
         // The stale-rev build is excluded, so a later prune can reclaim it.
         assert!(!keep.contains(&OsString::from("old-glibc-2.41")));
-        assert_eq!(keep.len(), 6);
+        assert_eq!(keep.len(), 7);
     }
 
     #[test]

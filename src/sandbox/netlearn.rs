@@ -15,6 +15,14 @@
 //!
 //! So the reason whitelist is the security boundary of this feature.
 //!
+//! # Plane
+//!
+//! A rule's scheme names a plane, so it is taken from the refusal's `proto` and never guessed from
+//! the port: a cleartext (`http://`) refusal yields an `http://` rule at whatever port it used, an
+//! inspected one an `https://` rule. Subsumption against the current policy is asked of that same
+//! plane — cleartext is strictly opt-in, so an `https://` rule never counts as already covering a
+//! cleartext refusal.
+//!
 //! # Granularity
 //!
 //! How wide a rule to synthesize is the caller's choice ([`Granularity`]):
@@ -33,7 +41,7 @@
 
 use std::collections::BTreeSet;
 
-use super::control::LogEvent;
+use super::control::{LogEvent, Proto};
 use crate::allowlist::{Decision, EgressPolicy, canonical_segments, classify};
 
 /// The refusal reasons that mean "this destination is simply not in the allowlist yet" — the only
@@ -104,7 +112,7 @@ pub(crate) fn synthesize(
         if already_allowed(policy, e) {
             continue;
         }
-        if host_token(&e.host, e.port).is_none() {
+        if host_token(&e.host, e.port, e.proto).is_none() {
             notes.push(format!(
                 "skipped an egress refusal for an unusable host `{}:{}`",
                 e.host, e.port
@@ -156,7 +164,7 @@ fn build_domain(
     widened: &mut BTreeSet<String>,
 ) {
     for e in events {
-        let host = host_token(&e.host, e.port).expect("filtered to usable hosts");
+        let host = host_token(&e.host, e.port, e.proto).expect("filtered to usable hosts");
         if is_ws(e) {
             rules.insert(format!("{{WS}} {host}"));
         } else {
@@ -175,7 +183,7 @@ fn build_domain(
 /// segments) has no section to scope and falls back to a host rule.
 fn build_path(events: &[&LogEvent], rules: &mut BTreeSet<String>, widened: &mut BTreeSet<String>) {
     for e in events {
-        let host = host_token(&e.host, e.port).expect("filtered to usable hosts");
+        let host = host_token(&e.host, e.port, e.proto).expect("filtered to usable hosts");
         let ws = is_ws(e);
         let verb = if ws { "WS" } else { "*" };
         let segs = canonical_segments(e.path.as_deref().unwrap_or(""));
@@ -199,7 +207,7 @@ fn build_path(events: &[&LogEvent], rules: &mut BTreeSet<String>, widened: &mut 
 /// query). A refusal with no usable method cannot become an exact rule and is surfaced.
 fn build_exact(events: &[&LogEvent], rules: &mut BTreeSet<String>, notes: &mut Vec<String>) {
     for e in events {
-        let host = host_token(&e.host, e.port).expect("filtered to usable hosts");
+        let host = host_token(&e.host, e.port, e.proto).expect("filtered to usable hosts");
         let Some(method) = e.method.as_deref() else {
             notes.push(format!(
                 "skipped `{host}` for `exact` — the refusal carries no method"
@@ -220,13 +228,19 @@ fn build_exact(events: &[&LogEvent], rules: &mut BTreeSet<String>, notes: &mut V
 /// Whether the current policy already admits the destination this event names — using the event's own
 /// path/verb (a missing verb reads as `GET`, the read default). Defensive: a refused event was not
 /// admitted, but a manual edit between iterations could have added it.
+///
+/// Subsumption is asked of the plane that actually refused: a cleartext refusal goes to
+/// [`EgressPolicy::explain_clear`], everything else to [`EgressPolicy::explain`]. Asking the inspected
+/// plane about a cleartext refusal would report an `https://` rule as already covering it and drop the
+/// `http://` rule that is the only thing which can open it.
 fn already_allowed(policy: &EgressPolicy, e: &LogEvent) -> bool {
     let path = e.path.as_deref().unwrap_or("/");
     let method = e.method.as_deref().unwrap_or("GET");
-    matches!(
-        policy.explain(&e.host, e.port, path, method),
-        Decision::AllowedBy(_) | Decision::AllowedDefault
-    )
+    let decision = match e.proto {
+        Proto::Http => policy.explain_clear(&e.host, e.port, path, method),
+        _ => policy.explain(&e.host, e.port, path, method),
+    };
+    matches!(decision, Decision::AllowedBy(_) | Decision::AllowedDefault)
 }
 
 /// Whether this refusal was a WebSocket (evaluated under the `WS` pseudo-verb). A WebSocket is a
@@ -235,18 +249,28 @@ fn is_ws(e: &LogEvent) -> bool {
     e.method.as_deref() == Some("WS")
 }
 
-/// The host part of a rule, scheme-and-port shaped: `443`→`https://h`, `80`→`http://h` (cleartext),
-/// any other port→`https://h:<port>` (the port is explicit, so the default web-port shorthand does
-/// not silently narrow it). `None` for an empty or malformed host — a rule must name a concrete,
-/// sane destination.
-fn host_token(host: &str, port: u16) -> Option<String> {
+/// The host part of a rule, shaped from the plane that refused the request and its port. The scheme
+/// comes from the event's [`Proto`], never from the port: a cleartext refusal on `:8080` was shaped
+/// `https://h:8080`, a rule that names the inspected plane and so can never admit the cleartext
+/// request it was learned from (`explain_clear` opens only on an `http://` rule). The port is omitted
+/// only when it is the scheme's own default — 443 for `https://`, 80 for `http://` — so the shorthand
+/// never silently narrows a non-standard port. `None` for an empty or malformed host — a rule must
+/// name a concrete, sane destination.
+fn host_token(host: &str, port: u16, proto: Proto) -> Option<String> {
     if !host_is_sane(host) {
         return None;
     }
-    Some(match port {
-        443 => format!("https://{host}"),
-        80 => format!("http://{host}"),
-        p => format!("https://{host}:{p}"),
+    // Only the cleartext plane is `http://`. A splice (`Tcp`) and an unknown transport (`Other`)
+    // never carry a learnable reason, so they read as the inspected plane rather than inventing a
+    // scheme for a refusal this feature cannot learn from anyway.
+    let (scheme, default_port) = match proto {
+        Proto::Http => ("http", 80),
+        _ => ("https", 443),
+    };
+    Some(if port == default_port {
+        format!("{scheme}://{host}")
+    } else {
+        format!("{scheme}://{host}:{port}")
     })
 }
 
@@ -300,6 +324,19 @@ mod tests {
         path: Option<&str>,
         reason: &str,
     ) -> LogEvent {
+        ev_on(host, port, method, path, reason, Proto::Https)
+    }
+
+    /// The same refusal, on a named plane — the cleartext plane logs `Proto::Http`, and the scheme of
+    /// the rule learned from it must follow the plane, not the port.
+    fn ev_on(
+        host: &str,
+        port: u16,
+        method: Option<&str>,
+        path: Option<&str>,
+        reason: &str,
+        proto: Proto,
+    ) -> LogEvent {
         LogEvent {
             seq: 0,
             at_epoch_ms: 0,
@@ -308,7 +345,7 @@ mod tests {
             method: method.map(str::to_string),
             path: path.map(str::to_string),
             verdict: LogVerdict::Deny,
-            proto: crate::sandbox::control::Proto::Https,
+            proto,
             http_ver: crate::sandbox::control::HttpVer::Unknown,
             rpc: crate::sandbox::control::RpcKind::None,
             reason: reason.to_string(),
@@ -395,12 +432,16 @@ mod tests {
     }
 
     #[test]
-    fn domain_ports_shape_the_scheme() {
+    fn domain_the_plane_shapes_the_scheme_and_the_port_only_the_suffix() {
+        // The scheme follows the refusing plane, the port only decides whether the `:port` suffix is
+        // needed. An inspected refusal on 80 is `https://h:80`, not `http://h` — inferring the scheme
+        // from the port would learn a rule for a plane that never refused anything.
         let got = rules(
             &[
                 ev("tls.test", 443, None, None, "denied-default"),
-                ev("clear.test", 80, None, None, "denied-default"),
+                ev_on("clear.test", 80, None, None, "denied-default", Proto::Http),
                 ev("alt.test", 8443, None, None, "denied-default"),
+                ev("tls80.test", 80, None, None, "denied-default"),
             ],
             Granularity::Domain,
         );
@@ -410,7 +451,87 @@ mod tests {
                 "{*} http://clear.test".to_string(),
                 "{*} https://alt.test:8443".to_string(),
                 "{*} https://tls.test".to_string(),
+                "{*} https://tls80.test:80".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn a_cleartext_refusal_learns_a_rule_that_actually_admits_it() {
+        // The defect this pins: the scheme used to come from the port, so a cleartext refusal on any
+        // port but 80 became an `https://` rule — and cleartext is strictly opt-in, so that rule could
+        // never admit the request it was learned from. Assert the end-to-end property (the learned
+        // rule readmits the refusal on the cleartext plane), at every granularity.
+        for gran in [Granularity::Domain, Granularity::Path, Granularity::Exact] {
+            let got = rules(
+                &[ev_on(
+                    "clear.test",
+                    8080,
+                    Some("GET"),
+                    Some("/v1/health"),
+                    "denied-default",
+                    Proto::Http,
+                )],
+                gran,
+            );
+            assert_eq!(got.len(), 1, "one rule at {gran:?}: {got:?}");
+            assert!(
+                got[0].contains("http://clear.test:8080"),
+                "the cleartext plane must yield an `http://` rule at {gran:?}: {got:?}"
+            );
+            let learned = EgressPolicy::new(vec![classify(&got[0]).unwrap()], vec![]);
+            assert!(
+                matches!(
+                    learned.explain_clear("clear.test", 8080, "/v1/health", "GET"),
+                    Decision::AllowedBy(_)
+                ),
+                "the learned rule must readmit the refusal it came from at {gran:?}: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_https_rule_does_not_subsume_a_cleartext_refusal() {
+        // Subsumption is asked of the plane that refused. An `https://` allow does not open cleartext,
+        // so a cleartext refusal for that host must still learn its `http://` rule; the inverse (an
+        // inspected refusal for a host an `https://` rule already opens) must still be skipped, so the
+        // guard cannot be satisfied by simply never subsuming anything.
+        // The rule spans every port, so the inspected plane really would admit the cleartext
+        // request's host/port/path — only the plane separates them.
+        let policy = EgressPolicy::new(vec![classify("{*} https://api.test:*").unwrap()], vec![]);
+        let got = synthesize(
+            &[ev_on(
+                "api.test",
+                80,
+                Some("GET"),
+                Some("/v1/x"),
+                "denied-default",
+                Proto::Http,
+            )],
+            &policy,
+            Granularity::Domain,
+        )
+        .rules;
+        assert_eq!(
+            got,
+            vec!["{*} http://api.test".to_string()],
+            "an https allow must not subsume a cleartext refusal"
+        );
+        assert!(
+            synthesize(
+                &[ev(
+                    "api.test",
+                    443,
+                    Some("GET"),
+                    Some("/v1/x"),
+                    "denied-default"
+                )],
+                &policy,
+                Granularity::Domain,
+            )
+            .rules
+            .is_empty(),
+            "the inspected plane must still subsume against its own https rule"
         );
     }
 

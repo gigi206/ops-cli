@@ -23,7 +23,7 @@
 //!   `no_new_privs`, no bounded capability can ever become effective, so a full bounding
 //!   set (which `setns` leaves in place) is inert and grants nothing the agent lacks.
 //!
-//! Two residuals, both named and accepted:
+//! Three residuals, all named and accepted:
 //! - **cgroup resource limits are not shared.** `setns(CLONE_NEWCGROUP)` joins the cgroup
 //!   *namespace* (the `/proc/self/cgroup` view) but not the cage's cgroup *membership*, so the
 //!   attached process runs in `sbx session attach`'s own scope, outside the cage's `MemoryMax`/`TasksMax`.
@@ -35,6 +35,13 @@
 //!   container. Entering an agent's environment to inspect it is the whole point; the confinement
 //!   above bounds what the entered process can do, and the operation is host-initiated by the
 //!   trusted user — the caged agent cannot trigger it.
+//! - **the environment the shell starts from is the agent's too.** It is read out of a live in-cage
+//!   process ([`read_environ`]), which that process owns: `PATH`, the proxy variables and the CA
+//!   path are whatever the agent left there, not whatever bubblewrap originally set. It is passed
+//!   through unfiltered on purpose — those variables are what let the entered shell resolve
+//!   anything inside the cage, and stripping them would buy no confinement, because the binary they
+//!   point at is the agent's either way (bullet above). What bounds the entered process is the
+//!   seccomp and capability re-application, never the environment it inherits.
 
 use std::collections::BTreeMap;
 use std::ffi::CString;
@@ -132,10 +139,15 @@ fn join_mask(
     mask
 }
 
-/// Read the cage environment from the payload's `/proc/<pid>/environ` (NUL-separated
-/// `KEY=VALUE`). This is the exact environment bubblewrap set for the agent — its
-/// PATH, proxy, and CA settings — and, by the never-in-the-cage secrets invariant, it
-/// carries no plaintext credential. Best-effort: an empty read yields an empty env.
+/// Read the cage environment from a live in-cage process's `/proc/<pid>/environ`
+/// (NUL-separated `KEY=VALUE`) — ordinarily what bubblewrap set for the agent, its
+/// PATH, proxy and CA settings. Ordinarily, not necessarily: the process it is read
+/// from is one the agent owns, so the agent decides what it says — it can exec a child
+/// with any environment it likes, or rewrite its own `environ` region in place. That is
+/// the third residual this module names above, and it is bounded the same way: the
+/// entered process is confined regardless of what it is told, and by the
+/// never-in-the-cage secrets invariant no plaintext credential is there to leak. The
+/// read itself is best-effort: an empty one yields an empty env.
 pub(super) fn read_environ(pid: u32) -> Vec<u8> {
     std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default()
 }

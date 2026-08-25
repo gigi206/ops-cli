@@ -10,7 +10,9 @@
 //!   and it masks every configured secret before storing them, so the ring never holds a credential
 //!   and no reader can forget to mask. Masking a *complete* buffer (rather than each streamed
 //!   chunk) is what makes it exact — a secret split across two reads is still one contiguous run by
-//!   the time it is masked.
+//!   the time it is masked. A value the launch has since **re-resolved** is masked too
+//!   ([`CaptureRing::needles`]): a capture is filed after its exchange ends, so the credential it
+//!   carries is often the one the `401` just replaced.
 //! - **Bounded three ways.** Each part is capped on its own ([`CaptureCaps`]), the number of
 //!   captured exchanges is capped, and the ring holds a total byte budget past which the *oldest*
 //!   captures are dropped. An in-cage agent streaming gigabytes therefore costs a fixed amount of
@@ -32,7 +34,6 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-#[cfg(test)]
 use crate::sandbox::proxy::SecretNeedle;
 use crate::sandbox::proxy::redact_in_place;
 
@@ -105,6 +106,13 @@ pub(crate) const CAPTURE_RING_CAP: usize = 200;
 /// captures until the newest fits, so memory is flat regardless of how long a session runs or how
 /// large the per-body cap is.
 pub(crate) const CAPTURE_TOTAL_BUDGET: usize = 16 * 1024 * 1024;
+
+/// How many needle values the ring keeps to mask with — the live ones plus the superseded ones it
+/// has seen (see [`CaptureRing::needles`]). A ceiling rather than an unbounded union because every
+/// needle is scanned over every captured part, so the set bounds the masking cost as well as the
+/// memory: a launch declaring a handful of credentials and refreshing them all session stays far
+/// inside it, and past it the least recently seen values are dropped first.
+const NEEDLE_HISTORY_MAX: usize = 256;
 
 /// The per-part byte caps a launch captures with, derived once from the policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,6 +320,10 @@ pub(crate) struct CaptureRing {
     /// private copy would eventually mask against a superseded value — which is the one failure
     /// that matters here, since an unmasked token is a token written into `sbx net logs`.
     credentials: std::sync::Arc<crate::sandbox::proxy::Credentials>,
+    /// Every needle value the live state has carried since this ring was built, which is what the
+    /// masking actually runs against. See [`CaptureRing::needles`] for why sharing the live state
+    /// is necessary but not sufficient.
+    history: Mutex<std::sync::Arc<Vec<SecretNeedle>>>,
 }
 
 struct CaptureInner {
@@ -338,6 +350,9 @@ impl CaptureRing {
                 bytes: 0,
                 evicted: 0,
             }),
+            // Seeded with the state as first resolved, so a credential re-resolved before this ring
+            // ever files anything is still masked out of the exchange that carried the old value.
+            history: Mutex::new(std::sync::Arc::new(credentials.snapshot().needles.clone())),
             caps,
             credentials,
         }
@@ -377,6 +392,7 @@ impl CaptureRing {
         if capture.is_empty() {
             return;
         }
+        let needles = self.needles();
         for part in [
             &mut capture.req_head,
             &mut capture.injected,
@@ -386,7 +402,7 @@ impl CaptureRing {
             &mut capture.ws_up,
             &mut capture.ws_down,
         ] {
-            redact_in_place(&mut part.bytes, &self.credentials.snapshot().needles);
+            redact_in_place(&mut part.bytes, &needles);
         }
         let weight = capture.weight();
         let mut g = self.inner.lock().unwrap();
@@ -420,6 +436,47 @@ impl CaptureRing {
             g.bytes = g.bytes.saturating_sub(dropped.weight());
             g.evicted += 1;
         }
+    }
+
+    /// The needle set the masking runs against: every value the live credential state has carried
+    /// since this ring was built, not only the ones it carries now.
+    ///
+    /// Sharing the live state is necessary — a credential resolved or refreshed after the launch has
+    /// to be masked too — and it is not sufficient, because a capture is filed *after* the exchange
+    /// it describes and the refresh commonly lands in between: a `401` on this very exchange is the
+    /// ordinary way a token is re-resolved. Masking against the live set alone therefore missed
+    /// exactly the value the exchange contained, and the superseded token went into the ring in
+    /// cleartext for `sbx net logs --with-headers` to print. Retiring a value from injection is not
+    /// retiring it from *scanning*.
+    ///
+    /// The union is rebuilt only when the live state introduces a value this ring has not seen, so
+    /// the ordinary insert pays one comparison per needle and no allocation. What it costs is the
+    /// retired values kept in host memory for the life of the launch — never written, never
+    /// rendered, and exactly what the live credential state already does with the current ones.
+    fn needles(&self) -> std::sync::Arc<Vec<SecretNeedle>> {
+        let current = self.credentials.snapshot();
+        let mut history = self.history.lock().unwrap();
+        if current
+            .needles
+            .iter()
+            .all(|n| history.iter().any(|h| h.as_bytes() == n.as_bytes()))
+        {
+            return history.clone();
+        }
+        let mut merged: Vec<SecretNeedle> = history.as_ref().clone();
+        for n in &current.needles {
+            if !merged.iter().any(|h| h.as_bytes() == n.as_bytes()) {
+                merged.push(n.clone());
+            }
+        }
+        // Bounded, because every needle here is scanned over every captured part and a session that
+        // re-resolves a credential on a schedule would otherwise grow the set for as long as it
+        // runs. The live values are appended last, so dropping from the front retires the least
+        // recently seen first and never the ones in use.
+        let over = merged.len().saturating_sub(NEEDLE_HISTORY_MAX);
+        merged.drain(..over);
+        *history = std::sync::Arc::new(merged);
+        history.clone()
     }
 
     /// The captures for `seqs` (those still retained), plus how many captures have been evicted over
@@ -571,6 +628,49 @@ mod tests {
                 .any(|w| w == b"s3cr3t-value"),
             "a reflected secret is masked on the response side too"
         );
+    }
+
+    /// A credential re-resolved between the exchange and its filing — a `401` refresh, the ordinary
+    /// case — must not leave the superseded value in the ring. The masking ran against the *live*
+    /// needles only, so the token the exchange actually carried was the one value it could not
+    /// mask, and `sbx net logs --with-headers` printed it in cleartext.
+    #[test]
+    fn a_superseded_credential_is_still_masked_out_of_a_capture_filed_after_the_refresh() {
+        use crate::sandbox::proxy::{CredentialSet, Credentials};
+
+        let credentials = std::sync::Arc::new(Credentials::new(
+            Vec::new(),
+            vec![needle("old-t0ken-value")],
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+        ));
+        let ring = CaptureRing::new(
+            CaptureCaps::new(CaptureLevel::Bodies, 8),
+            credentials.clone(),
+        );
+        // The upstream rejected the old value and the proxy re-resolved it, all while the exchange
+        // below was still in flight — its capture is filed only afterwards.
+        credentials.replace(CredentialSet {
+            injections: Vec::new(),
+            needles: vec![needle("new-t0ken-value")],
+        });
+
+        let mut cap = Capture::new(1);
+        cap.req_head = bytes(b"GET /v1 HTTP/1.1\r\nauthorization: Bearer old-t0ken-value\r\n\r\n");
+        cap.res_body = bytes(b"retry with new-t0ken-value please");
+        ring.insert(cap);
+
+        let (found, _) = ring.get(&[1]);
+        let stored = &found[0];
+        let head = String::from_utf8(stored.req_head.bytes.clone()).unwrap();
+        assert!(
+            head.contains("Bearer ***************"),
+            "the superseded value is masked at equal length, not left in the ring: {head}"
+        );
+        // The live value is still masked, so this cannot be satisfied by masking the wrong set, and
+        // the rest of the exchange is untouched, so it cannot be satisfied by masking everything.
+        let body = String::from_utf8(stored.res_body.bytes.clone()).unwrap();
+        assert_eq!(body, "retry with *************** please");
+        assert!(head.starts_with("GET /v1 HTTP/1.1"), "not this: {head}");
     }
 
     #[test]

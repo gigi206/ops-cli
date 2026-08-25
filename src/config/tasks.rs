@@ -859,18 +859,31 @@ fn validate_task_injections(
             // and two host spellings that differ only in case or a trailing dot are two keys that
             // canonicalise to one `to`.
             //
+            // Compared on what each declaration WRITES (`headers()`), not on `header`, which for a
+            // signed declaration is only the first header its plugin's manifest lists — a label the
+            // inventory names it by. Two signers whose manifests lead with different headers and
+            // agree on a later one read as unrelated under `header`, and both went to the proxy,
+            // which is the doubling this refuses.
+            //
             // Refused rather than last-wins-with-a-warning, which is what the session path does,
             // because this one has nowhere to put a warning — `validate_task` returns `Result` and
             // every other thing it rejects is an error. A task is validated before it can run, so
             // the author sees this at the moment they can fix it.
-            if let Some(clash) = out
-                .iter()
-                .find(|s| s.to == secret.to && s.header.eq_ignore_ascii_case(&secret.header))
-            {
+            let writes = secret.headers();
+            if let Some((clash, shared)) = out.iter().find_map(|s| {
+                if s.to != secret.to {
+                    return None;
+                }
+                let shared = s
+                    .headers()
+                    .into_iter()
+                    .find(|h| writes.iter().any(|w| w.eq_ignore_ascii_case(h)))?;
+                Some((s, shared.to_string()))
+            }) {
                 return Err(format!(
-                    "`inject` declares `{}` twice for {} (as `{}` and `{}`) — two copies of one \
-                     header would reach the upstream; give them different headers or one target",
-                    secret.header, secret.to, clash.name, secret.name
+                    "`inject` declares `{shared}` twice for {} (as `{}` and `{}`) — two copies of \
+                     one header would reach the upstream; give them different headers or one target",
+                    secret.to, clash.name, secret.name
                 ));
             }
             out.push(secret);
@@ -1672,6 +1685,82 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(validate(ok).unwrap().injections.len(), 2);
+    }
+
+    /// The same dedup, asked about what a declaration *writes* rather than what it is named by.
+    ///
+    /// A signed declaration's `header` is only the first header its plugin's manifest lists — the
+    /// label the inventory shows. Two signers for one host whose manifests lead with different
+    /// headers and agree on a later one therefore read as unrelated, and both reached the task's
+    /// proxy, which puts two copies of the shared header on the request. `upsert_secret` already
+    /// compares `headers()` for the session path; the task path compared `header`.
+    #[test]
+    fn two_signers_sharing_any_header_on_one_host_are_refused() {
+        let signer = |name: &str, sets: &[&str]| crate::plugins::signer::SignerPlugin {
+            name: name.to_string(),
+            dir: std::path::PathBuf::from(format!("/data/plugins/{name}")),
+            exec: std::path::PathBuf::from(format!("/data/plugins/{name}/sign")),
+            sandbox: Default::default(),
+            signer: crate::plugins::signer::SignerSpec {
+                sets_headers: sets.iter().map(|s| (*s).to_string()).collect(),
+                sees_headers: Vec::new(),
+                reads_secret: false,
+                body_digest: None,
+            },
+            version: None,
+            description: None,
+            host: Default::default(),
+        };
+        let signed = |name: &str| RawHostSecret {
+            name: Some(name.to_string()),
+            description: None,
+            kind: None,
+            key: None,
+            from: Some(SecretFrom::One("env://DEMO_KEY".into())),
+            header: None,
+            value_type: None,
+            prefix: None,
+            sign: Some(name.to_string()),
+        };
+        let task = |plugins: &PluginRegistry| {
+            let mut raw = raw_task();
+            raw.network = vec!["api.example.com".into()];
+            raw.inject = [(
+                "api.example.com".to_string(),
+                RawHostSecrets::Many(vec![signed("alpha"), signed("beta")]),
+            )]
+            .into_iter()
+            .collect();
+            validate_task(
+                "db-query",
+                raw,
+                &TaskOrigin::Project,
+                &TaskDefaults::default(),
+                &SecretDefaults::default(),
+                plugins,
+            )
+        };
+
+        // Different first headers, one shared later one: `X-Date` would go on the wire twice.
+        let shared = PluginRegistry::with_signers([
+            signer("alpha", &["Authorization", "X-Date"]),
+            signer("beta", &["X-Date", "Signature"]),
+        ]);
+        let e = task(&shared).unwrap_err();
+        assert!(
+            e.contains("X-Date") && e.contains("twice"),
+            "the refusal must name the header both signers write: {e}"
+        );
+
+        // Two signers to one host that share no header write different requests headers and are
+        // both legitimate — the guard must not answer "no" to every pair of signers.
+        let distinct = PluginRegistry::with_signers([
+            signer("alpha", &["Authorization"]),
+            signer("beta", &["Signature"]),
+        ]);
+        let spec =
+            task(&distinct).expect("two signers writing different headers are two credentials");
+        assert_eq!(spec.injections.len(), 2);
     }
 
     #[test]

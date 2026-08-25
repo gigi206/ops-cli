@@ -1282,6 +1282,7 @@ fn build_override_scalars(
     // `[proc]\ndeny=[…]` keeps the effective mode); an *unknown* mode is fatal, exactly like `gui` —
     // keeping the baseline could leave *less* enforcement than the user's mistyped intent, a fail-open.
     if let Some(field) = proc {
+        warn_unknown_proc_keys(notes, OVERRIDE_SOURCE, &field);
         match validate_proc(notes, OVERRIDE_SOURCE, field, baseline_proc) {
             Some(policy) => scalars.proc = Some(policy),
             None => fatal.push("proc".to_string()),
@@ -1291,6 +1292,7 @@ fn build_override_scalars(
     // mode is fatal, like `proc`. Keeping the baseline on a typo could leave a launch quieter than the
     // invoker's intent, which is the one direction this feature must never fail in.
     if let Some(field) = notify {
+        warn_unknown_notify_keys(notes, OVERRIDE_SOURCE, &field);
         match validate_notify(notes, OVERRIDE_SOURCE, field, baseline_notify) {
             Some(policy) => scalars.notify = Some(policy),
             None => fatal.push("notify".to_string()),
@@ -1447,7 +1449,15 @@ fn apply_plugin_host_config(
         apply_to_header_secrets(&mut app.secrets, cfg, matched, warnings);
         apply_to_tasks(&mut app.tasks, cfg, matched, warnings);
     }
-    for name in cfg.keys() {
+    for (name, table) in cfg {
+        // Named, not refused at the parse layer: `deny_unknown_fields` here failed the whole
+        // config file over one mistyped key, taking every declaration written beside it.
+        for key in table.rest.keys() {
+            warnings.push(format!(
+                "`[plugin.{name}]`: ignoring unknown key `{key}` — the table supplies `env` and \
+                 `programs`, and the plugin reads nothing else from it"
+            ));
+        }
         if !matched.contains(name) {
             warnings.push(format!(
                 "`[plugin.{name}]`: no secret uses a plugin by that name — check the spelling \
@@ -1778,11 +1788,12 @@ fn resolve(
     // is never mistaken for one.
     let mut network_origin = Provenance::Default;
     // The egress-stats toggle rides the `[network]` table (the global layer is trusted by location);
-    // extract it before the field moves into `validate_network`. Default on.
+    // extract it before the field moves into `validate_network`. Default on. Committed below, once
+    // the table is known to be accepted: a rejected `[network]` leaves the posture at the built-in
+    // default, and the toggle written beside it must not be the one half of it that still lands —
+    // the same rule the project layer applies.
     let mut egress_stats = true;
-    if let Some(b) = global.network.as_ref().and_then(network_stats_of) {
-        egress_stats = b;
-    }
+    let global_stats = global.network.as_ref().and_then(network_stats_of);
     if let Some(field) = global.network.as_ref() {
         warn_if_baseline_sets_default_methods(&mut warnings, GLOBAL_CONFIG, field);
     }
@@ -1803,12 +1814,18 @@ fn resolve(
         }
         None => NetworkPolicy::default(),
     };
+    if network_origin == Provenance::Global
+        && let Some(b) = global_stats
+    {
+        egress_stats = b;
+    }
     // The GUI posture is trusted by location at the global layer; an invalid or unset value
     // falls back to the default (no display).
     // The process/exec posture is trusted by location at the global layer. `parent` is the built-in
     // default (off) — the global layer has no lower config to inherit a table's omitted mode from.
     let mut proc_origin = Provenance::Default;
     let mut proc = match global.proc.and_then(|v| {
+        warn_unknown_proc_keys(&mut warnings, GLOBAL_CONFIG, &v);
         validate_proc(
             &mut warnings,
             GLOBAL_CONFIG,
@@ -1825,10 +1842,10 @@ fn resolve(
     // The notification policy is trusted by location at the global layer. `parent` is the built-in
     // default (every event `once`) — the global layer has no lower config to inherit from.
     let mut notify_origin = Provenance::Default;
-    let mut notify = match global
-        .notify
-        .and_then(|v| validate_notify(&mut warnings, GLOBAL_CONFIG, v, &Default::default()))
-    {
+    let mut notify = match global.notify.and_then(|v| {
+        warn_unknown_notify_keys(&mut warnings, GLOBAL_CONFIG, &v);
+        validate_notify(&mut warnings, GLOBAL_CONFIG, v, &Default::default())
+    }) {
         Some(policy) => {
             notify_origin = Provenance::Global;
             policy
@@ -2054,6 +2071,25 @@ fn resolve(
                              config, beside the plugin's installation"
                         ));
                     }
+                    // `secret` is global-only for a sharper version of the same reason, so it is
+                    // named for the same reason: the two fields are dropped side by side, and
+                    // saying so for one and not the other left a project author watching a
+                    // credential they had declared never reach the wire, with nothing said.
+                    if table.secret.is_some() {
+                        warnings.push(format!(
+                            "{PROJECT_CONFIG}: ignoring `[broker.{name}] secret` — the credential \
+                             a broker places on the wire is declared in the global config, beside \
+                             the plugin's installation"
+                        ));
+                    }
+                    // Only the global tables reach `resolve_brokers`, which reports its own
+                    // unknown keys; a project table is folded into the bound one field by field,
+                    // so a key misspelled here would otherwise be seen by nothing.
+                    for key in table.rest.keys() {
+                        warnings.push(format!(
+                            "{PROJECT_CONFIG}: ignoring unknown key `{key}` in `[broker.{name}]`"
+                        ));
+                    }
                     match broker_cfg.get_mut(&name) {
                         Some(bound) => {
                             bound.allow = table.allow;
@@ -2148,6 +2184,13 @@ fn resolve(
         // `network` is a security field — a trusted project may change the posture;
         // an untrusted or changed one may not narrow or widen the network.
         if let Some(value) = proj.network {
+            // The stats toggle rides the same trusted `[network]` table, so it is read before the
+            // field moves into `validate_network` — but committed only if that table is *accepted*.
+            // Setting it inside the closure meant a rejected table (an unknown mode, a bad
+            // allowlist) left the posture untouched and still turned the egress audit off: half of
+            // a table that was refused whole. An untrusted project never reaches here.
+            let stats = network_stats_of(&value);
+            let mut accepted = false;
             gate.take_validated(
                 &mut network,
                 &mut network_origin,
@@ -2156,16 +2199,15 @@ fn resolve(
                 // `parent` is the posture as it stands after the global layer: a project
                 // `[network]` table without a `mode` inherits it.
                 |w, parent| {
-                    // The stats toggle rides the same trusted `[network]` table — honor it before
-                    // the field moves into `validate_network`, so a trusted project may turn its
-                    // own audit off (or back on). An untrusted project never reaches here.
-                    if let Some(b) = network_stats_of(&value) {
-                        egress_stats = b;
-                    }
                     warn_if_baseline_sets_default_methods(w, PROJECT_CONFIG, &value);
-                    validate_network(w, PROJECT_CONFIG, value, &net_groups, parent)
+                    let policy = validate_network(w, PROJECT_CONFIG, value, &net_groups, parent);
+                    accepted = policy.is_some();
+                    policy
                 },
             );
+            if accepted && let Some(b) = stats {
+                egress_stats = b;
+            }
         }
         // `proc` is a security field — a trusted project may set its agent's exec posture; an
         // untrusted or changed one may not forge or loosen the enforcement of its own agent.
@@ -2177,7 +2219,10 @@ fn resolve(
                 &mut proc_origin,
                 "`proc` policy",
                 &mut warnings,
-                |w, parent| validate_proc(w, PROJECT_CONFIG, value, parent),
+                |w, parent| {
+                    warn_unknown_proc_keys(w, PROJECT_CONFIG, &value);
+                    validate_proc(w, PROJECT_CONFIG, value, parent)
+                },
             );
         }
         // `notify` is a security field — a trusted project may tune how loudly its own refusals are
@@ -2191,7 +2236,10 @@ fn resolve(
                 &mut notify_origin,
                 "`notify` policy",
                 &mut warnings,
-                |w, parent| validate_notify(w, PROJECT_CONFIG, value, parent),
+                |w, parent| {
+                    warn_unknown_notify_keys(w, PROJECT_CONFIG, &value);
+                    validate_notify(w, PROJECT_CONFIG, value, parent)
+                },
             );
         }
         // `gui` is a security field — a trusted project may open a display; an untrusted or
@@ -2592,6 +2640,41 @@ fn resolve_app_default_methods(
     )
 }
 
+/// Report the unknown keys of a `[proc]` table, beside the mode that *did* take effect.
+///
+/// The keys are collected in a bag and named rather than refused by `deny_unknown_fields`, because
+/// `proc` is an untagged-enum field ([`schema::ProcField`]): a key refused at the parse layer fails
+/// the variant and drops the whole config layer — packages, apps and all — over one typo. Silence
+/// was the worse half of that trade: a misspelled `deny` left `mode = "enforce"` enforcing an empty
+/// list, which reads exactly like enforcement that decided to allow everything.
+fn warn_unknown_proc_keys(warnings: &mut Vec<String>, source: &str, field: &schema::ProcField) {
+    let schema::ProcField::Table(table) = field else {
+        return;
+    };
+    for key in table.rest.keys() {
+        warnings.push(format!(
+            "{source}: ignoring unknown key `{key}` in `[proc]` — the table reads `mode`, `allow` \
+             and `deny`, so nothing enforces what is written under `{key}`"
+        ));
+    }
+}
+
+/// Report the unknown keys of a `[notify]` table, for the reason [`warn_unknown_proc_keys`] gives:
+/// `notify` is an untagged-enum field too, so its unknown keys are named rather than refused. A
+/// misspelled `events` leaves the table's mode in force and the refinement written beside it
+/// silently absent, which is how a lens comes to be believed quieter — or louder — than it is.
+fn warn_unknown_notify_keys(warnings: &mut Vec<String>, source: &str, field: &schema::NotifyField) {
+    let schema::NotifyField::Table(table) = field else {
+        return;
+    };
+    for key in table.rest.keys() {
+        warnings.push(format!(
+            "{source}: ignoring unknown key `{key}` in `[notify]` — the table reads `mode`, \
+             `events` and `repeat_after`, so nothing is announced differently for `{key}`"
+        ));
+    }
+}
+
 /// Warn when the **baseline** `[network]` carries a `default_methods`: it is an app-only posture
 /// (Mode-B agents read by default), and `sbx run` (Mode A) deliberately stay all-verbs,
 /// so a baseline value is parsed but ignored. Surfacing it keeps a user from believing they made
@@ -2772,14 +2855,43 @@ fn apply_fs(warnings: &mut Vec<String>, source: &str, raw: Option<schema::RawFs>
             )),
         }
     }
+    // Each pattern compiles on its own above; the *set* has its own ceiling, and only building it
+    // answers whether this layer's list clears it. It is built here, per layer, because the launch
+    // refuses outright when the scanner will not compile — and `[fs]` is the one table an untrusted
+    // project may fill, so a cloned repo's `.sbx.toml` carrying a few thousand patterns could
+    // otherwise abort every launch in its own directory instead of losing its own scan. Dropping
+    // just this layer's entries is the same fail-closed drop every other bad `[fs]` entry gets, and
+    // it leaves the shapes a trusted layer declared compiling as before. What is bounded here is
+    // one layer's contribution: the launch compiles the union of the accepted layers, and a union
+    // that does not fit is still refused there.
+    //
+    // The scan ceiling passed here is the built-in one: it bounds how many bytes a scan *reads* and
+    // has no bearing on whether the set compiles, which is the only question asked.
+    if let Err(reason) =
+        crate::open_policy::OpenPolicy::compile(&policy.scan, crate::open_policy::MAX_SCAN_DEFAULT)
+    {
+        warnings.push(format!(
+            "{source}: ignoring `[fs] scan` ({reason}) — no file is scanned for those shapes"
+        ));
+        policy.scan.clear();
+    }
     // Zero would read nothing and call every file clean, which is worse than not scanning at all:
-    // `config show` lists the shapes either way, so the protection would read as present.
+    // `config show` lists the shapes either way, so the protection would read as present. A
+    // negative value is refused here rather than by the parser, for the reason the field's own doc
+    // gives: at the parse layer it costs the whole config file.
     match raw.scan_max_kb {
+        None => {}
         Some(0) => warnings.push(format!(
             "{source}: ignoring `[fs] scan_max_kb = 0` — a scan that reads nothing would pass every \
              file; leave it unset for the built-in ceiling"
         )),
-        other => policy.scan_max_kb = other,
+        Some(kb) => match u64::try_from(kb) {
+            Ok(kb) => policy.scan_max_kb = Some(kb),
+            Err(_) => warnings.push(format!(
+                "{source}: ignoring `[fs] scan_max_kb = {kb}` — a scan reads a length, so this is \
+                 no ceiling at all; leave it unset for the built-in one"
+            )),
+        },
     }
     policy
 }
@@ -3336,6 +3448,7 @@ fn resolve_app(
             }
         }
         if let Some(field) = app.proc {
+            warn_unknown_proc_keys(&mut warnings, &source, &field);
             // A table without a mode inherits from the app's own proc so far, else the baseline.
             let parent = proc.as_ref().unwrap_or(baseline_proc);
             if let Some(policy) = validate_proc(&mut warnings, &source, field, parent) {
@@ -3344,6 +3457,7 @@ fn resolve_app(
             }
         }
         if let Some(field) = app.notify {
+            warn_unknown_notify_keys(&mut warnings, &source, &field);
             // A table without a mode inherits per event from the app's own policy so far, else the
             // baseline.
             let parent = notify.as_ref().unwrap_or(baseline_notify);
@@ -3558,6 +3672,7 @@ fn resolve_app(
                 "`proc` policy",
                 &mut warnings,
                 |w, current| {
+                    warn_unknown_proc_keys(w, &source, &field);
                     let parent = current.as_ref().unwrap_or(baseline_proc);
                     validate_proc(w, &source, field, parent).map(Some)
                 },
@@ -3572,6 +3687,7 @@ fn resolve_app(
                 "`notify` policy",
                 &mut warnings,
                 |w, current| {
+                    warn_unknown_notify_keys(w, &source, &field);
                     let parent = current.as_ref().unwrap_or(baseline_notify);
                     validate_notify(w, &source, field, parent).map(Some)
                 },
@@ -5457,6 +5573,267 @@ fn dropped_binds_warning(state: TrustState, count: usize) -> String {
             "{PROJECT_CONFIG} is untrusted: dropping {count} bind(s) — \
              run `sbx trust` to apply them"
         ),
+    }
+}
+
+/// What a layer pays for a field it got wrong.
+///
+/// Two rules meet here, and every test below holds one of them against a whole config file: a value
+/// sbx cannot use costs **that value**, never the file it is written in (an untagged enum refusing a
+/// key at the parse layer takes the packages, apps and credentials beside it down with it); and a
+/// key sbx passes over is **named**, because a rule believed to be in force and governing nothing is
+/// the failure the `[fs]`, `[proc]` and `[notify]` tables exist to avoid.
+#[cfg(test)]
+mod bad_fields_cost_a_field {
+    use super::*;
+
+    /// Parse a config the way the loader does, failing with the parser's own message — which is the
+    /// assertion in half these tests: the file must still load.
+    fn cfg(text: &str) -> RawConfig {
+        schema::parse(text.as_bytes())
+            .unwrap_or_else(|e| panic!("this config must still parse — {e}\n---\n{text}"))
+    }
+
+    /// Resolve a global-only config.
+    fn global(text: &str) -> Resolved {
+        resolve(cfg(text), None, &PluginRegistry::default())
+    }
+
+    /// Resolve a global config under a project one at the given trust.
+    fn layered(g: &str, p: &str, state: TrustState) -> Resolved {
+        resolve(cfg(g), Some((cfg(p), state)), &PluginRegistry::default())
+    }
+
+    /// Whether any warning contains every one of `parts`.
+    fn warned(r: &Resolved, parts: &[&str]) -> bool {
+        r.warnings
+            .iter()
+            .any(|w| parts.iter().all(|part| w.contains(part)))
+    }
+
+    #[test]
+    fn a_negative_limit_costs_the_limit_and_not_the_file() {
+        // `RawLimit`'s numeric variant is signed for this: as a `u64` it refused `-1` at the parse
+        // layer, and since `RawLimit` is untagged that failure was the whole file's.
+        let r = global("[env]\nFOO = \"bar\"\n\n[limits]\ntasks_max = -1\n");
+        assert!(
+            r.env.iter().any(|(k, v)| k == "FOO" && v == "bar"),
+            "the rest of the layer survives a bad limit: {:?}",
+            r.env
+        );
+        assert_eq!(r.limits.tasks_max, None, "the bad limit itself is dropped");
+        assert!(
+            warned(&r, &["limits.tasks_max", "-1"]),
+            "the drop is named: {:?}",
+            r.warnings
+        );
+        // The guard still admits a real count, or the check above would pass by refusing everything.
+        let ok = global("[limits]\ntasks_max = 8192\n");
+        assert_eq!(ok.limits.tasks_max.as_deref(), Some("8192"));
+    }
+
+    #[test]
+    fn a_negative_scan_ceiling_costs_the_ceiling_and_not_the_file() {
+        // Same trade as the limits above, on the field that decides how much of a file the content
+        // lens reads: as a `u64` the parser refused `-1`, and the refusal was the whole file's.
+        let r = global("[env]\nFOO = \"bar\"\n\n[fs]\nscan_max_kb = -1\n");
+        assert!(
+            r.env.iter().any(|(k, _)| k == "FOO"),
+            "the rest of the layer survives: {:?}",
+            r.warnings
+        );
+        assert_eq!(r.fs.scan_max_kb, None, "the bad ceiling is dropped");
+        assert!(
+            warned(&r, &["[fs] scan_max_kb = -1"]),
+            "and named: {:?}",
+            r.warnings
+        );
+        // A real ceiling still lands, so the check is not a blanket refusal.
+        assert_eq!(global("[fs]\nscan_max_kb = 64\n").fs.scan_max_kb, Some(64));
+    }
+
+    #[test]
+    fn an_unknown_broker_or_plugin_key_is_named_and_the_file_still_loads() {
+        // Both tables carried `deny_unknown_fields`, which fails the *document* — and which also
+        // silenced the unknown-key report `resolve_brokers` has always tried to make.
+        let r = global(
+            "[env]\nFOO = \"bar\"\n\n[broker.gpg]\nsocket = \"/tmp/gpg.sock\"\nsokcet = \"/x\"\n\n\
+             [plugin.age]\nprograms = { age = \"nix:age\" }\ntypo = 1\n",
+        );
+        assert!(
+            r.env.iter().any(|(k, _)| k == "FOO"),
+            "one mistyped key does not take the file down: {:?}",
+            r.warnings
+        );
+        assert!(
+            warned(&r, &["unknown key `sokcet`", "[broker.gpg]"]),
+            "the broker's unknown key is named: {:?}",
+            r.warnings
+        );
+        assert!(
+            warned(&r, &["unknown key `typo`", "[plugin.age]"]),
+            "the plugin's unknown key is named: {:?}",
+            r.warnings
+        );
+        // And the keys these tables *do* read stay silent, so the report cannot be satisfied by
+        // complaining about everything.
+        let ok = global("[broker.gpg]\nsocket = \"/tmp/gpg.sock\"\nallow = [\"sign\"]\n");
+        assert!(
+            !ok.warnings.iter().any(|w| w.contains("unknown key")),
+            "{:?}",
+            ok.warnings
+        );
+        assert_eq!(ok.brokers.len(), 1, "the binding still stands");
+        assert_eq!(ok.brokers[0].allow, vec!["sign".to_string()]);
+    }
+
+    #[test]
+    fn a_project_broker_secret_is_named_like_its_sibling_socket() {
+        // `socket` and `secret` are both global-only, and both are dropped from a project table.
+        // Naming one and not the other left a project author watching a credential they had
+        // declared never reach the wire, with nothing said.
+        let r = layered(
+            "[broker.gpg]\nsocket = \"/tmp/gpg.sock\"\nallow = [\"sign\"]\n",
+            "[broker.gpg]\nallow = [\"list\"]\nsecret = \"env://TOKEN\"\nsokcet = \"/tmp/evil\"\n",
+            TrustState::Trusted,
+        );
+        assert!(
+            warned(&r, &[PROJECT_CONFIG, "[broker.gpg] secret"]),
+            "the dropped credential is named: {:?}",
+            r.warnings
+        );
+        assert!(
+            warned(
+                &r,
+                &[PROJECT_CONFIG, "unknown key `sokcet`", "[broker.gpg]"]
+            ),
+            "a project table's unknown key is reported by the project loop, since only the global \
+             tables reach `resolve_brokers`: {:?}",
+            r.warnings
+        );
+        // The one field a trusted project *may* set still lands, and the socket it may not set is
+        // still the global's.
+        assert_eq!(r.brokers.len(), 1);
+        assert_eq!(r.brokers[0].allow, vec!["list".to_string()]);
+        assert_eq!(r.brokers[0].origin, Provenance::Project);
+    }
+
+    #[test]
+    fn a_misspelled_proc_or_notify_key_is_named() {
+        // The sharpest silence in the schema: `mode = "enforce"` enforcing an empty list, because
+        // the rules were written under a key nothing reads.
+        let r = global("[proc]\nmode = \"enforce\"\ndney = [\"curl\"]\n");
+        assert_eq!(r.proc.mode, crate::proc_policy::ProcMode::Enforce);
+        assert!(
+            r.proc.deny.is_empty(),
+            "the misspelled rules are not in force"
+        );
+        assert!(
+            warned(&r, &["unknown key `dney`", "[proc]"]),
+            "so the key is named: {:?}",
+            r.warnings
+        );
+
+        let n = global("[notify]\nmode = \"always\"\nevnets = [\"network\"]\n");
+        assert!(
+            warned(&n, &["unknown key `evnets`", "[notify]"]),
+            "{:?}",
+            n.warnings
+        );
+
+        // Spelled right, both tables take effect and say nothing.
+        let ok = global(
+            "[proc]\nmode = \"enforce\"\ndeny = [\"curl\"]\n\n\
+             [notify]\nmode = \"always\"\nevents = [\"network\"]\n",
+        );
+        assert_eq!(ok.proc.deny.len(), 1, "the rule is in force");
+        assert!(
+            !ok.warnings.iter().any(|w| w.contains("unknown key")),
+            "{:?}",
+            ok.warnings
+        );
+    }
+
+    #[test]
+    fn a_refused_network_table_does_not_take_its_stats_half_with_it() {
+        // `stats` rides the `[network]` table, and was committed before the table was validated: a
+        // table refused whole still turned the egress audit off, at either layer.
+        let g = global("[network]\nmode = \"bogus\"\nstats = false\n");
+        assert_eq!(
+            g.network_origin,
+            Provenance::Default,
+            "the table is refused"
+        );
+        assert!(
+            g.egress_stats,
+            "a refused global `[network]` leaves the audit on: {:?}",
+            g.warnings
+        );
+
+        let p = layered(
+            "",
+            "[network]\nmode = \"bogus\"\nstats = false\n",
+            TrustState::Trusted,
+        );
+        assert_eq!(p.network_origin, Provenance::Default);
+        assert!(
+            p.egress_stats,
+            "and so does a refused project `[network]`: {:?}",
+            p.warnings
+        );
+
+        // An *accepted* table still turns it off from either layer, or the fix would just be a
+        // toggle that no longer works.
+        assert!(!global("[network]\nmode = \"deny\"\nstats = false\n").egress_stats);
+        assert!(
+            !layered(
+                "",
+                "[network]\nmode = \"deny\"\nstats = false\n",
+                TrustState::Trusted
+            )
+            .egress_stats
+        );
+    }
+
+    /// A `[fs] scan` list whose patterns each compile alone but whose combined scanner does not fit
+    /// the set's size limit — the shape a hostile project uses, written small.
+    fn scan_bomb() -> String {
+        let patterns: Vec<String> = ('a'..='t')
+            .map(|c| format!("\"(?:{c}{{500}}){{500}}\""))
+            .collect();
+        format!("[fs]\nscan = [{}]\n", patterns.join(", "))
+    }
+
+    #[test]
+    fn an_over_budget_scan_set_costs_that_layer_its_scan_and_not_the_launch() {
+        // `[fs]` is the one table an untrusted project may fill, and the launch *refuses* when the
+        // scanner will not compile — so an over-budget list in a cloned repo's `.sbx.toml` could
+        // abort every launch in its own directory. It is compiled here instead, and dropped like
+        // every other bad `[fs]` entry.
+        let r = layered(
+            "[fs]\nscan = [\"AKIA[0-9A-Z]{16}\"]\n",
+            &scan_bomb(),
+            TrustState::Untrusted,
+        );
+        assert_eq!(
+            r.fs.scan,
+            vec!["AKIA[0-9A-Z]{16}".to_string()],
+            "the trusted layer's lens is untouched and the project's is gone: {:?}",
+            r.warnings
+        );
+        assert!(
+            warned(&r, &[PROJECT_CONFIG, "`[fs] scan`"]),
+            "the drop is named against the layer that caused it: {:?}",
+            r.warnings
+        );
+        // An ordinary list of shapes still compiles and still scans, so the drop is not universal.
+        let ok = global("[fs]\nscan = [\"AKIA[0-9A-Z]{16}\", \"-----BEGIN [A-Z ]*PRIVATE KEY\"]\n");
+        assert_eq!(ok.fs.scan.len(), 2, "{:?}", ok.warnings);
+        assert!(
+            !ok.warnings.iter().any(|w| w.contains("[fs] scan")),
+            "{:?}",
+            ok.warnings
+        );
     }
 }
 

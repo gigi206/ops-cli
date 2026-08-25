@@ -25,9 +25,20 @@
 //! what its own manifest declared ([`SignerSpec::sets_headers`]) and refused outright where a
 //! header would move the request rather than authenticate it.
 //!
-//! Those two together are the ceiling: **a signer plugin can never see or place more than the
-//! `[[secret]]` declaration naming it already puts on the wire.** It is meant to place it far
-//! better — bound to one request instead of replayable on any.
+//! Those two together are the ceiling on where a signer stands: one host's requests, over a pipe,
+//! with no resource of its own. What it may **place** is bounded a third time, by its own manifest
+//! — only the headers [`SignerSpec::sets_headers`] declares, never one of [`NEVER_SET`], and the
+//! bound is enforced on the answer rather than trusted. So a signer places nothing the `[[secret]]`
+//! declaration naming it does not already put on the wire; it is meant to place it far better,
+//! bound to one request instead of replayable on any.
+//!
+//! What it may **see** is bounded by that same manifest and not by the declaration, and the
+//! difference is worth stating plainly: beyond the method, the host and the target, a signer is
+//! shown exactly the headers [`SignerSpec::sees_headers`] names — which may include headers the
+//! cage put on the request for itself, because a scheme that has to canonicalize an existing
+//! `Authorization` or `Cookie` into its signature is the case that field was written for. Hence the
+//! list is empty by default and reading it is part of reviewing a manifest: it is the one place a
+//! signer's window widens past the credential it was named to form.
 
 use serde::Deserialize;
 use std::path::PathBuf;

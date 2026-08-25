@@ -109,7 +109,8 @@ secret = "env://PGPASSWORD"        # or a fallback chain, like a [secret] `from`
 The plugin's manifest must declare `uses_secret` for this to apply: which plugin may be
 handed a credential is a property of the code that was installed, not of the machine that
 configures it. A `secret` named for a plugin that does not declare it is reported and
-dropped.
+dropped. So is one written in a **project** config, and for a sharper version of the reason
+`socket` is global-only: this names a value `sbx` reads host-side and places on a wire.
 
 At the start of every connection the plugin receives a **random marker**, places it where
 the protocol wants the value, and `sbx` replaces it on the way to the host resource. The

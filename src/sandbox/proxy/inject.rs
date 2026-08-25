@@ -674,6 +674,13 @@ impl Credentials {
     /// worthless value and sbx substitutes the real one on every request: observing the placeholder
     /// would break the design it exists to protect.
     ///
+    /// The exclusion therefore has to answer "is this header being replaced?" with the SAME equality
+    /// the replacement uses — [`super::header_name_eq`], which folds `_` onto `-` as well as case.
+    /// Matching on case alone here left a gap between the two: an injection declared `X_Api_Key`
+    /// still stripped a client's `X-Api-Key` (the strip folds), while this filter did not recognise
+    /// the pair, so the placeholder it stripped was learned as a needle and the next request
+    /// carrying it was refused as an outbound leak.
+    ///
     /// Reads through a [`HeaderLookup`] so every plane can call it with what it already holds: the
     /// HTTP/1.1 planes' parsed pairs, and the HTTP/2 plane's decoded header map. The alternative was
     /// a signature only one plane could satisfy, which is how this ended up running on one plane out
@@ -687,7 +694,7 @@ impl Credentials {
         let mut kept = 0;
         for name in OBSERVED_AUTH_HEADERS
             .iter()
-            .filter(|name| !injected.iter().any(|inj| name.eq_ignore_ascii_case(inj)))
+            .filter(|name| !injected.iter().any(|inj| super::header_name_eq(name, inj)))
         {
             headers.for_each(name, &mut |value| {
                 if self.observe(name, value, dest) {
@@ -743,13 +750,24 @@ const OBSERVE_MIN_LEN: usize = 16;
 const OBSERVE_MAX: usize = 8;
 
 /// The credential inside an auth header value: the token, with a `Bearer`/`Basic`/`Token` scheme
-/// prefix removed. The bare token is what matters, since that is the spelling that would appear if
-/// it leaked somewhere other than this header.
+/// prefix removed however the client cased it. The bare token is what matters, since that is the
+/// spelling that would appear if it leaked somewhere other than this header.
 fn credential_in(value: &str) -> &str {
     let value = value.trim();
-    for scheme in ["Bearer ", "bearer ", "Basic ", "basic ", "Token ", "token "] {
-        if let Some(rest) = value.strip_prefix(scheme) {
-            return rest.trim();
+    // Case-insensitively, because RFC 9110 makes the auth scheme case-insensitive and clients do use
+    // the other spellings (`BEARER`, `bEaReR` from a hand-rolled header). Listing a couple of casings
+    // and comparing exactly missed those, and the needle then held the scheme word too: the outbound
+    // tripwire only refused the token when it left inside a header spelled exactly that way, and the
+    // response masking never matched the bare token at all — which is the spelling that matters,
+    // since that is how the credential appears when it leaks somewhere other than this header.
+    // `get(..)` rather than an index: the value is attacker-shaped, and a byte offset that lands
+    // inside a multi-byte character (`abcdef\u{e9}`) panics a slice while it merely yields `None`
+    // here. A panic on this path is a killed proxy thread, not a refused request.
+    for scheme in ["bearer ", "basic ", "token "] {
+        if let Some(prefix) = value.get(..scheme.len())
+            && prefix.eq_ignore_ascii_case(scheme)
+        {
+            return value[scheme.len()..].trim();
         }
     }
     value
@@ -1375,6 +1393,94 @@ mod tests {
             creds.snapshot().needles.is_empty(),
             "and nothing is tripwired, so the next request carrying it still passes"
         );
+    }
+
+    /// The same exclusion, reached through the spelling that used to slip past it. The strip on the
+    /// injection path compares header names with [`super::header_name_eq`], which folds `_` onto `-`;
+    /// this filter compared case only. So an injection declared `X_Api_Key` stripped the client's
+    /// `X-Api-Key` and this filter did not recognise the two as the same header — the placeholder was
+    /// learned, and the very next request carrying it was refused as an outbound leak.
+    ///
+    /// Teeth: with the filter back on `eq_ignore_ascii_case`, `kept` is 2 and the placeholder has a
+    /// needle. The `Authorization` in the same head is the other half of the assertion — it is not
+    /// being injected, so it must still be observed, and a filter that simply dropped everything
+    /// could not pass.
+    #[test]
+    fn an_injected_header_is_excluded_under_every_spelling_the_strip_folds() {
+        let creds = default_creds(Vec::new(), Vec::new());
+        let kept = creds.observe_head(
+            &vec![
+                (
+                    "X-Api-Key".into(),
+                    "sbx-placeholder-not-a-real-credential".into(),
+                ),
+                ("Authorization".into(), "Bearer tok-0123456789abcdef".into()),
+            ],
+            // The declaration's own spelling, which the strip folds onto the client's.
+            &["X_Api_Key"],
+            "host.test",
+        );
+        assert_eq!(kept, 1, "only the header sbx does not replace is observed");
+        let set = creds.snapshot();
+        let needles: Vec<Vec<u8>> = set.needles.iter().map(|n| n.as_bytes().to_vec()).collect();
+        assert!(
+            !needles
+                .iter()
+                .any(|n| n == b"sbx-placeholder-not-a-real-credential"),
+            "the stripped placeholder must not be tripwired: {needles:?}"
+        );
+        assert_eq!(
+            needles,
+            vec![b"tok-0123456789abcdef".to_vec()],
+            "and the header that does reach the wire is still remembered"
+        );
+    }
+
+    /// The auth scheme is case-insensitive (RFC 9110), so the needle must be the bare token whichever
+    /// way the client spelled it. Comparing a hand-written list of casings exactly left `BEARER
+    /// <token>` unstripped, and the needle then carried the scheme word: the outbound tripwire only
+    /// refused the token inside a header spelled that same way, and the response masking never
+    /// matched the bare token — the one spelling that matters, because it is how the credential looks
+    /// when it leaks somewhere other than this header.
+    ///
+    /// Teeth: with the case-sensitive prefix list, the first assertion reports the needle as
+    /// `BEARER tok-…` instead of the token.
+    #[test]
+    fn a_scheme_prefix_is_stripped_however_the_client_cased_it() {
+        for value in [
+            "BEARER tok-0123456789abcdef",
+            "bEaReR tok-0123456789abcdef",
+            "Bearer tok-0123456789abcdef",
+        ] {
+            assert_eq!(
+                credential_in(value),
+                "tok-0123456789abcdef",
+                "`{value}` carries the bare token"
+            );
+        }
+        assert_eq!(
+            credential_in("BASIC dXNlcjpwYXNzd29yZA=="),
+            "dXNlcjpwYXNzd29yZA==",
+        );
+        assert_eq!(
+            credential_in("TOKEN tok-0123456789abcdef"),
+            "tok-0123456789abcdef"
+        );
+
+        // And the widening stops at a scheme: a value that merely starts with those letters is a
+        // credential in its own right and must be kept whole, or the needle would be a suffix of the
+        // secret and the masking would leave the first bytes of it on the wire.
+        assert_eq!(
+            credential_in("bearerish-0123456789abcdef"),
+            "bearerish-0123456789abcdef"
+        );
+        assert_eq!(
+            credential_in("opaque-token-0123456789"),
+            "opaque-token-0123456789"
+        );
+        // A non-ASCII value whose seventh byte falls inside a character: `None` from `get`, never a
+        // panicked proxy thread.
+        assert_eq!(credential_in("abcdef\u{e9}ghij"), "abcdef\u{e9}ghij");
     }
 
     // The needle holds a secret to scan the wire for; its `Debug` reports only the byte length, never

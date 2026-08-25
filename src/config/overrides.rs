@@ -504,7 +504,6 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
             allow_insecure_http.is_some(),
             cli_side.allow_insecure_http.is_some(),
         ),
-        ("fs", fs.is_some(), cli_side.fs.is_some()),
     ] {
         if env_has && !cli_has {
             note(field);
@@ -518,6 +517,11 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
         ("forward", forward.is_some()),
         ("seccomp", seccomp.is_some()),
         ("devices", devices.is_some()),
+        // `[fs]` sat in the scalar list above, where a field is only noted when the CLI left it
+        // unset — but `overlay_into` folds it through `union_fs_opt`, so a CLI `[fs]` does not
+        // replace an ambient one, it is *added to* it. An `SBX_CONFIG` mask therefore reached the
+        // launch unannounced whenever the command line happened to carry a `[fs]` of its own.
+        ("fs", fs.is_some()),
         ("ssh_agent", ssh_agent.is_some()),
         ("open", !open.is_empty()),
         ("service", !service.is_empty()),
@@ -1086,7 +1090,7 @@ fn set_limit(
 /// One limit value as declared: a bare number is a `Number` (a byte count for memory, a task count),
 /// anything else a `Text` (`"80%"`, `"16G"`, `"infinity"`) validated downstream.
 fn parse_raw_limit(value: &str) -> RawLimit {
-    match value.parse::<u64>() {
+    match value.parse::<i64>() {
         Ok(n) => RawLimit::Number(n),
         Err(_) => RawLimit::Text(value.to_string()),
     }
@@ -2336,6 +2340,74 @@ mod tests {
         // The tighter ceiling wins, the rule the layer merge already applies: a later blob may not
         // widen how far an earlier one had narrowed the read.
         assert_eq!(fs.scan_max_kb, Some(64));
+    }
+
+    /// The same union, read from the notice side. `[fs]` was listed among the *replaced* scalars,
+    /// which note a field only when the command line left it unset — but the fold above unions the
+    /// two sides, so a command line carrying any `[fs]` of its own suppressed the notice while the
+    /// ambient mask went on applying. The rule is `forward`'s: a unioned field is named whenever
+    /// the environment contributed to it.
+    #[test]
+    fn an_ambient_fs_mask_is_named_even_when_the_command_line_carries_one() {
+        let both = collect_from(
+            &CliOverrides {
+                config: owned(&["[fs]\ndeny = [\"cli.key\"]"]),
+                ..Default::default()
+            },
+            AmbientOverrides {
+                config: Some("[fs]\ndeny = [\"ambient.key\"]".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // The ambient mask is in force — it is not the CLI's that applies alone…
+        let fs = both.raw.fs.as_ref().expect("fs present");
+        assert!(
+            fs.deny.contains(&"ambient.key".to_string()),
+            "the ambient mask applies: {:?}",
+            fs.deny
+        );
+        // …so it has to be named.
+        assert!(
+            both.notices()
+                .iter()
+                .any(|n| n.contains("security field `fs`")),
+            "an ambient `[fs]` that reaches the launch must be named: {:?}",
+            both.notices()
+        );
+        // And the notice still fires for an ambient `[fs]` with no command-line `[fs]` at all,
+        // which is the case the scalar list did get right.
+        let alone = ambient(AmbientOverrides {
+            config: Some("[fs]\ndeny = [\"ambient.key\"]".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            alone
+                .notices()
+                .iter()
+                .any(|n| n.contains("security field `fs`")),
+            "{:?}",
+            alone.notices()
+        );
+        // A `[fs]` the command line alone sets is not environment-sourced and stays unremarked, so
+        // the notice cannot be satisfied by naming the field unconditionally.
+        let cli_only = collect_from(
+            &CliOverrides {
+                config: owned(&["[fs]\ndeny = [\"cli.key\"]"]),
+                ..Default::default()
+            },
+            AmbientOverrides::default(),
+        )
+        .unwrap();
+        assert!(
+            !cli_only
+                .notices()
+                .iter()
+                .any(|n| n.contains("security field `fs`")),
+            "{:?}",
+            cli_only.notices()
+        );
     }
 
     #[test]

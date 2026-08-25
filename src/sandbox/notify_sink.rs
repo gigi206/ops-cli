@@ -556,6 +556,9 @@ impl Notifier {
                 },
             };
             let mut coalescer = Coalescer::default();
+            // How much of the coalescer's running total has already been handed to the shared
+            // counter. See [`publish_unannounced`] for why the total itself is not what is stored.
+            let mut published_unannounced = 0u64;
             // Ends when the channel closes *or* the stop flag is set and nothing is left queued —
             // whichever comes first. A refusal that fired in a session's last moments is still
             // delivered, but teardown never waits on a sender some other path is still holding.
@@ -571,7 +574,11 @@ impl Notifier {
                     Err(RecvTimeoutError::Disconnected) => break,
                 };
                 let speak = coalescer.decide(policy, &block, std::time::Instant::now());
-                thread_unannounced.store(coalescer.unannounced(), Ordering::Relaxed);
+                publish_unannounced(
+                    &thread_unannounced,
+                    &mut published_unannounced,
+                    coalescer.unannounced(),
+                );
                 let Speak::Say { replaces } = speak else {
                     continue;
                 };
@@ -650,6 +657,21 @@ fn drop_report(n: u64) -> Option<String> {
              desktop could show them (the logs — `sbx net logs`, `sbx proc logs` — are complete)"
         )
     })
+}
+
+/// Hand the coalescer's running `total` of unannounced problems to the shared counter, as the
+/// **delta** since this thread last published, and remember `total` for the next call.
+///
+/// Storing the total instead is what this replaces, and it made the advisory non-idempotent: teardown
+/// reports by swapping the counter to zero, and the delivery thread goes on draining what is queued
+/// after `finish` has set the stop flag — so the next block it handled re-published the whole total
+/// and the `Drop` that followed printed the same advisory a second time. As a delta the counter
+/// behaves like `dropped`: what has been taken is gone, and only what happened since is added.
+fn publish_unannounced(counter: &AtomicU64, published: &mut u64, total: u64) {
+    // `Coalescer::unannounced` only ever grows, so the subtraction cannot wrap; saturating rather
+    // than wrapping keeps that an assumption this function does not depend on.
+    counter.fetch_add(total.saturating_sub(*published), Ordering::Relaxed);
+    *published = total;
 }
 
 /// The teardown advisory for `n` distinct problems the repeat memory had no room to announce, or
@@ -971,6 +993,39 @@ mod tests {
         assert!(msg.starts_with("7 blocked-request notification(s) were dropped"));
         // It points at the record that *is* complete, so the reader knows nothing was actually lost.
         assert!(msg.contains("sbx net logs"));
+    }
+
+    #[test]
+    fn the_unannounced_count_is_published_as_a_delta_so_teardown_cannot_repeat_it() {
+        let counter = AtomicU64::new(0);
+        let mut published = 0;
+
+        // What the counter must still carry: the problems the repeat memory had no room for.
+        publish_unannounced(&counter, &mut published, 3);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            3,
+            "three problems went unannounced, and teardown has to be able to say so"
+        );
+
+        // `finish` takes the count and prints the advisory. The delivery thread is still draining
+        // what was queued, so it publishes again — and must not re-arm what was just reported.
+        counter.swap(0, Ordering::Relaxed);
+        publish_unannounced(&counter, &mut published, 3);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "the three were already reported; publishing the running total again would make the \
+             Drop after `finish` print the same advisory twice"
+        );
+
+        // And what happens after the report is still reported.
+        publish_unannounced(&counter, &mut published, 5);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            2,
+            "only the two problems forgotten since the last report"
+        );
     }
 
     #[test]

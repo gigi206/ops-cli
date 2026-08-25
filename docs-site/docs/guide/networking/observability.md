@@ -334,7 +334,9 @@ sent and `<` for what came back:
 
 - **Any configured secret.** Every value is masked to an equal-length run of `*`
   before the bytes are stored, so the capture ring never holds a credential: not in a
-  request, and not in a response that reflects one back.
+  request, and not in a response that reflects one back. A value a **refresh** has since
+  replaced is masked as well: an exchange is captured when it ends, so the token it carried
+  is often exactly the one the `401` on it caused sbx to re-resolve.
 - **Any credential sbx injects.** The head recorded is the **client's own** as it stood
   *before* the [injection](../configuration/secret) happens, so an injected value
   cannot reach the capture even in principle. The injected headers are listed by

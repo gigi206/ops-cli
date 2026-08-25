@@ -11,10 +11,17 @@
 //! actions work end to end. The notification id the host returns is passed through verbatim, so a
 //! signal carrying that id routes back to the right notification with no remapping.
 //!
-//! It adds no capability beyond what the filtered host bus (`dbus = true`) already grants — that
-//! posture likewise allows `org.freedesktop.Notifications` — so the accepted notification-spoofing
-//! residual is the same, and no keyring/portal/other service is reachable through this relay (it
-//! forwards only the notifications interface).
+//! What that forwarding costs is stated here rather than justified away. This section used to argue
+//! that the relay adds no capability beyond what the filtered host bus already grants, but under
+//! `dbus = true` the cage gets a private bus and no host bus at all, so the relay is its *only*
+//! route to the host daemon and everything the relay forwards is capability it would otherwise not
+//! have. What it forwards is the notifications interface alone (no keyring, no portal, no other host
+//! service). The residual accepted is notification **spoofing**: the cage picks the app name, icon
+//! and text of a toast the user reads as the desktop's. Notification **hijacking** is not accepted —
+//! `Notify`'s `replaces_id` and `CloseNotification` are checked against the ids the host daemon
+//! actually returned for this cage's own calls ([`OwnedIds`]), so the cage cannot overwrite or
+//! dismiss a notification it never raised, sbx's own refusal toasts ([`super::notify_sink`])
+//! included.
 //!
 //! Lifecycle: [`NotifyRelay::start`] spawns a dedicated thread that drives the async work with
 //! `async_io::block_on` (the pure-Rust async-io backend — no tokio, and the runtime never leaves this
@@ -26,9 +33,11 @@
 //! picker and at-launch theme, served entirely in-cage, are unaffected).
 
 use crate::diag;
+use crate::sandbox::locks::locked;
 use futures_util::{FutureExt, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use zbus::zvariant::OwnedValue;
@@ -79,11 +88,49 @@ pub(crate) trait HostNotifications {
     fn notification_closed(&self, id: u32, reason: u32) -> zbus::Result<()>;
 }
 
+/// The notification ids the host daemon returned for *this* cage's `Notify` calls, minus those it
+/// has since reported closed — the whole of what the relay knows about which notifications on the
+/// host belong to the cage.
+///
+/// A notification id is a host-wide `u32` counter, so an id the cage guesses (or reads off a
+/// forwarded `NotificationClosed`) names some other app's notification just as well as its own, and
+/// `replaces_id` on a foreign id overwrites it in place. Every id the cage names is checked here
+/// first.
+///
+/// Takes [`locked`] rather than `lock().unwrap()`: this guards a decision rather than a record, so
+/// it owes that argument where it lives. Its mutations are a single `insert`/`remove` of a `u32`,
+/// which an unwind cannot leave half-applied, and panicking instead would end the thread serving the
+/// private bus — removing the check rather than tightening it. Poisoning cannot arise from this
+/// module in any case: nothing that can panic runs while the guard is held.
+#[derive(Default)]
+struct OwnedIds(Mutex<HashSet<u32>>);
+
+impl OwnedIds {
+    /// Record an id the host daemon just returned for one of this cage's `Notify` calls.
+    fn record(&self, id: u32) {
+        locked(&self.0).insert(id);
+    }
+
+    /// Forget an id the host reported closed. Keeps the set to the cage's *live* notifications, so a
+    /// long-running app does not accumulate ids for the whole launch.
+    fn forget(&self, id: u32) {
+        locked(&self.0).remove(&id);
+    }
+
+    /// Whether `id` is one of this cage's own live notifications. `0` is never owned — in the
+    /// notifications spec it is the "not a replacement" sentinel, never a real id.
+    fn owns(&self, id: u32) -> bool {
+        id != 0 && locked(&self.0).contains(&id)
+    }
+}
+
 /// The interface served on the **private** bus: every method is forwarded to the host proxy. A
 /// forwarding error becomes an `fdo` error reply so the caged app sees a clean failure rather than a
 /// dropped call.
 struct Served {
     host: HostNotificationsProxy<'static>,
+    /// Shared with the signal pump in [`run`], which forgets an id when the host reports it closed.
+    ours: Arc<OwnedIds>,
 }
 
 #[interface(name = "org.freedesktop.Notifications")]
@@ -100,7 +147,16 @@ impl Served {
         hints: HashMap<String, OwnedValue>,
         expire_timeout: i32,
     ) -> fdo::Result<u32> {
-        self.host
+        // An id the relay never handed out is not the cage's to overwrite, so it is downgraded to the
+        // spec's "no replacement" sentinel rather than refused: the app still gets its notification,
+        // it just gets a new one instead of taking over somebody else's.
+        let replaces_id = if self.ours.owns(replaces_id) {
+            replaces_id
+        } else {
+            0
+        };
+        let id = self
+            .host
             .notify(
                 &app_name,
                 replaces_id,
@@ -112,10 +168,20 @@ impl Served {
                 expire_timeout,
             )
             .await
-            .map_err(|e| fdo::Error::Failed(format!("forward Notify: {e}")))
+            .map_err(|e| fdo::Error::Failed(format!("forward Notify: {e}")))?;
+        self.ours.record(id);
+        Ok(id)
     }
 
     async fn close_notification(&self, id: u32) -> fdo::Result<()> {
+        // Same rule as `replaces_id`: an id outside the set is either foreign — the cage must not
+        // dismiss what it never raised — or one of the cage's own that the host has already closed
+        // (`forget` dropped it then). Answered `Ok` rather than as an error because of the second
+        // case: an app closing a notification that has just expired must not start seeing failures,
+        // and closing an already-closed notification is a no-op on the host daemon too.
+        if !self.ours.owns(id) {
+            return Ok(());
+        }
         self.host
             .close_notification(id)
             .await
@@ -211,7 +277,11 @@ async fn run(
 
     // Private bus: own the notifications name and serve the forwarding interface. zbus dispatches the
     // served interface's method calls on its own internal executor, so this future only pumps signals.
-    let served = Served { host: host.clone() };
+    let ours = Arc::new(OwnedIds::default());
+    let served = Served {
+        host: host.clone(),
+        ours: Arc::clone(&ours),
+    };
     let address = format!("unix:path={}", private_socket.display());
     let private_conn = connection::Builder::address(address.as_str())?
         .name(IFACE)?
@@ -237,6 +307,10 @@ async fn run(
             sig = closed.next().fuse() => match sig {
                 Some(sig) => if let Ok(a) = sig.args() {
                     let (id, reason) = (a.id, a.reason);
+                    // Whoever raised it, this id now names nothing: drop it so the set stays the
+                    // cage's live notifications, and an id the host later recycles for another app's
+                    // notification is not still claimed as the cage's.
+                    ours.forget(id);
                     let _ = private_conn
                         .emit_signal(None::<&str>, OBJECT, IFACE, "NotificationClosed", &(id, reason))
                         .await;
@@ -246,4 +320,33 @@ async fn run(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_ids_admits_only_the_ids_the_relay_handed_out() {
+        let ours = OwnedIds::default();
+        ours.record(7);
+
+        // What the guard must permit: the cage replacing and closing its own notification.
+        assert!(ours.owns(7), "an id this relay returned is the cage's own");
+
+        // What it must refuse: a host-wide id the cage never obtained from us — `replaces_id` on one
+        // of these overwrites another app's notification in place, sbx's own refusal toasts included.
+        assert!(
+            !ours.owns(8),
+            "an id the relay never returned is not the cage's"
+        );
+        assert!(
+            !ours.owns(0),
+            "0 is the no-replacement sentinel, never an id"
+        );
+
+        // Once the host reports it closed the id names nothing, and may be recycled for someone else.
+        ours.forget(7);
+        assert!(!ours.owns(7), "a closed id is no longer the cage's");
+    }
 }

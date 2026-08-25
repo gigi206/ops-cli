@@ -646,14 +646,29 @@ fn serve_conn(
     // The first message is read under a deadline, and before anything is stood up for this
     // connection — so a cage that connects and says nothing holds neither a connection to the
     // user's own agent nor a slot for longer than the deadline.
+    //
+    // Both halves are needed and neither replaces the other, on the pairing `serve_exchanges` in
+    // [`super::broker`] states in full: the socket timeout so a connection that sends nothing at all
+    // does not block in `read` for good, and the wall-clock budget so one that trickles does not
+    // extend the wait a frame's length at a time. The timeout alone was not a deadline — a message
+    // arrives across several reads (a four-byte length, then a body of the client's own chosen
+    // size), each starting a fresh timeout, so a cage sending one byte just inside it held a thread
+    // and one of `MAX_CONCURRENT_CONNS` slots for as long as it cared to keep dribbling.
+    let deadline = std::time::Instant::now() + first_message;
     cage.set_read_timeout(Some(first_message))?;
-    let mut request = match read_message(&mut cage) {
+    let first = {
+        let mut bounded = super::deadline::Deadlined::new(&mut cage, deadline);
+        read_message(&mut bounded)
+    };
+    let mut request = match first {
         Ok(r) => r,
         Err(e) => {
             // A client that connects and closes without asking anything is ordinary (a probe for
             // the socket's existence does exactly that) and is passed over in silence. Running out
             // the deadline is not: it is the one shape that costs the session something, so it is
-            // recorded.
+            // recorded — and the two ways of running it out are recorded apart, since a connection
+            // that said nothing and one that said just enough to stay alive are different faults to
+            // go looking for. The socket timeout is asked first: a silent client trips both.
             if matches!(
                 e.kind(),
                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
@@ -662,12 +677,19 @@ fn serve_conn(
                     AgentKind::Refuse,
                     "a connection that asked for nothing within the broker's deadline",
                 );
+            } else if std::time::Instant::now() >= deadline {
+                ring.push(
+                    AgentKind::Refuse,
+                    "a connection that did not finish its first request within the broker's \
+                     deadline",
+                );
             }
             return Ok(());
         }
     };
     // Lifted for the rest of the connection: an ssh client holds its agent connection open for the
-    // whole session and is idle between signatures.
+    // whole session and is idle between signatures. The budget goes with it — it bounded the first
+    // message, and a session idle between signatures is the ordinary case rather than a fault.
     cage.set_read_timeout(None)?;
     let mut host = UnixStream::connect(host_sock)?;
     let mut conn = Conn::new(filter, ring).with_confirm(confirm);
@@ -1279,6 +1301,58 @@ mod tests {
             "the record says what happened: {:?}",
             events[0].detail
         );
+    }
+
+    #[test]
+    fn a_cage_connection_that_trickles_is_given_up_on_at_the_deadline() {
+        // The other half of the same bound, and the one a socket timeout alone did not give: a
+        // message arrives across several reads, so a client sending one byte just inside the timeout
+        // reset it forever and held a thread and one of `MAX_CONCURRENT_CONNS` slots for as long as
+        // it liked. The budget is wall-clock, so the dribble buys nothing.
+        let (cage, mut held) = UnixStream::pair().expect("a socket pair");
+        let ring = AgentRing::new(64);
+        let first_message = std::time::Duration::from_millis(200);
+        let trickle = std::thread::spawn(move || {
+            // A well-formed 256-byte frame, sent one byte at a time: well inside the per-read
+            // timeout each time, and well past the whole budget in total. The length has to be a
+            // real one, or the frame is refused for its size before any deadline is reached.
+            let frame = [0u8, 0, 1, 0];
+            for byte in frame.iter().chain(std::iter::repeat(&0xAAu8)).take(20) {
+                if held.write_all(&[*byte]).is_err() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(60));
+            }
+        });
+
+        let started = std::time::Instant::now();
+        serve_conn(
+            cage,
+            // Reaching the host agent would be the bug: the first message never completed, so
+            // nothing may be stood up for this connection.
+            Path::new("/nonexistent/sbx-test-agent.sock"),
+            &Filter::default(),
+            &ring,
+            None,
+            first_message,
+        )
+        .expect("a trickling connection ends cleanly rather than erroring");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the budget ends it at the deadline, not the client at its leisure: {:?}",
+            started.elapsed()
+        );
+        let events = ring.snapshot(None).events;
+        assert_eq!(events.len(), 1, "one decision recorded: {events:?}");
+        assert_eq!(events[0].kind, AgentKind::Refuse);
+        assert!(
+            events[0]
+                .detail
+                .contains("did not finish its first request"),
+            "the record separates a dribble from a connection that said nothing: {:?}",
+            events[0].detail
+        );
+        let _ = trickle.join();
     }
 
     #[test]

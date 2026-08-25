@@ -1302,6 +1302,43 @@ fn serve_conn(
     )
 }
 
+/// Write one plugin-produced frame to the cage, holding it to the one rule that governs every such
+/// frame: it must never carry the secret marker. Returns whether the connection may go on — `false`
+/// both for a frame refused here and for a write that failed, since either ends it.
+///
+/// A function rather than the check spelled out at each write site, because one site did not have
+/// it. The rule lived inline in the request loop under a comment calling that "the last place bytes
+/// can reach the cage"; the host's greeting reaches the cage from a *different* loop above it, which
+/// wrote back whatever the plugin returned. So on a `host_greets` protocol a plugin could teach the
+/// cage the marker in exchange 0, before the cage had said anything at all — and the record would
+/// show a forwarded greeting. Both sites call this now, so the promise that comment makes is one
+/// place rather than two that must be kept in step.
+fn write_to_cage(
+    cage_w: &mut impl Write,
+    spec: &crate::plugins::broker::BrokerSpec,
+    bytes: &[u8],
+    marker: Option<&SecretMarker>,
+    ring: &super::broker_control::BrokerRing,
+    name: &str,
+) -> bool {
+    if let Some(marker) = marker
+        && marker.present_in(bytes)
+    {
+        ring.push(
+            super::broker_control::BrokerKind::Refuse,
+            name,
+            "a frame that would have taught the cage the credential's marker",
+            None,
+        );
+        crate::diag::warn(&format!(
+            "broker `{name}`: a frame bound for the cage carried the secret marker — refused and \
+             the connection ended"
+        ));
+        return false;
+    }
+    write_frame(cage_w, spec.framing, bytes, true).is_ok()
+}
+
 /// Relay one connection's exchanges, from the host's greeting (where the protocol has one) to
 /// whichever side ends it.
 ///
@@ -1332,7 +1369,7 @@ fn serve_exchanges(
             .ok_or("the host resource closed before greeting")?;
         let greeted = collect_reply(spec, decider, host, 0, Some(greeting), marker)?;
         for bytes in &greeted.frames {
-            if write_frame(&mut cage_w, spec.framing, bytes, true).is_err() {
+            if !write_to_cage(&mut cage_w, spec, bytes, marker, ring, name) {
                 return Ok(());
             }
         }
@@ -1510,26 +1547,11 @@ fn serve_exchanges(
             continue;
         }
         for bytes in &answer {
-            // The last place bytes can reach the cage, and therefore the right place to hold the
-            // rule that they must never carry the marker. The verdict paths refuse it earlier and
-            // with a better message; this is the net under them, so a path added later cannot
-            // quietly become the one that leaks it.
-            if let Some(marker) = marker
-                && marker.present_in(bytes)
-            {
-                ring.push(
-                    super::broker_control::BrokerKind::Refuse,
-                    name,
-                    "a frame that would have taught the cage the credential's marker",
-                    None,
-                );
-                crate::diag::warn(&format!(
-                    "broker `{name}`: a frame bound for the cage carried the secret marker — \
-                     refused and the connection ended"
-                ));
-                return Ok(());
-            }
-            if write_frame(&mut cage_w, spec.framing, bytes, true).is_err() {
+            // Every frame bound for the cage goes through the one door, greeting included — see
+            // [`write_to_cage`]. The verdict paths refuse a marker earlier and with a better
+            // message; that door is the net under them, so a path added later cannot quietly
+            // become the one that leaks it.
+            if !write_to_cage(&mut cage_w, spec, bytes, marker, ring, name) {
                 return Ok(());
             }
         }
@@ -3163,6 +3185,85 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             "and says what was refused, with the plugin's own words: {:?}",
             events[0].detail
         );
+    }
+
+    /// Every frame bound for the cage is held to the marker rule — the host's greeting included.
+    ///
+    /// The rule lived inline in the request loop, under a comment calling that "the last place bytes
+    /// can reach the cage". It was not: a `host_greets` protocol relays exchange 0 from a loop above
+    /// it, which wrote back whatever `collect_reply` produced — and a host frame forwarded as it
+    /// stands is scanned for the marker nowhere else. A greeting carrying the marker therefore taught
+    /// it to the cage before the cage had said a word, and the record called that a forward.
+    ///
+    /// The second arm is what keeps the guard from being satisfied by refusing every greeting: an
+    /// ordinary one still reaches the cage, and is not recorded as a refusal.
+    #[test]
+    fn a_greeting_carrying_the_marker_is_refused_like_any_other_frame_bound_for_the_cage() {
+        for carries_marker in [true, false] {
+            let mut spec = spec(None);
+            spec.host_greets = true;
+            let marker = marker_for("hunter2");
+            let greeting = if carries_marker {
+                format!("GREETING {}", marker.token()).into_bytes()
+            } else {
+                b"GREETING".to_vec()
+            };
+
+            let (cage, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+            let mut client = theirs;
+            // Half-closed, so a greeting that *is* delivered is followed by an ordinary end of the
+            // cage's messages rather than a wait for one that is not coming.
+            client
+                .shutdown(std::net::Shutdown::Write)
+                .expect("half-close");
+
+            // The host speaks first and the manifest grants no reply inspection, so the plugin is
+            // never asked about the greeting: it is forwarded as it stands, which is exactly the
+            // shape no other guard covers.
+            let mut plugin = ScriptedPlugin::new(Vec::new());
+            let mut host = FakeHost::with_runs(Vec::new());
+            write_frame(&mut host.outbox, spec.framing, &greeting, true)
+                .expect("stage the greeting");
+
+            let ring = super::super::broker_control::BrokerRing::new(8);
+            serve_exchanges(
+                &spec,
+                &mut plugin,
+                &mut host,
+                cage,
+                &ring,
+                Some(&marker),
+                "x",
+            )
+            .expect("served");
+
+            let mut back = Vec::new();
+            client.read_to_end(&mut back).expect("read what came back");
+            let events = ring.snapshot(None).events;
+            if carries_marker {
+                assert!(
+                    back.is_empty(),
+                    "not one byte of a greeting carrying the marker may reach the cage: {back:?}"
+                );
+                assert_eq!(events.len(), 1, "the refusal is recorded: {events:?}");
+                assert!(
+                    events[0].detail.contains("marker"),
+                    "and names what was refused: {:?}",
+                    events[0].detail
+                );
+            } else {
+                let mut cur = std::io::Cursor::new(&back[..]);
+                assert_eq!(
+                    read_frame(&mut cur, spec.framing, 4096, true).unwrap(),
+                    Some(b"GREETING".to_vec()),
+                    "an ordinary greeting must still reach the cage"
+                );
+                assert!(
+                    events.is_empty(),
+                    "and must not be recorded as a refusal: {events:?}"
+                );
+            }
+        }
     }
 
     /// A message the protocol answers with nothing does not end the conversation.

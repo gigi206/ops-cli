@@ -372,8 +372,16 @@ pub(super) struct Deflate {
 /// Read the negotiated `permessage-deflate` parameters off an upgrade response head.
 ///
 /// Only the response decides: the client may offer the extension and the server decline it, in which
-/// case nothing is compressed. A response naming any other extension first is not something this
-/// decoder can follow, so it reports nothing negotiated and the payloads are captured as they cross.
+/// case nothing is compressed. A response naming any other extension — first, last, or beside
+/// `permessage-deflate` — is not something this decoder can follow, so it reports nothing negotiated
+/// and the payloads are captured as they cross.
+///
+/// That is a whole-list rule, not a search for the deflate entry: extensions negotiated on one
+/// stream compose, each transforming what the next one sees (RFC 6455 §9.1), so an unknown entry
+/// sits between the framing and the DEFLATE stream this would otherwise inflate. Picking the deflate
+/// entry out of the list and inflating past the unknown one — which this did — decodes whatever that
+/// other extension left behind, and files it as the message's text. Reporting nothing negotiated
+/// keeps the payload as it crossed: honest about not knowing, where a wrong inflate is not.
 pub(super) fn negotiated_deflate(resp_head: &[u8]) -> Deflate {
     let head = String::from_utf8_lossy(resp_head);
     let Some(value) = head.lines().find_map(|line| {
@@ -384,14 +392,21 @@ pub(super) fn negotiated_deflate(resp_head: &[u8]) -> Deflate {
     }) else {
         return Deflate::default();
     };
-    // One negotiated extension per comma-separated entry; only the deflate one concerns this.
+    // One negotiated extension per comma-separated entry, and every one of them has to be the
+    // deflate entry — see the doc above for why an entry beside it is not skipped past.
+    let mut negotiated: Option<Deflate> = None;
     for entry in value.split(',') {
         let mut params = entry.split(';').map(str::trim);
         if !params
             .next()
             .is_some_and(|n| n.eq_ignore_ascii_case("permessage-deflate"))
         {
-            continue;
+            return Deflate::default();
+        }
+        if negotiated.is_some() {
+            // The same extension negotiated twice is no more followable: there is one window per
+            // direction and this response asks for two sets of parameters over it.
+            return Deflate::default();
         }
         let mut out = Deflate {
             negotiated: true,
@@ -405,9 +420,9 @@ pub(super) fn negotiated_deflate(resp_head: &[u8]) -> Deflate {
                 out.server_no_context_takeover = true;
             }
         }
-        return out;
+        negotiated = Some(out);
     }
-    Deflate::default()
+    negotiated.unwrap_or_default()
 }
 
 /// What one pass over the header bytes so far concluded.
@@ -588,7 +603,11 @@ impl FrameTee {
                     // window out of step, so this direction stops here rather than decoding the rest
                     // wrongly.
                     if self.pending.len() + piece.len() > self.compressed_budget() {
-                        filled |= self.consume(&piece);
+                        // Nothing is consumed on the way out. `piece` is raw DEFLATE — consuming it
+                        // filed the compressor's output in the transcript as if it were the
+                        // message's text, and handed the scan bytes no needle can ever match. The
+                        // transcript ends at the last message actually decoded, which is the answer
+                        // the failed-decode path in `end_of_frame` already gives.
                         self.done = true;
                         break;
                     }
@@ -874,12 +893,18 @@ pub(super) fn relay_upgrade(
     let upstream = up_br.into_inner();
     let client_pending = br.buffer().to_vec();
     let client = br.into_inner();
+    // The host this tunnel is bound for, which decides which learned credential the leak tripwire
+    // scans for. Read off the handshake's own `Host` rather than threaded down from the CONNECT:
+    // `serve_tunneled_request` refuses the request outright unless the CONNECT target, the SNI and
+    // this header all canonicalize to the same name, so there is one host here and not two.
+    let dest = inner.header("host").map(strip_port).unwrap_or_default();
     relay_websocket(
         client,
         &client_pending,
         upstream,
         &upstream_pending,
         deflate,
+        &dest,
         TunnelObservers {
             up,
             down,
@@ -995,12 +1020,31 @@ fn follow(tee: &mut Option<FrameTee>, chunk: &[u8], way: SecretWay, obs: &Tunnel
     seen
 }
 
+/// The needles a tunnel bound for `dest` scans for, on the same rule the request planes use
+/// ([`SecretNeedle::scanned_for`]): every declared secret, and every credential the cage *learned*
+/// except on the host it was learned from.
+///
+/// Scanning the whole set here contradicted that rule on the one path where it costs the most. A
+/// tunnel to `chat.example` carries the session token the app obtained from `chat.example` in its
+/// very first frame; the tripwire read it as a leak, and under `[network] websocket_secret = block`
+/// closed the socket the app had just opened — the app cutting its own session off, reported as an
+/// exfiltration attempt. The way back is filtered on the same set, so the credential's own service
+/// echoing it is not filed as a secret that "came back" either.
+fn tunnel_needles(needles: &[SecretNeedle], dest: &str) -> Vec<SecretNeedle> {
+    needles
+        .iter()
+        .filter(|n| n.scanned_for(dest))
+        .cloned()
+        .collect()
+}
+
 pub(super) fn relay_websocket(
     mut client: StreamOwned<ServerConnection, UnixStream>,
     client_pending: &[u8],
     mut upstream: StreamOwned<ClientConnection, TcpStream>,
     upstream_pending: &[u8],
     deflate: Deflate,
+    dest: &str,
     obs: TunnelObservers,
 ) -> io::Result<()> {
     // Only a body-keeping capture has anything to file for a tunnel, so it is narrowed once, here,
@@ -1041,8 +1085,9 @@ pub(super) fn relay_websocket(
         false => (None, None),
     };
     let creds = ctx.credentials.snapshot();
-    let mut tee_up = FrameTee::new(to_upstream, &creds.needles, up_deflate);
-    let mut tee_down = FrameTee::new(to_client, &creds.needles, down_deflate);
+    let needles = tunnel_needles(&creds.needles, dest);
+    let mut tee_up = FrameTee::new(to_upstream, &needles, up_deflate);
+    let mut tee_down = FrameTee::new(to_client, &needles, down_deflate);
     // The transcript is filed whenever a direction reaches its cap, and once more when the tunnel
     // ends (in the capture guard's teardown). Each direction has its own trigger, and each fires at
     // most once: one side of a live stream can fill in seconds while the other trickles for hours,
@@ -1625,6 +1670,58 @@ mod tests {
         assert_eq!(captured(&sink).bytes, b"plain text");
     }
 
+    /// A message whose compressed bytes run past [`FrameTee::compressed_budget`] leaves the
+    /// transcript at the last message that was actually decoded.
+    ///
+    /// The direction has to stop there — the peer's window is now ahead of this decoder's, so every
+    /// later message would inflate to rubbish. What it must not do is *file* the bytes it gave up
+    /// on: they are raw DEFLATE, and consuming them (which this did) stored the compressor's output
+    /// in the capture as if it were the message's text, and handed the leak scan bytes no needle
+    /// could ever match.
+    #[test]
+    fn a_message_past_the_compressed_budget_files_none_of_its_deflate_bytes() {
+        use miniz_oxide::deflate::core::CompressorOxide;
+        let (mut t, sink) = deflating_tee(4096, false);
+
+        // A real compressed message first, so the assertion below cannot be satisfied by a tee that
+        // captures nothing at all.
+        let mut c = CompressorOxide::new(raw_deflate_flags());
+        t.push(&deflated_frame(b"decoded-and-kept", &mut c));
+        assert_eq!(
+            captured(&sink).bytes,
+            b"decoded-and-kept",
+            "the ordinary compressed message must be captured, else this test proves nothing"
+        );
+
+        // Then one claiming RSV1 whose payload alone exceeds the budget (`plaintext_cap * 4`, floored
+        // at 64 KiB). It is never inflated — the budget is checked before the message is assembled —
+        // so its bytes are exactly what a consumer would file if this path consumed them.
+        let marker = b"NOT-PLAINTEXT-";
+        let payload: Vec<u8> = marker.iter().copied().cycle().take(80 * 1024).collect();
+        assert!(
+            payload.len() > t.compressed_budget(),
+            "the payload must exceed the budget under test"
+        );
+        let mut wire = vec![0xc1u8, 127];
+        wire.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        wire.extend_from_slice(&payload);
+        t.push(&wire);
+
+        assert!(
+            t.done,
+            "a direction that gave up on a message holds a window it cannot square, so it stops"
+        );
+        let got = captured(&sink).bytes;
+        assert!(
+            !got.windows(marker.len()).any(|w| w == marker),
+            "DEFLATE bytes were filed as a message's text — nothing any peer sent looks like this"
+        );
+        assert_eq!(
+            got, b"decoded-and-kept",
+            "the transcript must end at the last message actually decoded"
+        );
+    }
+
     /// A stream that claims compression but does not decode stops the direction rather than storing
     /// rubbish — and it must stop, since every later message shares the same window.
     #[test]
@@ -1671,6 +1768,34 @@ mod tests {
             !other.negotiated,
             "an extension this decoder cannot follow is not claimed"
         );
+
+        // Co-negotiated, in both orders. Extensions on one stream compose, so an unknown entry sits
+        // between the framing and the DEFLATE stream — picking the deflate entry out of the list
+        // and inflating past the unknown one decodes whatever that other extension left behind and
+        // files it as the message's text. Neither order may report a followable stream.
+        for head in [
+            b"HTTP/1.1 101 Switching Protocols\r\n              Sec-WebSocket-Extensions: x-custom, permessage-deflate\r\n\r\n"
+                .as_slice(),
+            b"HTTP/1.1 101 Switching Protocols\r\n              Sec-WebSocket-Extensions: permessage-deflate, x-custom\r\n\r\n"
+                .as_slice(),
+        ] {
+            let got = negotiated_deflate(head);
+            assert!(
+                !got.negotiated,
+                "deflate co-negotiated with an extension this decoder cannot follow must report \
+                 nothing negotiated, so the payload is captured as it crosses: {}",
+                String::from_utf8_lossy(head)
+            );
+        }
+        // And the guard still admits the plain case, so it cannot be satisfied by refusing every
+        // response that carries an extension header at all.
+        assert!(
+            negotiated_deflate(
+                b"HTTP/1.1 101 Switching Protocols\r\n                  Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n",
+            )
+            .negotiated,
+            "a response naming only permessage-deflate is exactly what this follows"
+        );
     }
 
     /// The sink's cap bounds a chatty tunnel, and filling it is the signal the relay uses to show a
@@ -1690,6 +1815,61 @@ mod tests {
         let got = captured(&sink);
         assert_eq!(got.bytes, b"12345678");
         assert!(got.truncated, "the cut is reported, never silent");
+    }
+
+    /// A tunnel must not scan for a credential the cage learned on the very host the tunnel goes to.
+    ///
+    /// `carries_secret` already waves that case through on the request planes ([`SecretNeedle::scanned_for`]):
+    /// re-sending a session token to the service that issued it is the app using its own sign-in.
+    /// The tunnel scanned the whole set instead, so under `[network] websocket_secret = block` the
+    /// first frame carrying the app's own token closed the socket it had just opened — the app
+    /// cutting off its own session, reported as an exfiltration attempt.
+    ///
+    /// The declared needle and the needle learned on *another* host are asserted kept in the same
+    /// breath, so the filter cannot be satisfied by scanning for nothing.
+    #[test]
+    fn a_tunnel_does_not_scan_for_a_credential_learned_on_its_own_host() {
+        const OWN: &str = "SESSION-TOKEN-OWN-HOST-01";
+        const OTHER: &str = "SESSION-TOKEN-OTHER-HOST-1";
+        let creds = Credentials::new(
+            Vec::new(),
+            vec![SecretNeedle::named("declared", NEEDLE_VALUE.to_vec())],
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+        );
+        assert!(
+            creds.observe("Authorization", &format!("Bearer {OWN}"), "chat.example"),
+            "the needle learned on the tunnel's own host is the premise of this test"
+        );
+        assert!(
+            creds.observe("Authorization", &format!("Bearer {OTHER}"), "other.example"),
+            "the needle learned elsewhere is the premise of this test"
+        );
+
+        let all = creds.snapshot();
+        let kept = tunnel_needles(&all.needles, "chat.example");
+        let has =
+            |needles: &[SecretNeedle], value: &[u8]| needles.iter().any(|n| n.as_bytes() == value);
+        assert!(
+            !has(&kept, OWN.as_bytes()),
+            "a credential learned on chat.example must not be scanned for on a tunnel to \
+             chat.example — the app's own authenticated stream is not a leak"
+        );
+        assert!(
+            has(&kept, OTHER.as_bytes()),
+            "a credential learned on another host is exactly what this tripwire exists to catch"
+        );
+        assert!(
+            has(&kept, NEEDLE_VALUE),
+            "a declared secret is scanned for everywhere, destination included"
+        );
+        // The exemption is scoped to the one host: the same tunnel to anywhere else still scans it.
+        assert!(
+            has(
+                &tunnel_needles(&all.needles, "elsewhere.example"),
+                OWN.as_bytes()
+            ),
+            "the exemption must be the host it was learned on and no other"
+        );
     }
 
     /// The value [`needle`] looks for, so a test can send exactly what the scan is watching for.

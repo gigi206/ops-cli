@@ -3028,6 +3028,7 @@ fn proc_is_trusted_gated_and_the_app_overlay_replaces_the_baseline() {
             mode: Some(mode.into()),
             allow: Vec::new(),
             deny: deny.iter().map(|s| s.to_string()).collect(),
+            rest: BTreeMap::new(),
         }))
     };
 
@@ -6502,7 +6503,7 @@ fn the_default_devices_grant_is_empty() {
 }
 
 /// A `RawConfig` declaring an `[fs]` table carrying content-scan patterns.
-fn raw_fs_scan(scan: &[&str], scan_max_kb: Option<u64>) -> RawConfig {
+fn raw_fs_scan(scan: &[&str], scan_max_kb: Option<i64>) -> RawConfig {
     RawConfig {
         fs: Some(schema::RawFs {
             rest: Default::default(),
@@ -7840,6 +7841,7 @@ fn a_mode_less_override_proc_table_inherits_the_baseline_mode() {
                 mode: None,
                 allow: vec![],
                 deny: vec!["curl".into()],
+                rest: BTreeMap::new(),
             })),
             ..RawConfig::default()
         },
@@ -8742,6 +8744,7 @@ fn raw_plugin_table_with(name: &str, env: &[(&str, &str)], programs: &[(&str, &s
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            ..Default::default()
         },
     );
     cfg

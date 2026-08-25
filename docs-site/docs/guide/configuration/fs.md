@@ -159,9 +159,16 @@ system libraries and `/proc` are where the volume is and where your secrets are 
 `scan_max_kb` bounds how much of one file is read, and a file longer than that is judged on its
 start. The launch says so when it happens, rather than presenting a prefix as a whole-file
 result. Leave it unset for the built-in ceiling; `0` is refused, since a scan that reads nothing
-would pass everything while still looking like a scan. Where two layers both set it, the **larger**
-window is the one that applies: a bigger number closes more files, and `[fs]` is honoured from an
-untrusted project precisely because nothing in it can widen what another layer closed.
+would pass everything while still looking like a scan, and so is a negative number, which is no
+ceiling at all. Where two layers both set it, the **larger** window is the one that applies: a
+bigger number closes more files, and `[fs]` is honoured from an untrusted project precisely because
+nothing in it can widen what another layer closed.
+
+**One scanner per layer.** Every pattern a layer lists is compiled into a single scanner, so the
+cost of a scan does not grow with the length of the list; that scanner has a size ceiling, though,
+and a list too large to fit it compiles into nothing. Such a list is dropped at config time, named,
+and only for the layer that wrote it: the shapes another layer declared keep scanning, and a project
+that piles on patterns loses its own scan rather than the launch.
 
 **What it costs you.** Every open of a project file goes through the supervisor, so a build is
 slower than it is without a scan. `scan` also brings that supervisor up on its own, without
@@ -207,7 +214,9 @@ This is different, and it has three named holes:
 
 1. **A second hard link.** A mask covers a *path*, not an inode. If another name in the
    project points at the same file, the content is readable through it. `sbx` warns at
-   launch when a masked file has more than one link.
+   launch when a masked file has more than one link. That holds for a `readonly` entry too,
+   where the alias is not merely readable but *writable*: the re-bind refuses writes on the
+   path it covers, and the second name reaches the same inode around it.
 2. **A file that appears mid-session**, outside a denied directory. The masks are resolved
    at launch; a file created afterwards matching a file pattern is not covered. A denied
    directory does not have this hole.

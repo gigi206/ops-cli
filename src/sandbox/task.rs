@@ -379,6 +379,32 @@ impl std::fmt::Display for TaskError {
     }
 }
 
+/// The announcement one refused admission makes.
+///
+/// Split out because of what `name` is: the tail of a `RUN <name>` request line, chosen by the
+/// cage and bounded by the crossing socket only at that plane's `MAX_PAYLOAD_BYTES` — a mebibyte.
+/// A `Block`'s subject is not merely rendered and dropped: the notifier's coalescer keys its
+/// repeat memory on it, one entry per distinct problem and up to `notify::SEEN_MAX` of them,
+/// held for the session. So a cage asking over and over for tasks that do not exist could pin
+/// roughly a gibibyte of supervisor memory in keys nothing evicts — the same shape the invocation
+/// log ring was fixed for, one sink further along. The sink's own guard cannot close it: that one
+/// shapes what is *shown*, and by then the key is already stored.
+///
+/// [`super::sanitize`] is the crate's single answer to a value the cage chose — control characters
+/// (a newline that would forge a second line) to spaces, and the length capped. `detail` takes it
+/// too, since `TaskError::Unknown`'s `Display` embeds the very same name.
+fn refusal_block(name: &str, reason: &str, detail: &str) -> crate::notify::Block {
+    crate::notify::Block {
+        event: crate::notify::NotifyEvent::Task,
+        subject: super::sanitize(name),
+        reason: reason.to_string(),
+        detail: super::sanitize(detail),
+        // Nothing to suggest: a task is a declaration, and the answer to a refused one is to change
+        // what is declared beside it — never a one-line command.
+        fix: String::new(),
+    }
+}
+
 impl TaskEngine {
     /// Build the engine from the agent cage's own spec, so a task cage is derived from — rather than
     /// a parallel reimplementation of — whatever the launcher assembled for this session.
@@ -601,18 +627,11 @@ impl TaskEngine {
                 _ => None,
             };
             if let Some(reason) = reason {
-                notify.notifier.block(crate::notify::Block {
-                    event: crate::notify::NotifyEvent::Task,
-                    subject: name.to_string(),
-                    reason: reason.to_string(),
-                    detail: match &outcome {
-                        Err(e) => e.to_string(),
-                        Ok(_) => String::new(),
-                    },
-                    // Nothing to suggest: a task is a declaration, and the answer to a refused one is
-                    // to change what is declared beside it — never a one-line command.
-                    fix: String::new(),
-                });
+                let detail = match &outcome {
+                    Err(e) => e.to_string(),
+                    Ok(_) => String::new(),
+                };
+                notify.notifier.block(refusal_block(name, reason, &detail));
             }
         }
         outcome
@@ -1627,9 +1646,27 @@ impl TaskEngine {
     /// script, which the kernel does not do (Linux runs one `#!` hop) but a reader might write. The
     /// hop cap is what a loop meets; an unreadable file is left as itself, and the policy then simply
     /// governs a program that never appears — fail-closed.
+    ///
+    /// A **relative** spelling is resolved against the cage's working directory first, because what
+    /// this returns is a caller key: the supervisor addresses a caller by `/proc/<pid>/exe`, which
+    /// is absolute, always. A node declared as `[exec."./build.sh"]` was keyed by the string
+    /// `./build.sh`, which no caller can equal, and an unmatched caller under a `CallerGraph` takes
+    /// `unmatched()` — `Deny` for the `confine` mode a task runs in. The declaration read as a grant
+    /// and behaved as a denial, and nothing said so. The working directory is the task's project
+    /// directory (what the cage's `--chdir` is set to), which is what the kernel would resolve the
+    /// name against; resolving it here is also what lets the file be read at all, since a relative
+    /// cage path has no host counterpart.
+    ///
+    /// Only the **caller** side is resolved. A target rule is matched against the path the process
+    /// asked for, which may itself be relative, so an entry of a `spawn` list stays as written.
     fn entered_as(&self, incage: &str, task: &TaskSpec) -> String {
         const MAX_HOPS: usize = 4;
-        let mut cur = incage.to_string();
+        let mut cur = match incage.starts_with('/') {
+            true => incage.to_string(),
+            false => lexical_join(&self.project, Path::new(incage))
+                .to_string_lossy()
+                .into_owned(),
+        };
         for _ in 0..MAX_HOPS {
             let Some(interpreter) = self.shebang_of(&cur, task) else {
                 break;
@@ -1724,10 +1761,12 @@ impl TaskEngine {
             // Keyed by what the program is **entered as**, exactly like the command's node above
             // and for the reason stated there: a script's process is its interpreter from its first
             // instruction, so a node keyed by the script file governs a caller that never exists.
-            // These nodes skipped that step, which made every `[exec."./build.sh"]` a dead entry —
-            // and dead in the direction that refuses, since an unmatched caller under a
+            // These nodes skipped that step, which made every `[exec."/opt/build.sh"]` a dead entry
+            // — and dead in the direction that refuses, since an unmatched caller under a
             // `CallerGraph` takes `unmatched()`, which is `Deny` for the `confine` mode a task runs
-            // in. The declaration read as a grant and behaved as a denial.
+            // in. The declaration read as a grant and behaved as a denial. `entered_as` also
+            // resolves a relative spelling against the cage's working directory, for the same
+            // reason and with the same consequence — see its own doc.
             //
             // `warn_if_multicall` stays on the declared program: its question is whether *that*
             // name is one of several for one binary, which is not a question about the interpreter.
@@ -3819,6 +3858,103 @@ mod tests {
             policy.decide(
                 &["/nix/store/demo/bin/build.sh".to_string()],
                 "/nix/store/demo/bin/psql"
+            ),
+            Verdict::Deny
+        );
+    }
+
+    /// What a refusal announces is bounded where it is *built*, because the notifier keeps it: the
+    /// coalescer keys its repeat memory on the subject, one key per distinct problem for the
+    /// session's life. The name is whatever the cage put after `RUN `, capped by the crossing
+    /// socket at a mebibyte, so a cage naming tasks that do not exist could hold about a gibibyte
+    /// of supervisor memory in keys nothing evicts. The sink's guard does not reach it — that one
+    /// shapes what is shown, after the key is stored.
+    #[test]
+    fn a_refused_announcement_bounds_the_name_the_cage_chose() {
+        // The bound `super::super::sanitize` applies, in characters.
+        const MAX: usize = 512;
+        let huge = "x".repeat(4096);
+        let block = refusal_block(
+            &huge,
+            "undeclared",
+            &TaskError::Unknown(huge.clone()).to_string(),
+        );
+        assert!(
+            block.subject.chars().count() <= MAX,
+            "the subject is what the repeat memory holds: {} characters",
+            block.subject.chars().count()
+        );
+        assert!(
+            block.detail.chars().count() <= MAX,
+            "and the reason embeds the same name: {} characters",
+            block.detail.chars().count()
+        );
+        // A newline in the name would forge a second line of whatever reads the announcement.
+        let forged = refusal_block("first\nsecond", "refused", "a\nb");
+        assert!(!forged.subject.contains('\n') && !forged.detail.contains('\n'));
+        // An ordinary name is carried through untouched, or this would be mangling rather than
+        // bounding — and the announcement would name a task nobody declared.
+        let plain = refusal_block("db-query", "undeclared", "no such task `db-query`");
+        assert_eq!(plain.subject, "db-query");
+        assert_eq!(plain.detail, "no such task `db-query`");
+        assert_eq!(plain.reason, "undeclared");
+        assert_eq!(plain.event, crate::notify::NotifyEvent::Task);
+    }
+
+    /// A node whose program is spelled **relative** — `[exec."./build.sh"]`, the natural spelling
+    /// for a script that lives beside the project's own files — is keyed by what the supervisor
+    /// will read out of `/proc/<pid>/exe`, and that is an absolute path, always.
+    ///
+    /// Keyed by the string as typed, such a node governed a caller that cannot exist, and it failed
+    /// in the direction that refuses: an unmatched caller under a `CallerGraph` takes `unmatched()`,
+    /// which is `Deny` for `confine`. So the whole list under the section was read by nothing and
+    /// the script could run none of it.
+    #[test]
+    fn a_relative_node_is_keyed_by_the_program_the_caller_will_report() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::testutil::TmpDir::new();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).expect("the project");
+        let mut task = task();
+        task.cmd = vec!["/bin/sh".to_string()];
+        task.spawn = Some(vec!["./build.sh".to_string()]);
+        task.exec = [("./build.sh".to_string(), vec!["psql".to_string()])]
+            .into_iter()
+            .collect();
+        let mut engine = engine_with_store(root.path(), &["sh", "psql"], vec![task.clone()]);
+        engine.project = project.clone();
+        // The script the relative name points at: in the project, which is the cage's working
+        // directory, entered as the interpreter its `#!` names.
+        let script = project.join("build.sh");
+        std::fs::write(&script, b"#!/nix/store/demo/bin/sh\npsql\n").expect("the script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("mode");
+
+        let policy = engine
+            .spawn_policy(&task, task.spawn.as_ref().unwrap(), &engine.base_env)
+            .expect("a policy");
+        use crate::proc_policy::Verdict;
+        assert_eq!(
+            policy.decide(
+                &["/nix/store/demo/bin/sh".to_string()],
+                "/nix/store/demo/bin/psql"
+            ),
+            Verdict::Allow,
+            "the node must govern the program the script is entered as, wherever it was spelled \
+             from"
+        );
+        // The other half of the declaration still holds: the command may run the script under the
+        // relative name it was written with, because a *target* is matched against the path the
+        // process asked for, not against `/proc/<pid>/exe`.
+        assert_eq!(
+            policy.decide(&["/bin/sh".to_string()], "./build.sh"),
+            Verdict::Allow
+        );
+        // And the node grants only what it names — the guard cannot be satisfied by admitting
+        // everything the interpreter reaches for.
+        assert_eq!(
+            policy.decide(
+                &["/nix/store/demo/bin/sh".to_string()],
+                "/nix/store/demo/bin/less"
             ),
             Verdict::Deny
         );

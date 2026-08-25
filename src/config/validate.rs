@@ -510,8 +510,13 @@ fn warn_inert_under_posture(
     } else {
         "gives the cage the host's network, unfiltered"
     };
+    // Written with `\` continuations like every other message here: an unbroken literal wrapped by
+    // the formatter kept its indentation, and the warning reached the user with two ten-space runs
+    // in the middle of its sentences.
     warnings.push(format!(
-        "{source_label}: ignoring `{named}` under `[network]` — `mode = \"{posture}\"` {what}, so          there is no egress proxy for these to address; a rule list here restricts nothing. Use          `mode = \"deny\"` or `\"ask\"` to filter."
+        "{source_label}: ignoring `{named}` under `[network]` — `mode = \"{posture}\"` {what}, so \
+         there is no egress proxy for these to address; a rule list here restricts nothing. Use \
+         `mode = \"deny\"` or `\"ask\"` to filter."
     ));
 }
 
@@ -994,5 +999,47 @@ fn service_ready(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A warning is a sentence someone reads, and its literal is written to be readable in both
+    /// places. This one had been left unbroken and the formatter wrapped it where it stood, so the
+    /// message carried its own source indentation: two ten-space runs, mid-sentence, in the middle
+    /// of the one line a user sees when a rule list is quietly doing nothing.
+    #[test]
+    fn the_inert_network_fields_warning_carries_no_stray_whitespace() {
+        let table: schema::NetworkTable =
+            toml::from_str("mode = \"shared\"\nallow = [\"api.example.com\"]\n")
+                .expect("a `[network]` table with a non-filtering mode");
+        let mut warnings = Vec::new();
+        validate_network(
+            &mut warnings,
+            "t",
+            NetworkField::Table(table),
+            &NetGroups::new(),
+            &NetworkPolicy::default(),
+        );
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one warning naming the inert field: {warnings:?}"
+        );
+        assert!(
+            !warnings[0].contains("  "),
+            "the message is one sentence, not a wrapped source literal: {:?}",
+            warnings[0]
+        );
+        // And still the whole message: the wrapping is what changed, never what it says.
+        assert!(
+            warnings[0].contains("ignoring `allow` under `[network]`")
+                && warnings[0].contains("there is no egress proxy for these to address")
+                && warnings[0].ends_with("to filter."),
+            "{:?}",
+            warnings[0]
+        );
     }
 }

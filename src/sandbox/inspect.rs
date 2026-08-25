@@ -10,14 +10,17 @@ use std::path::{Path, PathBuf};
 /// the version directories realized for it.
 pub(crate) struct InstalledTool {
     /// The directory name mise gives the tool under `installs/` — the *munged* form of its declared
-    /// token (see [`mise_munge`]), e.g. `aqua-example-demo-tool`.
+    /// token (see [`mise_munge`]), e.g. `aqua-example-demo-tool`. Sanitised on the way in, because
+    /// the cage writes this directory itself (see [`mise_installed_in`]).
     pub(crate) name: String,
     /// The real backend token mise recorded for this tool (`pipx:demo-agent`, `aqua:example/demo-tool`,
     /// …), read from its `.mise.backend.toml`. `None` when that metadata is absent. Preferred over
-    /// the munged directory name for display *and* for an exact match against a declared token.
+    /// the munged directory name for display *and* for an exact match against a declared token, and
+    /// sanitised for the same reason the name is.
     pub(crate) token: Option<String>,
-    /// The version subdirectories realized for the tool. Includes mise's `latest` alias directory
-    /// alongside the concrete version it points at; [`concrete_versions`] filters the alias out.
+    /// The version subdirectories realized for the tool, sanitised like the name. Includes mise's
+    /// `latest` alias directory alongside the concrete version it points at; [`concrete_versions`]
+    /// filters the alias out.
     pub(crate) versions: Vec<String>,
 }
 
@@ -78,6 +81,11 @@ pub(crate) fn mise_installed(home: &Path) -> Vec<InstalledTool> {
 /// any non-directory entry. Sorted by name; empty when the dir carries no mise data. Read-only. Used
 /// for a home's mise dir (via [`mise_installed`]) and for a global app's per-project pool, whose
 /// `installs/` sits directly under the pool dir (the pool *is* mise's data dir).
+///
+/// Every name it returns is run through [`crate::sandbox::sanitize`] first. The `installs/` tree is
+/// inside the cage's own writable home, so a hostile payload chooses these directory names — and
+/// `sbx app show` prints them to a terminal. Filtering at this entry point (rather than in the
+/// renderer) is what keeps a later renderer, `--json` included, from getting the raw form.
 pub(crate) fn mise_installed_in(installs: &Path) -> Vec<InstalledTool> {
     let mut tools = Vec::new();
     let Ok(entries) = std::fs::read_dir(installs) else {
@@ -87,13 +95,18 @@ pub(crate) fn mise_installed_in(installs: &Path) -> Vec<InstalledTool> {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
+        // These names come off the cage's own writable home: the payload can `mkdir` whatever it
+        // likes under `installs/`, so a directory name is attacker-chosen text, not mise's. Sanitise
+        // it here, at the one place it enters the model, rather than at each renderer — the human
+        // table and `--json` and anything added later then all get the filtered form, and a name
+        // carrying `\r` or an ANSI escape cannot forge a line of `sbx app show`.
+        let name = crate::sandbox::sanitize(&entry.file_name().to_string_lossy());
         let token = backend_token(&entry.path());
         let mut versions: Vec<String> = match std::fs::read_dir(entry.path()) {
             Ok(vs) => vs
                 .flatten()
                 .filter(|v| v.file_type().map(|t| t.is_dir()).unwrap_or(false))
-                .map(|v| v.file_name().to_string_lossy().into_owned())
+                .map(|v| crate::sandbox::sanitize(&v.file_name().to_string_lossy()))
                 .collect(),
             Err(_) => Vec::new(),
         };
@@ -119,7 +132,10 @@ fn backend_token(tool_dir: &Path) -> Option<String> {
             let rest = line.trim().strip_prefix(key)?.trim_start();
             let rest = rest.strip_prefix('=')?.trim();
             let quoted = rest.strip_prefix('"')?.strip_suffix('"')?;
-            (!quoted.is_empty()).then(|| quoted.to_string())
+            // The file sits in the cage's writable home, so its value is payload-chosen; it is
+            // displayed in place of the directory name, so it gets the same filter (see
+            // [`mise_installed_in`]).
+            (!quoted.is_empty()).then(|| crate::sandbox::sanitize(quoted))
         })
     };
     value("short").or_else(|| value("full"))
@@ -338,11 +354,19 @@ fn flake_built_in(dir: &Path, name: &str) -> Option<String> {
     None
 }
 
-/// The nix store roots a project tree has realized — the gcroot names under
-/// `<data>/gcroots/projects/<id>/`, skipping the `.expr` derivation-source siblings. This is the
-/// project's **shared** store content: the roots accrue from the project baseline *and* every app
-/// launched in it (they share one per-project store). A `deb-<name>` / `appimage-<name>` name is a
-/// prebuilt build output; every other name is a `nix:` package (or a hole provision). Sorted.
+/// The nix store roots a project tree has realized — the out-link names under
+/// `<data>/gcroots/projects/<id>/`. This is the project's **shared** store content: the roots accrue
+/// from the project baseline *and* every app launched in it (they share one per-project store). A
+/// `deb-<name>` / `appimage-<name>` name is a prebuilt build output; every other name is a `nix:`
+/// package (or a hole provision). Sorted.
+///
+/// A root is a **leaf** out-link, so a sub-*directory* is not one:
+/// [`nixhub::provision`](crate::sandbox::nixhub::provision) roots the tree's `nix:` mise tools one
+/// level down, in the `nix-tools/` directory it keeps apart from the native `[packages]` roots so the
+/// two tool sources cannot collide on a shared name — and that directory entry was read as a root of
+/// its own, so `sbx projects show` listed a `nix:` package literally named `nix-tools` that no project
+/// declares. The `.expr` derivation-source stamp beside a prebuilt root is a plain file and is skipped
+/// by name, as before.
 ///
 /// Read-only; an absent gcroot dir is simply no roots.
 pub(crate) fn gcroot_names(data_dir: &Path, tree_id: &str) -> Vec<String> {
@@ -350,6 +374,7 @@ pub(crate) fn gcroot_names(data_dir: &Path, tree_id: &str) -> Vec<String> {
     let mut names: Vec<String> = match std::fs::read_dir(&dir) {
         Ok(entries) => entries
             .flatten()
+            .filter(|e| !e.file_type().is_ok_and(|t| t.is_dir()))
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| !n.ends_with(".expr"))
             .collect(),
@@ -496,6 +521,51 @@ mod tests {
     }
 
     #[test]
+    fn mise_installed_filters_control_characters_the_cage_chose() {
+        // `installs/` is inside the cage's own writable home, so a hostile payload picks these
+        // directory names and the `.mise.backend.toml` value beside them. Every one of the three
+        // reaches a terminal through `sbx app show`, so a `\r` or an ANSI escape in any of them
+        // would let the payload forge a line of the host's own output.
+        let dir = crate::testutil::TmpDir::new();
+        let tmp = dir.path();
+        let installs = tmp.join(".local/share/mise/installs");
+        let tool = "evil\u{1b}[2Ktool";
+        std::fs::create_dir_all(installs.join(tool).join("1.0\rfake")).unwrap();
+        std::fs::write(
+            installs.join(tool).join(".mise.backend.toml"),
+            "short = \"npm:evil\u{1b}[31mpkg\"\n",
+        )
+        .unwrap();
+
+        let tools = mise_installed(tmp);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0].name, "evil [2Ktool",
+            "the directory name must arrive with its control bytes replaced"
+        );
+        assert_eq!(
+            tools[0].versions,
+            vec!["1.0 fake".to_string()],
+            "a version directory name is payload-chosen too"
+        );
+        assert_eq!(
+            tools[0].token.as_deref(),
+            Some("npm:evil [31mpkg"),
+            "the backend token is read out of a cage-writable file"
+        );
+        assert_eq!(tools[0].label(), "npm:evil [31mpkg");
+        // The filter must not eat ordinary names: a plain install still reads back verbatim.
+        std::fs::create_dir_all(installs.join("bare-tool/1.17.9")).unwrap();
+        let tools = mise_installed(tmp);
+        let bare = tools.iter().find(|t| t.name == "bare-tool").expect("kept");
+        assert_eq!(bare.versions, vec!["1.17.9".to_string()]);
+        assert!(
+            bare.is("bare-tool"),
+            "pairing with a declared token survives"
+        );
+    }
+
+    #[test]
     fn mise_installed_is_empty_without_a_mise_dir() {
         let dir = crate::testutil::TmpDir::new();
         assert!(mise_installed(dir.path()).is_empty());
@@ -601,20 +671,31 @@ mod tests {
     }
 
     #[test]
-    fn gcroot_names_lists_roots_skipping_expr_siblings() {
+    fn gcroot_names_lists_the_out_links_not_the_nix_tools_directory() {
         let scratch = crate::testutil::TmpDir::new();
         let data = scratch.path();
         let dir = data.join("gcroots/projects/abc123");
         std::fs::create_dir_all(&dir).unwrap();
-        for f in ["chromium", "deb-demo-app", "deb-demo-app.expr", "node"] {
-            std::fs::write(dir.join(f), b"x").unwrap();
+        // The real directory layout: an out-link symlink per realized package, a plain `.expr`
+        // derivation-source stamp beside a prebuilt one, and the `nix-tools/` sub-directory the
+        // `nix:` mise tools are rooted under.
+        for f in ["chromium", "deb-demo-app", "node"] {
+            std::os::unix::fs::symlink(format!("/nix/store/hash-{f}"), dir.join(f)).unwrap();
         }
+        std::fs::write(dir.join("deb-demo-app.expr"), b"x").unwrap();
+        let nix_tools = dir.join("nix-tools");
+        std::fs::create_dir_all(&nix_tools).unwrap();
+        std::os::unix::fs::symlink("/nix/store/hash-jq", nix_tools.join("jq")).unwrap();
+
         let names = gcroot_names(data, "abc123");
         assert_eq!(
             names,
             vec!["chromium", "deb-demo-app", "node"],
-            "expr skipped"
+            "the out-links, and only those: no `.expr` stamp and no `nix-tools` directory"
         );
+        // The `nix:` tool rooted inside `nix-tools/` is not a project package root either — it must
+        // not be pulled up a level and reported as one.
+        assert!(!names.iter().any(|n| n == "jq"));
         assert!(gcroot_names(data, "absent").is_empty());
     }
 
@@ -690,13 +771,14 @@ mod tests {
         for id in ["t1", "t3"] {
             let g = data.join("gcroots/projects").join(id);
             std::fs::create_dir_all(&g).unwrap();
-            std::fs::write(g.join("chromium"), "").unwrap();
-            // A derivation-source sibling must not count as a build (gcroot_names filters `.expr`).
+            std::os::unix::fs::symlink("/nix/store/hash-chromium", g.join("chromium")).unwrap();
+            // A derivation-source sibling is a plain file, not an out-link, and must not count as a
+            // build.
             std::fs::write(g.join("chromium.expr"), "").unwrap();
         }
         let t2 = data.join("gcroots/projects/t2");
         std::fs::create_dir_all(&t2).unwrap();
-        std::fs::write(t2.join("jq"), "").unwrap();
+        std::os::unix::fs::symlink("/nix/store/hash-jq", t2.join("jq")).unwrap();
 
         assert_eq!(
             nix_built_trees(data, "chromium"),

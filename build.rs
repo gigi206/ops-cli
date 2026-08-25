@@ -92,8 +92,14 @@ fn main() {
 /// static, and a development build's shim matches the loader that build already relies on.
 fn emit_proc_shim(manifest: &Path, out_dir: &Path) {
     let crate_dir = manifest.join("proc-shim");
-    for file in ["Cargo.toml", "Cargo.lock", "src/main.rs"] {
-        println!("cargo:rerun-if-changed={}", crate_dir.join(file).display());
+    // `src` as a directory, not `src/main.rs`: cargo walks a watched directory, so a shim source
+    // file added, edited or removed re-runs this script (the same reason `emit_mise_plugin` watches
+    // its root). Naming the single file meant the day the shim grew a second module, an edit to it
+    // rebuilt nothing and sbx went on embedding the previous enforcement binary — silently, which is
+    // the "some builds bind something else" state this path exists to end. The manifest and lockfile
+    // are still named one by one; they sit beside `src`, not inside it.
+    for entry in ["Cargo.toml", "Cargo.lock", "src"] {
+        println!("cargo:rerun-if-changed={}", crate_dir.join(entry).display());
     }
 
     let target = env::var("TARGET").expect("TARGET is set for a build script");

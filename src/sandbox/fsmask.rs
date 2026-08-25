@@ -210,7 +210,8 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
         ));
     }
 
-    guard_hard_links(&out.denied, &mut out.warnings);
+    guard_hard_links(&out.denied, "deny", &mut out.warnings);
+    guard_hard_links(&out.readonly, "readonly", &mut out.warnings);
     guard_git_tracked(&root, &out.denied, &mut out.warnings);
 
     let count = out.count();
@@ -346,15 +347,25 @@ fn admit(
 /// still readable through it — measured, not assumed. The cage cannot *make* one (a link across the
 /// mask's mount boundary fails with `EXDEV`), so what this catches is a link that already existed
 /// when the launch started, which is the only way the hole opens.
-fn guard_hard_links(denied: &[Masked], warnings: &mut Vec<String>) {
-    for m in denied.iter().filter(|m| !m.is_dir) {
+///
+/// Both lists are walked, because both leak through an alias and they leak differently: a `deny`
+/// alias is still *readable*, while a `readonly` alias is still *writable* — the re-bind refuses
+/// writes on the path it covers, and the second name reaches the same inode around it. Running
+/// this over `deny` alone left the more surprising of the two silent.
+fn guard_hard_links(masked: &[Masked], field: &str, warnings: &mut Vec<String>) {
+    for m in masked.iter().filter(|m| !m.is_dir) {
         let Ok(meta) = std::fs::metadata(&m.path) else {
             continue;
         };
         if meta.nlink() > 1 {
+            let leak = if field == "readonly" {
+                "the same file stays writable under every other name for it"
+            } else {
+                "the same content stays readable under every other name for it"
+            };
             warnings.push(format!(
-                "`[fs] deny` covers `{}`, which has {} hard links — the mask closes this path, and \
-                 the same content stays readable under every other name for it",
+                "`[fs] {field}` covers `{}`, which has {} hard links — the mask covers this path, \
+                 and {leak}",
                 m.pattern,
                 meta.nlink()
             ));
@@ -801,6 +812,40 @@ mod tests {
             e.warnings.iter().any(|w| w.contains("hard links")),
             "the mask covers a path, not an inode, and that has to be said: {:?}",
             e.warnings
+        );
+    }
+
+    /// A `readonly` entry leaks through a second link too, and worse than a `deny` one: the
+    /// re-bind refuses writes on the path it covers, so the alias is a *writable* way to the same
+    /// inode. The guard used to walk `deny` only, which left that silent.
+    #[test]
+    fn a_second_hard_link_to_a_read_only_file_is_reported_as_writable() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        std::fs::hard_link(root.join("certs/server.pem"), root.join("certs/alias.pem")).unwrap();
+        let e = expand(&root, &policy(&[], &["certs/server.pem", "main.rs"]));
+        let hits: Vec<&String> = e
+            .warnings
+            .iter()
+            .filter(|w| w.contains("hard links"))
+            .collect();
+        assert!(
+            !hits.is_empty(),
+            "a `readonly` mask reachable under a second name must warn: the re-bind covers the \
+             path it names, and the alias writes the same inode: {:?}",
+            e.warnings
+        );
+        assert_eq!(
+            hits.len(),
+            1,
+            "only the aliased path warns — `main.rs` has one link and must not: {:?}",
+            e.warnings
+        );
+        assert!(
+            hits[0].contains("`[fs] readonly`") && hits[0].contains("writable"),
+            "the warning must name the field that produced it and say the alias is writable, not \
+             merely readable: {}",
+            hits[0]
         );
     }
 

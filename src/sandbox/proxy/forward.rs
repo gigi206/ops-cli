@@ -19,7 +19,8 @@ use super::*;
 /// opt-in `http://` scheme):
 ///   - the verdict uses [`EgressPolicy::explain`](crate::allowlist::EgressPolicy::explain) — a normal `https` allow rule permits it, so this
 ///     is NOT a separate opt-in (it is exactly the egress an equivalent `CONNECT` would have gotten,
-///     down to parking an `ask`-undecided host for `sbx net pending`);
+///     down to parking an `ask`-undecided host for `sbx net pending`, and down to deciding a
+///     WebSocket handshake under the `WS` pseudo-verb rather than its literal `GET`);
 ///   - the upstream leg is TLS with certificate validation (never downgraded — a forged upstream is a
 ///     `502`, as on the MITM path);
 ///   - a host-scoped credential IS injected: it rides the encrypted upstream leg (unlike a cleartext
@@ -33,6 +34,12 @@ use super::*;
 /// verdict, the validated certificate, and any host-scoped credential) while its `Host` header sends
 /// the upstream to vhost-route it elsewhere — so the check is what keeps an injected credential on
 /// the request the policy actually approved.
+///
+/// The equivalence is one of **verdict**, not of transport: this plane relays one request and one
+/// response and cannot switch protocols, so a `101` from the upstream is relayed as the interim
+/// response [`relay_response_head`] reads it as, and an upgrade the policy permits does not complete
+/// here the way it does through a CONNECT. What it does share with the tunneled path is every gate
+/// the upgrade passes through first — the `WS` opt-in and the credential-injection refusal below.
 ///
 /// Conscious, bounded property: request and response travel cleartext on the client→proxy leg — but
 /// that leg is a loopback socket inside the cage, unreadable by any cage process (no `CAP_NET_RAW`
@@ -73,21 +80,53 @@ pub(super) fn handle_https_forward(
         return Ok(());
     };
 
+    // 4d. A WebSocket handshake is decided under the `WS` pseudo-verb, as `serve_tunneled_request`
+    //     decides one inside a tunnel: only a rule that names `WS` admits it — NOT an unrestricted
+    //     `{*}` and NOT the read-by-default `{GET,HEAD}`. Deciding it as the literal `GET` it
+    //     arrives as, which is what this plane did, handed the absolute form an upgrade the same
+    //     launch's `CONNECT` would have refused `denied-method`: the opt-in is a property of the
+    //     request, not of the transport that carried it here.
+    let ws_upgrade = is_websocket_upgrade(head);
+    let verb = if ws_upgrade { "WS" } else { method };
+
     // 5. The verdict — the SAME `https` decision a `CONNECT` to this host gets ([`decide_https`]):
     //    same rules, same denial shapes, same parking for an undecided host. Only the answer differs,
     //    written on the plaintext client socket this form arrived on.
-    let deciding: Option<Rule> =
-        match decide_https(ctx, &host, port, &path, method, AskPosture::Park) {
-            Ok(rule) => rule,
-            Err(refusal) => {
-                return write_refusal(
-                    &mut client,
-                    refusal.status_line(),
-                    refusal.tag(),
-                    &refusal.message(ctx, &host, port, method),
-                );
-            }
-        };
+    let deciding: Option<Rule> = match decide_https(ctx, &host, port, &path, verb, AskPosture::Park)
+    {
+        Ok(rule) => rule,
+        Err(refusal) => {
+            return write_refusal(
+                &mut client,
+                refusal.status_line(),
+                refusal.tag(),
+                &refusal.message(ctx, &host, port, verb),
+            );
+        }
+    };
+
+    // 5b. A credential-injected host cannot also host a WebSocket, for the reason the tunneled path
+    //     states in full: the injected secret rides the handshake, and once the upgrade completes the
+    //     frames are opaque and cannot be redacted. Refused fail-closed here, before any egress, so
+    //     no `allow` is recorded. Reached only when a `{WS}` rule already permitted the upgrade —
+    //     an upgrade to a non-`{WS}` host was denied by method above.
+    if ws_upgrade && !matching_injection_ids(&creds, &host, port, &path).is_empty() {
+        ctx.outcome(
+            crate::sandbox::control::Proto::Https,
+            &host,
+            port,
+            Some(verb),
+            Some(&path),
+            StatKind::Blocked,
+            "ws-injection-refused",
+        );
+        return write_refusal(
+            &mut client,
+            "403 Forbidden",
+            "ws-injection-refused",
+            "a WebSocket to a credential-injected host is refused: its frames cannot be redacted",
+        );
+    }
 
     // 6. Resolve host-side, then the SSRF guard against the deciding rule. A resolution failure for an
     //    allowed host is a clean 502, distinct from a refusal.
@@ -567,4 +606,109 @@ pub(super) fn handle_https_forward(
         pool.park(key, upstream, ctx.timeout);
     }
     Ok(())
+}
+
+/// Tests for what this plane decides *before* it opens anything upstream — the gates an absolute-form
+/// request passes on its way to a verdict, driven through [`handle_https_forward`] itself over a
+/// socket pair.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::allowlist::{EgressPolicy, classify};
+    use std::io::Read;
+
+    /// Serve one absolute-form request under `rules` and `injections`, and return what the client
+    /// read back. The resolver answers loopback, so a request the policy *permits* ends at its own
+    /// connection rather than at a name lookup — no listener, and no test that passes by refusing
+    /// everything.
+    fn served(rules: &[&str], injections: Vec<HeaderInjection>, request: &str) -> String {
+        let ctx = ProxyCtx::new(
+            Arc::new(Ca::ephemeral().unwrap()),
+            EgressPolicy::new(rules.iter().map(|r| classify(r).unwrap()).collect(), vec![]),
+        )
+        .unwrap()
+        .with_injections(injections)
+        .with_resolver(Box::new(|_| {
+            Ok(vec![std::net::IpAddr::from([127, 0, 0, 1])])
+        }));
+        let (client, mut peer) = UnixStream::pair().unwrap();
+        let bytes = request.as_bytes().to_vec();
+        let head = parse_head(&bytes).unwrap();
+        let (method, target) = request_line_parts(&head.request_line).unwrap();
+        handle_https_forward(client, &head, &bytes, &method, &target, &ctx).unwrap();
+        let mut transcript = String::new();
+        peer.read_to_string(&mut transcript).unwrap();
+        transcript
+    }
+
+    /// An absolute-form WebSocket handshake to `host` on port 9 (discard: a permitted request ends
+    /// at a refused connection, immediately and without a listener).
+    fn upgrade_to(host: &str) -> String {
+        format!(
+            "GET https://{host}:9/socket HTTP/1.1\r\nHost: {host}:9\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        )
+    }
+
+    #[test]
+    fn an_absolute_form_upgrade_is_decided_under_the_ws_pseudo_verb() {
+        // `{GET}` is not `{WS}`: the same handshake through a CONNECT reads `denied-method`, and this
+        // plane claims that verdict. Decided as its literal `GET`, which is what it did, an
+        // unrestricted-method or read-by-default rule admitted an upgrade nobody opted into.
+        let transcript = served(
+            &["{GET} ws-host.test:*"],
+            vec![],
+            &upgrade_to("ws-host.test"),
+        );
+        assert!(
+            transcript.contains("403") && transcript.contains("denied-method"),
+            "an upgrade to a host with no `WS` rule must be refused by method: {transcript:?}"
+        );
+
+        // The guard is not "refuse everything": the same rule still admits the plain `GET` it names,
+        // which then gets as far as its own connection.
+        let transcript = served(
+            &["{GET} ws-host.test:*"],
+            vec![],
+            "GET https://ws-host.test:9/socket HTTP/1.1\r\nHost: ws-host.test:9\r\n\r\n",
+        );
+        assert!(
+            !transcript.contains("denied-method"),
+            "a plain GET the rule names is not a WebSocket: {transcript:?}"
+        );
+
+        // And a `WS` rule admits the upgrade the launch opted into.
+        let transcript = served(
+            &["{WS} ws-host.test:*"],
+            vec![],
+            &upgrade_to("ws-host.test"),
+        );
+        assert!(
+            !transcript.contains("denied-method"),
+            "a `{{WS}}` rule is what admits an upgrade: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn an_absolute_form_upgrade_to_a_credential_injected_host_is_refused() {
+        // The tunneled path's rule, which this plane states it shares: the injected secret rides the
+        // handshake, and the frames that follow it cannot be redacted.
+        let transcript = served(
+            &["{WS} secret-host.test:*"],
+            vec![HeaderInjection::fixed(
+                classify("secret-host.test:*").unwrap(),
+                "Authorization".to_string(),
+                "Bearer s3cr3t".to_string(),
+            )],
+            &upgrade_to("secret-host.test"),
+        );
+        assert!(
+            transcript.contains("403") && transcript.contains("ws-injection-refused"),
+            "a credential-injected WebSocket must be refused: {transcript:?}"
+        );
+        assert!(
+            !transcript.contains("s3cr3t"),
+            "and the refusal carries no part of the credential: {transcript:?}"
+        );
+    }
 }

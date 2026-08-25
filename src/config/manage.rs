@@ -659,6 +659,12 @@ fn scalar_value(val: &str) -> Value {
 /// would look like it worked and change nothing, which is the same silent revert one layer down.
 /// So every such field is checked here against the resolver's own parser, never a second copy of
 /// its rules.
+///
+/// `forward` was for a while the only one checked, while the sentence above said "every such
+/// field". `[fs]` is the other one, and the one where the gap costs the most: its lists are plain
+/// strings too, so `sbx config add fs.deny /etc/shadow` parsed, committed, and was dropped by
+/// [`super::apply_fs`] at the next load — a mask the user was told had been written, over a path
+/// the cage goes on reading.
 fn validate_layer(doc: &DocumentMut) -> Result<(), String> {
     let raw = super::schema::parse(doc.to_string().as_bytes())?;
     let apps = raw.app.values().filter_map(|a| a.forward.as_ref());
@@ -672,6 +678,49 @@ fn validate_layer(doc: &DocumentMut) -> Result<(), String> {
                 .unwrap_or_else(|| "invalid `forward` entry".into())
                 .trim_start_matches(": ")
                 .to_string());
+        }
+    }
+    // The baseline `[fs]` and every app's, since an app's table is loaded through the same
+    // `apply_fs` and dropped by it on the same grounds.
+    let app_fs = raw.app.values().filter_map(|a| a.fs.as_ref());
+    for fs in raw.fs.iter().chain(app_fs) {
+        for (field, entries) in [("deny", &fs.deny), ("readonly", &fs.readonly)] {
+            for entry in entries {
+                if let Err(reason) = super::fspolicy::validate_entry(entry) {
+                    return Err(format!(
+                        "`[fs] {field}` entry `{entry}` {reason} — it would be dropped at load, \
+                         leaving that path open to the cage"
+                    ));
+                }
+            }
+        }
+        for pattern in &fs.scan {
+            if let Err(reason) = crate::open_policy::validate_pattern(pattern) {
+                return Err(format!(
+                    "`[fs] scan` pattern `{pattern}` is not a regular expression ({reason}) — it \
+                     would be dropped at load, and no file closed for carrying that shape"
+                ));
+            }
+        }
+        // The same two values `apply_fs` refuses, and for its reasons: zero reads nothing and calls
+        // every file clean, while `config show` still lists the shapes — the protection reads as
+        // present either way. A negative is not a length at all.
+        match fs.scan_max_kb {
+            None => {}
+            Some(kb) if kb > 0 => {}
+            Some(0) => {
+                return Err(
+                    "`[fs] scan_max_kb = 0` would read nothing and pass every file — leave it \
+                     unset for the built-in ceiling"
+                        .to_string(),
+                );
+            }
+            Some(kb) => {
+                return Err(format!(
+                    "`[fs] scan_max_kb = {kb}` is no ceiling at all — a scan reads a length; leave \
+                     it unset for the built-in one"
+                ));
+            }
         }
     }
     Ok(())
@@ -2129,6 +2178,78 @@ mod tests {
             before,
             "a refused remap must leave the file byte-for-byte unchanged"
         );
+    }
+
+    /// `[fs]` is the second field whose schema type is too broad to catch a bad value, and
+    /// `validate_layer` claimed to check "every such field" while checking only `forward`.
+    ///
+    /// Every entry below parses as a string, is committed, and is then dropped by `apply_fs` at the
+    /// next load with a warning on stderr that nobody reads back — so `sbx config add fs.deny
+    /// /etc/shadow` reported a success over a mask that never closed anything, and `scan_max_kb =
+    /// 0` reported one over a scanner that reads nothing and passes every file while `sbx config
+    /// show` goes on listing the shapes.
+    #[test]
+    fn an_fs_entry_the_resolver_would_drop_is_refused_before_it_commits() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "[fs]\ndeny = [\".env\"]\n");
+        let before = std::fs::read_to_string(&p).unwrap();
+        for (key, bad) in [
+            ("fs.deny", "/etc/shadow"),
+            ("fs.deny", "secrets/**"),
+            ("fs.readonly", "../outside"),
+            ("fs.readonly", "*/etc/x"),
+        ] {
+            assert!(
+                matches!(add(&p, key, bad), Err(ManageError::InvalidValue(_, _))),
+                "`{key} += {bad}` must be refused rather than dropped at load"
+            );
+        }
+        // A pattern that does not compile closes no file for carrying that shape.
+        assert!(matches!(
+            add(&p, "fs.scan", "sk-[A-Za-z"),
+            Err(ManageError::InvalidValue(_, _))
+        ));
+        // A ceiling that reads nothing, and one that is not a length.
+        for bad in ["0", "-1"] {
+            assert!(
+                matches!(
+                    set(&p, "fs.scan_max_kb", bad),
+                    Err(ManageError::InvalidValue(_, _))
+                ),
+                "`scan_max_kb = {bad}` must be refused"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            before,
+            "a refused `[fs]` edit must leave the file byte-for-byte unchanged"
+        );
+
+        // And the gate still lets through everything the resolver accepts, or it would be refusing
+        // the field rather than validating it.
+        assert!(add(&p, "fs.deny", "config/prod.key").unwrap());
+        assert!(add(&p, "fs.readonly", "Cargo.lock").unwrap());
+        assert!(add(&p, "fs.deny", "secrets/*.pem").unwrap());
+        assert!(add(&p, "fs.scan", "AKIA[0-9A-Z]{16}").unwrap());
+        assert!(set(&p, "fs.scan_max_kb", "64").is_ok());
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            after.contains("config/prod.key") && after.contains("scan_max_kb = 64"),
+            "the valid edits landed: {after}"
+        );
+    }
+
+    /// The same gate on an app's own `[fs]`, which is loaded through the same `apply_fs` and
+    /// dropped by it on the same grounds.
+    #[test]
+    fn an_apps_fs_entry_is_validated_like_the_baselines() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "[app.demo]\ncmd = [\"demo\"]\n");
+        assert!(matches!(
+            add(&p, "app.demo.fs.deny", "/etc/shadow"),
+            Err(ManageError::InvalidValue(_, _))
+        ));
+        assert!(add(&p, "app.demo.fs.deny", ".env").unwrap());
     }
 
     #[test]

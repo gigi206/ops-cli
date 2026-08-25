@@ -555,6 +555,12 @@ fn toml_blocks(page: &str) -> Vec<String> {
 ///
 /// The catalogue is the only place a reader can discover a profile by name, so one that is shipped
 /// but unlisted is one nobody imports.
+///
+/// A table **row** is required rather than a bare mention, for the reason
+/// [`every_upgrade_target_has_a_row_in_its_reference_page`] spells out: a profile stem is an
+/// ordinary word or a package name that the page's prose, its `import` examples and other profiles'
+/// rows already carry, so a substring match passed for 27 of the 71 stems with their rows deleted —
+/// it guarded the page against nothing for those.
 #[test]
 fn every_shipped_app_profile_is_in_the_catalogue() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/app");
@@ -577,7 +583,7 @@ fn every_shipped_app_profile_is_in_the_catalogue() {
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string();
-        if !catalogue.contains(&name) {
+        if !catalogue.contains(&format!("| `{name}` |")) {
             missing.push(name);
         }
     }

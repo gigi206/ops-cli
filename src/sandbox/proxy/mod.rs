@@ -594,7 +594,7 @@ impl PolicyRefusal {
             // bit. Scoped to the app when this is an `sbx app` launch.
             Self::DeniedDefault => format!(
                 "`{host}:{port}` is not allowed by the network policy. Allow it: {}",
-                ctx.allow_suggestion(host)
+                ctx.allow_suggestion(&inspected_rule_destination(host, port))
             ),
             Self::AskedDenied => {
                 "this request was denied by a live decision or the ask timeout elapsed".to_string()
@@ -608,6 +608,26 @@ impl PolicyRefusal {
                  cannot wait for a decision — allow the host explicitly to reach it"
             ),
         }
+    }
+}
+
+/// The refused destination spelled as a rule for the **inspected-TLS** plane, so pasting it after
+/// `sbx net allow` writes a rule that admits the very request that was refused.
+///
+/// A bare host is an `https://` rule on port 443 (the rule grammar's `split_scheme` gives a
+/// scheme-less entry `Layer::L7` and that default port), so the port may be dropped only when it *is*
+/// 443. Suggesting the bare host for a refusal on `:8443` handed the user a command that changes
+/// nothing they can observe: they run it, retry, and are refused again by the same rule they were
+/// told to write. Same shape as the `host_token` net-learn synthesizes its candidate rules with,
+/// which learns from these very refusals — the two must not drift.
+///
+/// The cleartext plane spells its own (`http://host`, default port 80) at its refusal site; this one
+/// is the `https` planes'.
+fn inspected_rule_destination(host: &str, port: u16) -> String {
+    if port == 443 {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
     }
 }
 
@@ -1393,7 +1413,16 @@ fn begin_response_stream(upstream: &TcpStream) {
 ///
 /// A head the upstream cuts short is relayed as far as it arrived and reported incomplete, never an
 /// error: the caller then delimits the rest by the close, which is what this path did throughout
-/// before it framed anything.
+/// before it framed anything. A head that runs past [`HEAD_MAX`] arrives here the same way, and it
+/// is relayed the same way, on purpose. Such a head has no terminator yet, so the `Connection`
+/// rewrite below declines it (`rewrite_client_connection` returns an unterminated head untouched —
+/// dropping a header line out of a head whose remainder the client is still going to read as body
+/// would re-attach that remainder to the wrong header). The cage therefore sees the upstream's own
+/// hop-by-hop `Connection` on a leg sbx closes anyway: `final_head` is false, so the framing is
+/// [`BodyFraming::ToEof`] and `persistent` is false. That is a stale header on a closing connection,
+/// not a framing sbx got wrong — and the alternatives are worse: refusing the response would drop a
+/// large-but-legitimate head (which is exactly what the tolerant read exists to keep serving), and
+/// stopping the relay at the cap would hand the cage a head cut off mid-line.
 ///
 /// `client_leg` decides what the relayed head says about the **client's** connection, which the
 /// `Connection` header makes a per-hop question: it is sbx's statement about its own leg, never a
@@ -1944,6 +1973,55 @@ fn admit_absolute_form(
 /// An `InvalidData` error with a static cause, for the proxy's fail-closed paths.
 fn invalid(msg: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
+/// Tests for the refusal sentences' own pieces, kept beside them rather than in [`tests`] because
+/// what they assert is a property of the text a refusal prints, with no connection served.
+#[cfg(test)]
+mod suggestion_tests {
+    use super::*;
+
+    /// A `denied-default` body hands the agent a command to run, so that command has to admit the
+    /// request it was printed for. A bare host is an `https://` rule on **443**: for a refusal on
+    /// `:8443` the suggestion `sbx net allow api.test` wrote a rule that changed nothing observable
+    /// — the retry was refused again, by the policy the user had just been told to fix.
+    ///
+    /// Teeth: drop the port from the token again and the `8443`/`8080` rows classify to a 443 rule,
+    /// so `explain` answers `DeniedDefault` and the first assertion fails naming the port.
+    #[test]
+    fn a_denied_default_suggestion_admits_the_port_it_was_refused_on() {
+        for port in [443u16, 8443, 8080] {
+            let token = inspected_rule_destination("api.test", port);
+            let rule = allowlist::classify(&token)
+                .unwrap_or_else(|e| panic!("`sbx net allow {token}` must be a valid rule: {e}"));
+            let policy = allowlist::EgressPolicy::new(vec![rule], Vec::new());
+            assert!(
+                matches!(
+                    policy.explain("api.test", port, "/", "GET"),
+                    Decision::AllowedBy(_)
+                ),
+                "`sbx net allow {token}` must admit the `api.test:{port}` it was suggested for"
+            );
+            // And it opens that port only — a suggestion that widened the host to every port would
+            // admit the refused request while granting far more than the refusal was about.
+            let other = if port == 443 { 8443 } else { 443 };
+            assert!(
+                matches!(
+                    policy.explain("api.test", other, "/", "GET"),
+                    Decision::DeniedDefault
+                ),
+                "`sbx net allow {token}` must not also open `api.test:{other}`"
+            );
+        }
+
+        // The 443 shorthand must survive, or this test could be "satisfied" by pinning every
+        // suggestion to `host:port` and making the common refusal uglier for nothing.
+        assert_eq!(inspected_rule_destination("api.test", 443), "api.test");
+        assert_eq!(
+            inspected_rule_destination("api.test", 8443),
+            "api.test:8443"
+        );
+    }
 }
 
 #[cfg(test)]

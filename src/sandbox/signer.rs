@@ -348,8 +348,10 @@ pub(crate) fn parse_signature(
 
     let mut out = Vec::with_capacity(headers.len());
     // Walked in the manifest's order, not the answer's: this is also what refuses a header the
-    // manifest never declared, since anything left over at the end was not in that list.
-    let mut seen = 0usize;
+    // manifest never declared, since anything left over at the end was not in that list. Which of
+    // the answer's own keys the walk took is recorded, because "left over" has two causes and they
+    // do not read alike.
+    let mut claimed: Vec<&String> = Vec::with_capacity(sets.len());
     for declared in sets {
         let Some((name, value)) = headers
             .iter()
@@ -357,23 +359,35 @@ pub(crate) fn parse_signature(
         else {
             continue;
         };
-        seen += 1;
+        claimed.push(name);
         check_value(name, value).map_err(AnswerRefused::from)?;
         // The manifest's spelling wins: it is the one that was reviewed, and it keeps two runs of
         // one plugin from differing by case alone.
         out.push((declared.clone(), value.clone()));
     }
-    if seen != headers.len() {
-        let extra: Vec<&str> = headers
+    if claimed.len() != headers.len() {
+        // The two causes, separated rather than inferred from the count. A key the manifest never
+        // declared is the ordinary overstep. A key it *did* declare, which the walk did not take, is
+        // the answer spelling one header two ways — `Authorization` and `authorization` are two JSON
+        // keys and one header, and the walk takes the first. Read as the first cause, which is what
+        // this did, that answer was refused by a sentence whose list of undeclared headers was
+        // empty: a refusal naming no header at all.
+        let (duplicated, extra): (Vec<String>, Vec<String>) = headers
             .keys()
-            .filter(|name| !sets.iter().any(|d| d.eq_ignore_ascii_case(name)))
-            .map(String::as_str)
-            .collect();
+            .filter(|name| !claimed.iter().any(|taken| taken == name))
+            .cloned()
+            .partition(|name| sets.iter().any(|d| d.eq_ignore_ascii_case(name)));
+        if !duplicated.is_empty() {
+            return Err(format!(
+                "the answer sets {} under a second spelling of a header it already sets, so which \
+                 value would sign the request is undecided",
+                crate::plugins::quoted_list(&duplicated)
+            )
+            .into());
+        }
         return Err(format!(
             "the answer sets {}, which the plugin's manifest does not declare in `sets_headers`",
-            crate::plugins::quoted_list(
-                &extra.iter().map(|s| (*s).to_string()).collect::<Vec<_>>()
-            )
+            crate::plugins::quoted_list(&extra)
         )
         .into());
     }
@@ -681,6 +695,41 @@ mod tests {
         assert!(
             err.contains("X-Sneaky") && err.contains("sets_headers"),
             "{err}"
+        );
+    }
+
+    /// One header spelt two ways is refused, and the refusal says which header. The count that
+    /// separates "declared" from "left over" cannot tell the two causes apart on its own: the case
+    /// duplicate is left over *because* the walk already took its twin, so reading it as an
+    /// undeclared header produced a sentence with an empty list — a refusal naming nothing.
+    #[test]
+    fn one_header_set_under_two_spellings_is_refused_by_name() {
+        let err = answer(serde_json::json!({
+            "seq": 7,
+            "headers": { "Authorization": "one", "authorization": "two" }
+        }))
+        .expect_err("two spellings of one header are refused");
+        assert!(
+            err.contains("authorization"),
+            "the refusal has to name the header it is about: {err}"
+        );
+        assert!(
+            !err.contains("does not declare in `sets_headers`"),
+            "and not blame a manifest that declares this header: {err}"
+        );
+
+        // Not satisfiable by refusing every answer: one spelling of each declared header still signs.
+        let sig = answer(serde_json::json!({
+            "seq": 7,
+            "headers": { "authorization": "one", "X-Amz-Date": "20260813T000000Z" }
+        }))
+        .expect("a single spelling of each declared header is a valid answer");
+        assert_eq!(
+            sig.headers,
+            vec![
+                ("Authorization".to_string(), "one".to_string()),
+                ("X-Amz-Date".to_string(), "20260813T000000Z".to_string()),
+            ]
         );
     }
 

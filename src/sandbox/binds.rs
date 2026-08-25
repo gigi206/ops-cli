@@ -87,12 +87,25 @@ const XDG_OPEN_INCAGE: &str = "/usr/bin/xdg-open";
 /// bounded to that name deliberately: it is the name no project can usefully own (a hermetic cage
 /// has no desktop, so a real `xdg-utils` here would open nothing), and the one profiles already
 /// rewrite by hand for want of a way to declare it.
+///
+/// Both halves of that are enforced by the mount plan rather than merely arranged: every component
+/// of this path is a mountpoint, so no ancestor can be renamed aside and rebuilt around a forged
+/// router, and the directory itself is a read-only bind, so nothing in the cage can drop a second
+/// name into the directory that leads `PATH`. See [`cage_mounts`] for the chain.
 const OPEN_ROUTER_DIR: &str = "/opt/sbx/open";
 
 /// Where the router is bound inside [`OPEN_ROUTER_DIR`]. The same file as [`XDG_OPEN_INCAGE`],
 /// exposed under a second name: the FHS path stays for anything that calls it absolutely, and this
 /// one is what `PATH` resolves.
 const OPEN_ROUTER_INCAGE: &str = "/opt/sbx/open/xdg-open";
+
+/// sbx's own directory inside the cage: the parent of [`OPEN_ROUTER_DIR`] and of everything else
+/// the launcher mounts for its own plumbing (the egress CA, the task client, the mise pools).
+const SBX_INCAGE_DIR: &str = "/opt/sbx";
+
+/// The FHS parent of [`SBX_INCAGE_DIR`]. Named because the cage mounts it: it is the first link of
+/// the router's mountpoint chain (see [`cage_mounts`]), not a path anything is bound *at*.
+const OPT_DIR: &str = "/opt";
 
 /// Where sbx's IANA zone database appears in the cage: the FHS path glibc, `iana-time-zone` and
 /// every language runtime look under, so `TZDIR` names it and [`CAGE_LOCALTIME`] points into it.
@@ -290,8 +303,13 @@ struct SandboxPaths<'a> {
     shell_rc_src: &'a Path,
     /// Generated egress contract; bound read-only at [`super::contract::EGRESS_CONTRACT_INCAGE`].
     contract_src: &'a Path,
-    /// Synthetic `xdg-open` script; bound read-only at [`XDG_OPEN_INCAGE`].
+    /// Synthetic `xdg-open` script; bound read-only at [`XDG_OPEN_INCAGE`]. It is the single file
+    /// inside [`Self::open_router_src`], so both in-cage names serve one staged source.
     xdg_open_src: &'a Path,
+    /// The directory holding exactly that script and nothing else; bound read-only at
+    /// [`OPEN_ROUTER_DIR`], the directory that leads the cage's `PATH`. Bound as a *directory* on
+    /// purpose — see the mount in [`cage_mounts`] for the rename it is what refuses.
+    open_router_src: &'a Path,
     /// Synthetic `/etc/hosts`; bound read-only at `/etc/hosts`.
     hosts_src: &'a Path,
     /// Synthetic system-wide ssh client config; bound read-only at `/etc/ssh/ssh_config`. `None`
@@ -306,7 +324,9 @@ struct SandboxPaths<'a> {
     /// under `$HOME` are the highest-priority ones, and a copy anywhere else would be shadowed by
     /// one written there. Freezing the mountpoint is enough for exactly that reason — the lookup
     /// asks for these paths by name, and a read-only bind refuses both the write and the unlink
-    /// that would replace them.
+    /// that would replace them. Freezing the leaf alone was *not* enough: the directories above it
+    /// were writable and renaming one carries the mount along, so [`cage_mounts`] pins every
+    /// component of the path as a mountpoint too.
     ///
     /// The entry is bound as its whole *directory* rather than as one file, which is what makes the
     /// portal answer at all rather than only what makes it answer correctly — see
@@ -341,6 +361,10 @@ fn assemble(
 /// earlier one at the same target; the config-declared binds are therefore laid down first and every
 /// structural mount below may shadow a colliding one. Nothing here reorders, and the comments at the
 /// individual mounts record which of them depend on that.
+///
+/// The single mount emitted *before* the config binds is the [`OPT_DIR`] pin, and it is placed there
+/// precisely so it shadows nothing: it exists to make the path a mountpoint, not to own what is
+/// under it.
 fn cage_mounts(
     paths: &SandboxPaths,
     userland: &Userland,
@@ -349,22 +373,32 @@ fn cage_mounts(
     extra_binds: &[ExtraBind],
     devices: &[PathBuf],
 ) -> Vec<Mount> {
-    // Config-declared binds come first, so any structural mount below shadows a colliding one —
+    // The first link of the router's mountpoint chain, and the one mount that precedes the config
+    // binds. Without it `/opt` is an ordinary directory on the cage's writable root, and an ordinary
+    // directory can be renamed even while it holds mountpoints: the kernel refuses the rename of a
+    // mountpoint itself with `EBUSY`, but nothing stops `mv /opt /opt.bak` followed by recreating
+    // `/opt/sbx/open/xdg-open` as the cage's own script — which every later `xdg-open` then
+    // resolves, since that directory leads `PATH` ([`OPEN_ROUTER_DIR`]). A tmpfs here is a
+    // mountpoint, so the rename fails. It is emitted before the config binds rather than with the
+    // structural block because it must shadow nothing: a `[[binds]]` under `/opt` still lands inside
+    // this tmpfs, and one *at* `/opt` replaces it with a mount of its own, which keeps the property
+    // the pin is here for.
+    let mut mounts: Vec<Mount> = vec![Mount::Tmpfs {
+        dest: PathBuf::from(OPT_DIR),
+    }];
+
+    // Config-declared binds come next, so any structural mount below shadows a colliding one —
     // a config bind can never displace `/nix`, the synthetic `/etc/passwd`/`group`, the loader,
     // or the project itself, whether it is read-only or read-write. A `mode = "rw"` bind is a
     // read-write mount (the cage writes through to the host path); the default is read-only.
-    let mut mounts: Vec<Mount> = overlay
-        .binds
-        .iter()
-        .map(|b| {
-            let (src, dest) = (b.path.clone(), b.path.clone());
-            if b.writable {
-                Mount::Bind { src, dest }
-            } else {
-                Mount::RoBind { src, dest }
-            }
-        })
-        .collect();
+    mounts.extend(overlay.binds.iter().map(|b| {
+        let (src, dest) = (b.path.clone(), b.path.clone());
+        if b.writable {
+            Mount::Bind { src, dest }
+        } else {
+            Mount::RoBind { src, dest }
+        }
+    }));
 
     // Zone 1 — the store at `/nix`, read-write for a per-project store the cage may
     // write into, read-only for the shared store. It precedes every other structural
@@ -411,6 +445,15 @@ fn cage_mounts(
             target: userland.env_bin.clone(),
             dest: PathBuf::from(SANDBOX_ENV),
         },
+        // Zone 1 — the second link of the router's mountpoint chain: sbx's own in-cage directory,
+        // a mountpoint so it cannot be renamed aside either (pinning only the leaf is useless —
+        // renaming any ancestor moves the whole subtree, mounts included). A tmpfs rather than a
+        // bind because everything else sbx mounts under it — the egress CA, the task client, the
+        // mise pools — needs bwrap to create a mountpoint here, which a read-only bind refuses.
+        // Structural, so a config bind inside sbx's own directory is shadowed by it.
+        Mount::Tmpfs {
+            dest: PathBuf::from(SBX_INCAGE_DIR),
+        },
         // Zone 1 — the synthetic `/usr/bin/xdg-open`: a stub that prints its
         // argument and exits 0. A tool that auto-opens a browser or file (an OAuth
         // device-auth flow, a docs link) calls `xdg-open <file|url>`; the hermetic
@@ -424,13 +467,20 @@ fn cage_mounts(
             src: paths.xdg_open_src.to_path_buf(),
             dest: PathBuf::from(XDG_OPEN_INCAGE),
         },
-        // Zone 1 — the same file under [`OPEN_ROUTER_INCAGE`], the copy `PATH` actually resolves.
-        // Two names for one source rather than a move: the FHS path is what a tool calling
-        // `/usr/bin/xdg-open` absolutely expects to find, and this one sits in the directory the
-        // cage cannot shadow. See [`OPEN_ROUTER_DIR`] for why that directory leads `PATH`.
+        // Zone 1 — the third and last link of the chain: the staged directory holding that same
+        // script, read-only, so the cage reaches it at [`OPEN_ROUTER_INCAGE`] — the copy `PATH`
+        // actually resolves. Two names for one source rather than a move: the FHS path is what a
+        // tool calling `/usr/bin/xdg-open` absolutely expects to find.
+        //
+        // The *directory* is bound, not the file, and that is what makes the two claims at
+        // [`OPEN_ROUTER_DIR`] true. Binding only the file left the directory around it a writable
+        // directory on the cage's root: it could be renamed aside and rebuilt with a forged router
+        // in it, and it could be given a second name — which matters because this directory leads
+        // `PATH`, so any name dropped in it shadows every declared tool. A read-only bind refuses
+        // both (`EBUSY` on the rename, `EROFS` on the create).
         Mount::RoBind {
-            src: paths.xdg_open_src.to_path_buf(),
-            dest: PathBuf::from(OPEN_ROUTER_INCAGE),
+            src: paths.open_router_src.to_path_buf(),
+            dest: PathBuf::from(OPEN_ROUTER_DIR),
         },
         // Zone 1 — the embedded mise "nix" backend plugin, read-only: an agent's
         // in-cage mise resolves it (via a symlink in the writable mise data dir) to
@@ -585,6 +635,26 @@ fn cage_mounts(
     // What the in-cage portal reads to reach the router. Emitted *after* the writable home above,
     // so they layer over it rather than being shadowed by it — the whole point is that these paths
     // inside a writable directory are the ones the cage cannot rewrite.
+    //
+    // Both are preceded by a pin of every directory between the home and them, because a read-only
+    // bind is unmovable only at its own path: `$HOME/.local` and `$HOME/.config` were ordinary
+    // writable directories, and renaming one takes the mountpoint under it along, after which the
+    // cage recreates the path with a desktop entry of its own and the XDG lookup — which asks for
+    // these paths by name — reads that instead. The pins re-mount each intermediate on itself,
+    // read-write, so the tree stays as writable as it was while every component of the path is a
+    // mountpoint the kernel refuses to rename (`EBUSY`). Same shape, and the same reason, as the
+    // control-plane pins the config loader emits around sbx's own roots.
+    let open_rels: Vec<&str> = paths
+        .open_apps_src
+        .map(|_| super::openuri::APPLICATIONS_REL)
+        .into_iter()
+        .chain(
+            paths
+                .open_mimeapps_src
+                .map(|_| super::openuri::MIMEAPPS_REL),
+        )
+        .collect();
+    mounts.extend(home_mountpoint_pins(paths.home_src, &open_rels));
     if let Some(src) = paths.open_apps_src {
         mounts.push(Mount::RoBind {
             src: src.to_path_buf(),
@@ -635,6 +705,41 @@ fn cage_mounts(
         }
     }));
     mounts
+}
+
+/// Make every directory between the writable home and each of `rels` a mountpoint of its own, so a
+/// read-only bind at one of those paths cannot be moved out of the way by renaming a parent.
+///
+/// Read-write binds of the host home's own subdirectories: same source, same content, same mode —
+/// all they change is that the kernel now refuses to rename or remove those components.
+///
+/// Returned shallow-to-deep, so a parent is mounted before its child: a child mounted first would be
+/// shadowed when the parent landed on top of it, silently undoing the pin. A prefix two `rels`
+/// share is pinned once — mounting it twice would work, but the second mount would hide the first
+/// and leave the plan reading as though one of them were redundant.
+///
+/// The last component of each `rel` is deliberately not pinned: that is the path the caller binds.
+/// The sources are the home's own subdirectories, which the caller has created (see `build_spec`) —
+/// bwrap fails a bind whose source does not exist.
+fn home_mountpoint_pins(home_src: &Path, rels: &[&str]) -> Vec<Mount> {
+    let mut pinned: Vec<PathBuf> = Vec::new();
+    for rel in rels {
+        let mut relative = PathBuf::new();
+        let components: Vec<&str> = rel.split('/').collect();
+        for component in &components[..components.len().saturating_sub(1)] {
+            relative.push(component);
+            if !pinned.contains(&relative) {
+                pinned.push(relative.clone());
+            }
+        }
+    }
+    pinned
+        .into_iter()
+        .map(|rel| Mount::Bind {
+            src: home_src.join(&rel),
+            dest: PathBuf::from(format!("{SANDBOX_HOME}/{}", rel.display())),
+        })
+        .collect()
 }
 
 /// The cage's environment: the sandbox `PATH` and the variables that describe the userland to what
@@ -757,7 +862,9 @@ fn cage_env(
 /// destination that does not depend on the specific project or app. The runtime-derived paths are
 /// deliberately excluded (the project is mounted at its own absolute path, and a config bind that
 /// overlaps the project tree is normal; the launcher's extra binds live at sbx's own paths), while
-/// the fixed `SANDBOX_HOME` is listed. A config bind whose canonical destination *nests* with one
+/// the fixed `SANDBOX_HOME` is listed. [`OPT_DIR`] is excluded for a different reason: it is the one
+/// structural mount emitted *before* the config binds, so it shadows nothing and there is nothing to
+/// warn about. A config bind whose canonical destination *nests* with one
 /// of these is not reconciled by the exact-destination shadowing `assemble` relies on, so
 /// [`structural_nesting_warning`] surfaces it. Kept in lockstep with `assemble` by
 /// `structural_dests_lists_every_fixed_mount_assemble_emits`, which fails if a new structural mount
@@ -782,9 +889,12 @@ pub(super) const STRUCTURAL_DESTS: &[&str] = &[
     SANDBOX_BASH,
     SANDBOX_ENV,
     XDG_OPEN_INCAGE,
+    SBX_INCAGE_DIR,
+    OPEN_ROUTER_DIR,
     OPEN_ROUTER_INCAGE,
     CAGE_CA_BUNDLE,
     SHELL_RC_INCAGE,
+    SSH_CONFIG_INCAGE,
     super::miseplugin::INCAGE_DIR,
     MISE_PROJECT_INCAGE,
     super::contract::EGRESS_CONTRACT_INCAGE,
@@ -1317,6 +1427,11 @@ fn current_identity() -> Identity {
 /// Materialise the synthetic `passwd`/`group` into `etc_dir` (created owner-only)
 /// and return their paths, ready to bind read-only. The shell field matches the
 /// in-sandbox `/bin/sh`, and `$HOME` matches the writable home bind.
+///
+/// Written through [`write_atomic`], like every other file staged in this directory and for the same
+/// reason: concurrent cages of one project share it, and these two are bound read-only into each of
+/// them, so an in-place rewrite could show a running cage a truncated `passwd` — every `getpwuid` in
+/// it failing for as long as the window lasts.
 fn materialize_etc(etc_dir: &Path, id: &Identity) -> io::Result<(PathBuf, PathBuf)> {
     use std::fs::{DirBuilder, Permissions};
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -1329,8 +1444,11 @@ fn materialize_etc(etc_dir: &Path, id: &Identity) -> io::Result<(PathBuf, PathBu
 
     let passwd = etc_dir.join("passwd");
     let group = etc_dir.join("group");
-    std::fs::write(&passwd, passwd_contents(id, SANDBOX_HOME, SANDBOX_SHELL))?;
-    std::fs::write(&group, group_contents(id))?;
+    write_atomic(
+        &passwd,
+        passwd_contents(id, SANDBOX_HOME, SANDBOX_SHELL).as_bytes(),
+    )?;
+    write_atomic(&group, group_contents(id).as_bytes())?;
     Ok((passwd, group))
 }
 
@@ -1412,7 +1530,17 @@ pub(crate) fn build_spec(
     // it has no writable alias the agent could rewrite), then make it executable so a tool calling
     // `xdg-open` runs it. Undeclared, it is the printing stub; with `[open]` it routes by scheme.
     // Regenerated every launch, so a handler removed from the config is gone from the next run.
-    let xdg_open = rt.etc_dir.join("xdg-open");
+    //
+    // In a directory of its own, holding nothing else: that directory is what the cage binds at
+    // [`OPEN_ROUTER_DIR`], and it leads the cage's `PATH`, so every name in it is a name the cage
+    // resolves ahead of the project's tools. `write_atomic`'s temp sibling is the one other name
+    // that appears here, briefly and never as an executable one.
+    let open_router = rt.etc_dir.join("open");
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&open_router)?;
+    let xdg_open = open_router.join("xdg-open");
     write_atomic(&xdg_open, super::openuri::router(open).as_bytes())?;
     std::fs::set_permissions(&xdg_open, std::fs::Permissions::from_mode(0o755))?;
 
@@ -1451,7 +1579,9 @@ pub(crate) fn build_spec(
         // bwrap creates a missing mountpoint, but it would create it in the *host* home this bind
         // exposes — leaving a stray empty file or directory behind after the cage is gone. Creating
         // the parents here (owner-only, like the mise pool) keeps that placement sbx's decision
-        // rather than a side effect.
+        // rather than a side effect. They are also the *sources* of the mountpoint pins the cage
+        // lays over them (see `home_mountpoint_pins`), and bwrap fails a bind whose source is
+        // missing, so this loop is what makes those pins bindable at all.
         for rel in [
             super::openuri::APPLICATIONS_REL,
             super::openuri::MIMEAPPS_REL,
@@ -1548,6 +1678,7 @@ pub(crate) fn build_spec(
         shell_rc_src: &shell_rc,
         contract_src: &contract,
         xdg_open_src: &xdg_open,
+        open_router_src: &open_router,
         hosts_src: &hosts,
         ssh_config_src,
         machine_id_src: &machine_id,
@@ -1638,12 +1769,11 @@ mod tests {
         }
     }
 
-    fn assembled() -> SandboxSpec {
-        assembled_with_ssh_config(None)
-    }
-
-    fn assembled_with_ssh_config(ssh_config_src: Option<&Path>) -> SandboxSpec {
-        let paths = SandboxPaths {
+    /// The resolved paths the assembler tests start from, with every *conditional* source absent.
+    /// One place to add a field, and one place a test overrides the field it is about
+    /// (`SandboxPaths { ssh_config_src: Some(..), ..base_paths() }`).
+    fn base_paths() -> SandboxPaths<'static> {
+        SandboxPaths {
             project: Path::new("/home/u/proj"),
             home_src: Path::new("/data/sbx/projects/abc/home"),
             mise_project_src: None,
@@ -1651,14 +1781,24 @@ mod tests {
             group_src: Path::new("/data/sbx/projects/abc/etc/group"),
             mise_plugin_src: Path::new("/store/mise-plugin"),
             shell_rc_src: Path::new("/store/bashrc"),
+            xdg_open_src: Path::new("/data/sbx/projects/abc/etc/open/xdg-open"),
+            open_router_src: Path::new("/data/sbx/projects/abc/etc/open"),
             contract_src: Path::new("/store/egress-contract.md"),
-            xdg_open_src: Path::new("/data/sbx/projects/abc/etc/xdg-open"),
             hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
-            ssh_config_src,
+            ssh_config_src: None,
             machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
             open_apps_src: None,
             open_mimeapps_src: None,
-        };
+        }
+    }
+
+    fn assembled() -> SandboxSpec {
+        assembled_with_ssh_config(None)
+    }
+
+    /// The spec `paths` assembles to under the default userland, store and posture — the shared
+    /// tail of every `assembled*` helper.
+    fn assembled_from(paths: &SandboxPaths) -> SandboxSpec {
         let env = [("TERM".to_string(), "xterm".to_string())];
         let overlay = Overlay {
             env: &env,
@@ -1668,7 +1808,7 @@ mod tests {
             fresh_release_tokens: &[],
         };
         assemble(
-            &paths,
+            paths,
             &userland(),
             &nix_mount(),
             &overlay,
@@ -1680,18 +1820,51 @@ mod tests {
         .expect("valid spec")
     }
 
+    fn assembled_with_ssh_config(ssh_config_src: Option<&Path>) -> SandboxSpec {
+        assembled_from(&SandboxPaths {
+            ssh_config_src,
+            ..base_paths()
+        })
+    }
+
+    /// A spec in which every conditional mount is present: the ssh client config, a global app's
+    /// per-project mise pool, and both `[open]` destinations. The structural-dest guard walks this
+    /// rather than the bare `assembled()`, because a mount that only some configurations emit is
+    /// precisely the one that gets added without being listed.
+    fn assembled_with_every_conditional_mount() -> SandboxSpec {
+        assembled_from(&SandboxPaths {
+            mise_project_src: Some(Path::new("/data/sbx/projects/abc/mise")),
+            ssh_config_src: Some(Path::new("/data/sbx/projects/abc/etc/ssh_config")),
+            open_apps_src: Some(Path::new("/data/sbx/projects/abc/etc/applications")),
+            open_mimeapps_src: Some(Path::new("/data/sbx/projects/abc/etc/mimeapps.list")),
+            ..base_paths()
+        })
+    }
+
     #[test]
     fn structural_dests_lists_every_fixed_mount_assemble_emits() {
         // The bind-nesting warning checks a config bind against STRUCTURAL_DESTS, a hand-kept copy
         // of the destinations `assemble` mounts. If a new structural mount is added without
         // extending the const, the warning silently goes blind to it — so pin the two together.
-        // `assembled()` has no config binds and no extra binds, so its only runtime-variable
-        // destination is the project path; every other destination must be listed in the const.
-        let spec = assembled();
+        //
+        // Walked over a spec with *every* conditional source supplied, which is what the finding
+        // behind this shape cost: `assembled()` leaves them all `None`, so the ssh-config mount was
+        // invisible to this test and stayed unlisted. A conditional mount is exactly the kind that
+        // gets forgotten, so the guard must see them all.
+        let spec = assembled_with_every_conditional_mount();
         let project = Path::new("/home/u/proj");
+        let home = Path::new(SANDBOX_HOME);
         for mount in &spec.mounts {
             let dest = mount.dest();
-            if dest == project {
+            // The project is mounted at its own runtime path, and the `[open]` destinations (and
+            // the pins above them) are runtime-derived *under* the home — which is listed, so a
+            // config bind that overlaps them is already caught by it.
+            if dest == project || (dest.starts_with(home) && dest != home) {
+                continue;
+            }
+            // The `/opt` pin is emitted before the config binds and therefore shadows none of them;
+            // see the const's own note.
+            if dest == Path::new(OPT_DIR) {
                 continue;
             }
             assert!(
@@ -1959,22 +2132,7 @@ mod tests {
         // A `[devices]` grant becomes a `--dev-bind-try` of the host device at its own path, emitted
         // *after* the minimal `--dev` so the real device layers over the hostless default rather than
         // being shadowed by it. Both granted devices must be present, each after the `--dev`.
-        let paths = SandboxPaths {
-            project: Path::new("/home/u/proj"),
-            home_src: Path::new("/data/sbx/projects/abc/home"),
-            mise_project_src: None,
-            passwd_src: Path::new("/data/sbx/projects/abc/etc/passwd"),
-            group_src: Path::new("/data/sbx/projects/abc/etc/group"),
-            mise_plugin_src: Path::new("/store/mise-plugin"),
-            shell_rc_src: Path::new("/store/bashrc"),
-            contract_src: Path::new("/store/egress-contract.md"),
-            xdg_open_src: Path::new("/data/sbx/projects/abc/etc/xdg-open"),
-            hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
-            ssh_config_src: None,
-            machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
-            open_apps_src: None,
-            open_mimeapps_src: None,
-        };
+        let paths = base_paths();
         let overlay = Overlay {
             env: &[],
             binds: &[],
@@ -2222,22 +2380,7 @@ mod tests {
     fn assemble_emits_launcher_extra_binds_after_the_structural_mounts() {
         // The egress machinery binds (the socket, the CA) must land *after* the tmpfs, so the
         // socket sits on a writable mountpoint, and carry their declared mode.
-        let paths = SandboxPaths {
-            project: Path::new("/home/u/proj"),
-            home_src: Path::new("/data/sbx/projects/abc/home"),
-            mise_project_src: None,
-            passwd_src: Path::new("/data/sbx/projects/abc/etc/passwd"),
-            group_src: Path::new("/data/sbx/projects/abc/etc/group"),
-            mise_plugin_src: Path::new("/store/mise-plugin"),
-            shell_rc_src: Path::new("/store/bashrc"),
-            contract_src: Path::new("/store/egress-contract.md"),
-            xdg_open_src: Path::new("/data/sbx/projects/abc/etc/xdg-open"),
-            hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
-            ssh_config_src: None,
-            machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
-            open_apps_src: None,
-            open_mimeapps_src: None,
-        };
+        let paths = base_paths();
         let overlay = Overlay {
             env: &[],
             binds: &[],
@@ -2313,22 +2456,7 @@ mod tests {
         extra_binds: &[crate::config::Bind],
         extra_bin_paths: &[PathBuf],
     ) -> SandboxSpec {
-        let paths = SandboxPaths {
-            project: Path::new("/home/u/proj"),
-            home_src: Path::new("/data/sbx/projects/abc/home"),
-            mise_project_src: None,
-            passwd_src: Path::new("/data/sbx/projects/abc/etc/passwd"),
-            group_src: Path::new("/data/sbx/projects/abc/etc/group"),
-            mise_plugin_src: Path::new("/store/mise-plugin"),
-            shell_rc_src: Path::new("/store/bashrc"),
-            contract_src: Path::new("/store/egress-contract.md"),
-            xdg_open_src: Path::new("/data/sbx/projects/abc/etc/xdg-open"),
-            hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
-            ssh_config_src: None,
-            machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
-            open_apps_src: None,
-            open_mimeapps_src: None,
-        };
+        let paths = base_paths();
         let overlay = Overlay {
             env: extra_env,
             binds: extra_binds,
@@ -2474,23 +2602,142 @@ mod tests {
     #[test]
     fn the_router_binds_the_same_stub_read_only_under_both_names() {
         // The router path is what PATH resolves; the FHS path stays for a caller that names
-        // `/usr/bin/xdg-open` absolutely. One staged source, two read-only binds — a second copy
-        // would be a second thing to keep in step.
+        // `/usr/bin/xdg-open` absolutely. One staged source, bound under both — a second copy
+        // would be a second thing to keep in step. The PATH-resolved name comes from the bind of
+        // the staged *directory*, which is why it is that source the argv carries.
         let argv = argv_strings(&assembled());
+        let fhs = argv
+            .iter()
+            .position(|s| s == XDG_OPEN_INCAGE)
+            .expect("the FHS name is synthesised");
+        assert_eq!(
+            argv[fhs - 1],
+            "/data/sbx/projects/abc/etc/open/xdg-open",
+            "the FHS name binds the staged stub"
+        );
         let router = argv
             .iter()
-            .position(|s| s == OPEN_ROUTER_INCAGE)
-            .expect("the router is synthesised");
+            .position(|s| s == OPEN_ROUTER_DIR)
+            .expect("the router directory is bound");
         assert_eq!(
             argv[router - 1],
-            "/data/sbx/projects/abc/etc/xdg-open",
-            "the router binds the same staged stub as /usr/bin/xdg-open"
+            "/data/sbx/projects/abc/etc/open",
+            "the router directory binds the directory that stub lives in"
         );
         assert_eq!(
             argv[router - 2],
             "--ro-bind",
-            "the router is a read-only bind"
+            "the router directory is a read-only bind"
         );
+        assert!(
+            Path::new(OPEN_ROUTER_INCAGE).starts_with(OPEN_ROUTER_DIR),
+            "the name PATH resolves is the one inside that directory"
+        );
+    }
+
+    #[test]
+    fn every_component_of_the_router_directory_is_a_mountpoint() {
+        // The finding this answers: only `/opt/sbx/open/xdg-open` was a mount, so `/opt` and
+        // `/opt/sbx` were ordinary directories on the cage's writable root. The kernel refuses to
+        // rename a mountpoint (EBUSY) but not an ancestor of one — the mounts simply travel with
+        // the directory — so in-cage code could `mv /opt /opt.bak`, recreate
+        // `/opt/sbx/open/xdg-open` as its own script, and own the `xdg-open` that leads PATH for
+        // every later caller. Every component down to the router directory must therefore be a
+        // mount of its own, and each must be established before the one below it: a child mounted
+        // first is shadowed when its parent lands on top.
+        let spec = assembled();
+        let dests: Vec<&Path> = spec.mounts.iter().map(|m| m.dest()).collect();
+        let at = |p: &str| {
+            dests
+                .iter()
+                .position(|d| *d == Path::new(p))
+                .unwrap_or_else(|| panic!("{p} is not a mountpoint: {dests:?}"))
+        };
+        let (opt, sbx, open) = (at(OPT_DIR), at(SBX_INCAGE_DIR), at(OPEN_ROUTER_DIR));
+        assert!(
+            opt < sbx && sbx < open,
+            "the chain is laid shallow-to-deep: {dests:?}"
+        );
+        assert!(
+            matches!(&spec.mounts[open], Mount::RoBind { .. }),
+            "the router directory is read-only, so the cage cannot add a second name to the \
+             directory that leads PATH"
+        );
+    }
+
+    #[test]
+    fn the_opt_pin_does_not_shadow_a_config_bind_under_it() {
+        // The `/opt` pin exists to make the path a mountpoint, not to own what is under it, so it
+        // is the one structural mount emitted *before* the config binds. A `[[binds]]` under `/opt`
+        // must still land inside the cage — the pin is not allowed to buy its guarantee by making
+        // declared binds disappear.
+        let bind = crate::config::Bind {
+            path: PathBuf::from("/opt/vendor"),
+            writable: false,
+        };
+        let spec = assemble_with(&[], std::slice::from_ref(&bind), &[]);
+        let dests: Vec<&Path> = spec.mounts.iter().map(|m| m.dest()).collect();
+        let opt = dests
+            .iter()
+            .position(|d| *d == Path::new(OPT_DIR))
+            .expect("the pin is emitted");
+        let vendor = dests
+            .iter()
+            .position(|d| *d == Path::new("/opt/vendor"))
+            .expect("the config bind survives");
+        assert!(
+            opt < vendor,
+            "the pin precedes the config bind, so the bind mounts inside it rather than being \
+             shadowed by it: {dests:?}"
+        );
+    }
+
+    #[test]
+    fn every_component_of_an_open_destination_is_a_mountpoint() {
+        // Same finding as the router chain, in the home: the `[open]` files are bound read-only
+        // *inside* a writable bind, and a read-only bind is unmovable only at its own path. With
+        // `$HOME/.local` an ordinary directory, the cage renames it, recreates
+        // `$HOME/.local/share/applications` with a desktop entry of its own, and the XDG lookup —
+        // which asks for that path by name — reads the forgery. Every directory between the home
+        // and each destination must be a mountpoint, laid shallow-to-deep, and still read-write:
+        // pinning them read-only would freeze parts of the home the cage legitimately writes.
+        let spec = assembled_with_every_conditional_mount();
+        let dests: Vec<&Path> = spec.mounts.iter().map(|m| m.dest()).collect();
+        for rel in [
+            super::super::openuri::APPLICATIONS_REL,
+            super::super::openuri::MIMEAPPS_REL,
+        ] {
+            let dest = PathBuf::from(format!("{SANDBOX_HOME}/{rel}"));
+            let leaf = dests
+                .iter()
+                .position(|d| *d == dest)
+                .unwrap_or_else(|| panic!("{} is not bound: {dests:?}", dest.display()));
+            let mut previous = dests
+                .iter()
+                .position(|d| *d == Path::new(SANDBOX_HOME))
+                .expect("the home is bound");
+            for ancestor in dest.ancestors().collect::<Vec<_>>().iter().rev() {
+                if !ancestor.starts_with(SANDBOX_HOME) || *ancestor == Path::new(SANDBOX_HOME) {
+                    continue;
+                }
+                let at = dests.iter().position(|d| d == ancestor).unwrap_or_else(|| {
+                    panic!("{} is not a mountpoint: {dests:?}", ancestor.display())
+                });
+                assert!(
+                    at > previous,
+                    "{} must be mounted after its parent: {dests:?}",
+                    ancestor.display()
+                );
+                previous = at;
+                if at != leaf {
+                    assert!(
+                        matches!(&spec.mounts[at], Mount::Bind { .. }),
+                        "{} is pinned read-write — the home stays writable",
+                        ancestor.display()
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2525,7 +2772,7 @@ mod tests {
             .expect("/usr/bin/xdg-open is synthesised");
         assert_eq!(
             argv[xdg - 1],
-            "/data/sbx/projects/abc/etc/xdg-open",
+            "/data/sbx/projects/abc/etc/open/xdg-open",
             "/usr/bin/xdg-open binds the staged stub"
         );
         assert_eq!(
@@ -2720,22 +2967,7 @@ mod tests {
         // The open-cage posture: backed by a per-project store, `/nix` is a read-write
         // bind of it (the agent may write its own toolchain into the project's own
         // store), not the read-only bind of the shared store.
-        let paths = SandboxPaths {
-            project: Path::new("/home/u/proj"),
-            home_src: Path::new("/data/sbx/projects/abc/home"),
-            mise_project_src: None,
-            passwd_src: Path::new("/data/sbx/projects/abc/etc/passwd"),
-            group_src: Path::new("/data/sbx/projects/abc/etc/group"),
-            mise_plugin_src: Path::new("/store/mise-plugin"),
-            shell_rc_src: Path::new("/store/bashrc"),
-            contract_src: Path::new("/store/egress-contract.md"),
-            xdg_open_src: Path::new("/data/sbx/projects/abc/etc/xdg-open"),
-            hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
-            ssh_config_src: None,
-            machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
-            open_apps_src: None,
-            open_mimeapps_src: None,
-        };
+        let paths = base_paths();
         let nix = NixMount {
             src: PathBuf::from("/data/sbx/projects/abc/store/nix"),
             writable: true,
@@ -2860,6 +3092,68 @@ mod tests {
         );
         assert!(std::fs::read_to_string(&passwd).unwrap().contains("4321"));
         assert!(std::fs::read_to_string(&group).unwrap().contains("nogroup"));
+    }
+
+    #[test]
+    fn re_materializing_the_identity_installs_a_new_inode_instead_of_rewriting_in_place() {
+        // The finding: `passwd`/`group` were the only files staged in this directory written with a
+        // plain `fs::write`, while the directory is shared by concurrent cages of one project and
+        // both files are bound read-only into each of them. An in-place write truncates the file
+        // the running cage is reading through that bind, so every `getpwuid` in it fails for the
+        // width of the window; and even after the write it swaps the identity under a cage that
+        // already resolved it. A temp-and-rename leaves the running cage on the inode it bound.
+        use std::io::Read as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let base = TmpDir::new();
+        let etc = base.join("etc");
+        let first = Identity {
+            uid: 4321,
+            gid: 4321,
+            user: "sandbox".to_string(),
+        };
+        let (passwd, group) = materialize_etc(&etc, &first).unwrap();
+        let (passwd_ino, group_ino) = (
+            std::fs::metadata(&passwd).unwrap().ino(),
+            std::fs::metadata(&group).unwrap().ino(),
+        );
+        // The handle a running cage holds on the file it bound.
+        let mut bound = std::fs::File::open(&passwd).unwrap();
+
+        let second = Identity {
+            uid: 5555,
+            gid: 5555,
+            user: "sandbox".to_string(),
+        };
+        let (passwd_again, group_again) = materialize_etc(&etc, &second).unwrap();
+        assert_eq!((&passwd, &group), (&passwd_again, &group_again));
+
+        let mut held = String::new();
+        bound.read_to_string(&mut held).unwrap();
+        assert!(
+            held.contains("4321") && !held.contains("5555"),
+            "a cage already bound to the file keeps its own complete view: {held}"
+        );
+        assert_ne!(
+            std::fs::metadata(&passwd).unwrap().ino(),
+            passwd_ino,
+            "passwd is replaced by rename, not rewritten in place"
+        );
+        assert_ne!(
+            std::fs::metadata(&group).unwrap().ino(),
+            group_ino,
+            "group is replaced by rename, not rewritten in place"
+        );
+        // The next launch does get the new identity — and no temp sibling is left behind, which
+        // would be a second name in a directory the cage reads.
+        assert!(
+            std::fs::read_to_string(&passwd).unwrap().contains("5555"),
+            "the new identity is what the path now names"
+        );
+        let staged: Vec<String> = std::fs::read_dir(&etc)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(staged.len(), 2, "no leftover temp file: {staged:?}");
     }
 
     #[test]
@@ -3054,7 +3348,8 @@ mod tests {
             mise_plugin_src: Path::new("/store/mise-plugin"),
             shell_rc_src: Path::new("/store/bashrc"),
             contract_src: Path::new("/store/egress-contract.md"),
-            xdg_open_src: Path::new("/data/sbx/apps/demo-app/etc/xdg-open"),
+            xdg_open_src: Path::new("/data/sbx/apps/demo-app/etc/open/xdg-open"),
+            open_router_src: Path::new("/data/sbx/apps/demo-app/etc/open"),
             hosts_src: Path::new("/data/sbx/apps/demo-app/etc/hosts"),
             ssh_config_src: None,
             machine_id_src: Path::new("/data/sbx/apps/demo-app/etc/machine-id"),
