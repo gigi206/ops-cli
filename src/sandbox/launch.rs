@@ -174,6 +174,21 @@ fn observation_flags(proc: &crate::proc_policy::ProcPolicy, observe: bool) -> (b
     (exec_poll, observe)
 }
 
+/// Whether a guardless cage may `exec`-replace this process instead of forking and supervising it.
+///
+/// An [`Observation`](super::observe_feed::Observation) lives in host threads rooted on *this*
+/// process, so anything that starts one needs a live parent for the cage's lifetime — an `exec`
+/// would replace the supervisor out from under it and drop the socket, the ring and the poll
+/// thread on the floor. The decision used to be written against the `--observe` flag alone, which
+/// silently lost a config-declared `[proc] mode = "observe"`: the detached path started the
+/// observer and then exec'd it away (so `sbx proc logs` had nothing to read), and the foreground
+/// path never started one at all. Ask [`observation_flags`] — the same pair that decides whether
+/// to start the observer — so the two answers cannot disagree.
+fn may_exec_replace(proc: &crate::proc_policy::ProcPolicy, observe: bool) -> bool {
+    let (exec_poll, fs) = observation_flags(proc, observe);
+    !(exec_poll || fs)
+}
+
 /// Why `--observe`'s inline `[sbx:exec]` feed will not appear, or `None` when it will.
 ///
 /// The feed rides one path only: a non-tty foreground launch whose exec observation is the poller.
@@ -299,11 +314,16 @@ fn launch_foreground(
 
     register(prep.layout.data_dir(), &spec, kind, runtime, false);
 
+    // Decided before the match: the same pair drives both the exec/supervise choice and the
+    // observer below, so a config-declared `[proc] mode = "observe"` cannot be seen by one and
+    // missed by the other.
+    let (exec_poll, fs) = observation_flags(&prep.cfg.proc, observe);
+
     match guard {
         // The default postures with no observation: exec-replace, so the command's exit status
         // becomes sbx's. The pid and its start time survive the exec, so the registry record keeps
         // matching the sandbox and is reclaimed by liveness pruning once it exits.
-        None if !observe => {
+        None if may_exec_replace(&prep.cfg.proc, observe) => {
             // On success this never returns; reaching past it means exec itself failed.
             let err = exec(&prep.bwrap, &spec, &prep.cfg.limits);
             crate::diag::error(&format!("sbx: failed to launch the sandbox: {err}"));
@@ -319,7 +339,6 @@ fn launch_foreground(
         // is true here: this is the non-tty foreground path, the one place the `[sbx:exec]` feed
         // streams to stderr (as well as into the ring `sbx proc logs` reads).
         maybe_guard => {
-            let (exec_poll, fs) = observation_flags(&prep.cfg.proc, observe);
             let observer = (exec_poll || fs).then(|| {
                 super::observe_feed::Observation::start(
                     prep.layout.data_dir(),
@@ -405,8 +424,9 @@ fn launch_detached(
 /// its output still on the terminal (so setup errors are visible), signals readiness, then
 /// redirects to the session log and runs the cage. Never returns: every path ends in `exec`
 /// (which replaces the process) or [`std::process::exit`], so the parent's tail logic can never
-/// run a second time in the child. With `observe`, it also stands up the process observer — which,
-/// like a guard, forces the supervised (fork+wait) path so a live parent outlives the cage.
+/// run a second time in the child. With observation on — the `--observe` flag *or* a
+/// config-declared `[proc] mode = "observe"` — it also stands up the process observer, which, like
+/// a guard, forces the supervised (fork+wait) path so a live parent outlives the cage.
 fn detached_child(
     prep: Prepared,
     runtime: binds::Runtime,
@@ -478,7 +498,7 @@ fn detached_child(
     });
 
     match guard {
-        None if !observe => {
+        None if may_exec_replace(&prep.cfg.proc, observe) => {
             // exec-replace: bwrap (pid 1 of the cage's namespace) inherits the redirected stdio.
             let err = exec(&prep.bwrap, &spec, &prep.cfg.limits);
             crate::diag::error(&format!("sbx: failed to launch the sandbox: {err}"));
@@ -641,13 +661,7 @@ fn open_detach_log(path: &Path) -> io::Result<File> {
 /// not shaped the way its config plainly reads. A foreground launch needs none of this: its
 /// warnings go to a stderr its invoker owns.
 ///
-/// `needles` redacts the note the way [`super::notify_sink`] redacts the very same string on its way
-/// to the desktop. No producer of a trust-drop warning interpolates agent-chosen text today — they
-/// carry a layer label, a caller-spelled field phrase, a bind count, plugin table names and a nix
-/// tool name — so this is a no-op on every string it currently sees. It is here for the producer
-/// added later: [`crate::config::is_trust_drop`] matches on the remedy rather than on any one
-/// reason's wording, so a new one flows into this writer without anyone revisiting it. A launch that
-/// needs no guard carries no needle set, and then the note goes out as the terminal already had it.
+/// The redaction is [`trust_drop_notes`]'; see there for what the needle set is for.
 ///
 /// Best-effort, like the header above it: a note that cannot be written costs a reader context,
 /// never a session that is otherwise ready to run.
@@ -657,20 +671,48 @@ fn note_trust_drops(
     wiring: Option<&super::notify_sink::NotifyWiring>,
 ) {
     use std::io::Write as _;
-    let needles = wiring.and_then(|w| w.needles.read().ok());
     let mut sink = log;
-    for warning in warnings.iter().filter(|w| crate::config::is_trust_drop(w)) {
-        let note = match needles.as_deref() {
-            Some(n) => {
-                super::redact::redact_string(warning, n, &super::redact::Placeholder::Plain).0
-            }
-            None => warning.clone(),
-        };
+    for note in trust_drop_notes(warnings, wiring.map(|w| &w.needles)) {
         let _ = writeln!(
             sink,
             "{SESSION_LOG_TRUST_DROP_OPEN}{note}{SESSION_LOG_HEADER_CLOSE}"
         );
     }
+}
+
+/// The trust-drop warnings of a launch, redacted, in the order they were produced.
+///
+/// `needles` redacts each note the way [`super::notify_sink`] redacts the very same string on its
+/// way to the desktop. No producer of a trust-drop warning interpolates agent-chosen text today —
+/// they carry a layer label, a caller-spelled field phrase, a bind count, plugin table names and a
+/// nix tool name — so this is a no-op on every string it currently sees. It is here for the producer
+/// added later: [`crate::config::is_trust_drop`] matches on the remedy rather than on any one
+/// reason's wording, so a new one flows into this writer without anyone revisiting it. A launch that
+/// needs no guard carries no needle set, and then the note goes out as the terminal already had it.
+///
+/// The lock is taken through [`super::locks::read_locked`], not `read().ok()`. This is the second
+/// reader of a set whose [`Needles`](super::notify_sink::Needles) doc calls the delivery thread its
+/// only one, and a panic on that thread poisons the `RwLock` for this one. `read().ok()` turned that
+/// into `None` — the branch that writes the warning **unredacted** — so the one event most likely to
+/// leave a half-finished credential set behind would also have been the event that stopped redacting
+/// against it. Recovering the set is what the rest of the crate does with a poisoned lock, and it is
+/// the fail-closed reading here: a set filled by a thread that later panicked still names real
+/// credentials.
+fn trust_drop_notes(
+    warnings: &[String],
+    needles: Option<&super::notify_sink::Needles>,
+) -> Vec<String> {
+    let needles = needles.map(|n| super::locks::read_locked(n));
+    warnings
+        .iter()
+        .filter(|w| crate::config::is_trust_drop(w))
+        .map(|warning| match needles.as_deref() {
+            Some(n) => {
+                super::redact::redact_string(warning, n, &super::redact::Placeholder::Plain).0
+            }
+            None => warning.clone(),
+        })
+        .collect()
 }
 
 /// Close the readiness pipe without a success byte and exit non-zero — the daemon failed to set
@@ -1990,6 +2032,54 @@ fn report_optimise(
     }
 }
 
+/// The in-store `sbx-flake-<name>` gcroot names of every **declared** inline `[flakes.<name>]`,
+/// which is the keep-set `sbx gc` reconciles those roots against.
+///
+/// Declared, **not** trusted — the same rule [`packages::project_gcroot_names`] states for the
+/// data-dir out-links, and for the same reason. This was read through
+/// [`packages::flake_inline_packages`], which filters to `TrustState::Trusted` because it decides
+/// what is actually built and bound; that made a lapse in project trust indistinguishable from a
+/// removal. One edit to `sbx.toml` turns every inline flake `Changed`, and the next `sbx gc
+/// --prune` would then drop the roots of flakes the config still declares and collect their
+/// builds. Trust decides what runs; only a package no longer declared at all is a removal.
+///
+/// [`packages::project_gcroot_names`]: super::packages::project_gcroot_names
+/// [`packages::flake_inline_packages`]: super::packages::flake_inline_packages
+fn inline_flake_gcroot_names(packages: &[crate::config::Package]) -> Vec<String> {
+    packages
+        .iter()
+        .filter(|p| matches!(p.backend, crate::config::Backend::FlakeInline { .. }))
+        .map(|p| p.name.clone())
+        .collect()
+}
+
+/// Why `sbx gc` must not collect this project's store right now, or `None` when it may.
+///
+/// Collecting a store a running cage reads and writes could drop a path it still needs, so the
+/// registry is consulted first. The unreadable case is the point of this function: the check used
+/// to be `if let Ok(sessions) = …`, which turned "I cannot tell you what is running" into "nothing
+/// is running" and let the sweep proceed unguarded against a live cage. Not being able to read the
+/// registry is not evidence that it is empty, so it refuses — matching `Registry::scan`, which
+/// already skips individual unreadable records rather than reporting an empty list for the same
+/// reason. A missing `sessions/` directory is not an error there (it lists empty), so this cannot
+/// refuse on a cold data directory.
+fn gc_live_session_refusal(
+    listed: std::io::Result<Vec<session::Session>>,
+    project: &Path,
+) -> Option<String> {
+    match listed {
+        Ok(sessions) if sessions.iter().any(|s| s.project == project) => Some(
+            "sbx gc: a sandbox is running in this project — stop it first (see `sbx session ls`)."
+                .to_string(),
+        ),
+        Err(e) => Some(format!(
+            "sbx gc: cannot read the session registry ({e}) — refusing to collect, because a live \
+             sandbox holding this project cannot be ruled out."
+        )),
+        Ok(_) => None,
+    }
+}
+
 /// Reclaim the current project's own writable store.
 ///
 /// The agent self-equips into a per-project store — `flake:` builds, in-cage installs — and over
@@ -2053,12 +2143,11 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
 
     // Refuse if a live sandbox holds this project: collecting a store a running cage reads and
     // writes could drop a path it still needs. The registry list prunes dead records as it goes.
-    if let Ok(sessions) = session::Registry::at(prep.layout.data_dir()).list()
-        && sessions.iter().any(|s| s.project == project)
-    {
-        crate::diag::error(
-            "sbx gc: a sandbox is running in this project — stop it first (see `sbx session ls`).",
-        );
+    if let Some(refusal) = gc_live_session_refusal(
+        session::Registry::at(prep.layout.data_dir()).list(),
+        &project,
+    ) {
+        crate::diag::error(&refusal);
         return Err(ExitCode::FAILURE);
     }
 
@@ -2080,13 +2169,10 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
     // at an unwanted build — this prunes those so the sweep reclaims them. The current set spans every
     // runtime — the baseline and each app's merged packages — so an inline flake declared only in an
     // app keeps its root.
-    let flake_root_names = |pkgs: &[crate::config::Package]| {
-        super::packages::flake_inline_packages(pkgs)
-            .into_iter()
-            .map(|(name, _, _)| name)
-    };
     let mut flake_names: std::collections::BTreeSet<String> =
-        flake_root_names(&prep.cfg.packages).collect();
+        inline_flake_gcroot_names(&prep.cfg.packages)
+            .into_iter()
+            .collect();
     // The host-provisioned data-dir out-links a removed package leaks: `<data>/gcroots/projects/<id>/
     // <name>` (bare `<name>` for `nix:`, `deb-`/`appimage-`/`tarball-<name>` for a prebuilt) is
     // add-only, so a package no longer declared keeps its out-link — which reads into the keep-set
@@ -2100,7 +2186,7 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
     for app in prep.cfg.apps.values() {
         let mut merged = prep.cfg.clone();
         merged.merge_app(app.clone());
-        flake_names.extend(flake_root_names(&merged.packages));
+        flake_names.extend(inline_flake_gcroot_names(&merged.packages));
         package_names.extend(super::packages::project_gcroot_names(&merged.packages));
     }
     let data_gcroots = prep.layout.data_dir().join("gcroots");
@@ -3912,23 +3998,21 @@ fn build(
             // `network = "none"`: a mise tool cannot be fetched, so skip the equip (it would only
             // fail). An already-equipped tool still resolves through its persisted shim, so this
             // is a warning, not a hard error.
-            let declared: Vec<&str> = global_mise
-                .iter()
-                .chain(auto_equip.iter())
-                .map(String::as_str)
-                .collect();
+            let declared = mise_token_display(global_mise.iter().chain(auto_equip.iter()));
             crate::diag::warn(&format!(
-                "mise tools [{}] are declared but `network = \"none\"` — they \
-                 cannot be fetched and will be absent unless already equipped",
-                declared.join(", ")
+                "mise tools [{declared}] are declared but `network = \"none\"` — they \
+                 cannot be fetched and will be absent unless already equipped"
             ));
         } else {
             if !auto_equip.is_empty() {
                 if !prep.quiet_equip {
+                    // The display copy only. The tokens handed to `wrap_mise_equip` below stay raw
+                    // on purpose: they ride `\"$@\"` positionally and must reach mise exactly as the
+                    // project wrote them.
+                    let shown = mise_token_display(auto_equip.iter());
                     eprintln!(
-                        "sbx: equipping non-nix tools in-cage via mise: {} (each backend's host \
-                         must be in [network].allow under an allowlist)",
-                        auto_equip.join(", ")
+                        "sbx: equipping non-nix tools in-cage via mise: {shown} (each backend's \
+                         host must be in [network].allow under an allowlist)"
                     );
                 }
                 wraps.push((
@@ -5292,6 +5376,27 @@ fn mise_tools(prep: &Prepared) -> Result<super::packages::Provisioned, ExitCode>
     })
 }
 
+/// A list of mise tool tokens, rendered for the launching terminal.
+///
+/// The tokens [`auto_equip_tokens`] produces are a `[tools]` key and version copied verbatim out of
+/// the project's `.mise.toml` — a file the trust gate never approves and a hostile repo fully
+/// controls. A quoted TOML key is an arbitrary string, so it can carry `\r`, `\n` or a CSI
+/// sequence, and both of the launch messages that name these tools go straight to the terminal that
+/// started sbx. Printed raw, a tool called `"x\u{1b}[2K\rsbx: trusted"` scrubs the trust warnings
+/// sbx printed just above it and writes its own in their place, which is the one thing the launching
+/// terminal is there to say. [`crate::sandbox::sanitize`] is applied per token rather than once over
+/// the joined line so that a legitimately long list is not truncated to a single value's cap.
+///
+/// Display only — the tokens actually handed to mise stay raw, since they ride `"$@"` positionally
+/// (see [`wrap_mise_equip`]) and must reach it exactly as the project wrote them.
+fn mise_token_display<'a>(tokens: impl IntoIterator<Item = &'a String>) -> String {
+    tokens
+        .into_iter()
+        .map(|t| crate::sandbox::sanitize(t))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The `<token>@<version>` install specs for the project's non-`nix:` mise tools — the tools
 /// the launcher auto-equips in-cage rather than host-provisioning. Empty when the project
 /// declares no mise file. A pure re-parse of the already-loaded mise files, independent of
@@ -6256,6 +6361,149 @@ mod tests {
         for mode in [ProcMode::Off, ProcMode::Observe, ProcMode::Enforce] {
             assert_eq!(observe_feed_absent_reason(false, true, &with(mode)), None);
         }
+    }
+
+    /// Observation and the `exec`-replace shortcut cannot coexist: the observer's control socket,
+    /// its ring and its poll thread hang off *this* process, and an `exec` replaces the process
+    /// that owns them.
+    ///
+    /// Both guardless launch paths used to decide the shortcut from the `--observe` flag rather
+    /// than from the resolved policy, so a project whose config declares `[proc] mode = "observe"`
+    /// lost observation in two different ways with no error on either: the detached daemon started
+    /// the observer and then exec'd straight over it, and the foreground non-tty path never started
+    /// one at all. Both now ask [`may_exec_replace`], which reads the same
+    /// [`observation_flags`] pair that decides whether to start the observer.
+    #[test]
+    fn config_declared_observation_blocks_the_exec_replace_shortcut() {
+        use crate::proc_policy::{ProcMode, ProcPolicy};
+
+        let with = |mode| ProcPolicy {
+            mode,
+            ..ProcPolicy::default()
+        };
+
+        // The regression: no flag, but the policy alone turns the poll exec lens on.
+        let declared = with(ProcMode::Observe);
+        assert!(
+            observation_flags(&declared, false).0,
+            "a config-declared observe mode runs the poll lens without `--observe`"
+        );
+        assert!(
+            !may_exec_replace(&declared, false),
+            "so a guardless launch must fork+wait — an exec would replace the observer's own parent"
+        );
+
+        // The flag alone, on a policy that declares nothing, blocks it too (the fs lens follows
+        // the flag).
+        assert!(!may_exec_replace(&with(ProcMode::Off), true));
+        // Including under enforcement, where the poller is off but the inotify lens still runs.
+        assert!(!may_exec_replace(&with(ProcMode::Enforce), true));
+
+        // And the shortcut is still granted where it belongs, or this guard would be satisfiable
+        // by refusing every launch: with nothing observed there is nothing to outlive the cage.
+        assert!(may_exec_replace(&with(ProcMode::Off), false));
+        // An unasked enforcing launch keeps it here as well — its seccomp supervisor arrives as a
+        // `LaunchGuard`, and it is the guard, not this predicate, that forces supervision.
+        assert!(may_exec_replace(&with(ProcMode::Enforce), false));
+    }
+
+    /// `sbx gc` collects a store a live cage is reading and writing, so the live-session check is
+    /// the only thing standing between a running sandbox and a sweep of its own store. It used to
+    /// be written `if let Ok(sessions) = …`, which silently read an unreadable registry as an empty
+    /// one — the failure mode that matters is precisely the one where the answer is unknown, and it
+    /// took the permissive branch. Refuse instead, and say which of the two refusals it is.
+    #[test]
+    fn gc_refuses_when_the_session_registry_cannot_be_read() {
+        use crate::session::{Kind, Session, SessionRuntime};
+
+        let project = PathBuf::from("/home/u/proj");
+        let session = |p: &str| Session {
+            project: PathBuf::from(p),
+            pid: 4321,
+            start_ticks: 99,
+            kind: Kind::Run,
+            runtime: SessionRuntime::Project,
+            detached: true,
+        };
+
+        // The regression: an unreadable registry is not an empty one.
+        let refusal = gc_live_session_refusal(
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            &project,
+        )
+        .expect("an unreadable registry cannot rule out a live cage, so gc must refuse");
+        assert!(
+            refusal.contains("cannot read the session registry"),
+            "and it must name the real reason, not claim a sandbox is running: {refusal}"
+        );
+
+        // The refusal it already had, unchanged.
+        let running = gc_live_session_refusal(Ok(vec![session("/home/u/proj")]), &project)
+            .expect("a live session in this project still refuses");
+        assert!(running.contains("a sandbox is running in this project"));
+
+        // And gc still runs where it should, or this guard would be satisfied by refusing
+        // everything: an empty registry (a cold data dir lists empty, it does not error), and a
+        // registry holding only some *other* project's live session.
+        assert_eq!(gc_live_session_refusal(Ok(Vec::new()), &project), None);
+        assert_eq!(
+            gc_live_session_refusal(Ok(vec![session("/home/u/other")]), &project),
+            None
+        );
+    }
+
+    /// The inline-flake keep-set is read for one purpose: deciding which `sbx-flake-<name>` roots
+    /// `sbx gc --prune` drops. A dropped root means the build is collected, so the question it must
+    /// answer is "is this flake still declared?", never "is this project still trusted?" — reading
+    /// it off the trusted-only provisioning filter meant a single edit to `sbx.toml` (which turns
+    /// every package `Changed` until re-approved) presented as a wholesale removal, and the next
+    /// prune threw away builds the config still asks for.
+    #[test]
+    fn a_lapse_in_trust_does_not_look_like_a_removed_inline_flake() {
+        use crate::config::{Backend, Package};
+        use crate::trust::TrustState;
+
+        let inline = |name: &str, state| Package {
+            name: name.to_string(),
+            backend: Backend::FlakeInline {
+                content: "{ outputs = _: {}; }".to_string(),
+                attr: "default".to_string(),
+            },
+            state,
+            libs: Vec::new(),
+        };
+
+        let declared = vec![
+            inline("trusted-one", TrustState::Trusted),
+            inline("edited-one", TrustState::Changed),
+            inline("never-approved", TrustState::Untrusted),
+            // A `nix:` package roots as a data-dir out-link, not as `sbx-flake-<name>`; including
+            // it here would make the prune keep a root that this set does not own.
+            Package {
+                name: "ripgrep".to_string(),
+                backend: Backend::Nix("ripgrep".to_string()),
+                state: TrustState::Trusted,
+                libs: Vec::new(),
+            },
+        ];
+
+        assert_eq!(
+            inline_flake_gcroot_names(&declared),
+            vec![
+                "trusted-one".to_string(),
+                "edited-one".to_string(),
+                "never-approved".to_string(),
+            ],
+            "every declared inline flake keeps its root, whatever its trust; nothing else is in \
+             this set"
+        );
+
+        // A flake actually removed from the config is absent — which is what makes the prune work
+        // at all, and what stops this test being satisfiable by keeping everything.
+        assert!(
+            !inline_flake_gcroot_names(&declared[..1]).contains(&"edited-one".to_string()),
+            "a flake no longer declared is a removal, and its root is dropped"
+        );
     }
 
     /// Nothing a cage's environment carries may reach bubblewrap's **argument list**:
@@ -7472,6 +7720,98 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
                 "aqua:BurntSushi/ripgrep@latest".to_string(),
                 "node@20".to_string(),
             ]
+        );
+    }
+
+    /// A detached session's trust-drop note is redacted against the launch's credential set, and
+    /// that set lives behind an `RwLock` whose only other reader is the notifier's delivery thread.
+    /// A panic there poisons the lock, and this reader used to take it with `read().ok()` — which
+    /// mapped "poisoned" onto `None`, the branch that writes the warning **unredacted**, into a log
+    /// file that outlives the session. The one event most likely to leave a half-populated needle
+    /// set behind would have been the event that stopped redacting against it, so recover the set
+    /// instead: what a panicking holder had already put there still names real credentials.
+    #[test]
+    fn a_poisoned_needle_set_still_redacts_the_trust_drop_note() {
+        use crate::sandbox::proxy::SecretNeedle;
+        use std::sync::{Arc, RwLock};
+
+        let secret = "hunter2-actual-token";
+        let warning =
+            format!("project: dropped `network.allow` (token {secret}) — run `sbx trust`");
+        let needles: crate::sandbox::notify_sink::Needles =
+            Arc::new(RwLock::new(vec![SecretNeedle::named(
+                "TOKEN",
+                secret.as_bytes().to_vec(),
+            )]));
+
+        // Poison it exactly as a panic on the delivery thread would.
+        let poisoner = Arc::clone(&needles);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.write().unwrap();
+            panic!("delivery thread died holding the needle set");
+        })
+        .join();
+        assert!(
+            needles.read().is_err(),
+            "the lock is poisoned for this reader"
+        );
+
+        let notes = trust_drop_notes(std::slice::from_ref(&warning), Some(&needles));
+        assert_eq!(notes.len(), 1, "the trust drop is still recorded");
+        assert!(
+            !notes[0].contains(secret),
+            "a poisoned lock must not fall back to writing the secret verbatim: {}",
+            notes[0]
+        );
+        // Redacted, not discarded — the reader still learns which field was dropped and how to
+        // get it back, or the note would be worthless.
+        assert!(notes[0].contains("`network.allow`") && notes[0].contains("`sbx trust`"));
+
+        // And with no wiring at all there is nothing to redact against, so the note goes out as
+        // the terminal already had it — this guard must not be satisfiable by blanking everything.
+        assert_eq!(
+            trust_drop_notes(std::slice::from_ref(&warning), None),
+            vec![warning.clone()]
+        );
+        // A warning that is not a trust drop is not noted here at all.
+        assert!(
+            trust_drop_notes(&["project: some other warning".to_string()], Some(&needles))
+                .is_empty()
+        );
+    }
+
+    /// `wrap_mise_equip` already proves a hostile `.mise.toml` token cannot inject *shell*. The
+    /// other end of the same token is the launching terminal, which reads escapes: the two launch
+    /// messages that name these tools printed them verbatim, so a `[tools]` key of
+    /// `"x\u{1b}[2K\rsbx: trusted"` — a quoted TOML key is an arbitrary string — could erase the
+    /// trust warnings sbx had just printed above it and write a reassuring line of its own. The
+    /// terminal is where sbx says what it dropped and why; a repo must not be able to edit that.
+    #[test]
+    fn a_hostile_mise_token_cannot_rewrite_the_launching_terminal() {
+        let tokens = [
+            "node@22".to_string(),
+            "x\u{1b}[2K\rsbx: project trusted\n@1.0".to_string(),
+        ];
+        let shown = mise_token_display(tokens.iter());
+
+        assert!(
+            !shown.contains('\u{1b}') && !shown.contains('\r') && !shown.contains('\n'),
+            "no escape, carriage return or newline may reach the terminal: {shown:?}"
+        );
+        assert!(
+            !shown.chars().any(char::is_control),
+            "and nothing else the terminal acts on either: {shown:?}"
+        );
+        // The forged text itself is left visible rather than dropped — the reader should see the
+        // token the project actually declared, only stripped of the bytes that move the cursor.
+        assert!(shown.contains("sbx: project trusted"));
+
+        // And an ordinary declaration is untouched, or this guard would be satisfied by mangling
+        // every token: the message has to stay readable for the tools people really declare.
+        assert!(shown.starts_with("node@22, "));
+        assert_eq!(
+            mise_token_display(["aqua:BurntSushi/ripgrep@latest".to_string()].iter()),
+            "aqua:BurntSushi/ripgrep@latest"
         );
     }
 

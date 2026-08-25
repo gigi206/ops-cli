@@ -67,9 +67,17 @@
 //! backtracking). The regex is matched unanchored, so the pattern author owns anchoring and
 //! escaping (an unanchored `api\.github\.com` would also match `evil.com/?x=api.github.com`);
 //! for pinning a host, prefer the exact `Host`/`Subdomain` kinds, which cannot be fumbled.
-//! Unlike a structured `Url` rule, the regex path is **not** `.`/`..`-resolved, so a `re:`
-//! deny can be dodged by `/foo/../secret` — anchor and structure the pattern accordingly, or
-//! use a structured rule when a dot-segment-proof deny is what you need.
+//! A `re:` rule is tested against **two** forms of that URL, and matching either is a match: the
+//! request as sent (percent-decoded, query attached, `.`/`..` left exactly as the caller wrote
+//! them) and the canonical rebuild ([`Request::canonical_url`] — `.`/`..` resolved, empty
+//! segments dropped, query removed). A `re:` deny is therefore **not** dodged by `/foo/../secret`,
+//! which the canonical form resolves to `/secret`. This paragraph claimed the opposite until it
+//! was corrected against the matcher, which has tested both forms since `canonical_url` was added:
+//! anyone who reached for a structured rule *because* a `re:` deny was said to be dot-segment
+//! dodgeable was working around a hole that was already closed. The cost is on the other side and
+//! is the half worth knowing: a `re:` **allow** matches in both forms too, so it admits a little
+//! more than its author may picture. When a path has to be matched exactly, a structured `Url`
+//! rule is canonical by construction; a `re:` names a family.
 
 use std::fmt;
 use std::net::IpAddr;

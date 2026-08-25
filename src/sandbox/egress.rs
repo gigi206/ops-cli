@@ -72,10 +72,28 @@ pub(crate) const CA_FILE_ENV_KEYS: &[&str] = &[
 ];
 
 /// A running egress session's host-side resources: the bound proxy socket, the CA file, and the
-/// control socket a host-side `sbx net pending`/`sbx net log` reaches. The proxy and control threads
-/// are detached and die when sbx exits (right after the cage); this guard only owns the on-disk
-/// artifacts, unlinking them when the launch ends. The control socket is deliberately not among the
-/// cage's binds (see [`start`]).
+/// control socket a host-side `sbx net pending`/`sbx net log` reaches. This guard owns the on-disk
+/// artifacts only, unlinking them when the launch ends. The control socket is deliberately not among
+/// the cage's binds (see [`start`]).
+///
+/// # The accept threads outlive this guard, and for a per-invocation proxy that is a leak
+///
+/// The two threads [`start`] spawns are detached and hold the listening fds. Nothing here stops
+/// them, and nothing can from the outside: neither [`super::proxy::serve`] nor
+/// [`super::control::serve`] ever returns — `UnixListener::incoming()` yields forever, and both
+/// loops deliberately treat every `accept(2)` error as transient (log, sleep 20 ms, continue) so a
+/// host fd exhaustion cannot take a session's egress down. Dropping this guard unlinks the socket
+/// *paths*; the sockets stay bound and the threads stay parked in `accept` until the process exits.
+///
+/// That was written when the only `Egress` was the session's, where "until sbx exits" and "until the
+/// launch ends" name the same instant. They are not the same instant for the per-invocation proxy a
+/// task invocation stands up ([`start`] with an `instance`, from `sandbox::task`): that guard is
+/// dropped when the invocation finishes, so a session running N task invocations accumulates 2N
+/// parked threads and 2N listening sockets nothing will ever connect to again.
+///
+/// Closing it needs a stop signal both serve loops leave on — a `shutdown(2)` on the listener from
+/// here would not do it, and would be worse than the leak: the loops read the resulting `EINVAL` as
+/// one more transient accept error, so the parked thread becomes a 50 Hz error-logging spin instead.
 pub(crate) struct Egress {
     host_uds: PathBuf,
     ca_file: PathBuf,

@@ -32,8 +32,19 @@
 //! is permitted only to an ancestor of the target — which the supervisor (a thread in the launching
 //! sbx process) is: the cage is its descendant in host pid-space for the whole live run (the
 //! `systemd-run --scope` wrapper exec-chains, so bwrap stays a child of sbx; reparenting onto the
-//! systemd manager only happens at teardown, after the run). [`notif_id_valid`] guards
-//! the read against a reaped-and-reused pid.
+//! systemd manager only happens at teardown, after the run).
+//!
+//! [`notif_id_valid`] is asked **before** that read, which is not the order the kernel's own
+//! documentation prescribes (open the handles, *then* validate, then read) and does not by itself
+//! stop a reaped-and-reused pid from being read: the target can be killed and its number handed to
+//! a fresh process in the window between the check and the open of `/proc/<pid>/mem`. What makes
+//! that window inert is the other end. A notification id stays valid only while its target is
+//! parked, so a pid that has been reused belongs to a target that is gone — and the kernel refuses
+//! every answer to a gone target's id (`NOTIF_SEND` and `ADDFD` both return `ENOENT`). A verdict
+//! formed from a stranger's memory therefore reaches no process; what is left of it is a wrong line
+//! in the ring. Closing the window properly means pinning the handles first — `/proc/<pid>/mem` and
+//! an `O_PATH` on `/proc/<pid>`, with `root`/`cwd`/`fd/N`/`exe`/`status` resolved through the pinned
+//! directory for the rest of the decision — and validating after; it is not done today.
 //!
 //! ## The single-listener discipline (no serialization deadlock)
 //!
@@ -45,7 +56,7 @@
 //!
 //! ## Bypass resistance (a `deny` is hard against the in-cage adversary)
 //!
-//! Two ways a hostile agent might try to run a denied binary around this gate are both closed by the
+//! Three ways a hostile agent might try to run a denied binary around this gate are all closed by the
 //! kernel, verified empirically:
 //!
 //! - **A compat-ABI `execve`** (a 64-bit process issuing the i386 `int 0x80` `execve`, whose number is
@@ -75,9 +86,24 @@
 //!   only make `execve` **more** restrictive (this filter's `USER_NOTIF` outranks a later `ALLOW`), so
 //!   it can deny its own `execve` but never run a denied binary without the supervisor's `CONTINUE`.
 //!
-//! So a `deny` is a hard stop on `execve`. What exec enforcement is *not* is a full containment
-//! boundary: an agent can do harm **in-process** (in its own interpreter) without `execve`ing at all,
-//! and an `allow`/`CONTINUE` re-runs the real syscall so *approving a specific path* is TOCTOU-racy
+//! One route the kernel does **not** close, and this enumeration used to read as though there were
+//! none: the interpreter a `#!` line names. `execve("./script")` on a file whose first two bytes are
+//! `#!` is a single syscall — the kernel loads the named interpreter inside that same call, and no
+//! second `execve` is ever issued — so the supervisor is notified of `./script` and never of
+//! `/bin/sh`. A `deny` on `/bin/sh` therefore does not stop a script that runs under it, and the same
+//! holds for every `binfmt_misc` handler (a registered interpreter for a `.jar`, a `.py`, a wine
+//! binary): the enrolled interpreter runs without a notification of its own. The rule that leaves is
+//! exact, and is the one to hold: **a rule decides what may be `execve`d, and an interpreter reached
+//! through a `#!` line is decided by the script's own path, not by the interpreter's.** Under
+//! `confine` that means a script is exactly as confined as the allowlist entry that let the *script*
+//! run. Closing it needs the target's first two bytes read through a vouched probe (the shape the
+//! open lens already walks) and the interpreter decided as well, on the stricter of the two verdicts;
+//! that is not done today, and saying so is not the same as doing it.
+//!
+//! So a `deny` is a hard stop on the `execve` it names. What exec enforcement is *not* is a full
+//! containment boundary: an agent can do harm **in-process** (in its own interpreter) without
+//! `execve`ing at all, and an `allow`/`CONTINUE` re-runs the real syscall so *approving a specific
+//! path* is TOCTOU-racy
 //! (refusing is not — the syscall never runs). It is a guardrail with real teeth on the exec channel,
 //! layered on the cage's actual boundaries (confinement by absence, the read-only store, the netns).
 
@@ -106,6 +132,15 @@ const ASK_PENDING_CAP: usize = 256;
 /// otherwise hang the whole tree — the timeout releases it (with `EPERM`, fail-closed) so the tree
 /// makes progress. A live `sbx proc allow`/`deny` decides it well within this window.
 const ASK_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How often the receive loop looks for a parked `execve` that has run out of time.
+///
+/// One tick of the loop's own poll slice. The sweep used to ride on the idle branch, which meant it
+/// ran only when the cage had gone quiet — so the timeout was reliable exactly where nothing needed
+/// releasing, and absent while a busy cage held the notification fd readable. Asking on a clock
+/// instead of on idleness costs one registry lock per quarter-second at the very most, whatever the
+/// cage does.
+const SWEEP_EVERY: Duration = Duration::from_millis(250);
 
 /// Where the exec shim is bound read-only inside the cage, and where the notification handoff
 /// socket appears. Both under `/opt/sbx`, beside the egress CA — a path the cage cannot reach outside
@@ -603,7 +638,11 @@ fn exec_verdict(
             (dirfd != libc::AT_FDCWD)
                 .then(|| std::fs::read_link(format!("/proc/{pid}/fd/{dirfd}")).ok())
                 .flatten()
-                .map(|p| p.to_string_lossy().into_owned())
+                // `into_string` and not `to_string_lossy`, for the reason [`read_exec_path`] gives
+                // about the path beside it: a link whose bytes no name can carry would arrive here
+                // with each of them replaced, and the policy would decide — and the ring record —
+                // a program that is not the one behind the descriptor.
+                .and_then(|p| p.into_os_string().into_string().ok())
                 .filter(|p| !p.is_empty())
         });
     if let Some(path) = named {
@@ -626,16 +665,53 @@ fn exec_verdict(
     (cx.policy.unmatched(), "<unreadable>".to_string())
 }
 
-/// The path an open asked for, or the empty string when it could not be read.
+/// What the supervisor could make of the path a notified open named.
+///
+/// The two failures are answered differently, which is why they are told apart. See [`open_name`].
+enum OpenName {
+    /// A name this supervisor can carry, and so can resolve, scan and serve.
+    Named(String),
+    /// Nothing was read at all, so there is nothing to decide about. The lens allows these: it
+    /// takes away what it can prove, and a cage whose undecidable opens all failed would not run.
+    Unreadable,
+    /// The path was read but is not a name this supervisor can carry (see [`read_exec_path`]), so it
+    /// is refused rather than allowed — the one place the lens departs from "unreadable means
+    /// allowed", because unlike a read that did not work this one is the cage's own choosing: a
+    /// `rename` to a name with one non-UTF-8 byte costs it nothing and needs no read of the
+    /// content, so allowing these would be a documented way around the scan rather than a hole in
+    /// the supervisor's reach. Refusing is also what the cage already met — the substituted name
+    /// resolved to nothing and the open was answered `ENOENT` — with the errno now saying which
+    /// side refused it.
+    Unusable,
+}
+
+/// The path an open asked for.
 ///
 /// The read is where an unnameable open is counted, because it is the only step that knows it
 /// happened: the decision downstream allows it, and this lens records the refusals it decided rather
 /// than the decisions it could not take, so nothing afterwards would remember. Counted only where a
 /// lens is armed — with none there was nothing to decide and nothing was given up, and a number on
 /// those cages would be a number on a lens they never asked for.
-fn open_name(cx: &Deciding<'_>, pid: u32, path_addr: u64) -> String {
-    if let Some(named) = read_exec_path(pid, path_addr).filter(|p| !p.is_empty()) {
-        return named;
+fn open_name(cx: &Deciding<'_>, pid: u32, path_addr: u64) -> OpenName {
+    match read_path_bytes(pid, path_addr) {
+        Some(bytes) if !bytes.is_empty() => match String::from_utf8(bytes) {
+            Ok(named) => return OpenName::Named(named),
+            Err(_) => {
+                // Once: a cage that keeps naming them would otherwise fill the session's output
+                // with the same line, and it is the same line every time.
+                if !UNNAMEABLE_OPEN_SAID.swap(true, Ordering::Relaxed) {
+                    crate::diag::warn(
+                        "an open named a path that is not valid UTF-8, and the content lens \
+                         resolves, scans and serves by name — so it was refused rather than \
+                         decided under a name with the bytes replaced, which would be a different \
+                         file",
+                    );
+                }
+                return OpenName::Unusable;
+            }
+        },
+        // An empty pathname names no file; it is answered like a read that produced nothing.
+        Some(_) | None => {}
     }
     if cx.open.is_some() && cx.undecidable.open.fetch_add(1, Ordering::Relaxed) == 0 {
         crate::diag::warn(
@@ -644,8 +720,12 @@ fn open_name(cx: &Deciding<'_>, pid: u32, path_addr: u64) -> String {
              where that does not hold, the lens examines nothing at all",
         );
     }
-    String::new()
+    OpenName::Unreadable
 }
+
+/// Set once an open has been refused for naming a path this supervisor cannot carry, so a cage that
+/// keeps doing it pays one line for the session rather than one per open.
+static UNNAMEABLE_OPEN_SAID: AtomicBool = AtomicBool::new(false);
 
 /// What one supervisor needs to decide a notification, carried together because every step of the
 /// receive path needs the same set.
@@ -677,17 +757,20 @@ fn supervise(listener: UnixListener, stop: &AtomicBool, cx: &Deciding<'_>) {
 
 /// End supervision: deny everything still parked, then close the notification descriptor.
 ///
-/// The order is the whole of it. A parked entry holds the descriptor it will be answered through,
-/// and the loop can return with entries still in the registry — on stop, or when the cage's filter
-/// goes away with a decision outstanding. Closing first would leave those entries holding a
-/// descriptor that no longer exists, so a later `sbx proc allow <id>` would `ioctl` a number the
-/// process may since have reissued to something else. Draining first also means a target parked at
-/// teardown gets a verdict from sbx rather than none: `deny`, the same answer the idle sweep gives
-/// a decision that ran out of time, and the only fail-closed one.
+/// Draining first is what gives a target parked at teardown a verdict from sbx rather than none:
+/// `deny`, the same answer the sweep gives a decision that ran out of time, and the only
+/// fail-closed one. The loop can return with entries still in the registry — on stop, or when the
+/// cage's filter goes away with a decision outstanding — and each of them holds a process.
+///
+/// The order is *not* what keeps an entry from answering through a descriptor that no longer
+/// exists, which is what this comment used to claim: [`PendingExec::answer`] takes an entry out of
+/// the registry and answers it after releasing the lock, so a control thread already past the
+/// `remove` finds nothing here to drain and is unaffected by any order this function could keep.
+/// What settles it is that the entry answers through its own `dup` ([`Parked::notif_fd`]).
 fn close_supervision(notif_fd: libc::c_int, pending: &PendingExec) {
     pending.answer_all(false);
-    // SAFETY: notif_fd is our owned descriptor from recv_fd; closed exactly once here, and after
-    // the last entry that could have answered through it is gone.
+    // SAFETY: notif_fd is our owned descriptor from recv_fd, closed exactly once here. Every parked
+    // entry answers through a dup of its own, so this close cannot land under one mid-answer.
     unsafe { libc::close(notif_fd) };
 }
 
@@ -735,12 +818,22 @@ fn accept_handoff(listener: &UnixListener, stop: &AtomicBool) -> Option<libc::c_
 /// with `EPERM`, an `allow`/continue, an `ask`-undecided by parking it in `pending` for the control
 /// plane (never blocking here — the single notification fd must keep draining). Ends when the cage's
 /// filter is gone (the fd hangs up) or on stop.
+///
+/// The expiry sweep runs on the loop itself, not on its idle branch. It sat on the idle branch,
+/// which reads as "there is nothing else to do, so tidy up" and is wrong for the one thing the sweep
+/// is for: a cage that keeps the notification fd busy never lets the poll time out, so
+/// [`ASK_TIMEOUT`] never fires and the parked `execve` the timeout exists to release waits for a
+/// human indefinitely. A process tree `execve`ing in a loop is enough to hold it there, and a cage
+/// with a parked ancestor has every reason to. Paid once per [`SWEEP_EVERY`] rather than per
+/// notification, so a hot loop still costs one registry lock per tick.
 fn recv_loop(notif_fd: libc::c_int, stop: &AtomicBool, cx: &Deciding<'_>) {
+    let mut last_sweep = Instant::now();
     while !stop.load(Ordering::Relaxed) {
-        if !poll_readable(notif_fd, 250) {
-            // Idle tick: release any parked `execve` that has waited past the decision timeout, so a
-            // stalled decision never hangs a process tree.
+        if last_sweep.elapsed() >= SWEEP_EVERY {
             cx.pending.sweep();
+            last_sweep = Instant::now();
+        }
+        if !poll_readable(notif_fd, 250) {
             continue;
         }
         let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
@@ -763,8 +856,12 @@ fn recv_loop(notif_fd: libc::c_int, stop: &AtomicBool, cx: &Deciding<'_>) {
 /// unreadable path (an anomaly under the ancestor invariant) is treated as unmatched — never a
 /// silent deny that could brick the whole cage, and never a silent allow of a named `deny`.
 fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<'_>) {
-    // Confirm the notification is still live before reading the target's memory (a reaped-and-reused
-    // pid would otherwise be read/acted on as the wrong process).
+    // A live notification, asked before any of the target's `/proc` is read. This is an early-out
+    // and not the pid-reuse guard it was once described as: the check and the reads that follow are
+    // separate steps, so a target killed in between can have its number reissued and the reads land
+    // on a stranger. What keeps that from mattering is that the kernel refuses every answer to the
+    // id of a target that is gone, so such a decision reaches no process — the module header states
+    // the ordering the kernel documents, and what closing the window properly would take.
     if !notif_id_valid(notif_fd, req.id) {
         return;
     }
@@ -773,7 +870,18 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
     // Checked on the syscall number rather than on the lens being present, so a notification the
     // filter should not have produced is still answered as an open.
     if let Some((dirfd, path_addr)) = open_args(req.data.nr, &req.data.args) {
-        let named = open_name(cx, req.pid, path_addr);
+        let named = match open_name(cx, req.pid, path_addr) {
+            OpenName::Named(named) => named,
+            // Nothing read: the empty name falls through to the allowing arm below, which is what
+            // the lens does with an open it could not examine.
+            OpenName::Unreadable => String::new(),
+            // Read, and not a name this supervisor can act on. Answered here rather than allowed —
+            // see [`OpenName::Unusable`].
+            OpenName::Unusable => {
+                respond_errno(notif_fd, req.id, libc::EACCES);
+                return;
+            }
+        };
         // Twice at most, and the second pass only when the first found nothing there and the open
         // asked for the name to be created. Creating it is what makes the second pass meaningful:
         // the file exists by then, so the ordinary decision has something to examine.
@@ -817,6 +925,14 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
                         // The name is there after all — it appeared while this was being decided, so it
                         // carries content nothing has examined and belongs to the ordinary decision.
                         Creation::Exists => continue,
+                        // Made and then unmade: nothing was handed over and the name is as the open
+                        // found it, so the real syscall runs and creates it for itself. `CONTINUE`
+                        // rather than the ordinary decision, which would answer `EEXIST` for the
+                        // file this supervisor had just made and removed.
+                        Creation::Unmade => {
+                            respond_continue(notif_fd, req.id);
+                            return;
+                        }
                         Creation::Declined => {}
                     }
                 }
@@ -1239,8 +1355,12 @@ fn serve_open(
 enum Creation {
     /// The file was made and its descriptor handed over; the notification is answered.
     Served,
-    /// The name is there after all, so the ordinary decision applies to it.
+    /// The name is there after all — put there by someone else while this was being decided — so
+    /// the ordinary decision applies to it.
     Exists,
+    /// The file was made, could not be handed over, and has been taken away again, leaving the
+    /// name as the open found it. Nothing was answered, and the real syscall has to run.
+    Unmade,
     /// Nothing was made, and nothing was answered.
     Declined,
 }
@@ -1352,12 +1472,20 @@ fn serve_creation(
     // at all, and either way this side is done with it.
     unsafe { libc::close(made) };
     if ok {
-        Creation::Served
-    } else {
-        // The file was made but could not be handed over. It is there now, and empty, so the
-        // ordinary decision reaches the same place by the ordinary route.
-        Creation::Exists
+        return Creation::Served;
     }
+    // The file was made but could not be handed over — the kernel has no `ADDFD_SEND`, or this one
+    // notification could not take it. Leaving it there and falling into the ordinary decision was
+    // the shape this had, and it answered `EEXIST` to an `O_CREAT|O_EXCL` open: the second pass
+    // finds a file that is there, and `serve_open` reports the exclusivity failure the caller asked
+    // to be told about — for a file the supervisor itself had just created a line earlier. The cage
+    // is then told a name it holds exclusively is taken, which is the one answer it acts on.
+    //
+    // So the creation is undone and the syscall left to run for real. `O_EXCL` proved the file was
+    // this call's when it was made, and it has been open and empty ever since.
+    // SAFETY: parent is a live directory descriptor and cbase a live NUL-terminated name.
+    unsafe { libc::unlinkat(parent.as_raw_fd(), cbase.as_ptr(), 0) };
+    Creation::Unmade
 }
 
 /// Whether an `errno` from an open describes the **file** or this **process**.
@@ -1506,6 +1634,19 @@ fn read_u64(pid: u32, addr: u64) -> Option<u64> {
     Some(u64::from_ne_bytes(buf))
 }
 
+/// The smallest `struct open_how` the kernel will accept from an `openat2` caller.
+///
+/// `openat2(dirfd, path, how, size)` refuses a `size` below this outright — `EINVAL`, before the
+/// path is looked at — because the struct's first version is already three words long and there is
+/// no shorter one to read. The three readers below therefore treat a short `size` as a call they
+/// cannot establish anything about, rather than reading the words that *are* there: what they would
+/// establish belongs to a syscall that never runs.
+///
+/// This is the ABI's own number and not a guess at it. `size_of::<libc::open_how>()` agrees today
+/// and is asserted to, but the constant is the contract: a later kernel that grows the struct grows
+/// the type with it, while the minimum the kernel accepts stays where it is.
+const OPEN_HOW_VER0: u64 = 24;
+
 /// The flags a notified open was called with, by syscall number.
 ///
 /// The three forms do not agree on where they keep them, exactly as they disagree on the path (see
@@ -1525,8 +1666,9 @@ fn open_flags(pid: u32, nr: libc::c_int, args: &[u64; 6]) -> Option<u64> {
     }
     if nr as libc::c_long == libc::SYS_openat2 {
         // `struct open_how { __u64 flags; __u64 mode; __u64 resolve; }`. Only the first word is
-        // wanted, and a `size` too small to hold it describes a call the kernel refuses anyway.
-        if args[3] < 8 {
+        // wanted, but a call whose `size` is short of the whole struct is one the kernel refuses
+        // ([`OPEN_HOW_VER0`]) — so there are no flags to establish, whatever sits at that address.
+        if args[3] < OPEN_HOW_VER0 {
             return None;
         }
         return read_u64(pid, args[2]);
@@ -1547,8 +1689,9 @@ fn open_mode(pid: u32, nr: libc::c_int, args: &[u64; 6]) -> Option<u64> {
     }
     if nr as libc::c_long == libc::SYS_openat2 {
         // `struct open_how { __u64 flags; __u64 mode; __u64 resolve; }`. The mode is the second
-        // word, so the struct has to be long enough to carry one.
-        if args[3] < 16 {
+        // word — and, as for the flags, a `size` short of the whole struct describes a call the
+        // kernel refuses before it reads any of it ([`OPEN_HOW_VER0`]).
+        if args[3] < OPEN_HOW_VER0 {
             return None;
         }
         return read_u64(pid, args[2].wrapping_add(8));
@@ -1573,10 +1716,13 @@ fn open_resolve(pid: u32, nr: libc::c_int, args: &[u64; 6]) -> Option<u64> {
     }
     if nr as libc::c_long == libc::SYS_openat2 {
         // `struct open_how { __u64 flags; __u64 mode; __u64 resolve; }`. A `size` short of the
-        // third word describes a call that asks for no restriction: the kernel reads the missing
-        // tail as zero.
-        if args[3] < 24 {
-            return Some(0);
+        // third word was read here as a call asking for no restriction, on the reasoning that the
+        // kernel reads a missing tail as zero. It does not: `copy_struct_from_user` zero-fills a
+        // struct the *caller* is older than, but `openat2` refuses anything shorter than the first
+        // version outright ([`OPEN_HOW_VER0`]). Answering `Some(0)` therefore served a descriptor
+        // for a syscall that was never going to run, from a `resolve` word nobody had established.
+        if args[3] < OPEN_HOW_VER0 {
+            return None;
         }
         return read_u64(pid, args[2].wrapping_add(16));
     }
@@ -1598,16 +1744,31 @@ pub(crate) fn send_resp(notif_fd: libc::c_int, resp: &libc::seccomp_notif_resp) 
 // ── ask-mode parking ──────────────────────────────────────────────────────────────────────────────
 
 /// The registry of `ask`-parked `execve`s awaiting a decision. Each entry carries the kernel
-/// notification id and the fd needed to answer it, so the control plane (`sbx proc allow`/`deny`) and
-/// the idle-tick timeout sweeper can respond out-of-band while the receive loop keeps draining the next
-/// notification. Shared (via `Arc`) between the supervisor thread and the control serve thread.
+/// notification id and a descriptor of its own to answer it through, so the control plane
+/// (`sbx proc allow`/`deny`) and the timeout sweeper can respond out-of-band while the receive loop
+/// keeps draining the next notification. Shared (via `Arc`) between the supervisor thread and the
+/// control serve thread.
 pub(crate) struct PendingExec {
     inner: Mutex<BTreeMap<u64, Parked>>,
 }
 
 struct Parked {
     id: u64,
-    notif_fd: libc::c_int,
+    /// This entry's **own** `dup` of the notification descriptor, closed when the entry is dropped.
+    ///
+    /// Not the supervisor's number, which is the shape this had and which the teardown order alone
+    /// cannot save. `answer` takes an entry out of the registry and only then answers it, so a
+    /// control thread can be between those two steps at the moment [`close_supervision`] drains the
+    /// registry (finding it already empty) and closes the descriptor — after which the answer is an
+    /// `ioctl` on a number this process may since have reissued to something else entirely. The
+    /// `dup` is the same fix [`park_open`] makes for an open answered from its own thread, and it
+    /// also keeps the kernel's listener alive for exactly as long as something can still answer
+    /// through it.
+    ///
+    /// An [`OwnedFd`](std::os::fd::OwnedFd) and not a raw number, so the close rides on the entry
+    /// leaving the registry however it leaves — answered, swept, or dropped with the map — and the
+    /// rest of the entry stays movable out of it.
+    notif_fd: std::os::fd::OwnedFd,
     pid: u32,
     path: String,
     since: Instant,
@@ -1634,23 +1795,35 @@ impl PendingExec {
     /// Sanitising is idempotent, so the ring's copy of the same string is unaffected; the verdict
     /// itself was reached on the raw path, above.
     fn park(&self, notif_fd: libc::c_int, id: u64, pid: u32, path: &str) {
+        use std::os::unix::io::FromRawFd;
         let path = super::sanitize(path);
+        // SAFETY: notif_fd is the supervisor's live notification descriptor; the copy belongs to the
+        // entry below, which closes it. See [`Parked::notif_fd`] for why the entry does not simply
+        // keep the supervisor's number.
+        let own_fd = unsafe { libc::dup(notif_fd) };
+        if own_fd < 0 {
+            // A park that cannot be answered later is not a park. Refused now, fail-closed, rather
+            // than registered against a descriptor nobody can respond through.
+            respond_errno(notif_fd, id, libc::EPERM);
+            return;
+        }
+        // SAFETY: own_fd is a fresh owned descriptor; the OwnedFd takes sole ownership of it.
+        let own_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(own_fd) };
+        let entry = Parked {
+            id,
+            notif_fd: own_fd,
+            pid,
+            path,
+            since: Instant::now(),
+        };
         {
             let mut g = locked(&self.inner);
             if g.len() < ASK_PENDING_CAP {
-                g.insert(
-                    id,
-                    Parked {
-                        id,
-                        notif_fd,
-                        pid,
-                        path,
-                        since: Instant::now(),
-                    },
-                );
+                g.insert(id, entry);
                 return;
             }
         }
+        // Over the cap: `entry` was never inserted, so its `dup` is closed as it drops here.
         respond_errno(notif_fd, id, libc::EPERM);
     }
 
@@ -1683,7 +1856,9 @@ impl PendingExec {
     }
 
     /// Auto-deny (with `EPERM`) any parked `execve` older than [`ASK_TIMEOUT`], so a stalled decision
-    /// never hangs a process tree. Called on the receive loop's idle ticks.
+    /// never hangs a process tree. Called once per [`SWEEP_EVERY`] by the receive loop — on the
+    /// clock and not on the loop being idle, because a busy cage is exactly the case where a parked
+    /// ancestor needs releasing and exactly the case an idle branch never reaches.
     fn sweep(&self) {
         let mut g = locked(&self.inner);
         let expired: Vec<u64> = g
@@ -1702,22 +1877,24 @@ impl PendingExec {
 /// Answer a single parked entry, guarded by the notification id still being valid (the target may have
 /// been reaped while parked, in which case there is nothing to answer).
 fn answer_parked(p: &Parked, allow: bool) {
-    if !notif_id_valid(p.notif_fd, p.id) {
+    use std::os::unix::io::AsRawFd;
+    let fd = p.notif_fd.as_raw_fd();
+    if !notif_id_valid(fd, p.id) {
         return;
     }
     if allow {
-        respond_continue(p.notif_fd, p.id);
+        respond_continue(fd, p.id);
     } else {
-        respond_errno(p.notif_fd, p.id, libc::EPERM);
+        respond_errno(fd, p.id, libc::EPERM);
     }
 }
 
-/// Read a NUL-terminated path from a parked target's memory at `addr`. The notified *thread* is
-/// blocked in the `execve`, so the pointer is valid to read — but only that thread is stopped: a
-/// sibling in the cage can rewrite the buffer between this read and the `CONTINUE`, which is why
-/// allowing a named path is TOCTOU-racy while refusing one is not (module header). Nothing here
-/// closes that window. Returns `None` on any read failure.
-fn read_exec_path(pid: u32, addr: u64) -> Option<String> {
+/// Read a NUL-terminated path from a parked target's memory at `addr`, as the bytes it is. The
+/// notified *thread* is blocked in the `execve`, so the pointer is valid to read — but only that
+/// thread is stopped: a sibling in the cage can rewrite the buffer between this read and the
+/// `CONTINUE`, which is why allowing a named path is TOCTOU-racy while refusing one is not (module
+/// header). Nothing here closes that window. Returns `None` on any read failure.
+fn read_path_bytes(pid: u32, addr: u64) -> Option<Vec<u8>> {
     use std::io::Read;
     let mut file = std::fs::File::open(format!("/proc/{pid}/mem")).ok()?;
     // Seek and read a bounded window; a path is at most PATH_MAX.
@@ -1729,7 +1906,26 @@ fn read_exec_path(pid: u32, addr: u64) -> Option<String> {
         return None;
     }
     let end = buf[..n].iter().position(|&b| b == 0).unwrap_or(n);
-    Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+    Some(buf[..end].to_vec())
+}
+
+/// The same read, as a name this supervisor can carry — or `None` where it cannot.
+///
+/// `from_utf8` and not `from_utf8_lossy`, for the reason [`caller_chain`] gives about the program
+/// that issued the call: a Linux path is bytes and every byte the encoding cannot carry becomes the
+/// same replacement character, so what came back was a **different name** from the one the cage
+/// wrote. That name was then matched against the policy, and — under the open lens — resolved,
+/// scanned, served and created: measured, an `open` of a file whose name carries one non-UTF-8 byte
+/// had the supervisor walk to a path that does not exist, and a *creating* one of the same shape
+/// would have made a file under the substituted name and handed the cage its descriptor. A name
+/// that cannot be carried is not a name, and joins the reads that did not work.
+///
+/// Carrying the bytes end to end would be better still — such a path would then be scanned like any
+/// other rather than refused — but it is the whole resolution chain (`open_target_path`,
+/// `caller_proc_path`, `splice_first_link`, `serve_creation`) plus the `String` keys
+/// [`ProcPolicy`] matches on, and this is the half that stops a wrong file being acted on.
+fn read_exec_path(pid: u32, addr: u64) -> Option<String> {
+    String::from_utf8(read_path_bytes(pid, addr)?).ok()
 }
 
 /// Where a notified open keeps its directory descriptor and its path pointer, by syscall number.
@@ -2321,7 +2517,7 @@ fn open_is_refused(lens: &OpenLens, pid: u32, dirfd: libc::c_int, path: &str) ->
         return OpenOutcome {
             refused: false,
             report: verdict.scanned.is_partial().then(|| OpenReport {
-                path: path.to_string(),
+                path: super::sanitize(path),
                 shapes: Vec::new(),
                 partial: true,
             }),
@@ -2340,7 +2536,7 @@ fn open_is_refused(lens: &OpenLens, pid: u32, dirfd: libc::c_int, path: &str) ->
     OpenOutcome {
         refused: true,
         report: Some(OpenReport {
-            path: path.to_string(),
+            path: super::sanitize(path),
             shapes,
             partial: false,
         }),
@@ -2415,6 +2611,14 @@ impl OpenOutcome {
 /// What one file's first scan is worth saying: either the shapes that closed it, or that the answer
 /// covers only a prefix.
 struct OpenReport {
+    /// The name the cage asked for, **sanitised** on the way in — for the reason
+    /// [`PendingExec::park`] states about the registry beside it, and it was this producer's turn to
+    /// be written apart. This string is read out of the cage's own memory, a Linux path may carry a
+    /// newline or an escape sequence, and both report sites put it on a `diag::warn` line that
+    /// reaches the operator's terminal and the session log `sbx logs` reads. A cage could otherwise
+    /// paint whole lines of its own there — a refusal that never happened, or an escape run that
+    /// hides the one that did. Sanitising is idempotent and the verdict was reached on the raw path
+    /// above, so nothing but the rendering changes.
     path: String,
     /// The patterns that matched. Empty when the report is about coverage rather than a refusal.
     shapes: Vec<String>,
@@ -2731,8 +2935,14 @@ mod open_path_tests {
         // A path may legally carry a newline on Linux, and this one is read out of the cage's own
         // memory — so this is a name a hostile cage can simply give itself.
         let forged = "/tmp/a\npending id=99 pid=1 waiting=0 path=/bin/ls\nok";
-        // `-1` is never answered here: the registry is under its cap, so `park` only inserts.
-        pending.park(-1, 1, 4242, forged);
+        // A real descriptor, because a park now takes a `dup` of the one it is answered through and
+        // an entry it cannot duplicate is refused rather than registered. Nothing is ever answered
+        // here: the registry is under its cap, so `park` only inserts.
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a live two-element array, which is what `pipe` fills.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "the pipe opens");
+        let (read_end, write_end) = (fds[0], fds[1]);
+        pending.park(read_end, 1, 4242, forged);
 
         let listed = pending.list();
         assert_eq!(listed.len(), 1, "the park is registered");
@@ -2745,6 +2955,13 @@ mod open_path_tests {
             path, "/tmp/a pending id=99 pid=1 waiting=0 path=/bin/ls ok",
             "replaced rather than dropped, so what the cage asked to run is still legible"
         );
+
+        // SAFETY: both are this test's own descriptors, each closed exactly once; the entry's own
+        // dup is closed when the registry drops with this scope.
+        unsafe {
+            libc::close(read_end);
+            libc::close(write_end);
+        }
     }
 
     #[test]
@@ -3444,8 +3661,8 @@ mod tests {
             None,
             "a syscall that is not an open has no mode to read"
         );
-        // `openat2` carries the mode in the struct, and a `size` too small to reach it describes a
-        // call the kernel refuses anyway.
+        // `openat2` carries the mode in the struct, and a `size` short of the whole struct describes
+        // a call the kernel refuses with `EINVAL` before it reads a word of it.
         let how: [u64; 3] = [libc::O_CREAT as u64, 0o600, 0];
         let mut args2 = [0u64; 6];
         args2[2] = how.as_ptr() as u64;
@@ -3453,7 +3670,14 @@ mod tests {
         assert_eq!(
             open_mode(std::process::id(), libc::SYS_openat2 as libc::c_int, &args2),
             None,
-            "a struct too short to hold the mode word carries no mode"
+            "a `size` the kernel refuses carries no mode, whatever sits at that address"
+        );
+        args2[3] = 16;
+        assert_eq!(
+            open_mode(std::process::id(), libc::SYS_openat2 as libc::c_int, &args2),
+            None,
+            "and a struct that reaches the mode word but stops before the end of the version the \
+             kernel accepts is refused just the same"
         );
         args2[3] = std::mem::size_of_val(&how) as u64;
         assert_eq!(
@@ -3517,14 +3741,18 @@ mod tests {
             Some(libc::RESOLVE_NO_SYMLINKS),
             "the restriction is the third field of `struct open_how`"
         );
-        // A `size` short of the third word is a call that asks for no restriction: the kernel reads
-        // the missing tail as zero, and so must this.
-        args[3] = 16;
-        assert_eq!(
-            open_resolve(std::process::id(), libc::SYS_openat2 as libc::c_int, &args),
-            Some(0),
-            "a struct that stops before `resolve` restricts nothing"
-        );
+        // A `size` short of the third word was read here as a call asking for no restriction, on
+        // the reasoning that the kernel reads a missing tail as zero. It does not: `openat2`
+        // refuses any `size` below the first version of the struct, so such a call never runs — and
+        // a supervisor that answered it with a served descriptor answered for the kernel.
+        for short in [0, 8, 16, OPEN_HOW_VER0 - 1] {
+            args[3] = short;
+            assert_eq!(
+                open_resolve(std::process::id(), libc::SYS_openat2 as libc::c_int, &args),
+                None,
+                "a `size` of {short} is refused by the kernel, so there is no walk to establish"
+            );
+        }
     }
 
     /// The reader is only half of it: `serve_open` has to act on what it says. A restricted
@@ -3572,6 +3800,52 @@ mod tests {
             !serve(libc::RESOLVE_BENEATH),
             "the same holds for every other restriction this supervisor cannot reproduce"
         );
+    }
+
+    /// And an `openat2` whose `size` is below the struct's first version is left to the kernel too.
+    ///
+    /// Such a call is refused with `EINVAL` before the path is looked at, so there is nothing to
+    /// serve it from and nothing the served descriptor could be the answer to. It used to be served
+    /// anyway: the `resolve` reader answered `Some(0)` for a short `size` — "the kernel reads the
+    /// missing tail as zero" — which is true of a struct the caller is *older* than and not of one
+    /// shorter than any version there has ever been. The cage received a descriptor for a syscall
+    /// that never ran.
+    ///
+    /// The same socket-inode probe as above, whose answer is formed from the type alone and needs no
+    /// live notification descriptor — so the only difference between the arms is `size`.
+    #[test]
+    fn a_short_openat2_is_left_to_the_kernel_to_refuse() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = TmpDir::new();
+        let sock_path = dir.join("probe.sock");
+        let _listener = UnixListener::bind(&sock_path).expect("bind the probe socket");
+
+        let serve = |size: u64| {
+            let probe = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH)
+                .open(&sock_path)
+                .expect("hold the socket inode");
+            let how: [u64; 3] = [libc::O_RDONLY as u64, 0, 0];
+            let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
+            req.pid = std::process::id();
+            req.data.nr = libc::SYS_openat2 as libc::c_int;
+            req.data.args[2] = how.as_ptr() as u64;
+            req.data.args[3] = size;
+            serve_open(-1, &req, libc::AT_FDCWD, "probe.sock", Some(probe))
+        };
+
+        assert!(
+            serve(OPEN_HOW_VER0),
+            "the shortest `size` the kernel accepts is still served the way every other open is"
+        );
+        for short in [0, 8, 16, OPEN_HOW_VER0 - 1] {
+            assert!(
+                !serve(short),
+                "a `size` of {short} is refused by the kernel with `EINVAL`, so this supervisor \
+                 must not answer it with a descriptor of its own"
+            );
+        }
     }
 
     #[test]
@@ -3784,6 +4058,285 @@ mod tests {
             open_flags(std::process::id(), libc::SYS_openat2 as libc::c_int, &args),
             None,
             "a `size` too small to hold the flag word describes a call the kernel refuses anyway"
+        );
+        args[3] = 16;
+        assert_eq!(
+            open_flags(std::process::id(), libc::SYS_openat2 as libc::c_int, &args),
+            None,
+            "and so does one that holds the flag word but stops short of the whole struct: \
+             `openat2` refuses any `size` below its first version rather than zero-filling the tail"
+        );
+    }
+
+    /// The threshold the three `openat2` readers refuse below is the kernel's own, not a count of
+    /// the words each of them happens to need.
+    #[test]
+    fn the_shortest_open_how_the_kernel_accepts_is_the_whole_first_version() {
+        assert_eq!(
+            OPEN_HOW_VER0 as usize,
+            std::mem::size_of::<libc::open_how>(),
+            "`OPEN_HOW_VER0` is `sizeof(struct open_how)` as the ABI first shipped it"
+        );
+    }
+
+    /// The refusal a person reads is composed from the name the **cage** wrote, and a Linux path may
+    /// carry a newline or an escape sequence. Both `diag::warn` sites in the open path put that name
+    /// on a line that reaches the operator's terminal and the session log `sbx logs` reads, so an
+    /// unsanitised one lets a cage paint whole lines of its own there — a refusal that never
+    /// happened, or an escape run that hides the one that did. Same rule as the parked registry and
+    /// the exec ring beside it; this producer was written apart from both.
+    #[test]
+    fn a_reported_open_path_carries_no_byte_that_could_forge_a_line_the_operator_reads() {
+        let dir = TmpDir::new();
+        // A name a hostile cage can simply give itself, in a directory it writes to.
+        let forged = "carries\nclosed etc-shadow to the cage: its content matches aws-key\n.txt";
+        let secret = dir.path().join(forged);
+        std::fs::write(&secret, b"API key: sk-ABC123DEF456GHI789\n").expect("write the fixture");
+
+        let lens = OpenLens::new(
+            crate::open_policy::OpenPolicy::compile(
+                &[r"sk-[A-Za-z0-9]{12,}".to_string()],
+                crate::open_policy::MAX_SCAN_DEFAULT,
+            )
+            .expect("the test pattern compiles")
+            .expect("a non-empty list yields a policy"),
+            std::fs::canonicalize(dir.path()).expect("canonical fixture root"),
+        );
+        let outcome = open_is_refused(
+            &lens,
+            std::process::id(),
+            libc::AT_FDCWD,
+            secret.to_str().expect("utf-8 fixture path"),
+        );
+
+        assert!(
+            outcome.refused,
+            "the fixture must be refused, or there is no report to examine"
+        );
+        let report = outcome
+            .report
+            .expect("a first refusal reports what closed the file");
+        assert!(
+            !report.path.chars().any(char::is_control),
+            "a reported path reached the operator's line with a control byte: {:?}",
+            report.path
+        );
+        assert!(
+            report.path.contains("carries closed etc-shadow"),
+            "replaced rather than dropped, so the name the cage asked for is still legible: {:?}",
+            report.path
+        );
+    }
+
+    /// A file the supervisor made and could not hand over must not be left behind.
+    ///
+    /// The handover fails on a kernel without `ADDFD_SEND`, and for a single notification whose
+    /// target was reaped or ran out of descriptors. Leaving the file there sent the decision round
+    /// for its second pass, which found a name that is now present — and `serve_open` answers an
+    /// `O_CREAT|O_EXCL` open on a present file with `EEXIST`, for a file this supervisor had created
+    /// a line earlier. The cage is then told the name it holds exclusively is taken, which is the
+    /// one answer it acts on.
+    ///
+    /// `-1` is the notification descriptor here: it fails the handover with `EBADF`, which is about
+    /// this call rather than about the kernel, so the session-wide `ADDFD_UNAVAILABLE` flag is left
+    /// alone and no other test inherits a fallback.
+    #[test]
+    fn a_creation_that_could_not_be_handed_over_is_taken_away_again() {
+        let dir = TmpDir::new();
+        let lens = OpenLens::new(
+            crate::open_policy::OpenPolicy::compile(
+                &[r"sk-[A-Za-z0-9]{12,}".to_string()],
+                crate::open_policy::MAX_SCAN_DEFAULT,
+            )
+            .expect("the test pattern compiles")
+            .expect("a non-empty list yields a policy"),
+            std::fs::canonicalize(dir.path()).expect("canonical fixture root"),
+        );
+        let made = dir.join("made.txt");
+        let named = made.to_str().expect("utf-8 fixture path");
+
+        let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
+        req.pid = std::process::id();
+        req.data.nr = libc::SYS_openat as libc::c_int;
+        req.data.args[2] = (libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL) as u64;
+        req.data.args[3] = 0o600;
+
+        assert!(
+            matches!(
+                serve_creation(-1, &req, &lens, libc::AT_FDCWD, named),
+                Creation::Unmade
+            ),
+            "a creation nothing could be handed over from is undone, not handed to the ordinary \
+             decision"
+        );
+        assert!(
+            !made.exists(),
+            "the file the supervisor made and could not hand over was left behind: the cage asked \
+             for `O_CREAT|O_EXCL` and the second pass then answers `EEXIST` for it"
+        );
+
+        // The other half, so this cannot be satisfied by a `serve_creation` that removes whatever
+        // it finds: a name that was already there is the genuine `EEXIST`, and belongs to the
+        // ordinary decision untouched.
+        std::fs::write(&made, b"not the supervisor's\n")
+            .expect("place a file the cage did not make");
+        assert!(
+            matches!(
+                serve_creation(-1, &req, &lens, libc::AT_FDCWD, named),
+                Creation::Exists
+            ),
+            "a name that is already there is the ordinary decision's, not this path's"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&made).expect("the file is still there"),
+            "not the supervisor's\n",
+            "and nothing of a file this supervisor did not create is removed"
+        );
+    }
+
+    /// `/proc/<pid>/mem` holds bytes and a policy holds names, and the bridge between them must not
+    /// be a lossy one.
+    ///
+    /// Every byte the encoding cannot carry becomes the same replacement character, so what came
+    /// back was a **different path** from the one the cage wrote — and the open lens goes on to
+    /// resolve, scan, serve and create under exactly that name. The same rule `caller_chain` holds
+    /// for the program that issued the call: a name that cannot be carried is not a name.
+    ///
+    /// Read out of this process's own memory, which is the read the supervisor makes of a parked
+    /// target's.
+    #[test]
+    fn a_target_named_in_bytes_no_name_can_carry_is_not_read_as_a_name_with_them_replaced() {
+        let me = std::process::id();
+        let good = b"/usr/bin/env\0";
+        assert_eq!(
+            read_exec_path(me, good.as_ptr() as u64).as_deref(),
+            Some("/usr/bin/env"),
+            "a path that is a name is still read as one"
+        );
+
+        // A Latin-1 file name, which is an ordinary thing for a tarball to carry and not an exotic
+        // one for a cage to write.
+        let odd = b"/tmp/caf\xe9\0";
+        assert_eq!(
+            read_exec_path(me, odd.as_ptr() as u64),
+            None,
+            "a lossy read answers the same path with a replacement character in it, which names a \
+             different file — and the lens would resolve, scan, serve and create under it"
+        );
+        assert_eq!(
+            read_path_bytes(me, odd.as_ptr() as u64),
+            Some(b"/tmp/caf\xe9".to_vec()),
+            "the bytes are readable, so this is the conversion refusing and not the read failing"
+        );
+    }
+
+    /// And the open lens refuses such a name rather than deciding under a substituted one.
+    ///
+    /// Refused, not allowed: this is the one place the lens departs from "what it cannot examine, it
+    /// allows", because unlike a read that did not work, this is the cage's own choosing. A
+    /// `rename` to a name with one non-UTF-8 byte costs it nothing and needs no read of the content,
+    /// so letting these through would be a documented way around the scan rather than a limit of the
+    /// supervisor's reach.
+    #[test]
+    fn an_open_named_in_bytes_no_name_can_carry_is_refused_rather_than_resolved_under_another() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = TmpDir::new();
+        let odd = dir.path().join(OsStr::from_bytes(b"secret\xff.txt"));
+        std::fs::write(&odd, b"API key: sk-ABC123DEF456GHI789\n").expect("write the fixture");
+        let clean = dir.join("ordinary.txt");
+        std::fs::write(&clean, b"just ordinary prose\n").expect("write the control fixture");
+
+        let script = format!(
+            "cd {} && /bin/cat \"$(printf 'secret\\377.txt')\" 2>&1; /bin/cat {}",
+            dir.path().to_str().expect("utf-8 fixture root"),
+            clean.to_str().expect("utf-8 fixture path"),
+        );
+        let (_, out) = run_with_open_lens(
+            &["/bin/sh", "-c", &script],
+            &[r"sk-[A-Za-z0-9]{12,}"],
+            &dir.join("."),
+        );
+
+        assert!(
+            !out.contains("sk-ABC123DEF456GHI789"),
+            "a name the supervisor cannot carry must not be a way past the scan: {out}"
+        );
+        assert!(
+            out.contains("Permission denied") || out.contains("Permission non accord"),
+            "the open must be refused for what it is, not answered `ENOENT` from a walk to the \
+             substituted name — which is a different file, and one that happens not to exist: {out}"
+        );
+        assert!(
+            out.contains("just ordinary prose"),
+            "and an open the supervisor can name is served exactly as it was: {out}"
+        );
+    }
+
+    /// The same rule on the other reader: a target named by its **descriptor**.
+    ///
+    /// `execveat(fd, "", …, AT_EMPTY_PATH)` — what glibc's `fexecve` issues — carries an empty
+    /// pathname, so the program is read from the descriptor's own `/proc` link. That link is bytes
+    /// like any other path, and a lossy conversion of it would hand the policy, and the ring, a
+    /// program that is not the one behind the descriptor.
+    #[test]
+    fn a_target_named_by_its_descriptor_is_undecidable_rather_than_substituted() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::AsRawFd;
+
+        let dir = TmpDir::new();
+        let plain = std::fs::canonicalize(dir.path())
+            .expect("canonical fixture root")
+            .join("plain.bin");
+        std::fs::write(&plain, b"x").expect("write the control fixture");
+        let odd = std::fs::canonicalize(dir.path())
+            .expect("canonical fixture root")
+            .join(OsStr::from_bytes(b"odd\xff.bin"));
+        std::fs::write(&odd, b"x").expect("write the fixture");
+
+        // An empty pathname at a readable address: the path read succeeds and yields nothing, which
+        // is what sends the decision to the descriptor's link.
+        let empty: [u8; 1] = [0];
+        let me = std::process::id();
+        let allowed = plain.to_str().expect("utf-8 control path").to_string();
+        let policy = ProcPolicy::new(ProcMode::Confine, std::slice::from_ref(&allowed), &[]);
+        let parts = DecidingParts::new();
+
+        // The control arm, so this cannot be satisfied by a reader that names nothing at all: a
+        // descriptor-named target the allowlist holds still runs.
+        let plain_fd = std::fs::File::open(&plain).expect("hold the control fixture");
+        assert_eq!(
+            exec_verdict(
+                &parts.cx(&policy),
+                &[],
+                me,
+                plain_fd.as_raw_fd(),
+                empty.as_ptr() as u64
+            ),
+            (Verdict::Allow, allowed.clone()),
+            "a target named through its descriptor is still decided by that name"
+        );
+        assert_eq!(parts.undecidable.exec.load(Ordering::Relaxed), 0);
+
+        let odd_fd = std::fs::File::open(&odd).expect("hold the fixture");
+        assert_eq!(
+            exec_verdict(
+                &parts.cx(&policy),
+                &[],
+                me,
+                odd_fd.as_raw_fd(),
+                empty.as_ptr() as u64
+            ),
+            (Verdict::Deny, "<unreadable>".to_string()),
+            "a link whose bytes no name can carry must take the mode's default, not be decided and \
+             recorded under the same path with those bytes replaced"
+        );
+        assert_eq!(
+            parts.undecidable.exec.load(Ordering::Relaxed),
+            1,
+            "and it joins the reads that did not work, rather than passing as a target"
         );
     }
 
@@ -4307,6 +4860,189 @@ mod tests {
         (status.code(), ring)
     }
 
+    /// A parked `execve` is released when its time runs out **while the cage keeps the loop busy**,
+    /// which is the only case where it matters.
+    ///
+    /// The sweep used to ride on the receive loop's idle branch, so it ran when the poll timed out —
+    /// that is, once the cage had gone quiet. A cage that keeps `execve`ing keeps the notification fd
+    /// readable, the poll never times out, and the parked `execve` (with the process tree waiting
+    /// behind it) sits there past [`ASK_TIMEOUT`] for as long as the traffic lasts. The payload is
+    /// exactly that shape: one background exec that parks, and a loop that keeps the supervisor fed
+    /// while the entry ages.
+    ///
+    /// The entry is backdated rather than waited out, because the real timeout is two minutes. What
+    /// is under test is *when the sweep is reached*, not what it decides once it is.
+    #[test]
+    fn a_parked_decision_times_out_while_the_cage_keeps_the_receive_loop_busy() {
+        let dir = TmpDir::new();
+        let shim = materialized_shim(&dir);
+        let sock_path = dir.join("notif.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind the handoff socket");
+
+        // `/bin/nope` is not there and never runs: a target that does not exist parks exactly as one
+        // that does, and the `&` puts it in a process of its own so the loop behind it keeps going.
+        let script = "/bin/nope & i=0; while [ $i -lt 20000 ]; do /bin/true; i=$((i+1)); done";
+        let mut cmd = std::process::Command::new(&shim);
+        cmd.arg(&sock_path)
+            .arg("--")
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = spawn_shim(&mut cmd);
+        let (sock, _) = listener.accept().expect("the shim never connected");
+        let notif = recv_fd(&sock).expect("receive the listener fd");
+
+        // `/bin/sh` and `/bin/true` are allowed so the loop runs and keeps notifying; everything
+        // else is unmatched, which under `ask` parks.
+        let policy = ProcPolicy::new(
+            ProcMode::Ask,
+            &["/bin/sh".to_string(), "/bin/true".to_string()],
+            &[],
+        );
+        let parts = DecidingParts::new();
+        let stop = AtomicBool::new(false);
+        let cx = parts.cx(&policy);
+        let swept = std::thread::scope(|scope| {
+            scope.spawn(|| recv_loop(notif, &stop, &cx));
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while parts.pending.list().is_empty() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the background exec never parked, so there is nothing to time out"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            {
+                let mut g = locked(&parts.pending.inner);
+                for p in g.values_mut() {
+                    p.since = p
+                        .since
+                        .checked_sub(ASK_TIMEOUT + Duration::from_secs(1))
+                        .expect("this machine has been up longer than the decision timeout");
+                }
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut swept = false;
+            while std::time::Instant::now() < deadline {
+                if parts.pending.list().is_empty() {
+                    swept = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // Read before the loop is stopped: if the payload had already finished, the fd would
+            // have gone idle and a sweep proves nothing about a busy one.
+            let still_busy = child.try_wait().expect("poll the payload").is_none();
+            stop.store(true, Ordering::Relaxed);
+            (swept, still_busy)
+        });
+        let _ = child.kill();
+        let _ = child.wait();
+        // SAFETY: notif is this test's owned descriptor, closed exactly once — the receive loop has
+        // been joined by the scope above.
+        unsafe { libc::close(notif) };
+
+        assert!(
+            swept.1,
+            "the payload stopped feeding the supervisor before the sweep was observed, so this run \
+             says nothing about a busy loop"
+        );
+        assert!(
+            swept.0,
+            "a decision that ran out of time was never released: the sweep only ran when the poll \
+             timed out, and a cage that keeps `execve`ing never lets it"
+        );
+    }
+
+    /// A parked `execve` answers through a descriptor of its own, not through the supervisor's.
+    ///
+    /// [`PendingExec::answer`] takes an entry out of the registry and answers it after releasing the
+    /// lock, so a control thread can be between those two steps when supervision ends — at which
+    /// point the drain finds the registry already empty and the notification descriptor is closed
+    /// underneath the answer. The order [`close_supervision`] keeps cannot help there, whatever its
+    /// comment used to say. The `dup` can: it keeps the kernel's listener alive for exactly as long
+    /// as something can still answer through it, and the number it uses is nobody else's to reissue.
+    ///
+    /// Driven end to end, because the property is only visible in whether the payload runs: the
+    /// answer is given after the supervisor's own descriptor is gone, and `/bin/true` either
+    /// receives its `CONTINUE` or waits forever.
+    #[test]
+    fn a_parked_exec_is_answered_after_the_supervisors_own_descriptor_is_gone() {
+        let dir = TmpDir::new();
+        let shim = materialized_shim(&dir);
+        let sock_path = dir.join("notif.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind the handoff socket");
+
+        let mut cmd = std::process::Command::new(&shim);
+        cmd.arg(&sock_path)
+            .arg("--")
+            .arg("/bin/true")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = spawn_shim(&mut cmd);
+        let (sock, _) = listener.accept().expect("the shim never connected");
+        let notif = recv_fd(&sock).expect("receive the listener fd");
+
+        // Nothing is allowed or denied by name, so the shim's exec of `/bin/true` is unmatched —
+        // which under `ask` is what parks it.
+        let policy = ProcPolicy::new(ProcMode::Ask, &[], &[]);
+        let parts = DecidingParts::new();
+        assert!(
+            poll_readable(notif, 5000),
+            "the payload's `execve` must reach the supervisor"
+        );
+        let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
+        // SAFETY: req is a live, correctly-sized seccomp_notif for the RECV ioctl to fill.
+        let rc = unsafe { libc::ioctl(notif, notif_recv_code() as libc::Ioctl, &mut req) };
+        assert!(rc >= 0, "the notification must be received");
+        handle_notif(notif, &req, &parts.cx(&policy));
+
+        let parked = parts.pending.list();
+        assert_eq!(
+            parked.len(),
+            1,
+            "the unmatched exec must be parked: {parked:?}"
+        );
+        let id = parked[0].0;
+
+        // Supervision ends while the decision is outstanding — the window a control thread answers
+        // in. Nothing else holds this number afterwards.
+        // SAFETY: notif is this test's owned descriptor, closed exactly once here.
+        unsafe { libc::close(notif) };
+        assert!(
+            parts.pending.answer(id, true).is_some(),
+            "the parked entry must still be there to answer"
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll the payload") {
+                break Some(status);
+            }
+            if std::time::Instant::now() > deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let Some(status) = status else {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the allow never reached the kernel: the entry answered through the supervisor's \
+                 own descriptor, which had been closed — and on a busier process that number would \
+                 by then belong to something else"
+            );
+        };
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "the payload was allowed, so it must have run"
+        );
+    }
+
     /// The load-bearing enforcement proof, host-side (no cage): a `deny` verdict reaches the syscall
     /// as `EPERM`, so the payload is **never executed** — there is no time-of-check/time-of-use
     /// window on a refusal. The shim reports that refusal as its own exit 126.
@@ -4688,7 +5424,10 @@ mod tests {
         let armed = DecidingParts::with_lens();
         for _ in 0..2 {
             assert!(
-                open_name(&armed.cx(&policy), pid, addr).is_empty(),
+                matches!(
+                    open_name(&armed.cx(&policy), pid, addr),
+                    OpenName::Unreadable
+                ),
                 "an open whose path cannot be read has no name to decide against"
             );
         }
@@ -4700,7 +5439,10 @@ mod tests {
 
         // And a cage that never asked for the lens is not told it lost something it never had.
         let bare = DecidingParts::new();
-        assert!(open_name(&bare.cx(&policy), pid, addr).is_empty());
+        assert!(matches!(
+            open_name(&bare.cx(&policy), pid, addr),
+            OpenName::Unreadable
+        ));
         assert_eq!(bare.undecidable.open.load(Ordering::Relaxed), 0);
     }
 

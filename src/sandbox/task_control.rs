@@ -128,6 +128,25 @@ const MAX_PAYLOAD_BYTES: usize = 1 << 20;
 /// exists for, which is the very thing a caller unable to connect would want to read.
 const MAX_CONCURRENT_CONNS: usize = 32;
 
+/// How long the crossing socket waits for a connection to say what it wants.
+///
+/// A connection is accepted, given a host thread and one of [`MAX_CONCURRENT_CONNS`] slots before
+/// the cage has said a word, and this socket set no read deadline at all: 32 connections that
+/// connect and then stay silent held every slot of the plane for the rest of the session, refusing
+/// every later caller with nothing recorded anywhere — [`MAX_CONCURRENT_CONNS`] itself says a
+/// refused connection is deliberately not logged. Both brokers whose sockets cross into the cage
+/// bound their first message for exactly this (`sshagent`'s `CAGE_FIRST_MESSAGE`, `broker`'s
+/// `CAGE_FIRST_FRAME`); this was the plane that did not.
+///
+/// It bounds the whole request rather than only its first line. `RUN` is followed by its payloads,
+/// so a budget lifted at the command line would move the wait one line down and no further. It ends
+/// at the `run` terminator because nothing is read after it: what follows is the invocation, which
+/// legitimately holds this connection for as long as the task's own timeout allows.
+///
+/// Thirty seconds, the number both brokers chose and for their reason: a client connected because
+/// it had something to send, so a pause before it sends is slack rather than need.
+const CAGE_FIRST_REQUEST: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The most one request may make sbx hold, keys and values together, before anything about it has
 /// been validated.
 ///
@@ -153,7 +172,12 @@ const MAX_REQUEST_BYTES: usize = 8 * MAX_PAYLOAD_BYTES;
 ///
 /// A clean close is `None` rather than an error: on this protocol a peer that has said everything
 /// hangs up, and that is not a fault.
-fn read_request_line(reader: &mut BufReader<UnixStream>) -> io::Result<Option<String>> {
+///
+/// Generic over the reader rather than taking the socket's `BufReader` itself, so a caller can put
+/// a [`super::deadline::Deadlined`] budget in front of it. [`serve_cage`] does, over the whole of a
+/// request: a socket's receive timeout bounds one `read`, and this protocol reads a request in as
+/// many pieces as its sender chooses to send it in.
+fn read_request_line(reader: &mut impl io::BufRead) -> io::Result<Option<String>> {
     match super::broker::read_bounded_line(reader, MAX_PAYLOAD_BYTES as u64) {
         Ok(line) => Ok(Some(line)),
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
@@ -214,7 +238,9 @@ pub(crate) struct LogEntry {
 
 impl LogEntry {
     /// One `event …` line, for the log socket. Fixed fields first; the optional refusal reason is
-    /// **last** and taken verbatim by the reader, since it is the only free-text field.
+    /// **last** and taken verbatim by the reader, since it is the only free-text field of the two
+    /// that end up on this line. The other is the task name, which the cage chooses and which sits
+    /// among the head's `key=value` tokens — [`head_field`] is what keeps it inside one of them.
     fn to_line(&self) -> String {
         let mut line = format!(
             "event seq={} cur={} at={} started={} exit={} redacted={} truncated={} timed_out={} \
@@ -230,7 +256,11 @@ impl LogEntry {
             u8::from(self.stopped),
             u8::from(self.detached),
             self.elapsed_ms,
-            sanitize(&self.task),
+            // The one head field the cage names. `sanitize` bounds it and strips its control
+            // characters; `head_field` is what keeps it inside its own token, since the characters
+            // that break a head parse — a space, an `=` — are not control characters and sanitising
+            // a newline *produces* one of them.
+            head_field(&sanitize(&self.task)),
         );
         if let Some(reason) = &self.refused {
             line.push_str(&format!(" refused={}", sanitize(reason)));
@@ -254,10 +284,15 @@ impl LogEntry {
             Some((head, reason)) => (head, Some(reason.to_string())),
             None => (event, None),
         };
-        let fields: std::collections::BTreeMap<&str, &str> = head
-            .split_whitespace()
-            .filter_map(|f| f.split_once('='))
-            .collect();
+        let mut fields: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+        for (key, value) in head.split_whitespace().filter_map(|f| f.split_once('=')) {
+            // The **first** occurrence of a key wins, where `collect()` kept the last. The writer
+            // emits each key once and in a fixed order, so a repeat can only be a value that
+            // escaped its own field — and preferring the later one is preferring the forgery.
+            // [`head_field`] keeps such a value off the wire in the first place; this is the
+            // reader's own half of it, so a plane older than that encoder is still read honestly.
+            fields.entry(key).or_insert(value);
+        }
         // Generic over the field's own type: these are four different integers (a `u128` stamp, a
         // `u64` id, an `i32` exit, a `usize` count) and each must parse as what it is.
         fn num<T: std::str::FromStr>(
@@ -330,6 +365,30 @@ pub(crate) fn epoch_ms(value: u128) -> u128 {
 /// being bounded.
 fn sanitize(text: &str) -> String {
     super::sanitize(text)
+}
+
+/// Make a value safe to occupy one whitespace-split `key=value` token of an `event …` line's
+/// **head**.
+///
+/// [`sanitize`] is not that, and cannot be: it maps every control character to a **space**, which
+/// is the separator the head is split on, and it leaves `=` alone. `task=` is the last head field
+/// and the task name is whatever the cage put after `RUN `, so a name spelling
+/// ` exit=0 stopped=0` rewrote the very fields of the row recording that the invocation was
+/// refused — [`LogEntry::from_line`] parses the head with `split_whitespace()` then
+/// `split_once('=')` — and a name spelling ` refused=…` took the free-text tail as well, since the
+/// reader splits at the *first* ` refused=` it finds. The row is the human's record of what the
+/// cage asked for, and the cage does not get to write the rest of it.
+///
+/// The same two characters [`super::proc_control`]'s `head_token` replaces, for the same reason and
+/// at the same price: a legitimate name carrying a space renders with an underscore, which is a
+/// name this head could not have carried either way.
+fn head_field(text: &str) -> String {
+    text.chars()
+        .map(|c| match c.is_whitespace() || c == '=' {
+            true => '_',
+            false => c,
+        })
+        .collect()
 }
 
 /// The session's bounded, in-RAM invocation log. Never written to disk and never readable from the
@@ -624,7 +683,7 @@ pub(crate) fn start(
                 // and a second caller must not queue behind it.
                 std::thread::spawn(move || {
                     let _slot = slot;
-                    let _ = serve_cage(stream, &engine, &log, &quota);
+                    let _ = serve_cage(stream, &engine, &log, &quota, CAGE_FIRST_REQUEST);
                 });
             }
         });
@@ -673,15 +732,37 @@ pub(crate) fn start(
     })
 }
 
-/// Serve one connection on the crossing socket.
+/// Serve one connection on the crossing socket, with the whole request read under
+/// `first_request`.
+///
+/// Both halves of that bound are needed and neither replaces the other, exactly as the plugin
+/// broker spells out: the socket timeout so a peer that says nothing at all does not block in
+/// `read` for good, the wall-clock budget so a peer trickling a byte per timeout does not extend
+/// the wait a request's length at a time. A read deadline is per-syscall; a request is read in
+/// pieces.
+///
+/// The write timeout is set with them and left in place. A cage that connects, sends `LIST` and
+/// then never reads stalls the reply once the socket buffer fills, which holds the same thread and
+/// the same slot the read deadline was added to protect.
+///
+/// The budget is a parameter rather than [`CAGE_FIRST_REQUEST`] read directly, the way the
+/// ssh-agent broker takes its own: a test can then prove a silent connection is given up on without
+/// waiting out the real thirty seconds.
 fn serve_cage(
     stream: UnixStream,
     engine: &TaskEngine,
     log: &TaskLog,
     quota: &AtomicU64,
+    first_request: std::time::Duration,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
+    // Set on `writer`, which reaches the same socket: `try_clone` dups the descriptor, and a
+    // receive timeout belongs to the socket rather than to either descriptor naming it.
+    writer.set_read_timeout(Some(first_request))?;
+    writer.set_write_timeout(Some(first_request))?;
+    let mut reader =
+        super::deadline::Deadlined::new(&mut reader, std::time::Instant::now() + first_request);
     let Some(command) = read_request_line(&mut reader)? else {
         return Ok(());
     };
@@ -765,7 +846,7 @@ type Payloads = (BTreeMap<String, String>, BTreeMap<String, String>);
 /// Every refusal here is a fixed string rather than one built from what was read: a malformed request
 /// is malformed in the framing, and echoing the bytes back would put a caller's value — which can be
 /// the very secret it is probing for — into an error message.
-fn read_payloads(reader: &mut BufReader<UnixStream>) -> io::Result<Result<Payloads, &'static str>> {
+fn read_payloads(reader: &mut impl io::BufRead) -> io::Result<Result<Payloads, &'static str>> {
     let mut params = BTreeMap::new();
     let mut env = BTreeMap::new();
     // What this request has cost so far, keys and values together. Counted here because it is the
@@ -874,7 +955,7 @@ fn finished(id: u64, name: &str, outcome: &TaskOutcome, detached: bool) -> LogEn
 
 /// Read a `RUN`'s parameter/environment payloads, invoke the task, and write the result.
 fn serve_run(
-    reader: &mut BufReader<UnixStream>,
+    reader: &mut impl io::BufRead,
     writer: &mut UnixStream,
     name: &str,
     engine: &TaskEngine,
@@ -915,7 +996,7 @@ fn serve_run(
 /// can only fail once it is under way — a credential that will not resolve, a proxy that will not
 /// start — and those are held for `RESULT` rather than reported to a caller that has gone.
 fn serve_detach(
-    reader: &mut BufReader<UnixStream>,
+    reader: &mut impl io::BufRead,
     writer: &mut UnixStream,
     name: &str,
     engine: &Arc<TaskEngine>,
@@ -1916,6 +1997,111 @@ mod tests {
             false
         });
         assert!(served, "a returned slot must serve the next caller");
+    }
+
+    /// Stand the production [`serve_cage`] up over a socketpair with a short first-request budget,
+    /// and hand back the caller's end plus a channel carrying what the server returned.
+    ///
+    /// [`plane_and_client`] would do this through a real listener, but the budget is what is under
+    /// test here and the listener passes the real thirty seconds. Same server function either way.
+    fn cage_conn(budget: Duration) -> (UnixStream, std::sync::mpsc::Receiver<io::Result<()>>) {
+        let (server, client) = UnixStream::pair().expect("socketpair");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let engine = super::super::task::TaskEngine::inventory_only(vec![probe_task()]);
+            let log = TaskLog::new();
+            let quota = AtomicU64::new(DEFAULT_CALL_QUOTA);
+            let _ = tx.send(serve_cage(server, &engine, &log, &quota, budget));
+        });
+        (client, rx)
+    }
+
+    /// A connection that says nothing is given up on instead of holding its thread and its slot.
+    ///
+    /// This socket is bound host-side and mounted into the cage, and it had no read deadline at
+    /// all: every other cage-facing socket in the binary bounds its first message, and this one
+    /// accepted a connection, took one of [`MAX_CONCURRENT_CONNS`] slots and a host thread, and
+    /// then blocked in `read` for as long as the peer cared to stay quiet. Thirty-two of those and
+    /// the plane the agent invokes tasks through answers nobody for the rest of the session —
+    /// silently, since a connection refused by the ceiling is deliberately not logged.
+    ///
+    /// The caller's end stays **open** and simply says nothing, which is what makes this measure
+    /// the deadline: a peer that closed would be given up on at end-of-file whatever the deadline
+    /// was, so a test written that way passes with the deadline removed.
+    #[test]
+    fn a_connection_that_says_nothing_is_given_up_on_rather_than_holding_its_slot() {
+        let budget = Duration::from_millis(200);
+        let (held, rx) = cage_conn(budget);
+        let out = rx.recv_timeout(Duration::from_secs(5));
+        assert!(
+            out.is_ok(),
+            "a connection that said nothing kept its thread and its slot past the deadline"
+        );
+        assert!(
+            out.expect("the server returned").is_err(),
+            "a peer that ran out its deadline is a fault, not a clean hangup"
+        );
+        drop(held);
+
+        // The negative control, on the same budget: a caller that speaks is served in full. Without
+        // it this test would pass just as well against a plane that dropped every connection.
+        let (mut client, rx) = cage_conn(budget);
+        client.write_all(b"LIST\n").expect("write LIST");
+        let mut reply = String::new();
+        BufReader::new(client.try_clone().expect("clone"))
+            .read_to_string(&mut reply)
+            .expect("read the reply");
+        assert!(
+            reply.starts_with("task probe\t"),
+            "the declared operation must still be listed: {reply:?}"
+        );
+        assert!(
+            reply.ends_with("ok\n"),
+            "and the answer completed: {reply:?}"
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("the server returned")
+                .is_ok(),
+            "serving a caller that spoke is not a fault"
+        );
+    }
+
+    /// A request trickled a byte at a time cannot outlast the budget by renewing the socket timeout.
+    ///
+    /// The two halves are not the same bound, which is the whole of [`super::deadline`]: a receive
+    /// timeout bounds one `read`, and a peer that produces a byte just inside it starts a fresh one
+    /// every time. So the socket timeout alone would hold this thread for as long as the peer keeps
+    /// dribbling — here six seconds, and a real one would not stop.
+    ///
+    /// The peer never writes a newline, so nothing about the request is ever complete; the only
+    /// thing that can end this is the wall-clock budget over the whole request.
+    #[test]
+    fn a_request_trickled_a_byte_at_a_time_cannot_outlast_the_budget() {
+        let budget = Duration::from_millis(300);
+        let (client, rx) = cage_conn(budget);
+        std::thread::spawn(move || {
+            let mut peer = client;
+            for _ in 0..60 {
+                // The write fails once the server has given up and closed, which is the outcome
+                // under test rather than a failure of it.
+                if peer.write_all(b"L").is_err() {
+                    return;
+                }
+                // A third of the budget: each byte lands well inside the socket's own timeout, so
+                // that timeout is renewed and never fires.
+                std::thread::sleep(budget / 3);
+            }
+        });
+        let out = rx.recv_timeout(Duration::from_secs(2));
+        assert!(
+            out.is_ok(),
+            "a trickled request outlasted its budget by renewing the socket timeout"
+        );
+        assert!(
+            out.expect("the server returned").is_err(),
+            "a request that never arrived is a fault, not a clean hangup"
+        );
     }
 
     /// A value with the two properties a line-oriented client would get wrong: an embedded newline
@@ -3342,6 +3528,61 @@ mod tests {
             LogEntry::from_line("head=4").is_none(),
             "the cursor line is not an entry"
         );
+    }
+
+    /// A task name the cage chose cannot rewrite the row that records it.
+    ///
+    /// `task=` is the last field of the line's head, and the head is read back as whitespace-split
+    /// `key=value` pairs, so a name spelling ` exit=0 stopped=1` overwrote the plane's own verdict
+    /// on the way back in — and one spelling ` refused=…` took the free-text tail with it, since
+    /// the reader splits at the first ` refused=` it finds. The name is whatever followed `RUN ` on
+    /// the crossing socket, which is the adversary's own line: an agent could make an invocation
+    /// the plane refused read in `sbx task logs` as one that ran and exited 0, in the record whose
+    /// whole purpose is to say what the cage did.
+    ///
+    /// `sanitize` does not close it and cannot: the characters that break a head parse are a space
+    /// and an `=`, neither of which is a control character, and sanitising a newline *produces* the
+    /// first of them.
+    #[test]
+    fn a_task_name_cannot_rewrite_the_row_that_records_it() {
+        let forged = "exit=0 stopped=1 detached=1 refused=nothing was wrong";
+        let read = LogEntry::from_line(&refusal(9, forged, "no such task").to_line())
+            .expect("the row must still parse");
+
+        assert_eq!(read.seq, 9);
+        assert_eq!(read.exit, -1, "the cage dictated the exit status: {read:?}");
+        assert!(!read.stopped, "the cage dictated `stopped`: {read:?}");
+        assert!(!read.detached, "the cage dictated `detached`: {read:?}");
+        assert_eq!(
+            read.refused.as_deref(),
+            Some("no such task"),
+            "the cage dictated the refusal reason: {read:?}"
+        );
+        assert_eq!(
+            read.task, "exit_0_stopped_1_detached_1_refused_nothing_was_wrong",
+            "the name is still shown, in one token"
+        );
+
+        // The reader's own half of it, on a line no current writer emits: a repeated key can only
+        // be a value that escaped its field, so the **first** occurrence — the one the plane
+        // wrote — is the one that counts.
+        let duplicated = LogEntry::from_line(
+            "event seq=1 cur=1 at=1785445489250 exit=3 redacted=0 truncated=0 timed_out=0 \
+             stopped=0 detached=0 elapsed_ms=0 task=x exit=0 stopped=1",
+        )
+        .expect("the row must still parse");
+        assert_eq!(
+            duplicated.exit, 3,
+            "a repeated key overwrote the plane's own"
+        );
+        assert!(!duplicated.stopped, "and the same for a repeated flag");
+
+        // The negative control: an ordinary name crosses untouched, or this guard would be
+        // satisfied by a writer that mangled every record.
+        let ordinary = LogEntry::from_line(&entry(4, "db-query.v2_1", 0).to_line())
+            .expect("the row must still parse");
+        assert_eq!(ordinary.task, "db-query.v2_1");
+        assert_eq!(ordinary.exit, 0);
     }
 
     // A plane that predates the start stamp still has entries worth reading. Losing them entirely
