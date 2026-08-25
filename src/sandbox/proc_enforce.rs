@@ -2532,6 +2532,36 @@ fn poll_readable(fd: libc::c_int, timeout_ms: libc::c_int) -> bool {
     rc > 0
 }
 
+/// A control buffer for exactly one `SCM_RIGHTS` cmsg, **aligned for a `cmsghdr`**.
+///
+/// A `[u8; N]` is byte-aligned and `cmsghdr` is not: `CMSG_FIRSTHDR` hands the buffer back as a
+/// `*mut cmsghdr`, so every field access through it is only defined if the storage is aligned for
+/// one. A bare local array is aligned in practice on the targets sbx builds for, and "in practice"
+/// is not what the rule says — the union ties the alignment to the type itself rather than to a
+/// number that would have to be kept right.
+#[repr(C)]
+union CmsgBuf {
+    bytes: [u8; 32], // >= CMSG_SPACE(size_of::<c_int>())
+    _align: libc::cmsghdr,
+}
+
+impl CmsgBuf {
+    fn zeroed() -> Self {
+        Self { bytes: [0u8; 32] }
+    }
+
+    /// The buffer as bytes, for `msg_control`. Reading the `bytes` arm is sound whatever was last
+    /// written: every arm is plain data with no padding to leave uninitialised.
+    fn as_mut_ptr(&mut self) -> *mut libc::c_void {
+        // SAFETY: `bytes` covers the whole union and every byte of it is initialised.
+        unsafe { self.bytes.as_mut_ptr() as *mut libc::c_void }
+    }
+
+    fn len(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
 /// Receive one file descriptor sent over a Unix stream as an `SCM_RIGHTS` ancillary message.
 fn recv_fd(stream: &UnixStream) -> io::Result<libc::c_int> {
     use std::os::unix::io::AsRawFd;
@@ -2540,13 +2570,14 @@ fn recv_fd(stream: &UnixStream) -> io::Result<libc::c_int> {
         iov_base: dummy.as_mut_ptr() as *mut libc::c_void,
         iov_len: 1,
     };
-    let mut cbuf = [0u8; 32];
+    let mut cbuf = CmsgBuf::zeroed();
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_control = cbuf.as_mut_ptr();
     msg.msg_controllen = cbuf.len() as _;
-    // SAFETY: msg's buffers are live; we read exactly one cmsg carrying one fd.
+    // SAFETY: msg's buffers are live and the control one is aligned for a `cmsghdr` ([`CmsgBuf`]);
+    // we read exactly one cmsg carrying one fd.
     unsafe {
         let n = libc::recvmsg(stream.as_raw_fd(), &mut msg, 0);
         if n < 0 {
@@ -3359,6 +3390,29 @@ mod tests {
         );
     }
 
+    /// The control buffer a descriptor handoff uses is handed back by `CMSG_FIRSTHDR` as a
+    /// `*mut cmsghdr`, so every field access through it is only defined if the storage is aligned
+    /// for one. It was a `[u8; 32]`, which is byte-aligned: aligned in practice on the targets sbx
+    /// builds for, and "in practice" is not what the rule says.
+    #[test]
+    fn the_handoff_control_buffer_is_aligned_for_the_header_it_is_read_as() {
+        use std::mem::{align_of, size_of};
+        assert!(
+            align_of::<CmsgBuf>() >= align_of::<libc::cmsghdr>(),
+            "a cmsg header is read out of this buffer: {} < {}",
+            align_of::<CmsgBuf>(),
+            align_of::<libc::cmsghdr>()
+        );
+        // And it still holds one header plus one descriptor, which is what it is sized for.
+        // SAFETY: `CMSG_SPACE` reads nothing; it computes a size from a size.
+        let needed = unsafe { libc::CMSG_SPACE(size_of::<libc::c_int>() as u32) } as usize;
+        assert!(
+            size_of::<CmsgBuf>() >= needed,
+            "{} < {needed}",
+            size_of::<CmsgBuf>()
+        );
+    }
+
     /// An `openat2` may ask the kernel for a stricter path walk than the supervisor performed. The
     /// probe follows symlinks by design, so a descriptor served from it is the result of the looser
     /// walk: a caller that asked for `RESOLVE_NO_SYMLINKS` would be handed exactly what its own
@@ -3894,14 +3948,15 @@ mod tests {
             iov_base: &mut dummy as *mut u8 as *mut libc::c_void,
             iov_len: 1,
         };
-        let mut cbuf = [0u8; 32];
+        let mut cbuf = CmsgBuf::zeroed();
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
-        msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_control = cbuf.as_mut_ptr();
         msg.msg_controllen =
             unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) } as _;
-        // SAFETY: the control buffer is live and sized for one cmsg header plus one descriptor.
+        // SAFETY: the control buffer is live, sized for one cmsg header plus one descriptor, and
+        // aligned for a `cmsghdr` ([`CmsgBuf`]).
         unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(&msg);
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
