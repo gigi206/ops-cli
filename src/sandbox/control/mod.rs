@@ -1082,10 +1082,16 @@ pub(crate) fn serve(
 /// cannot make us buffer unboundedly. The peer is the owner-only, host-side control client.
 const CMD_MAX: u64 = 8 * 1024;
 
-/// The largest control *reply* accepted. Unlike a command, a reply carries the destination the agent
-/// reached (`ok host=<h> …`), which for a URL rule can be far longer than `CMD_MAX` — bounding it at
-/// `CMD_MAX` would truncate the host and, with `--save`, persist a wrong (agent-influenceable) rule.
-/// Still bounded (a URL is not unbounded) so a hostile peer cannot make the reader buffer forever.
+/// The largest control *reply* accepted. A reply carries the destination the agent reached
+/// (`ok host=<h> …`), which for a URL rule is far longer than a terse command: a bound sized for
+/// `ALLOW <seq>` would truncate the host and, with `--save`, persist a wrong (agent-influenceable)
+/// rule. Still bounded (a URL is not unbounded) so a hostile peer cannot make the reader buffer
+/// forever.
+///
+/// Equal to [`CMD_MAX`], and that is the direction the equality was reached from: this bound was
+/// sized for a URL first, and the command bound was then raised to match it because `REMEMBER
+/// ALLOW|DENY <rule>` carries the same shape of value. Two names for one size, kept apart because
+/// they answer two questions and either could move alone.
 const REPLY_MAX: u64 = 8 * 1024;
 
 /// Handle one control connection: read a single command line, dispatch it, write the response, and

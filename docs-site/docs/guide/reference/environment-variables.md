@@ -198,7 +198,7 @@ Inside a **task** cage (the ephemeral sibling an invocation runs in) the set is 
 
 | Variable | Meaning |
 |---|---|
-| `SBX_TASK` | the name of the operation being run. A task is never interactive, so a tool that would otherwise prompt can fail fast instead of hanging until the timeout |
+| `SBX_TASK` | the name of the operation being run, so a command that runs both by hand and as a declared operation can tell which it is. A label, not a switch: what stops a tool from prompting is the closed stdin an invocation is given, on which a prompt reads EOF and fails fast instead of hanging until the timeout |
 | `SBX_TASK_OUT` | the writable [output directory](../tasks/output#producing-a-file-output) (`/opt/sbx/out`), set only when the declaration carries `output = true`. The calling cage reads the same artifacts at `/opt/sbx/task-out/<task>/` |
 
 A [plugin](../plugins/) runs in a cage of its own, and gets one variable no other cage

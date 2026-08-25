@@ -324,8 +324,11 @@ impl CaptureGuard {
 
     /// File the exchange now rather than at drop, for a relay that hands the connection off and will
     /// not return for a long time (a WebSocket tunnel). Filing early releases the log event's single
-    /// amendment, so the handshake's `101` shows up live instead of at teardown; the frames past it
-    /// are never captured either way.
+    /// amendment, so the handshake's `101` shows up live instead of at teardown.
+    ///
+    /// The frames past it are captured on their own terms, not by this: [`Self::ws_sinks`] feeds
+    /// them and [`Self::file_frames_snapshot`] shows them as each direction fills, so a tunnel that
+    /// stays open for hours is not a blank line for hours.
     pub(super) fn file_now(&self) {
         self.file();
     }

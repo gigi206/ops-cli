@@ -713,8 +713,11 @@ impl TaskEngine {
             prepend_path(&mut cage_env, &dirs);
             cage_env.extend(super::taskpool::task_env(TASK_HOME));
         }
-        // A task is never interactive: say so, so a tool that would otherwise try to prompt fails
-        // fast instead of hanging until the timeout.
+        // The operation's own name, so a command that runs both by hand and as a declared operation
+        // can tell which it is. What actually stops a tool from prompting is the closed stdin
+        // `exec` gives it (`Stdio::null`): a prompt then reads EOF and the tool fails fast rather
+        // than hanging until the timeout. This variable is a label, not the mechanism — nothing
+        // reads it for interactivity, and the comment here used to claim it did.
         cage_env.push(("SBX_TASK".to_string(), name.to_string()));
         // The same directory by name, for a command that takes its destination from the environment
         // rather than from an argument.

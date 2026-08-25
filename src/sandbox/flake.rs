@@ -5,11 +5,15 @@
 //! the cage. By default the ref *floats* — each cold launch resolves the flake's latest revision. `sbx upgrade flake` pins
 //! it: it resolves each declared ref to its current immutable revision with `nix flake
 //! metadata` and records `(declared ref → revision, locked ref)` in a per-project lock. A launch
-//! then builds the *locked* ref into an out-link keyed by that revision (`<name>-<rev>`), so a
-//! lock change — a rev-keyed path that does not yet exist — triggers a rebuild at the next
-//! launch, with no home enumerated: the host-side lock rewrite is the whole roll. A package
-//! with no lock entry keeps the floating behaviour, so a project that never runs `sbx upgrade
-//! flake` is unchanged.
+//! then builds the *locked* ref rather than the declared one (`packages::realise`), host-side into
+//! the shared store under the package's own project gcroot — so a lock change changes the build
+//! target, the next launch builds the new revision and the gcroot moves to it, with no home
+//! enumerated: the host-side lock rewrite is the whole roll. A package with no lock entry keeps the
+//! floating behaviour, so a project that never runs `sbx upgrade flake` is unchanged.
+//!
+//! The revision is recorded and displayed, not used as a path: nothing here is keyed by it. Only an
+//! **inline** flake has a content-keyed out-link (`binds::flake_out_link_hash`), because it builds
+//! in the cage and has no revision to name.
 //!
 //! The lock is keyed by the *declared* reference (the floating `flake:<ref>` value), not the
 //! package name: two packages naming the same ref in different homes share one pin, and a

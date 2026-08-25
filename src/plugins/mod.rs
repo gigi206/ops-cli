@@ -845,13 +845,13 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<Plugin>, String> {
     }
     let mut allow_paths = Vec::with_capacity(raw.sandbox.allow_paths.len());
     for entry in &raw.sandbox.allow_paths {
-        if let Some(p) = expand_allow_path(entry, exp)? {
+        if let Some(p) = expand_allow_path("allow_paths", entry, exp)? {
             allow_paths.push(p);
         }
     }
     let mut mask_paths = Vec::with_capacity(raw.sandbox.mask_paths.len());
     for entry in &raw.sandbox.mask_paths {
-        if let Some(p) = expand_allow_path(entry, exp)? {
+        if let Some(p) = expand_allow_path("mask_paths", entry, exp)? {
             mask_paths.push(p);
         }
     }
@@ -1084,9 +1084,13 @@ impl Expansion {
 /// (`config::expand_bind_path`) so the user sees one variable vocabulary, but the two differ
 /// intentionally: this resolver allowlist rejects *any* stray `$`, whereas a `binds` source keeps
 /// a literal `$` past the head (a real mount path may contain one). Keep them separate.
-fn expand_allow_path(raw: &str, exp: &Expansion) -> Result<Option<PathBuf>, String> {
+///
+/// `field` is the manifest key the entry came from, because two of them come here: `allow_paths`
+/// and `mask_paths`. Every refusal used to say `allow_paths`, so a bad `mask_paths` entry sent its
+/// author to look at the wrong list.
+fn expand_allow_path(field: &str, raw: &str, exp: &Expansion) -> Result<Option<PathBuf>, String> {
     if raw.is_empty() {
-        return Err("an `allow_paths` entry is empty".to_string());
+        return Err(format!("an `{field}` entry is empty"));
     }
     let (head, rest) = match raw.split_once('/') {
         Some((h, r)) => (h, Some(r)),
@@ -1119,15 +1123,13 @@ fn expand_allow_path(raw: &str, exp: &Expansion) -> Result<Option<PathBuf>, Stri
         other => {
             if other.contains('$') || rest.is_some_and(|r| r.contains('$')) {
                 return Err(format!(
-                    "`allow_paths` entry `{raw}` uses an unsupported variable \
+                    "`{field}` entry `{raw}` uses an unsupported variable \
                      (only `~`, `$HOME`, `$XDG_RUNTIME_DIR` are expanded)"
                 ));
             }
             let p = PathBuf::from(raw);
             if !p.is_absolute() {
-                return Err(format!(
-                    "`allow_paths` entry `{raw}` is not an absolute path"
-                ));
+                return Err(format!("`{field}` entry `{raw}` is not an absolute path"));
             }
             return Ok(Some(p));
         }
@@ -2568,13 +2570,27 @@ mod tests {
 
     #[test]
     fn an_unsupported_path_variable_is_refused() {
-        assert!(expand_allow_path("$SECRET_DIR/x", &Expansion::default()).is_err());
-        assert!(expand_allow_path("/etc/$injected", &Expansion::default()).is_err());
+        assert!(expand_allow_path("allow_paths", "$SECRET_DIR/x", &Expansion::default()).is_err());
+        assert!(expand_allow_path("allow_paths", "/etc/$injected", &Expansion::default()).is_err());
     }
 
     #[test]
     fn a_relative_literal_path_is_refused() {
-        assert!(expand_allow_path("relative/path", &Expansion::default()).is_err());
+        assert!(expand_allow_path("allow_paths", "relative/path", &Expansion::default()).is_err());
+        // Two manifest keys reach this function, and a refusal names the one the entry is in. Every
+        // message said `allow_paths`, so a bad `mask_paths` entry sent its author to the wrong list.
+        for (field, entry) in [
+            ("mask_paths", "relative/path"),
+            ("mask_paths", ""),
+            ("mask_paths", "/etc/$injected"),
+        ] {
+            let why = expand_allow_path(field, entry, &Expansion::default())
+                .expect_err("each of these is refused");
+            assert!(
+                why.contains("mask_paths") && !why.contains("allow_paths"),
+                "the refusal must name the field the entry is in: {why}"
+            );
+        }
     }
 
     #[test]
@@ -2590,17 +2606,17 @@ mod tests {
             runtime: None,
         };
         assert_eq!(
-            expand_allow_path("$XDG_RUNTIME_DIR/gnupg", &exp).unwrap(),
+            expand_allow_path("allow_paths", "$XDG_RUNTIME_DIR/gnupg", &exp).unwrap(),
             None
         );
         assert_eq!(
-            expand_allow_path("~/.ssh", &exp).unwrap(),
+            expand_allow_path("allow_paths", "~/.ssh", &exp).unwrap(),
             Some(PathBuf::from("/home/u/.ssh"))
         );
         // A malformed entry is still an error: it can never be right on any host, while an unset
         // variable is a fact about this one.
-        assert!(expand_allow_path("relative/path", &exp).is_err());
-        assert!(expand_allow_path("$SECRET_DIR/x", &exp).is_err());
+        assert!(expand_allow_path("allow_paths", "relative/path", &exp).is_err());
+        assert!(expand_allow_path("allow_paths", "$SECRET_DIR/x", &exp).is_err());
     }
 
     #[test]
@@ -2610,11 +2626,11 @@ mod tests {
             runtime: Some(PathBuf::from("/run/user/1000")),
         };
         assert_eq!(
-            expand_allow_path("$HOME", &exp).unwrap(),
+            expand_allow_path("allow_paths", "$HOME", &exp).unwrap(),
             Some(PathBuf::from("/home/u"))
         );
         assert_eq!(
-            expand_allow_path("$XDG_RUNTIME_DIR", &exp).unwrap(),
+            expand_allow_path("allow_paths", "$XDG_RUNTIME_DIR", &exp).unwrap(),
             Some(PathBuf::from("/run/user/1000"))
         );
     }

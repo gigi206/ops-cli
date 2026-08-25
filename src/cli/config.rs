@@ -690,8 +690,6 @@ fn notify_section(view: &config::view::ConfigView, pal: &style::Palette) -> Stri
     o
 }
 
-/// The desktop holes, each shown only when opened so a config that opened none stays uncluttered:
-/// GUI (with the compositor caveat on `wayland`, and what `offscreen` supplies since it exposes
 /// The cage's clock, rendered only when a layer actually named a zone. Every cage has one, so
 /// printing it unconditionally would put a line reading `timezone: UTC` on every `sbx config show`
 /// that says nothing — the same reason `gui: none` is not printed. What is worth reading is that
@@ -709,6 +707,8 @@ fn timezone_section(view: &config::view::ConfigView, pal: &style::Palette) -> Op
     ))
 }
 
+/// The desktop holes, each shown only when opened so a config that opened none stays uncluttered:
+/// GUI (with the compositor caveat on `wayland`, and what `offscreen` supplies since it exposes
 /// nothing), GPU, audio, and the in-cage D-Bus portal.
 fn desktop_sections(view: &config::view::ConfigView, pal: &style::Palette) -> Option<String> {
     use config::view::GuiView;

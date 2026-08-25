@@ -301,8 +301,9 @@ pub(crate) fn prebuilt_pin_key(backend: &crate::config::Backend, name: &str) -> 
 /// read side checks both, current first, to report such a home accurately through the transition.
 const FLAKE_ROOTS_REL_LEGACY: &str = ".local/state/ops/flake";
 
-/// Whether a `flake:` package named `name` (its free label) has a warm build out-link in `home` —
-/// `<home>/<FLAKE_ROOTS_REL>/<name>` (a floating build) or `<name>-<rev>` (a pinned one), where the
+/// Whether an inline `[flakes.<name>]` package named `name` (its free label) has a warm build
+/// out-link in `home` — `<home>/<FLAKE_ROOTS_REL>/<name>` (the stable PATH entry) or
+/// `<name>-<hash>` (one build, keyed by the flake source's content hash), where the
 /// out-link's target store path lives in the per-project store the launch bound at `/nix`. The
 /// out-link *symlink* is the realized signal a launch leaves in the home (a *floating* flake has an
 /// out-link but no lock entry at all, which a lock scan would miss). The current relative path is
@@ -651,7 +652,7 @@ mod tests {
             Some("demo-agent-0.18.2".to_string()),
             "the store-path label, hash stripped"
         );
-        // A pinned out-link is keyed `<name>-<rev>`; still matched by the name.
+        // A per-build out-link is keyed `<name>-<hash>`; still matched by the name.
         assert!(flake_built(home, "other").is_none());
         std::os::unix::fs::symlink(
             "/nix/store/abcd1234abcd1234abcd1234abcd1234abcd1234-other-1.0",

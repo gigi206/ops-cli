@@ -952,8 +952,9 @@ pub(crate) fn flake_out_link(name: &str) -> PathBuf {
 /// warm short-circuit rebuilds (the stale build is left unrooted, so `sbx gc` reclaims it). `name`
 /// is a validated package name and `hash` is hex, so neither escapes [`flake_roots_dir`].
 ///
-/// Residual (the same class as the rev-keyed remote out-links, but accruing per *edit* rather than
-/// per `sbx upgrade`): each edit leaves the old `<name>-<oldhash>` symlink dangling in the home. The
+/// Residual, and this form is the only one that has it: a remote `flake:` package is built
+/// host-side under one project gcroot that moves with the lock, while each edit here leaves the old
+/// `<name>-<oldhash>` symlink dangling in the home. The
 /// store path it pointed at is reclaimed (its `sbx-flake-<name>` gcroot was re-pointed to the new
 /// build), so only the dead symlink lingers; re-editing back to a prior source reuses its surviving
 /// out-link. Cleaning the dead symlinks is an `sbx gc` concern, not a per-launch one.

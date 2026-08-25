@@ -5351,11 +5351,12 @@ fn wrap_flake_equip(
     let n = quads.len();
     // Per package (`$1` ref, `$2` build target, `$3` good out-link, `$4` key): build the target if
     // it is neither warm nor already known-failed (a `<target>.failed` marker, so a broken pin is
-    // retried once per revision, not on every launch, and a new pin — a new rev-keyed target — is
-    // attempted afresh). On success the good out-link (what PATH resolves through) is promoted to the
+    // retried once per build target, not on every launch, and an edited flake — a new
+    // content-keyed target — is attempted afresh). On success the good out-link (what PATH resolves
+    // through) is promoted to the
     // fresh build and any marker cleared; on failure it is left at the last good build so the app
-    // still runs, with a loud notice. Only the target/good pair is marked (never a floating package,
-    // whose target *is* its good — it has no revision to clear the marker, so it retries as before).
+    // still runs, with a loud notice. Only the target/good pair is marked (never a package whose
+    // target *is* its good — it has no second key to clear the marker, so it retries as before).
     // The hard-fail (exit 1) is reserved for the case where no prior good build exists at all.
     let script = format!(
         "mkdir -p '{dir}'\n\
@@ -7671,7 +7672,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
 
     #[test]
     fn wrap_flake_equip_falls_back_to_the_last_good_build_when_a_pinned_build_fails() {
-        // The headline of the fallback feature, run for real: when the pinned (rev-keyed) build
+        // The headline of the fallback feature, run for real: when the content-keyed build
         // fails, the launch must run the last good build instead of breaking — and must not
         // re-attempt the doomed build on the next launch (the `<target>.failed` marker).
         let tmp = crate::testutil::TmpDir::new();
@@ -7692,7 +7693,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         std::fs::create_dir_all(good_store.join("bin")).unwrap();
         let good = flake.join("tool");
         std::os::unix::fs::symlink(&good_store, &good).unwrap();
-        let target = flake.join("tool-deadbeef"); // rev-keyed, does not exist
+        let target = flake.join("tool-deadbeef"); // content-keyed, does not exist
 
         let quads = vec![(
             "github:o/tool#default".to_string(),

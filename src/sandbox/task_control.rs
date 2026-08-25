@@ -1252,8 +1252,10 @@ pub(crate) fn read_log(socket: &Path) -> io::Result<Vec<String>> {
     ask_host(socket, "LOG")
 }
 
-/// One read of the invocation log as parsed entries: what is past `after`, how many fell out of the
-/// ring, and the head to come back with.
+/// One read of the invocation log as parsed entries: what is past `after`, the head to come back
+/// with, and how many fell out of the ring — in that order, which is not the order
+/// [`TaskLog::since`] returns its three in. The two are read by different callers and the tuple a
+/// reader binds is this one.
 ///
 /// `after` is **append order**, never an invocation id (see [`TaskLog::since`]), and a caller only
 /// ever gets one from a previous read — so a plane too old to send `head=` yields head `0` and is
