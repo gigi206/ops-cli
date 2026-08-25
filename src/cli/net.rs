@@ -4747,6 +4747,83 @@ mod tests {
     }
 
     #[test]
+    fn a_by_id_save_persists_the_port_the_stand_in_session_parked_the_request_on() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        // The defect is at the `--save` call site, not in the mapping above: the answer reply names
+        // the host and nothing else, so the port has to be read off the parked row (`LIST`) *before*
+        // the answer clears it from the queue. This drives the whole verb — `net pending allow <id>
+        // --save --global` — against a stand-in session parking one request on 8443, and asserts on
+        // the rule the global config ends up carrying.
+        let _lock = env_lock();
+        let data = TmpDir::new();
+        let config_home = TmpDir::new();
+        let _data_var = EnvVar::set("SBX_DATA_DIR", data.path());
+        let _config_var = EnvVar::set("XDG_CONFIG_HOME", config_home.path());
+
+        let pid = 424_242u32; // no live session: the socket is the whole session, as far as sbx sees
+        let egress = data.path().join("egress");
+        std::fs::create_dir_all(&egress).expect("create the control directory");
+        let socket = egress.join(format!("control-{pid}.sock"));
+        let listener = UnixListener::bind(&socket).expect("bind the stand-in control socket");
+
+        // The stand-in serves one command per connection and returns once the answer lands, so it
+        // ends whether or not the reader asked for the listing first.
+        let session = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let stream = stream.expect("accept a control connection");
+                let mut cmd = String::new();
+                BufReader::new(&stream)
+                    .read_line(&mut cmd)
+                    .expect("read the command");
+                let cmd = cmd.trim_end().to_string();
+                if cmd == "LIST" {
+                    (&stream)
+                        .write_all(
+                            b"pending seq=1 port=8443 waiting=3 host=api.test path=/v1/x\nok\n",
+                        )
+                        .expect("write the pending row");
+                    continue;
+                }
+                let reply: &[u8] = if cmd.starts_with("ALLOW ") {
+                    b"ok host=api.test count=1\n"
+                } else {
+                    b"err bad-request\n"
+                };
+                (&stream).write_all(reply).expect("write the reply");
+                return cmd;
+            }
+            String::new()
+        });
+
+        let _code = net_pending_answer(
+            sandbox::control::Verdict::Allow,
+            &[
+                OsString::from(format!("{pid}.1")),
+                OsString::from("--save"),
+                OsString::from("--global"),
+            ],
+        );
+        // Unblock a stand-in still waiting on `accept` (the answer never reached it), so a failure
+        // reports itself instead of hanging the suite.
+        if let Ok(poke) = std::os::unix::net::UnixStream::connect(&socket) {
+            let _ = (&poke).write_all(b"QUIT\n");
+        }
+        let answered = session.join().expect("the stand-in session thread");
+        assert_eq!(answered, "ALLOW 1", "the request must have been answered");
+
+        let global = std::fs::read_to_string(config_home.path().join("sbx").join("sbx.toml"))
+            .expect("`--save --global` must have written the global config");
+        assert!(
+            global.contains("\"api.test:8443\""),
+            "the saved rule must carry the port the request was answered on, or it cannot match \
+             that request next launch:\n{global}"
+        );
+    }
+
+    #[test]
     fn a_muted_event_is_neither_shown_nor_counted_as_an_eviction() {
         use sandbox::control::{LogVerdict::*, SessionLog};
         let p = style::Palette::plain();
@@ -4804,6 +4881,88 @@ mod tests {
         assert!(
             all.contains("telemetry.test"),
             "`--all` shows the muted refusal:\n{all}"
+        );
+    }
+
+    #[test]
+    fn the_log_reader_asks_each_session_for_its_muted_ring_so_a_hole_is_not_an_eviction() {
+        use crate::testutil::{EnvVar, TmpDir, env_lock};
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        // The sibling test above builds the merged snapshot by hand, so it says nothing about the
+        // half of the fix that has to hold for the arithmetic to work: that the *reader* asks for
+        // both rings whatever the view shows. This stand-in session answers like a real one — a
+        // plain `LOG` omits the muted refusal, leaving a hole where seq 1 was, and `LOG all` folds
+        // it back in — so a reader that asks for the default view is told an event was evicted that
+        // the session still holds.
+        let _lock = env_lock();
+        let data = TmpDir::new();
+        let _data_var = EnvVar::set("SBX_DATA_DIR", data.path());
+
+        let pid = 424_243u32;
+        let egress = data.path().join("egress");
+        std::fs::create_dir_all(&egress).expect("create the control directory");
+        let socket = egress.join(format!("control-{pid}.sock"));
+        let listener = UnixListener::bind(&socket).expect("bind the stand-in control socket");
+
+        let session = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept the log read");
+            let mut cmd = String::new();
+            BufReader::new(&stream)
+                .read_line(&mut cmd)
+                .expect("read the command");
+            let mut out = String::from("head=3\namended=0\n");
+            // Only `LOG all` gets the muted ring — the split the session keeps between the two.
+            if cmd.split_whitespace().any(|t| t == "all") {
+                out.push_str(
+                    "event seq=1 at=1000000 port=443 verdict=deny proto=https \
+                     reason=denied-default muted=1 host=telemetry.test\n",
+                );
+            }
+            out.push_str(
+                "event seq=2 at=1000000 port=443 verdict=allow proto=https reason=allowed \
+                 method=GET host=api.test path=/a\n\
+                 event seq=3 at=1000000 port=443 verdict=allow proto=https reason=allowed \
+                 method=GET host=api.test path=/b\n\
+                 ok\n",
+            );
+            (&stream)
+                .write_all(out.as_bytes())
+                .expect("write the log reply");
+            cmd.trim_end().to_string()
+        });
+
+        let (sessions, context) = collect_logs(data.path(), None, false);
+        let asked = session.join().expect("the stand-in session thread");
+        assert_eq!(sessions.len(), 1, "the stand-in session must be reachable");
+        assert_eq!(
+            snapshot_evicted(&sessions[0].snapshot),
+            0,
+            "nothing was evicted — seq 1 is the muted refusal, still held (the reader asked \
+             `{asked}`)"
+        );
+
+        // And the fold is invisible to the reader: the muted refusal is still suppressed, the two
+        // real events still shown, and no eviction line invented from the hole it left.
+        let out = render_logs(
+            &sessions,
+            &context,
+            &LogView::default(),
+            &style::Palette::plain(),
+            true,
+        );
+        assert!(
+            !out.contains("evicted from the ring"),
+            "no eviction happened, so none may be reported:\n{out}"
+        );
+        assert!(
+            !out.contains("telemetry.test"),
+            "a muted refusal stays out of the default view:\n{out}"
+        );
+        assert!(
+            out.contains("/a") && out.contains("/b"),
+            "the unmuted events are shown:\n{out}"
         );
     }
 

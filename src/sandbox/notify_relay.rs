@@ -34,6 +34,7 @@
 
 use crate::diag;
 use crate::sandbox::locks::locked;
+use futures_util::future::BoxFuture;
 use futures_util::{FutureExt, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -88,6 +89,76 @@ pub(crate) trait HostNotifications {
     fn notification_closed(&self, id: u32, reason: u32) -> zbus::Result<()>;
 }
 
+/// One `Notify` as it leaves the relay: the caged app's arguments, with `replaces_id` already
+/// settled by the guard in [`Served::notify`] rather than as the cage spelled it.
+struct NotifyCall {
+    app_name: String,
+    replaces_id: u32,
+    app_icon: String,
+    summary: String,
+    body: String,
+    actions: Vec<String>,
+    hints: HashMap<String, OwnedValue>,
+    expire_timeout: i32,
+}
+
+/// Where the relay forwards to: the host notifications daemon.
+///
+/// A trait for the reason [`super::notify_sink::Sink`] is one. What this module is worth is its
+/// forwarding *decisions* — which `replaces_id` reaches the daemon, which `CloseNotification` is
+/// dropped — and behind a bare proxy those would be reachable only from a live session bus, so they
+/// would go untested on every machine that runs the suite. The one production implementation is
+/// [`HostNotificationsProxy`]; the tests drive [`Served`]'s own methods, which is what the private
+/// bus dispatches to, against a recording double.
+///
+/// Boxed futures rather than a trait `async fn`: an interface served on a connection needs futures
+/// that are `Send`, which an `async fn` in a trait cannot promise for an arbitrary implementor.
+trait HostBus: Send + Sync {
+    /// Forward a `Notify`, answering with the id the host daemon assigned to it.
+    fn notify(&self, call: NotifyCall) -> BoxFuture<'_, zbus::Result<u32>>;
+    /// Forward a `CloseNotification` for an id the host daemon handed out.
+    fn close_notification(&self, id: u32) -> BoxFuture<'_, zbus::Result<()>>;
+    /// Forward a `GetCapabilities`.
+    fn get_capabilities(&self) -> BoxFuture<'_, zbus::Result<Vec<String>>>;
+    /// Forward a `GetServerInformation`.
+    fn get_server_information(
+        &self,
+    ) -> BoxFuture<'_, zbus::Result<(String, String, String, String)>>;
+}
+
+impl HostBus for HostNotificationsProxy<'static> {
+    fn notify(&self, call: NotifyCall) -> BoxFuture<'_, zbus::Result<u32>> {
+        Box::pin(async move {
+            HostNotificationsProxy::notify(
+                self,
+                &call.app_name,
+                call.replaces_id,
+                &call.app_icon,
+                &call.summary,
+                &call.body,
+                call.actions,
+                call.hints,
+                call.expire_timeout,
+            )
+            .await
+        })
+    }
+
+    fn close_notification(&self, id: u32) -> BoxFuture<'_, zbus::Result<()>> {
+        Box::pin(HostNotificationsProxy::close_notification(self, id))
+    }
+
+    fn get_capabilities(&self) -> BoxFuture<'_, zbus::Result<Vec<String>>> {
+        Box::pin(HostNotificationsProxy::get_capabilities(self))
+    }
+
+    fn get_server_information(
+        &self,
+    ) -> BoxFuture<'_, zbus::Result<(String, String, String, String)>> {
+        Box::pin(HostNotificationsProxy::get_server_information(self))
+    }
+}
+
 /// The notification ids the host daemon returned for *this* cage's `Notify` calls, minus those it
 /// has since reported closed — the whole of what the relay knows about which notifications on the
 /// host belong to the cage.
@@ -128,7 +199,7 @@ impl OwnedIds {
 /// forwarding error becomes an `fdo` error reply so the caged app sees a clean failure rather than a
 /// dropped call.
 struct Served {
-    host: HostNotificationsProxy<'static>,
+    host: Box<dyn HostBus>,
     /// Shared with the signal pump in [`run`], which forgets an id when the host reports it closed.
     ours: Arc<OwnedIds>,
 }
@@ -157,16 +228,16 @@ impl Served {
         };
         let id = self
             .host
-            .notify(
-                &app_name,
+            .notify(NotifyCall {
+                app_name,
                 replaces_id,
-                &app_icon,
-                &summary,
-                &body,
+                app_icon,
+                summary,
+                body,
                 actions,
                 hints,
                 expire_timeout,
-            )
+            })
             .await
             .map_err(|e| fdo::Error::Failed(format!("forward Notify: {e}")))?;
         self.ours.record(id);
@@ -279,7 +350,7 @@ async fn run(
     // served interface's method calls on its own internal executor, so this future only pumps signals.
     let ours = Arc::new(OwnedIds::default());
     let served = Served {
-        host: host.clone(),
+        host: Box::new(host.clone()),
         ours: Arc::clone(&ours),
     };
     let address = format!("unix:path={}", private_socket.display());
@@ -325,6 +396,129 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The first id the double hands out. Well away from `0` and from any small number a test
+    /// writes by hand, so an id the cage guessed is never accidentally one of the cage's own.
+    const FIRST_ID: u32 = 4200;
+
+    /// A recording stand-in for the host daemon: it assigns ids the way a real one does and keeps
+    /// what actually reached it, so a test can ask what the relay forwarded rather than what the
+    /// cage asked for. No session bus, so the whole cage-facing path runs on any machine.
+    #[derive(Clone, Default)]
+    struct FakeHost {
+        /// The `replaces_id` of every forwarded `Notify`, in order.
+        replaced: Arc<Mutex<Vec<u32>>>,
+        /// The id of every forwarded `CloseNotification`, in order.
+        closed: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl FakeHost {
+        fn replaced(&self) -> Vec<u32> {
+            locked(&self.replaced).clone()
+        }
+
+        fn closed(&self) -> Vec<u32> {
+            locked(&self.closed).clone()
+        }
+    }
+
+    impl HostBus for FakeHost {
+        fn notify(&self, call: NotifyCall) -> BoxFuture<'_, zbus::Result<u32>> {
+            let mut replaced = locked(&self.replaced);
+            replaced.push(call.replaces_id);
+            let id = FIRST_ID + replaced.len() as u32 - 1;
+            drop(replaced);
+            Box::pin(std::future::ready(Ok(id)))
+        }
+
+        fn close_notification(&self, id: u32) -> BoxFuture<'_, zbus::Result<()>> {
+            locked(&self.closed).push(id);
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn get_capabilities(&self) -> BoxFuture<'_, zbus::Result<Vec<String>>> {
+            Box::pin(std::future::ready(Ok(Vec::new())))
+        }
+
+        fn get_server_information(
+            &self,
+        ) -> BoxFuture<'_, zbus::Result<(String, String, String, String)>> {
+            Box::pin(std::future::ready(Ok(Default::default())))
+        }
+    }
+
+    /// The interface the private bus serves, in front of a recording host.
+    fn served(host: &FakeHost) -> Served {
+        Served {
+            host: Box::new(host.clone()),
+            ours: Arc::new(OwnedIds::default()),
+        }
+    }
+
+    /// One `Notify` as the caged app makes it, answered with the id the relay returns to the cage.
+    fn notify(served: &Served, replaces_id: u32) -> u32 {
+        async_io::block_on(served.notify(
+            "caged-app".to_string(),
+            replaces_id,
+            String::new(),
+            "summary".to_string(),
+            "body".to_string(),
+            Vec::new(),
+            HashMap::new(),
+            -1,
+        ))
+        .expect("the recording host accepts every call forwarded to it")
+    }
+
+    #[test]
+    fn notify_does_not_forward_a_replaces_id_the_relay_never_handed_out() {
+        let host = FakeHost::default();
+        let served = served(&host);
+
+        // A host-wide id the cage names without ever having been given it: on the real bus this
+        // overwrites whatever app owns it, sbx's own refusal toasts included.
+        let mine = notify(&served, 4242);
+        assert_eq!(
+            host.replaced(),
+            vec![0],
+            "a `replaces_id` the relay never handed out must reach the host daemon as the spec's \
+             no-replacement sentinel, not as the cage spelled it"
+        );
+
+        // What the guard must still permit: the cage revising its own notification in place.
+        notify(&served, mine);
+        assert_eq!(
+            host.replaced(),
+            vec![0, mine],
+            "an id this relay returned is the cage's own and is forwarded verbatim"
+        );
+    }
+
+    #[test]
+    fn close_notification_is_dropped_for_an_id_the_relay_never_handed_out() {
+        let host = FakeHost::default();
+        let served = served(&host);
+        let mine = notify(&served, 0);
+
+        // Answered `Ok` — an app closing a notification the host already expired must not start
+        // seeing failures — but nothing reaches the daemon.
+        async_io::block_on(served.close_notification(mine + 1))
+            .expect("closing an id the cage does not own is a no-op, not an error");
+        assert!(
+            host.closed().is_empty(),
+            "a `CloseNotification` for an id the relay never handed out must not reach the host \
+             daemon: got {:?}",
+            host.closed()
+        );
+
+        async_io::block_on(served.close_notification(mine))
+            .expect("closing the cage's own notification forwards cleanly");
+        assert_eq!(
+            host.closed(),
+            vec![mine],
+            "the cage dismissing its own notification is still forwarded"
+        );
+    }
 
     #[test]
     fn owned_ids_admits_only_the_ids_the_relay_handed_out() {

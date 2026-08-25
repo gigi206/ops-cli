@@ -6373,6 +6373,11 @@ mod tests {
     /// the observer and then exec'd straight over it, and the foreground non-tty path never started
     /// one at all. Both now ask [`may_exec_replace`], which reads the same
     /// [`observation_flags`] pair that decides whether to start the observer.
+    ///
+    /// What is pinned here is the predicate's own answer. That the two launch paths ask it — the
+    /// half that was actually written wrong — is guarded by
+    /// `the_guardless_launch_paths_ask_the_predicate_and_not_the_observe_flag`, because a call site
+    /// can go back to reading the flag while every assertion below still holds.
     #[test]
     fn config_declared_observation_blocks_the_exec_replace_shortcut() {
         use crate::proc_policy::{ProcMode, ProcPolicy};
@@ -6405,6 +6410,66 @@ mod tests {
         // An unasked enforcing launch keeps it here as well — its seccomp supervisor arrives as a
         // `LaunchGuard`, and it is the guard, not this predicate, that forces supervision.
         assert!(may_exec_replace(&with(ProcMode::Enforce), false));
+    }
+
+    /// The predicate is half the fix; the other half is that the two guardless launch paths
+    /// actually ask it. Both used to decide the `exec`-replace shortcut from the `--observe` flag
+    /// alone — `None if !observe` — and that is the shape the defect takes if it returns:
+    /// [`may_exec_replace`] can keep every semantic the test above pins while a call site goes on
+    /// reading the raw flag, losing a config-declared `[proc] mode = "observe"` exactly as before
+    /// (the detached daemon starts the observer and execs over it, the foreground path starts none).
+    ///
+    /// Neither `launch_foreground` nor `detached_child` is reachable from a unit test — both take a
+    /// whole `Prepared`, build a real cage, and end in `exec` or `process::exit` — and nothing else
+    /// in the crate calls them, so the decision at those two sites is guarded here on the source, the
+    /// way `the_wraps_nest_around_the_composed_startup_and_not_the_bare_command` guards `build`'s own
+    /// ordering, because the alternative is no check at all.
+    #[test]
+    fn the_guardless_launch_paths_ask_the_predicate_and_not_the_observe_flag() {
+        let source = include_str!("launch.rs");
+        // Only production code: the test module below quotes these very fragments.
+        let production = &source[..source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the test module is where this file's non-production code ends")];
+
+        for name in ["launch_foreground", "detached_child"] {
+            let start = production
+                .find(&format!("\nfn {name}("))
+                .unwrap_or_else(|| panic!("`{name}` is where a guardless launch decides to exec"));
+            // A top-level `}` in the first column ends the function.
+            let rest = &production[start + 1..];
+            let body = &rest[..rest
+                .find("\n}\n")
+                .unwrap_or_else(|| panic!("`{name}` never closes"))];
+
+            // The pair that decides whether an observer is started at all.
+            assert!(
+                body.contains("observation_flags(&prep.cfg.proc, observe)"),
+                "`{name}` no longer reads the resolved policy to decide observation"
+            );
+
+            let arms: Vec<&str> = body
+                .match_indices("None if ")
+                .map(|(at, kw)| {
+                    let cond = &body[at + kw.len()..];
+                    &cond[..cond.find(" =>").unwrap_or(cond.len())]
+                })
+                .collect();
+            assert_eq!(
+                arms.len(),
+                1,
+                "`{name}` has {} guardless arms: a second one can reinstate the flag-only \
+                 decision for whichever matches first ({arms:?})",
+                arms.len()
+            );
+            assert_eq!(
+                arms[0], "may_exec_replace(&prep.cfg.proc, observe)",
+                "`{name}` decides the exec-replace shortcut with `{}` instead of asking \
+                 `may_exec_replace`, so a config-declared `[proc] mode = \"observe\"` — which sets \
+                 no flag — takes the shortcut again and its observation is lost with no error",
+                arms[0]
+            );
+        }
     }
 
     /// `sbx gc` collects a store a live cage is reading and writing, so the live-session check is

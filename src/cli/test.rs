@@ -173,105 +173,129 @@ fn net_test(args: &[OsString]) -> ExitCode {
                 print!("{}", render_l4_decision(target, &l4, &pal));
                 return ExitCode::SUCCESS;
             }
-            let (host, port, path) = match allowlist::parse_url_target(&url) {
-                Ok(t) => t,
+            // The whole verdict is assembled by one presenter, so what this command prints for a
+            // URL — and the order its checks run in, which *is* the answer — is asserted in a test
+            // rather than only the pieces it is built from.
+            match render_url_verdict(&url, &effective, policy, &method, &resolved.secrets, &pal) {
+                Ok(out) => {
+                    print!("{out}");
+                    ExitCode::SUCCESS
+                }
                 Err(e) => {
                     diag::error(&format!("sbx: {e}"));
-                    return ExitCode::from(2);
-                }
-            };
-            // An `http://` URL is a cleartext (L7Clear) question, decided through the same
-            // `explain_clear` the proxy's absolute-form handler uses (so the tester cannot drift from
-            // the wire). Cleartext is strictly opt-in: only an explicit `http://` allow permits it —
-            // the L7 default action above does not open it, so a bare host stays HTTPS-only here too.
-            let clear = url.starts_with("http://");
-            // Decided **before** the policy verdict, because that is where the proxy decides it: an
-            // IP-literal CONNECT is answered `403 ip-literal` ahead of the allowlist entirely, so a
-            // rule allowing the address made this command print ALLOWED for a request the wire
-            // refuses — the one answer a tester exists to prevent.
-            if refused_as_ip_literal(&host, clear, &effective.l4_decision(&host, port)) {
-                print!("{}", render_ip_literal_refusal(&url, &host, port, &pal));
-                return ExitCode::SUCCESS;
-            }
-            let decision = if clear {
-                effective.explain_clear(&host, port, &path, &method)
-            } else {
-                effective.explain(&host, port, &path, &method)
-            };
-            // Tag a request allowed *only* by the built-in set (not the user's own
-            // rules), so "why does this pass — I never allowed it?" is answerable. The union adds
-            // only allow rules, so an effective `AllowedBy` the user policy does not also allow can
-            // only be the built-in set. Discriminate on the user verdict's own variant (definitely
-            // "the user allowed it") rather than a separate predicate. The `clear` question is
-            // decided through the same `explain_clear`, so the tag matches the wire (the built-in set
-            // is all `https://` hosts, so a cleartext allow is always the user's own).
-            let user_decision = if clear {
-                policy.explain_clear(&host, port, &path, &method)
-            } else {
-                policy.explain(&host, port, &path, &method)
-            };
-            let user_allowed = matches!(
-                user_decision,
-                allowlist::Decision::AllowedBy(_) | allowlist::Decision::AllowedDefault
-            );
-            let builtin = matches!(decision, allowlist::Decision::AllowedBy(_)) && !user_allowed;
-            // The policy verdict is only half of what the wire does: the proxy resolves the host and
-            // runs the address guard before connecting. Replay that guard here so the tester does not
-            // promise a pass the proxy refuses. On an **IP literal** the answer is exact and needs no
-            // resolution, so it replaces the verdict — which on this path means a cleartext one,
-            // since an inspected IP literal was already answered `ip-literal` above; on a **name**
-            // the tester resolves nothing (no network), so it can only note the condition, and only
-            // when the deciding rule does not name the host exactly (the one shape the guard admits
-            // for a private address).
-            let deciding = match &decision {
-                allowlist::Decision::AllowedBy(rule) => Some(*rule),
-                _ => None,
-            };
-            let allowed = matches!(
-                decision,
-                allowlist::Decision::AllowedBy(_) | allowlist::Decision::AllowedDefault
-            );
-            if allowed && let Some(refusal) = literal_addr_refusal(&host, deciding) {
-                let by = match deciding {
-                    Some(rule) => format!("the policy allows it (allow rule: {rule})"),
-                    None => "the policy allows it (allow-by-default)".to_string(),
-                };
-                print!("{}", render_addr_refusal(&url, &by, &refusal, &pal));
-                return ExitCode::SUCCESS;
-            }
-            print!("{}", render_net_decision(&url, &decision, builtin, &pal));
-            if allowed
-                && host.parse::<std::net::IpAddr>().is_err()
-                && !sandbox::names_exact_host(&host, deciding)
-            {
-                print!("{}", render_private_name_note(&pal));
-            }
-            // The policy permitting an inspected request is not the same as the cage being able to
-            // make it: a loopback host is exempt from the cage's proxy and gets no in-cage listener,
-            // so nothing inside takes this rule. Said here because this command is what an author
-            // checks before concluding the host's loopback is unreachable.
-            if allowed && sandbox::egress::proxy_exempt(&host) {
-                print!("{}", render_loopback_note(&host, port, &pal));
-            }
-            // On an allowed request, surface any credential the proxy would inject for this exact
-            // destination — by header and source locator only, never the value, and with no I/O. A
-            // **cleartext** (`http://`) request never receives an injection (a bearer is not sent in
-            // the clear — the proxy skips injection wholesale), so no note is shown for it.
-            if !clear
-                && matches!(
-                    decision,
-                    allowlist::Decision::AllowedBy(_) | allowlist::Decision::AllowedDefault
-                )
-            {
-                for secret in &resolved.secrets {
-                    if allowlist::rule_matches(&secret.to, &host, port, &path) {
-                        print!("{}", render_injection_note(secret, &pal));
-                    }
+                    ExitCode::from(2)
                 }
             }
-            ExitCode::SUCCESS
         }
     }
+}
+
+/// Render every line `sbx test net` prints for an `https://`/`http://` target: the verdict, the
+/// notes that qualify it, and any credential the proxy would inject.
+///
+/// A presenter rather than inline printing, because the *order* of the checks is the answer this
+/// command exists to give and is therefore what a test has to be able to read. The proxy answers an
+/// IP-literal CONNECT before it consults the allowlist, so the refusal is rendered here ahead of the
+/// policy verdict; a rule allowing the address does not get to speak first. Every span is empty
+/// under a non-terminal palette, so a capture is plain text.
+///
+/// `Err` carries the message for a target this command cannot parse as a URL; the caller reports it
+/// as a usage error.
+fn render_url_verdict(
+    url: &str,
+    effective: &allowlist::EgressPolicy,
+    user: &allowlist::EgressPolicy,
+    method: &str,
+    secrets: &[config::HeaderSecret],
+    pal: &style::Palette,
+) -> Result<String, String> {
+    let (host, port, path) = allowlist::parse_url_target(url)?;
+    let mut o = String::new();
+    // An `http://` URL is a cleartext (L7Clear) question, decided through the same
+    // `explain_clear` the proxy's absolute-form handler uses (so the tester cannot drift from
+    // the wire). Cleartext is strictly opt-in: only an explicit `http://` allow permits it —
+    // the L7 default action does not open it, so a bare host stays HTTPS-only here too.
+    let clear = url.starts_with("http://");
+    // Decided **before** the policy verdict, because that is where the proxy decides it: an
+    // IP-literal CONNECT is answered `403 ip-literal` ahead of the allowlist entirely, so a
+    // rule allowing the address made this command print ALLOWED for a request the wire
+    // refuses — the one answer a tester exists to prevent.
+    if refused_as_ip_literal(&host, clear, &effective.l4_decision(&host, port)) {
+        o.push_str(&render_ip_literal_refusal(url, &host, port, pal));
+        return Ok(o);
+    }
+    let decision = if clear {
+        effective.explain_clear(&host, port, &path, method)
+    } else {
+        effective.explain(&host, port, &path, method)
+    };
+    // Tag a request allowed *only* by the built-in set (not the user's own
+    // rules), so "why does this pass — I never allowed it?" is answerable. The union adds
+    // only allow rules, so an effective `AllowedBy` the user policy does not also allow can
+    // only be the built-in set. Discriminate on the user verdict's own variant (definitely
+    // "the user allowed it") rather than a separate predicate. The `clear` question is
+    // decided through the same `explain_clear`, so the tag matches the wire (the built-in set
+    // is all `https://` hosts, so a cleartext allow is always the user's own).
+    let user_decision = if clear {
+        user.explain_clear(&host, port, &path, method)
+    } else {
+        user.explain(&host, port, &path, method)
+    };
+    let user_allowed = matches!(
+        user_decision,
+        allowlist::Decision::AllowedBy(_) | allowlist::Decision::AllowedDefault
+    );
+    let builtin = matches!(decision, allowlist::Decision::AllowedBy(_)) && !user_allowed;
+    // The policy verdict is only half of what the wire does: the proxy resolves the host and
+    // runs the address guard before connecting. Replay that guard here so the tester does not
+    // promise a pass the proxy refuses. On an **IP literal** the answer is exact and needs no
+    // resolution, so it replaces the verdict — which on this path means a cleartext one,
+    // since an inspected IP literal was already answered `ip-literal` above; on a **name**
+    // the tester resolves nothing (no network), so it can only note the condition, and only
+    // when the deciding rule does not name the host exactly (the one shape the guard admits
+    // for a private address).
+    let deciding = match &decision {
+        allowlist::Decision::AllowedBy(rule) => Some(*rule),
+        _ => None,
+    };
+    let allowed = matches!(
+        decision,
+        allowlist::Decision::AllowedBy(_) | allowlist::Decision::AllowedDefault
+    );
+    if allowed && let Some(refusal) = literal_addr_refusal(&host, deciding) {
+        let by = match deciding {
+            Some(rule) => format!("the policy allows it (allow rule: {rule})"),
+            None => "the policy allows it (allow-by-default)".to_string(),
+        };
+        o.push_str(&render_addr_refusal(url, &by, &refusal, pal));
+        return Ok(o);
+    }
+    o.push_str(&render_net_decision(url, &decision, builtin, pal));
+    if allowed
+        && host.parse::<std::net::IpAddr>().is_err()
+        && !sandbox::names_exact_host(&host, deciding)
+    {
+        o.push_str(&render_private_name_note(pal));
+    }
+    // The policy permitting an inspected request is not the same as the cage being able to
+    // make it: a loopback host is exempt from the cage's proxy and gets no in-cage listener,
+    // so nothing inside takes this rule. Said here because this command is what an author
+    // checks before concluding the host's loopback is unreachable.
+    if allowed && sandbox::egress::proxy_exempt(&host) {
+        o.push_str(&render_loopback_note(&host, port, pal));
+    }
+    // On an allowed request, surface any credential the proxy would inject for this exact
+    // destination — by header and source locator only, never the value, and with no I/O. A
+    // **cleartext** (`http://`) request never receives an injection (a bearer is not sent in
+    // the clear — the proxy skips injection wholesale), so no note is shown for it.
+    if !clear && allowed {
+        for secret in secrets {
+            if allowlist::rule_matches(&secret.to, &host, port, &path) {
+                o.push_str(&render_injection_note(secret, pal));
+            }
+        }
+    }
+    Ok(o)
 }
 
 /// Render an egress allowlist decision — a pure presenter (so its colored layout is asserted in a
@@ -710,6 +734,53 @@ mod tests {
              inspected path (`ip-literal`): there is no hostname to mint a certificate for, \
              whatever the policy says. Declare `tcp://10.0.0.5:443` to reach the address raw, or \
              name the host\n"
+        );
+    }
+    /// The refusal above is only worth having if the command consults it. The reported defect was
+    /// `sbx test net https://10.0.0.5/v1` printing ALLOWED, because the policy verdict was rendered
+    /// first and a rule naming the address answered it; the proxy refuses that request with
+    /// `ip-literal` before it ever reads the allowlist. This asserts the whole rendered answer, so
+    /// dropping the pre-check from the verdict path is caught, not only a weakened predicate.
+    #[test]
+    fn the_verdict_answers_an_ip_literal_before_the_policy_speaks() {
+        let p = style::Palette::plain();
+        // A policy that plainly allows the address on the inspected plane, and a name beside it.
+        let policy = allowlist::EgressPolicy::new(
+            vec![
+                allowlist::classify("10.0.0.5").unwrap(),
+                allowlist::classify("api.example.com").unwrap(),
+            ],
+            Vec::new(),
+        );
+        let out = render_url_verdict("https://10.0.0.5/v1", &policy, &policy, "GET", &[], &p)
+            .expect("an IP-literal host is a URL this command parses");
+        assert!(
+            out.starts_with("DENIED   https://10.0.0.5/v1\n"),
+            "the verdict for an inspected IP literal is the wire's, whatever the rules say: {out}"
+        );
+        assert!(
+            out.contains("`ip-literal`"),
+            "the reason names the token the proxy answers and logs: {out}"
+        );
+        assert!(
+            !out.contains("ALLOWED"),
+            "an allow rule for the address must not reach the reader as a green light: {out}"
+        );
+
+        // The guard is not "refuse every literal, and never mind the rest": a name the same policy
+        // allows still reads ALLOWED.
+        let named = render_url_verdict(
+            "https://api.example.com/v1",
+            &policy,
+            &policy,
+            "GET",
+            &[],
+            &p,
+        )
+        .expect("a named host parses");
+        assert!(
+            named.starts_with("ALLOWED  https://api.example.com/v1\n"),
+            "an allowed name is unaffected by the IP-literal pre-check: {named}"
         );
     }
 

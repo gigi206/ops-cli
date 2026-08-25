@@ -1997,13 +1997,21 @@ mod suggestion_tests {
     /// `:8443` the suggestion `sbx net allow api.test` wrote a rule that changed nothing observable
     /// — the retry was refused again, by the policy the user had just been told to fix.
     ///
-    /// Teeth: drop the port from the token again and the `8443`/`8080` rows classify to a 443 rule,
-    /// so `explain` answers `DeniedDefault` and the first assertion fails naming the port.
+    /// The assertion runs on the sentence [`PolicyRefusal::message`] actually prints, not on the
+    /// token helper beside it: the defect was the refusal arm passing the bare host, so a test that
+    /// only exercised the helper would pass with the bare host back in the body.
     #[test]
     fn a_denied_default_suggestion_admits_the_port_it_was_refused_on() {
+        let ctx = ProxyCtx::new(
+            Arc::new(Ca::ephemeral().unwrap()),
+            allowlist::EgressPolicy::new(Vec::new(), Vec::new()),
+        )
+        .unwrap();
+
         for port in [443u16, 8443, 8080] {
-            let token = inspected_rule_destination("api.test", port);
-            let rule = allowlist::classify(&token)
+            let body = PolicyRefusal::DeniedDefault.message(&ctx, "api.test", port, "GET");
+            let token = suggested_rule(&body);
+            let rule = allowlist::classify(token)
                 .unwrap_or_else(|e| panic!("`sbx net allow {token}` must be a valid rule: {e}"));
             let policy = allowlist::EgressPolicy::new(vec![rule], Vec::new());
             assert!(
@@ -2027,11 +2035,23 @@ mod suggestion_tests {
 
         // The 443 shorthand must survive, or this test could be "satisfied" by pinning every
         // suggestion to `host:port` and making the common refusal uglier for nothing.
-        assert_eq!(inspected_rule_destination("api.test", 443), "api.test");
         assert_eq!(
-            inspected_rule_destination("api.test", 8443),
+            suggested_rule(&PolicyRefusal::DeniedDefault.message(&ctx, "api.test", 443, "GET")),
+            "api.test"
+        );
+        assert_eq!(
+            suggested_rule(&PolicyRefusal::DeniedDefault.message(&ctx, "api.test", 8443, "GET")),
             "api.test:8443"
         );
+    }
+
+    /// The rule token a `denied-default` body offers: everything the printed `sbx net allow`
+    /// command names, which is what a reader pastes back into a shell.
+    fn suggested_rule(body: &str) -> &str {
+        body.split_once("sbx net allow ")
+            .unwrap_or_else(|| panic!("a denied-default body carries an allow suggestion: {body}"))
+            .1
+            .trim()
     }
 }
 
