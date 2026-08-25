@@ -171,7 +171,8 @@ pub(crate) use projects::{
 pub(crate) use projectstore::PROJECT_MARKER;
 pub(crate) use projectstore::{reflink_verdict, supports_reflink};
 pub(crate) use proxy::{
-    AddrRefusal, builtin_allow_rules, ip_refusal, names_exact_host, union_with_builtin,
+    AddrRefusal, builtin_allow_rules, header_name_eq, ip_refusal, names_exact_host,
+    union_with_builtin,
 };
 pub(crate) use search::run as search;
 pub(crate) use smoke::run as smoke;

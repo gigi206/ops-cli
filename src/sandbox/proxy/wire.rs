@@ -17,7 +17,7 @@ pub(super) fn head_expects_continue(head: &Head) -> bool {
 /// Whether two header names denote the same header for stripping: case-insensitive, and
 /// treating `_` and `-` as equivalent (some servers fold `X_API_KEY` onto `X-Api-Key`). So a
 /// client cannot dodge the strip-and-replace with an alternate spelling of a header sbx injects.
-pub(super) fn header_name_eq(a: &str, b: &str) -> bool {
+pub(crate) fn header_name_eq(a: &str, b: &str) -> bool {
     let norm = |s: &str| -> Vec<u8> {
         s.bytes()
             .map(|c| {

@@ -210,7 +210,19 @@ pub(super) fn validate(raw: RawSigner, name: &str) -> Result<SignerSpec, String>
     let sets_headers = check_header_list(raw.sets_headers, "sets_headers")?;
     for header in &sets_headers {
         let lowered = header.to_ascii_lowercase();
-        if NEVER_SET.contains(&lowered.as_str()) || lowered.starts_with(NEVER_SET_PREFIX) {
+        // Matched by the same rule the *injection* path strips by, not by exact text.
+        // `header_name_eq` folds `_` onto `-` precisely so a client cannot dodge a strip with an
+        // alternate spelling — but this guard compared exactly, so a manifest could: declaring
+        // `content_length` passed here, and then `reserialize_request` recognised it as
+        // `Content-Length` and dropped the client's real one, emitting the plugin's in its place.
+        // On the streaming path sbx adds no length of its own, so the upstream got a head with
+        // neither `Content-Length` nor `Transfer-Encoding` followed by a body — the CL/TE desync
+        // this list exists to prevent, on a connection then returned to the pool.
+        if NEVER_SET
+            .iter()
+            .any(|n| crate::sandbox::header_name_eq(n, &lowered))
+            || lowered.replace('_', "-").starts_with(NEVER_SET_PREFIX)
+        {
             return Err(format!(
                 "`sets_headers` names `{header}`, which moves or reframes the request rather than \
                  authenticating it — where a request goes, where it ends and what the connection \
@@ -259,9 +271,11 @@ fn check_header_list(headers: Vec<String>, field: &str) -> Result<Vec<String>, S
         }
         // Case-insensitively, because that is how the header is matched on the wire: two spellings
         // of one name are two declarations of one grant that a later edit can make disagree.
+        // Same rule again: `x-api-key` and `x_api_key` are one header to the injection path, so
+        // declaring both is one grant written twice, not two.
         if headers[..i]
             .iter()
-            .any(|prev| prev.eq_ignore_ascii_case(header))
+            .any(|prev| crate::sandbox::header_name_eq(prev, header))
         {
             return Err(format!(
                 "`{field}` names `{header}` twice — one header, one declaration"
@@ -317,6 +331,55 @@ pub(super) fn check_sandbox(grant: &super::SandboxGrant) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A manifest cannot name a forbidden header in a spelling the guard misses and the wire folds.
+    ///
+    /// `header_name_eq` treats `_` as `-` on the injection path — deliberately, so a *client*
+    /// cannot dodge a strip with an alternate spelling. This guard compared exactly, so a
+    /// *manifest* could: `content_length` passed validation, then `reserialize_request` recognised
+    /// it as `Content-Length`, dropped the client's real one and emitted the plugin's. The
+    /// streaming path adds no length of its own, so the upstream received a head with neither
+    /// `Content-Length` nor `Transfer-Encoding` and a body behind it — the CL/TE desync the list
+    /// exists to prevent, on a connection that then goes back to the pool.
+    #[test]
+    fn a_forbidden_header_cannot_be_smuggled_past_the_guard_with_an_underscore() {
+        for spelling in [
+            "content_length",
+            "Content_Length",
+            "transfer_encoding",
+            "proxy_authorization",
+            "PROXY_CONNECTION",
+        ] {
+            let raw = RawSigner {
+                sets_headers: vec![spelling.to_string()],
+                ..Default::default()
+            };
+            assert!(
+                validate(raw, "probe").is_err(),
+                "`{spelling}` was accepted, and the injection path reads it as the header it \
+                 spells"
+            );
+        }
+        // The ordinary case still works — this refuses a spelling, not the feature.
+        let ok = RawSigner {
+            sets_headers: vec!["authorization".to_string()],
+            ..Default::default()
+        };
+        assert!(validate(ok, "probe").is_ok());
+    }
+
+    /// Two spellings of one header are one declaration, by the same rule.
+    #[test]
+    fn one_header_declared_twice_under_two_spellings_is_refused() {
+        let raw = RawSigner {
+            sets_headers: vec!["x-api-key".to_string(), "x_api_key".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            validate(raw, "probe").is_err(),
+            "one header, two spellings, one grant — a later edit could make them disagree"
+        );
+    }
     use super::*;
 
     fn raw() -> RawSigner {

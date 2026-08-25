@@ -212,6 +212,10 @@ use ssrf::{checked_address, resolve_checked};
 use tunnel::{Turn, serve_tunneled_request};
 use websocket::*;
 use wire::*;
+// Re-exported crate-wide: the signer manifest validator has to refuse a header by the same rule the
+// injection path strips one by, or a manifest can name a spelling the guard does not recognise and
+// the injection does. See [`header_name_eq`]'s own doc for why `_` folds onto `-`.
+pub(crate) use wire::header_name_eq;
 
 /// Serve the egress proxy on `listener` (the host end of the cage's bound socket), one thread per
 /// connection. Each accepted stream gets the per-socket timeouts before it is handled, so a slow
