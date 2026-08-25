@@ -192,6 +192,12 @@ struct Inflater {
     state: Box<InflateState>,
     /// Whether the peer resets its window per message, in which case so must this.
     no_context_takeover: bool,
+    /// The budget [`Self::drain`] works to, from [`RESYNC_PLAINTEXT_CAP`].
+    ///
+    /// A field rather than the constant read straight from the function, so a test can reach the
+    /// give-up path — the one that reports a window it could not square — without inflating
+    /// sixty-four megabytes to get there. Production has exactly one value for it.
+    resync_cap: usize,
 }
 
 impl Inflater {
@@ -199,6 +205,7 @@ impl Inflater {
         Inflater {
             state: InflateState::new_boxed(DataFormat::Raw),
             no_context_takeover,
+            resync_cap: RESYNC_PLAINTEXT_CAP,
         }
     }
 
@@ -303,7 +310,7 @@ impl Inflater {
             }
             rest = &rest[res.bytes_consumed..];
             inflated = inflated.saturating_add(res.bytes_written);
-            if inflated > RESYNC_PLAINTEXT_CAP {
+            if inflated > self.resync_cap {
                 return false;
             }
             // Square only when the input is spent *and* the decoder stopped short of filling the
@@ -1343,19 +1350,56 @@ mod tests {
     }
 
     /// The companion to the test above, on the axis it cannot cover: when the remainder is too big
-    /// to inflate away ([`RESYNC_PLAINTEXT_CAP`]), the window stays out of step — and the direction
-    /// must then *stop*, which is what the two sibling bounds already do, rather than carry on
-    /// handing the scan whatever the desynced decoder produces.
+    /// to inflate away, the window stays out of step — and that must be *reported*, so the direction
+    /// stops rather than carrying on handing the scan whatever a desynced decoder produces.
+    ///
+    /// The resync budget is lowered for the test rather than the message being grown to sixty-four
+    /// megabytes, and the assertion is on `in_step` itself: a decode that merely failed would leave
+    /// this path unobserved while still looking green.
     #[test]
-    fn a_window_that_cannot_be_squared_stops_the_direction_instead_of_scanning_rubbish() {
+    fn a_window_that_cannot_be_squared_is_reported_as_out_of_step() {
+        use miniz_oxide::deflate::core::CompressorOxide;
+        let mut c = CompressorOxide::new(raw_deflate_flags());
+        let framed = deflated_message(&vec![b'a'; SCAN_MESSAGE_CAP + 64 * 1024], &mut c);
+        // Past the header, whichever length form it used — asserted rather than assumed, so a
+        // change in how well this payload compresses cannot quietly slice off the wrong bytes.
+        assert_eq!(framed[1], 126, "expected the two-byte length form");
+        let body = &framed[4..];
+
         let mut inflater = Inflater::new(false);
-        // A truncated stream: the decoder cannot finish it, so the window is left mid-message.
-        let short = [0x00u8, 0x01, 0x02];
+        inflater.resync_cap = 1024; // far below the ~64 KiB left after the cap
+        let got = inflater
+            .message(body, SCAN_MESSAGE_CAP)
+            .expect("the message decodes as far as the cap");
+        assert_eq!(
+            got.plain.len(),
+            SCAN_MESSAGE_CAP + 1,
+            "the overflow path is the one under test, so the cap must be what stopped it"
+        );
         assert!(
-            inflater
-                .message(&short, SCAN_MESSAGE_CAP)
-                .is_none_or(|i| !i.in_step),
-            "a message that cannot be inflated whole must never be reported as in step"
+            !got.in_step,
+            "a window the drain gave up on must be reported out of step, or the direction carries \
+             on scanning rubbish and reporting nothing"
+        );
+    }
+
+    /// And the tee acts on that report: the direction stops, which is what the compressed budget and
+    /// a failed decode already do. Without this the flag could be set and ignored.
+    #[test]
+    fn a_direction_whose_window_cannot_be_squared_stops() {
+        use miniz_oxide::deflate::core::CompressorOxide;
+        let mut c = CompressorOxide::new(raw_deflate_flags());
+        let overflowing = deflated_message(&vec![b'a'; SCAN_MESSAGE_CAP + 64 * 1024], &mut c);
+
+        let mut t = scanning_tee(&[needle()], Some(false));
+        t.inflater
+            .as_mut()
+            .expect("a deflate direction has an inflater")
+            .resync_cap = 1024;
+        t.push(&overflowing);
+        assert!(
+            t.done,
+            "a direction holding a window it could not square must stop, not keep scanning"
         );
     }
 
