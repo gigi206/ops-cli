@@ -672,7 +672,22 @@ fn supervise(listener: UnixListener, stop: &AtomicBool, cx: &Deciding<'_>) {
     };
     drop(listener); // one handoff only; the agent cannot connect a second fd
     recv_loop(notif_fd, stop, cx);
-    // SAFETY: notif_fd is our owned descriptor from recv_fd; closed exactly once here.
+    close_supervision(notif_fd, cx.pending);
+}
+
+/// End supervision: deny everything still parked, then close the notification descriptor.
+///
+/// The order is the whole of it. A parked entry holds the descriptor it will be answered through,
+/// and the loop can return with entries still in the registry — on stop, or when the cage's filter
+/// goes away with a decision outstanding. Closing first would leave those entries holding a
+/// descriptor that no longer exists, so a later `sbx proc allow <id>` would `ioctl` a number the
+/// process may since have reissued to something else. Draining first also means a target parked at
+/// teardown gets a verdict from sbx rather than none: `deny`, the same answer the idle sweep gives
+/// a decision that ran out of time, and the only fail-closed one.
+fn close_supervision(notif_fd: libc::c_int, pending: &PendingExec) {
+    pending.answer_all(false);
+    // SAFETY: notif_fd is our owned descriptor from recv_fd; closed exactly once here, and after
+    // the last entry that could have answered through it is gone.
     unsafe { libc::close(notif_fd) };
 }
 
@@ -2645,6 +2660,43 @@ mod open_path_tests {
             "the same receive loop carries `execve`, which must fall through to the exec policy              rather than be read as a path to scan"
         );
         assert_eq!(open_args(libc::SYS_read as libc::c_int, &args), None);
+    }
+
+    #[test]
+    fn ending_supervision_denies_what_is_still_parked_before_closing_their_descriptor() {
+        // A parked entry holds the descriptor it will be answered through, and the receive loop can
+        // return with entries still registered — on stop, or when the cage's filter goes away with
+        // a decision outstanding. Closing first left those entries pointing at a number the process
+        // may since have reissued, and left a target parked at teardown with no verdict from sbx at
+        // all. Draining first is the fail-closed order.
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a live two-element array, which is what `pipe` fills.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "the pipe opens");
+        let (read_end, write_end) = (fds[0], fds[1]);
+
+        let pending = PendingExec::new();
+        pending.park(read_end, 1, 4242, "/bin/ls");
+        pending.park(read_end, 2, 4243, "/bin/cat");
+        assert_eq!(pending.list().len(), 2, "both parks are registered");
+
+        // Answering a pipe is not answering a seccomp listener: `notif_id_valid` refuses it, so no
+        // response is written. What is under test is the registry being emptied, and the descriptor
+        // being closed only after it is.
+        close_supervision(read_end, &pending);
+        assert!(
+            pending.list().is_empty(),
+            "nothing may outlive the descriptor it answers through: {:?}",
+            pending.list()
+        );
+
+        // SAFETY: both are this test's own descriptors. The first close proves `close_supervision`
+        // already closed the read end; the second releases the write end.
+        assert_eq!(
+            unsafe { libc::close(read_end) },
+            -1,
+            "the descriptor was closed by the teardown"
+        );
+        unsafe { libc::close(write_end) };
     }
 
     /// The parked registry is the third producer on the line-based control wire that
