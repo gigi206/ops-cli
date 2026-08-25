@@ -557,7 +557,22 @@ fn parse_valid_until(stamp: &str) -> Option<u64> {
     if time.next().is_some() || fields.next()? != "UTC" || fields.next().is_some() {
         return None;
     }
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || (h, m, sec) >= (24, 60, 60) {
+    // Each field on its own. `(h, m, sec) >= (24, 60, 60)` is a *lexicographic* comparison: the
+    // hour decides it, so `23:99:99` passed and the minutes and seconds were bounded only by `u64`
+    // — enough for the arithmetic below to overflow on a stamp a repository chose.
+    //
+    // The year is bounded too, and that is the same defect at the other end: the arithmetic is
+    // unsigned and subtracts (`year - 1` for January, `days - 719_468` for the epoch), so anything
+    // before 1970 wrapped rather than parsed, and `0000` underflowed on the first line. There is no
+    // apt release older than the epoch, and a wrapped stamp reads as valid for half a million
+    // years, which is exactly the direction a staleness check must not fail in.
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(1970..=9999).contains(&year)
+        || h > 23
+        || m > 59
+        || sec > 59
+    {
         return None;
     }
     // Days from the civil epoch, by the shift-the-year-to-March algorithm: it makes the leap day the
@@ -1593,5 +1608,45 @@ Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
         assert!(!expired_at("whenever", u64::MAX));
         assert!(!expired_at("Tue, 25 Foo 2026 23:37:43 UTC", u64::MAX));
         assert!(valid_until("Origin: demo\n").is_none());
+    }
+
+    /// Every field of the stamp is bounded on its own, because the arithmetic that follows is
+    /// unsigned and this string comes from a remote repository.
+    ///
+    /// The hour, minute and second were compared as one tuple, which is a *lexicographic* test: the
+    /// hour decided it, so `23:99:99` passed and the two remaining fields were bounded only by
+    /// `u64` — enough to overflow the seconds-since-epoch sum. The year had the mirror image of the
+    /// same problem: the arithmetic subtracts, so anything before 1970 wrapped instead of parsing,
+    /// and a January date in year zero underflowed on the first line of it.
+    ///
+    /// A wrapped stamp reads as valid for half a million years, which is the direction a staleness
+    /// check must not fail in.
+    #[test]
+    fn a_stamp_the_arithmetic_cannot_express_is_unreadable_rather_than_wrapped() {
+        for bad in [
+            // The lexicographic hole: an hour under 24 let anything through beside it.
+            "Tue, 25 Aug 2026 23:99:99 UTC",
+            "Tue, 25 Aug 2026 23:60:00 UTC",
+            "Tue, 25 Aug 2026 23:00:60 UTC",
+            "Tue, 25 Aug 2026 00:18446744073709551615:00 UTC",
+            // Before the epoch, which the unsigned subtraction cannot express.
+            "Wed, 31 Dec 1969 23:59:59 UTC",
+            "Mon, 01 Jan 1900 00:00:00 UTC",
+            // January in year zero, where `year - 1` underflows before anything else runs.
+            "Sat, 01 Jan 0000 00:00:00 UTC",
+            "Sat, 01 Feb 0000 00:00:00 UTC",
+        ] {
+            assert_eq!(
+                parse_valid_until(bad),
+                None,
+                "`{bad}` must be unreadable, not arithmetic"
+            );
+            // And an unreadable stamp is not expired, on the rule the neighbouring test states.
+            assert!(!expired_at(bad, u64::MAX));
+        }
+
+        // The boundaries themselves still parse.
+        assert_eq!(parse_valid_until("Thu, 01 Jan 1970 00:00:00 UTC"), Some(0));
+        assert!(parse_valid_until("Tue, 25 Aug 2026 23:59:59 UTC").is_some());
     }
 }
