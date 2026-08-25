@@ -237,10 +237,30 @@ impl Methods {
     /// `{*,WS}` reads as "all HTTP methods **and** WebSocket" in one rule — the ergonomic form of an
     /// all-verbs host that also needs the WS capability. `*` never matches the `WS` pseudo-verb (that
     /// still needs an explicit `WS`), so `{*}`-widening a host and `WS`-opting it stay separate choices.
+    /// This is the **allow** side's question, and the `WS` carve-out belongs only to it. See
+    /// [`Self::admits_deny`] for why asking it of a deny rule inverts what it is for.
     fn admits(&self, method: &str) -> bool {
         if method == "WS" {
             return matches!(self, Methods::Only(ms) if ms.iter().any(|m| m == "WS"));
         }
+        self.admits_deny(method)
+    }
+
+    /// Whether this method set admits `method` when the rule is a **deny**.
+    ///
+    /// A deny is broad by construction: [`EgressPolicy::apply_default_methods`] leaves deny rules alone precisely
+    /// because "a deny stays broad — narrowing it would weaken it". The `WS` opt-in above exists to
+    /// stop an *allowance* handing out a capability nobody asked for, so reading it here does the
+    /// exact opposite of its purpose — it narrows every deny an operator can write, against the one
+    /// capability the code elsewhere calls a distinct, unredactable, bidirectional channel.
+    ///
+    /// It was one function serving both lists, so a bare `deny host`, a `deny host:*`, an explicit
+    /// `{*} deny` and every `{VERB}` deny not literally naming `WS` all failed to match a WebSocket
+    /// — and the cage picks whether its request is judged as `GET` or as `WS`, by sending the
+    /// upgrade headers `tunnel.rs` reads. So the verb that dodged the deny list was the caller's to
+    /// choose. Here `*` means every verb, `WS` included: on a deny there is no second choice to keep
+    /// separate.
+    fn admits_deny(&self, method: &str) -> bool {
         match self {
             Methods::Unspecified | Methods::Any => true,
             Methods::Only(ms) => ms.iter().any(|m| m == method || m == "*"),
@@ -430,6 +450,12 @@ impl Rule {
     /// injection, live `ask`-session rules) go straight through [`RuleKind::matches`] instead.
     fn matches(&self, req: &Request, method: &str) -> bool {
         self.methods.admits(method) && self.kind.matches(req)
+    }
+
+    /// [`Self::matches`] as a **deny** rule asks it: same kind matcher, but the method set read
+    /// broadly ([`Methods::admits_deny`]) rather than through the allow side's `WS` opt-in.
+    fn matches_deny(&self, req: &Request, method: &str) -> bool {
+        self.methods.admits_deny(method) && self.kind.matches(req)
     }
 
     /// Whether this rule silences a denied request's log line for `method` — the `mute` match. Like
@@ -1404,7 +1430,7 @@ impl EgressPolicy {
         if let Some(rule) = self
             .deny
             .iter()
-            .find(|r| r.layer == Layer::L7 && r.matches(&req, &method))
+            .find(|r| r.layer == Layer::L7 && r.matches_deny(&req, &method))
         {
             return Decision::DeniedBy(rule);
         }
@@ -1414,6 +1440,20 @@ impl EgressPolicy {
             .find(|r| r.layer == Layer::L7 && r.matches(&req, &method))
         {
             return Decision::AllowedBy(rule);
+        }
+        // A WebSocket never reaches the default action. The opt-in is a statement about the
+        // capability, not about one posture: a `{WS}` rule is the only thing that opens one, which is
+        // what [`Methods::admits`] says and what the tunnel's own comment tells the reader. Left to
+        // fall through, a denylist (`mode = "allow"`) granted a WebSocket to every host with no rule
+        // naming it — and, with the deny side then unable to match one either, no rule an operator
+        // could write would stop it. `ask` was worse than permissive: it *parked* a WebSocket to an
+        // explicitly denied host for a person to answer, where [`DefaultAction::Ask`] promises deny
+        // rules still auto-fail.
+        //
+        // This is the shape the other two planes already have — the cleartext verdict and the raw
+        // splice are opt-in, and neither consults the default either.
+        if method == "WS" {
+            return Decision::DeniedDefault;
         }
         match self.default_action {
             DefaultAction::Deny => Decision::DeniedDefault,
@@ -1697,6 +1737,118 @@ mod tests {
 
     fn rule(s: &str) -> Rule {
         classify(s).unwrap_or_else(|e| panic!("classify({s:?}) failed: {e}"))
+    }
+
+    /// A deny rule refuses a WebSocket like it refuses anything else.
+    ///
+    /// The `WS` opt-in exists so an *allowance* cannot hand out a capability nobody asked for. It
+    /// was asked of deny rules too, where it does the opposite: it narrowed every deny an operator
+    /// can write against the one capability the tunnel calls distinct, unredactable and
+    /// bidirectional. And the cage chooses which question is asked — `tunnel.rs` reads the verb as
+    /// `WS` precisely because the request carried the upgrade headers the cage put there — so the
+    /// verb that dodged the deny list was the caller's to pick.
+    #[test]
+    fn a_deny_refuses_a_websocket_however_the_deny_is_spelled() {
+        for spelling in [
+            "evil.com",
+            "evil.com:*",
+            "{*} evil.com",
+            "{GET,WS} evil.com",
+        ] {
+            let p = EgressPolicy::new(vec![rule("{*,WS} evil.com")], vec![rule(spelling)]);
+            assert!(
+                matches!(
+                    p.explain("evil.com", 443, "/ws", "WS"),
+                    Decision::DeniedBy(_)
+                ),
+                "`deny {spelling}` did not refuse a WebSocket"
+            );
+        }
+        // A deny the operator scoped to particular verbs stays scoped — `{GET}` denies GET, and a
+        // WebSocket is not a GET. Breadth is for the deny that names no verbs; this is the other
+        // half of the same rule, and getting it wrong in this direction would make every
+        // method-scoped deny secretly total.
+        let scoped = EgressPolicy::new(vec![rule("{*,WS} evil.com")], vec![rule("{GET} evil.com")]);
+        assert!(
+            matches!(
+                scoped.explain("evil.com", 443, "/ws", "WS"),
+                Decision::AllowedBy(_)
+            ),
+            "a `{{GET}}`-scoped deny must not reach a WebSocket"
+        );
+        assert!(
+            matches!(
+                scoped.explain("evil.com", 443, "/ws", "GET"),
+                Decision::DeniedBy(_)
+            ),
+            "...while still denying the verb it names"
+        );
+        // The path-scoped case, which is the one an operator reaches for: the host is granted WS,
+        // one path is carved out, and the carve-out has to hold for a WS as it does for a GET.
+        let p = EgressPolicy::new(
+            vec![rule("{*,WS} api.example.com")],
+            vec![rule("api.example.com/admin/*")],
+        );
+        assert!(
+            matches!(
+                p.explain("api.example.com", 443, "/admin/x", "GET"),
+                Decision::DeniedBy(_)
+            ),
+            "the control: a GET to the denied path is refused"
+        );
+        assert!(
+            matches!(
+                p.explain("api.example.com", 443, "/admin/x", "WS"),
+                Decision::DeniedBy(_)
+            ),
+            "a WebSocket reached a path the operator denied"
+        );
+        // And the grant still works where nothing denies it, so this did not just refuse everything.
+        assert!(
+            matches!(
+                p.explain("api.example.com", 443, "/feed", "WS"),
+                Decision::AllowedBy(_)
+            ),
+            "the `{{WS}}` grant must still open a WebSocket off the denied path"
+        );
+    }
+
+    /// The `{WS}` grant is the only thing that opens a WebSocket, in **every** posture.
+    ///
+    /// The opt-in is a statement about the capability, not about deny-by-default. Reaching the
+    /// default action, a denylist granted a WebSocket to every host with no rule naming one, and
+    /// `ask` parked a WebSocket to an explicitly denied host for a person to answer — where
+    /// `DefaultAction::Ask` promises deny rules still auto-fail.
+    #[test]
+    fn no_posture_opens_a_websocket_without_a_rule_naming_it() {
+        for action in [
+            DefaultAction::Allow,
+            DefaultAction::Ask,
+            DefaultAction::Deny,
+        ] {
+            let bare = EgressPolicy::new(vec![], vec![]).with_default(action);
+            assert!(
+                matches!(
+                    bare.explain("anywhere.example", 443, "/ws", "WS"),
+                    Decision::DeniedDefault
+                ),
+                "{action:?} opened a WebSocket with no rule naming one"
+            );
+            let denied = EgressPolicy::new(vec![], vec![rule("evil.com:*")]).with_default(action);
+            assert!(
+                !matches!(
+                    denied.explain("evil.com", 443, "/ws", "WS"),
+                    Decision::AllowedDefault | Decision::Ask
+                ),
+                "{action:?} let a WebSocket to an explicitly denied host through"
+            );
+        }
+        // An ordinary verb still follows its posture — this narrowed `WS`, nothing else.
+        let open = EgressPolicy::new(vec![], vec![]).with_default(DefaultAction::Allow);
+        assert!(matches!(
+            open.explain("anywhere.example", 443, "/", "GET"),
+            Decision::AllowedDefault
+        ));
     }
 
     /// A policy carrying every setting a layer can set, for the comparison below to have something
