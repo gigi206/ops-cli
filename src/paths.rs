@@ -143,6 +143,42 @@ const DATA_ENTRIES: &[Entry] = &[
         enumerate: Enumerate::None,
     },
     Entry {
+        label: "fs/",
+        rel: "fs",
+        desc: "per-launch filesystem-observation sockets",
+        enumerate: Enumerate::None,
+    },
+    Entry {
+        label: "tasks/",
+        rel: "tasks",
+        desc: "per-launch declared-operation sockets (one directory per session)",
+        enumerate: Enumerate::None,
+    },
+    Entry {
+        label: "broker/",
+        rel: "broker",
+        desc: "per-launch broker-plugin sockets and their record",
+        enumerate: Enumerate::None,
+    },
+    Entry {
+        label: "signer/",
+        rel: "signer",
+        desc: "per-launch signer-plugin record sockets",
+        enumerate: Enumerate::None,
+    },
+    Entry {
+        label: "ssh-agent/",
+        rel: "ssh-agent",
+        desc: "per-launch ssh-agent fence sockets and their record",
+        enumerate: Enumerate::None,
+    },
+    Entry {
+        label: "mise-stage/",
+        rel: "mise-stage",
+        desc: "staging area for a mise engine being provisioned",
+        enumerate: Enumerate::None,
+    },
+    Entry {
         label: "logs/",
         rel: "logs",
         desc: "detached sessions' output, read by `sbx session logs`",
@@ -432,7 +468,14 @@ fn enumerate(
                 }),
                 Enumerate::Profiles if path.is_file() && name.ends_with(".toml") => {
                     Some(ChildView {
-                        name: name.trim_end_matches(".toml").to_string(),
+                        // One suffix, not every trailing one: an app may be named `x.toml`, whose
+                        // profile is `x.toml.toml`, and `trim_end_matches` ate both — so `sbx path`
+                        // called it `x` while every other listing (which reads the file stem) called
+                        // it `x.toml`.
+                        name: name
+                            .strip_suffix(".toml")
+                            .unwrap_or(name.as_str())
+                            .to_string(),
                         path,
                         state: None,
                         last_used: None,
@@ -608,6 +651,78 @@ pub(crate) fn render(view: &PathView, pal: &crate::style::Palette) -> String {
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
+
+    /// "It lists **every directory sbx owns**" is this module's own claim, and the way it broke
+    /// each time was a directory added elsewhere and not added to the table — nothing failed, the
+    /// overview simply stopped being one. Six were missing: the four control-socket directories the
+    /// lenses and the plugin fences bind under, the per-session task directory, and the mise
+    /// engine's staging area.
+    ///
+    /// Each is asked of the module that owns it, so this cannot pass by repeating a string: if a
+    /// lens moves its directory, the table has to move with it.
+    #[test]
+    fn every_directory_a_launch_binds_under_is_in_the_table() {
+        let data = Path::new("/data/sbx");
+        let parent_of = |p: PathBuf| p.parent().expect("a socket has a directory").to_path_buf();
+        let owned: Vec<PathBuf> = vec![
+            crate::sandbox::fs_control::fs_control_dir(data),
+            crate::sandbox::proc_control::proc_control_dir(data),
+            crate::sandbox::task_control::task_dir(data, 1),
+            parent_of(crate::sandbox::broker_control::broker_control_socket(
+                data, 1,
+            )),
+            parent_of(crate::sandbox::signer_control::signer_control_socket(
+                data, 1,
+            )),
+            parent_of(crate::sandbox::sshagent_control::agent_control_socket(
+                data, 1,
+            )),
+        ];
+        for dir in owned {
+            let rel = dir
+                .strip_prefix(data)
+                .unwrap_or_else(|_| panic!("{dir:?} is not under the data directory"))
+                .components()
+                .next()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .expect("a first component");
+            assert!(
+                DATA_ENTRIES.iter().any(|e| e.rel == rel),
+                "`{rel}/` is a directory sbx binds under and the overview does not list it"
+            );
+        }
+    }
+
+    /// One suffix is stripped, not every trailing one. An app may be named `x.toml`, whose profile
+    /// file is `x.toml.toml`: `trim_end_matches` ate both, so this overview called it `x` while
+    /// every other listing (which reads the file stem) called it `x.toml`.
+    #[test]
+    fn a_profile_whose_app_name_ends_in_toml_keeps_it() {
+        let data = TmpDir::new();
+        let cfg = TmpDir::new();
+        let state = TmpDir::new();
+        std::fs::create_dir_all(cfg.path().join("apps")).unwrap();
+        std::fs::write(cfg.path().join("apps").join("x.toml.toml"), "").unwrap();
+        std::fs::write(cfg.path().join("apps").join("plain.toml"), "").unwrap();
+
+        let v = view_with_roots(
+            Some(data.path().to_path_buf()),
+            Some(cfg.path().to_path_buf()),
+            Some(state.path().to_path_buf()),
+        );
+        let names: Vec<&str> = v
+            .bases
+            .iter()
+            .flat_map(|b| b.entries.iter())
+            .flat_map(|e| e.children.iter())
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"x.toml"),
+            "the app's own name ends in `.toml`: {names:?}"
+        );
+        assert!(names.contains(&"plain"), "{names:?}");
+    }
 
     /// The view must be serializable to a valid JSON document — the `--json`
     /// contract a script relies on. Exercises every base and an enumerated child.
