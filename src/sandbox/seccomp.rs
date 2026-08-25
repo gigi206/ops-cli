@@ -101,9 +101,22 @@ fn arg0_has_flag(flag: u64) -> SeccompRule {
 }
 
 /// Match an `ioctl` whose request (arg1) equals `request`.
+///
+/// Compared as a **`Dword`**, and that is the whole of this guard. `ioctl` is
+/// `SYSCALL_DEFINE3(ioctl, unsigned int fd, unsigned int cmd, unsigned long arg)`: the kernel takes
+/// `cmd` as a 32-bit `unsigned int` and drops whatever rode in the top half of the register. A
+/// filter comparing the register's full 64 bits therefore answers a different question from the one
+/// the kernel goes on to act on, and `ioctl(fd, 0x1_0000_5412, …)` walks past a `Qword` equality
+/// against `0x5412` into a kernel that reads it as `TIOCSTI` and injects into the terminal — the
+/// exact escape [`TIOCSTI`] is on this list to close. Every high bit is a fresh spelling, so there
+/// is no enumerating them: the comparison has to be the width the kernel uses.
+///
+/// The masked flag rules beside this one ([`arg0_has_flag`]) are not exposed the same way — a
+/// `MaskedEq` looks only at the bits in its mask, so setting others changes nothing — and `clone`
+/// does take a 64-bit `flags`, which is why they stay `Qword`.
 fn arg1_is(request: u64) -> SeccompRule {
     SeccompRule::new(vec![
-        SeccompCondition::new(1, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, request)
+        SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, request)
             .expect("a constant condition is valid"),
     ])
     .expect("a single-condition rule is valid")
@@ -1154,6 +1167,67 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         Some(stdout)
+    }
+
+    /// The `ioctl` request comparison must be the width the kernel uses, not the width of the
+    /// register — and this proves it against the running kernel rather than against the emitted BPF.
+    ///
+    /// `ioctl` takes `cmd` as an `unsigned int`, so the top half of the register is dropped before
+    /// the kernel acts on it. A `Qword` equality against `0x5412` therefore let
+    /// `ioctl(fd, 0x1_0000_5412, …)` past the filter into a kernel that read it as `TIOCSTI` and
+    /// injected into the terminal: EPERM for the plain spelling, ENOTTY (the tty layer answering, so
+    /// the call had *arrived*) for the high-bit one. Every high bit is another spelling, so this is
+    /// asserted on more than one of them.
+    ///
+    /// Installed in a forked child because a filter cannot be taken off a live process, and directly
+    /// rather than through a cage so it runs on any host — no bwrap, no user namespaces.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_denied_ioctl_request_stays_denied_with_the_high_half_set() {
+        // Answered through the exit status: EPERM is 1, and any other errno means the syscall
+        // reached the kernel. 0 says every spelling was refused.
+        const REFUSED_ALL: i32 = 0;
+        let requests = [
+            TIOCSTI,
+            TIOCSTI | 0x1_0000_0000,
+            TIOCSTI | 0xffff_ffff_0000_0000,
+            TIOCLINUX | 0x1_0000_0000,
+        ];
+        // SAFETY: the child does no allocation between `fork` and `_exit` beyond the filter bytes it
+        // was handed before forking, and the parent only waits for it.
+        let filters = filter_bytes(&SeccompPolicy::default());
+        let status = unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    libc::_exit(90);
+                }
+                if !install_filters(&filters) {
+                    libc::_exit(91);
+                }
+                for (i, req) in requests.iter().enumerate() {
+                    *libc::__errno_location() = 0;
+                    libc::syscall(libc::SYS_ioctl, 0i64, *req as i64, 0i64);
+                    if *libc::__errno_location() != libc::EPERM {
+                        libc::_exit(i as i32 + 1);
+                    }
+                }
+                libc::_exit(REFUSED_ALL);
+            }
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+            libc::WEXITSTATUS(status)
+        };
+        assert_ne!(status, 90, "the child could not set no_new_privs");
+        assert_ne!(status, 91, "the child could not install the denylist");
+        assert_eq!(
+            status,
+            REFUSED_ALL,
+            "ioctl request {:#x} was not refused with EPERM — it reached the kernel, which reads \
+             `cmd` as 32 bits and would act on it as TIOCSTI/TIOCLINUX",
+            requests[(status as usize).saturating_sub(1).min(requests.len() - 1)]
+        );
     }
 
     /// End-to-end teeth: load the DEFAULT (mandatory) filters into a real cage and confirm the
