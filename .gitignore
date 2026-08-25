@@ -33,3 +33,9 @@ flake.lock
 docs-site/node_modules/
 docs-site/build/
 docs-site/.docusaurus/
+
+# Scratch git worktrees an agent session creates under `.claude/` to work on an isolated copy of
+# the tree. They are checkouts of this same repository, so a `git add -A` picks them up as embedded
+# repositories rather than as files — commit one and the history gains a gitlink pointing at a path
+# that will not exist. `.claude/settings.json` beside them is tracked and stays so.
+.claude/worktrees/
