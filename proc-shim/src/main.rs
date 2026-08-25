@@ -118,12 +118,12 @@ const OPEN_LENS_FLAG: &str = "open-lens";
 /// A syscall absent from the target's ABI is simply not in this list — `open` does not exist on
 /// aarch64, where `openat` is the only form.
 fn open_lens_syscalls() -> Vec<libc::c_long> {
-    let mut out = Vec::with_capacity(3);
-    #[cfg(target_arch = "x86_64")]
-    out.push(libc::SYS_open);
-    out.push(libc::SYS_openat);
-    out.push(libc::SYS_openat2);
-    out
+    vec![
+        #[cfg(target_arch = "x86_64")]
+        libc::SYS_open,
+        libc::SYS_openat,
+        libc::SYS_openat2,
+    ]
 }
 
 /// Install a `NEW_LISTENER` seccomp filter that notifies on `execve`/`execveat` — and, when
@@ -337,10 +337,7 @@ fn exec_payload(payload: &[OsString]) -> ! {
         exit::NOT_EXECUTABLE
     };
     fail(
-        &format!(
-            "cannot execute {}: {err}",
-            payload[0].to_string_lossy()
-        ),
+        &format!("cannot execute {}: {err}", payload[0].to_string_lossy()),
         code,
     )
 }

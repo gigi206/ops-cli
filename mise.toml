@@ -69,12 +69,20 @@ node                            = "24"
 # ============================================================================
 
 [tasks.fmt]
-description = "Check formatting (rustfmt)"
-run = "cargo fmt --check"
+description = "Check formatting (rustfmt) for sbx and for the in-cage shim"
+# `proc-shim/` is named separately because it is its own workspace root, deliberately: the shim runs
+# inside a cage and must inherit none of sbx's dependency graph. The cost of that isolation is that
+# no cargo invocation rooted here reaches it -- `--all` spans a workspace's members, and the shim is
+# not one. Its only gate was build.rs compiling it, which says nothing about formatting or lints, and
+# both had drifted by the time anyone looked.
+run = ["cargo fmt --check", "cargo fmt --manifest-path proc-shim/Cargo.toml --check"]
 
 [tasks.lint]
-description = "Run clippy over all targets, denying warnings"
-run = "cargo clippy --all-targets -- -D warnings"
+description = "Run clippy over all targets, denying warnings — sbx and the in-cage shim"
+run = [
+  "cargo clippy --all-targets -- -D warnings",
+  "cargo clippy --manifest-path proc-shim/Cargo.toml --all-targets -- -D warnings",
+]
 
 [tasks.rustdoc]
 description = "Build the crate's own rustdoc, denying warnings (a doc reference that resolves to nothing)"

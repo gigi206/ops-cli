@@ -56,6 +56,10 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all --check
+      # `proc-shim/` is its own workspace root, deliberately -- the in-cage shim must inherit none
+      # of sbx's dependency graph -- so `--all` does not reach it: that flag spans a workspace's
+      # members, and the shim is not one. Named here, or its only gate is build.rs compiling it.
+      - run: cargo fmt --manifest-path proc-shim/Cargo.toml --check
 
   clippy:
     name: clippy
@@ -68,6 +72,10 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo clippy --all-targets -- -D warnings
+      # The in-cage shim, for the reason the rustfmt job gives: its separate workspace root is what
+      # keeps sbx's dependencies out of a binary that runs inside a cage, and the same separation is
+      # what keeps every cargo invocation rooted here from ever looking at it.
+      - run: cargo clippy --manifest-path proc-shim/Cargo.toml --all-targets -- -D warnings
 
   rustdoc:
     name: rustdoc

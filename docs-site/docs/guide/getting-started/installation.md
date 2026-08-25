@@ -93,13 +93,18 @@ able to sandbox.
 Common tasks are wired through mise:
 
 ```sh
-mise run fmt             # cargo fmt --check
-mise run lint            # cargo clippy --all-targets -- -D warnings
+mise run fmt             # cargo fmt --check, for sbx and for proc-shim/
+mise run lint            # cargo clippy --all-targets -- -D warnings, for sbx and for proc-shim/
 mise run rustdoc         # cargo doc with -D warnings (catches a doc reference that resolves to nothing)
 mise run test            # cargo test --no-fail-fast (the whole suite; the sandbox e2e skip where the host cannot sandbox)
 mise run coverage        # cargo-llvm-cov coverage report (pass --html for a browsable report)
 mise run ci              # fmt + lint + rustdoc + test, as CI runs them
 ```
+
+`fmt` and `lint` name `proc-shim/` separately because it is its own workspace root: the
+in-cage exec shim must inherit none of sbx's dependency graph, and the cost of that
+isolation is that no cargo invocation rooted at the repository reaches it, since `--all`
+spans a workspace's members and the shim is not one.
 
 The self-contained build has its own pair of tasks:
 
