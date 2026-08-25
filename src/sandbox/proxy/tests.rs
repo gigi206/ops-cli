@@ -236,6 +236,18 @@ fn spawn_upstream_capturing(
         let _ = tx.send(head);
         let _ = tls.write_all(response);
         let _ = tls.flush();
+        // Read to the client's close before letting the socket go.
+        //
+        // Not politeness: the request body is still sitting unread (the head loop above stops at
+        // the blank line, and its `BufReader` is dropped with whatever it had). Closing a socket
+        // that holds unread received data makes Linux send an RST rather than a FIN, and an RST
+        // discards whatever this end had queued to send — including the response just written. It
+        // fires only when the response has not yet been delivered, which is why it surfaced as a
+        // test that failed once in tens of runs with the proxy reporting an upstream that closed
+        // without answering.
+        let _ = tls.sock.set_read_timeout(Some(Duration::from_secs(30)));
+        let mut rest = Vec::new();
+        let _ = tls.read_to_end(&mut rest);
     });
     (addr, ca_der, rx)
 }
@@ -2447,6 +2459,7 @@ fn a_one_request_leg_states_its_own_close_over_an_upstream_that_offered_reuse() 
         "the counter measures what crossed"
     );
 }
+
 /// The `down` byte total for `sbx net live` must equal what actually crossed to the cage — every
 /// head, not just the last one. An interim `1xx` is the case that could drift: it is relayed but
 /// then read past, so a counter placed only on the returned head would under-report it. Masking
@@ -3063,11 +3076,27 @@ fn spawn_upstream_that_resets_after_one(
                         return;
                     }
                     // Only the first connection is destroyed, so the retry has somewhere to go.
-                    // The wait lets the proxy finish relaying and park it: a reset arriving
-                    // before that is simply a connection the pool never accepts, which is not
-                    // the case under test.
+                    //
+                    // Two things have to be true before the reset, and each has its own wait. The
+                    // response above must reach the client: `SO_LINGER 0` discards whatever is
+                    // still in the send buffer, so a reset that raced it would fail the *first*
+                    // request rather than the second. And the next request must already be on the
+                    // wire: a reset that lands before it is written leaves a connection the pool's
+                    // checkout probe simply discards, which is a different branch from the one
+                    // these tests are about — the POST would go out on a fresh connection and be
+                    // answered instead of refused.
+                    //
+                    // The second wait is a *peek*, so it is a fact rather than a guess. A fixed
+                    // stretch of wall clock decides which branch runs by whichever of the proxy and
+                    // this thread the scheduler happens to reach first, and under a loaded suite it
+                    // decided the wrong way often enough to be seen.
                     if nth == 1 {
                         thread::sleep(Duration::from_millis(80));
+                        // A bound so a proxy that never sends again ends this thread rather than
+                        // holding it for the life of the run; the timeout lands on the same reset.
+                        let _ = tls.sock.set_read_timeout(Some(Duration::from_secs(30)));
+                        let mut next = [0u8; 1];
+                        let _ = tls.sock.peek(&mut next);
                         let linger = libc::linger {
                             l_onoff: 1,
                             l_linger: 0,
