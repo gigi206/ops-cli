@@ -881,7 +881,6 @@ const UNDOCUMENTED_MODULE_ITEMS: &[(&str, &str)] = &[
     ("cli/task.rs", "one_plane"),
     ("cli/task.rs", "resolve_named"),
     ("config/fspolicy.rs", "glob_walk"),
-    ("config/mod.rs", "warn_mise_nix_packages"),
     ("config/schema.rs", "NetworkField"),
     ("config/view.rs", "NetworkView"),
     ("main.rs", "main"),

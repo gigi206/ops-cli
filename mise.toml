@@ -125,7 +125,7 @@ for suite in attach completion config detach doctor fs netns plugins proc projec
 done
 # The unit tests too, and on a capable host they are not a formality: the guards that need a real
 # scope, a real bus or a real store skip everywhere else, so this is the only run where they have
-# teeth. `an_escaped_dollar_argument_reaches_the_program_verbatim` is the one that matters most --
+# teeth. `a_dollar_argument_reaches_the_program_verbatim` is the one that matters most --
 # it drives a throwaway scope and compares the arguments that arrive, so it measures the behaviour a
 # launch depends on rather than the version of the host it is running on.
 cargo test --bin sbx --no-fail-fast || rc=$?

@@ -1344,13 +1344,6 @@ fn override_fatal_error(fatal: Vec<String>, notes: Vec<String>) -> Vec<String> {
     errs
 }
 
-/// Warn about any `mise:nix:<pkg>` package. Routing `nix:` content through the mise backend pins the
-/// install record app-global (Lane-1 `mise use -g`, so a global app's declared `mise:` tool installs
-/// once and is shared) while the built store path is per-project — so the record and content misalign
-/// across projects, the same failure the per-project mise split fixes for `nix:`-via-mise self-equips.
-/// The fix is a plain `nix:<pkg>`, which is host-provisioned and seeded into each project's store,
-/// per-project-aligned by construction — so this warns rather than rerouting. Trusted-only: a withheld
-/// package never equips, so it stays silent. `source` prefixes the message (e.g. `` `app <name> ` ``).
 /// Answer the baseline credentials, split from [`apply_plugin_host_config`] so it can run **before**
 /// the posture clear.
 ///
@@ -1608,6 +1601,13 @@ fn declared_vars_of(grant: &crate::plugins::SandboxGrant) -> String {
     }
 }
 
+/// Warn about any `mise:nix:<pkg>` package. Routing `nix:` content through the mise backend pins the
+/// install record app-global (Lane-1 `mise use -g`, so a global app's declared `mise:` tool installs
+/// once and is shared) while the built store path is per-project — so the record and content misalign
+/// across projects, the same failure the per-project mise split fixes for `nix:`-via-mise self-equips.
+/// The fix is a plain `nix:<pkg>`, which is host-provisioned and seeded into each project's store,
+/// per-project-aligned by construction — so this warns rather than rerouting. Trusted-only: a withheld
+/// package never equips, so it stays silent. `source` prefixes the message (e.g. `` `app <name> ` ``).
 fn warn_mise_nix_packages(source: &str, packages: &[Package], warnings: &mut Vec<String>) {
     for pkg in packages {
         if pkg.state != TrustState::Trusted {

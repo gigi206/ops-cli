@@ -286,20 +286,37 @@ mod tests {
         // The proxy reads a boolean and `sbx test net` reads the reason; if they ever came from two
         // decisions the tester would mispredict exactly what it exists to predict. Pin them to the
         // same call across all three classes and both sides of the exact-host exception.
+        //
+        // Each case carries the verdict it *should* get, rather than asserting the boolean against
+        // `ip_refusal(..).is_none()`: `ip_permitted` is defined as exactly that expression, so
+        // comparing the two was a tautology that held whatever the classifier did — the shape of
+        // test that cannot fail. Spelling the answer out means a change to `classify_ip` or to the
+        // exact-host exception is caught here, and the two readings are still pinned together
+        // because both are asserted per case.
         let exact = allowlist::classify("10.0.0.5").unwrap();
         let wild = allowlist::classify("re:.*").unwrap();
-        for (ip, host, deciding) in [
-            ("93.184.216.34", "93.184.216.34", Some(&wild)),
-            ("10.0.0.5", "10.0.0.5", Some(&exact)),
-            ("10.0.0.5", "10.0.0.5", Some(&wild)),
-            ("127.0.0.1", "127.0.0.1", None),
-            ("169.254.169.254", "169.254.169.254", Some(&exact)),
+        for (ip, host, deciding, permitted) in [
+            // Public: reachable however the rule is written.
+            ("93.184.216.34", "93.184.216.34", Some(&exact), true),
+            ("93.184.216.34", "93.184.216.34", Some(&wild), true),
+            // Private: reachable only when the deciding rule names this exact host.
+            ("10.0.0.5", "10.0.0.5", Some(&exact), true),
+            ("10.0.0.5", "10.0.0.5", Some(&wild), false),
+            // No deciding rule at all (an allow-by-default verdict) is not an exact host either.
+            ("127.0.0.1", "127.0.0.1", None, false),
+            // Blocked: never reachable, even named exactly.
+            ("169.254.169.254", "169.254.169.254", Some(&exact), false),
         ] {
             let ip: IpAddr = ip.parse().unwrap();
             assert_eq!(
                 ip_permitted(ip, host, deciding),
+                permitted,
+                "the guard's boolean is wrong for {ip} via {deciding:?}"
+            );
+            assert_eq!(
                 ip_refusal(ip, host, deciding).is_none(),
-                "the two readings of the guard disagree on {ip} for {host}"
+                permitted,
+                "the reported reason disagrees with the boolean for {ip} via {deciding:?}"
             );
         }
         // And the reason discriminates the two refusing classes, which is what the reader needs.

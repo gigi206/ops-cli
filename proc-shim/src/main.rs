@@ -162,8 +162,43 @@ fn install_notif_filter(open_lens: bool) -> io::Result<libc::c_int> {
     // (1-based) therefore jumps `n + 1 - i` forward, which is the arithmetic the two-syscall filter
     // this generalises was written out by hand.
     let n = notified.len();
-    let mut filter = Vec::with_capacity(n + 6);
-    // The architecture first, in a three-instruction block placed entirely ahead of the rest so the
+    let mut filter = Vec::with_capacity(n + 9);
+    // x32 first, ahead of even the architecture check, because it is the one foreign ABI that
+    // *passes* that check: it reports `AUDIT_ARCH_X86_64` and carries `__X32_SYSCALL_BIT` in the
+    // call number, so every comparison below is against a number it can never equal and a filter
+    // whose default is ALLOW allows the whole of it. sbx's mandatory denylist answers `ENOSYS` to
+    // the same range and under the shipped configuration fires first — but this filter is what
+    // enforces exec supervision, and the paragraph below already gives the reason it does not lean
+    // on that: it holds on its own terms, as `no_new_privs` is set again above for the same reason.
+    // Three instructions, prepended whole so every offset computed below stays valid.
+    #[cfg(target_arch = "x86_64")]
+    {
+        const JMP_JGE_K: u16 = 0x35;
+        const RET_ERRNO: u32 = 0x0005_0000;
+        /// The bit an x32 system call carries in its number (`__X32_SYSCALL_BIT`).
+        const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+        // A <- seccomp_data.nr
+        filter.push(libc::sock_filter {
+            code: LD_ABS_W,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        });
+        // if A >= __X32_SYSCALL_BIT: fall through to the refusal; else skip it
+        filter.push(libc::sock_filter {
+            code: JMP_JGE_K,
+            jt: 0,
+            jf: 1,
+            k: X32_SYSCALL_BIT,
+        });
+        filter.push(libc::sock_filter {
+            code: RET_K,
+            jt: 0,
+            jf: 0,
+            k: RET_ERRNO | (libc::ENOSYS as u32),
+        });
+    }
+    // The architecture next, in a three-instruction block placed entirely ahead of the rest so the
     // comparisons below keep the offsets they were computed with. A call number only means anything
     // within the ABI it was numbered in — `execve` is 59 here and 11 under i386's `int 0x80` — so a
     // syscall arriving through a foreign ABI would match nothing below and be allowed through
