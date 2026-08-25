@@ -2966,13 +2966,16 @@ fn parse_forward_entry(
     entry: &schema::RawForward,
 ) -> Option<ForwardPort> {
     let spec = match entry {
-        schema::RawForward::Port(0) => {
+        // Range-checked here rather than by the deserializer, for the reason `RawForward` states:
+        // a value the schema layer refuses takes the whole config layer with it, so a port typed
+        // with one digit too many would drop the env, the packages and the apps beside it.
+        schema::RawForward::Port(p) if !(1..=65535).contains(p) => {
             warnings.push(format!(
-                "{source}: ignoring `forward` port `0` (not a real port)"
+                "{source}: ignoring `forward` port `{p}` — not a port in 1-65535"
             ));
             return None;
         }
-        schema::RawForward::Port(p) => return Some(ForwardPort::same(*p)),
+        schema::RawForward::Port(p) => return Some(ForwardPort::same(*p as u16)),
         schema::RawForward::Remap(s) => s.trim(),
     };
     let mut warn = |why: &str| {

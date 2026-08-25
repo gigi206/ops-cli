@@ -486,14 +486,19 @@ pub(crate) struct RawBundle {
 /// could only be resolved by editing the profile; splitting them means it is resolved by the
 /// one-shot override, which is what an override is for.
 ///
-/// A string is parsed downstream, not here: a malformed value is skipped with a per-entry warning
-/// rather than failing the untagged-enum parse and dropping the *whole* config layer (env,
-/// packages, apps and all) — the same reason [`RawBindTable::path`] is optional at this layer.
+/// **Neither form is range-checked here**, and both are parsed downstream, for one reason: a value
+/// this layer refuses fails the untagged-enum parse and drops the *whole* config layer (env,
+/// packages, apps and all) with a warning about a port. That is the same reason
+/// [`RawBindTable::path`] is optional at this layer — and the integer form had it only for the
+/// string half, so `forward = [70000]`, a port typed with one digit too many, took the config down
+/// with it while `forward = ["70000:80"]` beside it was skipped with a per-entry warning.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub(crate) enum RawForward {
-    /// A bare port: bound on the host and reached in the cage at that same port.
-    Port(u16),
+    /// A bare port: bound on the host and reached in the cage at that same port. Held as an `i64`
+    /// so that anything TOML accepts as an integer reaches the downstream check, which names the
+    /// entry rather than failing the layer.
+    Port(i64),
     /// A `"host:cage"` pair. Parsed downstream, so a malformed string warns rather than failing
     /// the layer.
     Remap(String),

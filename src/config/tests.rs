@@ -671,7 +671,7 @@ fn raw_forward(ports: &[u16]) -> RawConfig {
         &ports
             .iter()
             .copied()
-            .map(RawForward::Port)
+            .map(|p| RawForward::Port(p.into()))
             .collect::<Vec<_>>(),
     )
 }
@@ -2090,6 +2090,49 @@ fn ask_notice_defaults_on_and_can_be_silenced() {
         w.iter().any(|m| m.contains("ask_notice")),
         "a moot ask_notice must warn: {w:?}"
     );
+}
+
+/// A port typed with one digit too many is a per-entry warning, not a lost config layer.
+///
+/// The string form was already parsed downstream for exactly this reason: a value the schema layer
+/// refuses fails the untagged-enum parse and takes the whole layer with it — env, packages, apps
+/// and all — leaving a warning about a port. The integer form did not have it, so
+/// `forward = [70000]` dropped the config while `forward = ["70000:80"]` beside it was skipped and
+/// named.
+#[test]
+fn a_forward_port_out_of_range_is_skipped_rather_than_dropping_the_layer() {
+    let raw: RawConfig = toml::from_str(
+        "forward = [70000, 1455]\n[env]\nKEEP = \"yes\"\n[packages]\nhello = \"nix:hello\"\n",
+    )
+    .expect("the layer must still parse: the port is checked downstream");
+    let r = resolve_no_plugins(raw, None);
+    assert_eq!(
+        r.forward.len(),
+        1,
+        "the good port survives its neighbour: {:?}",
+        r.forward
+    );
+    assert_eq!(r.forward[0].host, 1455);
+    assert!(
+        r.warnings.iter().any(|w| w.contains("70000")),
+        "and the bad one is named: {:?}",
+        r.warnings
+    );
+    // The rest of the layer is untouched, which is the whole point.
+    assert!(r.env.iter().any(|(k, v)| k == "KEEP" && v == "yes"));
+    assert!(r.packages.iter().any(|p| p.name == "hello"));
+
+    // Zero and a negative are the same answer, by the same route.
+    for bad in ["0", "-1"] {
+        let raw: RawConfig = toml::from_str(&format!("forward = [{bad}]\n")).expect("parses");
+        let r = resolve_no_plugins(raw, None);
+        assert!(r.forward.is_empty(), "`{bad}` is not a port");
+        assert!(
+            r.warnings.iter().any(|w| w.contains(bad)),
+            "and is named: {:?}",
+            r.warnings
+        );
+    }
 }
 
 #[test]

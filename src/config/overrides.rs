@@ -801,9 +801,12 @@ fn parse_forward(spec: &str, label: &str) -> Result<Vec<schema::RawForward>, Str
 /// at the point of the mistake, naming the token as typed.
 fn parse_forward_token(token: &str, label: &str) -> Result<schema::RawForward, String> {
     let Some((host, cage)) = token.split_once(':') else {
+        // Checked as a `u16` here even though the schema holds an `i64`: a flag fails at the point
+        // of the mistake, naming the token as typed, while a *config* value is range-checked
+        // downstream so that a bad port cannot take its whole layer with it.
         return token
             .parse::<u16>()
-            .map(schema::RawForward::Port)
+            .map(|p| schema::RawForward::Port(p.into()))
             .map_err(|_| format!("{label}: `{token}` is not a valid port (expected 0–65535)"));
     };
     let bad = |side: &str, which: &str| {
