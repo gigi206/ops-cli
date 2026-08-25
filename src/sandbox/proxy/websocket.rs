@@ -760,7 +760,14 @@ pub(super) fn reserialize_upgrade(head: &Head, injections: &[(String, String)]) 
     out.push_str(&head.request_line);
     out.push_str("\r\n");
     for (k, v) in &head.headers {
-        if k.eq_ignore_ascii_case("proxy-connection") || k.eq_ignore_ascii_case("expect") {
+        if k.eq_ignore_ascii_case("proxy-connection")
+            || k.eq_ignore_ascii_case("expect")
+            // A credential the client addressed to the proxy hop, never to the origin server —
+            // the same rule `reserialize_request` states for every other request, and it was
+            // missing only here and on the h2 rebuild. `Connection` is deliberately *not* stripped
+            // alongside it: an upgrade needs its `Connection: Upgrade` to survive.
+            || k.eq_ignore_ascii_case("proxy-authorization")
+        {
             continue;
         }
         if injections.iter().any(|(name, _)| header_name_eq(k, name)) {
@@ -1687,6 +1694,42 @@ mod tests {
 
     /// The value [`needle`] looks for, so a test can send exactly what the scan is watching for.
     const NEEDLE_VALUE: &[u8] = b"SECRET-VALUE-0123456789";
+
+    /// The credential the client addressed to the **proxy hop** must not reach the origin server.
+    ///
+    /// `reserialize_request` drops `Proxy-Authorization` on both HTTP/1.1 planes, saying why in as
+    /// many words; the upgrade reserializer did not, so a `ws://`/`wss://` handshake handed the
+    /// far end a secret that was meant for sbx. `Connection` is asserted to survive in the same
+    /// breath, because an upgrade needs it and a blanket hop-by-hop strip would break the feature
+    /// this function exists for.
+    #[test]
+    fn a_websocket_upgrade_does_not_hand_the_proxy_credential_to_the_origin() {
+        let head = Head {
+            request_line: "GET /chat HTTP/1.1".to_string(),
+            headers: vec![
+                ("Host".to_string(), "example.com".to_string()),
+                ("Upgrade".to_string(), "websocket".to_string()),
+                ("Connection".to_string(), "Upgrade".to_string()),
+                (
+                    "Proxy-Authorization".to_string(),
+                    "Basic c2J4OnNlY3JldA==".to_string(),
+                ),
+            ],
+        };
+        let wire = String::from_utf8(reserialize_upgrade(&head, &[])).expect("ascii");
+        assert!(
+            !wire.to_ascii_lowercase().contains("proxy-authorization"),
+            "the proxy-hop credential was forwarded to the origin:\n{wire}"
+        );
+        assert!(
+            !wire.contains("c2J4OnNlY3JldA=="),
+            "the credential value survived under some other spelling:\n{wire}"
+        );
+        assert!(
+            wire.contains("Connection: Upgrade"),
+            "the upgrade's own Connection header must survive:\n{wire}"
+        );
+    }
 
     /// A needle for the leak-scan tests. The value is long enough to clear the redaction floor, and
     /// distinctive enough that a match cannot be a coincidence.

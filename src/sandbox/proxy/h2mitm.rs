@@ -1140,13 +1140,24 @@ impl HeaderLookup for H2Headers<'_> {
     }
 }
 
-/// Connection-specific request headers HTTP/2 forbids (RFC 9113 §8.2.2), plus `host` (h2 carries
-/// the authority as the `:authority` pseudo-header). `te` is deliberately kept — gRPC requires
-/// `te: trailers`, which h2 permits.
+/// Request headers this plane does not forward: the connection-specific ones HTTP/2 forbids
+/// (RFC 9113 §8.2.2), plus `host` (h2 carries the authority as the `:authority` pseudo-header), plus
+/// `proxy-authorization`. `te` is deliberately kept — gRPC requires `te: trailers`, which h2 permits.
+///
+/// `proxy-authorization` is the odd one out and is here on its own reasoning, not the RFC's: it is a
+/// credential the client addressed to the **proxy hop**, so handing it to the origin server gives
+/// that server a secret meant for sbx. `reserialize_request` says exactly this and drops it on both
+/// HTTP/1.1 planes; this plane and the WebSocket upgrade were forwarding it.
 fn forbidden_request_header(name: &str) -> bool {
     matches!(
         name,
-        "host" | "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade"
+        "host"
+            | "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "proxy-authorization"
+            | "transfer-encoding"
+            | "upgrade"
     )
 }
 
@@ -1165,6 +1176,26 @@ mod tests {
     // signature; the tests below still spell their own policy imports where they build one.
     use crate::allowlist::EgressPolicy;
     use crate::sandbox::egress_stats::Counts;
+
+    /// The h2 plane drops the proxy-hop credential too, and keeps what gRPC needs.
+    ///
+    /// `forbidden_request_header` is the h2 rebuild's only filter, so a header absent from it is
+    /// forwarded to the origin. `proxy-authorization` was, handing the far end a secret the client
+    /// addressed to sbx — while both HTTP/1.1 planes have always dropped it. `te` is asserted in the
+    /// same test because gRPC requires `te: trailers` and a careless widening of this list would
+    /// take it out.
+    #[test]
+    fn the_proxy_credential_is_not_forwarded_and_grpc_keeps_its_te() {
+        assert!(forbidden_request_header("proxy-authorization"));
+        assert!(
+            !forbidden_request_header("te"),
+            "gRPC requires `te: trailers`, which h2 permits"
+        );
+        assert!(
+            !forbidden_request_header("authorization"),
+            "the origin's own credential is not the proxy hop's and must still be forwarded"
+        );
+    }
 
     /// A peer whose stream window is smaller than one relayed chunk must still be relayed to.
     ///
