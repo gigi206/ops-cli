@@ -45,23 +45,38 @@ pub(super) fn count_host_secrets(hosts: &BTreeMap<String, RawHostSecrets>) -> us
         .sum()
 }
 
-/// Set the secret for its (target, header) pair, overriding an existing one (last-wins)
-/// with a warning while preserving declaration order. Two secrets to the same host and
-/// header would otherwise inject two copies of the header upstream.
+/// Set the secret for its target and headers, overriding an existing one (last-wins) with a
+/// warning while preserving declaration order. Two secrets to the same host that write the same
+/// header would otherwise inject two copies of it upstream.
+///
+/// The comparison is over **every** header each declaration writes, not the one it is named by. A
+/// signed declaration's `header` is only the first its plugin's manifest lists, so two signers for
+/// one host whose manifests differ in that first header and agree on a later one read as unrelated
+/// and both went on the wire — which is the exact collision this function exists to prevent, on the
+/// declarations most likely to produce it (a signer writes several headers by design).
 pub(super) fn upsert_secret(
     out: &mut Vec<HeaderSecret>,
     warnings: &mut Vec<String>,
     source: &str,
     secret: HeaderSecret,
 ) {
-    match out
-        .iter_mut()
-        .find(|s| s.to == secret.to && s.header.eq_ignore_ascii_case(&secret.header))
-    {
-        Some(slot) => {
+    let writes = secret.headers();
+    let shared = |s: &HeaderSecret| -> Option<String> {
+        s.headers()
+            .iter()
+            .find(|h| writes.iter().any(|w| w.eq_ignore_ascii_case(h)))
+            .map(|h| (*h).to_string())
+    };
+    match out.iter_mut().find_map(|s| {
+        (s.to == secret.to)
+            .then(|| shared(s))
+            .flatten()
+            .map(|h| (s, h))
+    }) {
+        Some((slot, header)) => {
             warnings.push(format!(
-                "{source}: a later secret overrides an earlier one for `{}` -> {}",
-                secret.header, secret.to
+                "{source}: a later secret overrides an earlier one for `{header}` -> {}",
+                secret.to
             ));
             *slot = secret;
         }
@@ -139,10 +154,12 @@ pub(super) fn validate_host_secret(
     // there is no silent built-in default. A signed declaration takes neither: its inventory label
     // is the first header its plugin declares, and its shape is the plugin.
     let (header, shape) = match &signer {
-        // The first header the plugin declares. It is also what [`upsert_secret`] dedups on, which
-        // is the intended reading: two signed declarations to one host whose plugins lead with the
-        // same header would set it twice, and last-wins is the same answer an ordinary duplicate
-        // gets. Two plugins leading with different headers are two credentials, and both apply.
+        // The first header the plugin declares — the declaration's *label*, not what
+        // [`upsert_secret`] dedups on. That distinction is the correction: the dedup asks whether
+        // two declarations to one host write any header in common, so two signers whose manifests
+        // lead with different headers and agree on a later one are the same collision as an
+        // ordinary duplicate and get the same last-wins answer. Reading the first header alone let
+        // that pair through, and both went on the wire.
         Some(plugin) => (
             plugin.signer.sets_headers[0].clone(),
             // Never read for a signed declaration: the plugin forms every value. Spelled as the

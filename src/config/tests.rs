@@ -7252,6 +7252,86 @@ fn a_description_is_flattened_to_one_capped_line() {
     assert_eq!(capped.chars().count(), 200, "the description is capped");
 }
 
+/// The dedup asks what a declaration *writes*, not what it is named by.
+///
+/// A signed declaration's `header` is only the first its plugin's manifest lists, so two signers
+/// for one host whose manifests lead with different headers and agree on a later one read as
+/// unrelated — and both went on the wire, putting two copies of the shared header on the request.
+/// That is the exact collision this function exists to prevent, on the declarations most likely to
+/// produce it: a signer writes several headers by design.
+#[test]
+fn two_signers_sharing_any_header_on_one_host_are_deduped() {
+    let signer = |name: &str, sets: &[&str]| crate::plugins::signer::SignerPlugin {
+        name: name.to_string(),
+        dir: PathBuf::from(format!("/data/plugins/{name}")),
+        exec: PathBuf::from(format!("/data/plugins/{name}/sign")),
+        sandbox: Default::default(),
+        signer: crate::plugins::signer::SignerSpec {
+            sets_headers: sets.iter().map(|s| (*s).to_string()).collect(),
+            sees_headers: Vec::new(),
+            reads_secret: false,
+            body_digest: None,
+        },
+        version: None,
+        description: None,
+        host: Default::default(),
+    };
+    let declared = |name: &str, sets: &[&str]| {
+        let reg = PluginRegistry::with_signers([signer(name, sets)]);
+        let mut raw = raw_secret_from(vec!["env://K"]);
+        raw.header = None;
+        raw.value_type = None;
+        raw.sign = Some(name.to_string());
+        vhs_with(raw, &reg).expect("a signed declaration")
+    };
+
+    // Different first headers, one shared later one: the shared header would be written twice.
+    let mut out = Vec::new();
+    let mut warnings = Vec::new();
+    upsert_secret(
+        &mut out,
+        &mut warnings,
+        "global config",
+        declared("alpha", &["Authorization", "X-Date"]),
+    );
+    upsert_secret(
+        &mut out,
+        &mut warnings,
+        "global config",
+        declared("beta", &["X-Date", "Signature"]),
+    );
+    assert_eq!(
+        out.len(),
+        1,
+        "one header, one credential: the later declaration replaces the earlier"
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("X-Date")),
+        "and the shared header is named: {warnings:?}"
+    );
+
+    // Two signers to one host that share no header are two credentials, and both apply.
+    let mut out = Vec::new();
+    let mut warnings = Vec::new();
+    upsert_secret(
+        &mut out,
+        &mut warnings,
+        "global config",
+        declared("alpha", &["Authorization"]),
+    );
+    upsert_secret(
+        &mut out,
+        &mut warnings,
+        "global config",
+        declared("beta", &["Signature"]),
+    );
+    assert_eq!(out.len(), 2, "nothing collides, nothing is dropped");
+    assert!(
+        !warnings.iter().any(|w| w.contains("overrides")),
+        "and nothing is reported as overridden: {warnings:?}"
+    );
+}
+
 // Two credentials may legally share a name (it is a label, not a key), but a redacted value
 // prints only the name — so the reader could not tell which was withheld. Warn, naming both
 // destinations, and keep both.
