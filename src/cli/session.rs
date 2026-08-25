@@ -215,6 +215,17 @@ fn stop_cmd(args: Vec<OsString>) -> ExitCode {
                 }
             }
             Some("--all") => all = true,
+            // An unrecognised flag is refused, not taken for an id. It was pushed onto `ids`, so a
+            // mistyped `--dry-run` became a session to stop rather than an error — and a verb whose
+            // job is to kill things must not read a flag it does not know as a target. `--` still
+            // ends the options for an id that genuinely starts with a dash.
+            Some(flag) if flag.starts_with('-') && flag != "--" => {
+                diag::error(&format!(
+                    "sbx: unknown option '{flag}' for `session stop` (ids are the PIDs shown by \
+                     `sbx session ls`; `--all` stops every session)."
+                ));
+                return ExitCode::from(2);
+            }
             Some(id) => ids.push(id.to_string()),
             None => {
                 diag::error(

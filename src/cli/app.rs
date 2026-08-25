@@ -1170,6 +1170,12 @@ fn app_rm_purge_one(
 
     // 1. The profile (if any). Under --purge a missing profile is not fatal — the homes may still
     //    exist (an app whose profile was already removed, or a project/inline app that has none).
+    //    A profile that could not be *deleted* is a different answer from one that was not there,
+    //    and collapsing them into one `false` is what let a failed purge print `purged` and exit 0:
+    //    the flag fed the "nothing found" check and the summary's wording, and nothing else, while
+    //    `ok` was computed from the home removals alone. The sibling `app_rm_profiles` has always
+    //    set `had_error` on this exact arm.
+    let mut profile_failed = false;
     let profile_removed = match config::profile_path(name) {
         Some(path) => match std::fs::remove_file(&path) {
             Ok(()) => {
@@ -1180,6 +1186,7 @@ fn app_rm_purge_one(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => {
                 diag::error(&format!("sbx: cannot remove {}: {e}", path.display()));
+                profile_failed = true;
                 false
             }
         },
@@ -1198,11 +1205,19 @@ fn app_rm_purge_one(
             sandbox::human_bytes(home.bytes)
         );
     }
-    for (path, e) in &report.failed {
-        diag::error(&format!(
-            "{warn}sbx: could not remove {}: {e}{r}",
-            path.display()
-        ));
+    // Coloured for **stderr**, which is where `diag::error` writes — `pal` was chosen from stdout,
+    // so with one stream redirected and the other a terminal this wrote escape codes into a file.
+    // The stderr-derived palette is the idiom the rest of this module already uses.
+    {
+        let epal = style::Palette::for_stream(std::io::stderr().is_terminal());
+        for (path, e) in &report.failed {
+            diag::error(&format!(
+                "{}sbx: could not remove {}: {e}{}",
+                epal.warn,
+                path.display(),
+                epal.reset
+            ));
+        }
     }
 
     // 3. Nothing found across either source → a no-op (likely a typo); do not report success.
@@ -1228,7 +1243,8 @@ fn app_rm_purge_one(
     };
     // A partial failure (a home that would not delete) is not a clean purge — say so, so the green
     // summary never contradicts the non-zero exit the batch will carry.
-    let verb = if report.failed.is_empty() {
+    let clean = report.failed.is_empty() && !profile_failed;
+    let verb = if clean {
         format!("{ok}purged{r}")
     } else {
         format!("{warn}purged with errors{r}")
@@ -1237,9 +1253,11 @@ fn app_rm_purge_one(
         "{verb} app {n}{name}{r} — freed {n}{}{r} {dim}({removed_what}){r}",
         sandbox::human_bytes(report.freed())
     );
-    // The purge itself left state behind if a home would not delete — surface it in the exit code.
+    // The purge left state behind if a home or the profile would not delete — surface it in the
+    // exit code. A surviving profile is the more consequential of the two: `sbx app run <name>`
+    // still resolves it, so the app is not gone in the way the word `purged` says it is.
     AppPurgeOutcome {
-        ok: report.failed.is_empty(),
+        ok: clean,
         acted: true,
     }
 }

@@ -512,8 +512,16 @@ fn print_health(
 }
 
 /// The manifest's one-line description, indented under the plugin, when it has one.
+///
+/// Sanitized on the way out. A manifest is third-party TOML — the whole point of the integrity and
+/// origin lines beside it is that its author is not trusted — so its free text can carry escape
+/// sequences, and this lands on a terminal. Unfiltered, a description could repaint the very
+/// `[modified since install]` and origin markers a person runs `sbx plugins list` to read —
+/// [`sanitize_detail`](crate::sandbox::lens::sanitize_detail) is the treatment the lens wire
+/// already gives every field it cannot vouch for, and its doc names a terminal as the other sink.
 fn print_description(description: Option<&str>, pal: &style::Palette) {
     if let Some(desc) = description {
+        let desc = crate::sandbox::lens::sanitize_detail(desc);
         println!("    {}{desc}{}", pal.dim, pal.reset);
     }
 }
@@ -2203,8 +2211,14 @@ fn print_about(
     pal: &style::Palette,
 ) {
     let (err, r) = (pal.err, pal.reset);
-    println!("  version:     {}", about.version.unwrap_or("(unset)"));
-    println!("  description: {}", about.description.unwrap_or("(none)"));
+    // Both are the manifest author's free text, and this page's purpose is to let a person check
+    // an untrusted plugin — so neither may be able to rewrite the integrity and origin lines below.
+    let sanitized = |v: Option<&str>, absent: &'static str| {
+        v.map(crate::sandbox::lens::sanitize_detail)
+            .unwrap_or_else(|| absent.to_string())
+    };
+    println!("  version:     {}", sanitized(about.version, "(unset)"));
+    println!("  description: {}", sanitized(about.description, "(none)"));
     println!(
         "  origin:      {}",
         plugins::origin::read(layout, about.dir_name).label()
@@ -2631,6 +2645,30 @@ fn print_grant_env_paths(keys: &[String], err: &str, r: &str) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A manifest's free text cannot repaint the page a person opened to judge it.
+    ///
+    /// `sbx plugins list` and `plugins show` exist so an operator can check an *untrusted* plugin —
+    /// its origin, and whether it has been modified since install. Both fields the manifest author
+    /// writes reach that page, so an unfiltered escape sequence could erase or forge exactly the
+    /// lines being read. The sanitizer the lens wire already uses is what stands between them.
+    #[test]
+    fn a_manifest_cannot_paint_escapes_onto_the_page_that_judges_it() {
+        let hostile = "1.0\u{1b}[2K\u{1b}[1A tampered\r\n  integrity:   unchanged since install";
+        let clean = crate::sandbox::lens::sanitize_detail(hostile);
+        assert!(
+            !clean.contains('\u{1b}'),
+            "an escape survived into the rendered field: {clean:?}"
+        );
+        assert!(
+            !clean.contains('\n') && !clean.contains('\r'),
+            "a line break survived, so one field can forge another line: {clean:?}"
+        );
+        assert!(
+            clean.contains("tampered"),
+            "the visible text is kept — this filters, it does not blank the field: {clean:?}"
+        );
+    }
     #[test]
     fn store_list_takes_a_store_name_a_flag_or_both() {
         use std::ffi::OsString;

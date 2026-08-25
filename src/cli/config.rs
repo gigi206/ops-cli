@@ -2639,8 +2639,7 @@ fn config_set(args: &[OsString]) -> ExitCode {
             };
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!("{}", render_config_write(verb, &key, &path, &pal));
-            report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref(), gated);
-            ExitCode::SUCCESS
+            report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref(), gated)
         }
         Err(e) => {
             diag::error(&format!("sbx: config: {e}"));
@@ -2718,8 +2717,7 @@ fn config_list_edit(args: &[OsString], op: ListEdit) -> ExitCode {
                 "{}",
                 render_list_edit(done, preposition, entry, &key, &path, &pal)
             );
-            report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref(), gated);
-            ExitCode::SUCCESS
+            report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref(), gated)
         }
         Ok(false) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
@@ -2776,8 +2774,7 @@ fn config_unset(args: &[OsString]) -> ExitCode {
         Ok(true) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!("{}", render_config_write("unset", &key, &path, &pal));
-            report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref(), gated);
-            ExitCode::SUCCESS
+            report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref(), gated)
         }
         Ok(false) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
@@ -3037,7 +3034,7 @@ fn report_write_trust(
     trust_flag: bool,
     store_dir: Option<&Path>,
     gated: bool,
-) {
+) -> ExitCode {
     // The global config and the app profiles under `apps/` are trusted **by location** — they carry
     // no per-file trust marker, so a write never re-arms a gate and needs no `sbx trust`. Reporting
     // one would be a false positive (the field applies as soon as the file is read), so say nothing —
@@ -3049,20 +3046,36 @@ fn report_write_trust(
                 path.display()
             ));
         }
-        return;
+        return ExitCode::SUCCESS;
     }
     if trust_flag {
+        // A `--trust` that could not be recorded is a **failure**, not a warning. The write itself
+        // succeeded, so the security field is on disk — and inert, because the file is still
+        // untrusted and a gated field applies only once it is trusted. Reporting success there
+        // tells a script the security setting took effect when it did not, which is the one
+        // direction this must not be wrong in.
         match store_dir {
             Some(dir) => match trust::trust(dir, path) {
                 Ok(()) => {
                     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
                     println!("{}", render_trusted_whole_file(path, &pal));
                 }
-                Err(e) => diag::warn(&format!("could not trust {e}")),
+                Err(e) => {
+                    diag::error(&format!("sbx: could not trust {e}"));
+                    diag::hint(&format!(
+                        "       the field was written but does not apply; run `sbx trust {}`",
+                        path.display()
+                    ));
+                    return ExitCode::FAILURE;
+                }
             },
-            None => diag::warn("no trust store available; cannot --trust"),
+            None => {
+                diag::error("sbx: no trust store available; cannot --trust");
+                diag::hint("       the field was written but does not apply until it is trusted");
+                return ExitCode::FAILURE;
+            }
         }
-        return;
+        return ExitCode::SUCCESS;
     }
     if was_trusted {
         diag::warn(&format!(
@@ -3079,6 +3092,7 @@ fn report_write_trust(
             path.display()
         ));
     }
+    ExitCode::SUCCESS
 }
 
 /// Whether a dotted config key names a security-relevant field. The only field applied without
