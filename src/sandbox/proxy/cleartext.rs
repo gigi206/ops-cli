@@ -277,7 +277,9 @@ pub(super) fn handle_cleartext(
         capture.as_ref(),
         &[],
         method,
-        ClientLeg::Verbatim,
+        // One request per connection on this plane, so the client is told `close` in sbx's own
+        // words rather than in whatever the upstream chose to answer.
+        ClientLeg::Close,
     )?;
     if let Some(code) = parse_status_code(&resp_head)
         && code >= 200

@@ -1434,14 +1434,12 @@ fn relay_response_head<R: BufRead, W: Write>(
             // by anything: announcing a persistent connection would leave it waiting for a boundary
             // that never comes.
             && !matches!(framing, BodyFraming::ToEof);
-        // State sbx's own answer whenever this head is one sbx speaks about — `close` when the
-        // connection ends here, the offer of another request when it does not, and in both cases
-        // with the upstream's hop headers dropped rather than passed off as this leg's. `Verbatim`
-        // is the caller that does not speak: it forwards the upstream's framing untouched, having
-        // already forced `Connection: close` onto the request that produced it.
+        // State sbx's own answer on every final head — `close` when the connection ends here, the
+        // offer of another request when it does not, and in both cases with the upstream's hop
+        // headers dropped rather than passed off as this leg's. An interim `1xx` is not a head sbx
+        // speaks about, so it crosses untouched.
         let mut wire = match client_leg {
             _ if !final_head => head.clone(),
-            ClientLeg::Verbatim => head.clone(),
             ClientLeg::MayReuse { idle } if persistent => offer_reuse_in_head(&head, idle),
             ClientLeg::Close | ClientLeg::MayReuse { .. } => force_close_in_head(&head),
         };
@@ -1478,13 +1476,18 @@ struct RelayedHead {
 }
 
 /// What a relayed head should tell the client about the **client's own** connection.
+///
+/// Neither variant relays the upstream's answer. What the upstream said describes the *upstream's*
+/// socket, and the two legs are not the same connection: a plane that serves one request had been
+/// passing a `Connection: close` request's response through untouched, on the reasoning that such a
+/// response must itself say `close`. It must, but saying so is the upstream's job, and an upstream
+/// that answers `keep-alive` anyway would have told the cage it could send a second request into a
+/// connection sbx is about to close. sbx states its own answer instead, which it is the only side
+/// in a position to know.
 enum ClientLeg {
     /// Rewrite the final head to `Connection: close`: this connection serves one request, and the
     /// client is told so rather than left to find out when the stream ends.
     Close,
-    /// Relay the head as the upstream framed it, and close regardless. The request that produced it
-    /// already forced `Connection: close` upstream, so the head being relayed carries that answer.
-    Verbatim,
     /// Relay the head as the upstream framed it when it leaves the client's connection usable, and
     /// rewrite it to `Connection: close` when it does not. The only variant that reports back, and
     /// the only one that carries the idle bound: what it announces to the client has to be the bound

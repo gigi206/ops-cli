@@ -2392,6 +2392,61 @@ fn read_response_head_hands_back_a_head_the_upstream_cut_short() {
     assert_eq!(parse_status_code(&head), None);
 }
 
+/// A plane that serves one request tells the client `close` in sbx's own words, whatever the
+/// upstream answered.
+///
+/// The cleartext and https-forward planes force `Connection: close` on the request, and used to
+/// relay the response head untouched on the reasoning that a response to such a request must itself
+/// say `close`. It must — but saying so is the upstream's job, and the upstream is not a party sbx
+/// trusts to do its job. One that answers `keep-alive` anyway would have handed the cage a promise
+/// of a second request on a connection sbx closes the moment the body ends, and its
+/// `Keep-Alive: timeout=` would have described the upstream's socket while reading as this leg's.
+#[test]
+fn a_one_request_leg_states_its_own_close_over_an_upstream_that_offered_reuse() {
+    let wire = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\
+                 Connection: keep-alive\r\nKeep-Alive: timeout=60\r\n\r\nok";
+    let mut up = io::BufReader::new(io::Cursor::new(wire.to_vec()));
+    let mut client = Vec::new();
+    let down = Arc::new(AtomicU64::new(0));
+    let RelayedHead {
+        head, persistent, ..
+    } = relay_response_head(
+        &mut up,
+        &mut client,
+        &down,
+        None,
+        &[],
+        "GET",
+        ClientLeg::Close,
+    )
+    .unwrap();
+
+    let written = String::from_utf8_lossy(&client).into_owned();
+    let lower = written.to_ascii_lowercase();
+    assert!(
+        lower.contains("connection: close"),
+        "the client is told the connection ends here: {written:?}"
+    );
+    assert!(
+        !lower.contains("keep-alive"),
+        "neither the upstream's offer nor its timeout may reach this leg: {written:?}"
+    );
+    assert!(!persistent, "nothing may ride on a leg that was told close");
+    // The head that comes back is the upstream's own bytes, so every decision downstream is read
+    // off what arrived rather than off what sbx wrote.
+    assert!(
+        String::from_utf8_lossy(&head)
+            .to_ascii_lowercase()
+            .contains("keep-alive"),
+        "the returned head is the one that arrived: {:?}",
+        String::from_utf8_lossy(&head)
+    );
+    assert_eq!(
+        down.load(Ordering::Relaxed),
+        client.len() as u64,
+        "the counter measures what crossed"
+    );
+}
 /// The `down` byte total for `sbx net live` must equal what actually crossed to the cage — every
 /// head, not just the last one. An interim `1xx` is the case that could drift: it is relayed but
 /// then read past, so a counter placed only on the returned head would under-report it. Masking
@@ -2414,7 +2469,7 @@ fn every_relayed_head_is_counted_including_an_interim_one() {
             None,
             &needles,
             "GET",
-            ClientLeg::Verbatim,
+            ClientLeg::Close,
         )
         .unwrap();
         assert_eq!(
@@ -2431,9 +2486,21 @@ fn every_relayed_head_is_counted_including_an_interim_one() {
             client.len() as u64,
             "the counter must equal the bytes written to the client"
         );
-        // Both heads crossed, so the count covers the interim one too.
+        // Both heads crossed, so the count covers the interim one too. The interim head is not one
+        // sbx speaks about, so no `Connection` line is put on it (its `Link` value is the redaction
+        // pass's business, and that replacement is the same length); the final head carries sbx's
+        // own `Connection: close`, which is why the total is the wire's heads plus that line.
+        assert!(
+            client.starts_with(b"HTTP/1.1 103 Early Hints\r\nLink: ")
+                && !client.starts_with(b"HTTP/1.1 103 Early Hints\r\nConnection:"),
+            "the interim head crossed without sbx's own answer put on it: {:?}",
+            String::from_utf8_lossy(&client)
+        );
         let heads = wire.len() - b"ok".len();
-        assert_eq!(down.load(Ordering::Relaxed), heads as u64);
+        assert_eq!(
+            down.load(Ordering::Relaxed),
+            (heads + b"Connection: close\r\n".len()) as u64
+        );
     }
 }
 

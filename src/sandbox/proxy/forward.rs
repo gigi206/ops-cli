@@ -502,12 +502,8 @@ pub(super) fn handle_https_forward(
         method,
         // This plane's client leg is the proxy's own listening socket, spoken in cleartext and
         // served one request at a time — there is nothing on it to keep alive, whatever the
-        // upstream leg does.
-        if keep_alive {
-            ClientLeg::Close
-        } else {
-            ClientLeg::Verbatim
-        },
+        // upstream leg does or says it does.
+        ClientLeg::Close,
     )?;
     // An upstream that closed without answering leaves nothing to relay, and an empty success would
     // be indistinguishable from a genuine zero-byte response — see the tunneled path.
