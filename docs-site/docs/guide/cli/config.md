@@ -261,7 +261,10 @@ read whole than assemble field by field.
 | `-a, --app <name>` | address the key under that app (`app.<name>.<key>` inline, or `-g` its profile) |
 
 Writing a trusted project file re-arms its [trust gate](../concepts/trust); pass
-`--trust` to re-trust in one step. The global config and app profiles are trusted by
+`--trust` to re-trust in one step. A command that changes nothing writes nothing, and so
+re-arms nothing: setting a key to the value it already holds, adding an entry a list
+already carries, removing one it does not, or unsetting a key that was never set all
+report `no change` and leave the file (and its trust) exactly as it was. The global config and app profiles are trusted by
 location, so a write there needs no trust; a free `env` or `timezone` value needs none either.
 
 `--trust` blesses the **whole current file**, which is why these four verbs refuse it on

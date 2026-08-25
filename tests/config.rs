@@ -3032,6 +3032,44 @@ fn a_local_write_still_warns_when_it_re_arms_a_trusted_project() {
 }
 
 #[test]
+fn setting_a_key_to_the_value_it_already_holds_leaves_the_trust_gate_alone() {
+    // The mirror of the warning above. The trust marker hashes the file's contents, so a `set` that
+    // writes nothing new re-arms nothing — and saying it did would tell someone their security
+    // fields had stopped applying when they had not, sending them to `sbx trust` for no reason.
+    // `add`/`rm` already treat an unchanged file this way; `set` has to agree.
+    let fx = Fixture::new();
+    fx.write_project("network = \"ask\"\n");
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    let before = std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap();
+
+    let out = fx.run(&["config", "set", "network", "ask"]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("re-armed the trust gate"),
+        "setting a key to the value it already holds re-arms nothing:\n{stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("no change"),
+        "and it says so:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap(),
+        before,
+        "the file is left untouched"
+    );
+
+    // The gate really is still open: the security field applies without a fresh `sbx trust`.
+    let show = fx.run(&["config", "show"]);
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        stdout.contains("network: ask"),
+        "the trusted posture still applies:\n{stdout}"
+    );
+}
+
+#[test]
 fn an_app_secret_shows_a_count_by_default_and_its_destination_under_details() {
     let fx = Fixture::new();
     // A profile whose credential lives in the app overlay — the common case, since the shipped

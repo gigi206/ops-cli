@@ -62,6 +62,17 @@ pub(crate) fn render_list_unchanged(
     )
 }
 
+/// The no-op confirmation for `sbx config set` on a key that already holds the value asked for -
+/// dimmed, since nothing was written and so trust is not re-armed. A pure presenter.
+pub(crate) fn render_config_same_value(key: &str, path: &Path, pal: &style::Palette) -> String {
+    let (dim, r) = (pal.dim, pal.reset);
+    format!(
+        "sbx: {} {dim}already reads that way in {} (no change){r}",
+        style::paint_spans(&format!("`{key}`"), pal.name, "", pal),
+        path.display()
+    )
+}
+
 /// The no-op confirmation for `sbx config unset` on a key that was not set — dimmed, since nothing
 /// changed (and so trust is never re-armed). A pure presenter.
 pub(crate) fn render_config_unchanged(key: &str, path: &Path, pal: &style::Palette) -> String {

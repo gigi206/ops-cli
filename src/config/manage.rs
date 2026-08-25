@@ -342,8 +342,27 @@ pub(crate) fn get(path: &Path, key: &str) -> Result<Option<String>, ManageError>
     }
 }
 
+/// What a [`set`] did to the file, which is what the caller turns into a word for the user and,
+/// more importantly, into a decision about the trust gate.
+///
+/// [`Unchanged`](SetOutcome::Unchanged) is the one that carries weight. The trust marker is a hash
+/// of the file's contents, so re-setting a key to the value it already holds re-arms nothing;
+/// warning that it did would tell someone their security fields had stopped applying when they had
+/// not. `add` and `rm` already answer this question, and `set` has to answer it the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetOutcome {
+    /// The key was not in the file and now is.
+    Created,
+    /// The key was in the file and now holds a different value.
+    Updated,
+    /// The file already read exactly this way; nothing was written.
+    Unchanged,
+}
+
 /// Set a value at a dotted key, preserving the rest of the file. Creates the file and any
-/// intermediate tables as needed. Returns whether the key was created (vs updated in place).
+/// intermediate tables as needed. Reports what it did as a [`SetOutcome`]; a value the file
+/// already holds is left alone rather than rewritten, so a repeated command cannot re-arm the
+/// trust gate on a file it did not change.
 ///
 /// The value is written with its natural TOML type — a bare `true`/`false` as a boolean, a bare
 /// integer as an integer — so a typed schema key (a `bool`/number knob) round-trips; a value that
@@ -351,19 +370,20 @@ pub(crate) fn get(path: &Path, key: &str) -> Result<Option<String>, ManageError>
 /// the layer invalid in BOTH forms is **refused without writing**: a committed unparseable layer is
 /// silently dropped whole at the next load (e.g. a filtering `network` posture reverting to open
 /// egress), so this fails closed and loud rather than reporting success over a broken file.
-pub(crate) fn set(path: &Path, key: &str, val: &str) -> Result<bool, ManageError> {
+pub(crate) fn set(path: &Path, key: &str, val: &str) -> Result<SetOutcome, ManageError> {
     let mut doc = read_or_empty(path)?;
+    // Rendered rather than read off disk, so the comparison below asks the question that matters —
+    // "would writing this change the file?" — and not the one about how `toml_edit` happens to
+    // re-render bytes it did not touch.
+    let before = doc.to_string();
     // A value written as a TOML array is taken as one, so a list field is settable in a single
     // command. It is tried first and never falls back to a string: someone who typed brackets meant
     // a list, and silently storing `[".env"]` as the *text* `[".env"]` would be a config that looks
     // right and behaves wrong.
     if let Some(array) = parsed_array(val) {
-        put_value(&mut doc, key, array)?;
+        let created = put_value(&mut doc, key, array)?;
         return match validate_layer(&doc) {
-            Ok(()) => {
-                write_doc(path, &doc)?;
-                Ok(true)
-            }
+            Ok(()) => commit(path, &doc, &before, created),
             Err(detail) => Err(ManageError::InvalidValue(key.to_string(), detail)),
         };
     }
@@ -375,8 +395,27 @@ pub(crate) fn set(path: &Path, key: &str, val: &str) -> Result<bool, ManageError
             return Err(ManageError::InvalidValue(key.to_string(), detail));
         }
     }
-    write_doc(path, &doc)?;
-    Ok(created)
+    commit(path, &doc, &before, created)
+}
+
+/// Write `doc` unless it renders exactly as `before`, and name the outcome. The tail both arms of
+/// [`set`] share: the write is skipped precisely when there is nothing to write, which is what
+/// keeps an unchanged file's trust marker valid.
+fn commit(
+    path: &Path,
+    doc: &DocumentMut,
+    before: &str,
+    created: bool,
+) -> Result<SetOutcome, ManageError> {
+    if doc.to_string() == before {
+        return Ok(SetOutcome::Unchanged);
+    }
+    write_doc(path, doc)?;
+    Ok(if created {
+        SetOutcome::Created
+    } else {
+        SetOutcome::Updated
+    })
 }
 
 /// `sbx config add <key> <entry>`: append one entry to the list at `key`, creating the list if it is
@@ -1765,10 +1804,14 @@ mod tests {
             "# keep me\nnixpkgs = \"old\"\n\n[env]\nFOO = \"bar\" # inline\n",
         );
         assert!(
-            !set(&p, "nixpkgs", "new").unwrap(),
+            set(&p, "nixpkgs", "new").unwrap() == SetOutcome::Updated,
             "nixpkgs already existed"
         );
-        assert!(set(&p, "env.BAZ", "qux").unwrap(), "env.BAZ is new");
+        assert_eq!(
+            set(&p, "env.BAZ", "qux").unwrap(),
+            SetOutcome::Created,
+            "env.BAZ is new"
+        );
         let after = std::fs::read_to_string(&p).unwrap();
         assert!(after.contains("# keep me"), "comment preserved:\n{after}");
         assert!(
@@ -1787,7 +1830,11 @@ mod tests {
     fn set_creates_a_missing_file_and_its_tables() {
         let tmp = crate::testutil::TmpDir::new();
         let p = tmp.path().join(".sbx.toml");
-        assert!(set(&p, "env.A", "1").unwrap(), "created in a new file");
+        assert_eq!(
+            set(&p, "env.A", "1").unwrap(),
+            SetOutcome::Created,
+            "created in a new file"
+        );
         assert_eq!(get(&p, "env.A").unwrap().as_deref(), Some("1"));
     }
 
@@ -1797,7 +1844,11 @@ mod tests {
         // first write — the atomic placement must create the directory, not fail on it.
         let tmp = crate::testutil::TmpDir::new();
         let p = tmp.path().join("nested").join("dir").join("sbx.toml");
-        assert!(set(&p, "env.A", "1").unwrap(), "created under a new dir");
+        assert_eq!(
+            set(&p, "env.A", "1").unwrap(),
+            SetOutcome::Created,
+            "created under a new dir"
+        );
         assert_eq!(get(&p, "env.A").unwrap().as_deref(), Some("1"));
     }
 
@@ -1824,7 +1875,11 @@ mod tests {
         // the WHOLE layer (reverting the filtering posture to open egress). Pin that it round-trips.
         let tmp = crate::testutil::TmpDir::new();
         let p = doc_at(tmp.path(), "[network]\nmode = \"deny\"\n");
-        assert!(set(&p, "network.stats", "false").unwrap(), "stats is new");
+        assert_eq!(
+            set(&p, "network.stats", "false").unwrap(),
+            SetOutcome::Created,
+            "stats is new"
+        );
         let after = std::fs::read_to_string(&p).unwrap();
         assert!(
             after.contains("stats = false"),
@@ -1869,6 +1924,24 @@ mod tests {
         assert!(
             super::super::schema::parse(after.as_bytes()).is_ok(),
             "the edited layer still parses:\n{after}"
+        );
+    }
+
+    #[test]
+    fn setting_a_list_reports_created_only_when_the_key_was_absent() {
+        // The bool `set` returns is what `sbx config set` turns into "set" vs "updated". The array
+        // path used to answer `true` unconditionally, so replacing an existing list read as if the
+        // key had just been created — the one word that tells the user whether they overwrote
+        // something.
+        let tmp = crate::testutil::TmpDir::new();
+        let fresh = doc_at(tmp.path(), "[fs]\n");
+        assert!(
+            set(&fresh, "fs.deny", r#"[".env"]"#).unwrap() == SetOutcome::Created,
+            "an absent key is created"
+        );
+        assert!(
+            set(&fresh, "fs.deny", r#"[".env", "secrets/"]"#).unwrap() == SetOutcome::Updated,
+            "replacing the list it just wrote is an update, not a creation"
         );
     }
 
@@ -2148,7 +2221,11 @@ mod tests {
         let p = doc_at(tmp.path(), "network = { mode = \"deny\", stats = true }\n");
         assert_eq!(get(&p, "network.mode").unwrap().as_deref(), Some("deny"));
         // set a new inline key and flip an existing one
-        assert!(!set(&p, "network.stats", "false").unwrap(), "stats existed");
+        assert_eq!(
+            set(&p, "network.stats", "false").unwrap(),
+            SetOutcome::Updated,
+            "stats existed"
+        );
         assert_eq!(get(&p, "network.stats").unwrap().as_deref(), Some("false"));
         assert!(unset(&p, "network.stats").unwrap(), "stats removed");
         assert_eq!(get(&p, "network.stats").unwrap(), None);

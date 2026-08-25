@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::cli::confirm::{
-    render_config_unchanged, render_config_write, render_list_edit, render_list_unchanged,
-    render_trusted_whole_file,
+    render_config_same_value, render_config_unchanged, render_config_write, render_list_edit,
+    render_list_unchanged, render_trusted_whole_file,
 };
 use crate::{ScopeArgs, config_cwd, net_mode_word, short_rev, split_scope};
 use crate::{config, diag, help, style, trust};
@@ -2624,8 +2624,19 @@ fn config_set(args: &[OsString]) -> ExitCode {
     };
 
     match config::manage::set(&path, &key, val) {
-        Ok(created) => {
-            let verb = if created { "set" } else { "updated" };
+        Ok(config::manage::SetOutcome::Unchanged) => {
+            // Nothing was written, so the trust marker still matches and the gate is not re-armed —
+            // the same reasoning (and the same silence about trust) as `add`/`rm` on a no-op.
+            let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+            println!("{}", render_config_same_value(&key, &path, &pal));
+            ExitCode::SUCCESS
+        }
+        Ok(outcome) => {
+            let verb = if outcome == config::manage::SetOutcome::Created {
+                "set"
+            } else {
+                "updated"
+            };
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!("{}", render_config_write(verb, &key, &path, &pal));
             report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref(), gated);
