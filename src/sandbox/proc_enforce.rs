@@ -34,17 +34,24 @@
 //! `systemd-run --scope` wrapper exec-chains, so bwrap stays a child of sbx; reparenting onto the
 //! systemd manager only happens at teardown, after the run).
 //!
-//! [`notif_id_valid`] is asked **before** that read, which is not the order the kernel's own
-//! documentation prescribes (open the handles, *then* validate, then read) and does not by itself
-//! stop a reaped-and-reused pid from being read: the target can be killed and its number handed to
-//! a fresh process in the window between the check and the open of `/proc/<pid>/mem`. What makes
-//! that window inert is the other end. A notification id stays valid only while its target is
-//! parked, so a pid that has been reused belongs to a target that is gone — and the kernel refuses
-//! every answer to a gone target's id (`NOTIF_SEND` and `ADDFD` both return `ENOENT`). A verdict
-//! formed from a stranger's memory therefore reaches no process; what is left of it is a wrong line
-//! in the ring. Closing the window properly means pinning the handles first — `/proc/<pid>/mem` and
-//! an `O_PATH` on `/proc/<pid>`, with `root`/`cwd`/`fd/N`/`exe`/`status` resolved through the pinned
-//! directory for the rest of the decision — and validating after; it is not done today.
+//! That read is guarded against a reaped-and-reused pid in the order `seccomp_unotify(2)`
+//! prescribes: **open the handle, then validate, then read** ([`open_target_mem`]). Validating only
+//! *before* the open proves nothing, because the two are separate steps — the target can be killed
+//! and its number handed to a fresh process in between. Validating after does prove it: a pid is
+//! free to be reused only once its process is gone, and a notification id stays valid only while
+//! its target is parked, so an id still valid after the open says the target never left, which says
+//! the number was never free, which says the descriptor is the target's.
+//!
+//! The check kept ahead of the read is an early-out, not the guard — it saves the work for a target
+//! that is already gone. And even before the second check existed the window could not carry a
+//! *verdict* anywhere: the kernel refuses every answer to a gone target's id (`NOTIF_SEND` and
+//! `ADDFD` both return `ENOENT`), so what was at stake was a wrong line in the ring and a read of an
+//! unrelated process's memory, rather than a decision landing on a stranger.
+//!
+//! The rest of the target's `/proc` — `root`, `cwd`, `fd/N`, `exe`, `status` — is still resolved by
+//! path rather than through an `O_PATH` handle pinned at the same moment, so those reads keep the
+//! narrower version of the same window. They inform the *name* a decision is recorded under, never
+//! whether it reaches a process.
 //!
 //! ## The single-listener discipline (no serialization deadlock)
 //!
@@ -626,8 +633,9 @@ fn exec_verdict(
     pid: u32,
     dirfd: libc::c_int,
     addr: u64,
+    notif: Option<(libc::c_int, u64)>,
 ) -> (Verdict, String) {
-    let named = read_exec_path(pid, addr)
+    let named = read_exec_path(pid, addr, notif)
         .filter(|p| !p.is_empty())
         // `execveat(fd, "", …, AT_EMPTY_PATH)` names its target by the descriptor and passes an
         // empty pathname — which is exactly what glibc's `fexecve` issues, so this is the ordinary
@@ -692,8 +700,13 @@ enum OpenName {
 /// than the decisions it could not take, so nothing afterwards would remember. Counted only where a
 /// lens is armed — with none there was nothing to decide and nothing was given up, and a number on
 /// those cages would be a number on a lens they never asked for.
-fn open_name(cx: &Deciding<'_>, pid: u32, path_addr: u64) -> OpenName {
-    match read_path_bytes(pid, path_addr) {
+fn open_name(
+    cx: &Deciding<'_>,
+    pid: u32,
+    path_addr: u64,
+    notif: Option<(libc::c_int, u64)>,
+) -> OpenName {
+    match read_path_bytes(pid, path_addr, notif) {
         Some(bytes) if !bytes.is_empty() => match String::from_utf8(bytes) {
             Ok(named) => return OpenName::Named(named),
             Err(_) => {
@@ -856,12 +869,10 @@ fn recv_loop(notif_fd: libc::c_int, stop: &AtomicBool, cx: &Deciding<'_>) {
 /// unreadable path (an anomaly under the ancestor invariant) is treated as unmatched — never a
 /// silent deny that could brick the whole cage, and never a silent allow of a named `deny`.
 fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<'_>) {
-    // A live notification, asked before any of the target's `/proc` is read. This is an early-out
-    // and not the pid-reuse guard it was once described as: the check and the reads that follow are
-    // separate steps, so a target killed in between can have its number reissued and the reads land
-    // on a stranger. What keeps that from mattering is that the kernel refuses every answer to the
-    // id of a target that is gone, so such a decision reaches no process — the module header states
-    // the ordering the kernel documents, and what closing the window properly would take.
+    // A live notification, asked before any of the target's `/proc` is read. This one is an
+    // early-out — it saves the work when the target is already gone. The *guard* against reading a
+    // stranger's memory is the second check, taken after `/proc/<pid>/mem` is opened: see
+    // [`open_target_mem`], which is where the ordering that makes it a proof lives.
     if !notif_id_valid(notif_fd, req.id) {
         return;
     }
@@ -870,7 +881,7 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
     // Checked on the syscall number rather than on the lens being present, so a notification the
     // filter should not have produced is still answered as an open.
     if let Some((dirfd, path_addr)) = open_args(req.data.nr, &req.data.args) {
-        let named = match open_name(cx, req.pid, path_addr) {
+        let named = match open_name(cx, req.pid, path_addr, notif_of(notif_fd, req.id)) {
             OpenName::Named(named) => named,
             // Nothing read: the empty name falls through to the allowing arm below, which is what
             // the lens does with an open it could not examine.
@@ -958,7 +969,14 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
         return;
     };
     let caller = caller_chain(cx, req.pid);
-    let (verdict, shown) = exec_verdict(cx, &caller, req.pid, exec_dirfd, path_addr);
+    let (verdict, shown) = exec_verdict(
+        cx,
+        &caller,
+        req.pid,
+        exec_dirfd,
+        path_addr,
+        notif_of(notif_fd, req.id),
+    );
     let shown = shown.as_str();
     let by = caller.last().map(String::as_str).unwrap_or_default();
     match verdict {
@@ -1222,7 +1240,12 @@ fn serve_open(
     probe: Option<std::fs::File>,
 ) -> bool {
     let Some(probe) = probe else { return false };
-    let Some(flags) = open_flags(req.pid, req.data.nr, &req.data.args) else {
+    let Some(flags) = open_flags(
+        req.pid,
+        req.data.nr,
+        &req.data.args,
+        notif_of(notif_fd, req.id),
+    ) else {
         return false;
     };
     let flags = flags as libc::c_int;
@@ -1240,7 +1263,12 @@ fn serve_open(
     // quietly removed by being supervised. So the call is declined here and answered `CONTINUE`,
     // which runs the real `openat2` with the real `resolve` semantics; it joins the other flags
     // that cannot be carried onto a descriptor.
-    match open_resolve(req.pid, req.data.nr, &req.data.args) {
+    match open_resolve(
+        req.pid,
+        req.data.nr,
+        &req.data.args,
+        notif_of(notif_fd, req.id),
+    ) {
         Some(0) => {}
         _ => return false,
     }
@@ -1395,8 +1423,18 @@ fn serve_creation(
 ) -> Creation {
     use std::os::unix::io::{AsRawFd, FromRawFd};
     let (Some(flags), Some(mode)) = (
-        open_flags(req.pid, req.data.nr, &req.data.args),
-        open_mode(req.pid, req.data.nr, &req.data.args),
+        open_flags(
+            req.pid,
+            req.data.nr,
+            &req.data.args,
+            notif_of(notif_fd, req.id),
+        ),
+        open_mode(
+            req.pid,
+            req.data.nr,
+            &req.data.args,
+            notif_of(notif_fd, req.id),
+        ),
     ) else {
         return Creation::Declined;
     };
@@ -1623,11 +1661,47 @@ fn park_open(
     true
 }
 
+/// The notification a memory read is guarded by, or `None` when the caller holds none.
+///
+/// A negative descriptor is how a caller says "no notification in hand" — the unit tests that drive
+/// one arm of a decision directly, without a listener. Passing it through as a real pair would make
+/// [`open_target_mem`]'s check fail on `EBADF` and read as "the target is gone", turning the guard
+/// into a refusal of every such call.
+fn notif_of(notif_fd: libc::c_int, id: u64) -> Option<(libc::c_int, u64)> {
+    (notif_fd >= 0).then_some((notif_fd, id))
+}
+
+/// Open a target's memory, and confirm afterwards that it is still the target's.
+///
+/// The order is the point, and it is what `seccomp_unotify(2)` prescribes: open first, then re-check
+/// the notification id. A pid is only free to be reused once its process is gone, and a notification
+/// id stays valid only while its target is parked in the syscall — so an id still valid *after* the
+/// open proves the target never left, which proves the number was never free, which proves this
+/// descriptor is the target's memory and not a stranger's.
+///
+/// Checking before the open cannot give that: the two are separate steps, and a target killed in
+/// between can have its number reissued under the read. Nothing catastrophic followed (the kernel
+/// refuses every answer to a gone target's id, so a verdict formed on a stranger's memory reaches no
+/// process) — but a refusal line naming another process's path is still a wrong record, and reading
+/// an unrelated process's memory at all is worth not doing.
+///
+/// `notif` is `None` for a caller with no notification in hand — the unit tests, which read this
+/// process's own memory.
+fn open_target_mem(pid: u32, notif: Option<(libc::c_int, u64)>) -> Option<std::fs::File> {
+    let file = std::fs::File::open(format!("/proc/{pid}/mem")).ok()?;
+    if let Some((notif_fd, id)) = notif
+        && !notif_id_valid(notif_fd, id)
+    {
+        return None;
+    }
+    Some(file)
+}
+
 /// Read one `u64` from a target's memory. `openat2` passes its flags behind a pointer rather than in
 /// a register, and that word has to be read the same careful way the path is.
-fn read_u64(pid: u32, addr: u64) -> Option<u64> {
+fn read_u64(pid: u32, addr: u64, notif: Option<(libc::c_int, u64)>) -> Option<u64> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(format!("/proc/{pid}/mem")).ok()?;
+    let mut file = open_target_mem(pid, notif)?;
     file.seek(SeekFrom::Start(addr)).ok()?;
     let mut buf = [0u8; 8];
     file.read_exact(&mut buf).ok()?;
@@ -1657,7 +1731,12 @@ const OPEN_HOW_VER0: u64 = 24;
 ///
 /// `None` means the flags could not be established, and a caller that cannot establish them must not
 /// serve the open from a descriptor.
-fn open_flags(pid: u32, nr: libc::c_int, args: &[u64; 6]) -> Option<u64> {
+fn open_flags(
+    pid: u32,
+    nr: libc::c_int,
+    args: &[u64; 6],
+    notif: Option<(libc::c_int, u64)>,
+) -> Option<u64> {
     if nr as libc::c_long == libc::SYS_open {
         return Some(args[1]);
     }
@@ -1671,7 +1750,7 @@ fn open_flags(pid: u32, nr: libc::c_int, args: &[u64; 6]) -> Option<u64> {
         if args[3] < OPEN_HOW_VER0 {
             return None;
         }
-        return read_u64(pid, args[2]);
+        return read_u64(pid, args[2], notif);
     }
     None
 }
@@ -1680,7 +1759,12 @@ fn open_flags(pid: u32, nr: libc::c_int, args: &[u64; 6]) -> Option<u64> {
 ///
 /// The mirror of [`open_flags`], and needed for the same reason: a file made on the cage's behalf
 /// has to arrive with the permissions the cage asked for rather than with a guess.
-fn open_mode(pid: u32, nr: libc::c_int, args: &[u64; 6]) -> Option<u64> {
+fn open_mode(
+    pid: u32,
+    nr: libc::c_int,
+    args: &[u64; 6],
+    notif: Option<(libc::c_int, u64)>,
+) -> Option<u64> {
     if nr as libc::c_long == libc::SYS_open {
         return Some(args[2]);
     }
@@ -1694,7 +1778,7 @@ fn open_mode(pid: u32, nr: libc::c_int, args: &[u64; 6]) -> Option<u64> {
         if args[3] < OPEN_HOW_VER0 {
             return None;
         }
-        return read_u64(pid, args[2].wrapping_add(8));
+        return read_u64(pid, args[2].wrapping_add(8), notif);
     }
     None
 }
@@ -1710,7 +1794,12 @@ fn open_mode(pid: u32, nr: libc::c_int, args: &[u64; 6]) -> Option<u64> {
 ///
 /// `None` means it could not be established, which — like an unreadable flag word — is a call that
 /// must not be served from a descriptor.
-fn open_resolve(pid: u32, nr: libc::c_int, args: &[u64; 6]) -> Option<u64> {
+fn open_resolve(
+    pid: u32,
+    nr: libc::c_int,
+    args: &[u64; 6],
+    notif: Option<(libc::c_int, u64)>,
+) -> Option<u64> {
     if nr as libc::c_long == libc::SYS_open || nr as libc::c_long == libc::SYS_openat {
         return Some(0);
     }
@@ -1724,7 +1813,7 @@ fn open_resolve(pid: u32, nr: libc::c_int, args: &[u64; 6]) -> Option<u64> {
         if args[3] < OPEN_HOW_VER0 {
             return None;
         }
-        return read_u64(pid, args[2].wrapping_add(16));
+        return read_u64(pid, args[2].wrapping_add(16), notif);
     }
     None
 }
@@ -1894,9 +1983,9 @@ fn answer_parked(p: &Parked, allow: bool) {
 /// thread is stopped: a sibling in the cage can rewrite the buffer between this read and the
 /// `CONTINUE`, which is why allowing a named path is TOCTOU-racy while refusing one is not (module
 /// header). Nothing here closes that window. Returns `None` on any read failure.
-fn read_path_bytes(pid: u32, addr: u64) -> Option<Vec<u8>> {
+fn read_path_bytes(pid: u32, addr: u64, notif: Option<(libc::c_int, u64)>) -> Option<Vec<u8>> {
     use std::io::Read;
-    let mut file = std::fs::File::open(format!("/proc/{pid}/mem")).ok()?;
+    let mut file = open_target_mem(pid, notif)?;
     // Seek and read a bounded window; a path is at most PATH_MAX.
     use std::io::{Seek, SeekFrom};
     file.seek(SeekFrom::Start(addr)).ok()?;
@@ -1924,8 +2013,8 @@ fn read_path_bytes(pid: u32, addr: u64) -> Option<Vec<u8>> {
 /// other rather than refused — but it is the whole resolution chain (`open_target_path`,
 /// `caller_proc_path`, `splice_first_link`, `serve_creation`) plus the `String` keys
 /// [`ProcPolicy`] matches on, and this is the half that stops a wrong file being acted on.
-fn read_exec_path(pid: u32, addr: u64) -> Option<String> {
-    String::from_utf8(read_path_bytes(pid, addr)?).ok()
+fn read_exec_path(pid: u32, addr: u64, notif: Option<(libc::c_int, u64)>) -> Option<String> {
+    String::from_utf8(read_path_bytes(pid, addr, notif)?).ok()
 }
 
 /// Where a notified open keeps its directory descriptor and its path pointer, by syscall number.
@@ -3647,17 +3736,32 @@ mod tests {
         args[2] = 0o600;
         args[3] = 0o640;
         assert_eq!(
-            open_mode(std::process::id(), libc::SYS_open as libc::c_int, &args),
+            open_mode(
+                std::process::id(),
+                libc::SYS_open as libc::c_int,
+                &args,
+                None
+            ),
             Some(0o600),
             "`open` keeps its mode in the third argument"
         );
         assert_eq!(
-            open_mode(std::process::id(), libc::SYS_openat as libc::c_int, &args),
+            open_mode(
+                std::process::id(),
+                libc::SYS_openat as libc::c_int,
+                &args,
+                None
+            ),
             Some(0o640),
             "`openat` leads with the descriptor, so its mode sits one along"
         );
         assert_eq!(
-            open_mode(std::process::id(), libc::SYS_read as libc::c_int, &args),
+            open_mode(
+                std::process::id(),
+                libc::SYS_read as libc::c_int,
+                &args,
+                None
+            ),
             None,
             "a syscall that is not an open has no mode to read"
         );
@@ -3668,20 +3772,35 @@ mod tests {
         args2[2] = how.as_ptr() as u64;
         args2[3] = 8;
         assert_eq!(
-            open_mode(std::process::id(), libc::SYS_openat2 as libc::c_int, &args2),
+            open_mode(
+                std::process::id(),
+                libc::SYS_openat2 as libc::c_int,
+                &args2,
+                None
+            ),
             None,
             "a `size` the kernel refuses carries no mode, whatever sits at that address"
         );
         args2[3] = 16;
         assert_eq!(
-            open_mode(std::process::id(), libc::SYS_openat2 as libc::c_int, &args2),
+            open_mode(
+                std::process::id(),
+                libc::SYS_openat2 as libc::c_int,
+                &args2,
+                None
+            ),
             None,
             "and a struct that reaches the mode word but stops before the end of the version the \
              kernel accepts is refused just the same"
         );
         args2[3] = std::mem::size_of_val(&how) as u64;
         assert_eq!(
-            open_mode(std::process::id(), libc::SYS_openat2 as libc::c_int, &args2),
+            open_mode(
+                std::process::id(),
+                libc::SYS_openat2 as libc::c_int,
+                &args2,
+                None
+            ),
             Some(0o600),
             "the mode is the second field of `struct open_how`"
         );
@@ -3719,17 +3838,32 @@ mod tests {
     fn each_open_form_states_the_path_walk_it_asked_for() {
         let mut args = [0u64; 6];
         assert_eq!(
-            open_resolve(std::process::id(), libc::SYS_open as libc::c_int, &args),
+            open_resolve(
+                std::process::id(),
+                libc::SYS_open as libc::c_int,
+                &args,
+                None
+            ),
             Some(0),
             "`open` has no `resolve` word, so it restricts nothing"
         );
         assert_eq!(
-            open_resolve(std::process::id(), libc::SYS_openat as libc::c_int, &args),
+            open_resolve(
+                std::process::id(),
+                libc::SYS_openat as libc::c_int,
+                &args,
+                None
+            ),
             Some(0),
             "nor does `openat`"
         );
         assert_eq!(
-            open_resolve(std::process::id(), libc::SYS_read as libc::c_int, &args),
+            open_resolve(
+                std::process::id(),
+                libc::SYS_read as libc::c_int,
+                &args,
+                None
+            ),
             None,
             "a syscall that is not an open asks for no walk at all"
         );
@@ -3737,7 +3871,12 @@ mod tests {
         args[2] = how.as_ptr() as u64;
         args[3] = std::mem::size_of_val(&how) as u64;
         assert_eq!(
-            open_resolve(std::process::id(), libc::SYS_openat2 as libc::c_int, &args),
+            open_resolve(
+                std::process::id(),
+                libc::SYS_openat2 as libc::c_int,
+                &args,
+                None
+            ),
             Some(libc::RESOLVE_NO_SYMLINKS),
             "the restriction is the third field of `struct open_how`"
         );
@@ -3748,7 +3887,12 @@ mod tests {
         for short in [0, 8, 16, OPEN_HOW_VER0 - 1] {
             args[3] = short;
             assert_eq!(
-                open_resolve(std::process::id(), libc::SYS_openat2 as libc::c_int, &args),
+                open_resolve(
+                    std::process::id(),
+                    libc::SYS_openat2 as libc::c_int,
+                    &args,
+                    None
+                ),
                 None,
                 "a `size` of {short} is refused by the kernel, so there is no walk to establish"
             );
@@ -4024,17 +4168,32 @@ mod tests {
         args[1] = 0x111;
         args[2] = 0x222;
         assert_eq!(
-            open_flags(std::process::id(), libc::SYS_open as libc::c_int, &args),
+            open_flags(
+                std::process::id(),
+                libc::SYS_open as libc::c_int,
+                &args,
+                None
+            ),
             Some(0x111),
             "`open` keeps its flags in the second argument"
         );
         assert_eq!(
-            open_flags(std::process::id(), libc::SYS_openat as libc::c_int, &args),
+            open_flags(
+                std::process::id(),
+                libc::SYS_openat as libc::c_int,
+                &args,
+                None
+            ),
             Some(0x222),
             "`openat` leads with the descriptor, so its flags sit one along"
         );
         assert_eq!(
-            open_flags(std::process::id(), libc::SYS_read as libc::c_int, &args),
+            open_flags(
+                std::process::id(),
+                libc::SYS_read as libc::c_int,
+                &args,
+                None
+            ),
             None,
             "a syscall that is not an open has no flags to read"
         );
@@ -4049,19 +4208,34 @@ mod tests {
         args[2] = how.as_ptr() as u64;
         args[3] = std::mem::size_of_val(&how) as u64;
         assert_eq!(
-            open_flags(std::process::id(), libc::SYS_openat2 as libc::c_int, &args),
+            open_flags(
+                std::process::id(),
+                libc::SYS_openat2 as libc::c_int,
+                &args,
+                None
+            ),
             Some(libc::O_RDONLY as u64 | libc::O_CLOEXEC as u64),
             "the flag word is the first field of `struct open_how`"
         );
         args[3] = 4;
         assert_eq!(
-            open_flags(std::process::id(), libc::SYS_openat2 as libc::c_int, &args),
+            open_flags(
+                std::process::id(),
+                libc::SYS_openat2 as libc::c_int,
+                &args,
+                None
+            ),
             None,
             "a `size` too small to hold the flag word describes a call the kernel refuses anyway"
         );
         args[3] = 16;
         assert_eq!(
-            open_flags(std::process::id(), libc::SYS_openat2 as libc::c_int, &args),
+            open_flags(
+                std::process::id(),
+                libc::SYS_openat2 as libc::c_int,
+                &args,
+                None
+            ),
             None,
             "and so does one that holds the flag word but stops short of the whole struct: \
              `openat2` refuses any `size` below its first version rather than zero-filling the tail"
@@ -4209,7 +4383,7 @@ mod tests {
         let me = std::process::id();
         let good = b"/usr/bin/env\0";
         assert_eq!(
-            read_exec_path(me, good.as_ptr() as u64).as_deref(),
+            read_exec_path(me, good.as_ptr() as u64, None).as_deref(),
             Some("/usr/bin/env"),
             "a path that is a name is still read as one"
         );
@@ -4218,13 +4392,13 @@ mod tests {
         // one for a cage to write.
         let odd = b"/tmp/caf\xe9\0";
         assert_eq!(
-            read_exec_path(me, odd.as_ptr() as u64),
+            read_exec_path(me, odd.as_ptr() as u64, None),
             None,
             "a lossy read answers the same path with a replacement character in it, which names a \
              different file — and the lens would resolve, scan, serve and create under it"
         );
         assert_eq!(
-            read_path_bytes(me, odd.as_ptr() as u64),
+            read_path_bytes(me, odd.as_ptr() as u64, None),
             Some(b"/tmp/caf\xe9".to_vec()),
             "the bytes are readable, so this is the conversion refusing and not the read failing"
         );
@@ -4313,7 +4487,8 @@ mod tests {
                 &[],
                 me,
                 plain_fd.as_raw_fd(),
-                empty.as_ptr() as u64
+                empty.as_ptr() as u64,
+                None
             ),
             (Verdict::Allow, allowed.clone()),
             "a target named through its descriptor is still decided by that name"
@@ -4327,7 +4502,8 @@ mod tests {
                 &[],
                 me,
                 odd_fd.as_raw_fd(),
-                empty.as_ptr() as u64
+                empty.as_ptr() as u64,
+                None
             ),
             (Verdict::Deny, "<unreadable>".to_string()),
             "a link whose bytes no name can carry must take the mode's default, not be decided and \
@@ -5400,7 +5576,7 @@ mod tests {
             let (pid, addr) = UNREADABLE;
             for _ in 0..3 {
                 assert_eq!(
-                    exec_verdict(&cx, &[], pid, libc::AT_FDCWD, addr),
+                    exec_verdict(&cx, &[], pid, libc::AT_FDCWD, addr, None),
                     (expected, "<unreadable>".to_string()),
                     "under {mode:?}"
                 );
@@ -5425,7 +5601,7 @@ mod tests {
         for _ in 0..2 {
             assert!(
                 matches!(
-                    open_name(&armed.cx(&policy), pid, addr),
+                    open_name(&armed.cx(&policy), pid, addr, None),
                     OpenName::Unreadable
                 ),
                 "an open whose path cannot be read has no name to decide against"
@@ -5440,7 +5616,7 @@ mod tests {
         // And a cage that never asked for the lens is not told it lost something it never had.
         let bare = DecidingParts::new();
         assert!(matches!(
-            open_name(&bare.cx(&policy), pid, addr),
+            open_name(&bare.cx(&policy), pid, addr, None),
             OpenName::Unreadable
         ));
         assert_eq!(bare.undecidable.open.load(Ordering::Relaxed), 0);
@@ -5568,7 +5744,7 @@ mod tests {
         // What this cannot show is how OFTEN production reaches it. That depends on the host's
         // `ptrace_scope`, a machine-wide setting no test may raise on its way past.
         let (pid, addr) = UNREADABLE;
-        assert!(read_exec_path(pid, addr).is_none());
-        assert!(read_u64(pid, addr).is_none());
+        assert!(read_exec_path(pid, addr, None).is_none());
+        assert!(read_u64(pid, addr, None).is_none());
     }
 }
