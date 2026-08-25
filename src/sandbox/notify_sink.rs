@@ -160,7 +160,14 @@ pub(crate) trait Sink: Send {
 /// session leaves behind for `sbx logs`. A newline in a subject would add a line of the cage's
 /// writing there, and an escape would drive the terminal. The desktop sink needs none of this: D-Bus
 /// carries its fields with their lengths, so nothing there is delimited by what it contains.
+///
+/// All three parts, the session label included. It reads like sbx's own text and is not: its
+/// project half is the launch directory's *name*, which the project chose and which Linux lets
+/// carry a newline or an escape as readily as any path the cage names. A label is the one part of
+/// the line a reader takes on trust, so it is the worst part to leave writable.
 fn stderr_line(context: &str, summary: &str, body: &str) -> String {
+    let context = crate::sandbox::sanitize(context);
+    let context = context.as_str();
     let summary = crate::sandbox::sanitize(summary);
     let body = crate::sandbox::sanitize(body);
     match (context, body.as_str()) {
@@ -1006,6 +1013,27 @@ mod tests {
         assert!(
             line.starts_with("demo@proj[4242]: Blocked: /tmp/x sbx: warning:"),
             "{line:?}"
+        );
+    }
+
+    /// The label half of the same line. It reads as sbx's own words — which sandbox this came from
+    /// — and its project half is the launch directory's name, chosen by whoever laid the project
+    /// out and free to carry a newline or an escape like any other path.
+    #[test]
+    fn a_project_directory_cannot_write_a_line_of_its_own_through_the_session_label() {
+        let line = stderr_line(
+            "demo@proj\nsbx: warning: Blocked: /bin/su: allowed\u{1b}[2J[4242]",
+            "Blocked: /tmp/x",
+            "no rule",
+        );
+        assert_eq!(line.matches('\n').count(), 0, "{line:?}");
+        assert!(
+            !line.contains('\u{1b}'),
+            "an escape reached the terminal: {line:?}"
+        );
+        assert!(
+            line.starts_with("demo@proj sbx: warning:"),
+            "replaced rather than dropped, so the label is still legible: {line:?}"
         );
     }
 
