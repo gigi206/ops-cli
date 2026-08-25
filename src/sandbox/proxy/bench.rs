@@ -247,7 +247,11 @@ fn serve_on_uds(ctx: Arc<ProxyCtx>) -> (TmpDir, std::path::PathBuf) {
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
     thread::spawn(move || {
-        let _ = serve(listener, ctx);
+        let _ = serve(
+            listener,
+            ctx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
     });
     (dir, path)
 }

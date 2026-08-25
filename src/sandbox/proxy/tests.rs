@@ -266,7 +266,11 @@ fn through_proxy(
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
     thread::spawn(move || {
-        let _ = serve(listener, ctx);
+        let _ = serve(
+            listener,
+            ctx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
     });
 
     let mut sock = UnixStream::connect(&path).unwrap();
@@ -395,7 +399,11 @@ fn through_proxy_clean_close(
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
     thread::spawn(move || {
-        let _ = serve(listener, ctx);
+        let _ = serve(
+            listener,
+            ctx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
     });
     let mut sock = UnixStream::connect(&path).unwrap();
     write!(
@@ -505,7 +513,11 @@ fn through_proxy_websocket(
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
     thread::spawn(move || {
-        let _ = serve(listener, ctx);
+        let _ = serve(
+            listener,
+            ctx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
     });
     let mut sock = UnixStream::connect(&path).unwrap();
     write!(
@@ -607,7 +619,11 @@ fn through_cleartext(ctx: Arc<ProxyCtx>, request: &[u8]) -> io::Result<String> {
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
     thread::spawn(move || {
-        let _ = serve(listener, ctx);
+        let _ = serve(
+            listener,
+            ctx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
     });
     let mut sock = UnixStream::connect(&path).unwrap();
     sock.write_all(request)?;
@@ -1229,7 +1245,11 @@ fn through_proxy_ws_bytes(
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
     thread::spawn(move || {
-        let _ = serve(listener, ctx);
+        let _ = serve(
+            listener,
+            ctx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
     });
     let mut sock = UnixStream::connect(&path).unwrap();
     write!(
@@ -1361,7 +1381,11 @@ fn through_proxy_ws_read_exact(
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
     thread::spawn(move || {
-        let _ = serve(listener, ctx);
+        let _ = serve(
+            listener,
+            ctx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
     });
     let mut sock = UnixStream::connect(&path).unwrap();
     write!(
@@ -2944,7 +2968,11 @@ fn through_proxy_repeatedly(
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
     thread::spawn(move || {
-        let _ = serve(listener, ctx);
+        let _ = serve(
+            listener,
+            ctx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
     });
     let mut roots = RootCertStore::empty();
     roots.add(proxy_ca).unwrap();
@@ -3404,7 +3432,11 @@ fn through_one_tunnel_paused(
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
     thread::spawn(move || {
-        let _ = serve(listener, ctx);
+        let _ = serve(
+            listener,
+            ctx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
     });
     let mut sock = UnixStream::connect(&path).unwrap();
     write!(
@@ -3919,7 +3951,11 @@ fn a_connection_over_the_cap_is_told_why() {
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
     thread::spawn(move || {
-        let _ = serve(listener, ctx);
+        let _ = serve(
+            listener,
+            ctx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
     });
 
     // One connection that is accepted and then holds its thread: the CONNECT is answered, and the
@@ -4010,7 +4046,11 @@ fn a_real_client_fetches_twice_down_one_tunnel() {
     let sock = dir.join("proxy.sock");
     let listener = UnixListener::bind(&sock).unwrap();
     thread::spawn(move || {
-        let _ = serve(listener, ctx);
+        let _ = serve(
+            listener,
+            ctx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
     });
     let ca_file = dir.join("ca.pem");
     std::fs::write(&ca_file, ca_pem).unwrap();
@@ -4800,7 +4840,11 @@ fn a_tunneled_head_that_never_finished_is_logged_against_its_host() {
         let path = dir.join("proxy.sock");
         let listener = UnixListener::bind(&path).unwrap();
         thread::spawn(move || {
-            let _ = serve(listener, ctx);
+            let _ = serve(
+                listener,
+                ctx,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
         });
         let mut sock = UnixStream::connect(&path).unwrap();
         write!(
@@ -4904,7 +4948,11 @@ fn a_tunneled_head_that_never_finished_is_logged_against_its_host() {
     let path2 = dir2.join("proxy.sock");
     let listener2 = UnixListener::bind(&path2).unwrap();
     thread::spawn(move || {
-        let _ = serve(listener2, ctx2);
+        let _ = serve(
+            listener2,
+            ctx2,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
     });
     let mut sock2 = UnixStream::connect(&path2).unwrap();
     write!(
@@ -6271,7 +6319,15 @@ fn a_session_injected_allow_makes_a_request_proceed_without_parking() {
         let (pending, served_manual, log, flows) =
             (pending.clone(), manual.clone(), log.clone(), flows.clone());
         std::thread::spawn(move || {
-            let _ = control::serve(listener, pending, served_manual, log, flows, None);
+            let _ = control::serve(
+                listener,
+                pending,
+                served_manual,
+                log,
+                flows,
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
         });
     }
 
@@ -8578,7 +8634,11 @@ fn through_proxy_raw(
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
     thread::spawn(move || {
-        let _ = serve(listener, ctx);
+        let _ = serve(
+            listener,
+            ctx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
     });
     let mut sock = UnixStream::connect(&path).unwrap();
     sock.set_read_timeout(Some(std::time::Duration::from_secs(10)))
@@ -8608,7 +8668,11 @@ fn splice_connect_reply(ctx: Arc<ProxyCtx>, connect_host: &str, connect_port: u1
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
     thread::spawn(move || {
-        let _ = serve(listener, ctx);
+        let _ = serve(
+            listener,
+            ctx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
     });
     let mut sock = UnixStream::connect(&path).unwrap();
     sock.set_read_timeout(Some(std::time::Duration::from_secs(10)))
@@ -8684,7 +8748,11 @@ fn an_unroutable_non_connect_request_is_refused_and_logged() {
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
     thread::spawn(move || {
-        let _ = serve(listener, ctx);
+        let _ = serve(
+            listener,
+            ctx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
     });
     let mut sock = UnixStream::connect(&path).unwrap();
     sock.set_read_timeout(Some(std::time::Duration::from_secs(10)))
@@ -9493,7 +9561,11 @@ fn ws_send_from_cage(
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
     thread::spawn(move || {
-        let _ = serve(listener, ctx);
+        let _ = serve(
+            listener,
+            ctx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
     });
     let mut sock = UnixStream::connect(&path).unwrap();
     write!(
@@ -9613,7 +9685,11 @@ fn through_proxy_ws_frames(
     let path = dir.join("proxy.sock");
     let listener = UnixListener::bind(&path).unwrap();
     thread::spawn(move || {
-        let _ = serve(listener, ctx);
+        let _ = serve(
+            listener,
+            ctx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
     });
     let mut sock = UnixStream::connect(&path).unwrap();
     write!(
@@ -9871,7 +9947,11 @@ fn a_websocket_capture_is_filed_while_the_tunnel_is_still_open() {
     let listener = UnixListener::bind(&path).unwrap();
     let serving = ctx.clone();
     thread::spawn(move || {
-        let _ = serve(listener, serving);
+        let _ = serve(
+            listener,
+            serving,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
     });
 
     // A client that opens the tunnel and then STAYS on it: its final read returns only once the

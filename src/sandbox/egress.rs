@@ -76,24 +76,25 @@ pub(crate) const CA_FILE_ENV_KEYS: &[&str] = &[
 /// artifacts only, unlinking them when the launch ends. The control socket is deliberately not among
 /// the cage's binds (see [`start`]).
 ///
-/// # The accept threads outlive this guard, and for a per-invocation proxy that is a leak
+/// # Stopping the accept threads
 ///
-/// The two threads [`start`] spawns are detached and hold the listening fds. Nothing here stops
-/// them, and nothing can from the outside: neither [`super::proxy::serve`] nor
-/// [`super::control::serve`] ever returns — `UnixListener::incoming()` yields forever, and both
-/// loops deliberately treat every `accept(2)` error as transient (log, sleep 20 ms, continue) so a
-/// host fd exhaustion cannot take a session's egress down. Dropping this guard unlinks the socket
-/// *paths*; the sockets stay bound and the threads stay parked in `accept` until the process exits.
+/// The two threads [`start`] spawns are detached and hold the listening fds, and neither
+/// [`super::proxy::serve`] nor [`super::control::serve`] returns on its own —
+/// `UnixListener::incoming()` yields forever, and both loops deliberately treat every `accept(2)`
+/// error as transient (log, sleep 20 ms, continue) so host fd exhaustion cannot take a session's
+/// egress down.
 ///
-/// That was written when the only `Egress` was the session's, where "until sbx exits" and "until the
-/// launch ends" name the same instant. They are not the same instant for the per-invocation proxy a
-/// task invocation stands up ([`start`] with an `instance`, from `sandbox::task`): that guard is
-/// dropped when the invocation finishes, so a session running N task invocations accumulates 2N
-/// parked threads and 2N listening sockets nothing will ever connect to again.
+/// While the only `Egress` was the session's, that cost nothing: "until sbx exits" and "until the
+/// launch ends" named the same instant. They are not the same instant for the per-invocation proxy
+/// a task invocation stands up ([`start`] with an `instance`, from `sandbox::task`), whose guard is
+/// dropped when the invocation finishes — so a session running N task invocations accumulated 2N
+/// parked threads and 2N listening sockets nothing would ever connect to again.
 ///
-/// Closing it needs a stop signal both serve loops leave on — a `shutdown(2)` on the listener from
-/// here would not do it, and would be worse than the leak: the loops read the resulting `EINVAL` as
-/// one more transient accept error, so the parked thread becomes a 50 Hz error-logging spin instead.
+/// So the guard carries a stop flag both loops read, and [`Drop`] sets it and then connects once to
+/// each socket to unpark the `accept`. It has to be a flag plus a poke: a `shutdown(2)` on the
+/// listener would be read as one more transient accept error and turn the parked thread into a
+/// 50 Hz error-logging spin, and `close(2)` is worse still — an `EBADF` spin, plus an fd-reuse
+/// hazard against the thread's own eventual close.
 pub(crate) struct Egress {
     host_uds: PathBuf,
     ca_file: PathBuf,
@@ -109,6 +110,9 @@ pub(crate) struct Egress {
     /// `sbx app <name> --net-learn` synthesizes rules from. The proxy appends to it; this is a
     /// read handle.
     log: Arc<super::control::LogRing>,
+    /// The stop signal both serve loops read, set by [`Drop`] — see the header above for why the
+    /// threads cannot be ended any other way.
+    stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Egress {
@@ -137,6 +141,17 @@ impl Egress {
 
 impl Drop for Egress {
     fn drop(&mut self) {
+        // Stop the two serve threads before the paths go, and in this order: the flag first, then
+        // one throwaway connection per socket to unpark the `accept` they are blocked in. The loops
+        // read the flag the moment `accept` returns — with the connection or with an error, either
+        // ends them — so the poke has to happen while the path still resolves, which is why the
+        // unlinks below come after. A refused or failed connect costs nothing: the thread is then
+        // already gone, or the process is exiting anyway.
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::os::unix::net::UnixStream::connect(&self.host_uds);
+        if let Some(control) = &self.control_uds {
+            let _ = std::os::unix::net::UnixStream::connect(control);
+        }
         let _ = std::fs::remove_file(&self.host_uds);
         let _ = std::fs::remove_file(&self.ca_file);
         if let Some(control) = &self.control_uds {
@@ -844,6 +859,9 @@ pub(crate) fn start(
     // clones of the same `Arc`.
     let log = event_log
         .unwrap_or_else(|| Arc::new(super::control::LogRing::new(super::control::LOG_RING_CAP)));
+    // One stop signal for both serve threads. Set by the guard's `Drop`, which then connects to each
+    // socket once to unpark the `accept` that would otherwise block forever — see `Egress`.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let control_uds = {
         let control_uds = dir.join(format!("control-{pid}{instance}.sock"));
         let _ = std::fs::remove_file(&control_uds);
@@ -860,6 +878,7 @@ pub(crate) fn start(
         let control_listener = UnixListener::bind(&control_uds)?;
         let control_log = log.clone();
         let control_capture = capture.clone();
+        let control_stop = stop.clone();
         std::thread::spawn(move || {
             let _ = super::control::serve(
                 control_listener,
@@ -868,6 +887,7 @@ pub(crate) fn start(
                 control_log,
                 flows,
                 control_capture,
+                control_stop,
             );
         });
         Some(control_uds)
@@ -923,9 +943,10 @@ pub(crate) fn start(
     // queue from the moment the cage can reach the socket — no first-request race.
     let listener = UnixListener::bind(&host_uds)?;
     let serve_ctx = ctx.clone();
+    let proxy_stop = stop.clone();
     std::thread::spawn(move || {
         // A serve error ends the proxy thread; the cage then loses egress (fail-closed).
-        let _ = super::proxy::serve(listener, serve_ctx);
+        let _ = super::proxy::serve(listener, serve_ctx, proxy_stop);
     });
 
     let proxy_url = format!("http://127.0.0.1:{CAGE_PROXY_PORT}");
@@ -981,6 +1002,7 @@ pub(crate) fn start(
             control_uds,
             stats,
             log,
+            stop,
         },
         Wiring { binds, env },
     ))
@@ -1383,6 +1405,46 @@ fn classify_value(raw: String, header: &str, label: &str) -> io::Result<Option<S
 
 #[cfg(test)]
 mod tests {
+
+    /// Dropping the guard ends its serve threads, instead of leaving them parked forever.
+    ///
+    /// A session stands up one proxy, but a *task invocation* stands up its own and drops it when
+    /// the invocation finishes — so without this each invocation left two threads blocked in
+    /// `accept` on two sockets nothing would connect to again. Asserted by the observable
+    /// consequence rather than by counting threads: once the guard is gone the socket must be
+    /// unbound, which only happens because the loop returned and dropped its listener.
+    #[test]
+    fn dropping_the_guard_ends_the_threads_holding_its_sockets() {
+        let dir = crate::testutil::TmpDir::new();
+        let sock = dir.path().join("probe.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let serving = stop.clone();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = done.clone();
+        let handle = std::thread::spawn(move || {
+            // The same shape both real serve loops have: block in `accept`, and read the flag the
+            // moment it returns, whether it returned a connection or an error.
+            for stream in listener.incoming() {
+                if serving.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                drop(stream);
+            }
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        // The flag alone cannot be enough — the thread is inside `accept` and will not look at it
+        // until something arrives. This is the poke `Drop` makes.
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::os::unix::net::UnixStream::connect(&sock);
+
+        handle.join().expect("the serve thread must end");
+        assert!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            "the loop returned without running to its end"
+        );
+    }
     use super::*;
     use crate::testutil::{EnvVar, TmpDir, env_lock};
     use std::os::unix::fs::PermissionsExt;
@@ -1671,6 +1733,7 @@ mod tests {
             })
             .collect();
         drop(Egress {
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             host_uds: paths[0].clone(),
             ca_file: paths[1].clone(),
             control_uds: Some(paths[2].clone()),

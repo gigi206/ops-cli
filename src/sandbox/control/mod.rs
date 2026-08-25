@@ -1046,8 +1046,13 @@ pub(crate) fn serve(
     log: Arc<LogRing>,
     flows: Arc<FlowRegistry>,
     capture: Option<Arc<CaptureRing>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
 ) -> io::Result<()> {
     for stream in listener.incoming() {
+        // See [`super::proxy::serve`]: the owner sets this and pokes the socket to unpark `accept`.
+        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
         let stream = match stream {
             Ok(s) => s,
             Err(e) => {
@@ -1762,7 +1767,15 @@ mod tests {
         let served_manual = manual.clone();
         let flows = Arc::new(FlowRegistry::new());
         thread::spawn(move || {
-            let _ = serve(listener, pending, served_manual, log, flows, None);
+            let _ = serve(
+                listener,
+                pending,
+                served_manual,
+                log,
+                flows,
+                None,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
         });
 
         // A loaded rule reports `Loaded` and lands in the overlay the proxy folds into its policy.
@@ -1799,7 +1812,15 @@ mod tests {
             let log = log.clone();
             let flows = flows.clone();
             thread::spawn(move || {
-                let _ = serve(listener, pending, manual, log, flows, None);
+                let _ = serve(
+                    listener,
+                    pending,
+                    manual,
+                    log,
+                    flows,
+                    None,
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                );
             });
         }
 
@@ -1981,7 +2002,15 @@ mod tests {
             let log = log.clone();
             let flows = flows.clone();
             thread::spawn(move || {
-                let _ = serve(listener, pending, manual, log, flows, None);
+                let _ = serve(
+                    listener,
+                    pending,
+                    manual,
+                    log,
+                    flows,
+                    None,
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                );
             });
         }
 
@@ -2344,7 +2373,15 @@ mod tests {
             let log = log.clone();
             let flows = flows.clone();
             thread::spawn(move || {
-                let _ = serve(listener, pending, manual, log, flows, None);
+                let _ = serve(
+                    listener,
+                    pending,
+                    manual,
+                    log,
+                    flows,
+                    None,
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                );
             });
         }
 

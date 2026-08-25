@@ -220,8 +220,19 @@ pub(crate) use wire::header_name_eq;
 /// Serve the egress proxy on `listener` (the host end of the cage's bound socket), one thread per
 /// connection. Each accepted stream gets the per-socket timeouts before it is handled, so a slow
 /// or hung peer cannot pin a thread forever.
-pub(crate) fn serve(listener: UnixListener, ctx: Arc<ProxyCtx>) -> io::Result<()> {
+pub(crate) fn serve(
+    listener: UnixListener,
+    ctx: Arc<ProxyCtx>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> io::Result<()> {
     for stream in listener.incoming() {
+        // Checked here rather than only on the happy path, so a woken accept ends the loop whether
+        // it woke with a connection or with an error. The owner sets the flag and then connects
+        // once to unpark this `accept` — nothing else can, since `incoming()` blocks forever and
+        // every accept error below is deliberately transient.
+        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
         let mut stream = match stream {
             Ok(s) => s,
             Err(e) => {
