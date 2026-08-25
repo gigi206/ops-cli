@@ -275,6 +275,32 @@ pub(crate) fn state(store_dir: &Path, config_path: &Path) -> TrustState {
 /// mise file is refused rather than blessed, and the hash covers exactly the gated
 /// bytes of both.
 pub(crate) fn trust(store_dir: &Path, config_path: &Path) -> io::Result<()> {
+    trust_inner(store_dir, config_path, None)
+}
+
+/// [`trust`] over bytes the caller already holds, for a caller that has just *written* the file.
+///
+/// The difference is one read, and it is the whole point. `trust` reads `config_path` back and
+/// attests to whatever is there at that moment; a caller that composed and wrote the file already
+/// knows what it meant to bless, and the project tree is bound read-write into the cage — so a
+/// payload that writes between the caller's write and `trust`'s read gets its own config attested.
+/// Hashing the given bytes instead means a file changed underneath simply no longer matches its
+/// marker, and the next launch drops it: the fail-safe answer, and the one the caller's own gate
+/// already assumes it gets.
+///
+/// The sibling mise files are still read here, because the caller did not write those — attesting
+/// to bytes it never composed would be inventing them.
+pub(crate) fn trust_written(
+    store_dir: &Path,
+    config_path: &Path,
+    sbx_bytes: &[u8],
+) -> io::Result<()> {
+    trust_inner(store_dir, config_path, Some(sbx_bytes))
+}
+
+/// The body of both: `written` is the config's bytes when the caller composed them, `None` to read
+/// them from `config_path`.
+fn trust_inner(store_dir: &Path, config_path: &Path, written: Option<&[u8]>) -> io::Result<()> {
     // Every error out of this function opens with the file it is about, so a caller can name the
     // action alone (`could not re-trust {e}`) instead of prefixing a path the message already
     // carries. The two reads get that from the safety gate, which is also the only layer that knows
@@ -291,7 +317,11 @@ pub(crate) fn trust(store_dir: &Path, config_path: &Path) -> io::Result<()> {
             ),
         )
     };
-    let sbx_bytes = crate::config::safety::read_safe_bytes(config_path)?;
+    // The safety gate still runs on the path even when the bytes are given: it is what refuses a
+    // world-writable or foreign-owned file, and that question is about the file on disk, not about
+    // what the caller holds. Only the *hashed* bytes come from the caller.
+    let read_back = crate::config::safety::read_safe_bytes(config_path)?;
+    let sbx_bytes = written.map(|b| b.to_vec()).unwrap_or(read_back);
     let mise_inputs = mise_inputs_for(config_path)?;
     let hash = content_hash(&sbx_bytes, &mise_inputs);
 
@@ -360,6 +390,48 @@ pub(crate) fn untrust(store_dir: &Path, config_path: &Path) -> io::Result<bool> 
 
 #[cfg(test)]
 mod tests {
+
+    /// Trust attests to the bytes the caller wrote, not to whatever is on disk afterwards.
+    ///
+    /// `sbx net allow --local` writes a project config and then blesses it. The project tree is
+    /// bound read-write into the cage, so if the marker were taken from a *re-read* an in-cage
+    /// payload writing between the two would have its own config attested — and its security fields
+    /// would apply from the next launch. Here the racing write is simulated by simply writing
+    /// something else after the composed bytes: the marker must not match it.
+    #[test]
+    fn trust_attests_to_what_was_written_not_to_a_later_writer() {
+        let dir = crate::testutil::TmpDir::new();
+        let store = dir.path().join("store");
+        let config = dir.path().join(crate::config::PROJECT_CONFIG);
+
+        // What sbx composed and wrote.
+        let composed = "[network]\nmode = \"deny\"\nallow = [\"example.com\"]\n";
+        std::fs::write(&config, composed).expect("write the composed config");
+
+        // The racing writer lands between the write and the trust.
+        let hostile = "[network]\nmode = \"allow\"\n";
+        std::fs::write(&config, hostile).expect("the racing write");
+
+        trust_written(&store, &config, composed.as_bytes()).expect("record trust");
+
+        // `Changed`, not `Trusted`: there *is* a marker (sbx wrote one), and the file no longer
+        // matches it — which is precisely the signal a launch drops the security fields on. Had the
+        // marker been taken from a re-read, this would say `Trusted` and the racing write would
+        // apply.
+        assert_eq!(
+            state(&store, &config),
+            TrustState::Changed,
+            "the racing write was blessed — the marker covered the file on disk, not what sbx wrote"
+        );
+
+        // And the composed bytes are what the marker does cover: put them back and it is trusted.
+        std::fs::write(&config, composed).expect("restore the composed config");
+        assert_eq!(
+            state(&store, &config),
+            TrustState::Trusted,
+            "the bytes that were attested to must be the ones that verify"
+        );
+    }
     use super::*;
     use crate::testutil::TmpDir;
 

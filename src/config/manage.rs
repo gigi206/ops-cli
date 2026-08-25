@@ -140,7 +140,7 @@ impl ProcList {
 }
 
 /// The result of adding an egress rule.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AddOutcome {
     /// The rule was added. `created_mode` is the mode of a `[network]` table this call created —
     /// either by bootstrapping a fresh allowlist (`"deny"`) or by promoting a bare-string posture
@@ -148,6 +148,23 @@ pub(crate) enum AddOutcome {
     Added { created_mode: Option<String> },
     /// The rule was already present (an exact-string match): a no-op.
     AlreadyPresent,
+}
+
+/// What an add left on disk: its [`AddOutcome`], and the exact document text the file now holds.
+///
+/// The text is carried out because the caller has to attest to it. `sbx net allow --local` writes a
+/// project config and then re-trusts it, and `trust` hashing the *path* would read the file a second
+/// time — so a payload writing the project between the two (the tree is bound read-write into the
+/// cage) got its own config blessed. Hashing what was composed closes that: a file changed underneath
+/// no longer matches its marker, and the next launch drops it, which is the fail-safe answer.
+///
+/// `AlreadyPresent` carries text too, and the same text the decision was made on: nothing was
+/// written, so what is attested to is the document as read — consistent with the answer given, and
+/// still not a second read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Written {
+    pub(crate) outcome: AddOutcome,
+    pub(crate) text: String,
 }
 
 impl std::fmt::Display for ManageError {
@@ -776,7 +793,7 @@ pub(crate) fn add_egress_rule(
     app: Option<&str>,
     list: EgressList,
     rule: &str,
-) -> Result<AddOutcome, ManageError> {
+) -> Result<Written, ManageError> {
     // Inspect the current `network` field into an owned decision first, so the read borrow is
     // released before the document is mutated below.
     enum NetCase {
@@ -866,8 +883,8 @@ pub(crate) fn add_egress_rule(
         }
     };
 
-    write_doc(path, &doc)?;
-    Ok(outcome)
+    let text = write_doc(path, &doc)?;
+    Ok(Written { outcome, text })
 }
 
 /// Add a process/exec `rule` to the `[proc]` `list` of the target file (baseline or `[app.<name>]`).
@@ -884,7 +901,7 @@ pub(crate) fn add_proc_rule(
     app: Option<&str>,
     list: ProcList,
     rule: &str,
-) -> Result<AddOutcome, ManageError> {
+) -> Result<Written, ManageError> {
     enum ProcCase {
         Absent,
         BareMode(String),
@@ -956,8 +973,8 @@ pub(crate) fn add_proc_rule(
         }
     };
 
-    write_doc(path, &doc)?;
-    Ok(outcome)
+    let text = write_doc(path, &doc)?;
+    Ok(Written { outcome, text })
 }
 
 /// Guard the `mode` of a `[proc]` table/bare-string before appending an allow/deny rule to it. A
@@ -1302,8 +1319,12 @@ fn read_or_empty(path: &Path) -> Result<DocumentMut, ManageError> {
 /// A fresh file is written owner-only (`0600`), independent of the caller's umask, so sbx's own
 /// write always passes its safety gate (a world-writable config is later refused); an existing
 /// file keeps its mode. The temp name carries the pid so two concurrent writers do not collide.
-fn write_doc(path: &Path, doc: &DocumentMut) -> Result<(), ManageError> {
-    write_text(path, &doc.to_string(), Some(0o600))
+/// Returns the exact text written, so a caller that must then attest to the file's *content* can
+/// hash what it composed instead of reading the path back — see [`Written`].
+fn write_doc(path: &Path, doc: &DocumentMut) -> Result<String, ManageError> {
+    let text = doc.to_string();
+    write_text(path, &text, Some(0o600))?;
+    Ok(text)
 }
 
 /// Write `text` to `path` on the terms [`write_doc`] describes — the body of it, shared with the
@@ -2431,7 +2452,9 @@ mod tests {
     fn add_egress_rule_bootstraps_an_allowlist_for_allow_on_a_fresh_config() {
         let tmp = crate::testutil::TmpDir::new();
         let p = tmp.path().join(".sbx.toml");
-        let out = add_egress_rule(&p, None, EgressList::Allow, "github.com").unwrap();
+        let out = add_egress_rule(&p, None, EgressList::Allow, "github.com")
+            .unwrap()
+            .outcome;
         assert_eq!(
             out,
             AddOutcome::Added {
@@ -2455,7 +2478,9 @@ mod tests {
         );
 
         // Add a mute rule → it lands in a `mute` array beside `allow`, the verdict lists untouched.
-        let added = add_egress_rule(&p, None, EgressList::Mute, "play.googleapis.com").unwrap();
+        let added = add_egress_rule(&p, None, EgressList::Mute, "play.googleapis.com")
+            .unwrap()
+            .outcome;
         assert_eq!(added, AddOutcome::Added { created_mode: None });
         let body = std::fs::read_to_string(&p).unwrap();
         assert!(body.contains("mute = [\"play.googleapis.com\"]"), "{body}");
@@ -2466,7 +2491,9 @@ mod tests {
 
         // Adding the same rule again is idempotent.
         assert_eq!(
-            add_egress_rule(&p, None, EgressList::Mute, "play.googleapis.com").unwrap(),
+            add_egress_rule(&p, None, EgressList::Mute, "play.googleapis.com")
+                .unwrap()
+                .outcome,
             AddOutcome::AlreadyPresent
         );
 
@@ -2539,7 +2566,9 @@ mod tests {
     fn add_egress_rule_promotes_a_bare_string_posture_keeping_its_mode() {
         let tmp = crate::testutil::TmpDir::new();
         let p = doc_at(tmp.path(), "network = \"allow\"\n");
-        let out = add_egress_rule(&p, None, EgressList::Deny, "evil.com").unwrap();
+        let out = add_egress_rule(&p, None, EgressList::Deny, "evil.com")
+            .unwrap()
+            .outcome;
         assert_eq!(
             out,
             AddOutcome::Added {
@@ -2597,16 +2626,22 @@ mod tests {
             "[network]\nmode = \"deny\"\nallow = [\"a.com\"]\n",
         );
         assert_eq!(
-            add_egress_rule(&p, None, EgressList::Allow, "b.com").unwrap(),
+            add_egress_rule(&p, None, EgressList::Allow, "b.com")
+                .unwrap()
+                .outcome,
             AddOutcome::Added { created_mode: None }
         );
         assert_eq!(
-            add_egress_rule(&p, None, EgressList::Deny, "evil.com").unwrap(),
+            add_egress_rule(&p, None, EgressList::Deny, "evil.com")
+                .unwrap()
+                .outcome,
             AddOutcome::Added { created_mode: None }
         );
         // An exact-string match already present is a no-op.
         assert_eq!(
-            add_egress_rule(&p, None, EgressList::Allow, "b.com").unwrap(),
+            add_egress_rule(&p, None, EgressList::Allow, "b.com")
+                .unwrap()
+                .outcome,
             AddOutcome::AlreadyPresent
         );
         let body = std::fs::read_to_string(&p).unwrap();
@@ -2689,14 +2724,18 @@ mod tests {
             "network = { mode = \"deny\", allow = [\"a.com\"] }\n",
         );
         assert_eq!(
-            add_egress_rule(&p, None, EgressList::Allow, "b.com").unwrap(),
+            add_egress_rule(&p, None, EgressList::Allow, "b.com")
+                .unwrap()
+                .outcome,
             AddOutcome::Added { created_mode: None }
         );
         let body = std::fs::read_to_string(&p).unwrap();
         assert!(body.contains("a.com") && body.contains("b.com"), "{body}");
         // Idempotent within the inline form too.
         assert_eq!(
-            add_egress_rule(&p, None, EgressList::Allow, "b.com").unwrap(),
+            add_egress_rule(&p, None, EgressList::Allow, "b.com")
+                .unwrap()
+                .outcome,
             AddOutcome::AlreadyPresent
         );
     }
@@ -2829,7 +2868,9 @@ mod tests {
     fn add_proc_rule_bootstraps_enforce_for_a_deny_on_a_fresh_config() {
         let tmp = crate::testutil::TmpDir::new();
         let p = doc_at(tmp.path(), "");
-        let out = add_proc_rule(&p, None, ProcList::Deny, "curl").unwrap();
+        let out = add_proc_rule(&p, None, ProcList::Deny, "curl")
+            .unwrap()
+            .outcome;
         assert_eq!(
             out,
             AddOutcome::Added {
@@ -2869,7 +2910,9 @@ mod tests {
         ));
         // The deny still appends fine under enforce.
         assert_eq!(
-            add_proc_rule(&p, None, ProcList::Deny, "ssh").unwrap(),
+            add_proc_rule(&p, None, ProcList::Deny, "ssh")
+                .unwrap()
+                .outcome,
             AddOutcome::Added { created_mode: None }
         );
     }
@@ -2879,7 +2922,9 @@ mod tests {
         let tmp = crate::testutil::TmpDir::new();
         let p = doc_at(tmp.path(), "[proc]\nmode = \"ask\"\n");
         assert_eq!(
-            add_proc_rule(&p, None, ProcList::Allow, "git").unwrap(),
+            add_proc_rule(&p, None, ProcList::Allow, "git")
+                .unwrap()
+                .outcome,
             AddOutcome::Added { created_mode: None }
         );
         assert!(
@@ -2908,7 +2953,9 @@ mod tests {
     fn add_proc_rule_promotes_a_bare_string_mode_keeping_it() {
         let tmp = crate::testutil::TmpDir::new();
         let p = doc_at(tmp.path(), "proc = \"enforce\"\n");
-        let out = add_proc_rule(&p, None, ProcList::Deny, "curl").unwrap();
+        let out = add_proc_rule(&p, None, ProcList::Deny, "curl")
+            .unwrap()
+            .outcome;
         assert_eq!(out, AddOutcome::Added { created_mode: None });
         let body = std::fs::read_to_string(&p).unwrap();
         assert!(body.contains("[proc]"), "{body}");
@@ -2924,11 +2971,15 @@ mod tests {
             "[proc]\nmode = \"enforce\"\ndeny = [\"curl\"]\n",
         );
         assert_eq!(
-            add_proc_rule(&p, None, ProcList::Deny, "ssh").unwrap(),
+            add_proc_rule(&p, None, ProcList::Deny, "ssh")
+                .unwrap()
+                .outcome,
             AddOutcome::Added { created_mode: None }
         );
         assert_eq!(
-            add_proc_rule(&p, None, ProcList::Deny, "ssh").unwrap(),
+            add_proc_rule(&p, None, ProcList::Deny, "ssh")
+                .unwrap()
+                .outcome,
             AddOutcome::AlreadyPresent
         );
     }

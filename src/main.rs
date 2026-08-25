@@ -818,29 +818,21 @@ fn persist_egress_rule(
     } = open_rule_write("net", verb, NO_TRUST_STORE_ON_ADD, scope, app, base)?;
     let gated = store.is_some();
 
-    let outcome =
+    let written =
         manage::add_egress_rule(&path, app_key, list, rule).map_err(|e| (2, e.to_string()))?;
 
-    // Re-trust the project config after the write. Ordering is fail-safe against a *crash*: one
-    // between the write and the trust leaves a correct-but-untrusted file, which the next launch
-    // drops — the rule does not take effect, never a security hole.
+    // Re-trust the project config after the write, attesting to the bytes just written rather than
+    // to whatever is on disk now. Ordering is fail-safe against a crash — one between the write and
+    // the trust leaves a correct-but-untrusted file, which the next launch drops, so the rule does
+    // not take effect — and `trust_written` makes it fail-safe against a concurrent writer too.
     //
-    // It is **not** fail-safe against a concurrent writer, and the gap is worth naming because
-    // `local_save_permitted`'s gate reads as though it were. `trust::trust` re-reads the file (and
-    // its sibling mise files) from disk and hashes what it finds, so the marker covers whatever is
-    // on disk at that instant rather than what sbx just composed. The project tree is bound
-    // read-write into the cage, so an in-cage payload that wins the race between the write above
-    // and the read below gets its own `.sbx.toml` blessed, and its security fields apply from the
-    // next launch. Winning it means landing inside a sub-millisecond window in a command the user
-    // happens to run, which is why this is recorded rather than closed here.
-    //
-    // Closing it means never re-reading: `manage::add_egress_rule` (and `add_proc_rule` below)
-    // would carry the document text they wrote back out, and `trust` would gain an entry point that
-    // hashes given bytes instead of a path. Both are shaped for the fix — `write_doc` already has
-    // the exact text in hand — but the outcome type is matched in twenty-nine call sites, so it is
-    // a wider change than the window justifies on its own.
+    // That second half is not hypothetical: the project tree is bound read-write into the cage, so
+    // an in-cage payload racing this command could otherwise have had its own `.sbx.toml` read back
+    // and blessed here, and its security fields would apply from the next launch. Hashing what sbx
+    // composed means a file changed underneath simply no longer matches its marker — the same
+    // fail-safe outcome as the crash, and the one `local_save_permitted`'s gate reads as if it got.
     if let Some(store) = &store {
-        trust::trust(store, &path).map_err(|e| {
+        trust::trust_written(store, &path, written.text.as_bytes()).map_err(|e| {
             (
                 1,
                 format!(
@@ -852,7 +844,7 @@ fn persist_egress_rule(
         })?;
     }
 
-    Ok(match outcome {
+    Ok(match written.outcome {
         AddOutcome::AlreadyPresent => {
             format!("{verb} {rule} is already present in {target} — no change")
         }
@@ -897,13 +889,13 @@ fn persist_proc_rule(
     } = open_rule_write("proc", verb, NO_TRUST_STORE_ON_ADD, scope, app, base)?;
     let gated = store.is_some();
 
-    let outcome =
+    let written =
         manage::add_proc_rule(&path, app_key, list, rule).map_err(|e| (2, e.to_string()))?;
 
     // Re-trust after the write; the ordering is fail-safe (a crash between leaves a correct-but-
     // untrusted file the next launch drops — the rule does not take effect, never a security hole).
     if let Some(store) = &store {
-        trust::trust(store, &path).map_err(|e| {
+        trust::trust_written(store, &path, written.text.as_bytes()).map_err(|e| {
             (
                 1,
                 format!(
@@ -915,7 +907,7 @@ fn persist_proc_rule(
         })?;
     }
 
-    Ok(match outcome {
+    Ok(match written.outcome {
         AddOutcome::AlreadyPresent => {
             format!("{verb} {rule} is already present in {target} — no change")
         }
