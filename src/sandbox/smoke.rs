@@ -50,6 +50,18 @@ impl SmokeReport {
     }
 }
 
+/// Single-quote a value for the probe's shell.
+///
+/// `$HOME` is interpolated into a `[ -e … ]` test, and it was interpolated between bare quotes: a
+/// home directory containing an apostrophe closed the string, and the rest of the path became shell
+/// words. The consequence is not that the probe fails loudly — it is that the test runs against
+/// some other path and answers `ABSENT`, which is this check reporting the host home did not leak
+/// into the cage when it has not looked. A hardening probe that can be made to pass by the shape of
+/// a path is not one.
+fn shell_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// Launch the minimal hardened probe via `bwrap` and report what the kernel saw.
 ///
 /// Errors only when the probe could not be run at all (the spec is constant and
@@ -63,7 +75,8 @@ pub(crate) fn run(bwrap: &Path) -> io::Result<SmokeReport> {
     let host_home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let script = format!(
         "cat /proc/self/status; printf 'HOSTHOME='; \
-         if [ -e '{host_home}' ]; then echo PRESENT; else echo ABSENT; fi",
+         if [ -e {} ]; then echo PRESENT; else echo ABSENT; fi",
+        shell_quoted(&host_home)
     );
 
     let spec = probe_spec(work.path(), script)?;
@@ -183,6 +196,49 @@ mod tests {
     fn prerequisites() -> Option<PathBuf> {
         let bwrap = crate::pathfind::find_on_path("bwrap")?;
         matches!(crate::probe_userns(), crate::Userns::Ok).then_some(bwrap)
+    }
+
+    /// The probe tests `[ -e $HOME ]` inside the cage, and `$HOME` reaches that test through a
+    /// shell string. Interpolated between bare quotes, a home containing an apostrophe closed the
+    /// string and the rest became shell words — so the test ran against some other path and
+    /// answered `ABSENT`, which is this check reporting that the host home did not leak into the
+    /// cage without having looked at it.
+    ///
+    /// Run rather than read: the quoting is only correct if a shell agrees, so the shell is asked.
+    #[test]
+    fn a_home_containing_a_quote_is_still_the_path_the_probe_tests() {
+        let dir = crate::testutil::TmpDir::new();
+        let home = dir.path().join("it's a home");
+        std::fs::create_dir_all(&home).unwrap();
+        let quoted = shell_quoted(&home.display().to_string());
+
+        // The same test the probe runs, on a path that exists: `PRESENT` is the only right answer,
+        // and unquoted this line does not even parse.
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "if [ -e {quoted} ]; then echo PRESENT; else echo ABSENT; fi"
+            ))
+            .output()
+            .expect("run the probe's own test");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "PRESENT",
+            "the quoted path must reach `[ -e ]` whole; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // And a path that does not exist still answers ABSENT, so the quoting has not turned the
+        // test into one that passes on anything.
+        let missing = shell_quoted(&dir.path().join("no'such").display().to_string());
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "if [ -e {missing} ]; then echo PRESENT; else echo ABSENT; fi"
+            ))
+            .output()
+            .expect("run the probe's own test");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ABSENT");
     }
 
     #[test]
