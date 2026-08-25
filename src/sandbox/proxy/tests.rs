@@ -1727,7 +1727,7 @@ fn an_absolute_form_https_request_is_forwarded_over_a_validated_tls_upstream() {
         "the upstream response is relayed to the plaintext client: {resp:?}"
     );
     let upstream_head = rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(UPSTREAM_WAIT)
         .expect("the upstream received the forwarded request");
     assert!(
         upstream_head.starts_with("POST /oauth/token HTTP/1.1"),
@@ -1749,7 +1749,7 @@ fn an_absolute_form_https_request_is_forwarded_over_a_validated_tls_upstream() {
 /// received, plus the ceiling refusal this plane writes with its own refusal writer.
 #[test]
 fn the_absolute_form_plane_holds_a_body_to_digest_it_on_the_same_terms() {
-    let forwarded = |request: String| -> (String, String) {
+    let forwarded = |request: String, wait: Duration| -> (String, String) {
         let (addr, upstream_ca, rx) = spawn_upstream_capturing(
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
         );
@@ -1777,7 +1777,7 @@ fn the_absolute_form_plane_holds_a_body_to_digest_it_on_the_same_terms() {
                 .as_bytes(),
         )
         .unwrap();
-        let head = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+        let head = rx.recv_timeout(wait).unwrap_or_default();
         (resp, head)
     };
     let lengths = |head: &str| {
@@ -1791,6 +1791,7 @@ fn the_absolute_form_plane_holds_a_body_to_digest_it_on_the_same_terms() {
         "POST https://host.test:{port}/ HTTP/1.1\r\nHost: host.test\r\n\
          Content-Length: 11\r\n\r\nhello world"
             .to_string(),
+        UPSTREAM_WAIT,
     );
     assert!(resp.contains("200"), "{resp:?}");
     assert!(head.contains(hello), "{head:?}");
@@ -1800,6 +1801,7 @@ fn the_absolute_form_plane_holds_a_body_to_digest_it_on_the_same_terms() {
         "POST https://host.test:{port}/ HTTP/1.1\r\nHost: host.test\r\n\
          Transfer-Encoding: chunked\r\n\r\nb\r\nhello world\r\n0\r\n\r\n"
             .to_string(),
+        UPSTREAM_WAIT,
     );
     assert!(resp.contains("200"), "{resp:?}");
     assert!(head.contains(hello), "{head:?}");
@@ -1808,8 +1810,10 @@ fn the_absolute_form_plane_holds_a_body_to_digest_it_on_the_same_terms() {
         "{head:?}"
     );
 
-    let (resp, head) =
-        forwarded("GET https://host.test:{port}/ HTTP/1.1\r\nHost: host.test\r\n\r\n".to_string());
+    let (resp, head) = forwarded(
+        "GET https://host.test:{port}/ HTTP/1.1\r\nHost: host.test\r\n\r\n".to_string(),
+        UPSTREAM_WAIT,
+    );
     assert!(resp.contains("200"), "{resp:?}");
     assert!(
         head.contains("X-Body: 0/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
@@ -1821,10 +1825,13 @@ fn the_absolute_form_plane_holds_a_body_to_digest_it_on_the_same_terms() {
         "a bodyless request gains no framing on this plane either: {head:?}"
     );
 
-    let (resp, _) = forwarded(format!(
-        "POST https://host.test:{{port}}/ HTTP/1.1\r\nHost: host.test\r\nContent-Length: {}\r\n\r\n",
-        crate::allowlist::DEFAULT_BODY_MAX + 1
-    ));
+    let (resp, _) = forwarded(
+        format!(
+            "POST https://host.test:{{port}}/ HTTP/1.1\r\nHost: host.test\r\nContent-Length: {}\r\n\r\n",
+            crate::allowlist::DEFAULT_BODY_MAX + 1
+        ),
+        UPSTREAM_SILENCE,
+    );
     assert!(
         resp.contains("413") && resp.contains("signer-body-too-large"),
         "the ceiling is refused with this plane's own writer: {resp:?}"
@@ -1968,7 +1975,7 @@ fn an_absolute_form_https_forward_injects_the_scoped_credential() {
     );
     let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
     assert!(resp.contains("200"), "the response flows back: {resp:?}");
-    let head = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+    let head = rx.recv_timeout(UPSTREAM_WAIT).unwrap_or_default();
     assert!(
         head.contains("Authorization: Bearer sbx-secret-value"),
         "sbx's credential must reach the upstream over the encrypted leg: {head:?}"
@@ -2100,7 +2107,7 @@ fn an_ask_undecided_host_on_the_https_forward_path_parks_and_proceeds_when_allow
         "an allowed ask must reach the upstream: {resp:?}"
     );
     assert!(
-        rx.recv_timeout(Duration::from_secs(5))
+        rx.recv_timeout(UPSTREAM_WAIT)
             .unwrap_or_default()
             .starts_with("POST /oauth/token HTTP/1.1"),
         "the parked-then-allowed request must be forwarded in origin-form"
@@ -2255,7 +2262,7 @@ fn an_absolute_form_https_forward_preserves_the_query_string() {
     );
     let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
     assert!(resp.contains("200"), "the response flows back: {resp:?}");
-    let head = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+    let head = rx.recv_timeout(UPSTREAM_WAIT).unwrap_or_default();
     assert!(
         head.starts_with("GET /oauth/callback?code=abc%2Fdef&state=xyz HTTP/1.1"),
         "the query string must reach the upstream verbatim: {head:?}"
@@ -2292,7 +2299,7 @@ fn a_chunked_absolute_form_https_forward_is_de_chunked_and_re_framed() {
     );
     let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
     assert!(resp.contains("200"), "the response flows back: {resp:?}");
-    let head = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+    let head = rx.recv_timeout(UPSTREAM_WAIT).unwrap_or_default();
     let lower = head.to_ascii_lowercase();
     assert!(
         lower.contains("content-length: 12"),
@@ -2332,7 +2339,7 @@ fn a_proxy_authorization_header_is_never_forwarded_upstream() {
     );
     let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
     assert!(resp.contains("200"), "the response flows back: {resp:?}");
-    let head = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+    let head = rx.recv_timeout(UPSTREAM_WAIT).unwrap_or_default();
     assert!(
         !head.to_ascii_lowercase().contains("proxy-authorization"),
         "the proxy-hop credential must be stripped: {head:?}"
@@ -2637,7 +2644,7 @@ fn through_non_closing_upstream(response: &'static [u8], request: &'static [u8])
         );
         let _ = tx.send(got);
     });
-    let got = rx.recv_timeout(Duration::from_secs(10));
+    let got = rx.recv_timeout(UPSTREAM_WAIT);
     release.store(true, Ordering::Relaxed);
     got.expect("the relay must end at the end of the message, not wait for the upstream to close")
         .expect("the relay failed")
@@ -3429,7 +3436,7 @@ fn a_tunnel_survives_a_chunked_and_a_bodiless_response() {
             ));
         });
         let got = rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(UPSTREAM_WAIT)
             .unwrap_or_else(|_| panic!("{label}: neither side may be left waiting"))
             .unwrap();
         assert_eq!(got.len(), 2, "{label}: the tunnel carried both: {got:?}");
@@ -4013,7 +4020,7 @@ fn a_response_that_ends_short_of_its_declared_length_ends_the_tunnel() {
         ));
     });
     let got = rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(UPSTREAM_WAIT)
         .expect("the client must be released by the close, not left to wait out the idle bound")
         .unwrap();
     assert_eq!(
@@ -4952,7 +4959,7 @@ fn digesting_injection_for(to: &str) -> HeaderInjection {
 #[test]
 fn holding_a_body_to_digest_it_reframes_only_a_request_that_has_one() {
     let framed = |request: &[u8]| {
-        run_with_injections_and_redactions(vec![digesting_injection()], &[], request)
+        run_with_injections_and_redactions(vec![digesting_injection()], &[], request, UPSTREAM_WAIT)
     };
     let lengths = |head: &str| {
         head.lines()
@@ -6214,6 +6221,23 @@ fn a_session_injected_allow_makes_a_request_proceed_without_parking() {
     );
 }
 
+/// How long a test waits for a spawned stand-in upstream to hand back what it received.
+///
+/// Generous on purpose. What these waits are *about* is the shape of the head that arrived, never
+/// how fast it arrived — and the suite runs thousands of tests in parallel on however many cores
+/// the machine has, so a budget tight enough to be meaningful is a budget a loaded scheduler can
+/// miss. One did, once, on a run where nothing was wrong with the code. A hung test still fails,
+/// just later, which is the right trade for a wait that is not the subject.
+const UPSTREAM_WAIT: Duration = Duration::from_secs(60);
+
+/// How long a test waits when it is asserting that *nothing* reached the upstream.
+///
+/// The mirror of [`UPSTREAM_WAIT`], and short for the opposite reason: here the wait is the
+/// subject. A request the proxy refuses never reaches the stand-in upstream, so the receive is
+/// expected to time out and the budget is dead time paid on every run. It only has to outlast the
+/// hand-off the proxy would have made had it forwarded, which is local and immediate.
+const UPSTREAM_SILENCE: Duration = Duration::from_secs(1);
+
 /// Block until exactly one request is parked in `state`, answer it with `verdict`, and return
 /// the host it was for — so a test thread can answer a request the proxy thread just parked.
 fn answer_when_parked(
@@ -6686,7 +6710,7 @@ fn the_forwarded_request_forces_connection_close() {
     )
     .unwrap();
     let upstream_head = rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(UPSTREAM_WAIT)
         .expect("the upstream received a request");
     assert!(
         resp.contains("200"),
@@ -6782,7 +6806,7 @@ fn run_with_injections(
         request,
     )
     .unwrap();
-    let head = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+    let head = rx.recv_timeout(UPSTREAM_WAIT).unwrap_or_default();
     (resp, head)
 }
 
@@ -7410,6 +7434,7 @@ fn run_with_injections_and_redactions(
     injections: Vec<HeaderInjection>,
     needles: &[&str],
     request: &[u8],
+    wait: Duration,
 ) -> (String, String) {
     let (addr, upstream_ca, rx) = spawn_upstream_capturing(
         b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -7445,7 +7470,7 @@ fn run_with_injections_and_redactions(
         request,
     )
     .unwrap();
-    let head = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+    let head = rx.recv_timeout(wait).unwrap_or_default();
     (resp, head)
 }
 
@@ -7893,6 +7918,7 @@ fn the_redaction_does_not_self_trip_on_the_injected_value() {
         )],
         &["sbx-secret-value"],
         b"GET / HTTP/1.1\r\nHost: host.test\r\n\r\n",
+        UPSTREAM_WAIT,
     );
     assert!(
         resp.contains("200"),
@@ -7920,6 +7946,7 @@ fn replaying_the_secret_is_refused_but_a_different_value_is_stripped_and_replace
         )],
         &["sbx-secret-value"],
         b"GET / HTTP/1.1\r\nHost: host.test\r\nAuthorization: Bearer sbx-secret-value\r\n\r\n",
+        UPSTREAM_SILENCE,
     );
     assert!(
         resp_a.contains("403") && resp_a.contains("outbound-secret"),
@@ -7935,6 +7962,7 @@ fn replaying_the_secret_is_refused_but_a_different_value_is_stripped_and_replace
         )],
         &["sbx-secret-value"],
         b"GET / HTTP/1.1\r\nHost: host.test\r\nAuthorization: Bearer attacker\r\n\r\n",
+        UPSTREAM_WAIT,
     );
     assert!(
         resp_b.contains("200"),
@@ -9407,7 +9435,7 @@ fn ws_send_from_cage(
     let _ = tls.flush();
     drop(tls);
     upstream_got
-        .recv_timeout(Duration::from_secs(60))
+        .recv_timeout(UPSTREAM_WAIT)
         .expect("the upstream thread must report what it received")
 }
 
