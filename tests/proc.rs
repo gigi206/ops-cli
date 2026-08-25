@@ -68,6 +68,42 @@ fn sbx(args: &[&str], data: &Path, cwd: &Path) -> Output {
         .expect("run sbx")
 }
 
+/// A project scope that cannot be resolved is a refusal, not a widening.
+///
+/// The filter is an `Option`, and `None` means "every session". Swallowing the resolution error
+/// therefore listed every session on the machine — other projects' among them — which is precisely
+/// what `--all` is for asking. Both siblings (`sbx proc pending`, `sbx net rules`) already refuse.
+#[test]
+fn proc_rules_refuses_a_project_it_cannot_resolve_rather_than_listing_everything() {
+    let base = TmpDir::new();
+    let (work, data) = (base.path().join("work"), base.path().join("data"));
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+
+    // A process whose working directory has been unlinked: `getcwd` then fails, which is the state
+    // this branch is about. Reached through a shell because the directory has to go *after* the
+    // `cd` and before the exec.
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("cd work && rm -rf ../work && exec \"$SBX\" proc rules")
+        .current_dir(base.path())
+        .env("SBX", env!("CARGO_BIN_EXE_sbx"))
+        .env("XDG_DATA_HOME", &data)
+        .env("LC_ALL", "C.UTF-8")
+        .output()
+        .expect("run sbx");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {err}");
+    assert!(
+        err.contains("cannot resolve the current project directory"),
+        "the refusal must name what could not be resolved: {err}"
+    );
+    assert!(
+        err.contains("--all"),
+        "and point at the flag that asks for every session: {err}"
+    );
+}
+
 #[test]
 fn proc_ls_with_no_sessions_reports_none_and_exits_2() {
     let (data, proj) = (TmpDir::new(), TmpDir::new());
