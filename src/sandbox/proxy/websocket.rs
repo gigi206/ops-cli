@@ -167,11 +167,14 @@ impl Inflater {
         }
     }
 
-    /// Inflate one whole message, yielding at most `cap + 1` bytes — one past the sink's capacity, so
+    /// Inflate one whole message, keeping at most `cap + 1` bytes — one past the sink's capacity, so
     /// a message that overflows is seen as an overflow rather than as one that happened to fit.
     /// `None` means the stream did not decode, and the caller stops capturing this direction rather
     /// than storing rubbish.
-    fn message(&mut self, compressed: &[u8], cap: usize) -> Option<Vec<u8>> {
+    ///
+    /// The cap bounds what is **kept**, never what is **decoded**: see [`Inflated::in_step`] for why
+    /// the difference is the whole of this direction's leak scan.
+    fn message(&mut self, compressed: &[u8], cap: usize) -> Option<Inflated> {
         let mut input: Vec<u8> = Vec::with_capacity(compressed.len() + 4);
         input.extend_from_slice(compressed);
         input.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
@@ -195,29 +198,123 @@ impl Inflater {
                 Err(_) => return None,
                 _ => {}
             }
-            if read >= input.len() || written >= limit {
+            if written >= limit {
                 break;
             }
             if written == out.len() {
-                // The output buffer filled while input remained: grow it, still bounded by `limit`.
+                // The output buffer filled: grow it, still bounded by `limit`, and go round again.
+                // Whether or not the input is spent — a back-reference goes on unrolling into the
+                // output long after the few bytes naming it were read, so "the input is consumed"
+                // does not mean "the message is out". Stopping here on a spent input would drop
+                // whatever was still coming, which for a message whose length lands on one of these
+                // doublings is its tail: a truncated transcript, and a secret in those bytes
+                // unseen by a scan that reported nothing.
                 let grown = (out.len() * 2).min(limit);
                 if grown == out.len() {
                     break;
                 }
                 out.resize(grown, 0);
-            } else if res.bytes_consumed == 0 && res.bytes_written == 0 {
+                continue;
+            }
+            // Room was left over, so the decoder emitted everything it had: with the input spent
+            // too, the message is whole.
+            if read >= input.len() {
+                break;
+            }
+            if res.bytes_consumed == 0 && res.bytes_written == 0 {
                 // No progress and no room needed: the decoder wants more input than this message
                 // has, which for a whole message means the stream is not what it claimed.
                 return None;
             }
         }
         out.truncate(written);
+        // A peer that resets its window per message shares nothing across them, so a message the cap
+        // cut short costs the next one nothing: reset, and the decoder is in step by construction.
         if self.no_context_takeover {
             self.state.reset(DataFormat::Raw);
+            return Some(Inflated {
+                plain: out,
+                in_step: true,
+            });
         }
-        Some(out)
+        // Otherwise the window carries across messages, and the bytes past the cap are part of it.
+        // Inflate the rest and throw it away, so the window this message leaves behind is the one
+        // the peer has. The loop above exits with input pending *only* on the cap — its other exits
+        // both require the input consumed — so this is exactly the overflow path.
+        let in_step = read >= input.len() || self.drain(&input[read..]);
+        Some(Inflated {
+            plain: out,
+            in_step,
+        })
+    }
+
+    /// Inflate the rest of a message the plaintext cap cut short, discarding every byte it yields,
+    /// so this direction's window ends the message holding what the peer's does.
+    ///
+    /// Bounded like everything else here that inflates hostile input, but on a different axis from
+    /// the cap it is recovering from: the discard buffer is one fixed block reused to the end, so the
+    /// *memory* cost is constant however far the message inflates, and [`RESYNC_PLAINTEXT_CAP`]
+    /// bounds the *work*. Returns whether the input was consumed — `false` leaves the decoder out of
+    /// step, and is the caller's signal to stop this direction rather than decode the rest wrongly.
+    fn drain(&mut self, mut rest: &[u8]) -> bool {
+        let mut scratch = vec![0u8; 16 * 1024];
+        let mut inflated = 0usize;
+        loop {
+            let res = inflate(&mut self.state, rest, &mut scratch, MZFlush::None);
+            match res.status {
+                Ok(MZStatus::Ok | MZStatus::StreamEnd) => {}
+                Err(_) => return false,
+                _ => {}
+            }
+            rest = &rest[res.bytes_consumed..];
+            inflated = inflated.saturating_add(res.bytes_written);
+            if inflated > RESYNC_PLAINTEXT_CAP {
+                return false;
+            }
+            // Square only when the input is spent *and* the decoder stopped short of filling the
+            // block — the same distinction the capped loop above draws, and for the same reason: a
+            // back-reference keeps unrolling after its token is read, and those bytes are precisely
+            // the window this is here to rebuild.
+            if rest.is_empty() && res.bytes_written < scratch.len() {
+                return true;
+            }
+            // No progress with a whole empty block to write into: the stream is not what it claimed,
+            // or it has ended with input still behind it. Either way the window cannot be squared.
+            if res.bytes_consumed == 0 && res.bytes_written == 0 {
+                return false;
+            }
+        }
     }
 }
+
+/// What inflating one message yielded, and whether the decoder can still be trusted after it.
+struct Inflated {
+    /// The plaintext, capped at one byte past what this direction's consumers could use.
+    plain: Vec<u8>,
+    /// Whether this direction's decoder is still level with the peer's compressor.
+    ///
+    /// Under `permessage-deflate` with context takeover — the default, since `no_context_takeover`
+    /// has to be announced — one window carries across a direction's messages. A message stopped at
+    /// the plaintext cap therefore leaves the decoder holding a window the peer does not share, and
+    /// **every later message on this direction decodes to rubbish or not at all**: the capture stores
+    /// noise and the leak scan sees none of the values it exists to catch. That is a security control
+    /// the cage switches off at will — one large compressible message, then exfiltrate freely down
+    /// the same tunnel — so the overflow path inflates the remainder rather than abandoning it, and
+    /// this reports the case where even that could not square the window.
+    in_step: bool,
+}
+
+/// The most plaintext [`Inflater::drain`] will inflate and discard to bring one direction's window
+/// back level with the peer's.
+///
+/// Squaring the window means inflating every byte the peer put in it — there is no shortcut, so the
+/// bound is on work rather than on memory (the discard buffer is a single reused block). It is set
+/// far above any message a real peer sends and far below what one message could be made to cost: the
+/// compressed input is already held to [`FrameTee::compressed_budget`], and DEFLATE's ratio tops out
+/// near 1000:1, so without a bound here one crafted message could ask for a gigabyte of inflate.
+/// A message past this is not decoded further; the direction stops instead, which is the same answer
+/// the compressed budget and a failed decode already give.
+const RESYNC_PLAINTEXT_CAP: usize = 64 * 1024 * 1024;
 
 /// What the peers agreed for `permessage-deflate`, read off the upgrade response. Absent means the
 /// extension was not negotiated and payloads cross uncompressed.
@@ -487,13 +584,20 @@ impl FrameTee {
             return false;
         };
         match inflater.message(&compressed, cap) {
-            Some(plain) => {
+            Some(inflated) => {
                 // The message arrives whole here, so the scan needs no carry on this path — it is
                 // handed the one payload it was going to reassemble anyway.
                 if let Some(scan) = self.scan.as_mut() {
                     scan.start_message();
                 }
-                let filled = self.consume(&plain);
+                let filled = self.consume(&inflated.plain);
+                if !inflated.in_step {
+                    // The window could not be brought back level with the peer's, so every later
+                    // message on this direction would decode to rubbish. Stop, rather than scan
+                    // noise and report nothing — the same answer the compressed budget above and a
+                    // failed decode below already give.
+                    self.done = true;
+                }
                 if self.spent() {
                     self.done = true;
                 }
@@ -1075,6 +1179,119 @@ mod tests {
     /// capture being on — that would make a security check follow a debugging setting.
     fn scanning_tee(needles: &[SecretNeedle], deflate: Option<bool>) -> FrameTee {
         FrameTee::new(None, needles, deflate).expect("needles are a consumer")
+    }
+
+    /// One `permessage-deflate` message, compressed against `c`'s running window and framed with
+    /// whichever of the three length forms fits — the two-byte and eight-byte forms included, since
+    /// the message this exists for is far past the 125 bytes the short form carries.
+    fn deflated_message(
+        payload: &[u8],
+        c: &mut miniz_oxide::deflate::core::CompressorOxide,
+    ) -> Vec<u8> {
+        use miniz_oxide::deflate::core::{TDEFLFlush, compress};
+        let mut body = vec![0u8; payload.len() * 2 + 4096];
+        let (status, consumed, n) = compress(c, payload, &mut body, TDEFLFlush::Sync);
+        // Asserted, not assumed: a short write would silently compress a *prefix* of the payload,
+        // and a test whose big message turned out not to be big proves nothing.
+        assert_eq!(
+            consumed,
+            payload.len(),
+            "the whole payload must compress in one call (status {status:?})"
+        );
+        body.truncate(n);
+        if body.ends_with(&[0x00, 0x00, 0xff, 0xff]) {
+            body.truncate(body.len() - 4);
+        }
+        let mut framed = vec![0xc1u8]; // FIN | RSV1 | text
+        let n = body.len();
+        if n < 126 {
+            framed.push(n as u8);
+        } else if n <= u16::MAX as usize {
+            framed.push(126);
+            framed.extend_from_slice(&(n as u16).to_be_bytes());
+        } else {
+            framed.push(127);
+            framed.extend_from_slice(&(n as u64).to_be_bytes());
+        }
+        framed.extend_from_slice(&body);
+        framed
+    }
+
+    /// A message that inflates past [`SCAN_MESSAGE_CAP`] must not blind the messages behind it.
+    ///
+    /// With context takeover — the default, since `no_context_takeover` has to be announced — one
+    /// DEFLATE window carries across a direction's messages. Stopping the inflate at the cap with
+    /// input still pending would leave the decoder holding a window the peer does not share, and
+    /// every later message would inflate to rubbish. That is not a truncated scan, it is a scan the
+    /// cage switches **off**: send one large compressible message, then exfiltrate freely down the
+    /// same tunnel. So the cap bounds what is *kept*, never what is *decoded* — the remainder is
+    /// inflated and discarded, and the secret in the message behind it is still seen.
+    #[test]
+    fn an_overflowing_message_does_not_blind_the_scan_behind_it() {
+        use miniz_oxide::deflate::core::CompressorOxide;
+        const SECRET: &[u8] = b"SUPERSECRETVALUE0000";
+        let needle = SecretNeedle::named("test-secret", SECRET.to_vec());
+
+        // The control. Without it a green test could mean the scan never sees anything at all.
+        let mut c = CompressorOxide::new(raw_deflate_flags());
+        let mut control = scanning_tee(std::slice::from_ref(&needle), Some(false));
+        control.push(&deflated_message(SECRET, &mut c));
+        assert_eq!(
+            control.sightings(),
+            vec!["test-secret".to_string()],
+            "the scan must see a secret sent on its own, else this test proves nothing"
+        );
+
+        // The real thing. Message 1 runs past the cap and ends with a distinctive stretch, so that
+        // stretch lands in the peer's window but in the part a capped inflate never produces.
+        // Message 2 repeats it and then carries the secret, so the compressor back-references into
+        // exactly that part: message 2 is decodable only if message 1 was inflated *whole*. Both are
+        // compressed against one window (`Some(false)` — the peer keeps context across messages).
+        let tail: Vec<u8> = (0..8192u32).flat_map(|i| i.to_le_bytes()).collect();
+        let mut first = vec![b'a'; SCAN_MESSAGE_CAP + 1024];
+        first.extend_from_slice(&tail);
+        let mut second = tail.clone();
+        second.extend_from_slice(SECRET);
+
+        let mut c = CompressorOxide::new(raw_deflate_flags());
+        let overflowing = deflated_message(&first, &mut c);
+        let carrying = deflated_message(&second, &mut c);
+        // The whole point of the attack shape: it is cheap. A cage buys a blinded tunnel for a few
+        // kilobytes, and the message stays well inside the compressed budget, so what is under test
+        // is the plaintext cap and not that other bound.
+        assert!(
+            overflowing.len() < 64 * 1024,
+            "the overflowing message must be cheap on the wire ({} bytes) — otherwise the \
+             compressed budget stops it first and this tests the wrong bound",
+            overflowing.len()
+        );
+
+        let mut t = scanning_tee(std::slice::from_ref(&needle), Some(false));
+        t.push(&overflowing);
+        t.push(&carrying);
+        assert_eq!(
+            t.sightings(),
+            vec!["test-secret".to_string()],
+            "a message past the scan cap blinded the scan behind it — the leak tripwire on this \
+             direction is off for the rest of the tunnel"
+        );
+    }
+
+    /// The companion to the test above, on the axis it cannot cover: when the remainder is too big
+    /// to inflate away ([`RESYNC_PLAINTEXT_CAP`]), the window stays out of step — and the direction
+    /// must then *stop*, which is what the two sibling bounds already do, rather than carry on
+    /// handing the scan whatever the desynced decoder produces.
+    #[test]
+    fn a_window_that_cannot_be_squared_stops_the_direction_instead_of_scanning_rubbish() {
+        let mut inflater = Inflater::new(false);
+        // A truncated stream: the decoder cannot finish it, so the window is left mid-message.
+        let short = [0x00u8, 0x01, 0x02];
+        assert!(
+            inflater
+                .message(&short, SCAN_MESSAGE_CAP)
+                .is_none_or(|i| !i.in_step),
+            "a message that cannot be inflated whole must never be reported as in step"
+        );
     }
 
     /// Compressor flags for RAW deflate (negative window bits) at a level that genuinely compresses.
