@@ -393,8 +393,11 @@ pub(crate) fn parse_answer(
 ///
 /// The declared bound is checked **before** the body is allocated. The cage writes this length, so
 /// a reader that trusted it would turn a four-byte prefix into an allocation of the cage's
-/// choosing. A zero length is refused for the same reason it is refused in an answer: it is not a
-/// frame, and no protocol here has one.
+/// choosing. Under [`Framing::LengthU32Be`] a zero length is refused for the same reason it is
+/// refused in an answer: it is not a frame, and no protocol carried over that framing has one. But
+/// PostgreSQL's has: `Sync`, `Flush` and `Terminate` are a type byte and a length of exactly four,
+/// so [`Framing::PgWire`] reads a bodyless message as the protocol working rather than as a frame
+/// that is not one.
 pub(crate) fn read_frame(
     r: &mut impl Read,
     framing: Framing,
