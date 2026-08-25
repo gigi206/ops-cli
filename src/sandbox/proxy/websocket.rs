@@ -22,8 +22,12 @@ use miniz_oxide::{DataFormat, MZFlush, MZStatus};
 ///
 /// When `permessage-deflate` is negotiated the payloads are DEFLATE-compressed per *message*, so
 /// they are reassembled across the message's frames and inflated before being captured; see
-/// [`Inflater`]. Control frames (close, ping, pong) carry no application data and are skipped, and
-/// they may interleave a fragmented message without disturbing its reassembly.
+/// [`Inflater`]. Control frames (close, ping, pong) are not part of the message transcript, so
+/// nothing they carry is captured, and they may interleave a fragmented message without disturbing
+/// its reassembly. They are still **scanned**, though: RFC 6455 §5.5.2 and §5.5.3 both allow a ping
+/// and a pong to carry "Application data" and close carries a reason, so up to 125 bytes a frame
+/// are whatever the cage put there — skipping them outright, as this once did, left a channel past
+/// the outbound-secret tripwire that needed no reassembly and no compression to use.
 pub(super) struct FrameTee {
     /// The capture's sink, when the launch captures bodies.
     sink: Option<Arc<CapBuf>>,
@@ -40,6 +44,17 @@ pub(super) struct FrameTee {
     /// What is left of the current frame's payload, and how this frame is to be treated.
     payload_left: u64,
     keeps: bool,
+    /// Whether the frame being decoded is a control frame, whose payload is scanned but never
+    /// captured — see [`Self::control_payload`].
+    control: bool,
+    /// The current control frame's payload, gathered so it can be scanned whole.
+    ///
+    /// Gathered rather than scanned piecewise because a frame can arrive split across reads and a
+    /// value straddling the split would otherwise be missed, and kept apart from [`Self::pending`]
+    /// because a control frame may interleave a fragmented message that is using that buffer. It is
+    /// bounded by [`CONTROL_MAX`]: RFC 6455 §5.5 caps a control payload at 125 bytes, so a frame
+    /// claiming more is not one, and nothing here grows on a length the cage picked.
+    control_payload: Vec<u8>,
     mask: Option<[u8; 4]>,
     /// Where in the 4-byte mask key the next payload byte lands, carried across reads.
     mask_at: u8,
@@ -65,6 +80,14 @@ pub(super) struct FrameTee {
 /// is generous next to anything that would plausibly carry a leaked credential, and a message that
 /// inflates past it is scanned up to it — never silently claimed to have been scanned whole.
 const SCAN_MESSAGE_CAP: usize = 256 * 1024;
+
+/// The most payload one control frame can carry, from RFC 6455 §5.5: "All control frames MUST have
+/// a payload length of 125 bytes or less".
+///
+/// It bounds [`FrameTee::control_payload`], so what is gathered follows the protocol's limit rather
+/// than the length the sender wrote — a frame claiming more is not a control frame, and the buffer
+/// must not grow on its say-so.
+const CONTROL_MAX: usize = 125;
 
 /// The leak tripwire for one direction of an established WebSocket.
 ///
@@ -120,6 +143,18 @@ impl LeakScan {
     /// A new application message begins: nothing carries across it.
     fn start_message(&mut self) {
         self.carry.clear();
+    }
+
+    /// Scan a payload that stands on its own — a control frame's, which RFC 6455 §5.4 forbids
+    /// fragmenting — without disturbing the carry of the message it may be sitting between.
+    ///
+    /// The carry is set aside and put back rather than cleared, because a control frame is allowed
+    /// to interleave a fragmented message: clearing it would let a ping sent between two halves of a
+    /// secret hide the secret, which is the hole this exists to close wearing a different hat.
+    fn take_standalone(&mut self, piece: &[u8]) {
+        let held = std::mem::take(&mut self.carry);
+        self.take(piece);
+        self.carry = held;
     }
 
     /// Scan one decoded piece of the current message.
@@ -379,6 +414,10 @@ enum HeaderScan {
         payload_len: u64,
         /// Whether this frame carries application data (so its payload is captured).
         keeps: bool,
+        /// Whether this is a control frame (close, ping, pong). Its payload is not part of the
+        /// message transcript, so it is never captured — but it is still bytes the cage chose, so
+        /// it is still scanned. See [`FrameTee::control_payload`].
+        control: bool,
         mask: Option<[u8; 4]>,
         /// Whether this frame ends its message.
         fin: bool,
@@ -412,6 +451,8 @@ impl FrameTee {
             header: Vec::with_capacity(14),
             payload_left: 0,
             keeps: false,
+            control: false,
+            control_payload: Vec::new(),
             mask: None,
             mask_at: 0,
             done: false,
@@ -478,6 +519,7 @@ impl FrameTee {
                     HeaderScan::Done {
                         payload_len,
                         keeps,
+                        control,
                         mask,
                         fin,
                         rsv1,
@@ -485,6 +527,8 @@ impl FrameTee {
                     } => {
                         self.payload_left = payload_len;
                         self.keeps = keeps;
+                        self.control = control;
+                        self.control_payload.clear();
                         self.mask = mask;
                         self.mask_at = 0;
                         self.header.clear();
@@ -513,14 +557,24 @@ impl FrameTee {
                 continue;
             }
             let take = self.payload_left.min((chunk.len() - at) as u64) as usize;
-            if self.keeps {
+            if self.keeps || (self.control && self.scan.is_some()) {
                 let mut piece = chunk[at..at + take].to_vec();
                 if let Some(key) = self.mask {
                     for (n, byte) in piece.iter_mut().enumerate() {
                         *byte ^= key[(self.mask_at as usize + n) % 4];
                     }
                 }
-                if self.compressed {
+                if self.control {
+                    // A control frame's payload is application data the cage chose (RFC 6455 §5.5.2
+                    // and §5.5.3 both allow one), so the scan reads it — but it is not part of the
+                    // message transcript, so the capture never sees it. Gathered to the frame's end
+                    // rather than scanned as it arrives, so a value split across two reads is still
+                    // matched, and bounded so the buffer follows the protocol's limit and not the
+                    // length the sender wrote.
+                    let room = CONTROL_MAX.saturating_sub(self.control_payload.len());
+                    let fits = piece.len().min(room);
+                    self.control_payload.extend_from_slice(&piece[..fits]);
+                } else if self.compressed {
                     // A compressed message is only decodable whole, so it is held until its last
                     // frame. Bounded by what its consumers could ever use: past that, inflating more
                     // would yield bytes nobody reads, and stopping mid-message leaves the shared
@@ -575,6 +629,16 @@ impl FrameTee {
     /// Settle a frame that has just ended. A compressed message becomes capturable only now, on its
     /// final frame. Returns whether the sink filled.
     fn end_of_frame(&mut self) -> bool {
+        if self.control {
+            // The frame is whole, so its payload can be scanned as the self-contained thing it is
+            // (§5.4 forbids fragmenting a control frame) — and without clearing the carry of the
+            // message it may be interleaving, which is what `take_standalone` is for.
+            let payload = std::mem::take(&mut self.control_payload);
+            if let Some(scan) = self.scan.as_mut() {
+                scan.take_standalone(&payload);
+            }
+            return false;
+        }
         if !self.keeps || !self.compressed || !self.fin {
             return false;
         }
@@ -658,6 +722,7 @@ fn scan_frame_header(buf: &[u8]) -> HeaderScan {
     HeaderScan::Done {
         payload_len,
         keeps: matches!(opcode, 0x0..=0x2),
+        control: matches!(opcode, 0x8..=0xa),
         mask,
         fin: buf[0] & 0x80 != 0,
         rsv1: buf[0] & 0x40 != 0,
@@ -1576,10 +1641,13 @@ mod tests {
         assert!(got.truncated, "the cut is reported, never silent");
     }
 
+    /// The value [`needle`] looks for, so a test can send exactly what the scan is watching for.
+    const NEEDLE_VALUE: &[u8] = b"SECRET-VALUE-0123456789";
+
     /// A needle for the leak-scan tests. The value is long enough to clear the redaction floor, and
     /// distinctive enough that a match cannot be a coincidence.
     fn needle() -> SecretNeedle {
-        SecretNeedle::named("demo-token", b"SECRET-VALUE-0123456789".to_vec())
+        SecretNeedle::named("demo-token", NEEDLE_VALUE.to_vec())
     }
 
     /// The scan reports a configured secret it sees crossing, and reports it by NAME. Teeth: the
@@ -1683,6 +1751,42 @@ mod tests {
         let mut t = scanning_tee(&[needle()], None);
         t.push(&frame(0x1, b"{\"type\":\"ping\",\"n\":1}", None));
         assert!(t.sightings().is_empty());
+    }
+
+    /// A control frame carries application data, so the scan has to read it.
+    ///
+    /// RFC 6455 §5.5.2 and §5.5.3 both say a ping and a pong "MAY include 'Application data'", and
+    /// close carries a reason — up to 125 bytes the cage chooses, on a frame the tee used to skip
+    /// whole. That is a clean exfiltration channel past the outbound-secret tripwire: no reassembly,
+    /// no compression, 125 bytes a frame and as many frames as it likes.
+    #[test]
+    fn a_secret_in_a_control_frame_payload_is_seen() {
+        for opcode in [0x9u8, 0xa, 0x8] {
+            let mut t = scanning_tee(&[needle()], None);
+            t.push(&frame(opcode, NEEDLE_VALUE, Some([0x11, 0x22, 0x33, 0x44])));
+            assert_eq!(
+                t.sightings(),
+                vec!["demo-token".to_string()],
+                "a secret sent as the payload of control frame {opcode:#x} crossed unseen"
+            );
+        }
+    }
+
+    /// A control frame may interleave a fragmented message, and scanning its payload must not
+    /// disturb the carry that message's own scan depends on — otherwise sending a ping between two
+    /// halves of a secret would hide it, which is the same hole wearing a different hat.
+    #[test]
+    fn a_control_frame_between_two_halves_of_a_secret_does_not_hide_it() {
+        let (first, second) = NEEDLE_VALUE.split_at(5);
+        let mut t = scanning_tee(&[needle()], None);
+        t.push(&frame_with_fin(0x1, first, None, false));
+        t.push(&frame(0x9, b"keepalive", None));
+        t.push(&frame_with_fin(0x0, second, None, true));
+        assert_eq!(
+            t.sightings(),
+            vec!["demo-token".to_string()],
+            "a ping between the halves of a secret hid it from the scan"
+        );
     }
 
     /// With neither a capture sink nor a needle there is no consumer, so no decoder is built at all
