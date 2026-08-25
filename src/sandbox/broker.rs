@@ -1649,7 +1649,15 @@ pub(crate) fn start(
         let ring = serving_ring;
         let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
         for conn in listener.incoming() {
-            let Ok(conn) = conn else { continue };
+            let conn = match conn {
+                Ok(c) => c,
+                // A bare `continue` kept the listener alive but spun this thread flat out for as
+                // long as the error lasted, and the error that lasts is host fd exhaustion.
+                Err(e) => {
+                    super::conncap::accept_backoff("broker", &e);
+                    continue;
+                }
+            };
             let Some(slot) = cap.take() else { continue };
             let (bwrap, plugin, allow, host_socket, ring, secret) = (
                 bwrap.clone(),

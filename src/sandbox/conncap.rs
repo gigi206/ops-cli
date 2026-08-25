@@ -15,6 +15,31 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// What an accept loop does with a failed `accept(2)`: say so, pause briefly, and carry on serving.
+///
+/// A per-connection error is that connection's problem, never the server's — and this tree has got
+/// that wrong twice, in the two opposite ways, which is why the answer is written once here instead
+/// of a fifth time at each loop.
+///
+/// `?` on the accept ends the `for`, and every one of these loops is the body of a detached thread,
+/// so returning drops the `UnixListener` and closes the listening fd for the rest of the launch.
+/// Nothing announces it: the socket file stays on disk (only the owner's `Drop` unlinks it) and the
+/// pid keeps being reported, so the plane is simply gone and every verb that needs it fails for a
+/// session that is otherwise running fine.
+///
+/// Swallowing it with a bare `continue` keeps the listener alive but spins the thread flat out for
+/// as long as the condition lasts — and the usual cause is host fd exhaustion (`EMFILE`), which is
+/// exactly when a machine can least afford a core. The pause is far too short to matter to a real
+/// connection and long enough to make a persistent error cost nothing.
+///
+/// The egress proxy's loop and the egress control plane's carry this same defence inline, written
+/// out with the history of how each came to need it; `who` names the plane so the line reads the
+/// same as theirs.
+pub(super) fn accept_backoff(who: &str, e: &std::io::Error) {
+    crate::diag::error(&format!("sbx: {who}: accept error: {e}"));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+}
+
 /// A ceiling on live connections, shared by an accept loop and the threads it spawns.
 #[derive(Clone)]
 pub(super) struct ConnCap {

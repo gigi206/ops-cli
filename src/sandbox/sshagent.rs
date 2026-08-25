@@ -693,7 +693,15 @@ pub(crate) fn serve(
 ) {
     let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
     for conn in listener.incoming() {
-        let Ok(conn) = conn else { continue };
+        let conn = match conn {
+            Ok(c) => c,
+            // As in the broker beside it: skipping the error silently kept the socket serving but
+            // burned a core for as long as the condition held, with nothing said anywhere.
+            Err(e) => {
+                super::conncap::accept_backoff("ssh-agent broker", &e);
+                continue;
+            }
+        };
         let Some(slot) = cap.take() else {
             // A connection refused for want of a thread is a fact about the session, not about the
             // request: without this line the client simply sees the socket close.

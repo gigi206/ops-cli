@@ -248,7 +248,18 @@ where
 {
     let dispatch = Arc::new(dispatch);
     for stream in listener.incoming() {
-        let stream = stream?;
+        let stream = match stream {
+            Ok(s) => s,
+            // Not `?`: that ended the loop, and this runs on a detached thread, so returning closed
+            // the listening fd and took every lens's control socket down with it for the rest of the
+            // launch — `sbx proc logs`, `sbx fs logs` and their siblings all failing for a session
+            // still running fine. The rule the doc above states ("a per-connection error is that
+            // connection's problem, never the server's") is the one this broke.
+            Err(e) => {
+                super::conncap::accept_backoff("lens control", &e);
+                continue;
+            }
+        };
         let dispatch = dispatch.clone();
         std::thread::spawn(move || {
             let _ = handle(stream, dispatch.as_ref());

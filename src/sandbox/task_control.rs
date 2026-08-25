@@ -599,7 +599,16 @@ pub(crate) fn start(
         let quota = Arc::clone(&quota);
         let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
         std::thread::spawn(move || {
-            for stream in cage_listener.incoming().flatten() {
+            for stream in cage_listener.incoming() {
+                let stream = match stream {
+                    Ok(s) => s,
+                    // `.flatten()` dropped the error and went straight round again, which kept the
+                    // plane serving but spun this thread flat out while the condition held.
+                    Err(e) => {
+                        super::conncap::accept_backoff("task control (cage)", &e);
+                        continue;
+                    }
+                };
                 // Dropping the stream closes it: a caller past the ceiling is refused rather than
                 // queued, so nothing waits on a thread that will not come.
                 let Some(slot) = cap.take() else { continue };
@@ -622,7 +631,16 @@ pub(crate) fn start(
         let quota = Arc::clone(&quota);
         let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
         std::thread::spawn(move || {
-            for stream in log_listener.incoming().flatten() {
+            for stream in log_listener.incoming() {
+                let stream = match stream {
+                    Ok(s) => s,
+                    // The same as the crossing socket above, and worth saying twice: this is the
+                    // listener `sbx task status` and `sbx task stop` are answered on.
+                    Err(e) => {
+                        super::conncap::accept_backoff("task control (logs)", &e);
+                        continue;
+                    }
+                };
                 // Its own ceiling rather than a share of the crossing socket's: a cage filling the
                 // one must not be able to lock the user out of the other, which is where `sbx task
                 // status` and `sbx task stop` are answered.
