@@ -92,21 +92,7 @@ fn secret_list(args: &[OsString]) -> ExitCode {
     let mut any = false;
     for secret in &resolved.secrets {
         any = true;
-        let mut line = format!(
-            "{}{}{}  wire -> {} ({})",
-            palette.name,
-            secret.name,
-            palette.reset,
-            secret.to,
-            secret.headers().join(", ")
-        );
-        if sources {
-            line.push_str(&format!("  from {}", secret.describe_sources()));
-        }
-        if let Some(desc) = &secret.description {
-            line.push_str(&format!("  — {desc}"));
-        }
-        println!("{line}");
+        println!("{}", wire_line(secret, "wire", sources, &palette));
     }
     for task in &resolved.tasks {
         for secret in &task.secrets {
@@ -137,19 +123,43 @@ fn secret_list(args: &[OsString]) -> ExitCode {
         }
         for injection in &task.injections {
             any = true;
-            println!(
-                "{}{}{}  wire of task `{}` -> {} ({})",
-                palette.name,
-                injection.name,
-                palette.reset,
-                task.name,
-                injection.to,
-                injection.header
-            );
+            let scope = format!("wire of task `{}`", task.name);
+            println!("{}", wire_line(injection, &scope, sources, &palette));
         }
     }
     if !any {
         println!("no credentials are declared for this project");
     }
     ExitCode::SUCCESS
+}
+
+/// One inventory line for a credential injected on the wire: its name, where `scope` says it is
+/// declared, the destination it is pinned to, and every header it sets. Under `--sources` the
+/// resolver chain follows, then the description.
+///
+/// Shared by the two places a [`config::HeaderSecret`] is listed. A task's injection is the same
+/// declaration as a launch's, resolved from the same host-side sources, so listing one with its
+/// chain and the other without would understate where the host's plaintext is read from — which is
+/// the question `--sources` exists to answer.
+fn wire_line(
+    secret: &config::HeaderSecret,
+    scope: &str,
+    sources: bool,
+    palette: &style::Palette,
+) -> String {
+    let mut line = format!(
+        "{}{}{}  {scope} -> {} ({})",
+        palette.name,
+        secret.name,
+        palette.reset,
+        secret.to,
+        secret.headers().join(", ")
+    );
+    if sources {
+        line.push_str(&format!("  from {}", secret.describe_sources()));
+    }
+    if let Some(desc) = &secret.description {
+        line.push_str(&format!("  — {desc}"));
+    }
+    line
 }

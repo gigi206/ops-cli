@@ -3032,6 +3032,56 @@ fn a_local_write_still_warns_when_it_re_arms_a_trusted_project() {
 }
 
 #[test]
+fn the_secret_inventory_names_the_source_of_a_task_wire_injection_too() {
+    // `--sources` answers "where is the host reading this plaintext from?" — the question that
+    // matters when auditing what leaves the machine. A task's `inject` is the same declaration as a
+    // launch-wide one, read from the same host-side chain, so the inventory has to answer for it as
+    // well; it used to print the destination alone and say nothing about the source.
+    let fx = Fixture::new();
+    fx.write_project(
+        r#"
+[secret."api.example.com"]
+from   = "env://LAUNCH_TOKEN"
+header = "Authorization"
+type   = "bearer"
+
+[task.gh-comment]
+cmd     = ["curl", "-sS", "https://api.github.com/"]
+network = ["api.github.com"]
+
+[task.gh-comment.inject."api.github.com"]
+from        = "env://TASK_TOKEN"
+header      = "Authorization"
+type        = "bearer"
+description = "the task's own token"
+"#,
+    );
+
+    // Credentials are a gated field, so the inventory sees them only once the file is trusted.
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+
+    let out = fx.run(&["secret", "list", "--sources"]);
+    assert!(out.status.success(), "{:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("LAUNCH_TOKEN"),
+        "the launch-wide credential names its source:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("wire of task `gh-comment`"),
+        "the task's injection is listed:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("TASK_TOKEN"),
+        "and names its source as well:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("the task's own token"),
+        "its description is printed like every other entry's:\n{stdout}"
+    );
+}
+
+#[test]
 fn setting_a_key_to_the_value_it_already_holds_leaves_the_trust_gate_alone() {
     // The mirror of the warning above. The trust marker hashes the file's contents, so a `set` that
     // writes nothing new re-arms nothing — and saying it did would tell someone their security

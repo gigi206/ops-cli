@@ -45,7 +45,9 @@ Two kinds appear:
   request by the egress proxy. The value never enters the cage at all.
 - **env of task `<name>`**, a [`[task.<name>.secret]`](../tasks/credentials)
   credential, handed to that operation's command in its own cage. The parenthesis is the `encode`.
-  A task's wire-injected credential shows as **wire of task `<name>`**.
+  A task's wire-injected credential shows as **wire of task `<name>`**, carrying the same columns
+  as a launch-wide one: its destination, every header it sets, and under `--sources` the locator
+  chain it would be read from.
 
 Set `name` and `description` on a `[secret."host"]` entry to make this listing legible: a credential
 with no name is listed under its destination host. The name is also what a substituted value is
