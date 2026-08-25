@@ -70,6 +70,12 @@ an **allowlist of message types**:
 The one exception is `session-bind@openssh.com`, which is **forwarded**: see the next
 section, where it does real work.
 
+A connection that opens and then says nothing is given up on after 30 seconds and recorded as
+a refusal. A client connects because it has a request to make, so silence has no legitimate
+reason behind it; left alone, enough silent connections would fill the broker's concurrency
+ceiling and leave the cage's own `ssh` with nothing to reach. Your agent is contacted only once
+a request has actually arrived, so such a connection never touches it at all.
+
 Admission is re-derived from your agent on **every** request, so a key you `ssh-add -d`
 mid-session stops working immediately, and one you add mid-session is picked up without
 relaunching, provided the grant names it *and* the broker is running. If nothing matched

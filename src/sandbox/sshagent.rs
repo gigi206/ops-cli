@@ -87,6 +87,21 @@ const MAX_MESSAGE: usize = 256 * 1024;
 /// is closed rather than allowed to pin an unbounded number of threads.
 const MAX_CONCURRENT_CONNS: usize = 64;
 
+/// How long a cage connection may say nothing before the broker gives up on it.
+///
+/// A client connects because it has a request to make: `ssh` opens the socket to ask for the
+/// identities, and asks straight away. Silence after connecting has no legitimate reason behind it,
+/// and it is not free — a connection that never speaks holds a thread and one of the
+/// [`MAX_CONCURRENT_CONNS`] slots, so a cage could open the ceiling's worth of silent connections
+/// and leave its own `git push` with no broker to reach. The cage is the side sbx does not trust,
+/// so it does not get to hold the channel open for nothing.
+///
+/// The deadline covers the **first** message only, and is lifted once it is in: an ssh client keeps
+/// its agent connection open for the life of the session and is idle between signatures, which is
+/// the ordinary case rather than a fault. The same shape, and for the same reason, as the plugin
+/// broker's own first-frame bound.
+const CAGE_FIRST_MESSAGE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// One identity the host agent holds: the public key blob it is addressed by, and its comment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Identity {
@@ -614,26 +629,56 @@ fn session_bind_host_key(payload: &[u8]) -> Option<String> {
     Some(fingerprint(blob))
 }
 
-/// Serve one cage connection: a fresh connection to the host agent, then request/response until the
-/// client hangs up. Errors end the connection and nothing else — one client's malformed frame must
-/// not take down the broker.
+/// Serve one cage connection: the first request under `first_message`, then a fresh connection to
+/// the host agent and request/response until the client hangs up. Errors end the connection and
+/// nothing else — one client's malformed frame must not take down the broker.
+///
+/// The deadline is a parameter rather than [`CAGE_FIRST_MESSAGE`] read directly so a test can prove
+/// a silent connection is given up on without waiting out the real budget.
 fn serve_conn(
     mut cage: UnixStream,
     host_sock: &Path,
     filter: &Filter,
     ring: &AgentRing,
     confirm: Option<&Confirmer>,
+    first_message: std::time::Duration,
 ) -> io::Result<()> {
+    // The first message is read under a deadline, and before anything is stood up for this
+    // connection — so a cage that connects and says nothing holds neither a connection to the
+    // user's own agent nor a slot for longer than the deadline.
+    cage.set_read_timeout(Some(first_message))?;
+    let mut request = match read_message(&mut cage) {
+        Ok(r) => r,
+        Err(e) => {
+            // A client that connects and closes without asking anything is ordinary (a probe for
+            // the socket's existence does exactly that) and is passed over in silence. Running out
+            // the deadline is not: it is the one shape that costs the session something, so it is
+            // recorded.
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) {
+                ring.push(
+                    AgentKind::Refuse,
+                    "a connection that asked for nothing within the broker's deadline",
+                );
+            }
+            return Ok(());
+        }
+    };
+    // Lifted for the rest of the connection: an ssh client holds its agent connection open for the
+    // whole session and is idle between signatures.
+    cage.set_read_timeout(None)?;
     let mut host = UnixStream::connect(host_sock)?;
     let mut conn = Conn::new(filter, ring).with_confirm(confirm);
     loop {
-        let request = match read_message(&mut cage) {
+        let reply = respond(&request, &mut host, &mut conn)?;
+        write_message(&mut cage, &reply)?;
+        request = match read_message(&mut cage) {
             Ok(r) => r,
             // EOF or a malformed frame: the client is done with us.
             Err(_) => return Ok(()),
         };
-        let reply = respond(&request, &mut host, &mut conn)?;
-        write_message(&mut cage, &reply)?;
     }
 }
 
@@ -666,7 +711,14 @@ pub(crate) fn serve(
             // Held for the connection's life and given back by its `Drop`, so a handler that
             // panics does not take the slot with it.
             let _slot = slot;
-            let _ = serve_conn(conn, &host_sock, &filter, &ring, confirm.as_deref());
+            let _ = serve_conn(
+                conn,
+                &host_sock,
+                &filter,
+                &ring,
+                confirm.as_deref(),
+                CAGE_FIRST_MESSAGE,
+            );
         });
     }
 }
@@ -1182,6 +1234,67 @@ mod tests {
             std::fs::remove_file(dir.join(file)).expect("the private key is removable");
         }
         Some(agent)
+    }
+
+    #[test]
+    fn a_cage_connection_that_says_nothing_is_given_up_on_and_recorded() {
+        // A connection costs the session a thread and one of `MAX_CONCURRENT_CONNS` slots, and used
+        // to cost it a connection to the user's own agent as well — all of it committed before the
+        // cage had said a word. Silent connections could therefore fill the ceiling and leave the
+        // cage's own `ssh` with no broker to reach. The deadline is what bounds that, and the
+        // record is what makes it visible rather than a channel that mysteriously stopped working.
+        let (cage, _held) = UnixStream::pair().expect("a socket pair");
+        let ring = AgentRing::new(64);
+
+        // The host agent path is deliberately absent: reaching it would be the bug. A silent
+        // connection must be given up on before anything is stood up for it.
+        let started = std::time::Instant::now();
+        serve_conn(
+            cage,
+            Path::new("/nonexistent/sbx-test-agent.sock"),
+            &Filter::default(),
+            &ring,
+            None,
+            std::time::Duration::from_millis(200),
+        )
+        .expect("a silent connection ends cleanly rather than erroring");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the deadline, not the client, decides when a silent connection ends"
+        );
+
+        let events = ring.snapshot(None).events;
+        assert_eq!(events.len(), 1, "one decision recorded: {events:?}");
+        assert_eq!(events[0].kind, AgentKind::Refuse);
+        assert!(
+            events[0].detail.contains("asked for nothing"),
+            "the record says what happened: {:?}",
+            events[0].detail
+        );
+    }
+
+    #[test]
+    fn a_cage_connection_that_closes_without_asking_is_passed_over_in_silence() {
+        // The other half: connecting and closing is what a probe for the socket's existence does,
+        // and it costs the session nothing. Recording it would fill `sbx ssh-agent logs` with
+        // refusals that are not refusals of anything.
+        let (cage, held) = UnixStream::pair().expect("a socket pair");
+        drop(held);
+        let ring = AgentRing::new(64);
+        serve_conn(
+            cage,
+            Path::new("/nonexistent/sbx-test-agent.sock"),
+            &Filter::default(),
+            &ring,
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .expect("a closed connection ends cleanly");
+        assert!(
+            ring.snapshot(None).events.is_empty(),
+            "a probe is not a decision: {:?}",
+            ring.snapshot(None).events
+        );
     }
 
     #[test]
