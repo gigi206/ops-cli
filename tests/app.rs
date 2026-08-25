@@ -716,6 +716,41 @@ fn import_reports_an_egress_group_the_profile_references_and_nothing_defines() {
     );
 }
 
+/// A `--force` import keeps the bytes it is about to drop, and refuses the whole import when it
+/// cannot. That held for a copy it could not *write* and not for one it could not *read*: the
+/// unreadable case fell into the arm meaning "there is nothing to keep", so the file was
+/// overwritten with no copy and nothing said — which is the one outcome the copy exists to prevent.
+#[test]
+fn a_forced_import_refuses_when_the_profile_it_would_replace_cannot_be_read() {
+    let fx = Fixture::new();
+    let dest = fx.profile_path("demo-app");
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    // Present and unreadable, for every uid: a read of a directory is `EISDIR`, where a mode of
+    // `0o000` is simply ignored for root and would make this test a no-op there.
+    std::fs::create_dir(&dest).unwrap();
+    std::fs::write(dest.join("marker"), b"still here").unwrap();
+
+    // Named so the import targets the very profile staged above (the stem is the app name).
+    let source = fx.proj.path().join("demo-app.toml");
+    std::fs::write(&source, "cmd = \"new\"\n").unwrap();
+
+    let out = fx.sbx(&["app", "import", "--force", source.to_str().unwrap()]);
+    assert!(
+        !out.status.success(),
+        "a profile that cannot be read must refuse the import: {}",
+        text(&out)
+    );
+    assert!(
+        text(&out).contains("nothing was overwritten"),
+        "and say what was left alone: {}",
+        text(&out)
+    );
+    assert!(
+        dest.join("marker").exists(),
+        "what was there must be exactly as it was"
+    );
+}
+
 #[test]
 fn bundle_import_reports_the_groups_the_bundle_itself_references() {
     let fx = Fixture::new();

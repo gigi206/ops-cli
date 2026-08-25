@@ -472,8 +472,21 @@ fn app_import(args: &[OsString]) -> ExitCode {
                 }
             }
         }
-        // Same bytes (a re-import that changes nothing), or no previous file at all.
-        _ => None,
+        // Same bytes: a re-import that changes nothing has nothing to keep.
+        Ok(_) => None,
+        // No previous file: this is an import, not an overwrite.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        // The file is there and could not be read. Refused, on the same terms as a copy that could
+        // not be written: the whole point of the copy is that the overwrite is about to drop
+        // whatever this file held, and dropping it because sbx could not look at it is the one
+        // outcome this branch exists to prevent. It was swallowed with the two cases above.
+        Err(e) => {
+            diag::error(&format!(
+                "sbx: cannot read the profile being replaced at {}: {e} — nothing was overwritten",
+                dest.display()
+            ));
+            return ExitCode::FAILURE;
+        }
     };
     if let Err(e) = write_profile_file(&dir, &dest, &bytes) {
         diag::error(&format!("sbx: cannot write {}: {e}", dest.display()));
