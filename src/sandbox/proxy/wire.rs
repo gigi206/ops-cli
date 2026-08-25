@@ -188,14 +188,37 @@ fn content_length(value: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-/// The method and target of a request line, requiring all three space-separated tokens
-/// (`METHOD target HTTP/x`).
+/// The method and target of a request line, requiring exactly the three tokens RFC 9112 §3 defines
+/// (`method SP request-target SP HTTP-version`).
+///
+/// Split on **SP**, never on Unicode whitespace, and that distinction is the whole guard:
+/// `split_whitespace` ends a token at U+00A0, U+0085, U+1680, U+2000‥U+200A, U+2028/9, U+202F,
+/// U+205F, U+3000 — and at HTAB, which [`head_carries_control_byte`] deliberately permits. An origin
+/// server treats every one of those as ordinary request-target bytes, because it splits the line on
+/// SP alone.
+///
+/// That matters here and not in most proxies because the tunneled and WebSocket-upgrade planes
+/// forward the client's request line **verbatim**: [`reserialize_request`] copies
+/// `head.request_line`, and only the cleartext and absolute-form planes rebuild it from what was
+/// parsed. So a target read here as `/v1/public` and by the upstream as
+/// `/v1/public\u{a0}/../../admin` is exactly the smuggling desync this module's re-serialization
+/// exists to close, arriving through the one field it does not rewrite — and the verdict, the path
+/// rules and the credential scoping are all decided on a path the request never goes to. Splitting
+/// the way the peer splits is what keeps sbx's reading of the line and the upstream's the same
+/// reading.
+///
+/// An empty token, and a fourth one, are refused rather than ignored: a request-target cannot carry
+/// a raw space, so either means a line no two parsers will agree on. Both callers answer a `None`
+/// with `400`, so the strictness fails closed.
 pub(super) fn request_line_parts(line: &str) -> Option<(String, String)> {
-    let mut it = line.split_whitespace();
-    let method = it.next()?.to_string();
-    let target = it.next()?.to_string();
-    it.next()?; // the HTTP-version token must be present
-    Some((method, target))
+    let mut it = line.split(' ');
+    let method = it.next().filter(|t| !t.is_empty())?;
+    let target = it.next().filter(|t| !t.is_empty())?;
+    it.next().filter(|t| !t.is_empty())?; // the HTTP-version token must be present
+    if it.next().is_some() {
+        return None;
+    }
+    Some((method.to_string(), target.to_string()))
 }
 
 /// Split a CONNECT authority `host:port` (port required) into its parts, handling a bracketed
@@ -1318,6 +1341,50 @@ mod tests {
             "a missing HTTP-version token is refused"
         );
         assert_eq!(request_line_parts(""), None);
+    }
+
+    /// The request line is split the way the peer splits it — on SP — so sbx's reading of a target
+    /// and the upstream's cannot come apart.
+    ///
+    /// Teeth: the tunneled and WebSocket planes forward this line **verbatim**, so a target cut
+    /// short here at a byte the origin reads as ordinary is a smuggling desync straight past the
+    /// allowlist. Each character below ends a token for `split_whitespace` and for nothing else;
+    /// under it the target read out was `/v1/public`, while the origin — splitting on SP, then
+    /// normalising `..` — fetched `/admin`. HTAB is in the list because
+    /// `head_carries_control_byte` deliberately allows it, so it was reachable through a head that
+    /// passed every other guard.
+    #[test]
+    fn a_request_target_is_not_cut_short_at_unicode_whitespace() {
+        for sep in ['\u{a0}', '\t', '\u{2000}', '\u{3000}', '\u{205f}', '\u{85}'] {
+            let line = format!("GET /v1/public{sep}/../../admin HTTP/1.1");
+            let head = Head {
+                request_line: line.clone(),
+                headers: vec![],
+            };
+            assert!(
+                !head_carries_control_byte(&head),
+                "{sep:?} passes the control-byte guard, which is why the split has to hold"
+            );
+            assert_eq!(
+                request_line_parts(&line),
+                Some(("GET".to_string(), format!("/v1/public{sep}/../../admin"))),
+                "the target was cut short at {sep:?}, so the verdict would be taken on a path the \
+                 request does not go to"
+            );
+        }
+    }
+
+    /// A line no two parsers would agree on is refused outright, rather than read as its first three
+    /// tokens and forwarded whole. A request-target cannot carry a raw space, so a fourth token
+    /// means the rest of the line is something this proxy is not reading the way the upstream will.
+    #[test]
+    fn a_request_line_with_a_stray_space_is_refused() {
+        assert_eq!(request_line_parts("GET /a b HTTP/1.1"), None);
+        assert_eq!(
+            request_line_parts("GET  / HTTP/1.1"),
+            None,
+            "a doubled SP leaves an empty token, which is not a target"
+        );
     }
 
     #[test]
