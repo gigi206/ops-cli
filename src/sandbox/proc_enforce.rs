@@ -2577,8 +2577,35 @@ impl CmsgBuf {
     }
 }
 
-/// Receive one file descriptor sent over a Unix stream as an `SCM_RIGHTS` ancillary message.
+/// Receive one file descriptor sent over a Unix stream as an `SCM_RIGHTS` ancillary message, and
+/// confirm it is a seccomp notification listener before handing it back.
 fn recv_fd(stream: &UnixStream) -> io::Result<libc::c_int> {
+    let fd = recv_fd_raw(stream)?;
+    if !is_notif_listener(fd) {
+        // SAFETY: `fd` is ours from `recv_fd_raw` and is closed exactly once here.
+        unsafe { libc::close(fd) };
+        return Err(io::Error::other(
+            "the handoff carried a descriptor that is not a seccomp notification listener",
+        ));
+    }
+    Ok(fd)
+}
+
+/// The receive itself, with no opinion about what the descriptor is.
+///
+/// Split out from [`recv_fd`] so the close-on-exec property below can be asserted against any
+/// descriptor — the listener check needs a live seccomp filter, which means a cage, which means a
+/// test that skips on the hosted runner. A guard whose test does not run where it ships is the
+/// shape of guard this tree already had to go looking for once.
+///
+/// **`MSG_CMSG_CLOEXEC`**, and it is the whole point of the flag argument. A descriptor arriving
+/// through `SCM_RIGHTS` is an ordinary one: without this it lands with `FD_CLOEXEC` clear and is
+/// then inherited by every process the supervisor goes on to `fork`+`exec` — nix, bwrap, and the
+/// third-party programs a broker or a signer plugin runs. What leaks is the seccomp **notification
+/// listener**, so a process holding it can answer the cage's `execve` notifications itself, which is
+/// the whole of exec enforcement. Setting it after the fact would leave a window; the flag makes it
+/// atomic with the receive.
+fn recv_fd_raw(stream: &UnixStream) -> io::Result<libc::c_int> {
     use std::os::unix::io::AsRawFd;
     let mut dummy = [0u8; 1];
     let mut iov = libc::iovec {
@@ -2594,7 +2621,7 @@ fn recv_fd(stream: &UnixStream) -> io::Result<libc::c_int> {
     // SAFETY: msg's buffers are live and the control one is aligned for a `cmsghdr` ([`CmsgBuf`]);
     // we read exactly one cmsg carrying one fd.
     unsafe {
-        let n = libc::recvmsg(stream.as_raw_fd(), &mut msg, 0);
+        let n = libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC);
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -2613,12 +2640,6 @@ fn recv_fd(stream: &UnixStream) -> io::Result<libc::c_int> {
         );
         if fd < 0 {
             return Err(io::Error::other("invalid fd in the handoff message"));
-        }
-        if !is_notif_listener(fd) {
-            libc::close(fd);
-            return Err(io::Error::other(
-                "the handoff carried a descriptor that is not a seccomp notification listener",
-            ));
         }
         Ok(fd)
     }
@@ -3989,6 +4010,43 @@ mod tests {
             ],
             "the flag must sit between the socket and `--`, where the shim parses its flags: after              the separator it would be handed to the payload as an argument instead"
         );
+    }
+
+    /// A descriptor handed over `SCM_RIGHTS` arrives close-on-exec.
+    ///
+    /// The one that actually crosses this socket is the seccomp **notification listener**, so a
+    /// descriptor left inheritable is inherited by every process the supervisor later
+    /// `fork`+`exec`s — nix, bwrap, and the third-party programs a broker or signer plugin runs.
+    /// Any of them could then answer the cage's `execve` notifications, which is the whole of exec
+    /// enforcement. Asserted against a plain pipe rather than a real listener so it runs everywhere:
+    /// a listener needs a live seccomp filter, and a test needing a cage does not run on the hosted
+    /// runner — which is exactly how a guard goes untested while looking green.
+    #[test]
+    fn a_descriptor_received_over_the_handoff_socket_is_close_on_exec() {
+        let (tx, rx) = UnixStream::pair().expect("socketpair");
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a live two-element array, which is what `pipe` writes.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let (r, w) = (fds[0], fds[1]);
+
+        send_fd(&tx, r);
+        let got = recv_fd_raw(&rx).expect("receive the descriptor");
+
+        // SAFETY: `got` is a live descriptor this test owns; F_GETFD only reads its flags.
+        let flags = unsafe { libc::fcntl(got, libc::F_GETFD) };
+        assert!(flags >= 0, "F_GETFD failed");
+        assert!(
+            flags & libc::FD_CLOEXEC != 0,
+            "the received descriptor is inheritable — it would survive into every process the \
+             supervisor spawns, seccomp notification listener included"
+        );
+
+        // SAFETY: three live descriptors this test owns, each closed exactly once.
+        unsafe {
+            libc::close(got);
+            libc::close(r);
+            libc::close(w);
+        }
     }
 
     /// Hand one descriptor over a connected stream, the way the shim does — the impostor's half of
