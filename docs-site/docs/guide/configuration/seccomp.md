@@ -75,10 +75,12 @@ Some syscalls reopen a real escape surface, not just defense-in-depth. Lifting t
 allowed (you are the trusted operator), but `sbx` prints a **caution** naming what you
 opened:
 
-- **`clone`, `clone:newuser`, `clone3`** → reopens unprivileged **user-namespace
-  creation**. (`clone3` cannot be argument-filtered: its flags live behind a struct
-  pointer a cBPF filter cannot read: so lifting it reopens *unfiltered* namespace
-  creation. Prefer `clone:newns` unless you truly need `clone3`.)
+- **`clone`, `clone:newuser`, `clone3`, `unshare`** → reopens unprivileged
+  **user-namespace creation**. (`clone3` cannot be argument-filtered: its flags live
+  behind a struct pointer a cBPF filter cannot read: so lifting it reopens *unfiltered*
+  namespace creation. Prefer `clone:newns` unless you truly need `clone3`. `unshare`
+  takes no `:selector`, so the bare token is the wholesale lift and `unshare(CLONE_NEWUSER)`
+  comes with it.)
 - **`ioctl`, `ioctl:tiocsti`, `ioctl:tioclinux`** → reopens **terminal input injection**
   (writing into the controlling terminal's input queue).
 - **`umount2`** → reopens **tearing down a mount**. This is the one entry with a

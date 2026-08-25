@@ -550,6 +550,11 @@ pub(crate) fn resolve_allow(token: &str) -> Result<(Allow, Option<Caution>), Str
                     // clone3 cannot be argument-filtered (its flags live behind a struct pointer a
                     // cBPF cannot read), so lifting it reopens unfiltered namespace creation.
                     "clone3" => Some(Caution::Userns),
+                    // `unshare(CLONE_NEWUSER)` creates a user namespace exactly as `clone` does,
+                    // and there is no `:selector` form to narrow it to the harmless flags — so the
+                    // bare token is the wholesale lift. It carried no caution while its two
+                    // siblings did, which left the one spelling of this grant that says nothing.
+                    "unshare" => Some(Caution::Userns),
                     _ => None,
                 };
                 Ok((Allow::Whole(nr), caution))
@@ -845,6 +850,13 @@ mod tests {
         ));
         assert!(matches!(
             resolve_allow("clone3"),
+            Ok((Allow::Whole(_), Some(Caution::Userns)))
+        ));
+        // `unshare(CLONE_NEWUSER)` creates a user namespace as surely as `clone` does, and takes no
+        // `:selector` to narrow it — so the bare token is the wholesale lift and must say so. It
+        // was the one spelling of this grant that resolved silently.
+        assert!(matches!(
+            resolve_allow("unshare"),
             Ok((Allow::Whole(_), Some(Caution::Userns)))
         ));
         // Selectors lift only the named sub-rule; `newns` reopens nothing worth a caution,
