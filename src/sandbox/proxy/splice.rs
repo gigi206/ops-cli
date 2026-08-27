@@ -81,7 +81,7 @@ pub(super) fn splice_l4(
     let checked = match connect_host.parse::<IpAddr>() {
         // An IP-literal target: this path is the only one that accepts one, and there is nothing to
         // resolve — the guard still decides.
-        Ok(ip) => checked_address(
+        Ok(ip) => checked_addresses(
             ctx,
             crate::sandbox::control::Proto::Tcp,
             connect_host,
@@ -101,8 +101,8 @@ pub(super) fn splice_l4(
             Some(deciding),
         ),
     };
-    let ip = match checked {
-        Ok(ip) => ip,
+    let ips = match checked {
+        Ok(ips) => ips,
         Err(refusal) => {
             return write_refusal(
                 &mut client,
@@ -113,9 +113,11 @@ pub(super) fn splice_l4(
         }
     };
 
-    // Open the raw upstream to the checked address (no TLS, no certificate validation — a raw splice
-    // is uninspected by design; the empty netns + the allowlist are the boundary).
-    let upstream = match TcpStream::connect((ip, port)) {
+    // Open the raw upstream to a checked address (no TLS, no certificate validation — a raw splice
+    // is uninspected by design; the empty netns + the allowlist are the boundary). Every address the
+    // guard permitted is tried in turn, under one shared deadline, for the reasons `dial_first`
+    // gives; an IP-literal target is a list of one.
+    let upstream = match dial_first(&ips, port, ctx) {
         Ok(s) => {
             // Nagle off. A raw splice carries whatever protocol the cage speaks, including
             // interactive ones whose small writes are exactly what Nagle holds back.

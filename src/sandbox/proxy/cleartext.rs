@@ -124,7 +124,7 @@ pub(super) fn handle_cleartext(
     // 6. Resolve host-side, then the SSRF guard against the deciding rule (a private/metadata address
     //    is refused unless the `http://` rule names this exact host). A resolution failure for an
     //    allowed host is a clean 502, distinct from a refusal.
-    let ip = match resolve_checked(
+    let ips = match resolve_checked(
         ctx,
         crate::sandbox::control::Proto::Http,
         &host,
@@ -133,7 +133,7 @@ pub(super) fn handle_cleartext(
         Some(&path),
         Some(&deciding),
     ) {
-        Ok(ip) => ip,
+        Ok(ips) => ips,
         Err(refusal) => {
             return write_refusal(
                 &mut client,
@@ -158,9 +158,11 @@ pub(super) fn handle_cleartext(
     //     scopes it to the destination it was acquired on.
     ctx.credentials.observe_head(&head.headers, &[], &host);
 
-    // 7. Open the plaintext upstream to the checked address (no TLS, no certificate — an `http://`
+    // 7. Open the plaintext upstream to a checked address (no TLS, no certificate — an `http://`
     //    connection is cleartext by definition; the empty netns + the allowlist are the boundary).
-    let mut upstream = match TcpStream::connect((ip, port)) {
+    //    Every address the guard permitted is tried in turn, under one shared deadline, for the
+    //    reasons `dial_first` gives.
+    let mut upstream = match dial_first(&ips, port, ctx) {
         Ok(s) => {
             let _ = s.set_read_timeout(Some(ctx.timeout));
             let _ = s.set_write_timeout(Some(ctx.timeout));

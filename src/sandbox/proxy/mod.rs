@@ -208,7 +208,7 @@ use inject::{SignRefusal, pairs_for as injection_values};
 use pool::{PoolKey, UpstreamTls};
 use splice::splice_l4;
 pub(crate) use ssrf::{AddrRefusal, ip_refusal, names_exact_host};
-use ssrf::{checked_address, resolve_checked};
+use ssrf::{checked_addresses, resolve_checked};
 use tunnel::{Turn, serve_tunneled_request};
 use websocket::*;
 use wire::*;
@@ -754,26 +754,54 @@ enum UpstreamError {
     CertRejected,
 }
 
+/// Dial the first of `ips` that answers, the whole walk bounded by the launch's own timeout.
+///
+/// Two properties are held together here, and each is a defect on its own if the other is taken
+/// alone. Walking the list is what makes a multi-homed allowed host usable: settling on the first
+/// address reported the host unreachable whenever that one was down, while every ordinary client
+/// would have connected. Bounding the walk — one deadline shared by every attempt, not one timeout
+/// each — is what keeps that from buying the reachability back at the cost of the connection cap: a
+/// socket's read and write timeouts are set *after* `connect(2)` returns and do not bound it, so an
+/// address that blackholes SYNs otherwise held the serving thread, and the [`ProxyCtx::max_conns`]
+/// slot it occupies, for the kernel's whole SYN-retry budget (about two minutes on Linux) — a
+/// connection-cap exhaustion reachable with allowed destinations alone, and one a name published
+/// with several such addresses would otherwise multiply. The HTTP/2 branch bounds the same step
+/// with the same duration.
+///
+/// Every address here has already been through the SSRF guard, so a walk cannot reach a
+/// destination the first attempt was refused.
+fn dial_first(ips: &[IpAddr], port: u16, ctx: &ProxyCtx) -> io::Result<TcpStream> {
+    let deadline = Instant::now() + ctx.timeout;
+    let mut last = io::Error::new(io::ErrorKind::NotFound, "no permitted address to dial");
+    for ip in ips {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&SocketAddr::new(*ip, port), left) {
+            Ok(sock) => return Ok(sock),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 /// Open a validated TLS connection to a checked upstream address. The TCP target is the
 /// already-guarded IP; the certificate is validated against `host` (the name), so the connection
 /// goes to the exact address the SSRF guard approved while still authenticating the real server.
 /// The handshake is completed here so a validation failure surfaces now (a 502), distinct from a
 /// plain unreachable host (also a 502, but a different reason).
 ///
-/// The dial itself is bounded by the launch's own timeout, like every other wait on this path. A
-/// socket's read/write timeouts are set *after* `connect(2)` returns and do not bound it, so an
-/// allowlisted address that blackholes SYNs otherwise held the serving thread — and the
-/// [`ProxyCtx::max_conns`] slot it occupies — for the kernel's whole SYN-retry budget (about two
-/// minutes on Linux), which is a connection-cap exhaustion reachable with allowed destinations
-/// alone. The HTTP/2 branch already bounds the same step with the same duration.
+/// The dial walks `ips` in order and is bounded as a whole by [`dial_first`]; a TLS failure is not
+/// walked past, because the certificate is checked against the *name* and every address on the list
+/// answers for that same name — a second address cannot make a rejected identity acceptable.
 fn connect_upstream(
-    ip: IpAddr,
+    ips: &[IpAddr],
     port: u16,
     host: &str,
     ctx: &ProxyCtx,
 ) -> Result<StreamOwned<ClientConnection, TcpStream>, UpstreamError> {
-    let sock = TcpStream::connect_timeout(&SocketAddr::new(ip, port), ctx.timeout)
-        .map_err(|_| UpstreamError::Unreachable)?;
+    let sock = dial_first(ips, port, ctx).map_err(|_| UpstreamError::Unreachable)?;
     sock.set_read_timeout(Some(ctx.timeout))
         .map_err(|_| UpstreamError::Unreachable)?;
     sock.set_write_timeout(Some(ctx.timeout))
@@ -805,7 +833,7 @@ fn connect_upstream(
 fn acquire_upstream(
     ctx: &ProxyCtx,
     key: Option<&PoolKey>,
-    ip: IpAddr,
+    ips: &[IpAddr],
     port: u16,
     host: &str,
 ) -> Result<(UpstreamTls, bool), UpstreamError> {
@@ -814,7 +842,7 @@ fn acquire_upstream(
     {
         return Ok((stream, true));
     }
-    connect_upstream(ip, port, host, ctx).map(|stream| (stream, false))
+    connect_upstream(ips, port, host, ctx).map(|stream| (stream, false))
 }
 
 /// Refuse a request because its validated upstream could not be opened. Both shapes are a `502`,

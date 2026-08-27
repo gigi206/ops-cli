@@ -703,6 +703,63 @@ fn a_client_trusting_the_ca_handshakes_through_the_resolver() {
     srv.join().unwrap();
 }
 
+/// A name that resolves to several addresses is reachable through any of them, not only the first.
+///
+/// The guard used to settle on one address — the first the policy permitted — and every dial went
+/// there. A host whose first published address happened to be down was then answered
+/// `502 upstream-unreachable` while an ordinary client, walking the list the resolver returned,
+/// would have connected to the second. Nothing about that first address made it the right one: it
+/// was simply first.
+///
+/// Teeth: the dead address is `127.0.0.2`, which refuses immediately rather than hanging, so a
+/// green run means the walk happened and not that a timeout was waited out. It is also on the same
+/// side of the SSRF guard as the live one (both private, both reached through a rule naming this
+/// exact host), so what is under test is the walk and not the verdict.
+#[test]
+fn a_host_that_resolves_to_several_addresses_is_reached_through_the_one_that_answers() {
+    let (addr, upstream_ca, up) = spawn_upstream(
+        "upstream.test",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+    );
+    let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+    let proxy_ca_der = proxy_ca.ca_cert_der();
+    let mut roots = RootCertStore::empty();
+    roots.add(upstream_ca).unwrap();
+    let upstream_cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let ctx = Arc::new(
+        ProxyCtx::new(proxy_ca, policy(&["upstream.test:*"]))
+            .unwrap()
+            .with_upstream(upstream_cfg)
+            .with_resolver(Box::new(|_| {
+                Ok(vec![
+                    IpAddr::from([127, 0, 0, 2]),
+                    IpAddr::from([127, 0, 0, 1]),
+                ])
+            })),
+    );
+
+    let resp = through_proxy(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        "upstream.test",
+        addr.port(),
+        b"GET /path HTTP/1.1\r\nHost: upstream.test\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
+    // Asserted before the join: a regression leaves the upstream waiting on an `accept` that never
+    // comes, so joining first would hang the suite instead of failing it.
+    assert!(
+        resp.contains("200 OK") && resp.contains("hello"),
+        "the second resolved address answers, so the request must not be refused: {resp:?}"
+    );
+    up.join().unwrap();
+}
+
 /// The happy path end to end: an allowed request is MITM'd, forwarded to a loopback upstream
 /// validated against its own CA, and the response is streamed back. Proves the byte plumbing
 /// across both read boundaries (CONNECT head → ClientHello, inner head → response body).
@@ -8876,6 +8933,31 @@ fn one_capture(
 /// absent exactly when it was needed.
 #[test]
 fn a_secret_leaving_through_a_websocket_crosses_or_not_by_the_configured_posture() {
+    websocket_posture_decides_what_crosses(false);
+}
+
+/// The same two postures, with the cage's frame **pipelined behind its handshake** — written in the
+/// same call as the upgrade request, so the proxy reads it past the request head and it reaches the
+/// relay as the tunnel's pending bytes rather than through the relay loop.
+///
+/// That arrival used to skip the gate it is documented to pass. The pending bytes were written into
+/// the upstream's TLS writer before the tripwire ran, so the block path's own flush put them on the
+/// wire immediately ahead of the `close_notify` meant to stop them: the block was reported on the
+/// event and the frame crossed anyway. A cage choosing to pipeline costs nothing and is what a
+/// client library does on its own.
+///
+/// Teeth: the `Warn` half must still carry the frame, so a fix that simply dropped pipelined bytes
+/// would fail here rather than look like a stricter block.
+#[test]
+fn a_secret_pipelined_behind_the_handshake_is_blocked_like_one_sent_after_it() {
+    websocket_posture_decides_what_crosses(true);
+}
+
+/// The body of the two tests above: one tunnel per posture, the cage sending a frame that carries a
+/// configured secret, measured by what the upstream actually received. `pipelined` chooses which
+/// buffer the frame reaches the relay through; the verdict must not depend on it.
+#[cfg(test)]
+fn websocket_posture_decides_what_crosses(pipelined: bool) {
     use crate::allowlist::WebsocketSecret;
     use crate::sandbox::control::{LOG_RING_CAP, LogRing};
     const LEAK: &[u8] = br#"{"send":"SECRET-VALUE-0123456789"}"#;
@@ -8912,8 +8994,15 @@ fn a_secret_leaving_through_a_websocket_crosses_or_not_by_the_configured_posture
             .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
         );
 
-        let received =
-            ws_send_from_cage(ctx, proxy_ca_der, "upstream.test", addr.port(), LEAK, got);
+        let received = ws_send_from_cage(
+            ctx,
+            proxy_ca_der,
+            "upstream.test",
+            addr.port(),
+            LEAK,
+            got,
+            pipelined,
+        );
         // Compared against the frame as it goes on the wire, not against the payload: a client
         // frame is masked, so the plaintext appears nowhere in what the upstream receives. The
         // proxy relays byte for byte, so what crossed is exactly the frame that was sent.
@@ -9548,7 +9637,13 @@ fn spawn_listening_ws_upstream() -> (
 
 /// Drive one tunnel in which the cage sends `payload` as a frame, and hand back what the upstream
 /// received.
+///
+/// `pipelined` chooses how the frame arrives: written in the same call as the upgrade request, so
+/// the proxy reads it past the handshake head and holds it as the tunnel's pending bytes, or
+/// written once the `101` is in hand, so it comes through the relay loop. Both are the tunnel's
+/// first frames.
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn ws_send_from_cage(
     ctx: Arc<ProxyCtx>,
     proxy_ca: CertificateDer<'static>,
@@ -9556,6 +9651,7 @@ fn ws_send_from_cage(
     connect_port: u16,
     payload: &[u8],
     upstream_got: std::sync::mpsc::Receiver<Vec<u8>>,
+    pipelined: bool,
 ) -> Vec<u8> {
     let dir = TmpDir::new();
     let path = dir.join("proxy.sock");
@@ -9588,13 +9684,19 @@ fn ws_send_from_cage(
              Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
              Sec-WebSocket-Version: 13\r\n\r\n"
     );
-    tls.write_all(upgrade.as_bytes()).unwrap();
+    let frame = ws_frame(0x1, payload, Some(CAGE_MASK));
+    let mut opening = upgrade.into_bytes();
+    if pipelined {
+        opening.extend_from_slice(&frame);
+    }
+    tls.write_all(&opening).unwrap();
     tls.flush().unwrap();
     let head = read_head_until_blank(&mut tls).unwrap();
     assert!(head.contains("101 Switching Protocols"), "{head:?}");
-    tls.write_all(&ws_frame(0x1, payload, Some(CAGE_MASK)))
-        .unwrap();
-    tls.flush().unwrap();
+    if !pipelined {
+        tls.write_all(&frame).unwrap();
+        tls.flush().unwrap();
+    }
     // Closed right behind the frame, so the upstream's read ends and the test does not wait on a
     // tunnel that has no reason to close. The close travels the same stream as the frame, so the
     // proxy relays the frame first and only then sees the end — unless it refused, which is the

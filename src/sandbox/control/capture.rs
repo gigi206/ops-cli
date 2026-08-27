@@ -111,7 +111,9 @@ pub(crate) const CAPTURE_TOTAL_BUDGET: usize = 16 * 1024 * 1024;
 /// has seen (see [`CaptureRing::needles`]). A ceiling rather than an unbounded union because every
 /// needle is scanned over every captured part, so the set bounds the masking cost as well as the
 /// memory: a launch declaring a handful of credentials and refreshing them all session stays far
-/// inside it, and past it the least recently seen values are dropped first.
+/// inside it, and past it the least recently seen **superseded** values are dropped first. A value
+/// the live credential state still carries is never dropped, so the ceiling can shorten the history
+/// but can never leave a live credential unmasked.
 const NEEDLE_HISTORY_MAX: usize = 256;
 
 /// The per-part byte caps a launch captures with, derived once from the policy.
@@ -471,10 +473,22 @@ impl CaptureRing {
         }
         // Bounded, because every needle here is scanned over every captured part and a session that
         // re-resolves a credential on a schedule would otherwise grow the set for as long as it
-        // runs. The live values are appended last, so dropping from the front retires the least
-        // recently seen first and never the ones in use.
-        let over = merged.len().saturating_sub(NEEDLE_HISTORY_MAX);
-        merged.drain(..over);
+        // runs. What the bound may drop is a *superseded* value and never a live one: the live set
+        // is moved to the tail first, so the trim below reaches only the retired prefix, oldest
+        // first. Trimming the merged order instead retired whichever value happened to sit at the
+        // front, and the launch's originally declared credentials are exactly what sits there —
+        // dropping one filed the very next capture with that credential unmasked.
+        let live = |n: &SecretNeedle| current.needles.iter().any(|c| c.as_bytes() == n.as_bytes());
+        let (mut retired, in_use): (Vec<SecretNeedle>, Vec<SecretNeedle>) =
+            merged.into_iter().partition(|n| !live(n));
+        // Never past the retired prefix, so a launch declaring more credentials than the ceiling
+        // keeps masking all of them rather than silently unmasking the excess.
+        let over = (retired.len() + in_use.len())
+            .saturating_sub(NEEDLE_HISTORY_MAX)
+            .min(retired.len());
+        retired.drain(..over);
+        let mut merged = retired;
+        merged.extend(in_use);
         *history = std::sync::Arc::new(merged);
         history.clone()
     }
@@ -671,6 +685,63 @@ mod tests {
         let body = String::from_utf8(stored.res_body.bytes.clone()).unwrap();
         assert_eq!(body, "retry with *************** please");
         assert!(head.starts_with("GET /v1 HTTP/1.1"), "not this: {head}");
+    }
+
+    /// The needle history's ceiling must retire only values the launch has *superseded*. The
+    /// history is seeded with the credentials as first resolved, so a static value declared at
+    /// launch sits at the front of it for the whole session; trimming from the front therefore
+    /// evicted a value still in use, and the capture filed by that very call went into the ring
+    /// with a live credential in cleartext for `sbx net logs --with-headers` to print.
+    #[test]
+    fn the_needle_history_ceiling_retires_a_superseded_value_and_never_a_live_one() {
+        use crate::sandbox::proxy::{CredentialSet, Credentials};
+
+        let static_key = needle("static-API-KEY-value");
+        let credentials = std::sync::Arc::new(Credentials::new(
+            Vec::new(),
+            vec![static_key.clone(), needle("rotating-t0ken-000")],
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+        ));
+        let ring = CaptureRing::new(
+            CaptureCaps::new(CaptureLevel::Bodies, 8),
+            credentials.clone(),
+        );
+        // A launch whose OAuth token the upstream keeps expiring: each refresh adds one value to
+        // the history, well past its ceiling, while the declared API key never changes.
+        for i in 1..=(NEEDLE_HISTORY_MAX + 8) {
+            credentials.replace(CredentialSet {
+                injections: Vec::new(),
+                needles: vec![
+                    static_key.clone(),
+                    needle(&format!("rotating-t0ken-{i:03}")),
+                ],
+            });
+            let mut cap = Capture::new(i as u64);
+            cap.req_head =
+                bytes(b"GET /v1 HTTP/1.1\r\nauthorization: Bearer static-API-KEY-value\r\n\r\n");
+            ring.insert(cap);
+        }
+
+        // Every retained capture, because the value is re-appended on the call after the one that
+        // dropped it: exactly one filing is masked against a set missing it, and that filing is the
+        // one holding the credential in cleartext.
+        let seqs: Vec<u64> = (1..=(NEEDLE_HISTORY_MAX + 8) as u64).collect();
+        let (found, _) = ring.get(&seqs);
+        assert!(!found.is_empty(), "the ring retains the recent captures");
+        for stored in &found {
+            let head = String::from_utf8(stored.req_head.bytes.clone()).unwrap();
+            assert!(
+                !head.contains("static-API-KEY-value"),
+                "capture {} was filed with a credential the launch still uses: {head}",
+                stored.seq
+            );
+            assert!(
+                head.contains("Bearer ********************"),
+                "the live value is masked at equal length: {head}"
+            );
+        }
+        // The ceiling still bounds the set, so this cannot be satisfied by keeping everything.
+        assert!(ring.needles().len() <= NEEDLE_HISTORY_MAX);
     }
 
     #[test]

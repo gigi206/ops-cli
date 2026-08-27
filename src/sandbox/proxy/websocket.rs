@@ -51,9 +51,11 @@ pub(super) struct FrameTee {
     ///
     /// Gathered rather than scanned piecewise because a frame can arrive split across reads and a
     /// value straddling the split would otherwise be missed, and kept apart from [`Self::pending`]
-    /// because a control frame may interleave a fragmented message that is using that buffer. It is
-    /// bounded by [`CONTROL_MAX`]: RFC 6455 §5.5 caps a control payload at 125 bytes, so a frame
-    /// claiming more is not one, and nothing here grows on a length the cage picked.
+    /// because a control frame may interleave a fragmented message that is using that buffer. Past
+    /// [`CONTROL_MAX`] it is scanned and dropped in pieces (see [`Self::scan_control_overflow`])
+    /// rather than either grown or cut: it never holds more than the protocol's limit plus the read
+    /// that crossed it, so nothing here grows on the length the cage wrote, and nothing the cage
+    /// sends crosses unscanned.
     control_payload: Vec<u8>,
     mask: Option<[u8; 4]>,
     /// Where in the 4-byte mask key the next payload byte lands, carried across reads.
@@ -74,11 +76,14 @@ pub(super) struct FrameTee {
     fin: bool,
 }
 
-/// The most plaintext the leak scan asks the decoder to produce out of one compressed message.
+/// The most plaintext the leak scan asks the decoder to hold at once out of one compressed message.
 ///
-/// A bound is needed because a compressed message can inflate to far more than it cost to send. It
-/// is generous next to anything that would plausibly carry a leaked credential, and a message that
-/// inflates past it is scanned up to it — never silently claimed to have been scanned whole.
+/// A bound is needed because a compressed message can inflate to far more than it cost to send, and
+/// it bounds the **buffer**, not the scan: what inflates past it is produced a block at a time and
+/// scanned as it goes ([`Inflater::drain`]), so the whole message is seen and only
+/// [`RESYNC_PLAINTEXT_CAP`] bounds how far. Capping what the scan *saw* would have made a leak cost
+/// one compressible pad: padding is nearly free on the wire, so a secret placed past the cap crossed
+/// with the tripwire reporting nothing.
 const SCAN_MESSAGE_CAP: usize = 256 * 1024;
 
 /// The most payload one control frame can carry, from RFC 6455 §5.5: "All control frames MUST have
@@ -86,7 +91,9 @@ const SCAN_MESSAGE_CAP: usize = 256 * 1024;
 ///
 /// It bounds [`FrameTee::control_payload`], so what is gathered follows the protocol's limit rather
 /// than the length the sender wrote — a frame claiming more is not a control frame, and the buffer
-/// must not grow on its say-so.
+/// must not grow on its say-so. What is past the limit is scanned and dropped as it arrives rather
+/// than discarded: the frame is relayed whole either way, so bytes the buffer refused to hold were
+/// bytes the tripwire never saw.
 const CONTROL_MAX: usize = 125;
 
 /// The leak tripwire for one direction of an established WebSocket.
@@ -182,6 +189,11 @@ impl LeakScan {
     }
 }
 
+/// Where a decoder hands the plaintext it produces, piece by piece and in order: the leak scan,
+/// when this launch has one. It is threaded through the inflate loops rather than called at one
+/// site, which is what makes the tail past the plaintext cap scannable without being kept.
+type PlaintextSink<'a> = &'a mut dyn FnMut(&[u8]);
+
 /// One direction's `permessage-deflate` decompressor.
 ///
 /// Two details of RFC 7692 matter and are easy to get wrong. A message's payload is a raw DEFLATE
@@ -215,8 +227,15 @@ impl Inflater {
     /// than storing rubbish.
     ///
     /// The cap bounds what is **kept**, never what is **decoded**: see [`Inflated::in_step`] for why
-    /// the difference is the whole of this direction's leak scan.
-    fn message(&mut self, compressed: &[u8], cap: usize) -> Option<Inflated> {
+    /// the difference is the whole of this direction's leak scan. `scanned` is handed every byte the
+    /// message inflates to, in order and the tail past the cap included, so what the scan sees is
+    /// the message and what the cap holds back is only the capture's copy of it.
+    fn message(
+        &mut self,
+        compressed: &[u8],
+        cap: usize,
+        mut scanned: Option<PlaintextSink<'_>>,
+    ) -> Option<Inflated> {
         let mut input: Vec<u8> = Vec::with_capacity(compressed.len() + 4);
         input.extend_from_slice(compressed);
         input.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
@@ -270,9 +289,27 @@ impl Inflater {
             }
         }
         out.truncate(written);
+        if let Some(scanned) = scanned.as_deref_mut() {
+            scanned(&out);
+        }
+        // Whether the cap is what stopped the loop: its other exits require both the input consumed
+        // and room left in the block, which together mean the message is out. Read off `written`
+        // rather than off what is left of the input, because a message can be cut short by the cap
+        // with its input already spent — a back-reference goes on unrolling into the output long
+        // after the few bytes naming it were read, and for a compressible payload that is most of
+        // it. Taking a spent input for a finished message left those bytes inside the decoder,
+        // unscanned and waiting to be prepended to the next message.
+        let overflowed = written >= limit;
+        let rest = &input[read..];
         // A peer that resets its window per message shares nothing across them, so a message the cap
         // cut short costs the next one nothing: reset, and the decoder is in step by construction.
+        // The remainder is still inflated when something is scanning it, because it crossed to the
+        // peer whether or not this decoder needed it; with nothing scanning there is no reader for
+        // those bytes and inflating them would be work for no one.
         if self.no_context_takeover {
+            if overflowed && scanned.is_some() {
+                let _ = self.drain(rest, scanned);
+            }
             self.state.reset(DataFormat::Raw);
             return Some(Inflated {
                 plain: out,
@@ -280,25 +317,25 @@ impl Inflater {
             });
         }
         // Otherwise the window carries across messages, and the bytes past the cap are part of it.
-        // Inflate the rest and throw it away, so the window this message leaves behind is the one
-        // the peer has. The loop above exits with input pending *only* on the cap — its other exits
-        // both require the input consumed — so this is exactly the overflow path.
-        let in_step = read >= input.len() || self.drain(&input[read..]);
+        // Inflate the rest, scan it and throw it away, so the window this message leaves behind is
+        // the one the peer has.
+        let in_step = !overflowed || self.drain(rest, scanned);
         Some(Inflated {
             plain: out,
             in_step,
         })
     }
 
-    /// Inflate the rest of a message the plaintext cap cut short, discarding every byte it yields,
-    /// so this direction's window ends the message holding what the peer's does.
+    /// Inflate the rest of a message the plaintext cap cut short, handing every byte it yields to
+    /// `scanned` and then discarding it, so this direction's window ends the message holding what
+    /// the peer's does and the tripwire sees a payload the cap alone would have hidden.
     ///
     /// Bounded like everything else here that inflates hostile input, but on a different axis from
     /// the cap it is recovering from: the discard buffer is one fixed block reused to the end, so the
     /// *memory* cost is constant however far the message inflates, and [`RESYNC_PLAINTEXT_CAP`]
     /// bounds the *work*. Returns whether the input was consumed — `false` leaves the decoder out of
     /// step, and is the caller's signal to stop this direction rather than decode the rest wrongly.
-    fn drain(&mut self, mut rest: &[u8]) -> bool {
+    fn drain(&mut self, mut rest: &[u8], mut scanned: Option<PlaintextSink<'_>>) -> bool {
         let mut scratch = vec![0u8; 16 * 1024];
         let mut inflated = 0usize;
         loop {
@@ -307,6 +344,9 @@ impl Inflater {
                 Ok(MZStatus::Ok | MZStatus::StreamEnd) => {}
                 Err(_) => return false,
                 _ => {}
+            }
+            if let Some(scanned) = scanned.as_deref_mut() {
+                scanned(&scratch[..res.bytes_written]);
             }
             rest = &rest[res.bytes_consumed..];
             inflated = inflated.saturating_add(res.bytes_written);
@@ -493,6 +533,13 @@ impl FrameTee {
         if let Some(scan) = self.scan.as_mut() {
             scan.take(piece);
         }
+        self.store(piece)
+    }
+
+    /// The capture half of [`Self::consume`], for the one path that has already scanned its bytes:
+    /// a compressed message is scanned as it inflates, tail past the plaintext cap included, while
+    /// the sink is only ever offered the part the cap kept.
+    fn store(&mut self, piece: &[u8]) -> bool {
         if self.sink_full {
             return false;
         }
@@ -591,11 +638,11 @@ impl FrameTee {
                     // and §5.5.3 both allow one), so the scan reads it — but it is not part of the
                     // message transcript, so the capture never sees it. Gathered to the frame's end
                     // rather than scanned as it arrives, so a value split across two reads is still
-                    // matched, and bounded so the buffer follows the protocol's limit and not the
-                    // length the sender wrote.
-                    let room = CONTROL_MAX.saturating_sub(self.control_payload.len());
-                    let fits = piece.len().min(room);
-                    self.control_payload.extend_from_slice(&piece[..fits]);
+                    // matched.
+                    self.control_payload.extend_from_slice(&piece);
+                    if self.control_payload.len() > CONTROL_MAX {
+                        self.scan_control_overflow();
+                    }
                 } else if self.compressed {
                     // A compressed message is only decodable whole, so it is held until its last
                     // frame. Bounded by what its consumers could ever use: past that, inflating more
@@ -652,6 +699,28 @@ impl FrameTee {
         self.plaintext_cap().saturating_mul(4).max(64 * 1024)
     }
 
+    /// Scan what has gathered of a control frame's payload once it is past [`CONTROL_MAX`], keeping
+    /// only the overlap a value split across the cut needs.
+    ///
+    /// A payload over the limit is not a control frame's (RFC 6455 §5.5), but the frame is relayed
+    /// byte for byte whatever this decoder makes of it, so the bytes past the limit still leave the
+    /// cage. Holding the buffer at the limit and dropping the rest — which this did — left exactly
+    /// that: 125 scanned bytes of cover per frame and an unscanned tail behind each of them, a
+    /// channel past the outbound-secret tripwire needing no reassembly and no compression. Stopping
+    /// the direction instead would be worse still: one oversized frame would switch the tripwire off
+    /// for the rest of the tunnel, where the framing here is perfectly followable.
+    fn scan_control_overflow(&mut self) {
+        let Some(scan) = self.scan.as_mut() else {
+            self.control_payload.clear();
+            return;
+        };
+        let gathered = std::mem::take(&mut self.control_payload);
+        scan.take_standalone(&gathered);
+        let overlap = scan.keep.min(gathered.len());
+        self.control_payload
+            .extend_from_slice(&gathered[gathered.len() - overlap..]);
+    }
+
     /// Settle a frame that has just ended. A compressed message becomes capturable only now, on its
     /// final frame. Returns whether the sink filled.
     fn end_of_frame(&mut self) -> bool {
@@ -670,17 +739,27 @@ impl FrameTee {
         }
         let compressed = std::mem::take(&mut self.pending);
         let cap = self.plaintext_cap();
+        // The message arrives whole here, so the scan needs no carry on this path — it is handed
+        // the one payload it was going to reassemble anyway.
+        if let Some(scan) = self.scan.as_mut() {
+            scan.start_message();
+        }
         let Some(inflater) = self.inflater.as_mut() else {
             return false;
         };
-        match inflater.message(&compressed, cap) {
+        // The scan reads the plaintext as it is produced rather than the part that came back: the
+        // cap holds back what the capture keeps, and a message inflating past it goes on being
+        // scanned to its end (see [`Inflater::message`]).
+        let mut scan = self.scan.as_mut();
+        let mut scanned = |plain: &[u8]| {
+            if let Some(scan) = scan.as_deref_mut() {
+                scan.take(plain);
+            }
+        };
+        let decoded = inflater.message(&compressed, cap, Some(&mut scanned));
+        match decoded {
             Some(inflated) => {
-                // The message arrives whole here, so the scan needs no carry on this path — it is
-                // handed the one payload it was going to reassemble anyway.
-                if let Some(scan) = self.scan.as_mut() {
-                    scan.start_message();
-                }
-                let filled = self.consume(&inflated.plain);
+                let filled = self.store(&inflated.plain);
                 if !inflated.in_step {
                     // The window could not be brought back level with the peer's, so every later
                     // message on this direction would decode to rubbish. Stop, rather than scan
@@ -807,6 +886,35 @@ pub(super) fn reserialize_upgrade(head: &Head, injections: &[(String, String)]) 
     out.into_bytes()
 }
 
+/// Whether an upgrade response head is an **interim** `1xx` that the upstream's real answer follows,
+/// rather than the answer itself.
+///
+/// `101` is the upgrade, and is never interim. Every other `1xx` is a complete message of its own
+/// that the final head follows — a CDN answering `103 Early Hints` ahead of the handshake response
+/// is the ordinary case — which is the rule [`relay_response_head`] states for every other response.
+/// Reading one as the upstream's answer took the declined-upgrade path instead, so the `101` behind
+/// it and every frame behind that were dropped and the WebSocket never established.
+fn interim_upgrade_head(head: &[u8]) -> bool {
+    matches!(parse_status_code(head), Some(code) if (100..200).contains(&code) && code != 101)
+}
+
+/// Where a declined upgrade's response body ends, decided from the response head and the
+/// handshake's own request line.
+///
+/// The verb has to come from the request line because nothing before this point holds the handshake
+/// to the `GET` RFC 6455 §4.1 requires: [`is_websocket_upgrade`] reads the two upgrade headers
+/// alone, and the verdict names the `WS` pseudo-verb rather than the literal one, so a `HEAD` or a
+/// `POST` carrying those headers reaches the relay. [`response_framing`] holds the bodiless-method
+/// rule; framing a declined `HEAD` as if it were a `GET` bypassed it, and the relay then waited out
+/// the upstream's read timeout on a `Content-Length` body that a correct server never sends for a
+/// `HEAD` — one proxy thread and one connection slot per request, for a few dozen bytes of cage.
+fn declined_framing(resp_head: &[u8], request_line: &str) -> BodyFraming {
+    let method = request_line_parts(request_line)
+        .map(|(method, _)| method)
+        .unwrap_or_default();
+    response_framing(resp_head, &method)
+}
+
 /// Forward an allowed WebSocket upgrade and, on a `101`, relay the two TLS streams bidirectionally.
 /// The handshake was already inspected by the same verdict as any request (host / path / method /
 /// anti-fronting / SSRF / upstream-cert), so the allowlist still governs which host and path may open
@@ -840,7 +948,21 @@ pub(super) fn relay_upgrade(
     // Read the upstream's response head. A BufReader may read past it into the server's first frames;
     // those buffered bytes are drained below so none is lost.
     let mut up_br = BufReader::new(upstream);
-    let resp_head = read_head_buffered(&mut up_br, HEAD_MAX, head_deadline(ctx))?;
+    // One head budget covers the whole sequence, so an upstream that keeps sending interim heads is
+    // bounded by the deadline a single head already is.
+    let deadline = head_deadline(ctx);
+    let resp_head = loop {
+        let head = read_head_buffered(&mut up_br, HEAD_MAX, deadline)?;
+        if !interim_upgrade_head(&head) {
+            break head;
+        }
+        // Relayed and read past, never captured: it is a message of its own and not the response
+        // this exchange got, which is exactly what `relay_response_head` does with one. The bytes
+        // still crossed to the cage, so they are still counted.
+        br.get_mut().write_all(&head)?;
+        br.get_mut().flush()?;
+        down.fetch_add(head.len() as u64, Ordering::Relaxed);
+    };
 
     if parse_status_code(&resp_head) != Some(101) {
         // The upstream declined the upgrade — relay its response as a normal one, then close. The
@@ -858,9 +980,9 @@ pub(super) fn relay_upgrade(
         if let Some(c) = capture {
             c.push_response(&resp_head);
         }
-        // Framed like any ordinary response, so the relay ends at the end of the message. The
-        // handshake was a `GET`, so no bodiless-method rule applies here.
-        let framing = response_framing(&resp_head, "GET");
+        // Framed like any ordinary response, so the relay ends at the end of the message — and
+        // framed against the handshake's own verb, which is not always `GET`.
+        let framing = declined_framing(&resp_head, &inner.request_line);
         // Count the declined response body (`down`) as it streams back to the client.
         let counted = CountingReader::new(FramedBody::new(up_br, framing), down.clone());
         let mut body: Box<dyn Read + '_> = match capture {
@@ -975,7 +1097,8 @@ pub(super) fn read_plaintext<D: rustls::SideData>(
 /// (never in a read), so a live-but-idle channel is never cut; a dead peer that neither sends nor
 /// closes is bounded by the connection cap, as for the L4 splice. Each read-side EOF half-closes only
 /// that direction (a `close_notify` to the peer), so the reverse direction drains fully before teardown.
-/// The bytes each side already read past its head (`*_pending`) are seeded into the send buffers first.
+/// The bytes each side already read past its head (`*_pending`) are seeded into the send buffers
+/// first, except the cage's, which are written only once the leak tripwire has cleared them.
 #[allow(clippy::too_many_arguments)]
 /// Everything an established tunnel reports its activity to, gathered so the relay and its decoders
 /// pass one value rather than five. They travel together because they answer one question between
@@ -1055,11 +1178,11 @@ pub(super) fn relay_websocket(
         ..obs
     };
     let TunnelObservers { up, down, ctx, .. } = &obs;
-    // Seed the already-read bytes into the destination send buffers (the loop flushes them out), and
-    // count them (`up` = client→upstream, `down` = upstream→client) toward the live flow view.
-    upstream.conn.writer().write_all(client_pending)?;
+    // Seed what the upstream already sent into the client's send buffer (the loop flushes it out)
+    // and count it (`down` = upstream→client) toward the live flow view. The bytes the CAGE sent
+    // behind its handshake are deliberately not seeded here: they are the tunnel's first frames, so
+    // they are written only once the leak gate below has cleared them (see there).
     client.conn.writer().write_all(upstream_pending)?;
-    up.fetch_add(client_pending.len() as u64, Ordering::Relaxed);
     down.fetch_add(upstream_pending.len() as u64, Ordering::Relaxed);
 
     // One frame decoder per direction, present when this launch has something to do with the frames:
@@ -1099,7 +1222,10 @@ pub(super) fn relay_websocket(
     // costs no clone.
     let blocking = obs.ctx.policy.websocket_secret() == crate::allowlist::WebsocketSecret::Block;
     // The bytes the cage already sent behind its handshake go through the same gate as the ones
-    // that follow: they are the first frames of the tunnel, not a preamble.
+    // that follow: they are the first frames of the tunnel, not a preamble. Scanned BEFORE they are
+    // written, in the order the main loop below uses — written into the upstream's rustls buffer
+    // first, they were put on the wire by the block path's own `flush_tls`, immediately ahead of the
+    // `close_notify` meant to stop them: the block was reported on the event and did not block.
     let pending_seen = follow(&mut tee_up, client_pending, SecretWay::Out, &obs);
     let _ = follow(&mut tee_down, upstream_pending, SecretWay::Back, &obs);
     if pending_seen && blocking {
@@ -1109,6 +1235,9 @@ pub(super) fn relay_websocket(
         let _ = flush_tls(&mut upstream.conn, &mut upstream.sock);
         return Ok(());
     }
+    // Cleared, so the cage's first frames go out with the rest.
+    upstream.conn.writer().write_all(client_pending)?;
+    up.fetch_add(client_pending.len() as u64, Ordering::Relaxed);
     client.sock.set_nonblocking(true)?;
     upstream.sock.set_nonblocking(true)?;
 
@@ -1401,6 +1530,71 @@ mod tests {
         );
     }
 
+    /// A secret placed past [`SCAN_MESSAGE_CAP`] inside ONE compressed message is still seen.
+    ///
+    /// The cap bounds the plaintext buffer, and the bytes past it used to be inflated into a
+    /// scratch block and thrown away unscanned, purely to re-sync the DEFLATE window. Because the
+    /// pad ahead of the secret is compressed, moving the secret past the cap cost the cage a few
+    /// hundred bytes on the wire: one cheap message and the tripwire reported nothing at all.
+    ///
+    /// Teeth: the message is asserted to stay far inside `compressed_budget`, so what is under test
+    /// is the plaintext cap and not the other bound, and a control sends the same secret unpadded.
+    #[test]
+    fn a_secret_padded_past_the_plaintext_cap_is_still_seen() {
+        use miniz_oxide::deflate::core::CompressorOxide;
+        const SECRET: &[u8] = b"SUPERSECRETVALUE0000";
+        let needle = SecretNeedle::named("test-secret", SECRET.to_vec());
+
+        // The control, so a green test cannot mean the scan never sees anything at all.
+        let mut c = CompressorOxide::new(raw_deflate_flags());
+        let mut control = scanning_tee(std::slice::from_ref(&needle), Some(false));
+        control.push(&deflated_message(SECRET, &mut c));
+        assert_eq!(
+            control.sightings(),
+            vec!["test-secret".to_string()],
+            "the scan must see a secret sent on its own, else this test proves nothing"
+        );
+
+        let mut payload = vec![b'a'; SCAN_MESSAGE_CAP + 1];
+        payload.extend_from_slice(SECRET);
+        let mut c = CompressorOxide::new(raw_deflate_flags());
+        let wire = deflated_message(&payload, &mut c);
+
+        let mut t = scanning_tee(std::slice::from_ref(&needle), Some(false));
+        assert!(
+            wire.len() < t.compressed_budget(),
+            "the padded message must be cheap on the wire ({} bytes) — otherwise the compressed \
+             budget stops it first and this tests the wrong bound",
+            wire.len()
+        );
+        t.push(&wire);
+        assert_eq!(
+            t.sightings(),
+            vec!["test-secret".to_string()],
+            "a compressible pad ahead of a secret put it past the scan, so the tripwire is off for \
+             the price of one small message"
+        );
+    }
+
+    /// The same, for a peer that announced `client_no_context_takeover`: the window is reset per
+    /// message there, so nothing has to be inflated to stay in step — and the tail past the cap was
+    /// therefore dropped without being looked at, which is the same hole reached by announcing one
+    /// extension parameter.
+    #[test]
+    fn a_secret_padded_past_the_cap_is_seen_even_when_the_window_resets_per_message() {
+        use miniz_oxide::deflate::core::CompressorOxide;
+        const SECRET: &[u8] = b"SUPERSECRETVALUE0000";
+        let needle = SecretNeedle::named("test-secret", SECRET.to_vec());
+        let mut payload = vec![b'a'; SCAN_MESSAGE_CAP + 1];
+        payload.extend_from_slice(SECRET);
+        let mut c = CompressorOxide::new(raw_deflate_flags());
+        let wire = deflated_message(&payload, &mut c);
+
+        let mut t = scanning_tee(std::slice::from_ref(&needle), Some(true));
+        t.push(&wire);
+        assert_eq!(t.sightings(), vec!["test-secret".to_string()]);
+    }
+
     /// The companion to the test above, on the axis it cannot cover: when the remainder is too big
     /// to inflate away, the window stays out of step — and that must be *reported*, so the direction
     /// stops rather than carrying on handing the scan whatever a desynced decoder produces.
@@ -1421,7 +1615,7 @@ mod tests {
         let mut inflater = Inflater::new(false);
         inflater.resync_cap = 1024; // far below the ~64 KiB left after the cap
         let got = inflater
-            .message(body, SCAN_MESSAGE_CAP)
+            .message(body, SCAN_MESSAGE_CAP, None)
             .expect("the message decodes as far as the cap");
         assert_eq!(
             got.plain.len(),
@@ -1911,6 +2105,62 @@ mod tests {
         );
     }
 
+    /// An interim `1xx` ahead of the `101` is not the upstream's answer.
+    ///
+    /// A CDN answering `103 Early Hints` before the handshake response is the ordinary case, and
+    /// the upgrade path read the first head it got as final: `103` is not `101`, so it took the
+    /// declined branch, relayed the hints to the cage as the response and closed — dropping the
+    /// real `101` and every frame behind it. `relay_response_head` reads the same bytes correctly
+    /// on the ordinary response path, and the two parsers in one proxy must not disagree.
+    #[test]
+    fn an_interim_head_ahead_of_the_upgrade_is_not_the_upstreams_answer() {
+        assert!(
+            interim_upgrade_head(b"HTTP/1.1 103 Early Hints\r\nLink: </s.js>; rel=preload\r\n\r\n"),
+            "a 103 is a message of its own that the real head follows"
+        );
+        assert!(interim_upgrade_head(b"HTTP/1.1 100 Continue\r\n\r\n"));
+        assert!(
+            !interim_upgrade_head(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n"
+            ),
+            "the 101 IS the upgrade, so reading past it would drop the tunnel"
+        );
+        assert!(
+            !interim_upgrade_head(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"),
+            "a declined upgrade is a final head"
+        );
+    }
+
+    /// A declined upgrade is framed against the handshake's own verb.
+    ///
+    /// Nothing before the relay holds the handshake to the `GET` RFC 6455 §4.1 requires:
+    /// `is_websocket_upgrade` reads the two upgrade headers alone, and the verdict names the `WS`
+    /// pseudo-verb rather than the literal one. Framing the declined response as if the request had
+    /// always been a `GET` bypassed `response_framing`'s bodiless-method rule, so a `HEAD` upgrade
+    /// answered `Content-Length: 1048576` left the relay waiting out the upstream's read timeout on
+    /// a megabyte a correct server never sends — a thread and a connection slot for a few dozen
+    /// bytes of cage.
+    #[test]
+    fn a_declined_upgrade_is_framed_by_the_verb_the_handshake_actually_used() {
+        const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n";
+        assert!(
+            matches!(
+                declined_framing(HEAD, "HEAD / HTTP/1.1"),
+                BodyFraming::Empty
+            ),
+            "a HEAD is answered with the length of a body that is never sent"
+        );
+        // The ordinary handshake still reads its body, so this cannot be satisfied by framing every
+        // declined upgrade as bodiless.
+        assert!(
+            matches!(
+                declined_framing(HEAD, "GET /chat HTTP/1.1"),
+                BodyFraming::Length(1048576)
+            ),
+            "a declined GET upgrade carries its body like any other response"
+        );
+    }
+
     /// A needle for the leak-scan tests. The value is long enough to clear the redaction floor, and
     /// distinctive enough that a match cannot be a coincidence.
     fn needle() -> SecretNeedle {
@@ -2037,6 +2287,43 @@ mod tests {
                 "a secret sent as the payload of control frame {opcode:#x} crossed unseen"
             );
         }
+    }
+
+    /// A control frame claiming more than the 125 bytes RFC 6455 §5.5 allows is still scanned in
+    /// full. The frame is relayed byte for byte whatever this decoder makes of it, so gathering
+    /// only the first 125 bytes — as this did — left the rest crossing unseen: a secret placed past
+    /// the limit reached the upstream with the tripwire reporting nothing, 125 bytes of cover per
+    /// frame and as many frames as the cage liked.
+    ///
+    /// Fed one byte at a time, so the scan has to carry across the cut it makes at the limit as
+    /// well. Teeth: a second needle is sent on an ordinary data frame afterwards, because refusing
+    /// the frame outright would stop the direction and buy the cage a blind tunnel instead.
+    #[test]
+    fn a_secret_past_the_control_payload_limit_is_still_seen() {
+        const SECOND: &[u8] = b"SECOND-VALUE-9876543210";
+        let later = SecretNeedle::named("second-token", SECOND.to_vec());
+        let mut t = scanning_tee(&[needle(), later], None);
+
+        let mut payload = vec![b'A'; CONTROL_MAX];
+        payload.extend_from_slice(NEEDLE_VALUE);
+        let wire = frame(0x9, &payload, Some([0x11, 0x22, 0x33, 0x44]));
+        for byte in &wire {
+            t.push(std::slice::from_ref(byte));
+        }
+        assert_eq!(
+            t.sightings(),
+            vec!["demo-token".to_string()],
+            "a secret past the control-frame limit crossed unseen"
+        );
+
+        t.push(&frame(0x1, SECOND, None));
+        assert_eq!(
+            t.sightings(),
+            vec!["second-token".to_string()],
+            "the direction must keep following the framing after an oversized control frame, not \
+             hand the cage a blind tunnel for the price of one bad frame"
+        );
+        assert!(!t.done, "the framing here is followable, so nothing stops");
     }
 
     /// A control frame may interleave a fragmented message, and scanning its payload must not

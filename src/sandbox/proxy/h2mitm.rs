@@ -83,8 +83,10 @@ async fn serve(
     let acceptor = tokio_rustls::TlsAcceptor::from(ctx.server_config_h2.clone());
     // Bound the handshake so a client that connects but stalls mid-handshake cannot pin this
     // connection's thread + runtime (the per-socket read/write timeouts the sync path relies on
-    // do not apply once the stream is in nonblocking/tokio mode). Established streams are then
-    // driven with no overall deadline — a gRPC stream may legitimately be long-lived.
+    // do not apply once the stream is in nonblocking/tokio mode). A tunnel carrying no stream is
+    // then bounded by `[network] idle_timeout` in the accept loop below, the same bound the
+    // HTTP/1.1 tunnel waits under between requests; established streams are driven with no overall
+    // deadline — a gRPC stream may legitimately be long-lived.
     let tls = match tokio::time::timeout(ctx.timeout, acceptor.accept(client)).await {
         Ok(Ok(t)) => t,
         _ => {
@@ -157,7 +159,7 @@ async fn serve(
                     if inflight.len() >= MAX_STREAMS as usize {
                         // Backstop the advertised SETTINGS limit: refuse the excess stream
                         // rather than letting an in-cage client open unbounded work per tunnel.
-                        let _ = refuse(respond, StatusCode::TOO_MANY_REQUESTS, "http2-stream-cap");
+                        refuse_over_stream_cap(respond, ctx, connect_host, port, &req);
                         continue;
                     }
                     inflight.push(stream(req, respond, connect_host, port, ctx, &pool));
@@ -167,6 +169,16 @@ async fn serve(
                 Some(Err(_)) | None => break,
             },
             Some(()) = inflight.next(), if !inflight.is_empty() => {}
+            // The idle bound, armed only while this tunnel carries no stream at all. An established
+            // tunnel between streams is the state `[network] idle_timeout` governs on the HTTP/1.1
+            // plane, where the tunnel between requests waits exactly this long
+            // (`set_read_timeout(ctx.idle)`); this plane read `ctx.idle` nowhere, and the per-socket
+            // timeouts the sync accept loop set do not survive the `set_nonblocking` above. Without
+            // it a client that finishes both handshakes and then sends no HEADERS frame holds this
+            // thread, its runtime, the socket and its `max_connections` slot for the life of the
+            // launch. A live stream disarms it, because a gRPC stream may legitimately be
+            // long-lived; the timer restarts whenever a stream is accepted or one finishes.
+            () = tokio::time::sleep(ctx.idle), if inflight.is_empty() => break,
         }
     }
     // Drain the in-flight streams, but bounded: once `accept()` has returned (the connection is
@@ -290,7 +302,7 @@ async fn stream(
     // Resolve host-side, then the SSRF guard against the deciding rule (a private/metadata
     // address is refused unless the rule names the exact host) — then connect the checked IP with
     // no re-resolution, exactly like the HTTP/1.1 path.
-    let ip = match resolve_checked(
+    let ips = match resolve_checked(
         ctx,
         Proto::Https,
         connect_host,
@@ -299,7 +311,7 @@ async fn stream(
         Some(&path),
         deciding.as_ref(),
     ) {
-        Ok(ip) => ip,
+        Ok(ips) => ips,
         Err(refusal) => {
             // The refusal is already recorded — the shared guard counts an SSRF block and logs a
             // resolution failure, so this path answers the client and nothing else.
@@ -311,7 +323,7 @@ async fn stream(
     relay(
         req,
         respond,
-        ip,
+        &ips,
         port,
         connect_host,
         method.as_str(),
@@ -329,7 +341,7 @@ async fn stream(
 async fn relay(
     req: Request<h2::RecvStream>,
     mut respond: h2::server::SendResponse<Bytes>,
-    ip: IpAddr,
+    ips: &[IpAddr],
     port: u16,
     host: &str,
     method: &str,
@@ -422,7 +434,7 @@ async fn relay(
     // Nothing about the decision is reused. The `:authority` re-check, the outbound tripwire, the
     // verdict, the resolution and the address guard all ran above, per stream, and a stream that any
     // of them refuses never reaches this line. What is reused is the handshake.
-    let send_req = match ready_upstream(pool, &injected_ids, ip, port, host, ctx).await {
+    let send_req = match ready_upstream(pool, &injected_ids, ips, port, host, ctx).await {
         Ok(send) => send,
         Err(reason) => {
             refuse_upstream(respond, ctx, host, port, method, path, reason);
@@ -555,7 +567,7 @@ async fn relay(
     // injection this request actually carried, so a refusal from a host sbx injects nothing into can
     // never let an in-cage agent drive the resolver.
     if rparts.status.as_u16() == 401 && super::any_refreshable(&creds, &injected_ids) {
-        ctx.credential_refused();
+        refresh_off_reactor(ctx).await;
     }
     // Stop sharing a connection the upstream has just bound an identity to — see
     // [`binds_identity_to_the_connection`].
@@ -617,6 +629,29 @@ async fn relay(
     } else {
         let _ = relay_body(up_body, client_send_body, res_sink, None).await;
     }
+}
+
+/// Re-resolve the injected credentials after an upstream refused one, **off this tunnel's
+/// reactor**.
+///
+/// What runs is what [`ProxyCtx::credential_refused`] runs on the two HTTP/1.1 planes, and it runs
+/// synchronously: the launch's own resolver, which is a subprocess, a file read or a network call.
+/// Those planes are one OS thread per request, so a slow resolver costs the one request that
+/// triggered it. Here every stream of a tunnel shares one current-thread runtime, so calling it
+/// inline stops the whole tunnel for its full duration — no sibling stream is polled, no DATA frame
+/// is read, no `WINDOW_UPDATE` is written, the spawned upstream connection drivers stall and every
+/// timer on the runtime (the drain bound included) is held back. The blocking pool takes the work
+/// instead, and this stream awaits it, so the ordering the HTTP/1.1 planes have — the refresh is
+/// settled before the stream goes on — is kept while the siblings keep running.
+///
+/// It reaches for the handle rather than calling [`ProxyCtx::credential_refused`] because leaving
+/// the reactor needs something owned: the shared `Arc` is what the blocking pool can hold, where a
+/// borrow of the context cannot outlive this future.
+async fn refresh_off_reactor(ctx: &ProxyCtx) {
+    let Some(refresh) = ctx.refresh.clone() else {
+        return;
+    };
+    let _ = tokio::task::spawn_blocking(move || refresh.on_refusal()).await;
 }
 
 /// Render a client HTTP/2 request head as text for the traffic capture.
@@ -853,19 +888,35 @@ async fn send_masked(dst: &mut h2::SendStream<Bytes>, data: Vec<u8>) -> Result<b
 }
 
 /// Whether the client's decoded request head carries any configured secret value verbatim — the
-/// outbound leak tripwire, HTTP/2 form. Reconstructs a byte blob of the `:path` plus each
+/// outbound leak tripwire, HTTP/2 form. Reconstructs a byte blob of the request line plus each
 /// `name: value` header line and reuses the HTTP/1.1 [`carries_secret`] scan. Scanned before sbx's
 /// own injection is added, so an injected credential can never self-trip it.
+///
+/// The request line is rendered from the pseudo-headers, and rendering all of them is what makes
+/// the scanned bytes the same head the HTTP/1.1 twin scans (which reads the decrypted head whole,
+/// request line included). `:path` alone left `:method` and `:scheme` unscanned, and both are
+/// cage-chosen and forwarded to the upstream verbatim: an HTTP/2 method is any RFC 9110 token, a
+/// character set that covers essentially every API-key and JWT shape, so a secret sent as the
+/// method left the cage where the byte-identical HTTP/1.1 request was refused.
 fn head_carries_secret(
     req: &Request<h2::RecvStream>,
     needles: &[SecretNeedle],
     dest: &str,
 ) -> bool {
     let mut blob = Vec::new();
+    blob.extend_from_slice(req.method().as_str().as_bytes());
+    blob.push(b' ');
+    if let Some(scheme) = req.uri().scheme_str() {
+        blob.extend_from_slice(scheme.as_bytes());
+        blob.extend_from_slice(b"://");
+    }
+    if let Some(authority) = req.uri().authority() {
+        blob.extend_from_slice(authority.as_str().as_bytes());
+    }
     if let Some(pq) = req.uri().path_and_query() {
         blob.extend_from_slice(pq.as_str().as_bytes());
-        blob.push(b'\n');
     }
+    blob.push(b'\n');
     for (name, value) in req.headers().iter() {
         blob.extend_from_slice(name.as_str().as_bytes());
         blob.extend_from_slice(b": ");
@@ -924,7 +975,7 @@ struct UpstreamPool {
 async fn ready_upstream(
     pool: &UpstreamPool,
     ids: &[usize],
-    ip: IpAddr,
+    ips: &[IpAddr],
     port: u16,
     host: &str,
     ctx: &ProxyCtx,
@@ -932,7 +983,7 @@ async fn ready_upstream(
     // `[network] pool = false` means what it says on this plane too: a launch that asked for no
     // upstream reuse gets a connection per stream, as it did before this pool existed.
     if ctx.pool.is_none() {
-        return open_upstream(ip, port, host, ctx)
+        return open_upstream(ips, port, host, ctx)
             .await?
             .ready()
             .await
@@ -951,7 +1002,7 @@ async fn ready_upstream(
             Err(_) => pool.open.borrow_mut().retain(|(k, _)| k != ids),
         }
     }
-    let send = open_upstream(ip, port, host, ctx).await?;
+    let send = open_upstream(ips, port, host, ctx).await?;
     {
         let mut open = pool.open.borrow_mut();
         if open.len() < MAX_POOLED {
@@ -966,21 +1017,33 @@ async fn ready_upstream(
 /// reason token, so a caller answers the same refusal whether the connection was opened for this
 /// stream or for the one before it.
 async fn open_upstream(
-    ip: IpAddr,
+    ips: &[IpAddr],
     port: u16,
     host: &str,
     ctx: &ProxyCtx,
 ) -> Result<h2::client::SendRequest<Bytes>, &'static str> {
-    let tcp =
-        match tokio::time::timeout(ctx.timeout, tokio::net::TcpStream::connect((ip, port))).await {
-            Ok(Ok(t)) => {
-                // Nagle off, as on the HTTP/1.1 paths: h2 writes headers and DATA as separate
-                // frames, so the coalescing Nagle waits for is latency this plane adds per stream.
-                let _ = t.set_nodelay(true);
-                t
+    // Every address the guard permitted, in turn, inside the one timeout that already bounded the
+    // single dial: the shape `dial_first` takes on the synchronous planes, for the same two reasons.
+    // A name's other addresses are what make a multi-homed host reachable at all, and one deadline
+    // over the whole walk is what stops that from multiplying the wait a blackholed address costs.
+    let tcp = match tokio::time::timeout(ctx.timeout, async {
+        for ip in ips {
+            if let Ok(t) = tokio::net::TcpStream::connect((*ip, port)).await {
+                return Some(t);
             }
-            _ => return Err("upstream-unreachable"),
-        };
+        }
+        None
+    })
+    .await
+    {
+        Ok(Some(t)) => {
+            // Nagle off, as on the HTTP/1.1 paths: h2 writes headers and DATA as separate
+            // frames, so the coalescing Nagle waits for is latency this plane adds per stream.
+            let _ = t.set_nodelay(true);
+            t
+        }
+        _ => return Err("upstream-unreachable"),
+    };
     let name = upstream_server_name(host).map_err(|_| "upstream-cert-rejected")?;
     let connector = tokio_rustls::TlsConnector::from(ctx.upstream_h2.clone());
     let upstream_tls = match tokio::time::timeout(ctx.timeout, connector.connect(name, tcp)).await {
@@ -1076,6 +1139,43 @@ fn handshake_reason(e: &io::Error) -> &'static str {
         }
         _ => "upstream-cert-rejected",
     }
+}
+
+/// What a stream refused over [`MAX_STREAMS`] is told, and the reason it is recorded under.
+const STREAM_CAP: &str = "http2-stream-cap";
+
+/// Refuse one stream over the per-tunnel stream cap: the client gets the `429` and its reason, and
+/// the refusal is counted and logged.
+///
+/// The recording is the point. This was the one refusal in the proxy that left no trace at all —
+/// no stat, no log line, no notice — while every other refusal on this plane goes through
+/// [`ProxyCtx::outcome`] or [`ProxyCtx::push_log`], and both sibling capacity caps record too (the
+/// connection cap counts `connection-cap`, the raw splice cap counts `splice-cap`). `inflight` can
+/// outrun h2's own concurrent-stream count, because a handler outlives the client stream it
+/// answers, so a cage that resets its streams while their handlers are still relaying can reach
+/// this backstop with the egress it is refused for appearing nowhere a reader can see it.
+fn refuse_over_stream_cap(
+    respond: h2::server::SendResponse<Bytes>,
+    ctx: &ProxyCtx,
+    host: &str,
+    port: u16,
+    req: &Request<h2::RecvStream>,
+) {
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    ctx.outcome(
+        Proto::Https,
+        host,
+        port,
+        Some(req.method().as_str()),
+        Some(path),
+        StatKind::Blocked,
+        STREAM_CAP,
+    );
+    let _ = refuse(respond, StatusCode::TOO_MANY_REQUESTS, STREAM_CAP);
 }
 
 /// Answer the client on this stream with a header-only refusal carrying the reason category (as
@@ -1294,6 +1394,103 @@ mod tests {
         );
     }
 
+    /// An established h2 tunnel carrying no stream is let go after `[network] idle_timeout`.
+    ///
+    /// The two handshake bounds cover a client that stalls *inside* a handshake; a client that
+    /// completes both and then never sends a HEADERS frame was bounded by nothing at all, because
+    /// `set_nonblocking` voids the per-socket timeouts the sync accept loop set on this socket.
+    /// Each such tunnel holds an OS thread, a tokio runtime, the socket and one of
+    /// `[network] max_connections` for the life of the launch, so a cage that opened the cap's
+    /// worth of them left every later request — its own and every other tool's — refused
+    /// `connection-cap` with nothing ever reclaiming a slot. The identical idle tunnels on the
+    /// HTTP/1.1 plane are closed after this same bound.
+    ///
+    /// Driven through the real entry point over a socket pair, so what is exercised is the tunnel
+    /// as `handle_client` hands it over: the CONNECT answer, TLS terminated as h2, the h2
+    /// handshake, and then silence. The client's runtime and its connection are held open for the
+    /// whole wait, so a tunnel that closes did so on the bound rather than on an EOF.
+    #[test]
+    fn an_h2_tunnel_that_carries_no_stream_is_let_go_after_the_idle_timeout() {
+        use crate::allowlist::classify;
+        use std::time::{Duration, Instant};
+        use tokio::io::AsyncReadExt;
+
+        const IDLE: Duration = Duration::from_millis(200);
+
+        let ca = Arc::new(super::super::Ca::ephemeral().unwrap());
+        let ca_der = ca.ca_cert_der();
+        let mut ctx = ProxyCtx::new(
+            ca,
+            EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]),
+        )
+        .unwrap();
+        ctx.idle = IDLE;
+        let ctx = Arc::new(ctx);
+
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let started = Instant::now();
+        let tunnel = {
+            let ctx = Arc::clone(&ctx);
+            std::thread::spawn(move || handle(server, "grpc.test".to_string(), 443, &ctx))
+        };
+
+        // The cage's leg: read the CONNECT answer, terminate TLS as h2, complete the h2 handshake
+        // — and then hold the tunnel open without ever opening a stream on it.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _held = rt.block_on(async {
+            client.set_nonblocking(true).unwrap();
+            let mut client = tokio::net::UnixStream::from_std(client).unwrap();
+            let mut greeting = Vec::new();
+            while !greeting.ends_with(b"\r\n\r\n") {
+                let mut byte = [0u8; 1];
+                client.read_exact(&mut byte).await.unwrap();
+                greeting.push(byte[0]);
+            }
+            assert_eq!(greeting, b"HTTP/1.1 200 Connection established\r\n\r\n");
+
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(ca_der).unwrap();
+            let mut cfg = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            cfg.alpn_protocols = vec![b"h2".to_vec()];
+            let tls = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+                .connect(upstream_server_name("grpc.test").unwrap(), client)
+                .await
+                .expect("the tunnel's minted leaf is accepted");
+            assert_eq!(
+                tls.get_ref().1.alpn_protocol(),
+                Some(b"h2".as_slice()),
+                "the tunnel negotiated HTTP/2, so what follows is an established h2 tunnel"
+            );
+            // Both handles are kept: dropping either closes the socket, and a tunnel that ended on
+            // an EOF would prove nothing about the idle bound.
+            tokio::time::timeout(Duration::from_secs(10), h2::client::handshake(tls))
+                .await
+                .expect("the h2 handshake must not stall")
+                .expect("the h2 handshake succeeds")
+        });
+
+        // A generous ceiling on a 200 ms bound: what fails here is a tunnel that is never let go.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !tunnel.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            tunnel.is_finished(),
+            "an h2 tunnel with no stream on it must be let go after `idle_timeout`, not hold its \
+             thread, its runtime and its connection slot for the life of the launch"
+        );
+        assert!(
+            started.elapsed() >= IDLE,
+            "and let go on the bound, not on a handshake that failed or a socket that closed"
+        );
+        assert!(tunnel.join().unwrap().is_ok());
+    }
+
     /// An SSRF refusal on the HTTP/2 path must be *accounted for* the way the HTTP/1.1 one is, not
     /// merely written into the log: the `blocked` bucket `sbx net stats` reports, and — because
     /// [`ProxyCtx::outcome`] is the one chokepoint that announces a refusal — the desktop notice
@@ -1398,6 +1595,215 @@ mod tests {
                 events[0].reason.as_str()
             ),
             ("grpc.test", LogVerdict::Blocked, "ssrf-blocked")
+        );
+    }
+
+    /// Drive ONE h2 stream over an in-memory duplex, handing the stream the proxy leg accepts to
+    /// `handler`, and read back what the client was told: the status and the `x-sbx-egress-reason`
+    /// token. [`h2_verdict`] is this with the handler fixed to [`stream`] and a context of its own;
+    /// the tests below need their own context and, for the stream cap, their own handler.
+    ///
+    /// The connection has to keep being polled after the handler returns, or the queued answer is
+    /// never written back and the client's leg waits for a response that was already formed.
+    fn one_stream_answer<F, Fut>(request: Request<()>, handler: F) -> (StatusCode, String)
+    where
+        F: FnOnce(Request<h2::RecvStream>, h2::server::SendResponse<Bytes>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use std::time::Duration;
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+                let client = async {
+                    let (mut send, conn) = h2::client::handshake(client_io).await.unwrap();
+                    let driver = tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
+                    let (resp, _body) = send.send_request(request, true).unwrap();
+                    let resp = resp.await.unwrap();
+                    let reason = resp
+                        .headers()
+                        .get("x-sbx-egress-reason")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let status = resp.status();
+                    driver.abort();
+                    (status, reason)
+                };
+                let proxy = async {
+                    let mut conn = h2::server::handshake(server_io).await.unwrap();
+                    let (req, respond) = conn.accept().await.unwrap().unwrap();
+                    handler(req, respond).await;
+                    while conn.accept().await.is_some() {}
+                };
+                // A bound so a regression that stalls the exchange fails the test instead of
+                // hanging the suite; the real exchange is in-memory and takes microseconds.
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    tokio::select! {
+                        answer = client => answer,
+                        () = proxy => panic!("the proxy leg ended before the client had its answer"),
+                    }
+                })
+                .await
+                .expect("the in-memory h2 exchange must not stall")
+            })
+    }
+
+    /// A context that allows `grpc.test` and records what it decides, with a resolver that PANICS:
+    /// both refusals below are settled from the head alone, so one that reaches a name lookup is
+    /// one that ran too late.
+    fn recording_ctx() -> (
+        ProxyCtx,
+        Arc<crate::sandbox::egress_stats::EgressStats>,
+        Arc<crate::sandbox::control::LogRing>,
+        crate::testutil::TmpDir,
+    ) {
+        use crate::allowlist::classify;
+        use crate::sandbox::control::{LOG_RING_CAP, LogRing};
+        use crate::sandbox::egress_stats::EgressStats;
+        use crate::testutil::TmpDir;
+
+        let dir = TmpDir::new();
+        let stats = Arc::new(EgressStats::new(dir.join("stats"), "/t".into(), None));
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = ProxyCtx::new(
+            Arc::new(super::super::Ca::ephemeral().unwrap()),
+            EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]),
+        )
+        .unwrap()
+        .with_stats(Arc::clone(&stats))
+        .with_log(Arc::clone(&log))
+        .with_resolver(Box::new(|_| {
+            panic!("this refusal must be settled before any name is resolved")
+        }));
+        (ctx, stats, log, dir)
+    }
+
+    /// The stream cap's refusal is *accounted for* like every other refusal on this plane, not
+    /// merely answered.
+    ///
+    /// It was the one refusal in the proxy that left no record at all — no stat, no log line, no
+    /// notice — while `host-mismatch`, `method-not-allowed`, `outbound-secret` and every verdict
+    /// beside it record, and both sibling capacity caps record too (the connection cap counts
+    /// `connection-cap`, the raw splice cap counts `splice-cap`). It is reachable while h2's own
+    /// concurrent-stream count is low, because a handler outlives the client stream it answers, so
+    /// an operator could see an agent's egress failing with nothing anywhere naming the cause.
+    #[test]
+    fn a_stream_refused_by_the_h2_stream_cap_is_counted_and_logged() {
+        let (ctx, stats, log, _dir) = recording_ctx();
+
+        let (status, reason) = one_stream_answer(
+            Request::builder()
+                .method(Method::POST)
+                .uri("https://grpc.test/pkg.Svc/Method")
+                .header("content-type", "application/grpc")
+                .body(())
+                .unwrap(),
+            |req, respond| async move {
+                refuse_over_stream_cap(respond, &ctx, "grpc.test", 443, &req);
+            },
+        );
+
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the stream is refused"
+        );
+        assert_eq!(reason, STREAM_CAP);
+        assert_eq!(
+            stats
+                .snapshot()
+                .get("grpc.test")
+                .copied()
+                .unwrap_or_default(),
+            Counts {
+                blocked: 1,
+                ..Default::default()
+            },
+            "a capacity refusal counts in the `blocked` bucket, as the connection cap does"
+        );
+        let events = log.snapshot(None, None, false).events;
+        assert_eq!(events.len(), 1, "one event for one refusal: {events:?}");
+        assert_eq!(
+            (
+                events[0].host.as_str(),
+                events[0].verdict,
+                events[0].reason.as_str(),
+                events[0].method.as_deref(),
+                events[0].path.as_deref(),
+            ),
+            (
+                "grpc.test",
+                LogVerdict::Blocked,
+                STREAM_CAP,
+                Some("POST"),
+                Some("/pkg.Svc/Method"),
+            )
+        );
+    }
+
+    /// The outbound-secret tripwire scans the request line, not the `:path` alone.
+    ///
+    /// `:method` and `:scheme` are chosen by the cage and forwarded to the upstream verbatim, and
+    /// an HTTP/2 method is any RFC 9110 token — a character set that covers essentially every
+    /// API-key and JWT shape. Scanning only the path and the headers let a stream whose *method*
+    /// was the secret carry it out of the cage to a host the policy never scoped it to, while the
+    /// byte-identical HTTP/1.1 request (`<secret> /p HTTP/1.1`) was refused `outbound-secret` on
+    /// the tunnel plane, which scans the decrypted head whole.
+    #[test]
+    fn a_secret_sent_as_the_h2_method_is_refused_like_the_http1_request_line() {
+        const SECRET: &str = "sk-ant-api03-AbCdEf-1234";
+
+        let (ctx, stats, log, _dir) = recording_ctx();
+        let ctx = ctx.with_redactions(vec![SecretNeedle::named(
+            "test-secret",
+            SECRET.as_bytes().to_vec(),
+        )]);
+
+        let (status, reason) = one_stream_answer(
+            Request::builder()
+                .method(SECRET)
+                .uri("https://grpc.test/pkg.Svc/Method")
+                .header("content-type", "application/grpc")
+                .body(())
+                .unwrap(),
+            |req, respond| async move {
+                stream(
+                    req,
+                    respond,
+                    "grpc.test",
+                    443,
+                    &ctx,
+                    &UpstreamPool::default(),
+                )
+                .await;
+            },
+        );
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(reason, "outbound-secret");
+        assert_eq!(
+            stats
+                .snapshot()
+                .get("grpc.test")
+                .copied()
+                .unwrap_or_default(),
+            Counts {
+                blocked: 1,
+                ..Default::default()
+            },
+            "the tripwire counts its refusal, as it does for a secret in a header"
+        );
+        let events = log.snapshot(None, None, false).events;
+        assert_eq!(events.len(), 1, "one event for one refusal: {events:?}");
+        assert_eq!(
+            (events[0].verdict, events[0].reason.as_str()),
+            (LogVerdict::Blocked, "outbound-secret")
         );
     }
 
@@ -2629,6 +3035,84 @@ mod tests {
             run(StatusCode::UNAUTHORIZED, "other.test:*"),
             (0, "Bearer stale".to_string()),
             "a 401 from a host sbx injects nothing into must not reach the resolver"
+        );
+    }
+
+    /// The credential re-resolution runs off the tunnel's reactor.
+    ///
+    /// [`CredentialRefresh::on_refusal`](crate::sandbox::proxy::CredentialRefresh::on_refusal) runs
+    /// the launch's own resolver synchronously — a subprocess, a file read, a network call. The two
+    /// HTTP/1.1 planes are one OS thread per request, so a slow one costs the request that
+    /// triggered it; here every stream of a tunnel shares one current-thread runtime, so a refresh
+    /// called inline freezes every sibling stream for its whole duration: no DATA frame is read, no
+    /// `WINDOW_UPDATE` is written, the upstream connection drivers stall and no timer on the
+    /// runtime fires. The cage picks when that happens, by driving one stream to a `401`.
+    ///
+    /// The refresher here blocks until a task on the very runtime awaiting it has run, so the
+    /// deadlock is the assertion: called on the reactor it can only time out, leaving the
+    /// credential stale; called off it the runtime keeps turning and the refresh completes.
+    #[test]
+    fn a_blocking_credential_refresh_does_not_freeze_the_tunnels_runtime() {
+        use crate::allowlist::classify;
+        use crate::sandbox::proxy::{CredentialRefresh, Credentials, HeaderInjection};
+        use std::time::Duration;
+
+        let injection = |value: &str| {
+            HeaderInjection::fixed(
+                classify("grpc.test:*").unwrap(),
+                "authorization".to_string(),
+                value.to_string(),
+            )
+        };
+        let credentials = Arc::new(Credentials::new(
+            vec![injection("Bearer stale")],
+            Vec::new(),
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+        ));
+        // The gate the resolver waits on. A `Mutex` because the refresher is a `Fn` shared across
+        // threads and a receiver is not `Sync`.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rx = std::sync::Mutex::new(rx);
+        let refresh = Arc::new(CredentialRefresh::new(
+            Arc::clone(&credentials),
+            Box::new(move |_| {
+                rx.lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|_| {
+                        io::Error::other("the runtime never got back to its other work")
+                    })?;
+                Ok((vec![injection("Bearer refreshed")], Vec::new()))
+            }),
+        ));
+        let ctx = ProxyCtx::new(
+            Arc::new(super::super::Ca::ephemeral().unwrap()),
+            EgressPolicy::default(),
+        )
+        .unwrap()
+        .with_shared_credentials(Arc::clone(&credentials))
+        .with_refresh(refresh);
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                // Stands in for every sibling stream: work the runtime can only do while the
+                // refresh is running if the refresh is not running on the runtime.
+                let sibling = tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let _ = tx.send(());
+                });
+                refresh_off_reactor(&ctx).await;
+                let _ = sibling.await;
+            });
+
+        assert_eq!(
+            credentials.snapshot().injections[0].value(),
+            "Bearer refreshed",
+            "the refresh completes, which it can only do if the tunnel's runtime kept turning \
+             while the resolver blocked"
         );
     }
 

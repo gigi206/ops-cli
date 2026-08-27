@@ -5,7 +5,7 @@
 //! The proxy runs on the host with full network reach, so an allowlisted *hostname* (or a rebound
 //! DNS answer for it) resolving to an internal address would be an SSRF vector; the guard below is
 //! applied before every upstream connection. It is reached only through [`resolve_checked`] /
-//! [`checked_address`], which record the refusal as they make it -- so a connect path cannot turn a
+//! [`checked_addresses`], which record the refusal as they make it -- so a connect path cannot turn a
 //! request down here without the counter, the log and the notification saying so.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -148,7 +148,7 @@ pub(crate) enum AddrRefusal {
 /// is reachable only when the deciding rule named this exact host (a deliberate internal target —
 /// not a `*.domain`/regex/built-in match, which would turn into an SSRF wildcard); a blocked address
 /// never is. The single decision behind both callers: the proxy's guarded resolution
-/// ([`checked_address`]) and the `sbx test net` tester, which would otherwise mispredict a private
+/// ([`checked_addresses`]) and the `sbx test net` tester, which would otherwise mispredict a private
 /// target.
 pub(crate) fn ip_refusal(ip: IpAddr, host: &str, deciding: Option<&Rule>) -> Option<AddrRefusal> {
     match classify_ip(ip) {
@@ -161,7 +161,7 @@ pub(crate) fn ip_refusal(ip: IpAddr, host: &str, deciding: Option<&Rule>) -> Opt
 
 /// Whether the proxy may connect to `ip` for a request to `host` the policy permitted via
 /// `deciding` — [`ip_refusal`] read as a boolean, which is all the connect paths need. Private to
-/// this module: a path reaches it through [`checked_address`], never directly, so the refusal is
+/// this module: a path reaches it through [`checked_addresses`], never directly, so the refusal is
 /// always recorded.
 fn ip_permitted(ip: IpAddr, host: &str, deciding: Option<&Rule>) -> bool {
     ip_refusal(ip, host, deciding).is_none()
@@ -217,9 +217,9 @@ impl ConnectRefusal {
     }
 }
 
-/// Resolve `host` host-side, then settle on the one address the proxy may dial for it: the first
-/// resolved address the guard permits for `deciding`. A resolution failure for an allowed host is
-/// an error the client is told about (a clean `502`), not a dropped connection.
+/// Resolve `host` host-side, then keep every resolved address the guard permits for `deciding`, in
+/// resolution order. A resolution failure for an allowed host is an error the client is told about
+/// (a clean `502`), not a dropped connection.
 pub(super) fn resolve_checked(
     ctx: &ProxyCtx,
     proto: Proto,
@@ -228,7 +228,7 @@ pub(super) fn resolve_checked(
     method: Option<&str>,
     path: Option<&str>,
     deciding: Option<&Rule>,
-) -> Result<IpAddr, ConnectRefusal> {
+) -> Result<Vec<IpAddr>, ConnectRefusal> {
     let Ok(ips) = (ctx.resolve)(host) else {
         ctx.push_log(
             proto,
@@ -241,14 +241,21 @@ pub(super) fn resolve_checked(
         );
         return Err(ConnectRefusal::Dns);
     };
-    checked_address(ctx, proto, host, port, method, path, deciding, ips)
+    checked_addresses(ctx, proto, host, port, method, path, deciding, ips)
 }
 
 /// The guard alone, over addresses already in hand — for the raw splice, whose target may be an IP
 /// literal it holds without resolving anything. [`resolve_checked`] is this with the resolution in
 /// front of it.
+///
+/// Every permitted address is returned, not the first one: a name resolves to all the addresses its
+/// owner published, and settling on one made the proxy report an allowed host as unreachable
+/// whenever that single address happened to be down, where any client walking the list would have
+/// connected. The guard has refused each address it would not permit, so what comes back is a list
+/// whose every member is an approved destination and whose order is the resolver's. Refusing is
+/// still all-or-nothing: an empty list is the block, counted once for the host it was asked about.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn checked_address(
+pub(super) fn checked_addresses(
     ctx: &ProxyCtx,
     proto: Proto,
     host: &str,
@@ -257,8 +264,12 @@ pub(super) fn checked_address(
     path: Option<&str>,
     deciding: Option<&Rule>,
     ips: Vec<IpAddr>,
-) -> Result<IpAddr, ConnectRefusal> {
-    let Some(ip) = ips.into_iter().find(|ip| ip_permitted(*ip, host, deciding)) else {
+) -> Result<Vec<IpAddr>, ConnectRefusal> {
+    let permitted: Vec<IpAddr> = ips
+        .into_iter()
+        .filter(|ip| ip_permitted(*ip, host, deciding))
+        .collect();
+    if permitted.is_empty() {
         ctx.outcome(
             proto,
             host,
@@ -269,8 +280,8 @@ pub(super) fn checked_address(
             ConnectRefusal::Ssrf.tag(),
         );
         return Err(ConnectRefusal::Ssrf);
-    };
-    Ok(ip)
+    }
+    Ok(permitted)
 }
 
 /// Whether `deciding` is an explicit, exact-host rule for `host` (not a wildcard/regex). Used to
@@ -293,6 +304,7 @@ pub(crate) fn names_exact_host(host: &str, deciding: Option<&Rule>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::proxy::Ca;
 
     #[test]
     fn the_connect_boolean_and_the_reported_reason_are_one_decision() {
@@ -387,6 +399,46 @@ mod tests {
         // and the two that denote themselves keep the classes the v6 classifier gives them
         assert!(matches!(c("::1"), IpClass::Private));
         assert!(matches!(c("::"), IpClass::Blocked));
+    }
+
+    /// The guard keeps every address it permits, in the resolver's order, and refuses only when it
+    /// permits none.
+    ///
+    /// One address was kept before, and the connect paths dialed that one: a name whose first
+    /// published address was down was reported unreachable even though the rest answered. Keeping
+    /// the list is what lets a dial walk it; the filtering itself must not change, so a mixed answer
+    /// is asserted to lose exactly the addresses the guard refuses and keep the rest in order.
+    #[test]
+    fn the_guard_keeps_every_permitted_address_and_refuses_only_when_there_are_none() {
+        let ctx = ProxyCtx::new(
+            std::sync::Arc::new(Ca::ephemeral().unwrap()),
+            allowlist::EgressPolicy::default(),
+        )
+        .unwrap();
+        let keep = |ips: Vec<IpAddr>| {
+            checked_addresses(&ctx, Proto::Https, "h.test", 443, None, None, None, ips)
+        };
+        let public = |n: u8| IpAddr::from([93, 184, 216, n]);
+
+        // Order is the resolver's, and every permitted address survives.
+        assert_eq!(
+            keep(vec![public(1), public(2), public(3)]).ok(),
+            Some(vec![public(1), public(2), public(3)])
+        );
+        // A refused address is dropped from the middle without taking its neighbours with it. With
+        // no deciding rule the private exception never applies, so loopback is the refused one.
+        assert_eq!(
+            keep(vec![public(1), IpAddr::from([127, 0, 0, 1]), public(2)]).ok(),
+            Some(vec![public(1), public(2)])
+        );
+        // All refused is still one refusal for the host, not a partial answer.
+        assert!(matches!(
+            keep(vec![
+                IpAddr::from([127, 0, 0, 1]),
+                IpAddr::from([169, 254, 169, 254])
+            ]),
+            Err(ConnectRefusal::Ssrf)
+        ));
     }
 
     /// The ranges IANA set aside for something other than the public Internet are not public
