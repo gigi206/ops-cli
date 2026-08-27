@@ -245,6 +245,23 @@ pub(super) fn request_line_parts(line: &str) -> Option<(String, String)> {
     Some((method.to_string(), target.to_string()))
 }
 
+/// The HTTP-version token of a request line: its third field, split exactly the way
+/// [`request_line_parts`] splits the line — on **SP**, never on Unicode whitespace — so every
+/// reading of one line is the same reading.
+///
+/// The split is the whole of it. `split_whitespace().nth(2)` also ends a token at HTAB (which
+/// [`head_carries_control_byte`] permits), at U+00A0, at U+2000‥U+200A and the rest, so on a line
+/// whose request-target carries one of those it names a token out of the middle of the *target* as
+/// the version. The tunneled plane forwards the request line verbatim, so the upstream then reads
+/// the version this function reads and sbx read another: a `HTTP/1.0` request whose target hides
+/// the text `HTTP/1.1` was answered as a persistent one, holding a host thread and a descriptor for
+/// the whole idle timeout on a connection its stated version does not persist.
+///
+/// `None` when the line has no third field, or an empty one.
+pub(super) fn request_line_version(line: &str) -> Option<&str> {
+    line.split(' ').nth(2).filter(|t| !t.is_empty())
+}
+
 /// Split a CONNECT authority `host:port` (port required) into its parts, handling a bracketed
 /// IPv6 literal.
 pub(super) fn split_authority(authority: &str) -> Option<(String, u16)> {
@@ -361,22 +378,41 @@ pub(super) fn copy_exact<R: Read, W: Write>(r: &mut R, w: &mut W, mut n: u64) ->
 /// caps.
 pub(super) const CHUNK_LINE_MAX: u64 = 8 * 1024;
 
+/// The most the trailer section after the terminal chunk may total, over every line of it.
+///
+/// [`CHUNK_LINE_MAX`] bounds one trailer line; nothing bounded how many of them there are. The
+/// section is read by the request de-chunker while its caller holds a [`BodyBudget`] reservation of
+/// the whole per-request ceiling (a chunked body's length is unknowable until it is read), so an
+/// unbounded line count let an in-cage client hold a host thread, a descriptor, a connection slot
+/// and that reservation for as long as it liked, at a cost of one short line per socket timeout —
+/// and these are host-side, outside the cage's cgroup. Trailers are read only to reach the end of
+/// the body and are then discarded, so the whole section gets the ceiling one request head gets.
+pub(super) const TRAILER_MAX: u64 = HEAD_MAX as u64;
+
 /// De-chunk a `Transfer-Encoding: chunked` request body into one buffer, fail-closed on malformed
 /// framing (a non-hex chunk size, a short data read, a missing trailing CRLF) or a body over
 /// the caller's ceiling. The caller re-frames the result with a synthesized `Content-Length`
 /// (stripping `Transfer-Encoding`), so the upstream receives one unambiguous Content-Length and no
 /// TE — no CL/TE request-smuggling ambiguity can reach it. Trailers after the zero chunk are read
-/// and discarded (the proxy does not forward them; they are not part of any secret-tripwire path).
+/// and discarded (the proxy does not forward them; they are not part of any secret-tripwire path),
+/// bounded per line by [`CHUNK_LINE_MAX`] and in total by [`TRAILER_MAX`].
 pub(super) fn read_chunked_body<R: BufRead>(r: &mut R, cap: u64) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     loop {
         let size = read_chunk_size_line(r)?;
         if size == 0 {
-            // trailers (if any) end at a blank line; read until it, each trailer line bounded.
+            // trailers (if any) end at a blank line; read until it, each trailer line bounded and
+            // the section as a whole bounded by `TRAILER_MAX` (see there for what an unbounded
+            // count held open).
+            let mut trailer_bytes: u64 = 0;
             loop {
                 let t = read_line_bounded(r, CHUNK_LINE_MAX)?;
                 if t.is_empty() || strip_eol(&t).is_empty() {
                     break;
+                }
+                trailer_bytes += t.len() as u64;
+                if trailer_bytes > TRAILER_MAX {
+                    return Err(invalid("chunked trailer section too large"));
                 }
             }
             return Ok(buf);
@@ -431,6 +467,16 @@ pub(super) fn read_chunk_size_line<R: BufRead>(r: &mut R) -> io::Result<u64> {
 /// `;extensions`), requiring a CRLF/LF terminator so a line cut short by an EOF is a malformed-body
 /// error rather than a silent short read. Split out from [`read_chunk_size_line`] so a relay that
 /// must forward the line verbatim can parse the copy it already holds.
+///
+/// The size field is `1*HEXDIG` and nothing else (RFC 9112 §7.1), checked before the number is
+/// parsed — the same reason [`content_length`] checks its digits rather than handing the field
+/// straight to Rust's integer parser. That parser accepts a leading `+`, and `str::trim` accepts
+/// ASCII *and* Unicode whitespace around the field; a conforming reader accepts neither. This one is
+/// the response-side reader behind [`FramedBody`], which relays the size line to the cage
+/// **verbatim** while framing the body from its own reading of it, so a laxity here is sbx and the
+/// cage's own HTTP client deciding where the message ends from two different grammars over the same
+/// bytes. Refusing the field fails closed instead: the relay degrades rather than parking a
+/// connection at a position the two disagree about.
 pub(super) fn parse_chunk_size(line: &[u8]) -> io::Result<u64> {
     if !line.ends_with(b"\n") {
         return Err(invalid("chunk size line has no line terminator"));
@@ -440,9 +486,13 @@ pub(super) fn parse_chunk_size(line: &[u8]) -> io::Result<u64> {
         Some(i) => &s[..i],
         None => s,
     };
+    if size_field.is_empty() || !size_field.iter().all(u8::is_ascii_hexdigit) {
+        return Err(invalid("chunk size is not hexadecimal"));
+    }
+    // ASCII by the check above, so this is the hex digits themselves.
     let size_str =
         std::str::from_utf8(size_field).map_err(|_| invalid("chunk size is not ASCII"))?;
-    u64::from_str_radix(size_str.trim(), 16).map_err(|_| invalid("chunk size is not hexadecimal"))
+    u64::from_str_radix(size_str, 16).map_err(|_| invalid("chunk size does not fit in 64 bits"))
 }
 
 /// Read a response head from a buffered reader, **tolerantly**: like [`read_head_buffered`], but an
@@ -1649,6 +1699,96 @@ mod tests {
             read_chunked_body(&mut r, 2).is_err(),
             "a chunk past the cap is refused"
         );
+    }
+
+    /// The chunk-size field is `1*HEXDIG`, and Rust's integer parser is looser than that in the two
+    /// ways `content_length` already refuses: it takes a leading `+`, and a `trim()` in front of it
+    /// takes ASCII *and* Unicode whitespace.
+    ///
+    /// Teeth: this parser is the response-side reader `FramedBody` frames a body with while relaying
+    /// the size line to the cage **verbatim**. Under the lax parse, an upstream answering `+a` had
+    /// sbx consume ten data bytes, reach the terminal chunk and park the connection as cleanly
+    /// framed, while the cage's own client — applying `1*HEXDIG` — abandoned the message at another
+    /// offset: two readings of one byte stream, which is the desync every other check here exists to
+    /// prevent.
+    #[test]
+    fn a_chunk_size_outside_the_hexdig_grammar_is_refused() {
+        for bad in [
+            &b"+a\r\n"[..],
+            b"-a\r\n",
+            b" a\r\n",
+            b"a \r\n",
+            b"\ta\r\n",
+            b"\xc2\xa0a\r\n", // U+00A0, which `str::trim` also strips
+            b"0xa\r\n",
+            b"\r\n",
+            b";ext\r\n",
+        ] {
+            assert!(
+                parse_chunk_size(bad).is_err(),
+                "`{}` is not a chunk size and must be refused",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // The grammar it does accept is untouched: hex, upper or lower, with the extensions the
+        // line may carry after it.
+        assert_eq!(parse_chunk_size(b"a\r\n").unwrap(), 10);
+        assert_eq!(parse_chunk_size(b"1A\r\n").unwrap(), 26);
+        assert_eq!(parse_chunk_size(b"5;ext=1\r\n").unwrap(), 5);
+        assert_eq!(parse_chunk_size(b"0\n").unwrap(), 0);
+    }
+
+    /// The trailer section that follows the terminal chunk is bounded in total, not only per line.
+    ///
+    /// Teeth: `CHUNK_LINE_MAX` bounds one line and nothing bounded how many, so a cage that sent
+    /// `0\r\n` and then one six-byte trailer line per socket-timeout period held this reader — and
+    /// with it a host thread, a descriptor, a connection slot and the whole per-request body
+    /// reservation its caller took before calling — for as long as it cared to. The break at the
+    /// blank line is never reached on that stream, so the section needs a ceiling of its own.
+    #[test]
+    fn the_chunked_trailer_section_is_bounded_in_total_and_not_only_per_line() {
+        let mut flood = b"0\r\n".to_vec();
+        while (flood.len() as u64) < TRAILER_MAX + CHUNK_LINE_MAX {
+            flood.extend_from_slice(b"a: b\r\n"); // a well-formed trailer, under the line bound
+        }
+        let mut r: &[u8] = &flood;
+        let err = read_chunked_body(&mut r, crate::allowlist::DEFAULT_BODY_MAX).unwrap_err();
+        assert!(
+            err.to_string().contains("trailer section too large"),
+            "a trailer section past the ceiling must fail closed: {err}"
+        );
+        // An ordinary trailer section is still read and discarded, terminator and all.
+        let mut r: &[u8] = b"3\r\nabc\r\n0\r\nTrailer: x\r\nAnother: y\r\n\r\n";
+        assert_eq!(
+            read_chunked_body(&mut r, crate::allowlist::DEFAULT_BODY_MAX).unwrap(),
+            b"abc"
+        );
+    }
+
+    /// The HTTP-version token comes off the same SP split the request-target does, because the
+    /// planes that forward the line verbatim leave the upstream reading that split and no other.
+    ///
+    /// Teeth: read with `split_whitespace`, a line whose target carries HTAB (which
+    /// `head_carries_control_byte` allows) yields a token out of the middle of the *target* as the
+    /// version — so `GET /a\tHTTP/1.1 HTTP/1.0` was read as `HTTP/1.1` and kept alive as a
+    /// persistent request, while the origin answering it read the `HTTP/1.0` the line states.
+    #[test]
+    fn the_http_version_token_is_read_off_the_same_split_as_the_target() {
+        assert_eq!(request_line_version("GET / HTTP/1.1"), Some("HTTP/1.1"));
+        assert_eq!(
+            request_line_version("GET /a\tHTTP/1.1 HTTP/1.0"),
+            Some("HTTP/1.0"),
+            "the version is the third SP-separated field, not the third whitespace-separated one"
+        );
+        // And it agrees with the split the target is read off, on the same line.
+        let line = "GET /a\u{a0}b HTTP/1.0";
+        assert_eq!(
+            request_line_parts(line),
+            Some(("GET".to_string(), "/a\u{a0}b".to_string()))
+        );
+        assert_eq!(request_line_version(line), Some("HTTP/1.0"));
+        // A line with no third field has no version to read.
+        assert_eq!(request_line_version("GET /"), None);
     }
 
     #[test]

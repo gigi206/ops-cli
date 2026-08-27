@@ -55,18 +55,24 @@
 //! (`…/secret/*` covers `/secret/sub` too — segment-aware, so not `/secretarial`). Its host is
 //! concrete (an exact host or IP); a `*.domain` wildcard with a path is not expressible — use
 //! `re:` for that. The
-//! request path is canonicalized first (percent-decoded, `.`/`..` resolved, query dropped),
-//! so a deny on a given resource cannot be dodged by `/secret?x`, `/secret/`, `%2f`, or
-//! `/foo/../secret` (all the same resource) — the in-cage agent controls the request, so
+//! request path is canonicalized first (percent-decoded, `.`/`..` resolved, query, `#fragment`
+//! and each segment's `;params` dropped), so a deny on a given resource cannot be dodged by
+//! `/secret?x`, `/secret/`, `%2f`, `/foo/../secret`, `/secret;x` or `/secret#x` (all the same
+//! resource) — the in-cage agent controls the request, so
 //! raw-string path matching would be a hole. A different sub-resource is a deliberate
 //! choice (`/secret/*` to include it); for a query-specific or arbitrary pattern, use `re:`.
 //!
 //! A `re:<pattern>` kind matches the request's **whole reconstructed URL** —
 //! `https://<host>[:<port>]<path>` (the port omitted when it is 443, `<path>` percent-decoded
 //! and including any query string) — with the [`regex`] engine (linear-time, no catastrophic
-//! backtracking). The regex is matched unanchored, so the pattern author owns anchoring and
-//! escaping (an unanchored `api\.github\.com` would also match `evil.com/?x=api.github.com`);
-//! for pinning a host, prefer the exact `Host`/`Subdomain` kinds, which cannot be fumbled.
+//! backtracking). That rebuild names no transport: a cleartext (`http://`) request and a
+//! pre-decrypt CONNECT authority present the same `https://…` form, so `^https://` covers all
+//! three planes and a pattern anchored on any other literal scheme is refused when it is
+//! classified (it could never fire; the plane a `re:` cannot name is named by the structured
+//! `http://host` / `tcp://host:port` forms). The regex is matched unanchored, so the pattern
+//! author owns anchoring and escaping (an unanchored `api\.github\.com` would also match
+//! `evil.com/?x=api.github.com`); for pinning a host, prefer the exact `Host`/`Subdomain` kinds,
+//! which cannot be fumbled.
 //! A `re:` rule is tested against **two** forms of that URL, and matching either is a match: the
 //! request as sent (percent-decoded, query attached, `.`/`..` left exactly as the caller wrote
 //! them) and the canonical rebuild ([`Request::canonical_url`] — `.`/`..` resolved, empty
@@ -380,7 +386,7 @@ pub(crate) struct Request {
     /// The request port.
     port: u16,
     /// The canonical path segments: percent-decoded, `.`/`..` resolved, empties dropped,
-    /// query removed. `/a//b/../c?x=1` → `["a", "c"]`.
+    /// query, `#fragment` and `;params` removed. `/a//b/../c?x=1` → `["a", "c"]`.
     segs: Vec<String>,
     /// The request as sent, decoded: `https://host[:port]<decoded-target>` (the port shown only
     /// when it is not 443, an IPv6 host bracketed). Egress is HTTPS, so the scheme is always
@@ -472,8 +478,13 @@ impl Rule {
     /// and scheme (a bare-host mute covers the host's cleartext `:80` noise as well as `:443`), and
     /// the rule's own layer is irrelevant. Method and path scope are still honored, so a
     /// `{POST} host/log` mute stays precise.
+    ///
+    /// The method set is read as a deny's ([`Methods::admits_deny`]), not as an allowance's: a mute
+    /// is broad unless the operator scoped it, and the `WS` opt-in exists to stop an *allow* handing
+    /// out a capability — reading it here would leave a bare-host mute unable to silence the one
+    /// verb a refused WebSocket retries under, the noisiest thing an operator writes a mute for.
     fn matches_mute(&self, req: &Request, method: &str) -> bool {
-        self.methods.admits(method) && self.kind.matches_any_port(req)
+        self.methods.admits_deny(method) && self.kind.matches_any_port(req)
     }
 
     /// Whether this rule's host match admits **every** host: the reach a bare `*` would have if the
@@ -580,15 +591,28 @@ fn path_matches(req_segs: &[String], rule_path: &str, subtree: bool) -> bool {
 }
 
 /// Canonicalize a raw request target into path segments for matching: drop the query,
-/// percent-decode, then resolve `.`/`..` and drop empty segments. The result is what
-/// segment-prefix matching compares, so an encoded or dot-laden path cannot slip past a
-/// rule. (Single-level decoding — a double-encoded `%252f` stays literal, matching a
-/// server that decodes once.)
+/// percent-decode, drop the `#fragment` and each segment's `;params`, then resolve `.`/`..` and
+/// drop empty segments. The result is what segment-prefix matching compares, so an encoded or
+/// dot-laden path cannot slip past a rule. (Single-level decoding — a double-encoded `%252f` stays
+/// literal, matching a server that decodes once.)
+///
+/// The fragment and the RFC 3986 path parameters are dropped **after** decoding, for the same
+/// reason `.`/`..` are resolved after it: the cage writes the request, so an encoded delimiter
+/// (`%23`, `%3B`) must not buy a path the raw one would not. Upstreams differ on which of these
+/// they strip — a Tomcat/Jetty-family server serves `/admin;x` as `/admin`, nginx cuts a raw `#`
+/// as a fragment delimiter — so both are folded away here rather than left as a per-upstream
+/// question a deny carve-out would have to be written twice for. The cost is the one this whole
+/// canonicalization already accepts elsewhere: an allow rule also matches the folded forms, so it
+/// admits a resource a strict upstream would keep distinct. A rule that must be exact about such a
+/// path is a `re:`, which sees the target as sent.
 pub(crate) fn canonical_segments(target: &str) -> Vec<String> {
     let path = target.split('?').next().unwrap_or("");
     let decoded = percent_decode(path);
+    let decoded = decoded.split('#').next().unwrap_or("");
     let mut out: Vec<String> = Vec::new();
     for seg in decoded.split('/') {
+        // an RFC 3986 path parameter (`;jsessionid=…`) names no resource of its own
+        let seg = seg.split(';').next().unwrap_or("");
         match seg {
             "" | "." => {}
             ".." => {
@@ -1086,11 +1110,13 @@ impl EgressPolicy {
         let Self {
             // The rules are not settings: replacing them is what declaring a table is *for*, and the
             // resolved view shows the result. `capture_body_kb` rides `capture` — it is refused
-            // where it is read without one — so naming `capture` names both. The posture is not a
-            // setting either, but it is read below: it bounds where two of them mean anything.
+            // where it is read without one — so naming `capture` names it too *when `capture` is
+            // itself named*; the case where it is not (a layer re-declaring the same level and
+            // omitting the cap) is reported below on its own. The posture is not a setting either,
+            // but it is read below: it bounds where two of them mean anything.
             allow: _,
             deny: _,
-            capture_body_kb: _,
+            capture_body_kb,
             default_action,
             mute,
             http2,
@@ -1155,6 +1181,15 @@ impl EgressPolicy {
             "websocket_secret",
             parent.websocket_secret != neutral.websocket_secret,
             *websocket_secret == neutral.websocket_secret,
+        );
+        // Only where `capture` itself says nothing: a layer that drops or replaces the level is
+        // already told so on the `capture` line above, and a cap is meaningless without the level
+        // it rides. What is left is the silent case — the same level re-declared without the cap,
+        // which reverts it to the built-in default with nothing else to show for it.
+        lost(
+            "capture_max_kb",
+            parent.capture_body_kb != neutral.capture_body_kb && parent.capture == *capture,
+            *capture_body_kb == neutral.capture_body_kb,
         );
         // The two `ask` settings only where the parked wait exists at all. A layer that also changes
         // the posture (`ask` below, `deny` here) does not *drop* them, it leaves the mode they
@@ -1378,7 +1413,10 @@ impl EgressPolicy {
     /// and scheme — its cleartext `http://…:80` noise (a component updater, an NTP-over-HTTP probe)
     /// as well as its `:443` traffic, and whether the rule was written bare, `https://`, `http://`,
     /// or `tcp://`. Method and path scope are still honored, so a `{POST} host/log` mute stays
-    /// precise. A method-less request (an early-CONNECT block) is matched with an empty method, so a
+    /// precise; an *unscoped* mute silences every verb, the `WS` pseudo-verb included (the method
+    /// set is read as a deny's — see [`Rule::matches_mute`]), so a refused WebSocket retried in a
+    /// loop is silenced by the bare host entry written for it. A method-less request (an
+    /// early-CONNECT block) is matched with an empty method, so a
     /// method-scoped mute rule does not match it — failing toward *showing* the log, the safe
     /// direction when the verb is unknown.
     pub(crate) fn muted(
@@ -1498,7 +1536,10 @@ impl EgressPolicy {
     ///
     /// **Deny wins, layer-agnostically** — mirroring [`Self::l4_decision`]: any deny rule (of any
     /// layer) whose [`RuleKind`] matches the request denies it, so an inspected deny (`deny evil.com`)
-    /// and an `http://` deny both suppress cleartext. Its consequence is the same as the splice's: a
+    /// and an `http://` deny both suppress cleartext. A deny's method set is read broadly here
+    /// ([`Rule::matches_deny`]) exactly as on the inspected plane, so a bare deny refuses a
+    /// WebSocket on this plane too — the `WS` opt-in narrows an *allowance*, and the cage picks the
+    /// verb by choosing whether to send the upgrade headers. Its consequence is the same as the splice's: a
     /// deny scoped to a path or a non-matching port does not block the host outright — a bare
     /// `deny evil.com` (port 443) does not stop `http://evil.com` (port 80); use `deny evil.com:*`
     /// (or `deny http://evil.com`). The request is canonicalized once (the same evasion-proof view as
@@ -1512,8 +1553,11 @@ impl EgressPolicy {
     ) -> Decision<'_> {
         let req = Request::new(host, port, path);
         let method = method.to_ascii_uppercase();
-        // Deny wins, across every layer (matched by kind), like the splice suppression.
-        if let Some(rule) = self.deny.iter().find(|r| r.matches(&req, &method)) {
+        // Deny wins, across every layer (matched by kind), like the splice suppression. The method
+        // set is read as a deny's ([`Rule::matches_deny`]), exactly as on the inspected plane: the
+        // `WS` opt-in belongs to the allow side, and asking it of a deny would let the cage pick the
+        // verb that dodges the deny list by sending the upgrade headers itself.
+        if let Some(rule) = self.deny.iter().find(|r| r.matches_deny(&req, &method)) {
             return Decision::DeniedBy(rule);
         }
         // Allow only via an explicit `http://` rule; the default action is never consulted.
@@ -1708,12 +1752,13 @@ pub(crate) enum Decision<'a> {
 
 /// Whether `rule`'s host/port/path matches a request to `host`:`port` for `target`, canonicalized
 /// exactly the way [`EgressPolicy::explain`] canonicalizes it (host lowercased, path
-/// percent-decoded / `.`/`..`-resolved / query dropped). **Method-agnostic by design** — it tests
-/// the [`RuleKind`] only, never the method set. The filtering proxy uses it to decide whether a
-/// per-host credential injection applies to a request it has already allowed, and the live `ask`
-/// overlay to match a remembered host rule; both deal in host-scoped, method-less rules, and a
-/// credential is injected for the destination regardless of verb. So the injection sees the
-/// identical normalized view as the verdict, and a host or path dodge cannot separate the two.
+/// percent-decoded / `.`/`..`-resolved / query, fragment and `;params` dropped). **Method-agnostic
+/// by design** — it tests the [`RuleKind`] only, never the method set. The filtering proxy uses it
+/// to decide whether a per-host credential injection applies to a request it has already allowed,
+/// and the live `ask` overlay to match a remembered host rule; both deal in host-scoped,
+/// method-less rules, and a credential is injected for the destination regardless of verb. So the
+/// injection sees the identical normalized view as the verdict, and a host or path dodge cannot
+/// separate the two.
 pub(crate) fn rule_matches(rule: &Rule, host: &str, port: u16, target: &str) -> bool {
     rule.kind.matches(&Request::new(host, port, target))
 }
@@ -1956,6 +2001,64 @@ mod tests {
                 .settings_dropped_from(&EgressPolicy::new(Vec::new(), Vec::new()))
                 .is_empty(),
             "nothing was carried below, so nothing is given up"
+        );
+    }
+
+    /// A layer that keeps `capture` but omits its cap is told the cap went with it.
+    ///
+    /// `capture_max_kb` rides `capture`, which is why naming `capture` names both — but only when
+    /// `capture` is itself named. A layer re-declaring the same level and omitting the cap reported
+    /// nothing at all, while the cap reverted to the built-in default: the silent reversion this
+    /// function exists to prevent.
+    #[test]
+    fn re_declaring_capture_without_its_cap_gives_the_cap_up() {
+        use crate::sandbox::control::CaptureLevel;
+        let parent = every_setting(); // `capture = "bodies"`, `capture_max_kb = 32`
+        let same_level_no_cap = EgressPolicy::new(vec![rule("example.com")], Vec::new())
+            .with_capture(CaptureLevel::Bodies, None);
+        assert!(
+            same_level_no_cap
+                .settings_dropped_from(&parent)
+                .contains(&"capture_max_kb"),
+            "the cap reverted to the default with nothing said"
+        );
+        assert_eq!(
+            same_level_no_cap.capture_body_kb(),
+            crate::sandbox::control::CAPTURE_BODY_KB_DEFAULT,
+            "which is the reversion being reported"
+        );
+        // Re-declaring the cap as well gives up nothing …
+        let kept = EgressPolicy::new(vec![rule("example.com")], Vec::new())
+            .with_capture(CaptureLevel::Bodies, Some(32));
+        assert!(
+            !kept
+                .settings_dropped_from(&parent)
+                .contains(&"capture_max_kb")
+        );
+        // … and neither does a layer that replaces or drops `capture` itself: a cap is meaningless
+        // without the level it rides, and the `capture` line already speaks for both.
+        let other_level = EgressPolicy::new(vec![rule("example.com")], Vec::new())
+            .with_capture(CaptureLevel::Headers, None);
+        assert!(
+            !other_level
+                .settings_dropped_from(&parent)
+                .contains(&"capture_max_kb"),
+            "a replaced level is reported as `capture`, not twice"
+        );
+        assert_eq!(
+            EgressPolicy::new(vec![rule("example.com")], Vec::new()).settings_dropped_from(&parent),
+            vec![
+                "mute",
+                "http2",
+                "dns_cache_ttl",
+                "pool",
+                "idle_timeout",
+                "max_connections",
+                "body_max_mb",
+                "ca_roots",
+                "capture",
+            ],
+            "a dropped level is reported as `capture`, which names the cap with it"
         );
     }
 
@@ -2395,6 +2498,61 @@ mod tests {
         assert!(!p.method_denied_clear("unlisted.example.com", 80, "/", "POST"));
     }
 
+    /// A deny refuses a WebSocket on the **cleartext** plane as it does on the inspected one.
+    ///
+    /// The deny arm read its method set through the allow side's `WS` opt-in, which exists to stop
+    /// an *allowance* handing out a capability nobody asked for. Asked of a deny it does the
+    /// opposite: a bare deny, a `host:*` deny and an explicit `{*}` deny all failed to match a
+    /// WebSocket, and the cage chooses which question is asked by sending (or not sending) the
+    /// upgrade headers the proxy reads as `WS`.
+    #[test]
+    fn a_cleartext_deny_refuses_a_websocket_however_the_deny_is_spelled() {
+        for spelling in [
+            "api.test:80",
+            "api.test:*",
+            "{*} api.test:80",
+            "http://api.test",
+            "{GET,WS} api.test:80",
+        ] {
+            let p = EgressPolicy::new(
+                vec![rule("{*,WS} http://api.test:80")],
+                vec![rule(spelling)],
+            );
+            assert!(
+                matches!(
+                    p.explain_clear("api.test", 80, "/ws", "WS"),
+                    Decision::DeniedBy(_)
+                ),
+                "`deny {spelling}` did not refuse a cleartext WebSocket"
+            );
+            // …and the plane's own verdict for an ordinary verb is unchanged.
+            assert!(
+                matches!(
+                    p.explain_clear("api.test", 80, "/ws", "GET"),
+                    Decision::DeniedBy(_)
+                ),
+                "`deny {spelling}` must still refuse a cleartext GET"
+            );
+        }
+        // A deny the operator scoped to particular verbs stays scoped — the other half of the same
+        // rule, exactly as on the inspected plane.
+        let scoped = EgressPolicy::new(
+            vec![rule("{*,WS} http://api.test:80")],
+            vec![rule("{GET} api.test:80")],
+        );
+        assert!(
+            matches!(
+                scoped.explain_clear("api.test", 80, "/ws", "WS"),
+                Decision::AllowedBy(_)
+            ),
+            "a `{{GET}}`-scoped deny must not reach a WebSocket"
+        );
+        assert!(matches!(
+            scoped.explain_clear("api.test", 80, "/ws", "GET"),
+            Decision::DeniedBy(_)
+        ));
+    }
+
     #[test]
     fn apply_default_methods_rewrites_cleartext_allows() {
         // An `http://` allow rule is HTTP-inspected, so an app's read-by-default posture must narrow
@@ -2732,6 +2890,104 @@ mod tests {
         }
     }
 
+    /// A `*` anywhere but the trailing `/*` is refused, not stored as a literal segment.
+    ///
+    /// `deny host/*/secrets` reads as a wildcard and was matched as the one-character segment `*`,
+    /// so it blocked nothing and warned about nothing — a fail-open spelling in the one list where
+    /// that direction is worst. The grammar refuses the whole family and names `re:`, the form that
+    /// does express a pattern path.
+    #[test]
+    fn a_star_inside_a_path_is_refused_rather_than_matched_literally() {
+        for bad in [
+            "api.test/*/secrets",
+            "api.test/o/*/secrets",
+            "api.test/*/",
+            "api.test/logs*",
+            "api.test/*x/y",
+            "http://api.test:8080/*/secrets",
+        ] {
+            let err = classify(bad).unwrap_err();
+            assert!(
+                err.contains("re:"),
+                "{bad:?} must be refused with a pointer to `re:`, got: {err}"
+            );
+        }
+        // The trailing `/*` subtree form, the only wildcard a path rule has, still parses — with a
+        // port spec of its own, whose `*` sits before the path and is untouched.
+        assert!(classify("api.test/v1/*").is_ok());
+        assert!(classify("api.test:*/oauth/*").is_ok());
+        assert!(classify("api.test/*").is_ok());
+        // And the pattern path the refusal points at is expressible.
+        assert!(classify(r"re:^https://api\.test/[^/]+/secrets$").is_ok());
+    }
+
+    /// A `?query` in a path rule is refused rather than silently widened to every query.
+    ///
+    /// The rule path is canonicalized with the same [`canonical_segments`] as the request, whose
+    /// first act is to drop the query — so `allow api.test/exec?cmd=ls` admitted every `cmd`, while
+    /// its text, and its rendering in `sbx net rules`, named one.
+    #[test]
+    fn a_query_in_a_path_rule_is_refused_rather_than_widened() {
+        for bad in [
+            "api.test/exec?cmd=ls",
+            "api.test/?",
+            "http://api.test/exec?cmd=ls",
+            "api.test:8443/exec?cmd=ls",
+        ] {
+            let err = classify(bad).unwrap_err();
+            assert!(
+                err.contains("re:"),
+                "{bad:?} must be refused with a pointer to `re:`, got: {err}"
+            );
+        }
+        // The query-shaped match the refusal points at is expressible, and the path alone still is.
+        assert!(classify(r"re:^https://api\.test/exec\?cmd=ls$").is_ok());
+        assert!(classify("api.test/exec").is_ok());
+    }
+
+    /// A `re:` pattern anchored on a scheme other than `https` is refused: it can never match.
+    ///
+    /// Every request is rebuilt as `https://<host>[:<port>]<path>` on every plane — a cleartext
+    /// request included — so `deny re:^http://internal\.corp`, the spelling an operator reaches
+    /// for to carve the cleartext plane back out, was a deny that could not fire.
+    #[test]
+    fn a_regex_anchored_on_a_foreign_scheme_is_refused() {
+        for bad in [
+            r"re:^http://internal\.corp",
+            "re:^tcp://internal.corp:22",
+            "re:^ftp://x",
+            "re:^HTTPS://x",
+        ] {
+            let err = classify(bad).unwrap_err();
+            assert!(
+                err.contains("https://"),
+                "{bad:?} must be refused naming the rebuilt form, got: {err}"
+            );
+        }
+        // What still classifies: the `https` anchor, a pattern whose scheme is regex syntax (both
+        // of these do match the rebuilt form), and an unanchored `http://` — a legitimate match
+        // against a URL that *carries* one in its query string.
+        for good in [
+            r"re:^https://internal\.corp",
+            r"re:^https?://internal\.corp",
+            r"re:^(http|https)://internal\.corp",
+            r"re:http://internal\.corp",
+            r"re:^internal\.corp",
+        ] {
+            assert!(classify(good).is_ok(), "{good:?} must classify");
+        }
+        // The refusal is not a loss of reach: the cleartext plane is named by the structured form,
+        // which does carry a scheme — and a bare host deny reaches every plane.
+        let p = EgressPolicy::new(
+            vec![rule("http://internal.corp")],
+            vec![rule("http://internal.corp")],
+        );
+        assert!(matches!(
+            p.explain_clear("internal.corp", 80, "/x", "GET"),
+            Decision::DeniedBy(_)
+        ));
+    }
+
     /// Every scheme-free spelling of the bare `*` host: plain, with a port spec, and as a path rule.
     /// (A *scheme*-prefixed `*` is rejected one step earlier by the scheme guard — see
     /// `rejects_a_scheme_in_an_entry`.)
@@ -2953,6 +3209,11 @@ mod tests {
             "/foo/../secret", // dot-segment
             "/./secret",      // current-dir
             "/%73ecret",      // percent-encoded 's'
+            "/secret;x",      // an RFC 3986 path parameter
+            "/secret;",       // an empty one
+            "/secret%3Bx",    // …encoded
+            "/secret#x",      // a fragment
+            "/secret%23x",    // …encoded
         ] {
             assert!(
                 !p.permits("github.com", 443, same),
@@ -2976,6 +3237,37 @@ mod tests {
         );
     }
 
+    /// A deny carve-out under a subtree allow holds against a `;param` and a `#fragment`.
+    ///
+    /// The canonicalization dropped the query, resolved `.`/`..` and decoded `%xx`, but left an RFC
+    /// 3986 path parameter and a fragment in the segment. Upstreams do not: a Tomcat/Jetty-family
+    /// server strips `;params` and serves `/v1/admin`, and nginx cuts a raw `#` as a fragment
+    /// delimiter and serves the same — so the deny was dodged by a suffix the origin never saw.
+    #[test]
+    fn a_path_deny_holds_against_a_path_parameter_or_a_fragment() {
+        let p = EgressPolicy::new(
+            vec![rule("api.example.com/v1/*")],
+            vec![rule("api.example.com/v1/admin")],
+        );
+        for dodge in [
+            "/v1/admin",
+            "/v1/admin;x",
+            "/v1/admin;",
+            "/v1/admin%3Bx",
+            "/v1/admin#x",
+            "/v1/admin%23x",
+            "/v1/;x/admin",
+        ] {
+            assert!(
+                !p.permits("api.example.com", 443, dodge),
+                "the deny must catch `{dodge}`, which the upstream serves as `/v1/admin`"
+            );
+        }
+        // The rest of the subtree is untouched — the folding is of delimiters, not of segments.
+        assert!(p.permits("api.example.com", 443, "/v1/public"));
+        assert!(p.permits("api.example.com", 443, "/v1/administrative"));
+    }
+
     #[test]
     fn canonical_segments_normalizes_the_path() {
         assert_eq!(canonical_segments("/a/b/c"), ["a", "b", "c"]);
@@ -2991,6 +3283,20 @@ mod tests {
         assert_eq!(canonical_segments("/"), [] as [&str; 0]);
         // a double-encoded slash stays literal (single-level decode)
         assert_eq!(canonical_segments("/a%252fb"), ["a%2fb"]);
+        // an RFC 3986 path parameter names no resource of its own, encoded or not
+        assert_eq!(canonical_segments("/admin;x"), ["admin"]);
+        assert_eq!(canonical_segments("/admin;"), ["admin"]);
+        assert_eq!(canonical_segments("/admin%3Bx"), ["admin"]);
+        assert_eq!(canonical_segments("/a;p=1/b;q=2"), ["a", "b"]);
+        assert_eq!(
+            canonical_segments("/;p/admin"),
+            ["admin"],
+            "a param-only segment is empty"
+        );
+        // a fragment terminates the path, encoded or not
+        assert_eq!(canonical_segments("/admin#x"), ["admin"]);
+        assert_eq!(canonical_segments("/admin%23x"), ["admin"]);
+        assert_eq!(canonical_segments("/admin#x/y"), ["admin"]);
     }
 
     #[test]
@@ -3361,6 +3667,34 @@ mod tests {
         // And `mute` still changes NO verdict — a muted cleartext host is still denied.
         assert_eq!(
             policy.explain_clear("update.googleapis.com", 80, "/service/update2/json", "POST"),
+            Decision::DeniedDefault
+        );
+    }
+
+    /// An unscoped `mute` silences a refused WebSocket like it silences any other verb.
+    ///
+    /// `mute` read its method set through the allow side's `WS` opt-in, so a bare host entry
+    /// silenced every verb *except* the one an in-cage client retries in a loop — the noise the
+    /// entry was written for. A mute is broad unless the operator scoped it, so it asks the deny
+    /// side's question; an entry that names verbs still means them.
+    #[test]
+    fn a_bare_mute_silences_a_websocket_refusal_like_any_other_verb() {
+        let policy = EgressPolicy::new(vec![], vec![]).with_mute(vec![rule("api.test")]);
+        assert!(policy.muted("api.test", 443, Some("/ws"), Some("GET")));
+        assert!(
+            policy.muted("api.test", 443, Some("/ws"), Some("WS")),
+            "a bare-host mute must silence the WebSocket refusal too"
+        );
+        // An explicit `{*}` mute is just as broad — on this side `*` means every verb, `WS` with it.
+        let star = EgressPolicy::new(vec![], vec![]).with_mute(vec![rule("{*} api.test")]);
+        assert!(star.muted("api.test", 443, Some("/ws"), Some("WS")));
+        // A verb-scoped mute still means the verbs it names, and nothing else.
+        let scoped = EgressPolicy::new(vec![], vec![]).with_mute(vec![rule("{POST} api.test")]);
+        assert!(scoped.muted("api.test", 443, Some("/log"), Some("POST")));
+        assert!(!scoped.muted("api.test", 443, Some("/ws"), Some("WS")));
+        // And mute still changes no verdict: the WebSocket is refused either way.
+        assert_eq!(
+            policy.explain("api.test", 443, "/ws", "WS"),
             Decision::DeniedDefault
         );
     }

@@ -101,7 +101,7 @@
 //! | `503` | `connection-cap`         | the proxy is already serving as many client connections as it will serve at once (`[network] max_connections`). Answered on the accept loop, before anything is read, so the caller's own request is still unread when the connection closes and the refusal arrives followed by a reset |
 //! | `503` | `body-buffer-cap`        | the proxy is already holding as much request-body data as it will hold at one time (retry when one in flight completes). Nothing is wrong with the request: it is a shared ceiling on host memory, since the proxy buffers host-side and the cage's own `MemoryMax` does not reach it |
 //! | `421` | `host-mismatch`          | the TLS SNI or `Host` header disagreed with the CONNECT target (or, on an absolute-form request, with the request-line host) |
-//! | `400` | `bad-request`            | the request was malformed or used ambiguous framing. Every inspected plane reads the framing through one shared check ([`inspect_framing`]), so the same request is refused under the same reason whichever plane it arrived on. The reason is sub-categorized: `bad-request:transfer-encoding` (a coding other than `chunked`), `bad-request:dup-content-length`, `bad-request:dup-host`, `bad-request:dup-transfer-encoding`, `bad-request:invalid-content-length`, `bad-request:control-char` (a byte in the request line or a header that another parser could read as a line break — see [`head_carries_control_byte`]), `bad-request:chunked` (a `Transfer-Encoding: chunked` body that was malformed or over the proxy cap), or `bad-request:head` (a head that never arrived whole: truncated, over [`HEAD_MAX`], past [`head_deadline`], or not UTF-8 — read before there is a request line, so it names no host and no method). A well-formed `chunked` request is de-chunked and re-framed with a synthesized `Content-Length` (not refused) |
+//! | `400` | `bad-request`            | the request was malformed or used ambiguous framing. Every inspected plane reads the framing through one shared check ([`inspect_framing`]), so the same request is refused under the same reason whichever plane it arrived on. The reason is sub-categorized: `bad-request:transfer-encoding` (a coding other than `chunked`), `bad-request:dup-content-length`, `bad-request:dup-host`, `bad-request:dup-transfer-encoding`, `bad-request:invalid-content-length`, `bad-request:control-char` (a byte in the request line or a header that another parser could read as a line break — see [`head_carries_control_byte`]), `bad-request:chunked` (a `Transfer-Encoding: chunked` body that was malformed, over the proxy cap, or whose trailer section ran past [`TRAILER_MAX`]), or `bad-request:head` (a head that never arrived whole: truncated, over [`HEAD_MAX`], past [`head_deadline`], or not UTF-8 — read before there is a request line, so it names no host and no method). A well-formed `chunked` request is de-chunked and re-framed with a synthesized `Content-Length` (not refused) |
 //! | `405` | `method-not-allowed`     | a non-CONNECT request that is neither a routable `http://` nor `https://` absolute-form (a bare origin-form has no destination) |
 //! | `502` | `dns-failure`            | DNS resolution failed for an allowed host |
 //! | `502` | `upstream-unreachable`   | the host is allowed but the TCP connection failed |
@@ -165,7 +165,7 @@
 //! minimum-length-mitigated, and confined to the one injection-target host.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
@@ -441,7 +441,14 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
 
     // An IP-literal target carries no SNI to bind the minted leaf to, so the inspected L7 path
     // refuses it (a hostname target is required to MITM; only the raw splice above accepts an IP).
-    if host.parse::<IpAddr>().is_ok() {
+    //
+    // Asked of `connect_host`, the canonicalized authority every other decision on this connection
+    // is made from (the L4 splice above, `speaks_http2`, the SNI comparison, the verdict, the pool
+    // key) — never of the raw authority. `canonical_host` drops the trailing DNS root dot before
+    // re-parsing, so `93.184.216.34.` is the address `93.184.216.34`, while `IpAddr`'s own parser
+    // refuses that spelling outright: reading the raw host here let the one authority form this
+    // guard exists for walk past it, unlogged, into the MITM path.
+    if connect_host.parse::<IpAddr>().is_ok() {
         // Log the attempt (host = the IP the agent tried to reach) before refusing. Pre-tunnel, so
         // there is no method/path yet.
         ctx.push_log(
@@ -752,13 +759,21 @@ enum UpstreamError {
 /// goes to the exact address the SSRF guard approved while still authenticating the real server.
 /// The handshake is completed here so a validation failure surfaces now (a 502), distinct from a
 /// plain unreachable host (also a 502, but a different reason).
+///
+/// The dial itself is bounded by the launch's own timeout, like every other wait on this path. A
+/// socket's read/write timeouts are set *after* `connect(2)` returns and do not bound it, so an
+/// allowlisted address that blackholes SYNs otherwise held the serving thread — and the
+/// [`ProxyCtx::max_conns`] slot it occupies — for the kernel's whole SYN-retry budget (about two
+/// minutes on Linux), which is a connection-cap exhaustion reachable with allowed destinations
+/// alone. The HTTP/2 branch already bounds the same step with the same duration.
 fn connect_upstream(
     ip: IpAddr,
     port: u16,
     host: &str,
     ctx: &ProxyCtx,
 ) -> Result<StreamOwned<ClientConnection, TcpStream>, UpstreamError> {
-    let sock = TcpStream::connect((ip, port)).map_err(|_| UpstreamError::Unreachable)?;
+    let sock = TcpStream::connect_timeout(&SocketAddr::new(ip, port), ctx.timeout)
+        .map_err(|_| UpstreamError::Unreachable)?;
     sock.set_read_timeout(Some(ctx.timeout))
         .map_err(|_| UpstreamError::Unreachable)?;
     sock.set_write_timeout(Some(ctx.timeout))
@@ -986,8 +1001,12 @@ impl Head {
     /// close` token says outright that this is the last request on the connection. `HTTP/1.0`
     /// answers no even when it asks to keep alive: that extension carries framing ambiguities of its
     /// own, and every client this proxy exists for speaks 1.1.
+    ///
+    /// The version comes from [`request_line_version`], which splits the line on SP as the upstream
+    /// does, so this reads the version the request states rather than a token out of a target that
+    /// carries non-SP whitespace.
     fn keeps_alive(&self) -> bool {
-        self.request_line.split_whitespace().nth(2) == Some("HTTP/1.1")
+        request_line_version(&self.request_line) == Some("HTTP/1.1")
             && !self
                 .headers
                 .iter()
@@ -2052,6 +2071,115 @@ mod suggestion_tests {
             .unwrap_or_else(|| panic!("a denied-default body carries an allow suggestion: {body}"))
             .1
             .trim()
+    }
+}
+
+/// Tests for the guards `handle_client` applies to a CONNECT authority **before** a tunnel exists.
+/// Driven straight over a socket pair, because what they decide is settled before a listener, a
+/// policy or a TLS session is involved: the guard, the refusal it writes and the line it logs are
+/// the whole of what a connection sees.
+#[cfg(test)]
+mod connect_authority_tests {
+    use super::*;
+
+    /// The IP-literal refusal is asked of the **canonicalized** authority, so no spelling of an
+    /// address reaches the inspected path.
+    ///
+    /// Teeth: `canonical_host` strips the trailing DNS root dot and re-parses, and every other
+    /// decision on this connection (the L4 splice check, `speaks_http2`, the SNI comparison, the
+    /// verdict, the pool key, this refusal's own log line) is made from what it returns. Asked of
+    /// the raw authority instead, `93.184.216.34.` failed `IpAddr`'s stricter parse, so the guard
+    /// did not fire: the proxy answered `200 Connection established` and went on into the MITM path
+    /// with an address for a host, and the attempt appeared nowhere in `sbx net logs`.
+    #[test]
+    fn a_trailing_dot_ip_literal_connect_target_is_refused_as_an_ip_literal() {
+        use crate::sandbox::control::{LOG_RING_CAP, LogRing, LogVerdict};
+
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                allowlist::EgressPolicy::new(Vec::new(), Vec::new()),
+            )
+            .unwrap()
+            .with_log(log.clone()),
+        );
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let served = std::thread::spawn(move || handle_client(server, &ctx));
+        write!(
+            client,
+            "CONNECT 93.184.216.34.:443 HTTP/1.1\r\nHost: 93.184.216.34.\r\n\r\n"
+        )
+        .unwrap();
+        client.flush().unwrap();
+        // A refusal ends the connection, so the reply is everything up to the close. The timeout is
+        // the failure mode's exit: a guard that did not fire leaves the proxy waiting for a
+        // ClientHello that is never coming.
+        let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
+        let mut reply = Vec::new();
+        let mut buf = [0u8; 512];
+        loop {
+            match client.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => reply.extend_from_slice(&buf[..n]),
+            }
+        }
+        drop(client);
+        let _ = served.join();
+
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(
+            reply.starts_with("HTTP/1.1 403 Forbidden"),
+            "the trailing-dot spelling of an IP literal must be refused, not tunneled: {reply:?}"
+        );
+        assert!(reply.contains("ip-literal"), "{reply:?}");
+
+        let events = log.snapshot(None, None, false).events;
+        assert_eq!(events.len(), 1, "the attempt must not be dark: {events:?}");
+        assert_eq!(events[0].verdict, LogVerdict::Blocked);
+        assert_eq!(events[0].reason, "ip-literal");
+        assert_eq!(
+            events[0].host, "93.184.216.34",
+            "the log records the address the guard refused, canonicalized"
+        );
+        assert_eq!(events[0].port, 443);
+    }
+}
+
+/// Tests for what a parsed [`Head`] says about itself, kept beside it: each is a property of the
+/// request line and its headers, with no connection served.
+#[cfg(test)]
+mod head_tests {
+    use super::*;
+
+    /// A request persists its connection only when the version **it states** is `HTTP/1.1`.
+    ///
+    /// Teeth: read with `split_whitespace`, the version was the third token of a split no other
+    /// reader of this line makes — HTAB and the Unicode whitespace it also breaks on are ordinary
+    /// request-target bytes to an origin server, and the tunneled plane forwards the line verbatim.
+    /// So `GET /a\tHTTP/1.1 HTTP/1.0` was answered `Connection: keep-alive` with a
+    /// `Keep-Alive: timeout=<idle>` the version it states does not carry, holding a host thread and
+    /// a descriptor for the whole idle timeout.
+    #[test]
+    fn a_request_keeps_its_connection_alive_only_on_the_version_it_states() {
+        let head = |line: &str| Head {
+            request_line: line.to_string(),
+            headers: Vec::new(),
+        };
+        assert!(head("GET / HTTP/1.1").keeps_alive());
+        assert!(!head("GET / HTTP/1.0").keeps_alive());
+        assert!(
+            !head("GET /a\tHTTP/1.1 HTTP/1.0").keeps_alive(),
+            "the version is the line's third SP-separated field, not a token from its target"
+        );
+        // And an explicit `close` still ends the connection whatever the version says.
+        assert!(
+            !Head {
+                request_line: "GET / HTTP/1.1".to_string(),
+                headers: vec![("Connection".to_string(), "close".to_string())],
+            }
+            .keeps_alive()
+        );
     }
 }
 

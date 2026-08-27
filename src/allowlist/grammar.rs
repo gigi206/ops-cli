@@ -55,6 +55,7 @@ pub(crate) fn classify_in(entry: &str, slot: Slot) -> Result<Rule, String> {
     let rest = rest.trim();
     // `re:` patterns may contain `://`, so they are never scheme-split — always inspected over TLS.
     if let Some(pattern) = rest.strip_prefix("re:") {
+        reject_foreign_scheme_anchor(pattern)?;
         let re = Regex::new(pattern).map_err(|e| format!("invalid regex `{pattern}`: {e}"))?;
         return Ok(Rule {
             kind: RuleKind::Regex {
@@ -127,6 +128,36 @@ fn split_scheme(s: &str) -> Result<(Layer, &str), String> {
         ));
     }
     Ok((Layer::L7, s))
+}
+
+/// Refuse a `re:` pattern anchored on a scheme other than `https`, which no request can present.
+///
+/// A regex is matched against the request rebuilt as `https://<host>[:<port>]<path>`
+/// ([`Request::new`]), and that rebuild names no transport: a cleartext (`http://`) request and a
+/// pre-decrypt CONNECT authority present the same `https://…` form as an inspected one. So a pattern
+/// anchored on `^http://` — the spelling an operator reaches for to carve the cleartext plane back
+/// out — is a rule that can never fire, and a silently inert deny is the wrong direction to fail in.
+/// The structured `http://host[/path]` form does name that plane and is the way to write it.
+///
+/// Only a **literal** scheme anchor counts: the `://` must follow a leading `^` with nothing but
+/// ASCII alphanumerics between them, so `^https?://` and `^(http|https)://` — which do match the
+/// rebuilt form — are untouched, as is an unanchored `http://`, a legitimate match against a URL
+/// that *contains* one (a redirect target carried in a query string).
+fn reject_foreign_scheme_anchor(pattern: &str) -> Result<(), String> {
+    let Some((scheme, _)) = pattern.strip_prefix('^').and_then(|p| p.split_once("://")) else {
+        return Ok(());
+    };
+    if scheme.is_empty() || scheme == "https" || !scheme.bytes().all(|b| b.is_ascii_alphanumeric())
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "`re:{pattern}` anchors on `{scheme}://`, which no request ever presents: a `re:` rule is \
+         matched against the request rebuilt as `https://<host>[:<port>]<path>`, on every plane — a \
+         cleartext request and a raw CONNECT authority included — so this rule could never fire. \
+         Anchor on `^https://` (it covers all three), or name the cleartext plane with a structured \
+         rule (`http://host[/path]`), which carries its own scheme"
+    ))
 }
 
 /// Split an optional leading `{VERB,VERB,...}` method prefix off an entry, returning the method
@@ -527,6 +558,14 @@ pub(crate) fn parse_tcp_target(target: &str) -> Result<(String, u16), String> {
 /// the leading `/`, is the path. The host must be concrete — an exact hostname or IP literal
 /// (bracketed for IPv6); a `*.domain` wildcard with a path is rejected (use `re:`). A trailing `/*`
 /// marks a subtree rule (the path and everything under it); without it the path matches exactly.
+///
+/// The path itself carries no other pattern syntax, and the two spellings that *look* like it are
+/// refused rather than taken literally, each pointing at `re:`, the form that does express them:
+/// - a `*` anywhere but the trailing `/*` — it would be compared as the one-character segment `*`,
+///   so `deny host/*/secrets` would match nothing and block nothing;
+/// - a `?query` — the request's query is dropped before matching ([`canonical_segments`]), so
+///   `allow host/exec?cmd=ls` would admit every query on `/exec` while its text, and its rendering
+///   in `sbx net rules`, named one.
 fn parse_path_rule(
     s: &str,
     slash: usize,
@@ -545,7 +584,28 @@ fn parse_path_rule(
              concrete host or IP; use `re:` for a wildcard host)"
         ));
     }
+    if path.contains('?') {
+        return Err(format!(
+            "entry `{s}` carries a `?query`: a path rule matches the path only — the request's \
+             query is dropped before matching, so this rule would admit every query on that path, \
+             not the one it names. Drop the query, or use `re:` for a query-shaped match (the \
+             regex sees the query string)"
+        ));
+    }
     let subtree = path.ends_with("/*");
+    let literal = if subtree {
+        &path[..path.len() - 2]
+    } else {
+        path
+    };
+    if literal.contains('*') {
+        return Err(format!(
+            "entry `{s}` uses `*` inside its path: a path rule's only wildcard is a **trailing** \
+             `/*` (that path and its subtree). Anywhere else `*` is matched as a literal segment, \
+             so the rule would never fire. Use `re:` for a pattern path, e.g. \
+             `re:^https://host/[^/]+/secrets$`"
+        ));
+    }
     Ok(RuleKind::Url {
         host: canonical_host(host),
         ports,

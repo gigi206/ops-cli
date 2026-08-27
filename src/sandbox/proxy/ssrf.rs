@@ -41,9 +41,9 @@ enum IpClass {
 fn classify_ip(ip: IpAddr) -> IpClass {
     match ip {
         IpAddr::V4(v4) => classify_v4(v4),
-        // An IPv6 address that embeds a v4 (mapped, NAT64, 6to4, Teredo) is classified as that v4,
-        // so an internal/metadata v4 cannot dodge the v4 guard wearing a v6 spelling (e.g.
-        // `64:ff9b::a9fe:a9fe`, NAT64 of `169.254.169.254`).
+        // An IPv6 address that embeds a v4 (mapped, compatible, NAT64, 6to4, Teredo) is
+        // classified as that v4, so an internal/metadata v4 cannot dodge the v4 guard wearing a v6
+        // spelling (e.g. `64:ff9b::a9fe:a9fe`, NAT64 of `169.254.169.254`).
         IpAddr::V6(v6) => match embedded_v4(v6) {
             Some(v4) => classify_v4(v4),
             None => classify_v6(v6),
@@ -53,10 +53,13 @@ fn classify_ip(ip: IpAddr) -> IpClass {
 
 /// The IPv4 address an IPv6 address embeds through a translation/transition form, or `None`.
 ///
-/// Covers IPv4-mapped (`::ffff:a.b.c.d`), NAT64 well-known (`64:ff9b::/96`, the v4 in the low 32
-/// bits), 6to4 (`2002:AABB:CCDD::/16`), and Teredo (`2001:0::/32`, the client v4 in the last two
-/// segments, bit-inverted). The host's stack actually routing these is what makes the SSRF real;
-/// classifying them by their embedded v4 keeps the metadata/internal guard sound where it does.
+/// Covers IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`), NAT64 well-known
+/// (`64:ff9b::/96`, the v4 in the low 32 bits), 6to4 (`2002:AABB:CCDD::/16`), and Teredo
+/// (`2001:0::/32`, the client v4 in the last two segments, bit-inverted). The host's stack actually
+/// routing these is what makes the SSRF real; classifying them by their embedded v4 keeps the
+/// metadata/internal guard sound where it does — and the guard is stated as "an internal v4 cannot
+/// dodge the v4 rules wearing a v6 spelling", so a spelling this misses is a hole in the statement
+/// whether or not today's kernel routes it.
 fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     if let Some(v4) = v6.to_ipv4_mapped() {
         return Some(v4);
@@ -75,6 +78,16 @@ fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     // Teredo 2001:0::/32 — the client v4 is the last two segments, bit-inverted.
     if s[0] == 0x2001 && s[1] == 0x0000 {
         return Some(v4_of(!s[6], !s[7]));
+    }
+    // IPv4-compatible ::a.b.c.d (`::/96`), the transition form `Ipv6Addr::to_ipv4` recognises
+    // alongside the mapped one. `::` and `::1` are the unspecified and loopback addresses, not
+    // embeddings of `0.0.0.0`/`0.0.0.1`, so they stay with the v6 classifier that already answers
+    // for them.
+    if s[..6] == [0, 0, 0, 0, 0, 0] {
+        let v4 = v4_of(s[6], s[7]);
+        if !matches!(v4.octets(), [0, 0, 0, 0 | 1]) {
+            return Some(v4);
+        }
     }
     None
 }
@@ -349,6 +362,31 @@ mod tests {
         assert!(matches!(c("2606:4700:4700::1111"), IpClass::Public));
         // the pre-existing v4-mapped case still folds to its v4 class
         assert!(matches!(c("::ffff:127.0.0.1"), IpClass::Private));
+    }
+
+    /// The IPv4-compatible form `::a.b.c.d` is a v4 wearing a v6 spelling, exactly like the four
+    /// forms `embedded_v4` already unwrapped — and it was the one it did not. `::7f00:1` (that is
+    /// `::127.0.0.1`) is not `::1`, not `fe80::/10` and not `fc00::/7`, so the v6 classifier called
+    /// it `Public` and a DNS answer carrying it for an allowlisted host was dialed, while every
+    /// other spelling of the same address is refused.
+    ///
+    /// The two addresses inside `::/96` that are *not* embeddings — the unspecified `::` and the
+    /// loopback `::1` — are asserted too, because unwrapping the form must not hand them to the v4
+    /// classifier, which reads them as the ordinary addresses `0.0.0.0` and `0.0.0.1`.
+    #[test]
+    fn an_ipv4_compatible_v6_address_is_classified_as_the_v4_it_embeds() {
+        let c = |s: &str| classify_ip(s.parse::<IpAddr>().unwrap());
+        // loopback, in both spellings of the same address
+        assert!(matches!(c("::127.0.0.1"), IpClass::Private));
+        assert!(matches!(c("::7f00:1"), IpClass::Private));
+        // the cloud metadata address, and an RFC1918 one
+        assert!(matches!(c("::169.254.169.254"), IpClass::Blocked));
+        assert!(matches!(c("::10.0.0.5"), IpClass::Private));
+        // a public v4 in the same form stays an ordinary destination
+        assert!(matches!(c("::93.184.216.34"), IpClass::Public));
+        // and the two that denote themselves keep the classes the v6 classifier gives them
+        assert!(matches!(c("::1"), IpClass::Private));
+        assert!(matches!(c("::"), IpClass::Blocked));
     }
 
     /// The ranges IANA set aside for something other than the public Internet are not public
