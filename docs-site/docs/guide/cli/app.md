@@ -97,11 +97,16 @@ from a per-app verb would advance every app that rides it, under a command that 
 though it touched only this one. A `nix:` package has the opposite shape: it resolves
 against the **app's own** nixpkgs lock, and advancing that lock re-resolves the channel
 and rebuilds the base userland, a download this verb does not take on unasked. Either way
-the roll belongs to the channel command:
+the roll belongs to the channel command, named with the scope that command actually has:
 
 ```
-  `deb:`, `nix:` packages advance with the project, not with one app: `sbx upgrade deb`, `sbx upgrade nix`.
+  `deb:` packages advance with the project, not with one app: `sbx upgrade deb`.
+  `nix:` packages advance with this app's own lock, and this verb does not roll them: `sbx upgrade nix --app claude-code`.
 ```
+
+A project that **pins** `nixpkgs` is the exception: the app inherits the pinned revision,
+`sbx upgrade nix --app <name>` is refused there, and the `nix:` line names the project-wide
+`sbx upgrade nix` along with the other channels.
 
 That is the honest limit of the verb: what it removes is the question "which channel?",
 not the scope of the locks behind each answer. See [`sbx upgrade`](upgrade) for the

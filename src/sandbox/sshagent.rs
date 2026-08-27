@@ -462,6 +462,13 @@ impl<'a> Conn<'a> {
     }
 }
 
+/// How a frame that is not a message is named in the record. [`read_message`] refuses a length
+/// prefix naming nothing (a zero-length body) or more than [`MAX_MESSAGE`], and that ends the
+/// connection: recorded, because an operator looking for what a session's cage sent must find the
+/// malformed frame, not an absence they would read as "nothing was sent".
+const MALFORMED_FRAME: &str =
+    "a frame that is not a message (its length names nothing, or more than the protocol allows)";
+
 /// Decide one request and produce the reply body the cage will receive.
 ///
 /// The message type is an **allowlist**, not a denylist: anything not named here — including a type
@@ -478,6 +485,10 @@ fn respond<S: Read + Write>(
 ) -> io::Result<Vec<u8>> {
     let refused = vec![FAILURE];
     let Some((&kind, payload)) = request.split_first() else {
+        // The floor under the message types, not the path a cage takes to get here: a zero-length
+        // frame is refused by `read_message` before a body exists to dispatch, and the caller
+        // records that as `MALFORMED_FRAME`. This branch answers a body that is empty for any other
+        // reason, so a request with no type can never be read as a type.
         conn.ring.push(AgentKind::Refuse, "an empty request");
         return Ok(refused);
     };
@@ -587,6 +598,10 @@ fn refused_message_name(kind: u8, payload: &[u8]) -> String {
         22 => "to lock your agent",
         23 => "to unlock your agent",
         20 | 21 => "to add or drop a smartcard in your agent",
+        // A type this broker knows: an identities request reaches the refusal only by carrying a
+        // payload it has none of. Named as the malformed request it is, rather than falling to the
+        // unknown-type arm, which would read as a protocol extension the broker had never seen.
+        REQUEST_IDENTITIES => return "a malformed identities request".to_string(),
         EXTENSION => {
             let named = extension_name(payload).is_some();
             return format!(
@@ -683,6 +698,8 @@ fn serve_conn(
                     "a connection that did not finish its first request within the broker's \
                      deadline",
                 );
+            } else if e.kind() == io::ErrorKind::InvalidData {
+                ring.push(AgentKind::Refuse, MALFORMED_FRAME);
             }
             return Ok(());
         }
@@ -698,8 +715,15 @@ fn serve_conn(
         write_message(&mut cage, &reply)?;
         request = match read_message(&mut cage) {
             Ok(r) => r,
-            // EOF or a malformed frame: the client is done with us.
-            Err(_) => return Ok(()),
+            // EOF is the client being done with us, which is ordinary and says nothing. A frame
+            // outside the protocol's size range is a fault of the cage's making, and ends the
+            // connection with a record rather than in silence.
+            Err(e) => {
+                if e.kind() == io::ErrorKind::InvalidData {
+                    ring.push(AgentKind::Refuse, MALFORMED_FRAME);
+                }
+                return Ok(());
+            }
         };
     }
 }
@@ -1141,14 +1165,55 @@ mod tests {
         // message it says it is, so it falls through to the refusal rather than being trusted.
         let filter = Filter::new(&["work-key".into()]);
         let mut host = FakeAgent::new(vec![answer(&[id(b"blob-one", "work-key")])]);
+        let ring = AgentRing::new(16);
         let reply = respond(
             &[REQUEST_IDENTITIES, 0xff],
             &mut host,
-            &mut Conn::new(&filter, &AgentRing::new(16)),
+            &mut Conn::new(&filter, &ring),
         )
         .unwrap();
         assert_eq!(reply, vec![FAILURE]);
         assert!(host.seen.is_empty());
+
+        // And it is recorded as the malformed request it is. Type 11 is a type this broker knows,
+        // so naming it by its number ("a request of type 11, which the broker does not know") read
+        // as an unknown protocol extension rather than as a malformed identities request.
+        let events = ring.snapshot(None).events;
+        assert_eq!(events.len(), 1, "one decision recorded: {events:?}");
+        assert_eq!(
+            events[0].detail, "a malformed identities request",
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_frame_that_is_not_a_message_is_recorded_rather_than_passed_over() {
+        // A length prefix naming nothing (a zero-length body) or more than the protocol allows is
+        // refused by `read_message`, which ends the connection. Ending it in silence left an
+        // operator grepping `sbx ssh-agent logs` after a suspicious session with an absence, which
+        // reads as "the cage sent nothing malformed" — the one thing the record must not say.
+        let (cage, mut held) = UnixStream::pair().expect("a socket pair");
+        let ring = AgentRing::new(64);
+        held.write_all(&0u32.to_be_bytes())
+            .expect("the frame reaches the broker");
+        drop(held);
+
+        serve_conn(
+            cage,
+            // Reaching the host agent would be the bug: the frame is refused before a request
+            // exists to forward.
+            Path::new("/nonexistent/sbx-test-agent.sock"),
+            &Filter::default(),
+            &ring,
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .expect("a malformed frame ends the connection cleanly rather than erroring");
+
+        let events = ring.snapshot(None).events;
+        assert_eq!(events.len(), 1, "one decision recorded: {events:?}");
+        assert_eq!(events[0].kind, AgentKind::Refuse);
+        assert_eq!(events[0].detail, MALFORMED_FRAME, "{events:?}");
     }
 
     #[test]

@@ -1284,7 +1284,7 @@ mod tests {
     /// A fully lifted policy emits one filter with no rules — three instructions of x32 refusal,
     /// three of architecture check, one `ALLOW` — and nothing short of a real launch proves bwrap
     /// loads it and the kernel takes it. The lift is read back through `clone3`: denied it answers
-    /// `ENOSYS` (the filter's own action), lifted it reaches the kernel and answers `EFAULT` for
+    /// `ENOSYS` (the filter's own action), lifted it reaches the kernel and answers `EINVAL` for
     /// the zero-sized argument struct the probe passes. That distinction is the kernel's own —
     /// `clone3` rejects a size below its first version before it ever reads the pointer — so it
     /// cannot be produced by a filter that quietly refused to load.

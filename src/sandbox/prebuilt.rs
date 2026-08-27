@@ -214,6 +214,55 @@ pub(crate) fn is_sri(s: &str) -> bool {
     })
 }
 
+/// The SRI form of a lowercase-hex SHA-256, so a digest published as hex (an apt `Packages`
+/// stanza's `SHA256:`) can be compared against the `sha256-<base64>` a prefetch returns. `None` for
+/// anything that is not 64 hex characters, so a malformed field is a refusal at the comparison
+/// rather than a value that quietly never matches.
+///
+/// The base64 is written out for the reason [`super::openpgp`] gives for its own decoder: the input
+/// is thirty-two bytes, and taking a dependency for it would widen the supply chain of a path whose
+/// whole job is to make an artefact match what a signature attests.
+pub(crate) fn sri_from_sha256_hex(hex: &str) -> Option<String> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let digest: Vec<u8> = hex
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let val = |b: u8| match b {
+                b'0'..=b'9' => b - b'0',
+                b'a'..=b'f' => b - b'a' + 10,
+                _ => b - b'A' + 10,
+            };
+            val(pair[0]) << 4 | val(pair[1])
+        })
+        .collect();
+    let mut out = String::from("sha256-");
+    for chunk in digest.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    Some(out)
+}
+
 /// A locked prebuilt package, keyed in its backend's lock by the declared *locator*. `url` is the
 /// concrete artefact the pin resolved to — equal to the key when the locator already IS the download
 /// URL, and the separately resolved asset otherwise (a `github:` release asset, an `apt:` index
@@ -333,9 +382,14 @@ pub(crate) fn pinned_hashes(cwd: &Path, lock_file: &str) -> BTreeMap<String, Str
 /// name set (`[A-Za-z0-9+._?=-]`, every other byte → `-`). `nix store prefetch-file` otherwise
 /// derives the store name from the URL and **percent-decodes** it — so a vendor filename carrying an
 /// encoded space (`My%20App.tar.gz` → `My App.tar.gz`) yields an illegal store name (a space) and the
-/// prefetch fails. The name is cosmetic (only labels the fetched store
-/// entry; the returned hash is content-addressed and the generated derivation re-fetches by hash), so
-/// a lossy sanitization is safe; an empty segment falls back to `source`.
+/// prefetch fails. What the name identifies is only the fetched store entry — the returned hash is
+/// content-addressed and the generated derivation re-fetches by hash — so a lossy sanitization is
+/// safe; an empty segment falls back to `source`.
+///
+/// It is not, however, a concern of this function alone: a generated derivation's own `fetchurl`
+/// derives the same name from the same URL, so every backend passes one explicitly (`@NAME@-download`,
+/// built from the package name) rather than letting `baseNameOf url` decide. A `%` in the URL would
+/// otherwise pin here and fail at build time, on every later launch, with the pin already recorded.
 pub(crate) fn prefetch_name(url: &str) -> String {
     let base = url.rsplit('/').next().unwrap_or("").trim();
     let name: String = base
@@ -839,6 +893,27 @@ where
     Ok(((url, hash), true))
 }
 
+/// Persist one freshly-minted pin **additively**: re-read the on-disk lock, merge just this entry,
+/// and write the result.
+///
+/// The whole-map write it replaces was a lost update waiting to happen. Minting is a network query
+/// and often a full artefact download — minutes — and the map handed to a write-back was read
+/// before all of that: anything another process committed to the same lock in between (a second
+/// launch pinning a different package, an `sbx upgrade` rolling one forward) was silently rolled
+/// back or dropped. This is the rule [`super::nixhub`] already applies to its own lock, for the
+/// same reason and with the same shape.
+fn record_pin(
+    layout: &Layout,
+    project_id: &str,
+    lock_file: &str,
+    key: &str,
+    pin: &Pin,
+) -> io::Result<()> {
+    let mut disk = pins(layout, project_id, lock_file);
+    disk.insert(key.to_string(), pin.clone());
+    write_pins(layout, project_id, lock_file, &disk)
+}
+
 /// Provision one package from its per-project pin, minting the pin on first use — the sequence the
 /// direct and `:resolve` forms share. They differ only in how a missing pin is minted, which is
 /// `mint`, and in the lock key: the locator itself for the direct form, [`resolve_key`] for the
@@ -859,7 +934,12 @@ where
     let mut lock = pins(ctx.layout, project_id.as_str(), &lock_file);
     let ((url, hash), minted) = pinned_or_mint(&mut lock, key, mint)?;
     if minted {
-        write_pins(ctx.layout, project_id.as_str(), &lock_file, &lock)?;
+        // Just this pin, onto the lock as it stands now — never the whole map read before the mint.
+        let pin = Pin {
+            hash: hash.clone(),
+            url: url.clone(),
+        };
+        record_pin(ctx.layout, project_id.as_str(), &lock_file, key, &pin)?;
     }
     build_pinned(kind, ctx, project_id.as_str(), name, &url, &hash, libs)
 }
@@ -971,7 +1051,9 @@ pub(crate) enum Upgrade {
 /// Re-resolve a project's declared references for one backend and rewrite its per-project lock —
 /// pinning new ones, rolling changed ones forward, and pruning entries no longer declared (so a
 /// removed-then-readded package never reuses a stale pin). Resolution is best-effort per reference:
-/// a failure keeps the prior pin and is reported, and the lock is rewritten once at the end.
+/// a failure keeps the prior pin and is reported, and the lock is written once at the end — as a
+/// **merge** onto the file as it stands then, applying only this run's own prunes and rolls, so a
+/// pin another process committed while the network work ran is carried through rather than reset.
 ///
 /// Every resolution here runs with `fresh` set, which is what makes this an *upgrade* rather than a
 /// re-read: it bypasses nix's metadata cache, so a locator's source query sees a new GitHub release
@@ -1001,6 +1083,9 @@ pub(crate) fn upgrade(
     let system = super::current_system();
     let mut lock = pins(layout, project_id, &lock_file);
     let mut outcomes = Vec::new();
+    // The keys this run actually resolved. A reference that failed is deliberately absent: its
+    // prior pin is kept, and keeping it means leaving whatever the lock holds alone.
+    let mut rolled: Vec<String> = Vec::new();
 
     // Prune entries whose locator is no longer declared (across ALL layers regardless of trust, so a
     // withheld project's still-declared package keeps its pin rather than being silently unpinned).
@@ -1009,9 +1094,12 @@ pub(crate) fn upgrade(
         .filter(|k| !universe.contains(k.as_str()))
         .cloned()
         .collect();
-    for url in stale {
-        lock.remove(&url);
-        outcomes.push(Upgrade::Pruned { url });
+    // `stale` outlives the loop: the write-back below applies this run's own removals to whatever
+    // the lock holds by then, rather than deciding the file's whole content from a snapshot taken
+    // before any resolution ran.
+    for url in &stale {
+        lock.remove(url);
+        outcomes.push(Upgrade::Pruned { url: url.clone() });
     }
 
     for reference in &declared {
@@ -1062,7 +1150,8 @@ pub(crate) fn upgrade(
                         hash: hash.clone(),
                     },
                 };
-                lock.insert(key, Pin { hash, url });
+                lock.insert(key.clone(), Pin { hash, url });
+                rolled.push(key);
                 outcomes.push(outcome);
             }
             Err(e) => outcomes.push(Upgrade::Failed {
@@ -1072,7 +1161,22 @@ pub(crate) fn upgrade(
         }
     }
 
-    write_pins(layout, project_id, &lock_file, &lock)?;
+    // Write this run's outcomes onto the lock as it stands NOW, not the snapshot read before the
+    // first resolution: every reference above is a network round trip, and a new pin is a full
+    // artefact download, so a concurrent launch of the same project may have minted a pin of its
+    // own meanwhile. Only what this run decided is applied — the entries it pruned, removed, and
+    // the ones it resolved, inserted — so an entry it never touched is carried through as found
+    // instead of being reset to a stale value or dropped.
+    let mut merged = pins(layout, project_id, &lock_file);
+    for key in &stale {
+        merged.remove(key);
+    }
+    for key in &rolled {
+        if let Some(pin) = lock.get(key) {
+            merged.insert(key.clone(), pin.clone());
+        }
+    }
+    write_pins(layout, project_id, &lock_file, &merged)?;
     Ok(outcomes)
 }
 
@@ -1161,6 +1265,10 @@ mod tests {
     #[derive(Default)]
     struct Recording {
         fresh: std::cell::Cell<Option<bool>>,
+        /// Run at the moment a source is resolved. Resolution is where a real roll spends its time
+        /// (a release query, a full artefact download), so this is the window another process has
+        /// to write to the same lock, and the only way to put one there in a single-threaded test.
+        during_resolve: std::cell::RefCell<Option<Box<dyn Fn()>>>,
     }
 
     const RECORDED_HASH: &str = "sha256-jBGtMS5lpJWVXe+KzQgRSho8BcaEzGvONzIbAWled0w=";
@@ -1185,6 +1293,9 @@ mod tests {
             _allow_insecure_http: bool,
         ) -> io::Result<(String, String)> {
             self.fresh.set(Some(fresh));
+            if let Some(concurrent) = self.during_resolve.borrow().as_ref() {
+                concurrent();
+            }
             Ok((locator.to_string(), RECORDED_HASH.to_string()))
         }
         fn derivation_expr(
@@ -1252,6 +1363,73 @@ mod tests {
             lock.get(url).map(|p| p.hash.as_str()),
             Some(RECORDED_HASH),
             "the pin reached the lock the backend's name spells"
+        );
+    }
+
+    /// The lock is written back as a **merge** onto what is on disk when the run ends, never as the
+    /// snapshot read before it began. Every reference is a network round trip and a new pin is a
+    /// full artefact download, so a concurrent launch of the same project (a second `--app` overlay
+    /// contributing its own package, say) routinely commits a pin inside that window; writing the
+    /// start-of-run map back dropped it, and the next launch re-minted it from whatever the source
+    /// served then.
+    #[test]
+    fn a_roll_merges_its_outcome_onto_the_lock_rather_than_writing_a_stale_snapshot() {
+        let data = TmpDir::new();
+        let project = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let id = super::super::binds::project_runtime_id(project.path()).unwrap();
+        let kind = Recording::default();
+        let lock_file = lock_file(&kind);
+        const OTHER: &str = "https://example.com/other.tar.gz";
+        const OTHER_HASH: &str = "sha256-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA=";
+
+        // Another process pins a package of its own while this roll is resolving.
+        let data_path = data.path().to_path_buf();
+        let other_id = id.clone();
+        let other_lock = lock_file.clone();
+        *kind.during_resolve.borrow_mut() = Some(Box::new(move || {
+            let layout = Layout::under(&data_path);
+            let mut disk = pins(&layout, &other_id, &other_lock);
+            disk.insert(
+                OTHER.to_string(),
+                Pin {
+                    hash: OTHER_HASH.to_string(),
+                    url: OTHER.to_string(),
+                },
+            );
+            write_pins(&layout, &other_id, &other_lock, &disk).expect("the concurrent write lands");
+        }));
+
+        let url = "https://example.com/demo-app.tar.gz";
+        let cfg = resolved(
+            vec![crate::config::Package {
+                name: "demo-app".to_string(),
+                backend: crate::config::Backend::Tarball(url.to_string()),
+                state: crate::trust::TrustState::Trusted,
+                libs: Vec::new(),
+            }],
+            vec![],
+        );
+        upgrade(
+            &kind,
+            Path::new("/nonexistent/nix"),
+            &layout,
+            project.path(),
+            &cfg,
+            None,
+        )
+        .expect("the roll writes its lock");
+
+        let lock = pins(&layout, &id, &lock_file);
+        assert_eq!(
+            lock.get(url).map(|p| p.hash.as_str()),
+            Some(RECORDED_HASH),
+            "this run's own pin has to be written"
+        );
+        assert_eq!(
+            lock.get(OTHER).map(|p| p.hash.as_str()),
+            Some(OTHER_HASH),
+            "a pin committed while this run was resolving must not be dropped"
         );
     }
 

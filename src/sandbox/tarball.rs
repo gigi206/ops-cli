@@ -109,7 +109,14 @@ pub(crate) fn resolve_source(
 /// install phase is generic for an Electron layout — [`prebuilt::launcher_wrap`] locates the app
 /// directory by its `resources/` signature (a packed `resources/app.asar` or, for an asar-less VS
 /// Code fork, the `resources/app/` directory) and wraps the app's own launcher, so no per-app path
-/// is hardcoded. Every interpolated value is sbx-controlled and charset-validated (`name`, `url`,
+/// is hardcoded.
+///
+/// `src` is fetched with an explicit `name`, as [`super::binary`] does and for the same reason that
+/// [`prebuilt::prefetch_hash`] passes one: without it `fetchurl` names the store path after the
+/// URL's last segment, and a percent-encoded segment (a vendor's `My%20App.tar.gz`, which the URL
+/// validators admit) is not a legal store-path name, so the build aborts on a URL that pinned fine.
+///
+/// Every interpolated value is sbx-controlled and charset-validated (`name`, `url`,
 /// `hash`, the pinned `nixpkgs`, the `system`), so the expression carries nothing to escape;
 /// placeholders keep nix's `${…}`/`{…}` out of Rust's formatter.
 fn derivation_expr(
@@ -123,7 +130,7 @@ fn derivation_expr(
     const TEMPLATE: &str = r#"let pkgs = (builtins.getFlake "@NIXPKGS@").legacyPackages.@SYSTEM@;
 in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
   name = "@NAME@";
-  src = pkgs.fetchurl { url = "@URL@"; hash = "@HASH@"; };
+  src = pkgs.fetchurl { name = "@NAME@-download"; url = "@URL@"; hash = "@HASH@"; };
   nativeBuildInputs = with pkgs; [ gzip gnutar makeWrapper autoPatchelfHook ];
   buildInputs = with pkgs; [ @LIBS@ ];
   # Ignore ALL unresolved deps (not just the musl loader the `deb:` backend lists). A raw vendor
@@ -450,6 +457,14 @@ mod tests {
         ));
         assert!(expr.contains("url = \"https://example.com/x/1.0/linux-x64/Demo%20App.tar.gz\";"));
         assert!(expr.contains(&format!("hash = \"{HASH}\";")));
+        // The fetch names its own store path. This URL's last segment is percent-encoded — the
+        // shape the validators deliberately admit — and `%` is not in nix's store-name charset, so
+        // letting `fetchurl` fall back to `baseNameOf url` fails the build of an already-pinned
+        // package on every launch, with no re-resolve able to change it.
+        assert!(
+            expr.contains("name = \"demo-app-download\";"),
+            "the fetch must name the store path rather than derive it from the URL:\n{expr}"
+        );
         // gzip tarball extraction with a non-root `tar` so a setuid `chrome-sandbox` does not abort
         // the unpack; unpack-only, no build script (safe host-side); the Electron lib set is present.
         assert!(expr.contains("tar -xz --no-same-permissions --no-same-owner -f $src"));

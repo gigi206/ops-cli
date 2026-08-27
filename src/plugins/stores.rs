@@ -15,7 +15,10 @@
 //! and places nothing. Authenticity rests entirely on the signature: git moves bytes and
 //! checks their integrity, never their origin, so the transport is not a trust boundary.
 
-use super::ensure_owner_only;
+// The owner-only directory bootstrap, the owner-only file writer and the staging-suffix counter
+// are the plugins tree's own, shared with the rest of it: what a `store.toml` (the pinned trust
+// anchor) is created with is the same decision as what an origin record is created with.
+use super::{ensure_owner_only, unique, write_owner_only};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::path::{Path, PathBuf};
@@ -31,9 +34,18 @@ const STORE_TOML: &str = "store.toml";
 const CATALOGUE_LOCK: &str = "catalogue.lock";
 const CHECKOUT: &str = "checkout";
 
-/// The public-key file a store repository carries at its root, read only by a trust-on-first-use
-/// add (`--trust`) to learn the key it then pins. A pinned add (`--key`) ignores it entirely, and
-/// `update` never reads it — the trust anchor is always the key recorded in `store.toml`.
+/// The public-key file a store repository carries at its root. It is remote, unverified material,
+/// and **nothing decides trust by it** except a trust-on-first-use add or rekey (`--trust`), which
+/// pins the key it learns; a pinned add or rekey (`--key`) ignores it entirely, and the trust
+/// anchor from then on is always the key recorded in `store.toml`.
+///
+/// Its four readers, since what an unverified remote gets to feed each of them is the question a
+/// review of this file has to answer: [`add`] and [`rekey`] on their TOFU path (the only trust
+/// decision), [`shipped_pubkey`], which fetches it to *show* the user a key before they decide
+/// anything, and [`update`], which reads it only after a signature has already failed — to say
+/// whether the store now ships a different key than the one pinned, and never to accept it. The
+/// last two never pin; both put the file's contents on the user's terminal, which is why
+/// [`read_repo_pubkey`] reads it through the same bounded, symlink-refusing path as the catalogue.
 const REPO_PUBKEY: &str = "pubkey";
 
 /// The git attribute file a publish writes at the store root, disabling end-of-line conversion for
@@ -151,11 +163,11 @@ fn add_inner(
     // update re-clones from scratch.
     let _ = std::fs::remove_dir_all(checkout.join(".git"));
 
-    write_file(
+    write_owner_only(
         &stage.0.join(STORE_TOML),
         store_toml(url, &pubkey, tofu).as_bytes(),
     )?;
-    write_file(
+    write_owner_only(
         &stage.0.join(CATALOGUE_LOCK),
         format!("{}\n", catalogue.rev).as_bytes(),
     )?;
@@ -254,7 +266,7 @@ pub(crate) fn verify_key(
     let dir = layout.store_path(name);
     let tmp = dir.join(format!(".store-toml-{}-{}", std::process::id(), unique()));
     let _ = std::fs::remove_file(&tmp);
-    write_file(&tmp, store_toml(&cfg.url, &cfg.pubkey, false).as_bytes())?;
+    write_owner_only(&tmp, store_toml(&cfg.url, &cfg.pubkey, false).as_bytes())?;
     if let Err(e) = std::fs::rename(&tmp, dir.join(STORE_TOML)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("cannot record the confirmation: {e}"));
@@ -771,7 +783,10 @@ fn place_plugin(
     }
 
     // The content gate: the directory must reproduce the digest the signed catalogue pinned, so the
-    // bytes about to be installed are exactly what was listed and signed.
+    // bytes about to be installed are exactly what was listed and signed. The pin travels on into
+    // the install (`StoreClaim::sha256`), which re-checks it on the staged copy: this checkout is
+    // only a path, and `update`/`rekey` replace the whole store directory by rename, so the tree
+    // read here and the tree copied there are not guaranteed to be the same bytes.
     crate::plugins::catalogue::verify_entry(entry, &plugin_dir)?;
 
     // The store's URL is carried into the record so a later listing still names where the plugin
@@ -791,6 +806,7 @@ fn place_plugin(
                 name: plugin_name,
                 kind: entry.kind,
                 scheme: entry.scheme.as_deref(),
+                sha256: &entry.sha256,
             },
             origin,
         )
@@ -802,6 +818,7 @@ fn place_plugin(
                 name: plugin_name,
                 kind: entry.kind,
                 scheme: entry.scheme.as_deref(),
+                sha256: &entry.sha256,
             },
             origin,
         )
@@ -878,11 +895,11 @@ pub(crate) fn rekey(
     }
 
     let _ = std::fs::remove_dir_all(checkout.join(".git"));
-    write_file(
+    write_owner_only(
         &stage.0.join(STORE_TOML),
         store_toml(&cfg.url, &pubkey, tofu).as_bytes(),
     )?;
-    write_file(
+    write_owner_only(
         &stage.0.join(CATALOGUE_LOCK),
         format!("{}\n", catalogue.rev).as_bytes(),
     )?;
@@ -971,11 +988,11 @@ pub(crate) fn update(
     }
 
     let _ = std::fs::remove_dir_all(checkout.join(".git"));
-    write_file(
+    write_owner_only(
         &stage.0.join(STORE_TOML),
         store_toml(&cfg.url, &cfg.pubkey, cfg.tofu).as_bytes(),
     )?;
-    write_file(
+    write_owner_only(
         &stage.0.join(CATALOGUE_LOCK),
         format!("{}\n", catalogue.rev).as_bytes(),
     )?;
@@ -1212,28 +1229,6 @@ fn store_toml(url: &str, pubkey: &[u8; 32], tofu: bool) -> String {
         crate::plugins::catalogue::to_hex(pubkey),
         if tofu { "tofu" } else { "pinned" }
     )
-}
-
-/// Write a file owner-readable/writable only, creating it fresh.
-fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-    f.write_all(bytes)
-        .map_err(|e| format!("cannot write {}: {e}", path.display()))
-}
-
-/// A per-call-unique suffix for the staging directory, so two adds in one process never
-/// collide. A monotonic process-local counter — no clock or RNG.
-fn unique() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 /// A staging directory removed when it goes out of scope, so a fetch never leaks its tree —

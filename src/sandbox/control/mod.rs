@@ -1105,6 +1105,12 @@ const REPLY_MAX: u64 = 8 * 1024;
 /// Handle one control connection: read a single command line, dispatch it, write the response, and
 /// close. The socket is owner-only and host-side, so the peer is trusted; the bound read and the
 /// timeout are belt-and-braces against a stuck or malformed caller.
+///
+/// A command that fills [`CMD_MAX`] without a terminating newline was truncated by the bound, and is
+/// refused with `err bad-request` rather than dispatched: the one command long enough to reach the
+/// bound is `REMEMBER ALLOW|DENY <rule>`, and a truncated rule that still classifies would load a
+/// rule the operator never wrote into the live overlay. This mirrors the reply-side truncation guard
+/// in the control client.
 fn handle(
     stream: UnixStream,
     state: &PendingState,
@@ -1117,8 +1123,12 @@ fn handle(
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new((&stream).take(CMD_MAX));
     let mut line = String::new();
-    reader.read_line(&mut line)?;
-    let response = dispatch(line.trim(), state, manual, log, flows, capture);
+    let n = reader.read_line(&mut line)?;
+    let response = if n as u64 >= CMD_MAX && !line.ends_with('\n') {
+        "err bad-request\n".to_string()
+    } else {
+        dispatch(line.trim(), state, manual, log, flows, capture)
+    };
     (&stream).write_all(response.as_bytes())?;
     (&stream).flush()
 }
@@ -1788,6 +1798,45 @@ mod tests {
             allow,
             vec![crate::allowlist::classify("*.svc.test").unwrap()]
         );
+    }
+
+    #[test]
+    fn a_command_truncated_by_the_bound_is_refused_rather_than_dispatched() {
+        // A `REMEMBER ALLOW <rule>` longer than `CMD_MAX` is cut by the bounded read, and the cut
+        // prefix can still classify as a rule — so dispatching it would load a rule the operator
+        // never wrote into the live overlay and answer `ok`, leaving the session enforcing a
+        // silently different policy. The server refuses the truncated line instead.
+        use crate::testutil::TmpDir;
+        let data = TmpDir::new();
+        std::fs::create_dir_all(control_dir(data.path())).unwrap();
+        let pid = 13579u32;
+        let sock = control_socket(data.path(), pid);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let pending = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let served_manual = manual.clone();
+        let flows = Arc::new(FlowRegistry::new());
+        thread::spawn(move || {
+            let _ = serve(
+                listener,
+                pending,
+                served_manual,
+                log,
+                flows,
+                None,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+        });
+
+        // Longer than `CMD_MAX`, and its truncation is itself a valid regex rule.
+        let rule = format!("re:^https://example\\.test/{}$", "a".repeat(9000));
+        assert!(matches!(
+            inject_rule(data.path(), pid, Verdict::Allow, &rule).unwrap(),
+            InjectOutcome::Refused
+        ));
+        let (allow, _) = manual.snapshot();
+        assert!(allow.is_empty(), "no rule may reach the overlay: {allow:?}");
     }
 
     #[test]

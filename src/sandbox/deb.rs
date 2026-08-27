@@ -114,9 +114,13 @@ fn write_pins(
 /// resolves to itself; a `github:<owner>/<repo>` locator queries the repo's latest release, selects
 /// its linux `.deb` asset, and **re-validates that GitHub-supplied URL** through the same
 /// injection-free barrier a hand-written `deb:` URL passes before it is fetched or interpolated into
-/// the generated derivation. `fresh` marks an `sbx upgrade` re-resolve: the release or index query
-/// bypasses nix's metadata cache so it sees a new entry, and the artefact fetch stays quiet for the
-/// summary. Fail-closed: an unvalidated or unselectable asset returns an error and no pin.
+/// the generated derivation. An `apt:<packages-index>` locator goes further: where the index was
+/// attested by the repository's signed `InRelease`, the fetched `.deb` is held to the `SHA256:` that
+/// index publishes for it ([`artefact_matches_index`]), so the pin covers the artefact the
+/// repository signed for and not merely the bytes the pool served. `fresh` marks an `sbx upgrade`
+/// re-resolve: the release or index query bypasses nix's metadata cache so it sees a new entry, and
+/// the artefact fetch stays quiet for the summary. Fail-closed: an unvalidated or unselectable
+/// asset, or one that does not match an attested digest, returns an error and no pin.
 pub(crate) fn resolve_source(
     nix: &Path,
     layout: &Layout,
@@ -125,12 +129,16 @@ pub(crate) fn resolve_source(
     fresh: bool,
     allow_insecure_http: bool,
 ) -> io::Result<(String, String)> {
-    let url = match parse_source(locator) {
-        DebSource::Url(url) => url,
+    // `attested` is the digest the repository's own signature covers, where there is one to
+    // enforce — see [`resolve_apt_deb_url`]. The other two forms have nothing of the kind: a direct
+    // URL and a GitHub release asset are pinned by the bytes fetched, which is what their trust
+    // level has always been.
+    let (url, attested) = match parse_source(locator) {
+        DebSource::Url(url) => (url, None),
         DebSource::Github { owner, repo } => {
             let api = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
             let json = super::nixhub::fetch_url_json(nix, layout, &api, fresh)?;
-            github_asset_url(&json, system, &owner, &repo)?
+            (github_asset_url(&json, system, &owner, &repo)?, None)
         }
         DebSource::Apt { packages_url } => {
             resolve_apt_deb_url(nix, layout, &packages_url, fresh, allow_insecure_http)?
@@ -139,7 +147,37 @@ pub(crate) fn resolve_source(
     // A re-resolve (`fresh`) is an `sbx upgrade` step — capture nix's output and fold the cause
     // into the error; a first launch streams the download progress live.
     let hash = prebuilt::prefetch_hash(nix, layout, &url, fresh)?;
+    if let Some(expected) = attested {
+        artefact_matches_index(&url, &expected, &hash)?;
+    }
     Ok((url, hash))
+}
+
+/// The last link of the signed apt chain: the fetched `.deb` must be the file the attested index
+/// published a `SHA256:` for.
+///
+/// Without it the chain stops at the index and the pin certifies itself — it records whatever the
+/// pool served at fetch time, which is a different origin from the `dists/` tree the signature
+/// covers (commonly a CDN bucket, and always a redirect target nix follows without reporting where
+/// it landed). Comparison is in the SRI space the prefetch answers in, so the two sides are the same
+/// encoding of the same thirty-two bytes; a `SHA256:` that is not 64 hex characters is a refusal,
+/// not a skipped check.
+fn artefact_matches_index(url: &str, expected_hex: &str, got_sri: &str) -> io::Result<()> {
+    let expected = prebuilt::sri_from_sha256_hex(expected_hex).ok_or_else(|| {
+        io::Error::other(format!(
+            "the apt index publishes a malformed `SHA256:` (`{expected_hex}`) for {url}, so the \
+             `.deb` it attests cannot be identified"
+        ))
+    })?;
+    if expected == got_sri {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "the `.deb` fetched from {url} is not the one the repository's signed index attests \
+         (expected {expected}, got {got_sri}). Either the repository published between the index \
+         fetch and this one, in which case resolving again succeeds, or the file served is not the \
+         one it signed"
+    )))
 }
 
 /// Resolve an `apt:` locator's Packages index to the concrete `.deb` URL of its highest-version
@@ -150,28 +188,40 @@ pub(crate) fn resolve_source(
 /// against the repo root, and **re-validates that derived URL through [`is_valid_deb_url`](crate::config::is_valid_deb_url)** — the
 /// index is remote-controlled, so this is the injection boundary before the URL is fetched or
 /// interpolated into the generated derivation. Fail-closed at every step.
+///
+/// Returns the URL and, with it, the `SHA256:` the selected stanza publishes — but **only when the
+/// index was attested**, which is what makes that digest worth anything: the caller refuses a
+/// fetched artefact that does not match it, closing the chain signature -> index -> `.deb`. On the
+/// unpinned first-pin path the digest is no better attested than the index it came from, so none is
+/// returned and the warning above stands as the whole statement of what was checked.
 fn resolve_apt_deb_url(
     nix: &Path,
     layout: &Layout,
     packages_url: &str,
     fresh: bool,
     allow_insecure_http: bool,
-) -> io::Result<String> {
+) -> io::Result<(String, Option<String>)> {
     let index = super::nixhub::fetch_url_text(nix, layout, packages_url, fresh)?;
     // Between the fetch and the selection, and over this very buffer: what the signature attests
     // and what the selection reads are the same bytes, with no second fetch to diverge from.
-    if let Attested::Unpinned(why) = attest_index(nix, layout, packages_url, &index, fresh)? {
+    let attested = attest_index(nix, layout, packages_url, &index, fresh)?;
+    if let Attested::Unpinned(why) = &attested {
         crate::diag::warn(&format!(
             "the apt repository at {packages_url} is trusted on TLS alone, because {why}; the \
              `.deb` it selects is pinned by content hash, but nothing attests that this index is \
              the one the repository published"
         ));
     }
-    let (version, filename) = select_latest_apt_deb(&index).map_err(|e| {
+    let selected = select_latest_apt_deb(&index).map_err(|e| {
         io::Error::other(format!(
             "the apt Packages index at {packages_url} could not be resolved: {e}"
         ))
     })?;
+    let AptSelection {
+        version,
+        filename,
+        sha256,
+    } = selected;
     let root = apt_repo_root(packages_url).ok_or_else(|| {
         io::Error::other(format!(
             "the apt Packages URL must contain a `/dists/` segment to locate the repo root: \
@@ -185,7 +235,23 @@ fn resolve_apt_deb_url(
              a valid `.deb` URL: {url}"
         )));
     }
-    Ok(url)
+    let expected = match (&attested, &sha256) {
+        (Attested::Yes, Some(hash)) => Some(hash.clone()),
+        // An attested index that publishes no digest for the file it names. Nothing here is
+        // exploitable by whoever serves the pool — removing the field takes rewriting the *signed*
+        // index — but the artefact is then pinned on the bytes served rather than on anything the
+        // repository signed, and that difference is the user's to know about.
+        (Attested::Yes, None) => {
+            crate::diag::warn(&format!(
+                "the signed apt index at {packages_url} publishes no `SHA256:` for the `.deb` it \
+                 names (version {version}), so the artefact is pinned on the bytes served rather \
+                 than on a digest the repository signed"
+            ));
+            None
+        }
+        (Attested::Unpinned(_), _) => None,
+    };
+    Ok((url, expected))
 }
 
 /// The `InRelease` that attests an apt repository's indexes: the signed file at the root of the
@@ -592,25 +658,30 @@ fn parse_valid_until(stamp: &str) -> Option<u64> {
 /// SAME `Package:` — a multi-package Debian mirror is refused (it is ambiguous which app to track).
 /// The highest `Version:` wins, compared as dotted **decimal** components (`1.21459.0` > `1.18286.2`);
 /// a version carrying a non-numeric component is **refused** rather than mis-ordered — this is
-/// deliberately not full dpkg ordering (no epochs, no `~`). Returns `(version, filename)` of the
-/// winner, `filename` being the path relative to the repo root. Pure, so it is unit-tested against a
-/// captured index.
-fn select_latest_apt_deb(index: &str) -> Result<(String, String), String> {
-    let mut stanzas: Vec<(String, String, String)> = Vec::new();
+/// deliberately not full dpkg ordering (no epochs, no `~`).
+///
+/// Returns the winner's [`AptSelection`]: its version, its `Filename:` (the path relative to the
+/// repo root), and the `SHA256:` the same stanza publishes for that file — the link that carries
+/// the index's attestation onto the artefact, which is why it is read here rather than discarded
+/// with the rest of the stanza. Pure, so it is unit-tested against a captured index.
+fn select_latest_apt_deb(index: &str) -> Result<AptSelection, String> {
+    let mut stanzas: Vec<(String, String, String, Option<String>)> = Vec::new();
     let (mut pkg, mut ver, mut file): (Option<String>, Option<String>, Option<String>) =
         (None, None, None);
+    let mut sha256: Option<String> = None;
     // Group RFC822 stanzas on blank lines by iterating `lines()` (which strips both `\n` and `\r\n`)
     // rather than splitting on `"\n\n"` — so an apt `Packages` served with CRLF still parses into
     // separate stanzas instead of collapsing into one. A trailing sentinel flushes the final stanza
     // when the file does not end in a blank line.
     for line in index.lines().chain(std::iter::once("")) {
         if line.trim().is_empty() {
+            let hash = sha256.take();
             if let (Some(p), Some(v), Some(f)) = (pkg.take(), ver.take(), file.take())
                 && !p.is_empty()
                 && !v.is_empty()
                 && !f.is_empty()
             {
-                stanzas.push((p, v, f));
+                stanzas.push((p, v, f, hash.filter(|h| !h.is_empty())));
             }
         } else if let Some(v) = line.strip_prefix("Package:") {
             pkg = Some(v.trim().to_string());
@@ -618,13 +689,15 @@ fn select_latest_apt_deb(index: &str) -> Result<(String, String), String> {
             ver = Some(v.trim().to_string());
         } else if let Some(v) = line.strip_prefix("Filename:") {
             file = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("SHA256:") {
+            sha256 = Some(v.trim().to_ascii_lowercase());
         }
     }
     let first = stanzas
         .first()
         .ok_or("no package stanza (Package/Version/Filename) found")?;
     let name = first.0.clone();
-    if stanzas.iter().any(|(p, _, _)| *p != name) {
+    if stanzas.iter().any(|(p, ..)| *p != name) {
         return Err(format!(
             "the index names more than one package (e.g. `{name}`); `deb:apt:` tracks a \
              single-application repo"
@@ -645,7 +718,25 @@ fn select_latest_apt_deb(index: &str) -> Result<(String, String), String> {
         }
     }
     let winner = &stanzas[best_idx];
-    Ok((winner.1.clone(), winner.2.clone()))
+    Ok(AptSelection {
+        version: winner.1.clone(),
+        filename: winner.2.clone(),
+        sha256: winner.3.clone(),
+    })
+}
+
+/// The stanza [`select_latest_apt_deb`] picked, reduced to what the resolve needs of it.
+#[derive(Debug)]
+struct AptSelection {
+    /// The winner's `Version:`, for the diagnostics that name which entry was selected.
+    version: String,
+    /// Its `Filename:`: the `.deb`'s path relative to the repository root.
+    filename: String,
+    /// Its `SHA256:`, lowercased, when the index publishes one. `None` is possible in principle
+    /// (nothing but convention makes the field mandatory) and is not treated as a match: a
+    /// repository that signs an index without a digest for its own `.deb` attests nothing about
+    /// the artefact, and the caller says so instead of pretending it does.
+    sha256: Option<String>,
 }
 
 /// Parse a dotted-decimal version (`1.21459.0`) into comparable numeric components. Returns `None` if
@@ -703,7 +794,14 @@ fn github_asset_url(
 /// is generic for an Electron layout — it locates the app directory by its `resources/` signature
 /// (a packed `resources/app.asar` or, for an asar-less VS Code fork, the `resources/app/`
 /// directory) and wraps the app's own launcher (the executable beside it that is not a `.so` or a
-/// Chromium helper), so no per-app path is hardcoded. Every interpolated value is sbx-controlled
+/// Chromium helper), so no per-app path is hardcoded.
+///
+/// `src` is fetched with an explicit `name`, as [`super::binary`] does and for the same reason that
+/// [`prebuilt::prefetch_hash`] passes one: without it `fetchurl` names the store path after the
+/// URL's last segment, and a percent-encoded segment (which the URL validators admit) is not a
+/// legal store-path name, so the build aborts on a URL that pinned fine.
+///
+/// Every interpolated value is sbx-controlled
 /// and charset-validated (`name`, `url`, `hash`, the pinned `nixpkgs`, the `system`), so the
 /// expression carries nothing to escape; placeholders keep nix's `${…}`/`{…}` out of Rust's
 /// formatter.
@@ -718,7 +816,7 @@ fn derivation_expr(
     const TEMPLATE: &str = r#"let pkgs = (builtins.getFlake "@NIXPKGS@").legacyPackages.@SYSTEM@;
 in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
   name = "@NAME@";
-  src = pkgs.fetchurl { url = "@URL@"; hash = "@HASH@"; };
+  src = pkgs.fetchurl { name = "@NAME@-download"; url = "@URL@"; hash = "@HASH@"; };
   nativeBuildInputs = with pkgs; [ dpkg makeWrapper autoPatchelfHook ];
   buildInputs = with pkgs; [ @LIBS@ ];
   autoPatchelfIgnoreMissingDeps = [ "libc.musl-x86_64.so.1" ];
@@ -861,6 +959,13 @@ mod tests {
         ));
         assert!(expr.contains("url = \"https://example.com/x/demo-app-linux-amd64.deb\";"));
         assert!(expr.contains(&format!("hash = \"{HASH}\";")));
+        // The fetch names its own store path rather than deriving it from the URL: a percent-encoded
+        // last segment — the shape the URL validators deliberately admit — is not a legal store-path
+        // name, so `baseNameOf url` fails the build of an already-pinned package on every launch.
+        assert!(
+            expr.contains("name = \"demo-app-download\";"),
+            "the fetch must name the store path rather than derive it from the URL:\n{expr}"
+        );
         // unpack-only, no build script (safe host-side); the Electron lib set is present. The
         // extraction pipes the data tarball through a non-root `tar` so a setuid file (Chromium's
         // `chrome-sandbox`) does not abort the unpack in the unprivileged nix builder.
@@ -1188,19 +1293,23 @@ mod tests {
 Package: demo-app
 Version: 1.18286.2
 Filename: pool/main/d/demo-app/demo-app_1.18286.2_amd64.deb
+SHA256: 1111111111111111111111111111111111111111111111111111111111111111
 
 Package: demo-app
 Version: 1.21459.0
 Filename: pool/main/d/demo-app/demo-app_1.21459.0_amd64.deb
+SHA256: 2222222222222222222222222222222222222222222222222222222222222222
 
 Package: demo-app
 Version: 1.17377.0
 Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
+SHA256: 3333333333333333333333333333333333333333333333333333333333333333
 ";
 
     #[test]
     fn select_latest_apt_deb_picks_the_highest_version_not_the_last_line() {
-        let (version, filename) = select_latest_apt_deb(APT_INDEX).expect("resolves");
+        let selected = select_latest_apt_deb(APT_INDEX).expect("resolves");
+        let (version, filename) = (selected.version, selected.filename);
         // 1.21459.0 > 1.18286.2 numerically (a lexical/`sort`-style compare would pick 1.18286.2);
         // and it is not the last stanza, so file order is not what won.
         assert_eq!(version, "1.21459.0");
@@ -1210,13 +1319,54 @@ Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
         );
     }
 
+    /// The digest travels with the stanza it belongs to. The signed chain runs signature -> index
+    /// -> `.deb`, and it is only a chain if the last link is checked: without the `SHA256:` the
+    /// index publishes for the file it names, the pin records whatever the pool served at fetch
+    /// time — a different origin from the signed `dists/` tree — and certifies itself.
+    #[test]
+    fn select_latest_apt_deb_carries_the_winners_own_sha256() {
+        let selected = select_latest_apt_deb(APT_INDEX).expect("resolves");
+        assert_eq!(selected.version, "1.21459.0");
+        assert_eq!(selected.sha256.as_deref(), Some(&"2".repeat(64)[..]));
+
+        // An index that publishes no digest yields none rather than another stanza's: the caller
+        // warns instead of enforcing something the repository never said.
+        let bare = "Package: p\nVersion: 1.0.0\nFilename: pool/p.deb\n";
+        assert_eq!(select_latest_apt_deb(bare).expect("resolves").sha256, None);
+    }
+
+    /// The comparison the last link is made of. Both sides have to be the same encoding of the same
+    /// thirty-two bytes: the index publishes hex, the prefetch answers in SRI base64, and a
+    /// malformed field is a refusal rather than a check that is quietly skipped.
+    #[test]
+    fn an_artefact_is_held_to_the_digest_the_signed_index_publishes() {
+        // sha256 of the empty input, in both encodings.
+        const HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        const SRI: &str = "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
+        assert_eq!(prebuilt::sri_from_sha256_hex(HEX).as_deref(), Some(SRI));
+        assert!(artefact_matches_index("https://e/a.deb", HEX, SRI).is_ok());
+
+        let err = artefact_matches_index("https://e/a.deb", HEX, "sha256-AAAA")
+            .expect_err("bytes that are not the attested ones are refused")
+            .to_string();
+        assert!(
+            err.contains("is not the one the repository's signed index attests"),
+            "{err}"
+        );
+
+        let err = artefact_matches_index("https://e/a.deb", "not-a-digest", SRI)
+            .expect_err("a malformed digest is refused, never skipped")
+            .to_string();
+        assert!(err.contains("malformed `SHA256:`"), "{err}");
+    }
+
     #[test]
     fn select_latest_apt_deb_is_crlf_safe() {
         // The same index served with CRLF line endings must parse into the same stanzas and pick the
         // same newest version — grouping on `lines()` (not `split("\n\n")`) makes it CRLF-safe. A
         // `\n\n`-based parser would collapse this to one block and return the LAST stanza (1.17377.0).
         let crlf = APT_INDEX.replace('\n', "\r\n");
-        let (version, _) = select_latest_apt_deb(&crlf).expect("resolves");
+        let version = select_latest_apt_deb(&crlf).expect("resolves").version;
         assert_eq!(version, "1.21459.0");
     }
 
@@ -1250,13 +1400,22 @@ Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
         let data = TmpDir::new();
         let layout = Layout::under(data.path());
         const INDEX: &str = "https://downloads.claude.ai/claude-desktop/apt/stable/dists/stable/main/binary-amd64/Packages";
-        let url = match resolve_apt_deb_url(&nix, &layout, INDEX, true, false) {
-            Ok(u) => u,
+        let (url, attested) = match resolve_apt_deb_url(&nix, &layout, INDEX, true, false) {
+            Ok(selected) => selected,
             Err(e) => {
                 skip_unreachable!("skipping deb:apt live resolve (network/nix): {e}");
                 return;
             }
         };
+        // A real vendor index publishes a `SHA256:` for the `.deb` it names, and this repository's
+        // `InRelease` is what pins the signing key: the live chain therefore has a digest to hold
+        // the artefact to, and it is the shape the prefetch compares against.
+        if let Some(hash) = &attested {
+            assert!(
+                prebuilt::sri_from_sha256_hex(hash).is_some(),
+                "the index's SHA256 must be a usable digest: {hash}"
+            );
+        }
         // The derived URL passed the same charset validation a hand-written `deb:` URL does, and
         // names the claude-desktop pool.
         assert!(
@@ -1334,7 +1493,9 @@ Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
         write_pinned_key(&pin, include_str!("openpgp/key.asc")).expect("the pin is written");
         let err = match resolve_apt_deb_url(&nix, &layout, INDEX, true, false) {
             Err(e) => e.to_string(),
-            Ok(url) => panic!("a repository whose pinned key no longer signs it resolved to {url}"),
+            Ok((url, _)) => {
+                panic!("a repository whose pinned key no longer signs it resolved to {url}")
+            }
         };
         // Refused at the signature, which is the enforcement: this is the whole value of pinning,
         // and a resolve that merely warned here would leave the TOFU open at every upgrade.
@@ -1344,7 +1505,7 @@ Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
         // index failing under another name.
         std::fs::remove_file(&pin).expect("the pin is removed");
         match resolve_apt_deb_url(&nix, &layout, INDEX, true, false) {
-            Ok(url) => assert!(url.ends_with("_amd64.deb"), "{url}"),
+            Ok((url, _)) => assert!(url.ends_with("_amd64.deb"), "{url}"),
             Err(e) => skip_unreachable!("skipping deb:apt pin enforcement (network/nix): {e}"),
         }
     }

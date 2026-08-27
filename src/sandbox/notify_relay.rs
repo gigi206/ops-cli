@@ -8,8 +8,9 @@
 //! on a host path) and to the real host session bus, **owns `org.freedesktop.Notifications` on the
 //! private bus**, and forwards every call to the host daemon — re-emitting the host's `ActionInvoked`
 //! and `NotificationClosed` signals back onto the private bus so click-to-focus and notification
-//! actions work end to end. The notification id the host returns is passed through verbatim, so a
-//! signal carrying that id routes back to the right notification with no remapping.
+//! actions work end to end (for this cage's own notifications; see below). The notification id the
+//! host returns is passed through verbatim, so a signal carrying that id routes back to the right
+//! notification with no remapping.
 //!
 //! What that forwarding costs is stated here rather than justified away. This section used to argue
 //! that the relay adds no capability beyond what the filtered host bus already grants, but under
@@ -17,11 +18,19 @@
 //! route to the host daemon and everything the relay forwards is capability it would otherwise not
 //! have. What it forwards is the notifications interface alone (no keyring, no portal, no other host
 //! service). The residual accepted is notification **spoofing**: the cage picks the app name, icon
-//! and text of a toast the user reads as the desktop's. Notification **hijacking** is not accepted —
-//! `Notify`'s `replaces_id` and `CloseNotification` are checked against the ids the host daemon
-//! actually returned for this cage's own calls ([`OwnedIds`]), so the cage cannot overwrite or
+//! and text of a toast the user reads as the desktop's, within the bounds the relay puts on how much
+//! of each it may write ([`SUMMARY_MAX`] and its neighbours). Notification **hijacking** is not
+//! accepted — `Notify`'s `replaces_id` and `CloseNotification` are checked against the ids the host
+//! daemon actually returned for this cage's own calls ([`OwnedIds`]), so the cage cannot overwrite or
 //! dismiss a notification it never raised, sbx's own refusal toasts ([`super::notify_sink`])
 //! included.
+//!
+//! The host→cage direction is checked against the same set. `ActionInvoked` and `NotificationClosed`
+//! are broadcasts: per the notifications spec they carry no destination, so the host daemon delivers
+//! them for *every* notification it serves, not only this relay's. Re-emitting them all would give
+//! the cage a live feed of the user's interaction with unrelated desktop applications (which app
+//! notified, when, which action was clicked) and enumerate the host-wide id counter, so the pump
+//! emits only the signals whose id this relay itself raised.
 //!
 //! Lifecycle: [`NotifyRelay::start`] spawns a dedicated thread that drives the async work with
 //! `async_io::block_on` (the pure-Rust async-io backend — no tokio, and the runtime never leaves this
@@ -89,6 +98,54 @@ pub(crate) trait HostNotifications {
     fn notification_closed(&self, id: u32, reason: u32) -> zbus::Result<()>;
 }
 
+/// The largest cage-authored `Notify` field the relay forwards, in bytes; longer is truncated. The
+/// cage writes every field of a `Notify`, and the host daemon (plus, on daemons that journal
+/// notifications, the journal) allocates and lays out whatever it is handed, in a process the cage's
+/// own cgroup limits do not cover. Nothing a user reads off a toast needs a megabyte, so these sit
+/// far above what any daemon displays and far below what hurts one.
+///
+/// What is bounded is what *leaves* the relay. The message is already deserialised host-side by the
+/// time a method body runs, so this is not a bound on the relay's own transient allocation: a ceiling
+/// on what the cage can put on the wire at all belongs to the private bus's own message limits, not
+/// here. Nor is there a rate limit: the cage may still notify as fast as the host daemon accepts.
+const APP_NAME_MAX: usize = 256;
+/// The largest `app_icon` forwarded (an icon name or a path). See [`APP_NAME_MAX`].
+const APP_ICON_MAX: usize = 512;
+/// The largest `summary` (the toast's title line) forwarded. See [`APP_NAME_MAX`].
+const SUMMARY_MAX: usize = 1024;
+/// The largest `body` forwarded. See [`APP_NAME_MAX`].
+const BODY_MAX: usize = 16 * 1024;
+/// The most `actions` entries forwarded. The list is flat `(key, label)` pairs, so the cap is even:
+/// truncating to an odd length would hand the daemon a key with no label. See [`APP_NAME_MAX`].
+const ACTIONS_MAX: usize = 32;
+/// The largest single `actions` entry (one key or one label) forwarded. See [`APP_NAME_MAX`].
+const ACTION_MAX: usize = 256;
+/// The most `hints` entries forwarded. Hints are optional by spec, so an entry over any of the hint
+/// caps is dropped rather than truncated; which entries survive is decided by sorted key so the same
+/// call is bounded the same way twice. See [`APP_NAME_MAX`].
+const HINTS_MAX: usize = 32;
+/// The largest hint key forwarded; a longer-keyed hint is dropped. See [`APP_NAME_MAX`].
+const HINT_KEY_MAX: usize = 128;
+/// The largest hint value forwarded, as a string's byte length or a container's element count; a
+/// larger one is dropped. Only the value itself is measured, not values nested inside a structure,
+/// so this bounds the hint shapes the spec defines (`image-path`, `sound-file`, `image-data`'s
+/// pixel array) rather than every value D-Bus can express. See [`APP_NAME_MAX`].
+const HINT_VALUE_MAX: usize = 4 * 1024 * 1024;
+
+/// Truncate `s` to at most `max` bytes, cutting on a char boundary (a D-Bus string is UTF-8 and must
+/// stay valid UTF-8 to serialise).
+fn clamp(mut s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s
+}
+
 /// One `Notify` as it leaves the relay: the caged app's arguments, with `replaces_id` already
 /// settled by the guard in [`Served::notify`] rather than as the cage spelled it.
 struct NotifyCall {
@@ -100,6 +157,47 @@ struct NotifyCall {
     actions: Vec<String>,
     hints: HashMap<String, OwnedValue>,
     expire_timeout: i32,
+}
+
+impl NotifyCall {
+    /// Apply the forwarding caps ([`APP_NAME_MAX`] and its neighbours) to one cage-authored call.
+    /// Text fields are truncated (the app still gets its notification, just not an unbounded one);
+    /// hints, being optional by spec, are dropped when they exceed a cap.
+    fn bounded(mut self) -> NotifyCall {
+        self.app_name = clamp(self.app_name, APP_NAME_MAX);
+        self.app_icon = clamp(self.app_icon, APP_ICON_MAX);
+        self.summary = clamp(self.summary, SUMMARY_MAX);
+        self.body = clamp(self.body, BODY_MAX);
+        self.actions.truncate(ACTIONS_MAX);
+        self.actions = self
+            .actions
+            .into_iter()
+            .map(|a| clamp(a, ACTION_MAX))
+            .collect();
+        self.hints
+            .retain(|k, v| k.len() <= HINT_KEY_MAX && hint_value_is_bounded(v));
+        if self.hints.len() > HINTS_MAX {
+            let mut keys: Vec<String> = self.hints.keys().cloned().collect();
+            keys.sort();
+            for key in keys.into_iter().skip(HINTS_MAX) {
+                self.hints.remove(&key);
+            }
+        }
+        self
+    }
+}
+
+/// Whether one hint value is within [`HINT_VALUE_MAX`]: a string by its byte length, a container by
+/// its element count. Any other value is a fixed-size scalar and is always within the cap.
+fn hint_value_is_bounded(v: &OwnedValue) -> bool {
+    use zbus::zvariant::Value;
+    match &**v {
+        Value::Str(s) => s.len() <= HINT_VALUE_MAX,
+        Value::ObjectPath(p) => p.len() <= HINT_VALUE_MAX,
+        Value::Array(a) => a.len() <= HINT_VALUE_MAX,
+        Value::Dict(d) => d.iter().count() <= HINT_VALUE_MAX,
+        _ => true,
+    }
 }
 
 /// Where the relay forwards to: the host notifications daemon.
@@ -182,10 +280,12 @@ impl OwnedIds {
         locked(&self.0).insert(id);
     }
 
-    /// Forget an id the host reported closed. Keeps the set to the cage's *live* notifications, so a
-    /// long-running app does not accumulate ids for the whole launch.
-    fn forget(&self, id: u32) {
-        locked(&self.0).remove(&id);
+    /// Forget an id the host reported closed, answering whether it *was* one of this cage's own.
+    /// Keeps the set to the cage's *live* notifications, so a long-running app does not accumulate
+    /// ids for the whole launch; the answer is what decides whether the closure is re-emitted into
+    /// the cage, and it has to be read before the id is dropped.
+    fn forget(&self, id: u32) -> bool {
+        id != 0 && locked(&self.0).remove(&id)
     }
 
     /// Whether `id` is one of this cage's own live notifications. `0` is never owned — in the
@@ -228,16 +328,19 @@ impl Served {
         };
         let id = self
             .host
-            .notify(NotifyCall {
-                app_name,
-                replaces_id,
-                app_icon,
-                summary,
-                body,
-                actions,
-                hints,
-                expire_timeout,
-            })
+            .notify(
+                NotifyCall {
+                    app_name,
+                    replaces_id,
+                    app_icon,
+                    summary,
+                    body,
+                    actions,
+                    hints,
+                    expire_timeout,
+                }
+                .bounded(),
+            )
             .await
             .map_err(|e| fdo::Error::Failed(format!("forward Notify: {e}")))?;
         self.ours.record(id);
@@ -367,11 +470,15 @@ async fn run(
             _ = shutdown.recv().fuse() => break,
             sig = actions.next().fuse() => match sig {
                 Some(sig) => if let Ok(a) = sig.args() {
-                    // Verbatim id → the app matches the signal to its own notification.
+                    // Verbatim id → the app matches the signal to its own notification. Only its
+                    // own: the host daemon broadcasts this for every notification it serves, and
+                    // another application's is not the cage's to see.
                     let (id, key) = (a.id, a.action_key.to_string());
-                    let _ = private_conn
-                        .emit_signal(None::<&str>, OBJECT, IFACE, "ActionInvoked", &(id, key.as_str()))
-                        .await;
+                    if ours.owns(id) {
+                        let _ = private_conn
+                            .emit_signal(None::<&str>, OBJECT, IFACE, "ActionInvoked", &(id, key.as_str()))
+                            .await;
+                    }
                 },
                 None => break,
             },
@@ -380,11 +487,14 @@ async fn run(
                     let (id, reason) = (a.id, a.reason);
                     // Whoever raised it, this id now names nothing: drop it so the set stays the
                     // cage's live notifications, and an id the host later recycles for another app's
-                    // notification is not still claimed as the cage's.
-                    ours.forget(id);
-                    let _ = private_conn
-                        .emit_signal(None::<&str>, OBJECT, IFACE, "NotificationClosed", &(id, reason))
-                        .await;
+                    // notification is not still claimed as the cage's. Whether it *was* the cage's
+                    // is also what decides the re-emission — this too is a broadcast, so the cage
+                    // would otherwise watch every host notification's lifecycle.
+                    if ours.forget(id) {
+                        let _ = private_conn
+                            .emit_signal(None::<&str>, OBJECT, IFACE, "NotificationClosed", &(id, reason))
+                            .await;
+                    }
                 },
                 None => break,
             },
@@ -406,15 +516,22 @@ mod tests {
     /// cage asked for. No session bus, so the whole cage-facing path runs on any machine.
     #[derive(Clone, Default)]
     struct FakeHost {
-        /// The `replaces_id` of every forwarded `Notify`, in order.
-        replaced: Arc<Mutex<Vec<u32>>>,
+        /// Every forwarded `Notify`, as it left the relay, in order.
+        calls: Arc<Mutex<Vec<NotifyCall>>>,
         /// The id of every forwarded `CloseNotification`, in order.
         closed: Arc<Mutex<Vec<u32>>>,
     }
 
     impl FakeHost {
+        /// The `replaces_id` of every forwarded `Notify`, in order.
         fn replaced(&self) -> Vec<u32> {
-            locked(&self.replaced).clone()
+            locked(&self.calls).iter().map(|c| c.replaces_id).collect()
+        }
+
+        /// Read the `index`-th forwarded call under the lock: a [`NotifyCall`] is not `Clone`, so
+        /// it is inspected in place rather than handed out.
+        fn with_call<R>(&self, index: usize, f: impl FnOnce(&NotifyCall) -> R) -> R {
+            f(&locked(&self.calls)[index])
         }
 
         fn closed(&self) -> Vec<u32> {
@@ -424,10 +541,10 @@ mod tests {
 
     impl HostBus for FakeHost {
         fn notify(&self, call: NotifyCall) -> BoxFuture<'_, zbus::Result<u32>> {
-            let mut replaced = locked(&self.replaced);
-            replaced.push(call.replaces_id);
-            let id = FIRST_ID + replaced.len() as u32 - 1;
-            drop(replaced);
+            let mut calls = locked(&self.calls);
+            calls.push(call);
+            let id = FIRST_ID + calls.len() as u32 - 1;
+            drop(calls);
             Box::pin(std::future::ready(Ok(id)))
         }
 
@@ -540,7 +657,104 @@ mod tests {
         );
 
         // Once the host reports it closed the id names nothing, and may be recycled for someone else.
-        ours.forget(7);
+        assert!(ours.forget(7), "the closed id was the cage's own");
         assert!(!ours.owns(7), "a closed id is no longer the cage's");
+    }
+
+    #[test]
+    fn only_signals_for_the_cages_own_notifications_cross_back_into_it() {
+        // `ActionInvoked`/`NotificationClosed` are broadcasts: the host daemon delivers them for
+        // every notification it serves. The pump re-emits a signal onto the private bus only when
+        // its id is one this relay raised, so the cage does not watch the user's interaction with
+        // unrelated desktop applications. `forget` answers that question for the closed case, and
+        // has to answer it while dropping the id (afterwards nothing remembers whose it was).
+        let ours = OwnedIds::default();
+        ours.record(FIRST_ID);
+
+        // A host notification the cage never raised: neither its action nor its closure crosses.
+        assert!(!ours.owns(4711), "a foreign action is not re-emitted");
+        assert!(!ours.forget(4711), "a foreign closure is not re-emitted");
+
+        // The cage's own still does, exactly once — the closure both re-emits and drops the id.
+        assert!(ours.owns(FIRST_ID), "the cage's own action is re-emitted");
+        assert!(
+            ours.forget(FIRST_ID),
+            "the cage's own closure is re-emitted"
+        );
+        assert!(
+            !ours.forget(FIRST_ID),
+            "a second closure for the same id names nothing this relay raised"
+        );
+    }
+
+    #[test]
+    fn notify_bounds_every_cage_written_field_before_it_reaches_the_host_daemon() {
+        // Every field of a `Notify` is written by the cage, and the host daemon (plus the journal,
+        // on daemons that log notifications) allocates and lays out whatever it is handed, in a
+        // process the cage's own cgroup limits do not cover. Forwarding a body, an actions list or
+        // a hints map of arbitrary size makes the caged app a lever on the user's desktop session.
+        use zbus::zvariant::Value;
+        let host = FakeHost::default();
+        let served = served(&host);
+
+        let value = |v: &str| {
+            OwnedValue::try_from(Value::from(v.to_string())).expect("a string is an owned value")
+        };
+        let mut hints: HashMap<String, OwnedValue> = (0..HINTS_MAX + 8)
+            .map(|i| (format!("hint-{i:03}"), value("v")))
+            .collect();
+        hints.insert("k".repeat(HINT_KEY_MAX + 1), value("v"));
+        hints.insert("huge".to_string(), value(&"v".repeat(HINT_VALUE_MAX + 1)));
+
+        async_io::block_on(
+            served.notify(
+                "n".repeat(APP_NAME_MAX + 10),
+                0,
+                "i".repeat(APP_ICON_MAX + 10),
+                "summary".to_string(),
+                // A 3-byte char, so the cap does not fall on a char boundary: the cut must still leave
+                // valid UTF-8 (a `String` that is not would not survive the round-trip at all).
+                "\u{20ac}".repeat(BODY_MAX),
+                (0..ACTIONS_MAX + 4)
+                    .map(|_| "a".repeat(ACTION_MAX + 10))
+                    .collect(),
+                hints,
+                -1,
+            ),
+        )
+        .expect("the recording host accepts every call forwarded to it");
+
+        host.with_call(0, |call| {
+            assert_eq!(call.app_name.len(), APP_NAME_MAX);
+            assert_eq!(call.app_icon.len(), APP_ICON_MAX);
+            assert_eq!(
+                call.summary, "summary",
+                "a field within its cap is forwarded unchanged"
+            );
+            assert!(
+                call.body.len() <= BODY_MAX && call.body.len() > BODY_MAX - 3,
+                "the body is cut to the cap, on the char boundary below it: {}",
+                call.body.len()
+            );
+            assert_eq!(call.actions.len(), ACTIONS_MAX);
+            assert!(
+                call.actions.iter().all(|a| a.len() == ACTION_MAX),
+                "each action label is capped too, not just their number"
+            );
+            assert_eq!(
+                call.hints.len(),
+                HINTS_MAX,
+                "an over-long key and an over-large value are dropped, then the map is cut to \
+                 the cap by sorted key"
+            );
+            assert!(
+                call.hints.contains_key("hint-000") && !call.hints.contains_key("hint-039"),
+                "which hints survive is decided by sorted key, so it is the same twice"
+            );
+            assert!(
+                !call.hints.contains_key("huge"),
+                "a hint value over the cap is dropped (hints are optional by spec)"
+            );
+        });
     }
 }

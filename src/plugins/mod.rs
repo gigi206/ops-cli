@@ -534,13 +534,25 @@ impl PluginRegistry {
         // `sign = "foo"` says they are two plugins. Reaching this takes placing directories by hand
         // — an install refuses a name already installed — but the registry describes it rather than
         // handing each namespace a different plugin under one name.
-        let shared: Vec<String> = brokers
+        //
+        // A name *already* recorded as ambiguous counts as a claim on it, which is why the set
+        // below is not merely the two live indexes intersected: `claim` removes a key from its
+        // index as soon as a second claimant of that type appears, so a broker name held by two
+        // brokers is live in neither index, and a live signer of that name would keep answering to
+        // a name every surface reports as disabled. More ambiguity must not mean less fail-closed.
+        let ambiguous: std::collections::BTreeSet<String> = brokers
             .keys()
-            .filter(|name| signers.contains_key(*name))
+            .chain(signers.keys())
+            .filter(|name| {
+                name_conflicts.contains_key(*name)
+                    || (brokers.contains_key(*name) && signers.contains_key(*name))
+            })
             .cloned()
             .collect();
-        for name in shared {
-            let mut claimants = Vec::new();
+        for name in ambiguous {
+            // The claimants already recorded are kept: the remedy has to name every plugin that
+            // has to be dealt with, not just the ones this pass unseated.
+            let mut claimants = name_conflicts.remove(&name).unwrap_or_default();
             if let Some(plugin) = brokers.remove(&name) {
                 claimants.push(plugin.dir_name().to_string());
             }
@@ -734,6 +746,15 @@ pub(crate) struct StoreClaim<'a> {
     pub(crate) kind: PluginKind,
     /// The scheme the listing advertises, for a resolver. `None` for a broker.
     pub(crate) scheme: Option<&'a str>,
+    /// The content digest the signed catalogue pins for this plugin, as 64 lowercase hex
+    /// characters — the same string [`catalogue::verify_entry`] checks the store's checkout
+    /// against, carried in so the check can be repeated on the tree that is actually installed.
+    ///
+    /// Repeated rather than trusted from the caller's earlier pass: the checkout is not stable for
+    /// the duration of an install (a concurrent `store update` replaces the whole store directory
+    /// by rename), and the install re-reads that path twice more after the gate. The bytes the
+    /// staged copy holds are the ones that will run, so they are the ones the pin has to cover.
+    pub(crate) sha256: &'a str,
 }
 
 /// A validated plugin of any type. They are indexed differently (a resolver by the scheme it
@@ -1197,9 +1218,10 @@ pub(crate) fn install(layout: &crate::store::Layout, source: &Path) -> Result<In
 /// user-facing listing; the manifest is authoritative for the install. They must agree — the
 /// plugin must install under the name the catalogue advertised (`expected_name`) and claim the
 /// scheme it advertised (`expected_scheme`) — or the install is refused fail-closed, so a catalogue
-/// that misrepresents what it pins can never install something other than what was listed. The
-/// content itself was already pinned to the catalogue by the caller's
-/// [`crate::plugins::catalogue::verify_entry`]; this adds the identity half of that reconciliation. The
+/// that misrepresents what it pins can never install something other than what was listed. This
+/// adds the identity half of that reconciliation to the content half the caller's
+/// [`crate::plugins::catalogue::verify_entry`] ran over the store's checkout — and re-checks the
+/// content half itself, on the staged copy, since that is the tree that will actually run. The
 /// store checkout's file modes (umask-dependent after a `git` fetch) are canonicalized during the
 /// install, so the placed plugin's permissions are deterministic regardless of how it was fetched.
 pub(crate) fn install_from_store(
@@ -1425,6 +1447,32 @@ fn install_inner(
         let _ = std::fs::remove_dir_all(&stage);
         return Err(e);
     }
+    // The staged copy is the real artifact for the signed content pin too, and for the same reason
+    // the manifest is re-read below: what the caller hashed was the source, which the install then
+    // re-read twice (once to load it, once to copy it), and a store checkout can be replaced
+    // wholesale by a concurrent `sbx plugins store update` in between. Recomputing the digest here
+    // — after the modes are canonicalized, so the tree is in its final shape — is what makes the
+    // catalogue's `sha256` cover the bytes that are placed rather than the bytes that were listed.
+    if let Some(claim) = &expect {
+        let staged_digest = catalogue::dir_digest(&stage)
+            .map(|d| catalogue::to_hex(&d))
+            .map_err(|e| format!("the staged plugin could not be hashed: {e}"));
+        match staged_digest {
+            Ok(got) if got == claim.sha256 => {}
+            Ok(got) => {
+                let _ = std::fs::remove_dir_all(&stage);
+                return Err(format!(
+                    "the staged plugin does not match the content the store's catalogue pins \
+                     (expected {}, got {got}) — nothing was installed",
+                    claim.sha256
+                ));
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&stage);
+                return Err(e);
+            }
+        }
+    }
     // The staged copy is the real artifact: validate it, not just the source.
     let staged_ok = load_one(&stage, &exp)
         .map_err(|e| format!("the staged plugin failed validation: {e}"))
@@ -1554,6 +1602,10 @@ pub(crate) fn integrity(layout: &crate::store::Layout, dir_name: &str) -> Integr
 /// first (so `..`/`/` can never escape the plugins directory), and the target must actually look
 /// like a plugin (carry a `plugin.toml`) so a typo cannot delete an unrelated directory. The
 /// directory is renamed aside atomically — leaving the registry at once — then removed.
+///
+/// Everything the plugin kept *outside* that tree goes with it, since all of it is keyed by the
+/// name a later install can take again: the origin record, the out-links of any program provisioned
+/// for it, and the private state directory of a `state = true` grant.
 pub(crate) fn remove(layout: &crate::store::Layout, name: &str) -> Result<(), String> {
     validate_install_name(name)?;
     let dest = layout.plugins_dir().join(name);
@@ -1586,7 +1638,44 @@ pub(crate) fn remove(layout: &crate::store::Layout, name: &str) -> Result<(), St
     // the store, invisibly: nix's own root is indirect, so it stays valid exactly as long as the
     // link does, and nothing else would ever name the plugin it was built for.
     programs::forget(layout, name);
+    // And the private state directory of a `state = true` plugin, which is the third thing kept
+    // outside the tree. It is the one that holds a *credential* — the rotating refresh token the
+    // grant exists for — so leaving it behind both keeps a secret the user believed `rm` destroyed
+    // and hands it to the next plugin installed under this name, which is bound to the same
+    // directory by that name alone.
+    forget_state(layout, name);
     Ok(())
+}
+
+/// The private state directory a `state = true` plugin is given, keyed by the plugin's *directory*
+/// name — the same rule [`crate::sandbox::resolver::state_dir`] derives it by from the installed
+/// tree's own location, stated here because this is the module that places and removes that tree.
+fn state_dir(layout: &crate::store::Layout, dir_name: &str) -> PathBuf {
+    layout.data_dir().join("plugin-state").join(dir_name)
+}
+
+/// Drop a removed plugin's private state directory, best effort, the way [`origin::forget`] drops
+/// its provenance record: a removal that cannot complete is not a reason to fail a removal whose
+/// tree is already gone, but it is never skipped. Renamed aside first, so the directory leaves the
+/// name at once even if deleting its contents does not finish.
+fn forget_state(layout: &crate::store::Layout, dir_name: &str) {
+    let dir = state_dir(layout, dir_name);
+    if !dir.exists() {
+        return;
+    }
+    let trash = layout.data_dir().join(format!(
+        ".plugin-state-rm-{}-{}",
+        std::process::id(),
+        unique()
+    ));
+    match std::fs::rename(&dir, &trash) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(&trash);
+        }
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }
 
 /// Validate a plugin's on-disk identity: a single, safe directory component. It becomes a directory
@@ -1716,9 +1805,32 @@ pub(super) fn ensure_owner_only(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Write `bytes` to `path` owner-readable/writable only (`0600`), creating it fresh: the file
+/// counterpart of [`ensure_owner_only`], and one function for the same reason. Every file this
+/// tree writes outside a plugin's own directory is trust-bearing — a store's `store.toml` carries
+/// the pinned public key, an origin record carries a plugin's provenance — so the mode they are
+/// created with, and any later hardening of how they are created, has to be one decision rather
+/// than one per module.
+///
+/// `create_new` is part of the rule, not an implementation detail: the file must not already
+/// exist, so a write never lands in something another process (or a leftover from a previous run)
+/// put there first.
+pub(super) fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    f.write_all(bytes)
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
 /// A per-call-unique suffix for a staging/trash temp directory, so two installs (or an install and
 /// a removal) in one process never collide. A monotonic process-local counter — no clock or RNG.
-fn unique() -> u64 {
+pub(super) fn unique() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     SEQ.fetch_add(1, Ordering::Relaxed)
@@ -2042,6 +2154,39 @@ mod tests {
             .name_conflict("gpg-agent")
             .expect("the conflict is recorded");
         assert_eq!(claimants, ["as-broker", "as-signer"]);
+    }
+
+    /// The cross-type check runs against the names already recorded as ambiguous, not only against
+    /// the two live indexes. A name claimed twice within one type is live in neither index — `claim`
+    /// removed it — so intersecting the live indexes would find nothing and leave the other type's
+    /// single claimant answering to a name `sbx plugins list` reports as disabled, with a remedy
+    /// that does not name it.
+    #[test]
+    fn a_name_already_ambiguous_within_one_type_still_unseats_the_other_types_claimant() {
+        let root = crate::testutil::TmpDir::new();
+        // Discovery is `dirs.sort()`, so the signer is filed first and the two brokers collide
+        // after it: the order in which the more-ambiguous side appears must not decide the outcome.
+        write_plugin(
+            root.path(),
+            "a-signer",
+            &signer_manifest("").replace("aws-sigv4", "gpg-agent"),
+        );
+        write_plugin(root.path(), "m-broker", &broker_manifest(""));
+        write_plugin(root.path(), "z-broker", &broker_manifest(""));
+        let (reg, _) = load(root.path());
+        assert!(
+            reg.signer("gpg-agent").is_none(),
+            "a signer must not keep answering to a name reported as ambiguous"
+        );
+        assert!(reg.broker("gpg-agent").is_none());
+        let claimants = reg
+            .name_conflict("gpg-agent")
+            .expect("the conflict is recorded");
+        assert_eq!(
+            claimants,
+            ["a-signer", "m-broker", "z-broker"],
+            "the remedy has to name every plugin holding the name"
+        );
     }
 
     /// A signer with no `[signer]` table is not a signer, and the refusal says which table.
@@ -2741,13 +2886,21 @@ mod tests {
         assert!(p.check_exec().unwrap_err().contains("group or other"));
     }
 
-    /// The claim a store makes about a resolver, as its catalogue would carry it.
-    fn resolver_claim<'a>(name: &'a str, scheme: &'a str) -> StoreClaim<'a> {
+    /// The claim a store makes about a resolver, as its catalogue would carry it: the identity it
+    /// advertises and the content digest it pins.
+    fn resolver_claim<'a>(name: &'a str, scheme: &'a str, sha256: &'a str) -> StoreClaim<'a> {
         StoreClaim {
             name,
             kind: PluginKind::Resolver,
             scheme: Some(scheme),
+            sha256,
         }
+    }
+
+    /// The digest a catalogue would pin for a source tree — what a store's `sha256` holds when the
+    /// listing describes the tree the install is handed.
+    fn tree_sha256(dir: &Path) -> String {
+        catalogue::to_hex(&catalogue::dir_digest(dir).expect("hash the source tree"))
     }
 
     /// The provenance a store install carries, for the tests that exercise the store path. The
@@ -2966,7 +3119,7 @@ mod tests {
         install_from_store(
             &layout,
             &from_store,
-            resolver_claim("vault", "secret-store"),
+            resolver_claim("vault", "secret-store", &tree_sha256(&from_store)),
             store_origin(),
         )
         .expect("install from the store");
@@ -3071,13 +3224,55 @@ mod tests {
         let installed = install_from_store(
             &layout,
             &source,
-            resolver_claim("pass", "secret-store"),
+            resolver_claim("pass", "secret-store", &tree_sha256(&source)),
             store_origin(),
         )
         .expect("install");
         assert_eq!(installed.name, "pass");
         assert_eq!(installed.scheme.as_deref(), Some("secret-store"));
         assert!(layout.plugins_dir().join("pass").exists());
+    }
+
+    /// The signed `sha256` has to cover the tree that is installed, not only the checkout the
+    /// caller hashed: the install re-reads that path to load and to copy it, and a concurrent
+    /// `sbx plugins store update` swaps the whole store directory by rename in between. The claim
+    /// here carries a digest the staged copy does not reproduce, which is what that swap looks like
+    /// from inside the install.
+    #[test]
+    fn install_from_store_refuses_a_tree_that_does_not_reproduce_the_pinned_digest() {
+        let data = crate::testutil::TmpDir::new();
+        let src_root = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        let source = source_plugin(
+            src_root.path(),
+            "checkout",
+            "name=\"pass\"\ntype=\"resolver\"\nscheme=\"secret-store\"\nexec=\"resolve\"\n",
+            0o755,
+        );
+        // The identity the catalogue advertises still matches, so nothing but the content gate can
+        // refuse this.
+        let err = install_from_store(
+            &layout,
+            &source,
+            resolver_claim("pass", "secret-store", &"a".repeat(64)),
+            store_origin(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("does not match the content the store's catalogue pins"),
+            "{err}"
+        );
+        assert!(!layout.plugins_dir().join("pass").exists());
+
+        // And the same tree under its own digest installs, so the gate is the digest and not the
+        // presence of a claim.
+        install_from_store(
+            &layout,
+            &source,
+            resolver_claim("pass", "secret-store", &tree_sha256(&source)),
+            store_origin(),
+        )
+        .expect("the pinned tree installs");
     }
 
     #[test]
@@ -3095,7 +3290,7 @@ mod tests {
         let err = install_from_store(
             &layout,
             &source,
-            resolver_claim("other", "secret-store"),
+            resolver_claim("other", "secret-store", &tree_sha256(&source)),
             store_origin(),
         )
         .unwrap_err();
@@ -3119,7 +3314,7 @@ mod tests {
         let err = install_from_store(
             &layout,
             &source,
-            resolver_claim("pass", "vault"),
+            resolver_claim("pass", "vault", &tree_sha256(&source)),
             store_origin(),
         )
         .unwrap_err();
@@ -3218,6 +3413,7 @@ mod tests {
                 name: "gpg-agent",
                 kind: PluginKind::Broker,
                 scheme: None,
+                sha256: &tree_sha256(&source),
             },
             store_origin(),
         )
@@ -3240,7 +3436,7 @@ mod tests {
         let err = install_from_store(
             &layout,
             &source,
-            resolver_claim("gpg-agent", "gpg"),
+            resolver_claim("gpg-agent", "gpg", &tree_sha256(&source)),
             store_origin(),
         )
         .unwrap_err();
@@ -3321,7 +3517,7 @@ mod tests {
         install_from_store(
             &layout,
             &from_store,
-            resolver_claim("pass", "secret-store"),
+            resolver_claim("pass", "secret-store", &tree_sha256(&from_store)),
             store_origin(),
         )
         .expect("install");
@@ -3345,19 +3541,34 @@ mod tests {
         let layout = crate::store::Layout::under(data.path());
         let manifest = "name=\"kp\"\ntype=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n";
         let first = source_plugin(src_root.path(), "v1", manifest, 0o755);
-        install_from_store(&layout, &first, resolver_claim("kp", "kp"), store_origin())
-            .expect("install");
+        install_from_store(
+            &layout,
+            &first,
+            resolver_claim("kp", "kp", &tree_sha256(&first)),
+            store_origin(),
+        )
+        .expect("install");
         assert_eq!(integrity(&layout, "kp"), Integrity::Intact);
 
         // A second tree under the same name: a fresh install refuses it, a replacement is what the
         // upgrade verb needs.
         let second = source_plugin(src_root.path(), "v2", manifest, 0o755);
         fs::write(second.join("resolve"), "#!/bin/sh\necho newer\n").unwrap();
-        let err = install_from_store(&layout, &second, resolver_claim("kp", "kp"), store_origin())
-            .unwrap_err();
+        let err = install_from_store(
+            &layout,
+            &second,
+            resolver_claim("kp", "kp", &tree_sha256(&second)),
+            store_origin(),
+        )
+        .unwrap_err();
         assert!(err.contains("already installed"), "{err}");
-        replace_from_store(&layout, &second, resolver_claim("kp", "kp"), store_origin())
-            .expect("replace");
+        replace_from_store(
+            &layout,
+            &second,
+            resolver_claim("kp", "kp", &tree_sha256(&second)),
+            store_origin(),
+        )
+        .expect("replace");
 
         // The placed tree is the new one, and the record follows it — otherwise the next `verify`
         // would call a correctly-upgraded plugin modified.
@@ -3389,8 +3600,13 @@ mod tests {
             "name=\"kp\"\ntype=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n",
             0o755,
         );
-        install_from_store(&layout, &good, resolver_claim("kp", "kp"), store_origin())
-            .expect("install");
+        install_from_store(
+            &layout,
+            &good,
+            resolver_claim("kp", "kp", &tree_sha256(&good)),
+            store_origin(),
+        )
+        .expect("install");
 
         // A candidate whose manifest disagrees with the catalogue's advertised identity — the same
         // reconciliation an install runs, refused just as hard.
@@ -3400,8 +3616,13 @@ mod tests {
             "name=\"impostor\"\ntype=\"resolver\"\nscheme=\"kp\"\nexec=\"resolve\"\n",
             0o755,
         );
-        let err = replace_from_store(&layout, &bad, resolver_claim("kp", "kp"), store_origin())
-            .unwrap_err();
+        let err = replace_from_store(
+            &layout,
+            &bad,
+            resolver_claim("kp", "kp", &tree_sha256(&bad)),
+            store_origin(),
+        )
+        .unwrap_err();
         assert!(err.contains("refusing the mismatch"), "{err}");
 
         // Still installed, still the tree that was there, still matching its record.
@@ -3490,6 +3711,35 @@ mod tests {
         // The record lives outside the tree that was removed, so it has to be dropped explicitly —
         // otherwise a later local install of that name would inherit the stale provenance.
         assert_eq!(origin::read(&layout, "pass"), origin::Origin::Unknown);
+    }
+
+    /// The private directory a `state = true` grant gives a plugin lives outside the plugin's tree
+    /// and is keyed by the plugin's directory name, so a removal that left it behind would keep the
+    /// credential it holds on disk and hand it to whatever installs under that name next.
+    #[test]
+    fn removing_a_plugin_drops_its_private_state_directory() {
+        let data = crate::testutil::TmpDir::new();
+        let src_root = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        let source = source_plugin(
+            src_root.path(),
+            "oauth",
+            "name=\"oauth\"\ntype=\"resolver\"\nscheme=\"oauth\"\nexec=\"resolve\"\n\
+             [sandbox]\nstate = true\n",
+            0o755,
+        );
+        install(&layout, &source).expect("install");
+        // The runner creates this on the plugin's first launch; write the token the grant exists
+        // for directly, since the removal is what is under test.
+        let state = state_dir(&layout, "oauth");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(state.join("token"), "refresh-token").unwrap();
+
+        remove(&layout, "oauth").expect("remove");
+        assert!(
+            !state.exists(),
+            "the state directory (and the credential in it) must not outlive the plugin"
+        );
     }
 
     #[test]

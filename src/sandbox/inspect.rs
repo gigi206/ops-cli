@@ -11,8 +11,15 @@ use std::path::{Path, PathBuf};
 pub(crate) struct InstalledTool {
     /// The directory name mise gives the tool under `installs/` — the *munged* form of its declared
     /// token (see [`mise_munge`]), e.g. `aqua-example-demo-tool`. Sanitised on the way in, because
-    /// the cage writes this directory itself (see [`mise_installed_in`]).
+    /// the cage writes this directory itself (see [`mise_installed_in`]). Display and matching only:
+    /// a caller that needs the directory back joins [`InstalledTool::dir_name`], never this.
     pub(crate) name: String,
+    /// The install directory's name exactly as it is on disk, unsanitised — the only form that
+    /// names the directory the enumeration actually found. [`name`](Self::name) replaces control
+    /// bytes and invalid UTF-8, both of which are legal in a Linux filename and both of which the
+    /// same-uid cage can create under `installs/`, so joining the sanitised form back onto the
+    /// filesystem addresses a *different* path (or none). Never rendered.
+    pub(crate) dir_name: std::ffi::OsString,
     /// The real backend token mise recorded for this tool (`pipx:demo-agent`, `aqua:example/demo-tool`,
     /// …), read from its `.mise.backend.toml`. `None` when that metadata is absent. Preferred over
     /// the munged directory name for display *and* for an exact match against a declared token, and
@@ -100,7 +107,8 @@ pub(crate) fn mise_installed_in(installs: &Path) -> Vec<InstalledTool> {
         // it here, at the one place it enters the model, rather than at each renderer — the human
         // table and `--json` and anything added later then all get the filtered form, and a name
         // carrying `\r` or an ANSI escape cannot forge a line of `sbx app show`.
-        let name = crate::sandbox::sanitize(&entry.file_name().to_string_lossy());
+        let dir_name = entry.file_name();
+        let name = crate::sandbox::sanitize(&dir_name.to_string_lossy());
         let token = backend_token(&entry.path());
         let mut versions: Vec<String> = match std::fs::read_dir(entry.path()) {
             Ok(vs) => vs
@@ -113,6 +121,7 @@ pub(crate) fn mise_installed_in(installs: &Path) -> Vec<InstalledTool> {
         versions.sort();
         tools.push(InstalledTool {
             name,
+            dir_name,
             token,
             versions,
         });
@@ -121,12 +130,35 @@ pub(crate) fn mise_installed_in(installs: &Path) -> Vec<InstalledTool> {
     tools
 }
 
+/// The largest `.mise.backend.toml` this reads. The real file is a two-line flat table; the cage
+/// chooses what sits at that path, so the read is bounded rather than trusting its length.
+const BACKEND_TOML_MAX: u64 = 64 * 1024;
+
 /// The real backend token mise recorded for the tool installed at `tool_dir` — the `short` (or
 /// `full`) key of its `.mise.backend.toml` (`short = "pipx:demo-agent"`). This recovers the
 /// provider the munged directory name hides. Parsed line-wise (the file is a tiny flat table), so no
 /// TOML dependency. `None` when the metadata is absent or unparsable.
+///
+/// The path is under the cage's own read-write home, so the payload chooses not only the file's
+/// text but what the name resolves to. The open is therefore `O_NOFOLLOW` (a symlink planted there
+/// is refused rather than followed to a host path that is deliberately absent from the cage),
+/// `O_NONBLOCK` (a FIFO opens instead of hanging this read forever), and only a regular file is
+/// read at all — a device node reached through either is rejected by the `is_file` check before a
+/// byte is taken. The read itself is bounded by [`BACKEND_TOML_MAX`], so no path this points at can
+/// grow the host's allocation without limit.
 fn backend_token(tool_dir: &Path) -> Option<String> {
-    let body = std::fs::read_to_string(tool_dir.join(".mise.backend.toml")).ok()?;
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(tool_dir.join(".mise.backend.toml"))
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut body = String::new();
+    file.take(BACKEND_TOML_MAX).read_to_string(&mut body).ok()?;
     let value = |key: &str| {
         body.lines().find_map(|line| {
             let rest = line.trim().strip_prefix(key)?.trim_start();
@@ -326,7 +358,9 @@ const FLAKE_ROOTS_REL_LEGACY: &str = ".local/state/ops/flake";
 /// [`binds::FLAKE_ROOTS_REL`](super::binds::FLAKE_ROOTS_REL) — the same constant the launch writes to, so the read side cannot drift
 /// from the write side — with the pre-rename [`FLAKE_ROOTS_REL_LEGACY`] as a fallback for a home built
 /// before the rename. Returns the out-link target's store-path label (e.g. `demo-agent-0.18.2`, the
-/// basename minus the store hash) for display, or `None` when no out-link exists. Read-only.
+/// basename minus the store hash) for display — filtered through [`crate::sandbox::sanitize`] like
+/// every other value this module reads out of the cage-writable home — or `None` when no out-link
+/// exists. Read-only.
 pub(crate) fn flake_built(home: &Path, name: &str) -> Option<String> {
     [super::binds::FLAKE_ROOTS_REL, FLAKE_ROOTS_REL_LEGACY]
         .into_iter()
@@ -344,10 +378,15 @@ fn flake_built_in(dir: &Path, name: &str) -> Option<String> {
             continue;
         }
         // The out-link target's basename, minus the store hash, is a friendly `<pname>-<version>`.
+        // The cage writes this out-link itself, and a symlink target is arbitrary bytes, so the
+        // label is filtered at this entry point for the same reason `mise_installed_in` and
+        // `backend_token` filter theirs: `sbx app show` prints it, and a `\r` or an ANSI escape in
+        // it would forge a line of sbx's own report.
         let detail = std::fs::read_link(entry.path())
             .ok()
             .and_then(|t| t.file_name().map(|f| f.to_string_lossy().into_owned()))
             .and_then(|base| base.split_once('-').map(|(_, rest)| rest.to_string()))
+            .map(|detail| crate::sandbox::sanitize(&detail))
             .unwrap_or_else(|| "built".to_string());
         return Some(detail);
     }
@@ -476,12 +515,14 @@ mod tests {
     fn concrete_versions_drops_the_latest_alias_but_keeps_it_when_alone() {
         let with_concrete = InstalledTool {
             name: "t".into(),
+            dir_name: "t".into(),
             token: None,
             versions: vec!["latest".into(), "2.1.209".into()],
         };
         assert_eq!(concrete_versions(&with_concrete), vec!["2.1.209"]);
         let alias_only = InstalledTool {
             name: "t".into(),
+            dir_name: "t".into(),
             token: None,
             versions: vec!["latest".into()],
         };
@@ -563,6 +604,80 @@ mod tests {
             bare.is("bare-tool"),
             "pairing with a declared token survives"
         );
+    }
+
+    /// The sanitised name is a *display* string, so it must never be the one a caller joins back
+    /// onto the filesystem: a control byte is legal in a Linux filename and the same-uid cage can
+    /// put one in an install directory's name, after which `installs/<sanitised>` addresses a
+    /// different path (or none) than the directory that was enumerated. `dir_name` carries the
+    /// bytes that were actually read, so `sbx app prune` deletes the install it decided on.
+    #[test]
+    fn an_installed_tools_dir_name_is_the_raw_one_the_sanitised_name_cannot_reopen() {
+        let dir = crate::testutil::TmpDir::new();
+        let tmp = dir.path();
+        let installs = tmp.join(".local/share/mise/installs");
+        // A tab in the real name, and a decoy whose name is what sanitising the real one yields.
+        std::fs::create_dir_all(installs.join("npm-evil\ttool/1.0")).unwrap();
+        std::fs::create_dir_all(installs.join("npm-evil tool")).unwrap();
+
+        let tools = mise_installed(tmp);
+        let evil = tools
+            .iter()
+            .find(|t| t.name == "npm-evil tool" && !t.versions.is_empty())
+            .expect("the tab-named install is enumerated");
+        assert_eq!(
+            evil.dir_name,
+            std::ffi::OsString::from("npm-evil\ttool"),
+            "the raw directory name is carried beside the display name"
+        );
+        assert!(
+            installs.join(&evil.dir_name).join("1.0").is_dir(),
+            "joining the raw name reopens the enumerated directory"
+        );
+        assert!(
+            !installs.join(&evil.name).join("1.0").is_dir(),
+            "joining the sanitised name reaches the decoy instead"
+        );
+    }
+
+    /// `.mise.backend.toml` sits in the cage's own read-write home, so the payload chooses what
+    /// that name resolves to as well as what it says. A symlink there must not be followed to a
+    /// host path the cage cannot otherwise reach (`/dev/zero` reads until sbx is OOM-killed, and a
+    /// host file's `short = "…"` line would be printed by `sbx app show`), and a FIFO must not hang
+    /// the read forever.
+    #[test]
+    fn backend_token_refuses_a_metadata_path_the_cage_redirected() {
+        let dir = crate::testutil::TmpDir::new();
+        let tmp = dir.path();
+        let installs = tmp.join(".local/share/mise/installs");
+        let host_secret = tmp.join("host-secret.toml");
+        std::fs::write(&host_secret, "short = \"leaked:host-value\"\n").unwrap();
+
+        // A symlink pointing out of the tool directory at a host file.
+        let linked = installs.join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(&host_secret, linked.join(".mise.backend.toml")).unwrap();
+        assert_eq!(
+            backend_token(&linked),
+            None,
+            "a symlinked metadata file is refused, not followed off the tool directory"
+        );
+
+        // A character device reached the same way: refused before a byte is read.
+        let device = installs.join("device");
+        std::fs::create_dir_all(&device).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", device.join(".mise.backend.toml")).unwrap();
+        assert_eq!(backend_token(&device), None, "a device node is not read");
+
+        // An ordinary file in place is still read, so the guard costs the real case nothing.
+        let real = installs.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(
+            real.join(".mise.backend.toml"),
+            "short = \"pipx:demo-agent\"\n",
+        )
+        .unwrap();
+        assert_eq!(backend_token(&real).as_deref(), Some("pipx:demo-agent"));
     }
 
     #[test]
@@ -741,6 +856,28 @@ mod tests {
         )
         .unwrap();
         assert!(flake_built(home, "other").is_some());
+    }
+
+    /// The out-link under `.local/state/sbx/flake/` is written by the in-cage build, so its target
+    /// is bytes the payload picks — and a symlink target may carry anything but `/` and NUL. The
+    /// label reaches a terminal through `sbx app show`, so a `\n` in it would forge an extra table
+    /// row and a `\r`/ANSI escape would overwrite a real one.
+    #[test]
+    fn flake_built_filters_a_label_the_cage_chose() {
+        let scratch = crate::testutil::TmpDir::new();
+        let home = scratch.path();
+        let flake = home.join(crate::sandbox::binds::FLAKE_ROOTS_REL);
+        std::fs::create_dir_all(&flake).unwrap();
+        std::os::unix::fs::symlink(
+            "/nix/store/aaaa-x\ndemo-app installed clean (no packages withheld)",
+            flake.join("demo-app"),
+        )
+        .unwrap();
+        assert_eq!(
+            flake_built(home, "demo-app"),
+            Some("x demo-app installed clean (no packages withheld)".to_string()),
+            "the label must arrive with its control bytes replaced"
+        );
     }
 
     #[test]

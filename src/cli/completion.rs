@@ -832,6 +832,7 @@ fn cursor_value_kind(path: &[&str], before: &[String]) -> Option<ValueKind> {
 /// `[=cell|cell]` list — or `None` when the flag takes no value. Postures the table
 /// spells symbolically get their real cell list here, mirroring the parser.
 fn flag_value_kind(flag: &str, path: &[&str]) -> Option<ValueKind> {
+    let path = grammar_page(path, flag);
     if let Some(cells) = flag_literals(path, flag) {
         return Some(ValueKind::Literal(cells));
     }
@@ -893,13 +894,39 @@ fn alternation_cells(tail: &str) -> Option<Vec<String>> {
         .then_some(cells)
 }
 
-/// Whether a documented flag takes a value at all, completable or not. The question
-/// [`flag_value_kind`] answers is narrower — *which* value — and a flag whose value sbx
+/// Whether a documented flag takes the **following word** as its value, completable or not. The
+/// question [`flag_value_kind`] answers is narrower — *which* value — and a flag whose value sbx
 /// cannot complete still consumes the word after it.
+///
+/// A fused optional value is not one: `--gpu[=true|false]` is read only inline (`take_flag_bool`
+/// removes the token and nothing else), so `sbx run --gpu <command>` leaves the command in place
+/// and the completion must leave the operand slot in place too. Offering the cells there answered
+/// the command position with `true`, which sbx would then have launched.
 fn flag_takes_value(flag: &str, path: &[&str]) -> bool {
-    help::options_of(path)
-        .iter()
-        .any(|(row, _)| flag_tail(row, flag).is_some())
+    let path = grammar_page(path, flag);
+    help::options_of(path).iter().any(|(row, _)| {
+        flag_tail(row, flag).is_some_and(|tail| !row.contains(&format!("{flag}{tail}")))
+    })
+}
+
+/// The page whose option rows carry `flag`'s value grammar: its own, except where a page documents
+/// a shared flag without repeating that grammar.
+///
+/// `sbx app run` is the one such page. It takes the whole one-shot override set `sbx run` takes —
+/// one parser, `take_override_flag`, serves both — but lists them for the reader in a single row
+/// (`--env / --net / … / --dbus`) that points at `sbx help run` for the prose and carries no
+/// metavariable. Read literally, none of those flags took a value here, so the word after `--net`
+/// was counted as an operand and consumed the page's only slot, `<name>`: the app registry went
+/// quiet on the one page where it is the whole point.
+fn grammar_page<'a>(path: &'a [&'a str], flag: &str) -> &'a [&'a str] {
+    if path == ["app", "run"]
+        && !help::options_of(path)
+            .iter()
+            .any(|(row, _)| flag_tail(row, flag).is_some())
+    {
+        return &["run"];
+    }
+    path
 }
 
 /// The value cell of a flag metavar — the shared vocabulary `--app <name>`,
@@ -939,8 +966,9 @@ fn flag_literals(path: &[&str], flag: &str) -> Option<Vec<String>> {
 }
 
 /// The value grammar tail of a flag in one option row: fused to the name
-/// (`--gpu[=true|false]`) or a following `<value>` token (`--app <name>`). An option row
-/// may pair a short and a long spelling; the one that matches decides.
+/// (`--gpu[=true|false]`) or a following value token — a `<value>` metavariable (`--app <name>`)
+/// or a bound one written in capitals (`--env KEY=VALUE`). An option row may pair a short and a
+/// long spelling; the one that matches decides.
 fn flag_tail<'a>(row: &'a str, flag: &str) -> Option<&'a str> {
     let toks: Vec<&str> = row.split_whitespace().collect();
     for (i, tok) in toks.iter().enumerate() {
@@ -960,7 +988,8 @@ fn flag_tail<'a>(row: &'a str, flag: &str) -> Option<&'a str> {
                 if next.starts_with('-') {
                     continue;
                 }
-                return (next.starts_with('<') || next.starts_with('[')).then_some(*next);
+                return (next.starts_with('<') || next.starts_with('[') || is_bound_metavar(next))
+                    .then_some(*next);
             }
             return None;
         }
@@ -968,6 +997,17 @@ fn flag_tail<'a>(row: &'a str, flag: &str) -> Option<&'a str> {
         return Some(rest);
     }
     None
+}
+
+/// A value written in capitals rather than in angle brackets: the `KEY=VALUE` of `--env` and of
+/// `--param`. It is a metavariable a reader recognizes on sight, and the flag before it takes the
+/// following word exactly as a `<value>` one does — so the completion must skip that word too,
+/// instead of counting it as the page's next operand.
+fn is_bound_metavar(tok: &str) -> bool {
+    tok.chars().any(|c| c.is_ascii_uppercase())
+        && tok
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c == '=' || c == '_')
 }
 
 // -----------------------------------------------------------------------------------
@@ -1329,9 +1369,10 @@ mod tests {
         // `--verdict <allow|deny|blocked|error>` on `net logs`.
         let verdict = names_at(&["net", "logs", "--verdict"], "");
         assert!(verdict.contains(&"blocked".to_string()));
-        // An inline `[=…]` list: `--gpu[=true|false]`.
-        let gpu = names_at(&["run", "--gpu"], "");
-        assert_eq!(gpu, ["false", "true"]);
+        // An inline `[=…]` list: `--gpu[=true|false]`. The cells answer the *fused* spelling,
+        // which is the only one that carries a value — see
+        // `an_optional_value_boolean_does_not_consume_the_word_after_it` for the other half.
+        assert_eq!(names_at(&["run"], "--gpu="), ["false", "true"]);
 
         // A flag that takes a file hands the word to the shell — including one whose
         // metavariable carries its own grammar, `--bind <path[:ro|:rw]>`.
@@ -1393,6 +1434,71 @@ mod tests {
                 "upgrade --app must complete app names ({spelling:?})"
             );
         }
+    }
+
+    /// An optional-value boolean is read only inline, so the word after it is not its value.
+    ///
+    /// `take_flag_bool` removes the flag token and nothing else, so `sbx run --gpu <command>`
+    /// leaves the command in place. Modelling the flag as consuming the next word offered
+    /// `false`/`true` in the command position, and accepting one produced `sbx run --gpu true` —
+    /// which launches `/bin/true` instead of the program the user was about to name.
+    #[test]
+    fn an_optional_value_boolean_does_not_consume_the_word_after_it() {
+        let words = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() };
+        for flag in ["--gpu", "--audio", "--dbus"] {
+            assert!(
+                !flag_takes_value(flag, &["run"]),
+                "{flag} is fused-value only, so it consumes no following word"
+            );
+            // The position after it is the command position, exactly as after any other switch.
+            assert_eq!(
+                cursor_value_kind(&["run"], &words(&[flag])),
+                cursor_value_kind(&["run"], &words(&["--detach"])),
+                "`sbx run {flag} <TAB>` must offer what any switch leaves: the command"
+            );
+            // On `app run` the same flags sit before the name, which stays the slot on offer.
+            assert_eq!(
+                cursor_value_kind(&["app", "run"], &words(&[flag])),
+                Some(ValueKind::Apps),
+                "{flag} swallowed the app name"
+            );
+        }
+        // The fused spelling still carries its cells: `--gpu=<TAB>` is the value position.
+        assert_eq!(names_at(&["run"], "--gpu="), ["false", "true"]);
+    }
+
+    /// The shared one-shot overrides of `app run` take their value grammar from the `run` page.
+    ///
+    /// One parser (`take_override_flag`) serves both pages, and the grammar is written out on
+    /// `run`; `app run` collapses the set into a single reader-facing row
+    /// (`--env / --net / … / --dbus`) that points at `sbx help run` and carries no metavariable.
+    /// Read literally, `--net deny` was two operands rather than a flag and its value, so `deny`
+    /// consumed the page's only slot — `<name>` — and no app was offered on the one page whose
+    /// whole point is the app registry.
+    #[test]
+    fn the_shared_overrides_of_app_run_take_their_grammar_from_the_run_page() {
+        let words = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() };
+        for typed in [
+            vec!["--net", "deny"],
+            vec!["--env", "FOO=1"],
+            vec!["--bind", "/x"],
+            vec!["--limit", "tasks_max=4"],
+            vec!["--package", "a=nix:b"],
+            vec!["--nixpkgs", "nixos-23.11"],
+            vec!["--gui", "none"],
+            vec!["--seccomp", "ptrace"],
+        ] {
+            assert_eq!(
+                cursor_value_kind(&["app", "run"], &words(&typed)),
+                Some(ValueKind::Apps),
+                "{typed:?} took the app-name slot"
+            );
+        }
+        // And the value position itself reads the cells `run` reads, rather than nothing.
+        assert_eq!(
+            cursor_value_kind(&["app", "run"], &words(&["--net"])),
+            cursor_value_kind(&["run"], &words(&["--net"])),
+        );
     }
 
     #[test]

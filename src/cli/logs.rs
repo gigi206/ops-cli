@@ -689,38 +689,17 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
     // reason a cursor can go `None` here rather than the loop returning.
     loop {
         std::thread::sleep(FOLLOW_INTERVAL);
-        let mut batch = Vec::new();
-        let mut evicted = 0;
-        for feed in &mut feeds {
-            let Some(cursor) = feed.cursor else { continue };
-            match (feed.read)(&feed.socket, Some(cursor)) {
-                Ok((rows, head, dropped)) => {
-                    batch.extend(rows);
-                    evicted += dropped;
-                    feed.cursor = head;
-                }
-                // Whoever stood the feed up unlinks its socket on drop, so a connect failure after a
-                // successful read is that feed ending, not a transient (a local UDS connect does not
-                // fail transiently).
-                Err(_) => feed.cursor = None,
-            }
-        }
-        if feeds.iter().all(|f| f.cursor.is_none()) {
-            if !json {
-                let mut out = std::io::stdout().lock();
-                let (dim, r) = (pal.dim, pal.reset);
-                let _ = writeln!(out, "  {dim}(session {} ended){r}", target.pid);
-            }
-            return ExitCode::SUCCESS;
-        }
+        let round = poll_round(&mut feeds);
+        let mut batch = round.rows;
         batch.sort_by_key(|r| r.at_epoch_ms);
         let mut out = std::io::stdout().lock();
         let wrote = (|| -> std::io::Result<()> {
-            if evicted > 0 && !json {
+            if round.evicted > 0 && !json {
                 let (dim, r) = (pal.dim, pal.reset);
                 writeln!(
                     out,
-                    "  {dim}({evicted} earlier event(s) evicted from a ring before this poll){r}"
+                    "  {dim}({} earlier event(s) evicted from a ring before this poll){r}",
+                    round.evicted
                 )?;
             }
             for row in &batch {
@@ -732,12 +711,104 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
         if wrote.is_err() {
             return ExitCode::SUCCESS;
         }
+        // Only now: the round that ends the session can carry rows, and returning on the verdict
+        // before the batch was written dropped them and told the reader the session had ended while
+        // its last events were in hand.
+        if round.all_ended {
+            if !json {
+                let mut out = std::io::stdout().lock();
+                let (dim, r) = (pal.dim, pal.reset);
+                let _ = writeln!(out, "  {dim}(session {} ended){r}", target.pid);
+            }
+            return ExitCode::SUCCESS;
+        }
+    }
+}
+
+/// What one `--follow` poll of every live feed collected.
+struct Round {
+    /// The events the feeds handed back, in the order the feeds were polled.
+    rows: Vec<Row>,
+    /// How many events a ring evicted before this read could reach them.
+    evicted: u64,
+    /// Every feed has ended, so this is the last round. Reported rather than acted on here,
+    /// because it is true of rounds that carry rows: a feed can hand back its final events and
+    /// drop its cursor in the same read (`read_task_rows` answers with rows and no head for a
+    /// plane that predates the append cursor), and those rows are the reader's before the view
+    /// says the session ended.
+    all_ended: bool,
+}
+
+/// Poll every live feed once, past its own cursor.
+///
+/// A feed whose cursor is `None` is gone and is not polled again. Whoever stood a feed up unlinks
+/// its socket on drop, so a connect failure after a successful read is that feed ending, not a
+/// transient (a local UDS connect does not fail transiently).
+fn poll_round(feeds: &mut [Feed]) -> Round {
+    let mut rows = Vec::new();
+    let mut evicted = 0;
+    for feed in feeds.iter_mut() {
+        let Some(cursor) = feed.cursor else { continue };
+        match (feed.read)(&feed.socket, Some(cursor)) {
+            Ok((batch, head, dropped)) => {
+                rows.extend(batch);
+                evicted += dropped;
+                feed.cursor = head;
+            }
+            Err(_) => feed.cursor = None,
+        }
+    }
+    Round {
+        rows,
+        evicted,
+        all_ended: feeds.iter().all(|f| f.cursor.is_none()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A feed's last read can carry rows and end the feed at once, so the round reports the end
+    /// instead of returning on it.
+    ///
+    /// `read_task_rows` answers with rows and no head for a plane that predates the append cursor,
+    /// so the poll assigns `cursor = None` for a feed that just handed back events. The follow loop
+    /// tested "have all feeds ended?" before it wrote the batch, so those events were dropped and
+    /// the reader was told "(session ended)" while the session was still running and its last
+    /// invocation had already been read.
+    #[test]
+    fn a_final_round_still_carries_the_rows_it_read() {
+        fn last_rows(
+            _socket: &Path,
+            _after: Option<u64>,
+        ) -> std::io::Result<(Vec<Row>, Option<u64>, u64)> {
+            Ok((
+                vec![Row {
+                    at_epoch_ms: 7,
+                    feed: "task",
+                    token: "exit=0".to_string(),
+                    subject: "build".to_string(),
+                }],
+                None,
+                0,
+            ))
+        }
+        let mut feeds = vec![Feed {
+            name: "task",
+            socket: PathBuf::from("/nonexistent"),
+            absent: "no declared operations",
+            read: last_rows,
+            cursor: Some(0),
+        }];
+        let round = poll_round(&mut feeds);
+        assert!(round.all_ended, "a feed with no cursor left is a feed gone");
+        assert_eq!(
+            round.rows.len(),
+            1,
+            "the rows read in the ending round are the reader's, not the loop's to discard"
+        );
+    }
 
     /// The vocabulary completion offers and the feeds this command actually reads are one list.
     /// Held together here because they cannot be one expression: a feed carries a socket path,

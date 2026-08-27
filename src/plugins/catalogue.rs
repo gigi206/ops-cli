@@ -288,10 +288,18 @@ pub(crate) fn verify_entry(entry: &CatalogueEntry, root: &Path) -> Result<(), St
 /// A `path` field from the catalogue: a non-empty, repo-relative location with no
 /// `..`, `.`, or absolute parts — so a fetched plugin can never be read from outside
 /// the cloned store.
+///
+/// The control-character guard runs first, and it is not a formality: a component made of ESC/CSI
+/// bytes is a perfectly good [`Component::Normal`], so the structural rules below would pass it,
+/// and the value is displayed verbatim (the refusal naming a `path` that is not in the checkout,
+/// `sbx plugins store list/info`) exactly as [`validate_free_text`]'s fields are. Held to one rule
+/// here so every field a catalogue can display is held to it, including the errors this function
+/// itself renders the path into.
 fn validate_repo_path(path: &str) -> Result<(), String> {
     if path.is_empty() {
         return Err("`path` is empty".to_string());
     }
+    validate_free_text("path", path)?;
     let p = Path::new(path);
     if p.is_absolute() {
         return Err(format!(
@@ -368,8 +376,8 @@ pub(crate) fn serialize_catalogue(cat: &Catalogue) -> Result<String, String> {
     Ok(out)
 }
 
-/// Refuse a control character in a catalogue free-text field (`version`/`description`), which is
-/// displayed verbatim. The serializer refuses them too, so this is symmetric: no legitimately-
+/// Refuse a control character in a catalogue field that is displayed verbatim (`version`,
+/// `description`, and the `path` [`validate_repo_path`] checks). The serializer refuses them too, so this is symmetric: no legitimately-
 /// published store carries one, and a malicious TOFU-pinned store cannot smuggle a terminal escape.
 fn validate_free_text(field: &str, s: &str) -> Result<(), String> {
     match s.chars().find(|c| c.is_control()) {
@@ -840,6 +848,19 @@ mod tests {
     fn a_path_escaping_the_repository_is_refused() {
         assert!(Catalogue::parse(one_entry("path", "../etc").as_bytes()).is_err());
         assert!(Catalogue::parse(one_entry("path", "/etc/passwd").as_bytes()).is_err());
+    }
+
+    /// A `path` is displayed verbatim too — the refusal for a directory missing from the checkout
+    /// prints it — so it is held to the same control-character rule as `version`/`description`. A
+    /// component of ESC/CSI bytes is a valid `Component::Normal`, so the structural rules pass it
+    /// and only this guard stops a TOFU-pinned store from writing an escape sequence to a terminal.
+    #[test]
+    fn a_control_character_in_a_path_is_refused() {
+        let err = Catalogue::parse(one_entry("path", "plugins/\\u001b]0;x").as_bytes())
+            .expect_err("an escape sequence in `path` is refused");
+        assert!(err.contains("control character"), "{err}");
+        // the same shape without the escape is a perfectly good path
+        assert!(Catalogue::parse(one_entry("path", "plugins/pass").as_bytes()).is_ok());
     }
 
     #[test]

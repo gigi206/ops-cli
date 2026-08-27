@@ -285,13 +285,21 @@ fn app_upgrade_names_the_project_wide_channels_and_rolls_nothing_itself() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "stdout:\n{stdout}");
     assert!(stdout.contains("sbx app upgrade — reader"), "{stdout}");
-    // Both channels named, each with the command that rolls it.
-    assert!(stdout.contains("`deb:`, `nix:`"), "{stdout}");
+    // Both channels named, each with the command that rolls it — and each with the scope that
+    // command actually has. The project's `deb:` lock is project-wide; the app's base channel is a
+    // lock of its own here (this project pins no `nixpkgs`), so the command that moves it names the
+    // app. Naming the bare `sbx upgrade nix` there would send the reader to a roll of every app in
+    // the project to advance the one they asked about.
     assert!(
-        stdout.contains("`sbx upgrade deb`, `sbx upgrade nix`"),
+        stdout.contains("`deb:` packages advance with the project"),
         "{stdout}"
     );
+    assert!(stdout.contains("`sbx upgrade deb`"), "{stdout}");
     assert!(stdout.contains("not with one app"), "{stdout}");
+    assert!(
+        stdout.contains("`sbx upgrade nix --app reader`"),
+        "{stdout}"
+    );
     // And nothing was rolled: neither in-cage roll prints its header.
     assert!(
         !stdout.contains("mise packages") && !stdout.contains("install steps"),
@@ -384,7 +392,7 @@ fn a_routing_answer_survives_an_unusable_data_directory() {
     );
     assert_eq!(out.status.code(), Some(0), "stdout:\n{stdout}\n{stderr}");
     assert!(
-        stdout.contains("`sbx upgrade nix`"),
+        stdout.contains("`sbx upgrade nix --app reader`"),
         "the answer must be whole without a store:\n{stdout}"
     );
 }

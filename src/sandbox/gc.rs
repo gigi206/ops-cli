@@ -437,14 +437,16 @@ pub(crate) fn human_bytes(bytes: u64) -> String {
 /// The outcome of a cross-project reap over the runtime trees under `<data>/projects/`.
 pub(crate) struct ReapReport {
     /// Trees whose project directory is gone (its parent still present, no live session holds it):
-    /// reclaimed when pruning, otherwise listed.
+    /// reclaimed when pruning, otherwise listed. When pruning, only the trees whose removal
+    /// **succeeded** appear, so the caller's "freed" total never counts bytes still on the disk.
     pub(crate) dead: Vec<DeadTree>,
     /// Trees with no marker — their project path predates marker-recording and is unknown, so
     /// deadness cannot be verified: listed for a manual decision, reclaimed only when the caller
     /// opts in with `--markerless` (the entries actually removed land in `reaped_unidentified`).
     pub(crate) unidentified: Vec<UnidentifiedTree>,
     /// Markerless trees reclaimed under the `--markerless` opt-in. Empty unless the caller passed
-    /// `prune_unidentified`; the trees in this list have already been removed.
+    /// `prune_unidentified`; every tree in this list has been removed, and one whose removal failed
+    /// is absent rather than reported as gone.
     pub(crate) reaped_unidentified: Vec<UnidentifiedTree>,
 }
 
@@ -478,6 +480,12 @@ pub(crate) struct UnidentifiedTree {
 /// The two switches are **independent**: `prune` reaps the dead (marker-identified, gone) trees and
 /// `prune_unidentified` reaps the markerless ones, so a caller can sweep either category alone or
 /// both. With neither set the call is a pure dry run — it computes the same sets and changes nothing.
+///
+/// A reap that is asked for and fails is not reported as one: the tree is left out of the report
+/// rather than named as reclaimed with bytes that are still on the disk. A dead tree is removed
+/// through [`remove_project_tree`], which unlinks its marker last, so a partial failure leaves the
+/// tree identifiable and the next sweep reaches the same verdict instead of demoting it to
+/// markerless.
 pub(crate) fn reap_dead_projects(
     projects_dir: &Path,
     live_ids: &BTreeSet<String>,
@@ -514,8 +522,12 @@ pub(crate) fn reap_dead_projects(
             // Identified, and the project is gone with its parent still present — reclaimable.
             Some(path) if project_is_gone(&path) => {
                 let bytes = tree_size(&dir);
-                if prune {
-                    let _ = force_remove_dir_all(&dir);
+                // Reported only when it actually went, for the reason [`prune_rev_dirs`] gives: a
+                // failed removal reported as one makes the caller announce bytes that are still on
+                // the disk. With `prune` off nothing was attempted and every candidate belongs in
+                // the list.
+                if prune && remove_project_tree(&dir).is_err() {
+                    continue;
                 }
                 dead.push(DeadTree { path, bytes });
             }
@@ -527,7 +539,11 @@ pub(crate) fn reap_dead_projects(
             None => {
                 let bytes = tree_size(&dir);
                 if prune_unidentified {
-                    let _ = force_remove_dir_all(&dir);
+                    // Same rule as the dead sweep above: a tree that could not be removed is not
+                    // reported as reclaimed, so `reaped_unidentified` names only what went.
+                    if force_remove_dir_all(&dir).is_err() {
+                        continue;
+                    }
                     reaped_unidentified.push(UnidentifiedTree { bytes, dir });
                 } else {
                     unidentified.push(UnidentifiedTree { bytes, dir });
@@ -540,6 +556,43 @@ pub(crate) fn reap_dead_projects(
         unidentified,
         reaped_unidentified,
     }
+}
+
+/// Remove a project runtime tree, unlinking its `project` marker **last**.
+///
+/// [`force_remove_dir_all`] walks in readdir order and propagates its first error, so a removal that
+/// fails part-way — a directory a leftover in-cage process is still writing into, an entry that
+/// cannot be unlinked — can take the marker and leave the rest. The marker is what names the project
+/// a tree belongs to, and [`reap_dead_projects`] reaps on deadness only for a tree that has one: a
+/// tree that loses it mid-removal is classified `Markerless` ever after, reclaimable only through
+/// the `--markerless` opt-in, whose whole point is that deadness cannot be proven. Removing it last
+/// means a partial failure leaves a tree the next sweep classifies exactly as this one did.
+///
+/// A symlink handed in is unlinked rather than walked, the same guarantee [`force_remove_dir_all`]
+/// makes about the root it is given: what the caller asked to remove is gone, and nothing outside
+/// was touched.
+fn remove_project_tree(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        return force_remove_dir_all(dir);
+    }
+    let marker = dir.join(super::projectstore::PROJECT_MARKER);
+    // The tree's own directory, forced writable first for the same reason the recursive walk does it.
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path == marker {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            force_remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    // Everything else is gone: the marker and the now-empty tree directory go together.
+    std::fs::remove_dir_all(dir)
 }
 
 /// The canonical project path recorded in `<dir>/project`, if the marker is present and holds an
@@ -587,7 +640,14 @@ pub(crate) fn is_safe_tree_id(id: &str) -> bool {
 /// needs no marker and no deadness check: it works on markerless trees too, and on trees a marker
 /// would call idle (the user named it, overriding the "keep" default). The only guard is the
 /// live-session one — a tree a running session holds is refused, the same guard [`reap_dead_projects`]
-/// applies. Destructive only when `prune`.
+/// applies. Destructive only when `prune`, and destructive through [`remove_project_tree`], so a
+/// removal that fails part-way leaves the tree's marker (and with it the tree's identity) behind.
+///
+/// Known gap, needing a wider change than this function can make: [`ReapOneOutcome`] has no variant
+/// for a removal that failed, so a partial removal is still answered `Tree` and the caller prints it
+/// as removed. Closing it means a `Failed` variant here and a new arm at the one call site
+/// (`super::projects::projects_rm`), which is why the bulk sweep — whose report is a list this
+/// function's is not — carries the rule and this does not.
 pub(crate) fn reap_one(
     projects_dir: &Path,
     id: &str,
@@ -611,7 +671,9 @@ pub(crate) fn reap_one(
     }
     let bytes = tree_size(&dir);
     if prune {
-        let _ = force_remove_dir_all(&dir);
+        // Marker last, as in the dead sweep: a removal that fails part-way must leave a tree the
+        // next `sbx projects` still identifies rather than a nameless orphan.
+        let _ = remove_project_tree(&dir);
     }
     ReapOneOutcome::Tree { dir, bytes }
 }
@@ -858,7 +920,8 @@ pub(crate) struct PrunedTool {
 /// undeclared and pruned: its install dir under `<home>/.local/share/mise/installs/` is deleted, and
 /// (so it does not re-equip at the next launch) its entry is dropped from the home's
 /// `<home>/.config/mise/config.toml` `[tools]`. With `apply = false` nothing is removed — the return
-/// is the preview of what would go. Read-only when previewing; a targeted cleanup when applying.
+/// is the preview of what would go; with `apply = true` it names what actually went, so a removal
+/// that failed is not counted as freed. Read-only when previewing; a targeted cleanup when applying.
 pub(crate) fn prune_app_tools(home: &Path, declared: &[&str], apply: bool) -> Vec<PrunedTool> {
     // Resolved and confined before anything is enumerated or removed. `home` is the cage's own
     // `$HOME` (a plain writable `Mount::Bind`), so `.local`, `.local/share`, `.local/share/mise` and
@@ -878,10 +941,21 @@ pub(crate) fn prune_app_tools(home: &Path, declared: &[&str], apply: bool) -> Ve
         if declared.iter().any(|d| tool.is(d)) {
             continue; // declared — keep it.
         }
-        let dir = installs.join(&tool.name);
+        // The *raw* directory name, never the sanitised display one: `InstalledTool::name` has had
+        // its control bytes and invalid UTF-8 replaced, and both are legal in a Linux filename that
+        // the same-uid cage can create here — so joining the display form would size and delete a
+        // different path than the one just judged undeclared, leaving the real install in place
+        // (and, where nothing sits at the sanitised path, leaving its `config.toml` entry too).
+        let dir = installs.join(&tool.dir_name);
         let bytes = tree_size(&dir);
+        // Reported only when it actually went, for the reason [`prune_rev_dirs`] gives: with
+        // `apply` off this is a plan and every candidate belongs in it; with `apply` on it is a
+        // report, and a removal that failed would announce freed bytes still on the disk.
         if apply {
-            removed_any |= force_remove_dir_all(&dir).is_ok();
+            if force_remove_dir_all(&dir).is_err() {
+                continue;
+            }
+            removed_any = true;
         }
         pruned.push(PrunedTool {
             token: tool.label().to_string(),
@@ -1405,6 +1479,119 @@ mod tests {
         assert!(
             !installs.join("drop-me").exists(),
             "the undeclared one goes"
+        );
+    }
+
+    /// The install directory this verb deletes must be the one it enumerated. `InstalledTool::name`
+    /// is a *display* string — every control byte replaced, invalid UTF-8 turned into U+FFFD — and
+    /// both are legal in a Linux filename the same-uid cage can create under `installs/`. Joining
+    /// that form addressed a different path: the undeclared install survived, its `config.toml`
+    /// entry survived with it (nothing was removed, so the config was never rewritten), and the
+    /// report named the tool as pruned.
+    #[test]
+    fn prune_deletes_the_install_directory_it_enumerated_not_its_display_name() {
+        let tmp = TmpDir::new();
+        let home = tmp.path().join("home");
+        let installs = home.join(".local/share/mise/installs");
+        // A literal TAB in the directory name; sanitising it yields `npm-evil tool`, which is a
+        // path that does not exist here.
+        let raw = "npm-evil\ttool";
+        std::fs::create_dir_all(installs.join(raw).join("1.0/bin")).unwrap();
+        std::fs::write(installs.join(raw).join("1.0/bin/payload"), b"xxxx").unwrap();
+        let config = home.join(".config/mise/config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "[tools]\n\"npm-evil\\ttool\" = \"1.0\"\n").unwrap();
+
+        // The app declares nothing, so the install is undeclared and must go.
+        let pruned = prune_app_tools(&home, &[], true);
+
+        assert_eq!(pruned.len(), 1, "the undeclared install is reported once");
+        assert!(
+            !installs.join(raw).exists(),
+            "the directory that was enumerated is the one removed"
+        );
+        assert!(
+            !std::fs::read_to_string(&config)
+                .unwrap()
+                .contains("npm-evil"),
+            "a real removal also strips the entry so the next launch does not re-equip it"
+        );
+    }
+
+    /// A tree that could not be removed must not be counted as reclaimed: the caller sums these
+    /// bytes into "freed up to N", so a failed removal reported as one announces disk that is still
+    /// occupied — the rule [`prune_rev_dirs`] already states for the revision directories.
+    #[test]
+    fn a_dead_tree_whose_removal_fails_is_not_reported_as_reclaimed() {
+        use std::os::unix::fs::PermissionsExt;
+        // The failure is a write-denied parent, which root is not subject to.
+        if unsafe { libc::geteuid() } == 0 {
+            skip_incapable!(
+                "skipping the failed-reap test: running as root, which unlinks from a directory                  whatever its mode, so the removal cannot be made to fail"
+            );
+            return;
+        }
+        let tmp = TmpDir::new();
+        let projects = tmp.path().join("projects");
+        let tree = projects.join("aaaaaaaaaaaaaaaa");
+        std::fs::create_dir_all(tree.join("store")).unwrap();
+        std::fs::write(tree.join("store/blob"), vec![b'x'; 4096]).unwrap();
+        // The recorded project is gone while its parent still exists — a reclaimable dead tree.
+        let gone = tmp.path().join("workspace/project");
+        std::fs::create_dir_all(gone.parent().unwrap()).unwrap();
+        std::fs::write(
+            tree.join(super::super::projectstore::PROJECT_MARKER),
+            gone.as_os_str().as_encoded_bytes(),
+        )
+        .unwrap();
+        // The tree can be entered and listed, but nothing can be unlinked *from* `projects/`, so
+        // the tree directory itself cannot go.
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let report = reap_dead_projects(&projects, &BTreeSet::new(), true, false);
+
+        // Restore write access before asserting, so the temp dir can be cleaned up either way.
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            report.dead.is_empty(),
+            "a tree that could not be removed must not be reported as reclaimed: {:?}",
+            report.dead.iter().map(|d| &d.path).collect::<Vec<_>>()
+        );
+        assert!(tree.is_dir(), "and it is indeed still on the disk");
+    }
+
+    /// The successful path of the same removal: a project tree goes whole, read-only store
+    /// directories included, and a symlink handed in is unlinked rather than walked (the guarantee
+    /// [`force_remove_dir_all`] makes about the root it is given, which this must not weaken).
+    #[test]
+    fn remove_project_tree_takes_the_whole_tree_and_never_follows_a_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TmpDir::new();
+        let tree = tmp.path().join("aaaaaaaaaaaaaaaa");
+        std::fs::create_dir_all(tree.join("store/nix/store/hash-pkg")).unwrap();
+        std::fs::write(tree.join("store/nix/store/hash-pkg/file"), b"x").unwrap();
+        std::fs::write(tree.join(super::super::projectstore::PROJECT_MARKER), b"/p").unwrap();
+        // The nix store leaves its path directories read-only, as they are on a real tree.
+        std::fs::set_permissions(
+            tree.join("store/nix/store/hash-pkg"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+
+        remove_project_tree(&tree).expect("a tree we own is removable");
+        assert!(!tree.exists(), "the whole tree goes, marker included");
+
+        // A symlink in the tree's place is unlinked; what it points at is untouched.
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.txt"), b"mine").unwrap();
+        let link = tmp.path().join("linked-tree");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        remove_project_tree(&link).expect("a symlink root is unlinked");
+        assert!(!link.exists(), "the link itself is gone");
+        assert!(
+            outside.join("keep.txt").exists(),
+            "the directory it pointed at was walked into"
         );
     }
 

@@ -53,6 +53,23 @@ pub(crate) fn reject_extra(path: &[&str], extra: &[OsString]) -> Result<(), Exit
     Err(ExitCode::from(2))
 }
 
+/// Refuse an inline `=value` on a switch that carries none, rather than dropping it.
+///
+/// A value-less flag is dispatched on [`crate::flag_name`], which strips everything from the first
+/// `=` — so `--detach=false` matches the `--detach` arm, turns the switch **on**, and discards the
+/// word the user wrote to turn it off. The neighbouring booleans of the same pages do take that
+/// spelling (`--gpu[=true|false]`), so writing it on a switch is a natural mistake and the one thing
+/// that must not happen silently. Returns the usage exit code when `raw` carries a suffix, `None`
+/// when it is the bare switch and the caller's arm may run.
+pub(crate) fn reject_inline_value(raw: &str, path: &[&str]) -> Option<ExitCode> {
+    if !raw.contains('=') {
+        return None;
+    }
+    diag::error(&format!("sbx: {} takes no value", crate::flag_name(raw)));
+    eprintln!("sbx: usage: {}", crate::help::synopsis_of(path));
+    Some(ExitCode::from(2))
+}
+
 /// What parsing a `<verb> <name> [switch]` command line yielded: show the verb's page, run with the
 /// name and the switch's state, or report a usage error. `Error` carries the message already
 /// formatted, and a hint only where the verb offers one, so the caller reports without deciding
@@ -433,10 +450,16 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
             while let Some(raw) = cmd.first().and_then(|a| a.to_str()) {
                 match crate::flag_name(raw) {
                     "--detach" => {
+                        if let Some(code) = reject_inline_value(raw, &["run"]) {
+                            return code;
+                        }
                         detach = true;
                         cmd.remove(0);
                     }
                     "--observe" => {
+                        if let Some(code) = reject_inline_value(raw, &["run"]) {
+                            return code;
+                        }
                         observe = true;
                         cmd.remove(0);
                     }
@@ -476,10 +499,7 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         "ssh-agent" => sshagent::ssh_agent_cmd(rest),
         "proc" => proc::proc_cmd(rest),
         "fs" => fs::fs_cmd(rest),
-        "logs" | "log" => match crate::help::maybe_help("logs", &rest) {
-            Some(code) => code,
-            None => logs::run_merged(&rest),
-        },
+        "logs" | "log" => logs::run_merged(&rest),
         "task" | "tasks" => task::task_cmd(rest),
         "secret" | "secrets" => secret::secret_cmd(rest),
         "plugins" => plugins::plugins_cmd(rest),
@@ -502,6 +522,23 @@ mod tests {
         let mut names = vec!["demo-tool", "demo-app", "demo-tool", "demo-app", "demo-svc"];
         dedupe_names(&mut names);
         assert_eq!(names, vec!["demo-tool", "demo-app", "demo-svc"]);
+    }
+
+    /// The switches of `sbx run`/`sbx app run` carry no value, and one written inline is refused
+    /// rather than dropped.
+    ///
+    /// Both dispatch on `flag_name`, which strips everything from the first `=`: `--detach=false`
+    /// matched the `--detach` arm, set the flag, and discarded the word meant to clear it, so a
+    /// launch asked for in the foreground ran detached with nothing said about it.
+    #[test]
+    fn a_switch_refuses_a_value_written_inline() {
+        assert!(super::reject_inline_value("--detach", &["run"]).is_none());
+        assert!(super::reject_inline_value("--observe", &["run"]).is_none());
+        assert!(super::reject_inline_value("--detach=false", &["run"]).is_some());
+        assert!(super::reject_inline_value("--observe=nonsense", &["run"]).is_some());
+        // A short spelling, and an empty value, are values all the same.
+        assert!(super::reject_inline_value("-g=false", &["app", "run"]).is_some());
+        assert!(super::reject_inline_value("--dry-run=", &["app", "run"]).is_some());
     }
 
     /// A `read` stand-in for [`super::fragment_beside`]: a file that always parses, declaring

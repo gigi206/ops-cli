@@ -107,6 +107,12 @@ const DATA_ENTRIES: &[Entry] = &[
         enumerate: Enumerate::None,
     },
     Entry {
+        label: "flake-inline/",
+        rel: "flake-inline",
+        desc: "staged inline `[flakes.<name>]` sources, one directory per source",
+        enumerate: Enumerate::None,
+    },
+    Entry {
         label: "fontconfig/",
         rel: "fontconfig",
         desc: "generated fontconfig for the Wayland hole",
@@ -691,6 +697,26 @@ mod tests {
                 "`{rel}/` is a directory sbx binds under and the overview does not list it"
             );
         }
+    }
+
+    /// The other half of the same claim, for a directory no launch *binds* under: an inline
+    /// `[flakes.<name>]` block is staged to `<data>/flake-inline/<content-hash>/`, one directory per
+    /// source ever staged, and the overview never mentioned it — so a user auditing sbx's footprint
+    /// could not learn it existed, and `sbx store` (which enumerates the data directory and labels
+    /// what it finds through [`data_entry_purpose`]) reported it with no description.
+    ///
+    /// Pinned by name rather than by asking the module that owns it: `sandbox::flake_inline` is
+    /// private to the sandbox module, so its staging path is not reachable from here.
+    #[test]
+    fn the_inline_flake_staging_area_is_listed_and_described() {
+        assert!(
+            DATA_ENTRIES.iter().any(|e| e.rel == "flake-inline"),
+            "`flake-inline/` is a directory sbx stages into and the overview does not list it"
+        );
+        assert!(
+            data_entry_purpose("flake-inline").is_some(),
+            "`sbx store` labels what it enumerates through this table"
+        );
     }
 
     /// One suffix is stripped, not every trailing one. An app may be named `x.toml`, whose profile

@@ -36,10 +36,12 @@ fn known_target(s: &str) -> Option<&'static str> {
     TARGETS.iter().copied().find(|&t| t == s)
 }
 
-/// The targets `--app <name>` narrows. Both are the in-cage rolls, the ones whose unit of work is
-/// already one app's own cage; every other target rewrites a project-wide lock host-side and has no
-/// per-app unit to select, so naming one there is a usage error rather than a flag that reads as
-/// "only this app" while rolling the project.
+/// The targets `--app <name>` narrows. Two are the in-cage rolls (`provision`, `mise`), whose unit
+/// of work is already one app's own cage; `nix` is the third, because an app resolves the base
+/// channel against a lock of its own whenever the project pins no `nixpkgs` (under a pin it
+/// inherits the project's revision, and `sbx upgrade nix --app` refuses). Every other target
+/// rewrites a project-wide lock host-side and has no per-app unit to select, so naming one there is
+/// a usage error rather than a flag that reads as "only this app" while rolling the project.
 const APP_SCOPED_TARGETS: &[&str] = &["provision", "mise", "nix"];
 
 /// The outcome of parsing `sbx upgrade`'s arguments: show help, run with a resolved target, an
@@ -457,9 +459,19 @@ fn app_selector_refusal(cfg: &config::Resolved, name: &str, what: &str) -> Optio
 /// roll's own filter) is what decides, not the backend alone. The withheld ones are surfaced by
 /// the roll's own warning either way.
 fn declares_mise_package(cfg: &config::Resolved, app: &config::ResolvedApp) -> bool {
+    !sandbox::mise_packages(&merged_for(cfg, app).packages).is_empty()
+}
+
+/// The config an app's cage is built from: the project baseline with the app folded in.
+///
+/// One expression for the fold, because every question about "what does this app equip" has to ask
+/// it the same way. A package folds by *name* (`Resolved::merge_app` upserts, it does not append),
+/// so walking the two layers side by side counts a baseline entry the app has replaced — a channel
+/// the cage never equips, and a trust verdict that belongs to a package this app does not carry.
+fn merged_for(cfg: &config::Resolved, app: &config::ResolvedApp) -> config::Resolved {
     let mut merged = cfg.clone();
     merged.merge_app(app.clone());
-    !sandbox::mise_packages(&merged.packages).is_empty()
+    merged
 }
 
 /// What advances one declared package, seen from a single app.
@@ -469,11 +481,13 @@ fn declares_mise_package(cfg: &config::Resolved, app: &config::ResolvedApp) -> b
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Advance {
     /// Rolled inside the app's own cage. The unit of work is already one app, so a per-app verb
-    /// runs it — the same two targets `APP_SCOPED_TARGETS` lets `--app` narrow.
+    /// runs it — the two in-cage rolls of `APP_SCOPED_TARGETS`, `provision` and `mise`.
     PerApp,
-    /// Rewritten in a project-wide lock, host-side. Named by the per-app verb, never rolled by it:
-    /// there is no per-app unit to select, so rolling it here would make a command that reads as
-    /// "only this app" advance every app in the project.
+    /// Rewritten in a lock outside the app's cage. Named by the per-app verb, never rolled by it.
+    /// For most channels that lock belongs to the project, so rolling it here would make a command
+    /// that reads as "only this app" advance every app in it; `nix` is the exception the note
+    /// spells out, since an unpinned project gives each app its own base-channel lock
+    /// ([`app_scoped_channel`]).
     ProjectWide(&'static str),
     /// Neither. An inline `[flakes.<name>]` pins its inputs inside its own source and rebuilds when
     /// that source changes, so no channel advances it — and `sbx upgrade flake` deliberately skips
@@ -517,6 +531,12 @@ struct AppUpgradePlan {
     /// The channels that advance with the project rather than with this app — named with the
     /// command that rolls them, never rolled here. Sorted and deduplicated.
     project_wide: Vec<&'static str>,
+    /// The channels that do have a per-app unit here, and are still not rolled by this verb: the
+    /// base channel, whose lock is the app's own when the project pins no `nixpkgs`. Named with
+    /// the command that narrows to this app (`--app <name>`), since sending the reader to the
+    /// project-wide spelling would roll every app to answer a question about one. Sorted and
+    /// deduplicated.
+    app_scoped: Vec<&'static str>,
     /// The app declares an inline flake, which no channel advances.
     floating: bool,
     /// Packages an untrusted layer declared, so the cage does not equip them.
@@ -532,32 +552,54 @@ struct AppUpgradePlan {
 /// Pure over the resolved config — no nix, no sandbox — so the dispatch table is unit-tested the
 /// way [`closing_note`] is. Two rules differ on purpose:
 ///
-/// * `mise` asks [`declares_mise_package`], which counts only what the cage *equips*, because it
-///   gates a roll that would otherwise print "nothing rolled".
+/// * `mise` counts only what the cage *equips*, because it gates a roll that would otherwise print
+///   "nothing rolled" — the question [`declares_mise_package`] answers for the channel verbs.
 /// * `project_wide` counts every declared package whatever its trust, because it gates no work at
 ///   all — it answers "where does a package like this advance?", and that answer does not change
 ///   when a layer is untrusted. The withheld count says the rest.
+///
+/// Both walk the **merged** view ([`merged_for`]), which is the set the cage equips: the baseline's
+/// packages and the app's own, folded by name.
 fn plan_app_upgrade(cfg: &config::Resolved, app: &config::ResolvedApp) -> AppUpgradePlan {
+    let merged = merged_for(cfg, app);
     let mut plan = AppUpgradePlan {
-        mise: declares_mise_package(cfg, app),
+        mise: !sandbox::mise_packages(&merged.packages).is_empty(),
         provision: !app.provisions.is_empty(),
         ..AppUpgradePlan::default()
     };
-    // Both layers: an app's cage equips the project baseline's packages as well as its own, so a
-    // baseline `deb:` is as much a part of "how does this app advance" as one the app declares.
-    for pkg in cfg.packages.iter().chain(app.packages.iter()) {
+    // Both layers, as the cage equips them: an app's cage carries the project baseline's packages
+    // as well as its own, so a baseline `deb:` is as much a part of "how does this app advance" as
+    // one the app declares — unless the app re-declared that name, in which case only its own
+    // backend is there to advance.
+    for pkg in &merged.packages {
         if pkg.state != trust::TrustState::Trusted {
             plan.withheld += 1;
         }
         match advance_of(&pkg.backend) {
             Advance::PerApp => {}
+            Advance::ProjectWide(channel) if app_scoped_channel(channel, cfg) => {
+                plan.app_scoped.push(channel)
+            }
             Advance::ProjectWide(channel) => plan.project_wide.push(channel),
             Advance::Floating => plan.floating = true,
         }
     }
     plan.project_wide.sort_unstable();
     plan.project_wide.dedup();
+    plan.app_scoped.sort_unstable();
+    plan.app_scoped.dedup();
     plan
+}
+
+/// Whether a channel that rewrites a project-wide lock can nonetheless be narrowed to this app.
+///
+/// `nix` is the one target where that is true, and it is why `APP_SCOPED_TARGETS` carries it: with
+/// no trusted project `nixpkgs` pin an app resolves the base channel against a lock of its own
+/// (`sandbox::effective_lock_target`), which `sbx upgrade nix --app <name>` rewrites and a plain
+/// `sbx upgrade nix` leaves alone. Under a pin the app inherits the project's revision and that
+/// command refuses, so there the channel really is project-wide.
+fn app_scoped_channel(channel: &str, cfg: &config::Resolved) -> bool {
+    channel == "nix" && cfg.nixpkgs_project.is_none()
 }
 
 /// What the verb owes the reader beyond the rolls it just ran: where the rest of this app's
@@ -589,6 +631,31 @@ fn app_upgrade_notes(name: &str, plan: &AppUpgradePlan, pal: &style::Palette) ->
             &format!(
                 "  {dim}{backends} packages advance with the project, not with one app: \
                  {commands}.{r}"
+            ),
+            pal,
+        ));
+    }
+    // A channel with a per-app unit: named with the flag that narrows it, because the bare command
+    // would roll the project to advance one app. `sbx help app upgrade` explains why this verb does
+    // not run it: re-resolving the base channel rebuilds the userland, a download it does not take
+    // on unasked.
+    if !plan.app_scoped.is_empty() {
+        let backends = plan
+            .app_scoped
+            .iter()
+            .map(|c| format!("`{c}:`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let commands = plan
+            .app_scoped
+            .iter()
+            .map(|c| format!("`sbx upgrade {c} --app {name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        notes.push(style::prose(
+            &format!(
+                "  {dim}{backends} packages advance with this app's own lock, and this verb does \
+                 not roll them: {commands}.{r}"
             ),
             pal,
         ));
@@ -1893,11 +1960,22 @@ mod tests {
                 mise: true,
                 provision: true,
                 // Sorted and deduplicated, and `mise` is absent — it is rolled, not named.
-                project_wide: vec!["deb", "nix"],
+                project_wide: vec!["deb"],
+                // This project pins no `nixpkgs`, so the app's base channel is its own lock and the
+                // command that moves it names the app.
+                app_scoped: vec!["nix"],
                 floating: false,
                 withheld: 0,
             }
         );
+
+        // The same declarations under a project pin: the app inherits the pinned revision, there is
+        // no app-only one to roll, and the base channel is project-wide again.
+        let mut pinned = cfg.clone();
+        pinned.nixpkgs_project = Some("nixos-24.05".to_string());
+        let plan = plan_app_upgrade(&pinned, &pinned.apps["demo"]);
+        assert_eq!(plan.project_wide, vec!["deb", "nix"]);
+        assert!(plan.app_scoped.is_empty());
 
         // The routing-only shape: no `mise:` package and no install step, so nothing runs in this
         // app's cage and the whole answer is where its packages advance instead. Sixteen of the
@@ -1914,7 +1992,63 @@ mod tests {
         );
         let plan = plan_app_upgrade(&routing, &routing.apps["reader"]);
         assert!(!plan.mise && !plan.provision);
-        assert_eq!(plan.project_wide, vec!["nix", "tarball"]);
+        assert_eq!(plan.project_wide, vec!["tarball"]);
+        assert_eq!(plan.app_scoped, vec!["nix"]);
+    }
+
+    /// A channel with a per-app lock is named with the flag that narrows it to this app.
+    ///
+    /// For an app whose base channel is its own lock, the verb used to print "`nix:` packages
+    /// advance with the project, not with one app: `sbx upgrade nix`" — sending the reader to a
+    /// command that rolls every app in the project, when `sbx upgrade nix --app <name>` moves the
+    /// one they asked about and is what `sbx help app upgrade` documents.
+    #[test]
+    fn a_channel_with_a_per_app_lock_is_named_with_the_flag_that_narrows_it() {
+        let plan = AppUpgradePlan {
+            app_scoped: vec!["nix"],
+            ..AppUpgradePlan::default()
+        };
+        let notes = app_upgrade_notes("demo", &plan, &style::Palette::plain()).join("\n");
+        assert!(notes.contains("`sbx upgrade nix --app demo`"), "{notes}");
+        assert!(
+            !notes.contains("not with one app"),
+            "the project-wide sentence is the wrong one here: {notes}"
+        );
+        assert!(
+            !notes.contains("nothing to advance"),
+            "something does advance this app: {notes}"
+        );
+    }
+
+    /// A package the app re-declares is one package, not two.
+    ///
+    /// Packages fold by *name* when the cage is built (`Resolved::merge_app` upserts), so the
+    /// baseline entry an app replaces is not equipped at all. Walking the two layers unmerged named
+    /// the replaced backend's channel — sending the reader to `sbx upgrade deb` for a package this
+    /// app's cage never carries — and counted its trust verdict, warning that a package was
+    /// withheld when the app had already replaced it.
+    #[test]
+    fn a_package_the_app_redeclares_is_counted_once_under_the_backend_it_kept() {
+        let mut baseline = pkg("tool", config::Backend::Deb("https://x/y.deb".into()));
+        baseline.state = crate::trust::TrustState::Untrusted;
+        let cfg = crate::testutil::resolved(
+            vec![baseline],
+            vec![(
+                "demo",
+                crate::testutil::app_with(vec![pkg("tool", config::Backend::Nix("jq".into()))]),
+            )],
+        );
+        let plan = plan_app_upgrade(&cfg, &cfg.apps["demo"]);
+        assert!(
+            plan.project_wide.is_empty(),
+            "the replaced `deb:` is not equipped, so no channel of its own: {:?}",
+            plan.project_wide
+        );
+        assert_eq!(plan.app_scoped, vec!["nix"], "the backend the app kept");
+        assert_eq!(
+            plan.withheld, 0,
+            "the untrusted baseline entry was replaced by name, so nothing is withheld"
+        );
     }
 
     /// A package an untrusted layer declared is counted, not silently dropped.

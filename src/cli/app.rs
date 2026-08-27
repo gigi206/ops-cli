@@ -161,7 +161,9 @@ fn finish_net_learn(name: &str, synth: sandbox::Synthesis, nl: &NetLearn) -> Exi
 /// they carry no config trust — an untrusted project cannot inject them, and the `cmd` integrity
 /// gate (which blocks a config-supplied `cmd` override) is a separate, intact vector. A pure
 /// parser so the split and the head rules are unit-tested without launching a cage; the caller
-/// maps `Err(code)` to an exit.
+/// maps `Err(code)` to an exit. A switch written with an inline value (`--detach=false`) is a usage
+/// error for the same reason: the dispatch strips a `=value` suffix, so accepting it would set the
+/// flag and drop the value that was meant to clear it.
 ///
 /// A one-shot override (`--config <toml|@file>`/`--env KEY=VALUE`, repeatable) is read from the head
 /// too, in any order with the name and `--detach`; the collected values are returned for the caller
@@ -196,10 +198,16 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
         };
         match flag_name(&raw) {
             "--detach" => {
+                if let Some(code) = crate::cli::reject_inline_value(&raw, &["app", "run"]) {
+                    return Err(code);
+                }
                 detach = true;
                 head.remove(0);
             }
             "--observe" => {
+                if let Some(code) = crate::cli::reject_inline_value(&raw, &["app", "run"]) {
+                    return Err(code);
+                }
                 observe = true;
                 head.remove(0);
             }
@@ -220,15 +228,24 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
                 head.remove(0);
             }
             "--dry-run" => {
+                if let Some(code) = crate::cli::reject_inline_value(&raw, &["app", "run"]) {
+                    return Err(code);
+                }
                 dry_run = true;
                 head.remove(0);
             }
             "--global" | "-g" => {
+                if let Some(code) = crate::cli::reject_inline_value(&raw, &["app", "run"]) {
+                    return Err(code);
+                }
                 scope = Scope::Global;
                 scope_seen = true;
                 head.remove(0);
             }
             "--local" | "-l" => {
+                if let Some(code) = crate::cli::reject_inline_value(&raw, &["app", "run"]) {
+                    return Err(code);
+                }
                 scope = Scope::Local;
                 scope_seen = true;
                 head.remove(0);
@@ -2293,6 +2310,30 @@ mod tests {
         assert!(parse_app_launch(&v(&["--", "-c"])).is_err());
         assert!(parse_app_launch(&v(&["demo-app", "--config"])).is_err());
         assert!(parse_app_launch(&v(&["demo-app", "--net"])).is_err());
+    }
+
+    /// A switch that carries no value refuses one written inline, instead of turning itself on.
+    ///
+    /// The head is dispatched on `flag_name`, which strips everything from the first `=`, so
+    /// `--detach=false` used to match the `--detach` arm: the flag was set, the `false` was dropped
+    /// without a word, and a launch asked for in the foreground ran as a detached session. The
+    /// neighbouring booleans (`--gpu[=true|false]`) do take that spelling, so it is what a user
+    /// reaches for on the flags beside them.
+    #[test]
+    fn a_value_less_flag_refuses_an_inline_value_rather_than_turning_itself_on() {
+        let v = |xs: &[&str]| -> Vec<OsString> { xs.iter().map(OsString::from).collect() };
+        assert!(parse_app_launch(&v(&["demo-app", "--detach=false"])).is_err());
+        assert!(parse_app_launch(&v(&["demo-app", "--observe=false"])).is_err());
+        // The `--net-learn` switches, refused for the same reason. Written with the flag they
+        // qualify, so the refusal is this rule and not the "only with --net-learn" one.
+        assert!(parse_app_launch(&v(&["demo-app", "--net-learn", "--dry-run=false"])).is_err());
+        assert!(parse_app_launch(&v(&["demo-app", "--net-learn", "--global=false"])).is_err());
+        assert!(parse_app_launch(&v(&["demo-app", "--net-learn", "--local=false"])).is_err());
+        // The bare spellings still parse, so the guard reads the suffix and not the flag.
+        assert!(parse_app_launch(&v(&["demo-app", "--detach"])).is_ok());
+        let learn = parse_app_launch(&v(&["demo-app", "--net-learn", "--dry-run", "-g"])).unwrap();
+        let nl = learn.net_learn.expect("--net-learn was asked for");
+        assert!(nl.dry_run);
     }
 
     #[test]

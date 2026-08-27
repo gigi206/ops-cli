@@ -320,6 +320,19 @@ const SUN_PATH_MAX: usize = 107;
 ///                                            holding one socket per forwarded port
 /// A new feature whose host socket path is wider than this must widen the sample below, or a
 /// data directory the cap accepts would still overrun `sun_path` at that feature's first launch.
+///
+/// **The broker plane is the one path this does not bound.** `sandbox::broker` binds
+/// `/broker/<pid>/<name>.sock` — 21 bytes plus the length of the `[broker.<name>]` key — so it
+/// fits inside this reservation only for names up to 12 bytes, and a longer broker name in a
+/// trusted config can still fail its `bind` with `ENAMETOOLONG` at launch on a data directory this
+/// cap accepted. Widening the sample to that form is not the fix: the name is config-chosen and
+/// unbounded, so any sample is a guess, and every byte reserved here is a byte taken off
+/// [`DATA_DIR_MAX`] — which would refuse to run at all for an existing install whose derived data
+/// directory sits between the new cap and the old one, a worse failure than the one being
+/// prevented. The bound belongs where the name is validated (`config::broker_bindings`), refusing
+/// a `[broker.<name>]` key wider than this reservation leaves room for. Until it is there, this
+/// constant covers every fixed-shape socket path and not that one. (`config::resolve_brokers` is
+/// where such a name is turned into a binding, and where it would be refused.)
 const LONGEST_SOCKET_SUFFIX: usize = "/forward/fwd-1234567/p-65535.sock".len();
 
 /// The most a data directory may measure and still host those sockets.
@@ -354,7 +367,8 @@ fn check_data_dir_override(value: &OsStr) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Refuse a *resolved* data directory whose path is too long to host sbx's sockets.
+/// Refuse a *resolved* data directory that is relative, or whose path is too long to host sbx's
+/// sockets.
 ///
 /// [`check_data_dir_override`] guards only an explicit `$SBX_DATA_DIR`; a directory sbx
 /// *derives* — `$XDG_DATA_HOME/sbx` or `$HOME/.local/share/sbx` — is not handed in and so
@@ -365,6 +379,17 @@ fn check_data_dir_override(value: &OsStr) -> Result<PathBuf, String> {
 /// refused as a side effect of the very problem it solves. An override that reached here already
 /// passed the stricter check above, so it too passes without a second, differently-worded refusal.
 fn check_resolved_data_dir(dir: &Path) -> Result<(), String> {
+    // Absoluteness first, and here as well as at the derivation: this is the guard on the *final*
+    // directory, and a relative one resolves against the current directory — the untrusted project
+    // — putting the engine sbx execs from, the trust markers and the plugins inside the tree the
+    // cage binds read-write. Refused rather than measured.
+    if !dir.is_absolute() {
+        return Err(format!(
+            "sbx's data directory resolved to a relative path ({}); it would be created inside \
+             whatever directory sbx is run from. Set SBX_DATA_DIR (or HOME) to an absolute path.",
+            dir.display()
+        ));
+    }
     let len = dir.as_os_str().as_encoded_bytes().len();
     if len > DATA_DIR_MAX {
         return Err(format!(
@@ -387,6 +412,13 @@ fn check_resolved_data_dir(dir: &Path) -> Result<(), String> {
 /// falling through, because quietly using a different directory than the one asked for
 /// would strand the user's projects and apps somewhere they never look. An unset *or
 /// empty* value is simply absent, so clearing the variable restores the default.
+///
+/// `$HOME` is held to the same absoluteness rule as the two overrides, the fail-closed stance
+/// [`crate::trust`] and [`crate::config`] already take when they derive a path from it: an empty
+/// `$HOME` (`env -i`, a systemd unit, a cron job) is `Some("")`, whose join is the *relative*
+/// `.local/share/sbx` — resolved against the current directory, which is the untrusted project.
+/// Every derived location would then sit inside the tree the cage binds read-write, the engine
+/// directory sbx execs from on the host included. No data directory at all is the answer instead.
 fn data_dir_from(
     sbx: Option<&OsStr>,
     xdg: Option<&OsStr>,
@@ -401,7 +433,8 @@ fn data_dir_from(
             return Some(p.join("sbx"));
         }
     }
-    Some(PathBuf::from(home?).join(".local/share/sbx"))
+    let home = PathBuf::from(home?);
+    home.is_absolute().then(|| home.join(".local/share/sbx"))
 }
 
 /// Create the store's directory skeleton if absent and tighten its permissions
@@ -1757,6 +1790,15 @@ fn provision_licensed(
         )));
     }
 
+    // The build has just repointed `gcroot`, and this writer keeps no `<gcroot>.expr` stamp of its
+    // own — so a stamp an earlier [`provision_flake`] / [`provision_expr`] left beside the same
+    // out-link now describes a build that is no longer there. Dropped here, or the next call to one
+    // of those would match its digest, read *this* out-link, and return this build under the other
+    // target's name: `crate::sandbox::packages` hands the same
+    // `<data>/gcroots/projects/<id>/<name>` path (and the same `bin` marker) to both writers, so
+    // switching one package between `flake:` and `nix:` is all it takes to reach it.
+    clear_expr_stamp(gcroot);
+
     let stdout = String::from_utf8_lossy(&out.stdout);
     select_marked_output(layout, &stdout, attr, marker)
 }
@@ -2007,6 +2049,17 @@ fn expr_stamp_path(gcroot: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Drop a gcroot's `<gcroot>.expr` stamp, if it has one.
+///
+/// The stamp says which expression produced the out-link's *current* target, so every writer that
+/// repoints an out-link without writing a stamp of its own has to remove the one that is there —
+/// otherwise [`reuse_built_expr`] matches a digest against a link that points somewhere else and
+/// short-circuits to the wrong build. Best-effort, and a no-op in the ordinary case: only a gcroot
+/// that a flake or expression build has previously written carries a stamp at all.
+fn clear_expr_stamp(gcroot: &Path) {
+    let _ = std::fs::remove_file(expr_stamp_path(gcroot));
+}
+
 /// The SHA-256 (hex) of a provisioning expression — the key deciding whether a prior build can be
 /// reused. The expression carries the nixpkgs revision, system, and every sbx-controlled input
 /// verbatim, so an equal hash means an identical derivation and output.
@@ -2023,6 +2076,11 @@ fn expr_digest(expr: &str) -> String {
 /// out-link, or a missing marker — so a changed expression or a vanished output always rebuilds. The
 /// out-link points at the logical `/nix/store/<hash>` path (mapped through [`physical_path`] for the
 /// marker probe, never followed, exactly as [`select_marked_output`] does).
+///
+/// The stamp describes the out-link rather than the gcroot path, so it is only as good as the rule
+/// that every writer of that out-link maintains it: a writer that repoints the link without
+/// stamping it clears the stamp instead (see [`clear_expr_stamp`]), or a digest would be matched
+/// against a target another build has since replaced.
 fn reuse_built_expr(
     layout: &Layout,
     gcroot: &Path,
@@ -2278,6 +2336,36 @@ mod tests {
             Some(PathBuf::from("/home/u/.local/share/sbx"))
         );
         assert_eq!(data_dir_from(None, None, None), None);
+    }
+
+    /// `$HOME` answers for the derived directory the way the two overrides answer for theirs. An
+    /// empty `$HOME` — an `env -i` shell, a systemd unit, a cron job — is `Some("")`, and joining it
+    /// used to yield the *relative* `.local/share/sbx`, which resolves against the current
+    /// directory: the untrusted project. Everything derived from it (the engine directory sbx
+    /// resolves a host `nix`/`bwrap` from and then execs, the plugins, the trust markers) would then
+    /// live inside the tree the cage binds read-write, at the same uid. The trust store
+    /// (`crate::trust`) and the config loader already refuse a relative `$HOME` for this reason.
+    #[test]
+    fn a_relative_or_empty_home_yields_no_data_dir_rather_than_one_under_the_cwd() {
+        assert_eq!(
+            data_dir_from(None, None, Some(OsStr::new(""))),
+            None,
+            "an empty HOME must not derive `.local/share/sbx` under the current directory"
+        );
+        assert_eq!(
+            data_dir_from(None, None, Some(OsStr::new("rel/home"))),
+            None,
+            "nor a plainly relative one"
+        );
+        // A relative `XDG_DATA_HOME` still falls through to `$HOME`, which must then be absolute
+        // for anything to resolve at all.
+        assert_eq!(
+            data_dir_from(None, Some(OsStr::new("rel/xdg")), Some(OsStr::new(""))),
+            None
+        );
+        // The guard on the derived form refuses the same shape, whatever produced it.
+        let why = check_resolved_data_dir(Path::new(".local/share/sbx")).unwrap_err();
+        assert!(why.contains("relative"), "{why}");
     }
 
     #[test]
@@ -3669,6 +3757,79 @@ mod tests {
         assert_eq!(expr_digest("x").len(), 64);
         assert_eq!(expr_digest("x"), expr_digest("x"));
         assert_ne!(expr_digest("x"), expr_digest("y"));
+    }
+
+    /// `provision`/`provision_unfree` write the very out-link a `<gcroot>.expr` stamp describes,
+    /// and write no stamp of their own. A stamp an earlier `provision_flake` left beside that
+    /// out-link therefore outlived the build it described: switching a package from
+    /// `flake:github:acme/tools#node` to `nix:nodejs_22` repointed the link, and switching back
+    /// found the stamp still matching, so `reuse_built_expr` returned the *nixpkgs* build under the
+    /// flake's name — offline, silently, with the flake never built.
+    ///
+    /// Driven through a stub `nix` (the build itself is not what is under test), so the real
+    /// sequence of writers runs.
+    #[test]
+    fn a_provision_build_drops_the_stale_expr_stamp_of_the_out_link_it_repoints() {
+        let base = TmpDir::new();
+        let layout = Layout::under(&base.join("sbx"));
+        let gcroot = base.join("sbx/gcroots/projects/aaaa/node");
+
+        // Two fabricated built outputs, each a logical /nix/store path whose physical copy carries
+        // the `bin` marker the provisioning selects on.
+        let build = |name: &str| {
+            let logical = PathBuf::from(format!("/nix/store/{name}"));
+            let physical = physical_path(&layout, &logical);
+            std::fs::create_dir_all(physical.join("bin")).unwrap();
+            logical
+        };
+        let flake_out = build("00000000000000000000000000000000-node-flake");
+        let nix_out = build("11111111111111111111111111111111-node-nixpkgs");
+
+        // The state a `provision_flake` build leaves: the out-link at the flake's output and the
+        // stamp recording the target that produced it.
+        std::fs::create_dir_all(gcroot.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&flake_out, &gcroot).unwrap();
+        let target = "github:acme/tools#node";
+        let stamp = expr_stamp_path(&gcroot);
+        write_expr_stamp(&stamp, &expr_digest(target));
+
+        // A stub `nix` that does what `nix build --out-link` does: repoint the link and print the
+        // path it built.
+        let stub = base.join("nix");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nln -sfn {} {}\necho {}\n",
+                nix_out.display(),
+                gcroot.display(),
+                nix_out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let built = provision(
+            &stub,
+            &layout,
+            &gcroot,
+            "github:NixOS/nixpkgs/dead0000",
+            "nodejs_22",
+            "bin",
+        )
+        .expect("the stub build succeeds");
+        assert_eq!(built, nix_out, "the out-link now holds the nixpkgs build");
+
+        // The stale stamp must be gone, so the flake target rebuilds instead of being handed the
+        // nixpkgs build that replaced it.
+        assert!(
+            !stamp.exists(),
+            "a build that repointed the out-link left the stamp describing the old target"
+        );
+        assert_eq!(
+            reuse_built_expr(&layout, &gcroot, "bin", &stamp, &expr_digest(target)),
+            None,
+            "the flake target must not short-circuit onto another build's output"
+        );
     }
 
     #[test]

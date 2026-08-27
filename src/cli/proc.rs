@@ -402,8 +402,11 @@ fn proc_rules(args: &[OsString]) -> ExitCode {
     } else {
         // Refused, not swallowed. `None` here means "no filter", so an identity that could not be
         // resolved widened this listing to **every** session on the machine — other projects' among
-        // them — which is what `--all` is for asking. Its two siblings (`sbx proc pending` above and
-        // `sbx net rules`) already refuse; this one used `.ok()`.
+        // them — which is what `--all` is for asking, and what `.ok()` here used to give silently.
+        // The two neighbouring listings answer it differently, which is worth naming rather than
+        // implying a shared rule: `sbx proc pending` is not project-scoped at all (it lists the
+        // parked execs of every live session, and takes no scoping flag), and `sbx net rules` falls
+        // back to the uncanonicalized cwd rather than refusing.
         match sandbox::project_identity(&cwd) {
             Ok((_, canonical)) => Some(session_pids_for_project(&data_dir, &canonical)),
             Err(e) => {
