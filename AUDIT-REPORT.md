@@ -959,6 +959,37 @@ Les 7 tests `#[ignore]` sont tous étiquetés mesure ou benchmark (`bench.rs`, `
 
 ---
 
+## Les 8 PLAUSIBLE, tranchés
+
+Un verdict PLAUSIBLE n'est pas un verdict. Chacun des huit a donc été repris après la passe de réfutation, avec la question précise que le réfuteur avait laissée ouverte. Aucun ne s'est effondré ; un s'est durci en confirmé mesuré, et un seul change de nature — son correctif n'est pas du code.
+
+| # | Finding | Après analyse | Suite |
+|---|---|---|---|
+| 1 | `src/store.rs:404` — `$HOME` relatif accepté | **confirmé, mesuré** | corriger |
+| 2 | `src/sandbox/proxy/ssrf.rs:60` — IPv6 compatible-IPv4 | faits acquis, portée non démontrée | corriger (3 lignes) |
+| 3 | `src/sandbox/proxy/mod.rs:990` — `split_whitespace` | divergence réelle mais étroite | corriger |
+| 4 | `src/sandbox/notify_relay.rs:210` — `Notify` non borné | nuisance, pas franchissement | corriger (plafond) |
+| 5 | `src/plugins/stores.rs:775` — pin vérifié sur le checkout | fenêtre étroite, contredit la règle du module | corriger |
+| 6 | `src/sandbox/attach.rs:95` — pidfd après découverte | écart doc/code, pas de mauvais rattachement démontré | corriger |
+| 7 | `src/sandbox/argv.rs:147` — `--die-with-parent` détaché | course latente réelle, jamais observée | corriger |
+| 8 | `src/sandbox/proc_enforce.rs:1273` — `openat2 resolve` | réel, mais le correctif « évident » introduirait une autre non-sûreté | **doc seulement** |
+
+**`store.rs:404` est le seul que l'analyse fait passer de PLAUSIBLE à confirmé.** Le maillon que le réfuteur n'avait pas fermé était « un `$HOME` relatif est-il seulement atteignable ». Mesuré contre le binaire de cette branche :
+
+```
+HOME=.             sbx path -> data: ./.local/share/sbx
+HOME=              sbx path -> data: .local/share/sbx
+HOME=../elsewhere  sbx path -> data: ../elsewhere/.local/share/sbx
+```
+
+Le répertoire de données — donc le store, les engines, les plugins, la CA du proxy et les sockets de contrôle — se résout alors contre le cwd, qui pour `sbx run` est le répertoire du projet, c'est-à-dire l'attaquant. `SBX_DATA_DIR` et `XDG_DATA_HOME` sont tous deux contrôlés absolus au même endroit ; `$HOME` ne l'est pas, et `trust.rs:169` fait exactement ce contrôle sur cette même variable, motif écrit à l'appui.
+
+**`proc_enforce.rs:1273` est le seul qui ne reçoit pas de correctif de code, et il faut dire pourquoi.** Le réfuteur a fermé le point que l'auditeur n'avait pas vu : servir le descripteur de la sonde à un appelant qui a demandé `RESOLVE_NO_SYMLINKS` (ou `RESOLVE_BENEATH`, ou `RESOLVE_NO_XDEV`) lui remettrait précisément la résolution que sa propre restriction devait refuser. Le correctif « évident » **introduirait une autre non-sûreté** ; le seul correctif sain est une sonde fidèle au `resolve` de l'appelant, c'est-à-dire un changement de conception dans un chemin d'application de politique. Et le repli `CONTINUE` est déjà décrit dans le code, en `proc_enforce.rs:950-955` et `1256-1265`.
+
+Ce qui reste est donc un écart entre deux documentations : `docs-site/docs/guide/configuration/fs.md` affirmait « One gap is left, and it is not one a cage can arrange », alors que le code décrit exactement une lacune que la cage arrange en choisissant la forme de son appel système. C'est la page qui est corrigée, pas le code — elle nomme désormais les deux lacunes, et dit ce que la seconde coûte réellement : la remise du descripteur, pas le verdict.
+
+---
+
 ## Les 17 findings réfutés
 
 Une réfutation est un résultat, pas un échec, et la taire donnerait une fausse idée du bruit. Chacun figurait dans une version précédente de ce rapport ; aucun n'y figure plus. La conclusion citée est celle du réfuteur.

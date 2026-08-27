@@ -189,11 +189,22 @@ name. A pipe, a device and a socket are each served or replied to on their own t
 that is not there is answered with the same error the cage would have received, rather than being
 looked up a second time once something has been moved into place behind it.
 
-One gap is left, and it is not one a cage can arrange: a kernel older than 5.9 does not offer the
-operation at all, and there `scan` behaves as it did before, swap included. That fallback is not
+Two gaps are left. The first is not one a cage can arrange: a kernel older than 5.9 does not offer
+the operation at all, and there `scan` behaves as it did before, swap included. That fallback is not
 silent. The first allowed open the kernel declines to serve this way prints a warning naming the
 missing operation, once for the session, so a weaker `scan` is something you are told about rather
 than something you have to infer from a kernel version.
+
+The second one a cage can arrange, and it costs less than it reads. An `openat2` may ask for a
+stricter walk than the one the scan performed — any non-empty `resolve`, `RESOLVE_NO_SYMLINKS` and
+`RESOLVE_BENEATH` among them — and the descriptor `sbx` holds was resolved with symlinks followed on
+purpose, since a scan that stopped at a link would be walked around with one `ln -s`. Serving from
+it would hand such a caller the resolution its own flags were meant to refuse, so that open is
+declined rather than served: the real `openat2` runs, with the real `resolve` semantics, and with it
+the second walk a sibling thread is free to redirect. What is lost is the handover, not the verdict.
+The scan judged the target the path resolved to, and only an open it allowed reaches this point, so
+a cage that reissues its opens this way buys back the redirect window it would have had without
+`scan` at all — and nothing beyond it.
 
 **What it does not do.** A pattern only finds the shapes you wrote: a password that looks like
 ordinary prose is not one of them, and a scan is a backstop rather than a proof. Rewriting a file
