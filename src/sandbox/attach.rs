@@ -87,10 +87,30 @@ const NAMESPACES: [(&str, libc::c_int); 7] = [
     ("cgroup", libc::CLONE_NEWCGROUP),
 ];
 
-/// Open a pidfd for the cage process `pid` and compute the namespace mask to join. Same uid, so
-/// `pidfd_open` is permitted; the pidfd pins that exact process, so a pid reused between discovery
-/// and the join can never be entered by mistake.
-pub(super) fn open_cage_handle(pid: u32) -> io::Result<CageHandle> {
+/// A cage process as [`find_cage_pid`] found it: its pid, and the user namespace it was in at that
+/// moment. The two travel together because the pid alone is not an identity — discovery walks the
+/// whole of `/proc` and the cage can exit at any point during or after that walk, after which the
+/// host is free to hand the number to an unrelated process. The namespace link is what
+/// [`open_cage_handle`] re-checks to prove the pid it pinned is still the process that was chosen.
+pub(super) struct CageTarget {
+    /// The pid of a live process inside the cage.
+    pub(super) pid: u32,
+    /// Its `user:[<inode>]` link at discovery time.
+    userns: String,
+}
+
+/// Open a pidfd for the cage process `target` and compute the namespace mask to join. Same uid, so
+/// `pidfd_open` is permitted.
+///
+/// The pidfd pins that exact process — while it is open the kernel cannot recycle the pid number —
+/// but discovery ran *before* it, so the reuse this closes is the window between the two: the cage
+/// exits mid-scan, the host hands its number to some other process in its own namespaces, and the
+/// join would enter that instead. The pidfd is therefore taken first and the process's user
+/// namespace re-read *after* it, which the pin makes conclusive: a link that no longer matches the
+/// one discovery saw means the pid is not the process that was chosen, and the attach is refused
+/// rather than entering a stranger.
+pub(super) fn open_cage_handle(target: &CageTarget) -> io::Result<CageHandle> {
+    let pid = target.pid;
     // SAFETY: `pidfd_open` with flags 0 returns a fresh owned descriptor or -1/errno.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
     if fd < 0 {
@@ -98,6 +118,12 @@ pub(super) fn open_cage_handle(pid: u32) -> io::Result<CageHandle> {
     }
     // SAFETY: `fd` is a fresh owned descriptor from `pidfd_open`, wrapped exactly once.
     let pidfd = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
+    if userns_link(pid).as_deref() != Some(target.userns.as_str()) {
+        return Err(io::Error::other(
+            "the session's cage exited before it could be entered (its pid now names a different \
+             process)",
+        ));
+    }
     let mask = namespaces_to_join(pid);
     Ok(CageHandle { pidfd, mask })
 }
@@ -176,14 +202,25 @@ pub(super) fn build_env(environ: &[u8], term: Option<&str>) -> Vec<CString> {
 /// cage; the payload (not bubblewrap itself) is preferred so its `environ` is the cage
 /// environment. Returns `None` if the cage has no live in-namespace process (it just
 /// exited, or the host lacks user namespaces).
-pub(super) fn find_cage_pid(session_pid: u32) -> Option<u32> {
+///
+/// The chosen process's user-namespace link is carried out with the pid (see [`CageTarget`]): this
+/// scan is not atomic, so the pid it returns is only a *candidate* until [`open_cage_handle`] pins
+/// it and confirms it is still the same process.
+pub(super) fn find_cage_pid(session_pid: u32) -> Option<CageTarget> {
     let host = userns_link(std::process::id())?;
     let parents = parent_map();
     let candidates: Vec<(u32, Option<String>, Option<String>)> = descendants(session_pid, &parents)
         .into_iter()
         .map(|p| (p, userns_link(p), comm(p)))
         .collect();
-    choose_cage_pid(&candidates, &host)
+    let pid = choose_cage_pid(&candidates, &host)?;
+    // The link the choice was made on, carried forward as that process's identity. Present by
+    // construction: `choose_cage_pid` only returns a candidate whose link it read.
+    let userns = candidates
+        .iter()
+        .find(|(p, _, _)| *p == pid)
+        .and_then(|(_, ns, _)| ns.clone())?;
+    Some(CageTarget { pid, userns })
 }
 
 /// Pick the cage process from `(pid, userns_link, comm)` candidates: skip any in the
@@ -356,8 +393,19 @@ unsafe fn confine_and_exec(
                 }
             }
             // A non-interactive command: keep sbx's own stdin/stdout/stderr so bytes pass
-            // through unmodified (no controlling terminal, no pty line translation).
-            TtyMode::Inherit => {}
+            // through unmodified (no pty line translation), but in a fresh session, so it has no
+            // controlling terminal. Nothing else on this path provides that — neither fork is a
+            // `setsid` — and without it the entered process keeps *sbx's* terminal as its
+            // controlling terminal, so anything it starts can `open("/dev/tty")` and read the
+            // user's keystrokes or write forged prompts back, long after sbx has exited. Every
+            // other way into a cage forbids that: `--new-session` on the launch paths, the
+            // supervisor's own `login_tty` on the pty path. Job control is lost with it, which this
+            // path (a pipe or a script, never a terminal on stdin) does not use.
+            TtyMode::Inherit => {
+                if libc::setsid() < 0 {
+                    libc::_exit(127);
+                }
+            }
         }
         // Re-apply the cage confinement — NONE of it survived `setns`. `no_new_privs`
         // before seccomp: an unprivileged filter install requires it.
@@ -481,6 +529,58 @@ mod tests {
             mask & libc::CLONE_NEWNET,
             0,
             "a namespace shared with the host must not be joined"
+        );
+    }
+
+    /// The pidfd pins a pid, but only from the moment it is opened: discovery walks the whole of
+    /// `/proc` first, and a cage that exits in that window leaves its number free for an unrelated
+    /// process in its own namespaces — which `namespaces_to_join` would happily build a full mask
+    /// for, dropping the user into a stranger's sandbox while announcing the session. The handle
+    /// therefore re-reads the process's user namespace once the pin is held and refuses a link that
+    /// is no longer the one the choice was made on.
+    #[test]
+    fn a_handle_is_refused_when_the_pid_is_no_longer_the_process_discovery_chose() {
+        let pid = std::process::id();
+        let Some(userns) = userns_link(pid) else {
+            return; // no user namespaces on this host: nothing to identify a cage by
+        };
+        let same = CageTarget {
+            pid,
+            userns: userns.clone(),
+        };
+        if open_cage_handle(&same).is_err() {
+            return; // the host refuses `pidfd_open` at all; the check below is unreachable
+        }
+        // The same pid, now naming a process in a different user namespace: the shape a recycled
+        // pid takes.
+        let recycled = CageTarget {
+            pid,
+            userns: format!("{userns}-not-the-same"),
+        };
+        let Err(e) = open_cage_handle(&recycled) else {
+            panic!("a changed user namespace must refuse the join");
+        };
+        assert!(e.to_string().contains("different process"), "{e}");
+    }
+
+    /// `sbx run` blocks terminal-input injection at the source by starting the cage in a new session
+    /// (`--new-session`), and the pty attach path does the same through its supervisor's
+    /// `login_tty`. The inherited-stdio attach path had neither: both of its forks kept sbx's
+    /// session, so the process it exec'd inside the cage kept sbx's *controlling terminal* and could
+    /// reopen it through `/dev/tty` — reading the user's keystrokes and writing to their terminal —
+    /// even after sbx exited. Guarded on the source because nothing between the `setns` and the
+    /// `execve` is reachable from a test.
+    #[test]
+    fn the_inherited_stdio_path_enters_a_new_session_so_the_launching_terminal_is_unreachable() {
+        let source = include_str!("attach.rs");
+        let arm = source
+            .find("TtyMode::Inherit => {")
+            .expect("`confine_and_exec` handles the inherited-stdio terminal mode");
+        let body: String = source[arm..].chars().take(200).collect();
+        assert!(
+            body.contains("setsid()"),
+            "the inherited-stdio attach path must `setsid` before it execs, or the entered \
+             process keeps sbx's controlling terminal: {body}"
         );
     }
 

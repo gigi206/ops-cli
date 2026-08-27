@@ -2,8 +2,8 @@
 //!
 //! A project's `.sbx.toml` is attacker-controlled, so its security-relevant
 //! fields are honored only once the user has vouched for the file's *contents*.
-//! `sbx trust` records a marker keyed by the config's canonical path, holding a
-//! SHA-256 of the whole file. Any later edit changes that hash, so the marker no
+//! `sbx trust` records a marker keyed by the config's canonical *directory* and
+//! file name, holding a SHA-256 of the whole file. Any later edit changes that hash, so the marker no
 //! longer matches and the project must be re-trusted — exactly like `direnv
 //! allow` re-arming when `.envrc` changes.
 //!
@@ -178,23 +178,44 @@ fn store_dir_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> 
 
 /// Canonicalized path string used as the marker key, or `None` when that path is not valid UTF-8.
 ///
-/// When the file itself cannot be canonicalized (typically: it no longer exists), its parent is
-/// canonicalized and the file name re-appended, so `sbx trust` (file present) and a later
-/// `sbx untrust` (file deleted) still derive the same key. Only when even the parent is gone does
-/// it fall back to the raw path. Never panics.
+/// What is canonicalized is the **directory**, with the config's own file name re-appended
+/// verbatim. That is what binds a verdict to the project the launch is actually for. Resolving the
+/// config file itself followed a symlink, and the trust store is keyed by the result: a hostile
+/// repo whose `.sbx.toml` was a symlink to a trusted project's config read back the trusted
+/// project's marker over the trusted project's bytes, and the cage started on the attacker's tree
+/// with that project's `binds`, ssh-agent grant and injected credentials. The gate reads the file
+/// through the safety gate, which follows the link on purpose (a global config kept in a dotfiles
+/// repo is a symlink in the ordinary case) — so it is the *key* that must name the directory,
+/// not the read that must refuse one.
+///
+/// Resolving the directory rather than nothing at all is what keeps one project from having two
+/// keys: a `..` component, a symlinked parent, or a relative invocation all name the same config,
+/// and each must derive the same marker. It also keeps `sbx trust` (file present) and a later
+/// `sbx untrust` (file deleted) agreeing, since the file's own existence never enters the key. Only
+/// when the directory itself cannot be resolved does it fall back to the raw path. Never panics.
 ///
 /// The conversion is `into_string`, not `to_string_lossy`: this string is what tells one config
 /// apart from another, and a lossy one does not — see [`marker_path`] for what that costs.
 fn canonical_string(config_path: &Path) -> Option<String> {
-    let resolved = config_path.canonicalize().unwrap_or_else(|_| {
-        match (config_path.parent(), config_path.file_name()) {
-            (Some(parent), Some(name)) => parent
+    let resolved = match config_path.file_name() {
+        // A bare `.sbx.toml` has an empty parent, which canonicalizes to nothing: the directory it
+        // means is the one the process is in.
+        Some(name) => {
+            let parent = match config_path.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => Path::new("."),
+            };
+            parent
                 .canonicalize()
-                .map(|p| p.join(name))
-                .unwrap_or_else(|_| config_path.to_path_buf()),
-            _ => config_path.to_path_buf(),
+                .map(|dir| dir.join(name))
+                .unwrap_or_else(|_| config_path.to_path_buf())
         }
-    });
+        // No file name at all (a bare `/`, or a path ending in `..`): nothing to re-append, so the
+        // whole path is resolved as before.
+        None => config_path
+            .canonicalize()
+            .unwrap_or_else(|_| config_path.to_path_buf()),
+    };
     resolved.into_os_string().into_string().ok()
 }
 
@@ -202,7 +223,9 @@ fn canonical_string(config_path: &Path) -> Option<String> {
 /// path is not valid UTF-8.
 ///
 /// The marker's *name* is what identifies which config a recorded trust belongs to, so the string
-/// it is derived from has to distinguish paths the filesystem distinguishes. A lossy conversion
+/// it is derived from has to distinguish paths the filesystem distinguishes — and has to name the
+/// project the launch is for, which is why [`canonical_string`] resolves the directory and leaves
+/// the file name alone rather than following a symlinked config to wherever it points. A lossy conversion
 /// does not: every invalid byte becomes the same U+FFFD, so two projects whose paths differ only in
 /// bytes the encoding cannot represent hash to one name — and a trust granted to the first is read
 /// back for the second. Refusing is the only answer that stays sound, and it is the same rule this
@@ -434,6 +457,77 @@ mod tests {
     }
     use super::*;
     use crate::testutil::TmpDir;
+
+    /// A trust marker names the project the launch is for, not the inode a symlink points at.
+    ///
+    /// The key was the *canonicalized config path*, and the safety gate opens without `O_NOFOLLOW`
+    /// (a global config kept in a dotfiles repo is a symlink in the ordinary case), so a hostile
+    /// repo whose `.sbx.toml` was a symlink into a trusted project read back the trusted project's
+    /// marker over the trusted project's bytes: the verdict came back `Trusted` and the cage started
+    /// on the attacker's tree with that project's `binds`, ssh-agent grant and injected credentials.
+    /// Nothing tied the verdict to the directory, and `sbx untrust` in the hostile repo revoked the
+    /// *other* project's trust.
+    #[test]
+    fn a_symlinked_config_does_not_inherit_another_projects_trust() {
+        let tmp = TmpDir::new();
+        let store = tmp.path().join("store");
+        let work = tmp.path().join("work");
+        let evil = tmp.path().join("evil");
+        std::fs::create_dir_all(&work).expect("the trusted project");
+        std::fs::create_dir_all(&evil).expect("the hostile project");
+
+        let trusted = work.join(crate::config::PROJECT_CONFIG);
+        std::fs::write(&trusted, "[ssh_agent]\nallow = [\"SHA256:deploy\"]\n").expect("write");
+        trust(&store, &trusted).expect("the user vouches for their own project");
+        assert_eq!(state(&store, &trusted), TrustState::Trusted);
+
+        // The hostile repo ships a `.sbx.toml` that is a link to the trusted one, so the bytes read
+        // are byte-identical and their hash matches the marker the user granted.
+        let linked = evil.join(crate::config::PROJECT_CONFIG);
+        std::os::unix::fs::symlink(&trusted, &linked).expect("the hostile symlink");
+        assert_eq!(
+            state(&store, &linked),
+            TrustState::Untrusted,
+            "a trust granted to one project must not be read back for another"
+        );
+
+        // And the two keys are distinct in both directions: revoking the hostile one leaves the
+        // trusted project trusted.
+        assert!(
+            !untrust(&store, &linked).expect("revoking is not an error"),
+            "the hostile project had no marker of its own to revoke"
+        );
+        assert_eq!(state(&store, &trusted), TrustState::Trusted);
+    }
+
+    /// The key resolves the *directory*, so the spellings that name one project still share a
+    /// marker: a `..` component, and a symlinked parent directory.
+    #[test]
+    fn two_spellings_of_one_projects_directory_share_its_trust() {
+        let tmp = TmpDir::new();
+        let store = tmp.path().join("store");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).expect("the project");
+        let config = work.join(crate::config::PROJECT_CONFIG);
+        std::fs::write(&config, "[network]\nmode = \"deny\"\n").expect("write");
+        trust(&store, &config).expect("record trust");
+
+        // Spelled as one relative segment that leaves the project and comes straight back, so the
+        // path never escapes the fixture it is joined to.
+        let detoured = tmp
+            .path()
+            .join("work/../work")
+            .join(crate::config::PROJECT_CONFIG);
+        assert_eq!(state(&store, &detoured), TrustState::Trusted);
+
+        let link = tmp.path().join("by-link");
+        std::os::unix::fs::symlink(&work, &link).expect("a symlinked project directory");
+        assert_eq!(
+            state(&store, &link.join(crate::config::PROJECT_CONFIG)),
+            TrustState::Trusted,
+            "a link to the directory names the same project"
+        );
+    }
 
     #[test]
     fn both_error_families_open_with_the_file_they_are_about() {

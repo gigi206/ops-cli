@@ -66,10 +66,15 @@ use super::fs_control::{FsKind, FsRing};
 pub(crate) const IGNORED_COMPONENTS: &[&str] = &[".git", "node_modules", "target", ".venv"];
 
 /// The inotify event mask installed on every watched directory. `IN_ONLYDIR` makes an accidental
-/// `add_watch` on a non-directory fail closed; `IN_EXCL_UNLINK` drops events for an already-unlinked
-/// open file (noise). The reported changes are a completed write (`IN_CLOSE_WRITE`), a create/move-in
+/// `add_watch` on a non-directory fail closed; `IN_DONT_FOLLOW` makes it fail on a **symlink** to
+/// one, which `IN_ONLYDIR` does not (a symlink to a directory resolves to a directory, so the watch
+/// would succeed on whatever it names); `IN_EXCL_UNLINK` drops events for an already-unlinked open
+/// file (noise). The reported changes are a completed write (`IN_CLOSE_WRITE`), a create/move-in
 /// (`IN_CREATE`/`IN_MOVED_TO`), a delete (`IN_DELETE`), and a move-out (`IN_MOVED_FROM`); the `*_SELF`
 /// masks let the watcher drop a directory that was itself removed.
+///
+/// The cage picks the path of every watch added after start (a directory it created), so following
+/// a link here would put the watch set, and the walk that rides on it, wherever the cage pointed.
 const WATCH_MASK: u32 = libc::IN_CLOSE_WRITE
     | libc::IN_CREATE
     | libc::IN_DELETE
@@ -78,6 +83,7 @@ const WATCH_MASK: u32 = libc::IN_CLOSE_WRITE
     | libc::IN_DELETE_SELF
     | libc::IN_MOVE_SELF
     | libc::IN_ONLYDIR
+    | libc::IN_DONT_FOLLOW
     | libc::IN_EXCL_UNLINK;
 
 /// A running filesystem-write observer. The thread drains inotify events and pushes each observed
@@ -229,7 +235,21 @@ impl Watcher {
     /// type is read without traversing it), so the watch set cannot loop or escape the project tree. On a
     /// watch-descriptor exhaustion the walk stops and warns once; the directories already watched keep
     /// working.
+    ///
+    /// The **root** of the walk is checked as carefully as the entries below it. `handle_event` calls
+    /// this with a path the cage just created, and the cage is free to replace that directory with a
+    /// symlink before the event is handled: `IN_ONLYDIR` does not refuse one (it resolves to a
+    /// directory) and `read_dir` follows it, so the walk would install watches and emit synthetic
+    /// creates for every name under whatever it points at — the whole home directory, for a link to
+    /// `$HOME`. So the start is `lstat`ed and walked only if it is itself a directory, the same
+    /// lstat-the-root rule [`super::gc::force_remove_dir_all`] applies.
     fn add_tree(&mut self, start: &Path, emit: bool) {
+        match std::fs::symlink_metadata(start) {
+            Ok(m) if m.file_type().is_dir() => {}
+            // A symlink, a file, or a path that vanished between the event and this walk: nothing to
+            // watch, and nothing below it belongs to this tree.
+            _ => return,
+        }
         let mut stack = vec![start.to_path_buf()];
         while let Some(dir) = stack.pop() {
             match add_watch(self.fd, &dir) {
@@ -525,6 +545,50 @@ mod tests {
                 .iter()
                 .any(|e| e.path.starts_with(".git")),
             "no `.git` event is ever recorded"
+        );
+    }
+
+    /// A symlink standing where a new directory was must not be walked. The cage creates the
+    /// directories this watcher adds watches for, so it can replace one with a symlink between the
+    /// `IN_CREATE` and the walk that answers it: `IN_ONLYDIR` does not refuse a link to a directory,
+    /// and a followed one would install watches over — and report every name under — whatever it
+    /// points at, outside the project entirely.
+    #[test]
+    fn a_symlink_where_a_new_directory_was_is_not_walked() {
+        let tmp = TmpDir::new();
+        let base = tmp.path().canonicalize().unwrap();
+        let root = base.join("proj");
+        let outside = base.join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("id_ed25519"), b"KEY").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("d")).unwrap();
+
+        // SAFETY: `inotify_init1` with valid flags returns a new fd or -1.
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(fd >= 0, "inotify_init1");
+        let ring = Arc::new(FsRing::new(100));
+        let mut watcher = Watcher {
+            fd,
+            root: root.clone(),
+            wd_paths: HashMap::new(),
+            ring: ring.clone(),
+            warned: Warned::new(),
+        };
+        // What `handle_event` does for a `Class::New { is_dir: true }`: walk the path the cage made.
+        watcher.add_tree(&root.join("d"), true);
+        // SAFETY: our own inotify fd, closed exactly once; it removes any watch that was added.
+        unsafe { libc::close(fd) };
+
+        assert!(
+            watcher.wd_paths.is_empty(),
+            "no watch is installed through the link: {:?}",
+            watcher.wd_paths
+        );
+        assert!(
+            ring.snapshot(None).events.is_empty(),
+            "nothing outside the project is reported as written in it: {:?}",
+            ring.snapshot(None).events
         );
     }
 

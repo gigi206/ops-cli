@@ -107,6 +107,11 @@ The rules, and why each one is there:
   file is refused rather than guessed at.
 - **An entry matching nothing is a warning**, never a failed launch: a profile may name a
   file only some checkouts carry.
+- **An entry whose path cannot be read at all refuses the launch.** Matching nothing and being
+  unable to look are different answers, and only one of them is safe to run past. The cage runs
+  as your uid in a project bound read-write, so a directory it closed off in an earlier session
+  would otherwise make every entry naming a path below it expand to nothing, closing nothing.
+  `sbx` names the entry and stops, the way it stops past the mask ceiling.
 - **A `*` also matches a name starting with a dot**, unlike a shell glob. `secrets/*` covers
   `secrets/.env`. The difference is deliberate: for a mask, covering more is the safe direction.
 
@@ -196,15 +201,22 @@ missing operation, once for the session, so a weaker `scan` is something you are
 than something you have to infer from a kernel version.
 
 The second one a cage can arrange, and it costs less than it reads. An `openat2` may ask for a
-stricter walk than the one the scan performed (any non-empty `resolve`, `RESOLVE_NO_SYMLINKS` and
-`RESOLVE_BENEATH` among them), and the descriptor `sbx` holds was resolved with symlinks followed on
-purpose, since a scan that stopped at a link would be walked around with one `ln -s`. Serving from
-it would hand such a caller the resolution its own flags were meant to refuse, so that open is
-declined rather than served: the real `openat2` runs, with the real `resolve` semantics, and with it
-the second walk a sibling thread is free to redirect. What is lost is the handover, not the verdict.
+stricter walk than the one the scan performed (`RESOLVE_NO_SYMLINKS`, `RESOLVE_BENEATH` and
+`RESOLVE_IN_ROOT`), and the descriptor `sbx` holds was resolved with symlinks followed on purpose,
+since a scan that stopped at a link would be walked around with one `ln -s`. Serving from it would
+hand such a caller the resolution its own flags were meant to refuse, so that open is declined
+rather than served: the real `openat2` runs, with the real `resolve` semantics, and with it the
+second walk a sibling thread is free to redirect. What is lost is the handover, not the verdict.
 The scan judged the target the path resolved to, and only an open it allowed reaches this point, so
 a cage that reissues its opens this way buys back the redirect window it would have had without
 `scan` at all, and nothing beyond it.
+
+Those three are the whole of it, and the rest of the `resolve` word is not a way in. The bits that
+only restrict how the walk runs (`RESOLVE_NO_XDEV`, `RESOLVE_NO_MAGICLINKS`, `RESOLVE_CACHED`) are
+served from the scanned descriptor like any other open, because declining on them would let a cage
+take every allowed open off the handover by asking for one harmless-looking flag. A `resolve` bit
+`sbx` does not know is declined as well, since the kernel refuses an unknown one with `EINVAL` and
+there is then no syscall for a served descriptor to be the answer to.
 
 **What it does not do.** A pattern only finds the shapes you wrote: a password that looks like
 ordinary prose is not one of them, and a scan is a backstop rather than a proof. Rewriting a file

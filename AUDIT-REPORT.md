@@ -972,7 +972,7 @@ Un verdict PLAUSIBLE n'est pas un verdict. Chacun des huit a donc été repris a
 | 5 | `src/plugins/stores.rs:775` — pin vérifié sur le checkout | fenêtre étroite, contredit la règle du module | corriger |
 | 6 | `src/sandbox/attach.rs:95` — pidfd après découverte | écart doc/code, pas de mauvais rattachement démontré | corriger |
 | 7 | `src/sandbox/argv.rs:147` — `--die-with-parent` détaché | course latente réelle, jamais observée | corriger |
-| 8 | `src/sandbox/proc_enforce.rs:1273` — `openat2 resolve` | réel, mais le correctif « évident » introduirait une autre non-sûreté | **doc seulement** |
+| 8 | `src/sandbox/proc_enforce.rs:1273` — `openat2 resolve` | réel ; « doc seulement » à l'analyse, corrigé en code à la passe suivante | corriger |
 
 **`store.rs:404` est le seul que l'analyse fait passer de PLAUSIBLE à confirmé.** Le maillon que le réfuteur n'avait pas fermé était « un `$HOME` relatif est-il seulement atteignable ». Mesuré contre le binaire de cette branche :
 
@@ -984,9 +984,13 @@ HOME=../elsewhere  sbx path -> data: ../elsewhere/.local/share/sbx
 
 Le répertoire de données — donc le store, les engines, les plugins, la CA du proxy et les sockets de contrôle — se résout alors contre le cwd, qui pour `sbx run` est le répertoire du projet, c'est-à-dire l'attaquant. `SBX_DATA_DIR` et `XDG_DATA_HOME` sont tous deux contrôlés absolus au même endroit ; `$HOME` ne l'est pas, et `trust.rs:169` fait exactement ce contrôle sur cette même variable, motif écrit à l'appui.
 
-**`proc_enforce.rs:1273` est le seul qui ne reçoit pas de correctif de code, et il faut dire pourquoi.** Le réfuteur a fermé le point que l'auditeur n'avait pas vu : servir le descripteur de la sonde à un appelant qui a demandé `RESOLVE_NO_SYMLINKS` (ou `RESOLVE_BENEATH`, ou `RESOLVE_NO_XDEV`) lui remettrait précisément la résolution que sa propre restriction devait refuser. Le correctif « évident » **introduirait une autre non-sûreté** ; le seul correctif sain est une sonde fidèle au `resolve` de l'appelant, c'est-à-dire un changement de conception dans un chemin d'application de politique. Et le repli `CONTINUE` est déjà décrit dans le code, en `proc_enforce.rs:950-955` et `1256-1265`.
+**`proc_enforce.rs:1273` est celui sur lequel l'analyse s'est arrêtée trop tôt, et il faut le dire aussi.** Le réfuteur avait fermé le point que l'auditeur n'avait pas vu : servir le descripteur de la sonde à un appelant qui a demandé `RESOLVE_NO_SYMLINKS` (ou `RESOLVE_BENEATH`, ou `RESOLVE_IN_ROOT`) lui remettrait précisément la résolution que sa propre restriction devait refuser. L'analyse en a conclu qu'aucun correctif de code n'était sain et qu'il fallait corriger la prose. La première moitié du raisonnement était juste ; la conclusion ne l'était pas.
 
-Ce qui reste est donc un écart entre deux documentations : `docs-site/docs/guide/configuration/fs.md` affirmait « One gap is left, and it is not one a cage can arrange », alors que le code décrit exactement une lacune que la cage arrange en choisissant la forme de son appel système. C'est la page qui est corrigée, pas le code — elle nomme désormais les deux lacunes, et dit ce que la seconde coûte réellement : la remise du descripteur, pas le verdict.
+Car `resolve` est lu dans la mémoire de la cage, et le décliner en bloc faisait du repli `CONTINUE` un choix que la cage pose elle-même : un `RESOLVE_NO_XDEV` d'apparence anodine suffisait à sortir **toutes** ses ouvertures autorisées de la remise du descripteur pour les remettre sur la seconde résolution qu'un thread frère peut détourner — la fenêtre même que la lentille existe pour fermer, rouverte à la demande de l'appelant.
+
+La passe de correction a donc partagé le mot au lieu de le refuser. Les bits qui ne changent pas *quel fichier* la marche peut atteindre (`RESOLVE_NO_XDEV`, `RESOLVE_NO_MAGICLINKS`, `RESOLVE_CACHED`) sont servis depuis la sonde ; les trois qui le changent restent déclinés ; un bit inconnu est décliné également, puisque le noyau répond `EINVAL` à un `resolve` qu'il ne connaît pas et qu'il n'existe alors aucun appel dont un descripteur pourrait être la réponse. Le prix est écrit sur place et dans le guide plutôt que tu : un appelant qui a demandé `RESOLVE_NO_XDEV` ou `RESOLVE_NO_MAGICLINKS` peut recevoir un descripteur que le noyau lui aurait refusé, une perte de fidélité à l'intérieur d'une cage qui confie déjà à `sbx` la résolution de ses ouvertures.
+
+`docs-site/docs/guide/configuration/fs.md` a donc été corrigée deux fois. D'abord parce qu'elle affirmait « One gap is left, and it is not one a cage can arrange » quand le code décrivait une seconde lacune que la cage arrange en choisissant la forme de son appel système. Puis pour nommer les trois bits qui déclinent réellement, une fois le code changé.
 
 ---
 

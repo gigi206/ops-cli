@@ -90,12 +90,17 @@ fn effective(override_value: &Option<String>, default: &str) -> (String, bool) {
     }
 }
 
+/// The base-1024 size suffixes systemd accepts, in ascending order — the position of a suffix here
+/// is its power of 1024 minus one.
+const SIZE_SUFFIXES: &str = "KMGTPE";
+
 /// Whether `s` is a memory-limit value `systemd-run -p Memory{High,Max}=` accepts: `infinity`,
 /// a percentage `N%` of physical RAM (0 < N ≤ 100), or a byte quantity — a decimal number with
 /// an optional single uppercase `K`/`M`/`G`/`T`/`P`/`E` suffix (base-1024; no `B`, no `i`, no
-/// lowercase). The grammar is verified against a real `systemd-run` in the tests, so the
-/// validator can never accept a value that would later brick a launch. Stricter than systemd on
-/// whitespace (any is rejected), keeping a config value tight and the `-p` token injection-free.
+/// lowercase) **whose value fits the `uint64_t` systemd parses it into**. The grammar is verified
+/// against a real `systemd-run` in the tests, so the validator can never accept a value that would
+/// later brick a launch. Stricter than systemd on whitespace (any is rejected), keeping a config
+/// value tight and the `-p` token injection-free.
 pub(crate) fn is_valid_memory_value(s: &str) -> bool {
     if s == "infinity" {
         return true;
@@ -103,13 +108,33 @@ pub(crate) fn is_valid_memory_value(s: &str) -> bool {
     if let Some(percent) = s.strip_suffix('%') {
         return is_unit_percent(percent);
     }
-    // A byte quantity: a decimal number with at most one base-1024 suffix. `strip_suffix` only
-    // strips when the last char is a suffix letter, so a bare integer (last char a digit) is left
-    // whole and validated as a plain decimal.
-    let number = s
-        .strip_suffix(|c| matches!(c, 'K' | 'M' | 'G' | 'T' | 'P' | 'E'))
-        .unwrap_or(s);
-    is_decimal(number)
+    // A byte quantity: a decimal number with at most one base-1024 suffix. The suffix is taken off
+    // the end only when the last character is one, so a bare integer (last character a digit) is
+    // left whole and validated as a plain decimal.
+    let (number, power) = match s.char_indices().next_back() {
+        Some((at, c)) => match SIZE_SUFFIXES.find(c) {
+            Some(i) => (&s[..at], i as u32 + 1),
+            None => (s, 0),
+        },
+        None => return false,
+    };
+    is_decimal(number) && fits_a_byte_count(number, power)
+}
+
+/// Whether `number` (already syntax-checked) scaled by 1024^`power` is a byte count systemd can
+/// hold. Syntax alone is not enough: systemd's own parser multiplies into a `uint64_t` and returns
+/// `-ERANGE` past it, so `99E` or a 25-digit integer parses here and is refused there — by
+/// `systemd-run`, on every launch of that project, with no line naming the config value that did it.
+///
+/// The comparison is deliberately strict (`<` against `u64::MAX` as an `f64`, which rounds *up* to
+/// 2^64): at the boundary the two possible mistakes are not symmetric. A value refused here is
+/// warned about at config-resolution time and the built-in default applies, while one wrongly
+/// accepted brings every launch down.
+fn fits_a_byte_count(number: &str, power: u32) -> bool {
+    let Ok(value) = number.parse::<f64>() else {
+        return false;
+    };
+    value * 1024f64.powi(power as i32) < u64::MAX as f64
 }
 
 /// Whether `s` is a `TasksMax=` value systemd accepts: `infinity` or a positive integer (systemd
@@ -359,17 +384,24 @@ pub(crate) fn scope_launcher_pid(name: &str) -> Option<u32> {
         .ok()
 }
 
-/// Every cage scope's cgroup directory under this user's slice.
+/// Every cage scope's cgroup directory under **this user's** slice.
 ///
 /// The user manager decides where it registers a scope — under `user@<uid>.service/app.slice/` for a
 /// desktop session, elsewhere for a login session — so the walk starts at the user slice rather than
-/// assuming a path. A cage scope is a leaf here: nothing below one is another cage's scope, so the
-/// walk does not descend into it. Unreadable directories are skipped rather than aborting the walk,
-/// since every consumer is best-effort and a partial view does less than the whole, never something
-/// wrong.
+/// assuming a path. It starts at `user-<uid>.slice`, not at `user.slice`: cgroup v2 directories are
+/// world-traversable, so the parent holds every logged-in user's slice, and another uid's
+/// `sbx-<slug>-<pid>.scope` would come back looking exactly like one of this session's. That scope's
+/// pid means nothing here — pids are per-host, and `pid_is_live` reads another uid's live process as
+/// dead (`kill` returns `EPERM`) — so the sweep could try to stop it, and the teardown's member
+/// lookup, which matches on the pid segment alone, could read a stranger's `cgroup.procs` instead of
+/// its own and conclude the cage has no members.
+///
+/// A cage scope is a leaf here: nothing below one is another cage's scope, so the walk does not
+/// descend into it. Unreadable directories are skipped rather than aborting the walk, since every
+/// consumer is best-effort and a partial view does less than the whole, never something wrong.
 pub(crate) fn cage_scope_dirs() -> Vec<PathBuf> {
     let mut found = Vec::new();
-    let mut stack = vec![PathBuf::from("/sys/fs/cgroup/user.slice")];
+    let mut stack = vec![user_slice_dir()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -391,6 +423,14 @@ pub(crate) fn cage_scope_dirs() -> Vec<PathBuf> {
         }
     }
     found
+}
+
+/// The unified-hierarchy directory of this user's own slice, the root every cage-scope walk starts
+/// from. Sibling slices belong to other uids and are never this session's to read or stop.
+fn user_slice_dir() -> PathBuf {
+    // SAFETY: `getuid` always succeeds and only reads the caller's id.
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/sys/fs/cgroup/user.slice/user-{uid}.slice"))
 }
 
 /// Whether a cage scope can be reclaimed: its launcher is gone **and** its cgroup holds no process.
@@ -689,8 +729,22 @@ mod tests {
             "infinity ",
             "-5",
             "2.",
+            // Syntactically fine, arithmetically not: systemd multiplies a byte quantity into a
+            // `uint64_t` and returns `-ERANGE` past it, so accepting one of these would leave
+            // `systemd-run` refusing the property on every launch of that project.
+            // exactly 2^64, one byte past what systemd can hold; ~1.14e20; the same overflow
+            // spelled one suffix down; and a plain integer far past the type.
+            "16E",
+            "99E",
+            "16384P",
+            "9999999999999999999999",
         ] {
             assert!(!is_valid_memory_value(bad), "memory should reject `{bad}`");
+        }
+        // The largest of each suffix that still fits stays accepted — the bound refuses the values
+        // systemd cannot hold, not the suffix.
+        for ok in ["1E", "15E", "15000P", "18446744073709551", "0"] {
+            assert!(is_valid_memory_value(ok), "memory should accept `{ok}`");
         }
 
         // Tasks: infinity or a positive integer. Never `0`, a percentage (deliberately
@@ -942,7 +996,19 @@ mod tests {
         // Exercises the real walk against this host's cgroup tree. Finding nothing is a legitimate
         // outcome (no cage is running); what is asserted is that whatever it does find is a cage
         // scope, since the sweep acts on the result.
+        //
+        // And that it is under *this* user's own slice: cgroup v2 directories are
+        // world-traversable, so a walk rooted at `user.slice` also returns other uids' cage scopes,
+        // which the sweep would try to stop and the teardown's member lookup could read in place of
+        // its own (the scope name carries a pid, and pids are not per-user).
+        let mine = user_slice_dir();
         for dir in cage_scope_dirs() {
+            assert!(
+                dir.starts_with(&mine),
+                "the walk left this user's slice: {} is not under {}",
+                dir.display(),
+                mine.display()
+            );
             let name = dir
                 .file_name()
                 .and_then(|n| n.to_str())

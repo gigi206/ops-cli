@@ -44,14 +44,29 @@ pub(crate) fn compose(spec: &SandboxSpec) -> io::Result<(Vec<OsString>, Option<F
         return Ok((argv, None));
     };
     // The placeholder becomes the descriptor's number here, and only here: this is the one step that
-    // can create it, which is what keeps [`to_argv`] pure.
-    let fd = OsString::from(file.as_raw_fd().to_string());
-    for arg in argv.iter_mut() {
-        if arg == ENV_ARGS_PLACEHOLDER {
-            arg.clone_from(&fd);
-        }
-    }
+    // can create it, which is what keeps [`to_argv`] pure. The one slot `to_argv` marked is rewritten
+    // *by position*, never by value: the same vector carries the cage's own command, every mount
+    // path, and the workdir, and one of those that happens to spell the placeholder is a literal the
+    // cage asked for — it must reach bwrap unchanged.
+    let slot = env_args_slot(&argv).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to launch: the argument list carries no slot for the cage's environment",
+        )
+    })?;
+    argv[slot] = OsString::from(file.as_raw_fd().to_string());
     Ok((argv, Some(file)))
+}
+
+/// The index of the single slot [`to_argv`] emitted for the environment descriptor: the argument
+/// right after the `--args` it pushed. `None` when the spec set no variables, so no such pair was
+/// emitted (or when the argument there is not the placeholder, which no spec can produce).
+///
+/// `to_argv` pushes that pair before any mount, the workdir, or the command, so the first `--args`
+/// in the vector is always its own.
+fn env_args_slot(argv: &[OsString]) -> Option<usize> {
+    let i = argv.iter().position(|a| a == "--args")? + 1;
+    (argv.get(i)? == ENV_ARGS_PLACEHOLDER).then_some(i)
 }
 
 /// The descriptor carrying the cage's environment, in bwrap's own `--args` encoding (NUL-separated
@@ -73,9 +88,22 @@ fn env_fd(spec: &SandboxSpec) -> io::Result<Option<File>> {
     }
     let mut bytes = Vec::new();
     for (key, value) in spec.secret_env.iter().chain(spec.env.iter()) {
-        if key.as_bytes().contains(&0) || value.as_bytes().contains(&0) {
-            // The name, never the value: reporting the value would print a credential, and the name
-            // is what a person needs to find the declaration.
+        // The name, never the value: reporting the value would print a credential, and the name is
+        // what a person needs to find the declaration. When the *name* is the one carrying the NUL,
+        // the same rule applies to it — everything after that byte is the injected payload — so it
+        // is cut at the NUL rather than echoed whole.
+        if let Some(cut) = key.as_bytes().iter().position(|b| *b == 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to launch: the name of the variable declared as `{}...` contains a \
+                     NUL byte, which would break out of its own argument and add arguments of its \
+                     own (the name is shown up to that byte)",
+                    &key[..cut]
+                ),
+            ));
+        }
+        if value.as_bytes().contains(&0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -461,10 +489,19 @@ mod tests {
         assert!(compose(&secret).is_err());
         let named = spec(
             vec![],
-            vec![("A\0--bind".to_string(), "x".to_string())],
+            vec![("A\0--bind\0/home\0/home".to_string(), "x".to_string())],
             NetPolicy::Shared,
         );
-        assert!(compose(&named).is_err());
+        let e = compose(&named).expect_err("a NUL-bearing name must refuse the launch");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        // The message says it is the *name* that is at fault, and is cut at the NUL: everything
+        // after that byte is the payload the check exists to refuse to hand to bwrap.
+        assert!(e.to_string().contains("the name of"), "{e}");
+        assert!(e.to_string().contains("`A..."), "{e}");
+        assert!(
+            !e.to_string().contains("--bind"),
+            "the message names the variable, never the injected arguments: {e}"
+        );
 
         // An ordinary environment is untouched by the check.
         let fine = spec(
@@ -473,6 +510,44 @@ mod tests {
             NetPolicy::Shared,
         );
         assert!(compose(&fine).is_ok());
+    }
+
+    /// The descriptor's number replaces the *slot* `to_argv` marked, never every element that
+    /// happens to spell the placeholder: the same vector carries the cage's own command and every
+    /// mount path, and a literal `@sbx-env-args` among those is a value the cage asked for. Rewriting
+    /// by value turned `printf %s @sbx-env-args` into a descriptor number and a bind destination
+    /// spelled that way into a relative path.
+    #[test]
+    fn only_the_marked_slot_becomes_the_descriptor_number() {
+        let mut s = spec(
+            vec![Mount::Bind {
+                src: PathBuf::from("/src"),
+                dest: PathBuf::from(ENV_ARGS_PLACEHOLDER),
+            }],
+            vec![("HOME".to_string(), "/home/sandbox".to_string())],
+            NetPolicy::Shared,
+        );
+        s.cmd = vec![
+            OsString::from("/bin/printf"),
+            OsString::from("%s"),
+            OsString::from(ENV_ARGS_PLACEHOLDER),
+        ];
+
+        let (argv, file) = compose(&s).expect("a composed argv");
+        let fd = file.expect("a descriptor for the cage environment");
+
+        let args = index_of(&argv, "--args").expect("--args present");
+        assert_eq!(argv[args + 1], OsString::from(fd.as_raw_fd().to_string()));
+        // The command and the mount destination are untouched.
+        let dashes = index_of(&argv, "--").expect("-- present");
+        assert_eq!(argv[dashes + 3], OsString::from(ENV_ARGS_PLACEHOLDER));
+        let bind = index_of(&argv, "--bind").expect("--bind present");
+        assert_eq!(argv[bind + 2], OsString::from(ENV_ARGS_PLACEHOLDER));
+        // Exactly one slot was rewritten.
+        assert_eq!(
+            argv.iter().filter(|a| *a == ENV_ARGS_PLACEHOLDER).count(),
+            2
+        );
     }
 
     #[test]

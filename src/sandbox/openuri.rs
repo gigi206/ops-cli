@@ -14,9 +14,16 @@
 //!
 //! **Neither route may be re-pointed from inside the cage.** The router is bound read-only in a
 //! directory that leads `PATH` (see [`super::binds`]), and the portal's inputs are bound read-only
-//! at the locations the XDG lookup prefers: `$XDG_DATA_HOME` and `$XDG_CONFIG_HOME` are unset in the
-//! cage, so their defaults under `$HOME` outrank everything else and a copy placed elsewhere would
-//! be shadowed by one written there.
+//! at the locations the XDG lookup prefers: `$XDG_DATA_HOME` and `$XDG_CONFIG_HOME` name their own
+//! defaults under `$HOME`, so those outrank everything else and a copy placed elsewhere is shadowed
+//! by one written there.
+//!
+//! Those two variables are **set** by the launcher rather than left unset, and set after the config
+//! overlay (see `cage_env` in [`super::binds`]). Leaving them unset gave the same defaults but let
+//! anything that could write the cage's environment choose otherwise: `[env]` is one of the two
+//! fields an untrusted project may set without passing the trust gate, and neither name is reserved,
+//! so a project could ship its own `applications/` and `mimeapps.list` in the work surface, point
+//! the bases at them, and outrank the handler the user vouched for.
 //!
 //! What that prevents is narrow and worth stating plainly: the cage is one trust domain, so this is
 //! not a privilege boundary, but a substituted handler lets whatever runs in the cage answer a
@@ -33,7 +40,8 @@ use std::collections::BTreeMap;
 pub(crate) const DESKTOP_FILE: &str = "sbx-open-uri.desktop";
 
 /// The desktop-entry **directory** bound into the cage, relative to `$HOME`. `$XDG_DATA_HOME` is
-/// unset in the cage, so the XDG default applies and this is the highest-priority location.
+/// set to its own default under `$HOME` (and cannot be moved by a config), so this is the
+/// highest-priority location.
 ///
 /// The whole directory rather than the one file, for a functional reason measured on the in-cage
 /// portal rather than a security one: `OpenURI` opens nothing at all when **two** entries claim the
@@ -56,8 +64,8 @@ pub(crate) const DESKTOP_FILE: &str = "sbx-open-uri.desktop";
 /// state, and the portal would go quiet again with no error anywhere to explain it.
 pub(crate) const APPLICATIONS_REL: &str = ".local/share/applications";
 
-/// Where the mime defaults are bound, relative to the cage's `$HOME`. `$XDG_CONFIG_HOME` is unset
-/// too, so this is likewise the location the lookup prefers.
+/// Where the mime defaults are bound, relative to the cage's `$HOME`. `$XDG_CONFIG_HOME` is pinned
+/// to its own default the same way, so this is likewise the location the lookup prefers.
 pub(crate) const MIMEAPPS_REL: &str = ".config/mimeapps.list";
 
 /// The `mimeinfo.cache` index the portal reads to find which entries claim a scheme.

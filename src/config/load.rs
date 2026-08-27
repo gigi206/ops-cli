@@ -901,6 +901,34 @@ fn describe_app_posture(app: &RawApp) -> Vec<String> {
     lines
 }
 
+/// The profile keys [`describe_app_posture`] renders a line of its own for, so [`undescribed_sections`]
+/// does not name them a second time.
+///
+/// Spelled in **wire** names, not Rust field names: the list is compared against the keys of the
+/// serialized profile, and a `#[serde(rename)]` makes the two differ (`RawApp::uses` serializes as
+/// `use`). A test holds every entry here against a profile that declares them all, so a rename
+/// cannot quietly turn one of these into a filter that never matches.
+const DESCRIBED: &[&str] = &[
+    "cmd",
+    "home_scope",
+    "use",
+    "packages",
+    "binds",
+    "network",
+    "gui",
+    "devices",
+    "seccomp",
+    "ssh_agent",
+    "secret",
+    "allow_insecure_http",
+    "gpu",
+    "audio",
+    "dbus",
+    "forward",
+    "task",
+    "service",
+];
+
 /// Every top-level key the profile declares that [`describe_app_posture`] does not render a line
 /// for, named as a bare list.
 ///
@@ -908,33 +936,12 @@ fn describe_app_posture(app: &RawApp) -> Vec<String> {
 /// standard was broken each time was a field added to [`RawApp`] and not added here — nothing
 /// failed, the profile simply arrived carrying one more thing than it said. This closes that by
 /// construction: the keys come from serializing the profile, so a field this function has never
-/// heard of still reaches the reader. A key that *is* rendered above is listed by name here, and
-/// the two lists are asserted against the schema in the tests.
+/// heard of still reaches the reader. A key that *is* rendered above is listed in [`DESCRIBED`],
+/// and that list is asserted against the schema in the tests.
 ///
 /// Deliberately terse. These are the sections a reader should go and look at, not ones this
 /// summary tries to explain; the explained ones are explained above.
 fn undescribed_sections(app: &RawApp) -> Vec<String> {
-    // Rendered in full above, so naming them again would be noise.
-    const DESCRIBED: &[&str] = &[
-        "cmd",
-        "home_scope",
-        "uses",
-        "packages",
-        "binds",
-        "network",
-        "gui",
-        "devices",
-        "seccomp",
-        "ssh_agent",
-        "secret",
-        "allow_insecure_http",
-        "gpu",
-        "audio",
-        "dbus",
-        "forward",
-        "task",
-        "service",
-    ];
     let Ok(toml::Value::Table(table)) = toml::Value::try_from(app) else {
         return Vec::new();
     };
@@ -1428,6 +1435,75 @@ mod tests {
         expand_bundles(&mut apps, &map, &mut notes);
         let warnings = notes.remove("demo").unwrap_or_default();
         (apps.remove("demo").unwrap(), warnings)
+    }
+
+    /// The consent report's catch-all is filtered against the **serialized** keys, so the list of
+    /// keys it already renders has to be spelled in wire names. `RawApp::uses` serializes as `use`,
+    /// so an entry reading `uses` matched nothing and the reader was sent to go and read a section
+    /// the line above had just rendered in full.
+    #[test]
+    fn a_profile_that_names_a_bundle_is_not_also_told_to_go_and_read_it() {
+        let app = schema::parse_app(b"cmd = \"demo\"\nuse = [\"python-tools\"]\n")
+            .expect("the fixture profile parses");
+        assert!(
+            undescribed_sections(&app).is_empty(),
+            "`use` is rendered as its own line, so it must not also be named as undescribed: {:?}",
+            undescribed_sections(&app)
+        );
+    }
+
+    /// Every name in `DESCRIBED` must be a key a serialized profile can actually carry. The list is
+    /// a filter over wire names, so a Rust field name written here (or a later `#[serde(rename)]`)
+    /// is a filter that never fires, and the key it was meant to cover falls through into the
+    /// catch-all beside the line that already explained it.
+    #[test]
+    fn every_key_the_report_claims_to_render_is_a_key_a_profile_can_declare() {
+        let app = schema::parse_app(
+            br#"
+                cmd = "demo"
+                home_scope = "project"
+                use = ["python-tools"]
+                gui = "wayland"
+                allow_insecure_http = true
+                gpu = true
+                audio = true
+                dbus = true
+                forward = [8080]
+                binds = ["/tmp/data"]
+                [packages]
+                rg = "mise:ripgrep"
+                [network]
+                mode = "deny"
+                [devices]
+                allow = ["/dev/kvm"]
+                [seccomp]
+                allow = ["ptrace"]
+                [ssh_agent]
+                allow = ["SHA256:AAAA"]
+                [secret."api.example.com"]
+                header = "Authorization"
+                from = "env://TOKEN"
+                type = "bearer"
+                [task.deploy]
+                cmd = ["deploy"]
+                [service.api]
+                cmd = ["serve"]
+                "#,
+        )
+        .expect("the fixture profile parses");
+        let toml::Value::Table(table) = toml::Value::try_from(&app).expect("a profile serializes")
+        else {
+            panic!("a profile serializes as a table");
+        };
+        for key in DESCRIBED {
+            assert!(
+                table.contains_key(*key),
+                "`{key}` is filtered out of the catch-all but no profile key is spelled that way \
+                 (serialized keys: {:?})",
+                table.keys().collect::<Vec<_>>()
+            );
+        }
+        assert!(undescribed_sections(&app).is_empty());
     }
 
     #[test]

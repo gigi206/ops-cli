@@ -797,6 +797,10 @@ fn close_supervision(notif_fd: libc::c_int, pending: &PendingExec) {
 /// which retries its connect for a second — is still served. What this does not defend against is a
 /// caller that floods the backlog for the whole of that second; that is a different bound, and not
 /// one a check on the descriptor can supply.
+///
+/// A connection that hands over **nothing** is refused the same way, and that takes a bound of its
+/// own: see [`recv_handoff`], which is what keeps a silent peer from wedging this thread inside
+/// `recvmsg`.
 fn accept_handoff(listener: &UnixListener, stop: &AtomicBool) -> Option<libc::c_int> {
     use std::os::unix::io::AsRawFd;
     let mut announced = false;
@@ -805,7 +809,7 @@ fn accept_handoff(listener: &UnixListener, stop: &AtomicBool) -> Option<libc::c_
             continue;
         }
         match listener.accept() {
-            Ok((stream, _)) => match recv_fd(&stream) {
+            Ok((stream, _)) => match recv_handoff(&stream, stop) {
                 Ok(fd) => return Some(fd),
                 Err(why) => {
                     // Once: a caller that keeps trying would otherwise fill the session's output
@@ -825,6 +829,43 @@ fn accept_handoff(listener: &UnixListener, stop: &AtomicBool) -> Option<libc::c_
         }
     }
     None
+}
+
+/// How long an accepted connection that has said nothing is given before it is refused.
+///
+/// The shim's `hand_off` connects and `sendmsg`s in the same breath, so a peer that has not written
+/// within this is not the shim, and every moment spent on it is a moment the shim's own handoff
+/// waits behind it. Long enough that a loaded machine's scheduling does not cost a real handoff its
+/// place, short enough that a cage looping on silent connections cannot hold the socket.
+const HANDOFF_QUIET: Duration = Duration::from_millis(500);
+
+/// Receive the handoff an accepted peer sends, giving up on one that sends nothing.
+///
+/// The wait is polled and bounded because `accept4` does **not** carry the listener's `O_NONBLOCK`
+/// onto the accepted socket: the `recvmsg` inside [`recv_fd`] blocks until its peer writes, with no
+/// timeout and no `stop` to re-read. The handoff socket is bind-mounted read-write into the cage and
+/// the exec filter is the innermost wrap, so every wrap that runs third-party code (the portal, the
+/// egress forwarder, `mise install`, `nix build`) runs before the shim connects: a pre-shim process
+/// that connects and then says nothing parked this thread inside `recvmsg` for the rest of the
+/// session. Behind it the real shim connects through the backlog, sends its listener without waiting
+/// for an ack and `execve`s its payload, whose trap then reaches nobody — the cage hangs at its first
+/// exec, and on the host [`ProcEnforce`]'s own `Drop` joins a thread that never returns, so sbx never exits
+/// and never unlinks its sockets.
+fn recv_handoff(stream: &UnixStream, stop: &AtomicBool) -> io::Result<libc::c_int> {
+    use std::os::unix::io::AsRawFd;
+    let deadline = Instant::now() + HANDOFF_QUIET;
+    while !stop.load(Ordering::Relaxed) {
+        // Readable covers a hang-up too, which `recv_fd` reads as the empty message it is.
+        if poll_readable(stream.as_raw_fd(), 250) {
+            return recv_fd(stream);
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+    Err(io::Error::other(
+        "the connection sent no handoff before it was given up on",
+    ))
 }
 
 /// The receive loop: for each notified `execve`, read the target path, decide, and respond — a `deny`
@@ -1260,16 +1301,43 @@ fn serve_open(
     // descriptor its own restriction was meant to refuse. The verdict is unaffected — the lens
     // judged the resolved target either way, and this is only reached for an open it permitted —
     // but a program inside the cage that hardened its own path walk must not have that hardening
-    // quietly removed by being supervised. So the call is declined here and answered `CONTINUE`,
+    // quietly removed by being supervised. So such a call is declined here and answered `CONTINUE`,
     // which runs the real `openat2` with the real `resolve` semantics; it joins the other flags
     // that cannot be carried onto a descriptor.
+    //
+    // Which bits decline is the whole of it, and "any bit at all" was the wrong line. `resolve` is
+    // read out of the cage's own memory, so a blanket decline made `CONTINUE` something the cage
+    // *chooses*: one harmless-looking `RESOLVE_NO_XDEV` moved every allowed open off the handover
+    // and onto the second walk, which a sibling thread is free to redirect — the very window the
+    // lens exists to close, reopened by the caller asking for it. So the word is judged by what it
+    // would change about *this* answer:
+    //
+    // - [`SERVEABLE_RESOLVE`] names the bits that do not change which file the walk may reach:
+    //   `RESOLVE_NO_XDEV` and `RESOLVE_NO_MAGICLINKS` restrict how the path is traversed, and
+    //   `RESOLVE_CACHED` only asks the kernel not to go to disk. Served from the probe, which is the
+    //   inode the lens examined.
+    // - `RESOLVE_NO_SYMLINKS`, `RESOLVE_BENEATH` and `RESOLVE_IN_ROOT` do change it: they refuse a
+    //   walk this probe was allowed to make (through a link, above the caller's own descriptor), and
+    //   the probe cannot reproduce them — it is resolved from `/proc/<pid>/root`, not from the
+    //   caller's `dirfd`. Declined, as before. `RESOLVE_NO_SYMLINKS` gives up nothing by it: a walk
+    //   that refuses every link is one no swapped link can redirect.
+    // - Anything else is a bit this supervisor does not know, and today a bit the kernel does not
+    //   know either — `openat2` answers an unknown `resolve` with `EINVAL` before it looks at the
+    //   path. Declined, so the cage meets that `EINVAL` rather than a descriptor for a syscall that
+    //   was never going to run (the same rule [`OPEN_HOW_VER0`] states for a short `size`).
+    //
+    // What the served bits cost is stated rather than hidden: a caller that asked `RESOLVE_NO_XDEV`
+    // or `RESOLVE_NO_MAGICLINKS` may be handed a descriptor the kernel would have refused, because
+    // the probe's own walk did not carry those restrictions. That is a fidelity loss inside a cage
+    // that already trusts sbx to resolve its opens; serving is what keeps the scan's answer and the
+    // cage's descriptor the same file.
     match open_resolve(
         req.pid,
         req.data.nr,
         &req.data.args,
         notif_of(notif_fd, req.id),
     ) {
-        Some(0) => {}
+        Some(resolve) if resolve & !SERVEABLE_RESOLVE == 0 => {}
         _ => return false,
     }
     // The file exists — holding a descriptor on it is the proof — so `O_CREAT|O_EXCL` is precisely
@@ -1284,8 +1352,16 @@ fn serve_open(
     // here instead, against the same path, and answered the way the kernel would have.
     //
     // Re-walking the path is a second resolution, and the cage may have moved it since. The two
-    // outcomes of losing that race are a spurious `ELOOP` and serving the inode that was scanned —
-    // never an open the lens did not examine, which is the property being defended.
+    // outcomes of losing that race are the errno the path gives on this pass and serving the inode
+    // that was scanned — never an open the lens did not examine, which is the property being
+    // defended.
+    //
+    // A failed re-probe is reported as what it says, not as `ELOOP`. This open can fail for reasons
+    // that describe *this process* — `EMFILE` at the supervisor's descriptor limit, `ENOMEM` — and
+    // answering a symlink loop to a cage opening an ordinary file it had every right to open is the
+    // defect [`errno_describes_the_file`] exists to state once. So the errno is asked about, and one
+    // that describes the supervisor falls through to `CONTINUE`, where the kernel runs the real open
+    // with the real `O_NOFOLLOW`.
     if flags & libc::O_NOFOLLOW != 0 {
         let target = open_target_path(req.pid, dirfd, path);
         let Ok(c) = std::ffi::CString::new(target.as_os_str().as_encoded_bytes()) else {
@@ -1299,7 +1375,13 @@ fn serve_open(
             )
         };
         if link_probe < 0 {
-            respond_errno(notif_fd, req.id, libc::ELOOP);
+            let e = io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::ELOOP);
+            if !errno_describes_the_file(e) {
+                return false;
+            }
+            respond_errno(notif_fd, req.id, e);
             return true;
         }
         // SAFETY: link_probe is a fresh owned descriptor this call is done with.
@@ -1737,6 +1819,10 @@ fn open_flags(
     args: &[u64; 6],
     notif: Option<(libc::c_int, u64)>,
 ) -> Option<u64> {
+    // `open` exists only where the target's syscall table has it (`libc::SYS_open` is defined for
+    // x86-64 and not for aarch64), so the arm is compiled where the number is — the same guard
+    // [`open_args`] carries and the shim's own `open_lens_syscalls` states.
+    #[cfg(target_arch = "x86_64")]
     if nr as libc::c_long == libc::SYS_open {
         return Some(args[1]);
     }
@@ -1765,6 +1851,8 @@ fn open_mode(
     args: &[u64; 6],
     notif: Option<(libc::c_int, u64)>,
 ) -> Option<u64> {
+    // Compiled where the syscall number exists; see [`open_flags`].
+    #[cfg(target_arch = "x86_64")]
     if nr as libc::c_long == libc::SYS_open {
         return Some(args[2]);
     }
@@ -1783,6 +1871,17 @@ fn open_mode(
     None
 }
 
+/// The `resolve` bits an allowed open may still be **served** from the supervisor's own descriptor.
+///
+/// Each of the three restricts *how* the kernel walks a path, not which file the walk is allowed to
+/// end on: `RESOLVE_NO_XDEV` refuses to cross a mount point, `RESOLVE_NO_MAGICLINKS` refuses to
+/// traverse a `/proc` magic link, and `RESOLVE_CACHED` refuses to go to disk. The bits left out are
+/// the ones that change the reachable set — `RESOLVE_NO_SYMLINKS`, `RESOLVE_BENEATH`,
+/// `RESOLVE_IN_ROOT` — and every bit no version of this supervisor has heard of. See the decision in
+/// [`serve_open`], which is where the trade is argued.
+const SERVEABLE_RESOLVE: u64 =
+    libc::RESOLVE_NO_XDEV | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_CACHED;
+
 /// The `resolve` word of an `openat2`, which names path-walk restrictions the caller wants the
 /// kernel to enforce (`RESOLVE_NO_SYMLINKS`, `RESOLVE_BENEATH`, `RESOLVE_IN_ROOT`,
 /// `RESOLVE_NO_MAGICLINKS`, `RESOLVE_NO_XDEV`). `Some(0)` for the two older forms, which have no
@@ -1800,7 +1899,13 @@ fn open_resolve(
     args: &[u64; 6],
     notif: Option<(libc::c_int, u64)>,
 ) -> Option<u64> {
-    if nr as libc::c_long == libc::SYS_open || nr as libc::c_long == libc::SYS_openat {
+    // Split rather than joined by `||`, so the half that names a syscall number this target may not
+    // have is the half that is compiled away; see [`open_flags`].
+    #[cfg(target_arch = "x86_64")]
+    if nr as libc::c_long == libc::SYS_open {
+        return Some(0);
+    }
+    if nr as libc::c_long == libc::SYS_openat {
         return Some(0);
     }
     if nr as libc::c_long == libc::SYS_openat2 {
@@ -2925,16 +3030,71 @@ fn recv_fd_raw(stream: &UnixStream) -> io::Result<libc::c_int> {
         {
             return Err(io::Error::other("no fd in the handoff message"));
         }
-        let mut fd: libc::c_int = -1;
-        std::ptr::copy_nonoverlapping(
-            libc::CMSG_DATA(cmsg),
-            &mut fd as *mut libc::c_int as *mut u8,
-            std::mem::size_of::<libc::c_int>(),
-        );
-        if fd < 0 {
+        let fds = cmsg_fds(cmsg);
+        // A message that carried more than one descriptor is not a handoff, and the descriptors it
+        // brought are already *this process's*: the kernel installs them during `recvmsg`, whatever
+        // the receiver goes on to read. Reading the first and returning left the rest open with
+        // nobody holding them, and the socket is reachable from inside the cage, so a peer looping on
+        // "connect, send four descriptors, close" leaked three per turn until the supervisor met
+        // `EMFILE` on every later `open`, `dup` and `socket` it needed for the real handoff, the
+        // egress proxy and the control sockets. So the whole message is accounted for, and every
+        // descriptor of a refused one is closed.
+        let truncated = msg.msg_flags & libc::MSG_CTRUNC != 0;
+        if fds.len() != 1 || truncated {
+            for fd in &fds {
+                if *fd >= 0 {
+                    libc::close(*fd);
+                }
+            }
+            return Err(io::Error::other(format!(
+                "the handoff message carried {} descriptors{}, and a handoff is exactly one",
+                fds.len(),
+                match truncated {
+                    true => " and more than the receive buffer holds",
+                    false => "",
+                }
+            )));
+        }
+        if fds[0] < 0 {
             return Err(io::Error::other("invalid fd in the handoff message"));
         }
-        Ok(fd)
+        Ok(fds[0])
+    }
+}
+
+/// Every descriptor an `SCM_RIGHTS` control message carries, read from its own `cmsg_len`.
+///
+/// The length is the only thing that says how many there are. A receiver that copies one `c_int` out
+/// and returns is right exactly when the sender sent one, and the sender here is whatever connected
+/// to a socket the cage can reach, so the count is read rather than assumed. [`CmsgBuf`] is sized
+/// for `CMSG_SPACE(size_of::<c_int>())` and holds four of them on the targets sbx builds for, which
+/// is how many the kernel will install from one message.
+///
+/// # Safety
+///
+/// `cmsg` must be a live `cmsghdr` from `CMSG_FIRSTHDR` on a filled `msghdr`, already confirmed to
+/// be `SOL_SOCKET`/`SCM_RIGHTS`.
+unsafe fn cmsg_fds(cmsg: *const libc::cmsghdr) -> Vec<libc::c_int> {
+    // SAFETY: the caller's contract — `cmsg` is a live header the kernel filled, whose payload is
+    // `cmsg_len - CMSG_LEN(0)` bytes of `c_int` starting at `CMSG_DATA`. Read unaligned, because the
+    // payload's alignment is the buffer's and not the type's.
+    unsafe {
+        // `cmsg_len` is a `size_t` on one libc and a `socklen_t` on another, and `CMSG_LEN`
+        // answers in a third type again, so the subtraction is done in `u64`: it is the one width
+        // both spellings widen into, which keeps this free of a cast that is a no-op on the target
+        // being built and a lint error there.
+        let header = u64::from(libc::CMSG_LEN(0));
+        let len = u64::try_from((*cmsg).cmsg_len).unwrap_or(0);
+        let payload = usize::try_from(len.saturating_sub(header)).unwrap_or(0);
+        let count = payload / std::mem::size_of::<libc::c_int>();
+        let data = libc::CMSG_DATA(cmsg);
+        (0..count)
+            .map(|i| {
+                std::ptr::read_unaligned(
+                    data.add(i * std::mem::size_of::<libc::c_int>()) as *const libc::c_int
+                )
+            })
+            .collect()
     }
 }
 
@@ -3735,6 +3895,8 @@ mod tests {
         let mut args = [0u64; 6];
         args[2] = 0o600;
         args[3] = 0o640;
+        // Compiled where the syscall number exists, as the arm it exercises is.
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(
             open_mode(
                 std::process::id(),
@@ -3837,6 +3999,8 @@ mod tests {
     #[test]
     fn each_open_form_states_the_path_walk_it_asked_for() {
         let mut args = [0u64; 6];
+        // Compiled where the syscall number exists, as the arm it exercises is.
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(
             open_resolve(
                 std::process::id(),
@@ -3899,13 +4063,22 @@ mod tests {
         }
     }
 
-    /// The reader is only half of it: `serve_open` has to act on what it says. A restricted
-    /// `openat2` must be declined *before* any answer is formed, so the kernel performs the walk the
-    /// caller asked for; an unrestricted one must be served exactly as before.
+    /// The reader is only half of it: `serve_open` has to act on what it says. An `openat2` that
+    /// restricts *which file* the walk may reach must be declined before any answer is formed, so
+    /// the kernel performs the walk the caller asked for; one that does not must be served exactly
+    /// as every other open is.
+    ///
+    /// Which side of that line each bit falls on is the whole test. The word is read out of the
+    /// cage's own memory, so declining on "any bit at all" made the weaker `CONTINUE` answer — the
+    /// one that re-walks a path a sibling thread can redirect — something the cage could ask for
+    /// with a single harmless `RESOLVE_NO_XDEV`, taking every allowed open off the handover the
+    /// lens depends on. A bit that only restricts how the walk runs is served; the three that
+    /// change what it may reach, and any bit this supervisor does not know (`openat2` answers an
+    /// unknown one with `EINVAL`, so there is nothing to serve), are declined.
     ///
     /// The control is a socket inode, whose answer (`ENXIO`) is formed from the probe's type alone
-    /// and needs no live notification descriptor — so the only difference between the two arms is
-    /// the `resolve` word, which is the point.
+    /// and needs no live notification descriptor — so the only difference between the arms is the
+    /// `resolve` word, which is the point.
     #[test]
     fn a_restricted_openat2_is_left_to_the_kernel_to_walk() {
         use std::os::unix::fs::OpenOptionsExt;
@@ -3943,6 +4116,68 @@ mod tests {
         assert!(
             !serve(libc::RESOLVE_BENEATH),
             "the same holds for every other restriction this supervisor cannot reproduce"
+        );
+        assert!(
+            !serve(libc::RESOLVE_IN_ROOT),
+            "and for the one that moves the walk's root, which the probe does not share"
+        );
+        assert!(
+            serve(libc::RESOLVE_NO_XDEV),
+            "a restriction on how the walk runs still gets the scanned descriptor: declining here \
+             would let a cage move every allowed open onto the second walk by asking for it"
+        );
+        assert!(
+            serve(libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_CACHED),
+            "and the other two of that kind, together"
+        );
+        assert!(
+            !serve(libc::RESOLVE_CACHED << 1),
+            "a bit no version of this supervisor knows is a bit the kernel refuses with `EINVAL`, \
+             so there is no syscall for a served descriptor to be the answer to"
+        );
+    }
+
+    /// A failed `O_NOFOLLOW` re-probe answers the errno it got, and only when that errno is about
+    /// the file.
+    ///
+    /// The arm resolves the path a second time to decide the flag, and it used to report *every*
+    /// failure of that open as `ELOOP`. Its `libc::open` can fail for reasons that belong to this
+    /// process rather than to the cage's file — `EMFILE` at the supervisor's own descriptor limit,
+    /// `ENOMEM` — and a build tool inside the cage was then told an ordinary file it had every right
+    /// to open was a symlink loop. That is the rule [`errno_describes_the_file`] states once for the
+    /// two sites that already ask; this was the third site that did not.
+    ///
+    /// Driven with a name longer than any component may be, which fails the re-probe with an errno
+    /// the rule does not recognise as the file's, and so without having to exhaust this process's
+    /// descriptors to reach the branch. A path that is merely gone still answers, because absence is
+    /// something the cage would have met itself.
+    #[test]
+    fn a_nofollow_reprobe_that_fails_for_reasons_of_its_own_is_not_reported_as_a_loop() {
+        let dir = TmpDir::new();
+        let held = dir.join("held.txt");
+        std::fs::write(&held, b"x").expect("write the fixture");
+
+        let answered = |path: &str| {
+            let probe = std::fs::File::open(&held).expect("hold a probe");
+            let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
+            req.pid = std::process::id();
+            req.data.nr = libc::SYS_openat as libc::c_int;
+            req.data.args[2] = (libc::O_RDONLY | libc::O_NOFOLLOW) as u64;
+            // No notification descriptor: what is under test is whether this answers at all, and
+            // the answer it would send goes nowhere.
+            serve_open(-1, &req, libc::AT_FDCWD, path, Some(probe))
+        };
+
+        let gone = dir.join("gone.txt");
+        assert!(
+            answered(gone.to_str().expect("utf-8 fixture path")),
+            "a path that is not there is an answer the cage would have reached itself"
+        );
+        let too_long = format!("/{}", "n".repeat(4096));
+        assert!(
+            !answered(&too_long),
+            "an errno that does not describe the file leaves the syscall to the kernel rather than \
+             inventing a symlink loop for a file that is not one"
         );
     }
 
@@ -4167,6 +4402,8 @@ mod tests {
         let mut args = [0u64; 6];
         args[1] = 0x111;
         args[2] = 0x222;
+        // Compiled where the syscall number exists, as the arm it exercises is.
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(
             open_flags(
                 std::process::id(),
@@ -4813,6 +5050,94 @@ mod tests {
         }
     }
 
+    /// Hand `fds` over in one `SCM_RIGHTS` message, the way a sender with more than a handoff in
+    /// mind would: the control buffer both sides use holds four descriptors, and the kernel installs
+    /// every one it fits into the receiver.
+    fn send_fds(stream: &UnixStream, fds: &[libc::c_int]) {
+        use std::os::unix::io::AsRawFd;
+        let mut dummy: u8 = b'x';
+        let mut iov = libc::iovec {
+            iov_base: &mut dummy as *mut u8 as *mut libc::c_void,
+            iov_len: 1,
+        };
+        let payload = std::mem::size_of_val(fds) as u32;
+        let mut cbuf = CmsgBuf::zeroed();
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf.as_mut_ptr();
+        // SAFETY: `CMSG_SPACE` computes a size from a size and reads nothing.
+        msg.msg_controllen = unsafe { libc::CMSG_SPACE(payload) } as _;
+        assert!(
+            (msg.msg_controllen as usize) <= cbuf.len(),
+            "the control buffer must hold the message this test sends"
+        );
+        // SAFETY: the control buffer is live, aligned for a `cmsghdr` ([`CmsgBuf`]) and large enough
+        // for one header plus `fds`.
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(payload) as _;
+            std::ptr::copy_nonoverlapping(
+                fds.as_ptr() as *const u8,
+                libc::CMSG_DATA(cmsg),
+                payload as usize,
+            );
+            assert!(
+                libc::sendmsg(stream.as_raw_fd(), &msg, 0) >= 0,
+                "the multi-descriptor message must reach the socket"
+            );
+        }
+    }
+
+    /// How many of this process's descriptors name `path`.
+    ///
+    /// A count of the whole descriptor table would be read by every test running beside this one;
+    /// a path only this test's fixture uses is read by nobody else, so what it counts is a leak.
+    fn fds_naming(path: &Path) -> usize {
+        let want = std::fs::canonicalize(path).expect("canonical fixture path");
+        std::fs::read_dir("/proc/self/fd")
+            .expect("read this process's own descriptor table")
+            .flatten()
+            .filter(|e| std::fs::read_link(e.path()).is_ok_and(|target| target == want))
+            .count()
+    }
+
+    /// A handoff message carrying more than one descriptor leaves none of them behind.
+    ///
+    /// The kernel installs every descriptor an `SCM_RIGHTS` message fits into the receiver, and the
+    /// control buffer here holds four. Reading the cmsg's payload as a single `c_int` and returning
+    /// it therefore left three descriptors open in the supervisor with nothing holding them, on the
+    /// success path and on the rejection path alike, and the socket is one in-cage code can reach:
+    /// a peer looping on "connect, send four, close" walks the launcher into `EMFILE`, where the
+    /// real handoff, the egress proxy and the control sockets all fail to open.
+    #[test]
+    fn a_handoff_message_carrying_more_than_one_descriptor_leaks_none_of_them() {
+        use std::os::unix::io::AsRawFd;
+        let dir = TmpDir::new();
+        let marker = dir.join("marker");
+        std::fs::write(&marker, b"x").expect("write the fixture");
+
+        let (tx, rx) = UnixStream::pair().expect("socketpair");
+        let held = std::fs::File::open(&marker).expect("hold the fixture");
+        let fd = held.as_raw_fd();
+        send_fds(&tx, &[fd, fd, fd, fd]);
+
+        let got = recv_fd_raw(&rx);
+        assert!(
+            got.is_err(),
+            "a message carrying four descriptors is not a handoff"
+        );
+        drop(held);
+        assert_eq!(
+            fds_naming(&marker),
+            0,
+            "every descriptor the refused message brought is closed: the receive installs them all, \
+             whatever the receiver goes on to read"
+        );
+    }
+
     /// The handoff socket is bound into the cage, so the first connection is not necessarily the
     /// shim's. A descriptor that is not a notification listener is refused, and refusing it does
     /// not end the wait: the shim's own handoff, right behind it, is still served.
@@ -4866,6 +5191,62 @@ mod tests {
             libc::close(read_end);
             libc::close(write_end);
         }
+    }
+
+    /// A peer that connects and then says nothing must not hold the handoff.
+    ///
+    /// `accept4` does not carry the listener's non-blocking mode onto the accepted socket, so the
+    /// `recvmsg` that reads a handoff blocks until its peer writes. The socket is bind-mounted into
+    /// the cage and every wrap that runs third-party code runs before the shim connects, so a
+    /// pre-shim process can connect and stay silent: the supervisor thread parked inside `recvmsg`
+    /// for the rest of the session, the shim's own handoff waited behind it forever (its payload
+    /// then trapping with nobody receiving), and the teardown that joins this thread never returned.
+    ///
+    /// Run on a thread with a deadline, because the failure this defends against is a wedge: an
+    /// assertion cannot observe a call that never comes back.
+    #[test]
+    fn a_connection_that_hands_over_nothing_does_not_hold_the_handoff() {
+        let dir = TmpDir::new();
+        let shim = materialized_shim(&dir);
+        let sock_path = dir.join("notif.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind the handoff socket");
+        listener
+            .set_nonblocking(true)
+            .expect("the listener is non-blocking, as the launcher sets it");
+
+        // What the cage can do without holding anything of its own: connect, and say nothing. Kept
+        // alive for the whole test, so the supervisor never sees a hang-up to read as an end.
+        let _silent = UnixStream::connect(&sock_path).expect("connect to the handoff socket");
+
+        // ...and the real shim, queued right behind it.
+        let mut cmd = std::process::Command::new(&shim);
+        cmd.arg(&sock_path)
+            .arg("--")
+            .arg("/bin/true")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = spawn_shim(&mut cmd);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let stop = AtomicBool::new(false);
+            let _ = tx.send(accept_handoff(&listener, &stop));
+        });
+        let served = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the wait for a handoff must not be held by a peer that sends nothing");
+        let notif = served.expect("the shim's handoff must still be served");
+        assert!(
+            is_notif_listener(notif),
+            "what the supervisor kept must be the shim's listener"
+        );
+
+        // The payload is parked in its `execve` notification with nobody answering; it is the
+        // handoff this test is about, not the decision.
+        let _ = child.kill();
+        let _ = child.wait();
+        // SAFETY: this test's own descriptor, closed exactly once.
+        unsafe { libc::close(notif) };
     }
 
     /// Lay the embedded shim down as an executable file and return its path. Its callers run

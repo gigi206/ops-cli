@@ -68,7 +68,8 @@ global app's [per-project mise pool](../apps/home#two-mise-pools-keep-a-global-a
 
 `$XDG_STATE_HOME/sbx/trusted/` (else `$HOME/.local/state/sbx/trusted/`): one marker
 per trusted project config, holding the SHA-256 of the file's contents, keyed by the
-config's canonical path. See [The trust gate](trust).
+canonical path of the project directory plus the config's own file name. See
+[The trust gate](trust).
 
 The trust store dir is required to be an **absolute** path: a relative base would
 let a cloned repository pre-approve itself.

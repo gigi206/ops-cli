@@ -45,15 +45,26 @@ pub(super) fn count_host_secrets(hosts: &BTreeMap<String, RawHostSecrets>) -> us
         .sum()
 }
 
-/// Set the secret for its target and headers, overriding an existing one (last-wins) with a
-/// warning while preserving declaration order. Two secrets to the same host that write the same
-/// header would otherwise inject two copies of it upstream.
+/// Set the secret for its target and headers, overriding **every** existing one it collides with
+/// (last-wins) with a warning apiece, while preserving declaration order. Two secrets to the same
+/// host that write the same header would otherwise inject two copies of it upstream.
 ///
 /// The comparison is over **every** header each declaration writes, not the one it is named by. A
 /// signed declaration's `header` is only the first its plugin's manifest lists, so two signers for
 /// one host whose manifests differ in that first header and agree on a later one read as unrelated
 /// and both went on the wire — which is the exact collision this function exists to prevent, on the
 /// declarations most likely to produce it (a signer writes several headers by design).
+///
+/// For the same reason the search runs to the end of the set rather than stopping at the first
+/// match: a declaration that writes several headers can collide with several existing ones at once
+/// (a signer setting `Authorization` and `X-Amz-Date` meets one declaration for each), and
+/// absorbing only the first left the rest in place — so `pairs_for` still produced two
+/// `Authorization` pairs and the request head carried both.
+///
+/// What is compared is the *target rule*, by equality. Two different spellings of one destination
+/// (a bare `host` and a `host/path` under it) classify to different rules and are not compared,
+/// while the proxy injects every rule whose match covers the request; a declaration pair written
+/// that way is outside what this absorbs.
 pub(super) fn upsert_secret(
     out: &mut Vec<HeaderSecret>,
     warnings: &mut Vec<String>,
@@ -67,33 +78,45 @@ pub(super) fn upsert_secret(
             .find(|h| writes.iter().any(|w| w.eq_ignore_ascii_case(h)))
             .map(|h| (*h).to_string())
     };
-    match out.iter_mut().find_map(|s| {
-        (s.to == secret.to)
-            .then(|| shared(s))
-            .flatten()
-            .map(|h| (s, h))
-    }) {
-        Some((slot, header)) => {
+    let collisions: Vec<(usize, String)> = out
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| {
+            (s.to == secret.to)
+                .then(|| shared(s))
+                .flatten()
+                .map(|h| (i, h))
+        })
+        .collect();
+    let Some(&(first, _)) = collisions.first() else {
+        // Two credentials under one name are legal (the name is a label, not a key) but
+        // ambiguous where the name is *rendered*: a redacted value prints `${name}`, so the
+        // reader could not tell which credential was withheld. Warn, naming both targets.
+        if let Some(clash) = out.iter().find(|s| s.name == secret.name) {
             warnings.push(format!(
-                "{source}: a later secret overrides an earlier one for `{header}` -> {}",
-                secret.to
+                "{source}: two secrets share the name `{}` ({} and {}) — a redacted value \
+                 names only the name, so give them distinct ones",
+                secret.name, clash.to, secret.to
             ));
-            *slot = secret;
         }
-        None => {
-            // Two credentials under one name are legal (the name is a label, not a key) but
-            // ambiguous where the name is *rendered*: a redacted value prints `${name}`, so the
-            // reader could not tell which credential was withheld. Warn, naming both targets.
-            if let Some(clash) = out.iter().find(|s| s.name == secret.name) {
-                warnings.push(format!(
-                    "{source}: two secrets share the name `{}` ({} and {}) — a redacted value \
-                     names only the name, so give them distinct ones",
-                    secret.name, clash.to, secret.to
-                ));
-            }
-            out.push(secret);
-        }
+        out.push(secret);
+        return;
+    };
+    // One warning per absorbed declaration, each naming the header it lost, because that header is
+    // what the reader has to look for in the config to see which line stopped applying.
+    for (_, header) in &collisions {
+        warnings.push(format!(
+            "{source}: a later secret overrides an earlier one for `{header}` -> {}",
+            secret.to
+        ));
     }
+    // Removed back to front so the earlier indices stay valid, and the replacement lands where the
+    // first absorbed declaration stood: a later declaration takes the position of the one it
+    // overrides, as it did when only one could be absorbed.
+    for (i, _) in collisions.iter().rev() {
+        out.remove(*i);
+    }
+    out.insert(first, secret);
 }
 
 /// Validate one host entry into a [`HeaderSecret`], or report why it is malformed. `host` is the
@@ -189,7 +212,7 @@ pub(super) fn validate_host_secret(
     };
     let name = match raw.name.as_deref() {
         Some(n) => validate_secret_name(n)?.to_string(),
-        None => host.to_string(),
+        None => default_secret_name(host),
     };
     Ok(HeaderSecret {
         name,
@@ -200,6 +223,38 @@ pub(super) fn validate_host_secret(
         shape,
         signer,
     })
+}
+
+/// The logical name a declaration that writes none falls back to: its `[secret."…"]` section key,
+/// reduced to the character set [`validate_secret_name`] accepts.
+///
+/// The default used to be the section key verbatim, which is the one path into a rendered name that
+/// no name check ever saw. A key only has to classify as a target, and a URL rule's path is stored
+/// unvalidated — so `[secret."api.example.com/<ESC>[2K\rALLOWED "]` reached the redactor, which
+/// prints a withheld value as `${<name>}`, and the escape rewrote the line the reader was looking
+/// at. That is exactly what the explicit name's charset exists to stop, and the default now gets
+/// it: a character outside the set becomes `-`, and the result is capped like any other name.
+///
+/// The key rather than the classified rule's host, so two path-scoped credentials on one host keep
+/// the distinct names they are declared with, and a redacted value still says which one it was.
+fn default_secret_name(host: &str) -> String {
+    let cleaned: String = host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(NAME_MAX)
+        .collect();
+    if cleaned.is_empty() {
+        // Unreachable through the loader (a target classifies only when it names a host), but a
+        // name is rendered and an empty `${}` names nothing at all.
+        return "secret".to_string();
+    }
+    cleaned
 }
 
 /// The longest description kept, in characters — a label for one terminal line, not a document.
@@ -795,4 +850,184 @@ pub(super) fn validate_header_shape(
         prefix: prefix.unwrap_or(default_prefix).to_string(),
         base64,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One declaration to `api.example.com`, writing `header`.
+    fn secret(header: &str) -> HeaderSecret {
+        let raw = RawHostSecret {
+            name: None,
+            description: None,
+            kind: Some("http-header".into()),
+            key: None,
+            from: Some(SecretFrom::One("env://TOKEN".into())),
+            header: Some(header.into()),
+            value_type: Some("raw".into()),
+            prefix: None,
+            sign: None,
+        };
+        validate_host_secret(
+            "api.example.com",
+            raw,
+            &SecretDefaults::default(),
+            &PluginRegistry::default(),
+        )
+        .expect("the fixture declaration validates")
+    }
+
+    /// A signed declaration to `api.example.com` whose manifest sets `sets`.
+    fn signed(name: &str, sets: &[&str]) -> HeaderSecret {
+        let plugin = crate::plugins::signer::SignerPlugin {
+            name: name.to_string(),
+            dir: std::path::PathBuf::from(format!("/data/plugins/{name}")),
+            exec: std::path::PathBuf::from(format!("/data/plugins/{name}/sign")),
+            sandbox: Default::default(),
+            signer: crate::plugins::signer::SignerSpec {
+                sets_headers: sets.iter().map(|h| (*h).to_string()).collect(),
+                sees_headers: Vec::new(),
+                reads_secret: false,
+                body_digest: None,
+            },
+            version: None,
+            description: None,
+            host: Default::default(),
+        };
+        let raw = RawHostSecret {
+            name: None,
+            description: None,
+            kind: Some("http-header".into()),
+            key: None,
+            from: Some(SecretFrom::One("env://AWS_SECRET".into())),
+            header: None,
+            value_type: None,
+            prefix: None,
+            sign: Some(name.to_string()),
+        };
+        validate_host_secret(
+            "api.example.com",
+            raw,
+            &SecretDefaults::default(),
+            &PluginRegistry::with_signers([plugin]),
+        )
+        .expect("the fixture signer declaration validates")
+    }
+
+    /// A declaration that writes several headers can collide with several existing ones at once,
+    /// and the search used to stop at the first. A signer setting `Authorization` and `X-Amz-Date`
+    /// absorbed only the `X-Amz-Date` declaration it met first, so the `Authorization` one stayed in
+    /// the set and the request head carried two `Authorization` lines: the exact duplicate this
+    /// function exists to prevent.
+    #[test]
+    fn a_signer_absorbs_every_declaration_it_collides_with_not_just_the_first() {
+        let mut out = Vec::new();
+        let mut warnings = Vec::new();
+        upsert_secret(
+            &mut out,
+            &mut warnings,
+            "global config",
+            secret("X-Amz-Date"),
+        );
+        upsert_secret(
+            &mut out,
+            &mut warnings,
+            "global config",
+            secret("Authorization"),
+        );
+        upsert_secret(
+            &mut out,
+            &mut warnings,
+            "global config",
+            signed("awsv4", &["Authorization", "X-Amz-Date"]),
+        );
+
+        assert_eq!(
+            out.len(),
+            1,
+            "both colliding declarations are absorbed: {:?}",
+            out.iter().map(|s| s.headers()).collect::<Vec<_>>()
+        );
+        let written: Vec<&str> = out.iter().flat_map(HeaderSecret::headers).collect();
+        assert_eq!(
+            written.iter().filter(|h| **h == "Authorization").count(),
+            1,
+            "no header may be written twice: {written:?}"
+        );
+        for header in ["Authorization", "X-Amz-Date"] {
+            assert!(
+                warnings.iter().any(|w| w.contains(header)),
+                "each absorbed declaration is named by the header it lost: {warnings:?}"
+            );
+        }
+    }
+
+    /// The other half of the rule, unchanged: a declaration that collides with nothing is kept, and
+    /// the set stays in declaration order.
+    #[test]
+    fn declarations_that_write_different_headers_all_survive() {
+        let mut out = Vec::new();
+        let mut warnings = Vec::new();
+        upsert_secret(
+            &mut out,
+            &mut warnings,
+            "global config",
+            secret("X-Amz-Date"),
+        );
+        upsert_secret(
+            &mut out,
+            &mut warnings,
+            "global config",
+            secret("Authorization"),
+        );
+        assert_eq!(
+            out.iter().map(|s| s.header.as_str()).collect::<Vec<_>>(),
+            vec!["X-Amz-Date", "Authorization"]
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("overrides")),
+            "nothing collided, so nothing is absorbed: {warnings:?}"
+        );
+    }
+
+    /// A declaration that omits `name` falls back to its section key, and that key never went
+    /// through the name gate: a URL rule's path is stored unvalidated, so an escape sequence written
+    /// into it reached the redactor, which prints a withheld value as `${<name>}` and handed the
+    /// escape to the reader's terminal. The default is now held to the same character set an
+    /// explicit name is.
+    #[test]
+    fn a_defaulted_name_cannot_carry_a_terminal_escape_into_a_redaction() {
+        let raw = RawHostSecret {
+            name: None,
+            description: None,
+            kind: Some("http-header".into()),
+            key: None,
+            from: Some(SecretFrom::One("env://TOKEN".into())),
+            header: Some("Authorization".into()),
+            value_type: Some("bearer".into()),
+            prefix: None,
+            sign: None,
+        };
+        let s = validate_host_secret(
+            "api.example.com/\u{1b}[2K\rALLOWED",
+            raw,
+            &SecretDefaults::default(),
+            &PluginRegistry::default(),
+        )
+        .expect("the target itself classifies");
+        assert!(
+            validate_secret_name(&s.name).is_ok(),
+            "a defaulted name is held to the gate an explicit one is: {:?}",
+            s.name
+        );
+        assert_eq!(s.name, "api.example.com---2K-ALLOWED");
+    }
+
+    /// An ordinary section key is its own name, unchanged: the gate reduces what it must and
+    /// nothing else.
+    #[test]
+    fn an_ordinary_host_key_is_its_own_default_name() {
+        assert_eq!(secret("Authorization").name, "api.example.com");
+    }
 }

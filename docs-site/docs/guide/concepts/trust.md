@@ -60,7 +60,9 @@ There are two ways a config is trusted:
 ## How content trust works
 
 `sbx trust` records a **SHA-256 of the whole file** (not a parsed subset) under the
-[trust store](directory-layout), keyed by the config's canonical path. When a
+[trust store](directory-layout), keyed by the canonical path of the project
+*directory* plus the config's own file name, so a `.sbx.toml` that is a symlink
+into another project does not inherit that project's trust. When a
 launch loads the config, it recomputes the hash of the exact bytes it parses and
 compares:
 

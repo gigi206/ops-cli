@@ -36,6 +36,20 @@ fn verdict(file_uid: u32, mode: u32, euid: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// The most bytes a config file may hold, in bytes.
+///
+/// A `.sbx.toml` (and every sibling mise file the trust hash folds in) is attacker-controlled the
+/// moment the user `cd`s into a cloned repo, and these bytes are read on the host, before any trust
+/// decision, with the user's own privileges. An unbounded `read_to_end` therefore let a repo decide
+/// how much memory the process allocated: a file of a few GiB, one long comment line, compresses to
+/// almost nothing in the git pack, so the clone is cheap and every sbx invocation in that directory
+/// dies (or takes another process down with it) before reaching a verdict.
+///
+/// Generous by design: this is a hand-written configuration file, and the shipped catalogue's
+/// largest is three orders of magnitude below the ceiling. It is here to bound the allocation, not
+/// to have an opinion about how long a config may be.
+const MAX_CONFIG_BYTES: u64 = 4 << 20;
+
 /// A refusal carries `PermissionDenied`, the closest kind to "this file is not
 /// trustworthy to load".
 fn refuse(why: &str) -> io::Error {
@@ -63,6 +77,13 @@ pub(crate) fn check_safe_file(f: &std::fs::File, path: &Path) -> io::Result<()> 
 /// consumed bytes cannot belong to two different files (the trust hash and the
 /// later parse act on exactly these bytes).
 ///
+/// The read is bounded by [`MAX_CONFIG_BYTES`], through the same descriptor: a file longer than
+/// that is refused rather than held, so a config nobody has vouched for cannot decide how much of
+/// the host's memory this process allocates. The refusal takes the ordinary [`refuse`] path, so a
+/// caller degrades to a dropped layer with a named warning exactly as it does for a
+/// world-writable file. The bound is read off the bytes actually delivered, not off the `fstat`
+/// size, so a file that grows between the two is still refused.
+///
 /// **Every error returned names the file**, so a caller renders it under an action and does not
 /// prefix the path a second time: `ignoring {e}`, `cannot trust {e}`, `cannot read {e}`. The gate
 /// names the file, the caller names the action. It has to be this way round because the gate is the
@@ -76,14 +97,27 @@ pub(crate) fn read_safe_bytes(path: &Path) -> io::Result<Vec<u8>> {
     // Open non-blocking: a writer-less FIFO would otherwise hang this `O_RDONLY` open indefinitely,
     // before the verdict below could refuse it as a non-regular file. For a regular file
     // `O_NONBLOCK` is a no-op on reads, so the bytes read are unaffected.
-    let mut f = std::fs::OpenOptions::new()
+    let f = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
         .map_err(|e| with_path(e, path))?;
     check_safe_file(&f, path)?;
     let mut out = Vec::new();
-    f.read_to_end(&mut out).map_err(|e| with_path(e, path))?;
+    // One byte past the ceiling, so a file exactly at it still loads and anything longer is
+    // detectable without reading (or allocating) the rest of it.
+    f.take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| with_path(e, path))?;
+    if out.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(with_path(
+            refuse(&format!(
+                "larger than {} KiB, the ceiling for a config file",
+                MAX_CONFIG_BYTES / 1024
+            )),
+            path,
+        ));
+    }
     Ok(out)
 }
 
@@ -161,6 +195,34 @@ mod tests {
         assert!(
             err.to_string().contains("absent.toml"),
             "a missing file must name the path; got: {err}"
+        );
+    }
+
+    /// The bytes of a `.sbx.toml` are read on the host, before any trust decision, so their length
+    /// is a cloned repo's choice. An unbounded `read_to_end` let that choice be the host's memory:
+    /// a multi-gigabyte file of one long comment compresses to nothing in the git pack, and every
+    /// sbx invocation in that directory allocated the whole of it before reaching a verdict.
+    #[test]
+    fn read_safe_bytes_refuses_a_config_larger_than_the_ceiling() {
+        let dir = TmpDir::new();
+        let big = dir.join("big.toml");
+        std::fs::write(&big, vec![b'#'; (MAX_CONFIG_BYTES + 1) as usize]).unwrap();
+        let err = read_safe_bytes(&big).expect_err("an oversized config must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("ceiling for a config file"),
+            "the refusal must say what it is about: {err}"
+        );
+
+        // The ceiling itself still loads: the bound is a bound, not an off-by-one refusal of the
+        // last acceptable file.
+        let exact = dir.join("exact.toml");
+        std::fs::write(&exact, vec![b'#'; MAX_CONFIG_BYTES as usize]).unwrap();
+        assert_eq!(
+            read_safe_bytes(&exact)
+                .expect("a config at the ceiling loads")
+                .len(),
+            MAX_CONFIG_BYTES as usize
         );
     }
 

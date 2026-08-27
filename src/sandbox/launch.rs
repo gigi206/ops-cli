@@ -422,11 +422,14 @@ fn launch_detached(
 
 /// The daemon body. Detaches from the controlling terminal, builds and registers the cage with
 /// its output still on the terminal (so setup errors are visible), signals readiness, then
-/// redirects to the session log and runs the cage. Never returns: every path ends in `exec`
-/// (which replaces the process) or [`std::process::exit`], so the parent's tail logic can never
-/// run a second time in the child. With observation on — the `--observe` flag *or* a
-/// config-declared `[proc] mode = "observe"` — it also stands up the process observer, which, like
-/// a guard, forces the supervised (fork+wait) path so a live parent outlives the cage.
+/// redirects to the session log and runs the cage. Never returns: it ends in
+/// [`std::process::exit`], so the parent's tail logic can never run a second time in the child.
+/// With observation on — the `--observe` flag *or* a config-declared `[proc] mode = "observe"` —
+/// it also stands up the process observer.
+///
+/// The cage is always run supervised (fork+wait), never by exec-replace: this daemon must stay
+/// alive as bwrap's parent, or `--die-with-parent` would bind the cage's life to the *launcher*,
+/// which detaching lets exit. A guard and the observer need that live parent too.
 fn detached_child(
     prep: Prepared,
     runtime: binds::Runtime,
@@ -497,24 +500,18 @@ fn detached_child(
         )
     });
 
-    match guard {
-        None if may_exec_replace(&prep.cfg.proc, observe) => {
-            // exec-replace: bwrap (pid 1 of the cage's namespace) inherits the redirected stdio.
-            let err = exec(&prep.bwrap, &spec, &prep.cfg.limits);
-            crate::diag::error(&format!("sbx: failed to launch the sandbox: {err}"));
-            std::process::exit(1);
-        }
-        maybe_guard => {
-            // Supervise: this daemon is the long-lived parent the proxy/forwarder threads, the
-            // observer, and bwrap (`--die-with-parent`) hang from. Drop the guard and observer
-            // explicitly before exiting — a bare `process::exit` runs no destructors, so their
-            // sockets would otherwise leak even on a clean exit.
-            let code = run_status(&prep.bwrap, &spec, &prep.cfg.limits);
-            drop(observer);
-            drop(maybe_guard);
-            std::process::exit(code);
-        }
-    }
+    // Supervise, always — a detached launch never takes the exec-replace shortcut the foreground
+    // path takes. This daemon is the long-lived parent the proxy/forwarder threads, the observer,
+    // and bwrap (`--die-with-parent`) hang from, and that last one is why the shortcut is wrong
+    // here even with no guard and no observer: exec-replace would leave bwrap's parent being the
+    // *launcher*, the very process detaching is about to let exit, and `--die-with-parent` then
+    // SIGKILLs the whole cage as soon as it does. Drop the guard and observer explicitly before
+    // exiting — a bare `process::exit` runs no destructors, so their sockets would otherwise leak
+    // even on a clean exit.
+    let code = run_status(&prep.bwrap, &spec, &prep.cfg.limits);
+    drop(observer);
+    drop(guard);
+    std::process::exit(code);
 }
 
 /// Wait for the daemon's readiness byte, then report. On success the daemon is reparented to init
@@ -680,6 +677,20 @@ fn note_trust_drops(
     }
 }
 
+/// Print one config warning to the terminal, with its control characters taken out.
+///
+/// The warnings a launch surfaces are not all sbx's own words: several interpolate strings taken
+/// verbatim from the project's `.sbx.toml`, and the untrusted-`[broker.*]` note names its raw TOML
+/// table keys. A quoted key follows basic-string rules, so it may carry ESC, CR and newlines, and
+/// [`crate::diag::warn`] writes what it is handed. Unfiltered, `ESC[2K` + CR in a key erases and
+/// rewrites the line: the lines this would be printed among are the trust-drop announcements, the
+/// one channel that says which security fields were withheld, so the forgery would land exactly
+/// where it does the most damage. [`crate::sandbox::sanitize`] is the same filter every other
+/// cage-chosen string reaches a reader through.
+fn warn_sanitized(warning: &str) {
+    crate::diag::warn(&super::sanitize(warning));
+}
+
 /// The trust-drop warnings of a launch, redacted, in the order they were produced.
 ///
 /// `needles` redacts each note the way [`super::notify_sink`] redacts the very same string on its
@@ -712,6 +723,12 @@ fn trust_drop_notes(
             }
             None => warning.clone(),
         })
+        // Control characters out, for the same reason the terminal print takes them out (see
+        // `warn_sanitized`) and one more that is this writer's own: a note carrying a newline would
+        // be written as two lines, and the second is free to spell `=== sbx session <pid>
+        // started=<n> ===`. `sbx session logs` splits the log on that line and shows only what
+        // follows it, so a forged one hides every line of the session that preceded it.
+        .map(|note| super::sanitize(&note))
         .collect()
 }
 
@@ -2153,7 +2170,7 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
 
     // Surface what the trust gate dropped or withheld, exactly as a launch would.
     for warning in &prep.cfg.warnings {
-        crate::diag::warn(warning);
+        warn_sanitized(warning);
     }
 
     // Provision the project's declared tools and seed its store: the seed gc-roots the base and
@@ -2377,7 +2394,7 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
         ExitCode::FAILURE
     })?;
     for warning in &packages.warnings {
-        crate::diag::warn(warning);
+        warn_sanitized(warning);
     }
 
     // The prebuilt backends are host-side like `nix:`, so their roots must be part of the gc seed
@@ -2422,7 +2439,7 @@ fn equip_for_gc(prep: &Prepared) -> Result<super::projectstore::ProjectStore, Ex
 
     let tools = mise_tools(prep)?;
     for warning in &tools.warnings {
-        crate::diag::warn(warning);
+        warn_sanitized(warning);
     }
 
     let font_layer = if prep.cfg.gui.renders() {
@@ -2653,21 +2670,21 @@ pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
     // Locate a live process inside the cage (the session pid is the cage's host-side anchor). A
     // `None` here means the cage has no in-namespace process left — it exited between `sbx session ls` and
     // now, or the host has no user namespaces (then it never had a cage).
-    let Some(cage_pid) = super::attach::find_cage_pid(target.pid) else {
+    let Some(cage_target) = super::attach::find_cage_pid(target.pid) else {
         crate::diag::error(&format!(
             "sbx session attach: session '{id}' has no live process to enter — it may have just exited \
              (run `sbx session ls`)."
         ));
         return ExitCode::FAILURE;
     };
-    let cage = match super::attach::open_cage_handle(cage_pid) {
+    let cage = match super::attach::open_cage_handle(&cage_target) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("sbx session attach: cannot open a handle to session '{id}''s cage: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let environ = super::attach::read_environ(cage_pid);
+    let environ = super::attach::read_environ(cage_target.pid);
 
     // The in-cage argv: the interactive rc shell for a bare attach, or the command run through
     // `bash -c 'exec "$@"'` so bash resolves it on the cage PATH and execs it in place.
@@ -3487,7 +3504,7 @@ fn build(
     cmd: Vec<OsString>,
 ) -> Result<(SandboxSpec, Option<LaunchGuard>), ExitCode> {
     for warning in &prep.cfg.warnings {
-        crate::diag::warn(warning);
+        warn_sanitized(warning);
     }
 
     // Reclaim the per-launch runtime files of launches that are gone, before standing up our own.
@@ -3521,7 +3538,7 @@ fn build(
         }
     };
     for warning in &packages.warnings {
-        crate::diag::warn(warning);
+        warn_sanitized(warning);
     }
 
     // Provision a trusted project's `nix:` mise tools — the exact-pinned dev toolchain.
@@ -3529,7 +3546,7 @@ fn build(
     // tool wins over the coarser package layer on a name clash.
     let tools = mise_tools(prep)?;
     for warning in &tools.warnings {
-        crate::diag::warn(warning);
+        warn_sanitized(warning);
     }
     let mut bin_paths = tools.bins;
     bin_paths.extend(packages.bins);
@@ -3941,7 +3958,9 @@ fn build(
             Err(e) => {
                 // Refused rather than dropped: a launch that ran with a scan it could not build
                 // would report a protection it does not have.
-                eprintln!("sbx: cannot build the `[fs] scan` content scanner: {e}");
+                crate::diag::error(&format!(
+                    "sbx: cannot build the `[fs] scan` content scanner: {e}"
+                ));
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -4333,7 +4352,9 @@ fn build(
                         Some((value, prep.cfg.redact_min_len))
                     }
                     Err(e) => {
-                        eprintln!("sbx: cannot resolve the secret for the `{name}` broker: {e}");
+                        crate::diag::error(&format!(
+                            "sbx: cannot resolve the secret for the `{name}` broker: {e}"
+                        ));
                         return Err(ExitCode::FAILURE);
                     }
                 }
@@ -4378,7 +4399,7 @@ fn build(
                     broker_guards.push(guard);
                 }
                 Err(e) => {
-                    eprintln!("sbx: cannot start the `{name}` broker: {e}");
+                    crate::diag::error(&format!("sbx: cannot start the `{name}` broker: {e}"));
                     return Err(ExitCode::FAILURE);
                 }
             }
@@ -4819,7 +4840,7 @@ fn build(
     // point: they are the only binds here meant to land on one.
     let fs_masks = super::fsmask::expand(&prep.cwd, &prep.cfg.fs);
     for warning in &fs_masks.warnings {
-        crate::diag::warn(warning);
+        warn_sanitized(warning);
     }
     if let Some(reason) = &fs_masks.refused {
         eprintln!("sbx: {reason}");
@@ -4837,9 +4858,9 @@ fn build(
             Err(e) => {
                 // Fail closed: without the decoys nothing masks those paths, and a session that
                 // ran anyway would leave open exactly the files the config asked to close.
-                eprintln!(
+                crate::diag::error(&format!(
                     "sbx: cannot stage the `[fs]` masks ({e}) — the paths they name would stay open"
-                );
+                ));
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -6371,12 +6392,13 @@ mod tests {
     /// than from the resolved policy, so a project whose config declares `[proc] mode = "observe"`
     /// lost observation in two different ways with no error on either: the detached daemon started
     /// the observer and then exec'd straight over it, and the foreground non-tty path never started
-    /// one at all. Both now ask [`may_exec_replace`], which reads the same
-    /// [`observation_flags`] pair that decides whether to start the observer.
+    /// one at all. The foreground path now asks [`may_exec_replace`], which reads the same
+    /// [`observation_flags`] pair that decides whether to start the observer; the detached daemon
+    /// takes no shortcut at all any more (it must stay alive as bwrap's parent).
     ///
-    /// What is pinned here is the predicate's own answer. That the two launch paths ask it — the
+    /// What is pinned here is the predicate's own answer. That the foreground path asks it — the
     /// half that was actually written wrong — is guarded by
-    /// `the_guardless_launch_paths_ask_the_predicate_and_not_the_observe_flag`, because a call site
+    /// `the_guardless_launch_path_asks_the_predicate_and_not_the_observe_flag`, because a call site
     /// can go back to reading the flag while every assertion below still holds.
     #[test]
     fn config_declared_observation_blocks_the_exec_replace_shortcut() {
@@ -6419,57 +6441,158 @@ mod tests {
     /// reading the raw flag, losing a config-declared `[proc] mode = "observe"` exactly as before
     /// (the detached daemon starts the observer and execs over it, the foreground path starts none).
     ///
-    /// Neither `launch_foreground` nor `detached_child` is reachable from a unit test — both take a
-    /// whole `Prepared`, build a real cage, and end in `exec` or `process::exit` — and nothing else
-    /// in the crate calls them, so the decision at those two sites is guarded here on the source, the
-    /// way `the_wraps_nest_around_the_composed_startup_and_not_the_bare_command` guards `build`'s own
-    /// ordering, because the alternative is no check at all.
+    /// `launch_foreground` is not reachable from a unit test — it takes a whole `Prepared`, builds
+    /// a real cage, and ends in `exec` or `process::exit` — and nothing else in the crate calls it,
+    /// so the decision at that site is guarded here on the source, the way
+    /// `the_wraps_nest_around_the_composed_startup_and_not_the_bare_command` guards `build`'s own
+    /// ordering, because the alternative is no check at all. `detached_child`, the other guardless
+    /// path, no longer decides anything: it always supervises, which
+    /// `a_detached_launch_never_exec_replaces_over_its_own_parent` pins.
     #[test]
-    fn the_guardless_launch_paths_ask_the_predicate_and_not_the_observe_flag() {
+    fn the_guardless_launch_path_asks_the_predicate_and_not_the_observe_flag() {
+        let name = "launch_foreground";
+        let body = production_fn_body(name);
+
+        // The pair that decides whether an observer is started at all.
+        assert!(
+            body.contains("observation_flags(&prep.cfg.proc, observe)"),
+            "`{name}` no longer reads the resolved policy to decide observation"
+        );
+
+        let arms: Vec<&str> = body
+            .match_indices("None if ")
+            .map(|(at, kw)| {
+                let cond = &body[at + kw.len()..];
+                &cond[..cond.find(" =>").unwrap_or(cond.len())]
+            })
+            .collect();
+        assert_eq!(
+            arms.len(),
+            1,
+            "`{name}` has {} guardless arms: a second one can reinstate the flag-only \
+             decision for whichever matches first ({arms:?})",
+            arms.len()
+        );
+        assert_eq!(
+            arms[0], "may_exec_replace(&prep.cfg.proc, observe)",
+            "`{name}` decides the exec-replace shortcut with `{}` instead of asking \
+             `may_exec_replace`, so a config-declared `[proc] mode = \"observe\"` — which sets \
+             no flag — takes the shortcut again and its observation is lost with no error",
+            arms[0]
+        );
+    }
+
+    /// A detached launch must never exec-replace, whatever the guard and the `[proc]` policy say.
+    ///
+    /// `detached_child` runs in the forked daemon whose parent is the launcher, and the launcher is
+    /// exactly the process detaching lets exit: `detach_parent` reads the readiness byte, reports the
+    /// session, and returns. Exec-replace would make that launcher bwrap's own parent, and
+    /// `--die-with-parent` (emitted for every spec by `super::argv::to_argv`) arms `PDEATHSIG=SIGKILL`
+    /// against it, so the cage was killed the moment the launcher exited — intermittently, since the
+    /// readiness byte is written before the exec, and silently, since the user had just been told the
+    /// session had started. Forking and waiting keeps the daemon alive as that parent.
+    ///
+    /// Guarded on the source for the same reason as the test above: `detached_child` takes a whole
+    /// `Prepared`, builds a real cage, and never returns.
+    #[test]
+    fn a_detached_launch_never_exec_replaces_over_its_own_parent() {
+        let body = production_fn_body("detached_child");
+
+        // The observer is still decided from the resolved policy, not from the flag.
+        assert!(
+            body.contains("observation_flags(&prep.cfg.proc, observe)"),
+            "`detached_child` no longer reads the resolved policy to decide observation"
+        );
+        assert!(
+            !body.contains("exec(&prep.bwrap"),
+            "`detached_child` exec-replaces again: the launcher becomes bwrap's parent and \
+             `--die-with-parent` SIGKILLs the cage when it exits"
+        );
+        assert!(
+            body.contains("run_status(&prep.bwrap"),
+            "`detached_child` no longer forks and waits, so nothing keeps a live parent for the \
+             cage, the guard, and the observer"
+        );
+        assert!(
+            !body.contains("None if "),
+            "`detached_child` decides between exec and supervision again; supervision is \
+             unconditional there"
+        );
+    }
+
+    /// `src/diag.rs` is the single chokepoint for the `sbx:` diagnostic family: it decides the
+    /// palette from stderr and lifts every `` `identifier` `` span to the identifier hue, and on a
+    /// captured stream it emits the same bytes a bare `eprintln!` would. Four refusals here carried
+    /// backticked identifiers straight to `eprintln!`, so on a terminal they printed raw backticks
+    /// where every sibling refusal painted the span.
+    #[test]
+    fn no_backticked_diagnostic_bypasses_the_diag_chokepoint() {
         let source = include_str!("launch.rs");
-        // Only production code: the test module below quotes these very fragments.
+        // Production code only: this module quotes diagnostics of its own.
         let production = &source[..source
             .find("\n#[cfg(test)]\nmod tests {")
             .expect("the test module is where this file's non-production code ends")];
-
-        for name in ["launch_foreground", "detached_child"] {
-            let start = production
-                .find(&format!("\nfn {name}("))
-                .unwrap_or_else(|| panic!("`{name}` is where a guardless launch decides to exec"));
-            // A top-level `}` in the first column ends the function.
-            let rest = &production[start + 1..];
-            let body = &rest[..rest
-                .find("\n}\n")
-                .unwrap_or_else(|| panic!("`{name}` never closes"))];
-
-            // The pair that decides whether an observer is started at all.
+        for (at, _) in production.match_indices("eprintln!(") {
+            let call = macro_call(production, at);
             assert!(
-                body.contains("observation_flags(&prep.cfg.proc, observe)"),
-                "`{name}` no longer reads the resolved policy to decide observation"
-            );
-
-            let arms: Vec<&str> = body
-                .match_indices("None if ")
-                .map(|(at, kw)| {
-                    let cond = &body[at + kw.len()..];
-                    &cond[..cond.find(" =>").unwrap_or(cond.len())]
-                })
-                .collect();
-            assert_eq!(
-                arms.len(),
-                1,
-                "`{name}` has {} guardless arms: a second one can reinstate the flag-only \
-                 decision for whichever matches first ({arms:?})",
-                arms.len()
-            );
-            assert_eq!(
-                arms[0], "may_exec_replace(&prep.cfg.proc, observe)",
-                "`{name}` decides the exec-replace shortcut with `{}` instead of asking \
-                 `may_exec_replace`, so a config-declared `[proc] mode = \"observe\"` — which sets \
-                 no flag — takes the shortcut again and its observation is lost with no error",
-                arms[0]
+                !call.contains('`'),
+                "a backticked identifier must go through `crate::diag`, which paints the span on \
+                 a terminal and changes nothing on a captured stream: {call}"
             );
         }
+    }
+
+    /// The whole text of a macro call starting at `at`, by parenthesis balance. Parentheses inside
+    /// string literals are skipped, so a diagnostic that spells one does not truncate the call.
+    fn macro_call(source: &str, at: usize) -> &str {
+        let bytes = source.as_bytes();
+        let open = at
+            + source[at..]
+                .find('(')
+                .expect("a macro call opens a parenthesis");
+        let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+        for (i, c) in bytes.iter().enumerate().skip(open) {
+            if in_string {
+                match c {
+                    _ if escaped => escaped = false,
+                    b'\\' => escaped = true,
+                    b'"' => in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                b'"' => in_string = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[at..=i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        &source[at..]
+    }
+
+    /// The body of a top-level function of this file's production code, for the source guards above.
+    /// The test module is excluded: it quotes the very fragments they look for.
+    fn production_fn_body(name: &str) -> &'static str {
+        let source = include_str!("launch.rs");
+        let production = &source[..source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the test module is where this file's non-production code ends")];
+        let start = production
+            .find(&format!("\nfn {name}("))
+            .unwrap_or_else(|| {
+                panic!("`{name}` is where a launch path decides how to run the cage")
+            });
+        // A top-level `}` in the first column ends the function.
+        let rest = &production[start + 1..];
+        &rest[..rest
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("`{name}` never closes"))]
     }
 
     /// `sbx gc` collects a store a live cage is reading and writing, so the live-session check is
@@ -7785,6 +7908,46 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
                 "aqua:BurntSushi/ripgrep@latest".to_string(),
                 "node@20".to_string(),
             ]
+        );
+    }
+
+    /// A launch's config warnings are not all sbx's own words: the untrusted-`[broker.*]` note
+    /// interpolates the project's raw TOML table keys, and a quoted key may carry ESC, CR and
+    /// newlines. Printed unfiltered they rewrite the terminal, and the lines they are printed among
+    /// are the trust-drop announcements: the one channel that says which security fields were
+    /// withheld. Written into a detached session's log unfiltered, a newline plus
+    /// `=== sbx session <pid> started=<n> ===` forges a session boundary, and `sbx session logs`
+    /// then shows nothing that preceded it.
+    #[test]
+    fn a_warning_carrying_terminal_control_bytes_is_filtered_before_it_is_shown() {
+        // The forged header, on its own line, inside a warning the trust filter keeps.
+        let warning = format!(
+            ".sbx.toml: ignoring `[broker.*]` (x\u{1b}[2K\r\n{SESSION_LOG_HEADER_OPEN}1 \
+             started=1{SESSION_LOG_HEADER_CLOSE}) — untrusted, run `sbx trust`"
+        );
+        let notes = trust_drop_notes(std::slice::from_ref(&warning), None);
+        let note = notes.first().expect("a trust drop is noted");
+        assert!(
+            !note.chars().any(char::is_control),
+            "no control byte survives into the note: {note:?}"
+        );
+        // One line, so nothing in it can be read as the boundary that hides the lines above it.
+        assert_eq!(note.lines().count(), 1, "{note:?}");
+        for line in note.lines() {
+            assert!(parse_session_header(line.as_bytes()).is_none(), "{line:?}");
+        }
+        // The text a reader acts on is still there — filtering is not redaction.
+        assert!(note.contains("[broker.*]"), "{note}");
+
+        // The terminal half of the same rule: every config warning printed by a launch goes through
+        // `warn_sanitized`, never straight to the family's chokepoint.
+        let source = include_str!("launch.rs");
+        let production = &source[..source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the test module is where this file's non-production code ends")];
+        assert!(
+            !production.contains(&format!("diag::warn({})", "warning")),
+            "a config warning must be filtered before it reaches the terminal (`warn_sanitized`)"
         );
     }
 

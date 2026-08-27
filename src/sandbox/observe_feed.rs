@@ -41,6 +41,24 @@ pub(crate) const OBSERVE_POLL_INTERVAL: Duration = Duration::from_millis(300);
 
 /// The launch plumbing (bubblewrap, and systemd-run on the scoped path) between the supervisor and
 /// the agent's command; not "the agent spawning something", so it is filtered out of the feed.
+///
+/// **The name is the cage's to choose, and this filter is a blind spot because of it.** `comm` is the
+/// basename of whatever a process `execve`d, and any process may rewrite it outright with
+/// `prctl(PR_SET_NAME)`, so a program in the cage that calls itself `socat` is not recorded in the
+/// exec ring, not echoed to stderr, and therefore not visible to `sbx proc logs`/`live` — while the
+/// same command under any other name is. Named here rather than left to be rediscovered, and it is
+/// the same class of gap as [`super::fs_watch::IGNORED_COMPONENTS`]: an observation lens, not the
+/// boundary (the cage is that).
+///
+/// Closing it needs an identity the **launch** owns rather than one the observed process states, and
+/// the launch is where that identity lives: the supervisor spawns bubblewrap and systemd-run itself,
+/// and the in-cage forwarder is the `socat` from the per-project store, at a path a cage cannot
+/// write. Suppressing on that (or tagging these processes in the ring instead of dropping them)
+/// reaches past this module, into what [`Observation::start`] is handed. Filtering on parentage
+/// alone does not do it: the forwarder is backgrounded by the cage's own preamble, so it is a
+/// descendant of the agent's command like everything else the agent runs, and reporting it
+/// unfiltered would put one line in the feed per proxied connection (the forwarder is a `,fork`
+/// listener), which is the noise this filter exists to keep out.
 fn is_plumbing(comm: &str) -> bool {
     matches!(comm, "bwrap" | "systemd-run" | "socat")
 }

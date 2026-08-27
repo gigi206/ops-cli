@@ -53,6 +53,14 @@ few structural keys:
   `RESOLV_HOST_CONF`, `HOSTALIASES`.
 - Shell/exec hooks: `BASH_ENV`, `ENV`, `IFS`, and the interactive-prompt hooks
   `PROMPT_COMMAND` and `PS1` (bash evaluates `$(...)` in both before each prompt).
+- Exported bash functions: anything starting with `BASH_FUNC_`. Bash imports a function
+  body from the environment under that prefix, so `BASH_FUNC_ls%%` makes every
+  `bash -c 'ls'` run the project's body instead of `ls`. The suffix is the hijacked
+  command's own name, so this is a prefix rather than a list of names.
+- Interpreter code-load hooks, the same class one runtime up: `NODE_OPTIONS` (it carries
+  `--require`), `PYTHONSTARTUP` and `PYTHONPATH`, `PERL5OPT` (`-M`), `RUBYOPT` (`-r`),
+  `ZDOTDIR` (it moves the zsh startup files), and `GIT_SSH_COMMAND` (the program git runs
+  for every fetch and push).
 - Structural: `HOME`, `PATH`.
 - The nix-config injection set (`NIX_CONFIG`, `NIX_USER_CONF_FILES`, `NIX_CONF_DIR`).
 - Proxy control, matched case-insensitively: `http_proxy`/`https_proxy`/`all_proxy`/

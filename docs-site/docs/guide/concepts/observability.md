@@ -63,7 +63,12 @@ Both are enabled for the lifetime of a single supervised launch:
 
 - **the exec lens**: polls `/proc` for newly-spawned processes under the cage's root
   every 300 ms and pushes each new entry (excluding `bwrap` / `systemd-run` /
-  `socat` plumbing) into a per-session **exec ring**.
+  `socat` plumbing) into a per-session **exec ring**. That exclusion is by process
+  name, and a process names itself: a program in the cage that calls itself `socat`
+  is left out of the feed the same way the real forwarder is. It is a gap in what
+  this lens reports, not a way out of the cage, and the enforcing exec filter
+  ([`[proc]`](../configuration/proc)) does not share it, since it decides each
+  `execve` by the program it names.
 - **the filesystem lens**: inotify-watches the project tree and pushes every write
   into a per-session **fs ring**.
 

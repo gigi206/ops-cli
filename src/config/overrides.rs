@@ -56,7 +56,7 @@
 
 use super::schema::{
     self, NetworkField, NetworkTable, NotifyField, ProcField, RawBind, RawBindTable, RawConfig,
-    RawDevices, RawFs, RawLimit, RawLimits, RawSeccomp,
+    RawDevices, RawFs, RawLimit, RawLimits, RawSeccomp, RawSshAgent,
 };
 
 /// The environment-variable prefix that sets one cage environment variable per key:
@@ -269,18 +269,31 @@ fn scan_ambient() -> AmbientOverrides {
     if let Some(v) = env_nonempty("SBX_DEVICE") {
         a.devices.push(v);
     }
-    for (k, v) in std::env::vars() {
-        if let Some(name) = k.strip_prefix(SBX_ENV_PREFIX) {
-            if !name.is_empty() {
-                a.env.push((name.to_string(), v));
-            }
-        } else if let Some(key) = k.strip_prefix(SBX_LIMIT_PREFIX) {
-            if !key.is_empty() {
-                a.limits.push((key.to_lowercase(), v));
-            }
-        } else if let Some(name) = k.strip_prefix(SBX_PACKAGE_PREFIX)
-            && !name.is_empty()
-        {
+    // `vars_os`, never `vars`: the latter panics on *any* entry in the whole environment whose key
+    // or value is not valid Unicode, and this is the only place that enumerates it — so one
+    // latin-1 `MAIL` or `LESSOPEN` exported by a legacy script took every sbx invocation down with
+    // a message naming nothing the user could act on. An entry that does not decode is skipped
+    // instead, which is what the named lookups beside this already do (`env_nonempty` goes through
+    // `std::env::var(..).ok()`, and that is `None` for a value that is not valid Unicode). The key
+    // is decoded first, so a value is only ever looked at under a name sbx actually reads.
+    for (k, v) in std::env::vars_os() {
+        let Some(k) = k.to_str() else { continue };
+        // The three prefixes are disjoint, so the one that matched is the one dispatched on below.
+        let Some(name) = k
+            .strip_prefix(SBX_ENV_PREFIX)
+            .or_else(|| k.strip_prefix(SBX_LIMIT_PREFIX))
+            .or_else(|| k.strip_prefix(SBX_PACKAGE_PREFIX))
+            .filter(|n| !n.is_empty())
+        else {
+            continue;
+        };
+        // Decoded only here, so a value is examined only under a name sbx actually reads.
+        let Ok(v) = v.into_string() else { continue };
+        if k.starts_with(SBX_ENV_PREFIX) {
+            a.env.push((name.to_string(), v));
+        } else if k.starts_with(SBX_LIMIT_PREFIX) {
+            a.limits.push((name.to_lowercase(), v));
+        } else {
             a.packages.push((name.to_string(), v));
         }
     }
@@ -645,7 +658,7 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
     base.fs = union_fs_opt(base.fs, fs);
     base.seccomp = union_allow_opt(base.seccomp, seccomp, |s| &mut s.allow);
     base.devices = union_allow_opt(base.devices, devices, |d| &mut d.allow);
-    base.ssh_agent = union_allow_opt(base.ssh_agent, ssh_agent, |s| &mut s.allow);
+    base.ssh_agent = union_ssh_agent_opt(base.ssh_agent, ssh_agent);
     base.app.extend(app);
     base.bundle.extend(bundle);
     base
@@ -658,8 +671,11 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
 /// plain append is enough. Unknown keys ride along so the table's own report still sees them.
 ///
 /// `scan_max_kb` is the one field that is not a list, and it folds by the rule its own layer merge
-/// uses ([`crate::config::fspolicy`]): the tighter ceiling wins, because a tier raising it would
-/// widen what a lower one had narrowed.
+/// uses ([`crate::config::fspolicy::FsPolicy::union`]): the **larger** window wins. It is how many
+/// bytes of a file the content lens reads before letting the open through, so a bigger number
+/// closes more files and a smaller one closes fewer; taking the minimum here let the lower tier
+/// win whenever it named a smaller ceiling, so a stale `SBX_CONFIG` shrank the window an invoker
+/// had just asked for on the command line.
 ///
 /// The higher side is **destructured exhaustively** rather than read field by field. A field added
 /// to [`RawFs`] and forgotten here is dropped in silence, and silence on this table means the thing
@@ -682,7 +698,7 @@ fn union_fs_opt(base: Option<RawFs>, higher: Option<RawFs>) -> Option<RawFs> {
             b.readonly.extend(readonly);
             b.scan.extend(scan);
             b.scan_max_kb = match (b.scan_max_kb, scan_max_kb) {
-                (Some(a), Some(c)) => Some(a.min(c)),
+                (Some(a), Some(c)) => Some(a.max(c)),
                 (None, other) | (other, None) => other,
             };
             b.rest.extend(rest);
@@ -691,7 +707,46 @@ fn union_fs_opt(base: Option<RawFs>, higher: Option<RawFs>) -> Option<RawFs> {
     }
 }
 
-/// Union two optional `{ allow: Vec<String> }` tables (`[seccomp]` / `[devices]` / `[ssh_agent]`), a higher tier's
+/// Union two `[ssh_agent]` tables, a higher tier's keys appended onto a lower's and `confirm`
+/// **OR'd** across them.
+///
+/// Not the allow-only helper beside it: that one returns the base with the higher tier's `allow`
+/// moved into it and drops every other field of the higher table, which is harmless for
+/// `[seccomp]`/`[devices]` (they carry nothing else) and a lost prompt here. `confirm` is what
+/// raises a host prompt before every signature the cage asks for, and its own schema doc states the
+/// invariant: the flag ORs across layers, so a layer that asks for confirmation cannot have it
+/// turned off by another. Folding it through the allow-only helper discarded the higher tier's
+/// `true`, so `--config '[ssh_agent] confirm = true'` written beside an `allow` in a lower tier
+/// granted the key and prompted for nothing.
+///
+/// The higher side is **destructured exhaustively**, like [`union_fs_opt`] and for the same reason:
+/// a field added to [`RawSshAgent`] and forgotten here would be dropped in silence, and on this
+/// table silence means a grant wider than the invoker asked for.
+fn union_ssh_agent_opt(
+    base: Option<RawSshAgent>,
+    higher: Option<RawSshAgent>,
+) -> Option<RawSshAgent> {
+    match (base, higher) {
+        (b, None) => b,
+        (None, h) => h,
+        (Some(mut b), Some(h)) => {
+            let RawSshAgent {
+                allow,
+                confirm,
+                rest,
+            } = h;
+            b.allow.extend(allow);
+            b.confirm = match (b.confirm, confirm) {
+                (Some(a), Some(c)) => Some(a || c),
+                (None, other) | (other, None) => other,
+            };
+            b.rest.extend(rest);
+            Some(b)
+        }
+    }
+}
+
+/// Union two optional `{ allow: Vec<String> }` tables (`[seccomp]` / `[devices]`), a higher tier's
 /// entries appended onto a lower's — the collection-union rule, so `--seccomp`/`--device` accumulate
 /// across the tiers rather than clobbering a blob's list. `None` means "this tier set none". The
 /// downstream `apply_*` dedups (devices) or is idempotent (seccomp), so a plain append is enough.
@@ -2337,9 +2392,109 @@ mod tests {
             "a repeated blob accumulates scan shapes: {:?}",
             fs.scan
         );
-        // The tighter ceiling wins, the rule the layer merge already applies: a later blob may not
-        // widen how far an earlier one had narrowed the read.
-        assert_eq!(fs.scan_max_kb, Some(64));
+        // The LARGER window wins, the rule the layer merge already applies: `scan_max_kb` is how
+        // many bytes the content lens reads before letting the open through, so a bigger number
+        // closes more files. Folding by the minimum let a later blob widen what an earlier one had
+        // narrowed, which is the direction this whole table is exempt from the trust gate for.
+        assert_eq!(fs.scan_max_kb, Some(512));
+    }
+
+    /// The same rule across the two precedence *tiers*, which is where the inverted fold actually
+    /// bit: the lower tier won whenever it named a smaller ceiling, so a stale
+    /// `SBX_CONFIG='[fs] scan_max_kb = 4'` shrank the window the command line had just asked for
+    /// and every file whose credential sat past the fourth KiB passed the scan.
+    #[test]
+    fn a_stale_ambient_ceiling_cannot_shrink_the_window_the_command_line_asked_for() {
+        let ov = collect_from(
+            &CliOverrides {
+                config: owned(&[
+                    "[fs]\nscan = [\"-----BEGIN [A-Z ]*PRIVATE KEY-----\"]\nscan_max_kb = 512",
+                ]),
+                ..Default::default()
+            },
+            AmbientOverrides {
+                config: Some("[fs]\nscan_max_kb = 4".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let fs = ov.raw.fs.as_ref().expect("fs present");
+        assert_eq!(
+            fs.scan_max_kb,
+            Some(512),
+            "the wider window is the tighter policy, on this plane as on the layer merge"
+        );
+    }
+
+    /// `[ssh_agent] confirm` raises a host prompt before every signature the cage asks for, and its
+    /// schema doc states the invariant: the flag ORs across layers, so a layer that asks for
+    /// confirmation cannot have it turned off by another. Folding the table through the allow-only
+    /// helper returned the base and threw away every other field of the higher tier, so the two
+    /// halves of this pair granted the key and prompted for nothing.
+    #[test]
+    fn a_confirm_asked_for_in_one_blob_survives_the_fold_with_another() {
+        let ov = collect_cli(Cli {
+            config: &[
+                "[ssh_agent]\nallow = [\"SHA256:AAAA\"]",
+                "[ssh_agent]\nconfirm = true",
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        let ssh = ov.raw.ssh_agent.as_ref().expect("ssh_agent present");
+        assert_eq!(ssh.allow, vec!["SHA256:AAAA".to_string()]);
+        assert_eq!(
+            ssh.confirm,
+            Some(true),
+            "a tier asking for a prompt cannot lose it to a tier that says nothing"
+        );
+
+        // And across the two precedence tiers, the direction that let a stale ambient variable
+        // disarm a prompt the command line asked for.
+        let tiered = collect_from(
+            &CliOverrides {
+                config: owned(&["[ssh_agent]\nconfirm = true"]),
+                ..Default::default()
+            },
+            AmbientOverrides {
+                config: Some("[ssh_agent]\nallow = [\"SHA256:BBBB\"]".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let ssh = tiered.raw.ssh_agent.as_ref().expect("ssh_agent present");
+        assert_eq!(ssh.allow, vec!["SHA256:BBBB".to_string()]);
+        assert_eq!(ssh.confirm, Some(true));
+    }
+
+    /// `scan_ambient` is the only place that enumerates the whole environment, and `std::env::vars`
+    /// panics on *any* entry that is not valid Unicode — not just an `SBX_*` one. One latin-1 value
+    /// exported by a legacy script therefore aborted every sbx invocation before a config was read.
+    #[test]
+    fn a_non_utf8_variable_elsewhere_in_the_environment_does_not_abort_the_launch() {
+        use crate::testutil::{EnvVar, env_lock};
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let _lock = env_lock();
+        let _legacy = EnvVar::set(
+            "SBX_TEST_LEGACY_MAIL",
+            OsString::from_vec(b"/var/mail/jos\xe9".to_vec()),
+        );
+        let _undecodable = EnvVar::set("SBX_ENV_LEGACY", OsString::from_vec(b"caf\xe9".to_vec()));
+        let _kept = EnvVar::set("SBX_ENV_KEPT", "value");
+
+        let ambient = scan_ambient();
+        assert!(
+            ambient.env.iter().any(|(k, v)| k == "KEPT" && v == "value"),
+            "a decodable override is still read: {:?}",
+            ambient.env
+        );
+        assert!(
+            ambient.env.iter().all(|(k, _)| k != "LEGACY"),
+            "a value that does not decode is dropped, not repaired: {:?}",
+            ambient.env
+        );
     }
 
     /// The same union, read from the notice side. `[fs]` was listed among the *replaced* scalars,

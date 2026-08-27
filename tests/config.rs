@@ -5159,6 +5159,22 @@ fn fs_scan_is_honored_untrusted_and_surfaced_in_config_show() {
         stdout.contains("fs scan: sk-[A-Za-z0-9]{20,}"),
         "an untrusted project's content scan must apply and be shown:\n{stdout}"
     );
+    // `scan_max_kb` is the one key in the table that does not only take access away: it is how many
+    // bytes of a file the lens reads before letting the open through, so a SMALLER window closes
+    // fewer files. An untrusted project naming one is therefore refused, and the built-in ceiling
+    // stands.
+    assert!(
+        stdout.contains("built-in ceiling"),
+        "an untrusted project must not shrink the scan window:\n{stdout}"
+    );
+
+    // Trusted, the project's own ceiling applies and is shown beside the shapes: the ceiling decides
+    // what a clean verdict rests on.
+    assert!(
+        fx.run(&["trust", ".sbx.toml"]).status.success(),
+        "trust failed"
+    );
+    let stdout = String::from_utf8_lossy(&fx.run(&["config", "show"]).stdout).into_owned();
     assert!(
         stdout.contains("256 KiB"),
         "the ceiling decides what a clean verdict rests on, so it belongs beside the shapes:\n{stdout}"

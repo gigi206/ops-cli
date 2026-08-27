@@ -89,8 +89,10 @@ pub(crate) struct Expanded {
     /// What the expansion found worth saying: an entry that matched nothing, a file reachable by a
     /// second name, a path git tracks. Surfaced by the launch, never fatal on its own.
     pub(crate) warnings: Vec<String>,
-    /// Set when the policy asks for more masks than [`MASK_MAX`]. The launch fails closed on it:
-    /// dropping the excess would leave paths open while the config says they are shut.
+    /// Set when the expansion cannot stand behind the policy: it asks for more masks than
+    /// [`MASK_MAX`], or one of its entries names a path this process cannot read at all. The launch
+    /// fails closed on either. Dropping the excess would leave paths open while the config says they
+    /// are shut, and so would treating a path that cannot be stat'ed as a path that is not there.
     pub(crate) refused: Option<String>,
 }
 
@@ -165,8 +167,20 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
         return out;
     };
 
-    out.denied = resolve_list(&root, &policy.deny, "deny", &mut out.warnings);
-    out.readonly = resolve_list(&root, &policy.readonly, "readonly", &mut out.warnings);
+    out.denied = resolve_list(
+        &root,
+        &policy.deny,
+        "deny",
+        &mut out.warnings,
+        &mut out.refused,
+    );
+    out.readonly = resolve_list(
+        &root,
+        &policy.readonly,
+        "readonly",
+        &mut out.warnings,
+        &mut out.refused,
+    );
 
     // A denied *directory* already covers everything under it: the cage sees an empty directory, so
     // nothing inside is nameable. Any other mask below one is therefore redundant — and worse than
@@ -231,23 +245,32 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
     out
 }
 
-/// Resolve one list of entries into the paths it covers, warning on each entry that yields none.
+/// Resolve one list of entries into the paths it covers, warning on each entry that yields none and
+/// refusing the launch on one whose paths cannot be read at all.
 fn resolve_list(
     root: &Path,
     entries: &[String],
     field: &str,
     warnings: &mut Vec<String>,
+    refused: &mut Option<String>,
 ) -> Vec<Masked> {
     let mut out: Vec<Masked> = Vec::new();
     for entry in entries {
         let dir_only = entry.ends_with('/');
         let body = entry.trim_end_matches('/');
-        let mut hits = match body.rsplit_once('/') {
+        let hits = match body.rsplit_once('/') {
             // A wildcard sits only in the last component (the grammar guarantees it), so at most
             // one directory is read, and only when there is a wildcard to match.
             Some((parent, last)) if has_wildcard(last) => match_in_dir(&root.join(parent), last),
             None if has_wildcard(body) => match_in_dir(root, body),
-            _ => vec![root.join(body)],
+            _ => Ok(vec![root.join(body)]),
+        };
+        let mut hits = match hits {
+            Ok(hits) => hits,
+            Err(reason) => {
+                refuse(field, entry, &reason, warnings, refused);
+                continue;
+            }
         };
         hits.sort();
         let mut matched = 0;
@@ -261,9 +284,13 @@ fn resolve_list(
                     }
                 }
                 Ok(None) => {}
-                Err(reason) => warnings.push(format!(
+                Err(Unmasked::Entry(reason)) => warnings.push(format!(
                     "`[fs] {field}` entry `{entry}`: {reason} — that path stays open to the cage"
                 )),
+                Err(Unmasked::Unreadable(reason)) => {
+                    refuse(field, entry, &reason, warnings, refused);
+                    matched += 1; // said already, and not by "matches nothing"
+                }
             }
         }
         if matched == 0 {
@@ -276,13 +303,44 @@ fn resolve_list(
     out
 }
 
-/// The entries of `dir` whose name matches `pattern`, or nothing when the directory cannot be read
-/// (an entry naming a directory that is absent matches nothing, which its own warning covers).
-fn match_in_dir(dir: &Path, pattern: &str) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+/// Record an entry the expansion could not evaluate: warn about it, and fail the launch closed on
+/// the first one.
+///
+/// The launch refuses rather than warning alone because the two states are indistinguishable from
+/// the config's side and only one of them is safe. An entry whose path cannot be stat'ed or whose
+/// directory cannot be read produces no mask, and a launch that went on would run with exactly the
+/// paths the policy names left open — which is what the mask ceiling and a failed decoy staging
+/// already refuse to do.
+fn refuse(
+    field: &str,
+    entry: &str,
+    reason: &str,
+    warnings: &mut Vec<String>,
+    refused: &mut Option<String>,
+) {
+    let said = format!(
+        "`[fs] {field}` entry `{entry}`: {reason} — what it closes cannot be established, and \
+         launching would leave that path open to the cage"
+    );
+    warnings.push(said.clone());
+    if refused.is_none() {
+        *refused = Some(said);
+    }
+}
+
+/// The entries of `dir` whose name matches `pattern`, or nothing when the directory is absent (an
+/// entry naming a directory that is not there matches nothing, which its own warning covers).
+///
+/// A directory that is *there* and cannot be read is an error rather than an empty list, and the
+/// difference is the whole point: the cage owns the project tree, so a `chmod 000` inside it would
+/// otherwise turn `certs/*.pem` into an entry that quietly matches nothing and closes nothing.
+fn match_in_dir(dir: &Path, pattern: &str) -> Result<Vec<PathBuf>, String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("cannot read `{}` ({e})", dir.display())),
     };
-    entries
+    Ok(entries
         .flatten()
         .filter(|e| {
             e.file_name()
@@ -290,12 +348,31 @@ fn match_in_dir(dir: &Path, pattern: &str) -> Vec<PathBuf> {
                 .is_some_and(|n| matches_component(pattern, n))
         })
         .map(|e| e.path())
-        .collect()
+        .collect())
+}
+
+/// Why one candidate path yields no mask, and whether the launch may go on without it.
+enum Unmasked {
+    /// The entry is answered on its merits: the path resolves outside the project, it is the
+    /// project root, or its shape is not what the entry asked for. Warned per entry, and the launch
+    /// runs — nothing about it is uncertain.
+    Entry(String),
+    /// The path could not be read at all, so what the entry covers is unknown. The launch refuses
+    /// ([`refuse`]).
+    Unreadable(String),
 }
 
 /// Judge one candidate path: it must exist, resolve inside the project, and match the entry's
 /// file/directory intent. `Ok(None)` is "not there", which the caller reports per entry rather than
 /// per path.
+///
+/// **Absent is read from the errno, never from a boolean.** `Path::exists` is `metadata(..).is_ok()`,
+/// which answers `false` for a path that is there but cannot be stat'ed — an `EACCES` on an ancestor
+/// reads exactly like an `ENOENT`. The cage runs as this uid and the project is bound read-write, so
+/// one `chmod 000` on a directory inside it made every entry naming a path below that directory
+/// report "matches nothing in this project", which is a warning the launch runs past: the session
+/// then started with the mask absent and the file readable. So only `NotFound` is absence; anything
+/// else is [`Unmasked::Unreadable`] and fails the launch closed.
 ///
 /// The containment check is on the **canonical** path, and it is the load-bearing one. `[fs]` is
 /// honored from any source, including an untrusted project, on the grounds that it can only take
@@ -307,32 +384,50 @@ fn admit(
     candidate: &Path,
     entry: &str,
     dir_only: bool,
-) -> Result<Option<Masked>, String> {
-    if !candidate.exists() {
-        return Ok(None);
+) -> Result<Option<Masked>, Unmasked> {
+    match std::fs::symlink_metadata(candidate) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(Unmasked::Unreadable(format!(
+                "cannot stat `{}` ({e})",
+                candidate.display()
+            )));
+        }
     }
-    let canon = candidate
-        .canonicalize()
-        .map_err(|e| format!("cannot resolve `{}` ({e})", candidate.display()))?;
+    let canon = match candidate.canonicalize() {
+        Ok(canon) => canon,
+        // A symlink whose target is gone: the name is there, the file it points at is not, and
+        // there is nothing to close.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(Unmasked::Unreadable(format!(
+                "cannot resolve `{}` ({e})",
+                candidate.display()
+            )));
+        }
+    };
     if !canon.starts_with(root) {
-        return Err(format!(
+        return Err(Unmasked::Entry(format!(
             "`{}` resolves to `{}`, outside the project — `[fs]` closes paths of the project it is \
              declared in, and nothing else",
             candidate.display(),
             canon.display()
-        ));
+        )));
     }
     if canon == root {
-        return Err("names the project root itself, which would close the whole tree".to_string());
+        return Err(Unmasked::Entry(
+            "names the project root itself, which would close the whole tree".to_string(),
+        ));
     }
     let meta = std::fs::metadata(&canon)
-        .map_err(|e| format!("cannot stat `{}` ({e})", canon.display()))?;
+        .map_err(|e| Unmasked::Unreadable(format!("cannot stat `{}` ({e})", canon.display())))?;
     let is_dir = meta.is_dir();
     if dir_only && !is_dir {
-        return Err(format!(
+        return Err(Unmasked::Entry(format!(
             "`{}` is not a directory, but the entry ends in `/`",
             canon.display()
-        ));
+        )));
     }
     Ok(Some(Masked {
         path: canon,
@@ -685,6 +780,84 @@ mod tests {
         let root = project(&tmp);
         let e = expand(&root, &policy(&["absent.key", "certs/*.crt"], &[]));
         assert!(e.denied.is_empty());
+        assert_eq!(e.warnings.len(), 2, "{:?}", e.warnings);
+        assert!(e.warnings.iter().all(|w| w.contains("matches nothing")));
+    }
+
+    /// A masked path that is **there** and cannot be stat'ed must not read as a path that is not
+    /// there. The cage runs as this uid and the project is bound read-write, so it can `chmod 000` a
+    /// directory of its own and make every entry naming a path below it report "matches nothing" —
+    /// a warning the launch runs past, after which the file it was told to close is open. The
+    /// expansion refuses instead, the way it already refuses the mask ceiling.
+    #[test]
+    fn an_entry_whose_path_cannot_be_stated_refuses_the_launch() {
+        // Root searches a directory whatever its mode, so the errno this test is about never
+        // arrives there.
+        if unsafe { libc::geteuid() } == 0 {
+            skip_incapable!(
+                "skipping the unstattable-mask test: running as root, which stats a path under a \
+                 mode-000 directory instead of being refused by it"
+            );
+            return;
+        }
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        std::fs::set_permissions(root.join("certs"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let e = expand(&root, &policy(&["certs/server.pem"], &[]));
+        // Put it back, so the fixture can be torn down whatever the assertions do.
+        std::fs::set_permissions(root.join("certs"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert!(
+            e.refused
+                .as_ref()
+                .is_some_and(|r| r.contains("certs/server.pem")),
+            "a path that cannot be stat'ed fails the launch closed rather than expanding to \
+             nothing: refused={:?} warnings={:?}",
+            e.refused,
+            e.warnings
+        );
+        assert!(
+            !e.warnings.iter().any(|w| w.contains("matches nothing")),
+            "and it is never reported as an entry that matches nothing: {:?}",
+            e.warnings
+        );
+    }
+
+    /// The wildcard half of the same rule: a directory a wildcard entry has to read, which cannot be
+    /// read at all, is not an empty match list. The cause here is a symlink loop rather than a mode
+    /// (root is refused by one and not the other), and the branch it exercises is the one every
+    /// errno but `NotFound` takes.
+    #[test]
+    fn an_entry_whose_directory_cannot_be_read_refuses_the_launch() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        let loop_dir = root.join("loop");
+        std::os::unix::fs::symlink(&loop_dir, &loop_dir).unwrap();
+        let e = expand(&root, &policy(&["loop/*.pem"], &[]));
+        assert!(
+            e.refused.as_ref().is_some_and(|r| r.contains("loop/*.pem")),
+            "a directory that cannot be read fails the launch closed: refused={:?} warnings={:?}",
+            e.refused,
+            e.warnings
+        );
+        assert!(
+            !e.warnings.iter().any(|w| w.contains("matches nothing")),
+            "and it is never reported as an entry that matches nothing: {:?}",
+            e.warnings
+        );
+    }
+
+    /// An entry naming a path that genuinely is not there still warns and still lets the launch run:
+    /// the refusal above is about a path whose state could not be established, not about one whose
+    /// absence is established.
+    #[test]
+    fn an_absent_path_is_still_a_warning_rather_than_a_refusal() {
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        std::os::unix::fs::symlink(root.join("gone.key"), root.join("dangling.key")).unwrap();
+        let e = expand(&root, &policy(&["absent.key", "dangling.key"], &[]));
+        assert!(e.refused.is_none(), "{:?}", e.refused);
         assert_eq!(e.warnings.len(), 2, "{:?}", e.warnings);
         assert!(e.warnings.iter().all(|w| w.contains("matches nothing")));
     }

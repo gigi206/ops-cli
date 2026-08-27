@@ -320,13 +320,15 @@ struct SandboxPaths<'a> {
     machine_id_src: &'a Path,
     /// The generated desktop-entry directory and mime defaults, present only when `[open]` declares
     /// a handler. Bound read-only *inside the writable home*, at the locations the XDG lookup
-    /// prefers: `$XDG_DATA_HOME` and `$XDG_CONFIG_HOME` are unset in the cage, so their defaults
-    /// under `$HOME` are the highest-priority ones, and a copy anywhere else would be shadowed by
-    /// one written there. Freezing the mountpoint is enough for exactly that reason — the lookup
-    /// asks for these paths by name, and a read-only bind refuses both the write and the unlink
-    /// that would replace them. Freezing the leaf alone was *not* enough: the directories above it
-    /// were writable and renaming one carries the mount along, so [`cage_mounts`] pins every
-    /// component of the path as a mountpoint too.
+    /// prefers: [`cage_env`] sets `$XDG_DATA_HOME` and `$XDG_CONFIG_HOME` to their defaults under
+    /// `$HOME` after the config overlay, so those are the highest-priority locations, no `[env]`
+    /// declaration can move them, and a copy anywhere else is shadowed by one written there.
+    ///
+    /// Freezing the mountpoint is enough for exactly that reason: the lookup asks for these paths
+    /// by name, and a read-only bind refuses both the write and the unlink that would replace
+    /// them. Freezing the leaf alone was *not* enough, though — the directories above it were
+    /// writable, and renaming one carries the mount along, so [`cage_mounts`] pins every component
+    /// of the path as a mountpoint too.
     ///
     /// The entry is bound as its whole *directory* rather than as one file, which is what makes the
     /// portal answer at all rather than only what makes it answer correctly — see
@@ -854,6 +856,33 @@ fn cage_env(
     ));
     for (key, val) in overlay.env {
         upsert_env(&mut env, key, val);
+    }
+
+    // The XDG bases the portal's own lookup consults first — set **after** the overlay, so they are
+    // the two variables a config cannot displace.
+    //
+    // Only when `[open]` declares a handler, and only then because that is when the answer matters:
+    // the desktop entry and the mime defaults are frozen read-only under `$HOME`, and the whole
+    // design rests on those being the locations the lookup prefers (see [`super::openuri`]). Their
+    // default *is* `$HOME/.local/share` and `$HOME/.config`, so this changes nothing about where the
+    // portal looks; what it changes is who decides. `[env]` is one of the two fields an untrusted
+    // project may set without passing the trust gate, and neither name is reserved, so leaving them
+    // unset let a project ship its own `applications/` and `mimeapps.list` inside the work surface
+    // and point the lookup at them — outranking the handler the user vouched for, and answering a
+    // sign-in click with an `Exec=` of the project's choosing. Stating them here costs a trusted
+    // project the ability to move its own XDG bases in a cage that routes URIs, which is the
+    // narrower loss.
+    if paths.open_apps_src.is_some() || paths.open_mimeapps_src.is_some() {
+        for (key, rel) in [
+            ("XDG_DATA_HOME", super::openuri::APPLICATIONS_REL),
+            ("XDG_CONFIG_HOME", super::openuri::MIMEAPPS_REL),
+        ] {
+            // The base is the parent of the bound path, derived from the same constant the bind
+            // uses so the two can never name different directories.
+            if let Some((base, _)) = rel.rsplit_once('/') {
+                upsert_env(&mut env, key, &format!("{SANDBOX_HOME}/{base}"));
+            }
+        }
     }
     env
 }
@@ -1447,8 +1476,9 @@ fn materialize_etc(etc_dir: &Path, id: &Identity) -> io::Result<(PathBuf, PathBu
     write_atomic(
         &passwd,
         passwd_contents(id, SANDBOX_HOME, SANDBOX_SHELL).as_bytes(),
+        None,
     )?;
-    write_atomic(&group, group_contents(id).as_bytes())?;
+    write_atomic(&group, group_contents(id).as_bytes(), None)?;
     Ok((passwd, group))
 }
 
@@ -1473,14 +1503,32 @@ fn materialize_etc(etc_dir: &Path, id: &Identity) -> io::Result<(PathBuf, PathBu
 /// read-only then sees either the complete old or complete new content — never a torn half-write —
 /// and, because the rename installs a fresh inode, a cage already bound to the prior inode keeps its
 /// own view rather than observing a later launch's overwrite.
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+///
+/// `mode`, when given, is applied to the temp file **before** the rename, so the file never appears
+/// at its final path in a mode it is not meant to have. That matters for the one file here the cage
+/// resolves by name on every use rather than binding once: the URL router, whose *directory* is what
+/// the cage binds. Chmod-after-rename left a window in which a concurrent cage's `xdg-open`
+/// exec'd a mode-0644 file and got `EACCES`. `None` keeps the process umask's default, which is
+/// what every bound-as-a-file document wants.
+fn write_atomic(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
+    let staged = |result: io::Result<()>| {
+        result.inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+    };
     std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    if let Some(mode) = mode {
+        staged(std::fs::set_permissions(
+            &tmp,
+            std::fs::Permissions::from_mode(mode),
+        ))?;
+    }
+    staged(std::fs::rename(&tmp, path))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1501,7 +1549,7 @@ pub(crate) fn build_spec(
     cmd: Vec<OsString>,
 ) -> io::Result<SandboxSpec> {
     use std::fs::DirBuilder;
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::DirBuilderExt;
 
     let project = canonicalize_project(cwd)?;
     let rt = project_runtime(data_dir, &project, runtime);
@@ -1516,7 +1564,7 @@ pub(crate) fn build_spec(
     // (outside every writable mount, so it has no writable alias the agent could use to
     // rewrite it); an interactive `sbx run` binds it read-only and points bash's `--rcfile` at it.
     let shell_rc = rt.etc_dir.join("bashrc");
-    write_atomic(&shell_rc, SHELL_RC_CONTENTS.as_bytes())?;
+    write_atomic(&shell_rc, SHELL_RC_CONTENTS.as_bytes(), None)?;
 
     // Materialize the generated egress contract beside the rc (same outside-every-writable-
     // mount placement, for the same reason: the agent must not be able to rewrite the
@@ -1524,7 +1572,7 @@ pub(crate) fn build_spec(
     // atomically (temp + rename) because this directory is shared by concurrent cages of the
     // same project — an in-place write could show a running cage a torn, half-written file.
     let contract = rt.etc_dir.join("egress-contract.md");
-    write_atomic(&contract, egress_contract.as_bytes())?;
+    write_atomic(&contract, egress_contract.as_bytes(), None)?;
 
     // Materialize the URL router beside the other synthetic files (outside every writable mount, so
     // it has no writable alias the agent could rewrite), then make it executable so a tool calling
@@ -1541,8 +1589,11 @@ pub(crate) fn build_spec(
         .mode(0o700)
         .create(&open_router)?;
     let xdg_open = open_router.join("xdg-open");
-    write_atomic(&xdg_open, super::openuri::router(open).as_bytes())?;
-    std::fs::set_permissions(&xdg_open, std::fs::Permissions::from_mode(0o755))?;
+    write_atomic(
+        &xdg_open,
+        super::openuri::router(open).as_bytes(),
+        Some(0o755),
+    )?;
 
     // The portal's route to the same router: a desktop-entry directory and the mime defaults naming
     // it, staged here (outside every writable mount, like the router) and bound read-only at the
@@ -1567,6 +1618,7 @@ pub(crate) fn build_spec(
         write_atomic(
             &open_apps.join(super::openuri::DESKTOP_FILE),
             super::openuri::desktop_entry(open, OPEN_ROUTER_INCAGE).as_bytes(),
+            None,
         )?;
         // The index the portal reads to find the claimants of a scheme. Generated because the
         // directory carrying it is read-only in the cage, so `update-desktop-database` cannot
@@ -1574,23 +1626,33 @@ pub(crate) fn build_spec(
         write_atomic(
             &open_apps.join("mimeinfo.cache"),
             super::openuri::mimeinfo_cache(open).as_bytes(),
+            None,
         )?;
-        write_atomic(&open_mimeapps, super::openuri::mimeapps(open).as_bytes())?;
+        write_atomic(
+            &open_mimeapps,
+            super::openuri::mimeapps(open).as_bytes(),
+            None,
+        )?;
         // bwrap creates a missing mountpoint, but it would create it in the *host* home this bind
         // exposes — leaving a stray empty file or directory behind after the cage is gone. Creating
         // the parents here (owner-only, like the mise pool) keeps that placement sbx's decision
         // rather than a side effect. They are also the *sources* of the mountpoint pins the cage
         // lays over them (see `home_mountpoint_pins`), and bwrap fails a bind whose source is
         // missing, so this loop is what makes those pins bindable at all.
+        //
+        // Every component is walked with `cagedir::ensure_under`, not `create_dir_all`: these
+        // parents are *inside* the cage-writable home, so `$HOME/.config` is an entry in-cage code
+        // can replace with a symlink and leave behind. `create_dir_all` is satisfied by a link that
+        // resolves to a directory, and the pin below would then bind whatever it points at —
+        // read-write, at that path, inside the cage — so a link to the user's real `~/.ssh` would
+        // hand the agent the host's private keys. A component that is not a real directory is a
+        // hard error instead.
         for rel in [
             super::openuri::APPLICATIONS_REL,
             super::openuri::MIMEAPPS_REL,
         ] {
-            if let Some(parent) = rt.home_src.join(rel).parent() {
-                DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o700)
-                    .create(parent)?;
+            if let Some((parent, _)) = rel.rsplit_once('/') {
+                super::cagedir::ensure_under(&rt.home_src, parent, 0o700)?;
             }
         }
         (Some(open_apps.as_path()), Some(open_mimeapps.as_path()))
@@ -1640,6 +1702,7 @@ pub(crate) fn build_spec(
     write_atomic(
         &hosts,
         hosts_contents(&super::naming::cage_hostname(&slug), &tcp.destinations).as_bytes(),
+        None,
     )?;
 
     // The synthetic ssh client config, materialized beside the other synthetic `/etc` files (and,
@@ -1651,7 +1714,7 @@ pub(crate) fn build_spec(
     let ssh_config_src =
         match super::egress::ssh_config_contents(&userland.socat_bin, &tcp.connect_only) {
             Some(contents) => {
-                write_atomic(&ssh_config, contents.as_bytes())?;
+                write_atomic(&ssh_config, contents.as_bytes(), None)?;
                 Some(ssh_config.as_path())
             }
             None => {
@@ -1666,7 +1729,11 @@ pub(crate) fn build_spec(
     // desktop app's fingerprinting reads a distinct, persistent id instead of hashing an empty
     // string (identical in every hermetic cage).
     let machine_id = rt.etc_dir.join("machine-id");
-    write_atomic(&machine_id, machine_id_contents(&rt.home_src).as_bytes())?;
+    write_atomic(
+        &machine_id,
+        machine_id_contents(&rt.home_src).as_bytes(),
+        None,
+    )?;
 
     let paths = SandboxPaths {
         project: &project,
@@ -1841,6 +1908,88 @@ mod tests {
         })
     }
 
+    /// The frozen portal route rests on `$HOME/.local/share/applications` and
+    /// `$HOME/.config/mimeapps.list` being the locations the XDG lookup prefers. `[env]` is one of
+    /// the two fields an *untrusted* project may set without passing the trust gate, and neither
+    /// `XDG_DATA_HOME` nor `XDG_CONFIG_HOME` is a reserved key, so leaving them unset let a project
+    /// point both bases at a directory it ships in the work surface: its own `.desktop` claiming
+    /// `x-scheme-handler/https` then outranks the read-only entry, and a sign-in click the user made
+    /// runs the project's `Exec=` instead of the handler the user vouched for. They are therefore
+    /// stated after the config overlay, at the values that were already their defaults.
+    #[test]
+    fn a_config_cannot_move_the_xdg_bases_the_frozen_open_route_depends_on() {
+        let repointed = [
+            ("XDG_DATA_HOME".to_string(), "/work/.x/share".to_string()),
+            ("XDG_CONFIG_HOME".to_string(), "/work/.x/cfg".to_string()),
+        ];
+        let overlay = Overlay {
+            env: &repointed,
+            binds: &[],
+            bin_paths: &[],
+            timezone: DEFAULT_ZONE,
+            fresh_release_tokens: &[],
+        };
+        let routed = SandboxPaths {
+            open_apps_src: Some(Path::new("/data/sbx/projects/abc/etc/applications")),
+            open_mimeapps_src: Some(Path::new("/data/sbx/projects/abc/etc/mimeapps.list")),
+            ..base_paths()
+        };
+        let value = |spec: &SandboxSpec, key: &str| {
+            spec.env
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        };
+
+        let spec = assemble(
+            &routed,
+            &userland(),
+            &nix_mount(),
+            &overlay,
+            &[],
+            &[],
+            NetPolicy::Shared,
+            vec![OsString::from("/bin/sh")],
+        )
+        .expect("valid spec");
+        // The bases name the directories the two `[open]` files are bound under, and each appears
+        // once: the config's value was replaced, not appended after it.
+        assert_eq!(
+            value(&spec, "XDG_DATA_HOME").as_deref(),
+            Some("/home/sandbox/.local/share"),
+        );
+        assert_eq!(
+            value(&spec, "XDG_CONFIG_HOME").as_deref(),
+            Some("/home/sandbox/.config"),
+        );
+        for key in ["XDG_DATA_HOME", "XDG_CONFIG_HOME"] {
+            assert_eq!(
+                spec.env.iter().filter(|(k, _)| k == key).count(),
+                1,
+                "one entry per base, or the last one written decides: {:?}",
+                spec.env
+            );
+        }
+
+        // A cage that routes nothing is not handed bases it never asked for: with no `[open]`, the
+        // project's own value stands, exactly as any other unreserved variable does.
+        let unrouted = assemble(
+            &base_paths(),
+            &userland(),
+            &nix_mount(),
+            &overlay,
+            &[],
+            &[],
+            NetPolicy::Shared,
+            vec![OsString::from("/bin/sh")],
+        )
+        .expect("valid spec");
+        assert_eq!(
+            value(&unrouted, "XDG_DATA_HOME").as_deref(),
+            Some("/work/.x/share")
+        );
+    }
+
     #[test]
     fn structural_dests_lists_every_fixed_mount_assemble_emits() {
         // The bind-nesting warning checks a config bind against STRUCTURAL_DESTS, a hand-kept copy
@@ -1997,8 +2146,23 @@ mod tests {
             "lowercase hex only: {a1:?}"
         );
         // Never the degenerate all-cages id (sha256 of an empty string, truncated) a fingerprinting
-        // app produces when the file is absent — the whole reason this exists.
-        assert_ne!(body, "e3b0c44298fc1c149afbf4c8996fb9242");
+        // app produces when the file is absent — the whole reason this exists. Computed rather than
+        // spelled out: a hand-copied literal of the wrong length compares unequal to every possible
+        // body, which makes the assertion pass for a reason that has nothing to do with the id.
+        let empty = {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(b"");
+            digest[..16]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(
+            empty.len(),
+            32,
+            "the reference id has the same shape as a real one"
+        );
+        assert_ne!(body, empty);
         // Deterministic per home (stable across launches) and unique across homes.
         assert_eq!(a1, a2, "same home → same id across launches");
         assert_ne!(a1, b, "a different home → a different id");
@@ -3443,6 +3607,122 @@ mod tests {
                 .any(|p| p == format!("{MISE_PROJECT_INCAGE}/shims")),
             "a single-pool cage has no per-project shims dir on PATH"
         );
+    }
+
+    /// The staged files are bound into the cage as *files*, so a running cage keeps the inode it
+    /// bound and never sees a later launch's rewrite. The URL router is the exception: its
+    /// **directory** is what the cage binds, and it leads the cage's `PATH`, so every `xdg-open`
+    /// resolves the name afresh and sees whatever the last launch renamed into place. Publishing it
+    /// mode 0644 and chmod'ing afterwards left a window in which a concurrent cage's `xdg-open`
+    /// returned `EACCES` — the device-auth flow the stub exists to keep working. The mode therefore
+    /// goes on the temp file, before the rename.
+    #[test]
+    fn the_url_router_is_executable_before_it_is_published_never_after() {
+        let dir = TmpDir::new();
+
+        let router = dir.path().join("xdg-open");
+        write_atomic(&router, b"#!/bin/sh\nexit 0\n", Some(0o755)).expect("stage the router");
+        let mode = std::fs::metadata(&router).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "the router is published executable");
+
+        // A document keeps the ordinary default: only the router is executable in that directory.
+        let doc = dir.path().join("egress-contract.md");
+        write_atomic(&doc, b"# contract\n", None).expect("stage a document");
+        assert_eq!(
+            std::fs::metadata(&doc).unwrap().permissions().mode() & 0o111,
+            0,
+            "a staged document is never executable"
+        );
+
+        // Neither write left its temp sibling behind in the directory the cage binds.
+        let staged: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            staged.len(),
+            2,
+            "no temp sibling survives the write: {staged:?}"
+        );
+
+        // The ordering itself is not observable after the fact, so it is guarded on the source: a
+        // chmod of the *published* path is exactly the window this closes. Production code only —
+        // this assertion quotes the very fragment it looks for.
+        let source = include_str!("binds.rs");
+        let production = &source[..source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the test module is where this file's non-production code ends")];
+        assert!(
+            !production.contains(&format!("set_permissions(&{}", "xdg_open")),
+            "the router's mode must be set on the temp file inside `write_atomic`, never on the \
+             path a concurrent cage is already resolving"
+        );
+    }
+
+    /// `$HOME/.local` and `$HOME/.config` live inside the cage-writable home, so in-cage code can
+    /// replace either with a symlink and leave it for the next launch. They are also the *sources*
+    /// of the read-write mountpoint pins a declared `[open]` lays over them, and bwrap resolves a
+    /// bind source on the host: a `.config` pointing at the user's real `~/.ssh` would mount the
+    /// host's private keys read-write inside the cage. `create_dir_all` is satisfied by such a link
+    /// (it stats through it and finds a directory); every component below the home is therefore
+    /// walked by `cagedir::ensure_under`, which refuses anything that is not a real directory.
+    #[test]
+    fn a_symlinked_home_config_refuses_the_launch_rather_than_becoming_a_bind_source() {
+        let data = TmpDir::new();
+        let project = TmpDir::new();
+        std::fs::write(project.path().join("README"), b"hi").unwrap();
+        let victim = TmpDir::new();
+        std::fs::write(victim.path().join("id_ed25519"), b"private").unwrap();
+
+        // What in-cage code leaves behind: the home's `.config` is now a link out of the home.
+        let home = project_runtime(
+            data.path(),
+            &project.path().canonicalize().unwrap(),
+            Runtime::ProjectDefault,
+        )
+        .home_src;
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(victim.path(), home.join(".config")).unwrap();
+
+        let overlay = Overlay {
+            env: &[],
+            binds: &[],
+            bin_paths: &[],
+            timezone: DEFAULT_ZONE,
+            fresh_release_tokens: &[],
+        };
+        let open = std::collections::BTreeMap::from([(
+            "https".to_string(),
+            crate::config::OpenHandler {
+                argv: vec!["chromium".to_string()],
+                mode: crate::config::OpenMode::Detach,
+            },
+        )]);
+        let e = build_spec(
+            data.path(),
+            project.path(),
+            Runtime::ProjectDefault,
+            &userland(),
+            &nix_mount(),
+            &overlay,
+            &[],
+            NetPolicy::Shared,
+            "",
+            &Default::default(),
+            crate::sandbox::seccomp::SeccompPolicy::default(),
+            &[],
+            &open,
+            vec![OsString::from("/bin/sh")],
+        )
+        .expect_err("a symlinked home component refuses the launch");
+        assert!(e.to_string().contains(".config"), "{e}");
+        assert!(e.to_string().contains("a symlink"), "{e}");
+        // And the link was not walked through: nothing was created inside the victim directory.
+        let inside: Vec<String> = std::fs::read_dir(victim.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(inside, vec!["id_ed25519".to_string()], "{inside:?}");
     }
 
     #[test]
