@@ -321,22 +321,42 @@ const SUN_PATH_MAX: usize = 107;
 /// A new feature whose host socket path is wider than this must widen the sample below, or a
 /// data directory the cap accepts would still overrun `sun_path` at that feature's first launch.
 ///
-/// **The broker plane is the one path this does not bound.** `sandbox::broker` binds
-/// `/broker/<pid>/<name>.sock` — 21 bytes plus the length of the `[broker.<name>]` key — so it
-/// fits inside this reservation only for names up to 12 bytes, and a longer broker name in a
-/// trusted config can still fail its `bind` with `ENAMETOOLONG` at launch on a data directory this
-/// cap accepted. Widening the sample to that form is not the fix: the name is config-chosen and
-/// unbounded, so any sample is a guess, and every byte reserved here is a byte taken off
-/// [`DATA_DIR_MAX`] — which would refuse to run at all for an existing install whose derived data
-/// directory sits between the new cap and the old one, a worse failure than the one being
-/// prevented. The bound belongs where the name is validated (`config::broker_bindings`), refusing
-/// a `[broker.<name>]` key wider than this reservation leaves room for. Until it is there, this
-/// constant covers every fixed-shape socket path and not that one. (`config::resolve_brokers` is
-/// where such a name is turned into a binding, and where it would be refused.)
+/// **The broker plane is the one path this cannot bound**, and it is checked instead of reserved
+/// for. `sandbox::broker` binds `/broker/<pid>/<name>.sock` — 21 bytes plus the length of the
+/// `[broker.<name>]` key — and that key is config-chosen and unbounded, so no sample here can
+/// cover it. Widening this constant to a guess is the wrong trade twice over: every byte reserved
+/// is a byte taken off [`DATA_DIR_MAX`], which would refuse to run at all for an existing install
+/// whose derived data directory sits between the new cap and the old one, and a fixed name budget
+/// would refuse names that fit perfectly well on a shorter data directory. So that one bind asks
+/// [`check_socket_path`] against the install it actually has, which is the only place the answer is
+/// knowable, and a name too long is refused by name rather than surfacing as an `ENAMETOOLONG` with
+/// nothing to act on.
 const LONGEST_SOCKET_SUFFIX: usize = "/forward/fwd-1234567/p-65535.sock".len();
 
 /// The most a data directory may measure and still host those sockets.
 const DATA_DIR_MAX: usize = SUN_PATH_MAX - LONGEST_SOCKET_SUFFIX;
+
+/// Refuse an `AF_UNIX` path `sun_path` cannot carry, naming what would have failed and by how much.
+///
+/// The fixed-shape socket paths under the data directory are covered by [`DATA_DIR_MAX`], which is
+/// what lets those binds run unchecked. This is for the one path whose width is config-chosen — a
+/// broker's, see [`LONGEST_SOCKET_SUFFIX`] — where the bound can only be known against the install
+/// in hand. `bind(2)` would answer `ENAMETOOLONG`, which names neither the declaration at fault nor
+/// what to do about it; both are here, and both are what the reader needs.
+pub(crate) fn check_socket_path(path: &Path, what: &str) -> io::Result<()> {
+    let len = path.as_os_str().as_encoded_bytes().len();
+    if len <= SUN_PATH_MAX {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "the socket path for {what} measures {len} bytes and a Unix socket carries at most \
+             {SUN_PATH_MAX}: {} — shorten the name, or point `SBX_DATA_DIR` at a shorter directory",
+            path.display()
+        ),
+    ))
+}
 
 /// Validate an explicit `$SBX_DATA_DIR`, returning the directory or why it was refused.
 ///
@@ -1050,17 +1070,21 @@ pub(crate) struct LockTarget {
     source: String,
     lock_path: PathBuf,
     origin: Origin,
-    /// Another lock to take this one's first revision from, when this lock does not exist yet and
-    /// that one already records **this** source. Set on the targets that were carved out of the
-    /// global channel after the fact (the mise engine, an app): every install that predates the
-    /// carve-out has `nixpkgs.lock` and nothing else, so resolving fresh would hit the network and
-    /// re-pin them to the day's revision — advancing an engine, or an app, on a mere binary update.
-    /// That is what the seeded-not-baked model forbids, and it would also make the first launch
-    /// need a network the base does not.
+    /// The locks to take this one's first revision from, most specific first, when this lock does
+    /// not exist yet and one of them already records **this** source. Set on the targets that were
+    /// carved out of another after the fact (the mise engine and an app out of the global channel; a
+    /// project-scoped app's lock out of that app's own): every install that predates a carve-out has
+    /// only the lock it was carved from, so resolving fresh would hit the network and re-pin it to
+    /// the day's revision — advancing an engine, or an app, on a mere binary update. That is what
+    /// the seeded-not-baked model forbids, and it would also make the first launch need a network
+    /// the base does not.
     ///
-    /// So the seed is not a cache: it is what makes the carve-out invisible until something is
-    /// rolled on purpose. `None` for the two targets that were always their own source of truth.
-    seed_from: Option<PathBuf>,
+    /// So the seed is not a cache: it is what makes a carve-out invisible until something is rolled
+    /// on purpose. Ordered because the carve-outs nest — a project-scoped app inherits that app's
+    /// pin if it has one and the global channel only if it does not, so the narrower home does not
+    /// silently roll an app that was already pinned. Empty for the two targets that were always
+    /// their own source of truth.
+    seed_from: Vec<PathBuf>,
 }
 
 impl LockTarget {
@@ -1072,7 +1096,7 @@ impl LockTarget {
             source,
             lock_path: global_lock_path(layout),
             origin,
-            seed_from: None,
+            seed_from: Vec::new(),
         }
     }
 
@@ -1087,7 +1111,7 @@ impl LockTarget {
             source,
             lock_path: engine_lock_path(layout),
             origin,
-            seed_from: Some(global_lock_path(layout)),
+            seed_from: vec![global_lock_path(layout)],
         }
     }
 
@@ -1098,7 +1122,7 @@ impl LockTarget {
             source: source.to_string(),
             lock_path: project_lock_path(layout, project_id),
             origin: Origin::ProjectPin,
-            seed_from: None,
+            seed_from: Vec::new(),
         }
     }
 
@@ -1119,13 +1143,27 @@ impl LockTarget {
         layout: &Layout,
         name: &str,
         override_source: Option<&str>,
+        project_id: Option<&str>,
     ) -> io::Result<Self> {
         let (source, origin) = global_source(override_source);
+        let shared = app_lock_path(layout, name)?;
+        let (lock_path, seed_from) = match project_id {
+            // A `home_scope = "project"` app keeps its state per (project, app), so its pin belongs
+            // there too: keyed by the app name alone, two projects declaring the same app name
+            // shared one lock, and rolling either moved both — while the state each roll was for
+            // stayed separate. Seeded from that app's shared lock first, so an app already pinned
+            // before it grew a per-project home keeps that revision instead of resolving fresh.
+            Some(id) => (
+                project_app_lock_path(layout, id, name),
+                vec![shared, global_lock_path(layout)],
+            ),
+            None => (shared, vec![global_lock_path(layout)]),
+        };
         Ok(Self {
             source,
-            lock_path: app_lock_path(layout, name)?,
+            lock_path,
             origin,
-            seed_from: Some(global_lock_path(layout)),
+            seed_from,
         })
     }
 
@@ -1160,13 +1198,7 @@ impl LockTarget {
     /// Resolve to a pinned `github:NixOS/nixpkgs/<rev>`, reusing the lock when its
     /// source matches and resolving (and recording) otherwise.
     pub(crate) fn resolve(&self, nix: &Path, layout: &Layout) -> io::Result<String> {
-        resolve_ref(
-            nix,
-            layout,
-            &self.source,
-            &self.lock_path,
-            self.seed_from.as_deref(),
-        )
+        resolve_ref(nix, layout, &self.source, &self.lock_path, &self.seed_from)
     }
 
     /// Force a fresh resolution of this source and rewrite the lock — the explicit
@@ -1212,6 +1244,21 @@ fn app_lock_path(layout: &Layout, name: &str) -> io::Result<PathBuf> {
         ));
     }
     Ok(layout.data_dir().join("apps").join(name).join(NIXPKGS_LOCK))
+}
+
+/// One project-scoped app's lock, beside that app's per-project state under
+/// `<data>/projects/<id>/apps/<name>/` — the same base the launch's bind layout roots such an
+/// app's home under, so the pin is removed by whatever removes the state it pinned.
+///
+/// The name is checked by [`app_lock_path`], which every caller reaches first.
+fn project_app_lock_path(layout: &Layout, project_id: &str, name: &str) -> PathBuf {
+    layout
+        .data_dir()
+        .join("projects")
+        .join(project_id)
+        .join("apps")
+        .join(name)
+        .join(NIXPKGS_LOCK)
 }
 
 /// A project's own lock, under its runtime tree, pinning a trusted pin's revision.
@@ -1346,7 +1393,7 @@ fn resolve_ref(
     layout: &Layout,
     source: &str,
     lock_path: &Path,
-    seed_from: Option<&Path>,
+    seed_from: &[PathBuf],
 ) -> io::Result<String> {
     ensure(layout)?;
     if let Some((locked_source, locked_rev)) = read_lock(lock_path)
@@ -1354,12 +1401,15 @@ fn resolve_ref(
     {
         return Ok(format!("{NIXPKGS_FLAKE_PREFIX}{locked_rev}"));
     }
-    if let Some(seed) = seed_from
-        && let Some((seed_source, seed_rev)) = read_lock(seed)
-        && seed_source == source
-    {
-        write_lock(lock_path, source, &seed_rev)?;
-        return Ok(format!("{NIXPKGS_FLAKE_PREFIX}{seed_rev}"));
+    // In order, most specific first: a carve-out inherits from the nearest lock that already
+    // records this source, so a narrower target never rolls past a pin a wider one was holding.
+    for seed in seed_from {
+        if let Some((seed_source, seed_rev)) = read_lock(seed)
+            && seed_source == source
+        {
+            write_lock(lock_path, source, &seed_rev)?;
+            return Ok(format!("{NIXPKGS_FLAKE_PREFIX}{seed_rev}"));
+        }
     }
     let rev = resolve_source_rev(nix, layout, source, false)?;
     write_lock(lock_path, source, &rev)?;
@@ -2150,6 +2200,70 @@ fn select_marked_output(
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
+
+    /// A `home_scope = "project"` app pins per (project, app), and inherits its own shared pin the
+    /// first time it does.
+    ///
+    /// The lock was keyed by the app name alone while such an app's *state* lives under its
+    /// project, so two projects declaring one app name shared a single lock: rolling the app in one
+    /// project moved the other project's build to the same revision, and `live_base_revisions` then
+    /// omitted the revision the other still depended on.
+    ///
+    /// The seed is the other half. An app pinned before it grew a per-project home has a revision
+    /// only in the shared lock, and a per-project lock that resolved fresh would move it to the
+    /// day's revision on a mere binary update — the thing the seeded-not-baked model forbids. So the
+    /// shared lock is the first seed, and the global channel only the second.
+    #[test]
+    fn a_project_scoped_app_pins_beside_its_own_state_and_seeds_from_its_shared_lock() {
+        let tmp = TmpDir::new();
+        let layout = Layout::under(&tmp.path().join("data"));
+
+        let a = LockTarget::app(&layout, "demo-app", None, Some("proj-a")).unwrap();
+        let b = LockTarget::app(&layout, "demo-app", None, Some("proj-b")).unwrap();
+        let shared = LockTarget::app(&layout, "demo-app", None, None).unwrap();
+        assert_ne!(
+            a.lock_path, b.lock_path,
+            "two projects must not share one app's pin"
+        );
+        assert_ne!(a.lock_path, shared.lock_path);
+        assert!(
+            a.lock_path
+                .starts_with(layout.data_dir().join("projects").join("proj-a")),
+            "the pin sits beside the state it pins: {}",
+            a.lock_path.display()
+        );
+        // Most specific first: the app's own shared lock, then the global channel.
+        assert_eq!(
+            a.seed_from,
+            vec![
+                shared.lock_path.clone(),
+                layout.data_dir().join(NIXPKGS_LOCK)
+            ]
+        );
+        // A global-scoped app is unchanged, and seeds from the channel alone.
+        assert_eq!(shared.seed_from, vec![layout.data_dir().join(NIXPKGS_LOCK)]);
+    }
+
+    /// A broker socket path too wide for `sun_path` is refused by name, not by `bind(2)`.
+    ///
+    /// The data directory's own cap reserves room for every socket path whose shape is fixed, and
+    /// the broker's is the one that is not: its width is the `[broker.<name>]` key's. A name that
+    /// overruns therefore reached `bind(2)`, which answers `ENAMETOOLONG` and names neither the
+    /// declaration at fault nor what to do about it.
+    ///
+    /// Teeth: the accepted case is a path at exactly `SUN_PATH_MAX`, so the check cannot pass by
+    /// being an off-by-one stricter than the kernel, and the message is asserted to carry the name
+    /// and a way out — a refusal a reader cannot act on is the failure being replaced.
+    #[test]
+    fn a_socket_path_wider_than_sun_path_is_refused_by_the_name_that_widened_it() {
+        let at = |len: usize| PathBuf::from("/".to_string() + &"a".repeat(len - 1));
+        assert!(check_socket_path(&at(SUN_PATH_MAX), "broker `x`").is_ok());
+        let e = check_socket_path(&at(SUN_PATH_MAX + 1), "broker `gpg-agent`")
+            .expect_err("one byte past the field is refused");
+        let msg = e.to_string();
+        assert!(msg.contains("gpg-agent"), "names the declaration: {msg}");
+        assert!(msg.contains("SBX_DATA_DIR"), "names a way out: {msg}");
+    }
     use std::os::unix::fs::PermissionsExt;
 
     /// The completion oracle runs on a keystroke, so it resolves the layout without acting. The
@@ -3174,7 +3288,7 @@ mod tests {
         )
         .unwrap();
 
-        let app = LockTarget::app(&layout, "demo-app", None).expect("a valid app name");
+        let app = LockTarget::app(&layout, "demo-app", None, None).expect("a valid app name");
         assert_eq!(
             app.resolve(Path::new(BOGUS_NIX), &layout)
                 .expect("the app seeds from the global lock with no nix"),
@@ -3209,7 +3323,7 @@ mod tests {
         let base = TmpDir::new();
         let layout = Layout::under(&base.join("sbx"));
         std::fs::create_dir_all(layout.data_dir()).unwrap();
-        let app = LockTarget::app(&layout, "demo-app", None).unwrap();
+        let app = LockTarget::app(&layout, "demo-app", None, None).unwrap();
         assert!(app.resolve(Path::new(BOGUS_NIX), &layout).is_err());
     }
 
@@ -3220,11 +3334,11 @@ mod tests {
         let base = TmpDir::new();
         let layout = Layout::under(&base.join("sbx"));
         for bad in ["", ".", "..", "../etc", "a/b", "/abs"] {
-            let err = LockTarget::app(&layout, bad, None)
+            let err = LockTarget::app(&layout, bad, None, None)
                 .expect_err("a name that is not a single component must be refused");
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         }
-        assert!(LockTarget::app(&layout, "demo-app", None).is_ok());
+        assert!(LockTarget::app(&layout, "demo-app", None, None).is_ok());
     }
 
     #[test]

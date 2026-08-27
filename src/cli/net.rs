@@ -3497,14 +3497,14 @@ fn persist_egress_removal(
     let outcome =
         manage::remove_egress_rule(&path, app_key, list, rule).map_err(|e| (2, e.to_string()))?;
 
-    match outcome {
+    match outcome.outcome {
         RemoveOutcome::NotPresent => Ok(format!("{noun} {rule} was not in {target} — no change")),
         RemoveOutcome::Removed => {
             // Re-trust only after an actual change (the file bytes changed). Fail-safe ordering: a
             // crash between the write and the trust leaves a correct-but-untrusted file the next
             // launch drops — never a security hole.
             if let Some(store) = &store {
-                trust::trust(store, &path).map_err(|e| {
+                trust::trust_written(store, &path, outcome.text.as_bytes()).map_err(|e| {
                     (
                         1,
                         format!(

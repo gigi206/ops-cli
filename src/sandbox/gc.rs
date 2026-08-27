@@ -94,6 +94,22 @@ pub(crate) fn prune_flake_roots(
 /// package's man/dev output would be deleted on every gc. A pruned prebuilt root's sibling `.expr`
 /// stamp (a plain file [`provision_expr`](crate::store::provision_expr) writes beside it) is removed with it; the
 /// stamp of a *kept* root is a non-symlink and is never touched. Destructive only when `prune`.
+///
+/// **`nix-tools/` is not reconciled here, and that is a known leak.** The read above skips a
+/// non-symlink, so the sub-directory holding the `nix:` mise tools' out-links is never descended,
+/// while [`project_keep_roots`] names it explicitly and does read it. The asymmetry means a tool
+/// dropped from a project's mise files keeps its out-link, that out-link keeps its build in the
+/// keep-set, and the closure is never reclaimed.
+///
+/// It is left rather than approximated because the cheap version is worse than the leak. The
+/// current-set this function is given is [`super::packages::project_gcroot_names`] over the
+/// project's `[packages]`, which returns nothing for a mise-equipped tool — reconciling
+/// `nix-tools/` against it would delete **every** live `nix:` tool root on the first
+/// `sbx gc --prune`. The real current-set is the declared tools from
+/// [`super::nixhub::parse_nix_tools`] over the project's mise files, mapped through the same
+/// out-link naming [`super::nixhub`] provisions them under; that is a second parameter on this
+/// function and a second derivation at the caller, and it must match that naming exactly, because
+/// the failure mode of a mismatch is deletion rather than retention.
 pub(crate) fn prune_project_package_roots(
     data_gcroots: &Path,
     id: &str,

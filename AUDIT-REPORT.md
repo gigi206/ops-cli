@@ -1068,7 +1068,36 @@ Nommées parce qu'une piste écartée pour une bonne raison vaut mieux qu'un fin
 
 ---
 
+## Ce qui a été corrigé, et ce qui ne l'a pas été
+
+Les 91 findings retenus ont été traités. Le travail a été découpé en lots à fichiers disjoints, chaque lot corrigé puis passé au crible de `mise run ci` (fmt + clippy + rustdoc + suite complète) avant d'être poussé. Chaque correctif de comportement porte un test de régression, et pour l'essentiel d'entre eux le test a été vérifié en annulant temporairement le correctif : sans lui, il échoue.
+
+**82 findings ont reçu un correctif de code.** Les quatre HIGH du périmètre cage/proxy en font partie : le `DirBuilder` récursif qui suivait un lien symbolique planté dans le `$HOME` inscriptible avant de livrer ce chemin à bwrap comme source de montage lecture-écriture ; le `[fs] deny` qui s'évaporait quand un chemin masqué devenait impossible à `stat` ; le chemin d'attache à stdio hérité qui ne quittait pas la session de `sbx` ; et les trames que la cage pipeline derrière sa poignée de main WebSocket, écrites dans le tampon TLS amont *avant* le passage du fil-piège, si bien que le blocage était signalé et n'avait pas lieu.
+
+**Neuf findings ont reçu de la documentation plutôt que du code, et il faut dire lesquels et pourquoi.** Quatre d'entre eux sont des défauts de documentation : la prose était la chose fausse, donc la corriger *est* le correctif. Le plus net est `seccomp.rs:1287`, dont le commentaire annonçait `EFAULT` pour la sonde `clone3` à structure vide alors que le noyau refuse la taille avant de déréférencer le pointeur — c'est `EINVAL`, exactement ce que le test affirmait déjà.
+
+Les cinq autres sont des refus assumés, chacun motivé sur place :
+
+| Finding | Pourquoi pas de code |
+|---|---|
+| `src/sandbox/observe_feed.rs:179` — le filtre du flux d'exec s'appuie sur `comm`, que tout processus réécrit | Le fermer demande une identité que possède le *lancement*, pas le processus observé. Cette machine ne peut pas exécuter de cage (ni bwrap ni userns porteur de capacités), donc le correctif serait invérifiable dans un chemin adjacent à l'application de politique. La lacune est décrite là où vit le filtre. |
+| `src/sandbox/gc.rs:103` — `nix-tools/` n'est jamais réconcilié, donc l'out-link d'un outil `nix:` retiré retient sa closure | Chemin destructeur. L'ensemble courant que la fonction reçoit ne contient rien pour un outil équipé par mise : réconcilier contre lui supprimerait **tous** les roots d'outils `nix:` vivants au premier `sbx gc --prune`, ce qui est strictement pire que la fuite. Le vrai correctif exige de rejouer exactement le nommage des out-links, et le mode d'échec d'un décalage est la suppression, pas la rétention. |
+| `src/cli/proc.rs:405` — le commentaire prétendait que `sbx proc pending` refuse un projet irrésolu | Le commentaire est corrigé ; la portée projet ne l'est pas. Ce serait une surface CLI nouvelle (`-a`/`--all`, une ligne de page d'aide, la complétion, les gardes de documentation), ni minimale ni locale. |
+| `src/store.rs:323` — le chemin de socket d'un broker peut dépasser la réserve de `DATA_DIR_MAX` | Rétrécir le plafond refuserait de démarrer une installation existante dont le répertoire de données tombe entre l'ancien et le nouveau — un verrouillage total, pire que le `ENAMETOOLONG` évité. **Corrigé autrement** : le seul chemin de socket dont la largeur est choisie par la configuration est mesuré contre l'installation réelle au moment du `bind`, et refusé en nommant le broker fautif. |
+| `src/config/secrets.rs:81` (b) — deux déclarations dont les cibles se *recouvrent* sans être égales | **Corrigé autrement, et c'est un choix.** Absorber la plus large parce qu'une plus étroite est déclarée ensuite retirerait le credential de tous les autres chemins de cet hôte : un changement silencieux de qui est authentifié, que la configuration ne demande pas. Le recouvrement est donc *signalé*, jamais résolu — comme un recouvrement de règles L4/L7 sur un même hôte l'est déjà dans ce dépôt. `Rule::overlaps` répond `true` seulement quand le recouvrement est certain ; un `re:` ou un `*.` non identique répond `false` plutôt que de deviner. |
+
+**Cinq findings franchissaient les frontières de lots** — le fichier à corriger n'appartenait pas au lot qui portait le finding — et ont été terminés ensuite, une fois l'arbre entier disponible :
+
+- **Le TOCTOU du portail de confiance** (`cli/config.rs:3058`, `cli/net.rs:3507`, `cli/proc.rs:231`). `sbx config set`, `sbx net allow --local` et `sbx proc` écrivaient la configuration puis la ré-attestaient par `trust::trust()`, qui **relit le fichier**. L'arbre du projet est monté en lecture-écriture dans la cage : une charge utile écrivant entre les deux faisait bénir sa propre configuration. `trust_written` existait déjà pour cela et `write_doc` composait déjà le texte — il était jeté sur ces chemins. `Written<T>` est devenu générique, les six verbes d'édition rendent le texte qu'ils ont écrit, et un no-op rend le document tel qu'il a été lu.
+- **Le `connect(2)` non borné** (`proxy/mod.rs:761`) nommait trois chemins ; un seul était atteignable depuis le lot qui le portait. Les deux autres — le clair et le splice brut — composaient les mêmes lignes que la marche multi-adresses, et les deux ont été faits ensemble.
+- **`is_valid_deb_url`** comparait l'extension telle quelle pendant que `select_release_asset` la minusculait, transformant le désaccord en refus dur de toute une release.
+- **Le verrou d'app par nom seul** (`store.rs:1174`) : deux projets déclarant une app `home_scope = "project"` de même nom partageaient un verrou, et rouler l'un déplaçait l'autre. La chaîne de graines devient ordonnée pour que l'app déjà épinglée hérite de sa propre révision plutôt que de repartir du canal global.
+- **`Rule::overlaps`**, ci-dessus.
+
+Le test qui manquait au HIGH WebSocket a été écrit à la main : `relay_websocket` n'est atteignable que de bout en bout, donc le test appartient à la suite e2e du proxy, un fichier hors du lot de l'agent. Il pipeline la trame derrière la poignée de main et affirme les deux postures ; annuler l'ordre du correctif le fait échouer.
+
 ## Ce qu'il faudrait corriger en premier
+
 
 Par ordre de rapport entre le risque fermé et le coût du correctif. Les six premiers tiennent chacun en quelques lignes, parce que dans chaque cas le code correct est déjà dans l'arbre.
 

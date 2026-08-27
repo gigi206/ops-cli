@@ -2624,22 +2624,30 @@ fn config_set(args: &[OsString]) -> ExitCode {
     };
 
     match config::manage::set(&path, &key, val) {
-        Ok(config::manage::SetOutcome::Unchanged) => {
+        Ok(w) if w.outcome == config::manage::SetOutcome::Unchanged => {
             // Nothing was written, so the trust marker still matches and the gate is not re-armed —
             // the same reasoning (and the same silence about trust) as `add`/`rm` on a no-op.
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!("{}", render_config_same_value(&key, &path, &pal));
             ExitCode::SUCCESS
         }
-        Ok(outcome) => {
-            let verb = if outcome == config::manage::SetOutcome::Created {
+        Ok(w) => {
+            let verb = if w.outcome == config::manage::SetOutcome::Created {
                 "set"
             } else {
                 "updated"
             };
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!("{}", render_config_write(verb, &key, &path, &pal));
-            report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref(), gated)
+            report_write_trust(
+                &path,
+                &key,
+                was_trusted,
+                trust,
+                store_dir.as_deref(),
+                gated,
+                &w.text,
+            )
         }
         Err(e) => {
             diag::error(&format!("sbx: config: {e}"));
@@ -2707,7 +2715,7 @@ fn config_list_edit(args: &[OsString], op: ListEdit) -> ExitCode {
         ListEdit::Remove => config::manage::remove(&path, &key, entry),
     };
     match outcome {
-        Ok(true) => {
+        Ok(w) if w.outcome => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             let (done, preposition) = match op {
                 ListEdit::Add => ("added", "to"),
@@ -2717,9 +2725,17 @@ fn config_list_edit(args: &[OsString], op: ListEdit) -> ExitCode {
                 "{}",
                 render_list_edit(done, preposition, entry, &key, &path, &pal)
             );
-            report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref(), gated)
+            report_write_trust(
+                &path,
+                &key,
+                was_trusted,
+                trust,
+                store_dir.as_deref(),
+                gated,
+                &w.text,
+            )
         }
-        Ok(false) => {
+        Ok(_) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             let why = match op {
                 ListEdit::Add => "is already in",
@@ -2771,12 +2787,20 @@ fn config_unset(args: &[OsString]) -> ExitCode {
     };
 
     match config::manage::unset(&path, &key) {
-        Ok(true) => {
+        Ok(w) if w.outcome => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!("{}", render_config_write("unset", &key, &path, &pal));
-            report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref(), gated)
+            report_write_trust(
+                &path,
+                &key,
+                was_trusted,
+                trust,
+                store_dir.as_deref(),
+                gated,
+                &w.text,
+            )
         }
-        Ok(false) => {
+        Ok(_) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!("{}", render_config_unchanged(&key, &path, &pal));
             ExitCode::SUCCESS
@@ -3027,6 +3051,12 @@ fn config_edit(args: &[OsString]) -> ExitCode {
 /// current file); otherwise a write to a previously-trusted file warns that its security fields
 /// will not apply until `sbx trust`, and a write of a security field to an untrusted file notes it
 /// needs trust to take effect. A free `env` write to an untrusted file needs neither.
+///
+/// `written` is the document text the edit composed, and it is what an accompanying `--trust`
+/// attests to. Hashing the *path* instead would read the file a second time, and the project tree
+/// is bound read-write into the cage: a payload writing between sbx's write and that read would
+/// have its own config blessed. See [`crate::trust::trust_written`].
+#[allow(clippy::too_many_arguments)]
 fn report_write_trust(
     path: &Path,
     key: &str,
@@ -3034,6 +3064,7 @@ fn report_write_trust(
     trust_flag: bool,
     store_dir: Option<&Path>,
     gated: bool,
+    written: &str,
 ) -> ExitCode {
     // The global config and the app profiles under `apps/` are trusted **by location** — they carry
     // no per-file trust marker, so a write never re-arms a gate and needs no `sbx trust`. Reporting
@@ -3055,7 +3086,7 @@ fn report_write_trust(
         // tells a script the security setting took effect when it did not, which is the one
         // direction this must not be wrong in.
         match store_dir {
-            Some(dir) => match trust::trust(dir, path) {
+            Some(dir) => match trust::trust_written(dir, path, written.as_bytes()) {
                 Ok(()) => {
                     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
                     println!("{}", render_trusted_whole_file(path, &pal));

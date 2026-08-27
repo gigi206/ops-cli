@@ -55,7 +55,7 @@ host ``) and in the `sbx config show --json` view, so the two spellings meet the
 
 | Field | Meaning |
 |---|---|
-| `name` | a logical name for the inventory, defaulting to the section key (the destination host) |
+| `name` | a logical name for the inventory, defaulting to the section key (the destination host), reduced to letters, digits, `_`, `-` and `.` and capped at 64 characters |
 | `description` | one line saying what the credential is for, printed beside the name |
 | `kind` | the broker kind; defaults to the only kind today, `"http-header"` |
 | `key` | a **terse** source name, expanded through `[secret.defaults]` (optionally pinned `key@resolver`) |

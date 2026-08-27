@@ -1323,7 +1323,13 @@ fn tools_view(m: &super::MiseConfig, resolved: &Resolved) -> ToolsView {
 /// back to the source and origin alone.
 fn nixpkgs_channel(cwd: &Path, resolved: &Resolved, app: Option<&str>) -> ChannelView {
     if let Some(layout) = store::Layout::from_env()
-        && let Ok(target) = sandbox::effective_lock_target(cwd, &layout, resolved, app)
+        && let Ok(target) = sandbox::effective_lock_target(
+            cwd,
+            &layout,
+            resolved,
+            app,
+            sandbox::app_home_scope(resolved, app),
+        )
     {
         return ChannelView {
             source: target.source().to_string(),

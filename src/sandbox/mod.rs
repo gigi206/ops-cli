@@ -139,8 +139,8 @@ pub(crate) use gc::{
     purge_app_homes, tree_size, tree_usage,
 };
 pub(crate) use launch::{
-    SessionHeader, app, attach, detach_log_path, effective_lock_target, gc, parse_session_header,
-    run, run_mise, stop, superseded_reclaimable_hint, upgrade_mise_packages,
+    SessionHeader, app, app_home_scope, attach, detach_log_path, effective_lock_target, gc,
+    parse_session_header, run, run_mise, stop, superseded_reclaimable_hint, upgrade_mise_packages,
     upgrade_provision_steps,
 };
 pub(crate) use naming::cage_name;

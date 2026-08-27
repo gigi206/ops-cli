@@ -1263,9 +1263,12 @@ pub(crate) enum RawHostSecrets {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawHostSecret {
     /// A logical name for this credential, for the inventory `sbx secret list` prints. Optional,
-    /// defaulting to the section key (the destination host) — several credentials to one host are
-    /// what make it worth setting. It is a label, never a source: naming a secret does not select
-    /// it, so a duplicate name is a warning, not a resolution rule.
+    /// defaulting to the section key (the destination host) reduced to the character set an
+    /// explicit name is held to — several credentials to one host are what make it worth setting.
+    /// The reduction is not tidiness: a redacted value is rendered as `${<name>}`, and a section key
+    /// carries a *path*, which is stored unvalidated, so a default taken verbatim could print an
+    /// escape sequence into text a human reads. It is a label, never a source: naming a secret does
+    /// not select it, so a duplicate name is a warning, not a resolution rule.
     pub(crate) name: Option<String>,
     /// A one-line description of what this credential is for, printed beside the name. Free text,
     /// stripped of control characters and length-capped at validation.

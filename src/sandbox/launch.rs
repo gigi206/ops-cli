@@ -885,7 +885,7 @@ pub(crate) fn app(
     };
     // The host's half, now that every answer that belongs to the project has been given: the
     // engines, the user namespace, and the channel this app's own lock resolves against.
-    let mut prep = match prepare_engines(pc, Some(name)) {
+    let mut prep = match prepare_engines(pc, Some(name), Some(app.home_scope)) {
         Ok(p) => p,
         Err(code) => return AppOutcome::plain(code),
     };
@@ -2327,7 +2327,7 @@ pub(crate) fn superseded_reclaimable_hint(
     if !super::projectstore::store_exists(layout, &id) {
         return;
     }
-    let Some(rev) = effective_lock_target(cwd, layout, cfg, app)
+    let Some(rev) = effective_lock_target(cwd, layout, cfg, app, app_home_scope(cfg, app))
         .ok()
         .and_then(|t| t.locked_revision())
     else {
@@ -3112,7 +3112,12 @@ fn prepare_in(
     ov: &crate::config::Override,
     app: Option<&str>,
 ) -> Result<Prepared, ExitCode> {
-    prepare_engines(prepare_config(cwd, ov)?, app)
+    let pc = prepare_config(cwd, ov)?;
+    // Read while the config still carries the app: `prepare_engines` needs the scope to key an
+    // app's pin, and the app launch path has to hand it over separately for the reason
+    // `effective_lock_target` states.
+    let scope = app_home_scope(&pc.cfg, app);
+    prepare_engines(pc, app, scope)
 }
 
 /// The half of a launch's preparation that needs no engine: where sbx keeps its data, and the
@@ -3166,7 +3171,11 @@ fn prepare_config(cwd: PathBuf, ov: &crate::config::Override) -> Result<Prepared
 /// ([`effective_lock_target`]), and nothing of the app's configuration is read here. A caller that
 /// has already taken the app out of the configuration (as [`app`] does, to refuse an undeclared one
 /// before reaching this point) therefore loses nothing by doing so.
-fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, ExitCode> {
+fn prepare_engines(
+    pc: PreparedConfig,
+    app: Option<&str>,
+    app_scope: Option<crate::config::AppHomeScope>,
+) -> Result<Prepared, ExitCode> {
     let PreparedConfig { layout, cwd, cfg } = pc;
     let Some(bwrap) = crate::store::resolve_bwrap(Some(&layout)).map(|c| c.path) else {
         return Err(missing("bubblewrap (the sandbox engine)"));
@@ -3187,7 +3196,7 @@ fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, Ex
         return Err(missing("nix-store (the store database tool)"));
     };
 
-    let nixpkgs = match effective_lock_target(&cwd, &layout, &cfg, app)
+    let nixpkgs = match effective_lock_target(&cwd, &layout, &cfg, app, app_scope)
         .and_then(|t| t.resolve(&nix, &layout))
     {
         Ok(r) => r,
@@ -3231,6 +3240,19 @@ fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, Ex
     })
 }
 
+/// The home scope of the app a launch names, read off a resolved config that still carries it.
+///
+/// The app launch path cannot use this — it has already taken the app out of the map — which is why
+/// [`effective_lock_target`] takes the scope rather than looking it up. Every other caller reaches
+/// it with the config intact, and this is the one spelling of the lookup they share.
+pub(crate) fn app_home_scope(
+    cfg: &crate::config::Resolved,
+    app: Option<&str>,
+) -> Option<crate::config::AppHomeScope> {
+    app.and_then(|name| cfg.apps.get(name))
+        .map(|a| a.home_scope)
+}
+
 /// The single channel decision for a launch — the one place that picks "which source, which lock",
 /// so the launch (resolve), `sbx upgrade` (refresh), and `sbx config` (display) all act on the same
 /// lock and can never drift.
@@ -3245,16 +3267,24 @@ fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, Ex
 /// - **Otherwise an app resolves against its own lock** ([`crate::store::LockTarget::app`]), so
 ///   `sbx upgrade nix --app <name>` moves one app and a global roll leaves it where it is. The
 ///   *source* is still not the app's to choose — `nixpkgs` under an app is a refused key — only the
-///   resolution is frozen per app.
+///   resolution is frozen per app. An app whose `home_scope` is `"project"` is frozen per (project,
+///   app), matching where its state lives: keyed by name alone, two projects declaring one app name
+///   shared a lock and a roll in either moved both.
 /// - **Otherwise the global channel**: a global-config override, else the default.
 ///
 /// Only the pinned case canonicalises the project to derive its lock path, so the common no-pin
 /// path does no extra work and a per-project lock is never even named without a current pin.
+///
+/// `app_scope` is the named app's [`crate::config::AppHomeScope`], and it is a parameter rather than
+/// a lookup on purpose: the app launch path takes its `ResolvedApp` out of `cfg.apps` before it gets
+/// here, so reading the map would answer `Global` for an app whose home is per-project and key its
+/// pin in the wrong place — silently, and only on the one path that matters most.
 pub(crate) fn effective_lock_target(
     cwd: &Path,
     layout: &Layout,
     cfg: &crate::config::Resolved,
     app: Option<&str>,
+    app_scope: Option<crate::config::AppHomeScope>,
 ) -> io::Result<crate::store::LockTarget> {
     match (cfg.nixpkgs_project.as_deref(), app) {
         (Some(source), _) => {
@@ -3262,7 +3292,21 @@ pub(crate) fn effective_lock_target(
             Ok(crate::store::LockTarget::project(layout, &id, source))
         }
         (None, Some(name)) => {
-            crate::store::LockTarget::app(layout, name, cfg.nixpkgs_global.as_deref())
+            // A `home_scope = "project"` app keeps its state per (project, app), so its pin is
+            // keyed the same way: two projects declaring one app name would otherwise share a
+            // single lock, and rolling either would move both while the state each roll was for
+            // stayed separate. Canonicalised only on that branch, like the pinned case above, so
+            // the common global-app path still does no extra work.
+            let project_id = match app_scope {
+                Some(crate::config::AppHomeScope::Project) => Some(binds::project_runtime_id(cwd)?),
+                Some(crate::config::AppHomeScope::Global) | None => None,
+            };
+            crate::store::LockTarget::app(
+                layout,
+                name,
+                cfg.nixpkgs_global.as_deref(),
+                project_id.as_deref(),
+            )
         }
         (None, None) => Ok(crate::store::LockTarget::global(
             layout,
@@ -7458,6 +7502,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             &layout,
             &resolved(None, None),
             None,
+            None,
         )
         .expect("global target needs no canonicalisation");
         assert_eq!(target.origin(), Origin::Default);
@@ -7475,6 +7520,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             &layout,
             &resolved(Some("nixos-23.11"), None),
             None,
+            None,
         )
         .expect("global override needs no canonicalisation");
         assert_eq!(target.origin(), Origin::Global);
@@ -7489,8 +7535,9 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         let proj = TmpDir::new();
         let layout = crate::store::Layout::under(data.path());
 
-        let target = effective_lock_target(proj.path(), &layout, &resolved(None, Some(REV)), None)
-            .expect("canonicalise the project");
+        let target =
+            effective_lock_target(proj.path(), &layout, &resolved(None, Some(REV)), None, None)
+                .expect("canonicalise the project");
         assert_eq!(target.origin(), Origin::ProjectPin);
         assert_eq!(target.source(), REV);
 
@@ -7519,6 +7566,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             &layout,
             &resolved(None, None),
             Some("demo-app"),
+            None,
         )
         .expect("the app branch needs no canonicalisation either");
         assert_eq!(target.origin(), Origin::Default);
@@ -7531,6 +7579,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             &layout,
             &resolved(Some(REV), None),
             Some("demo-app"),
+            None,
         )
         .unwrap();
         pinned
@@ -7561,6 +7610,7 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             &layout,
             &resolved(None, Some(REV)),
             Some("demo-app"),
+            None,
         )
         .expect("canonicalise the project");
         assert_eq!(target.origin(), Origin::ProjectPin);

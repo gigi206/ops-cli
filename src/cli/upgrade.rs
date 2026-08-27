@@ -934,7 +934,13 @@ fn upgrade_nix_channel(
     only: Option<&str>,
     pal: &style::Palette,
 ) -> Roll {
-    let target = match sandbox::effective_lock_target(cwd, layout, cfg, only) {
+    let target = match sandbox::effective_lock_target(
+        cwd,
+        layout,
+        cfg,
+        only,
+        sandbox::app_home_scope(cfg, only),
+    ) {
         Ok(t) => t,
         Err(e) => {
             diag::error(&format!("sbx: cannot resolve the channel target: {e}"));

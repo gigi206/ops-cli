@@ -487,6 +487,48 @@ impl Rule {
         self.methods.admits_deny(method) && self.kind.matches_any_port(req)
     }
 
+    /// Whether some request could match **both** rules, as [`rule_matches`] asks it: by host, port
+    /// and path. That call carries no verb, so a `{...}` method prefix does not narrow this, and
+    /// neither does the layer — the two things a rule's *verdict* consults but its match does not.
+    ///
+    /// Answered `true` only when the overlap is **certain**. Two reaches this cannot compare — a
+    /// `*.domain` wildcard or a `re:` regex against anything but an equal rule — answer `false`
+    /// rather than a guess, so a caller acting on `true` is acting on a fact rather than on a
+    /// suspicion. Whether one regex's language meets another's is not decidable by reading them,
+    /// which is the same reason [`Self::opens_every_host`] asks the engine instead of the pattern.
+    ///
+    /// This is not rule *equality*, and the difference is the point: `api.test` and `api.test/v2`
+    /// are different rules that both match a request to `/v2`, so the surfaces that ask "will these
+    /// two both fire" (a credential injected twice into one request head) have to ask this instead.
+    pub(crate) fn overlaps(&self, other: &Rule) -> bool {
+        if self == other {
+            // Covers the kinds below cannot compare: a rule always overlaps itself.
+            return true;
+        }
+        let (Some(ha), Some(hb)) = (self.kind.host_reach(), other.kind.host_reach()) else {
+            return false;
+        };
+        if ha != hb {
+            return false;
+        }
+        let (Some(pa), Some(pb)) = (self.kind.port_reach(), other.kind.port_reach()) else {
+            return false;
+        };
+        if !pa.intersects(pb) {
+            return false;
+        }
+        match (self.kind.path_reach(), other.kind.path_reach()) {
+            // A kind with no path scope matches every path on its host, so it meets any other.
+            (None, _) | (_, None) => true,
+            (Some((a, a_sub)), Some((b, b_sub))) => match (a_sub, b_sub) {
+                (false, false) => a == b,
+                (true, false) => b.starts_with(&a),
+                (false, true) => a.starts_with(&b),
+                (true, true) => a.starts_with(&b) || b.starts_with(&a),
+            },
+        }
+    }
+
     /// Whether this rule's host match admits **every** host: the reach a bare `*` would have if the
     /// grammar had one (it does not — [`Slot`] and the catch-all refusal see to that). Only a `re:`
     /// regex can express it; every other kind names a concrete host, an IP, or a bounded `*.domain`
@@ -542,6 +584,50 @@ impl RuleKind {
                 subtree,
             } => &req.host == h && ports.admits(req.port) && path_matches(&req.segs, pa, *subtree),
             RuleKind::Regex { re, .. } => re.is_match(&req.url) || re.is_match(&req.canonical_url),
+        }
+    }
+
+    /// The one host this kind matches, in a form two kinds can be compared by, or `None` when its
+    /// reach is not a single host. An IP is keyed by its parsed form so `::1` and its long spelling
+    /// compare equal, and a `Host`/`Url` whose text is an IP literal is keyed the same way, so the
+    /// two kinds a grammar could produce for one address do not read as different destinations.
+    /// `Subdomain` and `Regex` answer `None`: a suffix and a pattern are reaches, not hosts.
+    fn host_reach(&self) -> Option<String> {
+        let text = match self {
+            RuleKind::Ip(ip, _) => return Some(ip.to_string()),
+            RuleKind::Host(h, _) | RuleKind::Url { host: h, .. } => h,
+            RuleKind::Subdomain(..) | RuleKind::Regex { .. } => return None,
+        };
+        Some(
+            text.parse::<IpAddr>()
+                .map_or_else(|_| text.clone(), |ip| ip.to_string()),
+        )
+    }
+
+    /// The port set this kind admits, or `None` for a `Regex`, whose ports are whatever its pattern
+    /// happens to spell.
+    fn port_reach(&self) -> Option<&Ports> {
+        match self {
+            RuleKind::Ip(_, p) | RuleKind::Host(_, p) | RuleKind::Subdomain(_, p) => Some(p),
+            RuleKind::Url { ports, .. } => Some(ports),
+            RuleKind::Regex { .. } => None,
+        }
+    }
+
+    /// The path scope this kind narrows to, as [`path_matches`] compares it — the canonical
+    /// segments and whether they carry their subtree — or `None` for a kind that matches every path
+    /// on its host.
+    fn path_reach(&self) -> Option<(Vec<String>, bool)> {
+        match self {
+            RuleKind::Url { path, subtree, .. } => {
+                let base = if *subtree {
+                    path.strip_suffix("/*").unwrap_or(path)
+                } else {
+                    path
+                };
+                Some((canonical_segments(base), *subtree))
+            }
+            _ => None,
         }
     }
 
@@ -2120,6 +2206,40 @@ mod tests {
     /// An allow-only policy (no deny rules), for the single-list matching tests.
     fn allow(entries: &[&str]) -> EgressPolicy {
         EgressPolicy::new(entries.iter().map(|s| rule(s)).collect(), vec![])
+    }
+
+    /// `overlaps` answers "could one request match both", which is not rule equality: the rule
+    /// pairs that are equal are the smallest part of what it has to get right.
+    ///
+    /// The case it exists for is the first one: a bare host and a path under it are different rules
+    /// that both match a request to that path, so a credential declared on each goes into one
+    /// request head twice. Equality never saw them.
+    ///
+    /// Teeth: the negative cases are the ones that keep it from being `true` in disguise — a
+    /// different host, disjoint ports, and two exact paths that merely share a prefix must all be
+    /// `false`, and so must an undecidable pair (a `re:` or a `*.` wildcard against anything but
+    /// itself), which answers `false` rather than guessing.
+    #[test]
+    fn overlapping_reach_is_not_the_same_question_as_rule_equality() {
+        let meets = |a: &str, b: &str| rule(a).overlaps(&rule(b));
+        // A host rule covers every path on that host, so it meets any rule under it, both ways.
+        assert!(meets("api.test", "api.test/v2"));
+        assert!(meets("api.test/v2", "api.test"));
+        // A subtree meets what is under it; two exact paths meet only when they are the same path.
+        assert!(meets("api.test/v2/*", "api.test/v2/items"));
+        assert!(meets("api.test/v2", "api.test/v2"));
+        assert!(!meets("api.test/v2", "api.test/v2/items"));
+        assert!(!meets("api.test/v2", "api.test/v20"));
+        // Ports have to meet as well as hosts.
+        assert!(meets("api.test:443", "api.test:400-500/v2"));
+        assert!(!meets("api.test:443", "api.test:8443"));
+        // A different host is a different destination whatever the paths say.
+        assert!(!meets("api.test/v2", "other.test/v2"));
+        // Undecidable reaches: `false` unless the rules are equal.
+        assert!(!meets("*.api.test", "api.test"));
+        assert!(!meets("re:^https://api\\.test/", "api.test"));
+        assert!(meets("*.api.test", "*.api.test"));
+        assert!(meets("re:^https://api\\.test/", "re:^https://api\\.test/"));
     }
 
     #[test]

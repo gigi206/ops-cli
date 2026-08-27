@@ -1656,6 +1656,10 @@ pub(crate) fn start(
 
     // Cleared before the bind, since a stale file from a crashed predecessor would block it.
     let host_uds = host_socket(layout.data_dir(), &binding.name, pid);
+    // The one socket path under the data directory whose width the store's cap cannot reserve for,
+    // because the `[broker.<name>]` key that fills it is config-chosen — so it is measured against
+    // this install rather than guessed at. See `store::LONGEST_SOCKET_SUFFIX`.
+    crate::store::check_socket_path(&host_uds, &format!("broker `{}`", binding.name))?;
     let _ = std::fs::remove_file(&host_uds);
     let listener = UnixListener::bind(&host_uds)?;
 

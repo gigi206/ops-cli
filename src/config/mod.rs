@@ -4953,13 +4953,20 @@ fn strip_fetch_scheme(url: &str, allow_insecure_http: bool) -> Option<&str> {
 /// A `deb:` URL: an `https://` URL to a prebuilt `.deb`. Required to be HTTPS (the fetch is not
 /// authenticated beyond TLS, and a `.deb` is executed after autoPatchelf, so a plaintext source is
 /// refused — unless [`Resolved::allow_insecure_http`] opted in, see [`strip_fetch_scheme`]) and to
-/// end in `.deb` (so a mistyped value is caught, not silently built). The character
+/// end in `.deb` (case-insensitively, like its `appimage:` and `tarball:` siblings, so a `.DEB`
+/// spelling is accepted; a mistyped value is caught, not silently built). The character
 /// set is the unreserved URL set plus the sub-delims a release URL uses, so the value carries no
 /// shell/nix metacharacter — it is interpolated into a generated nix expression and a
 /// `nix store prefetch-file` argument, both of which must stay injection-free.
+///
+/// The case-insensitivity is not cosmetic. `prebuilt::select_release_asset`
+/// lowercases an asset name before matching it, so a release publishing `foo_amd64.DEB` is picked
+/// there and then refused here — and the disagreement is not a skipped asset but a hard refusal for
+/// the whole release, because the URL that was chosen is the one this validates.
 pub(crate) fn is_valid_deb_url(url: &str, allow_insecure_http: bool) -> bool {
-    strip_fetch_scheme(url, allow_insecure_http)
-        .is_some_and(|rest| !rest.is_empty() && url.ends_with(".deb") && is_injection_free_url(url))
+    strip_fetch_scheme(url, allow_insecure_http).is_some_and(|rest| {
+        !rest.is_empty() && url.to_ascii_lowercase().ends_with(".deb") && is_injection_free_url(url)
+    })
 }
 
 /// An `appimage:` URL: an `https://` URL to a prebuilt `.AppImage`. The sibling of [`is_valid_deb_url`]

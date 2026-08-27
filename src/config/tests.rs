@@ -5179,6 +5179,12 @@ fn a_deb_prefixed_package_parses_as_a_deb_backend_and_requires_https_dot_deb() {
     assert!(!is_valid_deb_url("http://example.com/x.deb", false));
     assert!(!is_valid_deb_url("https://example.com/x.tar.gz", false));
     assert!(!is_valid_deb_url("https://example.com/a b.deb", false));
+    // Case-insensitive, like the `appimage:` and `tarball:` validators beside it. A release that
+    // publishes `app.DEB` is *selected* by `select_release_asset`, which lowercases the asset name
+    // before matching, so a validator that compared the extension raw turned that disagreement into
+    // a refusal of the whole release rather than a skipped asset.
+    assert!(is_valid_deb_url("https://example.com/x.DEB", false));
+    assert!(is_valid_deb_url("https://example.com/x.Deb", false));
     // the bare `deb:resolve` sentinel is not a locator: it is bound to its `[deb.<name>]` table
     // by `apply_tools`, so parsing it as a backend locator is refused (checked before the `deb:`
     // strip, or it would parse as a `deb:` URL `resolve` and be rejected for the wrong reason).

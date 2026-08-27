@@ -182,6 +182,14 @@ pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Resul
 /// directory carrying the generated `portals.conf`. `XDG_*` are data paths, not code-load paths,
 /// so an untrusted `[env]` that re-points them only sabotages the cage's own portal lookup
 /// (self-DoS), never an escape — like `WAYLAND_DISPLAY`, they need no denylist entry.
+///
+/// That holds for the two this function states, and no longer for `XDG_DATA_HOME` and
+/// `XDG_CONFIG_HOME`, which are stated by the launch's own `cage_env` (in `super::binds`) instead:
+/// an `[open]` route is answered by a desktop entry the XDG lookup finds *by path*, so re-pointing
+/// those two bases moves which handler the portal runs. They are not denylisted either — they are
+/// declared after the config overlay, so a project cannot have the last word on them. Named here
+/// because this comment is where the rule about `XDG_*` is written, and it is now a rule with one
+/// stated exception.
 pub(crate) fn env(gtk_root: &Path) -> Vec<(String, String)> {
     vec![
         (

@@ -169,6 +169,13 @@ ceiling at all. Where two layers both set it, the **larger** window is the one t
 bigger number closes more files, and `[fs]` is honoured from an untrusted project precisely because
 nothing in it can widen what another layer closed.
 
+`scan_max_kb` is the one key in `[fs]` that does not follow from that, and it is the one key the
+trust gate holds back. Every other field a project writes only ever takes access away from the
+project's own cage; a ceiling is the reverse, because the *smaller* of two numbers reads less of
+each file. An untrusted or changed project's `scan_max_kb` is therefore refused outright and the
+launch says so, rather than being folded in and then out-voted. A trusted project's applies as
+written, and the larger-window rule above is what settles it against another layer.
+
 **One scanner per layer.** Every pattern a layer lists is compiled into a single scanner, so the
 cost of a scan does not grow with the length of the list; that scanner has a size ceiling, though,
 and a list too large to fit it compiles into nothing. Such a list is dropped at config time, named,

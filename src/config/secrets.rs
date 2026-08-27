@@ -61,10 +61,18 @@ pub(super) fn count_host_secrets(hosts: &BTreeMap<String, RawHostSecrets>) -> us
 /// absorbing only the first left the rest in place — so `pairs_for` still produced two
 /// `Authorization` pairs and the request head carried both.
 ///
-/// What is compared is the *target rule*, by equality. Two different spellings of one destination
-/// (a bare `host` and a `host/path` under it) classify to different rules and are not compared,
-/// while the proxy injects every rule whose match covers the request; a declaration pair written
-/// that way is outside what this absorbs.
+/// What is *absorbed* is compared by target-rule equality, and deliberately only that. Two
+/// different spellings of one destination — a bare `host` and a `host/path` under it — classify to
+/// different rules, and the proxy injects every rule whose match covers the request
+/// (`matching_injection_ids`, in the proxy), so both fire on a request under the path
+/// and the head carries the header twice. Absorbing one of them would fix that by *narrowing what
+/// the other reaches*: taking the bare host out because a `/v2` declaration came later leaves every
+/// other path on that host with no credential at all, a silent change to which requests are
+/// authenticated that the config does not ask for. So an overlap that is not an equality is
+/// **reported, never resolved** — the reader is told which two declarations will both fire and on
+/// which header, and narrows one of them. That is the same treatment an L4/L7 rule overlap on one
+/// host gets ([`Ports::intersects`](crate::allowlist)), and for the same reason: the collision is
+/// real, but which side should give way is the author's to say.
 pub(super) fn upsert_secret(
     out: &mut Vec<HeaderSecret>,
     warnings: &mut Vec<String>,
@@ -88,6 +96,22 @@ pub(super) fn upsert_secret(
                 .map(|h| (i, h))
         })
         .collect();
+    // Every declaration this one will *share a request with* but does not replace: a different rule
+    // whose reach meets this one's on a header they both write. Computed before the absorption below
+    // so the indices are the ones the reader sees in the file, and skipped where the targets are
+    // equal, because those are exactly the ones being absorbed.
+    for other in out.iter() {
+        if other.to != secret.to
+            && other.to.overlaps(&secret.to)
+            && let Some(header) = shared(other)
+        {
+            warnings.push(format!(
+                "{source}: `{}` and `{}` both match some requests and both set `{header}`, so that \
+                 request head carries it twice — narrow one of them",
+                other.to, secret.to
+            ));
+        }
+    }
     let Some(&(first, _)) = collisions.first() else {
         // Two credentials under one name are legal (the name is a label, not a key) but
         // ambiguous where the name is *rendered*: a redacted value prints `${name}`, so the
@@ -878,6 +902,28 @@ mod tests {
         .expect("the fixture declaration validates")
     }
 
+    /// One declaration writing `header`, scoped to `to` rather than to the bare host.
+    fn secret_to(to: &str, header: &str) -> HeaderSecret {
+        let raw = RawHostSecret {
+            name: Some("scoped".into()),
+            description: None,
+            kind: Some("http-header".into()),
+            key: None,
+            from: Some(SecretFrom::One("env://TOKEN".into())),
+            header: Some(header.into()),
+            value_type: Some("raw".into()),
+            prefix: None,
+            sign: None,
+        };
+        validate_host_secret(
+            to,
+            raw,
+            &SecretDefaults::default(),
+            &PluginRegistry::default(),
+        )
+        .expect("the fixture declaration validates")
+    }
+
     /// A signed declaration to `api.example.com` whose manifest sets `sets`.
     fn signed(name: &str, sets: &[&str]) -> HeaderSecret {
         let plugin = crate::plugins::signer::SignerPlugin {
@@ -961,6 +1007,69 @@ mod tests {
                 "each absorbed declaration is named by the header it lost: {warnings:?}"
             );
         }
+    }
+
+    /// Two declarations whose targets *overlap* without being equal are reported, and both kept.
+    ///
+    /// `api.example.com` and `api.example.com/v2` are different rules, so the absorption below never
+    /// compared them — while the proxy injects every rule whose match covers the request, so a
+    /// request to `/v2` took `Authorization` from both and the head carried it twice.
+    ///
+    /// Both are kept on purpose, and that is the half worth stating: absorbing the bare host because
+    /// a `/v2` declaration came later would leave every other path on that host unauthenticated, a
+    /// change to which requests carry a credential that nobody wrote. The warning names both targets
+    /// and the shared header, which is what the author needs to narrow one.
+    ///
+    /// Teeth: the second case is two declarations under *disjoint* paths on the same host, which no
+    /// request can match together — it must raise nothing, so a green run cannot mean the check
+    /// simply fires on every pair sharing a host.
+    #[test]
+    fn two_targets_that_overlap_without_being_equal_are_reported_and_both_kept() {
+        let mut out = Vec::new();
+        let mut warnings = Vec::new();
+        upsert_secret(
+            &mut out,
+            &mut warnings,
+            "the project config",
+            secret("Authorization"),
+        );
+        upsert_secret(
+            &mut out,
+            &mut warnings,
+            "the project config",
+            secret_to("api.example.com/v2", "Authorization"),
+        );
+        assert_eq!(out.len(), 2, "neither declaration is absorbed: {out:?}");
+        let overlap: Vec<&String> = warnings.iter().filter(|w| w.contains("twice")).collect();
+        assert_eq!(
+            overlap.len(),
+            1,
+            "one report, naming the pair: {warnings:?}"
+        );
+        assert!(
+            overlap[0].contains("api.example.com/v2") && overlap[0].contains("Authorization"),
+            "the report names both targets and the shared header: {overlap:?}"
+        );
+
+        let mut out = Vec::new();
+        let mut warnings = Vec::new();
+        upsert_secret(
+            &mut out,
+            &mut warnings,
+            "the project config",
+            secret_to("api.example.com/v1", "Authorization"),
+        );
+        upsert_secret(
+            &mut out,
+            &mut warnings,
+            "the project config",
+            secret_to("api.example.com/v2", "Authorization"),
+        );
+        assert_eq!(out.len(), 2);
+        assert!(
+            !warnings.iter().any(|w| w.contains("twice")),
+            "no request matches both paths, so there is nothing to report: {warnings:?}"
+        );
     }
 
     /// The other half of the rule, unchanged: a declaration that collides with nothing is kept, and

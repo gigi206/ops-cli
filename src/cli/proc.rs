@@ -220,7 +220,7 @@ fn persist_proc_removal(
     let outcome =
         manage::remove_proc_rule(&path, app_key, list, rule).map_err(|e| (2, e.to_string()))?;
 
-    match outcome {
+    match outcome.outcome {
         RemoveOutcome::NotPresent => Ok(format!("{noun} {rule} was not in {target} — no change")),
         RemoveOutcome::Removed => {
             // Re-trust only after an actual change. Fail-safe ordering: a crash between the write
@@ -228,15 +228,17 @@ fn persist_proc_removal(
             if let Some(store) = &store {
                 // Fully qualified: inside `cli`, a bare `trust` would bind the sibling `cli::trust`
                 // command module, not the crate-root trust store.
-                crate::trust::trust(store, &path).map_err(|e| {
-                    (
-                        1,
-                        format!(
-                            "removed the rule but could not re-trust {e} — run `sbx trust {}`",
-                            config::PROJECT_CONFIG
-                        ),
-                    )
-                })?;
+                crate::trust::trust_written(store, &path, outcome.text.as_bytes()).map_err(
+                    |e| {
+                        (
+                            1,
+                            format!(
+                                "removed the rule but could not re-trust {e} — run `sbx trust {}`",
+                                config::PROJECT_CONFIG
+                            ),
+                        )
+                    },
+                )?;
             }
             let mut msg = format!("removed {noun} {rule} from {target}");
             if gated {
