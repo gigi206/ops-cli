@@ -719,8 +719,13 @@ fn cage_mounts(
 /// and leave the plan reading as though one of them were redundant.
 ///
 /// The last component of each `rel` is deliberately not pinned: that is the path the caller binds.
+///
 /// The sources are the home's own subdirectories, which the caller has created (see `build_spec`) —
-/// bwrap fails a bind whose source does not exist.
+/// bwrap fails a bind whose source does not exist. Those subdirectories sit below a cage-writable
+/// bind, so the caller creates them through [`super::cagedir::ensure_under`] anchored on the home's
+/// mount point; a component the cage replaced with a symlink fails the launch there rather than
+/// becoming the source of a read-write bind here. This function is pure and cannot check that
+/// itself: it joins the paths the caller has already confined.
 fn home_mountpoint_pins(home_src: &Path, rels: &[&str]) -> Vec<Mount> {
     let mut pinned: Vec<PathBuf> = Vec::new();
     for rel in rels {
@@ -1582,15 +1587,20 @@ pub(crate) fn build_spec(
         // rather than a side effect. They are also the *sources* of the mountpoint pins the cage
         // lays over them (see `home_mountpoint_pins`), and bwrap fails a bind whose source is
         // missing, so this loop is what makes those pins bindable at all.
+        //
+        // Anchored on `rt.home_src` through `cagedir`, not `create_dir_all`, because these parents
+        // sit *below* a bind the cage owns: `.config` and `.local/share` are entries in-cage code
+        // can replace with a symlink and leave behind for the next launch. `create_dir_all` stats
+        // through such a link, finds a directory and reports the parents made; the pin then binds
+        // whatever the link named — read-write, since these pins are read-write — into the next
+        // cage. `ensure_under` refuses a component that is not a real directory, and the home's
+        // mount point is the one component the cage cannot exchange, so it is the anchor.
         for rel in [
             super::openuri::APPLICATIONS_REL,
             super::openuri::MIMEAPPS_REL,
         ] {
-            if let Some(parent) = rt.home_src.join(rel).parent() {
-                DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o700)
-                    .create(parent)?;
+            if let Some((parent, _)) = rel.rsplit_once('/') {
+                super::cagedir::ensure_under(&rt.home_src, parent, 0o700)?;
             }
         }
         (Some(open_apps.as_path()), Some(open_mimeapps.as_path()))
@@ -2738,6 +2748,69 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn build_spec_refuses_an_open_pin_parent_the_cage_pointed_out_of_the_home() {
+        // The pins `home_mountpoint_pins` emits are read-write binds whose *sources* are the home's
+        // own `.config` and `.local/share`. Those sit below the writable home bind, so they are
+        // entries in-cage code can replace with a symlink and leave behind — and the pin then binds
+        // whatever the link named into the next cage, read-write. `create_dir_all` could not see
+        // that: it stats through the link, finds a directory, and reports the parent made. Walking
+        // the components with symlinks refused, anchored on the home's mount point, is what turns a
+        // planted link into a failed launch instead of a bind of the host root at
+        // `/home/sandbox/.config`.
+        let data = TmpDir::new();
+        let project = TmpDir::new();
+        std::fs::write(project.path().join("README"), b"hi").unwrap();
+
+        let home = home_src(data.path(), project.path(), Runtime::ProjectDefault)
+            .expect("the home path is derivable");
+        std::fs::create_dir_all(&home).unwrap();
+        let outside = data.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join(".config")).unwrap();
+
+        let mut open = std::collections::BTreeMap::new();
+        open.insert(
+            "https".to_string(),
+            crate::config::OpenHandler {
+                argv: vec!["firefox".to_string()],
+                mode: crate::config::OpenMode::Exec,
+            },
+        );
+        let overlay = Overlay {
+            env: &[],
+            binds: &[],
+            bin_paths: &[],
+            timezone: DEFAULT_ZONE,
+            fresh_release_tokens: &[],
+        };
+        let err = build_spec(
+            data.path(),
+            project.path(),
+            Runtime::ProjectDefault,
+            &userland(),
+            &nix_mount(),
+            &overlay,
+            &[],
+            NetPolicy::Shared,
+            "",
+            &Default::default(),
+            crate::sandbox::seccomp::SeccompPolicy::default(),
+            &[],
+            &open,
+            vec![OsString::from("/bin/sh")],
+        )
+        .expect_err("a repointed pin parent must fail the launch");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        assert!(
+            std::fs::symlink_metadata(home.join(".config"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted link must be reported, not replaced"
+        );
     }
 
     #[test]
