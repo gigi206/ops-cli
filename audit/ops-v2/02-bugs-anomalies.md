@@ -1,93 +1,157 @@
-# Bugs, erreurs et anomalies — findings confirmés
+# Bugs, erreurs et anomalies — défauts établis
 
 Seize domaines fonctionnels ont été passés au crible pour la correction du code, hors
-périmètre sécurité (traité séparément). Comme pour l'audit de sécurité, chaque défaut a été
-soumis à un vérificateur chargé de le réfuter.
+périmètre sécurité, plus deux balayages transverses dédiés : les panics atteignables depuis une
+entrée non maîtrisée, et la dérive entre la prose et le code. Chaque défaut a subi la même
+réfutation adversariale.
 
-**Total : 74 défauts confirmés** (1 élevée, 20 moyenne, 53 faible).
+**Total : 89 défauts établis** (2 élevée, 22 moyenne, 65 faible).
 
 ## Table des matières
 
 | # | Gravité | Emplacement | Défaut |
 |---|---|---|---|
-| [B1](#b1-an-explicitly-declared-misetoollatest-can-never-be-satisfied-so-the-pool-is-never-warm-and-the-task-gets-no-shims) | Élevée | `src/sandbox/taskpool.rs:107` | An explicitly declared `mise:<tool>@latest` can never be satisfied, so the pool is never warm and the task gets no shims |
-| [B2](#b2-config-edit-trust-exits-0-after-failing-to-record-trust-unlike-every-other-trust-verb) | Moyenne | `src/cli/config.rs:3004` | `config edit --trust` exits 0 after failing to record trust, unlike every other `--trust` verb |
-| [B3](#b3-plugins-info-tells-the-user-to-run-an-install-that-is-always-refused-so-a-programs-entry-added-after-install-can-never-be-built) | Moyenne | `src/cli/plugins.rs:2299` | `plugins info` tells the user to run an install that is always refused, so a `programs` entry added after install can never be built |
-| [B4](#b4-sbx-session-logs-f-ignores-a-closed-stdout-and-keeps-polling-until-the-session-exits) | Moyenne | `src/cli/session.rs:714` | `sbx session logs -f` ignores a closed stdout and keeps polling until the session exits |
-| [B5](#b5-two-tasks-naming-different-versions-of-one-tool-can-never-both-be-satisfied-the-pool-config-flips-every-launch-and-one-task-fails-with-command-not-found) | Moyenne | `src/sandbox/taskpool.rs:210` | Two tasks naming different versions of one tool can never both be satisfied; the pool config flips every launch and one task fails with "command not found" |
-| [B6](#b6-a-readytcp-outside-u16-fails-the-untagged-rawservice-parse-and-drops-the-whole-config-layer) | Moyenne | `src/config/schema.rs:1159` | A `ready.tcp` outside u16 fails the untagged `RawService` parse and drops the whole config layer |
-| [B7](#b7-rawtask-carries-no-unknown-key-bag-so-a-misspelled-spawn-silently-disables-exec-supervision) | Moyenne | `src/config/schema.rs:1418` | `RawTask` carries no unknown-key bag, so a misspelled `spawn` silently disables exec supervision |
-| [B8](#b8-a-serviceopen-table-missing-its-cmd-or-an-enable-missing-env-drops-the-whole-config-layer) | Moyenne | `src/config/schema.rs:1053` | A `[service]`/`[open]` table missing its `cmd`, or an `enable` missing `env`, drops the whole config layer |
-| [B9](#b9-a-match-bound-rejects-values-its-own-regex-accepts-because-find-is-leftmost-first-not-anchored) | Moyenne | `src/config/tasks.rs:669` | A `match` bound rejects values its own regex accepts, because `find` is leftmost-first, not anchored |
-| [B10](#b10-a-higher-override-tiers-ssh-agent-confirm-is-silently-discarded-whenever-a-lower-tier-also-declares-ssh-agent) | Moyenne | `src/config/overrides.rs:648` | A higher override tier's `[ssh_agent] confirm` is silently discarded whenever a lower tier also declares `[ssh_agent]` |
-| [B11](#b11-the-override-plane-folds-fs-scan-max-kb-with-min-while-the-layer-merge-it-cites-uses-max-so-the-environment-beats-the-command-line) | Moyenne | `src/config/overrides.rs:684` | The override plane folds `[fs] scan_max_kb` with `min` while the layer merge it cites uses `max`, so the environment beats the command line |
-| [B12](#b12-space-entries-deletes-every-comment-inside-an-edited-array-and-collapses-it-to-one-line) | Moyenne | `src/config/manage.rs:578` | `space_entries` deletes every comment inside an edited array and collapses it to one line |
-| [B13](#b13-longest-socket-suffix-omits-the-broker-plugin-socket-so-data-dir-max-does-not-bound-sun-path) | Moyenne | `src/store.rs:323` | LONGEST_SOCKET_SUFFIX omits the broker plugin socket, so DATA_DIR_MAX does not bound sun_path |
-| [B14](#b14-sbx-task-run-tab-completes-app-names-instead-of-declared-operations) | Moyenne | `src/cli/completion.rs:697` | `sbx task run <TAB>` completes app names instead of declared operations |
-| [B15](#b15-sbx-projects-tab-never-offers-list-or-rm-sbx-proc-pending-tab-never-offers-allowdeny) | Moyenne | `src/cli/completion.rs:797` | `sbx projects <TAB>` never offers `list` or `rm`; `sbx proc pending <TAB>` never offers `allow`/`deny` |
-| [B16](#b16-app-runs-mashed-override-row-hides-the-flags-value-grammar-shifting-the-name-operand) | Moyenne | `src/help.rs:308` | `app run`'s mashed override row hides the flags' value grammar, shifting the `<name>` operand |
-| [B17](#b17-prune-app-tools-builds-the-delete-path-from-the-sanitised-display-name-so-a-tool-whose-real-directory-name-is-not-sanitise-stable-is-reported-as-pruned-but-never-removed) | Moyenne | `src/sandbox/gc.rs:881` | `prune_app_tools` builds the delete path from the *sanitised* display name, so a tool whose real directory name is not sanitise-stable is reported as pruned but never removed |
+| [B1](#b1-a-destination-host-beginning-with-project-rewrites-the-stats-files-identity-header-on-read-back-erasing-the-whole-session-from-sbx-net-stats) | Élevée | `src/sandbox/egress_stats.rs:380` | A destination host beginning with `project=` rewrites the stats file's identity header on read-back, erasing the whole session from `sbx net stats` |
+| [B2](#b2-an-explicitly-declared-misetoollatest-can-never-be-satisfied-so-the-pool-is-never-warm-and-the-task-gets-no-shims) | Élevée | `src/sandbox/taskpool.rs:107` | An explicitly declared `mise:<tool>@latest` can never be satisfied, so the pool is never warm and the task gets no shims |
+| [B3](#b3-sbx-task-run-tab-completes-app-names-instead-of-declared-operations) | Moyenne | `src/cli/completion.rs:697` | `sbx task run <TAB>` completes app names instead of declared operations |
+| [B4](#b4-sbx-projects-tab-never-offers-list-or-rm-sbx-proc-pending-tab-never-offers-allowdeny) | Moyenne | `src/cli/completion.rs:797` | `sbx projects <TAB>` never offers `list` or `rm`; `sbx proc pending <TAB>` never offers `allow`/`deny` |
+| [B5](#b5-config-edit-trust-exits-0-after-failing-to-record-trust-unlike-every-other-trust-verb) | Moyenne | `src/cli/config.rs:3004` | `config edit --trust` exits 0 after failing to record trust, unlike every other `--trust` verb |
+| [B6](#b6-plugins-info-tells-the-user-to-run-an-install-that-is-always-refused-so-a-programs-entry-added-after-install-can-never-be-built) | Moyenne | `src/cli/plugins.rs:2299` | `plugins info` tells the user to run an install that is always refused, so a `programs` entry added after install can never be built |
+| [B7](#b7-sbx-session-logs-f-ignores-a-closed-stdout-and-keeps-polling-until-the-session-exits) | Moyenne | `src/cli/session.rs:714` | `sbx session logs -f` ignores a closed stdout and keeps polling until the session exits |
+| [B8](#b8-space-entries-deletes-every-comment-inside-an-edited-array-and-collapses-it-to-one-line) | Moyenne | `src/config/manage.rs:578` | `space_entries` deletes every comment inside an edited array and collapses it to one line |
+| [B9](#b9-a-higher-override-tiers-ssh-agent-confirm-is-silently-discarded-whenever-a-lower-tier-also-declares-ssh-agent) | Moyenne | `src/config/overrides.rs:648` | A higher override tier's `[ssh_agent] confirm` is silently discarded whenever a lower tier also declares `[ssh_agent]` |
+| [B10](#b10-the-override-plane-folds-fs-scan-max-kb-with-min-while-the-layer-merge-it-cites-uses-max-so-the-environment-beats-the-command-line) | Moyenne | `src/config/overrides.rs:684` | The override plane folds `[fs] scan_max_kb` with `min` while the layer merge it cites uses `max`, so the environment beats the command line |
+| [B11](#b11-a-serviceopen-table-missing-its-cmd-or-an-enable-missing-env-drops-the-whole-config-layer) | Moyenne | `src/config/schema.rs:1053` | A `[service]`/`[open]` table missing its `cmd`, or an `enable` missing `env`, drops the whole config layer |
+| [B12](#b12-a-readytcp-outside-u16-fails-the-untagged-rawservice-parse-and-drops-the-whole-config-layer) | Moyenne | `src/config/schema.rs:1159` | A `ready.tcp` outside u16 fails the untagged `RawService` parse and drops the whole config layer |
+| [B13](#b13-rawtask-carries-no-unknown-key-bag-so-a-misspelled-spawn-silently-disables-exec-supervision) | Moyenne | `src/config/schema.rs:1418` | `RawTask` carries no unknown-key bag, so a misspelled `spawn` silently disables exec supervision |
+| [B14](#b14-a-match-bound-rejects-values-its-own-regex-accepts-because-find-is-leftmost-first-not-anchored) | Moyenne | `src/config/tasks.rs:669` | A `match` bound rejects values its own regex accepts, because `find` is leftmost-first, not anchored |
+| [B15](#b15-app-runs-mashed-override-row-hides-the-flags-value-grammar-shifting-the-name-operand) | Moyenne | `src/help.rs:308` | `app run`'s mashed override row hides the flags' value grammar, shifting the `<name>` operand |
+| [B16](#b16-compact-has-no-cross-process-exclusion-but-runs-on-every-launch-so-two-concurrent-launches-can-fold-one-sessions-counters-into-the-rollup-twice) | Moyenne | `src/sandbox/egress_stats.rs:508` | `compact` has no cross-process exclusion but runs on every launch, so two concurrent launches can fold one session's counters into the rollup twice |
+| [B17](#b17-a-forward-bind-failure-leaks-every-listener-already-bound-in-the-same-call-no-forwarder-is-ever-constructed-so-nothing-sets-the-shutdown-flag) | Moyenne | `src/sandbox/forward.rs:189` | A forward bind failure leaks every listener already bound in the same call — no `Forwarder` is ever constructed, so nothing sets the shutdown flag |
 | [B18](#b18-reap-dead-projectsreap-one-report-a-tree-as-reclaimed-even-when-force-remove-dir-all-failed-contradicting-the-rule-prune-rev-dirs-states-and-a-test-pins) | Moyenne | `src/sandbox/gc.rs:518` | `reap_dead_projects`/`reap_one` report a tree as reclaimed even when `force_remove_dir_all` failed, contradicting the rule `prune_rev_dirs` states and a test pins |
-| [B19](#b19-sbx-upgrades-resolver-cage-omits-the-mise-nix-tools-the-prebuilt-bins-and-every-app-overlay-the-launch-cage-carries) | Moyenne | `src/sandbox/resolve.rs:84` | `sbx upgrade`'s resolver cage omits the mise `nix:` tools, the prebuilt bins and every app overlay the launch cage carries |
+| [B19](#b19-prune-app-tools-builds-the-delete-path-from-the-sanitised-display-name-so-a-tool-whose-real-directory-name-is-not-sanitise-stable-is-reported-as-pruned-but-never-removed) | Moyenne | `src/sandbox/gc.rs:881` | `prune_app_tools` builds the delete path from the *sanitised* display name, so a tool whose real directory name is not sanitise-stable is reported as pruned but never removed |
 | [B20](#b20-a-removed-nix-mise-tools-gcroot-under-nix-tools-is-never-pruned-pinning-its-store-closure-forever) | Moyenne | `src/sandbox/nixhub.rs:256` | A removed `nix:` mise tool's gcroot under `nix-tools/` is never pruned, pinning its store closure forever |
-| [B21](#b21-sbx-search-prints-a-packages-declaration-line-that-is-invalid-toml-for-any-dotted-nixhub-package-name) | Moyenne | `src/sandbox/search.rs:231` | `sbx search` prints a `[packages]` declaration line that is invalid TOML for any dotted nixhub package name |
-| [B22](#b22-app-prefixed-key-rejects-a-dotted-app-name-on-the-strength-of-a-splitter-limitation-that-no-longer-exists) | Faible | `src/cli/config.rs:2355` | `app_prefixed_key` rejects a dotted app name on the strength of a splitter limitation that no longer exists |
-| [B23](#b23-is-security-key-splits-on-every-dot-so-a-quoted-app-name-env-key-is-wrongly-reported-as-a-security-field) | Faible | `src/cli/config.rs:3103` | `is_security_key` splits on every dot, so a quoted app-name `env` key is wrongly reported as a security field |
-| [B24](#b24-trust-is-accepted-and-silently-ignored-by-config-get-and-config-path) | Faible | `src/cli/config.rs:2386` | `--trust` is accepted and silently ignored by `config get` and `config path` |
-| [B25](#b25-config-show-app-silently-drops-the-notify-repeat-window-that-config-show-prints) | Faible | `src/cli/config.rs:1872` | `config show --app` silently drops the notify repeat window that `config show` prints |
-| [B26](#b26-sbx-net-pending-prints-a-session-header-for-every-reachable-session-including-ones-with-nothing-parked) | Faible | `src/cli/net.rs:617` | `sbx net pending` prints a session header for every reachable session, including ones with nothing parked |
-| [B27](#b27-pending-allow-all-save-a-app-reports-no-pending-requests-for-this-project-without-naming-the-app-filter-that-emptied-the-drain) | Faible | `src/cli/net.rs:3359` | `pending allow --all --save -a <app>` reports "no pending requests for this project" without naming the `--app` filter that emptied the drain |
-| [B28](#b28-comment-claims-a-session-rule-only-applies-to-ask-sessions-and-is-refused-with-err-not-ask-neither-is-true) | Faible | `src/cli/net.rs:3109` | Comment claims a `--session` rule only applies to `ask` sessions and is refused with `err not-ask`; neither is true |
-| [B29](#b29-dispatch-comment-says-a-live-session-mute-is-not-yet-wired-it-is-wired-end-to-end) | Faible | `src/cli/net.rs:46` | Dispatch comment says "a live `--session` mute is not yet wired" — it is wired end to end |
-| [B30](#b30-net-groups-export-out-writes-non-atomically-and-will-not-create-its-parent-directory-unlike-the-identical-bundle-export-out) | Faible | `src/cli/net.rs:2424` | `net groups export --out` writes non-atomically and will not create its parent directory, unlike the identical `bundle export --out` |
-| [B31](#b31-render-statss-other-hosts-overflow-row-is-padded-to-the-host-column-width-and-misaligns-the-numeric-columns) | Faible | `src/cli/net.rs:1243` | `render_stats`'s "(other hosts)" overflow row is padded to the host column width and misaligns the numeric columns |
-| [B32](#b32-task-show-invocation-id-answers-from-an-arbitrary-session-invocation-ids-are-per-session-not-globally-unique) | Faible | `src/cli/task.rs:1185` | `task show <invocation-id>` answers from an arbitrary session; invocation ids are per-session, not globally unique |
-| [B33](#b33-plugins-store-install-and-plugins-store-update-silently-drop-every-argument-past-the-ones-they-read) | Faible | `src/cli/plugins.rs:1169` | `plugins store install` and `plugins store update` silently drop every argument past the ones they read |
-| [B34](#b34-dispatch-docs-promise-a-built-inembedded-plugin-store-and-a-built-in-plugin-install-neither-exists) | Faible | `src/cli/plugins.rs:752` | Dispatch docs promise a built-in/embedded plugin store and a built-in plugin install; neither exists |
-| [B35](#b35-task-runs-doc-comment-says-a-refusal-is-exit-2-it-is-125) | Faible | `src/cli/task.rs:623` | `task run`'s doc comment says a refusal is exit 2; it is 125 |
-| [B36](#b36-a-store-listing-offers-a-brokersigner-entry-whose-name-is-already-taken-because-the-name-check-reads-directory-names-instead-of-manifest-names) | Faible | `src/cli/plugins.rs:360` | A store listing offers a broker/signer entry whose name is already taken, because the name check reads directory names instead of manifest names |
-| [B37](#b37-plugins-info-reports-a-brokersigner-name-miss-as-an-unclaimed-resolver-scheme-and-offers-no-remediation) | Faible | `src/cli/plugins.rs:2146` | `plugins info` reports a broker/signer name miss as an unclaimed resolver scheme, and offers no remediation |
-| [B38](#b38-sbx-store-reports-sizes-as-exact-when-the-reflink-probe-could-not-run-at-all) | Faible | `src/cli/store.rs:151` | `sbx store` reports sizes as "exact" when the reflink probe could not run at all |
-| [B39](#b39-closing-notes-doc-and-store-moved-notes-doc-both-deny-that-mise-can-trigger-the-store-moved-note-which-it-does) | Faible | `src/cli/upgrade.rs:353` | `closing_note`'s doc and `store_moved_note`'s doc both deny that `mise` can trigger the store-moved note, which it does |
-| [B40](#b40-app-scoped-targets-doc-says-both-for-three-targets-and-the-refusal-it-feeds-renders-provision-and-mise-and-nix) | Faible | `src/cli/upgrade.rs:39` | `APP_SCOPED_TARGETS` doc says "Both" for three targets, and the refusal it feeds renders "provision and mise and nix" |
-| [B41](#b41-sbx-test-net-with-no-url-prints-the-parent-verbs-usage-line-and-swallows-an-unknown-flag-as-the-url) | Faible | `src/cli/test.rs:72` | `sbx test net` with no URL prints the parent verb's usage line, and swallows an unknown flag as the URL |
-| [B42](#b42-sbx-search-silently-discards-every-flag-shaped-argument-instead-of-rejecting-it) | Faible | `src/cli/search.rs:13` | `sbx search` silently discards every flag-shaped argument instead of rejecting it |
-| [B43](#b43-detachfalse-observefalse-dry-runfalse-turn-the-flag-on-flag-name-strips-the-value-for-pure-booleans) | Faible | `src/cli/mod.rs:435` | `--detach=false` / `--observe=false` / `--dry-run=false` turn the flag ON — `flag_name` strips the value for pure booleans |
-| [B44](#b44-sbx-storage-migrate-leaves-the-whole-copy-in-the-volume-when-verification-fails-and-says-nothing-about-it) | Faible | `src/cli/storage.rs:458` | `sbx storage migrate` leaves the whole copy in the volume when verification fails, and says nothing about it |
-| [B45](#b45-sbx-logs-f-a-feed-that-answers-with-rows-but-no-cursor-makes-the-loop-drop-those-rows-and-declare-the-session-ended) | Faible | `src/cli/logs.rs:708` | `sbx logs -f`: a feed that answers with rows but no cursor makes the loop drop those rows and declare the session ended |
-| [B46](#b46-sbx-logs-feed-name-reports-session-n-is-recording-nothing-when-only-the-filtered-feed-is-absent) | Faible | `src/cli/logs.rs:621` | `sbx logs --feed <name>` reports "session N is recording nothing" when only the filtered feed is absent |
+| [B21](#b21-sbx-upgrades-resolver-cage-omits-the-mise-nix-tools-the-prebuilt-bins-and-every-app-overlay-the-launch-cage-carries) | Moyenne | `src/sandbox/resolve.rs:84` | `sbx upgrade`'s resolver cage omits the mise `nix:` tools, the prebuilt bins and every app overlay the launch cage carries |
+| [B22](#b22-sbx-search-prints-a-packages-declaration-line-that-is-invalid-toml-for-any-dotted-nixhub-package-name) | Moyenne | `src/sandbox/search.rs:231` | `sbx search` prints a `[packages]` declaration line that is invalid TOML for any dotted nixhub package name |
+| [B23](#b23-two-tasks-naming-different-versions-of-one-tool-can-never-both-be-satisfied-the-pool-config-flips-every-launch-and-one-task-fails-with-command-not-found) | Moyenne | `src/sandbox/taskpool.rs:210` | Two tasks naming different versions of one tool can never both be satisfied; the pool config flips every launch and one task fails with "command not found" |
+| [B24](#b24-longest-socket-suffix-omits-the-broker-plugin-socket-so-data-dir-max-does-not-bound-sun-path) | Moyenne | `src/store.rs:323` | LONGEST_SOCKET_SUFFIX omits the broker plugin socket, so DATA_DIR_MAX does not bound sun_path |
+| [B25](#b25-the-guide-states-the-cages-uid-is-1000-while-the-code-reflects-the-host-uid-same-uid) | Faible | `docs-site/docs/guide/concepts/security-model.md:46` | The guide states the cage's uid is 1000 while the code reflects the host uid (same-uid) |
+| [B26](#b26-sbx-app-rm-name-purge-reports-no-profile-and-no-home-for-a-profile-it-just-failed-to-delete) | Faible | `src/cli/app.rs:1224` | `sbx app rm <name> --purge` reports "no profile and no home" for a profile it just failed to delete |
+| [B27](#b27-the-flag-menu-goes-dead-after-any-typed-flag-not-just-after-a-positional-value) | Faible | `src/cli/completion.rs:225` | The flag menu goes dead after any typed flag, not just after a positional value |
+| [B28](#b28-the-emitted-bash-script-ignores-comp-wordbreaks-so-words-complete-nothing-there) | Faible | `src/cli/completion.rs:1028` | The emitted bash script ignores COMP_WORDBREAKS, so `:`/`=` words complete nothing there |
+| [B29](#b29-config-show-app-silently-drops-the-notify-repeat-window-that-config-show-prints) | Faible | `src/cli/config.rs:1872` | `config show --app` silently drops the notify repeat window that `config show` prints |
+| [B30](#b30-app-prefixed-key-rejects-a-dotted-app-name-on-the-strength-of-a-splitter-limitation-that-no-longer-exists) | Faible | `src/cli/config.rs:2355` | `app_prefixed_key` rejects a dotted app name on the strength of a splitter limitation that no longer exists |
+| [B31](#b31-trust-is-accepted-and-silently-ignored-by-config-get-and-config-path) | Faible | `src/cli/config.rs:2386` | `--trust` is accepted and silently ignored by `config get` and `config path` |
+| [B32](#b32-is-security-key-splits-on-every-dot-so-a-quoted-app-name-env-key-is-wrongly-reported-as-a-security-field) | Faible | `src/cli/config.rs:3103` | `is_security_key` splits on every dot, so a quoted app-name `env` key is wrongly reported as a security field |
+| [B33](#b33-sbx-logs-feed-name-reports-session-n-is-recording-nothing-when-only-the-filtered-feed-is-absent) | Faible | `src/cli/logs.rs:621` | `sbx logs --feed <name>` reports "session N is recording nothing" when only the filtered feed is absent |
+| [B34](#b34-sbx-logs-f-a-feed-that-answers-with-rows-but-no-cursor-makes-the-loop-drop-those-rows-and-declare-the-session-ended) | Faible | `src/cli/logs.rs:708` | `sbx logs -f`: a feed that answers with rows but no cursor makes the loop drop those rows and declare the session ended |
+| [B35](#b35-detachfalse-observefalse-dry-runfalse-turn-the-flag-on-flag-name-strips-the-value-for-pure-booleans) | Faible | `src/cli/mod.rs:435` | `--detach=false` / `--observe=false` / `--dry-run=false` turn the flag ON — `flag_name` strips the value for pure booleans |
+| [B36](#b36-dispatch-comment-says-a-live-session-mute-is-not-yet-wired-it-is-wired-end-to-end) | Faible | `src/cli/net.rs:46` | Dispatch comment says "a live `--session` mute is not yet wired" — it is wired end to end |
+| [B37](#b37-sbx-net-pending-prints-a-session-header-for-every-reachable-session-including-ones-with-nothing-parked) | Faible | `src/cli/net.rs:617` | `sbx net pending` prints a session header for every reachable session, including ones with nothing parked |
+| [B38](#b38-render-statss-other-hosts-overflow-row-is-padded-to-the-host-column-width-and-misaligns-the-numeric-columns) | Faible | `src/cli/net.rs:1243` | `render_stats`'s "(other hosts)" overflow row is padded to the host column width and misaligns the numeric columns |
+| [B39](#b39-net-groups-export-out-writes-non-atomically-and-will-not-create-its-parent-directory-unlike-the-identical-bundle-export-out) | Faible | `src/cli/net.rs:2424` | `net groups export --out` writes non-atomically and will not create its parent directory, unlike the identical `bundle export --out` |
+| [B40](#b40-comment-claims-a-session-rule-only-applies-to-ask-sessions-and-is-refused-with-err-not-ask-neither-is-true) | Faible | `src/cli/net.rs:3109` | Comment claims a `--session` rule only applies to `ask` sessions and is refused with `err not-ask`; neither is true |
+| [B41](#b41-pending-allow-all-save-a-app-reports-no-pending-requests-for-this-project-without-naming-the-app-filter-that-emptied-the-drain) | Faible | `src/cli/net.rs:3359` | `pending allow --all --save -a <app>` reports "no pending requests for this project" without naming the `--app` filter that emptied the drain |
+| [B42](#b42-a-store-listing-offers-a-brokersigner-entry-whose-name-is-already-taken-because-the-name-check-reads-directory-names-instead-of-manifest-names) | Faible | `src/cli/plugins.rs:360` | A store listing offers a broker/signer entry whose name is already taken, because the name check reads directory names instead of manifest names |
+| [B43](#b43-dispatch-docs-promise-a-built-inembedded-plugin-store-and-a-built-in-plugin-install-neither-exists) | Faible | `src/cli/plugins.rs:752` | Dispatch docs promise a built-in/embedded plugin store and a built-in plugin install; neither exists |
+| [B44](#b44-plugins-store-install-and-plugins-store-update-silently-drop-every-argument-past-the-ones-they-read) | Faible | `src/cli/plugins.rs:1169` | `plugins store install` and `plugins store update` silently drop every argument past the ones they read |
+| [B45](#b45-plugins-info-reports-a-brokersigner-name-miss-as-an-unclaimed-resolver-scheme-and-offers-no-remediation) | Faible | `src/cli/plugins.rs:2146` | `plugins info` reports a broker/signer name miss as an unclaimed resolver scheme, and offers no remediation |
+| [B46](#b46-sbx-search-silently-discards-every-flag-shaped-argument-instead-of-rejecting-it) | Faible | `src/cli/search.rs:13` | `sbx search` silently discards every flag-shaped argument instead of rejecting it |
 | [B47](#b47-sbx-session-stop-takes-as-a-session-id-the-comment-claims-it-ends-option-parsing) | Faible | `src/cli/session.rs:221` | `sbx session stop --` takes `--` as a session id; the comment claims it ends option parsing |
-| [B48](#b48-sbx-app-rm-name-purge-reports-no-profile-and-no-home-for-a-profile-it-just-failed-to-delete) | Faible | `src/cli/app.rs:1224` | `sbx app rm <name> --purge` reports "no profile and no home" for a profile it just failed to delete |
-| [B49](#b49-the-installs-stdout-tail-is-captured-and-then-discarded-so-a-mise-failure-reported-on-stdout-prints-no-output) | Faible | `src/sandbox/taskpool.rs:543` | The install's stdout tail is captured and then discarded, so a mise failure reported on stdout prints "no output" |
-| [B50](#b50-a-project-brokername-table-with-no-allow-key-silently-clears-the-global-configs-broker-policy) | Faible | `src/config/mod.rs:2095` | A project `[broker.<name>]` table with no `allow` key silently clears the global config's broker policy |
-| [B51](#b51-resolveds-field-docs-state-network-and-notify-defaults-the-code-does-not-implement) | Faible | `src/config/mod.rs:313` | `Resolved`'s field docs state network and notify defaults the code does not implement |
-| [B52](#b52-apply-override-adds-credentials-to-secrets-but-leaves-declared-secrets-stale) | Faible | `src/config/mod.rs:1182` | `apply_override` adds credentials to `secrets` but leaves `declared_secrets` stale |
-| [B53](#b53-bundleprovisions-doc-comment-opens-with-the-first-half-of-resolvedapps-sentence) | Faible | `src/config/mod.rs:503` | `BundleProvision`'s doc comment opens with the first half of `ResolvedApp`'s sentence |
-| [B54](#b54-the-capture-max-kb-warning-fires-only-when-capture-is-absent-not-in-the-two-cases-its-own-message-names) | Faible | `src/config/validate.rs:701` | The `capture_max_kb` warning fires only when `capture` is absent, not in the two cases its own message names |
-| [B55](#b55-validate-params-documents-declaration-order-but-a-btreemap-source-gives-alphabetical-order) | Faible | `src/config/tasks.rs:582` | `validate_params` documents declaration order but a `BTreeMap` source gives alphabetical order |
-| [B56](#b56-doc-comment-line-duplicated-on-itself-in-validate-task-network) | Faible | `src/config/tasks.rs:927` | Doc comment line duplicated on itself in `validate_task_network` |
+| [B48](#b48-sbx-storage-migrate-leaves-the-whole-copy-in-the-volume-when-verification-fails-and-says-nothing-about-it) | Faible | `src/cli/storage.rs:458` | `sbx storage migrate` leaves the whole copy in the volume when verification fails, and says nothing about it |
+| [B49](#b49-sbx-store-reports-sizes-as-exact-when-the-reflink-probe-could-not-run-at-all) | Faible | `src/cli/store.rs:151` | `sbx store` reports sizes as "exact" when the reflink probe could not run at all |
+| [B50](#b50-task-runs-doc-comment-says-a-refusal-is-exit-2-it-is-125) | Faible | `src/cli/task.rs:623` | `task run`'s doc comment says a refusal is exit 2; it is 125 |
+| [B51](#b51-task-show-invocation-id-answers-from-an-arbitrary-session-invocation-ids-are-per-session-not-globally-unique) | Faible | `src/cli/task.rs:1185` | `task show <invocation-id>` answers from an arbitrary session; invocation ids are per-session, not globally unique |
+| [B52](#b52-sbx-test-net-with-no-url-prints-the-parent-verbs-usage-line-and-swallows-an-unknown-flag-as-the-url) | Faible | `src/cli/test.rs:72` | `sbx test net` with no URL prints the parent verb's usage line, and swallows an unknown flag as the URL |
+| [B53](#b53-sbx-test-net-reports-denied-ip-literal-for-an-address-the-absolute-form-https-plane-actually-allows) | Faible | `src/cli/test.rs:427` | `sbx test net` reports DENIED `ip-literal` for an address the absolute-form `https://` plane actually allows |
+| [B54](#b54-app-scoped-targets-doc-says-both-for-three-targets-and-the-refusal-it-feeds-renders-provision-and-mise-and-nix) | Faible | `src/cli/upgrade.rs:39` | `APP_SCOPED_TARGETS` doc says "Both" for three targets, and the refusal it feeds renders "provision and mise and nix" |
+| [B55](#b55-closing-notes-doc-and-store-moved-notes-doc-both-deny-that-mise-can-trigger-the-store-moved-note-which-it-does) | Faible | `src/cli/upgrade.rs:353` | `closing_note`'s doc and `store_moved_note`'s doc both deny that `mise` can trigger the store-moved note, which it does |
+| [B56](#b56-put-value-blames-the-leaf-key-when-it-is-a-parent-that-holds-a-scalar-giving-useless-remediation) | Faible | `src/config/manage.rs:622` | `put_value` blames the leaf key when it is a *parent* that holds a scalar, giving useless remediation |
 | [B57](#b57-add-egress-ruleadd-proc-rule-rewrite-the-file-on-alreadypresent-which-the-doc-says-is-never-written) | Faible | `src/config/manage.rs:886` | `add_egress_rule`/`add_proc_rule` rewrite the file on `AlreadyPresent`, which the doc says is never written |
-| [B58](#b58-put-value-blames-the-leaf-key-when-it-is-a-parent-that-holds-a-scalar-giving-useless-remediation) | Faible | `src/config/manage.rs:622` | `put_value` blames the leaf key when it is a *parent* that holds a scalar, giving useless remediation |
-| [B59](#b59-split-key-only-understands-quoted-key-segments-silently-mangling-quoted-ones-into-a-nonsense-table) | Faible | `src/config/manage.rs:1271` | `split_key` only understands `"`-quoted key segments, silently mangling `'`-quoted ones into a nonsense table |
-| [B60](#b60-secrets-inherited-shadows-on-header-alone-while-upsert-secret-shadows-on-any-header-in-headers) | Faible | `src/config/view.rs:1879` | `secrets_inherited` shadows on `header` alone while `upsert_secret` shadows on any header in `headers()` |
-| [B61](#b61-sbx-path-exits-0-and-reports-no-base-when-the-data-directory-could-not-be-resolved) | Faible | `src/main.rs:296` | `sbx path` exits 0 and reports "no base" when the data directory could not be resolved |
-| [B62](#b62-an-untrusted-engine-override-is-reported-as-ignoring-and-then-as-not-found-neither-of-which-is-true) | Faible | `src/store.rs:678` | An untrusted engine override is reported as "ignoring" and then as "not found", neither of which is true |
-| [B63](#b63-refresh-ref-documents-a-40-hex-pin-as-needing-no-nix-call-while-it-spawns-nix-and-queries-github) | Faible | `src/store.rs:1339` | `refresh_ref` documents a 40-hex pin as needing "no nix call" while it spawns nix and queries GitHub |
-| [B64](#b64-the-bootstrap-local-save-refusal-prints-two-runs-of-14-literal-spaces-mid-sentence) | Faible | `src/main.rs:579` | The bootstrap `--local` save refusal prints two runs of 14 literal spaces mid-sentence |
-| [B65](#b65-two-doc-comments-carry-a-duplicated-leading-fragment-glued-to-the-real-summary-line) | Faible | `src/main.rs:591` | Two doc comments carry a duplicated leading fragment glued to the real summary line |
-| [B66](#b66-the-flag-menu-goes-dead-after-any-typed-flag-not-just-after-a-positional-value) | Faible | `src/cli/completion.rs:225` | The flag menu goes dead after any typed flag, not just after a positional value |
-| [B67](#b67-the-emitted-bash-script-ignores-comp-wordbreaks-so-words-complete-nothing-there) | Faible | `src/cli/completion.rs:1028` | The emitted bash script ignores COMP_WORDBREAKS, so `:`/`=` words complete nothing there |
-| [B68](#b68-sbx-app-prune-page-tells-the-user-to-run-sbx-stop-which-is-not-a-command) | Faible | `src/help.rs:2087` | `sbx app prune` page tells the user to run `sbx stop`, which is not a command |
-| [B69](#b69-two-pages-say-sbx-app-name-launches-an-app-the-dispatcher-refuses-that-form) | Faible | `src/help.rs:1963` | Two pages say `sbx app <name>` launches an app; the dispatcher refuses that form |
-| [B70](#b70-config-add-page-claims-config-rm-is-the-only-way-to-remove-a-rule-four-verbs-and-the-config-rm-page-say-otherwise) | Faible | `src/help.rs:1386` | `config add` page claims `config rm` is the only way to remove a rule; four verbs and the `config rm` page say otherwise |
-| [B71](#b71-the-exec-observers-seen-set-is-never-pruned-so-a-reused-pid-silently-drops-its-exec-event-and-the-set-grows-without-bound) | Faible | `src/sandbox/observe_feed.rs:173` | The exec observer's `seen` set is never pruned, so a reused pid silently drops its exec event and the set grows without bound |
-| [B72](#b72-sessiondescendants-has-no-visited-set-so-a-malformed-parent-graph-makes-sbx-session-stop-spin-forever-the-two-sibling-walkers-in-this-codebase-both-guard-against-exactly-that) | Faible | `src/session.rs:481` | `session::descendants` has no visited set, so a malformed parent graph makes `sbx session stop` spin forever -- the two sibling walkers in this codebase both guard against exactly that |
-| [B73](#b73-treestates-doc-sends-users-to-sbx-gc-all-to-reclaim-a-dead-tree-which-that-command-explicitly-does-not-do) | Faible | `src/sandbox/gc.rs:933` | `TreeState`'s doc sends users to `sbx gc --all` to reclaim a dead tree, which that command explicitly does not do |
-| [B74](#b74-flakepins-doc-says-the-revision-keys-the-out-link-the-module-header-fifteen-lines-above-says-nothing-is-keyed-by-it-and-the-code-agrees-with-the-header) | Faible | `src/sandbox/flake.rs:29` | `FlakePin`'s doc says the revision keys the out-link; the module header fifteen lines above says nothing is keyed by it, and the code agrees with the header |
+| [B58](#b58-split-key-only-understands-quoted-key-segments-silently-mangling-quoted-ones-into-a-nonsense-table) | Faible | `src/config/manage.rs:1271` | `split_key` only understands `"`-quoted key segments, silently mangling `'`-quoted ones into a nonsense table |
+| [B59](#b59-resolveds-field-docs-state-network-and-notify-defaults-the-code-does-not-implement) | Faible | `src/config/mod.rs:313` | `Resolved`'s field docs state network and notify defaults the code does not implement |
+| [B60](#b60-bundleprovisions-doc-comment-opens-with-the-first-half-of-resolvedapps-sentence) | Faible | `src/config/mod.rs:503` | `BundleProvision`'s doc comment opens with the first half of `ResolvedApp`'s sentence |
+| [B61](#b61-apply-override-adds-credentials-to-secrets-but-leaves-declared-secrets-stale) | Faible | `src/config/mod.rs:1182` | `apply_override` adds credentials to `secrets` but leaves `declared_secrets` stale |
+| [B62](#b62-a-project-brokername-table-with-no-allow-key-silently-clears-the-global-configs-broker-policy) | Faible | `src/config/mod.rs:2095` | A project `[broker.<name>]` table with no `allow` key silently clears the global config's broker policy |
+| [B63](#b63-validate-params-documents-declaration-order-but-a-btreemap-source-gives-alphabetical-order) | Faible | `src/config/tasks.rs:582` | `validate_params` documents declaration order but a `BTreeMap` source gives alphabetical order |
+| [B64](#b64-doc-comment-line-duplicated-on-itself-in-validate-task-network) | Faible | `src/config/tasks.rs:927` | Doc comment line duplicated on itself in `validate_task_network` |
+| [B65](#b65-the-capture-max-kb-warning-fires-only-when-capture-is-absent-not-in-the-two-cases-its-own-message-names) | Faible | `src/config/validate.rs:701` | The `capture_max_kb` warning fires only when `capture` is absent, not in the two cases its own message names |
+| [B66](#b66-secrets-inherited-shadows-on-header-alone-while-upsert-secret-shadows-on-any-header-in-headers) | Faible | `src/config/view.rs:1879` | `secrets_inherited` shadows on `header` alone while `upsert_secret` shadows on any header in `headers()` |
+| [B67](#b67-config-add-page-claims-config-rm-is-the-only-way-to-remove-a-rule-four-verbs-and-the-config-rm-page-say-otherwise) | Faible | `src/help.rs:1386` | `config add` page claims `config rm` is the only way to remove a rule; four verbs and the `config rm` page say otherwise |
+| [B68](#b68-two-pages-say-sbx-app-name-launches-an-app-the-dispatcher-refuses-that-form) | Faible | `src/help.rs:1963` | Two pages say `sbx app <name>` launches an app; the dispatcher refuses that form |
+| [B69](#b69-sbx-app-prune-page-tells-the-user-to-run-sbx-stop-which-is-not-a-command) | Faible | `src/help.rs:2087` | `sbx app prune` page tells the user to run `sbx stop`, which is not a command |
+| [B70](#b70-sbx-path-exits-0-and-reports-no-base-when-the-data-directory-could-not-be-resolved) | Faible | `src/main.rs:296` | `sbx path` exits 0 and reports "no base" when the data directory could not be resolved |
+| [B71](#b71-a-non-utf-8-flag-value-is-reported-as-a-missing-value-so-a-legitimate-bind-path-fails-with-a-message-describing-a-different-mistake) | Faible | `src/main.rs:340` | A non-UTF-8 flag value is reported as a missing value, so a legitimate `--bind` path fails with a message describing a different mistake |
+| [B72](#b72-the-bootstrap-local-save-refusal-prints-two-runs-of-14-literal-spaces-mid-sentence) | Faible | `src/main.rs:579` | The bootstrap `--local` save refusal prints two runs of 14 literal spaces mid-sentence |
+| [B73](#b73-two-doc-comments-carry-a-duplicated-leading-fragment-glued-to-the-real-summary-line) | Faible | `src/main.rs:591` | Two doc comments carry a duplicated leading fragment glued to the real summary line |
+| [B74](#b74-the-allowlist-contract-tells-the-cage-any-host-not-listed-above-is-refused-but-a-listed-host-can-still-be-refused-by-a-deny-rule-the-sibling-match-arm-says-so-and-this-one-does-not) | Faible | `src/sandbox/contract.rs:91` | The allowlist contract tells the cage "any host not listed above is refused", but a listed host can still be refused by a deny rule — the sibling match arm says so and this one does not |
+| [B75](#b75-reachable-hosts-https-lists-tcp-and-re-allow-rules-and-the-note-above-it-tells-the-cage-to-test-them-with-curl-https) | Faible | `src/sandbox/contract.rs:103` | `Reachable hosts (HTTPS)` lists `tcp://` and `re:` allow rules, and the note above it tells the cage to test them with `curl https://` |
+| [B76](#b76-flakepins-doc-says-the-revision-keys-the-out-link-the-module-header-fifteen-lines-above-says-nothing-is-keyed-by-it-and-the-code-agrees-with-the-header) | Faible | `src/sandbox/flake.rs:29` | `FlakePin`'s doc says the revision keys the out-link; the module header fifteen lines above says nothing is keyed by it, and the code agrees with the header |
+| [B77](#b77-the-forward-socket-directory-is-keyed-by-bare-pid-so-a-reused-pid-inherits-a-killed-predecessors-socket-files-and-every-forward-silently-stops-working) | Faible | `src/sandbox/forward.rs:156` | The forward socket directory is keyed by bare pid, so a reused pid inherits a killed predecessor's socket files and every forward silently stops working |
+| [B78](#b78-forwardaccept-loop-re-implements-both-shared-accept-primitives-dropping-the-diagnostic-that-makes-a-stuck-listener-visible) | Faible | `src/sandbox/forward.rs:247` | `forward::accept_loop` re-implements both shared accept primitives, dropping the diagnostic that makes a stuck listener visible |
+| [B79](#b79-treestates-doc-sends-users-to-sbx-gc-all-to-reclaim-a-dead-tree-which-that-command-explicitly-does-not-do) | Faible | `src/sandbox/gc.rs:933` | `TreeState`'s doc sends users to `sbx gc --all` to reclaim a dead tree, which that command explicitly does not do |
+| [B80](#b80-locksrs-claims-the-recoverdegrade-split-is-decided-once-and-names-every-exception-the-whole-sandboxcontrol-plane-still-panics-on-a-poisoned-lock) | Faible | `src/sandbox/locks.rs:23` | `locks.rs` claims the recover/degrade split is decided once and names every exception; the whole `sandbox/control` plane still panics on a poisoned lock |
+| [B81](#b81-the-exec-observers-seen-set-is-never-pruned-so-a-reused-pid-silently-drops-its-exec-event-and-the-set-grows-without-bound) | Faible | `src/sandbox/observe_feed.rs:173` | The exec observer's `seen` set is never pruned, so a reused pid silently drops its exec event and the set grows without bound |
+| [B82](#b82-the-proxys-every-refusal-category-tables-omit-five-live-reason-tokens-asked-denied-among-them) | Faible | `src/sandbox/proxy/mod.rs:84` | The proxy's "every refusal category" tables omit five live reason tokens, `asked-denied` among them |
+| [B83](#b83-accept-loops-hardened-against-accept2-failure-still-die-on-threadspawn-silently-taking-their-listener-down-for-the-session) | Faible | `src/sandbox/proxy/mod.rs:283` | Accept loops hardened against accept(2) failure still die on `thread::spawn`, silently taking their listener down for the session |
+| [B84](#b84-tasklogs-header-documents-expect-and-argues-for-a-loud-panic-the-code-recovers-silently-through-lockslocked) | Faible | `src/sandbox/task_control.rs:399` | `TaskLog`'s header documents `expect` and argues for a loud panic; the code recovers silently through `locks::locked` |
+| [B85](#b85-serve-host-documents-three-of-the-six-verbs-it-serves-and-the-wire-protocol-block-omits-info-entirely) | Faible | `src/sandbox/task_control.rs:1218` | `serve_host` documents three of the six verbs it serves, and the wire-protocol block omits `INFO` entirely |
+| [B86](#b86-the-installs-stdout-tail-is-captured-and-then-discarded-so-a-mise-failure-reported-on-stdout-prints-no-output) | Faible | `src/sandbox/taskpool.rs:543` | The install's stdout tail is captured and then discarded, so a mise failure reported on stdout prints "no output" |
+| [B87](#b87-sessiondescendants-has-no-visited-set-so-a-malformed-parent-graph-makes-sbx-session-stop-spin-forever-the-two-sibling-walkers-in-this-codebase-both-guard-against-exactly-that) | Faible | `src/session.rs:481` | `session::descendants` has no visited set, so a malformed parent graph makes `sbx session stop` spin forever -- the two sibling walkers in this codebase both guard against exactly that |
+| [B88](#b88-an-untrusted-engine-override-is-reported-as-ignoring-and-then-as-not-found-neither-of-which-is-true) | Faible | `src/store.rs:678` | An untrusted engine override is reported as "ignoring" and then as "not found", neither of which is true |
+| [B89](#b89-refresh-ref-documents-a-40-hex-pin-as-needing-no-nix-call-while-it-spawns-nix-and-queries-github) | Faible | `src/store.rs:1339` | `refresh_ref` documents a 40-hex pin as needing "no nix call" while it spawns nix and queries GitHub |
 
 ## Détail
 
-### B1 — An explicitly declared `mise:<tool>@latest` can never be satisfied, so the pool is never warm and the task gets no shims
+### B1 — A destination host beginning with `project=` rewrites the stats file's identity header on read-back, erasing the whole session from `sbx net stats`
+
+| | |
+|---|---|
+| **Gravité** | Élevée |
+| **Emplacement** | `src/sandbox/egress_stats.rs:380` |
+| **Catégorie** | `logic-bug` |
+| **Sous-système** | Apprentissage réseau, statistiques, contrat |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** `parse` walks every line and assigns `project` (and `app`) on *any* line carrying the prefix, last-one-wins:
+
+```rust
+for line in contents.lines() {
+    if let Some(rest) = line.strip_prefix("project=") {
+        project = Some(rest.to_string());
+    } else if let Some(rest) = line.strip_prefix("app=") {
+        app = Some(rest.to_string());
+```
+
+Counter rows are written into the same flat namespace (`serialize`, line 356: `{host}\t{allow}\t{deny}\t{blocked}`), and the only filter a host passes through is `Tally::bump` (line 143) → `observe_feed::sanitize`, which replaces *control characters* only. `=` and `/` survive. So a destination whose name starts with `project=` writes a line that `parse` reads back as the file's identity header, and because `hosts` is a `BTreeMap` serialized after the real header, the forged line always comes last and always wins.
+
+The module reasons about exactly this attack for the *project path* — `identity_is_recordable` (line 217) refuses a project name that could spell a second `project=` line, with a long comment about "a directory named to spell one hands `sbx net stats` a `project=` of its choosing" — and about *delimiters* for the host (`Tally::bump`'s comment, lines 133-140). Neither guards the header *prefix* on the host side. The `overflow=` arm at line 384 acknowledges the identical ambiguity but claims it "costs that destination its row and nothing else", which is true for `overflow=` and false for `project=`/`app=`.
+
+**Scénario.** A process in the cage issues `CONNECT project=/tmp/x:443` (proxy/wire.rs:250 `split_authority` does no hostname validation — it just splits on the last `:`), then completes the MITM TLS handshake with no SNI. `tunnel.rs:95` fires `ctx.outcome(..., connect_host, ..., StatKind::Blocked, "host-mismatch")`, which calls `stats.record("project=/tmp/x", Blocked)` (ctx.rs:437). The session file becomes:
+
+```
+project=/home/u/proj
+api.anthropic.com	120	0	0
+project=/tmp/x	0	0	1
+```
+
+`parse` returns `project == "/tmp/x\t0\t0\t1"`. `aggregate` (line 601) skips the file for `/home/u/proj`, so `sbx net stats` in the real project reports *nothing* for that whole session — including the 120 allows and every genuine denial. `reset` (line 629) skips it too, so `--reset` cannot clear it, and `compact` folds it into a rollup for a project nobody will ever query.
+
+**Correction proposée.** Bind the headers to the top of the file: accept each only once (`if project.is_none() { project = Some(...) }`, same for `app`), so a later line cannot restate the identity. Belt-and-braces, reject the collision at the source too — have `Tally::bump` refuse (or escape) a host whose sanitised form starts with `project=`, `app=` or `overflow=`, the same way it already refuses the tab and newline.
+
+**Rectification du vérificateur.** Two corrections to the write-up. (1) The attack as staged does not work: it says the client "completes the MITM TLS handshake with no SNI", but `CertResolver::resolve` (src/sandbox/proxy/ca.rs:186-189) is `let host = client_hello.server_name()?;` — with no SNI it returns `None`, the handshake fails, and nothing is recorded. The working variant is to send any *valid but different* SNI (e.g. `example.com`) after `CONNECT project=/tmp/x:443`; the leaf is minted for the SNI, the handshake succeeds, and tunnel.rs:88 still takes the `host-mismatch` arm, which records `connect_host` — the forged string — not the SNI. (2) The impact is hiding, not theft: the injected header value is always `<host>\t<allow>\t<deny>\t<blocked>`, so it necessarily contains tabs and can never equal a canonical project path; the session is orphaned under an unqueryable identity (invisible to `aggregate`, unclearable by `reset`, folded by `compact` into a rollup nobody reads) rather than credited to another project. Severity stands: this is durable audit evasion for hostile in-cage code — `sbx net log` is a live in-memory ring, so the session file is the only persistent record — but it is an accounting break, not a policy or cage bypass.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Every cited line checks out and I found no guard. `parse` (src/sandbox/egress_stats.rs:375) is last-one-wins on the identity: line 380 `if let Some(rest) = line.strip_prefix("project=") { project = Some(rest.to_string()); }` and line 382 the same for `app=`, with no "only once" condition; `serialize` (:351) writes `project=<p>` first (:353) and the BTreeMap host rows after (:357 `{host}\t{allow}\t{deny}\t{blocked}`), so any forged row is parsed after the real header and wins. The only filter on the host key is `Tally::bump` (:142) -> `observe_feed::sanitize` (src/sandbox/observe_feed.rs:112), which is literally `map(|c| if c.is_control() { ' ' } else { c })` — `=` and `/` pass. The reachability chain is intact: `split_authority` (src/sandbox/proxy/wire.rs:250) just `rsplit_once(':')` with no hostname validation; `allowlist::canonical_host` (src/allowlist/mod.rs:660) only lowercases and trims trailing dots; `handle_client` (src/sandbox/proxy/mod.rs:410-470) checks only IP-literal / L4-splice / h2 before accepting the tunnel; the SNI-mismatch arm at src/sandbox/proxy/tunnel.rs:88-103 calls `ctx.outcome(..., connect_host, ..., StatKind::Blocked, "host-mismatch")`, and `outcome_l7` (src/sandbox/proxy/ctx.rs:436) does `stats.record(host, kind)` with that raw string. Read-back then orphans the file: `aggregate` (:605) `if session.project != project { continue; }` and `reset` (:629) the same, and `compact` (:526) groups by the forged pair. The module explicitly reasons about this attack class for the project field (`identity_is_recordable`, :217, and the test `a_project_path_the_header_cannot_carry_records_no_file`, :814) and about delimiters for the host (`a_hostile_destination_name_cannot_forge_a_row`, :774) — neither covers the header *prefix* arriving through a host row. Stats are on unless `[network] stats = false` (src/sandbox/egress.rs:768).
+
+</details>
+
+---
+
+### B2 — An explicitly declared `mise:<tool>@latest` can never be satisfied, so the pool is never warm and the task gets no shims
+
 | | |
 |---|---|
 | **Gravité** | Élevée |
@@ -128,7 +192,80 @@ Verified end to end. taskpool.rs:107 is exactly `Some(v) => tool.versions.iter()
 
 ---
 
-### B2 — `config edit --trust` exits 0 after failing to record trust, unlike every other `--trust` verb
+### B3 — `sbx task run <TAB>` completes app names instead of declared operations
+
+| | |
+|---|---|
+| **Gravité** | Moyenne |
+| **Emplacement** | `src/cli/completion.rs:697` |
+| **Catégorie** | `logic-bug` |
+| **Sous-système** | Aide et complétion shell |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** `kind_of_metavar` maps the metavariable name `name` to `ValueKind::Apps` for every page except the two it overrides (`plugins`, `projects`):
+
+    "name" | "app" | "profile" | "sketch" => ValueKind::Apps,
+
+But four pages use `<name>` for something that is not an app. `task run` documents its operand as `("<name>", "the operation to run, as `sbx task list` shows it")` (src/help.rs:940) while its sibling `task list` documents `("<operation>", …)` (src/help.rs:885), which maps to `ValueKind::Tasks` — two pages for the same vocabulary that do not agree. `bundle` (src/help.rs:2178) and `bundle export` (2202) use `<name>…` for a bundle name; `net groups` (2246) and `net groups export` (2265) use it for an egress-group name. All five complete the machine's app profiles.
+
+The comment on the merge branch in `candidates` (src/cli/completion.rs:201-203) even asserts the opposite: "`sbx bundle <TAB>` offers export|import alongside the bundle names" — it offers app names.
+
+The sweep `every_value_position_is_completed_or_declared_unenumerable` only checks that `kind_of_metavar` returns *something*, so nothing pins which registry, and the bash/zsh integration sweeps only assert that command names appear.
+
+**Scénario.** With an imported app profile `demo-app` and a config declaring `[task.deploy]`: `sbx task run <TAB>` offers `demo-app` and never offers `deploy`. Accepting the completion yields `sbx task run demo-app`, which is refused as an unknown operation (exit 125). Same for `sbx bundle <TAB>` and `sbx net groups <TAB>`, which list app names for a bundle/group operand.
+
+**Correction proposée.** Add page-context overrides in `kind_of_metavar` next to the existing `plugins`/`projects` ones — `["task", "run"]` → `ValueKind::Tasks`; `bundle`/`net groups` need a Bundles/Groups vocabulary (or `NOT_ENUMERABLE` until one exists). Cheapest partial fix for the task case: rename the `task run` option row's `<name>` to `<operation>` in src/help.rs:940 so it agrees with `task list`.
+
+**Rectification du vérificateur.** Mechanism confirmed; two refinements. (1) The merge in `candidates` (src/cli/completion.rs:204-209) still adds the page's own subcommands, so `sbx bundle <TAB>` and `sbx net groups <TAB>` do offer `export`/`import` — only the value half is the wrong registry; `task run` has no subcommands, so there the whole menu is wrong. (2) The exit code in the attack is plausible but incidental: `sbx task run <app-name>` is refused by the control plane and rendered through `render_result`, which returns `REFUSED_EXIT` = 125 (src/cli/task.rs:32, :862). The defect itself is a wrong-vocabulary completion, not a wrong exit.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Verified line-by-line. src/cli/completion.rs:697 is exactly `"name" | "app" | "profile" | "sketch" => ValueKind::Apps,` and the only page-context overrides in `kind_of_metavar` are src/cli/completion.rs:681 (`path.first() == Some(&"plugins")`) and :691 (`path.first() == Some(&"projects")`) — neither covers `task`, `bundle` or `net groups`. `operand_slots(["task","run"])` sees only the bare row at src/help.rs:939-942 (`("<name>", "the operation to run, as `sbx task list` shows it")`) because every other row on that page starts with `-` and is skipped at src/cli/completion.rs:585, so the single slot is `Value("name")` -> `ValueKind::Apps`. The sibling row src/help.rs:886 (`("<operation>", ...)`) maps through src/cli/completion.rs:700 to `ValueKind::Tasks`, which really does enumerate `[task.<name>]` blocks (registry test at src/cli/completion.rs:1512-1516) — so the two pages for one vocabulary genuinely disagree. The same applies to src/help.rs:2178-2180 (`bundle`), :2202-2204 (`bundle export`), :2246-2248 (`net groups`), :2265-2267 (`net groups export`); there is no Bundles/Groups variant in the `ValueKind` enum (src/cli/completion.rs:260-288). Nothing makes this deliberate: the doc comment on `NOT_ENUMERABLE` at src/cli/completion.rs:1688-1690 states the governing rule — "A name that means something enumerable on one page and not on another is settled in `kind_of_metavar`, which sees the page" — so these are unclosed holes, and the sweep at :1724 only asks that *some* kind is returned. The merge comment at src/cli/completion.rs:201-202 does claim "`sbx bundle <TAB>` offers export|import alongside the bundle names".
+
+</details>
+
+---
+
+### B4 — `sbx projects <TAB>` never offers `list` or `rm`; `sbx proc pending <TAB>` never offers `allow`/`deny`
+
+| | |
+|---|---|
+| **Gravité** | Moyenne |
+| **Emplacement** | `src/cli/completion.rs:797` |
+| **Catégorie** | `logic-bug` |
+| **Sous-système** | Aide et complétion shell |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** A verb documented as an option row rather than as a page is lost twice over.
+
+(a) `operand_slots` accumulates bare literal rows into `pure`, but discards `pure` entirely once any row also names a metavariable: `if !saw_value_row && !pure.is_empty() { return vec![Operand::Literal(pure)] }` (line 616). On the `projects` page the rows are `("list", …)` (src/help.rs:1847) then `("rm <id>...", …)` (src/help.rs:1851), so `list` lands in `pure`, `rm <id>...` sets `saw_value_row`, and `pure` is thrown away.
+
+(b) `cursor_value_kind` then skips the surviving literal slot outright:
+
+    while let Some(Operand::Literal(_)) = slots.get(pos) { pos += 1; }
+
+so `Literal(["rm"])` at position 0 is jumped over and the `<id>` behind it is what gets completed. `proc pending` has the same shape — `Literal(["allow","deny"])` followed by `Value("id")` (src/help.rs:484-500) — so its two answer verbs are unreachable too.
+
+The merge branch's comment (line 202-203) claims "`sbx projects <TAB>` its commands alongside the tree ids"; only `show` appears, because `show` happens to have a page of its own. `every_command_path_in_the_table_completes` sweeps pages only, so neither case is caught.
+
+**Scénario.** `sbx projects <TAB>` offers project tree ids and `show`, but not `list` or `rm` — both real verbs (src/cli/projects.rs:20-22). `sbx projects l<TAB>` completes nothing at all. Likewise `sbx proc pending a<TAB>` offers nothing, though `sbx proc pending allow <id>` is the documented way to release a parked exec (src/cli/proc.rs:468).
+
+**Correction proposée.** Keep `pure` when a value row also exists (fold it into the leading literal slot), and offer the literal slot's words at `pos` instead of skipping it — e.g. return `ValueKind::Literal(words)` merged with the following value's candidates when `slots[pos]` is a `Literal` the cursor has not yet consumed.
+
+**Rectification du vérificateur.** Survives, and the proc case is slightly worse than reported: bare `sbx proc pending` rejects *any* positional (`reject_extra`, src/cli/proc.rs:478), so position 0 completes parked-request ids that the command itself refuses, while the only two words it accepts there are the ones withheld. One overstatement: `sbx projects l<TAB>` completing "nothing at all" is machine-dependent — a tree id beginning with `l` would still be offered; the sound claim is that `list`/`rm` are never offered. Note also that the root cause is partly upstream of completion.rs: CLAUDE.md requires every subcommand to have a `Page`, and these four verbs are documented as option rows instead.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Both halves traced. (a) In `operand_slots`, the `("list", ...)` row at src/help.rs:1847-1850 has no metavariable, so it lands in `pure` (src/cli/completion.rs:603-605); the later `("rm <id>...", ...)` row at src/help.rs:1852-1858 sets `saw_value_row = true` (:608), so the guard at src/cli/completion.rs:616 (`if !saw_value_row && !pure.is_empty()`) is false and `pure` is dropped — the returned slots are exactly `[Literal(["rm"]), Value("id")]`. (b) src/cli/completion.rs:797 is verbatim `while let Some(Operand::Literal(_)) = slots.get(pos) {`, so with nothing typed `pos` walks past `Literal(["rm"])` to `Value("id")`, which src/cli/completion.rs:691-694 maps to `ValueKind::Projects`. `subcommands_of(["projects"])` can only supply `show`, the sole child page (src/help.rs:2049), so `sbx projects <TAB>` = tree ids + `show`; `list` and `rm` are real verbs (src/cli/projects.rs:20-22) and are unreachable. `proc pending` has the identical shape: the rows at src/help.rs:485-498 yield `[Literal(["allow","deny"]), Value("id"), ...]`, the literal is skipped, and `is_pending_page` (src/cli/completion.rs:715-719) turns the `<id>` into `PendingIds`; `allow`/`deny` (src/cli/proc.rs:467-469) are never offered. No test pins the current behaviour — `every_command_path_in_the_table_completes` (src/cli/completion.rs:1525) sweeps pages only.
+
+</details>
+
+---
+
+### B5 — `config edit --trust` exits 0 after failing to record trust, unlike every other `--trust` verb
+
 | | |
 |---|---|
 | **Gravité** | Moyenne |
@@ -166,7 +303,8 @@ Confirmed at the cited line. src/cli/config.rs:2997-3007 is the `else if trust_f
 
 ---
 
-### B3 — `plugins info` tells the user to run an install that is always refused, so a `programs` entry added after install can never be built
+### B6 — `plugins info` tells the user to run an install that is always refused, so a `programs` entry added after install can never be built
+
 | | |
 |---|---|
 | **Gravité** | Moyenne |
@@ -192,7 +330,8 @@ Traced and confirmed. src/cli/plugins.rs:2298-2300 emits `(run: sbx plugins inst
 
 ---
 
-### B4 — `sbx session logs -f` ignores a closed stdout and keeps polling until the session exits
+### B7 — `sbx session logs -f` ignores a closed stdout and keeps polling until the session exits
+
 | | |
 |---|---|
 | **Gravité** | Moyenne |
@@ -218,206 +357,8 @@ Verified line-by-line. src/cli/session.rs:713-716 is exactly `let mut out = std:
 
 ---
 
-### B5 — Two tasks naming different versions of one tool can never both be satisfied; the pool config flips every launch and one task fails with "command not found"
-| | |
-|---|---|
-| **Gravité** | Moyenne |
-| **Emplacement** | `src/sandbox/taskpool.rs:210` |
-| **Catégorie** | `logic-bug` |
-| **Sous-système** | Concurrence, verrous, pools |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+### B8 — `space_entries` deletes every comment inside an edited array and collapses it to one line
 
-**Constat.** `bins_for` requires `recorded.get(locator).map(String::as_str) == Some(wanted_spec(wanted))` for *every* declared token. `recorded_specs` returns a `BTreeMap<String, String>` keyed by locator (taskpool.rs:148-172), so it holds **at most one** spec per tool — as does mise's `[tools]` table it is read from. Therefore when two tasks in one project declare `node@22` and `node@24`, at most one of the two tokens can ever have `pinned == true`, and the other is pushed onto `missing` forever, regardless of what is actually installed on disk.
-
-That is not hypothetical for this codebase: `upgrade_argv`'s own test fixture is `["node@22", "aqua:cli/gh", "node@24"]` (taskpool.rs:846-860), with a doc line explaining that duplicates collapse because "two tasks sharing a tool roll it once".
-
-Worse, `ensure` re-runs the install with only the currently-missing set (`mise use -g node@22`), which rewrites `[tools] node` to the *other* value — so the pin oscillates launch to launch and the guard that exists to detect drift can never converge. The comment at taskpool.rs:186-194 argues "failing *toward* re-running is cheap"; here re-running provably cannot fix the state.
-
-**Scénario.** A project declares `[task.a] packages = ["mise:node@22"]` and `[task.b] packages = ["mise:node@24"]`. `declared_packages()` yields both. Launch 1: `missing` is both, the install cage runs `mise use -g node@22 node@24`, config ends up `node = "24"`. `bins_for` now reports `node@22` missing, so `sbx task invoke a` gets `pool_bins() == None` (no shims on PATH) and fails with `node: command not found`, while `b` works. Launch 2: `ensure` sees `missing = ["node@22"]`, runs a full install cage again, config flips to `node = "22"` — and now task `b` is the one that fails. The project never reaches `PoolOutcome::Warm`, so every single launch pays a bwrap+mise install-cage run before the agent starts.
-
-**Correction proposée.** Detect the conflict instead of looping on it. In `bins_for` (or at config-resolve time in `TaskEngine::declared_packages`), group tokens by locator and refuse — or warn once and pick a single spec — when one locator carries two different `wanted_spec` values, e.g.:
-
-```rust
-let mut pinned_by: HashMap<&str, &str> = HashMap::new();
-for token in tokens {
-    let (locator, wanted) = split_version(token);
-    if let Some(prev) = pinned_by.insert(locator, wanted_spec(wanted))
-        && prev != wanted_spec(wanted) {
-        // one pool, one global mise config: this can never be satisfied
-    }
-}
-```
-
-A declaration that cannot be realised should be reported once as a configuration error, not turned into an install cage that runs on every launch forever.
-
-**Rectification du vérificateur.** Severity overstated and one part of the mechanism is speculative. The oscillation ("the pin flips launch to launch") assumes `mise use -g node@22` rewrites the whole `[tools] node` entry last-wins; mise also supports an array form (`node = ["22", "24"]`), which `recorded_specs`'s line-wise parse (taskpool.rs:167-171) would read as the literal value `["22", "24"]` and match against neither token. In that case there is no flip — both tokens stay missing and *both* tasks lose their shims, which is a different (and worse) shape than described. Also note the conflict is inherent, not just unhandled: one pool means one global mise config and one `shims/` directory, and mise cannot put two versions of one tool on one PATH either. The real defect is therefore the missing detection — sbx accepts an unsatisfiable declaration silently and converts it into an unbounded per-launch install-cage run — not that the two versions "should" both work. Finally, the reporter's own example (`node@22` / `node@24`) is confounded by the partial-version/symlink problem in the previous finding: with those tokens neither side is ever `realized`, so the conflict only produces the described one-wins/one-loses split for exact versions.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-The mechanism checks out. `recorded_specs` returns `BTreeMap<String, String>` keyed by locator (taskpool.rs:151-175), so `recorded.get(locator)` yields at most one spec, and taskpool.rs:210 requires it to equal `wanted_spec(wanted)` for every declared token — so of `node@22.3.0` and `node@24.4.1`, at most one can ever be `pinned`. Nothing upstream groups by locator or objects: `declared_packages` (task.rs:515-523) dedupes only byte-identical tokens, `validate_task_packages` (config/tasks.rs:565-567) likewise, and `ensure` (taskpool.rs:270-297) re-runs the install cage with whatever `bins_for` still calls missing, with no convergence check. So the state is genuinely non-convergent: `bins_for(...).missing` is never empty, `ensure`'s short-circuits at taskpool.rs:264 and 276 never fire, and launch.rs:5151 pays a bwrap+mise install-cage run on every single launch while `pool_bins` (task.rs:1318-1325) returns `None` for the losing task. No comment or doc declares this limitation — docs-site/docs/guide/tasks/execution.md:243-245 says only that the pool is shared, not that one tool may carry one version.
-
-</details>
-
----
-
-### B6 — A `ready.tcp` outside u16 fails the untagged `RawService` parse and drops the whole config layer
-| | |
-|---|---|
-| **Gravité** | Moyenne |
-| **Emplacement** | `src/config/schema.rs:1159` |
-| **Catégorie** | `error-handling` |
-| **Sous-système** | Configuration — modèle, schéma, types |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** `RawServiceReady::tcp` is a `u16`, and `RawServiceReady` sits inside `RawServiceTable`, which is a variant of the **untagged** enum `RawService` (schema.rs:1036-1043). A value TOML accepts as an integer but serde cannot fit into a `u16` therefore fails both untagged variants, which fails `RawConfig`/`RawApp` as a whole, and `read_layer` (load.rs:615-623) turns that into `warnings.push("ignoring <path>: …")` and returns `None` — the entire layer is discarded. This is precisely the failure the rest of the schema is written to avoid: `RawForward::Port` is an `i64` and says so ("a value this layer refuses fails the untagged-enum parse and drops the *whole* config layer (env, packages, apps and all) … `forward = [70000]`, a port typed with one digit too many, took the config down with it", schema.rs:489-494), and `RawFs::scan_max_kb` (schema.rs:661-666) and `RawLimit::Number` (schema.rs:569-575) are signed for the same stated reason. The downstream validator already expects to do the range work — `service_ready` (validate.rs:963) refuses `tcp == 0` with a per-entry warning — but a `u16` guarantees it can never see the other end of the range.
-
-**Scénario.** A project `.sbx.toml` containing `[env]\nKEEP = "yes"`, an `[fs] deny = [".env"]` mask, and `[service.gateway]\ncmd = ["hermes","gateway","run"]\nready = { tcp = 70000 }` fails `schema::parse` with "data did not match any variant of untagged enum RawService". The whole layer is dropped: the env var, the packages, every `[app.*]`, and the `[fs]` mask that was closing `.env` to the cage — all gone from one mistyped digit, where the same mistake in `forward = [70000]` is a named per-entry warning. The same typo in an `apps/<name>.toml` profile fails `parse_app` and takes the whole app with it.
-
-**Correction proposée.** Hold the port as an `i64` like `RawForward::Port` (`pub(crate) tcp: i64`) and move the range check next to the existing `tcp == 0` check in `validate::service_ready`, warning `ignoring `ready` of `[service]` entry `<name>` — <n> is not a port in 1-65535` and dropping only the gate.
-
-**Rectification du vérificateur.** Mechanism confirmed; severity overstated as high. Two corrections. (1) The cited validate line is 964, not 963 (off by one). (2) The authors were already aware of this field's fragility from the other direction: src/config/manage.rs:751-755 enumerates `RawServiceTable.cmd`, `RawServiceReady.tcp`, `RawOpenTable.cmd`, `RawInlineFlake.flake` by name as "required field with no `#[serde(default)]`" and makes `unset` validate the whole layer before committing (test at manage.rs:2421). So the gap is specifically the hand-edited path and the out-of-range value, not the field's existence; and the effect is a warning naming the file plus a silently reverted layer, the same cost the `forward` test treats as a bug worth fixing.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Verified. src/config/schema.rs:1159 is exactly `pub(crate) tcp: u16,` inside `RawServiceReady`, which is reached only through `RawServiceTable::ready` (schema.rs:1051-1050 region, field at 1050-1051) inside the untagged enum `RawService` (`#[serde(untagged)]` at schema.rs:1037, variants `Argv(RawCmd)` / `Detailed(RawServiceTable)` at 1039-1042). `RawCmd` is `Line(String) | Argv(Vec<String>)` (schema.rs:990-996), so a table never matches the first variant; `tcp = 70000` fails the second, so the untagged parse fails and `schema::parse` (schema.rs:2069) errors for the whole document. `read_layer` (src/config/load.rs:614-621) turns that into `warnings.push(format!("ignoring {}: {e}", path.display()))` and returns `None`, discarding the layer. The house rule the reporter cites is real and enforced elsewhere: schema.rs:489-494 states it verbatim, `RawForward::Port` is `i64` (schema.rs:499), `RawLimit::Number` is `i64` (schema.rs:576), `RawFs::scan_max_kb` is `Option<i64>` (schema.rs:666), and there is a dedicated regression test `a_forward_port_out_of_range_is_skipped_rather_than_dropping_the_layer` at src/config/tests.rs:2103-2117. The downstream gate can only ever see the low end: `if gate.tcp == 0` at src/config/validate.rs:964. No caller, invariant or earlier validation prevents an out-of-range integer from reaching serde. `service` is present on RawConfig (schema.rs:97), RawApp (457) and RawBundle (870), so app profiles are affected too.
-
-</details>
-
----
-
-### B7 — `RawTask` carries no unknown-key bag, so a misspelled `spawn` silently disables exec supervision
-| | |
-|---|---|
-| **Gravité** | Moyenne |
-| **Emplacement** | `src/config/schema.rs:1418` |
-| **Catégorie** | `inconsistency` |
-| **Sous-système** | Configuration — modèle, schéma, types |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : moyenne) |
-
-**Constat.** `RawTask` is the only significant table in the schema with no `#[serde(flatten)] rest: BTreeMap<String, RawIgnored>` — `RawConfig`, `RawApp`, `RawBundle`, `RawLimits`, `RawSeccomp`, `RawDevices`, `RawSshAgent`, `RawFs`, `RawRedact`, `RawPluginConfig`, `RawBrokerConfig`, `NetworkTable`, `ProcTable`, `NotifyTable` and even `RawTaskExecNode` (this table's own child, schema.rs:1563) all have one, each with a comment saying why silence is the worse half of the trade (`RawTaskExecNode`: "a node that means less than it says is the one failure this whole field exists to avoid"). `tasks.rs` reports unknown keys only for the exec node (tasks.rs:444); nothing walks a `[task.<name>]` table's own keys. The authors were aware of the silence and answered it per-key for two look-alikes only (`allow`/`deny`, schema.rs:1498-1505, "Present only so a task declaring them is refused rather than parsing into silence") — which leaves a misspelling of a *real* field unanswered, and `spawn` is the field where that costs a control: "Absent means no exec supervision at all" (schema.rs:1483-1489).
-
-**Scénario.** A `[task.deploy]` block written `cmd = ["git", "push"]` / `spwan = ["ssh"]` parses cleanly, `spawn` resolves to `None`, and the task runs with **no exec supervisor at all** — the command may `execve` anything in the cage, with the task's credential in its environment — while the author believes they confined it to `git` plus `ssh`. Nothing is warned. The same typo one level down (`[task.deploy.exec.git] spwan = […]`) is refused by name.
-
-**Correction proposée.** Add `#[serde(flatten)] pub(crate) rest: BTreeMap<String, RawIgnored>` to `RawTask` and report its keys in `tasks::apply_task_section`, in the same shape as the existing `node.rest` report at tasks.rs:444.
-
-**Rectification du vérificateur.** Survives, but the reporter missed that the omission is documented, and overstated the uniqueness. (1) src/config/mod.rs:2933-2934 states the exclusion deliberately: "A `[task.<name>]`/`[app.<name>]` entry's own fields are not walked here — those carry a `cmd` whose absence already fails loudly." That rationale does not hold for the reported case: `RawTask::cmd` is `#[serde(default)] Vec<String>` (schema.rs:1425-1426), so a missing `cmd` is caught at src/config/tasks.rs:195, not at parse — and a misspelled `spawn` is caught nowhere. The app half of that sentence is also already answered by `warn_unknown_app_keys`, which is what makes tasks the odd one out. (2) `RawTask` is not the only table without a bag: `RawTaskDefaults` (schema.rs:1396) has none either.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Verified. `RawTask` begins at src/config/schema.rs:1418 and its derive at 1417 is `#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]` with no `deny_unknown_fields`; reading the full body (1418-1520) confirms there is no `#[serde(flatten)] rest`, while its own child `RawTaskExecNode` has one at schema.rs:1559-1560 and reports it at src/config/tasks.rs:444. The only global unknown-key walker, `warn_unknown_keys` (src/config/mod.rs:2935), reports `raw.rest`, `[limits]`, `[seccomp]`, `[devices]`, `[ssh_agent]`, `[redact]` and `[fs]` — and its doc at mod.rs:2933-2934 explicitly excludes task entries. Apps get their own walker (`warn_unknown_app_keys`, mod.rs:2982, called at mod.rs:3405 and 3568); tasks get none — grep finds no unknown-key report for `[task.<name>]` anywhere. The consequence is confirmed by the project's own test: src/config/tasks.rs:1262-1265, `assert_eq!(absent.spawn, None, "absent means no supervision at all")`. So `spwan = ["ssh"]` parses, is dropped, and the task runs unsupervised with nothing said.
-
-</details>
-
----
-
-### B8 — A `[service]`/`[open]` table missing its `cmd`, or an `enable` missing `env`, drops the whole config layer
-| | |
-|---|---|
-| **Gravité** | Moyenne |
-| **Emplacement** | `src/config/schema.rs:1053` |
-| **Catégorie** | `error-handling` |
-| **Sous-système** | Configuration — modèle, schéma, types |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** `RawServiceTable::cmd` (1053), `RawOpenTable::cmd` (1170) and `RawEnableCond::env` (1115) are required fields inside untagged enum variants (`RawService`, `RawOpen`, `RawEnable`). A table that omits one matches no variant, so the untagged parse fails and `read_layer` discards the entire config file — the same whole-layer cost `RawBindTable::path` was made `Option` to avoid: "Optional at the parse layer so a table missing its `path` — a typo, or the tell-tale of a wrongly-authored entry — is skipped with a per-entry warning downstream rather than failing the untagged-enum parse and dropping the *whole* config layer (env, packages, apps and all)" (schema.rs:530-535). The downstream validators are already written as if these arrive per entry and cannot: `validate_service` warns "it names no program to run" (validate.rs:833) and `service_enable` warns "a condition names no variable" (validate.rs:892) — branches only reachable via an explicitly empty `cmd = ""`/`env = ""`, never via the omitted key those messages read as describing.
-
-**Scénario.** A global `sbx.toml` containing `[open.https]\nmode = "detach"` (the `cmd` line forgotten, or moved below the header) fails `schema::parse`; `read_global` warns once and returns `RawConfig::default()`, so every package, bind, network rule, secret and app in the global config is silently absent for that launch. Same for `[service.gateway]\nready = { tcp = 8100 }` with no `cmd`, and for `enable = { is = "1" }` with no `env`.
-
-**Correction proposée.** Make the three fields optional at the parse layer (`cmd: Option<RawCmd>`, `env: Option<String>`) and let the existing downstream branches in `validate_service`/`validate_open`/`service_enable` drop the one entry with the warning they already carry.
-
-**Rectification du vérificateur.** Survives, with two corrections to the reporter's framing. (1) The authors are not unaware of this shape — manage.rs:749-755 names these four fields explicitly and guards the `sbx config unset` write path (manage.rs:2417). The finding is therefore an unclosed gap on the hand-edited path, not an unnoticed one; the fix suggestion (make the fields optional) is still the one that matches `RawBindTable::path`. (2) The claim that the downstream branches are only reachable via an explicitly empty string is imprecise: src/config/validate.rs:833 tests `argv.is_empty() || argv[0].is_empty()`, so `cmd = []` reaches it too. Cited validate lines are off by one (the `enable` branch is 893, not 892; the service branch message is 835).
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Verified. src/config/schema.rs:1053 is `pub(crate) cmd: RawCmd,` in `RawServiceTable`, 1170 is `pub(crate) cmd: RawCmd,` in `RawOpenTable`, and 1115 is `pub(crate) env: String,` in `RawEnableCond` — all three required, no `#[serde(default)]`, all three inside untagged enums (`RawService` at 1037, `RawOpen` at 1018, `RawEnable` at 1087). `RawBindTable::path` is `Option` for precisely the stated reason (schema.rs:530-535). The decisive corroboration is the codebase's own words: src/config/manage.rs:749-755 says "several schema tables carry a required field with no `#[serde(default)]` (`RawServiceTable.cmd`, `RawServiceReady.tcp`, `RawOpenTable.cmd`, `RawInlineFlake.flake`), and `RawOpen`/`RawService` are `#[serde(untagged)]`, so a table left without its required field matches no variant at all", and the test at manage.rs:2417-2440 uses exactly the reporter's `[open.https]` example, commenting "the whole layer — the `network = \"deny\"` posture included — would stop parsing" and "the loader drops the WHOLE layer with only a warning, silently reverting every security field it carried". That guard covers only `sbx config unset`; nothing guards a hand-edited file, so the path from a forgotten `cmd` line to a dropped global layer is unobstructed.
-
-</details>
-
----
-
-### B9 — A `match` bound rejects values its own regex accepts, because `find` is leftmost-first, not anchored
-| | |
-|---|---|
-| **Gravité** | Moyenne |
-| **Emplacement** | `src/config/tasks.rs:669` |
-| **Catégorie** | `logic-bug` |
-| **Sous-système** | Configuration — couches, overrides, validation |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** `check_value` claims to anchor an unanchored pattern by requiring the found match to span the whole value: "A pattern must match the **whole** value: an unanchored regex would accept anything containing a match, so the check anchors it here rather than trusting the author to have written `^…$`." But `Regex::find` returns the *leftmost-first* match, not the longest one at that position. The regex 1.13 docs state this with a worked example: `Regex::new("sam|samwise").find("samwise")` returns `"sam"`. So whenever an alternation's earlier branch is a prefix of a later one — or a lazy quantifier is used — `m.end() != value.len()` and the value is refused even though the pattern plainly matches it whole. The comment describes anchoring; the code implements "the preferred match happens to be full-span".
-
-**Scénario.** Declare `[task.deploy.params] target = { match = "prod|prod-eu|staging" }`. Invoking the task with `target = "prod-eu"` is refused with `parameter \`target\` does not match its declared pattern` — leftmost-first picks `prod` (0..4) against a 7-byte value. Worse, add `default = "prod-eu"` to the same declaration: `validate_params` runs the same `check_value` on the default (tasks.rs:606), `validate_task` returns `Err`, and `apply_task_section` drops the entire task at config load with `ignoring task \`deploy\` — parameter \`target\` does not match its declared pattern`. A perfectly valid declaration silently disappears from the task list.
-
-**Correction proposée.** Anchor the pattern once and match on the anchored form, in both places that compile it. In `compile_bound` build and validate the anchored source (`format!(r"(?s:\A(?:{pattern})\z)")`, so an author's own `^`/`$` still behave and an invalid pattern is still caught at declaration), and in `check_value` compile that same anchored source and use `re.is_match(value)` instead of inspecting `find`'s span.
-
-**Rectification du vérificateur.** Survives, with two corrections. (1) The check on the default is at tasks.rs:598, not 606 — the reporter's in-prose cite is off by eight lines (the anchor cite, 669, is exact). (2) Severity is medium, not high: the defect is strictly fail-CLOSED. A full-span `find` result proves the pattern really does match the whole value, so no value is ever wrongly ACCEPTED; the only outcomes are a valid caller value refused at invocation, or a task with a `default` dropped at load — and the drop is not silent, it emits `ignoring task `<name>` — parameter `<p>` does not match its declared pattern` (tasks.rs:68). Note also a second, milder inconsistency the reporter did not mention: schema.rs:1611 documents the terse form as "the pattern the value must match, anchored by the author", which contradicts tasks.rs:649-651's claim that the check anchors it; the two comments disagree about who owns the anchoring, and the code implements neither cleanly.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Cite is exact. src/config/tasks.rs:669-671 is `match re.find(value) { Some(m) if m.start() == 0 && m.end() == value.len() => Ok(()), _ => Err(...) }`, under the doc at tasks.rs:649-651 that claims "the check anchors it here rather than trusting the author to have written `^…$`". The regex crate vendored in Cargo.lock is 1.13.1, and its own docs pin leftmost-first preference order with the exact worked example the reporter cites — ~/.cargo/registry/src/*/regex-1.13.1/src/lib.rs:726-732: `Regex::new(r"sam|samwise")` on "samwise" yields "sam". So for `match = "prod|prod-eu|staging"` and value "prod-eu", `find` returns 0..4, `m.end() != 7`, and check_value returns `parameter `target` does not match its declared pattern` even though the pattern matches the whole value. Nothing upstream anchors: compile_bound (tasks.rs:640-644) stores `pattern.to_string()` verbatim and only checks that it compiles, and no caller rewrites it (src/sandbox/task.rs:2217 passes the stored bound straight in). No test covers the case — `a_pattern_bound_must_match_the_whole_value` (tasks.rs:1203-1210) only uses the alternation-free `"SELECT"`. The docs promise whole-value matching (docs-site/docs/guide/tasks/parameters.md:114, "it must match the whole value"), so the behaviour contradicts the documented contract, and the load-time half is real too: a `default` goes through the same gate at tasks.rs:598, so validate_task returns Err and apply_task_section drops the whole task with `{source}: ignoring task `{name}` — …` (tasks.rs:68). Lazy quantifiers hit the same wall (`a.*?` never spans a 3-byte value).
-
-</details>
-
----
-
-### B10 — A higher override tier's `[ssh_agent] confirm` is silently discarded whenever a lower tier also declares `[ssh_agent]`
-| | |
-|---|---|
-| **Gravité** | Moyenne |
-| **Emplacement** | `src/config/overrides.rs:648` |
-| **Catégorie** | `logic-bug` |
-| **Sous-système** | Configuration — couches, overrides, validation |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** `union_allow_opt` is generic over a table reached only through an `allow: &mut Vec<String>` accessor, and its `(Some(b), Some(h))` arm (overrides.rs:706-710) moves `h`'s `allow` into `b` and returns `b` — every other field of `h` is dropped. That is exact for `RawSeccomp` and `RawDevices`, which hold only `allow` plus the unknown-key bag (schema.rs:599-621), but `RawSshAgent` also carries `confirm: Option<bool>` (schema.rs:713). Its doc even says "the flag ORs across layers — a layer that asks for confirmation cannot have it turned off by another", and `apply_ssh_agent` reads it (mod.rs:3017) into `self.ssh_agent_confirm |= confirm`. The higher tier's value never reaches it. The function's own doc calls all three tables `{ allow: Vec<String> }`, which is what hid this. This is the fourth instance of the exact silent-field-drop that drove `overlay_into` and `union_fs_opt` to exhaustive destructuring; `union_allow_opt` is the one fold that still reads a single field by hand. The regression test at overrides.rs:2248 passes only one blob, so it takes the `(None, h)` arm and never exercises the drop.
-
-**Scénario.** `sbx --config '[ssh_agent]\nallow = ["SHA256:aaa…"]' --config '[ssh_agent]\nallow = ["SHA256:bbb…"]\nconfirm = true' run …` — two CLI blobs, no environment needed. Tier 2 folds blob 1 then blob 2 through `overlay_into`, `union_allow_opt` returns blob 1's table with blob 2's key appended, and `confirm` is `None`. The launch grants both keys with no per-signature prompt, despite `confirm = true` on the command line. The inverse is equally wrong: `SBX_CONFIG` setting `confirm = true` beats a `--config` setting `confirm = false`, so the lower tier decides the field in both directions.
-
-**Correction proposée.** Fold `confirm` at the call site where the type is known: `base.ssh_agent = union_ssh_agent_opt(base.ssh_agent, ssh_agent)` with a dedicated function that destructures `RawSshAgent` exhaustively and ORs `confirm` (`b.confirm = match (b.confirm, h.confirm) { (Some(true), _) | (_, Some(true)) => Some(true), (a, None) => a, (None, c) => c }`), keeping `union_allow_opt` for the two tables that really are `{ allow }`. Fix its doc at the same time.
-
-**Rectification du vérificateur.** Survives, but the mechanism is half-overstated and the severity is medium rather than high. Only ONE of the reporter's two directions is a defect: a higher tier's `confirm = true` being lost when a lower tier also declares `[ssh_agent]` (blob 1 `allow`, blob 2 `confirm = true` → merged confirm is None → no per-signature prompt). The "inverse" they call "equally wrong" — `SBX_CONFIG` `confirm = true` beating a `--config` `confirm = false` — is precisely the documented OR rule (schema.rs:710-711, mod.rs:1156-1157: "an invoker may add the prompt, and the one place it must not be possible to remove it is the most convenient one to try"); tier precedence deliberately does not apply to this field. Medium because the fail-open outcome needs two override tiers to BOTH declare `[ssh_agent]` — a single blob takes the `(None, h)` arm and keeps `confirm`. One addition in the reporter's favour: the same arm also drops `h.rest`, the unknown-key bag that union_fs_opt's doc (overrides.rs:658) says must ride along; harmless only because warn_unknown_keys already fires per blob at overrides.rs:313/342.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Every cite checks out. overrides.rs:648 is `base.ssh_agent = union_allow_opt(base.ssh_agent, ssh_agent, |s| &mut s.allow);`, and union_allow_opt's `(Some(mut b), Some(mut h))` arm at overrides.rs:706-710 moves only `allow` out of `h` and returns `b`, so `h.confirm` is dropped. RawSshAgent really does carry a third field: schema.rs:713 `pub(crate) confirm: Option<bool>`, whose doc at schema.rs:706-711 states "the flag ORs across layers — a layer that asks for confirmation cannot have it turned off by another". RawSeccomp (schema.rs:599-605) and RawDevices (schema.rs:615-621) are genuinely `{ allow, rest }`, so union_allow_opt's own doc at overrides.rs:694 ("Union two optional `{ allow: Vec<String> }` tables (`[seccomp]` / `[devices]` / `[ssh_agent]`)") mis-describes only the third. The dropped value is load-bearing: apply_ssh_agent reads `raw.confirm.unwrap_or(false)` (mod.rs:3017) and apply_override ORs it in at mod.rs:1158. The fold path is as described — collect_from folds repeated `--config` blobs with `t2 = overlay_into(t2, parsed)` (overrides.rs:343) and then the two sides with `overlay_into(env_side, cli_side)` (overrides.rs:377). The regression test really does pass a single blob (overrides.rs:2253-2258), so it takes the `(None, h)` arm and never exercises the drop.
-
-</details>
-
----
-
-### B11 — The override plane folds `[fs] scan_max_kb` with `min` while the layer merge it cites uses `max`, so the environment beats the command line
-| | |
-|---|---|
-| **Gravité** | Moyenne |
-| **Emplacement** | `src/config/overrides.rs:684` |
-| **Catégorie** | `inconsistency` |
-| **Sous-système** | Configuration — couches, overrides, validation |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** `union_fs_opt` folds `scan_max_kb` with `a.min(c)`, and its doc (overrides.rs:660-662) says it "folds by the rule its own layer merge uses ([`crate::config::fspolicy`]): the tighter ceiling wins, because a tier raising it would widen what a lower one had narrowed." `fspolicy::FsPolicy::union` does the opposite — `a.max(b)` (fspolicy.rs:108) — under a long comment (fspolicy.rs:93-107) that spells out why: `scan_max_kb` is how many bytes of a file the content lens reads, so a *larger* number closes more files and "taking the minimum therefore let a layer widen what another had narrowed". Its test `a_union_can_only_ever_widen_the_scan_window_never_shrink_it` (fspolicy.rs:412) pins that. The override side's own test (overrides.rs:2342) asserts `Some(64)` under the comment "the tighter ceiling wins, the rule the layer merge already applies", so a test encodes the inverted rule. Beyond the divergence, `min` breaks this module's stated precedence — "any CLI input beats any environment one" (overrides.rs:36) — for this one field.
-
-**Scénario.** With `SBX_CONFIG='[fs]\nscan = ["AKIA[0-9A-Z]{16}"]\nscan_max_kb = 1'` left in the environment by a wrapper, run `sbx --config '[fs]\nscan_max_kb = 512' run …`. `union_fs_opt(Some(fs_env), Some(fs_cli))` yields `Some(1)`; `apply_override` then does `self.fs.union(over)` (mod.rs:1151), which maxes against the config layers — with none set, the launch scans one KiB per file. The invoker explicitly asked for 512 KiB on the command line and got the stale ambient 1 KiB, so every credential past the first line of a file passes.
-
-**Correction proposée.** Change `Some(a.min(c))` to `Some(a.max(c))` at overrides.rs:684, correct the doc at overrides.rs:660-662 to state the widening rule and why, and update the assertion at overrides.rs:2342 to `Some(512)` with the reason `fspolicy.rs:93-107` gives.
-
-**Rectification du vérificateur.** Survives; severity medium is right, and there is stronger corroboration than the reporter found. src/config/tests.rs:6581-6613 shows this is the leftover half of a completed fix: "The name this test used to carry — 'the tighter ceiling wins' — was the misreading itself, and it pinned the fold at `min`… the *larger* number is the tighter policy: it closes more files." The layer fold was deliberately flipped min→max and the override fold at overrides.rs:685 was not, which is why the stale comment and stale assertion survive verbatim in overrides.rs. Two small cite corrections: the `min` is on overrides.rs:685 (the `match` statement opens at 684), and `self.fs.union(over)` is mod.rs:1150, not 1151. One scope limit worth stating: both inputs here are invoker-supplied, so the untrusted-project threat fspolicy.rs:100-104 describes does not apply on this plane — the concrete harm is the narrower one the reporter names, an ambient SBX_CONFIG ceiling beating an explicit `--config` one, which also breaks the module's own precedence rule at overrides.rs:36.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-The divergence is real and every cite lands. overrides.rs:684-687 folds `(Some(a), Some(c)) => Some(a.min(c))`, under a doc at overrides.rs:660-662 asserting it "folds by the rule its own layer merge uses ([`crate::config::fspolicy`]): the tighter ceiling wins". fspolicy::FsPolicy::union does the opposite at fspolicy.rs:108-109, `(Some(a), Some(b)) => Some(a.max(b))`, under a comment at fspolicy.rs:91-107 that states the direction explicitly ("The **larger** window wins… a bigger number closes *more* files… Taking the minimum therefore let a layer widen what another had narrowed") and is pinned by fspolicy.rs:412 `a_union_can_only_ever_widen_the_scan_window_never_shrink_it`. The semantics check out downstream: launch.rs:3929-3933 turns scan_max_kb into the OpenPolicy `ceiling`, i.e. bytes examined before an open is let through. The override side's test at overrides.rs:2340-2342 asserts `Some(64)` under "The tighter ceiling wins, the rule the layer merge already applies", so the inverted rule is pinned by a test whose comment is false. The attack path holds: the folded `Some(1)` reaches `self.fs.union(over)` and, with no config layer setting the field, maxes against None to yield 1 KiB.
-
-</details>
-
----
-
-### B12 — `space_entries` deletes every comment inside an edited array and collapses it to one line
 | | |
 |---|---|
 | **Gravité** | Moyenne |
@@ -473,103 +414,170 @@ Verified end to end. `src/config/manage.rs:577-582` is `fn space_entries(list: &
 
 ---
 
-### B13 — LONGEST_SOCKET_SUFFIX omits the broker plugin socket, so DATA_DIR_MAX does not bound sun_path
+### B9 — A higher override tier's `[ssh_agent] confirm` is silently discarded whenever a lower tier also declares `[ssh_agent]`
+
 | | |
 |---|---|
 | **Gravité** | Moyenne |
-| **Emplacement** | `src/store.rs:323` |
+| **Emplacement** | `src/config/overrides.rs:648` |
 | **Catégorie** | `logic-bug` |
-| **Sous-système** | Point d'entrée, diagnostics, store, chemins |
+| **Sous-système** | Configuration — couches, overrides, validation |
 | **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
 
-**Constat.** `LONGEST_SOCKET_SUFFIX` (src/store.rs:323) is fixed at 33 bytes from a comment (src/store.rs:313-322) that claims "Every feature that binds an `AF_UNIX` socket under the data directory contributes one; the widest is what the cap must reserve for." It lists four families. The tree has at least ten, and the one it omits is the only *unbounded* one: `sandbox::broker::host_socket` (src/sandbox/broker.rs:1577) builds `<data>/broker/<pid>/<name>.sock` and `UnixListener::bind`s it at src/sandbox/broker.rs:1660. With a 7-digit pid that suffix is `21 + name.len()` bytes, so any broker whose `[broker.<name>]` key is 13 characters or longer exceeds 33. There is no length bound on the name: `plugins::validate_install_name` (src/plugins/mod.rs:1597) checks charset and leading dot only, and `config::is_valid_app_name`'s 64-byte cap does not apply to broker keys. The tests at src/store.rs:2321-2353 only compare a synthetic path against `LONGEST_SOCKET_SUFFIX` itself, so nothing holds the constant against a real socket path. (The list is also mislabelled: line 318 calls `/fs/control-<pid>.sock` "exec-enforcement control", but per DATA_ENTRIES in src/paths.rs `fs/` is filesystem observation and `proc/` is exec enforcement.)
+**Constat.** `union_allow_opt` is generic over a table reached only through an `allow: &mut Vec<String>` accessor, and its `(Some(b), Some(h))` arm (overrides.rs:706-710) moves `h`'s `allow` into `b` and returns `b` — every other field of `h` is dropped. That is exact for `RawSeccomp` and `RawDevices`, which hold only `allow` plus the unknown-key bag (schema.rs:599-621), but `RawSshAgent` also carries `confirm: Option<bool>` (schema.rs:713). Its doc even says "the flag ORs across layers — a layer that asks for confirmation cannot have it turned off by another", and `apply_ssh_agent` reads it (mod.rs:3017) into `self.ssh_agent_confirm |= confirm`. The higher tier's value never reaches it. The function's own doc calls all three tables `{ allow: Vec<String> }`, which is what hid this. This is the fourth instance of the exact silent-field-drop that drove `overlay_into` and `union_fs_opt` to exhaustive destructuring; `union_allow_opt` is the one fold that still reads a single field by hand. The regression test at overrides.rs:2248 passes only one blob, so it takes the `(None, h)` arm and never exercises the drop.
 
-**Scénario.** DATA_DIR_MAX is 107 − 33 = 74. Set `SBX_DATA_DIR` to a 74-byte absolute path — accepted by `check_data_dir_override`, which reports it fits "because sbx binds sockets under it". Declare `[broker.postgres-primary]` (16 chars) and launch with pid 1234567 (kernel.pid_max is 4194304 on a modern host). The bind path is 74 + len("/broker/1234567/")=16 + 16 + len(".sock")=5 = 111 > 107, so `UnixListener::bind` at src/sandbox/broker.rs:1660 fails with `InvalidInput: path must be shorter than SUN_LEN` and the launch reports a broker socket error — exactly the "fails at launch … with a message about a socket rather than about the directory" outcome `check_data_dir_override` exists to prevent, on a directory it explicitly approved.
+**Scénario.** `sbx --config '[ssh_agent]\nallow = ["SHA256:aaa…"]' --config '[ssh_agent]\nallow = ["SHA256:bbb…"]\nconfirm = true' run …` — two CLI blobs, no environment needed. Tier 2 folds blob 1 then blob 2 through `overlay_into`, `union_allow_opt` returns blob 1's table with blob 2's key appended, and `confirm` is `None`. The launch grants both keys with no per-signature prompt, despite `confirm = true` on the command line. The inverse is equally wrong: `SBX_CONFIG` setting `confirm = true` beats a `--config` setting `confirm = false`, so the lower tier decides the field in both directions.
 
-**Correction proposée.** Either widen the sample so the constant reserves for the widest real bind — include `/broker/<pid>/<name>.sock` with the maximum permitted broker-name length — or, better, bound the broker name so the family is fixed-width (add a length cap to `plugins::validate_install_name` and to the `[broker.<name>]` key validation) and add the broker path to the enumerated list. Also correct the `fs/` label on src/store.rs:318, and add a test that measures the real socket-path builders against `LONGEST_SOCKET_SUFFIX` rather than restating the constant.
+**Correction proposée.** Fold `confirm` at the call site where the type is known: `base.ssh_agent = union_ssh_agent_opt(base.ssh_agent, ssh_agent)` with a dedicated function that destructures `RawSshAgent` exhaustively and ORs `confirm` (`b.confirm = match (b.confirm, h.confirm) { (Some(true), _) | (_, Some(true)) => Some(true), (a, None) => a, (None, c) => c }`), keeping `union_allow_opt` for the two tables that really are `{ allow }`. Fix its doc at the same time.
 
-**Rectification du vérificateur.** Mechanism confirmed; one citation is two lines off — `host_socket` is src/sandbox/broker.rs:1575-1577, not 1577. Trigger needs both a data directory near the 74-byte cap and a broker key of ~13+ characters (16+ at a typical 4-digit pid), so it is an edge case, but it defeats an invariant the code states in its own comment and lands the user with the exact socket-shaped launch failure the guard was written to convert into a directory-shaped one.
+**Rectification du vérificateur.** Survives, but the mechanism is half-overstated and the severity is medium rather than high. Only ONE of the reporter's two directions is a defect: a higher tier's `confirm = true` being lost when a lower tier also declares `[ssh_agent]` (blob 1 `allow`, blob 2 `confirm = true` → merged confirm is None → no per-signature prompt). The "inverse" they call "equally wrong" — `SBX_CONFIG` `confirm = true` beating a `--config` `confirm = false` — is precisely the documented OR rule (schema.rs:710-711, mod.rs:1156-1157: "an invoker may add the prompt, and the one place it must not be possible to remove it is the most convenient one to try"); tier precedence deliberately does not apply to this field. Medium because the fail-open outcome needs two override tiers to BOTH declare `[ssh_agent]` — a single blob takes the `(None, h)` arm and keeps `confirm`. One addition in the reporter's favour: the same arm also drops `h.rest`, the unknown-key bag that union_fs_opt's doc (overrides.rs:658) says must ride along; harmless only because warn_unknown_keys already fires per blob at overrides.rs:313/342.
 
 <details>
 <summary>Preuve retenue par le vérificateur</summary>
 
-Traced end to end and found nothing preventing it. src/store.rs:323 `const LONGEST_SOCKET_SUFFIX: usize = "/forward/fwd-1234567/p-65535.sock".len();` (33), src/store.rs:326 `DATA_DIR_MAX = SUN_PATH_MAX - LONGEST_SOCKET_SUFFIX` (74), enforced at store.rs:346 (`check_data_dir_override`) and store.rs:369 (`check_resolved_data_dir`). The enumeration at store.rs:313-322 ends with an explicit invariant — "A new feature whose host socket path is wider than this must widen the sample below, or a data directory the cap accepts would still overrun `sun_path` at that feature's first launch" — so the comment supports the finding rather than excusing it. The broker family violates it: `sockets_dir` = `<data>/broker/<pid>` (src/sandbox/broker.rs:1570-1572), `host_socket` appends `<name>.sock` (src/sandbox/broker.rs:1575-1577), and `UnixListener::bind(&host_uds)?` at src/sandbox/broker.rs:1660 uses `layout.data_dir()` (broker.rs:1658). Suffix = 21 + name.len() with a 7-digit pid, so a 13-char broker key already exceeds 33. No length bound exists on the key: `resolve_brokers` (src/config/mod.rs:4112-4200) validates `socket`, `secret` and unknown keys but never the name's length, and `plugins::validate_install_name` (src/plugins/mod.rs:1597-1612) checks emptiness, leading dot and charset only. The bind error is fatal and socket-shaped: src/sandbox/launch.rs:4379-4382 prints `sbx: cannot start the `<name>` broker: {e}` and returns `ExitCode::FAILURE` — precisely the outcome check_data_dir_override says it exists to prevent (store.rs:331-336). The tests at src/store.rs:2321-2353 only restate `LONGEST_SOCKET_SUFFIX` against a synthetic path; no test measures a real builder. The secondary mislabel is also confirmed: store.rs:318 calls `/fs/control-<pid>.sock` "exec-enforcement control", while src/paths.rs:142/148 assign `proc/` = "per-launch exec-enforcement sockets" and `fs/` = "per-launch filesystem-observation sockets".
+Every cite checks out. overrides.rs:648 is `base.ssh_agent = union_allow_opt(base.ssh_agent, ssh_agent, |s| &mut s.allow);`, and union_allow_opt's `(Some(mut b), Some(mut h))` arm at overrides.rs:706-710 moves only `allow` out of `h` and returns `b`, so `h.confirm` is dropped. RawSshAgent really does carry a third field: schema.rs:713 `pub(crate) confirm: Option<bool>`, whose doc at schema.rs:706-711 states "the flag ORs across layers — a layer that asks for confirmation cannot have it turned off by another". RawSeccomp (schema.rs:599-605) and RawDevices (schema.rs:615-621) are genuinely `{ allow, rest }`, so union_allow_opt's own doc at overrides.rs:694 ("Union two optional `{ allow: Vec<String> }` tables (`[seccomp]` / `[devices]` / `[ssh_agent]`)") mis-describes only the third. The dropped value is load-bearing: apply_ssh_agent reads `raw.confirm.unwrap_or(false)` (mod.rs:3017) and apply_override ORs it in at mod.rs:1158. The fold path is as described — collect_from folds repeated `--config` blobs with `t2 = overlay_into(t2, parsed)` (overrides.rs:343) and then the two sides with `overlay_into(env_side, cli_side)` (overrides.rs:377). The regression test really does pass a single blob (overrides.rs:2253-2258), so it takes the `(None, h)` arm and never exercises the drop.
 
 </details>
 
 ---
 
-### B14 — `sbx task run <TAB>` completes app names instead of declared operations
+### B10 — The override plane folds `[fs] scan_max_kb` with `min` while the layer merge it cites uses `max`, so the environment beats the command line
+
 | | |
 |---|---|
 | **Gravité** | Moyenne |
-| **Emplacement** | `src/cli/completion.rs:697` |
-| **Catégorie** | `logic-bug` |
-| **Sous-système** | Aide et complétion shell |
+| **Emplacement** | `src/config/overrides.rs:684` |
+| **Catégorie** | `inconsistency` |
+| **Sous-système** | Configuration — couches, overrides, validation |
 | **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
 
-**Constat.** `kind_of_metavar` maps the metavariable name `name` to `ValueKind::Apps` for every page except the two it overrides (`plugins`, `projects`):
+**Constat.** `union_fs_opt` folds `scan_max_kb` with `a.min(c)`, and its doc (overrides.rs:660-662) says it "folds by the rule its own layer merge uses ([`crate::config::fspolicy`]): the tighter ceiling wins, because a tier raising it would widen what a lower one had narrowed." `fspolicy::FsPolicy::union` does the opposite — `a.max(b)` (fspolicy.rs:108) — under a long comment (fspolicy.rs:93-107) that spells out why: `scan_max_kb` is how many bytes of a file the content lens reads, so a *larger* number closes more files and "taking the minimum therefore let a layer widen what another had narrowed". Its test `a_union_can_only_ever_widen_the_scan_window_never_shrink_it` (fspolicy.rs:412) pins that. The override side's own test (overrides.rs:2342) asserts `Some(64)` under the comment "the tighter ceiling wins, the rule the layer merge already applies", so a test encodes the inverted rule. Beyond the divergence, `min` breaks this module's stated precedence — "any CLI input beats any environment one" (overrides.rs:36) — for this one field.
 
-    "name" | "app" | "profile" | "sketch" => ValueKind::Apps,
+**Scénario.** With `SBX_CONFIG='[fs]\nscan = ["AKIA[0-9A-Z]{16}"]\nscan_max_kb = 1'` left in the environment by a wrapper, run `sbx --config '[fs]\nscan_max_kb = 512' run …`. `union_fs_opt(Some(fs_env), Some(fs_cli))` yields `Some(1)`; `apply_override` then does `self.fs.union(over)` (mod.rs:1151), which maxes against the config layers — with none set, the launch scans one KiB per file. The invoker explicitly asked for 512 KiB on the command line and got the stale ambient 1 KiB, so every credential past the first line of a file passes.
 
-But four pages use `<name>` for something that is not an app. `task run` documents its operand as `("<name>", "the operation to run, as `sbx task list` shows it")` (src/help.rs:940) while its sibling `task list` documents `("<operation>", …)` (src/help.rs:885), which maps to `ValueKind::Tasks` — two pages for the same vocabulary that do not agree. `bundle` (src/help.rs:2178) and `bundle export` (2202) use `<name>…` for a bundle name; `net groups` (2246) and `net groups export` (2265) use it for an egress-group name. All five complete the machine's app profiles.
+**Correction proposée.** Change `Some(a.min(c))` to `Some(a.max(c))` at overrides.rs:684, correct the doc at overrides.rs:660-662 to state the widening rule and why, and update the assertion at overrides.rs:2342 to `Some(512)` with the reason `fspolicy.rs:93-107` gives.
 
-The comment on the merge branch in `candidates` (src/cli/completion.rs:201-203) even asserts the opposite: "`sbx bundle <TAB>` offers export|import alongside the bundle names" — it offers app names.
-
-The sweep `every_value_position_is_completed_or_declared_unenumerable` only checks that `kind_of_metavar` returns *something*, so nothing pins which registry, and the bash/zsh integration sweeps only assert that command names appear.
-
-**Scénario.** With an imported app profile `demo-app` and a config declaring `[task.deploy]`: `sbx task run <TAB>` offers `demo-app` and never offers `deploy`. Accepting the completion yields `sbx task run demo-app`, which is refused as an unknown operation (exit 125). Same for `sbx bundle <TAB>` and `sbx net groups <TAB>`, which list app names for a bundle/group operand.
-
-**Correction proposée.** Add page-context overrides in `kind_of_metavar` next to the existing `plugins`/`projects` ones — `["task", "run"]` → `ValueKind::Tasks`; `bundle`/`net groups` need a Bundles/Groups vocabulary (or `NOT_ENUMERABLE` until one exists). Cheapest partial fix for the task case: rename the `task run` option row's `<name>` to `<operation>` in src/help.rs:940 so it agrees with `task list`.
-
-**Rectification du vérificateur.** Mechanism confirmed; two refinements. (1) The merge in `candidates` (src/cli/completion.rs:204-209) still adds the page's own subcommands, so `sbx bundle <TAB>` and `sbx net groups <TAB>` do offer `export`/`import` — only the value half is the wrong registry; `task run` has no subcommands, so there the whole menu is wrong. (2) The exit code in the attack is plausible but incidental: `sbx task run <app-name>` is refused by the control plane and rendered through `render_result`, which returns `REFUSED_EXIT` = 125 (src/cli/task.rs:32, :862). The defect itself is a wrong-vocabulary completion, not a wrong exit.
+**Rectification du vérificateur.** Survives; severity medium is right, and there is stronger corroboration than the reporter found. src/config/tests.rs:6581-6613 shows this is the leftover half of a completed fix: "The name this test used to carry — 'the tighter ceiling wins' — was the misreading itself, and it pinned the fold at `min`… the *larger* number is the tighter policy: it closes more files." The layer fold was deliberately flipped min→max and the override fold at overrides.rs:685 was not, which is why the stale comment and stale assertion survive verbatim in overrides.rs. Two small cite corrections: the `min` is on overrides.rs:685 (the `match` statement opens at 684), and `self.fs.union(over)` is mod.rs:1150, not 1151. One scope limit worth stating: both inputs here are invoker-supplied, so the untrusted-project threat fspolicy.rs:100-104 describes does not apply on this plane — the concrete harm is the narrower one the reporter names, an ambient SBX_CONFIG ceiling beating an explicit `--config` one, which also breaks the module's own precedence rule at overrides.rs:36.
 
 <details>
 <summary>Preuve retenue par le vérificateur</summary>
 
-Verified line-by-line. src/cli/completion.rs:697 is exactly `"name" | "app" | "profile" | "sketch" => ValueKind::Apps,` and the only page-context overrides in `kind_of_metavar` are src/cli/completion.rs:681 (`path.first() == Some(&"plugins")`) and :691 (`path.first() == Some(&"projects")`) — neither covers `task`, `bundle` or `net groups`. `operand_slots(["task","run"])` sees only the bare row at src/help.rs:939-942 (`("<name>", "the operation to run, as `sbx task list` shows it")`) because every other row on that page starts with `-` and is skipped at src/cli/completion.rs:585, so the single slot is `Value("name")` -> `ValueKind::Apps`. The sibling row src/help.rs:886 (`("<operation>", ...)`) maps through src/cli/completion.rs:700 to `ValueKind::Tasks`, which really does enumerate `[task.<name>]` blocks (registry test at src/cli/completion.rs:1512-1516) — so the two pages for one vocabulary genuinely disagree. The same applies to src/help.rs:2178-2180 (`bundle`), :2202-2204 (`bundle export`), :2246-2248 (`net groups`), :2265-2267 (`net groups export`); there is no Bundles/Groups variant in the `ValueKind` enum (src/cli/completion.rs:260-288). Nothing makes this deliberate: the doc comment on `NOT_ENUMERABLE` at src/cli/completion.rs:1688-1690 states the governing rule — "A name that means something enumerable on one page and not on another is settled in `kind_of_metavar`, which sees the page" — so these are unclosed holes, and the sweep at :1724 only asks that *some* kind is returned. The merge comment at src/cli/completion.rs:201-202 does claim "`sbx bundle <TAB>` offers export|import alongside the bundle names".
+The divergence is real and every cite lands. overrides.rs:684-687 folds `(Some(a), Some(c)) => Some(a.min(c))`, under a doc at overrides.rs:660-662 asserting it "folds by the rule its own layer merge uses ([`crate::config::fspolicy`]): the tighter ceiling wins". fspolicy::FsPolicy::union does the opposite at fspolicy.rs:108-109, `(Some(a), Some(b)) => Some(a.max(b))`, under a comment at fspolicy.rs:91-107 that states the direction explicitly ("The **larger** window wins… a bigger number closes *more* files… Taking the minimum therefore let a layer widen what another had narrowed") and is pinned by fspolicy.rs:412 `a_union_can_only_ever_widen_the_scan_window_never_shrink_it`. The semantics check out downstream: launch.rs:3929-3933 turns scan_max_kb into the OpenPolicy `ceiling`, i.e. bytes examined before an open is let through. The override side's test at overrides.rs:2340-2342 asserts `Some(64)` under "The tighter ceiling wins, the rule the layer merge already applies", so the inverted rule is pinned by a test whose comment is false. The attack path holds: the folded `Some(1)` reaches `self.fs.union(over)` and, with no config layer setting the field, maxes against None to yield 1 KiB.
 
 </details>
 
 ---
 
-### B15 — `sbx projects <TAB>` never offers `list` or `rm`; `sbx proc pending <TAB>` never offers `allow`/`deny`
+### B11 — A `[service]`/`[open]` table missing its `cmd`, or an `enable` missing `env`, drops the whole config layer
+
 | | |
 |---|---|
 | **Gravité** | Moyenne |
-| **Emplacement** | `src/cli/completion.rs:797` |
-| **Catégorie** | `logic-bug` |
-| **Sous-système** | Aide et complétion shell |
+| **Emplacement** | `src/config/schema.rs:1053` |
+| **Catégorie** | `error-handling` |
+| **Sous-système** | Configuration — modèle, schéma, types |
 | **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
 
-**Constat.** A verb documented as an option row rather than as a page is lost twice over.
+**Constat.** `RawServiceTable::cmd` (1053), `RawOpenTable::cmd` (1170) and `RawEnableCond::env` (1115) are required fields inside untagged enum variants (`RawService`, `RawOpen`, `RawEnable`). A table that omits one matches no variant, so the untagged parse fails and `read_layer` discards the entire config file — the same whole-layer cost `RawBindTable::path` was made `Option` to avoid: "Optional at the parse layer so a table missing its `path` — a typo, or the tell-tale of a wrongly-authored entry — is skipped with a per-entry warning downstream rather than failing the untagged-enum parse and dropping the *whole* config layer (env, packages, apps and all)" (schema.rs:530-535). The downstream validators are already written as if these arrive per entry and cannot: `validate_service` warns "it names no program to run" (validate.rs:833) and `service_enable` warns "a condition names no variable" (validate.rs:892) — branches only reachable via an explicitly empty `cmd = ""`/`env = ""`, never via the omitted key those messages read as describing.
 
-(a) `operand_slots` accumulates bare literal rows into `pure`, but discards `pure` entirely once any row also names a metavariable: `if !saw_value_row && !pure.is_empty() { return vec![Operand::Literal(pure)] }` (line 616). On the `projects` page the rows are `("list", …)` (src/help.rs:1847) then `("rm <id>...", …)` (src/help.rs:1851), so `list` lands in `pure`, `rm <id>...` sets `saw_value_row`, and `pure` is thrown away.
+**Scénario.** A global `sbx.toml` containing `[open.https]\nmode = "detach"` (the `cmd` line forgotten, or moved below the header) fails `schema::parse`; `read_global` warns once and returns `RawConfig::default()`, so every package, bind, network rule, secret and app in the global config is silently absent for that launch. Same for `[service.gateway]\nready = { tcp = 8100 }` with no `cmd`, and for `enable = { is = "1" }` with no `env`.
 
-(b) `cursor_value_kind` then skips the surviving literal slot outright:
+**Correction proposée.** Make the three fields optional at the parse layer (`cmd: Option<RawCmd>`, `env: Option<String>`) and let the existing downstream branches in `validate_service`/`validate_open`/`service_enable` drop the one entry with the warning they already carry.
 
-    while let Some(Operand::Literal(_)) = slots.get(pos) { pos += 1; }
-
-so `Literal(["rm"])` at position 0 is jumped over and the `<id>` behind it is what gets completed. `proc pending` has the same shape — `Literal(["allow","deny"])` followed by `Value("id")` (src/help.rs:484-500) — so its two answer verbs are unreachable too.
-
-The merge branch's comment (line 202-203) claims "`sbx projects <TAB>` its commands alongside the tree ids"; only `show` appears, because `show` happens to have a page of its own. `every_command_path_in_the_table_completes` sweeps pages only, so neither case is caught.
-
-**Scénario.** `sbx projects <TAB>` offers project tree ids and `show`, but not `list` or `rm` — both real verbs (src/cli/projects.rs:20-22). `sbx projects l<TAB>` completes nothing at all. Likewise `sbx proc pending a<TAB>` offers nothing, though `sbx proc pending allow <id>` is the documented way to release a parked exec (src/cli/proc.rs:468).
-
-**Correction proposée.** Keep `pure` when a value row also exists (fold it into the leading literal slot), and offer the literal slot's words at `pos` instead of skipping it — e.g. return `ValueKind::Literal(words)` merged with the following value's candidates when `slots[pos]` is a `Literal` the cursor has not yet consumed.
-
-**Rectification du vérificateur.** Survives, and the proc case is slightly worse than reported: bare `sbx proc pending` rejects *any* positional (`reject_extra`, src/cli/proc.rs:478), so position 0 completes parked-request ids that the command itself refuses, while the only two words it accepts there are the ones withheld. One overstatement: `sbx projects l<TAB>` completing "nothing at all" is machine-dependent — a tree id beginning with `l` would still be offered; the sound claim is that `list`/`rm` are never offered. Note also that the root cause is partly upstream of completion.rs: CLAUDE.md requires every subcommand to have a `Page`, and these four verbs are documented as option rows instead.
+**Rectification du vérificateur.** Survives, with two corrections to the reporter's framing. (1) The authors are not unaware of this shape — manage.rs:749-755 names these four fields explicitly and guards the `sbx config unset` write path (manage.rs:2417). The finding is therefore an unclosed gap on the hand-edited path, not an unnoticed one; the fix suggestion (make the fields optional) is still the one that matches `RawBindTable::path`. (2) The claim that the downstream branches are only reachable via an explicitly empty string is imprecise: src/config/validate.rs:833 tests `argv.is_empty() || argv[0].is_empty()`, so `cmd = []` reaches it too. Cited validate lines are off by one (the `enable` branch is 893, not 892; the service branch message is 835).
 
 <details>
 <summary>Preuve retenue par le vérificateur</summary>
 
-Both halves traced. (a) In `operand_slots`, the `("list", ...)` row at src/help.rs:1847-1850 has no metavariable, so it lands in `pure` (src/cli/completion.rs:603-605); the later `("rm <id>...", ...)` row at src/help.rs:1852-1858 sets `saw_value_row = true` (:608), so the guard at src/cli/completion.rs:616 (`if !saw_value_row && !pure.is_empty()`) is false and `pure` is dropped — the returned slots are exactly `[Literal(["rm"]), Value("id")]`. (b) src/cli/completion.rs:797 is verbatim `while let Some(Operand::Literal(_)) = slots.get(pos) {`, so with nothing typed `pos` walks past `Literal(["rm"])` to `Value("id")`, which src/cli/completion.rs:691-694 maps to `ValueKind::Projects`. `subcommands_of(["projects"])` can only supply `show`, the sole child page (src/help.rs:2049), so `sbx projects <TAB>` = tree ids + `show`; `list` and `rm` are real verbs (src/cli/projects.rs:20-22) and are unreachable. `proc pending` has the identical shape: the rows at src/help.rs:485-498 yield `[Literal(["allow","deny"]), Value("id"), ...]`, the literal is skipped, and `is_pending_page` (src/cli/completion.rs:715-719) turns the `<id>` into `PendingIds`; `allow`/`deny` (src/cli/proc.rs:467-469) are never offered. No test pins the current behaviour — `every_command_path_in_the_table_completes` (src/cli/completion.rs:1525) sweeps pages only.
+Verified. src/config/schema.rs:1053 is `pub(crate) cmd: RawCmd,` in `RawServiceTable`, 1170 is `pub(crate) cmd: RawCmd,` in `RawOpenTable`, and 1115 is `pub(crate) env: String,` in `RawEnableCond` — all three required, no `#[serde(default)]`, all three inside untagged enums (`RawService` at 1037, `RawOpen` at 1018, `RawEnable` at 1087). `RawBindTable::path` is `Option` for precisely the stated reason (schema.rs:530-535). The decisive corroboration is the codebase's own words: src/config/manage.rs:749-755 says "several schema tables carry a required field with no `#[serde(default)]` (`RawServiceTable.cmd`, `RawServiceReady.tcp`, `RawOpenTable.cmd`, `RawInlineFlake.flake`), and `RawOpen`/`RawService` are `#[serde(untagged)]`, so a table left without its required field matches no variant at all", and the test at manage.rs:2417-2440 uses exactly the reporter's `[open.https]` example, commenting "the whole layer — the `network = \"deny\"` posture included — would stop parsing" and "the loader drops the WHOLE layer with only a warning, silently reverting every security field it carried". That guard covers only `sbx config unset`; nothing guards a hand-edited file, so the path from a forgotten `cmd` line to a dropped global layer is unobstructed.
 
 </details>
 
 ---
 
-### B16 — `app run`'s mashed override row hides the flags' value grammar, shifting the `<name>` operand
+### B12 — A `ready.tcp` outside u16 fails the untagged `RawService` parse and drops the whole config layer
+
+| | |
+|---|---|
+| **Gravité** | Moyenne |
+| **Emplacement** | `src/config/schema.rs:1159` |
+| **Catégorie** | `error-handling` |
+| **Sous-système** | Configuration — modèle, schéma, types |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** `RawServiceReady::tcp` is a `u16`, and `RawServiceReady` sits inside `RawServiceTable`, which is a variant of the **untagged** enum `RawService` (schema.rs:1036-1043). A value TOML accepts as an integer but serde cannot fit into a `u16` therefore fails both untagged variants, which fails `RawConfig`/`RawApp` as a whole, and `read_layer` (load.rs:615-623) turns that into `warnings.push("ignoring <path>: …")` and returns `None` — the entire layer is discarded. This is precisely the failure the rest of the schema is written to avoid: `RawForward::Port` is an `i64` and says so ("a value this layer refuses fails the untagged-enum parse and drops the *whole* config layer (env, packages, apps and all) … `forward = [70000]`, a port typed with one digit too many, took the config down with it", schema.rs:489-494), and `RawFs::scan_max_kb` (schema.rs:661-666) and `RawLimit::Number` (schema.rs:569-575) are signed for the same stated reason. The downstream validator already expects to do the range work — `service_ready` (validate.rs:963) refuses `tcp == 0` with a per-entry warning — but a `u16` guarantees it can never see the other end of the range.
+
+**Scénario.** A project `.sbx.toml` containing `[env]\nKEEP = "yes"`, an `[fs] deny = [".env"]` mask, and `[service.gateway]\ncmd = ["hermes","gateway","run"]\nready = { tcp = 70000 }` fails `schema::parse` with "data did not match any variant of untagged enum RawService". The whole layer is dropped: the env var, the packages, every `[app.*]`, and the `[fs]` mask that was closing `.env` to the cage — all gone from one mistyped digit, where the same mistake in `forward = [70000]` is a named per-entry warning. The same typo in an `apps/<name>.toml` profile fails `parse_app` and takes the whole app with it.
+
+**Correction proposée.** Hold the port as an `i64` like `RawForward::Port` (`pub(crate) tcp: i64`) and move the range check next to the existing `tcp == 0` check in `validate::service_ready`, warning `ignoring `ready` of `[service]` entry `<name>` — <n> is not a port in 1-65535` and dropping only the gate.
+
+**Rectification du vérificateur.** Mechanism confirmed; severity overstated as high. Two corrections. (1) The cited validate line is 964, not 963 (off by one). (2) The authors were already aware of this field's fragility from the other direction: src/config/manage.rs:751-755 enumerates `RawServiceTable.cmd`, `RawServiceReady.tcp`, `RawOpenTable.cmd`, `RawInlineFlake.flake` by name as "required field with no `#[serde(default)]`" and makes `unset` validate the whole layer before committing (test at manage.rs:2421). So the gap is specifically the hand-edited path and the out-of-range value, not the field's existence; and the effect is a warning naming the file plus a silently reverted layer, the same cost the `forward` test treats as a bug worth fixing.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Verified. src/config/schema.rs:1159 is exactly `pub(crate) tcp: u16,` inside `RawServiceReady`, which is reached only through `RawServiceTable::ready` (schema.rs:1051-1050 region, field at 1050-1051) inside the untagged enum `RawService` (`#[serde(untagged)]` at schema.rs:1037, variants `Argv(RawCmd)` / `Detailed(RawServiceTable)` at 1039-1042). `RawCmd` is `Line(String) | Argv(Vec<String>)` (schema.rs:990-996), so a table never matches the first variant; `tcp = 70000` fails the second, so the untagged parse fails and `schema::parse` (schema.rs:2069) errors for the whole document. `read_layer` (src/config/load.rs:614-621) turns that into `warnings.push(format!("ignoring {}: {e}", path.display()))` and returns `None`, discarding the layer. The house rule the reporter cites is real and enforced elsewhere: schema.rs:489-494 states it verbatim, `RawForward::Port` is `i64` (schema.rs:499), `RawLimit::Number` is `i64` (schema.rs:576), `RawFs::scan_max_kb` is `Option<i64>` (schema.rs:666), and there is a dedicated regression test `a_forward_port_out_of_range_is_skipped_rather_than_dropping_the_layer` at src/config/tests.rs:2103-2117. The downstream gate can only ever see the low end: `if gate.tcp == 0` at src/config/validate.rs:964. No caller, invariant or earlier validation prevents an out-of-range integer from reaching serde. `service` is present on RawConfig (schema.rs:97), RawApp (457) and RawBundle (870), so app profiles are affected too.
+
+</details>
+
+---
+
+### B13 — `RawTask` carries no unknown-key bag, so a misspelled `spawn` silently disables exec supervision
+
+| | |
+|---|---|
+| **Gravité** | Moyenne |
+| **Emplacement** | `src/config/schema.rs:1418` |
+| **Catégorie** | `inconsistency` |
+| **Sous-système** | Configuration — modèle, schéma, types |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : moyenne) |
+
+**Constat.** `RawTask` is the only significant table in the schema with no `#[serde(flatten)] rest: BTreeMap<String, RawIgnored>` — `RawConfig`, `RawApp`, `RawBundle`, `RawLimits`, `RawSeccomp`, `RawDevices`, `RawSshAgent`, `RawFs`, `RawRedact`, `RawPluginConfig`, `RawBrokerConfig`, `NetworkTable`, `ProcTable`, `NotifyTable` and even `RawTaskExecNode` (this table's own child, schema.rs:1563) all have one, each with a comment saying why silence is the worse half of the trade (`RawTaskExecNode`: "a node that means less than it says is the one failure this whole field exists to avoid"). `tasks.rs` reports unknown keys only for the exec node (tasks.rs:444); nothing walks a `[task.<name>]` table's own keys. The authors were aware of the silence and answered it per-key for two look-alikes only (`allow`/`deny`, schema.rs:1498-1505, "Present only so a task declaring them is refused rather than parsing into silence") — which leaves a misspelling of a *real* field unanswered, and `spawn` is the field where that costs a control: "Absent means no exec supervision at all" (schema.rs:1483-1489).
+
+**Scénario.** A `[task.deploy]` block written `cmd = ["git", "push"]` / `spwan = ["ssh"]` parses cleanly, `spawn` resolves to `None`, and the task runs with **no exec supervisor at all** — the command may `execve` anything in the cage, with the task's credential in its environment — while the author believes they confined it to `git` plus `ssh`. Nothing is warned. The same typo one level down (`[task.deploy.exec.git] spwan = […]`) is refused by name.
+
+**Correction proposée.** Add `#[serde(flatten)] pub(crate) rest: BTreeMap<String, RawIgnored>` to `RawTask` and report its keys in `tasks::apply_task_section`, in the same shape as the existing `node.rest` report at tasks.rs:444.
+
+**Rectification du vérificateur.** Survives, but the reporter missed that the omission is documented, and overstated the uniqueness. (1) src/config/mod.rs:2933-2934 states the exclusion deliberately: "A `[task.<name>]`/`[app.<name>]` entry's own fields are not walked here — those carry a `cmd` whose absence already fails loudly." That rationale does not hold for the reported case: `RawTask::cmd` is `#[serde(default)] Vec<String>` (schema.rs:1425-1426), so a missing `cmd` is caught at src/config/tasks.rs:195, not at parse — and a misspelled `spawn` is caught nowhere. The app half of that sentence is also already answered by `warn_unknown_app_keys`, which is what makes tasks the odd one out. (2) `RawTask` is not the only table without a bag: `RawTaskDefaults` (schema.rs:1396) has none either.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Verified. `RawTask` begins at src/config/schema.rs:1418 and its derive at 1417 is `#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]` with no `deny_unknown_fields`; reading the full body (1418-1520) confirms there is no `#[serde(flatten)] rest`, while its own child `RawTaskExecNode` has one at schema.rs:1559-1560 and reports it at src/config/tasks.rs:444. The only global unknown-key walker, `warn_unknown_keys` (src/config/mod.rs:2935), reports `raw.rest`, `[limits]`, `[seccomp]`, `[devices]`, `[ssh_agent]`, `[redact]` and `[fs]` — and its doc at mod.rs:2933-2934 explicitly excludes task entries. Apps get their own walker (`warn_unknown_app_keys`, mod.rs:2982, called at mod.rs:3405 and 3568); tasks get none — grep finds no unknown-key report for `[task.<name>]` anywhere. The consequence is confirmed by the project's own test: src/config/tasks.rs:1262-1265, `assert_eq!(absent.spawn, None, "absent means no supervision at all")`. So `spwan = ["ssh"]` parses, is dropped, and the task runs unsupervised with nothing said.
+
+</details>
+
+---
+
+### B14 — A `match` bound rejects values its own regex accepts, because `find` is leftmost-first, not anchored
+
+| | |
+|---|---|
+| **Gravité** | Moyenne |
+| **Emplacement** | `src/config/tasks.rs:669` |
+| **Catégorie** | `logic-bug` |
+| **Sous-système** | Configuration — couches, overrides, validation |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** `check_value` claims to anchor an unanchored pattern by requiring the found match to span the whole value: "A pattern must match the **whole** value: an unanchored regex would accept anything containing a match, so the check anchors it here rather than trusting the author to have written `^…$`." But `Regex::find` returns the *leftmost-first* match, not the longest one at that position. The regex 1.13 docs state this with a worked example: `Regex::new("sam|samwise").find("samwise")` returns `"sam"`. So whenever an alternation's earlier branch is a prefix of a later one — or a lazy quantifier is used — `m.end() != value.len()` and the value is refused even though the pattern plainly matches it whole. The comment describes anchoring; the code implements "the preferred match happens to be full-span".
+
+**Scénario.** Declare `[task.deploy.params] target = { match = "prod|prod-eu|staging" }`. Invoking the task with `target = "prod-eu"` is refused with `parameter \`target\` does not match its declared pattern` — leftmost-first picks `prod` (0..4) against a 7-byte value. Worse, add `default = "prod-eu"` to the same declaration: `validate_params` runs the same `check_value` on the default (tasks.rs:606), `validate_task` returns `Err`, and `apply_task_section` drops the entire task at config load with `ignoring task \`deploy\` — parameter \`target\` does not match its declared pattern`. A perfectly valid declaration silently disappears from the task list.
+
+**Correction proposée.** Anchor the pattern once and match on the anchored form, in both places that compile it. In `compile_bound` build and validate the anchored source (`format!(r"(?s:\A(?:{pattern})\z)")`, so an author's own `^`/`$` still behave and an invalid pattern is still caught at declaration), and in `check_value` compile that same anchored source and use `re.is_match(value)` instead of inspecting `find`'s span.
+
+**Rectification du vérificateur.** Survives, with two corrections. (1) The check on the default is at tasks.rs:598, not 606 — the reporter's in-prose cite is off by eight lines (the anchor cite, 669, is exact). (2) Severity is medium, not high: the defect is strictly fail-CLOSED. A full-span `find` result proves the pattern really does match the whole value, so no value is ever wrongly ACCEPTED; the only outcomes are a valid caller value refused at invocation, or a task with a `default` dropped at load — and the drop is not silent, it emits `ignoring task `<name>` — parameter `<p>` does not match its declared pattern` (tasks.rs:68). Note also a second, milder inconsistency the reporter did not mention: schema.rs:1611 documents the terse form as "the pattern the value must match, anchored by the author", which contradicts tasks.rs:649-651's claim that the check anchors it; the two comments disagree about who owns the anchoring, and the code implements neither cleanly.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Cite is exact. src/config/tasks.rs:669-671 is `match re.find(value) { Some(m) if m.start() == 0 && m.end() == value.len() => Ok(()), _ => Err(...) }`, under the doc at tasks.rs:649-651 that claims "the check anchors it here rather than trusting the author to have written `^…$`". The regex crate vendored in Cargo.lock is 1.13.1, and its own docs pin leftmost-first preference order with the exact worked example the reporter cites — ~/.cargo/registry/src/*/regex-1.13.1/src/lib.rs:726-732: `Regex::new(r"sam|samwise")` on "samwise" yields "sam". So for `match = "prod|prod-eu|staging"` and value "prod-eu", `find` returns 0..4, `m.end() != 7`, and check_value returns `parameter `target` does not match its declared pattern` even though the pattern matches the whole value. Nothing upstream anchors: compile_bound (tasks.rs:640-644) stores `pattern.to_string()` verbatim and only checks that it compiles, and no caller rewrites it (src/sandbox/task.rs:2217 passes the stored bound straight in). No test covers the case — `a_pattern_bound_must_match_the_whole_value` (tasks.rs:1203-1210) only uses the alternation-free `"SELECT"`. The docs promise whole-value matching (docs-site/docs/guide/tasks/parameters.md:114, "it must match the whole value"), so the behaviour contradicts the documented contract, and the load-time half is real too: a `default` goes through the same gate at tasks.rs:598, so validate_task returns Err and apply_task_section drops the whole task with `{source}: ignoring task `{name}` — …` (tasks.rs:68). Lazy quantifiers hit the same wall (`a.*?` never spans a 3-byte value).
+
+</details>
+
+---
+
+### B15 — `app run`'s mashed override row hides the flags' value grammar, shifting the `<name>` operand
+
 | | |
 |---|---|
 | **Gravité** | Moyenne |
@@ -599,7 +607,103 @@ The row is at src/help.rs:306-312, its flag string starting at :308 exactly as c
 
 ---
 
-### B17 — `prune_app_tools` builds the delete path from the *sanitised* display name, so a tool whose real directory name is not sanitise-stable is reported as pruned but never removed
+### B16 — `compact` has no cross-process exclusion but runs on every launch, so two concurrent launches can fold one session's counters into the rollup twice
+
+| | |
+|---|---|
+| **Gravité** | Moyenne |
+| **Emplacement** | `src/sandbox/egress_stats.rs:508` |
+| **Catégorie** | `race` |
+| **Sous-système** | Apprentissage réseau, statistiques, contrat |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : moyenne) |
+
+**Constat.** `compact` is a read-merge-write-unlink over a shared directory with no lock of any kind: `read_dir` at line 509, `read_to_string`+`parse` per entry at lines 522-527, `merge` into the group at line 530, `write_rollup` at line 546, `remove_file` of the sources at line 550. `crate::sandbox::locks` only offers in-process `Mutex`/`RwLock` helpers, and nothing else guards the directory.
+
+It is not a rare housekeeping path: `build()` calls `fold_egress_counters(..., true)` on **every** launch (launch.rs:3504), and `sbx gc --prune` calls it again (launch.rs:1892). Two `sbx run`/`sbx app` invocations started at the same time — the ordinary case of two terminals, or a scripted group — run it concurrently.
+
+The function's own doc-comment asserts the opposite: "This is housekeeping with no observable effect: nothing reads a single session's counters, so a folded directory answers `sbx net stats` exactly as the unfolded one did."
+
+**Scénario.** Steady state: rollup `R` (allow=1000) and one just-finished session file `S` (allow=7) for project `/p`.
+
+- P2 begins `compact`; its `read_dir` iterator yields `S` first and it reads and parses it (tally = 7).
+- P1 runs the whole of `compact`: tally = R+S = 1007, writes the rollup atomically (rename), unlinks `S`.
+- P2's iterator now yields the rollup entry and reads it — getting P1's *new* content, 1007. P2's tally = 7 + 1007 = 1014. P2 writes that to the rollup. Its `remove_file(S)` fails with ENOENT and is ignored.
+
+`sbx net stats` for `/p` now permanently reports 1014 allows where 1007 requests were decided. The inflation is written into the rollup, so it survives every later fold and can only be cleared by `sbx net stats --reset`, which discards everything.
+
+**Correction proposée.** Serialise the fold across processes: open (create) `<egress_dir>/.compact.lock` and hold an exclusive `flock(LOCK_EX)` for the whole body of `compact`, releasing it on return. A contending process that cannot take the lock should simply skip the fold — it is housekeeping, and the other process is already doing it.
+
+**Rectification du vérificateur.** Severity and category are right; two refinements. The window is wider than the write-up implies — it is not the microseconds between two adjacent reads but however long P2's directory scan takes to reach the rollup entry after it read a session file, which in a directory holding many finished sessions is the bulk of the scan. And inflation is not the only direction: the same absence of exclusion can *lose* counters — if P1 sees a session file P2's `read_dir` snapshot never yielded, P1 folds and unlinks it, then P2's later `write_rollup` at :546 overwrites the rollup with a total that never included it. Both outcomes are baked permanently into the rollup and clearable only by `sbx net stats --reset`. Note this is an accidental-concurrency correctness bug, not something in-cage code can drive: nothing inside the cage chooses when a second launch starts, and the caged process cannot write the egress directory.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Verified line by line and found no exclusion of any kind. src/sandbox/egress_stats.rs:508 `pub(crate) fn compact(egress_dir: &Path, prune: bool)`, `read_dir` at :509, per-entry `read_to_string` at :520 and `parse` at :523, `slot.1.merge(&session.tally)` at :530, `write_rollup` at :546 (temp + `rename`, :561-573), `remove_file` of the sources at :550 with the error ignored. The rollup is itself an input to the next pass — `is_finished` returns true for anything starting with `ROLLUP_PREFIX` (:466-468) — which is what makes a re-read of a just-rewritten rollup additive. `crate::sandbox::locks` (src/sandbox/locks.rs) exports only `locked`/`read_locked`/`write_locked` over in-process `Mutex`/`RwLock`; the only `flock` in the tree guards the nix store (src/sandbox/projectstore.rs:139-166) and the task pool (src/sandbox/taskpool.rs:322), neither held anywhere near this. The frequency claim is right: `build` calls `super::gc::fold_egress_counters(prep.layout.data_dir(), true)` at src/sandbox/launch.rs:3504 on every launch, and `runtime_housekeeping` calls it again at src/sandbox/launch.rs:1892; `fold_egress_counters` (src/sandbox/gc.rs:1298) is a direct `compact(&data_dir.join("egress"), prune)`. The egress directory is per-data-dir, not per-project, so launches in unrelated projects contend on it. The claimed interleaving is achievable: P2 reads session file S, is descheduled while P1 completes a whole pass (rollup rewritten by `rename` at the same path, S unlinked), then P2 reads the rollup by path and gets P1's new content, double-counting S. The function's doc-comment at :502-504 ("housekeeping with no observable effect… a folded directory answers `sbx net stats` exactly as the unfolded one did") is exactly the invariant this breaks.
+
+</details>
+
+---
+
+### B17 — A forward bind failure leaks every listener already bound in the same call — no `Forwarder` is ever constructed, so nothing sets the shutdown flag
+
+| | |
+|---|---|
+| **Gravité** | Moyenne |
+| **Emplacement** | `src/sandbox/forward.rs:189` |
+| **Catégorie** | `resource-leak` |
+| **Sous-système** | Apprentissage réseau, statistiques, contrat |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** `start` binds listeners in a loop, spawning an accept thread per listener into a local `accepts: Vec<JoinHandle<()>>` (line 190/196) and sharing a local `shutdown: Arc<AtomicBool>` (line 162). The `Forwarder` guard that owns them is only constructed on the success path at line 215. The `?` on the v4 bind at line 189 returns `Err` with `accepts` and `shutdown` as plain locals: dropping a `JoinHandle` detaches the thread, and nothing ever stores `true` into `shutdown`, so every accept loop spawned for an *earlier* port keeps polling `accept()` every `ACCEPT_POLL` (20 ms) and keeps its `TcpListener` bound for the life of the process. The `0700` `fwd-<pid>` directory created at line 157 is leaked with them.
+
+This is not bounded by process exit. `sbx upgrade` calls `build()` per app inside a loop and, on `Err(_)`, prints "failed to launch" and `continue`s to the next app in the same process (launch.rs:1600-1609) — and `forward::start`'s error is exactly how `build` fails here (launch.rs:4157).
+
+**Scénario.** `sbx upgrade` over two apps. App A declares `forward = [9200, 9300]` and an unrelated host service already holds 9300. `start` sorts the ports, binds 9200 (spawning its accept loop), then fails on 9300 and returns at line 189 — 9200 stays bound forever and its thread spins for the rest of the run. App B declares `forward = [9200]`. Its bind now fails with sbx's own message: "cannot bind host port 9200 for forward … it is already in use (another login, or a host service on :9200)" — naming causes that are all false; the holder is the previous iteration of the same process. App B is reported failed for a collision the user cannot find or fix, and `<data>/forward/fwd-<pid>` is left on disk.
+
+**Correction proposée.** Own the partial state before the loop can fail: construct the `Forwarder { dir, shutdown, accepts: Vec::new() }` immediately after the directory is created and push each `JoinHandle` into `guard.accepts`, returning `Err` by simply letting the guard drop (its `Drop` already stores the flag, joins the loops and removes the dir). Same shape as the success path, one guard, no path that can skip it.
+
+**Rectification du vérificateur.** Severity is overstated at high; the mechanism is right but the blast radius is narrower than described. The leak cannot outlive the process — a plain `sbx run`/`sbx app` returns `ExitCode::FAILURE` and exits, and the kernel reclaims port and thread — so it only bites the two multi-app loops (`sbx upgrade`'s package roll at launch.rs:1354 and the provision roll at 1600), and only when a later app in the same run declares a host port an earlier failed app had already bound. The on-disk half self-heals: `<data>/forward/fwd-<pid>` is in the runtime sweep table (src/sandbox/gc.rs:1254 `("forward", &["fwd-"])`), which every subsequent launch and `sbx gc` runs, so it is removed once the pid is gone — it is not a permanent disk leak. What genuinely survives is the correct core of the finding: a bound port plus a 20ms-polling thread held for the rest of the run, and a misleading "already in use (another login, or a host service on :<port>)" message naming causes that are all false. The suggested fix (build the guard before the loop and push handles into it) is the right shape.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Line numbers are exact and the mechanism holds. src/sandbox/forward.rs: `dir` created 0700 at :157-160, `shutdown` at :162, `accepts: Vec<JoinHandle<()>>` at :163 — all plain locals; the v4 bind's `map_err(...)?` is at :189 and `accepts.push(spawn_accept(v4, ...))` at :190, the best-effort v6 push at :196; the `Forwarder { dir, shutdown, accepts }` that owns them is constructed only on the success path at :215. `impl Drop for Forwarder` (:82-93) is the sole writer of the flag (`self.shutdown.store(true, ...)`, :87) and the only thing that joins the handles and removes the dir, so an early return at :189 drops the `JoinHandle`s (detaching the threads) with the flag still false. `accept_loop` (:238-241) only exits via `if shutdown.load(...) { return; }`, otherwise `sleep(ACCEPT_POLL)` (:248, 20ms per :69), keeping its `TcpListener` bound for the life of the process. The multi-launch reachability is real: `forward::start` is called from `build` at src/sandbox/launch.rs:4157 with `.map_err(|e| ... ExitCode::FAILURE)?`, and `build`'s `Err` is swallowed with `continue` inside two per-app loops in the same process — src/sandbox/launch.rs:1354-1364 and 1600-1609 ("failed to launch", `failed += 1`, `continue`). No cross-call cleanup exists for the orphaned listeners.
+
+</details>
+
+---
+
+### B18 — `reap_dead_projects`/`reap_one` report a tree as reclaimed even when `force_remove_dir_all` failed, contradicting the rule `prune_rev_dirs` states and a test pins
+
+| | |
+|---|---|
+| **Gravité** | Moyenne |
+| **Emplacement** | `src/sandbox/gc.rs:518` |
+| **Catégorie** | `error-handling` |
+| **Sous-système** | Cycle de vie des sessions (gc, projects, attach) |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** `reap_dead_projects` discards the removal result (`let _ = force_remove_dir_all(&dir);`, gc.rs:518 for a dead tree and gc.rs:530 for a `--markerless` one) and then unconditionally pushes the entry into `report.dead` / `report.reaped_unidentified`. `reap_one` does the same at gc.rs:614 before returning `ReapOneOutcome::Tree { dir, bytes }`. The callers in src/sandbox/projects.rs then print `reclaimed: <path> (<size>)` (projects.rs:62-66), `reclaimed N dead project tree(s), freed up to <total>` (projects.rs:70-74), `reclaimed (no marker, deadness unverified)` (projects.rs:97-101) and `removed: <dir>` (projects.rs:696-705) on the strength of a result nobody looked at.
+
+This is the exact failure mode the same module documents and rejects a few hundred lines further down. `prune_rev_dirs` (gc.rs:1205-1213) carries a five-line comment -- "a failed removal reported as one makes `sbx gc` announce bytes that are still on the disk -- and hides the entry that keeps failing, since it is named as gone every time" -- and gates its `removed.push` on the removal succeeding; the test `a_prune_reports_the_roots_it_removed_and_not_the_ones_it_could_not` (gc.rs:2290) pins that behaviour for both loops of `prune_shared_gcroots`. The reap paths, which delete far more (whole multi-hundred-megabyte project trees) and are the ones that print a byte total, apply the opposite rule.
+
+**Scénario.** A project tree contains one entry the recursive delete cannot get past -- e.g. `<data>/projects/<id>/home/mnt` is a mount point (`remove_dir` -> EBUSY), or a subdirectory is owned by another uid so the `let _ = set_permissions` at gc.rs:1051 is a no-op and `read_dir(path)?` at gc.rs:1052 returns EACCES. `sbx projects rm --dead --yes` prints `reclaimed: /home/u/gone-proj (2.4 GiB)` and `reclaimed 1 dead project tree(s), freed up to 2.4 GiB.` and exits 0. Nothing was freed; `df` is unchanged; the next run reports the same 2.4 GiB reclaimed again, forever, and never tells the user which entry is blocking it.
+
+**Correction proposée.** Have `force_remove_dir_all`'s `io::Result` decide what goes into the report, as `prune_rev_dirs` does: in `reap_dead_projects`, `if prune && force_remove_dir_all(&dir).is_err() { continue; }` before the `dead.push`/`reaped_unidentified.push`; in `reap_one`, return a new `ReapOneOutcome::Failed(io::Error)` (or fold the error into `Tree`) so `projects_rm` can say which tree could not be removed and set `had_error`.
+
+**Rectification du vérificateur.** Survives as stated. One correction to the proposed fix rather than the finding: `force_remove_dir_all` can fail *after* removing most of a tree (it propagates the first `?` inside the recursion, gc.rs:1052-1057), so `continue`-ing on error would hide a tree that is now partly gone and whose measured `bytes` are partly real. Threading the `io::Error` into the report — the shape `AppPurgeReport.failed` already uses — is the fix that stays honest in both directions.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Line numbers are exact. `grep -n 'let _ = force_remove_dir_all'` in gc.rs returns 518, 530, 614 — 518 inside the `Some(path) if project_is_gone(&path)` arm followed by an unconditional `dead.push(DeadTree { path, bytes })`, 530 inside the `None` arm followed by an unconditional `reaped_unidentified.push(...)`, 614 in `reap_one` followed by an unconditional `ReapOneOutcome::Tree { dir, bytes }`. The only two callers in the tree are projects.rs:44 and projects.rs:680; both print success on that basis — projects.rs prints `{ok}reclaimed{r}` per tree and `reclaimed {n} dead project tree(s), freed up to {size}.` whenever `prune` is set, `{ok}reclaimed{r} {warn}(no marker, deadness unverified){r}` for the markerless loop, and `{ok}removed{r}` in the `ReapOneOutcome::Tree` arm. The contrast is real and documented: `prune_rev_dirs` (gc.rs:1194-1214) carries the five-line comment the reporter quotes and gates `removed.push` on `force_remove_dir_all(&entry.path()).is_err()`, the sibling loop at gc.rs:1182-1185 says "Only what went, for the reason [`prune_rev_dirs`] gives", the test at gc.rs:2290 pins it, and `AppPurgeReport` (gc.rs:1250-1257) models failures explicitly. Nothing in the reap doc comments (gc.rs:462-478, gc.rs:586-590) claims the discard is deliberate.
+
+</details>
+
+---
+
+### B19 — `prune_app_tools` builds the delete path from the *sanitised* display name, so a tool whose real directory name is not sanitise-stable is reported as pruned but never removed
+
 | | |
 |---|---|
 | **Gravité** | Moyenne |
@@ -629,61 +733,8 @@ Every citation verifies. gc.rs:881 is exactly `let dir = installs.join(&tool.nam
 
 ---
 
-### B18 — `reap_dead_projects`/`reap_one` report a tree as reclaimed even when `force_remove_dir_all` failed, contradicting the rule `prune_rev_dirs` states and a test pins
-| | |
-|---|---|
-| **Gravité** | Moyenne |
-| **Emplacement** | `src/sandbox/gc.rs:518` |
-| **Catégorie** | `error-handling` |
-| **Sous-système** | Cycle de vie des sessions (gc, projects, attach) |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** `reap_dead_projects` discards the removal result (`let _ = force_remove_dir_all(&dir);`, gc.rs:518 for a dead tree and gc.rs:530 for a `--markerless` one) and then unconditionally pushes the entry into `report.dead` / `report.reaped_unidentified`. `reap_one` does the same at gc.rs:614 before returning `ReapOneOutcome::Tree { dir, bytes }`. The callers in src/sandbox/projects.rs then print `reclaimed: <path> (<size>)` (projects.rs:62-66), `reclaimed N dead project tree(s), freed up to <total>` (projects.rs:70-74), `reclaimed (no marker, deadness unverified)` (projects.rs:97-101) and `removed: <dir>` (projects.rs:696-705) on the strength of a result nobody looked at.
-
-This is the exact failure mode the same module documents and rejects a few hundred lines further down. `prune_rev_dirs` (gc.rs:1205-1213) carries a five-line comment -- "a failed removal reported as one makes `sbx gc` announce bytes that are still on the disk -- and hides the entry that keeps failing, since it is named as gone every time" -- and gates its `removed.push` on the removal succeeding; the test `a_prune_reports_the_roots_it_removed_and_not_the_ones_it_could_not` (gc.rs:2290) pins that behaviour for both loops of `prune_shared_gcroots`. The reap paths, which delete far more (whole multi-hundred-megabyte project trees) and are the ones that print a byte total, apply the opposite rule.
-
-**Scénario.** A project tree contains one entry the recursive delete cannot get past -- e.g. `<data>/projects/<id>/home/mnt` is a mount point (`remove_dir` -> EBUSY), or a subdirectory is owned by another uid so the `let _ = set_permissions` at gc.rs:1051 is a no-op and `read_dir(path)?` at gc.rs:1052 returns EACCES. `sbx projects rm --dead --yes` prints `reclaimed: /home/u/gone-proj (2.4 GiB)` and `reclaimed 1 dead project tree(s), freed up to 2.4 GiB.` and exits 0. Nothing was freed; `df` is unchanged; the next run reports the same 2.4 GiB reclaimed again, forever, and never tells the user which entry is blocking it.
-
-**Correction proposée.** Have `force_remove_dir_all`'s `io::Result` decide what goes into the report, as `prune_rev_dirs` does: in `reap_dead_projects`, `if prune && force_remove_dir_all(&dir).is_err() { continue; }` before the `dead.push`/`reaped_unidentified.push`; in `reap_one`, return a new `ReapOneOutcome::Failed(io::Error)` (or fold the error into `Tree`) so `projects_rm` can say which tree could not be removed and set `had_error`.
-
-**Rectification du vérificateur.** Survives as stated. One correction to the proposed fix rather than the finding: `force_remove_dir_all` can fail *after* removing most of a tree (it propagates the first `?` inside the recursion, gc.rs:1052-1057), so `continue`-ing on error would hide a tree that is now partly gone and whose measured `bytes` are partly real. Threading the `io::Error` into the report — the shape `AppPurgeReport.failed` already uses — is the fix that stays honest in both directions.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Line numbers are exact. `grep -n 'let _ = force_remove_dir_all'` in gc.rs returns 518, 530, 614 — 518 inside the `Some(path) if project_is_gone(&path)` arm followed by an unconditional `dead.push(DeadTree { path, bytes })`, 530 inside the `None` arm followed by an unconditional `reaped_unidentified.push(...)`, 614 in `reap_one` followed by an unconditional `ReapOneOutcome::Tree { dir, bytes }`. The only two callers in the tree are projects.rs:44 and projects.rs:680; both print success on that basis — projects.rs prints `{ok}reclaimed{r}` per tree and `reclaimed {n} dead project tree(s), freed up to {size}.` whenever `prune` is set, `{ok}reclaimed{r} {warn}(no marker, deadness unverified){r}` for the markerless loop, and `{ok}removed{r}` in the `ReapOneOutcome::Tree` arm. The contrast is real and documented: `prune_rev_dirs` (gc.rs:1194-1214) carries the five-line comment the reporter quotes and gates `removed.push` on `force_remove_dir_all(&entry.path()).is_err()`, the sibling loop at gc.rs:1182-1185 says "Only what went, for the reason [`prune_rev_dirs`] gives", the test at gc.rs:2290 pins it, and `AppPurgeReport` (gc.rs:1250-1257) models failures explicitly. Nothing in the reap doc comments (gc.rs:462-478, gc.rs:586-590) claims the discard is deliberate.
-
-</details>
-
----
-
-### B19 — `sbx upgrade`'s resolver cage omits the mise `nix:` tools, the prebuilt bins and every app overlay the launch cage carries
-| | |
-|---|---|
-| **Gravité** | Moyenne |
-| **Emplacement** | `src/sandbox/resolve.rs:84` |
-| **Catégorie** | `inconsistency` |
-| **Sous-système** | Provisionnement (nix, mise, flakes) |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** `UpgradeCage::build` claims (lines 59-61) to assemble "the same hermetic base userland plus the project's `nix:` package bins a launch gives a resolve command, so a command runs identically at first launch and at upgrade", and line 82-83 repeats it ("The app's `nix:` bins ... resolves at upgrade time exactly as it does at launch"). It then builds `bins` from `userland.bin_paths` plus `packages::provision(nix, layout, project, &nixpkgs, &cfg.packages)` only. The launch-time cage is assembled at src/sandbox/launch.rs:3572-3581 from `userland.bin_paths` plus `bin_paths`, which at that point holds three families: `mise_tools(prep).bins` (the `nix:` tools declared in the project's mise file, launch.rs:3528-3532), `packages.bins`, and every direct prebuilt package's bin dir pushed by the `DIRECT_ORDER` loop (launch.rs:3547-3560). None of the first and third reach `UpgradeCage`. Worse, `cfg.packages` is the project baseline, while `prebuilt::declared` (prebuilt.rs:733-738) and `has_resolve_ref` (prebuilt.rs:766-770) both walk each app's *merged* package list — so an app-scoped `<backend>:resolve` package is rolled by `upgrade` using a cage that never saw that app's own `nix:` packages either. The two paths that the comment asserts are identical are three families apart.
-
-**Scénario.** A project declares `"nix:yq-go" = "latest"` under `[tools]` in `.mise.toml`, and in `.sbx.toml` `app = "tarball:resolve"` with `[tarball.app] resolve = ["sh","-c","curl -sfL https://api.example.com/v | yq -r .url"]`. The first launch provisions `yq-go` host-side, puts its bin on the resolve cage's PATH, runs the command and pins the package. `sbx upgrade tarball` then builds `UpgradeCage` without that bin, the command dies with `yq: command not found`, `resolve_url` folds the stderr into `Upgrade::Failed`, and `sbx upgrade` exits non-zero reporting the package as un-rollable. It will never roll — the same failure repeats on every upgrade while the launch keeps working, so the package silently stays frozen at its first pin. The identical failure occurs for a resolve command that uses a `deb:`/`tarball:` package's binary, or for any resolver declared inside an app whose tool is declared in that app.
-
-**Correction proposée.** Build the upgrade cage's `bins` the way the launch does: prepend `nixhub::provision(...)` bins for the project's mise `nix:` tools (from `cfg.mise`, trusted-only), append the direct prebuilt packages' bin dirs, and walk `cfg.apps` with `merge_app` so an app-scoped resolver sees its own app's packages — or, if that set genuinely cannot be reproduced here, correct the three comments so they stop asserting parity that does not exist.
-
-**Rectification du vérificateur.** Mechanism is accurate; severity is medium rather than high. The divergence bites only a resolve command that reaches for a tool outside sbx's base userland and outside the baseline `[packages]` nix:/flake: layer, and it fails loudly (non-zero `sbx upgrade`, one `re-resolve failed` line per package) rather than silently: launches keep working off the existing pin. Also note the reporter's fix list is slightly off — the missing families are provisioned via `nixhub::provision` (mise `nix:` tools) and `prebuilt::provision` (direct bins), and rebuilding the direct layer at upgrade time is itself expensive, so correcting the three comments is the cheaper of the two remedies they offer.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Verified end to end. src/sandbox/resolve.rs:84 is exactly `if let Ok(p) = super::packages::provision(nix, layout, project, &nixpkgs, &cfg.packages) { bins.extend(p.bins); }` and that is the ONLY addition to `userland.bin_paths` (resolve.rs:81-86). `packages::provision` realises only `Backend::Nix` and `Backend::Flake` (src/sandbox/packages.rs:105-124; every prebuilt variant hits the explicit `continue` at packages.rs:137-147). The launch cage is strictly larger: `let mut bin_paths = tools.bins;` (launch.rs:3534, from `mise_tools(prep)` at launch.rs:3530 -> `nixhub::provision`, launch.rs:5365), then `bin_paths.extend(packages.bins)` (launch.rs:3535), then the `DIRECT_ORDER` loop pushes each prebuilt bin (launch.rs:3546-3552), and only then `let mut bins = prep.userland.bin_paths.clone(); bins.extend(bin_paths.iter().cloned());` (launch.rs:3573-3574). The parity claims are explicit and false for the upgrade path: resolve.rs:59-61 ("the same hermetic base userland plus the project's `nix:` package bins a launch gives a resolve command, so a command runs identically at first launch and at upgrade"), resolve.rs:82 ("The app's `nix:` bins ... exactly as it does at launch") and prebuilt.rs:640-642 ("a resolve command runs with every direct package's bin on `PATH`"). The app-overlay half also holds: `declared` materialises `merge_app` per app (prebuilt.rs:733-738) and `has_resolve_ref` does the same (prebuilt.rs:766-770), so an app-scoped resolver is rolled against a cage built from the baseline `cfg.packages` alone. Consequence chain confirmed: `resolve_url` failure -> `Upgrade::Failed` (prebuilt.rs:1067-1070), the prior pin is never removed (only successful resolutions `lock.insert`), and `upgrade_tarball_packages`/`upgrade_deb_packages` return false on any `Failed` (cli/upgrade.rs:1350-1353, 1180-1183), which feeds `ok &= ...` at cli/upgrade.rs:309. Nothing in the file argues the reduction is deliberate; the only deliberate narrowing commented there is the channel choice (resolve.rs:71-73).
-
-</details>
-
----
-
 ### B20 — A removed `nix:` mise tool's gcroot under `nix-tools/` is never pruned, pinning its store closure forever
+
 | | |
 |---|---|
 | **Gravité** | Moyenne |
@@ -709,7 +760,35 @@ Confirmed. `nixhub::provision` builds the out-link directory at src/sandbox/nixh
 
 ---
 
-### B21 — `sbx search` prints a `[packages]` declaration line that is invalid TOML for any dotted nixhub package name
+### B21 — `sbx upgrade`'s resolver cage omits the mise `nix:` tools, the prebuilt bins and every app overlay the launch cage carries
+
+| | |
+|---|---|
+| **Gravité** | Moyenne |
+| **Emplacement** | `src/sandbox/resolve.rs:84` |
+| **Catégorie** | `inconsistency` |
+| **Sous-système** | Provisionnement (nix, mise, flakes) |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** `UpgradeCage::build` claims (lines 59-61) to assemble "the same hermetic base userland plus the project's `nix:` package bins a launch gives a resolve command, so a command runs identically at first launch and at upgrade", and line 82-83 repeats it ("The app's `nix:` bins ... resolves at upgrade time exactly as it does at launch"). It then builds `bins` from `userland.bin_paths` plus `packages::provision(nix, layout, project, &nixpkgs, &cfg.packages)` only. The launch-time cage is assembled at src/sandbox/launch.rs:3572-3581 from `userland.bin_paths` plus `bin_paths`, which at that point holds three families: `mise_tools(prep).bins` (the `nix:` tools declared in the project's mise file, launch.rs:3528-3532), `packages.bins`, and every direct prebuilt package's bin dir pushed by the `DIRECT_ORDER` loop (launch.rs:3547-3560). None of the first and third reach `UpgradeCage`. Worse, `cfg.packages` is the project baseline, while `prebuilt::declared` (prebuilt.rs:733-738) and `has_resolve_ref` (prebuilt.rs:766-770) both walk each app's *merged* package list — so an app-scoped `<backend>:resolve` package is rolled by `upgrade` using a cage that never saw that app's own `nix:` packages either. The two paths that the comment asserts are identical are three families apart.
+
+**Scénario.** A project declares `"nix:yq-go" = "latest"` under `[tools]` in `.mise.toml`, and in `.sbx.toml` `app = "tarball:resolve"` with `[tarball.app] resolve = ["sh","-c","curl -sfL https://api.example.com/v | yq -r .url"]`. The first launch provisions `yq-go` host-side, puts its bin on the resolve cage's PATH, runs the command and pins the package. `sbx upgrade tarball` then builds `UpgradeCage` without that bin, the command dies with `yq: command not found`, `resolve_url` folds the stderr into `Upgrade::Failed`, and `sbx upgrade` exits non-zero reporting the package as un-rollable. It will never roll — the same failure repeats on every upgrade while the launch keeps working, so the package silently stays frozen at its first pin. The identical failure occurs for a resolve command that uses a `deb:`/`tarball:` package's binary, or for any resolver declared inside an app whose tool is declared in that app.
+
+**Correction proposée.** Build the upgrade cage's `bins` the way the launch does: prepend `nixhub::provision(...)` bins for the project's mise `nix:` tools (from `cfg.mise`, trusted-only), append the direct prebuilt packages' bin dirs, and walk `cfg.apps` with `merge_app` so an app-scoped resolver sees its own app's packages — or, if that set genuinely cannot be reproduced here, correct the three comments so they stop asserting parity that does not exist.
+
+**Rectification du vérificateur.** Mechanism is accurate; severity is medium rather than high. The divergence bites only a resolve command that reaches for a tool outside sbx's base userland and outside the baseline `[packages]` nix:/flake: layer, and it fails loudly (non-zero `sbx upgrade`, one `re-resolve failed` line per package) rather than silently: launches keep working off the existing pin. Also note the reporter's fix list is slightly off — the missing families are provisioned via `nixhub::provision` (mise `nix:` tools) and `prebuilt::provision` (direct bins), and rebuilding the direct layer at upgrade time is itself expensive, so correcting the three comments is the cheaper of the two remedies they offer.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Verified end to end. src/sandbox/resolve.rs:84 is exactly `if let Ok(p) = super::packages::provision(nix, layout, project, &nixpkgs, &cfg.packages) { bins.extend(p.bins); }` and that is the ONLY addition to `userland.bin_paths` (resolve.rs:81-86). `packages::provision` realises only `Backend::Nix` and `Backend::Flake` (src/sandbox/packages.rs:105-124; every prebuilt variant hits the explicit `continue` at packages.rs:137-147). The launch cage is strictly larger: `let mut bin_paths = tools.bins;` (launch.rs:3534, from `mise_tools(prep)` at launch.rs:3530 -> `nixhub::provision`, launch.rs:5365), then `bin_paths.extend(packages.bins)` (launch.rs:3535), then the `DIRECT_ORDER` loop pushes each prebuilt bin (launch.rs:3546-3552), and only then `let mut bins = prep.userland.bin_paths.clone(); bins.extend(bin_paths.iter().cloned());` (launch.rs:3573-3574). The parity claims are explicit and false for the upgrade path: resolve.rs:59-61 ("the same hermetic base userland plus the project's `nix:` package bins a launch gives a resolve command, so a command runs identically at first launch and at upgrade"), resolve.rs:82 ("The app's `nix:` bins ... exactly as it does at launch") and prebuilt.rs:640-642 ("a resolve command runs with every direct package's bin on `PATH`"). The app-overlay half also holds: `declared` materialises `merge_app` per app (prebuilt.rs:733-738) and `has_resolve_ref` does the same (prebuilt.rs:766-770), so an app-scoped resolver is rolled against a cage built from the baseline `cfg.packages` alone. Consequence chain confirmed: `resolve_url` failure -> `Upgrade::Failed` (prebuilt.rs:1067-1070), the prior pin is never removed (only successful resolutions `lock.insert`), and `upgrade_tarball_packages`/`upgrade_deb_packages` return false on any `Failed` (cli/upgrade.rs:1350-1353, 1180-1183), which feeds `ok &= ...` at cli/upgrade.rs:309. Nothing in the file argues the reduction is deliberate; the only deliberate narrowing commented there is the channel choice (resolve.rs:71-73).
+
+</details>
+
+---
+
+### B22 — `sbx search` prints a `[packages]` declaration line that is invalid TOML for any dotted nixhub package name
+
 | | |
 |---|---|
 | **Gravité** | Moyenne |
@@ -735,7 +814,234 @@ Confirmed at the cited line. src/sandbox/search.rs:230-232 emits `"  [packages] 
 
 ---
 
-### B22 — `app_prefixed_key` rejects a dotted app name on the strength of a splitter limitation that no longer exists
+### B23 — Two tasks naming different versions of one tool can never both be satisfied; the pool config flips every launch and one task fails with "command not found"
+
+| | |
+|---|---|
+| **Gravité** | Moyenne |
+| **Emplacement** | `src/sandbox/taskpool.rs:210` |
+| **Catégorie** | `logic-bug` |
+| **Sous-système** | Concurrence, verrous, pools |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** `bins_for` requires `recorded.get(locator).map(String::as_str) == Some(wanted_spec(wanted))` for *every* declared token. `recorded_specs` returns a `BTreeMap<String, String>` keyed by locator (taskpool.rs:148-172), so it holds **at most one** spec per tool — as does mise's `[tools]` table it is read from. Therefore when two tasks in one project declare `node@22` and `node@24`, at most one of the two tokens can ever have `pinned == true`, and the other is pushed onto `missing` forever, regardless of what is actually installed on disk.
+
+That is not hypothetical for this codebase: `upgrade_argv`'s own test fixture is `["node@22", "aqua:cli/gh", "node@24"]` (taskpool.rs:846-860), with a doc line explaining that duplicates collapse because "two tasks sharing a tool roll it once".
+
+Worse, `ensure` re-runs the install with only the currently-missing set (`mise use -g node@22`), which rewrites `[tools] node` to the *other* value — so the pin oscillates launch to launch and the guard that exists to detect drift can never converge. The comment at taskpool.rs:186-194 argues "failing *toward* re-running is cheap"; here re-running provably cannot fix the state.
+
+**Scénario.** A project declares `[task.a] packages = ["mise:node@22"]` and `[task.b] packages = ["mise:node@24"]`. `declared_packages()` yields both. Launch 1: `missing` is both, the install cage runs `mise use -g node@22 node@24`, config ends up `node = "24"`. `bins_for` now reports `node@22` missing, so `sbx task invoke a` gets `pool_bins() == None` (no shims on PATH) and fails with `node: command not found`, while `b` works. Launch 2: `ensure` sees `missing = ["node@22"]`, runs a full install cage again, config flips to `node = "22"` — and now task `b` is the one that fails. The project never reaches `PoolOutcome::Warm`, so every single launch pays a bwrap+mise install-cage run before the agent starts.
+
+**Correction proposée.** Detect the conflict instead of looping on it. In `bins_for` (or at config-resolve time in `TaskEngine::declared_packages`), group tokens by locator and refuse — or warn once and pick a single spec — when one locator carries two different `wanted_spec` values, e.g.:
+
+```rust
+let mut pinned_by: HashMap<&str, &str> = HashMap::new();
+for token in tokens {
+    let (locator, wanted) = split_version(token);
+    if let Some(prev) = pinned_by.insert(locator, wanted_spec(wanted))
+        && prev != wanted_spec(wanted) {
+        // one pool, one global mise config: this can never be satisfied
+    }
+}
+```
+
+A declaration that cannot be realised should be reported once as a configuration error, not turned into an install cage that runs on every launch forever.
+
+**Rectification du vérificateur.** Severity overstated and one part of the mechanism is speculative. The oscillation ("the pin flips launch to launch") assumes `mise use -g node@22` rewrites the whole `[tools] node` entry last-wins; mise also supports an array form (`node = ["22", "24"]`), which `recorded_specs`'s line-wise parse (taskpool.rs:167-171) would read as the literal value `["22", "24"]` and match against neither token. In that case there is no flip — both tokens stay missing and *both* tasks lose their shims, which is a different (and worse) shape than described. Also note the conflict is inherent, not just unhandled: one pool means one global mise config and one `shims/` directory, and mise cannot put two versions of one tool on one PATH either. The real defect is therefore the missing detection — sbx accepts an unsatisfiable declaration silently and converts it into an unbounded per-launch install-cage run — not that the two versions "should" both work. Finally, the reporter's own example (`node@22` / `node@24`) is confounded by the partial-version/symlink problem in the previous finding: with those tokens neither side is ever `realized`, so the conflict only produces the described one-wins/one-loses split for exact versions.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+The mechanism checks out. `recorded_specs` returns `BTreeMap<String, String>` keyed by locator (taskpool.rs:151-175), so `recorded.get(locator)` yields at most one spec, and taskpool.rs:210 requires it to equal `wanted_spec(wanted)` for every declared token — so of `node@22.3.0` and `node@24.4.1`, at most one can ever be `pinned`. Nothing upstream groups by locator or objects: `declared_packages` (task.rs:515-523) dedupes only byte-identical tokens, `validate_task_packages` (config/tasks.rs:565-567) likewise, and `ensure` (taskpool.rs:270-297) re-runs the install cage with whatever `bins_for` still calls missing, with no convergence check. So the state is genuinely non-convergent: `bins_for(...).missing` is never empty, `ensure`'s short-circuits at taskpool.rs:264 and 276 never fire, and launch.rs:5151 pays a bwrap+mise install-cage run on every single launch while `pool_bins` (task.rs:1318-1325) returns `None` for the losing task. No comment or doc declares this limitation — docs-site/docs/guide/tasks/execution.md:243-245 says only that the pool is shared, not that one tool may carry one version.
+
+</details>
+
+---
+
+### B24 — LONGEST_SOCKET_SUFFIX omits the broker plugin socket, so DATA_DIR_MAX does not bound sun_path
+
+| | |
+|---|---|
+| **Gravité** | Moyenne |
+| **Emplacement** | `src/store.rs:323` |
+| **Catégorie** | `logic-bug` |
+| **Sous-système** | Point d'entrée, diagnostics, store, chemins |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** `LONGEST_SOCKET_SUFFIX` (src/store.rs:323) is fixed at 33 bytes from a comment (src/store.rs:313-322) that claims "Every feature that binds an `AF_UNIX` socket under the data directory contributes one; the widest is what the cap must reserve for." It lists four families. The tree has at least ten, and the one it omits is the only *unbounded* one: `sandbox::broker::host_socket` (src/sandbox/broker.rs:1577) builds `<data>/broker/<pid>/<name>.sock` and `UnixListener::bind`s it at src/sandbox/broker.rs:1660. With a 7-digit pid that suffix is `21 + name.len()` bytes, so any broker whose `[broker.<name>]` key is 13 characters or longer exceeds 33. There is no length bound on the name: `plugins::validate_install_name` (src/plugins/mod.rs:1597) checks charset and leading dot only, and `config::is_valid_app_name`'s 64-byte cap does not apply to broker keys. The tests at src/store.rs:2321-2353 only compare a synthetic path against `LONGEST_SOCKET_SUFFIX` itself, so nothing holds the constant against a real socket path. (The list is also mislabelled: line 318 calls `/fs/control-<pid>.sock` "exec-enforcement control", but per DATA_ENTRIES in src/paths.rs `fs/` is filesystem observation and `proc/` is exec enforcement.)
+
+**Scénario.** DATA_DIR_MAX is 107 − 33 = 74. Set `SBX_DATA_DIR` to a 74-byte absolute path — accepted by `check_data_dir_override`, which reports it fits "because sbx binds sockets under it". Declare `[broker.postgres-primary]` (16 chars) and launch with pid 1234567 (kernel.pid_max is 4194304 on a modern host). The bind path is 74 + len("/broker/1234567/")=16 + 16 + len(".sock")=5 = 111 > 107, so `UnixListener::bind` at src/sandbox/broker.rs:1660 fails with `InvalidInput: path must be shorter than SUN_LEN` and the launch reports a broker socket error — exactly the "fails at launch … with a message about a socket rather than about the directory" outcome `check_data_dir_override` exists to prevent, on a directory it explicitly approved.
+
+**Correction proposée.** Either widen the sample so the constant reserves for the widest real bind — include `/broker/<pid>/<name>.sock` with the maximum permitted broker-name length — or, better, bound the broker name so the family is fixed-width (add a length cap to `plugins::validate_install_name` and to the `[broker.<name>]` key validation) and add the broker path to the enumerated list. Also correct the `fs/` label on src/store.rs:318, and add a test that measures the real socket-path builders against `LONGEST_SOCKET_SUFFIX` rather than restating the constant.
+
+**Rectification du vérificateur.** Mechanism confirmed; one citation is two lines off — `host_socket` is src/sandbox/broker.rs:1575-1577, not 1577. Trigger needs both a data directory near the 74-byte cap and a broker key of ~13+ characters (16+ at a typical 4-digit pid), so it is an edge case, but it defeats an invariant the code states in its own comment and lands the user with the exact socket-shaped launch failure the guard was written to convert into a directory-shaped one.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Traced end to end and found nothing preventing it. src/store.rs:323 `const LONGEST_SOCKET_SUFFIX: usize = "/forward/fwd-1234567/p-65535.sock".len();` (33), src/store.rs:326 `DATA_DIR_MAX = SUN_PATH_MAX - LONGEST_SOCKET_SUFFIX` (74), enforced at store.rs:346 (`check_data_dir_override`) and store.rs:369 (`check_resolved_data_dir`). The enumeration at store.rs:313-322 ends with an explicit invariant — "A new feature whose host socket path is wider than this must widen the sample below, or a data directory the cap accepts would still overrun `sun_path` at that feature's first launch" — so the comment supports the finding rather than excusing it. The broker family violates it: `sockets_dir` = `<data>/broker/<pid>` (src/sandbox/broker.rs:1570-1572), `host_socket` appends `<name>.sock` (src/sandbox/broker.rs:1575-1577), and `UnixListener::bind(&host_uds)?` at src/sandbox/broker.rs:1660 uses `layout.data_dir()` (broker.rs:1658). Suffix = 21 + name.len() with a 7-digit pid, so a 13-char broker key already exceeds 33. No length bound exists on the key: `resolve_brokers` (src/config/mod.rs:4112-4200) validates `socket`, `secret` and unknown keys but never the name's length, and `plugins::validate_install_name` (src/plugins/mod.rs:1597-1612) checks emptiness, leading dot and charset only. The bind error is fatal and socket-shaped: src/sandbox/launch.rs:4379-4382 prints `sbx: cannot start the `<name>` broker: {e}` and returns `ExitCode::FAILURE` — precisely the outcome check_data_dir_override says it exists to prevent (store.rs:331-336). The tests at src/store.rs:2321-2353 only restate `LONGEST_SOCKET_SUFFIX` against a synthetic path; no test measures a real builder. The secondary mislabel is also confirmed: store.rs:318 calls `/fs/control-<pid>.sock` "exec-enforcement control", while src/paths.rs:142/148 assign `proc/` = "per-launch exec-enforcement sockets" and `fs/` = "per-launch filesystem-observation sockets".
+
+</details>
+
+---
+
+### B25 — The guide states the cage's uid is 1000 while the code reflects the host uid (same-uid)
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `docs-site/docs/guide/concepts/security-model.md:46` |
+| **Catégorie** | `doc-drift` |
+| **Sous-système** | Dérive documentation / code |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** `docs-site/docs/guide/concepts/security-model.md:46` — "Inside the cage the process sees a synthetic identity, `uid=1000(sandbox)`". Only the *name* is synthetic. `current_identity` (`src/sandbox/binds.rs:1416-1421`) takes `libc::getuid()`/`getgid()` verbatim, and `passwd_contents` (binds.rs:1238-1246, whose own doc says "the sandbox user (same uid/gid as the host)") interpolates those ids. `src/sandbox/argv.rs:125-131` only ever passes `--uid`/`--gid` on the netns-holder path, and passes the *host* uid there, explicitly "to keep the same-uid model".
+
+The same page asserts the correct property eight lines earlier (line 8: "runs as your uid (same-uid), so **the bind layout is the security control**"), as do README.md:31-33, `concepts/index.md:67` and `concepts/enforcement.md:8`. Line 46 is the only place that names a number, and it is wrong for every host user whose uid is not 1000.
+
+**Scénario.** A user with uid 1001 (a second account, or a distro whose uids start at 500) runs `id` inside the cage and gets `uid=1001(sandbox)`, not what the security model page told them. More consequentially, the stated remap invites the wrong conclusion about writable binds: a reader who believes the cage runs as uid 1000 assumes host files owned by their real uid are protected from cage writes by ownership, when in fact the cage writes them as the owner — which is exactly why the model insists absence, not permissions, is the control.
+
+**Correction proposée.** Rewrite line 46 as e.g. "Inside the cage the process sees a synthetic *name* — `sandbox`, with a synthetic `/etc/passwd` and `/etc/group` — over your own uid and gid (the same-uid model above); `id` reports `uid=<your uid>(sandbox)`." Either drop the literal 1000 or mark it as an example for a uid-1000 host.
+
+**Rectification du vérificateur.** Two corrections to the write-up, neither of which changes the verdict. (1) The finding says "Line 46 is the only place that names a number" — it is not: `docs-site/docs/guide/reference/glossary.md:102` ("**Synthetic identity**, the `uid=1000(sandbox)` user...") and `docs-site/docs/guide/getting-started/quickstart.md:29` ("You should see a synthetic identity (`uid=1000(sandbox)`), not your host user.") repeat the same literal, and the quickstart's "not your host user" is the more misleading of the three since the uid *is* the host user's. Any fix has to touch all three. (2) The consequence paragraph ("invites the wrong conclusion about writable binds") overstates the risk in isolation: the same page states the correct model twice above the error — line 6-8 ("the cage runs **as your uid** (same-uid), so **the bind layout is the security control**") and the whole "Same-uid: confidentiality by absence" section at 12-27, including "it runs as the uid that owns the file". A reader of the page is told the right thing before reaching line 46; the defect is a stale literal contradicting its own page, not a security claim that misleads on its own.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Verified line-for-line. `docs-site/docs/guide/concepts/security-model.md:46` reads verbatim: "Inside the cage the process sees a synthetic identity, `uid=1000(sandbox)`, with a". The code contradicts the literal: `src/sandbox/binds.rs:1417-1424` `fn current_identity()` does `let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };` and only synthesises `user: "sandbox".to_string()`, and its own doc at 1415 says "The host identity to reflect into the sandbox (same-uid model)". `passwd_contents` (binds.rs:1238-1246) interpolates those ids straight into `{user}:x:{uid}:{gid}:...`, under a doc comment that says "the sandbox user (same uid/gid as the host)". The only `--uid`/`--gid` emission in the whole crate is `src/sandbox/argv.rs:127-132` (grep for `"--uid"` returns argv.rs:128 plus one test at 361), on the netns-holder branch only, and it passes `nd.uid`, which `src/sandbox/launch.rs:5076-5078` fills from `libc::getuid()`/`getgid()`; the comment at argv.rs:124-126 states the intent — "map the cage back to the host uid/gid to keep the same-uid model". `spec.rs:168-169` documents the field as "The host uid the cage is mapped to (`--uid`), preserving the same-uid model." No `setuid`/`setresuid` anywhere. So on any host whose uid is not 1000, `id` inside the cage prints that host uid, not 1000. The literal 1000 in the tree appears only in tests (binds.rs:3064-3074 constructs an `Identity { uid: 1000, gid: 1000 }` fixture) — nothing forces it at runtime. The claim is accurate and the severity (low, doc-only) is right.
+
+</details>
+
+---
+
+### B26 — `sbx app rm <name> --purge` reports "no profile and no home" for a profile it just failed to delete
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/cli/app.rs:1224` |
+| **Catégorie** | `ux-error-message` |
+| **Sous-système** | CLI — dispatcher, app, session, logs, storage |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** `app_rm_purge_one` keeps `profile_failed` and `profile_removed` as separate flags precisely so an undeletable profile is not confused with an absent one — the long comment at app.rs:1172-1177 spells that out. But the no-op check at app.rs:1224 tests only `!profile_removed && report.found_nothing()`, so the `profile_failed` case falls into it and prints "sbx: nothing to purge for '{name}' (no profile and no home)" one line after "sbx: cannot remove {path}: {e}". The two messages contradict each other, and the second is the one that reads as the verdict. It also returns `acted: false`, which is what makes the batch in `app_rm_purge` skip its closing note (app.rs:1113-1121).
+
+**Scénario.** Make the profiles directory non-writable (`chmod a-w ~/.config/sbx/apps`) and run `sbx app rm demo-app --purge` for an app with an imported profile and no home yet. Output: "sbx: cannot remove /home/u/.config/sbx/apps/demo-app.toml: Permission denied" followed by "sbx: nothing to purge for 'demo-app' (no profile and no home)" — the second sentence denies the existence of the file the first sentence just named.
+
+**Correction proposée.** Guard the no-op arm with the flag the function already tracks: `if !profile_removed && !profile_failed && report.found_nothing()`. A `profile_failed` name should fall through to the summary path so it reports "purged with errors" (which `clean` at app.rs:1246 already computes from `profile_failed`), or get its own message naming the profile that survived.
+
+**Rectification du vérificateur.** Survives, but two parts of the reporter's mechanism need correcting. (1) The comment at src/cli/app.rs:1172-1177 does not claim the no-op check distinguishes the two states — it says the collapsed flag "fed the 'nothing found' check and the summary's wording" and describes fixing the exit code/summary, so the no-op check was left as-is rather than contradicted. (2) The exit code is NOT wrong: `acted: false` also carries `ok: false`, so `app_rm_purge` sets had_error and `!purged_any` returns ExitCode::FAILURE (src/cli/app.rs:1077-1085). Skipping the closing gc note is also defensible, since nothing was actually reclaimed. The whole defect is the contradictory sentence.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Confirmed at the cited line: src/cli/app.rs:1224 is `if !profile_removed && report.found_nothing() {` followed by "sbx: nothing to purge for '{name}' (no profile and no home)" at src/cli/app.rs:1226, while the non-NotFound arm above (src/cli/app.rs:1213-1217) prints "sbx: cannot remove {}: {e}", sets `profile_failed = true` and yields `profile_removed = false`. `profile_failed` is consulted only at src/cli/app.rs:1246 (`let clean = report.failed.is_empty() && !profile_failed;`), which the early return at 1228-1231 never reaches. Reachability holds: `config::profile_path` (src/config/load.rs:658-660) only joins a path and never checks existence, so an existing profile in a non-writable directory yields Err(PermissionDenied), and with no homes on disk `report.found_nothing()` (src/sandbox/gc.rs:642-644) is true — the two contradictory sentences print back to back. No caller pre-validates that the profile exists (app_rm at src/cli/app.rs:912-952 only validates the name charset).
+
+</details>
+
+---
+
+### B27 — The flag menu goes dead after any typed flag, not just after a positional value
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/cli/completion.rs:225` |
+| **Catégorie** | `logic-bug` |
+| **Sous-système** | Aide et complétion shell |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** In the fallback branch of `candidates`, the command's own options are offered only when
+
+    if tail_at == before.len() { names.extend(flag_menu(&path)); }
+
+`tail_at` is the index just past the last *command* word, so this is true only when nothing at all has been typed after the command path. The comment above it states a different rule — "Bare on a command path (`sbx run <TAB>`, `sbx net logs <TAB>`), the menu is the command's own options; past a typed **value** it belongs to the launched command" — i.e. the gate is meant to fire on a positional value, not on a flag. Pages with no operand slots (`run`, `gc`, `doctor`, `net logs`, `net rules`, `net live`, `proc rules`, `logs`, `config edit`, `session ls`, …) therefore answer an empty cursor word with zero candidates as soon as one flag is present, and the emitted bash script deliberately drops `-o default`, so the prompt is dead rather than falling back to files.
+
+**Scénario.** `sbx net logs <TAB>` offers all eleven documented flags; `sbx net logs -f <TAB>` offers nothing. `sbx gc <TAB>` offers `--all --prune --optimise --optimize --help`; `sbx gc --prune <TAB>` offers nothing. Typing `-` first still works, so the breakage is silent and looks like completion having simply stopped.
+
+**Correction proposée.** Replace the gate with the condition the comment describes: offer the flag menu unless a non-flag word (that is not some flag's consumed value) has been typed after the command path — the information `cursor_value_kind` already computes while walking `before[tail_at..]`.
+
+**Rectification du vérificateur.** Survives, but the page list overstates it. `logs` is not affected — it has an `<id>` operand row (src/help.rs:665-667), so `cursor_value_kind` returns `Some(Sessions)` and its menu keeps answering after `-f`. `doctor` (src/help.rs:65) and `session ls` (src/help.rs:1153) declare `options: &[]`, so the only candidate lost there is the synthesized `--help`. The real cases are the flag-only pages listed above. Worth adding that the same gate also empties the menu after a flag's *value* (`sbx net rules -a myapp <TAB>`), where the value word is correctly consumed as the flag's — so even a fully-understood line goes quiet.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+The gate at src/cli/completion.rs:225 is `if tail_at == before.len() {`, and `tail_at` is set only while walking command words (:178), so it equals `before.len()` only when nothing whatsoever follows the command path — flags included. The comment directly above (:222-224) states a different rule ("past a typed **value** it belongs to the launched command"). For a page whose rows are all flags, `operand_slots` returns empty, `cursor_value_kind` reaches :802 with `slots.get(0) == None`, `all_literal_words` gives `None`, and the else branch is the only candidate source — so one typed flag empties it. Verified against flag-only pages: `gc` (src/help.rs:1661-1680), `net logs` (src/help.rs:2650-...), `net rules` (src/help.rs:2136-2157), `net live` (src/help.rs:2800-2817), `config edit` (src/help.rs:1481-1489). The `-o default` omission is real (src/cli/completion.rs:1017-1019), so the prompt is dead rather than falling back to files, and `cur` starting with `-` still reaches the flag branch at :186, which is why typing `-` first hides the breakage. No test pins the current behaviour: `a_positional_value_does_not_deepen_the_path` (src/cli/completion.rs:1233-1249) covers a typed *value*, not a typed flag.
+
+</details>
+
+---
+
+### B28 — The emitted bash script ignores COMP_WORDBREAKS, so `:`/`=` words complete nothing there
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/cli/completion.rs:1028` |
+| **Catégorie** | `inconsistency` |
+| **Sous-système** | Aide et complétion shell |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : moyenne) |
+
+**Constat.** The bash function forwards `COMP_WORDS` verbatim:
+
+    typed=("${COMP_WORDS[@]:1:COMP_CWORD-1}")
+    typed+=("${COMP_WORDS[COMP_CWORD]-}")
+
+Bash splits the line on `$COMP_WORDBREAKS`, whose default includes `:` and `=`, so `--net=allow` arrives as three words (`--net`, `=`, `allow`) and `api.example.com:443` as three (`api.example.com`, `:`, `443`). zsh's `${(@)words[2,CURRENT]}` splits on neither. Two consequences: the inline-value branch in `candidates` (`if let Some((flag, want)) = cur.split_once('=')`, line 189) is unreachable from bash — it only ever runs under zsh; and the stray `:`/`=` word is counted as a positional by `cursor_value_kind`, pushing the cursor past the page's operand slots. The unit tests build word lists by hand and the integration drives set `COMP_WORDS` themselves (tests/completion.rs:203-212, 450-455), so real bash word-splitting is never exercised.
+
+**Scénario.** In bash, `sbx run --net=<TAB>` and `sbx run --net=al<TAB>` offer nothing, while the same input in zsh offers none|shared|ask|allow|deny. `sbx net unallow api.example.com:<TAB>` offers nothing even though `api.example.com:443` is in the config's allow list and is offered for the bare cursor.
+
+**Correction proposée.** In the emitted bash function, reassemble the word under the cursor across word-break characters before sending it (the standard `_get_comp_words_by_ref -n :=` / `__ltrim_colon_completions` treatment), or strip `:` and `=` from `COMP_WORDBREAKS` in the script's preamble and trim the shared prefix off `COMPREPLY` entries.
+
+**Rectification du vérificateur.** The bash half is right; the zsh comparison is overstated. For `sbx run --net=<TAB>` zsh does NOT offer none|shared|ask|allow|deny either: the emitted zsh function (src/cli/completion.rs:1057-1086) never does `compset -P '*='`, so PREFIX stays `--net=` while the oracle returns bare cells (`value_candidates` returns the literals unprefixed), and compadd discards every one of them. So the inline-`=` branch at src/cli/completion.rs:190 is unreachable from bash and unusable from zsh — dead in practice in both shells, which is the sharper statement. The genuine bash-only divergence is the colon case (`sbx net unallow api.example.com:<TAB>` / `re:<TAB>`), which zsh completes and bash does not. Failure mode is silence, not a corrupted insertion, since the Rust side prefix-filters.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Cited line is exact: src/cli/completion.rs:1028 is `typed=("${COMP_WORDS[@]:1:COMP_CWORD-1}")`, followed at :1031 by `typed+=("${COMP_WORDS[COMP_CWORD]-}")`. Nothing in the repo touches COMP_WORDBREAKS (`grep -rn COMP_WORDBREAKS` over src/, tests/ and docs-site/ returns nothing), and the zsh twin at :1062 uses `${(@)words[2,CURRENT]}`, which does not split on `:`/`=`. I traced the colon case end to end: `sbx net unallow api.example.com:<TAB>` reaches candidates() with cur=":", so value_candidates(Rules{Allow}, ":") applies `out.retain(|(name,_)| name.starts_with(prefix))` (src/cli/completion.rs:~712) and rejects `api.example.com:443`; one keystroke later (`…com:44`) the stray ":" sits in `before` and is counted as a positional by cursor_value_kind (src/cli/completion.rs:786-790), pushing pos past net unallow's single `<rule>` slot so the function returns None and the menu is empty. Under zsh the same input completes, since PREFIX is `api.example.com:` and the candidate starts with it. Nothing defends bash: the drives set COMP_WORDS by hand (tests/completion.rs:202-212 and 450-455) so real word-splitting is never exercised, and no test anywhere uses a `flag=value` word (`grep -rn '"--[a-z-]*="'` over src/cli/completion.rs and tests/completion.rs returns nothing). The docs promise the opposite behaviour (docs-site/docs/guide/cli/completion.md: "A removal verb completes what it can remove"), and the ZSH doc comment at :1048-1051 shows colons in candidates were reasoned about for zsh only.
+
+</details>
+
+---
+
+### B29 — `config show --app` silently drops the notify repeat window that `config show` prints
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/cli/config.rs:1872` |
+| **Catégorie** | `inconsistency` |
+| **Sous-système** | CLI — sbx config |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** The baseline renderer builds a suffix from `repeat_after` (lines 665-670):
+
+```rust
+let every = if n.repeat_after.is_empty() { String::new() }
+            else { format!(" {dim}(a repeat waits {}){r}", n.repeat_after) };
+```
+
+and appends it to both the uniform and the per-event line. `render_app_detail`'s notify block (lines 1858-1882) reproduces the uniform/per-event logic verbatim but never reads `repeat_after` — `grep -n repeat_after src/cli/config.rs` returns only lines 666 and 669. The field is present on the app view: `AppDetailView.notify` is a full `NotifyView` (src/config/view.rs:627-633), and `build_app_detail` fills it through the same `notify_view` projection at src/config/view.rs:1635-1636, so the data is there and the renderer discards it.
+
+The drift is the exact hazard the neighbouring `write_net_posture_head` doc (lines 926-938) says it was extracted to prevent: "Keeping the preamble in one place is what stops the two from drifting: they already had, on `ask timeout: none`, where this view explained the value and the app view printed it bare." Notify was never given the same treatment.
+
+**Scénario.** Project config carries `[notify] repeat_after = "5m"` and an app `demo`. `sbx config show` prints `notify: once (a repeat waits 300s) (project)`. `sbx config show --app demo` prints `notify:  once (inherited)` — the quiet period is absent with no indication it exists, and it is not folded into the `at their default:` line either (`posture_shown` gates the whole notify block on `notify_origin`, which is not `Default` here, so the block *is* shown; only the suffix is missing). A user asking "why was I told about this refusal only once for this app" reads the per-app view, sees nothing about a repeat window, and concludes none is configured.
+
+**Correction proposée.** Compute the same `every` suffix inside `render_app_detail`'s notify block and append it to both the `Some(mode)` and `None` lines — or, following the precedent of `write_net_posture_head`, lift the notify rendering into one helper that both `notify_section` and `render_app_detail` call, with the provenance tag passed in by the caller.
+
+**Rectification du vérificateur.** The mechanism is right but the reporter's reproduction is a poor choice. `[notify] repeat_after = "5m"` with the default/uniform mode `once` trips the validator warning at src/config/validate.rs:407-416 ("`repeat_after` has no effect — it spaces out repeats, and no event is set to `always`"), so in that exact case the user is *not* left without a signal. A clean reproduction needs an event set to `always` — e.g. `[notify] mode = "always"` + `repeat_after = "5m"` — where `sbx config show` prints `notify: always (a repeat waits 300s) (project)` and `sbx config show --app demo` prints `notify:  always (inherited)` with the window gone. Two further notes: the JSON form is unaffected (`NotifyView` is `#[derive(Serialize)]` at src/config/view.rs:626 and is serialized whole), so this is a human-render-only inconsistency; and the suffix prints seconds, not the written value, because `notify_view` formats `format!("{}s", d.as_secs())` (src/config/view.rs:642-645) — which contradicts the field's own doc at src/config/view.rs:630 ("as it was written (`\"5m\"`)"). That contradiction is a separate defect from the one filed here.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Verified. `notify_section` builds the suffix at src/cli/config.rs:666-670 (`let every = if n.repeat_after.is_empty() { String::new() } else { format!(" {dim}(a repeat waits {}){r}", n.repeat_after) };`) and appends `{every}` on both branches (:675 and :682). `render_app_detail`'s notify block (guarded by `posture_shown` at :1859-1864) reproduces the same uniform/per-event logic at :1866-1880 and emits `"  {h}notify:{r}  {mode}{notify_tag}"` (:1874) and `"  {h}notify:{r}  {dim}per event{r}{notify_tag}"` (:1877) — no `every`. `grep -n repeat_after src/cli/config.rs` returns only 666 and 669, confirming the app renderer never reads it. The data is present: `AppDetailView.notify` is a full `NotifyView` (field at src/config/view.rs:883; struct at :627-633 with `repeat_after: String` at :632), filled by `build_app_detail` at src/config/view.rs:1635-1636 via the same `notify_view` projection (:635-647). The gating claim also holds: `posture_shown` folds only when `untouched(origin)`, i.e. `ProvenanceView::Default` (src/cli/config.rs:1713-1725), and `origin_or_inherited` (src/config/view.rs:1896-1908) returns `Inherited` when the baseline configured it — so the block prints, minus the suffix. The `write_net_posture_head` doc quoted by the reporter is real (src/cli/config.rs:929-938) and says exactly what they claim about drift. No test anywhere asserts the string "a repeat waits".
+
+</details>
+
+---
+
+### B30 — `app_prefixed_key` rejects a dotted app name on the strength of a splitter limitation that no longer exists
+
 | | |
 |---|---|
 | **Gravité** | Faible |
@@ -772,7 +1078,37 @@ The factual core checks out at every cited line. src/config/manage.rs:1258-1284 
 
 ---
 
-### B23 — `is_security_key` splits on every dot, so a quoted app-name `env` key is wrongly reported as a security field
+### B31 — `--trust` is accepted and silently ignored by `config get` and `config path`
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/cli/config.rs:2386` |
+| **Catégorie** | `dead-code` |
+| **Sous-système** | CLI — sbx config |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** `split_scope` (src/main.rs:174) parses `--trust` for every management verb and rejects any *other* unknown flag with exit 2 (src/main.rs:175-177). `config_get` destructures the result as `ScopeArgs { positionals, scope, app, .. }` (lines 2382-2387) and `config_path_cmd` as `ScopeArgs { positionals, scope, scope_explicit, app, .. }` (lines 2797-2803) — the `..` swallows `trust` in both. Neither verb has any trust behaviour, and neither `sbx help config get` (src/help.rs:1278-1298) nor `sbx help config path` (src/help.rs:1462-1479) lists `--trust` among its options. So the flag is parsed, carried, and dropped.
+
+This is inconsistent with the module's own stance on inapplicable flags: `reject_app` (line 2429) exists solely to refuse `--app` on `path` and `edit` rather than ignore it, and `set_show_source` (line 65) refuses a second conflicting source flag rather than take last-wins. `--trust` on a read-only verb gets neither treatment.
+
+**Scénario.** `sbx config get -l --trust network` prints the value and exits 0, having silently discarded `--trust`. `sbx config path -g --trust` prints the global config path and exits 0 likewise. A user who typed `get` where they meant `set` — or who believes `--trust` on `path` will report or arm something — gets no signal at all, while the neighbouring typo `sbx config get -l --truts network` is correctly refused with `sbx: config get: unknown flag `--truts`` and exit 2.
+
+**Correction proposée.** Add a `reject_trust(verb: &str, trust: bool) -> Option<ExitCode>` mirroring `reject_app`, and call it at the top of `config_get` and `config_path_cmd` (binding `trust` instead of letting `..` eat it), so an inapplicable `--trust` exits 2 with the verb's usage the way an inapplicable `--app` already does.
+
+**Rectification du vérificateur.** Two corrections to the framing. (1) The scope is wider than the two verbs named: `--trust` rides the shared `split_scope`, so `sbx proc rules --trust` (src/cli/proc.rs:371) and the `net pending` paths (src/cli/net.rs:762, :793) also swallow it — `proc rules` even bothers to refuse `scope_explicit` at src/cli/proc.rs:386-393 while letting `--trust` through unremarked. The fix should be a shared reject, not two call sites. (2) One comment half-blesses the current state: src/cli/config.rs:45 says "Other flags belong to a specific subcommand (get/set/… take -c/--local/--trust)", which names `get` as taking `--trust`; that comment is itself out of step with the help page, the guide synopsis, and the fact that `config_get` has no trust behaviour, so it reads as a lying comment rather than a rationale. Impact is bounded: on a read-only verb an ignored `--trust` cannot cause a wrong write or a wrong value, so this is an inert-flag/UX anomaly, not a correctness bug — `low` is the right severity, not higher.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Every citation is exact. src/main.rs:174 is `Some("--trust") => trust = true,` and 175-177 is `Some(flag) if flag.starts_with('-') && flag != "-" => { return Err(format!("unknown flag `{flag}`")); }`. src/cli/config.rs:2382-2387 destructures `ScopeArgs { positionals, scope, app, .. }` in `config_get` and 2797-2803 destructures `ScopeArgs { positionals, scope, scope_explicit, app, .. }` in `config_path_cmd` — `trust` is bound by neither, and neither function body mentions trust (the writing verbs bind it explicitly: 2597 `trust,`, 2677 `trust,`, 2747 `trust,`, 2893 `trust: trust_flag,`). `reject_app` is at 2429 and `set_show_source` at 65 as claimed. The dispatcher (src/cli/config.rs:32, :37) passes `&args[1..]` straight through with no pre-filter, so nothing upstream intercepts the flag. The help pages omit it (src/help.rs:1279 synopsis `sbx config get <key> [-l|--local|-g|--global|-c <file>] [-a|--app <name>]`; :1463 `sbx config path [-l|--local|-g|--global|-c <file>]`) and so does the guide (docs-site/docs/guide/cli/config.md:131 vs :132-135, which do carry `[--trust]`). No test in tests/ exercises `--trust` on `get` or `path`. The described sequence therefore reproduces exactly: `sbx config get -l --trust network` prints the value and exits 0.
+
+</details>
+
+---
+
+### B32 — `is_security_key` splits on every dot, so a quoted app-name `env` key is wrongly reported as a security field
+
 | | |
 |---|---|
 | **Gravité** | Faible |
@@ -805,70 +1141,124 @@ Confirmed. src/cli/config.rs:3102-3105 is `fn is_security_key(key: &str) -> bool
 
 ---
 
-### B24 — `--trust` is accepted and silently ignored by `config get` and `config path`
+### B33 — `sbx logs --feed <name>` reports "session N is recording nothing" when only the filtered feed is absent
+
 | | |
 |---|---|
 | **Gravité** | Faible |
-| **Emplacement** | `src/cli/config.rs:2386` |
-| **Catégorie** | `dead-code` |
-| **Sous-système** | CLI — sbx config |
+| **Emplacement** | `src/cli/logs.rs:621` |
+| **Catégorie** | `ux-error-message` |
+| **Sous-système** | CLI — dispatcher, app, session, logs, storage |
 | **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
 
-**Constat.** `split_scope` (src/main.rs:174) parses `--trust` for every management verb and rejects any *other* unknown flag with exit 2 (src/main.rs:175-177). `config_get` destructures the result as `ScopeArgs { positionals, scope, app, .. }` (lines 2382-2387) and `config_path_cmd` as `ScopeArgs { positionals, scope, scope_explicit, app, .. }` (lines 2797-2803) — the `..` swallows `trust` in both. Neither verb has any trust behaviour, and neither `sbx help config get` (src/help.rs:1278-1298) nor `sbx help config path` (src/help.rs:1462-1479) lists `--trust` among its options. So the flag is parsed, carried, and dropped.
+**Constat.** `--feed` narrows the list in place at logs.rs:592 (`feeds.retain(...)`), and the all-absent check that follows compares against the *narrowed* list: `if absent.len() == feeds.len()` (logs.rs:621) then `diag::error("sbx: logs: session {} is recording nothing.")` and exit 2. With a filter in play that sentence is false — it states a property of the whole session while only the selected subset was consulted. The message the code intends is defended in its own comment above ("'Recording nothing' is about feeds that did not **answer** …"), but the `--feed` interaction was not folded into the wording, and the hint loop underneath prints only the filtered feed's reason, so the reader is given a total verdict backed by a partial reading.
 
-This is inconsistent with the module's own stance on inapplicable flags: `reject_app` (line 2429) exists solely to refuse `--app` on `path` and `edit` rather than ignore it, and `set_show_source` (line 65) refuses a second conflicting source flag rather than take last-wins. `--trust` on a read-only verb gets neither treatment.
+**Scénario.** Launch a session with a filtering `[network] mode` but without `--observe`, so `net` records and `fs` does not. `sbx logs 4242` shows the egress rows. `sbx logs 4242 --feed fs` prints "sbx: logs: session 4242 is recording nothing." plus one hint about `fs`, and exits 2 — telling the operator the session records nothing while the very next command shows its egress log.
 
-**Scénario.** `sbx config get -l --trust network` prints the value and exits 0, having silently discarded `--trust`. `sbx config path -g --trust` prints the global config path and exits 0 likewise. A user who typed `get` where they meant `set` — or who believes `--trust` on `path` will report or arm something — gets no signal at all, while the neighbouring typo `sbx config get -l --truts network` is correctly refused with `sbx: config get: unknown flag `--truts`` and exit 2.
+**Correction proposée.** Word the refusal against what was asked for when `only.is_some()`: e.g. "none of the feeds you selected (fs) is recording for session 4242" plus the per-feed reasons, keeping the existing sentence for the unfiltered case. The `known` list is already available at logs.rs:588 to point at the feeds that were not asked about.
 
-**Correction proposée.** Add a `reject_trust(verb: &str, trust: bool) -> Option<ExitCode>` mirroring `reject_app`, and call it at the top of `config_get` and `config_path_cmd` (binding `trust` instead of letting `..` eat it), so an inapplicable `--trust` exits 2 with the verb's usage the way an inapplicable `--app` already does.
-
-**Rectification du vérificateur.** Two corrections to the framing. (1) The scope is wider than the two verbs named: `--trust` rides the shared `split_scope`, so `sbx proc rules --trust` (src/cli/proc.rs:371) and the `net pending` paths (src/cli/net.rs:762, :793) also swallow it — `proc rules` even bothers to refuse `scope_explicit` at src/cli/proc.rs:386-393 while letting `--trust` through unremarked. The fix should be a shared reject, not two call sites. (2) One comment half-blesses the current state: src/cli/config.rs:45 says "Other flags belong to a specific subcommand (get/set/… take -c/--local/--trust)", which names `get` as taking `--trust`; that comment is itself out of step with the help page, the guide synopsis, and the fact that `config_get` has no trust behaviour, so it reads as a lying comment rather than a rationale. Impact is bounded: on a read-only verb an ignored `--trust` cannot cause a wrong write or a wrong value, so this is an inert-flag/UX anomaly, not a correctness bug — `low` is the right severity, not higher.
+**Rectification du vérificateur.** Mechanism confirmed, with two corrections. (1) `known` is built at src/cli/logs.rs:586 (used at 588), not 588 — and it is the static seven-name list from `feeds_for`, which is what makes the case trivially reachable rather than a rare state. (2) The exit code itself is defensible — the operator asked for a feed that is not recording, so refusing is reasonable; the defect is purely the sentence, which asserts a whole-session property after consulting only the selected subset. Impact is a misleading message, not a wrong action.
 
 <details>
 <summary>Preuve retenue par le vérificateur</summary>
 
-Every citation is exact. src/main.rs:174 is `Some("--trust") => trust = true,` and 175-177 is `Some(flag) if flag.starts_with('-') && flag != "-" => { return Err(format!("unknown flag `{flag}`")); }`. src/cli/config.rs:2382-2387 destructures `ScopeArgs { positionals, scope, app, .. }` in `config_get` and 2797-2803 destructures `ScopeArgs { positionals, scope, scope_explicit, app, .. }` in `config_path_cmd` — `trust` is bound by neither, and neither function body mentions trust (the writing verbs bind it explicitly: 2597 `trust,`, 2677 `trust,`, 2747 `trust,`, 2893 `trust: trust_flag,`). `reject_app` is at 2429 and `set_show_source` at 65 as claimed. The dispatcher (src/cli/config.rs:32, :37) passes `&args[1..]` straight through with no pre-filter, so nothing upstream intercepts the flag. The help pages omit it (src/help.rs:1279 synopsis `sbx config get <key> [-l|--local|-g|--global|-c <file>] [-a|--app <name>]`; :1463 `sbx config path [-l|--local|-g|--global|-c <file>]`) and so does the guide (docs-site/docs/guide/cli/config.md:131 vs :132-135, which do carry `[--trust]`). No test in tests/ exercises `--trust` on `get` or `path`. The described sequence therefore reproduces exactly: `sbx config get -l --trust network` prints the value and exits 0.
+Line numbers check out: `feeds.retain(|f| names.contains(&f.name.to_string()))` at src/cli/logs.rs:592 narrows the list, and the all-absent test at src/cli/logs.rs:621 is `if absent.len() == feeds.len()`, printing "sbx: logs: session {} is recording nothing." (src/cli/logs.rs:623) and returning ExitCode::from(2). Nothing prevents the narrowed case: `feeds_for` (src/cli/logs.rs:414-466) returns a fixed vec of all seven feeds regardless of what the session actually stood up, so the `known` check at src/cli/logs.rs:586-590 accepts `--feed fs` for every session; the fs socket then fails to connect for a session launched without `--observe` (absent text at logs.rs:440), while `net` is live for a filtering `[network] mode` (logs.rs:433). absent = feeds = [fs] and the totalizing sentence fires. The comment at src/cli/logs.rs:617-620 defends only the cursor-vs-answer distinction, and the tests cover the two cases separately (tests/logs.rs:596 narrowing with a live feed, tests/logs.rs:637-655 the unfiltered empty session) — none covers a filter that selects only an absent feed, so nothing documents this wording as deliberate.
 
 </details>
 
 ---
 
-### B25 — `config show --app` silently drops the notify repeat window that `config show` prints
+### B34 — `sbx logs -f`: a feed that answers with rows but no cursor makes the loop drop those rows and declare the session ended
+
 | | |
 |---|---|
 | **Gravité** | Faible |
-| **Emplacement** | `src/cli/config.rs:1872` |
-| **Catégorie** | `inconsistency` |
-| **Sous-système** | CLI — sbx config |
+| **Emplacement** | `src/cli/logs.rs:708` |
+| **Catégorie** | `logic-bug` |
+| **Sous-système** | CLI — dispatcher, app, session, logs, storage |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : moyenne) |
+
+**Constat.** The merged follow loop collects each feed's new rows into `batch` and updates `feed.cursor = head` (logs.rs:694-707), then checks `if feeds.iter().all(|f| f.cursor.is_none())` and returns *before* `batch` is sorted and written (logs.rs:708-715). A feed can set its cursor to `None` on a **successful** read: `read_task_rows` deliberately returns `head = None` when `head == 0 && !rows.is_empty()` (logs.rs:378-382), the "older plane that cannot say what is new" case. When that is the last feed with a cursor, the rows it just handed back are silently discarded and the view prints "(session ended)" for a session that is still running. The first-read path handles this correctly — it keeps the rows and lists the feed under `unfollowable` (logs.rs:598-608), with a comment explaining that reading a missing cursor as a missing feed "threw those rows away and told the reader the session was recording nothing while holding its record in hand". The follow loop reintroduces exactly that.
+
+**Scénario.** Follow a session whose control plane predates the append cursor (launched by an earlier sbx) and whose task log was empty at the first read: `sbx logs <pid> -f --feed task`. The first read returns no entries and `head=0`, so `head` becomes `Some(0)` and the feed is treated as followable. When the agent's first declared operation finishes, the next poll returns one entry with `head=0`, `read_task_rows` maps that to `None`, every cursor is now `None`, and sbx prints "(session ended)" and exits 0 — without ever printing the invocation it had just read, and while the session is still alive.
+
+**Correction proposée.** Move the all-cursors-`None` check below the batch write, or write `batch` before returning: sort and emit `batch` (and the eviction note) first, then test `feeds.iter().all(|f| f.cursor.is_none())` and return. Distinguish the two ways a cursor becomes `None` if the "(session ended)" wording should not fire for a feed that merely stopped being followable.
+
+**Rectification du vérificateur.** Survives, but two corrections. (1) The line citation for the head→None mapping is wrong: it is src/cli/logs.rs:391-394, not 378-382 (378-386 is the `token`/`subject` match on `e.refused`). (2) Reachability is legacy-only, which the reporter states but under-weights: the current plane always writes `head=` (src/sandbox/task_control.rs:1331) and `TaskLog::since` returns `inner.appended` (task_control.rs:502), which is ≥1 whenever any entry exists (incremented at 456), so a modern session can never produce head=0-with-rows; and no non-task feed can return `None` on a successful read, so the drop needs the task feed to be the last one holding a cursor. A simpler variant of the same root shows up first: with `--feed task` on such a plane and a *non-empty* first read, the feed is marked `unfollowable` (cursor `None`) and the very first poll 400 ms later prints "(session ended)" for a session that is still running — no rows lost, but the same wrong claim.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+The load-bearing citation is right: src/cli/logs.rs:694-707 extends `batch` and sets `feed.cursor = head`, then 708-715 `if feeds.iter().all(|f| f.cursor.is_none()) { ... writeln!("(session {} ended)") ... return ExitCode::SUCCESS; }` fires before `batch.sort_by_key` (716) and the write block (717-734), so a batch collected in that round is discarded. A successful read can set the cursor to `None` — `read_task_rows` maps `head == 0 && !rows.is_empty()` to `None`. Tracing `sbx logs <pid> -f --feed task` against a plane that omits `head=`: first read returns no entries so `head` stays `Some(0)` and the feed is polled; a later poll returns a row with head still 0, the mapping yields `None`, every cursor is `None`, and the row is dropped while sbx prints "(session ended)" for a live session. The follow loop's own comment (logs.rs:686-689) explains only why a cursor may go `None`, not the ordering, and the first-read path deliberately does the opposite (logs.rs:601-620: it keeps the rows and lists the feed under `unfollowable`, with the comment "Reading the missing cursor as a missing feed threw those rows away and told the reader the session was recording nothing while holding its record in hand"). No test covers the follow loop (the only test in the module is `feeds_and_names_agree`, logs.rs:746-753).
+
+</details>
+
+---
+
+### B35 — `--detach=false` / `--observe=false` / `--dry-run=false` turn the flag ON — `flag_name` strips the value for pure booleans
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/cli/mod.rs:435` |
+| **Catégorie** | `logic-bug` |
+| **Sous-système** | CLI — dispatcher, app, session, logs, storage |
 | **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
 
-**Constat.** The baseline renderer builds a suffix from `repeat_after` (lines 665-670):
+**Constat.** Both launch parsers dispatch on `flag_name(raw)`, which is documented (src/main.rs:346-350) as "stripping a `=value` suffix — so `--config` and `--config=x` both dispatch on `--config`". That is right for the value-taking flags, but the pure booleans are matched through the same helper and then set unconditionally: `sbx run`'s loop matches `"--detach" => { detach = true; ... }` (src/cli/mod.rs:435-438) and `"--observe" => { observe = true; ... }` (mod.rs:439-442), and `parse_app_launch` does the same at src/cli/app.rs:198 (`--detach`), 202 (`--observe`), 222 (`--dry-run`), 226 (`--global`/`-g`) and 231 (`--local`/`-l`). The `=value` is discarded and the flag is switched on regardless of what it said. Nothing in the surrounding comments contemplates an `=` form for these; only `--net-learn` reads its own suffix (app.rs:208-218). The CLI itself teaches the `=false` idiom — `--gpu[=true|false]`, `--audio[=true|false]`, `--dbus[=true|false]` are documented optional-value booleans (src/help.rs:167-178) handled by `take_flag_bool` — so a user or script that spells every flag `--name=value` lands here. This is precisely the failure `parse_app_launch`'s own doc says it exists to prevent: "a typo cannot silently launch a different posture (a mistyped `--detach` running attached …)".
+
+**Scénario.** `sbx run --detach=false npm test` — the user explicitly asks not to detach, and sbx launches the session detached: the terminal returns immediately, the command's output goes to `<data>/logs/<pid>.log`, and its exit status is not propagated. Symmetrically `sbx app run demo-app --observe=false` turns the `[sbx:exec]` feed on, and `sbx app run demo-app --net-learn --dry-run=false` writes the learned egress rules to the profile when the user asked for a preview.
+
+**Correction proposée.** Match these booleans on the raw token rather than on `flag_name(raw)` (or, in each arm, reject a token carrying an `=`): e.g. keep `match flag_name(&raw)` for the value flags but add a guard `raw.contains('=')` on the `--detach`/`--observe`/`--dry-run`/`--global`/`--local` arms that reports `sbx: --detach takes no value` and exits 2 — or route them through `take_flag_bool` so `=true`/`=false` mean what they say.
+
+**Rectification du vérificateur.** Real but lower-impact than claimed. `--detach=false` is not a form the CLI documents: src/help.rs:102/106 spells the flag as a bare `--detach`, and only the optional-value booleans carry the `[=true|false]` grammar (src/help.rs:169-178, handled by `take_flag_bool` at src/main.rs:358-366). So the trigger is a user extrapolating from `--gpu=false`, not a documented spelling being mishandled — a strictness/anomaly bug rather than a likely field failure. Note the same swallowing applies to any `=` suffix on these arms, including `--help=x` and `--global=x`.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Every citation checks out. src/main.rs:348-350 `fn flag_name(raw: &str) -> &str { raw.split_once('=').map(|(f, _)| f).unwrap_or(raw) }`. src/cli/mod.rs:434-442 dispatches `match crate::flag_name(raw)` with `"--detach" => { detach = true; cmd.remove(0); }` and `"--observe" => { observe = true; cmd.remove(0); }`; src/cli/app.rs:197-235 does the same for `--detach` (198), `--observe` (202), `--dry-run` (222), `--global`/`-g` (226), `--local`/`-l` (231). I traced `sbx run --detach=false npm test`: `flag_name` yields `--detach`, the arm sets `detach = true`, `cmd.remove(0)` discards the whole token, and src/cli/mod.rs:460 calls `crate::sandbox::run(cmd, detach=true, ...)`. Nothing downstream re-reads the token. `--net-learn` is the only arm that reads its own `=` suffix (app.rs:208-218), so this is not a general convention being applied. No comment or test contemplates the `=` form for the pure booleans, and the silent acceptance contradicts the strictness the same function advertises (app.rs:240-246 rejects any other unknown `-`-leading token with `unknown flag {raw}`).
+
+</details>
+
+---
+
+### B36 — Dispatch comment says "a live `--session` mute is not yet wired" — it is wired end to end
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/cli/net.rs:46` |
+| **Catégorie** | `doc-drift` |
+| **Sous-système** | CLI — sbx net |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** In `net_cmd`:
 
 ```rust
-let every = if n.repeat_after.is_empty() { String::new() }
-            else { format!(" {dim}(a repeat waits {}){r}", n.repeat_after) };
+// `mute` adds a `dontaudit` log-suppression rule; `unmute` removes one. Both are
+// config-level (the same scopes as allow/deny) — a live `--session` mute is not yet wired.
+Some("mute") => net_add_rule(config::manage::EgressList::Mute, &args[1..]),
 ```
 
-and appends it to both the uniform and the per-event line. `render_app_detail`'s notify block (lines 1858-1882) reproduces the uniform/per-event logic verbatim but never reads `repeat_after` — `grep -n repeat_after src/cli/config.rs` returns only lines 666 and 669. The field is present on the app view: `AppDetailView.notify` is a full `NotifyView` (src/config/view.rs:627-633), and `build_app_detail` fills it through the same `notify_view` projection at src/config/view.rs:1635-1636, so the data is there and the renderer discards it.
+The full path exists and is implemented: `net_add_rule` routes `--session` to `net_inject_session`, which dispatches `EgressList::Mute => sandbox::control::inject_mute(...)` (line 3163); `inject_mute` sends `REMEMBER MUTE <rule>` (`control/client.rs:601`); the server routes it to the dedicated mute overlay (`control/mod.rs:1215-1224`, `Kind::Mute => manual.remember_mute(rule)`); `effective_policy` folds `manual.mute_snapshot()` into the policy's mute rules (`proxy/ctx.rs:805`); and `net_rules_manual` renders it back as `ManualKind::Mute => NetRuleKind::Mute` (line 2769). The help page for `net mute` documents `--session` and `--all` in full, including "A live mute is not un-loaded by `unmute`".
 
-The drift is the exact hazard the neighbouring `write_net_posture_head` doc (lines 926-938) says it was extracted to prevent: "Keeping the preamble in one place is what stops the two from drifting: they already had, on `ask timeout: none`, where this view explained the value and the app view printed it bare." Notify was never given the same treatment.
+**Scénario.** A reader of `net_cmd` — the file's dispatch table and the first thing anyone reads — concludes `sbx net mute <rule> --session` is unimplemented and either doesn't offer it to a user asking how to quiet a noisy refusal on a running session, or "adds" it by writing a second implementation. Running the command actually works today: it loads the mute into the live overlay and quiets the log immediately.
 
-**Scénario.** Project config carries `[notify] repeat_after = "5m"` and an app `demo`. `sbx config show` prints `notify: once (a repeat waits 300s) (project)`. `sbx config show --app demo` prints `notify:  once (inherited)` — the quiet period is absent with no indication it exists, and it is not folded into the `at their default:` line either (`posture_shown` gates the whole notify block on `notify_origin`, which is not `Default` here, so the block *is* shown; only the suffix is missing). A user asking "why was I told about this refusal only once for this app" reads the per-app view, sees nothing about a repeat window, and concludes none is configured.
+**Correction proposée.** Drop the stale clause: `// `mute` adds a `dontaudit` log-suppression rule; `unmute` removes one from a config file. Both take the same scopes as allow/deny, and `mute --session` loads a live mute into the overlay (there is no session-scoped `unmute` — a live mute dies with the session).`
 
-**Correction proposée.** Compute the same `every` suffix inside `render_app_detail`'s notify block and append it to both the `Some(mode)` and `None` lines — or, following the precedent of `write_net_posture_head`, lift the notify rendering into one helper that both `notify_section` and `render_app_detail` call, with the provenance tag passed in by the caller.
-
-**Rectification du vérificateur.** The mechanism is right but the reporter's reproduction is a poor choice. `[notify] repeat_after = "5m"` with the default/uniform mode `once` trips the validator warning at src/config/validate.rs:407-416 ("`repeat_after` has no effect — it spaces out repeats, and no event is set to `always`"), so in that exact case the user is *not* left without a signal. A clean reproduction needs an event set to `always` — e.g. `[notify] mode = "always"` + `repeat_after = "5m"` — where `sbx config show` prints `notify: always (a repeat waits 300s) (project)` and `sbx config show --app demo` prints `notify:  always (inherited)` with the window gone. Two further notes: the JSON form is unaffected (`NotifyView` is `#[derive(Serialize)]` at src/config/view.rs:626 and is serialized whole), so this is a human-render-only inconsistency; and the suffix prints seconds, not the written value, because `notify_view` formats `format!("{}s", d.as_secs())` (src/config/view.rs:642-645) — which contradicts the field's own doc at src/config/view.rs:630 ("as it was written (`\"5m\"`)"). That contradiction is a separate defect from the one filed here.
+**Rectification du vérificateur.** Confirmed as filed. One citation slip in the supporting evidence, not the anchor: the manual-rule render is src/cli/net.rs:2778, not 2769. The anchor line 46 is exact.
 
 <details>
 <summary>Preuve retenue par le vérificateur</summary>
 
-Verified. `notify_section` builds the suffix at src/cli/config.rs:666-670 (`let every = if n.repeat_after.is_empty() { String::new() } else { format!(" {dim}(a repeat waits {}){r}", n.repeat_after) };`) and appends `{every}` on both branches (:675 and :682). `render_app_detail`'s notify block (guarded by `posture_shown` at :1859-1864) reproduces the same uniform/per-event logic at :1866-1880 and emits `"  {h}notify:{r}  {mode}{notify_tag}"` (:1874) and `"  {h}notify:{r}  {dim}per event{r}{notify_tag}"` (:1877) — no `every`. `grep -n repeat_after src/cli/config.rs` returns only 666 and 669, confirming the app renderer never reads it. The data is present: `AppDetailView.notify` is a full `NotifyView` (field at src/config/view.rs:883; struct at :627-633 with `repeat_after: String` at :632), filled by `build_app_detail` at src/config/view.rs:1635-1636 via the same `notify_view` projection (:635-647). The gating claim also holds: `posture_shown` folds only when `untouched(origin)`, i.e. `ProvenanceView::Default` (src/cli/config.rs:1713-1725), and `origin_or_inherited` (src/config/view.rs:1896-1908) returns `Inherited` when the baseline configured it — so the block prints, minus the suffix. The `write_net_posture_head` doc quoted by the reporter is real (src/cli/config.rs:929-938) and says exactly what they claim about drift. No test anywhere asserts the string "a repeat waits".
+Verified at src/cli/net.rs:45-46 (`// ... Both are // config-level (the same scopes as allow/deny) — a live `--session` mute is not yet wired.`), and the whole path exists: net_add_rule dispatches `--session` at src/cli/net.rs:3013 (`return net_inject_session(list, &rule, all, parsed.app.as_deref(), &cwd);`); net_inject_session at src/cli/net.rs:3164 does `EgressList::Mute => sandbox::control::inject_mute(&data_dir, pid, rule)`; src/sandbox/control/client.rs:601-603 sends `REMEMBER MUTE <rule>` via send_remember; src/sandbox/control/mod.rs:1215-1226 parses the `MUTE ` prefix and calls `manual.remember_mute(rule)`; src/sandbox/proxy/ctx.rs:805 folds it in (`mute.extend(ctx.manual.mute_snapshot());`) with the comment "a live `sbx net mute --session` — folds onto the config mutes"; and src/cli/net.rs:2778 renders it back as `ManualKind::Mute => NetRuleKind::Mute`. The help page contradicts the comment outright: src/help.rs:2439 synopsis is `sbx net mute <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]` and src/help.rs:2472-2476 documents "`--session` instead loads the mute into the **live overlay** ... it quiets the log immediately". Nothing in the tree gates or stubs the mute injection. The comment is stale on both clauses ("Both are config-level" and "not yet wired").
 
 </details>
 
 ---
 
-### B26 — `sbx net pending` prints a session header for every reachable session, including ones with nothing parked
+### B37 — `sbx net pending` prints a session header for every reachable session, including ones with nothing parked
+
 | | |
 |---|---|
 | **Gravité** | Faible |
@@ -921,7 +1311,126 @@ Verified end to end. src/cli/net.rs:615-617 writes the header unconditionally in
 
 ---
 
-### B27 — `pending allow --all --save -a <app>` reports "no pending requests for this project" without naming the `--app` filter that emptied the drain
+### B38 — `render_stats`'s "(other hosts)" overflow row is padded to the host column width and misaligns the numeric columns
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/cli/net.rs:1243` |
+| **Catégorie** | `logic-bug` |
+| **Sous-système** | CLI — sbx net |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** `host_w` is derived only from the real host rows (line 1219-1225: `rows.iter().map(|(host, _)| host.len()).max().unwrap_or(4).max(4)`), but the overflow row is printed with that same width using a 13-character literal:
+
+```rust
+let _ = writeln!(
+    o,
+    "  {dim}{:<host_w$}{r}  {:>6}  {:>6}  {:>7}",
+    "(other hosts)", folded.allow, folded.deny, folded.blocked
+);
+```
+
+Whenever the longest recorded host is shorter than `"(other hosts)".len() == 13`, the row overflows its column and pushes ALLOW/DENY/BLOCKED right by `13 - host_w` characters relative to the header and every other row. The existing test `render_stats_shows_the_folded_destinations_as_their_own_row` (line 5128) only asserts `contains("(other hosts)")` and `contains("44")`, so nothing pins the alignment.
+
+**Scénario.** A project whose recorded destinations are short (`pypi.org`, `crates.io` — `host_w == 9`) and that exceeded the 256-host cap. `sbx net stats` prints:
+
+```
+  HOST       ALLOW    DENY  BLOCKED
+  pypi.org      12       0        0
+  (other hosts)       0      44        2
+```
+
+The fold row's `0 / 44 / 2` sit four columns right of the headers they belong to, so the counts read as if they were under DENY/BLOCKED/(nothing). The degenerate case in the code's own test — a tally with only overflow counts — gives `host_w == 4` and a nine-character shift.
+
+**Correction proposée.** Include the literal in the width: `let host_w = rows.iter().map(|(h, _)| h.len()).max().unwrap_or(4).max(4);` becomes `... .max(if tally.overflow.total() > 0 { "(other hosts)".len() } else { 4 });` — or unconditionally `.max("(other hosts)".len())` when a fold row is possible.
+
+**Rectification du vérificateur.** Confirmed as filed, including the arithmetic. Cosmetic only — the numbers themselves are correct and the JSON path (src/cli/net.rs:1168-1184) is unaffected, so this misleads a reader of the table and nothing else.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Confirmed. `host_w` is computed at src/cli/net.rs:1218-1223 from the real host rows only (`rows.iter().map(|(host, _)| host.len()).max().unwrap_or(4).max(4)`), and the fold row at src/cli/net.rs:1240-1245 reuses it with a 13-character literal: `"  {dim}{:<host_w$}{r}  {:>6}  {:>6}  {:>7}", "(other hosts)", folded.allow, folded.deny, folded.blocked`. Rust's `{:<width$}` pads but never truncates, so whenever the longest recorded host is under 13 characters the fold row runs `13 - host_w` columns wide and shifts ALLOW/DENY/BLOCKED right relative to the header and every host row. The header (src/cli/net.rs:1226-1230) and the host rows (1231-1237) both use the same unpadded `host_w`, so they stay aligned with each other and only the fold row breaks. Nothing prevents short hosts, and the only test covering this row, `render_stats_shows_the_folded_destinations_as_their_own_row` (src/cli/net.rs:5128), builds a tally whose sole host is `busy.test` (9 chars, so `host_w == 9`) and asserts only `folded.contains("44") && folded.contains("2")` (src/cli/net.rs:5149-5153) — it reproduces the misalignment and asserts nothing about it. The second half of that test, the overflow-only tally (src/cli/net.rs:5155-5166), gives `host_w == 4` and a 9-column shift.
+
+</details>
+
+---
+
+### B39 — `net groups export --out` writes non-atomically and will not create its parent directory, unlike the identical `bundle export --out`
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/cli/net.rs:2424` |
+| **Catégorie** | `inconsistency` |
+| **Sous-système** | CLI — sbx net |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** The `--out` arm writes the fragment straight through:
+
+```rust
+Some(path) => match std::fs::write(path, &fragment) {
+```
+
+Its exact twin, `sbx bundle export --out` (`cli/bundle.rs:271-281`), routes through `config::manage::write_text(&path, &fragment, None)`, whose doc (`config/manage.rs:1330-1340`) states the reason verbatim: "A fragment written straight through leaves a truncated file at a destination whose whole purpose is to be imported back, which is the half-write this function exists to prevent for the config itself." `write_text` also does `create_dir_all(dir)` and writes to a pid-suffixed temp before `rename`. The two commands are otherwise presented as the same command in two namespaces — same synopsis shape, same `-o|--out`, same "the inverse of `import`" help wording, same portable-fragment purpose.
+
+**Scénario.** `sbx net groups export --out ~/backup/2026-08/groups.toml` fails with `sbx: net groups export: cannot write /home/u/backup/2026-08/groups.toml: No such file or directory` when the directory does not yet exist, while `sbx bundle export --out ~/backup/2026-08/bundles.toml` in the same shell creates it and succeeds. Separately, a write interrupted part-way (full filesystem, ENOSPC) leaves a truncated `[network.groups]` fragment at the destination — the file whose entire purpose is to be fed back to `sbx net groups import`, which will then import a silently short group list.
+
+**Correction proposée.** Use the shared writer the twin uses:
+
+```rust
+Some(path) => match config::manage::write_text(path, &fragment, None) {
+```
+
+(keeping the existing error arm, which already formats a `ManageError` fine via `{e}`).
+
+**Rectification du vérificateur.** "Its exact twin" overstates the asymmetry: there are three export commands, and `sbx app export --out` (src/cli/app.rs:884, `if let Err(e) = std::fs::write(path, &bytes)`) behaves exactly like `net groups export`. So the split is two-vs-one with `bundle export` as the outlier, and which side is the defect is a judgment call — write_text's own doc frames `--out` as the same spelling as a shell redirect (src/config/manage.rs:1338-1340), and a shell redirect neither creates parent directories nor writes atomically. The defensible statement is that the three `--out` paths disagree and nothing declares why; the ENOSPC half-write half of the argument is the weaker half.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+The code difference is real. src/cli/net.rs:2424 is `Some(path) => match std::fs::write(path, &fragment) {`, error-formatted at src/cli/net.rs:2432-2435 as `sbx: net groups export: cannot write {path}: {e}` — exactly the quoted failure text. src/cli/bundle.rs:275 uses `config::manage::write_text(&path, &fragment, None)`, and write_text (src/config/manage.rs:1341-1367) does `std::fs::create_dir_all(dir)` then writes a `.{name}.sbx-tmp.{pid}` and `rename`s it. write_text's doc at src/config/manage.rs:1330-1333 states the rationale the reporter quotes verbatim. No comment, test, or caller in net_groups_export (src/cli/net.rs:2351-2438) explains or prevents the straight-through write, and the docs (docs-site/docs/guide/networking/groups.md:120-123) claim nothing either way. Survives, but as a low-value inconsistency rather than a wrong answer: the command reports the failure accurately, and the destination is a user-named artifact, not sbx's own config.
+
+</details>
+
+---
+
+### B40 — Comment claims a `--session` rule only applies to `ask` sessions and is refused with `err not-ask`; neither is true
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/cli/net.rs:3109` |
+| **Catégorie** | `doc-drift` |
+| **Sous-système** | CLI — sbx net |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** `net_inject_session`'s doc comment ends:
+
+```
+/// `--all` widens to every reachable session. Only an `ask`-posture session consults the overlay, so a
+/// filtering-posture session reports the load as skipped (`err not-ask`) rather than a silent no-op.
+```
+
+Both halves are false. (a) `sandbox/proxy/ctx.rs:785-808` (`effective_policy`) folds the manual overlay into the policy "in **every** filtering posture (allowlist, denylist, `ask`) and at every enforcement layer", and `sandbox/egress.rs:850-855` says the overlay "is wired into the proxy for **every** filtering posture (not only `ask`)". (b) The token `not-ask` appears nowhere else in the tree (`grep -rn "not-ask" src/` returns only this line); the server's `REMEMBER` handler (`sandbox/control/mod.rs:1199-1229`) replies `ok` for any classifiable rule regardless of posture, and `err bad-request` otherwise, which `send_remember` maps to `InjectOutcome::Refused` — which `render_inject` then reports as "an older sbx without --session rule support". The same file contradicts itself: `net_rules_manual`'s doc at line 2724 says "The proxy folds them into its effective policy, so they apply in any filtering posture, not only `ask`", and the `net allow` help page says the same.
+
+**Scénario.** A maintainer debugging why `sbx net allow evil.test --session` had no visible effect on an allowlist-posture session reads this comment, concludes the load was correctly skipped as a non-ask session, and stops — when in fact the rule was loaded and is being enforced. Conversely, someone reading it may add a posture check that would break the documented, tested behaviour of `--session` on allowlist/denylist sessions.
+
+**Correction proposée.** Replace the last sentence with the truth, e.g.: "The proxy folds the overlay into its effective policy in every filtering posture (allowlist, denylist, `ask`), so the rule takes effect immediately; a session whose control server predates `REMEMBER` refuses the load and is reported rather than silently skipped."
+
+**Rectification du vérificateur.** Accurate as filed. One refinement: `err not-ask` is not merely undocumented drift from a removed protocol — no control-server reply string of that shape exists anywhere in the tree, so the sentence describes a wire response that never existed in this code, and the only reply a refusal can produce is `err bad-request` (an unclassifiable rule) or a connect error (a dead socket).
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Both halves confirmed. (a) src/cli/net.rs:3109-3110 reads "Only an `ask`-posture session consults the overlay, so a filtering-posture session reports the load as skipped (`err not-ask`) rather than a silent no-op." src/sandbox/proxy/ctx.rs:785-808 `effective_policy` folds the overlay into the policy "in **every** filtering posture (allowlist, denylist, `ask`) and at every enforcement layer", and src/sandbox/egress.rs:850-854 says the overlay "is wired into the proxy for **every** filtering posture (not only `ask`)". (b) `grep -rn not-ask src/ tests/` returns exactly one hit — src/cli/net.rs:3110, the comment itself. The server never emits it: the `REMEMBER` handler (src/sandbox/control/mod.rs:1199-1229) returns `"ok"` for any rule `classify` accepts, regardless of posture, and `"err bad-request"` otherwise; src/sandbox/control/client.rs:616-619 maps anything but `ok` to `InjectOutcome::Refused`, which render_inject reports as "an older sbx without --session rule support" (src/cli/net.rs:3244-3245). The file contradicts itself at src/cli/net.rs:2724-2726 ("they apply in any filtering posture, not only `ask`") and so does the user-facing help at src/help.rs:2331-2333 ("it takes effect immediately, on an allowlist or denylist session as well as `ask`").
+
+</details>
+
+---
+
+### B41 — `pending allow --all --save -a <app>` reports "no pending requests for this project" without naming the `--app` filter that emptied the drain
+
 | | |
 |---|---|
 | **Gravité** | Faible |
@@ -968,260 +1477,8 @@ The cited line is exact: src/cli/net.rs:3359 begins `let scope_note = if local {
 
 ---
 
-### B28 — Comment claims a `--session` rule only applies to `ask` sessions and is refused with `err not-ask`; neither is true
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/cli/net.rs:3109` |
-| **Catégorie** | `doc-drift` |
-| **Sous-système** | CLI — sbx net |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+### B42 — A store listing offers a broker/signer entry whose name is already taken, because the name check reads directory names instead of manifest names
 
-**Constat.** `net_inject_session`'s doc comment ends:
-
-```
-/// `--all` widens to every reachable session. Only an `ask`-posture session consults the overlay, so a
-/// filtering-posture session reports the load as skipped (`err not-ask`) rather than a silent no-op.
-```
-
-Both halves are false. (a) `sandbox/proxy/ctx.rs:785-808` (`effective_policy`) folds the manual overlay into the policy "in **every** filtering posture (allowlist, denylist, `ask`) and at every enforcement layer", and `sandbox/egress.rs:850-855` says the overlay "is wired into the proxy for **every** filtering posture (not only `ask`)". (b) The token `not-ask` appears nowhere else in the tree (`grep -rn "not-ask" src/` returns only this line); the server's `REMEMBER` handler (`sandbox/control/mod.rs:1199-1229`) replies `ok` for any classifiable rule regardless of posture, and `err bad-request` otherwise, which `send_remember` maps to `InjectOutcome::Refused` — which `render_inject` then reports as "an older sbx without --session rule support". The same file contradicts itself: `net_rules_manual`'s doc at line 2724 says "The proxy folds them into its effective policy, so they apply in any filtering posture, not only `ask`", and the `net allow` help page says the same.
-
-**Scénario.** A maintainer debugging why `sbx net allow evil.test --session` had no visible effect on an allowlist-posture session reads this comment, concludes the load was correctly skipped as a non-ask session, and stops — when in fact the rule was loaded and is being enforced. Conversely, someone reading it may add a posture check that would break the documented, tested behaviour of `--session` on allowlist/denylist sessions.
-
-**Correction proposée.** Replace the last sentence with the truth, e.g.: "The proxy folds the overlay into its effective policy in every filtering posture (allowlist, denylist, `ask`), so the rule takes effect immediately; a session whose control server predates `REMEMBER` refuses the load and is reported rather than silently skipped."
-
-**Rectification du vérificateur.** Accurate as filed. One refinement: `err not-ask` is not merely undocumented drift from a removed protocol — no control-server reply string of that shape exists anywhere in the tree, so the sentence describes a wire response that never existed in this code, and the only reply a refusal can produce is `err bad-request` (an unclassifiable rule) or a connect error (a dead socket).
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Both halves confirmed. (a) src/cli/net.rs:3109-3110 reads "Only an `ask`-posture session consults the overlay, so a filtering-posture session reports the load as skipped (`err not-ask`) rather than a silent no-op." src/sandbox/proxy/ctx.rs:785-808 `effective_policy` folds the overlay into the policy "in **every** filtering posture (allowlist, denylist, `ask`) and at every enforcement layer", and src/sandbox/egress.rs:850-854 says the overlay "is wired into the proxy for **every** filtering posture (not only `ask`)". (b) `grep -rn not-ask src/ tests/` returns exactly one hit — src/cli/net.rs:3110, the comment itself. The server never emits it: the `REMEMBER` handler (src/sandbox/control/mod.rs:1199-1229) returns `"ok"` for any rule `classify` accepts, regardless of posture, and `"err bad-request"` otherwise; src/sandbox/control/client.rs:616-619 maps anything but `ok` to `InjectOutcome::Refused`, which render_inject reports as "an older sbx without --session rule support" (src/cli/net.rs:3244-3245). The file contradicts itself at src/cli/net.rs:2724-2726 ("they apply in any filtering posture, not only `ask`") and so does the user-facing help at src/help.rs:2331-2333 ("it takes effect immediately, on an allowlist or denylist session as well as `ask`").
-
-</details>
-
----
-
-### B29 — Dispatch comment says "a live `--session` mute is not yet wired" — it is wired end to end
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/cli/net.rs:46` |
-| **Catégorie** | `doc-drift` |
-| **Sous-système** | CLI — sbx net |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** In `net_cmd`:
-
-```rust
-// `mute` adds a `dontaudit` log-suppression rule; `unmute` removes one. Both are
-// config-level (the same scopes as allow/deny) — a live `--session` mute is not yet wired.
-Some("mute") => net_add_rule(config::manage::EgressList::Mute, &args[1..]),
-```
-
-The full path exists and is implemented: `net_add_rule` routes `--session` to `net_inject_session`, which dispatches `EgressList::Mute => sandbox::control::inject_mute(...)` (line 3163); `inject_mute` sends `REMEMBER MUTE <rule>` (`control/client.rs:601`); the server routes it to the dedicated mute overlay (`control/mod.rs:1215-1224`, `Kind::Mute => manual.remember_mute(rule)`); `effective_policy` folds `manual.mute_snapshot()` into the policy's mute rules (`proxy/ctx.rs:805`); and `net_rules_manual` renders it back as `ManualKind::Mute => NetRuleKind::Mute` (line 2769). The help page for `net mute` documents `--session` and `--all` in full, including "A live mute is not un-loaded by `unmute`".
-
-**Scénario.** A reader of `net_cmd` — the file's dispatch table and the first thing anyone reads — concludes `sbx net mute <rule> --session` is unimplemented and either doesn't offer it to a user asking how to quiet a noisy refusal on a running session, or "adds" it by writing a second implementation. Running the command actually works today: it loads the mute into the live overlay and quiets the log immediately.
-
-**Correction proposée.** Drop the stale clause: `// `mute` adds a `dontaudit` log-suppression rule; `unmute` removes one from a config file. Both take the same scopes as allow/deny, and `mute --session` loads a live mute into the overlay (there is no session-scoped `unmute` — a live mute dies with the session).`
-
-**Rectification du vérificateur.** Confirmed as filed. One citation slip in the supporting evidence, not the anchor: the manual-rule render is src/cli/net.rs:2778, not 2769. The anchor line 46 is exact.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Verified at src/cli/net.rs:45-46 (`// ... Both are // config-level (the same scopes as allow/deny) — a live `--session` mute is not yet wired.`), and the whole path exists: net_add_rule dispatches `--session` at src/cli/net.rs:3013 (`return net_inject_session(list, &rule, all, parsed.app.as_deref(), &cwd);`); net_inject_session at src/cli/net.rs:3164 does `EgressList::Mute => sandbox::control::inject_mute(&data_dir, pid, rule)`; src/sandbox/control/client.rs:601-603 sends `REMEMBER MUTE <rule>` via send_remember; src/sandbox/control/mod.rs:1215-1226 parses the `MUTE ` prefix and calls `manual.remember_mute(rule)`; src/sandbox/proxy/ctx.rs:805 folds it in (`mute.extend(ctx.manual.mute_snapshot());`) with the comment "a live `sbx net mute --session` — folds onto the config mutes"; and src/cli/net.rs:2778 renders it back as `ManualKind::Mute => NetRuleKind::Mute`. The help page contradicts the comment outright: src/help.rs:2439 synopsis is `sbx net mute <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]` and src/help.rs:2472-2476 documents "`--session` instead loads the mute into the **live overlay** ... it quiets the log immediately". Nothing in the tree gates or stubs the mute injection. The comment is stale on both clauses ("Both are config-level" and "not yet wired").
-
-</details>
-
----
-
-### B30 — `net groups export --out` writes non-atomically and will not create its parent directory, unlike the identical `bundle export --out`
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/cli/net.rs:2424` |
-| **Catégorie** | `inconsistency` |
-| **Sous-système** | CLI — sbx net |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** The `--out` arm writes the fragment straight through:
-
-```rust
-Some(path) => match std::fs::write(path, &fragment) {
-```
-
-Its exact twin, `sbx bundle export --out` (`cli/bundle.rs:271-281`), routes through `config::manage::write_text(&path, &fragment, None)`, whose doc (`config/manage.rs:1330-1340`) states the reason verbatim: "A fragment written straight through leaves a truncated file at a destination whose whole purpose is to be imported back, which is the half-write this function exists to prevent for the config itself." `write_text` also does `create_dir_all(dir)` and writes to a pid-suffixed temp before `rename`. The two commands are otherwise presented as the same command in two namespaces — same synopsis shape, same `-o|--out`, same "the inverse of `import`" help wording, same portable-fragment purpose.
-
-**Scénario.** `sbx net groups export --out ~/backup/2026-08/groups.toml` fails with `sbx: net groups export: cannot write /home/u/backup/2026-08/groups.toml: No such file or directory` when the directory does not yet exist, while `sbx bundle export --out ~/backup/2026-08/bundles.toml` in the same shell creates it and succeeds. Separately, a write interrupted part-way (full filesystem, ENOSPC) leaves a truncated `[network.groups]` fragment at the destination — the file whose entire purpose is to be fed back to `sbx net groups import`, which will then import a silently short group list.
-
-**Correction proposée.** Use the shared writer the twin uses:
-
-```rust
-Some(path) => match config::manage::write_text(path, &fragment, None) {
-```
-
-(keeping the existing error arm, which already formats a `ManageError` fine via `{e}`).
-
-**Rectification du vérificateur.** "Its exact twin" overstates the asymmetry: there are three export commands, and `sbx app export --out` (src/cli/app.rs:884, `if let Err(e) = std::fs::write(path, &bytes)`) behaves exactly like `net groups export`. So the split is two-vs-one with `bundle export` as the outlier, and which side is the defect is a judgment call — write_text's own doc frames `--out` as the same spelling as a shell redirect (src/config/manage.rs:1338-1340), and a shell redirect neither creates parent directories nor writes atomically. The defensible statement is that the three `--out` paths disagree and nothing declares why; the ENOSPC half-write half of the argument is the weaker half.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-The code difference is real. src/cli/net.rs:2424 is `Some(path) => match std::fs::write(path, &fragment) {`, error-formatted at src/cli/net.rs:2432-2435 as `sbx: net groups export: cannot write {path}: {e}` — exactly the quoted failure text. src/cli/bundle.rs:275 uses `config::manage::write_text(&path, &fragment, None)`, and write_text (src/config/manage.rs:1341-1367) does `std::fs::create_dir_all(dir)` then writes a `.{name}.sbx-tmp.{pid}` and `rename`s it. write_text's doc at src/config/manage.rs:1330-1333 states the rationale the reporter quotes verbatim. No comment, test, or caller in net_groups_export (src/cli/net.rs:2351-2438) explains or prevents the straight-through write, and the docs (docs-site/docs/guide/networking/groups.md:120-123) claim nothing either way. Survives, but as a low-value inconsistency rather than a wrong answer: the command reports the failure accurately, and the destination is a user-named artifact, not sbx's own config.
-
-</details>
-
----
-
-### B31 — `render_stats`'s "(other hosts)" overflow row is padded to the host column width and misaligns the numeric columns
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/cli/net.rs:1243` |
-| **Catégorie** | `logic-bug` |
-| **Sous-système** | CLI — sbx net |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** `host_w` is derived only from the real host rows (line 1219-1225: `rows.iter().map(|(host, _)| host.len()).max().unwrap_or(4).max(4)`), but the overflow row is printed with that same width using a 13-character literal:
-
-```rust
-let _ = writeln!(
-    o,
-    "  {dim}{:<host_w$}{r}  {:>6}  {:>6}  {:>7}",
-    "(other hosts)", folded.allow, folded.deny, folded.blocked
-);
-```
-
-Whenever the longest recorded host is shorter than `"(other hosts)".len() == 13`, the row overflows its column and pushes ALLOW/DENY/BLOCKED right by `13 - host_w` characters relative to the header and every other row. The existing test `render_stats_shows_the_folded_destinations_as_their_own_row` (line 5128) only asserts `contains("(other hosts)")` and `contains("44")`, so nothing pins the alignment.
-
-**Scénario.** A project whose recorded destinations are short (`pypi.org`, `crates.io` — `host_w == 9`) and that exceeded the 256-host cap. `sbx net stats` prints:
-
-```
-  HOST       ALLOW    DENY  BLOCKED
-  pypi.org      12       0        0
-  (other hosts)       0      44        2
-```
-
-The fold row's `0 / 44 / 2` sit four columns right of the headers they belong to, so the counts read as if they were under DENY/BLOCKED/(nothing). The degenerate case in the code's own test — a tally with only overflow counts — gives `host_w == 4` and a nine-character shift.
-
-**Correction proposée.** Include the literal in the width: `let host_w = rows.iter().map(|(h, _)| h.len()).max().unwrap_or(4).max(4);` becomes `... .max(if tally.overflow.total() > 0 { "(other hosts)".len() } else { 4 });` — or unconditionally `.max("(other hosts)".len())` when a fold row is possible.
-
-**Rectification du vérificateur.** Confirmed as filed, including the arithmetic. Cosmetic only — the numbers themselves are correct and the JSON path (src/cli/net.rs:1168-1184) is unaffected, so this misleads a reader of the table and nothing else.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Confirmed. `host_w` is computed at src/cli/net.rs:1218-1223 from the real host rows only (`rows.iter().map(|(host, _)| host.len()).max().unwrap_or(4).max(4)`), and the fold row at src/cli/net.rs:1240-1245 reuses it with a 13-character literal: `"  {dim}{:<host_w$}{r}  {:>6}  {:>6}  {:>7}", "(other hosts)", folded.allow, folded.deny, folded.blocked`. Rust's `{:<width$}` pads but never truncates, so whenever the longest recorded host is under 13 characters the fold row runs `13 - host_w` columns wide and shifts ALLOW/DENY/BLOCKED right relative to the header and every host row. The header (src/cli/net.rs:1226-1230) and the host rows (1231-1237) both use the same unpadded `host_w`, so they stay aligned with each other and only the fold row breaks. Nothing prevents short hosts, and the only test covering this row, `render_stats_shows_the_folded_destinations_as_their_own_row` (src/cli/net.rs:5128), builds a tally whose sole host is `busy.test` (9 chars, so `host_w == 9`) and asserts only `folded.contains("44") && folded.contains("2")` (src/cli/net.rs:5149-5153) — it reproduces the misalignment and asserts nothing about it. The second half of that test, the overflow-only tally (src/cli/net.rs:5155-5166), gives `host_w == 4` and a 9-column shift.
-
-</details>
-
----
-
-### B32 — `task show <invocation-id>` answers from an arbitrary session; invocation ids are per-session, not globally unique
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/cli/task.rs:1185` |
-| **Catégorie** | `logic-bug` |
-| **Sous-système** | CLI — sbx plugins et sbx task |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** The comment at lines 1185-1187 states "An invocation id belongs to exactly one session; an operation name can be declared in several, and then `--session` is how a reader says which". That is false: ids come from `static TASK_INVOCATION: AtomicU64 = AtomicU64::new(1)` (src/sandbox/task.rs:90-96), a **per-process** counter, and the task plane runs inside each session's own process. Every session therefore hands out ids starting at 1. The loop at lines 1190-1196 takes the first plane that answers `Ok` — planes come from `session_pids`, which is sorted, so the lowest pid always wins — and pushes the rest onto `also`, which is then reported as "`{target}` is also **declared** in session(s) …" (line 1246), wording that only makes sense for an operation name. `read_info` resolves a numeric target against that session's own engine and log (src/sandbox/task_control.rs:1281-1288, 1108-1142), so a colliding id in a different session is a different invocation entirely. Note the inconsistency: `task_result` goes through `plane_for`, which refuses and demands `--session` when several sessions exist, while `task_show` guesses.
-
-**Scénario.** Two sessions are live, pids 100 and 200. In session 200, `sbx task run --detach nightly-dump` prints `7`. `sbx task show 7` resolves planes [100, 200], session 100's log also holds invocation 7 (its seventh `unit-test` run), so session 100 answers first. The user is shown `operation unit-test`, that run's state, exit code and elapsed time — the wrong invocation — with a `session 100 — /path/to/other-project` line and a note claiming `7` is 'also declared' elsewhere.
-
-**Correction proposée.** When `target` parses as a `u64` and more than one plane answers, refuse the way `resolve_task_session` does — name the sessions and require `--session` — rather than taking the first. Failing that, phrase the note for an id ("invocation `{target}` also exists in session(s) …") and correct the comment at line 1185.
-
-**Rectification du vérificateur.** Mechanism verified; severity slightly overstated. `plane.announce()` (src/cli/task.rs:1206, printing `session <pid> — <project>`) runs before the fields, and the `also` note lists the other sessions, so the collision is visible rather than silent — and when the colliding ids belong to differently-named operations the `operation` row itself gives it away. The substantive defects are the false comment at src/cli/task.rs:1185-1187, the id/operation-blind note wording at line 1248, and the inconsistency with `plane_for`'s refusal; a genuinely misleading read needs the same operation name declared in both sessions.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Confirmed. `static TASK_INVOCATION: AtomicU64 = AtomicU64::new(1)` (src/sandbox/task.rs:90) is a process-global counter drawn by `next_invocation()` (src/sandbox/task.rs:95-96), whose only production caller is the per-session plane at src/sandbox/task_control.rs:933 — so every session numbers from 1 and ids collide across sessions, contradicting the comment at src/cli/task.rs:1185-1187 ("An invocation id belongs to exactly one session"). `task_show` fans out over `planes_for` (src/cli/task.rs:1181) whose pids come from `session_pids`, sorted at src/sandbox/task_control.rs:1490, and the loop at src/cli/task.rs:1190-1196 keeps the first `Ok` and pushes the rest onto `also`. The plane resolves a numeric target against its own engine and log (src/sandbox/task_control.rs:1276-1284 -> `finished_fields` -> `log.entry(id)` at 1281-1288), so a colliding id is a different invocation. The divergence from `task result`/`task stop`, which go through `plane_for` -> `resolve_task_session` and refuse ambiguity with "name one with `--session`" (src/cli/task.rs:228-236, 262-275), is real, and the note's wording "is also declared in session(s)" (src/cli/task.rs:1248) only fits an operation name.
-
-</details>
-
----
-
-### B33 — `plugins store install` and `plugins store update` silently drop every argument past the ones they read
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/cli/plugins.rs:1169` |
-| **Catégorie** | `logic-bug` |
-| **Sous-système** | CLI — sbx plugins et sbx task |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** `plugins_store_install` reads only `args.first()` and `args.get(1)` (lines 1169-1172) and `plugins_store_update` reads only `args.first()` (line 1111); neither validates the tail. Every sibling verb in this file refuses extras: `plugins list`, `plugins info`, `plugins install`, `plugins verify` (lines 26-49), `plugins store info` and `plugins store rm` (lines 771-784) all route through `crate::cli::reject_extra`, and `store list`/`store add`/`store publish`/`store verify`/`store rekey` each reject an unrecognised token explicitly. As a result the two placement verbs accept a mistyped or extra operand, act on a subset of what was asked, and exit 0. `store update` additionally treats an unknown option as a store name, so `--all` produces `cannot update store '--all'` at exit 1 instead of a usage error at exit 2.
-
-**Scénario.** `sbx plugins store install mine kp vault` installs only `kp`, prints the single success confirmation and exits 0 — the user believes `vault` was installed too and only discovers otherwise at the next launch. Likewise `sbx plugins store install mine kp --dry-run` performs a real install while silently discarding the flag, and `sbx plugins store update mine other-store` refreshes only `mine`.
-
-**Correction proposée.** Guard both dispatch arms the way `store info`/`store rm` are guarded: `crate::cli::reject_extra(&["plugins","store","install"], args.get(2..).unwrap_or(&[]))` before `plugins_store_install`, and `reject_extra(&["plugins","store","update"], args.get(1..).unwrap_or(&[]))` before `plugins_store_update` (also catching the `-`-prefixed token case there).
-
-**Rectification du vérificateur.** Real and correctly located, but medium overstates it. The consequence is a usage-validation inconsistency, not a wrong result: `store install mine kp vault` prints exactly one `render_plugin_installed` confirmation naming `kp` (src/cli/plugins.rs:1188-1197), so the output does not claim `vault` was installed — the user has to infer the omission rather than being told a falsehood. The `--dry-run` example in the report is a flag `store install` never had, so it is a mistyped-token case like any other.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Confirmed by reading both arms. `plugins_store_install` binds only `args.first()` and `args.get(1)` (src/cli/plugins.rs:1169-1172) and never inspects `args.get(2..)`; `plugins_store_update` binds only `args.first()` (src/cli/plugins.rs:1111-1118) and ignores the tail. The dispatch at src/cli/plugins.rs:765 and 764 passes `&args[1..]` straight through with no guard, while the siblings two arms below do guard: `store info` (768-774) and `store rm` (775-781) call `crate::cli::reject_extra(..., args.get(2..))`, and `plugins list`/`info`/`install`/`verify` do the same at lines 26-49. `store list`, `store add`, `store publish`, `store verify` and `store rekey` each reject an unrecognised token explicitly (src/cli/plugins.rs:1507-1513, 819-826, 1292-1299, 1357-1364). `reject_extra` exits 2 with `sbx: <path> takes no argument '<tok>'` (src/cli/mod.rs:39-54). The `--all` case also checks out: the token is accepted as a store name, `stores::update` -> `read_configured` fails (src/plugins/stores.rs:918-923), producing `sbx: cannot update store '--all': …` at exit 1 instead of a usage error at exit 2. No comment anywhere in either function claims the tolerance is deliberate, and no test pins it.
-
-</details>
-
----
-
-### B34 — Dispatch docs promise a built-in/embedded plugin store and a built-in plugin install; neither exists
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/cli/plugins.rs:752` |
-| **Catégorie** | `doc-drift` |
-| **Sous-système** | CLI — sbx plugins et sbx task |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** Line 752-753 documents `plugins store` as "`list` shows the built-in (embedded) store and every configured remote store". `plugins_store_list` only ever iterates `stores::list(layout)`, which reads directory entries under `layout.stores_dir()` (src/plugins/stores.rs:668-680) — the configured remote stores and nothing else — and prints the single heading `configured plugin stores`. There is no embedded store anywhere in the tree (`grep -rn 'embedded' src/plugins/` finds nothing). The module header at line 2 has the matching stale claim, "`install`/`rm` (place a local or built-in plugin)": `plugins_install` only takes a source directory, and `origin::Origin` has exactly three variants — `Local`, `Store`, `Unknown` — with no built-in among them. The same header also omits `upgrade`, `verify`, `store verify` and `store rekey`, all of which the dispatch handles. The vestigial `what`/`install_cmd` parameters of `print_source_footer`, which has exactly one caller passing `"this store"`, are the residue of the removed second source.
-
-**Scénario.** A maintainer (or a user reading the rendered docs) follows line 752 and runs `sbx plugins store list` on a machine with no store configured, expecting the built-in catalogue. The output is `configured plugin stores: (none)` plus the `store add` hint, exit 0 — the promised built-in listing never appears, and there is no command that produces one.
-
-**Correction proposée.** Delete the 'built-in (embedded) store' clause from line 752 and 'or built-in' from line 2, and add the missing verbs (`upgrade`, `verify`, `store verify`, `store rekey`) to the module header. If the parameterisation is no longer earning its keep, collapse `print_source_footer`'s `what`/`install_cmd` to the single store case.
-
-**Rectification du vérificateur.** The code facts hold, but the failure scenario is wrong: every cited claim lives in internal `//!`/`///` comments, not in user-facing output. The `plugins store list` help page (src/help.rs:2953-2972) correctly says "Every configured store" with no mention of a built-in one, so no user following the rendered CLI docs is misled — the audience for the stale text is maintainers reading `mise run rustdoc` output. Worth adding to the same cleanup: the `plugins_cmd` doc at src/cli/plugins.rs:22-24 is stale in the same direction ("A read-only diagnostic for now; installation and the signed plugin store are later increments, so the dispatch only knows the inspection verbs") when the dispatch already handles `install`, `rm`, `upgrade` and the whole `store` tree.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Confirmed as doc drift. src/cli/plugins.rs:752-753 says `list` shows "the built-in (embedded) store and every configured remote store", but `plugins_store_list` (src/cli/plugins.rs:1650-1685) only reads `stores::list(layout)` and prints `configured plugin stores`/`configured plugin stores: (none)`; there is no embedded catalogue anywhere (`grep -rn 'embedded' src/` hits only the mise plugin, the notify logos and the audio sitecustomize; no `include_str!`/`include_bytes!` of a catalogue). The module header at src/cli/plugins.rs:2 still says "`install`/`rm` (place a local or built-in plugin)" while `origin::Origin` has exactly `Local`/`Store`/`Unknown` (src/plugins/origin.rs:31-47), and line 3 omits `upgrade`, `verify`, `store verify` and `store rekey`, all dispatched at lines 45-51 and 766-767. `print_source_footer`'s `what`/`install_cmd` (src/cli/plugins.rs:1606-1620) do have exactly one caller, passing "this store" (lines 1731-1738).
-
-</details>
-
----
-
-### B35 — `task run`'s doc comment says a refusal is exit 2; it is 125
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/cli/task.rs:623` |
-| **Catégorie** | `doc-drift` |
-| **Sous-système** | CLI — sbx plugins et sbx task |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** Line 622-624 documents `task_run` as "a *refusal* (an unknown task, a value outside its bound) is exit 2, distinguishable from the command having run and failed". Every refusal path returns `REFUSED_EXIT` = 125 instead: `render_result` (line 753), `run_as_json` (line 1045) and `run_detached` (lines 741, 862). The constant's own doc at lines 28-32 explains why 2 was rejected — "that is a plausible exit code for the wrapped command itself, and a caller must be able to tell 'sbx refused to run it' from 'it ran and exited 2'" — and help.rs:966 documents 125 to users. Only this one comment still says 2, which is the value the design deliberately does not use.
-
-**Scénario.** A maintainer writing a wrapper reads line 623 and branches on `if [ $? -eq 2 ]` to detect a refusal. `sbx task run no-such-op` returns 125, the branch never fires, and a refused invocation is handled as if the wrapped command had run and exited 125.
-
-**Correction proposée.** Change 'is exit 2' to 'is exit 125' at line 623 (or point at `REFUSED_EXIT`), matching lines 28-32 and help.rs:966.
-
-**Rectification du vérificateur.** Accurate as reported, though its practical reach is smaller than the attack suggests: the wrong number lives only in a private `fn task_run` rustdoc comment, not in any user-facing output — `sbx help task run` (help.rs:966) and the `REFUSED_EXIT` constant both say 125 — so only a maintainer reading the source, not a user reading `--help`, can be misled.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Verified verbatim. src/cli/task.rs:622-624 reads "a *refusal* (an unknown task, a value outside its bound) is exit 2, distinguishable from the command having run and failed", while src/cli/task.rs:32 defines `const REFUSED_EXIT: u8 = 125;` and every refusal path returns it: line 741 (`--detach --json`), line 753 (`--detach` prose), line 862 in `render_result` — whose own comment at 857-859 says "Not 2: that is a plausible exit code for the wrapped command itself, and a caller must be able to tell 'sbx refused to run it' from 'it ran and exited 2'" — and line 1045 in `run_as_json`. help.rs:966 documents "is exit **125**" to users. No path returns 2 for a plane refusal (exit 2 is reserved for argument/usage errors, e.g. task.rs lines 663, 674, 682). The doc comment states the exact value the design explicitly rejected, in the wording of the category it rejected it for.
-
-</details>
-
----
-
-### B36 — A store listing offers a broker/signer entry whose name is already taken, because the name check reads directory names instead of manifest names
 | | |
 |---|---|
 | **Gravité** | Faible |
@@ -1247,7 +1504,62 @@ Traced end to end and nothing prevents it. `InstalledIndex::by_name` is built fr
 
 ---
 
-### B37 — `plugins info` reports a broker/signer name miss as an unclaimed resolver scheme, and offers no remediation
+### B43 — Dispatch docs promise a built-in/embedded plugin store and a built-in plugin install; neither exists
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/cli/plugins.rs:752` |
+| **Catégorie** | `doc-drift` |
+| **Sous-système** | CLI — sbx plugins et sbx task |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** Line 752-753 documents `plugins store` as "`list` shows the built-in (embedded) store and every configured remote store". `plugins_store_list` only ever iterates `stores::list(layout)`, which reads directory entries under `layout.stores_dir()` (src/plugins/stores.rs:668-680) — the configured remote stores and nothing else — and prints the single heading `configured plugin stores`. There is no embedded store anywhere in the tree (`grep -rn 'embedded' src/plugins/` finds nothing). The module header at line 2 has the matching stale claim, "`install`/`rm` (place a local or built-in plugin)": `plugins_install` only takes a source directory, and `origin::Origin` has exactly three variants — `Local`, `Store`, `Unknown` — with no built-in among them. The same header also omits `upgrade`, `verify`, `store verify` and `store rekey`, all of which the dispatch handles. The vestigial `what`/`install_cmd` parameters of `print_source_footer`, which has exactly one caller passing `"this store"`, are the residue of the removed second source.
+
+**Scénario.** A maintainer (or a user reading the rendered docs) follows line 752 and runs `sbx plugins store list` on a machine with no store configured, expecting the built-in catalogue. The output is `configured plugin stores: (none)` plus the `store add` hint, exit 0 — the promised built-in listing never appears, and there is no command that produces one.
+
+**Correction proposée.** Delete the 'built-in (embedded) store' clause from line 752 and 'or built-in' from line 2, and add the missing verbs (`upgrade`, `verify`, `store verify`, `store rekey`) to the module header. If the parameterisation is no longer earning its keep, collapse `print_source_footer`'s `what`/`install_cmd` to the single store case.
+
+**Rectification du vérificateur.** The code facts hold, but the failure scenario is wrong: every cited claim lives in internal `//!`/`///` comments, not in user-facing output. The `plugins store list` help page (src/help.rs:2953-2972) correctly says "Every configured store" with no mention of a built-in one, so no user following the rendered CLI docs is misled — the audience for the stale text is maintainers reading `mise run rustdoc` output. Worth adding to the same cleanup: the `plugins_cmd` doc at src/cli/plugins.rs:22-24 is stale in the same direction ("A read-only diagnostic for now; installation and the signed plugin store are later increments, so the dispatch only knows the inspection verbs") when the dispatch already handles `install`, `rm`, `upgrade` and the whole `store` tree.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Confirmed as doc drift. src/cli/plugins.rs:752-753 says `list` shows "the built-in (embedded) store and every configured remote store", but `plugins_store_list` (src/cli/plugins.rs:1650-1685) only reads `stores::list(layout)` and prints `configured plugin stores`/`configured plugin stores: (none)`; there is no embedded catalogue anywhere (`grep -rn 'embedded' src/` hits only the mise plugin, the notify logos and the audio sitecustomize; no `include_str!`/`include_bytes!` of a catalogue). The module header at src/cli/plugins.rs:2 still says "`install`/`rm` (place a local or built-in plugin)" while `origin::Origin` has exactly `Local`/`Store`/`Unknown` (src/plugins/origin.rs:31-47), and line 3 omits `upgrade`, `verify`, `store verify` and `store rekey`, all dispatched at lines 45-51 and 766-767. `print_source_footer`'s `what`/`install_cmd` (src/cli/plugins.rs:1606-1620) do have exactly one caller, passing "this store" (lines 1731-1738).
+
+</details>
+
+---
+
+### B44 — `plugins store install` and `plugins store update` silently drop every argument past the ones they read
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/cli/plugins.rs:1169` |
+| **Catégorie** | `logic-bug` |
+| **Sous-système** | CLI — sbx plugins et sbx task |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** `plugins_store_install` reads only `args.first()` and `args.get(1)` (lines 1169-1172) and `plugins_store_update` reads only `args.first()` (line 1111); neither validates the tail. Every sibling verb in this file refuses extras: `plugins list`, `plugins info`, `plugins install`, `plugins verify` (lines 26-49), `plugins store info` and `plugins store rm` (lines 771-784) all route through `crate::cli::reject_extra`, and `store list`/`store add`/`store publish`/`store verify`/`store rekey` each reject an unrecognised token explicitly. As a result the two placement verbs accept a mistyped or extra operand, act on a subset of what was asked, and exit 0. `store update` additionally treats an unknown option as a store name, so `--all` produces `cannot update store '--all'` at exit 1 instead of a usage error at exit 2.
+
+**Scénario.** `sbx plugins store install mine kp vault` installs only `kp`, prints the single success confirmation and exits 0 — the user believes `vault` was installed too and only discovers otherwise at the next launch. Likewise `sbx plugins store install mine kp --dry-run` performs a real install while silently discarding the flag, and `sbx plugins store update mine other-store` refreshes only `mine`.
+
+**Correction proposée.** Guard both dispatch arms the way `store info`/`store rm` are guarded: `crate::cli::reject_extra(&["plugins","store","install"], args.get(2..).unwrap_or(&[]))` before `plugins_store_install`, and `reject_extra(&["plugins","store","update"], args.get(1..).unwrap_or(&[]))` before `plugins_store_update` (also catching the `-`-prefixed token case there).
+
+**Rectification du vérificateur.** Real and correctly located, but medium overstates it. The consequence is a usage-validation inconsistency, not a wrong result: `store install mine kp vault` prints exactly one `render_plugin_installed` confirmation naming `kp` (src/cli/plugins.rs:1188-1197), so the output does not claim `vault` was installed — the user has to infer the omission rather than being told a falsehood. The `--dry-run` example in the report is a flag `store install` never had, so it is a mistyped-token case like any other.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Confirmed by reading both arms. `plugins_store_install` binds only `args.first()` and `args.get(1)` (src/cli/plugins.rs:1169-1172) and never inspects `args.get(2..)`; `plugins_store_update` binds only `args.first()` (src/cli/plugins.rs:1111-1118) and ignores the tail. The dispatch at src/cli/plugins.rs:765 and 764 passes `&args[1..]` straight through with no guard, while the siblings two arms below do guard: `store info` (768-774) and `store rm` (775-781) call `crate::cli::reject_extra(..., args.get(2..))`, and `plugins list`/`info`/`install`/`verify` do the same at lines 26-49. `store list`, `store add`, `store publish`, `store verify` and `store rekey` each reject an unrecognised token explicitly (src/cli/plugins.rs:1507-1513, 819-826, 1292-1299, 1357-1364). `reject_extra` exits 2 with `sbx: <path> takes no argument '<tok>'` (src/cli/mod.rs:39-54). The `--all` case also checks out: the token is accepted as a store name, `stores::update` -> `read_configured` fails (src/plugins/stores.rs:918-923), producing `sbx: cannot update store '--all': …` at exit 1 instead of a usage error at exit 2. No comment anywhere in either function claims the tolerance is deliberate, and no test pins it.
+
+</details>
+
+---
+
+### B45 — `plugins info` reports a broker/signer name miss as an unclaimed resolver scheme, and offers no remediation
+
 | | |
 |---|---|
 | **Gravité** | Faible |
@@ -1273,111 +1585,8 @@ Confirmed at the cited lines. `plugins_info` accepts three namespaces: a built-i
 
 ---
 
-### B38 — `sbx store` reports sizes as "exact" when the reflink probe could not run at all
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/cli/store.rs:151` |
-| **Catégorie** | `logic-bug` |
-| **Sous-système** | CLI — verbes restants |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+### B46 — `sbx search` silently discards every flag-shaped argument instead of rejecting it
 
-**Constat.** `build` sets `shares_storage: sandbox::supports_reflink(data_dir)`, and `supports_reflink` (src/sandbox/projectstore.rs:434) is `reflink_verdict(dir) == Some(true)` — it collapses `None` ("the probe could not be carried out") into `false` ("this filesystem definitely does not share storage"). `reflink_verdict` returns `None` whenever `fs::write` of the probe file fails: an unwritable data directory, or a full filesystem. `render` then prints the unqualified claim at line 279: "sizes count allocated blocks and a hardlinked file once; on this filesystem they are exact." The sibling probe guards against exactly this collapse and says so — `storage::Preflight` keeps `shares_blocks: Option<bool>` with the comment "A probe that could not be carried out stays `None`: an unwritable directory says nothing about its filesystem, and this decision must not read it as an answer" (src/storage.rs:1478-1481). So `sbx doctor` and `sbx store` reach opposite conclusions from the same unknown. The surrounding comment at src/cli/store.rs:149-150 ("the honesty of the sizes is decided by what this filesystem actually does") and the render comment at 262-268 ("the honest thing is to state the bound, not invent a number") both describe behaviour the code does not have. Separately, the module doc at src/cli/store.rs:8 calls the command "Read-only and cheap: a filesystem walk" — `supports_reflink` creates and removes two `.reflink-probe-*` files inside the user's data directory, which is not read-only and leaves litter in the listing if the process is killed mid-probe.
-
-**Scénario.** Point `SBX_DATA_DIR` at a btrfs directory owned by another user (or run `sbx store` when that filesystem is out of space). `fs::write` of `.reflink-probe-src-*` fails, `reflink_verdict` returns `None`, `supports_reflink` yields `false`, and the report closes with "on this filesystem they are exact" for a copy-on-write, compressing filesystem where every printed size is in fact a large over-estimate — the precise opposite of the truth, delivered as a certainty.
-
-**Correction proposée.** Make `shares_storage` an `Option<bool>` fed by `sandbox::reflink_verdict` (already `pub(crate)`), and give `render` a third closing sentence for `None` ("this filesystem's block sharing could not be probed, so the sizes may be an upper bound"). Also amend the module doc so the probe write is declared rather than denied.
-
-**Rectification du vérificateur.** Real, but the impact is one advisory sentence and one JSON bool in an informational report, not a decision input — medium overstates it. The doctor comparison is also imprecise: `storage::Preflight` only probes at all for an unrecognized filesystem (`matches!(host_fs, Some(FsKind::Other(_)))`, src/storage.rs:1482-1484), so on the reporter's btrfs example doctor answers from the name table and never consults the probe; the two commands do not "reach opposite conclusions from the same unknown", they use different evidence. The "Read-only and cheap" module-doc nit (src/cli/store.rs:8) is fair — the probe does create and remove two files — but the files are removed before returning.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Verified end to end. src/cli/store.rs:151 is `shares_storage: sandbox::supports_reflink(data_dir)`; src/sandbox/projectstore.rs:434-435 is `reflink_verdict(dir) == Some(true)`, and its own doc at :430-433 says the collapse "counts as no, which is what a caller about to copy needs" and explicitly redirects: "A caller that must tell the two apart wants [`reflink_verdict`]" — `sbx store` is a reporter, not a copier, so it is the caller that must tell them apart and it picked the wrong function. src/sandbox/projectstore.rs:443-449 returns `None` when `fs::write` of the probe file fails, and the unit test at projectstore.rs:700-702 pins exactly that (`reflink_verdict(&closed) == None` while `!supports_reflink(&closed)`). src/cli/store.rs:269-280 then prints the unqualified "on this filesystem they are exact" for the false branch. Nothing on the path prevents it: `store_cmd` (src/cli/store.rs:77-117) creates nothing and only resolves `store::Layout::from_env()`, so a readable-but-unwritable `SBX_DATA_DIR` (or an out-of-space filesystem — the very condition that makes a user run `sbx store`) yields the wrong sentence, plus `"shares_storage": false` in `--json`. The reachability is narrow, though: `render` returns early at src/cli/store.rs:222-225 when the listing is empty, so the dir must be readable and non-empty while being unwritable.
-
-</details>
-
----
-
-### B39 — `closing_note`'s doc and `store_moved_note`'s doc both deny that `mise` can trigger the store-moved note, which it does
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/cli/upgrade.rs:353` |
-| **Catégorie** | `doc-drift` |
-| **Sous-système** | CLI — verbes restants |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** The doc on `closing_note` states: "The scope is enforced twice over: only [`upgrade_nix_channel`] and [`upgrade_flake_packages`] return a [`Roll`] at all, so no other channel can set `moved_store_paths`" (lines 353-355). Three functions return `Roll`: `upgrade_nix_channel` (869), `upgrade_mise_tools` (963) and `upgrade_flake_packages` (1063), and `upgrade_cmd` ORs all three into `moved_store_paths` at lines 259, **273**, and 288. The match arm at line 370 is `"nix" | "flake" | "mise" if moved_store_paths`, and the comment immediately above it (365-369) correctly explains *why* mise is included. So the function's own header contradicts its body eight lines later. The same falsehood is repeated on the thing it routes to: `store_moved_note`'s doc at line 763 says "Only `nix` and `flake` reach this" and then explicitly excludes mise — "`mise` already rolls per-home inside a cage, so none of them moves the paths a home points into" — which is the reverse of the arm that dispatches to it. These are the two comments a maintainer reads before touching the store-invalidation logic, and both assert a safety invariant ("no other channel can set this") that the compiler does not enforce and the code does not honour.
-
-**Scénario.** A maintainer adds a `Roll`-returning channel and relies on the stated invariant ("only these two return a Roll") to skip auditing `closing_note`, or reads `store_moved_note`'s header and concludes a `sbx upgrade mise` run can never print the store-moved warning. Today, `sbx upgrade mise` in a project whose `nix:` tools roll forward prints exactly that note — reachable, and contradicting the documentation of the function that prints it.
-
-**Correction proposée.** Rewrite line 353-355 to name all three `Roll`-returning channels and drop the "no other channel can set `moved_store_paths`" claim, and rewrite line 763 (and the mise clause in 766-768) to match the arm at line 370: `nix`, `flake` and `mise` (via the project's `nix:` tools) reach it; `deb`/`appimage`/`tarball`/`binary` do not.
-
-**Rectification du vérificateur.** Documentation drift only — no runtime behaviour is wrong, the arm at :370 is the intended one — so low rather than medium. There is a third instance the finding missed: src/cli/upgrade.rs:253-254, "Tracked across the two channels that build through nix", above a variable three channels write.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Both quoted comments are stale and the code contradicts them. Three functions return `Roll`: `upgrade_nix_channel` (src/cli/upgrade.rs:862-869), `upgrade_mise_tools` (:957-963) and `upgrade_flake_packages` (:1057-1063), and `upgrade_cmd` ORs all three into `moved_store_paths` at :259, :273 and :288 — so the claim at :353-355 ("only [`upgrade_nix_channel`] and [`upgrade_flake_packages`] return a [`Roll`] at all, so no other channel can set `moved_store_paths`") is false on both halves. The dispatch arm eight lines below at :370 is `"nix" | "flake" | "mise" if moved_store_paths => ClosingNote::StoreMoved`, routed to `store_moved_hint`/`store_moved_note` at :319-321 and :765. `store_moved_note`'s own header at :763-768 ("Only `nix` and `flake` reach this … `mise` already rolls per-home inside a cage, so none of them moves the paths a home points into") is the reverse of the arm that calls it. The path is reachable: `sbx upgrade mise` with no `--app` takes the `only.is_none()` branch at :266-273, and the block comment there (:268-272) states outright that the project's `nix:` tools "resolve to store paths the cage binds, so rolling one repoints exactly what a home can hold" — i.e. the body knows what both headers deny.
-
-</details>
-
----
-
-### B40 — `APP_SCOPED_TARGETS` doc says "Both" for three targets, and the refusal it feeds renders "provision and mise and nix"
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/cli/upgrade.rs:39` |
-| **Catégorie** | `doc-drift` |
-| **Sous-système** | CLI — verbes restants |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** `APP_SCOPED_TARGETS` is `&["provision", "mise", "nix"]` (line 43), but its doc (lines 39-42) reads "Both are the in-cage rolls, the ones whose unit of work is already one app's own cage; every other target rewrites a project-wide lock host-side and has no per-app unit to select." Two independent errors: it says "Both" of a three-element list, and its stated criterion is wrong for `nix` — `nix` is *not* an in-cage roll, it is a host-side lock rewrite (`upgrade_nix_channel`, line 862), and it is app-scoped for an entirely different reason, which src/help.rs:1639-1643 states correctly ("an app resolves the base channel against a lock of its own"). The user-facing refusal built from the same constant inherits the drift: line 151-156 formats `APP_SCOPED_TARGETS.join(" and ")` into "sbx: upgrade: --app narrows provision and mise and nix only — `<what>` rewrites a project-wide lock host-side, which has no per-app unit to select." That sentence is both ungrammatical and self-refuting, since it has just listed `nix` — a project-wide host-side lock rewrite — as a target `--app` does narrow. The doc comment at line 471-472 (`Advance::PerApp` … "the same two targets `APP_SCOPED_TARGETS` lets `--app` narrow") carries the same stale count.
-
-**Scénario.** `sbx upgrade flake --app demo-app` prints: "sbx: upgrade: --app narrows provision and mise and nix only — `flake` rewrites a project-wide lock host-side, which has no per-app unit to select." A user who reads the clause literally concludes `nix` is not a project-wide lock rewrite, or that the tool has a display bug; a maintainer reading the constant's doc concludes `nix` was added by mistake and removes it, silently breaking `sbx upgrade nix --app <name>` (guarded only by the hand-written assertion at line 1638).
-
-**Correction proposée.** Rewrite the doc on line 39-42 to cover all three and give `nix` its own reason (per-app lock target), matching src/help.rs:1639-1643. Build the message with an Oxford-comma join ("provision, mise and nix") and reword the second clause so it does not claim host-side lock rewrites are never app-scoped — e.g. "`<what>` has no per-app unit to select."
-
-**Rectification du vérificateur.** Severity low is right, but two parts of the argument are overstated. The "maintainer removes `nix` and silently breaks it" scenario cannot be silent: src/cli/upgrade.rs:1637-1646 asserts `parse_upgrade_args(["nix", "--app", "demo-app"])` succeeds and its comment says it is "spelled out rather than derived from `APP_SCOPED_TARGETS`, so removing `nix` from that list fails here instead of quietly … leaving the suite green". And the refusal is not self-refuting: its second clause describes `<what>` — the target the user typed — which is an accurate description of `flake`/`deb`/`appimage`/`tarball`/`binary` (the defaulted `all` is the only loose fit). The genuine defects are the stale "Both"/"two" counts at :39-42 and :471-472 and the `join(" and ")` grammar at :155.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Confirmed at the cited lines. src/cli/upgrade.rs:39-42 opens "The targets `--app <name>` narrows. Both are the in-cage rolls…" over a three-element constant at :43 (`&["provision", "mise", "nix"]`), and the stated criterion is wrong for `nix`: `upgrade_nix_channel` (:862-915) is a host-side lock refresh, and src/help.rs:1639-1643 gives the correct and different reason ("and to `nix`, because an app resolves the base channel against a lock of its own"). The user-facing refusal at :151-156 does render `APP_SCOPED_TARGETS.join(" and ")` as "provision and mise and nix". The stale count is repeated at :471-472 (`Advance::PerApp` … "the same two targets `APP_SCOPED_TARGETS` lets `--app` narrow"), where the enum variant genuinely covers two but the constant it cross-references covers three.
-
-</details>
-
----
-
-### B41 — `sbx test net` with no URL prints the parent verb's usage line, and swallows an unknown flag as the URL
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/cli/test.rs:72` |
-| **Catégorie** | `ux-error-message` |
-| **Sous-système** | CLI — verbes restants |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** When the positional target is missing, `net_test` reports `help::synopsis("test")` (line 72), which is `synopsis_of(&["test"])` = "sbx test <subcommand> <target>" (src/help.rs:3158, src/help.rs:368) — the *parent* command's grammar. The page for the verb the user actually ran exists and reads "sbx test net [--app <name>] [-X|--method <verb>] <url|tcp://host:port>" (src/help.rs:2111), and the same function reaches for the child page correctly everywhere else via the "sbx: test net: …" prefix. The user is therefore told to supply a `<subcommand>` they already supplied, and is shown neither `--app`, `-X`, nor the `tcp://` form. Compounding it, the positional arm at line 61 is `Some(s) if target.is_none() => target = Some(s)` — placed after the flag arms but with no `starts_with('-')` guard — so any unrecognised flag is consumed as the URL and the *next* argument is what gets blamed.
-
-**Scénario.** `sbx test net -X POST -a claude` (URL forgotten) prints "sbx: usage: sbx test <subcommand> <target>", which names none of the flags just used and implies the subcommand was the mistake. `sbx test net --app=claude https://api.anthropic.com` — the `=` form that `sbx upgrade` accepts (src/cli/upgrade.rs:122) but this verb does not — consumes `--app=claude` as the target and fails with "sbx: test net: unexpected argument `https://api.anthropic.com`", blaming the one argument that was correct.
-
-**Correction proposée.** Use `help::synopsis_of(&["test", "net"])` (or `eprint!("{}", help::page_usage(&["test", "net"]).unwrap_or_default())`, as `proc_ls` and `logs::run` do) at line 72, and add a `Some(s) if s.starts_with('-')` arm before line 61 that rejects the token as an unknown flag.
-
-**Rectification du vérificateur.** Two corrections. (1) The line is src/cli/test.rs:73, not 72. (2) The 'swallows an unknown flag as the URL' half is milder than implied: a lone flag becomes the target, is completed to `https://--json`, and is then rejected by `parse_url_target` because `is_valid_hostname` forbids a label starting with '-' (src/allowlist/grammar.rs:459-460, 571), so `sbx test net --json` exits 2 with "sbx: URL `https://--json` has an invalid host `--json`" — a confusing message naming a URL the user never typed, not a silent zero-exit verdict. The genuinely wrong outcomes are therefore (a) the parent-grammar usage line, which names `<subcommand>` the user already supplied and shows none of `--app`, `-X` or the `tcp://` form, and (b) the misattributed blame when a flag is followed by the real URL. Fix as proposed: `help::synopsis_of(&["test", "net"])` at line 73 and a `Some(s) if s.starts_with('-')` arm before line 61.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Verified. src/cli/test.rs:73 reads `diag::error(&format!("sbx: usage: {}", help::synopsis("test")));` — the reporter cited 72 (the `let Some(target) = target else {` head at line 72), one line off, not enough to discredit. `synopsis("test")` = `synopsis_of(&["test"])` (src/help.rs:3158-3160) resolves to the PARENT page at src/help.rs:367-368, synopsis "sbx test <subcommand> <target>"; the child page exists at src/help.rs:2110-2111 with "sbx test net [--app <name>] [-X|--method <verb>] <url|tcp://host:port>". `net_test` is reached only from `test_cmd` (src/cli/test.rs:18) after the literal "net", so this message always concerns `test net` — and every other error in the function is prefixed "sbx: test net: …". The house convention is overwhelmingly the child path: 40+ call sites use `help::synopsis_of(&[parent, child])` (src/cli/proc.rs:701, src/cli/net.rs:161/242/326, src/cli/config.rs:78, src/cli/app.rs:193, src/cli/session.rs:169, …), and the shared grammar helper `parse_one_name` (src/cli/mod.rs:88-133) both rejects `-`-prefixed tokens with a hint and prints `synopsis_of(path)` for the exact path. No comment or test defends the parent synopsis here; grep across the tree finds the string "sbx test <subcommand> <target>" only at src/help.rs:368 and its use at src/cli/test.rs:73, so nothing pins the current text. The missing `-` guard at src/cli/test.rs:61 (`Some(s) if target.is_none() => target = Some(s)`, placed after the --app/-X arms) is verified: `sbx test net --app=claude https://api.anthropic.com` binds target="--app=claude" then hits the arm at line 62-65 and prints "sbx: test net: unexpected argument `https://api.anthropic.com`", blaming the correct token — and the `--app=` spelling really is accepted by `sbx upgrade` (src/cli/upgrade.rs:118-127) and by nothing else in this family. `--help`/`-h` never reaches here (intercepted centrally at src/main.rs:71-78), so no false claim there. tests/argv.rs sweeps `test net` only for a surplus SECOND positional (tests/argv.rs:150) and never for a flag, so the gap is untested rather than sanctioned.
-
-</details>
-
----
-
-### B42 — `sbx search` silently discards every flag-shaped argument instead of rejecting it
 | | |
 |---|---|
 | **Gravité** | Faible |
@@ -1403,111 +1612,8 @@ Verified. src/cli/search.rs:13-16 is exactly `args.iter().filter_map(|a| a.to_st
 
 ---
 
-### B43 — `--detach=false` / `--observe=false` / `--dry-run=false` turn the flag ON — `flag_name` strips the value for pure booleans
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/cli/mod.rs:435` |
-| **Catégorie** | `logic-bug` |
-| **Sous-système** | CLI — dispatcher, app, session, logs, storage |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** Both launch parsers dispatch on `flag_name(raw)`, which is documented (src/main.rs:346-350) as "stripping a `=value` suffix — so `--config` and `--config=x` both dispatch on `--config`". That is right for the value-taking flags, but the pure booleans are matched through the same helper and then set unconditionally: `sbx run`'s loop matches `"--detach" => { detach = true; ... }` (src/cli/mod.rs:435-438) and `"--observe" => { observe = true; ... }` (mod.rs:439-442), and `parse_app_launch` does the same at src/cli/app.rs:198 (`--detach`), 202 (`--observe`), 222 (`--dry-run`), 226 (`--global`/`-g`) and 231 (`--local`/`-l`). The `=value` is discarded and the flag is switched on regardless of what it said. Nothing in the surrounding comments contemplates an `=` form for these; only `--net-learn` reads its own suffix (app.rs:208-218). The CLI itself teaches the `=false` idiom — `--gpu[=true|false]`, `--audio[=true|false]`, `--dbus[=true|false]` are documented optional-value booleans (src/help.rs:167-178) handled by `take_flag_bool` — so a user or script that spells every flag `--name=value` lands here. This is precisely the failure `parse_app_launch`'s own doc says it exists to prevent: "a typo cannot silently launch a different posture (a mistyped `--detach` running attached …)".
-
-**Scénario.** `sbx run --detach=false npm test` — the user explicitly asks not to detach, and sbx launches the session detached: the terminal returns immediately, the command's output goes to `<data>/logs/<pid>.log`, and its exit status is not propagated. Symmetrically `sbx app run demo-app --observe=false` turns the `[sbx:exec]` feed on, and `sbx app run demo-app --net-learn --dry-run=false` writes the learned egress rules to the profile when the user asked for a preview.
-
-**Correction proposée.** Match these booleans on the raw token rather than on `flag_name(raw)` (or, in each arm, reject a token carrying an `=`): e.g. keep `match flag_name(&raw)` for the value flags but add a guard `raw.contains('=')` on the `--detach`/`--observe`/`--dry-run`/`--global`/`--local` arms that reports `sbx: --detach takes no value` and exits 2 — or route them through `take_flag_bool` so `=true`/`=false` mean what they say.
-
-**Rectification du vérificateur.** Real but lower-impact than claimed. `--detach=false` is not a form the CLI documents: src/help.rs:102/106 spells the flag as a bare `--detach`, and only the optional-value booleans carry the `[=true|false]` grammar (src/help.rs:169-178, handled by `take_flag_bool` at src/main.rs:358-366). So the trigger is a user extrapolating from `--gpu=false`, not a documented spelling being mishandled — a strictness/anomaly bug rather than a likely field failure. Note the same swallowing applies to any `=` suffix on these arms, including `--help=x` and `--global=x`.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Every citation checks out. src/main.rs:348-350 `fn flag_name(raw: &str) -> &str { raw.split_once('=').map(|(f, _)| f).unwrap_or(raw) }`. src/cli/mod.rs:434-442 dispatches `match crate::flag_name(raw)` with `"--detach" => { detach = true; cmd.remove(0); }` and `"--observe" => { observe = true; cmd.remove(0); }`; src/cli/app.rs:197-235 does the same for `--detach` (198), `--observe` (202), `--dry-run` (222), `--global`/`-g` (226), `--local`/`-l` (231). I traced `sbx run --detach=false npm test`: `flag_name` yields `--detach`, the arm sets `detach = true`, `cmd.remove(0)` discards the whole token, and src/cli/mod.rs:460 calls `crate::sandbox::run(cmd, detach=true, ...)`. Nothing downstream re-reads the token. `--net-learn` is the only arm that reads its own `=` suffix (app.rs:208-218), so this is not a general convention being applied. No comment or test contemplates the `=` form for the pure booleans, and the silent acceptance contradicts the strictness the same function advertises (app.rs:240-246 rejects any other unknown `-`-leading token with `unknown flag {raw}`).
-
-</details>
-
----
-
-### B44 — `sbx storage migrate` leaves the whole copy in the volume when verification fails, and says nothing about it
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/cli/storage.rs:458` |
-| **Catégorie** | `error-handling` |
-| **Sous-système** | CLI — dispatcher, app, session, logs, storage |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** `migrate` has two failure exits after the copy starts. The copy-*failure* path (storage.rs:440-454) sweeps: `let swept = volume_was_empty && clear_tree(&mount_point).is_ok();` and the message ends "and the volume was cleared, so this can simply be re-run". The copy-*verification* path immediately below (storage.rs:458-466) does not: on `copied != before` it returns `fail(...)` with the census diff and "{dir} is untouched and still in use", leaving the entire copied tree sitting in the mounted volume, running no sweep and never mentioning the volume's new contents. `volume_was_empty`, computed at storage.rs:439, is simply unused on this branch. The mismatch is an anticipated outcome — the comment at storage.rs:456-457 says "A count that drifted means something was not carried across — most consequentially the hardlinks a store deduplicates into" — so this is not a can't-happen path.
-
-**Scénario.** Run `sbx storage migrate` on a data directory whose store carries hardlinks that `copy_tree` does not reproduce. The copy runs to completion, `copied != before`, and sbx reports "the copy does not match the original, so nothing was switched over … is untouched and still in use" and exits 1 — but the volume now holds a full `store/`, `projects/` and `apps/`. The user fixes the cause and re-runs `sbx storage migrate`, which now trips the guard at storage.rs:393-398 — "<mount> already holds store, projects, apps — refusing to migrate into it (--force overrides)" — a second, unrelated-looking error the first message gave no warning of, and whose only documented escape (`--force`) makes the next copy interleave with the stale one.
-
-**Correction proposée.** Apply the same sweep on the verification-failure branch: `let swept = volume_was_empty && clear_tree(&mount_point).is_ok();` and extend the message the way the copy-failure branch does ("the volume was cleared, so this can simply be re-run"), or — when the volume was not empty to begin with and cannot be swept — say explicitly that the partial copy is still in the volume and that a re-run needs `--force`.
-
-**Rectification du vérificateur.** The defect is real but the reporter's trigger is wrong, and reachability is much narrower than implied. Hardlinks that cannot be reproduced do NOT reach this branch: `std::fs::hard_link` at src/storage.rs:869 (and `symlink` at 852) return `Err`, which takes the copy-*failure* arm that already sweeps. `copied != before` requires the two tallies to disagree, and `census` (src/storage.rs:782-814) and `copy_tree` (827-889) count dirs/files/inodes/bytes/symlinks/special by identical rules, so the branch is defensive — it needs the source tree to change under the copy, which the live-session guard at storage.rs:377-382 already narrows. One correction in the reporter's favour: `--force` does not merely "interleave" on the re-run — `copy_tree` will hit EEXIST on the stale copy's symlinks/hardlinks (src/storage.rs:852, 869) and fail, and that failure will not sweep either because `volume_is_empty` is now false, so the user is genuinely stuck without manually clearing the volume.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-The asymmetry is exactly as described. src/cli/storage.rs:439 `let volume_was_empty = volume_is_empty(&mount_point);`; the copy-failure arm at storage.rs:443-452 sweeps with `let swept = volume_was_empty && clear_tree(&mount_point).is_ok();` and appends "and the volume was cleared, so this can simply be re-run"; the verification arm at storage.rs:458-466 returns `fail(...)` with "{dir} is untouched and still in use" and no sweep, no mention of the volume. Nothing unmounts on the way out — `fail` is only `diag::error` + `ExitCode::FAILURE` (storage.rs:135-138) and `ensure_mounted` (src/storage.rs:253-264) leaves the volume up — so the copied `store/`, `projects/`, `apps/` stay in place and the re-run trips `occupied_subtrees` at storage.rs:393-400. No comment defends the asymmetry; the mismatch is explicitly anticipated (storage.rs:456-457).
-
-</details>
-
----
-
-### B45 — `sbx logs -f`: a feed that answers with rows but no cursor makes the loop drop those rows and declare the session ended
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/cli/logs.rs:708` |
-| **Catégorie** | `logic-bug` |
-| **Sous-système** | CLI — dispatcher, app, session, logs, storage |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : moyenne) |
-
-**Constat.** The merged follow loop collects each feed's new rows into `batch` and updates `feed.cursor = head` (logs.rs:694-707), then checks `if feeds.iter().all(|f| f.cursor.is_none())` and returns *before* `batch` is sorted and written (logs.rs:708-715). A feed can set its cursor to `None` on a **successful** read: `read_task_rows` deliberately returns `head = None` when `head == 0 && !rows.is_empty()` (logs.rs:378-382), the "older plane that cannot say what is new" case. When that is the last feed with a cursor, the rows it just handed back are silently discarded and the view prints "(session ended)" for a session that is still running. The first-read path handles this correctly — it keeps the rows and lists the feed under `unfollowable` (logs.rs:598-608), with a comment explaining that reading a missing cursor as a missing feed "threw those rows away and told the reader the session was recording nothing while holding its record in hand". The follow loop reintroduces exactly that.
-
-**Scénario.** Follow a session whose control plane predates the append cursor (launched by an earlier sbx) and whose task log was empty at the first read: `sbx logs <pid> -f --feed task`. The first read returns no entries and `head=0`, so `head` becomes `Some(0)` and the feed is treated as followable. When the agent's first declared operation finishes, the next poll returns one entry with `head=0`, `read_task_rows` maps that to `None`, every cursor is now `None`, and sbx prints "(session ended)" and exits 0 — without ever printing the invocation it had just read, and while the session is still alive.
-
-**Correction proposée.** Move the all-cursors-`None` check below the batch write, or write `batch` before returning: sort and emit `batch` (and the eviction note) first, then test `feeds.iter().all(|f| f.cursor.is_none())` and return. Distinguish the two ways a cursor becomes `None` if the "(session ended)" wording should not fire for a feed that merely stopped being followable.
-
-**Rectification du vérificateur.** Survives, but two corrections. (1) The line citation for the head→None mapping is wrong: it is src/cli/logs.rs:391-394, not 378-382 (378-386 is the `token`/`subject` match on `e.refused`). (2) Reachability is legacy-only, which the reporter states but under-weights: the current plane always writes `head=` (src/sandbox/task_control.rs:1331) and `TaskLog::since` returns `inner.appended` (task_control.rs:502), which is ≥1 whenever any entry exists (incremented at 456), so a modern session can never produce head=0-with-rows; and no non-task feed can return `None` on a successful read, so the drop needs the task feed to be the last one holding a cursor. A simpler variant of the same root shows up first: with `--feed task` on such a plane and a *non-empty* first read, the feed is marked `unfollowable` (cursor `None`) and the very first poll 400 ms later prints "(session ended)" for a session that is still running — no rows lost, but the same wrong claim.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-The load-bearing citation is right: src/cli/logs.rs:694-707 extends `batch` and sets `feed.cursor = head`, then 708-715 `if feeds.iter().all(|f| f.cursor.is_none()) { ... writeln!("(session {} ended)") ... return ExitCode::SUCCESS; }` fires before `batch.sort_by_key` (716) and the write block (717-734), so a batch collected in that round is discarded. A successful read can set the cursor to `None` — `read_task_rows` maps `head == 0 && !rows.is_empty()` to `None`. Tracing `sbx logs <pid> -f --feed task` against a plane that omits `head=`: first read returns no entries so `head` stays `Some(0)` and the feed is polled; a later poll returns a row with head still 0, the mapping yields `None`, every cursor is `None`, and the row is dropped while sbx prints "(session ended)" for a live session. The follow loop's own comment (logs.rs:686-689) explains only why a cursor may go `None`, not the ordering, and the first-read path deliberately does the opposite (logs.rs:601-620: it keeps the rows and lists the feed under `unfollowable`, with the comment "Reading the missing cursor as a missing feed threw those rows away and told the reader the session was recording nothing while holding its record in hand"). No test covers the follow loop (the only test in the module is `feeds_and_names_agree`, logs.rs:746-753).
-
-</details>
-
----
-
-### B46 — `sbx logs --feed <name>` reports "session N is recording nothing" when only the filtered feed is absent
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/cli/logs.rs:621` |
-| **Catégorie** | `ux-error-message` |
-| **Sous-système** | CLI — dispatcher, app, session, logs, storage |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** `--feed` narrows the list in place at logs.rs:592 (`feeds.retain(...)`), and the all-absent check that follows compares against the *narrowed* list: `if absent.len() == feeds.len()` (logs.rs:621) then `diag::error("sbx: logs: session {} is recording nothing.")` and exit 2. With a filter in play that sentence is false — it states a property of the whole session while only the selected subset was consulted. The message the code intends is defended in its own comment above ("'Recording nothing' is about feeds that did not **answer** …"), but the `--feed` interaction was not folded into the wording, and the hint loop underneath prints only the filtered feed's reason, so the reader is given a total verdict backed by a partial reading.
-
-**Scénario.** Launch a session with a filtering `[network] mode` but without `--observe`, so `net` records and `fs` does not. `sbx logs 4242` shows the egress rows. `sbx logs 4242 --feed fs` prints "sbx: logs: session 4242 is recording nothing." plus one hint about `fs`, and exits 2 — telling the operator the session records nothing while the very next command shows its egress log.
-
-**Correction proposée.** Word the refusal against what was asked for when `only.is_some()`: e.g. "none of the feeds you selected (fs) is recording for session 4242" plus the per-feed reasons, keeping the existing sentence for the unfiltered case. The `known` list is already available at logs.rs:588 to point at the feeds that were not asked about.
-
-**Rectification du vérificateur.** Mechanism confirmed, with two corrections. (1) `known` is built at src/cli/logs.rs:586 (used at 588), not 588 — and it is the static seven-name list from `feeds_for`, which is what makes the case trivially reachable rather than a rare state. (2) The exit code itself is defensible — the operator asked for a feed that is not recording, so refusing is reasonable; the defect is purely the sentence, which asserts a whole-session property after consulting only the selected subset. Impact is a misleading message, not a wrong action.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Line numbers check out: `feeds.retain(|f| names.contains(&f.name.to_string()))` at src/cli/logs.rs:592 narrows the list, and the all-absent test at src/cli/logs.rs:621 is `if absent.len() == feeds.len()`, printing "sbx: logs: session {} is recording nothing." (src/cli/logs.rs:623) and returning ExitCode::from(2). Nothing prevents the narrowed case: `feeds_for` (src/cli/logs.rs:414-466) returns a fixed vec of all seven feeds regardless of what the session actually stood up, so the `known` check at src/cli/logs.rs:586-590 accepts `--feed fs` for every session; the fs socket then fails to connect for a session launched without `--observe` (absent text at logs.rs:440), while `net` is live for a filtering `[network] mode` (logs.rs:433). absent = feeds = [fs] and the totalizing sentence fires. The comment at src/cli/logs.rs:617-620 defends only the cursor-vs-answer distinction, and the tests cover the two cases separately (tests/logs.rs:596 narrowing with a live feed, tests/logs.rs:637-655 the unfiltered empty session) — none covers a filter that selects only an absent feed, so nothing documents this wording as deliberate.
-
-</details>
-
----
-
 ### B47 — `sbx session stop --` takes `--` as a session id; the comment claims it ends option parsing
+
 | | |
 |---|---|
 | **Gravité** | Faible |
@@ -1533,280 +1639,228 @@ Verified verbatim: the comment at src/cli/session.rs:220-221 reads "`--` still e
 
 ---
 
-### B48 — `sbx app rm <name> --purge` reports "no profile and no home" for a profile it just failed to delete
+### B48 — `sbx storage migrate` leaves the whole copy in the volume when verification fails, and says nothing about it
+
 | | |
 |---|---|
 | **Gravité** | Faible |
-| **Emplacement** | `src/cli/app.rs:1224` |
-| **Catégorie** | `ux-error-message` |
+| **Emplacement** | `src/cli/storage.rs:458` |
+| **Catégorie** | `error-handling` |
 | **Sous-système** | CLI — dispatcher, app, session, logs, storage |
 | **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
 
-**Constat.** `app_rm_purge_one` keeps `profile_failed` and `profile_removed` as separate flags precisely so an undeletable profile is not confused with an absent one — the long comment at app.rs:1172-1177 spells that out. But the no-op check at app.rs:1224 tests only `!profile_removed && report.found_nothing()`, so the `profile_failed` case falls into it and prints "sbx: nothing to purge for '{name}' (no profile and no home)" one line after "sbx: cannot remove {path}: {e}". The two messages contradict each other, and the second is the one that reads as the verdict. It also returns `acted: false`, which is what makes the batch in `app_rm_purge` skip its closing note (app.rs:1113-1121).
+**Constat.** `migrate` has two failure exits after the copy starts. The copy-*failure* path (storage.rs:440-454) sweeps: `let swept = volume_was_empty && clear_tree(&mount_point).is_ok();` and the message ends "and the volume was cleared, so this can simply be re-run". The copy-*verification* path immediately below (storage.rs:458-466) does not: on `copied != before` it returns `fail(...)` with the census diff and "{dir} is untouched and still in use", leaving the entire copied tree sitting in the mounted volume, running no sweep and never mentioning the volume's new contents. `volume_was_empty`, computed at storage.rs:439, is simply unused on this branch. The mismatch is an anticipated outcome — the comment at storage.rs:456-457 says "A count that drifted means something was not carried across — most consequentially the hardlinks a store deduplicates into" — so this is not a can't-happen path.
 
-**Scénario.** Make the profiles directory non-writable (`chmod a-w ~/.config/sbx/apps`) and run `sbx app rm demo-app --purge` for an app with an imported profile and no home yet. Output: "sbx: cannot remove /home/u/.config/sbx/apps/demo-app.toml: Permission denied" followed by "sbx: nothing to purge for 'demo-app' (no profile and no home)" — the second sentence denies the existence of the file the first sentence just named.
+**Scénario.** Run `sbx storage migrate` on a data directory whose store carries hardlinks that `copy_tree` does not reproduce. The copy runs to completion, `copied != before`, and sbx reports "the copy does not match the original, so nothing was switched over … is untouched and still in use" and exits 1 — but the volume now holds a full `store/`, `projects/` and `apps/`. The user fixes the cause and re-runs `sbx storage migrate`, which now trips the guard at storage.rs:393-398 — "<mount> already holds store, projects, apps — refusing to migrate into it (--force overrides)" — a second, unrelated-looking error the first message gave no warning of, and whose only documented escape (`--force`) makes the next copy interleave with the stale one.
 
-**Correction proposée.** Guard the no-op arm with the flag the function already tracks: `if !profile_removed && !profile_failed && report.found_nothing()`. A `profile_failed` name should fall through to the summary path so it reports "purged with errors" (which `clean` at app.rs:1246 already computes from `profile_failed`), or get its own message naming the profile that survived.
+**Correction proposée.** Apply the same sweep on the verification-failure branch: `let swept = volume_was_empty && clear_tree(&mount_point).is_ok();` and extend the message the way the copy-failure branch does ("the volume was cleared, so this can simply be re-run"), or — when the volume was not empty to begin with and cannot be swept — say explicitly that the partial copy is still in the volume and that a re-run needs `--force`.
 
-**Rectification du vérificateur.** Survives, but two parts of the reporter's mechanism need correcting. (1) The comment at src/cli/app.rs:1172-1177 does not claim the no-op check distinguishes the two states — it says the collapsed flag "fed the 'nothing found' check and the summary's wording" and describes fixing the exit code/summary, so the no-op check was left as-is rather than contradicted. (2) The exit code is NOT wrong: `acted: false` also carries `ok: false`, so `app_rm_purge` sets had_error and `!purged_any` returns ExitCode::FAILURE (src/cli/app.rs:1077-1085). Skipping the closing gc note is also defensible, since nothing was actually reclaimed. The whole defect is the contradictory sentence.
+**Rectification du vérificateur.** The defect is real but the reporter's trigger is wrong, and reachability is much narrower than implied. Hardlinks that cannot be reproduced do NOT reach this branch: `std::fs::hard_link` at src/storage.rs:869 (and `symlink` at 852) return `Err`, which takes the copy-*failure* arm that already sweeps. `copied != before` requires the two tallies to disagree, and `census` (src/storage.rs:782-814) and `copy_tree` (827-889) count dirs/files/inodes/bytes/symlinks/special by identical rules, so the branch is defensive — it needs the source tree to change under the copy, which the live-session guard at storage.rs:377-382 already narrows. One correction in the reporter's favour: `--force` does not merely "interleave" on the re-run — `copy_tree` will hit EEXIST on the stale copy's symlinks/hardlinks (src/storage.rs:852, 869) and fail, and that failure will not sweep either because `volume_is_empty` is now false, so the user is genuinely stuck without manually clearing the volume.
 
 <details>
 <summary>Preuve retenue par le vérificateur</summary>
 
-Confirmed at the cited line: src/cli/app.rs:1224 is `if !profile_removed && report.found_nothing() {` followed by "sbx: nothing to purge for '{name}' (no profile and no home)" at src/cli/app.rs:1226, while the non-NotFound arm above (src/cli/app.rs:1213-1217) prints "sbx: cannot remove {}: {e}", sets `profile_failed = true` and yields `profile_removed = false`. `profile_failed` is consulted only at src/cli/app.rs:1246 (`let clean = report.failed.is_empty() && !profile_failed;`), which the early return at 1228-1231 never reaches. Reachability holds: `config::profile_path` (src/config/load.rs:658-660) only joins a path and never checks existence, so an existing profile in a non-writable directory yields Err(PermissionDenied), and with no homes on disk `report.found_nothing()` (src/sandbox/gc.rs:642-644) is true — the two contradictory sentences print back to back. No caller pre-validates that the profile exists (app_rm at src/cli/app.rs:912-952 only validates the name charset).
+The asymmetry is exactly as described. src/cli/storage.rs:439 `let volume_was_empty = volume_is_empty(&mount_point);`; the copy-failure arm at storage.rs:443-452 sweeps with `let swept = volume_was_empty && clear_tree(&mount_point).is_ok();` and appends "and the volume was cleared, so this can simply be re-run"; the verification arm at storage.rs:458-466 returns `fail(...)` with "{dir} is untouched and still in use" and no sweep, no mention of the volume. Nothing unmounts on the way out — `fail` is only `diag::error` + `ExitCode::FAILURE` (storage.rs:135-138) and `ensure_mounted` (src/storage.rs:253-264) leaves the volume up — so the copied `store/`, `projects/`, `apps/` stay in place and the re-run trips `occupied_subtrees` at storage.rs:393-400. No comment defends the asymmetry; the mismatch is explicitly anticipated (storage.rs:456-457).
 
 </details>
 
 ---
 
-### B49 — The install's stdout tail is captured and then discarded, so a mise failure reported on stdout prints "no output"
+### B49 — `sbx store` reports sizes as "exact" when the reflink probe could not run at all
+
 | | |
 |---|---|
 | **Gravité** | Faible |
-| **Emplacement** | `src/sandbox/taskpool.rs:543` |
-| **Catégorie** | `error-handling` |
-| **Sous-système** | Concurrence, verrous, pools |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** `run`'s doc at taskpool.rs:502-505 states: "**Both** of mise's streams are piped and forwarded to sbx's own stderr as they arrive ... The tail of each is kept for the message when the install fails: mise's diagnostics are the only way to tell a registry outage from a typo'd token."
-
-The code keeps only one. `out_reader` runs `tee_to_stderr` over the child's stdout and returns its `DIAGNOSTIC_TAIL` buffer — and line 543 throws that buffer away with `let _ = out_reader.join();`. `InstallRun` has a single `stderr: Vec<u8>` field (taskpool.rs:491-494), so there is nowhere for the stdout tail to go. The comment on line 542 explains why the *join* happens (ordering) and silently drops the returned bytes, which is the half the doc above promised to keep.
-
-Both consumers of `InstallRun` render only that one stream: `ensure` at taskpool.rs:284-292 and `sbx upgrade` at launch.rs:1754-1761, which both fall back to the literal string "no output" when it is empty.
-
-**Scénario.** A pool install fails for a reason mise reports on stdout (a backend that prints its resolution failure there, or a wrapped `npm`/`pip` whose diagnostic goes to stdout) while stderr carries only progress that ends empty after `trim()`. `ensure` then emits `the task tool pool did not install aqua:cli/gh — no output`, and `sbx upgrade` emits `mise upgrade failed: no output` — with the actual explanation having been read into `kept`, held in memory, and dropped one line later. The operator is left with exactly the "registry outage vs. typo'd token" ambiguity the doc says this machinery exists to resolve.
-
-**Correction proposée.** Keep both tails, as documented. Add `stdout: Vec<u8>` to `InstallRun`, bind the join result (`let stdout = out_reader.join().unwrap_or_default();`), and have `ensure`/`launch.rs:1754` fall back to the stdout tail when the stderr tail is empty. Alternatively concatenate the two into the single `stderr` field before returning — either way, stop discarding the buffer the thread was spawned to fill.
-
-**Rectification du vérificateur.** Severity overstated: the harm is a worse failure *message*, not lost diagnostics. Both streams are tee'd live to sbx's own stderr as they arrive (taskpool.rs:571), so mise's stdout output is already on the operator's terminal — the "registry outage vs. typo'd token" ambiguity the reporter describes is only in the one-line summary, with the full text scrolled just above it. Note also that `InstallRun`'s own doc at taskpool.rs:490 is honest ("its stderr for the message when it did not"); only the `run` doc at 504-505 overclaims, so the cleanest fix may be to correct that sentence rather than to add a field.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Confirmed as a documentation/code mismatch. taskpool.rs:504-505 states "The tail of each is kept for the message when the install fails: mise's diagnostics are the only way to tell a registry outage from a typo'd token." `out_reader` is spawned over `tee_to_stderr` at taskpool.rs:523, which returns the kept tail (taskpool.rs:563-580), and taskpool.rs:543 is `let _ = out_reader.join();` — the buffer is dropped. `InstallRun` has only `stderr: Vec<u8>` (taskpool.rs:491-494), so there is nowhere for it to go, and both consumers render that one stream with a "no output" fallback: taskpool.rs:282-292 and launch.rs:1753-1760 (`.lines().last().unwrap_or("no output")`). The comment on taskpool.rs:542 explains the join's ordering purpose only and does not address the discard, so the module-level promise at 504-505 is unfulfilled.
-
-</details>
-
----
-
-### B50 — A project `[broker.<name>]` table with no `allow` key silently clears the global config's broker policy
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/config/mod.rs:2095` |
+| **Emplacement** | `src/cli/store.rs:151` |
 | **Catégorie** | `logic-bug` |
-| **Sous-système** | Configuration — modèle, schéma, types |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : moyenne) |
-
-**Constat.** `bound.allow = table.allow;` overwrites the globally-declared policy with the project table's `allow` unconditionally. `RawBrokerConfig::allow` is `#[serde(default)] Vec<String>` (schema.rs:786-787), so "the project said nothing about the policy" and "the project set an empty policy" are the same value here, and both wipe the global list. The surrounding code proves the case is reachable: the loop immediately above warns that a project's `socket` and `secret` are ignored (mod.rs:2067-2084), i.e. it expects project tables that exist for reasons other than setting `allow`. `broker_origin.insert(name, Provenance::Project)` then attributes the now-empty policy to the project, so `sbx config` blames the layer that never wrote it. The field's own doc frames `allow` as a narrowing or widening of what the global config exposed (schema.rs:780-787), not as a reset.
-
-**Scénario.** Global `sbx.toml`: `[broker.gpg] socket = "$XDG_RUNTIME_DIR/gnupg/S.gpg-agent"` / `allow = ["sign"]`. A trusted project writes `[broker.gpg] socket = "/tmp/mine.sock"` trying to repoint the socket. sbx warns that the socket is ignored — and then sets `allow = []`. The gpg broker starts, every signing request is refused by an empty policy, and no warning connects that outcome to the project table. `sbx config` shows the empty `allow` with `Provenance::Project`.
-
-**Correction proposée.** Only override when the project actually declared entries — `if !table.allow.is_empty() { bound.allow = table.allow; broker_origin.insert(name, Provenance::Project); }` — or make the field `allow: Option<Vec<String>>` in `RawBrokerConfig` so "unset" and "empty" are distinguishable, and warn when a project table sets nothing sbx reads.
-
-**Rectification du vérificateur.** Mechanism confirmed at the cited line, but the stated consequence is asserted, not established. sbx does not interpret these entries: schema.rs:780-782 says "sbx does not interpret these: what an entry means belongs to the protocol the plugin speaks", and the list is passed verbatim in the handshake (`src/sandbox/broker.rs:191`, `let allow = serde_json::Value::from(self.allow.to_vec());`). So "every signing request is refused" is plugin-defined behaviour, not something sbx guarantees — the defect is that an unset project `allow` is indistinguishable from an empty one, silently replaces the global policy, and is then attributed to `Provenance::Project` (surfaced by `sbx config` via src/cli/config.rs:912). Real but low: it needs a project table containing only fields sbx already warns it is dropping.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Verified. src/config/mod.rs:2095 is exactly `bound.allow = table.allow;`, followed at 2096 by `broker_origin.insert(name, Provenance::Project);`, with no guard on whether the project actually wrote an `allow`. `RawBrokerConfig::allow` is `#[serde(default, skip_serializing_if = "Vec::is_empty")] pub(crate) allow: Vec<String>` (schema.rs:786-787), so absent and empty are the same `Vec::new()`. The loop above it (mod.rs:2069-2091) warns that a project's `socket` and `secret` are ignored and reports the table's unknown keys, proving project tables that carry no readable field are an anticipated case — so a project writing only `socket`, only `secret`, or a misspelled `alow` reaches line 2095 with an empty vector and wipes the global policy. The only test covering this path (mod.rs:5690-5718) exercises a project that *does* set `allow = ["list"]`; nothing covers the absent case.
-
-</details>
-
----
-
-### B51 — `Resolved`'s field docs state network and notify defaults the code does not implement
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/config/mod.rs:313` |
-| **Catégorie** | `doc-drift` |
-| **Sous-système** | Configuration — modèle, schéma, types |
+| **Sous-système** | CLI — verbes restants |
 | **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
 
-**Constat.** Three comments assert built-in defaults that contradict the code. (a) mod.rs:313-315 — "The resolved network posture: the default (`Shared`) unless the global config or a trusted project asked for `\"none\"`" — but the default is `NetworkPolicy::default()` = `Allowlist(EgressPolicy::default())`, the deny-by-default filtering posture, as `types.rs:230-255` states at length ("The default is the filtering allowlist, so a cage nobody configured reaches only the built-in self-equip set"), and the layer code falls back to exactly that at mod.rs:1815. The same stale claim is repeated in a schema test comment, schema.rs:2634-2635 ("the loader treats that as the default (shared)"). (b) mod.rs:340-341 — "the default (`once` for every event)" — and mod.rs:1842-1843 — "`parent` is the built-in default (every event `once`)" — but `NotifyPolicy::default()` is `uniform(NotifyMode::default())` and `NotifyMode`'s `#[default]` is `Always` (notify.rs:126-137), which is also what `RawConfig::notify` documents (schema.rs:159-160: "`\"always\"` (the default: every occurrence…)").
+**Constat.** `build` sets `shares_storage: sandbox::supports_reflink(data_dir)`, and `supports_reflink` (src/sandbox/projectstore.rs:434) is `reflink_verdict(dir) == Some(true)` — it collapses `None` ("the probe could not be carried out") into `false` ("this filesystem definitely does not share storage"). `reflink_verdict` returns `None` whenever `fs::write` of the probe file fails: an unwritable data directory, or a full filesystem. `render` then prints the unqualified claim at line 279: "sizes count allocated blocks and a hardlinked file once; on this filesystem they are exact." The sibling probe guards against exactly this collapse and says so — `storage::Preflight` keeps `shares_blocks: Option<bool>` with the comment "A probe that could not be carried out stays `None`: an unwritable directory says nothing about its filesystem, and this decision must not read it as an answer" (src/storage.rs:1478-1481). So `sbx doctor` and `sbx store` reach opposite conclusions from the same unknown. The surrounding comment at src/cli/store.rs:149-150 ("the honesty of the sizes is decided by what this filesystem actually does") and the render comment at 262-268 ("the honest thing is to state the bound, not invent a number") both describe behaviour the code does not have. Separately, the module doc at src/cli/store.rs:8 calls the command "Read-only and cheap: a filesystem walk" — `supports_reflink` creates and removes two `.reflink-probe-*` files inside the user's data directory, which is not read-only and leaves litter in the listing if the process is killed mid-probe.
 
-**Scénario.** A reader auditing the flagship posture reads `Resolved::network`'s doc and concludes that a machine with no `[network]` line anywhere hands the cage the host's network unfiltered, and that only `network = \"none\"` changes that. Both halves are false — the cage gets a deny-by-default allowlist, and `deny`/`allow`/`ask`/`shared` are all honored — so the comment misdescribes the single most security-relevant default in the crate, and the notify pair misstates whether a repeat is announced once or every time.
+**Scénario.** Point `SBX_DATA_DIR` at a btrfs directory owned by another user (or run `sbx store` when that filesystem is out of space). `fs::write` of `.reflink-probe-src-*` fails, `reflink_verdict` returns `None`, `supports_reflink` yields `false`, and the report closes with "on this filesystem they are exact" for a copy-on-write, compressing filesystem where every printed size is in fact a large over-estimate — the precise opposite of the truth, delivered as a certainty.
 
-**Correction proposée.** Rewrite mod.rs:313-315 to name `NetworkPolicy::default()` (deny-by-default filtering allowlist) and to say the posture comes from the global config or a trusted project; change `once` to `always` at mod.rs:340 and mod.rs:1843; fix the stale test comment at schema.rs:2634-2635.
+**Correction proposée.** Make `shares_storage` an `Option<bool>` fed by `sandbox::reflink_verdict` (already `pub(crate)`), and give `render` a third closing sentence for `None` ("this filesystem's block sharing could not be probed, so the sizes may be an upper bound"). Also amend the module doc so the probe write is declared rather than denied.
 
-**Rectification du vérificateur.** Accurate as written, with one scoping nuance: sub-claim (c), src/config/schema.rs:2634-2635, sits inside the `#[cfg(test)]` module that opens at schema.rs:2160, so it is a stale comment in test code rather than in shipped documentation — the load-bearing half of the finding is (a) mod.rs:313 and (b) mod.rs:340 / mod.rs:1843, which are production doc comments on `Resolved`'s fields and in `resolve`'s global layer. Impact is documentation-only; no runtime behavior is wrong, and `network_origin`/`notify_origin` still report `Provenance::Default` correctly.
+**Rectification du vérificateur.** Real, but the impact is one advisory sentence and one JSON bool in an informational report, not a decision input — medium overstates it. The doctor comparison is also imprecise: `storage::Preflight` only probes at all for an unrecognized filesystem (`matches!(host_fs, Some(FsKind::Other(_)))`, src/storage.rs:1482-1484), so on the reporter's btrfs example doctor answers from the name table and never consults the probe; the two commands do not "reach opposite conclusions from the same unknown", they use different evidence. The "Read-only and cheap" module-doc nit (src/cli/store.rs:8) is fair — the probe does create and remove two files — but the files are removed before returning.
 
 <details>
 <summary>Preuve retenue par le vérificateur</summary>
 
-Every cited line reads as claimed and every claim is contradicted by the code. src/config/mod.rs:313 — "/// The resolved network posture: the default (`Shared`) unless the global config" — but src/config/types.rs:248-255 is `impl Default for NetworkPolicy { fn default() -> Self { Self::Allowlist(crate::allowlist::EgressPolicy::default()) } }`, whose own doc says "Deny-by-default with no rules of its own: every host the cage reaches has to be named". The layer code agrees with types.rs and not with the field doc: src/config/mod.rs:1801-1802 comments "The parent of the global layer is sbx's built-in default (the `deny` allowlist)" and mod.rs:1815 is `None => NetworkPolicy::default()`. The field doc's second half ("unless … asked for `\"none\"`") is also wrong: `validate_network` accepts the table form with `mode` = deny/allow/ask as well. Notify: src/config/mod.rs:340 says "the default (`once` for every event)" and mod.rs:1843 says "default (every event `once`)", but src/notify.rs:181-184 is `NotifyPolicy::default() -> NotifyPolicy::uniform(NotifyMode::default())` and src/notify.rs:132-137 marks `Always` `#[default]` ("Every occurrence — the default"). The stale test comment is confirmed too, at src/config/schema.rs:2634-2635 ("the loader treats that as the default // (shared)"). Nothing in the surrounding prose reframes these as deliberate; they are three independent statements of a default the code does not have.
+Verified end to end. src/cli/store.rs:151 is `shares_storage: sandbox::supports_reflink(data_dir)`; src/sandbox/projectstore.rs:434-435 is `reflink_verdict(dir) == Some(true)`, and its own doc at :430-433 says the collapse "counts as no, which is what a caller about to copy needs" and explicitly redirects: "A caller that must tell the two apart wants [`reflink_verdict`]" — `sbx store` is a reporter, not a copier, so it is the caller that must tell them apart and it picked the wrong function. src/sandbox/projectstore.rs:443-449 returns `None` when `fs::write` of the probe file fails, and the unit test at projectstore.rs:700-702 pins exactly that (`reflink_verdict(&closed) == None` while `!supports_reflink(&closed)`). src/cli/store.rs:269-280 then prints the unqualified "on this filesystem they are exact" for the false branch. Nothing on the path prevents it: `store_cmd` (src/cli/store.rs:77-117) creates nothing and only resolves `store::Layout::from_env()`, so a readable-but-unwritable `SBX_DATA_DIR` (or an out-of-space filesystem — the very condition that makes a user run `sbx store`) yields the wrong sentence, plus `"shares_storage": false` in `--json`. The reachability is narrow, though: `render` returns early at src/cli/store.rs:222-225 when the listing is empty, so the dir must be readable and non-empty while being unwritable.
 
 </details>
 
 ---
 
-### B52 — `apply_override` adds credentials to `secrets` but leaves `declared_secrets` stale
+### B50 — `task run`'s doc comment says a refusal is exit 2; it is 125
+
 | | |
 |---|---|
 | **Gravité** | Faible |
-| **Emplacement** | `src/config/mod.rs:1182` |
-| **Catégorie** | `inconsistency` |
-| **Sous-système** | Configuration — modèle, schéma, types |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : moyenne) |
-
-**Constat.** `Resolved` keeps a pair: `secrets` (posture-cleared, effective) and `declared_secrets` ("The baseline credentials *before* the posture clear — what an app overlay inherits", mod.rs:467-473), snapshotted together at mod.rs:2489. `apply_override` folds an override's `[secret]` section into `self.secrets` (mod.rs:1182-1189) and re-runs `enforce_secret_posture`, but never touches `self.declared_secrets`, so after an override the two disagree. Nothing on the launch path notices — `merge_app` runs *before* `apply_override` — but `view.rs:1767` re-derives an app's effective credential set from `baseline.declared_secrets` *after* `apply_ambient_override` has run (view.rs:1578), so the display path reads the stale half.
-
-**Scénario.** With `SBX_CONFIG='[secret."api.example.com"]\nfrom = "env://TOKEN"\nheader = "Authorization"\ntype = "bearer"'` exported, `sbx config show --app agent` builds `eff_secrets` from `declared_secrets` (which the override never reached) and reports that the app injects no credential for api.example.com — while `sbx app run agent` with the same environment injects it. The view under-reports exactly the field it exists to make visible.
-
-**Correction proposée.** In `apply_override`, apply the override's section to both sets (or re-snapshot `self.declared_secrets = self.secrets.clone()` after `apply_secret_section` and before `enforce_secret_posture`), so the pair's invariant survives the final layer.
-
-**Rectification du vérificateur.** Mechanism and line numbers are correct; two refinements. (1) The blast radius is display-only and under-reports rather than over-reports — `secrets_inherited` at view.rs:1874 is computed from the same stale `declared_secrets`, so both the credential list and the inherited count are low, but no launch injects anything it should not. (2) The reporter's suggested fix of re-snapshotting `self.declared_secrets = self.secrets.clone()` inside `apply_override` should be taken with care: `merge_app` restores that snapshot wholesale (mod.rs:782, documented at mod.rs:1352-1353 and asserted by `an_app_inherits_a_baseline_credentials_plugin_host_config` in src/config/tests.rs), so any future path that ran `merge_app` after `apply_override` would then inherit override credentials as baseline. Fixing the view to derive `eff_secrets` the way `merge_app` does — or applying the override section to both vectors — is the narrower change.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Traced end to end and nothing prevents it. `apply_override` folds the override's `[secret]` section into `self.secrets` at src/config/mod.rs:1182 (`apply_secret_section(&mut self.secrets, …)`) and re-runs `enforce_secret_posture(&self.network, &mut self.secrets, …)` at mod.rs:1191; `declared_secrets` is never written there. Grepping every reference confirms it: `declared_secrets` is written only at src/config/mod.rs:2489 (`let declared_secrets = secrets.clone();`, the pre-posture snapshot in `resolve`) and read at mod.rs:782, view.rs:1767 and view.rs:1874 — `apply_override` touches neither. The two paths then diverge exactly as reported. Launch: src/sandbox/launch.rs:876 `prep.cfg.merge_app(app);` then launch.rs:879 `apply_launch_override(&mut prep.cfg, ov)`, with the comment at launch.rs:877-878 stating the override is applied "*after* the app overlay" — so `merge_app`'s `self.secrets = self.declared_secrets.clone()` (mod.rs:782) runs first and the override's credential survives into the injected set. Display: `build_app_detail` calls `apply_ambient_override(&mut resolved)` at src/config/view.rs:1578, which reaches `resolved.apply_override(ov)` at view.rs:1008, and only afterwards does `app_detail_view` build `let mut eff_secrets = baseline.declared_secrets.clone();` at view.rs:1767 — reading the half the override never reached. The view explicitly claims to mirror the launch (view.rs:1763-1766: "Reproduce that check so the count — and the note — match what `sbx app <name>` would actually inject"), so this is a broken stated invariant, not a difference of expectation. The override path does carry `[secret]`: `RawConfig`'s `secret` is destructured in `apply_override` (mod.rs:871), merged by the collector at src/config/overrides.rs:635 (`if secret.is_some() { base.secret = secret; }`), and exercised with literally this shape in overrides.rs:1231/1666.
-
-</details>
-
----
-
-### B53 — `BundleProvision`'s doc comment opens with the first half of `ResolvedApp`'s sentence
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/config/mod.rs:503` |
+| **Emplacement** | `src/cli/task.rs:623` |
 | **Catégorie** | `doc-drift` |
-| **Sous-système** | Configuration — modèle, schéma, types |
+| **Sous-système** | CLI — sbx plugins et sbx task |
 | **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
 
-**Constat.** `BundleProvision` was inserted into the middle of `ResolvedApp`'s doc comment. Its first line is `/// An app's resolved overlay over the sandbox baseline: the command to run plus the extra` (mod.rs:503), which describes `ResolvedApp` and not a provision step, immediately followed by the real sentence "One bundle's install step, as the fold hands it to a launch…". The remainder of the orphaned sentence is then the opening line of `ResolvedApp`'s own doc, which begins mid-clause: `/// environment, binds, packages, network posture, and credentials it declares — each` (mod.rs:519).
+**Constat.** Line 622-624 documents `task_run` as "a *refusal* (an unknown task, a value outside its bound) is exit 2, distinguishable from the command having run and failed". Every refusal path returns `REFUSED_EXIT` = 125 instead: `render_result` (line 753), `run_as_json` (line 1045) and `run_detached` (lines 741, 862). The constant's own doc at lines 28-32 explains why 2 was rejected — "that is a plausible exit code for the wrapped command itself, and a caller must be able to tell 'sbx refused to run it' from 'it ran and exited 2'" — and help.rs:966 documents 125 to users. Only this one comment still says 2, which is the value the design deliberately does not use.
 
-**Scénario.** `cargo doc` renders `BundleProvision` with a summary line claiming it is an app's resolved overlay over the sandbox baseline, and renders `ResolvedApp` with a summary beginning "environment, binds, packages, network posture, and credentials it declares" — two wrong type summaries from one editing accident, in a crate whose doc comments are the primary specification.
+**Scénario.** A maintainer writing a wrapper reads line 623 and branches on `if [ $? -eq 2 ]` to detect a refusal. `sbx task run no-such-op` returns 125, the branch never fires, and a refused invocation is handled as if the wrapped command had run and exited 125.
 
-**Correction proposée.** Move the dangling first line back onto `ResolvedApp` so its doc reads "An app's resolved overlay over the sandbox baseline: the command to run plus the extra environment, binds, packages, network posture, and credentials it declares — each …", and leave `BundleProvision`'s doc starting at "One bundle's install step".
+**Correction proposée.** Change 'is exit 2' to 'is exit 125' at line 623 (or point at `REFUSED_EXIT`), matching lines 28-32 and help.rs:966.
 
-**Rectification du vérificateur.** Confirmed as described; nothing to correct. Cosmetic/documentation only — it compiles, and `mise run rustdoc`'s broken-intra-doc-link denial does not catch a misplaced prose line, so only a reader notices. Note that view.rs carries a related editing accident worth folding into the same cleanup: src/config/view.rs:1012 concatenates two copies of a doc opener on one line (`/// Assemble the view restricted to one configuration `source`/// Assemble the view restricted to one configuration `source` — …`).
+**Rectification du vérificateur.** Accurate as reported, though its practical reach is smaller than the attack suggests: the wrong number lives only in a private `fn task_run` rustdoc comment, not in any user-facing output — `sbx help task run` (help.rs:966) and the `REFUSED_EXIT` constant both say 125 — so only a maintainer reading the source, not a user reading `--help`, can be misled.
 
 <details>
 <summary>Preuve retenue par le vérificateur</summary>
 
-Verified verbatim and the line numbers are exact. `grep -n` gives src/config/mod.rs:503 `/// An app's resolved overlay over the sandbox baseline: the command to run plus the extra`, immediately followed by mod.rs:504 `/// One bundle's install step, as the fold hands it to a launch: the step itself and the bundle`, with `pub(crate) struct BundleProvision {` at mod.rs:512 — so line 503 is unambiguously part of `BundleProvision`'s doc block and describes a different type. The orphaned remainder is likewise where the reporter says: mod.rs:519 `/// environment, binds, packages, network posture, and credentials it declares — each`, opening the doc block that ends at `pub(crate) struct ResolvedApp {` on mod.rs:524, so `ResolvedApp`'s summary line begins mid-clause. The two halves join into one grammatical sentence, which is the tell that a struct was pasted into the middle of an existing doc comment. No comment or test frames this as deliberate, and rustdoc takes the first line of each block as that item's summary, so both types render with the wrong one-liner.
+Verified verbatim. src/cli/task.rs:622-624 reads "a *refusal* (an unknown task, a value outside its bound) is exit 2, distinguishable from the command having run and failed", while src/cli/task.rs:32 defines `const REFUSED_EXIT: u8 = 125;` and every refusal path returns it: line 741 (`--detach --json`), line 753 (`--detach` prose), line 862 in `render_result` — whose own comment at 857-859 says "Not 2: that is a plausible exit code for the wrapped command itself, and a caller must be able to tell 'sbx refused to run it' from 'it ran and exited 2'" — and line 1045 in `run_as_json`. help.rs:966 documents "is exit **125**" to users. No path returns 2 for a plane refusal (exit 2 is reserved for argument/usage errors, e.g. task.rs lines 663, 674, 682). The doc comment states the exact value the design explicitly rejected, in the wording of the category it rejected it for.
 
 </details>
 
 ---
 
-### B54 — The `capture_max_kb` warning fires only when `capture` is absent, not in the two cases its own message names
+### B51 — `task show <invocation-id>` answers from an arbitrary session; invocation ids are per-session, not globally unique
+
 | | |
 |---|---|
 | **Gravité** | Faible |
-| **Emplacement** | `src/config/validate.rs:701` |
+| **Emplacement** | `src/cli/task.rs:1185` |
+| **Catégorie** | `logic-bug` |
+| **Sous-système** | CLI — sbx plugins et sbx task |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** The comment at lines 1185-1187 states "An invocation id belongs to exactly one session; an operation name can be declared in several, and then `--session` is how a reader says which". That is false: ids come from `static TASK_INVOCATION: AtomicU64 = AtomicU64::new(1)` (src/sandbox/task.rs:90-96), a **per-process** counter, and the task plane runs inside each session's own process. Every session therefore hands out ids starting at 1. The loop at lines 1190-1196 takes the first plane that answers `Ok` — planes come from `session_pids`, which is sorted, so the lowest pid always wins — and pushes the rest onto `also`, which is then reported as "`{target}` is also **declared** in session(s) …" (line 1246), wording that only makes sense for an operation name. `read_info` resolves a numeric target against that session's own engine and log (src/sandbox/task_control.rs:1281-1288, 1108-1142), so a colliding id in a different session is a different invocation entirely. Note the inconsistency: `task_result` goes through `plane_for`, which refuses and demands `--session` when several sessions exist, while `task_show` guesses.
+
+**Scénario.** Two sessions are live, pids 100 and 200. In session 200, `sbx task run --detach nightly-dump` prints `7`. `sbx task show 7` resolves planes [100, 200], session 100's log also holds invocation 7 (its seventh `unit-test` run), so session 100 answers first. The user is shown `operation unit-test`, that run's state, exit code and elapsed time — the wrong invocation — with a `session 100 — /path/to/other-project` line and a note claiming `7` is 'also declared' elsewhere.
+
+**Correction proposée.** When `target` parses as a `u64` and more than one plane answers, refuse the way `resolve_task_session` does — name the sessions and require `--session` — rather than taking the first. Failing that, phrase the note for an id ("invocation `{target}` also exists in session(s) …") and correct the comment at line 1185.
+
+**Rectification du vérificateur.** Mechanism verified; severity slightly overstated. `plane.announce()` (src/cli/task.rs:1206, printing `session <pid> — <project>`) runs before the fields, and the `also` note lists the other sessions, so the collision is visible rather than silent — and when the colliding ids belong to differently-named operations the `operation` row itself gives it away. The substantive defects are the false comment at src/cli/task.rs:1185-1187, the id/operation-blind note wording at line 1248, and the inconsistency with `plane_for`'s refusal; a genuinely misleading read needs the same operation name declared in both sessions.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Confirmed. `static TASK_INVOCATION: AtomicU64 = AtomicU64::new(1)` (src/sandbox/task.rs:90) is a process-global counter drawn by `next_invocation()` (src/sandbox/task.rs:95-96), whose only production caller is the per-session plane at src/sandbox/task_control.rs:933 — so every session numbers from 1 and ids collide across sessions, contradicting the comment at src/cli/task.rs:1185-1187 ("An invocation id belongs to exactly one session"). `task_show` fans out over `planes_for` (src/cli/task.rs:1181) whose pids come from `session_pids`, sorted at src/sandbox/task_control.rs:1490, and the loop at src/cli/task.rs:1190-1196 keeps the first `Ok` and pushes the rest onto `also`. The plane resolves a numeric target against its own engine and log (src/sandbox/task_control.rs:1276-1284 -> `finished_fields` -> `log.entry(id)` at 1281-1288), so a colliding id is a different invocation. The divergence from `task result`/`task stop`, which go through `plane_for` -> `resolve_task_session` and refuse ambiguity with "name one with `--session`" (src/cli/task.rs:228-236, 262-275), is real, and the note's wording "is also declared in session(s)" (src/cli/task.rs:1248) only fits an operation name.
+
+</details>
+
+---
+
+### B52 — `sbx test net` with no URL prints the parent verb's usage line, and swallows an unknown flag as the URL
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/cli/test.rs:72` |
 | **Catégorie** | `ux-error-message` |
-| **Sous-système** | Configuration — couches, overrides, validation |
+| **Sous-système** | CLI — verbes restants |
 | **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
 
-**Constat.** The guard is `} else if table.capture_max_kb.is_some()`, reached only when `table.capture` is `None`, but its message says `capture_max_kb` is only meaningful with `capture = "bodies"`. With `capture = "off"` or `capture = "headers"` the `if` branch is taken instead and `with_capture(level, table.capture_max_kb)` is called with a ceiling that level ignores — no warning at all. So the condition and the message describe different sets, and two of the three cases the message is about pass in silence. Same shape as the `ask_timeout`/`ask_notice` checks twenty lines up, which correctly key off the *effective* value rather than absence.
+**Constat.** When the positional target is missing, `net_test` reports `help::synopsis("test")` (line 72), which is `synopsis_of(&["test"])` = "sbx test <subcommand> <target>" (src/help.rs:3158, src/help.rs:368) — the *parent* command's grammar. The page for the verb the user actually ran exists and reads "sbx test net [--app <name>] [-X|--method <verb>] <url|tcp://host:port>" (src/help.rs:2111), and the same function reaches for the child page correctly everywhere else via the "sbx: test net: …" prefix. The user is therefore told to supply a `<subcommand>` they already supplied, and is shown neither `--app`, `-X`, nor the `tcp://` form. Compounding it, the positional arm at line 61 is `Some(s) if target.is_none() => target = Some(s)` — placed after the flag arms but with no `starts_with('-')` guard — so any unrecognised flag is consumed as the URL and the *next* argument is what gets blamed.
 
-**Scénario.** Write `[network]\nmode = "deny"\ncapture = "headers"\ncapture_max_kb = 256`. No warning is emitted and the body ceiling is inert, so an author who set both believes bodies are being captured up to 256 KiB and finds `sbx net logs --with-body` empty with nothing in the config output to explain it. The identical mistake with `capture` omitted entirely is warned.
+**Scénario.** `sbx test net -X POST -a claude` (URL forgotten) prints "sbx: usage: sbx test <subcommand> <target>", which names none of the flags just used and implies the subcommand was the mistake. `sbx test net --app=claude https://api.anthropic.com` — the `=` form that `sbx upgrade` accepts (src/cli/upgrade.rs:122) but this verb does not — consumes `--app=claude` as the target and fails with "sbx: test net: unexpected argument `https://api.anthropic.com`", blaming the one argument that was correct.
 
-**Correction proposée.** Move the check so it keys off the parsed level: after `CaptureLevel::parse` succeeds, warn when `table.capture_max_kb.is_some()` and the level is not `Bodies`; keep the existing `else if` arm for the absent-`capture` case. One message, one condition that matches it.
+**Correction proposée.** Use `help::synopsis_of(&["test", "net"])` (or `eprint!("{}", help::page_usage(&["test", "net"]).unwrap_or_default())`, as `proc_ls` and `logs::run` do) at line 72, and add a `Some(s) if s.starts_with('-')` arm before line 61 that rejects the token as an unknown flag.
 
-**Rectification du vérificateur.** Mechanism confirmed, impact slightly overstated. The message text is not itself false (in the branch it guards, the value really is ignored); the defect is that the guard's condition covers a strictly narrower set than the message describes, so two of three non-bodies cases pass silently. The attack's claim of "nothing in the config output to explain it" is not quite right: src/config/view.rs:1386-1390 renders `capture_max_kb: a.capture_level().captures_bodies().then(|| a.capture_body_kb())`, so `sbx config show` omits the field when the effective level is not `bodies` — a weak signal, but a signal. This is a warning-coverage gap, not a wrong effective policy: the resolved capture behaviour is correct in every case.
+**Rectification du vérificateur.** Two corrections. (1) The line is src/cli/test.rs:73, not 72. (2) The 'swallows an unknown flag as the URL' half is milder than implied: a lone flag becomes the target, is completed to `https://--json`, and is then rejected by `parse_url_target` because `is_valid_hostname` forbids a label starting with '-' (src/allowlist/grammar.rs:459-460, 571), so `sbx test net --json` exits 2 with "sbx: URL `https://--json` has an invalid host `--json`" — a confusing message naming a URL the user never typed, not a silent zero-exit verdict. The genuinely wrong outcomes are therefore (a) the parent-grammar usage line, which names `<subcommand>` the user already supplied and shows none of `--app`, `-X` or the `tcp://` form, and (b) the misattributed blame when a flag is followed by the real URL. Fix as proposed: `help::synopsis_of(&["test", "net"])` at line 73 and a `Some(s) if s.starts_with('-')` arm before line 61.
 
 <details>
 <summary>Preuve retenue par le vérificateur</summary>
 
-Verified. src/config/validate.rs:694-704 reads `if let Some(raw) = &table.capture { match CaptureLevel::parse(raw) { Some(level) => policy = policy.with_capture(level, table.capture_max_kb), ... } } else if table.capture_max_kb.is_some() { warnings.push(... "`capture_max_kb` is only meaningful with `capture = \"bodies\"` — ignored") }`. The guard at line 701 is reachable only when `capture` is absent, so `capture = "off"`/`"headers"` plus `capture_max_kb` takes the `if` arm and warns nothing, while the ceiling is provably inert: src/sandbox/control/capture.rs:130-138 `CaptureCaps::new` sets `body: if level.captures_bodies() { ... } else { 0 }`, and src/sandbox/egress.rs:810-816 only builds a CaptureRing at all when `capture_level.captures()`. Nothing prevents it: no comment in the block justifies keying off absence, and the neighbouring check at src/config/validate.rs:667-680 explicitly does the opposite ("key off `action`, not the raw `mode` string") for ask_timeout/ask_notice. No test pins the silence either — src/config/tests.rs:1806-1819 only exercises `headers` with `kb = None` and `bodies` with `Some(64)`. The only other mention of the field, src/config/validate.rs:498, is the `none`/`shared` inert-key listing, which does not cover a filtering posture.
+Verified. src/cli/test.rs:73 reads `diag::error(&format!("sbx: usage: {}", help::synopsis("test")));` — the reporter cited 72 (the `let Some(target) = target else {` head at line 72), one line off, not enough to discredit. `synopsis("test")` = `synopsis_of(&["test"])` (src/help.rs:3158-3160) resolves to the PARENT page at src/help.rs:367-368, synopsis "sbx test <subcommand> <target>"; the child page exists at src/help.rs:2110-2111 with "sbx test net [--app <name>] [-X|--method <verb>] <url|tcp://host:port>". `net_test` is reached only from `test_cmd` (src/cli/test.rs:18) after the literal "net", so this message always concerns `test net` — and every other error in the function is prefixed "sbx: test net: …". The house convention is overwhelmingly the child path: 40+ call sites use `help::synopsis_of(&[parent, child])` (src/cli/proc.rs:701, src/cli/net.rs:161/242/326, src/cli/config.rs:78, src/cli/app.rs:193, src/cli/session.rs:169, …), and the shared grammar helper `parse_one_name` (src/cli/mod.rs:88-133) both rejects `-`-prefixed tokens with a hint and prints `synopsis_of(path)` for the exact path. No comment or test defends the parent synopsis here; grep across the tree finds the string "sbx test <subcommand> <target>" only at src/help.rs:368 and its use at src/cli/test.rs:73, so nothing pins the current text. The missing `-` guard at src/cli/test.rs:61 (`Some(s) if target.is_none() => target = Some(s)`, placed after the --app/-X arms) is verified: `sbx test net --app=claude https://api.anthropic.com` binds target="--app=claude" then hits the arm at line 62-65 and prints "sbx: test net: unexpected argument `https://api.anthropic.com`", blaming the correct token — and the `--app=` spelling really is accepted by `sbx upgrade` (src/cli/upgrade.rs:118-127) and by nothing else in this family. `--help`/`-h` never reaches here (intercepted centrally at src/main.rs:71-78), so no false claim there. tests/argv.rs sweeps `test net` only for a surplus SECOND positional (tests/argv.rs:150) and never for a flag, so the gap is untested rather than sanctioned.
 
 </details>
 
 ---
 
-### B55 — `validate_params` documents declaration order but a `BTreeMap` source gives alphabetical order
+### B53 — `sbx test net` reports DENIED `ip-literal` for an address the absolute-form `https://` plane actually allows
+
 | | |
 |---|---|
 | **Gravité** | Faible |
-| **Emplacement** | `src/config/tasks.rs:582` |
+| **Emplacement** | `src/cli/test.rs:427` |
+| **Catégorie** | `inconsistency` |
+| **Sous-système** | Dérive documentation / code |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : moyenne) |
+
+**Constat.** `refused_as_ip_literal` (src/cli/test.rs:427) short-circuits the whole verdict for any IP-literal `https://` target that is not a `tcp://` splice, and `render_ip_literal_refusal` (line 449) tells the user "the proxy refuses an IP-literal target on the inspected path (`ip-literal`) … whatever the policy says". Its doc (lines 409-421) asserts "`src/sandbox/proxy` answers `403 ip-literal` there, ahead of the allowlist", and the check is introduced at lines 219-223 as "the one answer a tester exists to prevent".
+
+That is true of exactly one plane. `handle_client` refuses an IP literal at `src/sandbox/proxy/mod.rs:447-461`, but only after `method == "CONNECT"` (mod.rs:376). A client that sends the absolute form — `POST https://1.2.3.4/token HTTP/1.1` with no CONNECT — is routed at mod.rs:390 to `handle_https_forward`, and that function has no IP-literal check anywhere: `admit_absolute_form` does target-parse, framing, Host-match and the secret tripwire (mod.rs:1878-1955), then step 5 goes straight to `decide_https` (forward.rs:95). `grep -n IpAddr src/sandbox/proxy/forward.rs` finds only a test resolver at line 632.
+
+The proxy's own header makes the equivalence explicit and it does not hold: mod.rs:61-62 says the forward plane's verdict is the ordinary `https` policy "exactly as an equivalent `CONNECT` would, `ask` park included". An equivalent CONNECT gets `403 ip-literal` before the allowlist is consulted; the forward plane gets whatever `explain` says.
+
+**Scénario.** With `[network] allow = ["1.2.3.4"]`, run `sbx test net https://1.2.3.4/token`. The tester prints DENIED with the `ip-literal` explanation and tells you to declare `tcp://1.2.3.4:443`. In the cage, a tool using the secure-web-proxy form (the Kiro-IDE shape forward.rs:11-14 was written for) sends `POST https://1.2.3.4/token` and is admitted by the `Ip` allow rule — verdict ALLOW, an allow line in `sbx net logs`, and a host-scoped credential injected on the upstream leg. The tester says a request is refused that one supported plane permits.
+
+**Correction proposée.** Either refuse an IP-literal request-line host in `handle_https_forward` (a check beside step 4d in forward.rs, mirroring mod.rs:447-461 — the forward plane also has to validate the upstream certificate against that host), or narrow the tester: make `refused_as_ip_literal` and its rendered sentence say the refusal applies to the CONNECT plane, and correct "exactly as an equivalent `CONNECT` would" at src/sandbox/proxy/mod.rs:62. The first is the fail-closed option and keeps the two planes agreeing.
+
+**Rectification du vérificateur.** Mechanism confirmed, consequence overstated. (a) The line numbers for `render_ip_literal_refusal` are 439 (fn) / 449 (the quoted sentence), not "line 449" for the function. (b) No allowlist gate is bypassed: the forward plane still runs `explain`, the Host-match, the secret tripwire, the SSRF guard and a validated TLS upstream, so this is a tester-accuracy and doc-equivalence defect, not a policy hole. (c) The "allow line in `sbx net logs` and a host-scoped credential injected" tail is narrower than described: the allow is only recorded after the upstream handshake (forward.rs:331) and `connect_upstream` builds the ServerName from the literal (`upstream_server_name`, proxy/ca.rs:225), so rustls validates against `ServerName::IpAddress` — it succeeds only for an upstream whose publicly-trusted certificate carries a matching iPAddress SAN; otherwise the client gets `502 upstream-cert-rejected`. That is still not the `403 ip-literal` the tester predicts, so the disagreement stands. (d) The doc quote at proxy/mod.rs:62 ("exactly as an equivalent `CONNECT` would, `ask` park included") reads in context as a claim about which *policy* decides the verdict, not about pre-policy transport refusals, so it is weaker evidence than the analyst implies. The real cost is that the tester's remediation advice pushes an operator toward a strictly more permissive `tcp://` splice rule.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Traced end to end. src/cli/test.rs:427 is `fn refused_as_ip_literal(host, clear, l4)`, whose body is `!clear && host.parse::<IpAddr>().is_ok() && !proxy_exempt(host) && !matches!(l4, L4Decision::Splice(_))`; it is called at test.rs:223 before any policy verdict and short-circuits with `render_ip_literal_refusal`, whose sentence at test.rs:449 is verbatim "the proxy refuses an IP-literal target on the inspected path (`ip-literal`): there is no hostname to mint a certificate for, whatever the policy says. Declare `tcp://{host}:{port}` …". On the wire the refusal is genuinely CONNECT-only: src/sandbox/proxy/mod.rs:376 `if method != "CONNECT"` routes `https://` targets at mod.rs:390 to `handle_https_forward`, and the `if host.parse::<IpAddr>().is_ok()` refusal sits at mod.rs:444-461, i.e. after that branch. `grep -n IpAddr src/sandbox/proxy/forward.rs` returns only line 632 (a test resolver). The forward path is: `admit_absolute_form` (mod.rs:1869) — target parse, framing, Host-match, secret tripwire — then forward.rs:95 `decide_https(...)`, forward.rs:132 `resolve_checked`, forward.rs:320 `acquire_upstream`. `parse_url_target` explicitly permits an IP literal (grammar.rs:459 `is_valid_hostname(host) || host.parse::<IpAddr>().is_ok()`), a bare `1.2.3.4` allow entry classifies as `RuleKind::Ip` on layer L7 (grammar.rs:233), `RuleKind::matches` compares it to the request host (allowlist/mod.rs:512-518), the default resolver's `to_socket_addrs` returns the literal unchanged (dns.rs:16-23), and `ip_refusal` passes a public address (ssrf.rs:140-146). Nothing on that path answers `ip-literal`. The existing guard test `an_inspected_ip_literal_is_denied_however_the_policy_reads_it` (test.rs:663) only ever exercises the CONNECT/L4 model, so no comment or test covers the forward plane.
+
+</details>
+
+---
+
+### B54 — `APP_SCOPED_TARGETS` doc says "Both" for three targets, and the refusal it feeds renders "provision and mise and nix"
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/cli/upgrade.rs:39` |
 | **Catégorie** | `doc-drift` |
-| **Sous-système** | Configuration — couches, overrides, validation |
+| **Sous-système** | CLI — verbes restants |
 | **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
 
-**Constat.** The doc reads "Validate the parameter declarations, keeping declaration order", but `raw` is a `BTreeMap<String, RawTaskParam>` (schema.rs:1433), which discards authoring order at parse time and iterates sorted by key. The resulting `Vec<TaskParam>` is therefore alphabetical, and nothing downstream can recover what the author wrote. The order is user-visible: `task_control.rs:773` builds the caller-facing parameter list from it and `contract.rs:126` walks it to emit the task's schema, so an agent reading a task's contract sees the parameters re-sorted.
+**Constat.** `APP_SCOPED_TARGETS` is `&["provision", "mise", "nix"]` (line 43), but its doc (lines 39-42) reads "Both are the in-cage rolls, the ones whose unit of work is already one app's own cage; every other target rewrites a project-wide lock host-side and has no per-app unit to select." Two independent errors: it says "Both" of a three-element list, and its stated criterion is wrong for `nix` — `nix` is *not* an in-cage roll, it is a host-side lock rewrite (`upgrade_nix_channel`, line 862), and it is app-scoped for an entirely different reason, which src/help.rs:1639-1643 states correctly ("an app resolves the base channel against a lock of its own"). The user-facing refusal built from the same constant inherits the drift: line 151-156 formats `APP_SCOPED_TARGETS.join(" and ")` into "sbx: upgrade: --app narrows provision and mise and nix only — `<what>` rewrites a project-wide lock host-side, which has no per-app unit to select." That sentence is both ungrammatical and self-refuting, since it has just listed `nix` — a project-wide host-side lock rewrite — as a target `--app` does narrow. The doc comment at line 471-472 (`Advance::PerApp` … "the same two targets `APP_SCOPED_TARGETS` lets `--app` narrow") carries the same stale count.
 
-**Scénario.** Declare `[task.report.params]` with `since`, then `until`, then `format`. `sbx` lists the operation's parameters as `format, since, until`. The doc promises the authored order; a maintainer relying on it (say, to render a positional usage line or to keep a contract byte-stable against the file) gets the wrong answer and has no way to fix it inside this function.
+**Scénario.** `sbx upgrade flake --app demo-app` prints: "sbx: upgrade: --app narrows provision and mise and nix only — `flake` rewrites a project-wide lock host-side, which has no per-app unit to select." A user who reads the clause literally concludes `nix` is not a project-wide lock rewrite, or that the tool has a display bug; a maintainer reading the constant's doc concludes `nix` was added by mistake and removes it, silently breaking `sbx upgrade nix --app <name>` (guarded only by the hand-written assertion at line 1638).
 
-**Correction proposée.** Either drop the claim — "Validate the parameter declarations. Order follows the section's key order (a `BTreeMap`), not the file" — or, if the order is meant to be authored order, change `RawTask::params` to an order-preserving map (e.g. `IndexMap`, or a `Vec<(String, RawTaskParam)>` with a duplicate-key check) so the promise holds end to end.
+**Correction proposée.** Rewrite the doc on line 39-42 to cover all three and give `nix` its own reason (per-app lock target), matching src/help.rs:1639-1643. Build the message with an Oxford-comma join ("provision, mise and nix") and reword the second clause so it does not claim host-side lock rewrites are never app-scoped — e.g. "`<what>` has no per-app unit to select."
 
-**Rectification du vérificateur.** Real but purely a doc inaccuracy with no functional consequence, and the reporter's rationale is partly backwards. Parameters are addressed by name (`{name}` interpolation, and the `LIST`/contract listings are informational), so no behaviour depends on order; and because a BTreeMap is deterministic, the emitted contract IS byte-stable — just stable in key order rather than file order, which defeats the "byte-stable against the file" argument the reporter offers. The same claim also appears at src/config/types.rs:738 ("The declared parameters, in declaration order."), so a doc fix must touch both sites.
+**Rectification du vérificateur.** Severity low is right, but two parts of the argument are overstated. The "maintainer removes `nix` and silently breaks it" scenario cannot be silent: src/cli/upgrade.rs:1637-1646 asserts `parse_upgrade_args(["nix", "--app", "demo-app"])` succeeds and its comment says it is "spelled out rather than derived from `APP_SCOPED_TARGETS`, so removing `nix` from that list fails here instead of quietly … leaving the suite green". And the refusal is not self-refuting: its second clause describes `<what>` — the target the user typed — which is an accurate description of `flake`/`deb`/`appimage`/`tarball`/`binary` (the defaulted `all` is the only loose fit). The genuine defects are the stale "Both"/"two" counts at :39-42 and :471-472 and the `join(" and ")` grammar at :155.
 
 <details>
 <summary>Preuve retenue par le vérificateur</summary>
 
-Verified. src/config/tasks.rs:582 reads `/// Validate the parameter declarations, keeping declaration order. Each must carry exactly one bound` and src/config/tasks.rs:584 is `fn validate_params(raw: BTreeMap<String, RawTaskParam>) -> Result<Vec<TaskParam>, String>`, iterated with `for (name, param) in raw` at line 585. The source type is confirmed at src/config/schema.rs:1433: `pub(crate) params: BTreeMap<String, RawTaskParam>`, so serde discards authoring order at parse time and iteration is key-sorted. The cited downstream uses check out: src/sandbox/task_control.rs:774 `let params: Vec<&str> = task.params.iter().map(|p| p.name.as_str()).collect();` inside the `LIST` handler, and src/sandbox/contract.rs:126 `for param in &task.params {` inside `operations_section`. Nothing recovers file order, and the codebase uses "declaration order" elsewhere (src/sandbox/packages.rs:38, src/config/mod.rs:272) for genuinely order-preserving `Vec` sources, so the phrase does mean authored order here.
+Confirmed at the cited lines. src/cli/upgrade.rs:39-42 opens "The targets `--app <name>` narrows. Both are the in-cage rolls…" over a three-element constant at :43 (`&["provision", "mise", "nix"]`), and the stated criterion is wrong for `nix`: `upgrade_nix_channel` (:862-915) is a host-side lock refresh, and src/help.rs:1639-1643 gives the correct and different reason ("and to `nix`, because an app resolves the base channel against a lock of its own"). The user-facing refusal at :151-156 does render `APP_SCOPED_TARGETS.join(" and ")` as "provision and mise and nix". The stale count is repeated at :471-472 (`Advance::PerApp` … "the same two targets `APP_SCOPED_TARGETS` lets `--app` narrow"), where the enum variant genuinely covers two but the constant it cross-references covers three.
 
 </details>
 
 ---
 
-### B56 — Doc comment line duplicated on itself in `validate_task_network`
+### B55 — `closing_note`'s doc and `store_moved_note`'s doc both deny that `mise` can trigger the store-moved note, which it does
+
 | | |
 |---|---|
 | **Gravité** | Faible |
-| **Emplacement** | `src/config/tasks.rs:927` |
+| **Emplacement** | `src/cli/upgrade.rs:353` |
 | **Catégorie** | `doc-drift` |
-| **Sous-système** | Configuration — couches, overrides, validation |
+| **Sous-système** | CLI — verbes restants |
 | **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
 
-**Constat.** Line 927 is a single physical line containing its own text twice: `/// Classify the task's egress entries. The same grammar as `[network] allow`, so a task's rules read/// Classify the task's egress entries. The same grammar as `[network] allow`, so a task's rules read`, followed by line 928 `/// like any other egress rule.` A copy-paste artifact — the sentence renders once, mangled, in rustdoc and in any editor hover, and the line is 200 characters wide in a file that otherwise wraps at 100.
+**Constat.** The doc on `closing_note` states: "The scope is enforced twice over: only [`upgrade_nix_channel`] and [`upgrade_flake_packages`] return a [`Roll`] at all, so no other channel can set `moved_store_paths`" (lines 353-355). Three functions return `Roll`: `upgrade_nix_channel` (869), `upgrade_mise_tools` (963) and `upgrade_flake_packages` (1063), and `upgrade_cmd` ORs all three into `moved_store_paths` at lines 259, **273**, and 288. The match arm at line 370 is `"nix" | "flake" | "mise" if moved_store_paths`, and the comment immediately above it (365-369) correctly explains *why* mise is included. So the function's own header contradicts its body eight lines later. The same falsehood is repeated on the thing it routes to: `store_moved_note`'s doc at line 763 says "Only `nix` and `flake` reach this" and then explicitly excludes mise — "`mise` already rolls per-home inside a cage, so none of them moves the paths a home points into" — which is the reverse of the arm that dispatches to it. These are the two comments a maintainer reads before touching the store-invalidation logic, and both assert a safety invariant ("no other channel can set this") that the compiler does not enforce and the code does not honour.
 
-**Scénario.** Run `cargo doc` (or hover `validate_task_network`): the summary line reads "Classify the task's egress entries. The same grammar as `[network] allow`, so a task's rules read/// Classify the task's egress entries. …", with the stray `///` inline. The crate's own docs-coverage tooling (`src/docs_coverage.rs`) parses doc lines, so a duplicated one is also noise there.
+**Scénario.** A maintainer adds a `Roll`-returning channel and relies on the stated invariant ("only these two return a Roll") to skip auditing `closing_note`, or reads `store_moved_note`'s header and concludes a `sbx upgrade mise` run can never print the store-moved warning. Today, `sbx upgrade mise` in a project whose `nix:` tools roll forward prints exactly that note — reachable, and contradicting the documentation of the function that prints it.
 
-**Correction proposée.** Delete the duplicated half so line 927 reads once: `/// Classify the task's egress entries. The same grammar as `[network] allow`, so a task's rules read`.
+**Correction proposée.** Rewrite line 353-355 to name all three `Roll`-returning channels and drop the "no other channel can set `moved_store_paths`" claim, and rewrite line 763 (and the mise clause in 766-768) to match the arm at line 370: `nix`, `flake` and `mise` (via the project's `nix:` tools) reach it; `deb`/`appimage`/`tarball`/`binary` do not.
 
-**Rectification du vérificateur.** Cosmetic only, and one supporting claim is wrong: src/docs_coverage.rs does not parse Rust doc comments — it walks the guide's `.md` pages (see its `guide_pages`/code-fence handling around lines 28-107), so a duplicated `///` line is invisible to it. Nor does it fail any gate: there is no rustfmt.toml in the tree (defaults leave comments untouched, so `cargo fmt --check` passes) and an over-long doc line raises no rustdoc warning, so `mise run rustdoc` stays green. The whole impact is a mangled summary line in rustdoc output and editor hover.
+**Rectification du vérificateur.** Documentation drift only — no runtime behaviour is wrong, the arm at :370 is the intended one — so low rather than medium. There is a third instance the finding missed: src/cli/upgrade.rs:253-254, "Tracked across the two channels that build through nix", above a variable three channels write.
 
 <details>
 <summary>Preuve retenue par le vérificateur</summary>
 
-Verified byte-for-byte. `awk 'NR==927 {print length($0)}' src/config/tasks.rs` returns 202, and the line is `/// Classify the task's egress entries. The same grammar as `[network] allow`, so a task's rules read/// Classify the task's egress entries. The same grammar as `[network] allow`, so a task's rules read`, continued by line 928 `/// like any other egress rule.` and line 929 `fn validate_task_network(raw: &[String]) -> Result<Vec<Rule>, String> {`. This is production code — the only `#[cfg(test)]` in the file starts at line 1046 — and the function is live (called at src/config/tasks.rs:212). No surrounding comment or convention explains it; every other line in the file wraps at 100.
+Both quoted comments are stale and the code contradicts them. Three functions return `Roll`: `upgrade_nix_channel` (src/cli/upgrade.rs:862-869), `upgrade_mise_tools` (:957-963) and `upgrade_flake_packages` (:1057-1063), and `upgrade_cmd` ORs all three into `moved_store_paths` at :259, :273 and :288 — so the claim at :353-355 ("only [`upgrade_nix_channel`] and [`upgrade_flake_packages`] return a [`Roll`] at all, so no other channel can set `moved_store_paths`") is false on both halves. The dispatch arm eight lines below at :370 is `"nix" | "flake" | "mise" if moved_store_paths => ClosingNote::StoreMoved`, routed to `store_moved_hint`/`store_moved_note` at :319-321 and :765. `store_moved_note`'s own header at :763-768 ("Only `nix` and `flake` reach this … `mise` already rolls per-home inside a cage, so none of them moves the paths a home points into") is the reverse of the arm that calls it. The path is reachable: `sbx upgrade mise` with no `--app` takes the `only.is_none()` branch at :266-273, and the block comment there (:268-272) states outright that the project's `nix:` tools "resolve to store paths the cage binds, so rolling one repoints exactly what a home can hold" — i.e. the body knows what both headers deny.
 
 </details>
 
 ---
 
-### B57 — `add_egress_rule`/`add_proc_rule` rewrite the file on `AlreadyPresent`, which the doc says is never written
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/config/manage.rs:886` |
-| **Catégorie** | `logic-bug` |
-| **Sous-système** | Configuration — édition en place et rendu |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+### B56 — `put_value` blames the leaf key when it is a *parent* that holds a scalar, giving useless remediation
 
-**Constat.** Both rule adders end with an unconditional write:
-
-```rust
-let text = write_doc(path, &doc)?;   // line 886 (egress), line 976 (proc)
-Ok(Written { outcome, text })
-```
-
-but `Written`'s own doc at lines 161-163 states: "`AlreadyPresent` carries text too, and the same text the decision was made on: **nothing was written**, so what is attested to is the document as read". `persist_egress_rule` (src/main.rs:848) prints "…is already present in {target} — no change" on that outcome. The inverse operation gets this right — `remove_rule_from` guards with `if !removed { return Ok(RemoveOutcome::NotPresent); }` at line 1119, and its doc says "writes atomically only when it actually removed something" — so the asymmetry looks like an oversight rather than a decision.
-
-The consequences are (a) a documented no-op that can fail hard, (b) unlink/create/rename churn (new inode, new mtime) on a file the CLI says it did not change, and (c) a lost update: the document was read before the decision, so any edit that landed between `read_or_empty` and `write_doc` is silently reverted — on a project tree that, per the comment at lines 155-159, is bound read-write into the cage.
-
-**Scénario.** Put `.sbx.toml` (containing `[network]\nmode = "deny"\nallow = ["github.com"]`) in a directory the user can read but not write — a read-only checkout, or a global `sbx.toml` reached via `-c` in a root-owned config dir. Run `sbx net allow github.com`. Expected (and what the code decided): `AlreadyPresent` → "allow github.com is already present … — no change", exit 0. Actual: `write_doc` fails, `add_egress_rule` returns `ManageError::Write`, `persist_egress_rule` maps it to `(2, "cannot write …: Permission denied")`, and the command errors out on an operation that changed nothing.
-
-**Correction proposée.** Mirror `remove_rule_from`: skip the write when the outcome is `AlreadyPresent`, returning the document text as read. `let text = if matches!(outcome, AddOutcome::AlreadyPresent) { doc.to_string() } else { write_doc(path, &doc)? };` — this also keeps the attestation contract the `Written` doc describes.
-
-**Rectification du vérificateur.** Real, but the mechanism is smaller than described and half the attack is impossible. (1) `open_rule_write` (`src/main.rs:746-753`) rejects `Scope::File` outright — "`sbx net allow` does not take `-c <file>`" — so the "global sbx.toml reached via `-c`" scenario cannot happen; only a `--local` project file in a non-writable directory or a `--global` config in a non-writable config dir reaches the write. (2) The exit code is 2, not because `ManageError::Write` deserves it, but because `src/main.rs:822` blanket-maps every `ManageError` with `.map_err(|e| (2, e.to_string()))` — which itself contradicts `persist_egress_rule`'s own doc at `src/main.rs:798` ("an operational failure (no trust store, an unwritable path, a re-trust failure) is code `1`"). That doc/code mismatch is the sharper half of this finding. (3) The "lost update" is not a new hazard: the read→write window is the same one the `Added` path already has, and `trust_written` is documented (main.rs:824-832) as making it fail-safe. So the substance is a lying doc comment plus needless write churn and a hard failure on a read-only target, not silent data loss.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-The cited lines are correct: `src/config/manage.rs:886` and `:976` are both `let text = write_doc(path, &doc)?;` reached unconditionally after the `match` that produced `outcome`, and `write_doc` (line 1324) is unconditional — `write_text` creates a temp file and renames over the target every time (lines 1358-1366), with no compare-to-original short-circuit (contrast `commit` at line 427, which does have one: `if doc.to_string() == before { return Ok(SetOutcome::Unchanged); }`). The `Written` doc at `src/config/manage.rs:160-162` states plainly: "`AlreadyPresent` carries text too, and the same text the decision was made on: nothing was written, so what is attested to is the document as read". The inverse operation does guard — `remove_rule_from` at line 1119 is `if !removed { return Ok(RemoveOutcome::NotPresent); }`, and its doc at line 1055 says "writes atomically only when it actually removed something" — so the asymmetry is real and undefended by any comment. `persist_egress_rule` (`src/main.rs:848`) prints "…is already present in {target} — no change" while the inode and mtime have in fact changed.
-
-</details>
-
----
-
-### B58 — `put_value` blames the leaf key when it is a *parent* that holds a scalar, giving useless remediation
 | | |
 |---|---|
 | **Gravité** | Faible |
@@ -1843,7 +1897,44 @@ The cited line is exact: `src/config/manage.rs:622` is `.ok_or_else(|| ManageErr
 
 ---
 
-### B59 — `split_key` only understands `"`-quoted key segments, silently mangling `'`-quoted ones into a nonsense table
+### B57 — `add_egress_rule`/`add_proc_rule` rewrite the file on `AlreadyPresent`, which the doc says is never written
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/config/manage.rs:886` |
+| **Catégorie** | `logic-bug` |
+| **Sous-système** | Configuration — édition en place et rendu |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** Both rule adders end with an unconditional write:
+
+```rust
+let text = write_doc(path, &doc)?;   // line 886 (egress), line 976 (proc)
+Ok(Written { outcome, text })
+```
+
+but `Written`'s own doc at lines 161-163 states: "`AlreadyPresent` carries text too, and the same text the decision was made on: **nothing was written**, so what is attested to is the document as read". `persist_egress_rule` (src/main.rs:848) prints "…is already present in {target} — no change" on that outcome. The inverse operation gets this right — `remove_rule_from` guards with `if !removed { return Ok(RemoveOutcome::NotPresent); }` at line 1119, and its doc says "writes atomically only when it actually removed something" — so the asymmetry looks like an oversight rather than a decision.
+
+The consequences are (a) a documented no-op that can fail hard, (b) unlink/create/rename churn (new inode, new mtime) on a file the CLI says it did not change, and (c) a lost update: the document was read before the decision, so any edit that landed between `read_or_empty` and `write_doc` is silently reverted — on a project tree that, per the comment at lines 155-159, is bound read-write into the cage.
+
+**Scénario.** Put `.sbx.toml` (containing `[network]\nmode = "deny"\nallow = ["github.com"]`) in a directory the user can read but not write — a read-only checkout, or a global `sbx.toml` reached via `-c` in a root-owned config dir. Run `sbx net allow github.com`. Expected (and what the code decided): `AlreadyPresent` → "allow github.com is already present … — no change", exit 0. Actual: `write_doc` fails, `add_egress_rule` returns `ManageError::Write`, `persist_egress_rule` maps it to `(2, "cannot write …: Permission denied")`, and the command errors out on an operation that changed nothing.
+
+**Correction proposée.** Mirror `remove_rule_from`: skip the write when the outcome is `AlreadyPresent`, returning the document text as read. `let text = if matches!(outcome, AddOutcome::AlreadyPresent) { doc.to_string() } else { write_doc(path, &doc)? };` — this also keeps the attestation contract the `Written` doc describes.
+
+**Rectification du vérificateur.** Real, but the mechanism is smaller than described and half the attack is impossible. (1) `open_rule_write` (`src/main.rs:746-753`) rejects `Scope::File` outright — "`sbx net allow` does not take `-c <file>`" — so the "global sbx.toml reached via `-c`" scenario cannot happen; only a `--local` project file in a non-writable directory or a `--global` config in a non-writable config dir reaches the write. (2) The exit code is 2, not because `ManageError::Write` deserves it, but because `src/main.rs:822` blanket-maps every `ManageError` with `.map_err(|e| (2, e.to_string()))` — which itself contradicts `persist_egress_rule`'s own doc at `src/main.rs:798` ("an operational failure (no trust store, an unwritable path, a re-trust failure) is code `1`"). That doc/code mismatch is the sharper half of this finding. (3) The "lost update" is not a new hazard: the read→write window is the same one the `Added` path already has, and `trust_written` is documented (main.rs:824-832) as making it fail-safe. So the substance is a lying doc comment plus needless write churn and a hard failure on a read-only target, not silent data loss.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+The cited lines are correct: `src/config/manage.rs:886` and `:976` are both `let text = write_doc(path, &doc)?;` reached unconditionally after the `match` that produced `outcome`, and `write_doc` (line 1324) is unconditional — `write_text` creates a temp file and renames over the target every time (lines 1358-1366), with no compare-to-original short-circuit (contrast `commit` at line 427, which does have one: `if doc.to_string() == before { return Ok(SetOutcome::Unchanged); }`). The `Written` doc at `src/config/manage.rs:160-162` states plainly: "`AlreadyPresent` carries text too, and the same text the decision was made on: nothing was written, so what is attested to is the document as read". The inverse operation does guard — `remove_rule_from` at line 1119 is `if !removed { return Ok(RemoveOutcome::NotPresent); }`, and its doc at line 1055 says "writes atomically only when it actually removed something" — so the asymmetry is real and undefended by any comment. `persist_egress_rule` (`src/main.rs:848`) prints "…is already present in {target} — no change" while the inode and mtime have in fact changed.
+
+</details>
+
+---
+
+### B58 — `split_key` only understands `"`-quoted key segments, silently mangling `'`-quoted ones into a nonsense table
+
 | | |
 |---|---|
 | **Gravité** | Faible |
@@ -1883,7 +1974,197 @@ The citation is exact. src/config/manage.rs:1268-1274 is `let mut quoted = false
 
 ---
 
-### B60 — `secrets_inherited` shadows on `header` alone while `upsert_secret` shadows on any header in `headers()`
+### B59 — `Resolved`'s field docs state network and notify defaults the code does not implement
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/config/mod.rs:313` |
+| **Catégorie** | `doc-drift` |
+| **Sous-système** | Configuration — modèle, schéma, types |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** Three comments assert built-in defaults that contradict the code. (a) mod.rs:313-315 — "The resolved network posture: the default (`Shared`) unless the global config or a trusted project asked for `\"none\"`" — but the default is `NetworkPolicy::default()` = `Allowlist(EgressPolicy::default())`, the deny-by-default filtering posture, as `types.rs:230-255` states at length ("The default is the filtering allowlist, so a cage nobody configured reaches only the built-in self-equip set"), and the layer code falls back to exactly that at mod.rs:1815. The same stale claim is repeated in a schema test comment, schema.rs:2634-2635 ("the loader treats that as the default (shared)"). (b) mod.rs:340-341 — "the default (`once` for every event)" — and mod.rs:1842-1843 — "`parent` is the built-in default (every event `once`)" — but `NotifyPolicy::default()` is `uniform(NotifyMode::default())` and `NotifyMode`'s `#[default]` is `Always` (notify.rs:126-137), which is also what `RawConfig::notify` documents (schema.rs:159-160: "`\"always\"` (the default: every occurrence…)").
+
+**Scénario.** A reader auditing the flagship posture reads `Resolved::network`'s doc and concludes that a machine with no `[network]` line anywhere hands the cage the host's network unfiltered, and that only `network = \"none\"` changes that. Both halves are false — the cage gets a deny-by-default allowlist, and `deny`/`allow`/`ask`/`shared` are all honored — so the comment misdescribes the single most security-relevant default in the crate, and the notify pair misstates whether a repeat is announced once or every time.
+
+**Correction proposée.** Rewrite mod.rs:313-315 to name `NetworkPolicy::default()` (deny-by-default filtering allowlist) and to say the posture comes from the global config or a trusted project; change `once` to `always` at mod.rs:340 and mod.rs:1843; fix the stale test comment at schema.rs:2634-2635.
+
+**Rectification du vérificateur.** Accurate as written, with one scoping nuance: sub-claim (c), src/config/schema.rs:2634-2635, sits inside the `#[cfg(test)]` module that opens at schema.rs:2160, so it is a stale comment in test code rather than in shipped documentation — the load-bearing half of the finding is (a) mod.rs:313 and (b) mod.rs:340 / mod.rs:1843, which are production doc comments on `Resolved`'s fields and in `resolve`'s global layer. Impact is documentation-only; no runtime behavior is wrong, and `network_origin`/`notify_origin` still report `Provenance::Default` correctly.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Every cited line reads as claimed and every claim is contradicted by the code. src/config/mod.rs:313 — "/// The resolved network posture: the default (`Shared`) unless the global config" — but src/config/types.rs:248-255 is `impl Default for NetworkPolicy { fn default() -> Self { Self::Allowlist(crate::allowlist::EgressPolicy::default()) } }`, whose own doc says "Deny-by-default with no rules of its own: every host the cage reaches has to be named". The layer code agrees with types.rs and not with the field doc: src/config/mod.rs:1801-1802 comments "The parent of the global layer is sbx's built-in default (the `deny` allowlist)" and mod.rs:1815 is `None => NetworkPolicy::default()`. The field doc's second half ("unless … asked for `\"none\"`") is also wrong: `validate_network` accepts the table form with `mode` = deny/allow/ask as well. Notify: src/config/mod.rs:340 says "the default (`once` for every event)" and mod.rs:1843 says "default (every event `once`)", but src/notify.rs:181-184 is `NotifyPolicy::default() -> NotifyPolicy::uniform(NotifyMode::default())` and src/notify.rs:132-137 marks `Always` `#[default]` ("Every occurrence — the default"). The stale test comment is confirmed too, at src/config/schema.rs:2634-2635 ("the loader treats that as the default // (shared)"). Nothing in the surrounding prose reframes these as deliberate; they are three independent statements of a default the code does not have.
+
+</details>
+
+---
+
+### B60 — `BundleProvision`'s doc comment opens with the first half of `ResolvedApp`'s sentence
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/config/mod.rs:503` |
+| **Catégorie** | `doc-drift` |
+| **Sous-système** | Configuration — modèle, schéma, types |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** `BundleProvision` was inserted into the middle of `ResolvedApp`'s doc comment. Its first line is `/// An app's resolved overlay over the sandbox baseline: the command to run plus the extra` (mod.rs:503), which describes `ResolvedApp` and not a provision step, immediately followed by the real sentence "One bundle's install step, as the fold hands it to a launch…". The remainder of the orphaned sentence is then the opening line of `ResolvedApp`'s own doc, which begins mid-clause: `/// environment, binds, packages, network posture, and credentials it declares — each` (mod.rs:519).
+
+**Scénario.** `cargo doc` renders `BundleProvision` with a summary line claiming it is an app's resolved overlay over the sandbox baseline, and renders `ResolvedApp` with a summary beginning "environment, binds, packages, network posture, and credentials it declares" — two wrong type summaries from one editing accident, in a crate whose doc comments are the primary specification.
+
+**Correction proposée.** Move the dangling first line back onto `ResolvedApp` so its doc reads "An app's resolved overlay over the sandbox baseline: the command to run plus the extra environment, binds, packages, network posture, and credentials it declares — each …", and leave `BundleProvision`'s doc starting at "One bundle's install step".
+
+**Rectification du vérificateur.** Confirmed as described; nothing to correct. Cosmetic/documentation only — it compiles, and `mise run rustdoc`'s broken-intra-doc-link denial does not catch a misplaced prose line, so only a reader notices. Note that view.rs carries a related editing accident worth folding into the same cleanup: src/config/view.rs:1012 concatenates two copies of a doc opener on one line (`/// Assemble the view restricted to one configuration `source`/// Assemble the view restricted to one configuration `source` — …`).
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Verified verbatim and the line numbers are exact. `grep -n` gives src/config/mod.rs:503 `/// An app's resolved overlay over the sandbox baseline: the command to run plus the extra`, immediately followed by mod.rs:504 `/// One bundle's install step, as the fold hands it to a launch: the step itself and the bundle`, with `pub(crate) struct BundleProvision {` at mod.rs:512 — so line 503 is unambiguously part of `BundleProvision`'s doc block and describes a different type. The orphaned remainder is likewise where the reporter says: mod.rs:519 `/// environment, binds, packages, network posture, and credentials it declares — each`, opening the doc block that ends at `pub(crate) struct ResolvedApp {` on mod.rs:524, so `ResolvedApp`'s summary line begins mid-clause. The two halves join into one grammatical sentence, which is the tell that a struct was pasted into the middle of an existing doc comment. No comment or test frames this as deliberate, and rustdoc takes the first line of each block as that item's summary, so both types render with the wrong one-liner.
+
+</details>
+
+---
+
+### B61 — `apply_override` adds credentials to `secrets` but leaves `declared_secrets` stale
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/config/mod.rs:1182` |
+| **Catégorie** | `inconsistency` |
+| **Sous-système** | Configuration — modèle, schéma, types |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : moyenne) |
+
+**Constat.** `Resolved` keeps a pair: `secrets` (posture-cleared, effective) and `declared_secrets` ("The baseline credentials *before* the posture clear — what an app overlay inherits", mod.rs:467-473), snapshotted together at mod.rs:2489. `apply_override` folds an override's `[secret]` section into `self.secrets` (mod.rs:1182-1189) and re-runs `enforce_secret_posture`, but never touches `self.declared_secrets`, so after an override the two disagree. Nothing on the launch path notices — `merge_app` runs *before* `apply_override` — but `view.rs:1767` re-derives an app's effective credential set from `baseline.declared_secrets` *after* `apply_ambient_override` has run (view.rs:1578), so the display path reads the stale half.
+
+**Scénario.** With `SBX_CONFIG='[secret."api.example.com"]\nfrom = "env://TOKEN"\nheader = "Authorization"\ntype = "bearer"'` exported, `sbx config show --app agent` builds `eff_secrets` from `declared_secrets` (which the override never reached) and reports that the app injects no credential for api.example.com — while `sbx app run agent` with the same environment injects it. The view under-reports exactly the field it exists to make visible.
+
+**Correction proposée.** In `apply_override`, apply the override's section to both sets (or re-snapshot `self.declared_secrets = self.secrets.clone()` after `apply_secret_section` and before `enforce_secret_posture`), so the pair's invariant survives the final layer.
+
+**Rectification du vérificateur.** Mechanism and line numbers are correct; two refinements. (1) The blast radius is display-only and under-reports rather than over-reports — `secrets_inherited` at view.rs:1874 is computed from the same stale `declared_secrets`, so both the credential list and the inherited count are low, but no launch injects anything it should not. (2) The reporter's suggested fix of re-snapshotting `self.declared_secrets = self.secrets.clone()` inside `apply_override` should be taken with care: `merge_app` restores that snapshot wholesale (mod.rs:782, documented at mod.rs:1352-1353 and asserted by `an_app_inherits_a_baseline_credentials_plugin_host_config` in src/config/tests.rs), so any future path that ran `merge_app` after `apply_override` would then inherit override credentials as baseline. Fixing the view to derive `eff_secrets` the way `merge_app` does — or applying the override section to both vectors — is the narrower change.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Traced end to end and nothing prevents it. `apply_override` folds the override's `[secret]` section into `self.secrets` at src/config/mod.rs:1182 (`apply_secret_section(&mut self.secrets, …)`) and re-runs `enforce_secret_posture(&self.network, &mut self.secrets, …)` at mod.rs:1191; `declared_secrets` is never written there. Grepping every reference confirms it: `declared_secrets` is written only at src/config/mod.rs:2489 (`let declared_secrets = secrets.clone();`, the pre-posture snapshot in `resolve`) and read at mod.rs:782, view.rs:1767 and view.rs:1874 — `apply_override` touches neither. The two paths then diverge exactly as reported. Launch: src/sandbox/launch.rs:876 `prep.cfg.merge_app(app);` then launch.rs:879 `apply_launch_override(&mut prep.cfg, ov)`, with the comment at launch.rs:877-878 stating the override is applied "*after* the app overlay" — so `merge_app`'s `self.secrets = self.declared_secrets.clone()` (mod.rs:782) runs first and the override's credential survives into the injected set. Display: `build_app_detail` calls `apply_ambient_override(&mut resolved)` at src/config/view.rs:1578, which reaches `resolved.apply_override(ov)` at view.rs:1008, and only afterwards does `app_detail_view` build `let mut eff_secrets = baseline.declared_secrets.clone();` at view.rs:1767 — reading the half the override never reached. The view explicitly claims to mirror the launch (view.rs:1763-1766: "Reproduce that check so the count — and the note — match what `sbx app <name>` would actually inject"), so this is a broken stated invariant, not a difference of expectation. The override path does carry `[secret]`: `RawConfig`'s `secret` is destructured in `apply_override` (mod.rs:871), merged by the collector at src/config/overrides.rs:635 (`if secret.is_some() { base.secret = secret; }`), and exercised with literally this shape in overrides.rs:1231/1666.
+
+</details>
+
+---
+
+### B62 — A project `[broker.<name>]` table with no `allow` key silently clears the global config's broker policy
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/config/mod.rs:2095` |
+| **Catégorie** | `logic-bug` |
+| **Sous-système** | Configuration — modèle, schéma, types |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : moyenne) |
+
+**Constat.** `bound.allow = table.allow;` overwrites the globally-declared policy with the project table's `allow` unconditionally. `RawBrokerConfig::allow` is `#[serde(default)] Vec<String>` (schema.rs:786-787), so "the project said nothing about the policy" and "the project set an empty policy" are the same value here, and both wipe the global list. The surrounding code proves the case is reachable: the loop immediately above warns that a project's `socket` and `secret` are ignored (mod.rs:2067-2084), i.e. it expects project tables that exist for reasons other than setting `allow`. `broker_origin.insert(name, Provenance::Project)` then attributes the now-empty policy to the project, so `sbx config` blames the layer that never wrote it. The field's own doc frames `allow` as a narrowing or widening of what the global config exposed (schema.rs:780-787), not as a reset.
+
+**Scénario.** Global `sbx.toml`: `[broker.gpg] socket = "$XDG_RUNTIME_DIR/gnupg/S.gpg-agent"` / `allow = ["sign"]`. A trusted project writes `[broker.gpg] socket = "/tmp/mine.sock"` trying to repoint the socket. sbx warns that the socket is ignored — and then sets `allow = []`. The gpg broker starts, every signing request is refused by an empty policy, and no warning connects that outcome to the project table. `sbx config` shows the empty `allow` with `Provenance::Project`.
+
+**Correction proposée.** Only override when the project actually declared entries — `if !table.allow.is_empty() { bound.allow = table.allow; broker_origin.insert(name, Provenance::Project); }` — or make the field `allow: Option<Vec<String>>` in `RawBrokerConfig` so "unset" and "empty" are distinguishable, and warn when a project table sets nothing sbx reads.
+
+**Rectification du vérificateur.** Mechanism confirmed at the cited line, but the stated consequence is asserted, not established. sbx does not interpret these entries: schema.rs:780-782 says "sbx does not interpret these: what an entry means belongs to the protocol the plugin speaks", and the list is passed verbatim in the handshake (`src/sandbox/broker.rs:191`, `let allow = serde_json::Value::from(self.allow.to_vec());`). So "every signing request is refused" is plugin-defined behaviour, not something sbx guarantees — the defect is that an unset project `allow` is indistinguishable from an empty one, silently replaces the global policy, and is then attributed to `Provenance::Project` (surfaced by `sbx config` via src/cli/config.rs:912). Real but low: it needs a project table containing only fields sbx already warns it is dropping.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Verified. src/config/mod.rs:2095 is exactly `bound.allow = table.allow;`, followed at 2096 by `broker_origin.insert(name, Provenance::Project);`, with no guard on whether the project actually wrote an `allow`. `RawBrokerConfig::allow` is `#[serde(default, skip_serializing_if = "Vec::is_empty")] pub(crate) allow: Vec<String>` (schema.rs:786-787), so absent and empty are the same `Vec::new()`. The loop above it (mod.rs:2069-2091) warns that a project's `socket` and `secret` are ignored and reports the table's unknown keys, proving project tables that carry no readable field are an anticipated case — so a project writing only `socket`, only `secret`, or a misspelled `alow` reaches line 2095 with an empty vector and wipes the global policy. The only test covering this path (mod.rs:5690-5718) exercises a project that *does* set `allow = ["list"]`; nothing covers the absent case.
+
+</details>
+
+---
+
+### B63 — `validate_params` documents declaration order but a `BTreeMap` source gives alphabetical order
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/config/tasks.rs:582` |
+| **Catégorie** | `doc-drift` |
+| **Sous-système** | Configuration — couches, overrides, validation |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** The doc reads "Validate the parameter declarations, keeping declaration order", but `raw` is a `BTreeMap<String, RawTaskParam>` (schema.rs:1433), which discards authoring order at parse time and iterates sorted by key. The resulting `Vec<TaskParam>` is therefore alphabetical, and nothing downstream can recover what the author wrote. The order is user-visible: `task_control.rs:773` builds the caller-facing parameter list from it and `contract.rs:126` walks it to emit the task's schema, so an agent reading a task's contract sees the parameters re-sorted.
+
+**Scénario.** Declare `[task.report.params]` with `since`, then `until`, then `format`. `sbx` lists the operation's parameters as `format, since, until`. The doc promises the authored order; a maintainer relying on it (say, to render a positional usage line or to keep a contract byte-stable against the file) gets the wrong answer and has no way to fix it inside this function.
+
+**Correction proposée.** Either drop the claim — "Validate the parameter declarations. Order follows the section's key order (a `BTreeMap`), not the file" — or, if the order is meant to be authored order, change `RawTask::params` to an order-preserving map (e.g. `IndexMap`, or a `Vec<(String, RawTaskParam)>` with a duplicate-key check) so the promise holds end to end.
+
+**Rectification du vérificateur.** Real but purely a doc inaccuracy with no functional consequence, and the reporter's rationale is partly backwards. Parameters are addressed by name (`{name}` interpolation, and the `LIST`/contract listings are informational), so no behaviour depends on order; and because a BTreeMap is deterministic, the emitted contract IS byte-stable — just stable in key order rather than file order, which defeats the "byte-stable against the file" argument the reporter offers. The same claim also appears at src/config/types.rs:738 ("The declared parameters, in declaration order."), so a doc fix must touch both sites.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Verified. src/config/tasks.rs:582 reads `/// Validate the parameter declarations, keeping declaration order. Each must carry exactly one bound` and src/config/tasks.rs:584 is `fn validate_params(raw: BTreeMap<String, RawTaskParam>) -> Result<Vec<TaskParam>, String>`, iterated with `for (name, param) in raw` at line 585. The source type is confirmed at src/config/schema.rs:1433: `pub(crate) params: BTreeMap<String, RawTaskParam>`, so serde discards authoring order at parse time and iteration is key-sorted. The cited downstream uses check out: src/sandbox/task_control.rs:774 `let params: Vec<&str> = task.params.iter().map(|p| p.name.as_str()).collect();` inside the `LIST` handler, and src/sandbox/contract.rs:126 `for param in &task.params {` inside `operations_section`. Nothing recovers file order, and the codebase uses "declaration order" elsewhere (src/sandbox/packages.rs:38, src/config/mod.rs:272) for genuinely order-preserving `Vec` sources, so the phrase does mean authored order here.
+
+</details>
+
+---
+
+### B64 — Doc comment line duplicated on itself in `validate_task_network`
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/config/tasks.rs:927` |
+| **Catégorie** | `doc-drift` |
+| **Sous-système** | Configuration — couches, overrides, validation |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** Line 927 is a single physical line containing its own text twice: `/// Classify the task's egress entries. The same grammar as `[network] allow`, so a task's rules read/// Classify the task's egress entries. The same grammar as `[network] allow`, so a task's rules read`, followed by line 928 `/// like any other egress rule.` A copy-paste artifact — the sentence renders once, mangled, in rustdoc and in any editor hover, and the line is 200 characters wide in a file that otherwise wraps at 100.
+
+**Scénario.** Run `cargo doc` (or hover `validate_task_network`): the summary line reads "Classify the task's egress entries. The same grammar as `[network] allow`, so a task's rules read/// Classify the task's egress entries. …", with the stray `///` inline. The crate's own docs-coverage tooling (`src/docs_coverage.rs`) parses doc lines, so a duplicated one is also noise there.
+
+**Correction proposée.** Delete the duplicated half so line 927 reads once: `/// Classify the task's egress entries. The same grammar as `[network] allow`, so a task's rules read`.
+
+**Rectification du vérificateur.** Cosmetic only, and one supporting claim is wrong: src/docs_coverage.rs does not parse Rust doc comments — it walks the guide's `.md` pages (see its `guide_pages`/code-fence handling around lines 28-107), so a duplicated `///` line is invisible to it. Nor does it fail any gate: there is no rustfmt.toml in the tree (defaults leave comments untouched, so `cargo fmt --check` passes) and an over-long doc line raises no rustdoc warning, so `mise run rustdoc` stays green. The whole impact is a mangled summary line in rustdoc output and editor hover.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Verified byte-for-byte. `awk 'NR==927 {print length($0)}' src/config/tasks.rs` returns 202, and the line is `/// Classify the task's egress entries. The same grammar as `[network] allow`, so a task's rules read/// Classify the task's egress entries. The same grammar as `[network] allow`, so a task's rules read`, continued by line 928 `/// like any other egress rule.` and line 929 `fn validate_task_network(raw: &[String]) -> Result<Vec<Rule>, String> {`. This is production code — the only `#[cfg(test)]` in the file starts at line 1046 — and the function is live (called at src/config/tasks.rs:212). No surrounding comment or convention explains it; every other line in the file wraps at 100.
+
+</details>
+
+---
+
+### B65 — The `capture_max_kb` warning fires only when `capture` is absent, not in the two cases its own message names
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/config/validate.rs:701` |
+| **Catégorie** | `ux-error-message` |
+| **Sous-système** | Configuration — couches, overrides, validation |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** The guard is `} else if table.capture_max_kb.is_some()`, reached only when `table.capture` is `None`, but its message says `capture_max_kb` is only meaningful with `capture = "bodies"`. With `capture = "off"` or `capture = "headers"` the `if` branch is taken instead and `with_capture(level, table.capture_max_kb)` is called with a ceiling that level ignores — no warning at all. So the condition and the message describe different sets, and two of the three cases the message is about pass in silence. Same shape as the `ask_timeout`/`ask_notice` checks twenty lines up, which correctly key off the *effective* value rather than absence.
+
+**Scénario.** Write `[network]\nmode = "deny"\ncapture = "headers"\ncapture_max_kb = 256`. No warning is emitted and the body ceiling is inert, so an author who set both believes bodies are being captured up to 256 KiB and finds `sbx net logs --with-body` empty with nothing in the config output to explain it. The identical mistake with `capture` omitted entirely is warned.
+
+**Correction proposée.** Move the check so it keys off the parsed level: after `CaptureLevel::parse` succeeds, warn when `table.capture_max_kb.is_some()` and the level is not `Bodies`; keep the existing `else if` arm for the absent-`capture` case. One message, one condition that matches it.
+
+**Rectification du vérificateur.** Mechanism confirmed, impact slightly overstated. The message text is not itself false (in the branch it guards, the value really is ignored); the defect is that the guard's condition covers a strictly narrower set than the message describes, so two of three non-bodies cases pass silently. The attack's claim of "nothing in the config output to explain it" is not quite right: src/config/view.rs:1386-1390 renders `capture_max_kb: a.capture_level().captures_bodies().then(|| a.capture_body_kb())`, so `sbx config show` omits the field when the effective level is not `bodies` — a weak signal, but a signal. This is a warning-coverage gap, not a wrong effective policy: the resolved capture behaviour is correct in every case.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Verified. src/config/validate.rs:694-704 reads `if let Some(raw) = &table.capture { match CaptureLevel::parse(raw) { Some(level) => policy = policy.with_capture(level, table.capture_max_kb), ... } } else if table.capture_max_kb.is_some() { warnings.push(... "`capture_max_kb` is only meaningful with `capture = \"bodies\"` — ignored") }`. The guard at line 701 is reachable only when `capture` is absent, so `capture = "off"`/`"headers"` plus `capture_max_kb` takes the `if` arm and warns nothing, while the ceiling is provably inert: src/sandbox/control/capture.rs:130-138 `CaptureCaps::new` sets `body: if level.captures_bodies() { ... } else { 0 }`, and src/sandbox/egress.rs:810-816 only builds a CaptureRing at all when `capture_level.captures()`. Nothing prevents it: no comment in the block justifies keying off absence, and the neighbouring check at src/config/validate.rs:667-680 explicitly does the opposite ("key off `action`, not the raw `mode` string") for ask_timeout/ask_notice. No test pins the silence either — src/config/tests.rs:1806-1819 only exercises `headers` with `kb = None` and `bodies` with `Some(64)`. The only other mention of the field, src/config/validate.rs:498, is the `none`/`shared` inert-key listing, which does not cover a filtering posture.
+
+</details>
+
+---
+
+### B66 — `secrets_inherited` shadows on `header` alone while `upsert_secret` shadows on any header in `headers()`
+
 | | |
 |---|---|
 | **Gravité** | Faible |
@@ -1921,7 +2202,89 @@ Every cited line is accurate and the asymmetry is real. src/config/view.rs:1879 
 
 ---
 
-### B61 — `sbx path` exits 0 and reports "no base" when the data directory could not be resolved
+### B67 — `config add` page claims `config rm` is the only way to remove a rule; four verbs and the `config rm` page say otherwise
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/help.rs:1386` |
+| **Catégorie** | `doc-drift` |
+| **Sous-système** | Aide et complétion shell |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** The `config add` page ends its redirect paragraph with: "Removal is not redirected — `sbx config rm` is in fact the only way to take an `allow`/`deny` rule back out." The same table carries pages for `net unallow`, `net undeny`, `net unmute`, `proc unallow` and `proc undeny`, each summarised as "remove an allow rule from a config file (the inverse of …)" (src/help.rs:2342, 2406, 2479, 543, 611) and each dispatched (src/cli/net.rs:42-48, src/cli/proc.rs:38-40). The `config rm` page states the truth directly — "`sbx net unallow|undeny|unmute` and `sbx proc unallow|undeny` do the same removal in the vocabulary the rule was written in; this is the lower-level route to it" (src/help.rs:1427-1429) — so the two pages of one table flatly disagree.
+
+**Scénario.** A user who has just been redirected away from `sbx config add network.allow api.example.com` reads that paragraph and concludes the symmetric `sbx net unallow` does not exist, dropping to the raw dotted-key form — which additionally leaves `allow = []` behind where `net unallow` would have dropped the emptied list (the difference the `net unallow` page documents at line 2364).
+
+**Correction proposée.** Reword src/help.rs:1386 to match the `config rm` page: removal is *not* redirected, and both routes exist — `sbx net unallow|undeny|unmute` / `sbx proc unallow|undeny` in the rule's own vocabulary, `sbx config rm` as the lower-level route.
+
+**Rectification du vérificateur.** Confirmed stale prose, with history to prove it is not deliberate: the sentence landed in commit 4df15a2 (2026-08-05), and the removal verbs it denies were added the next day in e4df665 (2026-08-06, "feat(net): undo an egress rule with the verb that wrote it"), which updated the `config rm` page but not the `config add` page. Only the second clause is wrong — "Removal is not redirected" is accurate (`config rm` does work on `[network]`/`[proc]` lists, per src/help.rs:1426-1428); the "only way" claim is the drift.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+src/help.rs:1385-1386 reads "…so it is refused with the verb to use. Removal is not redirected — `sbx config rm` is in fact the only way to take an `allow`/`deny` rule back out." That is false: the same table carries pages at src/help.rs:2342 (net unallow), 2406 (net undeny), 2479 (net unmute), 543 (proc unallow), 611 (proc undeny), and all five are dispatched — src/cli/net.rs:42-48 (`Some("unallow") => net_remove_rule(EgressList::Allow, …)` etc.) and src/cli/proc.rs:38-40. The `config rm` page states the opposite at src/help.rs:1428-1431, and the net dispatcher's own comment (src/cli/net.rs:37-39) says "Each rule list is added to and taken back out with one vocabulary, so undoing a rule never means dropping to the schema key it was written under" — the exact inverse of the claim. The behavioural difference the reporter cites is real and documented at src/help.rs:2364 ("An emptied list is dropped rather than left as `allow = []`").
+
+</details>
+
+---
+
+### B68 — Two pages say `sbx app <name>` launches an app; the dispatcher refuses that form
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/help.rs:1963` |
+| **Catégorie** | `doc-drift` |
+| **Sous-système** | Aide et complétion shell |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** The `app import` page states "the profile stays inert until `sbx app <name>` launches it" (line 1963) and the `net rules` page states "`--app <name>` shows what `sbx app <name>` would launch with" (line 2166). Both contradict the `app` page itself, which is explicit that this spelling does not exist: "Launching always goes through `run`, so an app name is never a subcommand — an app may be named `run`, `show`, etc. and is still launched as `sbx app run <name>`" (lines 262-264). `app_cmd` (src/cli/app.rs:29-50) matches only `run|upgrade|import|export|rm|list|ls|show|prune` and sends anything else — including a valid app name — to the error arm.
+
+**Scénario.** A user reads `sbx app import ./demo-app.toml`'s own output/page and runs `sbx app demo-app`: it prints `sbx: app needs a subcommand — to launch an app, use `sbx app run <name>`.` plus the usage page and exits 2. The remaining four references in the same table all use the correct `sbx app run <name>` spelling.
+
+**Correction proposée.** Replace `sbx app <name>` with `sbx app run <name>` at src/help.rs:1963 and src/help.rs:2166.
+
+**Rectification du vérificateur.** Correct but cosmetic-leaning, and there is a third site: the rustdoc comment at src/help.rs:3388 uses the same wrong spelling ("`sbx app <name> -- --help` passes `--help` through"), and src/notify.rs:307 uses `sbx app <name>` as loose shorthand for "the app this launch runs". So the spelling reads as a house shorthand that leaked into two user-facing pages; the user-visible cost is bounded because the error the dispatcher prints names the right verb.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Both citations are exact. src/help.rs:1963: "profile stays inert until `sbx app <name>` launches it." src/help.rs:2166: "<name>` shows what `sbx app <name>` would launch with". The `app` page contradicts them at src/help.rs:261-264: "Launching always goes through `run`, so an app name is never a subcommand — an app may be named `run`, `show`, etc. and is still launched as `sbx app run <name>`." `app_cmd` (src/cli/app.rs:28-50) matches only run|upgrade|import|export|rm|list|ls|show|prune; any other first token, including a valid app name, hits the `_` arm at src/cli/app.rs:43-49, which prints "sbx: app needs a subcommand — to launch an app, use `sbx app run <name>`." plus the usage page and returns ExitCode::from(2). The doc comment above it (src/cli/app.rs:25-27) states the invariant deliberately, so this is drift in the prose, not an undocumented dispatcher quirk.
+
+</details>
+
+---
+
+### B69 — `sbx app prune` page tells the user to run `sbx stop`, which is not a command
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/help.rs:2087` |
+| **Catégorie** | `ux-error-message` |
+| **Sous-système** | Aide et complétion shell |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** The `app prune` page's remediation reads: "`--yes` is refused while a session of that app is running … Stop it with `sbx stop` and retry." There is no top-level `stop` verb — `dispatch` (src/cli/mod.rs:382-490) has no `"stop"` arm, so it falls into the catch-all and prints `sbx: unknown command 'stop'` with exit 2. Every other page names the real verb (`sbx session stop`, e.g. src/help.rs:1854 and 1888). This page is the single source of truth for that remediation, so the wrong name is what the user is handed at the exact moment the command failed.
+
+**Scénario.** `sbx app prune demo-app --yes` while a `demo-app` session is live prints the refusal and the hint; following the hint gives `sbx: unknown command 'stop'` (exit 2). The correct command is `sbx session stop <pid>`.
+
+**Correction proposée.** Change `sbx stop` to `sbx session stop` at src/help.rs:2087.
+
+**Rectification du vérificateur.** Stronger than reported, and the fix location is wrong. The page is NOT the source of that hint — the runtime message is a separate hard-coded copy at src/cli/app.rs:1926: `"       stop it with `sbx stop`, or re-run without `--yes` to see what would go"`. Both sites must change; patching src/help.rs:2087 alone leaves the user still reading `sbx stop` at the moment the command fails. (The reporter's secondary citations are also off by a line or two: the correct-spelling examples are at src/help.rs:1856 and 1889, not 1854/1888.) A fourth instance of the same shorthand sits in an internal doc comment at src/notify.rs:303 ("`sbx attach`/`sbx stop`"), where neither verb exists top-level.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+src/help.rs:2087 reads verbatim "under a command in flight. Stop it with `sbx stop` and retry. The preview deletes". `dispatch` in src/cli/mod.rs:382-490 has no "stop" arm — the nearest is `"session" | "sessions" => session::session_cmd(rest)` (src/cli/mod.rs:411) — so `sbx stop` falls to the catch-all at src/cli/mod.rs:483-487 and prints `sbx: unknown command 'stop'` with `ExitCode::from(2)`. The real verb is `sbx session stop <id>...`, whose page documents `<id>...` as "the PIDs `sbx session ls` shows" (src/help.rs:1224-1229). The refusal itself is reachable: src/cli/app.rs:1911-1928 gates on `if apply` plus a non-empty `session_pids_for_app`.
+
+</details>
+
+---
+
+### B70 — `sbx path` exits 0 and reports "no base" when the data directory could not be resolved
+
 | | |
 |---|---|
 | **Gravité** | Faible |
@@ -1947,7 +2310,526 @@ Line numbers check out: src/main.rs:296 `let layout = store::Layout::from_env();
 
 ---
 
-### B62 — An untrusted engine override is reported as "ignoring" and then as "not found", neither of which is true
+### B71 — A non-UTF-8 flag value is reported as a missing value, so a legitimate `--bind` path fails with a message describing a different mistake
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/main.rs:340` |
+| **Catégorie** | `ux-error-message` |
+| **Sous-système** | Balayage des panics atteignables |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** `take_flag_value` reads the `--flag value` form with `head.first().and_then(|a| a.to_str())` (src/main.rs:332). That `and_then` collapses two distinct outcomes into one: the argument is absent, and the argument is present but is not valid UTF-8. Both land in the `None` arm at line 339, which prints "sbx: {verb}: `{flag}` needs a value" and exits 2. On Linux a path is bytes, not text — sbx knows this and says so at src/main.rs:48-49 ("`args_os`, not `args`: a command run via `sbx run` may carry non-UTF-8 arguments, and panicking on them would be wrong") — so `--bind` and `--config @file`, both of which take paths, can legitimately be handed a value the message then denies exists. The user is told to supply the value they just supplied, and nothing anywhere says the flag is UTF-8-only. This affects every value-taking override flag routed through here: `--config`, `--env`, `--net`, `--gui`, `--proc`, `--notify`, `--nixpkgs`, `--bind`, `--forward`, `--limit`, `--package`, `--seccomp`, `--device` (src/main.rs:398-411).
+
+**Scénario.** On a host with a directory whose name is not valid UTF-8 (e.g. a latin-1 name from an old archive, `/data/caf\xe9`), run `sbx run --bind /data/caf\xe9:ro -- ls`. sbx prints `sbx: run: \`--bind\` needs a value` and exits 2 — naming a missing argument when the argument is present, and giving no hint that the real constraint is the encoding. The same for `sbx app run demo --config @/data/caf\xe9/sbx.toml` ("`--config` needs a value") and for the inline `--bind=<path>` form when the whole token is non-UTF-8, which never reaches the `=` split at line 331 either.
+
+**Correction proposée.** Split the two cases: `match head.first() { None => "`{flag}` needs a value", Some(v) if v.to_str().is_none() => "`{flag}` value is not valid text: {v:?} — sbx reads override values as UTF-8", Some(v) => ... }`. Same treatment for the inline branch at line 331, whose `to_str()` failure currently falls through to the next-argument path.
+
+**Rectification du vérificateur.** Two corrections, both narrowing it. (1) The rejection itself is deliberate and documented -- src/main.rs:317-318 says "A missing or non-text value is a usage error (exit 2)" -- and no configuration is actually lost: every override sink is a `Vec<String>` (config::CliOverrides) and the config surface is TOML, so a non-UTF-8 bind path cannot be expressed in sbx at all. The defect is confined to the message text naming the wrong mistake, not to the refusal. (2) The second half of the attack is wrong: a wholly non-UTF-8 `--bind=<path>` token never reaches take_flag_value, because take_override_flag bails at src/main.rs:376 (`head.first()?.to_str()?` -> None) and the `run` scan loop ends at src/cli/mod.rs:433 (`while let Some(raw) = cmd.first().and_then(|a| a.to_str())`), so the token is treated as the start of the command -- the documented behaviour at src/cli/mod.rs:82 ("An argument that is not valid UTF-8 cannot be a name sbx knows"). It produces no "needs a value" message. So the fix note's "same treatment for the inline branch" is unnecessary, and the inline branch is at lines 326-330, not 331 (331 is the comment for the next-argument path).
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Citations check out. src/main.rs:332 is `match head.first().and_then(|a| a.to_str())`, and the `None` arm at src/main.rs:339-341 prints "sbx: {verb}: `{flag}` needs a value" + exit 2, collapsing absent-value and present-but-non-UTF-8. The main.rs:48-49 `args_os` comment is quoted correctly, and the sink list at main.rs:398-411 (`--config`..`--device`) is as stated. Traced the reachable path: `sbx run --bind <non-utf8> -- ls` -> cli/mod.rs:433 sees UTF-8 `--bind`, main.rs:376 `flag_name(head.first()?.to_str()?)` resolves the name, take_flag_value's inline `=` split (main.rs:327) misses, `head.first().and_then(to_str)` yields None -> "needs a value" for a value that is present. Nothing guards it, and the codebase demonstrably knows the right wording elsewhere (`sbx: {verb}: argument is not valid UTF-8` at src/cli/mod.rs:116, src/cli/app.rs:931, src/cli/test.rs:67), so this is an inconsistency rather than a house style.
+
+</details>
+
+---
+
+### B72 — The bootstrap `--local` save refusal prints two runs of 14 literal spaces mid-sentence
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/main.rs:579` |
+| **Catégorie** | `ux-error-message` |
+| **Sous-système** | Point d'entrée, diagnostics, store, chemins |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** The format string in `local_save_refusal` (src/main.rs:579) carries two 14-space runs inside the message text — at offsets 96 and 194 of the literal, between "…a `--local` save would write" and "also trusts…", and between "…you have not reviewed." and "Create the config…". They are literal string content, not source indentation: the `\` line continuation at the end of line 579 correctly elides the *leading* whitespace of line 580, but these two runs sit mid-line. The shape is a reflow that joined wrapped lines without collapsing their indentation. No test pins the text — the only assertions (src/main.rs:1084-1092) check for the substrings "mise.toml" and "have not reviewed".
+
+**Scénario.** In a project with a `mise.toml` and no `.sbx.toml`, run `sbx net allow example.com --local` (or `sbx net pending --save --local`). The refusal reaching stderr reads: "this project has no .sbx.toml yet, and trusting the one a `--local` save would               also trusts mise.toml beside it — content sbx did not write and you have not reviewed.               Create the config …" — a gap wide enough to read as a column break in a paragraph that is otherwise the single most important explanation sbx gives about trust bootstrapping.
+
+**Correction proposée.** Collapse each 14-space run to a single space in the format string at src/main.rs:579, or re-break the literal across source lines with `\` continuations so every continuation's indentation is elided.
+
+**Rectification du vérificateur.** Substance holds; two details in the write-up are slightly off. (a) The offsets 96 and 194 are into the SOURCE LINE, not into the literal — the literal opens at column 12, so within the literal the runs sit at 84 and 182. (b) The "attack" transcription of the emitted text drops the word "write" and shows 15 spaces; the message actually reads "...a `--local` save would write<14 spaces>also trusts mise.toml beside it — ...". Neither slip affects the defect: two literal 14-space runs are printed mid-sentence, unmodified, by `sbx net allow <host> --local` (and the `net pending --save --local` path at src/cli/net.rs:3316) in a project with a mise file and no .sbx.toml. Cosmetic only — no logic is wrong, the refusal itself is correct — so "low" is the right severity.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Confirmed at the cited line. src/main.rs:579 is the format string, and a scan of that line finds space runs of exactly 14 at offsets 96 ("...`--local` save would write<14 spaces>also trusts {names}...") and 194 ("...you have not reviewed.<14 spaces>Create the config..."), alongside the expected 12-space source indent at offset 0. They are literal string content: the trailing `\` on line 579 elides only the leading whitespace of line 580, not runs sitting mid-line. I traced both callers to output. src/main.rs:644 (inside `precheck_local_save`, src/main.rs:626) and src/main.rs:773 (inside `open_rule_write`) return `Err((code, msg))`, consumed at src/cli/net.rs:3316 as `diag::error(&format!("sbx: {msg}"))`. `diag::error` (src/diag.rs:46) calls `highlight` (src/diag.rs:78-80), which is `crate::style::paint_spans(msg, pal.name, "", pal)`. paint_spans (src/style.rs:94-123) returns `text.to_owned()` verbatim on a plain palette (src/style.rs:98-100) and otherwise only wraps backtick spans in color — it never collapses or reflows whitespace, and src/diag.rs:87 `plain_lines_are_verbatim_including_backticks` asserts the plain path is byte-identical. No wrap/reflow helper exists on this path (src/style.rs has none; the crate-wide `fn wrap*` hits are all sandbox command wrappers). The only assertions on this text, src/main.rs:1093-1104, check the substrings "mise.toml", "have not reviewed" and the absence of "is not trusted", so nothing pins the spacing. The two gaps reach stderr as written.
+
+</details>
+
+---
+
+### B73 — Two doc comments carry a duplicated leading fragment glued to the real summary line
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/main.rs:591` |
+| **Catégorie** | `doc-drift` |
+| **Sous-système** | Point d'entrée, diagnostics, store, chemins |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** src/main.rs:591 reads `/// The write-side trust gate for a save that blesses what it writes:/// The write-side trust gate for a save that blesses what it writes: an existing-but-untrusted (or` — the summary sentence appears twice on one line, with an inline `///` marker in the middle of the rendered text. src/storage.rs:464 has the same corruption: `/// Report where the volume stands, without changing anything./// Report where the volume stands, without changing anything.` In both cases rustdoc renders the doubled sentence and the stray `///` verbatim as the item's summary — the first line of the tooltip and of the generated page. The crate's own doc-coverage tests do not catch it: `a_paragraph_break_inside_a_doc_comment_is_written_as_one` (src/docs_coverage.rs:1158) checks paragraph separators, and there is no maximum-doc-line-width check, so a 190-character `///` line passes. (The same pattern exists at src/cli/mod.rs:265, src/config/tasks.rs:927 and src/config/view.rs:1013, outside this scope — it looks like one bad bulk edit.)
+
+**Scénario.** Run `cargo doc --document-private-items` (or hover `local_save_permitted` / `storage::state` in an editor). The summary shown is "The write-side trust gate for a save that blesses what it writes:/// The write-side trust gate for a save that blesses what it writes: an existing-but-untrusted (or changed) config must not be silently blessed…" — the crate's most load-bearing trust invariant introduced by a doubled clause and a literal `///`.
+
+**Correction proposée.** Delete the duplicated fragment and the inline `///` on src/main.rs:591 and src/storage.rs:464 (and the three sibling sites outside this scope). Consider adding a doc-coverage assertion that no `///` line exceeds `DOC_WRAP` by a wide margin, or that no `///` body contains the sequence `///`, so a repeat of this edit fails the suite.
+
+**Rectification du vérificateur.** Real but purely cosmetic, and the audience is narrower than the write-up implies: `local_save_permitted` is private and `storage::state` is `pub(crate)`, so neither appears in default `cargo doc` output — the corruption is visible only under `--document-private-items` or on editor hover, which the description does concede. Nothing executes differently and no guard is weakened. The proposed "no `///` inside a `///` body" assertion would need an exemption for legitimate prose that quotes the marker in backticks — e.g. src/docs_coverage.rs:1146 ("so a bare `///` has") — which is why the crate-wide grep for doubled `///` returns 12 hits where only 5 are corruption.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Confirmed at both cited lines, and both are production items, not test code. src/main.rs:591 reads `/// The write-side trust gate for a save that blesses what it writes:/// The write-side trust gate for a save that blesses what it writes: an existing-but-untrusted (or` and documents `local_save_permitted`; src/storage.rs:464 reads `/// Report where the volume stands, without changing anything./// Report where the volume stands, without changing anything.` and documents `pub(crate) fn state` (src/storage.rs:465). The doubled fragment and the inline `///` are plain markdown text with no surrounding backticks or fence, so rustdoc renders them verbatim in the item summary. The reporter's account of why the guard misses it checks out: `DOC_WRAP = 96` is at src/docs_coverage.rs:1102 and `a_paragraph_break_inside_a_doc_comment_is_written_as_one` at src/docs_coverage.rs:1158, and its filter at src/docs_coverage.rs:1192 skips any line where `lines[i].chars().count() >= DOC_WRAP` — so the ~190-char main.rs line is treated as an ordinary wrapped line and passes. src/storage.rs:464 is additionally exempt because the following line is not a `/// ` body, so the `let (Some(cur), Some(next))` guard at src/docs_coverage.rs:1177 continues. No width or self-`///` check exists anywhere in src/docs_coverage.rs, and a duplicated sentence raises no rustdoc warning, so `mise run rustdoc` stays green. The three sibling sites named as out of scope are real and identical in shape: src/cli/mod.rs:265, src/config/tasks.rs:927, src/config/view.rs:1013.
+
+</details>
+
+---
+
+### B74 — The allowlist contract tells the cage "any host not listed above is refused", but a listed host can still be refused by a deny rule — the sibling match arm says so and this one does not
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/sandbox/contract.rs:91` |
+| **Catégorie** | `doc-drift` |
+| **Sous-système** | Apprentissage réseau, statistiques, contrat |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** `allowlist_contract` lists only allow rules (line 74, `wire.allow_rules()`) and then closes with a line chosen by the default action. The `Deny` arm states a one-way fact as if it were a biconditional:
+
+```rust
+DefaultAction::Deny => "Any host not listed above is refused (HTTP 403 at the proxy).",
+```
+
+A reader takes the contrapositive — everything listed is reachable — and that is not what the policy does. `EgressPolicy::explain` (allowlist/mod.rs:1438-1451) checks the deny list *first* and returns `DeniedBy` before it ever looks at the allow list, so a deny rule shadows any allow rule it overlaps. The `Allow` arm of this same `match`, twelve lines down at line 96, gets it right — "any other host is also reachable, **except ones the policy explicitly denies**. … deny carve-outs … remain in force". Two arms of one expression describe the same deny list and only one of them mentions it.
+
+This is the one thing the file exists to prevent. Its own module doc (lines 17-20) explains that an agent which concludes "no network" from an unexplained failure "starts rewriting `resolv.conf` and disabling TLS verification, which is indistinguishable from an attack".
+
+**Scénario.** Config: `allow = ["*.example.com"]`, `deny = ["secret.example.com"]`, default deny. The generated contract renders:
+
+```
+Reachable hosts (HTTPS):
+- {*} https://*.example.com
+…
+Any host not listed above is refused (HTTP 403 at the proxy).
+```
+
+An agent reads it, sees `secret.example.com` is covered by the listed wildcard, requests it, and gets a 403 for a host the contract just told it was reachable — landing back in exactly the unexplained-failure state the file was written to eliminate. Withholding the deny *specifics* is the documented and correct choice; asserting they do not exist is not.
+
+**Correction proposée.** Make the `Deny` arm match its `Allow` sibling on this point without disclosing anything: "Any host not listed above is refused (HTTP 403 at the proxy). A listed host may still be refused by an explicit deny rule; the specifics of deny rules are not disclosed here." The `Ask` arm at line 92 needs the same clause.
+
+**Rectification du vérificateur.** Real but overstated on two points. First, the `Deny` arm's sentence is *literally true* as written — it is a claim about hosts NOT listed, not a claim that listed hosts are reachable; the false implication actually comes from the hard-coded heading "Reachable hosts (HTTPS):" (contract.rs:103), which every arm shares. The defect is best described as the heading over-promising while only the `Allow` arm bothers to walk it back, not as the `Deny` arm asserting a biconditional. Second, the consequence is not the "unexplained failure" state the module doc warns about: the refusal arrives as a 403 carrying `X-Sbx-Egress-Reason: denied-by-rule`, distinct from `denied-default`, so a caller gets a specific and self-correcting signal on the first request. That makes this a cosmetic doc inconsistency in an informational, non-enforcing file — low, not medium. The suggested wording (and the same clause on the `Ask` arm at :92) remains the right fix.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+The quoted lines are verbatim and correctly placed. contract.rs:90-101: the `Deny` arm at :91 is `"Any host not listed above is refused (HTTP 403 at the proxy)."`, the `Ask` arm at :92-95 likewise says nothing about denies, and the `Allow` arm at :96-100 does carry "except ones the policy explicitly denies … deny carve-outs and credential redaction remain in force". Deny-wins is confirmed: `EgressPolicy::explain` (allowlist/mod.rs:1435-1451) scans `self.deny` first and returns `DeniedBy` before touching `self.allow`, and the doc at :1415 states "Deny wins: a matching deny rule decides even when an allow rule also matches". The overlap is not hypothetical — it is the documented recommended shape: docs-site/docs/guide/networking/rules.md:549-556 is titled "An allow with a narrow deny carve-out (deny wins)" and shows `mode = "deny"`, `allow = ["*.nixos.org"]`, `deny = ["evil.nixos.org"]`, which renders as `- {*} https://*.nixos.org` under "Reachable hosts (HTTPS)" with the unqualified Deny closing line. proxy/ctx.rs:57 adds that even the built-in self-equip set is one "a user `deny` can still carve". The existing test that covers this exact config (contract.rs:406-426) only asserts the deny *specifics* do not leak; nothing asserts or justifies the asymmetry. I looked for the disclosure rationale that would excuse it and it does not hold: the module's own rule (contract.rs:15-21) is "state what the cage could discover by trying", and the mere existence of a deny rule is discoverable in one request, since the proxy distinguishes `X-Sbx-Egress-Reason: denied-by-rule` from `denied-default` on the 403 (proxy/tests.rs:1584, 1609, 1638). So the caveat the `Allow` arm already carries can be added without disclosing anything.
+
+</details>
+
+---
+
+### B75 — `Reachable hosts (HTTPS)` lists `tcp://` and `re:` allow rules, and the note above it tells the cage to test them with `curl https://`
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/sandbox/contract.rs:103` |
+| **Catégorie** | `doc-drift` |
+| **Sous-système** | Apprentissage réseau, statistiques, contrat |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** The heading is hard-coded as HTTPS:
+
+```rust
+format!("{ISOLATION_NOTE}\nReachable hosts (HTTPS):\n{hosts}\n\n{closing}\n")
+```
+
+but `hosts` (line 74) is every rule in `wire.allow_rules()` rendered through `Display for Rule` (allowlist/mod.rs:721-740), which emits `tcp://` for `Layer::L4`, `http://` for `Layer::L7Clear`, and a bare `re:<pattern>` for a regex rule. None of those is an HTTPS host, and a raw `tcp://` splice is not an HTTP endpoint at all.
+
+`ISOLATION_NOTE` (lines 193-196) then hands the cage a recipe built on the false label: "Test connectivity with an HTTPS request to an allowed host, e.g. `curl -sSf https://<one of the hosts below>`."
+
+**Scénario.** A project with `allow = ["tcp://db.internal:5432", "re:^https://api\\.example\\.com/v1/.*$"]`. The contract renders `- {*} tcp://db.internal:5432` and `- {*} re:^https://api\.example\.com/v1/.*$` under "Reachable hosts (HTTPS)". An agent following the file's own instruction substitutes one into the template and runs `curl -sSf https://tcp://db.internal:5432` — a malformed URL that fails locally in curl, before any proxy is involved, teaching the agent that the destination the contract listed does not work.
+
+**Correction proposée.** Split the list by plane when rendering: keep `Reachable hosts (HTTPS):` for `Layer::L7` rules, and emit separate `Reachable cleartext (HTTP):` and `Reachable raw TCP (uninspected):` sections for `L7Clear` and `L4` when non-empty (regex rules can stay under the HTTPS heading, since their pattern already carries a scheme). The `curl` example in `ISOLATION_NOTE` then names something that exists.
+
+**Rectification du vérificateur.** Stands as written; severity "low" is correct. Two refinements. The mislabelling is worse than a malformed curl URL: per docs-site/docs/guide/networking/rules.md:322 and :361-377 a `tcp://` rule additionally gets its own in-cage loopback address and per-port listener, so listing it under an HTTPS heading points the cage at the wrong reachability mechanism, not merely the wrong scheme. Conversely, the practical blast radius is smaller than the attack narrative suggests, because the entries already carry a `- ` bullet and an optional `{GET,HEAD} ` method prefix (allowlist/mod.rs:739) — including on all eight built-in self-equip rules (proxy/ctx.rs:41-48) — so no reader can substitute a line verbatim into the template anyway; the template was already loose before any `tcp://` rule existed.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Confirmed on every cited line. contract.rs:103 is the hard-coded `format!("{ISOLATION_NOTE}\nReachable hosts (HTTPS):\n{hosts}\n\n{closing}\n")`, and `hosts` at :73-77 is `wire.allow_rules()` mapped through `format!("- {rule}")` with no filtering. `union_with_builtin` (proxy/ctx.rs:778-783) only extends the allow vector, so nothing is stripped, and `allow_rules()` (allowlist/mod.rs:1360-1362) returns the whole `self.allow` — which genuinely holds L4 rules, as `l4_decision` (allowlist/mod.rs:1572-1584) and `splices_any` (:1601-1602) both scan `self.allow` for `Layer::L4`. `Display for Rule` (allowlist/mod.rs:721-740) is exactly as described: `tcp://` for `Layer::L4`, `http://` for `Layer::L7Clear`, `https://` for structured L7, and an empty scheme for a `Regex` kind (:728), which then renders as a bare `re:`-style pattern. `ISOLATION_NOTE` really does close with the recipe — contract.rs:203-204, `"- Test connectivity with an HTTPS request to an allowed host, e.g.\n  `curl -sSf https://<one of the hosts below>`."`. The scenario is a supported, documented configuration: docs-site/docs/guide/networking/rules.md:316-318 shows `"tcp://ssh.example.com:22"`, `"tcp://db.internal:5432"`, `"tcp://host:*"` as allow entries. No caller filters the policy before contract generation, and nothing elsewhere in contract.rs mentions the cleartext or raw planes.
+
+</details>
+
+---
+
+### B76 — `FlakePin`'s doc says the revision keys the out-link; the module header fifteen lines above says nothing is keyed by it, and the code agrees with the header
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/sandbox/flake.rs:29` |
+| **Catégorie** | `doc-drift` |
+| **Sous-système** | Provisionnement (nix, mise, flakes) |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** Line 29 documents `FlakePin` as "the immutable revision (40-hex, **which keys the out-link**) and the immutable build reference". The module header at lines 13-16 states the opposite and gives the reasoning: "The revision is recorded and displayed, not used as a path: nothing here is keyed by it. Only an **inline** flake has a content-keyed out-link (`binds::flake_out_link_hash`), because it builds in the cage and has no revision to name." The code sides with the header: `packages::provision` reads only `pin.locked_ref` and roots the build at `gcroots.join(&p.name)` (src/sandbox/packages.rs:119-127), a bare package name; the in-cage path is `binds::flake_out_link(name)`, also name-only (src/sandbox/binds.rs:1055); and `pin.rev` reaches only `pinned_revs`, which feeds `sbx config`'s display. The revision keys nothing at all.
+
+**Scénario.** Not a runtime failure — a maintainer reading `FlakePin` believes a revision change re-points the out-link on its own, and so implements a roll (or a gc keep-set, or an out-link migration) on the assumption that two revisions of one `flake:` package occupy distinct out-links. They do not: both write `gcroots/projects/<id>/<name>`, and what actually forces the rebuild is `provision_flake`'s `<gcroot>.expr` stamp keyed on the *target string* (src/store.rs:1876-1935). Reasoning from the field doc rather than the header yields a change that silently serves the old build.
+
+**Correction proposée.** Reword line 29 to match the header and the code, e.g. "the immutable revision (40-hex, recorded and displayed only — the build target is `locked_ref`) and the immutable build reference the launch builds".
+
+**Rectification du vérificateur.** Two small corrections to the write-up: the module header is at lines 14-16, not 13-16, and the in-cage name-only out-link helper is `binds::flake_out_link` at src/sandbox/binds.rs:1055 (the reporter's 1055 is right, but it is the function definition line, and its rev-keyed sibling `flake_out_link_hash` is at 1071). Impact is documentation-only — no runtime behaviour is wrong today; the proposed rewording of line 29 to name `locked_ref` as the build target is the correct fix.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Verified verbatim. src/sandbox/flake.rs:29 reads "/// A locked flake package: the immutable revision (40-hex, which keys the out-link) and the", while the module header at src/sandbox/flake.rs:14-16 reads "The revision is recorded and displayed, not used as a path: nothing here is keyed by it. Only an **inline** flake has a content-keyed out-link (`binds::flake_out_link_hash`) …". The code sides with the header: the only consumer of the build reference is src/sandbox/packages.rs:123 `.map(|pin| pin.locked_ref.clone())`, whose gcroot is `gcroots.join(&p.name)` (packages.rs:125) — a bare package name; the in-cage out-link is `flake_out_link(name)` at src/sandbox/binds.rs:1055, also name-only, and the only rev-keyed path in the module is `flake_out_link_hash` at binds.rs:1071, which the header itself scopes to inline flakes. `pin.rev` reaches only `pinned_revs` (flake.rs:110, `.map(|(declared, pin)| (declared, pin.rev))`, consumed by `sbx config` at src/config/view.rs:1062 and 1586), the lock line (flake.rs:132) and the `FlakeUpgrade` display outcomes (flake.rs:301-316). Nothing keys an out-link on it; what forces a rebuild is `provision_flake`'s `<gcroot>.expr` stamp over the target string (src/store.rs:1876-1925). A field doc contradicting its own module header, in a codebase whose comments are the contract, is a real defect.
+
+</details>
+
+---
+
+### B77 — The forward socket directory is keyed by bare pid, so a reused pid inherits a killed predecessor's socket files and every forward silently stops working
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/sandbox/forward.rs:156` |
+| **Catégorie** | `inconsistency` |
+| **Sous-système** | Apprentissage réseau, statistiques, contrat |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : moyenne) |
+
+**Constat.** `start` names the per-launch directory `fwd-<pid>` from `std::process::id()` alone, and creates it with `DirBuilder::recursive(true)` (line 158), which succeeds silently when the directory already exists (and does not re-apply the `0o700` mode to it). The in-cage socket files inside it are named `p-<cage_port>.sock`.
+
+Every other artifact in this tree that outlives a signal is keyed by the process **incarnation**, not the pid, and the codebase says why: `egress.rs:755-760` builds `session_tag = "<pid>-<ticks>"` because "a later process that reuses the pid would otherwise overwrite a prior session's still-wanted counters", and `egress_stats::is_finished` (line 465) checks the exact `(pid, ticks)` pair for the same reason. `gc.rs`'s `sweep_runtime_dirs` sweeps `forward/fwd-` by bare pid and its comment covers only one direction of pid reuse — "a *reused* pid merely delays a stale entry to a later pass" — missing the case where the reusing process is a live launch that then *adopts* the stale entry.
+
+The adoption is not benign, because `wrap_command` (line 333) emits `socat UNIX-LISTEN:<uds>,fork …` with no `unlink-early` option, and socat's `UNIX-LISTEN` fails on an existing path. The command is backgrounded with `2>&1` into `/dev/null`, so the failure is invisible.
+
+**Scénario.** A launch with `forward = [9119]` is ended by `sbx session stop` (SIGTERM→SIGKILL). `Forwarder::drop` never runs, so `<data>/forward/fwd-4711/p-9119.sock` stays on disk. Later — on a host with the common `pid_max = 32768`, within an hour of ordinary activity — a new `sbx app` launch gets pid 4711. `DirBuilder::recursive(true).create()` returns `Ok` on the existing directory, and `gc`'s sweep leaves it alone because pid 4711 now reads as live. The bind at `/tmp/sbx-forward/p-9119.sock` is already occupied, so the in-cage socat exits immediately with "Address already in use" into `/dev/null`. The host listener on 9119 accepts the browser's OAuth callback, `bridge` connects to the stale inode, gets ECONNREFUSED, and drops the connection. The callback never completes and nothing anywhere reports a reason.
+
+**Correction proposée.** Key the directory by the incarnation the rest of the tree already uses — `format!("fwd-{pid}-{ticks}")` from `crate::session::current_start_ticks()`, falling back to the bare pid as `egress.rs` does — and update `gc::runtime_entry_pid`'s `"forward"` prefix handling to parse the pid out of that shape. As a cheap independent guard, unlink any pre-existing `p-*.sock` in the directory before returning from `start`.
+
+**Rectification du vérificateur.** Mechanism confirmed; likelihood and severity are overstated. (a) The window is much narrower than "within an hour of ordinary activity": every `build()` sweeps dead-pid `fwd-*` dirs (launch.rs:3503) and so does `sbx gc --prune` (launch.rs:1901), so any intervening sweeping invocation removes `fwd-4711` while pid 4711 is dead. The bug needs the *first* sweeping invocation after the kill to be the one that drew pid 4711 — roughly a 1/pid_max coincidence, not an hourly event. (b) It also needs the new launch to declare the same cage port, since the collision is on `p-<cage_port>.sock`; a different `forward` list just leaves a harmless orphan file. (c) The `0o700` remark is moot — the pre-existing directory was created 0o700 by this same code, so no mode is lost. (d) This is an availability/silent-failure defect only: no security boundary is crossed, nothing in-cage gains reach, so "low", not "medium". The proposed one-line guard (unlink any pre-existing `p-*.sock` in `start`) is the same fix egress.rs:754 already applies to its own socket.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Every link in the chain checks out, and I found no guard. `src/sandbox/forward.rs:153-160` is exactly as cited: `.join(format!("fwd-{}", std::process::id()))` then `DirBuilder::new().recursive(true).mode(0o700).create(&dir)?` — `create_dir_all` semantics, so an existing dir returns `Ok`. Nothing between lines 153 and 222 unlinks a pre-existing `p-*.sock`; the loop at 166-203 only computes `dir.join(format!("p-{}.sock", fwd.cage))` and binds host listeners. `wrap_command` at :332-338 emits `UNIX-LISTEN:{uds},fork` with no `unlink-early` and `</dev/null >/dev/null 2>&1 &`, so a bind failure on an occupied path is invisible. The stale file really does survive: `argv.rs:106-147` passes `--unshare-pid` and `--die-with-parent`, so when the host process dies on a signal bwrap (cage pid 1) is SIGKILLed and the kernel reaps socat without letting its `unlink-close` run, while `Forwarder::drop` (forward.rs:82-93, the only thing that removes the dir) does not run on a signal — `gc.rs:1225-1227` states this outright. The sweep does not save it: `sweep_runtime_dirs_with` (gc.rs:1304-1339) keys `("forward", &["fwd-"])` (gc.rs:1254) by bare pid through `runtime_entry_pid` and skips anything `pid_is_live` (session.rs:721-729, a bare `kill(pid,0)`) reports live — and `build` runs that sweep in-process at launch.rs:3503, so a `fwd-<own pid>` directory reads as live and is deliberately preserved. The analyst's reading of gc.rs:1282-1286 is fair: the comment reasons only about a stale entry being *delayed*, not adopted. The contrast they draw is real and in-tree: `egress.rs:749-754` says "A stale file from a crashed predecessor with a reused pid would block the bind, so clear it first" and does `let _ = std::fs::remove_file(&host_uds);`, and `egress.rs:756-761` / `egress_stats.rs:457-467` use the `<pid>-<ticks>` incarnation for the same reason. Forward has neither.
+
+</details>
+
+---
+
+### B78 — `forward::accept_loop` re-implements both shared accept primitives, dropping the diagnostic that makes a stuck listener visible
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/sandbox/forward.rs:247` |
+| **Catégorie** | `error-handling` |
+| **Sous-système** | Balayage des panics atteignables |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** src/sandbox/conncap.rs exists precisely to end this duplication — its header says the connection ceiling and the accept-error policy "wrote it four times and no copy had both halves", and `accept_backoff` (conncap.rs:37) is "written once here instead of a fifth time at each loop". `forward::accept_loop` is that fifth copy and uses neither. Two consequences. (1) The accept arm at line 247 is `Err(_) => { sleep; continue }` with no diagnostic at all, and the comment folds two very different events into one sentence: "No pending connection (non-blocking) or a transient error". Because the listener is non-blocking, `WouldBlock` is the normal idle case and must be swallowed — but every other error is swallowed with it, so a forward listener that has stopped accepting (EMFILE, ENFILE, ECONNABORTED storms) is indistinguishable from an idle port and says nothing, for the life of the session. `accept_backoff` in every sibling loop prints `sbx: <who>: accept error: <e>` for exactly this reason ("the usual cause is host fd exhaustion (`EMFILE`), which is exactly when a machine can least afford a core"). (2) The ceiling at forward.rs:255-259 is hand-rolled as a load-then-`fetch_add`, the check-then-take shape conncap.rs:10-12 names as one of the two defective halves it replaced. That particular race is not reachable here — there is a single accepting thread per listener, so no two takers can pass the check concurrently — but the pattern is now un-guarded by `ConnCap`'s regression test (`contending_takers_never_hold_more_than_the_ceiling_at_once`, conncap.rs:131) and will silently become a real overshoot the day this loop gains a second accepter.
+
+**Scénario.** A `forward = [3000]` session is running while the host hits its fd limit (another process leaks descriptors, or the same launch's cage opens many egress connections). `listener.accept()` starts returning EMFILE. `accept_loop` matches `Err(_)`, sleeps 20 ms, and loops forever: the host port stays bound and answers TCP (the kernel backlog accepts), but nothing is ever forwarded into the cage, and sbx prints nothing on any stream and logs nothing to any lens. A browser chasing the OAuth `localhost:3000` callback hangs with no diagnosis available anywhere. Under the same condition the egress proxy, the broker, the ssh-agent broker, the task plane and the lens plane each print `accept error: Too many open files`.
+
+**Correction proposée.** Match on the error kind: `Err(e) if e.kind() == io::ErrorKind::WouldBlock => { sleep(ACCEPT_POLL); continue }` for the idle case, and `Err(e) => { super::conncap::accept_backoff("forward", &e); continue }` for everything else. Replace the `live` counter and the ad-hoc `Dec` guard at forward.rs:255-270 with `super::conncap::ConnCap`/`ConnSlot`, so this loop is covered by conncap's tests and the ceiling is taken by the same operation that tests it.
+
+**Rectification du vérificateur.** Two overstatements to correct. (1) The ceiling half is not a live defect and should not be read as one: there is exactly one accept_loop thread per listener (spawned at forward.rs:226-228) and it is the only incrementer, so the check-then-take cannot overshoot; and the `Dec` guard at forward.rs:263-269 is a `Drop` guard, so the panic-leak half that conncap was written for does not apply here either. It is a maintainability/test-coverage note, nothing more. (2) "sbx prints nothing on any stream ... no diagnosis available anywhere" is wrong under the attack's own premise: EMFILE is a per-process limit and the broker, ssh-agent broker, both task-control listeners and the lens control plane run as threads in the same sbx host process, so they do print `accept error: Too many open files` -- the finding's last sentence concedes this and contradicts its own paragraph. What survives is only that this plane never names itself in that diagnosis. Also note the suggested fix cannot drop `accept_backoff` in unchanged: `WouldBlock` is the normal idle case for this non-blocking listener and must be matched first, as the fix text itself allows.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+The cited lines are exact: src/sandbox/forward.rs:244-251 is `match listener.accept() { Ok((s,_)) => s, // No pending connection (non-blocking) or a transient error: nap and re-poll the flag. Err(_) => { sleep(ACCEPT_POLL); continue } }`, with the listener put into non-blocking mode at forward.rs:227, and the ceiling hand-rolled as `live.load(..) >= MAX_CONCURRENT_CONNS` then `live.fetch_add(1, ..)` at forward.rs:255-259. conncap.rs's header and `accept_backoff` (conncap.rs:37-40) read as quoted, and grep confirms the five call sites that use it (lens.rs:262, task_control.rs:672 and 704, broker.rs:1679, sshagent.rs:723) plus the two inline copies named in its doc -- forward.rs is not among them. Commit 72c218c ("a failed accept is that connection's problem, not the plane's") converted exactly those four loops and says nothing about this one, and there is no comment anywhere in forward.rs justifying the silence. So the concrete consequence holds: when a connection is pending and `accept(2)` fails for a real reason (EMFILE/ENFILE/ECONNABORTED), the forward listener naps 20 ms and retries forever while saying nothing, and a caller that completed the kernel handshake hangs with no line attributing it to forwarding.
+
+</details>
+
+---
+
+### B79 — `TreeState`'s doc sends users to `sbx gc --all` to reclaim a dead tree, which that command explicitly does not do
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/sandbox/gc.rs:933` |
+| **Catégorie** | `doc-drift` |
+| **Sous-système** | Cycle de vie des sessions (gc, projects, attach) |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** The `TreeState` doc comment reads "`Dead` (the marker points at a gone path -- reclaimable by `sbx gc --all`)" (gc.rs:933-934). `sbx gc --all` does not reap project trees. Its implementation (`launch::gc`, src/sandbox/launch.rs:1814-1830) calls only `session_housekeeping`, `runtime_housekeeping` and `shared_store_gc`, and carries an inline comment saying so in as many words: "Reaping whole per-project runtime *trees* is `sbx projects rm`; `--all` here is purely the nix-store side" (launch.rs:1815-1817). `gc::reap_dead_projects` has exactly one production caller -- `projects::reap_dead_trees` (src/sandbox/projects.rs:44) -- reached only from `sbx projects rm --dead/--markerless`. The user-facing help agrees with the code (src/help.rs:1838), so gc.rs:933 is the outlier.
+
+A second stale reference sits in the same file: `is_safe_tree_id`'s doc calls itself "the anti-traversal guard for `sbx gc --id`" (gc.rs:573-574, echoed by the test comment at gc.rs:2044). There is no `sbx gc --id` flag anywhere in the CLI; the real sinks are `sbx projects rm <id>` (projects.rs:663), `sbx projects show <id>` (projects.rs:277) and `purge_app_homes` (gc.rs:672).
+
+**Scénario.** A user runs `sbx path`, sees a tree tagged `dead` (the label comes from `TreeState::label`, gc.rs:948), reads this doc, and runs `sbx gc --all --prune`. The command succeeds, reports on the shared store, and leaves the dead tree -- and its full size -- exactly where it was. Nothing in the output says the tree was skipped, and there is no hint pointing at `sbx projects rm --dead --yes`, which is the command that actually reclaims it.
+
+**Correction proposée.** Change gc.rs:933-934 to name `sbx projects rm --dead --yes`, and gc.rs:573-574 (plus the test comment at gc.rs:2044) to name `sbx projects rm <id>` / `sbx projects show <id>` / `sbx app rm <name> --purge` as the sinks this guard protects.
+
+**Rectification du vérificateur.** Real, but developer-facing rather than user-facing. `TreeState` is `pub(crate)`, so gc.rs:933-934 and gc.rs:573-574 are internal rustdoc, and every user-visible surface already names the right command: src/help.rs:1837-1839 says "Nothing is reclaimed here — that is `sbx gc --all --prune` for store closures, `sbx projects rm <id>` for a runtime tree", and the `sbx projects` listing footer at src/sandbox/projects.rs:605 says "sweep dead trees with `sbx projects rm --dead --yes`". The reporter's scenario of a user reading this doc and running `sbx gc --all --prune` therefore overstates it; the concrete harm is a maintainer trusting a comment the code contradicts. Two citation corrections: the launch.rs comment is at 1820-1822, not 1815-1817 (the function itself begins at 1814), and `TreeState::label` also feeds `sbx projects list` (projects.rs:179) and `sbx projects show` (projects.rs:418), which the doc's "for `sbx path`'s per-project annotation" omits.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Both halves check out at the cited lines. src/sandbox/gc.rs:933-934 reads "`Dead` (the marker points at a gone path — reclaimable by `sbx gc --all`)". `sbx gc --all` cannot reclaim a tree: `launch::gc` (src/sandbox/launch.rs:1814) calls only `sweep_current`, `session_housekeeping`, `runtime_housekeeping` and `shared_store_gc`, and its own inline comment at launch.rs:1820-1822 says "Reaping whole per-project runtime *trees* is `sbx projects rm`; `--all` here is purely the nix-store side". I checked the two passes that could plausibly touch a tree: `runtime_housekeeping` (launch.rs:1888) only folds egress counters and calls `sweep_runtime_dirs`, which per gc.rs:1279-1287 sweeps the per-launch RUNTIME_DIRS entries keyed by a dead launcher pid, not `projects/<id>`; `shared_store_gc` (launch.rs:1936) drops gc roots "of reaped projects" — already-reaped ones — so a Dead-but-unreaped tree still roots its closures. `reap_dead_projects` (gc.rs:481) has exactly one production caller, src/sandbox/projects.rs:44, reached only from `sbx projects rm --dead/--markerless`. The second half is also confirmed: `sbx gc` parses only `--prune`, `--all`, `--optimise/--optimize` (src/cli/gc.rs:33-38) and its help synopsis is "sbx gc [--all] [--prune] [--optimise]" (src/help.rs:1662), so the `sbx gc --id` named at gc.rs:573-574 and echoed at gc.rs:2044 does not exist; the real callers of `is_safe_tree_id` are projects.rs:277, projects.rs:663, gc.rs:602 (`reap_one`) and gc.rs:672 (`purge_app_homes`). I also confirmed the doc's premise that `sbx path` renders the label (src/paths.rs:487-492 calls `classify_tree` and stores `class.state.label()`).
+
+</details>
+
+---
+
+### B80 — `locks.rs` claims the recover/degrade split is decided once and names every exception; the whole `sandbox/control` plane still panics on a poisoned lock
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/sandbox/locks.rs:23` |
+| **Catégorie** | `inconsistency` |
+| **Sous-système** | Dérive documentation / code |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : moyenne) |
+
+**Constat.** The module header asserts at lines 8-9 that "Which half a lock belongs to is decided once, here, rather than re-decided at each site that takes one", then enumerates the deviations as if exhaustively: the degrading sites are "`proxy/pool.rs` and `proxy/dns.rs`" (line 23), and "**One** site recovers on neither argument, and says so where it lives: `ProcOverlay` in `sandbox/proc_enforce.rs`" (line 26).
+
+The enumeration is incomplete. `src/sandbox/control/` never adopted the helpers and still uses the pre-fix third answer — panic on poison — in production code:
+- `LogRing`, the egress decision ring `sbx net logs` reads: `.lock().unwrap()` at control/mod.rs:689 (`push`), 742, 763, 773, 792, 812, 847, 999.
+- `PendingState`, the `ask`-mode park queue: control/mod.rs:119, 145, 151, 176, 205.
+- `ManualRules`, the live `--session` overlay consulted on every request: control/mod.rs:257, 273, 283, 290, 297.
+- `CaptureRing`, the retained capture store: control/capture.rs:408, 458, 485.
+(The `#[cfg(test)]` blocks begin at control/mod.rs:1411 and control/capture.rs:555, so all of these are production sites.)
+
+By the header's own rule these are the recovering class — `LogRing` and `CaptureRing` are records "kept for a reader", and `PendingState` is the egress twin of the parked-`execve` registry that commit a1e77c8 explicitly converted. That commit's message even lists "the exec ring and the parked `execve` registry" and "the capture sinks" as converted; `src/sandbox/proxy/capture.rs` (the in-flight sinks) uses `locked`, while `src/sandbox/control/capture.rs` (the retained ring) does not.
+
+**Scénario.** A panic anywhere in a `LogRing` critical section poisons it; every later `push` from any proxy connection thread then panics too, and `sbx net logs` panics on read — exactly the "one panic in an unrelated handler would turn every one of them into a second panic" outcome the header at lines 14-15 says this module exists to prevent. Meanwhile a maintainer auditing lock discipline reads lines 20-31, sees a closed list of three exceptions, and never looks at `sandbox/control/`.
+
+**Correction proposée.** Either convert the `sandbox/control` sites to `locks::locked`/`read_locked`/`write_locked` (they guard a queue, a map and a `VecDeque` — the same non-unwinding shapes the `TaskLog` enumeration covers), or, if any of them is a deliberate exception, extend the enumeration at locks.rs:20-31 to name it and give the argument where it lives, as `ProcOverlay` does.
+
+**Rectification du vérificateur.** Three corrections to the mechanism, all sharpening rather than weakening it. (1) Mis-attributed lines: control/mod.rs:999 and 1024 are not `LogRing` — `impl LogRing` ends at 907 and those two are in `impl FlowRegistry` (931-1041), the open-flow registry behind `sbx net live`. The analyst listed 999 under `LogRing` and missed 1024. Worse for the module, `FlowRegistry` is itself internally inconsistent: `register` (999) and `snapshot` (1024) panic on poison while `impl Drop for FlowGuard` (mod.rs:971) degrades with `if let Ok(mut g) = registry.inner.lock()` — the precise "one struct held two of them: `output_held` panics when claiming and degrades when releasing" pattern a1e77c8's own message cites as the reason the module exists. (2) Taxonomy: `ManualRules` is not "the recovering class" by the header's rule — it is a live `--session` allow/deny/mute overlay folded into the effective egress policy, i.e. the `ProcOverlay` shape ("guards **live policy**, which is neither a record nor a resource"), which locks.rs:30-31 says "owes that argument in full at its own definition". It gives none, so it is an undocumented deviation either way, but the fix for it is an argument, not a blanket conversion. (3) The stated outcome is imprecise: `sbx net logs` is a separate process talking over the control socket, so a poisoned `LogRing` makes the *launcher's* per-connection serve thread panic and the reader sees a dropped connection, not a panic of its own. And no attacker-reachable panic inside these critical sections was found — the one cage-controlled computation under the `LogRing::push` guard is `super::sanitize` (observe_feed.rs:112-125), which is char-iterator based with no slicing and cannot panic. The finding's substance is therefore the stale closed enumeration plus inconsistent lock discipline in ~22 production sites, contingent on some unrelated panic to bite; low severity is correct.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Every cited line checks out. `src/sandbox/locks.rs:8-9` reads "Which half a lock belongs to is decided once, here, rather than re-decided at each site that takes one."; line 23 names the degrading sites as "`proxy/pool.rs` and `proxy/dns.rs`"; line 26 opens "One site recovers on neither argument, and says so where it lives: `ProcOverlay` in". The helpers are imported in exactly 8 places (`grep locks::locked|read_locked|write_locked`): egress_stats, notify_relay, lens, task_control, proc_enforce, proxy/capture, task, launch — `sandbox/control/` is not among them. The panicking sites are real production code: `grep '\.lock()|\.read()|\.write()' src/sandbox/control/mod.rs` gives 119/145/151/176/205 (inside `impl PendingState`, 89-226), 257/273/283/290/297 (inside `impl ManualRules`, 242-300, an `RwLock`), 689/742/763/773/792/812/847 (inside `impl LogRing`, 654-907), 999/1024, and `control/capture.rs` 408/458/485 (inside `impl CaptureRing`, 340-...). The `#[cfg(test)]` boundaries are mod.rs:1411 and capture.rs:555, so all of them are production; the only earlier `#[cfg(test)]` items (mod.rs:42, capture.rs:363) gate an import and `CaptureRing::with_needles`, neither of which is a cited line. Git confirms this is a miss, not a newer module: `src/sandbox/control/mod.rs` dates to 5fd129a (2026-06-26), two months before the locks fix a1e77c8 (2026-08-21) whose message claims "All 29 production sites that panicked now recover" and lists "the capture sinks", and the file was edited five more times after that commit (through d2912f6, 2026-08-25) without adopting the helpers. `src/sandbox/proxy/capture.rs:30` imports `locks::locked` while `src/sandbox/control/capture.rs` does not, exactly as described. Nothing in `sandbox/control` argues for panic-on-poison the way `ProcOverlay` argues for its choice. Nothing external prevents the poisoning either: no `panic = "abort"` in Cargo.toml, and each control connection is served on its own `std::thread::spawn` (mod.rs:1079-1081), so a panic unwinds and poisons rather than aborting the process.
+
+</details>
+
+---
+
+### B81 — The exec observer's `seen` set is never pruned, so a reused pid silently drops its exec event and the set grows without bound
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/sandbox/observe_feed.rs:173` |
+| **Catégorie** | `logic-bug` |
+| **Sous-système** | Cycle de vie des sessions (gc, projects, attach) |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : moyenne) |
+
+**Constat.** `run_loop` dedupes by `seen.insert(pid)` against a `BTreeSet<u32>` (observe_feed.rs:173) that lives for the whole supervised session and is never cleaned of pids that have exited. `ExecRing::push` does no dedup of its own (src/sandbox/proc_control.rs:156), so this set is the only gate on the feed.
+
+The dedup key is a bare host pid, which the kernel recycles. Once the host has wrapped its pid space, every cage process that lands on a previously-seen pid is dropped: `seen.insert(pid)` returns false and the `&&` chain short-circuits before `ring.push` and before the inline `[sbx:exec]` echo. The feed does not degrade loudly -- it goes progressively blind, and `sbx proc logs` shows nothing for commands that really ran. The rest of the codebase keys liveness on `(pid, start_ticks)` for exactly this reason (src/session.rs:11-16: "a bare pid is ambiguous because the kernel reuses pids"), and the module header here lists its limits honestly ("the exec poll only sees a process that outlives a tick, so very short-lived commands are missed", observe_feed.rs:20-22) without mentioning this one -- so the comment understates what the lens misses. Secondarily, the set is an unbounded leak for the supervisor's lifetime, capped only by `kernel.pid_max` (4194304 on a systemd host).
+
+**Scénario.** Run a long agent session with `--observe` on a host with `kernel.pid_max = 32768` (the kernel default). A single large build inside the cage burns through the pid space in minutes. After the wrap, the agent runs `rg TODO`, which the kernel gives a pid that some earlier `sh` already used: `seen.insert(pid)` is false, so no `ExecEvent` is pushed and no `[sbx:exec] rg TODO` line is written. `sbx proc logs` reports the session as having run nothing new, with no warning that events are being dropped.
+
+**Correction proposée.** Key the dedup on the incarnation, not the pid: keep `seen: BTreeSet<(u32, u64)>` using the start-time ticks already available via `crate::session::read_start_ticks` (or add a `start_ticks` field to `ProcInfo`, which `read_proc_table` parses `/proc/<pid>/stat` for anyway). That both fixes the drop and bounds the set -- pruning `seen` each tick to the pids still in `table` keeps it at the size of the live cage.
+
+**Rectification du vérificateur.** Real but materially overstated. (a) The effect is not "progressively blind": after a pid wrap a new process is dropped only if its pid is *already in* `seen`, so the loss rate is |seen| / pid_max, i.e. a fraction of events, not a silence. (b) The "unbounded leak" is bounded by the number of distinct cage-descendant pids that outlived a tick in one session, not by `kernel.pid_max` — the set cannot hold 4M entries unless the cage actually spawned that many observed processes. (c) The blast radius is a best-effort display lens: the module header (observe_feed.rs:19-22) already says this poll misses short-lived commands and points at the seccomp user-notification path as the precise capture, and `Observation`'s doc says explicitly "observation is not a security boundary here". The finding is worth fixing as an inconsistency with `session.rs`'s stated (pid, start_ticks) rule, not as a medium-severity data-loss bug. Line cite for `ExecRing::push` is 157, not 156.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+observe_feed.rs:173 is exactly `let mut seen: BTreeSet<u32> = BTreeSet::new();` declared inside `run_loop`, with `if seen.insert(pid)` at line 177 short-circuiting the `&&` chain before `ring.push` and the inline echo; the set is never pruned and `run_loop` lives for the whole supervised session (spawned at observe_feed.rs:144, stopped only by `ExecObserver::drop`). `ExecRing::push` (proc_control.rs:157, doc at 155-156) delegates straight to `lens::Ring` and adds no dedup, so the `seen` set is the only gate. The rest of the tree does key on the incarnation: session.rs:11-16 states "a bare pid is ambiguous because the kernel reuses pids" and `descendants` returns `(pid, start_ticks)` pairs for exactly that reason. No comment in the module claims the pid-only key is deliberate.
+
+</details>
+
+---
+
+### B82 — The proxy's "every refusal category" tables omit five live reason tokens, `asked-denied` among them
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/sandbox/proxy/mod.rs:84` |
+| **Catégorie** | `doc-drift` |
+| **Sous-système** | Dérive documentation / code |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** `src/sandbox/proxy/mod.rs:83-84` opens with "Every refusal the proxy *itself* issues … carries an `X-Sbx-Egress-Reason` header with a stable category token" and then, at line 88, "The categories:" followed by the table at lines 89-111. Two production categories are missing from it:
+
+- `ws-injection-refused` — a `403` written by `src/sandbox/proxy/tunnel.rs:267` and `src/sandbox/proxy/forward.rs:121` when a `{WS}` upgrade targets a credential-injected host. It is a first-class category everywhere else: `src/sandbox/proxy/ctx.rs:763` gives it its own notification sentence and `ctx.rs:913` pins it in `every_refusal_category_the_proxy_emits_has_its_own_sentence`.
+- `http2-ask-unsupported` — `PolicyRefusal::Http2AskUnsupported.tag()` at `src/sandbox/proxy/mod.rs:588`, the `403` the HTTP/2 plane frames for an `ask`-undecided host (`AskPosture::RefuseUnsupported`, mod.rs:565). Also sentenced at `ctx.rs:764` and pinned at `ctx.rs:914`.
+
+The same list in the guide, `docs-site/docs/guide/networking/architecture.md:459-470` ("Every refusal the proxy issues carries a stable reason category … The categories surface in `sbx net logs` as the per-event reason: …"), is missing five: those two plus `asked-denied`, `splice-cap` and `method-not-allowed`. `grep -rn 'asked-denied' docs-site/` returns nothing at all, so the reason token that every denied park in `ask` mode carries in `sbx net logs` is named nowhere in the user guide — not even on `docs-site/docs/guide/networking/ask.md`, the page about that posture.
+
+**Scénario.** Run an `ask`-mode session, let a request park, answer it with `sbx net pending deny <id>`, then `sbx net logs`. The event's reason is `asked-denied`. A reader who goes to the guide's "Refusal reasons" section to look it up finds a list that claims to be complete and does not contain the token. Likewise a gRPC (`[network] http2`) host under `ask` answers `403 http2-ask-unsupported`, a token that appears in neither table.
+
+**Correction proposée.** Add the `ws-injection-refused` (403) and `http2-ask-unsupported` (403) rows to the table at `src/sandbox/proxy/mod.rs:89-111`, and add those two plus `asked-denied`, `splice-cap` and `method-not-allowed` to `docs-site/docs/guide/networking/architecture.md:463-469`. The authoritative set is the one `ctx.rs:889-925` already asserts against plus the tokens passed to `write_refusal`; consider having that test read from a single shared list so the tables cannot drift again.
+
+**Rectification du vérificateur.** Mechanism and line numbers are all correct; only the severity is high. This is documentation-only: no refusal behaves differently, no policy is weakened, and both omitted tokens are already tested at their emit sites (proxy/tests.rs:1177, forward.rs:706, h2mitm.rs:1580-1581) and sentenced for notifications. The impact is a reader consulting a list that presents itself as exhaustive and not finding a token they just saw in `sbx net logs` -- a real violation of this project's documentation rule, but low severity in an audit sense. One refinement to the fix: the authoritative set is the union of `PolicyRefusal::tag()` (mod.rs:582-590) and every literal passed to `write_refusal`/`respond_refusal_tls`, which is larger than the ctx.rs:904-914 list (that list omits the transport-side and framing tokens, so it cannot be the single shared source on its own).
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Every citation verified. src/sandbox/proxy/mod.rs:83-84 does claim completeness ("Every refusal the proxy *itself* issues ... carries an `X-Sbx-Egress-Reason` header with a stable category token"), line 87 ends "The categories:", and the table at 89-111 contains neither `ws-injection-refused` nor `http2-ask-unsupported`. Both are live: `ws-injection-refused` is recorded and written as a 403 at src/sandbox/proxy/tunnel.rs:267/272 and src/sandbox/proxy/forward.rs:121/126, and `http2-ask-unsupported` is `PolicyRefusal::Http2AskUnsupported.tag()` at mod.rs:588, framed as a 403 for `AskPosture::RefuseUnsupported` (mod.rs:565). Both have their own notification sentence at ctx.rs:763-764 and are pinned by `every_refusal_category_the_proxy_emits_has_its_own_sentence` at ctx.rs:900-922 (tokens at 913-914) -- that test guards only the sentences, never the module table. The guide's list at docs-site/docs/guide/networking/architecture.md:463-469 is missing those two plus `asked-denied`, `splice-cap` and `method-not-allowed`, and `grep -rn 'asked-denied\|splice-cap\|method-not-allowed' docs-site/` returns zero hits, so the token every ask-mode denial carries in `sbx net logs` is named nowhere in the user guide. src/docs_coverage.rs (1210 lines) has no reason-token check, so nothing catches this drift.
+
+</details>
+
+---
+
+### B83 — Accept loops hardened against accept(2) failure still die on `thread::spawn`, silently taking their listener down for the session
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/sandbox/proxy/mod.rs:283` |
+| **Catégorie** | `panic` |
+| **Sous-système** | Balayage des panics atteignables |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : moyenne) |
+
+**Constat.** Every host-side accept loop in the tree is deliberately hardened against a transient accept error, and each says so at length. `src/sandbox/conncap.rs:37` (`accept_backoff`) exists because `?` on the accept "ends the `for`, and every one of these loops is the body of a detached thread, so returning drops the `UnixListener` and closes the listening fd for the rest of the launch. Nothing announces it". The proxy's own copy at src/sandbox/proxy/mod.rs:237-244 repeats it: "A transient accept error (host fd exhaustion, an aborted connection) must not take the whole session's egress down". But the very next statement in each loop is `std::thread::spawn`, which the standard library documents as *panicking* when the OS refuses to create the thread (EAGAIN). sbx builds with the default unwind panic strategy (no `panic = "abort"` in Cargo.toml, no `panic::set_hook`), so that panic unwinds the detached accept-loop thread, drops the listener, and produces exactly the outcome the `accept_backoff` machinery was written to prevent — with nothing announced. The trigger is the same host-resource exhaustion the accept path already anticipates: EMFILE and EAGAIN-on-clone arrive together on a loaded machine. Same shape at src/sandbox/broker.rs:1692, src/sandbox/sshagent.rs:740, src/sandbox/task_control.rs:684 and :719, src/sandbox/lens.rs:267, src/sandbox/control/mod.rs:1080, src/sandbox/forward.rs:262. In the proxy's case there is a second consequence: `ctx.conns.fetch_add(1, Ordering::Relaxed)` at line 281 runs *before* the spawn, so the slot is taken and never given back.
+
+**Scénario.** Host is near its per-uid thread/process ceiling (RLIMIT_NPROC, or systemd `TasksMax` on the user slice) while a session runs — the same condition that makes `accept()` return EMFILE and that `accept_backoff` explicitly names. The cage opens one more egress connection; `accept()` succeeds, the cap check passes, `std::thread::spawn` at src/sandbox/proxy/mod.rs:283 panics with "failed to spawn thread". The proxy's accept-loop thread unwinds, the `UnixListener` is dropped, and the cage's egress socket is closed for the remainder of the session. Every subsequent request from the agent fails at connect with no explanation, while `sbx session ls` still reports the session as healthy. The same one-connection sequence kills `sbx net logs`/`net live` (control/mod.rs:1080), the credential broker (broker.rs:1692), the ssh-agent broker (sshagent.rs:740) and the task control plane (task_control.rs:684).
+
+**Correction proposée.** Use `std::thread::Builder::new().spawn(...)` and treat `Err` the way the accept error above it is treated: report through `crate::diag::error`, drop the connection (returning the `ConnCap`/`ConnGuard` slot, and for the proxy answering `503` as the connection-cap branch already does), sleep the same short backoff, and `continue` — never let the loop thread unwind. Since all seven loops share the shape, the cleanest form is a helper beside `conncap::accept_backoff` (e.g. `conncap::spawn_conn(slot, f) -> bool`) so the rule is written once, as `ConnCap` and `accept_backoff` already are.
+
+**Rectification du vérificateur.** Three overstatements. (1) Not silent: with the default hook the panic prints `thread '<unnamed>' panicked at src/sandbox/proxy/mod.rs:283: failed to spawn thread: …` to the supervisor's stderr, which is where `crate::diag::error` writes too — what is missing is recovery, not the announcement. (2) The leaked `ctx.conns` slot from the pre-spawn `fetch_add` at :281 is moot: the loop that would consult the counter has just died. (3) The consequence is availability, not a policy hole — losing the proxy is fail-closed and egress.rs:948 already records it ("A serve error ends the proxy thread; the cage then loses egress"); the real cost is the control plane (`sbx net logs`/`live`/`pending`, broker, ssh-agent, task plane) going dead on a session that still reports healthy. The trigger is also not directly cage-driven: the cage's task count is bounded by the scope's `TasksMax=16384` (cgroup.rs:45, applied to the bwrap scope only, not the supervisor), so this needs a host already at its RLIMIT_NPROC / slice TasksMax ceiling. Low, not medium — but it does convert a transient host condition into a permanent loss, which is the exact property conncap.rs exists to preserve.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Every cited line is exactly where the analyst says: proxy/mod.rs:281 `ctx.conns.fetch_add(1, …)`, :283 `std::thread::spawn(move || {`, and the seven siblings (broker.rs:1692, sshagent.rs:740, task_control.rs:684 and :719, lens.rs:267, control/mod.rs:1080, forward.rs:262) are all a bare `std::thread::spawn` on the line given. `std::thread::spawn` panics when the OS refuses the thread, and nothing catches it: Cargo.toml has no `panic = "abort"` (only proc-shim/Cargo.toml:31 does) and there is no `panic::set_hook`/`catch_unwind` outside testutil.rs:309, so the panic unwinds out of `serve`. `serve` is the body of a detached thread that owns the listener (egress.rs:946-950: `std::thread::spawn(move || { let _ = super::proxy::serve(listener, serve_ctx, proxy_stop); })`), so the unwind drops the `UnixListener` — precisely the outcome egress.rs:79-95 and conncap.rs:24-33 say must not happen ("returning drops the `UnixListener` and closes the listening fd for the rest of the launch"), and the tree already knows the fix shape, using `Builder::new()…spawn(…).ok()` at theme_relay.rs:134-153 and notify_relay.rs:292. I found no supervisor, restart, or liveness check on these threads. Corrections in the note.
+
+</details>
+
+---
+
+### B84 — `TaskLog`'s header documents `expect` and argues for a loud panic; the code recovers silently through `locks::locked`
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/sandbox/task_control.rs:399` |
+| **Catégorie** | `doc-drift` |
+| **Sous-système** | Dérive documentation / code |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** The `TaskLog` header states at line 399: "Every method here takes the lock with an `expect`", and lines 411-416 spend a paragraph defending that choice — "Why `expect` rather than the degrade the proxy's certificate cache chose … If the invariant above ever breaks, a caller being told so loudly is the better of two bad answers." Lines 531-533 extend the same claim to `TaskResults` ("Its lock cannot be poisoned either … See [`TaskLog`] for the invariant").
+
+No method here uses `expect`. All five takes go through `crate::sandbox::locks::locked` (imported at line 76): lines 448, 477, 514 (`TaskLog`) and 542, 552 (`TaskResults`). `locked` is `m.lock().unwrap_or_else(|e| e.into_inner())` (`src/sandbox/locks.rs:44`) — it recovers from poisoning and never panics, which is the exact opposite of "a caller being told so loudly".
+
+Commit a1e77c8 ("fix(locks): a record a panic touched is kept, not turned into a second panic") made the swap and left the header untouched. The header now also contradicts `src/sandbox/locks.rs:11-14`, which names "an invocation log" as a lock that *must* recover and cites `sbx task status` as one of the readers that must not be turned into a second panic.
+
+**Scénario.** A maintainer reading `TaskLog`'s header before adding a method follows its stated rule and writes `self.inner.lock().expect("task log")`, matching what the doc says every sibling does. That single site now panics where every other take recovers — and it is the one the doc's own "what would break it" paragraph was trying to prevent. The reverse is equally live: someone auditing poison behaviour reads this header, concludes the task plane fails loudly on a poisoned log, and never opens `locks.rs`.
+
+**Correction proposée.** Rewrite lines 397-416 to state what the code does: the lock is taken through `sandbox::locks::locked`, it recovers rather than panics, and the enumeration of non-unwinding critical sections is what makes recovery safe (not what makes `expect` safe). Drop or invert the "Why `expect` rather than the degrade" paragraph and point at `locks.rs` for the rule. Fix the `TaskResults` cross-reference at lines 531-533 the same way.
+
+**Rectification du vérificateur.** Verified as stated, but it is documentation only — no runtime behaviour is wrong today (all five takes already recover, which is the intended behaviour per locks.rs). The harm is a stale normative rule a future method could follow, so "low" fits better than "medium". One small refinement: lines 531-533 do not repeat the `expect` claim verbatim; they say the lock "cannot be poisoned either" and defer to `TaskLog` for the invariant, so they inherit the stale rule by reference rather than restate it.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Every cited line is exact. src/sandbox/task_control.rs:399 reads "Every method here takes the lock with an `expect`, which an audit read as five places a panic in", and 411-416 are the paragraph "Why `expect` rather than the degrade the proxy's certificate cache chose … If the invariant above ever breaks, a caller being told so loudly / is the better of two bad answers." No method uses `expect`: `grep -n` shows the only `expect` occurrences in the file outside `#[cfg(test)]` are none — the five takes are `locked(&self.inner)` at 448, 477, 514 (TaskLog::push/since/entry) and 542, 552 (TaskResults::store/get), against `use crate::sandbox::locks::locked;` at line 76. `locked` is `m.lock().unwrap_or_else(|e| e.into_inner())` (src/sandbox/locks.rs:44) — it never panics, and its module header at locks.rs:11-14 names "an invocation log" and `sbx task status` as exactly the case that must recover rather than "be turned into a second panic". `git show a1e77c8 -- src/sandbox/task_control.rs` confirms the swap: each `self.inner.lock().expect("task log")` / `.expect("the detached results")` became `locked(&self.inner)` and no doc line in the header was touched. The TaskResults cross-reference at 531-533 ("Its lock cannot be poisoned either … See [`TaskLog`] for the invariant") inherits the stale rule. The drift is real and inverted: the doc's normative rule for a new method is the one thing locks.rs forbids for this class of lock.
+
+</details>
+
+---
+
+### B85 — `serve_host` documents three of the six verbs it serves, and the wire-protocol block omits `INFO` entirely
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/sandbox/task_control.rs:1218` |
+| **Catégorie** | `doc-drift` |
+| **Sous-système** | Dérive documentation / code |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** The `serve_host` header at lines 1218-1219 reads "Serve one connection on the session's host-only socket: `LOG` (optionally `after=<seq>`), `STATUS`, or `STOP <id>`", and line 1221 continues "All three are here rather than on the crossing socket, and that placement *is* the access control."
+
+The function dispatches six verbs: `STATUS` (1241), `DETACH` (1257), `RESULT` (1269), `INFO` (1276), `STOP` (1298), `LOG` (1316). The two the header omits but the module header does cover — `DETACH` and `RESULT` — are precisely the ones whose host-only placement carries the strongest access-control argument (module header lines 56-61: "that placement is the access control"), and they are missing from the very sentence that makes that argument.
+
+`INFO` is worse: it is absent from both. The module's wire-protocol block for the host-only socket (lines 43-54) lists `LOG`, `STATUS`, `STOP`, `DETACH`, `RESULT` and stops. `INFO <id-or-name>` is a live verb with a client (`read_info`, lines 1414-1416) and an `err` / `field …` / `ok` answer shape of its own (lines 1277-1293).
+
+**Scénario.** A reader implementing or auditing the task control plane works from the module's wire-protocol block at lines 43-54, which presents itself as the protocol. `INFO` is not in it, so an alternate client, a protocol-compat test, or a security review of what the host socket exposes silently omits a verb that returns an invocation's full declaration and state. Separately, someone reading `serve_host`'s own header concludes the socket carries three verbs and misses that `DETACH` — which *creates* invocations — is one of them.
+
+**Correction proposée.** Change lines 1218-1222 to name all six verbs and keep the per-verb access-control rationale for `DETACH`/`RESULT` (the module header already has the wording at lines 56-61). Add the `INFO <id|name>` line to the host-only block at lines 49-53, with its `field <key>\t<value>… then ok` / `err <reason>` answer shape.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Both citations are exact. src/sandbox/task_control.rs:1218-1219 reads "Serve one connection on the session's host-only socket: `LOG` (optionally `after=<seq>`), / `STATUS`, or `STOP <id>`." and 1221 continues "All three are here rather than on the crossing socket, and that placement *is* the access". The dispatcher below serves six: `STATUS` at 1241, `DETACH ` at 1257, `RESULT ` at 1269, `INFO ` at 1276, `STOP ` at 1298, `LOG` at 1316 (with `err unknown command` as the fallthrough at 1317). The module wire-protocol block for the host-only socket runs lines 43-54 and lists exactly LOG (44), STATUS (49), STOP (50), DETACH (51), RESULT (53) before closing the fence at 54 — `INFO` is absent, and lines 56-61 carry the `DETACH`/`RESULT` access-control rationale the function header omits. `INFO` is not dead or test-only: `read_info` at 1415-1416 sends `INFO {target}` and parses `field <k>\t<v>` / `err`, and it has two production callers, src/cli/task.rs:836 and src/cli/task.rs:1191. Nothing else in the tree documents the verb (no hits in docs/).
+
+</details>
+
+---
+
+### B86 — The install's stdout tail is captured and then discarded, so a mise failure reported on stdout prints "no output"
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/sandbox/taskpool.rs:543` |
+| **Catégorie** | `error-handling` |
+| **Sous-système** | Concurrence, verrous, pools |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
+
+**Constat.** `run`'s doc at taskpool.rs:502-505 states: "**Both** of mise's streams are piped and forwarded to sbx's own stderr as they arrive ... The tail of each is kept for the message when the install fails: mise's diagnostics are the only way to tell a registry outage from a typo'd token."
+
+The code keeps only one. `out_reader` runs `tee_to_stderr` over the child's stdout and returns its `DIAGNOSTIC_TAIL` buffer — and line 543 throws that buffer away with `let _ = out_reader.join();`. `InstallRun` has a single `stderr: Vec<u8>` field (taskpool.rs:491-494), so there is nowhere for the stdout tail to go. The comment on line 542 explains why the *join* happens (ordering) and silently drops the returned bytes, which is the half the doc above promised to keep.
+
+Both consumers of `InstallRun` render only that one stream: `ensure` at taskpool.rs:284-292 and `sbx upgrade` at launch.rs:1754-1761, which both fall back to the literal string "no output" when it is empty.
+
+**Scénario.** A pool install fails for a reason mise reports on stdout (a backend that prints its resolution failure there, or a wrapped `npm`/`pip` whose diagnostic goes to stdout) while stderr carries only progress that ends empty after `trim()`. `ensure` then emits `the task tool pool did not install aqua:cli/gh — no output`, and `sbx upgrade` emits `mise upgrade failed: no output` — with the actual explanation having been read into `kept`, held in memory, and dropped one line later. The operator is left with exactly the "registry outage vs. typo'd token" ambiguity the doc says this machinery exists to resolve.
+
+**Correction proposée.** Keep both tails, as documented. Add `stdout: Vec<u8>` to `InstallRun`, bind the join result (`let stdout = out_reader.join().unwrap_or_default();`), and have `ensure`/`launch.rs:1754` fall back to the stdout tail when the stderr tail is empty. Alternatively concatenate the two into the single `stderr` field before returning — either way, stop discarding the buffer the thread was spawned to fill.
+
+**Rectification du vérificateur.** Severity overstated: the harm is a worse failure *message*, not lost diagnostics. Both streams are tee'd live to sbx's own stderr as they arrive (taskpool.rs:571), so mise's stdout output is already on the operator's terminal — the "registry outage vs. typo'd token" ambiguity the reporter describes is only in the one-line summary, with the full text scrolled just above it. Note also that `InstallRun`'s own doc at taskpool.rs:490 is honest ("its stderr for the message when it did not"); only the `run` doc at 504-505 overclaims, so the cleanest fix may be to correct that sentence rather than to add a field.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Confirmed as a documentation/code mismatch. taskpool.rs:504-505 states "The tail of each is kept for the message when the install fails: mise's diagnostics are the only way to tell a registry outage from a typo'd token." `out_reader` is spawned over `tee_to_stderr` at taskpool.rs:523, which returns the kept tail (taskpool.rs:563-580), and taskpool.rs:543 is `let _ = out_reader.join();` — the buffer is dropped. `InstallRun` has only `stderr: Vec<u8>` (taskpool.rs:491-494), so there is nowhere for it to go, and both consumers render that one stream with a "no output" fallback: taskpool.rs:282-292 and launch.rs:1753-1760 (`.lines().last().unwrap_or("no output")`). The comment on taskpool.rs:542 explains the join's ordering purpose only and does not address the discard, so the module-level promise at 504-505 is unfulfilled.
+
+</details>
+
+---
+
+### B87 — `session::descendants` has no visited set, so a malformed parent graph makes `sbx session stop` spin forever -- the two sibling walkers in this codebase both guard against exactly that
+
+| | |
+|---|---|
+| **Gravité** | Faible |
+| **Emplacement** | `src/session.rs:481` |
+| **Catégorie** | `logic-bug` |
+| **Sous-système** | Cycle de vie des sessions (gc, projects, attach) |
+| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : moyenne) |
+
+**Constat.** `descendants` (src/session.rs:458-494) builds a `parent -> children` map from one `/proc` pass and then walks it with `let mut stack = vec![root]` (line 481) / `stack.pop()` (line 482) and no `visited` set and no `pid != ppid` filter. Any cycle in the map re-pushes its members forever: `out` and `stack` grow without bound until the process is OOM-killed, and `Session::stop` never reaches `stop_pinned`, so the cage is never signalled.
+
+The codebase treats this graph as untrustworthy everywhere else it walks it, and says why. `crate::observe::build_tree` (src/observe.rs:36-38) keeps a `visited` set because "a malformed parent graph (a self-parent or a cycle from a `/proc` read race) [must] terminate rather than recurse forever", and `observe_feed::descendant_pids` (src/sandbox/observe_feed.rs:48-59) is described as "Pure and cycle-safe", skips `pid == info.ppid`, seeds `seen` with the root, and has a dedicated test `descendant_pids_is_cycle_safe` (observe_feed.rs:400). `session::descendants` reads the same `/proc` in the same way and has neither guard -- two code paths that should agree and do not.
+
+**Scénario.** `/proc` reads are sequential and non-atomic, so a pid wrap during the scan produces the cycle the sibling modules defend against: pid 50's `stat` is read while its parent is 100, recording `50 -> 100`; process 100 then exits, pid 100 is recycled as a fork of pid 50's replacement, and the later read of `/proc/100/stat` records `100 -> 50`. `sbx session stop <pid>` (or `sbx stop`) then enters `descendants`, alternates 50/100 forever, allocates until the OOM killer fires, and the session it was asked to stop is left running with its SIGTERM never sent.
+
+**Correction proposée.** Mirror `observe_feed::descendant_pids`: skip self-parents when building the map (`if pid != ppid`), seed a `BTreeSet<u32> visited` with `root`, and only push a kid when `visited.insert(kid)` succeeds.
+
+**Rectification du vérificateur.** Survives as an inconsistency, but two corrections to the mechanism. First, a self-parent cannot actually appear in `/proc`: the kernel reparents an orphan onto a reaper whose pid differs from the child's, so `ppid == pid` is unreachable and the missing filter is defence-in-depth only. The sole realistic trigger is a >=2-cycle produced by pid reuse during the non-atomic `read_dir("/proc")` + per-pid `read_to_string` scan (session.rs:460-476), which needs the recycled pid to land on exactly the other member of the pair — much rarer than the finding implies, and it must also be reachable from `root`. Second, the other `descendants` call site, session.rs:1208, is inside `#[cfg(test)]`, so `Session::stop` is the only production exposure. The consequence when it does fire is as described: `out`/`stack` grow until the allocator or the OOM killer intervenes and the cage is never signalled.
+
+<details>
+<summary>Preuve retenue par le vérificateur</summary>
+
+Line numbers are exact: `fn descendants(root: u32) -> Vec<(u32, u64)>` at session.rs:458, `let mut stack = vec![root];` at 481, `while let Some(parent) = stack.pop()` at 482, and the unconditional `out.push((kid, start))` / `stack.push(kid)` at 488-489 — no `visited` set and no `pid != ppid` filter when the map is built (session.rs:475-476). The inconsistency with the siblings is real and self-documented: `observe::build_tree` (observe.rs:37-46) skips self-parents when building `kids` and threads a `visited` set through `node`, with the comment "a `visited` set makes a malformed parent graph (a self-parent or a cycle from a `/proc` read race) terminate rather than recurse forever"; `observe_feed::descendant_pids` (observe_feed.rs:48-70) does the same and is documented as "Pure and cycle-safe". The production caller is `Session::stop` at session.rs:241, `union_cage_members(descendants(self.pid), scope_members(self.pid))`, evaluated *before* `stop_pinned` — so a non-terminating walk means the SIGTERM is never sent, with the pidfd at that point still open. There is no timeout or bound around the call.
+
+</details>
+
+---
+
+### B88 — An untrusted engine override is reported as "ignoring" and then as "not found", neither of which is true
+
 | | |
 |---|---|
 | **Gravité** | Faible |
@@ -1976,7 +2858,8 @@ All four citations verified. src/store.rs:678-681 prints `sbx: ignoring untruste
 
 ---
 
-### B63 — `refresh_ref` documents a 40-hex pin as needing "no nix call" while it spawns nix and queries GitHub
+### B89 — `refresh_ref` documents a 40-hex pin as needing "no nix call" while it spawns nix and queries GitHub
+
 | | |
 |---|---|
 | **Gravité** | Faible |
@@ -1997,307 +2880,6 @@ All four citations verified. src/store.rs:678-681 prints `sbx: ignoring untruste
 <summary>Preuve retenue par le vérificateur</summary>
 
 The core claim holds for refresh_ref. src/store.rs:1339 reads "/// 40-hex source resolves to itself with no nix call, so refreshing a fixed pin is a" (continued at 1340 "well-defined no-op"), and `refresh_ref` (store.rs:1341-1351) calls `resolve_source_rev(nix, layout, source, true)`, which for a 40-hex source calls `witness_revision(nix, layout, &rev, fresh)` at src/store.rs:1369 before returning. `witness_revision` (store.rs:1552) → `reachability` (store.rs:1504-1523) → `crate::sandbox::nixhub::fetch_url_json` (src/sandbox/nixhub.rs:610-619), a nix `fetchurl`+`readFile` build against `https://api.github.com/repos/NixOS/nixpkgs/compare/master...<rev>` (reachability_url, store.rs:1483-1485), plus a second control fetch when the first fails. So nix is spawned and HTTPS is attempted on a path documented as needing neither. Two of the reporter's supporting claims are wrong, though. First, `resolve_source_rev`'s doc is not misleading in context: the sentence at store.rs:1354 ("needing no nix") is scoped to resolution, and the very next paragraph, store.rs:1356-1358, discloses the witness explicitly — "`fresh` is passed to the witness the pinned form goes through … an upgrade re-asks". Second, the rate-limit scenario is backwards: if the control request also 403s, `endpoint_answers` is false and `verdict(None, false)` returns `Reachability::Unknown` (src/store.rs:1542), which is silent — the spurious "does not contain it" warning needs the control request to *succeed* while the compare fails, which is the design's intended Absent signal (store.rs:1541). The test at src/store.rs:2988 does pass BOGUS_NIX and survives only because the witness swallows failures, so its name overstates what it pins.
-
-</details>
-
----
-
-### B64 — The bootstrap `--local` save refusal prints two runs of 14 literal spaces mid-sentence
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/main.rs:579` |
-| **Catégorie** | `ux-error-message` |
-| **Sous-système** | Point d'entrée, diagnostics, store, chemins |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** The format string in `local_save_refusal` (src/main.rs:579) carries two 14-space runs inside the message text — at offsets 96 and 194 of the literal, between "…a `--local` save would write" and "also trusts…", and between "…you have not reviewed." and "Create the config…". They are literal string content, not source indentation: the `\` line continuation at the end of line 579 correctly elides the *leading* whitespace of line 580, but these two runs sit mid-line. The shape is a reflow that joined wrapped lines without collapsing their indentation. No test pins the text — the only assertions (src/main.rs:1084-1092) check for the substrings "mise.toml" and "have not reviewed".
-
-**Scénario.** In a project with a `mise.toml` and no `.sbx.toml`, run `sbx net allow example.com --local` (or `sbx net pending --save --local`). The refusal reaching stderr reads: "this project has no .sbx.toml yet, and trusting the one a `--local` save would               also trusts mise.toml beside it — content sbx did not write and you have not reviewed.               Create the config …" — a gap wide enough to read as a column break in a paragraph that is otherwise the single most important explanation sbx gives about trust bootstrapping.
-
-**Correction proposée.** Collapse each 14-space run to a single space in the format string at src/main.rs:579, or re-break the literal across source lines with `\` continuations so every continuation's indentation is elided.
-
-**Rectification du vérificateur.** Substance holds; two details in the write-up are slightly off. (a) The offsets 96 and 194 are into the SOURCE LINE, not into the literal — the literal opens at column 12, so within the literal the runs sit at 84 and 182. (b) The "attack" transcription of the emitted text drops the word "write" and shows 15 spaces; the message actually reads "...a `--local` save would write<14 spaces>also trusts mise.toml beside it — ...". Neither slip affects the defect: two literal 14-space runs are printed mid-sentence, unmodified, by `sbx net allow <host> --local` (and the `net pending --save --local` path at src/cli/net.rs:3316) in a project with a mise file and no .sbx.toml. Cosmetic only — no logic is wrong, the refusal itself is correct — so "low" is the right severity.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Confirmed at the cited line. src/main.rs:579 is the format string, and a scan of that line finds space runs of exactly 14 at offsets 96 ("...`--local` save would write<14 spaces>also trusts {names}...") and 194 ("...you have not reviewed.<14 spaces>Create the config..."), alongside the expected 12-space source indent at offset 0. They are literal string content: the trailing `\` on line 579 elides only the leading whitespace of line 580, not runs sitting mid-line. I traced both callers to output. src/main.rs:644 (inside `precheck_local_save`, src/main.rs:626) and src/main.rs:773 (inside `open_rule_write`) return `Err((code, msg))`, consumed at src/cli/net.rs:3316 as `diag::error(&format!("sbx: {msg}"))`. `diag::error` (src/diag.rs:46) calls `highlight` (src/diag.rs:78-80), which is `crate::style::paint_spans(msg, pal.name, "", pal)`. paint_spans (src/style.rs:94-123) returns `text.to_owned()` verbatim on a plain palette (src/style.rs:98-100) and otherwise only wraps backtick spans in color — it never collapses or reflows whitespace, and src/diag.rs:87 `plain_lines_are_verbatim_including_backticks` asserts the plain path is byte-identical. No wrap/reflow helper exists on this path (src/style.rs has none; the crate-wide `fn wrap*` hits are all sandbox command wrappers). The only assertions on this text, src/main.rs:1093-1104, check the substrings "mise.toml", "have not reviewed" and the absence of "is not trusted", so nothing pins the spacing. The two gaps reach stderr as written.
-
-</details>
-
----
-
-### B65 — Two doc comments carry a duplicated leading fragment glued to the real summary line
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/main.rs:591` |
-| **Catégorie** | `doc-drift` |
-| **Sous-système** | Point d'entrée, diagnostics, store, chemins |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** src/main.rs:591 reads `/// The write-side trust gate for a save that blesses what it writes:/// The write-side trust gate for a save that blesses what it writes: an existing-but-untrusted (or` — the summary sentence appears twice on one line, with an inline `///` marker in the middle of the rendered text. src/storage.rs:464 has the same corruption: `/// Report where the volume stands, without changing anything./// Report where the volume stands, without changing anything.` In both cases rustdoc renders the doubled sentence and the stray `///` verbatim as the item's summary — the first line of the tooltip and of the generated page. The crate's own doc-coverage tests do not catch it: `a_paragraph_break_inside_a_doc_comment_is_written_as_one` (src/docs_coverage.rs:1158) checks paragraph separators, and there is no maximum-doc-line-width check, so a 190-character `///` line passes. (The same pattern exists at src/cli/mod.rs:265, src/config/tasks.rs:927 and src/config/view.rs:1013, outside this scope — it looks like one bad bulk edit.)
-
-**Scénario.** Run `cargo doc --document-private-items` (or hover `local_save_permitted` / `storage::state` in an editor). The summary shown is "The write-side trust gate for a save that blesses what it writes:/// The write-side trust gate for a save that blesses what it writes: an existing-but-untrusted (or changed) config must not be silently blessed…" — the crate's most load-bearing trust invariant introduced by a doubled clause and a literal `///`.
-
-**Correction proposée.** Delete the duplicated fragment and the inline `///` on src/main.rs:591 and src/storage.rs:464 (and the three sibling sites outside this scope). Consider adding a doc-coverage assertion that no `///` line exceeds `DOC_WRAP` by a wide margin, or that no `///` body contains the sequence `///`, so a repeat of this edit fails the suite.
-
-**Rectification du vérificateur.** Real but purely cosmetic, and the audience is narrower than the write-up implies: `local_save_permitted` is private and `storage::state` is `pub(crate)`, so neither appears in default `cargo doc` output — the corruption is visible only under `--document-private-items` or on editor hover, which the description does concede. Nothing executes differently and no guard is weakened. The proposed "no `///` inside a `///` body" assertion would need an exemption for legitimate prose that quotes the marker in backticks — e.g. src/docs_coverage.rs:1146 ("so a bare `///` has") — which is why the crate-wide grep for doubled `///` returns 12 hits where only 5 are corruption.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Confirmed at both cited lines, and both are production items, not test code. src/main.rs:591 reads `/// The write-side trust gate for a save that blesses what it writes:/// The write-side trust gate for a save that blesses what it writes: an existing-but-untrusted (or` and documents `local_save_permitted`; src/storage.rs:464 reads `/// Report where the volume stands, without changing anything./// Report where the volume stands, without changing anything.` and documents `pub(crate) fn state` (src/storage.rs:465). The doubled fragment and the inline `///` are plain markdown text with no surrounding backticks or fence, so rustdoc renders them verbatim in the item summary. The reporter's account of why the guard misses it checks out: `DOC_WRAP = 96` is at src/docs_coverage.rs:1102 and `a_paragraph_break_inside_a_doc_comment_is_written_as_one` at src/docs_coverage.rs:1158, and its filter at src/docs_coverage.rs:1192 skips any line where `lines[i].chars().count() >= DOC_WRAP` — so the ~190-char main.rs line is treated as an ordinary wrapped line and passes. src/storage.rs:464 is additionally exempt because the following line is not a `/// ` body, so the `let (Some(cur), Some(next))` guard at src/docs_coverage.rs:1177 continues. No width or self-`///` check exists anywhere in src/docs_coverage.rs, and a duplicated sentence raises no rustdoc warning, so `mise run rustdoc` stays green. The three sibling sites named as out of scope are real and identical in shape: src/cli/mod.rs:265, src/config/tasks.rs:927, src/config/view.rs:1013.
-
-</details>
-
----
-
-### B66 — The flag menu goes dead after any typed flag, not just after a positional value
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/cli/completion.rs:225` |
-| **Catégorie** | `logic-bug` |
-| **Sous-système** | Aide et complétion shell |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** In the fallback branch of `candidates`, the command's own options are offered only when
-
-    if tail_at == before.len() { names.extend(flag_menu(&path)); }
-
-`tail_at` is the index just past the last *command* word, so this is true only when nothing at all has been typed after the command path. The comment above it states a different rule — "Bare on a command path (`sbx run <TAB>`, `sbx net logs <TAB>`), the menu is the command's own options; past a typed **value** it belongs to the launched command" — i.e. the gate is meant to fire on a positional value, not on a flag. Pages with no operand slots (`run`, `gc`, `doctor`, `net logs`, `net rules`, `net live`, `proc rules`, `logs`, `config edit`, `session ls`, …) therefore answer an empty cursor word with zero candidates as soon as one flag is present, and the emitted bash script deliberately drops `-o default`, so the prompt is dead rather than falling back to files.
-
-**Scénario.** `sbx net logs <TAB>` offers all eleven documented flags; `sbx net logs -f <TAB>` offers nothing. `sbx gc <TAB>` offers `--all --prune --optimise --optimize --help`; `sbx gc --prune <TAB>` offers nothing. Typing `-` first still works, so the breakage is silent and looks like completion having simply stopped.
-
-**Correction proposée.** Replace the gate with the condition the comment describes: offer the flag menu unless a non-flag word (that is not some flag's consumed value) has been typed after the command path — the information `cursor_value_kind` already computes while walking `before[tail_at..]`.
-
-**Rectification du vérificateur.** Survives, but the page list overstates it. `logs` is not affected — it has an `<id>` operand row (src/help.rs:665-667), so `cursor_value_kind` returns `Some(Sessions)` and its menu keeps answering after `-f`. `doctor` (src/help.rs:65) and `session ls` (src/help.rs:1153) declare `options: &[]`, so the only candidate lost there is the synthesized `--help`. The real cases are the flag-only pages listed above. Worth adding that the same gate also empties the menu after a flag's *value* (`sbx net rules -a myapp <TAB>`), where the value word is correctly consumed as the flag's — so even a fully-understood line goes quiet.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-The gate at src/cli/completion.rs:225 is `if tail_at == before.len() {`, and `tail_at` is set only while walking command words (:178), so it equals `before.len()` only when nothing whatsoever follows the command path — flags included. The comment directly above (:222-224) states a different rule ("past a typed **value** it belongs to the launched command"). For a page whose rows are all flags, `operand_slots` returns empty, `cursor_value_kind` reaches :802 with `slots.get(0) == None`, `all_literal_words` gives `None`, and the else branch is the only candidate source — so one typed flag empties it. Verified against flag-only pages: `gc` (src/help.rs:1661-1680), `net logs` (src/help.rs:2650-...), `net rules` (src/help.rs:2136-2157), `net live` (src/help.rs:2800-2817), `config edit` (src/help.rs:1481-1489). The `-o default` omission is real (src/cli/completion.rs:1017-1019), so the prompt is dead rather than falling back to files, and `cur` starting with `-` still reaches the flag branch at :186, which is why typing `-` first hides the breakage. No test pins the current behaviour: `a_positional_value_does_not_deepen_the_path` (src/cli/completion.rs:1233-1249) covers a typed *value*, not a typed flag.
-
-</details>
-
----
-
-### B67 — The emitted bash script ignores COMP_WORDBREAKS, so `:`/`=` words complete nothing there
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/cli/completion.rs:1028` |
-| **Catégorie** | `inconsistency` |
-| **Sous-système** | Aide et complétion shell |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : moyenne) |
-
-**Constat.** The bash function forwards `COMP_WORDS` verbatim:
-
-    typed=("${COMP_WORDS[@]:1:COMP_CWORD-1}")
-    typed+=("${COMP_WORDS[COMP_CWORD]-}")
-
-Bash splits the line on `$COMP_WORDBREAKS`, whose default includes `:` and `=`, so `--net=allow` arrives as three words (`--net`, `=`, `allow`) and `api.example.com:443` as three (`api.example.com`, `:`, `443`). zsh's `${(@)words[2,CURRENT]}` splits on neither. Two consequences: the inline-value branch in `candidates` (`if let Some((flag, want)) = cur.split_once('=')`, line 189) is unreachable from bash — it only ever runs under zsh; and the stray `:`/`=` word is counted as a positional by `cursor_value_kind`, pushing the cursor past the page's operand slots. The unit tests build word lists by hand and the integration drives set `COMP_WORDS` themselves (tests/completion.rs:203-212, 450-455), so real bash word-splitting is never exercised.
-
-**Scénario.** In bash, `sbx run --net=<TAB>` and `sbx run --net=al<TAB>` offer nothing, while the same input in zsh offers none|shared|ask|allow|deny. `sbx net unallow api.example.com:<TAB>` offers nothing even though `api.example.com:443` is in the config's allow list and is offered for the bare cursor.
-
-**Correction proposée.** In the emitted bash function, reassemble the word under the cursor across word-break characters before sending it (the standard `_get_comp_words_by_ref -n :=` / `__ltrim_colon_completions` treatment), or strip `:` and `=` from `COMP_WORDBREAKS` in the script's preamble and trim the shared prefix off `COMPREPLY` entries.
-
-**Rectification du vérificateur.** The bash half is right; the zsh comparison is overstated. For `sbx run --net=<TAB>` zsh does NOT offer none|shared|ask|allow|deny either: the emitted zsh function (src/cli/completion.rs:1057-1086) never does `compset -P '*='`, so PREFIX stays `--net=` while the oracle returns bare cells (`value_candidates` returns the literals unprefixed), and compadd discards every one of them. So the inline-`=` branch at src/cli/completion.rs:190 is unreachable from bash and unusable from zsh — dead in practice in both shells, which is the sharper statement. The genuine bash-only divergence is the colon case (`sbx net unallow api.example.com:<TAB>` / `re:<TAB>`), which zsh completes and bash does not. Failure mode is silence, not a corrupted insertion, since the Rust side prefix-filters.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Cited line is exact: src/cli/completion.rs:1028 is `typed=("${COMP_WORDS[@]:1:COMP_CWORD-1}")`, followed at :1031 by `typed+=("${COMP_WORDS[COMP_CWORD]-}")`. Nothing in the repo touches COMP_WORDBREAKS (`grep -rn COMP_WORDBREAKS` over src/, tests/ and docs-site/ returns nothing), and the zsh twin at :1062 uses `${(@)words[2,CURRENT]}`, which does not split on `:`/`=`. I traced the colon case end to end: `sbx net unallow api.example.com:<TAB>` reaches candidates() with cur=":", so value_candidates(Rules{Allow}, ":") applies `out.retain(|(name,_)| name.starts_with(prefix))` (src/cli/completion.rs:~712) and rejects `api.example.com:443`; one keystroke later (`…com:44`) the stray ":" sits in `before` and is counted as a positional by cursor_value_kind (src/cli/completion.rs:786-790), pushing pos past net unallow's single `<rule>` slot so the function returns None and the menu is empty. Under zsh the same input completes, since PREFIX is `api.example.com:` and the candidate starts with it. Nothing defends bash: the drives set COMP_WORDS by hand (tests/completion.rs:202-212 and 450-455) so real word-splitting is never exercised, and no test anywhere uses a `flag=value` word (`grep -rn '"--[a-z-]*="'` over src/cli/completion.rs and tests/completion.rs returns nothing). The docs promise the opposite behaviour (docs-site/docs/guide/cli/completion.md: "A removal verb completes what it can remove"), and the ZSH doc comment at :1048-1051 shows colons in candidates were reasoned about for zsh only.
-
-</details>
-
----
-
-### B68 — `sbx app prune` page tells the user to run `sbx stop`, which is not a command
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/help.rs:2087` |
-| **Catégorie** | `ux-error-message` |
-| **Sous-système** | Aide et complétion shell |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** The `app prune` page's remediation reads: "`--yes` is refused while a session of that app is running … Stop it with `sbx stop` and retry." There is no top-level `stop` verb — `dispatch` (src/cli/mod.rs:382-490) has no `"stop"` arm, so it falls into the catch-all and prints `sbx: unknown command 'stop'` with exit 2. Every other page names the real verb (`sbx session stop`, e.g. src/help.rs:1854 and 1888). This page is the single source of truth for that remediation, so the wrong name is what the user is handed at the exact moment the command failed.
-
-**Scénario.** `sbx app prune demo-app --yes` while a `demo-app` session is live prints the refusal and the hint; following the hint gives `sbx: unknown command 'stop'` (exit 2). The correct command is `sbx session stop <pid>`.
-
-**Correction proposée.** Change `sbx stop` to `sbx session stop` at src/help.rs:2087.
-
-**Rectification du vérificateur.** Stronger than reported, and the fix location is wrong. The page is NOT the source of that hint — the runtime message is a separate hard-coded copy at src/cli/app.rs:1926: `"       stop it with `sbx stop`, or re-run without `--yes` to see what would go"`. Both sites must change; patching src/help.rs:2087 alone leaves the user still reading `sbx stop` at the moment the command fails. (The reporter's secondary citations are also off by a line or two: the correct-spelling examples are at src/help.rs:1856 and 1889, not 1854/1888.) A fourth instance of the same shorthand sits in an internal doc comment at src/notify.rs:303 ("`sbx attach`/`sbx stop`"), where neither verb exists top-level.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-src/help.rs:2087 reads verbatim "under a command in flight. Stop it with `sbx stop` and retry. The preview deletes". `dispatch` in src/cli/mod.rs:382-490 has no "stop" arm — the nearest is `"session" | "sessions" => session::session_cmd(rest)` (src/cli/mod.rs:411) — so `sbx stop` falls to the catch-all at src/cli/mod.rs:483-487 and prints `sbx: unknown command 'stop'` with `ExitCode::from(2)`. The real verb is `sbx session stop <id>...`, whose page documents `<id>...` as "the PIDs `sbx session ls` shows" (src/help.rs:1224-1229). The refusal itself is reachable: src/cli/app.rs:1911-1928 gates on `if apply` plus a non-empty `session_pids_for_app`.
-
-</details>
-
----
-
-### B69 — Two pages say `sbx app <name>` launches an app; the dispatcher refuses that form
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/help.rs:1963` |
-| **Catégorie** | `doc-drift` |
-| **Sous-système** | Aide et complétion shell |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** The `app import` page states "the profile stays inert until `sbx app <name>` launches it" (line 1963) and the `net rules` page states "`--app <name>` shows what `sbx app <name>` would launch with" (line 2166). Both contradict the `app` page itself, which is explicit that this spelling does not exist: "Launching always goes through `run`, so an app name is never a subcommand — an app may be named `run`, `show`, etc. and is still launched as `sbx app run <name>`" (lines 262-264). `app_cmd` (src/cli/app.rs:29-50) matches only `run|upgrade|import|export|rm|list|ls|show|prune` and sends anything else — including a valid app name — to the error arm.
-
-**Scénario.** A user reads `sbx app import ./demo-app.toml`'s own output/page and runs `sbx app demo-app`: it prints `sbx: app needs a subcommand — to launch an app, use `sbx app run <name>`.` plus the usage page and exits 2. The remaining four references in the same table all use the correct `sbx app run <name>` spelling.
-
-**Correction proposée.** Replace `sbx app <name>` with `sbx app run <name>` at src/help.rs:1963 and src/help.rs:2166.
-
-**Rectification du vérificateur.** Correct but cosmetic-leaning, and there is a third site: the rustdoc comment at src/help.rs:3388 uses the same wrong spelling ("`sbx app <name> -- --help` passes `--help` through"), and src/notify.rs:307 uses `sbx app <name>` as loose shorthand for "the app this launch runs". So the spelling reads as a house shorthand that leaked into two user-facing pages; the user-visible cost is bounded because the error the dispatcher prints names the right verb.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Both citations are exact. src/help.rs:1963: "profile stays inert until `sbx app <name>` launches it." src/help.rs:2166: "<name>` shows what `sbx app <name>` would launch with". The `app` page contradicts them at src/help.rs:261-264: "Launching always goes through `run`, so an app name is never a subcommand — an app may be named `run`, `show`, etc. and is still launched as `sbx app run <name>`." `app_cmd` (src/cli/app.rs:28-50) matches only run|upgrade|import|export|rm|list|ls|show|prune; any other first token, including a valid app name, hits the `_` arm at src/cli/app.rs:43-49, which prints "sbx: app needs a subcommand — to launch an app, use `sbx app run <name>`." plus the usage page and returns ExitCode::from(2). The doc comment above it (src/cli/app.rs:25-27) states the invariant deliberately, so this is drift in the prose, not an undocumented dispatcher quirk.
-
-</details>
-
----
-
-### B70 — `config add` page claims `config rm` is the only way to remove a rule; four verbs and the `config rm` page say otherwise
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/help.rs:1386` |
-| **Catégorie** | `doc-drift` |
-| **Sous-système** | Aide et complétion shell |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** The `config add` page ends its redirect paragraph with: "Removal is not redirected — `sbx config rm` is in fact the only way to take an `allow`/`deny` rule back out." The same table carries pages for `net unallow`, `net undeny`, `net unmute`, `proc unallow` and `proc undeny`, each summarised as "remove an allow rule from a config file (the inverse of …)" (src/help.rs:2342, 2406, 2479, 543, 611) and each dispatched (src/cli/net.rs:42-48, src/cli/proc.rs:38-40). The `config rm` page states the truth directly — "`sbx net unallow|undeny|unmute` and `sbx proc unallow|undeny` do the same removal in the vocabulary the rule was written in; this is the lower-level route to it" (src/help.rs:1427-1429) — so the two pages of one table flatly disagree.
-
-**Scénario.** A user who has just been redirected away from `sbx config add network.allow api.example.com` reads that paragraph and concludes the symmetric `sbx net unallow` does not exist, dropping to the raw dotted-key form — which additionally leaves `allow = []` behind where `net unallow` would have dropped the emptied list (the difference the `net unallow` page documents at line 2364).
-
-**Correction proposée.** Reword src/help.rs:1386 to match the `config rm` page: removal is *not* redirected, and both routes exist — `sbx net unallow|undeny|unmute` / `sbx proc unallow|undeny` in the rule's own vocabulary, `sbx config rm` as the lower-level route.
-
-**Rectification du vérificateur.** Confirmed stale prose, with history to prove it is not deliberate: the sentence landed in commit 4df15a2 (2026-08-05), and the removal verbs it denies were added the next day in e4df665 (2026-08-06, "feat(net): undo an egress rule with the verb that wrote it"), which updated the `config rm` page but not the `config add` page. Only the second clause is wrong — "Removal is not redirected" is accurate (`config rm` does work on `[network]`/`[proc]` lists, per src/help.rs:1426-1428); the "only way" claim is the drift.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-src/help.rs:1385-1386 reads "…so it is refused with the verb to use. Removal is not redirected — `sbx config rm` is in fact the only way to take an `allow`/`deny` rule back out." That is false: the same table carries pages at src/help.rs:2342 (net unallow), 2406 (net undeny), 2479 (net unmute), 543 (proc unallow), 611 (proc undeny), and all five are dispatched — src/cli/net.rs:42-48 (`Some("unallow") => net_remove_rule(EgressList::Allow, …)` etc.) and src/cli/proc.rs:38-40. The `config rm` page states the opposite at src/help.rs:1428-1431, and the net dispatcher's own comment (src/cli/net.rs:37-39) says "Each rule list is added to and taken back out with one vocabulary, so undoing a rule never means dropping to the schema key it was written under" — the exact inverse of the claim. The behavioural difference the reporter cites is real and documented at src/help.rs:2364 ("An emptied list is dropped rather than left as `allow = []`").
-
-</details>
-
----
-
-### B71 — The exec observer's `seen` set is never pruned, so a reused pid silently drops its exec event and the set grows without bound
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/sandbox/observe_feed.rs:173` |
-| **Catégorie** | `logic-bug` |
-| **Sous-système** | Cycle de vie des sessions (gc, projects, attach) |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : moyenne) |
-
-**Constat.** `run_loop` dedupes by `seen.insert(pid)` against a `BTreeSet<u32>` (observe_feed.rs:173) that lives for the whole supervised session and is never cleaned of pids that have exited. `ExecRing::push` does no dedup of its own (src/sandbox/proc_control.rs:156), so this set is the only gate on the feed.
-
-The dedup key is a bare host pid, which the kernel recycles. Once the host has wrapped its pid space, every cage process that lands on a previously-seen pid is dropped: `seen.insert(pid)` returns false and the `&&` chain short-circuits before `ring.push` and before the inline `[sbx:exec]` echo. The feed does not degrade loudly -- it goes progressively blind, and `sbx proc logs` shows nothing for commands that really ran. The rest of the codebase keys liveness on `(pid, start_ticks)` for exactly this reason (src/session.rs:11-16: "a bare pid is ambiguous because the kernel reuses pids"), and the module header here lists its limits honestly ("the exec poll only sees a process that outlives a tick, so very short-lived commands are missed", observe_feed.rs:20-22) without mentioning this one -- so the comment understates what the lens misses. Secondarily, the set is an unbounded leak for the supervisor's lifetime, capped only by `kernel.pid_max` (4194304 on a systemd host).
-
-**Scénario.** Run a long agent session with `--observe` on a host with `kernel.pid_max = 32768` (the kernel default). A single large build inside the cage burns through the pid space in minutes. After the wrap, the agent runs `rg TODO`, which the kernel gives a pid that some earlier `sh` already used: `seen.insert(pid)` is false, so no `ExecEvent` is pushed and no `[sbx:exec] rg TODO` line is written. `sbx proc logs` reports the session as having run nothing new, with no warning that events are being dropped.
-
-**Correction proposée.** Key the dedup on the incarnation, not the pid: keep `seen: BTreeSet<(u32, u64)>` using the start-time ticks already available via `crate::session::read_start_ticks` (or add a `start_ticks` field to `ProcInfo`, which `read_proc_table` parses `/proc/<pid>/stat` for anyway). That both fixes the drop and bounds the set -- pruning `seen` each tick to the pids still in `table` keeps it at the size of the live cage.
-
-**Rectification du vérificateur.** Real but materially overstated. (a) The effect is not "progressively blind": after a pid wrap a new process is dropped only if its pid is *already in* `seen`, so the loss rate is |seen| / pid_max, i.e. a fraction of events, not a silence. (b) The "unbounded leak" is bounded by the number of distinct cage-descendant pids that outlived a tick in one session, not by `kernel.pid_max` — the set cannot hold 4M entries unless the cage actually spawned that many observed processes. (c) The blast radius is a best-effort display lens: the module header (observe_feed.rs:19-22) already says this poll misses short-lived commands and points at the seccomp user-notification path as the precise capture, and `Observation`'s doc says explicitly "observation is not a security boundary here". The finding is worth fixing as an inconsistency with `session.rs`'s stated (pid, start_ticks) rule, not as a medium-severity data-loss bug. Line cite for `ExecRing::push` is 157, not 156.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-observe_feed.rs:173 is exactly `let mut seen: BTreeSet<u32> = BTreeSet::new();` declared inside `run_loop`, with `if seen.insert(pid)` at line 177 short-circuiting the `&&` chain before `ring.push` and the inline echo; the set is never pruned and `run_loop` lives for the whole supervised session (spawned at observe_feed.rs:144, stopped only by `ExecObserver::drop`). `ExecRing::push` (proc_control.rs:157, doc at 155-156) delegates straight to `lens::Ring` and adds no dedup, so the `seen` set is the only gate. The rest of the tree does key on the incarnation: session.rs:11-16 states "a bare pid is ambiguous because the kernel reuses pids" and `descendants` returns `(pid, start_ticks)` pairs for exactly that reason. No comment in the module claims the pid-only key is deliberate.
-
-</details>
-
----
-
-### B72 — `session::descendants` has no visited set, so a malformed parent graph makes `sbx session stop` spin forever -- the two sibling walkers in this codebase both guard against exactly that
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/session.rs:481` |
-| **Catégorie** | `logic-bug` |
-| **Sous-système** | Cycle de vie des sessions (gc, projects, attach) |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : moyenne) |
-
-**Constat.** `descendants` (src/session.rs:458-494) builds a `parent -> children` map from one `/proc` pass and then walks it with `let mut stack = vec![root]` (line 481) / `stack.pop()` (line 482) and no `visited` set and no `pid != ppid` filter. Any cycle in the map re-pushes its members forever: `out` and `stack` grow without bound until the process is OOM-killed, and `Session::stop` never reaches `stop_pinned`, so the cage is never signalled.
-
-The codebase treats this graph as untrustworthy everywhere else it walks it, and says why. `crate::observe::build_tree` (src/observe.rs:36-38) keeps a `visited` set because "a malformed parent graph (a self-parent or a cycle from a `/proc` read race) [must] terminate rather than recurse forever", and `observe_feed::descendant_pids` (src/sandbox/observe_feed.rs:48-59) is described as "Pure and cycle-safe", skips `pid == info.ppid`, seeds `seen` with the root, and has a dedicated test `descendant_pids_is_cycle_safe` (observe_feed.rs:400). `session::descendants` reads the same `/proc` in the same way and has neither guard -- two code paths that should agree and do not.
-
-**Scénario.** `/proc` reads are sequential and non-atomic, so a pid wrap during the scan produces the cycle the sibling modules defend against: pid 50's `stat` is read while its parent is 100, recording `50 -> 100`; process 100 then exits, pid 100 is recycled as a fork of pid 50's replacement, and the later read of `/proc/100/stat` records `100 -> 50`. `sbx session stop <pid>` (or `sbx stop`) then enters `descendants`, alternates 50/100 forever, allocates until the OOM killer fires, and the session it was asked to stop is left running with its SIGTERM never sent.
-
-**Correction proposée.** Mirror `observe_feed::descendant_pids`: skip self-parents when building the map (`if pid != ppid`), seed a `BTreeSet<u32> visited` with `root`, and only push a kid when `visited.insert(kid)` succeeds.
-
-**Rectification du vérificateur.** Survives as an inconsistency, but two corrections to the mechanism. First, a self-parent cannot actually appear in `/proc`: the kernel reparents an orphan onto a reaper whose pid differs from the child's, so `ppid == pid` is unreachable and the missing filter is defence-in-depth only. The sole realistic trigger is a >=2-cycle produced by pid reuse during the non-atomic `read_dir("/proc")` + per-pid `read_to_string` scan (session.rs:460-476), which needs the recycled pid to land on exactly the other member of the pair — much rarer than the finding implies, and it must also be reachable from `root`. Second, the other `descendants` call site, session.rs:1208, is inside `#[cfg(test)]`, so `Session::stop` is the only production exposure. The consequence when it does fire is as described: `out`/`stack` grow until the allocator or the OOM killer intervenes and the cage is never signalled.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Line numbers are exact: `fn descendants(root: u32) -> Vec<(u32, u64)>` at session.rs:458, `let mut stack = vec![root];` at 481, `while let Some(parent) = stack.pop()` at 482, and the unconditional `out.push((kid, start))` / `stack.push(kid)` at 488-489 — no `visited` set and no `pid != ppid` filter when the map is built (session.rs:475-476). The inconsistency with the siblings is real and self-documented: `observe::build_tree` (observe.rs:37-46) skips self-parents when building `kids` and threads a `visited` set through `node`, with the comment "a `visited` set makes a malformed parent graph (a self-parent or a cycle from a `/proc` read race) terminate rather than recurse forever"; `observe_feed::descendant_pids` (observe_feed.rs:48-70) does the same and is documented as "Pure and cycle-safe". The production caller is `Session::stop` at session.rs:241, `union_cage_members(descendants(self.pid), scope_members(self.pid))`, evaluated *before* `stop_pinned` — so a non-terminating walk means the SIGTERM is never sent, with the pidfd at that point still open. There is no timeout or bound around the call.
-
-</details>
-
----
-
-### B73 — `TreeState`'s doc sends users to `sbx gc --all` to reclaim a dead tree, which that command explicitly does not do
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/sandbox/gc.rs:933` |
-| **Catégorie** | `doc-drift` |
-| **Sous-système** | Cycle de vie des sessions (gc, projects, attach) |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** The `TreeState` doc comment reads "`Dead` (the marker points at a gone path -- reclaimable by `sbx gc --all`)" (gc.rs:933-934). `sbx gc --all` does not reap project trees. Its implementation (`launch::gc`, src/sandbox/launch.rs:1814-1830) calls only `session_housekeeping`, `runtime_housekeeping` and `shared_store_gc`, and carries an inline comment saying so in as many words: "Reaping whole per-project runtime *trees* is `sbx projects rm`; `--all` here is purely the nix-store side" (launch.rs:1815-1817). `gc::reap_dead_projects` has exactly one production caller -- `projects::reap_dead_trees` (src/sandbox/projects.rs:44) -- reached only from `sbx projects rm --dead/--markerless`. The user-facing help agrees with the code (src/help.rs:1838), so gc.rs:933 is the outlier.
-
-A second stale reference sits in the same file: `is_safe_tree_id`'s doc calls itself "the anti-traversal guard for `sbx gc --id`" (gc.rs:573-574, echoed by the test comment at gc.rs:2044). There is no `sbx gc --id` flag anywhere in the CLI; the real sinks are `sbx projects rm <id>` (projects.rs:663), `sbx projects show <id>` (projects.rs:277) and `purge_app_homes` (gc.rs:672).
-
-**Scénario.** A user runs `sbx path`, sees a tree tagged `dead` (the label comes from `TreeState::label`, gc.rs:948), reads this doc, and runs `sbx gc --all --prune`. The command succeeds, reports on the shared store, and leaves the dead tree -- and its full size -- exactly where it was. Nothing in the output says the tree was skipped, and there is no hint pointing at `sbx projects rm --dead --yes`, which is the command that actually reclaims it.
-
-**Correction proposée.** Change gc.rs:933-934 to name `sbx projects rm --dead --yes`, and gc.rs:573-574 (plus the test comment at gc.rs:2044) to name `sbx projects rm <id>` / `sbx projects show <id>` / `sbx app rm <name> --purge` as the sinks this guard protects.
-
-**Rectification du vérificateur.** Real, but developer-facing rather than user-facing. `TreeState` is `pub(crate)`, so gc.rs:933-934 and gc.rs:573-574 are internal rustdoc, and every user-visible surface already names the right command: src/help.rs:1837-1839 says "Nothing is reclaimed here — that is `sbx gc --all --prune` for store closures, `sbx projects rm <id>` for a runtime tree", and the `sbx projects` listing footer at src/sandbox/projects.rs:605 says "sweep dead trees with `sbx projects rm --dead --yes`". The reporter's scenario of a user reading this doc and running `sbx gc --all --prune` therefore overstates it; the concrete harm is a maintainer trusting a comment the code contradicts. Two citation corrections: the launch.rs comment is at 1820-1822, not 1815-1817 (the function itself begins at 1814), and `TreeState::label` also feeds `sbx projects list` (projects.rs:179) and `sbx projects show` (projects.rs:418), which the doc's "for `sbx path`'s per-project annotation" omits.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Both halves check out at the cited lines. src/sandbox/gc.rs:933-934 reads "`Dead` (the marker points at a gone path — reclaimable by `sbx gc --all`)". `sbx gc --all` cannot reclaim a tree: `launch::gc` (src/sandbox/launch.rs:1814) calls only `sweep_current`, `session_housekeeping`, `runtime_housekeeping` and `shared_store_gc`, and its own inline comment at launch.rs:1820-1822 says "Reaping whole per-project runtime *trees* is `sbx projects rm`; `--all` here is purely the nix-store side". I checked the two passes that could plausibly touch a tree: `runtime_housekeeping` (launch.rs:1888) only folds egress counters and calls `sweep_runtime_dirs`, which per gc.rs:1279-1287 sweeps the per-launch RUNTIME_DIRS entries keyed by a dead launcher pid, not `projects/<id>`; `shared_store_gc` (launch.rs:1936) drops gc roots "of reaped projects" — already-reaped ones — so a Dead-but-unreaped tree still roots its closures. `reap_dead_projects` (gc.rs:481) has exactly one production caller, src/sandbox/projects.rs:44, reached only from `sbx projects rm --dead/--markerless`. The second half is also confirmed: `sbx gc` parses only `--prune`, `--all`, `--optimise/--optimize` (src/cli/gc.rs:33-38) and its help synopsis is "sbx gc [--all] [--prune] [--optimise]" (src/help.rs:1662), so the `sbx gc --id` named at gc.rs:573-574 and echoed at gc.rs:2044 does not exist; the real callers of `is_safe_tree_id` are projects.rs:277, projects.rs:663, gc.rs:602 (`reap_one`) and gc.rs:672 (`purge_app_homes`). I also confirmed the doc's premise that `sbx path` renders the label (src/paths.rs:487-492 calls `classify_tree` and stores `class.state.label()`).
-
-</details>
-
----
-
-### B74 — `FlakePin`'s doc says the revision keys the out-link; the module header fifteen lines above says nothing is keyed by it, and the code agrees with the header
-| | |
-|---|---|
-| **Gravité** | Faible |
-| **Emplacement** | `src/sandbox/flake.rs:29` |
-| **Catégorie** | `doc-drift` |
-| **Sous-système** | Provisionnement (nix, mise, flakes) |
-| **Statut** | confirmé par réfutation adversariale (confiance de l'analyste : haute) |
-
-**Constat.** Line 29 documents `FlakePin` as "the immutable revision (40-hex, **which keys the out-link**) and the immutable build reference". The module header at lines 13-16 states the opposite and gives the reasoning: "The revision is recorded and displayed, not used as a path: nothing here is keyed by it. Only an **inline** flake has a content-keyed out-link (`binds::flake_out_link_hash`), because it builds in the cage and has no revision to name." The code sides with the header: `packages::provision` reads only `pin.locked_ref` and roots the build at `gcroots.join(&p.name)` (src/sandbox/packages.rs:119-127), a bare package name; the in-cage path is `binds::flake_out_link(name)`, also name-only (src/sandbox/binds.rs:1055); and `pin.rev` reaches only `pinned_revs`, which feeds `sbx config`'s display. The revision keys nothing at all.
-
-**Scénario.** Not a runtime failure — a maintainer reading `FlakePin` believes a revision change re-points the out-link on its own, and so implements a roll (or a gc keep-set, or an out-link migration) on the assumption that two revisions of one `flake:` package occupy distinct out-links. They do not: both write `gcroots/projects/<id>/<name>`, and what actually forces the rebuild is `provision_flake`'s `<gcroot>.expr` stamp keyed on the *target string* (src/store.rs:1876-1935). Reasoning from the field doc rather than the header yields a change that silently serves the old build.
-
-**Correction proposée.** Reword line 29 to match the header and the code, e.g. "the immutable revision (40-hex, recorded and displayed only — the build target is `locked_ref`) and the immutable build reference the launch builds".
-
-**Rectification du vérificateur.** Two small corrections to the write-up: the module header is at lines 14-16, not 13-16, and the in-cage name-only out-link helper is `binds::flake_out_link` at src/sandbox/binds.rs:1055 (the reporter's 1055 is right, but it is the function definition line, and its rev-keyed sibling `flake_out_link_hash` is at 1071). Impact is documentation-only — no runtime behaviour is wrong today; the proposed rewording of line 29 to name `locked_ref` as the build target is the correct fix.
-
-<details>
-<summary>Preuve retenue par le vérificateur</summary>
-
-Verified verbatim. src/sandbox/flake.rs:29 reads "/// A locked flake package: the immutable revision (40-hex, which keys the out-link) and the", while the module header at src/sandbox/flake.rs:14-16 reads "The revision is recorded and displayed, not used as a path: nothing here is keyed by it. Only an **inline** flake has a content-keyed out-link (`binds::flake_out_link_hash`) …". The code sides with the header: the only consumer of the build reference is src/sandbox/packages.rs:123 `.map(|pin| pin.locked_ref.clone())`, whose gcroot is `gcroots.join(&p.name)` (packages.rs:125) — a bare package name; the in-cage out-link is `flake_out_link(name)` at src/sandbox/binds.rs:1055, also name-only, and the only rev-keyed path in the module is `flake_out_link_hash` at binds.rs:1071, which the header itself scopes to inline flakes. `pin.rev` reaches only `pinned_revs` (flake.rs:110, `.map(|(declared, pin)| (declared, pin.rev))`, consumed by `sbx config` at src/config/view.rs:1062 and 1586), the lock line (flake.rs:132) and the `FlakeUpgrade` display outcomes (flake.rs:301-316). Nothing keys an out-link on it; what forces a rebuild is `provision_flake`'s `<gcroot>.expr` stamp over the target string (src/store.rs:1876-1925). A field doc contradicting its own module header, in a codebase whose comments are the contract, is a real defect.
 
 </details>
 

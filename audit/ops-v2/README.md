@@ -8,7 +8,7 @@ code, les anomalies, le découpage des modules, la duplication et les optimisati
 | **Objet** | crate `sbx` — lanceur de sandbox (bubblewrap + nix sans démon) |
 | **Branche** | `ops-v2` (`d717a05`) |
 | **Périmètre** | `src/`, `proc-shim/`, `tests/`, `build.rs`, `docs-site/docs` |
-| **Documents** | [Sécurité](01-securite.md) · [Bugs et anomalies](02-bugs-anomalies.md) · [Découpage](03-decoupage.md) · [Pistes non vérifiées](annexe-non-verifie.md) |
+| **Documents** | [Sécurité](01-securite.md) · [Bugs et anomalies](02-bugs-anomalies.md) · [Découpage](03-decoupage.md) · [Duplication et optimisation](04-duplication-optimisation.md) · [Plan de refactoring](05-plan-refactoring.md) · [Réfutations](annexe-refutations.md) |
 
 ## Le code en chiffres
 
@@ -47,9 +47,10 @@ périmètre de fichiers borné et une consigne de recherche spécifique.
 
 **Chaque défaut relevé a ensuite été soumis à un vérificateur indépendant chargé de le réfuter**,
 avec consigne de réfuter par défaut en cas de doute. Le taux de réfutation mesuré est de **29 % en
-sécurité** (21 défauts écartés sur 73) et **13 % en correction** (14 sur 105). Seuls les défauts
-ayant survécu figurent dans les documents de résultats ; les pistes dont la vérification n'a pas pu
-aboutir sont isolées en annexe et explicitement marquées comme non établies.
+sécurité** (21 écartés sur 73), **13 % en correction** (14 sur 105) et **20 % sur la duplication et
+la performance** (11 sur 55). Vingt-neuf relevés dont le vérificateur n'avait pas pu s'exécuter ont
+été repassés dans un lot de rattrapage, qui en a écarté quatre de plus et requalifié dix gravités.
+Aucun défaut de ce rapport n'est resté non vérifié.
 
 Une consigne a été donnée à tous les analystes et pèse sur la lecture des résultats : ce dépôt
 commente abondamment ses décisions, et une grande partie des « bugs évidents » y sont des choix
@@ -61,10 +62,17 @@ code n'a pas.
 
 | Catégorie | Critique | Élevée | Moyenne | Faible | Total |
 |---|---|---|---|---|---|
-| Sécurité | 1 | 5 | 11 | 23 | **40** |
-| Bugs, erreurs, anomalies | — | 1 | 20 | 53 | **74** |
-| **Total confirmé** | **1** | **6** | **31** | **76** | **114** |
-| Pistes non vérifiées (annexe) | — | 2 | 12 | 15 | 29 |
+| Sécurité | 1 | 6 | 15 | 27 | **49** |
+| Bugs, erreurs, anomalies | — | 2 | 22 | 65 | **89** |
+| **Défauts établis** | **1** | **8** | **37** | **92** | **138** |
+| Duplication et optimisation | — | — | 23 | 21 | **44** |
+
+À quoi s'ajoutent douze propositions de découpage de modules, arbitrées en un plan ordonné.
+
+Le taux de réfutation d'ensemble est de **21 %** : sur 233 défauts avancés par les analystes,
+50 ont été écartés par les vérificateurs. Le détail par vague est en
+[annexe](annexe-refutations.md), avec les quatre réfutations nominatives et les dix
+requalifications de gravité.
 
 ## Ce qui est solide
 
@@ -105,8 +113,9 @@ retouché. Les propriétés suivantes ont été vérifiées activement, et non s
 
 ## Les défauts qui comptent
 
-Les six défauts de gravité critique ou élevée, tous confirmés par réfutation. Le détail complet,
-avec le scénario et la correction proposée, se trouve dans [01-securite.md](01-securite.md).
+Le défaut critique et les huit défauts de gravité élevée, tous confirmés par réfutation. Le détail
+complet, avec le scénario et la correction, se trouve dans [01-securite.md](01-securite.md) et
+[02-bugs-anomalies.md](02-bugs-anomalies.md).
 
 ### 1. Une arborescence hôte arbitraire montée en écriture dans le cage suivant — `src/sandbox/binds.rs:739`
 
@@ -144,6 +153,25 @@ d'exec et de contenu ne soit en place, en exécutant des binaires du store que l
 Un seul octet de contrôle dans la cible d'une requête suffit à faire disparaître les requêtes
 d'egress refusées de `sbx net log`. C'est la trace d'audit elle-même qui est falsifiable par le
 sujet observé.
+
+### 7. Un import de bundle écrit dans la config globale des tables qu'il n'annonce pas — `src/cli/bundle.rs:492`
+
+Le récapitulatif de consentement présenté avant un import ne nomme que les étapes egress,
+credentials et install. Le même import écrit aussi `task`, `service`, `open`, `flakes` et les
+tables `*:resolve` dans la configuration globale — c'est-à-dire dans la couche approuvée, sans que
+l'utilisateur les ait vues passer.
+
+### 8. Une session entière disparaît des statistiques d'egress — `src/sandbox/egress_stats.rs:380`
+
+Un hôte de destination commençant par `project=` se relit comme l'en-tête d'identité du fichier de
+statistiques. Le cage choisit ses destinations : il lui suffit d'en contacter une ainsi nommée pour
+effacer toute la session de `sbx net stats`.
+
+### 9. Un `mise:<outil>@latest` déclaré ne peut jamais être satisfait — `src/sandbox/taskpool.rs:107`
+
+Le pool n'est alors jamais chaud et la tâche démarre sans ses shims, échouant sur un « command not
+found » dont la cause est invisible. Deux tâches nommant deux versions d'un même outil produisent
+le même effet, en faisant basculer la configuration du pool à chaque lancement.
 
 ## Deux motifs récurrents
 
@@ -207,14 +235,42 @@ est dans [03-decoupage.md](03-decoupage.md).
 
 ## Duplication et optimisation
 
-Les balayages de duplication (CLI, sandbox, proxy, config/plugins) et d'optimisation (chemin de
-données par octet, chemin de lancement, tri des signaux `clippy` stricts) sont en cours et seront
-livrés dans `04-duplication-optimisation.md`.
+Sept balayages transverses ont retenu **44 constats** : quatre sur la duplication (verbes CLI,
+modules sandbox, proxy, config/plugins/store), deux sur la performance (chemin de données par
+octet, chemin de lancement) et un sur le tri des remontées `clippy` en jeu strict. La consigne
+était stricte : une duplication n'est retenue que si les deux sites sont cités côte à côte, un
+coût de performance que si la fréquence d'appel est établie. Onze constats sur 55 ont été écartés
+à ce titre. Le détail est dans [04-duplication-optimisation.md](04-duplication-optimisation.md).
 
-Signal mécanique déjà collecté : sur un passage `clippy` en `pedantic + nursery` (au-delà du
-garde-fou du projet, qui est vert), 4 084 remontées dont 148 conversions numériques susceptibles de
-tronquer ou de perdre le signe, et 70 clones redondants. Ce lot a été filtré et confié à un
-analyste chargé de séparer les vrais défauts du bruit stylistique.
+Signal mécanique à l'appui : sur un passage `clippy` en `pedantic + nursery` (au-delà du garde-fou
+du projet, qui est vert), 4 084 remontées dont 148 conversions numériques susceptibles de tronquer
+ou de perdre le signe, et 70 clones redondants. Le tri de ce lot n'a retenu qu'un seul défaut réel,
+ce qui est en soi un résultat : le bruit stylistique domine, et le garde-fou actuel du projet est
+correctement calibré.
+
+## Plan de refactoring
+
+Les douze propositions de découpage ont été soumises à un architecte chargé de les **arbitrer** :
+rejeter celles qui dissoudraient une couture délibérée, trouver leurs conflits, et les ordonner en
+une séquence où chaque étape laisse l'arbre vert. Son verdict d'ensemble : le dépôt est mieux
+structuré que ses compteurs de lignes ne le suggèrent, et les propositions surestiment le problème
+d'environ moitié.
+
+Deux résultats méritent d'être retenus au-delà de la séquence elle-même :
+
+- **Un conflit réel entre deux propositions.** `src/cli/mod.rs:966` et `src/help.rs:3727` parcourent
+  `src/cli` avec un `read_dir` **non récursif** filtré sur l'extension `.rs`. Un
+  `src/cli/config/mod.rs` ferait donc échouer l'assertion de `cli/mod.rs:1113` avec « `sbx config` a
+  des pages de sous-commandes mais le scan n'a trouvé aucun dispatcher ». La forme correcte est
+  celle qu'a trouvée la proposition `cli-net` : garder `src/cli/net.rs` comme racine de module
+  **à côté** d'un répertoire `net/`.
+- **Environ 40 % du problème de taille est du code de test intégré**, et le dépôt possède déjà la
+  solution en trois endroits (`proxy/mod.rs:2059`, `config/mod.rs:5841`, `openpgp/mod.rs`). Extraire
+  les modules `#[cfg(test)]` vers des fichiers frères est l'étape la moins risquée et la plus
+  rentable du plan.
+
+La séquence complète, avec ce qu'il ne faut **pas** découper et pourquoi, est dans
+[05-plan-refactoring.md](05-plan-refactoring.md).
 
 ## Suite proposée
 
@@ -234,8 +290,8 @@ sont des corrections locales, le troisième est un chantier.
 
 ## Réserves sur cette analyse
 
-- Les 29 pistes en annexe **n'ont pas été réfutées**. Au taux de réfutation observé, il faut
-  s'attendre à ce qu'environ un quart d'entre elles ne tiennent pas.
+- Tous les défauts retenus ont franchi une réfutation adversariale, mais celle-ci reste une
+  lecture contradictoire par un pair, non une preuve.
 - La vérification est une lecture contradictoire du code, pas une exécution. Aucun des scénarios
   décrits n'a été reproduit sur une machine.
 - L'analyse porte sur `d717a05` et cite des numéros de ligne à cette révision.
