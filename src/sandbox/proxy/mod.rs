@@ -91,7 +91,9 @@
 //! | `403` | `denied-default`         | no allow rule matched the host / port / path |
 //! | `403` | `denied-by-rule`         | a deny rule matched (the rule text is not disclosed) |
 //! | `403` | `denied-method`          | an allow rule matched the host but not the request's HTTP method (a `{VERB}`-scoped rule) |
+//! | `403` | `ws-injection-refused`   | a WebSocket upgrade named a host a `[secret]` is injected into. The credential rides the handshake and the frames past the `101` are opaque, so nothing can redact a reflection of it — the upgrade is refused rather than opened |
 //! | `403` | `asked-denied`           | the `ask` posture parked the request and it was not allowed — deliberately conflating an explicit `sbx net pending deny`, the ask timeout, and the pending-queue cap (all three mean "no egress" in Mode B) |
+//! | `403` | `http2-ask-unsupported`  | an `ask`-undecided host designated `[network] http2`. Every stream of one HTTP/2 connection is multiplexed onto a single runtime, so parking one to wait for `sbx net pending` would stall its siblings; the stream fails closed under its own reason instead of being parked (see [`AskPosture`]) |
 //! | `403` | `ssrf-blocked`           | the host resolved only to private / metadata addresses |
 //! | `403` | `ip-literal`             | the CONNECT target was an IP literal on the inspected path (allow it raw with a `tcp://` rule) |
 //! | `403` | `outbound-secret`        | the request head carried a configured secret value verbatim (leak refused) |
@@ -278,23 +280,55 @@ pub(crate) fn serve(
             );
             continue;
         }
-        ctx.conns.fetch_add(1, Ordering::Relaxed);
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            struct ConnGuard<'a>(&'a AtomicUsize);
-            impl Drop for ConnGuard<'_> {
-                fn drop(&mut self) {
-                    self.0.fetch_sub(1, Ordering::Relaxed);
-                }
-            }
-            let _guard = ConnGuard(&ctx.conns);
+        // A thread the OS refuses is treated exactly like the accept error above, and for the same
+        // reason: `std::thread::spawn` *panics* when the kernel will not create a thread (`EAGAIN`
+        // under `RLIMIT_NPROC` or a slice's `TasksMax`), and this loop is the body of a detached
+        // thread — the unwind would drop the `UnixListener` and close the cage's only egress for the
+        // rest of the session. That is the very outcome the transient-accept-error arm exists to
+        // prevent, reached under the same host condition (fd and thread exhaustion arrive together
+        // on a loaded machine). `Builder::spawn` reports the refusal instead of panicking, so the
+        // connection is let go and the loop keeps serving.
+        if let Err(e) = spawn_connection(&ctx, stream) {
+            crate::diag::error(&format!(
+                "sbx: egress proxy: could not start a connection thread: {e}"
+            ));
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+    }
+    Ok(())
+}
+
+/// One live connection's slot in [`ProxyCtx::max_conns`], given back when this guard drops.
+///
+/// It owns its counter (through the shared context) rather than borrowing it, so it can be taken on
+/// the accept loop *before* the handler thread exists. That is what makes a refused thread free:
+/// [`spawn_connection`] hands the guard to the closure, and a spawn the OS turns down drops the
+/// closure — and the slot with it. A guard built inside the thread body would return nothing for a
+/// thread that never ran, leaking one slot per refusal until the cap was reached and every later
+/// connection was answered `503 connection-cap`.
+struct ConnGuard(Arc<ProxyCtx>);
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.conns.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Take a connection slot and hand `stream` to its own thread, or report that the host would not
+/// give one. The per-socket timeouts go on inside the thread, before anything is read.
+fn spawn_connection(ctx: &Arc<ProxyCtx>, stream: UnixStream) -> io::Result<()> {
+    ctx.conns.fetch_add(1, Ordering::Relaxed);
+    let guard = ConnGuard(Arc::clone(ctx));
+    std::thread::Builder::new()
+        .spawn(move || {
+            let ctx = &guard.0;
             let _ = stream.set_read_timeout(Some(ctx.timeout));
             let _ = stream.set_write_timeout(Some(ctx.timeout));
             // an error on one connection is that connection's problem, never the proxy's
-            let _ = handle_client(stream, &ctx);
-        });
-    }
-    Ok(())
+            let _ = handle_client(stream, ctx);
+        })
+        .map(|_| ())
 }
 
 /// What a connection refused over [`ProxyCtx::max_conns`] is told.
@@ -605,7 +639,7 @@ impl PolicyRefusal {
             // bit. Scoped to the app when this is an `sbx app` launch.
             Self::DeniedDefault => format!(
                 "`{host}:{port}` is not allowed by the network policy. Allow it: {}",
-                ctx.allow_suggestion(&inspected_rule_destination(host, port))
+                ctx.allow_suggestion(&rule_destination(super::control::Proto::Https, host, port))
             ),
             Self::AskedDenied => {
                 "this request was denied by a live decision or the ask timeout elapsed".to_string()
@@ -622,23 +656,37 @@ impl PolicyRefusal {
     }
 }
 
-/// The refused destination spelled as a rule for the **inspected-TLS** plane, so pasting it after
+/// The refused destination spelled as a rule for the plane that refused it, so pasting it after
 /// `sbx net allow` writes a rule that admits the very request that was refused.
 ///
-/// A bare host is an `https://` rule on port 443 (the rule grammar's `split_scheme` gives a
-/// scheme-less entry `Layer::L7` and that default port), so the port may be dropped only when it *is*
-/// 443. Suggesting the bare host for a refusal on `:8443` handed the user a command that changes
-/// nothing they can observe: they run it, retry, and are refused again by the same rule they were
-/// told to write. Same shape as the `host_token` net-learn synthesizes its candidate rules with,
-/// which learns from these very refusals — the two must not drift.
+/// The rule grammar's `split_scheme` reads the scheme as the **layer and the default port**: a
+/// scheme-less entry is `Layer::L7` on 443, an `http://` entry is `Layer::L7Clear` on 80. So the
+/// scheme may be dropped only for the inspected-TLS plane, and the port only when it already *is*
+/// that plane's default. Suggesting the bare host for a refusal on `:8443` handed the user a command
+/// that changes nothing they can observe: they run it, retry, and are refused again by the same rule
+/// they were told to write; a bare `sbx net allow host` for a cleartext refusal is worse still, since
+/// it writes an `https`/443 rule that cannot open the clear at all.
 ///
-/// The cleartext plane spells its own (`http://host`, default port 80) at its refusal site; this one
-/// is the `https` planes'.
-fn inspected_rule_destination(host: &str, port: u16) -> String {
-    if port == 443 {
-        host.to_string()
+/// One function for all three sites — the two refusal bodies and the desktop notification the
+/// [`ProxyCtx::outcome_l7`] chokepoint raises — because the notification is the channel that exists
+/// precisely because the agent may never surface the `403` body, and the two must not tell the user
+/// to run different commands about the same refusal. Same shape as the `host_token` net-learn
+/// synthesizes its candidate rules with, which learns from these very refusals — the three must not
+/// drift.
+///
+/// [`Proto::Tcp`](super::control::Proto::Tcp) and [`Proto::Other`](super::control::Proto::Other)
+/// take the inspected-TLS spelling: neither ever reaches a `denied-default` suggestion (a raw splice
+/// is decided on host:port before any scheme is known, and `Other` names no transport), so this is
+/// the harmless answer rather than a case worth a fourth spelling.
+fn rule_destination(proto: super::control::Proto, host: &str, port: u16) -> String {
+    let (scheme, default_port) = match proto {
+        super::control::Proto::Http => ("http://", 80),
+        _ => ("", 443),
+    };
+    if port == default_port {
+        format!("{scheme}{host}")
     } else {
-        format!("{host}:{port}")
+        format!("{scheme}{host}:{port}")
     }
 }
 
@@ -1986,6 +2034,65 @@ fn invalid(msg: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
+/// Tests for the accept loop's own bookkeeping, kept beside it rather than in [`tests`] because
+/// what they assert is a property of the slot a connection takes, with nothing served.
+#[cfg(test)]
+mod accept_tests {
+    use super::*;
+
+    /// A connection whose handler thread is never created gives its slot back.
+    ///
+    /// `std::thread::spawn` panics when the kernel refuses a thread (`EAGAIN` under `RLIMIT_NPROC`
+    /// or a slice's `TasksMax`), and the accept loop is the body of a detached thread — the unwind
+    /// dropped the `UnixListener` and closed the cage's only egress for the rest of the session.
+    /// [`spawn_connection`] reports the refusal instead, which puts the second half of the fix on
+    /// the slot: the guard has to travel *inside* the closure the spawner could not run, because
+    /// that closure is all the caller gets back. Taken on the loop and released only by a thread
+    /// that may never start — the shape this replaces — every refusal leaked one slot, until the
+    /// count reached `max_connections` and the loop answered `503 connection-cap` to a proxy that
+    /// was serving nothing at all.
+    #[test]
+    fn a_connection_whose_handler_thread_is_never_created_gives_its_slot_back() {
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                allowlist::EgressPolicy::default(),
+            )
+            .unwrap(),
+        );
+        // Exactly what `spawn_connection` builds and hands over, minus the spawn the OS refused.
+        ctx.conns.fetch_add(1, Ordering::Relaxed);
+        let guard = ConnGuard(Arc::clone(&ctx));
+        let never_ran = move || drop(guard);
+        assert_eq!(
+            ctx.conns.load(Ordering::Relaxed),
+            1,
+            "the slot is taken on the accept loop, before the thread exists"
+        );
+        drop(never_ran);
+        assert_eq!(
+            ctx.conns.load(Ordering::Relaxed),
+            0,
+            "and comes back with the closure that was never run"
+        );
+
+        // The slot a handler *does* take still comes back the ordinary way, so this cannot be
+        // satisfied by a counter nothing increments. The peer is closed first, so the handler meets
+        // EOF where it would read a head and returns at once.
+        let (client, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        spawn_connection(&ctx, client).expect("a thread for one connection");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ctx.conns.load(Ordering::Relaxed) != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the handler thread's slot was never released"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
 /// Tests for the refusal sentences' own pieces, kept beside them rather than in [`tests`] because
 /// what they assert is a property of the text a refusal prints, with no connection served.
 #[cfg(test)]
@@ -2043,6 +2150,49 @@ mod suggestion_tests {
             suggested_rule(&PolicyRefusal::DeniedDefault.message(&ctx, "api.test", 8443, "GET")),
             "api.test:8443"
         );
+    }
+
+    /// The cleartext plane's suggestion has to admit a *cleartext* refusal, which takes the scheme
+    /// and the port both.
+    ///
+    /// `sbx net allow host` writes an `https`/443 rule, which opens nothing on the clear at all —
+    /// the granted egress and the requested egress then have no port and no layer in common. Naming
+    /// the scheme and dropping the port, which the cleartext refusal body did, is the same defect
+    /// the inspected-TLS suggestion above was fixed for: an `http://` entry defaults to port 80, so
+    /// a refusal on `:8080` was answered with a command that opens a port nothing asked for.
+    #[test]
+    fn a_cleartext_denied_default_suggestion_admits_the_scheme_and_the_port_it_was_refused_on() {
+        for port in [80u16, 8080] {
+            let token = rule_destination(super::super::control::Proto::Http, "api.test", port);
+            let rule = allowlist::classify(&token)
+                .unwrap_or_else(|e| panic!("`sbx net allow {token}` must be a valid rule: {e}"));
+            let policy = allowlist::EgressPolicy::new(vec![rule], Vec::new());
+            assert!(
+                matches!(
+                    policy.explain_clear("api.test", port, "/", "GET"),
+                    Decision::AllowedBy(_)
+                ),
+                "`sbx net allow {token}` must open the cleartext `api.test:{port}` it was \
+                 suggested for"
+            );
+            // And it opens the clear only — a suggestion that also handed out the inspected-TLS
+            // lane would grant a layer the refusal was never about.
+            assert!(
+                matches!(
+                    policy.explain("api.test", port, "/", "GET"),
+                    Decision::DeniedDefault
+                ),
+                "`sbx net allow {token}` must not also open the inspected-TLS lane"
+            );
+        }
+        // The two spellings, pinned side by side: the scheme is never dropped on the clear, and the
+        // port is dropped only where it already is the scheme's own default.
+        let clear = |port| rule_destination(super::super::control::Proto::Http, "api.test", port);
+        assert_eq!(clear(80), "http://api.test");
+        assert_eq!(clear(8080), "http://api.test:8080");
+        let tls = |port| rule_destination(super::super::control::Proto::Https, "api.test", port);
+        assert_eq!(tls(443), "api.test");
+        assert_eq!(tls(8443), "api.test:8443");
     }
 
     /// The rule token a `denied-default` body offers: everything the printed `sbx net allow`

@@ -52,8 +52,8 @@ pub(super) struct FrameTee {
     /// Gathered rather than scanned piecewise because a frame can arrive split across reads and a
     /// value straddling the split would otherwise be missed, and kept apart from [`Self::pending`]
     /// because a control frame may interleave a fragmented message that is using that buffer. It is
-    /// bounded by [`CONTROL_MAX`]: RFC 6455 §5.5 caps a control payload at 125 bytes, so a frame
-    /// claiming more is not one, and nothing here grows on a length the cage picked.
+    /// bounded by [`CONTROL_MAX`], so nothing here grows on a length the cage picked — a second line
+    /// behind [`scan_frame_header`], which refuses an over-125 control frame outright.
     control_payload: Vec<u8>,
     mask: Option<[u8; 4]>,
     /// Where in the 4-byte mask key the next payload byte lands, carried across reads.
@@ -61,6 +61,9 @@ pub(super) struct FrameTee {
     /// Set once the sink is full or the framing stopped making sense; from then on this direction
     /// costs nothing at all.
     done: bool,
+    /// Whether [`Self::newly_blinded`] has already told the relay that the scan stopped. Asked once,
+    /// like a sighting: the fact is news the first time and noise on every read after it.
+    blind_reported: bool,
     /// This direction's decompressor, present only when `permessage-deflate` was negotiated.
     inflater: Option<Inflater>,
     /// The compressed payload of the message being reassembled. Non-empty only while a compressed
@@ -84,9 +87,11 @@ const SCAN_MESSAGE_CAP: usize = 256 * 1024;
 /// The most payload one control frame can carry, from RFC 6455 §5.5: "All control frames MUST have
 /// a payload length of 125 bytes or less".
 ///
-/// It bounds [`FrameTee::control_payload`], so what is gathered follows the protocol's limit rather
-/// than the length the sender wrote — a frame claiming more is not a control frame, and the buffer
-/// must not grow on its say-so.
+/// It is read twice, on the two questions a declared length raises. [`scan_frame_header`] refuses a
+/// control frame that declares more: the framing is then not what it claims, and following the
+/// declared length would let a fourteen-byte header swallow the rest of the tunnel. And it bounds
+/// [`FrameTee::control_payload`], so what is *gathered* follows the protocol's limit rather than the
+/// length the sender wrote, whatever else changes above it.
 const CONTROL_MAX: usize = 125;
 
 /// The leak tripwire for one direction of an established WebSocket.
@@ -478,6 +483,7 @@ impl FrameTee {
             mask: None,
             mask_at: 0,
             done: false,
+            blind_reported: false,
             inflater: deflate.map(Inflater::new),
             pending: Vec::new(),
             compressed: false,
@@ -515,6 +521,27 @@ impl FrameTee {
     /// capture is full and there is no scan to keep going for.
     fn spent(&self) -> bool {
         self.sink_full && self.scan.is_none()
+    }
+
+    /// Whether this direction's leak tripwire has *just* gone blind: the decoder gave up on the
+    /// framing while a scan was still configured, so nothing crossing from here on is watched.
+    ///
+    /// Reported once, like a sighting.
+    ///
+    /// [`Self::done`] is the right answer for the capture, whose transcript honestly ends at the last
+    /// message it decoded — but it is not an answer for the scan. This file already states the rule
+    /// ([`Inflated::in_step`]): a decoder that goes blind mid-tunnel is "a security control the cage
+    /// switches off at will", which is the whole reason the resync machinery exists. That machinery
+    /// closed one door; the compressed budget above closes on another, for a single protocol-legal
+    /// message, and `done` was invisible outside the tee — so `follow` reported no sighting, the
+    /// relay kept forwarding, and `websocket_secret = block` could never fire again on that tunnel.
+    /// Reporting it lets the relay treat a blinded direction as what it is.
+    fn newly_blinded(&mut self) -> bool {
+        if !self.done || self.scan.is_none() || self.blind_reported {
+            return false;
+        }
+        self.blind_reported = true;
+        true
     }
 
     /// Follow `chunk` through the framing, capturing what it carries. Returns whether the sink filled
@@ -591,8 +618,9 @@ impl FrameTee {
                     // and §5.5.3 both allow one), so the scan reads it — but it is not part of the
                     // message transcript, so the capture never sees it. Gathered to the frame's end
                     // rather than scanned as it arrives, so a value split across two reads is still
-                    // matched, and bounded so the buffer follows the protocol's limit and not the
-                    // length the sender wrote.
+                    // matched. The bound is redundant with the header check that refuses an over-125
+                    // control frame, and kept: the buffer must not grow on a length the cage picked,
+                    // whatever else changes above it.
                     let room = CONTROL_MAX.saturating_sub(self.control_payload.len());
                     let fits = piece.len().min(room);
                     self.control_payload.extend_from_slice(&piece[..fits]);
@@ -607,7 +635,10 @@ impl FrameTee {
                         // filed the compressor's output in the transcript as if it were the
                         // message's text, and handed the scan bytes no needle can ever match. The
                         // transcript ends at the last message actually decoded, which is the answer
-                        // the failed-decode path in `end_of_frame` already gives.
+                        // the failed-decode path in `end_of_frame` already gives. With a scan
+                        // configured the relay is told as well ([`Self::newly_blinded`]): one
+                        // protocol-legal message the cage chooses the size of would otherwise switch
+                        // the tripwire off for the rest of the tunnel with nothing said.
                         self.done = true;
                         break;
                     }
@@ -741,6 +772,16 @@ fn scan_frame_header(buf: &[u8]) -> HeaderScan {
         }
         _ => u64::from(len7),
     };
+    // RFC 6455 §5.5: "All control frames MUST have a payload length of 125 bytes or less and MUST
+    // NOT be fragmented." A frame claiming more, or claiming to continue, is not a control frame and
+    // this stream is not what it says it is. [`CONTROL_MAX`] bounds only the gather buffer, so
+    // without this the decoder went on *following* the declared length: fourteen bytes — a masked
+    // ping declaring 2^63-1 — made every byte behind them that frame's payload for the life of the
+    // tunnel, so the leak scan never saw another one and the `--with-body` transcript ended there,
+    // while the relay forwarded the ordinary frames behind it verbatim.
+    if matches!(opcode, 0x8..=0xa) && (payload_len > CONTROL_MAX as u64 || buf[0] & 0x80 == 0) {
+        return HeaderScan::Bad;
+    }
     let mask = masked.then(|| {
         let at = 2 + extended;
         [buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]
@@ -975,7 +1016,9 @@ pub(super) fn read_plaintext<D: rustls::SideData>(
 /// (never in a read), so a live-but-idle channel is never cut; a dead peer that neither sends nor
 /// closes is bounded by the connection cap, as for the L4 splice. Each read-side EOF half-closes only
 /// that direction (a `close_notify` to the peer), so the reverse direction drains fully before teardown.
-/// The bytes each side already read past its head (`*_pending`) are seeded into the send buffers first.
+/// The bytes each side already read past its head (`*_pending`) are the tunnel's first frames, not a
+/// preamble: they go through the outbound gate before anything is written on, and are seeded into the
+/// send buffers only once that gate has let them by.
 #[allow(clippy::too_many_arguments)]
 /// Everything an established tunnel reports its activity to, gathered so the relay and its decoders
 /// pass one value rather than five. They travel together because they answer one question between
@@ -1003,21 +1046,43 @@ pub(super) struct TunnelObservers<'a> {
 /// once: one side of a live stream can fill in seconds while the other trickles for hours, so a
 /// single shared trigger would strand whichever filled second. The guard drops a filing that would
 /// show what it already showed, which is what keeps the count bounded.
-fn follow(tee: &mut Option<FrameTee>, chunk: &[u8], way: SecretWay, obs: &TunnelObservers) -> bool {
+fn follow(
+    tee: &mut Option<FrameTee>,
+    chunk: &[u8],
+    way: SecretWay,
+    obs: &TunnelObservers,
+) -> Followed {
     let Some(tee) = tee.as_mut() else {
-        return false;
+        return Followed::default();
     };
     if tee.push(chunk)
         && let Some(c) = obs.capture
     {
         c.file_frames_snapshot();
     }
-    let mut seen = false;
+    let mut out = Followed {
+        seen: false,
+        blinded: tee.newly_blinded(),
+    };
     for name in tee.sightings() {
         obs.ctx.websocket_secret_seen(obs.seq, &name, way);
-        seen = true;
+        out.seen = true;
     }
-    seen
+    out
+}
+
+/// What one pass of a direction's decoder concluded, beyond the bytes it moved.
+///
+/// Two facts rather than one, because the relay owes each a different answer: a sighting is what
+/// `websocket_secret` decides on, and a decoder that stopped is the tunnel losing the control that
+/// would make that decision at all.
+#[derive(Default)]
+struct Followed {
+    /// A configured secret was newly seen crossing this direction.
+    seen: bool,
+    /// The decoder just gave up on the framing while a leak scan was configured — see
+    /// [`FrameTee::newly_blinded`].
+    blinded: bool,
 }
 
 /// The needles a tunnel bound for `dest` scans for, on the same rule the request planes use
@@ -1038,6 +1103,52 @@ fn tunnel_needles(needles: &[SecretNeedle], dest: &str) -> Vec<SecretNeedle> {
         .collect()
 }
 
+/// Hand the cage's pending bytes — the frames it sent behind its handshake, before the `101` — to
+/// the outbound tripwire, and then, only if they are allowed to cross, to the upstream.
+///
+/// One function because the **order** is the property rather than an ordering detail.
+///
+/// [`crate::allowlist::WebsocketSecret::Block`] states its guarantee in those terms — "the scan runs
+/// on each chunk read from the cage, before that chunk is written on, so a secret whole inside one
+/// chunk never crosses" — and the relay loop keeps it for every chunk it reads. On this one chunk it
+/// was inverted: the frames were written into the upstream's rustls send buffer first, and what
+/// follows a sighting is `send_close_notify` + [`flush_tls`], which drains the already-encrypted
+/// application data ahead of the close_notify. The secret was delivered and the tunnel was closed
+/// behind it — available exactly once per tunnel, on the ~8 KiB a cage that does not wait for the
+/// `101` gets to choose.
+///
+/// A direction whose decoder has *stopped* is refused on the same terms as a sighting: under `block`
+/// a tunnel this posture can no longer police must end rather than relay bytes nothing is watching.
+fn seed_outbound_pending(
+    to_upstream: &mut impl Write,
+    pending: &[u8],
+    tee: &mut Option<FrameTee>,
+    obs: &TunnelObservers,
+    blocking: bool,
+) -> io::Result<SeededPending> {
+    let followed = follow(tee, pending, SecretWay::Out, obs);
+    if blocking && (followed.seen || followed.blinded) {
+        return Ok(SeededPending {
+            followed,
+            crossed: false,
+        });
+    }
+    to_upstream.write_all(pending)?;
+    Ok(SeededPending {
+        followed,
+        crossed: true,
+    })
+}
+
+/// What became of the bytes the cage sent behind its handshake.
+struct SeededPending {
+    /// What the decoder concluded about them.
+    followed: Followed,
+    /// Whether they were written into the upstream. `false` means the outbound gate refused them —
+    /// nothing was written, and the caller must close the tunnel without relaying anything.
+    crossed: bool,
+}
+
 pub(super) fn relay_websocket(
     mut client: StreamOwned<ServerConnection, UnixStream>,
     client_pending: &[u8],
@@ -1055,12 +1166,6 @@ pub(super) fn relay_websocket(
         ..obs
     };
     let TunnelObservers { up, down, ctx, .. } = &obs;
-    // Seed the already-read bytes into the destination send buffers (the loop flushes them out), and
-    // count them (`up` = client→upstream, `down` = upstream→client) toward the live flow view.
-    upstream.conn.writer().write_all(client_pending)?;
-    client.conn.writer().write_all(upstream_pending)?;
-    up.fetch_add(client_pending.len() as u64, Ordering::Relaxed);
-    down.fetch_add(upstream_pending.len() as u64, Ordering::Relaxed);
 
     // One frame decoder per direction, present when this launch has something to do with the frames:
     // a traffic capture to fill, a configured secret to watch for, or both. They see exactly the
@@ -1098,17 +1203,53 @@ pub(super) fn relay_websocket(
     // rules and carries every setting through untouched, so the two answer the same and this one
     // costs no clone.
     let blocking = obs.ctx.policy.websocket_secret() == crate::allowlist::WebsocketSecret::Block;
-    // The bytes the cage already sent behind its handshake go through the same gate as the ones
-    // that follow: they are the first frames of the tunnel, not a preamble.
-    let pending_seen = follow(&mut tee_up, client_pending, SecretWay::Out, &obs);
-    let _ = follow(&mut tee_down, upstream_pending, SecretWay::Back, &obs);
-    if pending_seen && blocking {
+    // Said on the supervisor's stderr, once per direction: the tunnel's own log event carries secret
+    // *sightings*, and "the decoder stopped" is not one — filing it as a sighting would name a
+    // credential that was never seen. What the reader needs to know is that from here the transcript
+    // and the tripwire cover nothing, on a tunnel that may stay open for hours.
+    let report_blind = |way: SecretWay| {
+        let direction = match way {
+            SecretWay::Out => "cage → upstream",
+            SecretWay::Back => "upstream → cage",
+        };
+        crate::diag::warn(&format!(
+            "the WebSocket frame decoder for `{dest}` lost the framing on the {direction} \
+             direction: the outbound-secret tripwire and the traffic capture cover nothing further \
+             on this tunnel"
+        ));
+    };
+    // The bytes the cage already sent behind its handshake are the tunnel's first frames, not a
+    // preamble, so they go through the outbound gate before they are written on — see
+    // [`seed_outbound_pending`] for why that order is the property and not an ordering detail.
+    let pending_up = {
+        let mut upstream_writer = upstream.conn.writer();
+        seed_outbound_pending(
+            &mut upstream_writer,
+            client_pending,
+            &mut tee_up,
+            &obs,
+            blocking,
+        )?
+    };
+    if pending_up.followed.blinded {
+        report_blind(SecretWay::Out);
+    }
+    if !pending_up.crossed {
         client.conn.send_close_notify();
         upstream.conn.send_close_notify();
         let _ = flush_tls(&mut client.conn, &mut client.sock);
         let _ = flush_tls(&mut upstream.conn, &mut upstream.sock);
         return Ok(());
     }
+    up.fetch_add(client_pending.len() as u64, Ordering::Relaxed);
+    // The way back is recorded and never refused, whatever `websocket_secret` says — the same rule
+    // the loop below applies to every later inbound chunk — so these are seeded without a gate.
+    client.conn.writer().write_all(upstream_pending)?;
+    down.fetch_add(upstream_pending.len() as u64, Ordering::Relaxed);
+    if follow(&mut tee_down, upstream_pending, SecretWay::Back, &obs).blinded {
+        report_blind(SecretWay::Back);
+    }
+
     client.sock.set_nonblocking(true)?;
     upstream.sock.set_nonblocking(true)?;
 
@@ -1143,8 +1284,11 @@ pub(super) fn relay_websocket(
                     // promise: a secret whole inside this chunk does not reach the upstream at all.
                     // One split across chunks had its first part relayed a turn ago, and closing
                     // now stops the rest — the bound is the read size, not the tunnel.
-                    let seen = follow(&mut tee_up, &buf[..n], SecretWay::Out, &obs);
-                    if seen && blocking {
+                    let followed = follow(&mut tee_up, &buf[..n], SecretWay::Out, &obs);
+                    if followed.blinded {
+                        report_blind(SecretWay::Out);
+                    }
+                    if (followed.seen || followed.blinded) && blocking {
                         // Closed on both legs rather than dropped: a peer told the tunnel ended
                         // stops, where one left waiting on a socket that answers nothing retries.
                         // The sighting is already on the tunnel's own event, which is where a
@@ -1176,7 +1320,9 @@ pub(super) fn relay_websocket(
                     // peers agreed the framing of cannot do without rewriting their stream.
                     client.conn.writer().write_all(&buf[..n])?;
                     down.fetch_add(n as u64, Ordering::Relaxed);
-                    follow(&mut tee_down, &buf[..n], SecretWay::Back, &obs);
+                    if follow(&mut tee_down, &buf[..n], SecretWay::Back, &obs).blinded {
+                        report_blind(SecretWay::Back);
+                    }
                     progressed = true;
                 }
                 None => {}
@@ -2062,6 +2208,163 @@ mod tests {
     #[test]
     fn a_tunnel_with_nothing_to_do_builds_no_decoder() {
         assert!(FrameTee::new(None, &[], None).is_none());
+    }
+
+    /// A control frame that declares more than RFC 6455 §5.5 allows is refused, not followed.
+    ///
+    /// [`CONTROL_MAX`] bounded only the gather buffer, so the decoder went on counting the declared
+    /// length down: fourteen bytes — a masked ping claiming 2^63-1 — made every byte behind them
+    /// that frame's payload for the life of the tunnel. `payload_left` never reached zero, so no
+    /// further header was ever parsed; `done` was never set, so nothing could report it; and the
+    /// relay went on forwarding the ordinary frames behind it verbatim with the leak tripwire and
+    /// the `--with-body` transcript both off.
+    #[test]
+    fn a_control_frame_declaring_more_than_the_protocol_allows_stops_the_direction() {
+        // The whole of it: FIN|ping, masked, an 8-byte length of 2^63-1, and a mask key.
+        let mut wire = vec![0x89u8, 0xff];
+        wire.extend_from_slice(&0x7fff_ffff_ffff_ffffu64.to_be_bytes());
+        wire.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(wire.len(), 14, "the whole attack is fourteen bytes");
+
+        let mut t = scanning_tee(&[needle()], None);
+        t.push(&wire);
+        assert!(
+            t.done,
+            "a frame claiming to be a control frame and not being one must stop the decoder rather \
+             than have it follow the length"
+        );
+        assert!(
+            t.newly_blinded(),
+            "and the relay must be told the tripwire stopped"
+        );
+        assert!(!t.newly_blinded(), "once, not on every later read");
+
+        // §5.5 forbids fragmenting a control frame too, and the gather buffer assumes it: a
+        // continuation would be scanned as a self-contained payload it is not.
+        let mut fragmented = scanning_tee(&[needle()], None);
+        fragmented.push(&frame_with_fin(0x9, b"ping", None, false));
+        assert!(fragmented.done, "a fragmented control frame is not one");
+
+        // ...and a conforming ping is still read whole, so this cannot be satisfied by refusing
+        // every control frame — reading their payload is why they are followed at all.
+        let mut ok = scanning_tee(&[needle()], None);
+        ok.push(&frame(0x9, NEEDLE_VALUE, Some([0x11, 0x22, 0x33, 0x44])));
+        assert!(
+            !ok.done,
+            "a control frame inside the protocol's limit is ordinary traffic"
+        );
+        assert_eq!(ok.sightings(), vec!["demo-token".to_string()]);
+    }
+
+    /// A direction that gives up on the framing while a leak scan is configured says so — once.
+    ///
+    /// `done` is the right answer for the *capture*, whose transcript honestly ends at the last
+    /// message it decoded. It is not an answer for the *scan*: this file states that a decoder going
+    /// blind mid-tunnel is a security control the cage switches off at will, which is the whole
+    /// reason the resync machinery exists — and `done` was private, so `follow` reported nothing, the
+    /// relay kept forwarding, and `websocket_secret = block` could never fire again on that tunnel.
+    /// The cheapest protocol-legal way in is one compressed message past `compressed_budget()`,
+    /// whose size the cage chooses.
+    #[test]
+    fn a_direction_that_goes_blind_while_scanning_reports_it_once() {
+        // A capture-only tee that stops is NOT a tripwire that stopped: its transcript ending is the
+        // documented answer and there is no scan to lose. Asserted first, so the report cannot be
+        // satisfied by firing on every `done`.
+        let (mut capture_only, _sink) = tee(1024);
+        capture_only.push(&frame(0x5, b"reserved", None));
+        assert!(capture_only.done, "a reserved opcode stops the capture");
+        assert!(
+            !capture_only.newly_blinded(),
+            "a capture that ends is not a tripwire that was switched off"
+        );
+
+        let mut t = scanning_tee(&[needle()], Some(false));
+        let payload: Vec<u8> = b"NOT-PLAINTEXT-"
+            .iter()
+            .copied()
+            .cycle()
+            .take(t.compressed_budget() + 1)
+            .collect();
+        let mut wire = vec![0xc1u8, 127]; // FIN | RSV1 | text, 8-byte length
+        wire.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        wire.extend_from_slice(&payload);
+        t.push(&wire);
+        assert!(
+            t.done,
+            "a message past the compressed budget stops the direction"
+        );
+        assert!(
+            t.newly_blinded(),
+            "and the relay must be told, because from here nothing outbound is watched"
+        );
+        assert!(!t.newly_blinded(), "once, not on every later read");
+
+        // The report is the whole point: the secret behind that message really is unseen.
+        t.push(&frame(0x1, NEEDLE_VALUE, None));
+        assert!(
+            t.sightings().is_empty(),
+            "a blinded direction sees nothing — which is why it has to be reported"
+        );
+    }
+
+    /// The frames a cage pipelines behind its handshake are gated BEFORE they are written upstream.
+    ///
+    /// `WebsocketSecret::Block` states its guarantee as an order — "the scan runs on each chunk read
+    /// from the cage, before that chunk is written on, so a secret whole inside one chunk never
+    /// crosses" — and the relay loop keeps it for every chunk it reads. On this one chunk the write
+    /// came first: the frames were already in the upstream's rustls send buffer, and the `flush_tls`
+    /// that follows the close drains encrypted application data ahead of the close_notify, so the
+    /// secret was delivered and the tunnel was closed behind it. A cage that does not wait for the
+    /// `101` chooses those bytes, so the bypass was available exactly once per tunnel, on the frames
+    /// the attacker picks.
+    #[test]
+    fn frames_pipelined_behind_the_handshake_are_gated_before_they_are_written_upstream() {
+        let ctx = ProxyCtx::new(
+            Arc::new(Ca::ephemeral().unwrap()),
+            crate::allowlist::EgressPolicy::default(),
+        )
+        .unwrap();
+        let obs = TunnelObservers {
+            up: Arc::new(AtomicU64::new(0)),
+            down: Arc::new(AtomicU64::new(0)),
+            capture: None,
+            ctx: &ctx,
+            seq: None,
+        };
+        // Exactly what a cage writes in the same `write_all` as its upgrade request head: a masked
+        // text frame carrying a declared secret.
+        let carrying = frame(0x1, NEEDLE_VALUE, Some([0x37, 0xfa, 0x21, 0x3d]));
+        let ordinary = frame(0x1, br#"{"hello":"world"}"#, Some([1, 2, 3, 4]));
+
+        let mut tee = FrameTee::new(None, &[needle()], None);
+        let mut upstream = Vec::new();
+        let seeded = seed_outbound_pending(&mut upstream, &carrying, &mut tee, &obs, true).unwrap();
+        assert!(
+            seeded.followed.seen,
+            "the pipelined frame carries the value the tripwire exists for"
+        );
+        assert!(!seeded.crossed, "so under `block` it must not cross");
+        assert!(
+            upstream.is_empty(),
+            "not one byte may reach the upstream's send buffer: {upstream:?}"
+        );
+
+        // Under `warn` the tunnel stays byte-exact, sighting or not — so this cannot be satisfied by
+        // a gate that never writes.
+        let mut tee = FrameTee::new(None, &[needle()], None);
+        let mut upstream = Vec::new();
+        let seeded =
+            seed_outbound_pending(&mut upstream, &carrying, &mut tee, &obs, false).unwrap();
+        assert!(seeded.followed.seen && seeded.crossed);
+        assert_eq!(upstream, carrying, "`warn` records and relays");
+
+        // And ordinary pipelined frames cross under `block` too: what closes the tunnel is the
+        // sighting, never the pipelining.
+        let mut tee = FrameTee::new(None, &[needle()], None);
+        let mut upstream = Vec::new();
+        let seeded = seed_outbound_pending(&mut upstream, &ordinary, &mut tee, &obs, true).unwrap();
+        assert!(!seeded.followed.seen && seeded.crossed);
+        assert_eq!(upstream, ordinary);
     }
 
     /// A capture that has filled does not stop the scan: the decoder keeps following the framing for

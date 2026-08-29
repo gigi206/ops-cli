@@ -132,18 +132,53 @@ pub(crate) enum AddrRefusal {
 
 /// Why the proxy would refuse to connect to `ip` for a request to `host` that the policy permitted
 /// via `deciding`, or `None` when it may connect. Public addresses are reachable; a private address
-/// is reachable only when the deciding rule named this exact host (a deliberate internal target —
-/// not a `*.domain`/regex/built-in match, which would turn into an SSRF wildcard); a blocked address
-/// never is. The single decision behind both callers: the proxy's guarded resolution
+/// is reachable only when [`opens_private_address`] says so (a deliberate internal target — not a
+/// `*.domain`/regex/built-in match, which would turn into an SSRF wildcard); a blocked address never
+/// is. The single decision behind both callers: the proxy's guarded resolution
 /// ([`checked_address`]) and the `sbx test net` tester, which would otherwise mispredict a private
 /// target.
 pub(crate) fn ip_refusal(ip: IpAddr, host: &str, deciding: Option<&Rule>) -> Option<AddrRefusal> {
     match classify_ip(ip) {
         IpClass::Public => None,
         IpClass::Blocked => Some(AddrRefusal::NeverReachable),
-        IpClass::Private if names_exact_host(host, deciding) => None,
+        IpClass::Private if opens_private_address(host, deciding) => None,
         IpClass::Private => Some(AddrRefusal::PrivateWithoutExactHost),
     }
+}
+
+/// Whether the rule that permitted this request may reach a **private** address for `host`: it names
+/// the exact host ([`names_exact_host`]) *and* somebody wrote it.
+///
+/// The origin half is the one the contract above always claimed and the code did not have. The
+/// built-in self-equip allow set ([`builtin_allow_rules`](super::builtin_allow_rules)) is unioned
+/// into every policy in every posture, and six of its eight entries are bare hosts — `github.com`,
+/// `api.github.com`, `codeload.github.com`, `cache.nixos.org`, `search.devbox.sh`,
+/// `mise-versions.jdx.dev` — which classify as `RuleKind::Host` and therefore satisfied the
+/// exact-host test. (The two `*.` entries are `Subdomain` and were correctly excluded, which is what
+/// made the asymmetry invisible on a casual read.) So a cage with an empty allowlist reached a
+/// private address for a name no user ever wrote down, whenever the host's own resolver mapped one
+/// of those six somewhere internal — split-horizon DNS pointing `github.com` at an appliance on
+/// 10.x, a `address=/github.com/127.0.0.1` blocklist entry, an NXDOMAIN-hijacking resolver.
+///
+/// The exception exists for a target the operator deliberately named; a rule nobody wrote names
+/// nothing, so the built-in lane can only ever reach a public address. Compared by value rather than
+/// by an origin flag on [`Rule`]: `Rule`'s equality is its match (kind, methods, layer), the built-in
+/// entries all carry an explicit `{GET,HEAD}` prefix that no `apply_default_methods` pass rewrites,
+/// and the comparison is reached only for an address already classified private whose rule already
+/// names the host — so it costs nothing on any live path.
+pub(crate) fn opens_private_address(host: &str, deciding: Option<&Rule>) -> bool {
+    names_exact_host(host, deciding) && !decided_by_builtin(deciding)
+}
+
+/// Whether the deciding rule is one of the always-on self-equip entries rather than one the user
+/// wrote.
+fn decided_by_builtin(deciding: Option<&Rule>) -> bool {
+    let Some(rule) = deciding else {
+        return false;
+    };
+    super::builtin_allow_rules()
+        .iter()
+        .any(|builtin| builtin == rule)
 }
 
 /// Whether the proxy may connect to `ip` for a request to `host` the policy permitted via
@@ -260,10 +295,14 @@ pub(super) fn checked_address(
     Ok(ip)
 }
 
-/// Whether `deciding` is an explicit, exact-host rule for `host` (not a wildcard/regex). Used to
-/// gate the private-IP exception. With no deciding rule — an allow-by-default verdict — the
-/// exception never applies, so a private/loopback address is refused (a denylist opens public
-/// egress, not the host's own internal services).
+/// Whether `deciding` is an explicit, exact-host rule for `host` (not a wildcard/regex). With no
+/// deciding rule — an allow-by-default verdict — it is not, so a private/loopback address is refused
+/// (a denylist opens public egress, not the host's own internal services).
+///
+/// This is the *syntactic* half of the private-IP exception; [`opens_private_address`] is the whole
+/// of it and is what the guard reads. The credential planes use this one directly, to ask whether an
+/// injection's `to` rule names the host a response came from — a question about the rule's shape, not
+/// about who wrote it.
 pub(crate) fn names_exact_host(host: &str, deciding: Option<&Rule>) -> bool {
     let Some(deciding) = deciding else {
         return false;
@@ -332,6 +371,60 @@ mod tests {
             ),
             Some(AddrRefusal::NeverReachable)
         ));
+    }
+
+    /// The private-address exception belongs to a rule the operator wrote, never to the always-on
+    /// self-equip lane.
+    ///
+    /// `ip_refusal`'s contract names three shapes the exception excludes — `*.domain`, regex, and
+    /// built-in — and the code implemented two. Six of the eight built-in entries are bare hosts, so
+    /// they classify as `RuleKind::Host` and satisfied the exact-host test; the two `*.` entries are
+    /// `Subdomain` and were excluded, which is what made the gap invisible. A cage with an *empty*
+    /// allowlist therefore reached a private address for `github.com` whenever the host's own
+    /// resolver said so — split-horizon DNS to an appliance on 10.x, a Pi-hole `address=` entry, an
+    /// NXDOMAIN-hijacking resolver — with no rule of the user's authorising anything.
+    ///
+    /// The user-written arm is asserted in the same breath: the exception has to keep working for the
+    /// deliberate internal target it exists for, or this would be satisfied by refusing everything.
+    #[test]
+    fn the_private_address_exception_is_not_granted_to_a_built_in_rule() {
+        let private: IpAddr = "127.0.0.1".parse().unwrap();
+        let public: IpAddr = "93.184.216.34".parse().unwrap();
+
+        for builtin in super::super::builtin_allow_rules() {
+            // The host each built-in entry names, read back off the rule so the two cannot drift.
+            let RuleKind::Host(host, _) = &builtin.kind else {
+                continue; // the `*.` entries are `Subdomain` and were never granted the exception
+            };
+            let host = host.clone();
+            assert!(
+                matches!(
+                    ip_refusal(private, &host, Some(&builtin)),
+                    Some(AddrRefusal::PrivateWithoutExactHost)
+                ),
+                "the built-in lane must not reach a private address for `{host}`"
+            );
+            assert!(
+                ip_refusal(public, &host, Some(&builtin)).is_none(),
+                "and it must still reach `{host}` on the public Internet"
+            );
+        }
+
+        // A rule the user wrote for the same host keeps the exception — that is what it is for.
+        let mine = allowlist::classify("github.com").unwrap();
+        assert!(
+            ip_refusal(private, "github.com", Some(&mine)).is_none(),
+            "a rule naming the exact host is the deliberate internal target the exception exists for"
+        );
+        // ...and a wildcard still does not, so the built-in exclusion did not replace that one.
+        let wild = allowlist::classify("*.github.com").unwrap();
+        assert!(
+            matches!(
+                ip_refusal(private, "api.github.com", Some(&wild)),
+                Some(AddrRefusal::PrivateWithoutExactHost)
+            ),
+            "a `*.domain` match is still an SSRF wildcard"
+        );
     }
 
     #[test]

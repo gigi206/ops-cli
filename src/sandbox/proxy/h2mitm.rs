@@ -84,7 +84,8 @@ async fn serve(
     // Bound the handshake so a client that connects but stalls mid-handshake cannot pin this
     // connection's thread + runtime (the per-socket read/write timeouts the sync path relies on
     // do not apply once the stream is in nonblocking/tokio mode). Established streams are then
-    // driven with no overall deadline — a gRPC stream may legitimately be long-lived.
+    // driven with no overall deadline — a gRPC stream may legitimately be long-lived — while the
+    // *connection* carrying none is let go on `ctx.idle`, as [`accept_streams`] explains.
     let tls = match tokio::time::timeout(ctx.timeout, acceptor.accept(client)).await {
         Ok(Ok(t)) => t,
         _ => {
@@ -149,8 +150,53 @@ async fn serve(
 
     // One pool per tunnel, living exactly as long as the runtime that drives its connections.
     let pool = UpstreamPool::default();
+    accept_streams(&mut conn, connect_host, port, ctx, &pool).await;
+    Ok(())
+}
+
+/// Drive one established h2 tunnel: accept its streams and run them concurrently until the client
+/// stops, then drain what is still in flight.
+///
+/// Split out of [`serve`] so it can be driven over an in-memory duplex by a test — everything above
+/// it is the TLS the tunnel already terminated.
+///
+/// A connection carrying **no stream** has an idle bound, exactly as the HTTP/1.1 tunnel bounds the
+/// gap between two requests with `ctx.idle`. The no-overall-deadline choice this path documents is
+/// about a *stream* that may legitimately be long-lived (a server-streaming RPC), and that argument
+/// says nothing about a connection with nothing on it: without the bound a cage could complete
+/// `max_connections` tunnels, send nothing further, and pin every host handler thread for the life of
+/// the launch — with `ctx.conns` at its cap, so every later connection, to every other allowed host,
+/// was answered `503 connection-cap` with no timeout that could ever recover it. The timer is rebuilt
+/// each pass, so any activity resets it, and it is inert while a stream is in flight.
+///
+/// It covers the gap before the *first* stream as well, where the HTTP/1.1 tunnel gives its first
+/// head the longer per-request timeout. The two windows are not the same question: there, a head is
+/// already being read and the bound is how long that read may take; here the handshake is done and
+/// the only question left is whether anything is using the tunnel at all, which is precisely what
+/// `[network] idle_timeout` answers.
+async fn accept_streams<T>(
+    conn: &mut h2::server::Connection<T, Bytes>,
+    connect_host: &str,
+    port: u16,
+    ctx: &ProxyCtx,
+    pool: &UpstreamPool,
+) where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let bound = ctx.idle;
     let mut inflight = FuturesUnordered::new();
     loop {
+        // Read before the timer is built rather than inside it: the future is pinned across the
+        // `select!`, so a borrow of `inflight` taken here would still be live while the accept arm
+        // pushes onto it.
+        let quiet = inflight.is_empty();
+        let idle = async {
+            match quiet {
+                true => tokio::time::sleep(bound).await,
+                false => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(idle);
         tokio::select! {
             accepted = conn.accept() => match accepted {
                 Some(Ok((req, respond))) => {
@@ -160,13 +206,15 @@ async fn serve(
                         let _ = refuse(respond, StatusCode::TOO_MANY_REQUESTS, "http2-stream-cap");
                         continue;
                     }
-                    inflight.push(stream(req, respond, connect_host, port, ctx, &pool));
+                    inflight.push(stream(req, respond, connect_host, port, ctx, pool));
                 }
                 // Accept error, or the client sent GOAWAY / closed the connection: stop taking
                 // new streams, then drain the ones already in flight below.
                 Some(Err(_)) | None => break,
             },
             Some(()) = inflight.next(), if !inflight.is_empty() => {}
+            // An established tunnel carrying nothing, for longer than the launch's idle bound.
+            () = &mut idle => break,
         }
     }
     // Drain the in-flight streams, but bounded: once `accept()` has returned (the connection is
@@ -179,7 +227,6 @@ async fn serve(
         while inflight.next().await.is_some() {}
     })
     .await;
-    Ok(())
 }
 
 /// Handle one h2 stream: decode it, enforce the verdict + SSRF exactly like the HTTP/1.1 path,
@@ -200,11 +247,6 @@ async fn stream(
         .path_and_query()
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| "/".into());
-    let authority = req
-        .uri()
-        .authority()
-        .map(|a| allowlist::canonical_host(a.host()));
-
     // Extended CONNECT (h2 tunneling / WebSocket-over-h2) is a distinct, unredactable capability
     // — refuse it fail-closed in v1 (gRPC is POST).
     if method == Method::CONNECT {
@@ -226,7 +268,7 @@ async fn stream(
     }
     // Per-stream domain-fronting re-check: a client may send a different `:authority` per stream
     // over one h2 tunnel, so bind every stream to the CONNECT host (== the SNI checked above).
-    if authority.as_deref() != Some(connect_host) {
+    if !authority_bound_to(req.uri().authority(), connect_host, port) {
         ctx.outcome(
             Proto::Https,
             connect_host,
@@ -320,6 +362,34 @@ async fn stream(
         pool,
     )
     .await;
+}
+
+/// Whether a stream's `:authority` is bound to the tunnel it arrived on: the same host, the same
+/// port, and no userinfo.
+///
+/// The host comparison alone is not the check, because the string sbx *authorizes* has to be the
+/// string sbx *forwards*. The upstream request is rebuilt from the decoded `parts.uri` and h2
+/// re-emits the authority verbatim (`Pseudo::request` writes `authority.as_str()`), while
+/// `Authority::host()` drops both the userinfo and the port — so an authority of
+/// `victim.example@grpc.vendor.example` passed a host-only gate and then crossed to the origin
+/// whole, for any edge that keys on the raw bytes or reads the segment before the `@`. RFC 9113
+/// §8.3.1 settles it independently: `:authority` MUST NOT carry the deprecated userinfo, and an
+/// intermediary receiving one must treat the request as malformed. sbx is that intermediary.
+///
+/// The HTTP/1.1 twin never had the gap — `serve_tunneled_request` compares the whole `Host` value
+/// minus an all-digit `:`-suffix, so both spellings mismatch there — and the module header claims
+/// parity with it, which this restores. A port is optional in an `:authority` (a client on the
+/// scheme's default port omits it), so it is checked only when present.
+fn authority_bound_to(
+    authority: Option<&http::uri::Authority>,
+    connect_host: &str,
+    port: u16,
+) -> bool {
+    authority.is_some_and(|a| {
+        !a.as_str().contains('@')
+            && a.port_u16().is_none_or(|p| p == port)
+            && allowlist::canonical_host(a.host()) == connect_host
+    })
 }
 
 /// Connect the checked upstream over HTTP/2 (validate cert, require ALPN `h2`) and relay the RPC —
@@ -452,6 +522,20 @@ async fn relay(
         "allowed",
     );
 
+    // Register this stream in the live flow registry for as long as it is relayed, exactly where the
+    // other three planes register theirs (tunnel.rs, forward.rs, cleartext.rs all take the guard
+    // beside their allow) and on the contract [`ProxyCtx::register_flow`] states: after the request
+    // is permitted and the upstream is connected. Per stream rather than per tunnel, following the
+    // tunneled path — that is what keeps the byte totals attributable to the exchange that moved
+    // them, on a transport where one connection carries many.
+    //
+    // Without it `sbx net live` — the whole point of which is seeing what is moving right now — was
+    // empty for every gRPC tunnel, and its `↑`/`↓` totals zero, while the same transfer to the same
+    // host over HTTP/1.1 showed a row with running counts. A long-lived bidirectional stream is the
+    // canonical durable row, and it was the one kind that never appeared. This path stays `https`:
+    // an h2 stream over the MITM is inspected TLS like any other.
+    let flow = ctx.register_flow(host, port, Proto::Https);
+
     // Open the traffic capture for this stream, when the launch captures. The head recorded is the
     // client's own, rendered from the decoded request *before* the rebuild below adds any injected
     // credential, so a secret cannot reach the capture even in principle. The guard files on drop,
@@ -534,8 +618,19 @@ async fn relay(
     // The names sbx injected into the head, carried into the pump so the trailers of the same
     // request are held to the same strip — see [`relay_body`].
     let trailer_strip: Vec<String> = injected.iter().map(|(h, _)| h.clone()).collect();
+    // The `up` half of the flow's byte totals. Cloned rather than borrowed because the pump outlives
+    // this function on a request half that never ends; a counter the registry has already dropped is
+    // simply an atomic nobody reads any more.
+    let up_bytes = Arc::clone(&flow.up);
     tokio::spawn(async move {
-        let _ = relay_body(client_body, up_send_body, req_sink, Some(trailer_strip)).await;
+        let _ = relay_body(
+            client_body,
+            up_send_body,
+            req_sink,
+            Some(trailer_strip),
+            up_bytes,
+        )
+        .await;
     });
 
     let resp = match resp_fut.await {
@@ -613,9 +708,23 @@ async fn relay(
         .filter(|c| c.keeps_body())
         .map(|c| c.response_sink());
     if masks_reflection {
-        let _ = relay_body_redacting(up_body, client_send_body, &creds.needles, res_sink).await;
+        let _ = relay_body_redacting(
+            up_body,
+            client_send_body,
+            &creds.needles,
+            res_sink,
+            Arc::clone(&flow.down),
+        )
+        .await;
     } else {
-        let _ = relay_body(up_body, client_send_body, res_sink, None).await;
+        let _ = relay_body(
+            up_body,
+            client_send_body,
+            res_sink,
+            None,
+            Arc::clone(&flow.down),
+        )
+        .await;
     }
 }
 
@@ -713,15 +822,22 @@ async fn send_granted(
 /// frame is copied into it as it is relayed (bounded by the sink's own cap, so a large body costs a
 /// fixed amount). The source is reported exhausted only when the DATA loop ends of its own accord —
 /// never on the error or downstream-reset exits, where what was captured really is a prefix.
+///
+/// `bytes` is this direction's half of the live flow's totals, the row `sbx net live` renders.
+///
+/// Counted as each frame is *read*, which is what the HTTP/1.1 planes' `CountingReader` counts, so
+/// the two transports answer the same question the same way.
 async fn relay_body(
     mut src: h2::RecvStream,
     mut dst: h2::SendStream<Bytes>,
     cap: Option<Arc<CapBuf>>,
     strip: Option<Vec<String>>,
+    bytes: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<(), h2::Error> {
     while let Some(chunk) = src.data().await {
         let chunk = chunk?;
         let len = chunk.len();
+        bytes.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
         if let Some(cap) = &cap {
             cap.push(&chunk);
         }
@@ -811,10 +927,12 @@ async fn relay_body_redacting(
     mut dst: h2::SendStream<Bytes>,
     needles: &[SecretNeedle],
     cap: Option<Arc<CapBuf>>,
+    bytes: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<(), h2::Error> {
     while let Some(chunk) = src.data().await {
         let chunk = chunk?;
         let len = chunk.len();
+        bytes.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
         // Captured before the masking, like the HTTP/1.1 path: the capture ring masks whatever it
         // stores at filing time, over whole buffers rather than per frame.
         if let Some(cap) = &cap {
@@ -997,6 +1115,25 @@ async fn open_upstream(
     }
     let (send_req, connection) = h2::client::Builder::new()
         .max_header_list_size(MAX_HEADER_LIST)
+        // The same both-legs rule `MAX_HEADER_LIST` states, applied to the two settings that bound
+        // how much *state* a remote server can make the host hold. The proxy is a MITM and a remote
+        // server is untrusted here by the same rule that makes its certificate worth validating.
+        //
+        // Server push is the one that matters. h2 sends no `SETTINGS_ENABLE_PUSH` of its own and the
+        // default is on, so an allowlisted upstream could emit PUSH_PROMISE frames on a stream that
+        // never ends — which is the shape this plane exists for, a server-streaming RPC. Nothing
+        // here ever drains `ResponseFuture::push_promises`, and a reserved stream is explicitly
+        // outside the concurrency budget, so each promise's decoded head — up to the full
+        // `MAX_HEADER_LIST`, from a couple of HPACK indexed bytes on the wire — was retained for the
+        // life of the tunnel. That growth lands in the supervisor, which is deliberately outside the
+        // cage's cgroup, so the cage's `MemoryMax` does not contain it. Refused, the upstream's own
+        // stack will not send one at all, and h2 answers a PUSH_PROMISE that arrives anyway with a
+        // connection PROTOCOL_ERROR.
+        //
+        // The stream budget is the ordinary half: the cage-facing server advertises `MAX_STREAMS`,
+        // and a leg that advertised nothing let the peer open as many as it liked.
+        .enable_push(false)
+        .max_concurrent_streams(MAX_STREAMS)
         .handshake::<_, Bytes>(upstream_tls)
         .await
         .map_err(|_| "upstream-http2-unsupported")?;
@@ -1713,6 +1850,19 @@ mod tests {
         entered: std::sync::atomic::AtomicUsize,
         /// ...and returned
         returned: std::sync::atomic::AtomicUsize,
+        /// how many PUSH_PROMISEs the test upstream got to send...
+        pushes_accepted: std::sync::atomic::AtomicUsize,
+        /// ...and how many its own h2 stack refused because the proxy disabled server push
+        pushes_refused: std::sync::atomic::AtomicUsize,
+        /// The live flow registry a test attached, and the rows it held the moment each request
+        /// head reached the upstream.
+        ///
+        /// A flow is deregistered when its stream ends, so a row that existed only while the stream
+        /// was open cannot be read after the exchange returns. The upstream receiving a head is
+        /// proof the proxy had already registered — the registration sits between the allow and the
+        /// forward — so this is the one deterministic window onto the live view.
+        flows: std::sync::Mutex<Option<Arc<crate::sandbox::control::FlowRegistry>>>,
+        flows_when_forwarded: std::sync::Mutex<Vec<crate::sandbox::control::FlowSnapshot>>,
     }
 
     impl H2Trace {
@@ -1767,6 +1917,9 @@ mod tests {
         headers: Vec<(String, String)>,
         body: Vec<u8>,
         trailers: Vec<(String, String)>,
+        /// How many PUSH_PROMISEs to offer on the stream before answering — the shape a hostile
+        /// allowlisted upstream uses to make the host hold state it never asked for.
+        pushes: usize,
     }
 
     impl UpstreamReply {
@@ -1779,6 +1932,7 @@ mod tests {
                 headers: vec![("content-type".into(), "application/grpc".into())],
                 body: body.as_bytes().to_vec(),
                 trailers: vec![("grpc-status".into(), "0".into())],
+                pushes: 0,
             }
         }
 
@@ -1941,6 +2095,29 @@ mod tests {
             let _ = src.flow_control().release_capacity(chunk.len());
         }
         trace.seen.lock().unwrap().push(seen);
+        // Read the live view here and nowhere else: the proxy registers the stream's flow between
+        // the allow and the forward, so a head that has arrived is a row that is up right now.
+        if let Some(registry) = trace.flows.lock().unwrap().as_ref() {
+            trace
+                .flows_when_forwarded
+                .lock()
+                .unwrap()
+                .extend(registry.snapshot());
+        }
+        // Offered before the response, as RFC 9113 §8.4 requires. A peer that disabled server push
+        // makes h2 refuse this locally, which is exactly what is being asserted.
+        for _ in 0..reply.pushes {
+            let promised = Request::builder()
+                .method(Method::GET)
+                .uri("https://grpc.test/pushed")
+                .body(())
+                .expect("a static pushed request");
+            match respond.push_request(promised) {
+                Ok(_) => &trace.pushes_accepted,
+                Err(_) => &trace.pushes_refused,
+            }
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         if !reply.answers {
             // Dropping the responder resets the stream, which is what the proxy sees when a server
@@ -2378,6 +2555,7 @@ mod tests {
                 headers: vec![("www-authenticate".into(), "Negotiate".into())],
                 body: Vec::new(),
                 trailers: Vec::new(),
+                pushes: 0,
             },
             Arc::clone(&trace),
         );
@@ -2719,6 +2897,7 @@ mod tests {
                     ("grpc-status".into(), "0".into()),
                     ("x-echoed".into(), "topsecret".into()),
                 ],
+                pushes: 0,
             },
             Arc::clone(&trace),
         );
@@ -2951,6 +3130,268 @@ mod tests {
                 (LogVerdict::Allow, "allowed".to_string(), None),
                 (LogVerdict::Error, "upstream-closed".to_string(), None),
             ]
+        );
+    }
+
+    /// The upstream leg refuses server push, so an allowlisted host cannot make the supervisor hold
+    /// state it never asked for.
+    ///
+    /// h2 sends no `SETTINGS_ENABLE_PUSH` of its own and its default is on, so this leg advertised
+    /// push enabled with no concurrency budget beside it. Nothing here drains
+    /// `ResponseFuture::push_promises`, so every PUSH_PROMISE a compromised (or attacker-owned,
+    /// wildcard-matched) gRPC host emitted on a long-lived server-streaming call reserved a stream
+    /// and retained its decoded head — up to the whole 64 KiB `MAX_HEADER_LIST`, from a handful of
+    /// HPACK indexed bytes on the wire — for the life of the tunnel. It grows in the sbx supervisor,
+    /// which holds the CA key and every other connection's state and sits outside the cage's cgroup.
+    ///
+    /// Asserted from the upstream's own h2 stack: it is the peer's SETTINGS that decides whether a
+    /// push may be sent at all, so a refusal there is proof the proxy advertised the setting.
+    #[test]
+    fn the_upstream_leg_refuses_a_server_push_it_would_otherwise_have_to_hold() {
+        use std::sync::atomic::Ordering;
+
+        let trace = Arc::new(H2Trace::default());
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            1,
+            vec![b"h2".to_vec()],
+            UpstreamReply {
+                pushes: 3,
+                ..UpstreamReply::grpc("PONG")
+            },
+            Arc::clone(&trace),
+        );
+        let (ctx, _stats, _log, _dir) = relaying_ctx(upstream_ca);
+
+        let answer = through_h2_proxy(
+            &ctx,
+            "grpc.test",
+            addr.port(),
+            grpc_request(&[]),
+            None,
+            &trace,
+        );
+
+        assert_eq!(
+            answer.status,
+            StatusCode::OK,
+            "the ordinary answer still crosses: {}",
+            trace.render()
+        );
+        assert_eq!(
+            (
+                trace.pushes_accepted.load(Ordering::Relaxed),
+                trace.pushes_refused.load(Ordering::Relaxed),
+            ),
+            (0, 3),
+            "every push the upstream offered must be refused before it reaches the host"
+        );
+    }
+
+    /// An established h2 tunnel carrying **no stream** is let go on the launch's idle bound.
+    ///
+    /// `serve` retires the per-socket timeouts when it hands the stream to tokio, and bounds only
+    /// the TLS accept and the h2 handshake after that. The no-overall-deadline choice documented
+    /// beside them is about a *stream* that may legitimately be long-lived; it says nothing about a
+    /// connection with nothing on it, and that state had no bound at all where the HTTP/1.1 tunnel
+    /// bounds the gap between two requests with the same `ctx.idle`. A cage could complete
+    /// `max_connections` tunnels, send nothing further, and pin every host handler thread — with
+    /// `ctx.conns` stuck at its ceiling, so ordinary egress to every other allowed host was answered
+    /// `503 connection-cap` with no timeout that could ever recover it.
+    ///
+    /// The bound is the assertion: with none, the accept loop never returns and the join below
+    /// elapses.
+    #[test]
+    fn an_h2_tunnel_carrying_no_stream_is_let_go_on_the_idle_bound() {
+        use crate::allowlist::classify;
+        use std::time::Duration;
+
+        let ctx = ProxyCtx::new(
+            Arc::new(super::super::Ca::ephemeral().unwrap()),
+            EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![])
+                .with_idle_timeout(Some(Duration::from_millis(200))),
+        )
+        .unwrap();
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+                // The cage's leg: complete the preface, then send nothing ever again. The request
+                // handle is held for the whole exchange, so nothing closes this side — which is the
+                // whole point: the connection is alive, idle, and abandoned.
+                let client = async {
+                    let (keep_open, conn) = h2::client::handshake(client_io).await.unwrap();
+                    let _ = conn.await;
+                    drop(keep_open);
+                };
+                let proxy = async {
+                    let mut conn = h2::server::handshake(server_io).await.unwrap();
+                    accept_streams(&mut conn, "grpc.test", 443, &ctx, &UpstreamPool::default())
+                        .await;
+                };
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    tokio::join!(proxy, client)
+                })
+                .await
+                .expect(
+                    "an h2 tunnel carrying no stream must be let go on the idle bound; held, it \
+                     pins its host thread and its connection slot for the life of the launch",
+                );
+            });
+    }
+
+    /// The `:authority` sbx authorizes has to be the `:authority` sbx forwards.
+    ///
+    /// The gate reduced it to `Authority::host()`, which drops the userinfo and the port both, while
+    /// the upstream request is rebuilt from the decoded URI and h2 re-emits the authority whole. So
+    /// `victim.example@grpc.test` passed a host-only comparison and then crossed to the origin with
+    /// the userinfo still on it, for any edge that keys on the raw bytes or reads the segment before
+    /// the `@` — and RFC 9113 §8.3.1 makes a `:authority` carrying userinfo malformed for an
+    /// intermediary to relay at all. The HTTP/1.1 twin compares the whole `Host` value minus an
+    /// all-digit port suffix and refuses both spellings; this is the parity the module header claims.
+    ///
+    /// Teeth: the resolver answers the cloud-metadata address, which the SSRF guard always refuses.
+    /// A stream that slips past the authority gate therefore comes back `403 ssrf-blocked` — a
+    /// different answer from the `421 host-mismatch` under test, so neither failure can be mistaken
+    /// for the other, and the last case proves the gate still admits the tunnel's own authority.
+    #[test]
+    fn a_stream_authority_carrying_userinfo_or_another_port_is_refused_as_host_mismatch() {
+        use crate::allowlist::classify;
+        use crate::sandbox::control::{LOG_RING_CAP, LogRing};
+        use std::time::Duration;
+
+        fn answered(uri: &str) -> (StatusCode, String) {
+            let ctx = ProxyCtx::new(
+                Arc::new(super::super::Ca::ephemeral().unwrap()),
+                EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]),
+            )
+            .unwrap()
+            .with_log(Arc::new(LogRing::new(LOG_RING_CAP)))
+            // the cloud-metadata address: refused by the address guard whatever the rule says
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([169, 254, 169, 254])])));
+
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+                    let client = async {
+                        let (mut send, conn) = h2::client::handshake(client_io).await.unwrap();
+                        let driver = tokio::spawn(async move {
+                            let _ = conn.await;
+                        });
+                        let req = Request::builder()
+                            .method(Method::POST)
+                            .uri(uri)
+                            .header("content-type", "application/grpc")
+                            .body(())
+                            .unwrap();
+                        let (resp, _body) = send.send_request(req, true).unwrap();
+                        let resp = resp.await.unwrap();
+                        let reason = resp
+                            .headers()
+                            .get("x-sbx-egress-reason")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let status = resp.status();
+                        driver.abort();
+                        (status, reason)
+                    };
+                    let proxy = async {
+                        let mut conn = h2::server::handshake(server_io).await.unwrap();
+                        let (req, respond) = conn.accept().await.unwrap().unwrap();
+                        stream(req, respond, "grpc.test", 443, &ctx, &UpstreamPool::default())
+                            .await;
+                        while conn.accept().await.is_some() {}
+                    };
+                    tokio::time::timeout(Duration::from_secs(30), async {
+                        tokio::select! {
+                            answer = client => answer,
+                            () = proxy => panic!("the proxy leg ended before the client had its answer"),
+                        }
+                    })
+                    .await
+                    .expect("the in-memory h2 exchange must not stall")
+                })
+        }
+
+        for uri in [
+            // The userinfo dodge: everything before the `@` is what `host()` throws away and what
+            // the rebuilt request still carries.
+            "https://internal-admin.corp.example@grpc.test/pkg.Svc/Method",
+            // ...and a port that is not the one the tunnel was opened to, dropped by the same call
+            // and forwarded to any `host:port`-matching router on the far side.
+            "https://grpc.test:8080/pkg.Svc/Method",
+        ] {
+            assert_eq!(
+                answered(uri),
+                (StatusCode::MISDIRECTED_REQUEST, "host-mismatch".to_string()),
+                "`{uri}` is not the authority this tunnel was opened for"
+            );
+        }
+
+        assert_eq!(
+            answered("https://grpc.test/pkg.Svc/Method"),
+            (StatusCode::FORBIDDEN, "ssrf-blocked".to_string()),
+            "the tunnel's own authority must still pass the gate and reach the address guard"
+        );
+    }
+
+    /// A relayed gRPC stream appears in the live flow view while it is open, with its byte totals.
+    ///
+    /// Every other plane takes the guard beside its allow (tunnel.rs, forward.rs, cleartext.rs);
+    /// this one never did, so `sbx net live` — whose whole purpose is showing what is moving right
+    /// now — was empty for every gRPC tunnel and its `↑`/`↓` totals zero, while the identical
+    /// transfer to the same host over HTTP/1.1 showed a row with running counts. A long-lived
+    /// bidirectional stream is the canonical durable row and was the one kind that never appeared.
+    ///
+    /// The row is read at the only deterministic moment it exists: a flow is deregistered when its
+    /// stream ends, and the registration sits between the allow and the forward, so the upstream
+    /// receiving the request head is proof the row was up.
+    #[test]
+    fn a_relayed_h2_stream_registers_a_live_flow_with_its_byte_totals() {
+        use crate::sandbox::control::FlowRegistry;
+
+        let trace = Arc::new(H2Trace::default());
+        let (addr, upstream_ca) = spawn_h2_upstream(
+            1,
+            vec![b"h2".to_vec()],
+            UpstreamReply::grpc("PONG"),
+            Arc::clone(&trace),
+        );
+        let (ctx, _stats, _log, _dir) = relaying_ctx(upstream_ca);
+        let flows = Arc::new(FlowRegistry::new());
+        let ctx = ctx.with_flows(Arc::clone(&flows));
+        *trace.flows.lock().unwrap() = Some(Arc::clone(&flows));
+
+        let answer = through_h2_proxy(
+            &ctx,
+            "grpc.test",
+            addr.port(),
+            grpc_request(&[]),
+            Some(b"PING".to_vec()),
+            &trace,
+        );
+        assert_eq!(answer.status, StatusCode::OK, "{}", trace.render());
+
+        let rows = trace.flows_when_forwarded.lock().unwrap().clone();
+        assert_eq!(rows.len(), 1, "one open stream, one live row: {rows:?}");
+        assert_eq!(
+            (rows[0].host.as_str(), rows[0].port, rows[0].proto),
+            ("grpc.test", addr.port(), Proto::Https),
+            "the row names the destination and the inspected-TLS transport it rides"
+        );
+        assert!(
+            rows[0].up >= 4,
+            "the request body is counted into the flow as it is relayed: {rows:?}"
+        );
+        assert!(
+            flows.snapshot().is_empty(),
+            "and the row is gone once the stream closes"
         );
     }
 }

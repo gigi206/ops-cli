@@ -86,6 +86,17 @@ pub(super) fn handle_https_forward(
     //     arrives as, which is what this plane did, handed the absolute form an upgrade the same
     //     launch's `CONNECT` would have refused `denied-method`: the opt-in is a property of the
     //     request, not of the transport that carried it here.
+    //
+    //     `verb` is what every *record* this plane leaves names — the verdict, the allow, the
+    //     refusals, the stats and the `[notify] events.network` feed — which is the invariant
+    //     `serve_tunneled_request` states in as many words ("the verdict, the log and the stats all
+    //     name it"). It reached only the refusing paths here, so a WebSocket *denial* read `WS` and a
+    //     WebSocket *allow* read `GET`, on a plane the agent chooses by sending its handshake in the
+    //     absolute form. `method` stays the literal verb for the three things that are about the
+    //     request on the wire rather than about the decision: the origin-form request line, the
+    //     signer's `RequestFacts`, the response framing, and whether a lost connection may be
+    //     retried. That split is why rebinding `method` outright, as the tunneled path does, is not
+    //     available here.
     let ws_upgrade = is_websocket_upgrade(head);
     let verb = if ws_upgrade { "WS" } else { method };
 
@@ -135,7 +146,7 @@ pub(super) fn handle_https_forward(
         crate::sandbox::control::Proto::Https,
         &host,
         port,
-        Some(method),
+        Some(verb),
         Some(&path),
         deciding.as_ref(),
     ) {
@@ -166,7 +177,7 @@ pub(super) fn handle_https_forward(
             crate::sandbox::control::Proto::Https,
             &host,
             port,
-            Some(method),
+            Some(verb),
             Some(&path),
             StatKind::Blocked,
             SIGNER_BODY_TOO_LARGE,
@@ -202,7 +213,7 @@ pub(super) fn handle_https_forward(
                     crate::sandbox::control::Proto::Https,
                     &host,
                     port,
-                    Some(method),
+                    Some(verb),
                     Some(&path),
                     StatKind::Blocked,
                     BODY_BUFFER_CAP,
@@ -243,7 +254,7 @@ pub(super) fn handle_https_forward(
                         crate::sandbox::control::Proto::Https,
                         &host,
                         port,
-                        Some(method),
+                        Some(verb),
                         Some(&path),
                         crate::sandbox::control::LogVerdict::Blocked,
                         "bad-request:chunked",
@@ -282,7 +293,7 @@ pub(super) fn handle_https_forward(
                 crate::sandbox::control::Proto::Https,
                 &host,
                 port,
-                Some(method),
+                Some(verb),
                 Some(&path),
                 StatKind::Blocked,
                 SIGNER_REFUSED,
@@ -325,7 +336,7 @@ pub(super) fn handle_https_forward(
         &host,
     ) {
         Ok(pair) => pair,
-        Err(e) => return refuse_upstream(&mut client, ctx, &host, port, method, &path, e),
+        Err(e) => return refuse_upstream(&mut client, ctx, &host, port, verb, &path, e),
     };
 
     // The request is permitted and the upstream TLS handshake is validated — record the one `allow`.
@@ -337,7 +348,7 @@ pub(super) fn handle_https_forward(
         ),
         &host,
         port,
-        Some(method),
+        Some(verb),
         Some(&path),
         StatKind::Allow,
         "allowed",
@@ -407,7 +418,7 @@ pub(super) fn handle_https_forward(
                     crate::sandbox::control::Proto::Https,
                     &host,
                     port,
-                    Some(method),
+                    Some(verb),
                     Some(&path),
                     crate::sandbox::control::LogVerdict::Blocked,
                     "bad-request:chunked",
@@ -455,7 +466,7 @@ pub(super) fn handle_https_forward(
                     crate::sandbox::control::Proto::Https,
                     &host,
                     port,
-                    Some(method),
+                    Some(verb),
                     Some(&path),
                     crate::sandbox::control::LogVerdict::Error,
                     "upstream-closed",
@@ -472,7 +483,7 @@ pub(super) fn handle_https_forward(
             }
             let (fresh, _) = match acquire_upstream(ctx, None, ip, port, &host) {
                 Ok(pair) => pair,
-                Err(e) => return refuse_upstream(&mut client, ctx, &host, port, method, &path, e),
+                Err(e) => return refuse_upstream(&mut client, ctx, &host, port, verb, &path, e),
             };
             upstream = fresh;
             from_pool = false;
@@ -551,7 +562,7 @@ pub(super) fn handle_https_forward(
             crate::sandbox::control::Proto::Https,
             &host,
             port,
-            Some(method),
+            Some(verb),
             Some(&path),
             crate::sandbox::control::LogVerdict::Error,
             "upstream-closed",
@@ -687,6 +698,121 @@ mod tests {
             !transcript.contains("denied-method"),
             "a `{{WS}}` rule is what admits an upgrade: {transcript:?}"
         );
+    }
+
+    /// A one-shot loopback TLS upstream: its own ephemeral CA mints a leaf for whatever SNI is
+    /// asked for, it reads the request head and replies with `response`. Returns the port it is on
+    /// and the CA the proxy must trust to validate it.
+    fn spawn_https_upstream(
+        response: &'static [u8],
+    ) -> (u16, rustls::pki_types::CertificateDer<'static>) {
+        let ca = Arc::new(Ca::ephemeral().unwrap());
+        let ca_der = ca.ca_cert_der();
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(super::super::ca::CertResolver::new(ca))),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((sock, _)) = listener.accept() else {
+                return;
+            };
+            let Ok(conn) = ServerConnection::new(server_config) else {
+                return;
+            };
+            let mut tls = StreamOwned::new(conn, sock);
+            {
+                let mut br = BufReader::new(&mut tls);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match br.read_line(&mut line) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) if line == "\r\n" || line == "\n" => break,
+                        Ok(_) => {}
+                    }
+                }
+            }
+            let _ = tls.write_all(response);
+            let _ = tls.flush();
+            // Read to the client's close before letting the socket go: closing one that still holds
+            // unread received data makes Linux send an RST, which discards the response just
+            // written.
+            let _ = tls.sock.set_read_timeout(Some(Duration::from_secs(30)));
+            let mut rest = Vec::new();
+            let _ = tls.read_to_end(&mut rest);
+        });
+        (port, ca_der)
+    }
+
+    /// A WebSocket handshake this plane *allows* is recorded under `WS`, exactly as one it refuses.
+    ///
+    /// `verb` reached the verdict and every refusing path, and the literal `method` reached
+    /// everything else — so a `{WS}`-admitted upgrade was logged, counted and announced as a plain
+    /// `GET`, while the identical handshake through a `CONNECT` was attributed. The agent chooses
+    /// which transport carries its handshake, so this was a reporting channel it picked. The
+    /// tunneled path states the invariant in as many words: the verdict, the log and the stats all
+    /// name it.
+    ///
+    /// Driven to a real TLS upstream because the one `allow` record is written *after* the upstream
+    /// handshake succeeds — every refusal-only harness above stops short of it.
+    #[test]
+    fn an_absolute_form_upgrade_that_is_allowed_is_recorded_under_the_ws_pseudo_verb() {
+        use crate::sandbox::control::{LOG_RING_CAP, LogRing, LogVerdict};
+        use crate::sandbox::egress_stats::EgressStats;
+        use crate::testutil::TmpDir;
+
+        let (port, upstream_ca) = spawn_https_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let dir = TmpDir::new();
+        let stats = Arc::new(EgressStats::new(dir.join("stats"), "/t".into(), None));
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        let ctx = ProxyCtx::new(
+            Arc::new(Ca::ephemeral().unwrap()),
+            EgressPolicy::new(vec![classify("{WS} ws-host.test:*").unwrap()], vec![]),
+        )
+        .unwrap()
+        .with_upstream(upstream_cfg)
+        .with_stats(Arc::clone(&stats))
+        .with_log(Arc::clone(&log))
+        // loopback, permitted only because the deciding rule names this exact host
+        .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])));
+
+        let request = format!(
+            "GET https://ws-host.test:{port}/socket HTTP/1.1\r\nHost: ws-host.test:{port}\r\n\
+             Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        let bytes = request.into_bytes();
+        let head = parse_head(&bytes).unwrap();
+        let (method, target) = request_line_parts(&head.request_line).unwrap();
+        let (client, mut peer) = UnixStream::pair().unwrap();
+        handle_https_forward(client, &head, &bytes, &method, &target, &ctx).unwrap();
+        let mut transcript = String::new();
+        peer.read_to_string(&mut transcript).unwrap();
+        assert!(
+            transcript.contains("200 OK"),
+            "the upgrade had to be admitted and forwarded for there to be an allow: {transcript:?}"
+        );
+
+        let events = log.snapshot(None, None, false).events;
+        assert_eq!(events.len(), 1, "one exchange, one event: {events:?}");
+        assert_eq!(events[0].verdict, LogVerdict::Allow);
+        assert_eq!(
+            events[0].method.as_deref(),
+            Some("WS"),
+            "the one `allow` record must name the verb the verdict was reached under"
+        );
+        assert_eq!(stats.snapshot()["ws-host.test"].allow, 1);
     }
 
     #[test]

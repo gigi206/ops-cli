@@ -133,7 +133,10 @@ fn split_scheme(s: &str) -> Result<(Layer, &str), String> {
 /// set and the rest (the rule body, still to be trimmed). A leading `{` is an unambiguous sentinel
 /// that a method spec is present — no rule kind (`re:`, a host, a path, an IP) ever starts with one
 /// — so it never collides with the `{n,m}` quantifiers a `re:` body may contain (those sit after
-/// `re:`, never at the very start). No `{` means [`Methods::Any`] and the whole entry as the body.
+/// `re:`, never at the very start). No `{` means [`Methods::Unspecified`] and the whole entry as the
+/// body: all verbs on its own, but the one state a per-app `default_methods` narrows at resolution.
+/// An explicit `{*}` is [`Methods::Any`] instead — the same verbs today, but never rewritten, which
+/// is how a rule opts a host back out to every verb under a read-by-default app.
 fn split_method_prefix(s: &str) -> Result<(Methods, &str), String> {
     let Some(after) = s.strip_prefix('{') else {
         // No prefix: all verbs now, but a per-app `default_methods` may narrow it at resolution.

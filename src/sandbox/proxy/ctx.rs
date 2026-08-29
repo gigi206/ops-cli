@@ -448,7 +448,7 @@ impl ProxyCtx {
         // the same as a config one.
         let muted = matches!(kind, StatKind::Deny)
             && effective_policy(self).muted(host, port, path, method);
-        self.announce_refusal(host, port, kind, reason, muted);
+        self.announce_refusal(proto, host, port, kind, reason, muted);
         self.push_log_maybe_muted(
             muted, proto, http_ver, rpc, host, port, method, path, verdict, reason,
         )
@@ -468,7 +468,22 @@ impl ProxyCtx {
     ///   that for the log while still raising a desktop notification would defeat the point;
     /// - an `asked-denied` while the interactive park notices are on, because the person was already
     ///   asked about this exact request and answered (or let it time out).
-    fn announce_refusal(&self, host: &str, port: u16, kind: StatKind, reason: &str, muted: bool) {
+    ///
+    /// `proto` is carried in for one reason: the copy-paste fix. A notification is the channel that
+    /// exists *because* the agent may never surface the refusal body, so the command it offers has to
+    /// be the one that body offers — which means the same [`rule_destination`](super::rule_destination)
+    /// spelling, scheme and port included. Built from the bare host, it told the user to run
+    /// `sbx net allow host` for a refusal on `:8443` (an https rule on 443, which admits nothing they
+    /// asked for) or for a cleartext one (an https rule, which cannot open the clear at all).
+    fn announce_refusal(
+        &self,
+        proto: crate::sandbox::control::Proto,
+        host: &str,
+        port: u16,
+        kind: StatKind,
+        reason: &str,
+        muted: bool,
+    ) {
         let Some(notifier) = &self.notifier else {
             return;
         };
@@ -479,22 +494,24 @@ impl ProxyCtx {
             reason,
             muted,
             self.notices,
-            &self.allow_suggestion(host),
+            &self.allow_suggestion(&super::rule_destination(proto, host, port)),
         ) {
             notifier.block(block);
         }
     }
 
-    /// The copy-paste `sbx net allow` command a `denied-default` refusal body suggests. When the
-    /// launch is an `sbx app <name>` (the app hint is set), it names the app — `sbx net allow
-    /// <host> --app <name>` writes the allow into that app's config rather than the project
-    /// baseline, which is what the user almost always means when an *app's* egress was blocked.
-    /// Pure so it is unit-testable. The `--app` write defaults to the project scope (least
-    /// privilege); the user adds `-g` to reach a global profile.
-    pub(super) fn allow_suggestion(&self, host: &str) -> String {
+    /// The copy-paste `sbx net allow` command a `denied-default` refusal suggests, wrapped around
+    /// the rule `destination` its caller spelled with [`rule_destination`](super::rule_destination)
+    /// — this decides the *scoping*, never what is being allowed. When the launch is an `sbx app
+    /// <name>` (the app hint is set), it names the app — `sbx net allow <destination> --app <name>`
+    /// writes the allow into that app's config rather than the project baseline, which is what the
+    /// user almost always means when an *app's* egress was blocked. Pure so it is unit-testable. The
+    /// `--app` write defaults to the project scope (least privilege); the user adds `-g` to reach a
+    /// global profile.
+    pub(super) fn allow_suggestion(&self, destination: &str) -> String {
         match &self.app {
-            Some(name) => format!("sbx net allow {host} --app {name}"),
-            None => format!("sbx net allow {host}"),
+            Some(name) => format!("sbx net allow {destination} --app {name}"),
+            None => format!("sbx net allow {destination}"),
         }
     }
 
@@ -994,5 +1011,66 @@ mod wiring_tests {
         // The host leads the summary, so a desktop that truncates to one line still shows what was
         // refused; the explanation and the fix follow in the body.
         assert!(out[0].starts_with("Blocked: api.example.com:443|"));
+    }
+
+    /// The command a refusal *notification* offers is the command the refusal *body* offers.
+    ///
+    /// The notification exists precisely because the agent is under no obligation to surface a `403`
+    /// body, so the copy-paste fix a person actually reads is this one — and it was built from the
+    /// bare host while both bodies spelled a destination. A `denied-default` on `:8443` told the
+    /// user to run `sbx net allow api.test`, which writes an https rule on **443** and leaves the
+    /// retry refused by the very policy they had just been told to fix; a cleartext refusal got the
+    /// same command, which writes an https rule that cannot open the clear at all. Both now go
+    /// through the one [`rule_destination`](super::rule_destination) the bodies use.
+    #[test]
+    fn a_refusal_notification_offers_the_destination_it_was_refused_on() {
+        fn announced(proto: crate::sandbox::control::Proto, port: u16) -> String {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let notifier = Arc::new(Notifier::recording(
+                NotifyPolicy::uniform(NotifyMode::Once),
+                Box::new(Recorder(Arc::clone(&seen))),
+            ));
+            {
+                let ctx = ProxyCtx::new(
+                    Arc::new(crate::sandbox::proxy::ca::Ca::ephemeral().unwrap()),
+                    EgressPolicy::default(),
+                )
+                .unwrap()
+                .with_notifier(Arc::clone(&notifier));
+                ctx.outcome(
+                    proto,
+                    "api.test",
+                    port,
+                    Some("GET"),
+                    Some("/v1/thing"),
+                    StatKind::Deny,
+                    "denied-default",
+                );
+            }
+            drop(
+                Arc::try_unwrap(notifier)
+                    .map_err(|_| "the notifier is still shared")
+                    .unwrap(),
+            );
+            let out = seen.lock().unwrap().clone();
+            assert_eq!(out.len(), 1, "one refusal, one announcement: {out:?}");
+            out[0].clone()
+        }
+
+        use crate::sandbox::control::Proto;
+        for (proto, port, expected) in [
+            // Inspected TLS: the bare host only where the port already is the scheme's default.
+            (Proto::Https, 443u16, "sbx net allow api.test"),
+            (Proto::Https, 8443, "sbx net allow api.test:8443"),
+            // Cleartext: the scheme always (a bare host is an https/443 rule), and the port past 80.
+            (Proto::Http, 80, "sbx net allow http://api.test"),
+            (Proto::Http, 8080, "sbx net allow http://api.test:8080"),
+        ] {
+            let body = announced(proto, port);
+            assert!(
+                body.ends_with(&format!(" · allow it: {expected}")),
+                "a {proto:?} refusal on :{port} must offer `{expected}`, got {body:?}"
+            );
+        }
     }
 }

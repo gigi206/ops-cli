@@ -483,24 +483,35 @@ impl Rule {
     /// just the one rule whose reach its own text does not show, so the surfaces that display a
     /// policy say so out loud.
     ///
-    /// Answered by asking the regex itself against sentinel URLs sharing no host, port, or path, and
+    /// Answered by asking the matcher against sentinel requests sharing no host, port, or path, and
     /// deliberately **not** by inspecting the pattern: whether a regex matches everything is not
     /// decidable by reading it, and `re:.*`, a bare `re:` (the empty pattern matches anything), and
-    /// `re:^https://` are the same reach written three ways. A sentinel miss is a definite no; all
-    /// three matching is as close to yes as the matcher itself can get, since the matcher only ever
-    /// sees canonical URLs of this shape. The method set is not consulted — a `{GET} re:.*` still
-    /// opens every host, for that verb.
+    /// `re:^https://` are the same reach written three ways.
+    ///
+    /// The probe goes through [`RuleKind::matches`] rather than the compiled regex directly, so it
+    /// asks exactly the question a verdict asks. A `re:` rule matches the request **as sent** or its
+    /// canonical rebuild, and matching either is a match; interrogating only the sent form would ask
+    /// a strictly narrower question than the matcher answers. The gap that opens is not a corner:
+    /// one sentinel carries a query string, and the query is the one thing
+    /// [`Request::canonical_url`] drops, so a pattern that cannot hold in the presence of a `?`
+    /// would miss that sentinel while matching every real request through the canonical form — a
+    /// genuine catch-all escaping the label this function exists to attach. Asked through the
+    /// matcher, a sentinel miss is a definite no; all three matching is as close to yes as the
+    /// matcher itself can get, since the matcher only ever sees requests of this shape. The method
+    /// set is not consulted — a `{GET} re:.*` still opens every host, for that verb.
     pub(crate) fn opens_every_host(&self) -> bool {
-        let RuleKind::Regex { re, .. } = &self.kind else {
+        // Only a regex can name an unbounded host: every other kind carries a concrete host, an IP,
+        // or a bounded `*.domain` suffix, so the sentinels are never worth asking of one.
+        if !matches!(self.kind, RuleKind::Regex { .. }) {
             return false;
-        };
+        }
         [
             Request::new("a.invalid", 443, "/"),
             Request::new("2001:db8::1", 9, "/x?y=1"),
             Request::new("host.example", 8443, "/deep/path"),
         ]
         .iter()
-        .all(|req| re.is_match(&req.url))
+        .all(|req| self.kind.matches(req))
     }
 }
 
@@ -1496,12 +1507,15 @@ impl EgressPolicy {
     /// cleartext is a deliberate config act, not a live one). A regex or a bare/`https://` allow rule
     /// never opens cleartext (they are the inspected-over-TLS layer).
     ///
-    /// **Deny wins, layer-agnostically** — mirroring [`Self::l4_decision`]: any deny rule (of any
-    /// layer) whose [`RuleKind`] matches the request denies it, so an inspected deny (`deny evil.com`)
+    /// **Deny wins, layer-agnostically** — mirroring [`Self::l4_decision`]: a deny rule of **any**
+    /// layer whose [`RuleKind`] matches the request denies it, so an inspected deny (`deny evil.com`)
     /// and an `http://` deny both suppress cleartext. Its consequence is the same as the splice's: a
     /// deny scoped to a path or a non-matching port does not block the host outright — a bare
     /// `deny evil.com` (port 443) does not stop `http://evil.com` (port 80); use `deny evil.com:*`
-    /// (or `deny http://evil.com`). The request is canonicalized once (the same evasion-proof view as
+    /// (or `deny http://evil.com`). A deny that names verbs is still honoured on the verbs it names,
+    /// but its verb set is read the way a deny's set must be read ([`Rule::matches_deny`], not the
+    /// allow side's `WS` opt-in) — as on the inspected plane, so the caller cannot pick the verb
+    /// that dodges the deny list. The request is canonicalized once (the same evasion-proof view as
     /// [`Self::explain`]); `method` is uppercased here so the caller need not.
     pub(crate) fn explain_clear(
         &self,
@@ -1512,8 +1526,11 @@ impl EgressPolicy {
     ) -> Decision<'_> {
         let req = Request::new(host, port, path);
         let method = method.to_ascii_uppercase();
-        // Deny wins, across every layer (matched by kind), like the splice suppression.
-        if let Some(rule) = self.deny.iter().find(|r| r.matches(&req, &method)) {
+        // Deny wins, across every layer (matched by kind), like the splice suppression. Read as a
+        // deny — the allow side's `WS` opt-in exists to stop an allowance handing out a capability,
+        // and asking it here would narrow every deny an operator can write against exactly that
+        // capability.
+        if let Some(rule) = self.deny.iter().find(|r| r.matches_deny(&req, &method)) {
             return Decision::DeniedBy(rule);
         }
         // Allow only via an explicit `http://` rule; the default action is never consulted.
@@ -2378,6 +2395,59 @@ mod tests {
         ));
     }
 
+    /// A **cleartext** deny refuses a WebSocket like it refuses anything else.
+    ///
+    /// The plaintext plane read its deny list through the allow side's `WS` opt-in, which inverts
+    /// what that opt-in is for: it exists so an *allowance* cannot hand out a capability nobody
+    /// asked for, and asking it of a deny narrows every deny an operator can write — a bare
+    /// `deny host`, a `deny host:*`, an `http://` deny and an explicit `{*}` deny all failed to
+    /// reach a WebSocket, which a `{WS} http://host` allow then admitted. The inspected plane
+    /// already answers the deny question broadly; this pins the cleartext sibling to the same
+    /// reading, so `sbx test net -X WS http://…` cannot report ALLOWED for a destination the
+    /// operator denied.
+    #[test]
+    fn a_cleartext_deny_refuses_a_websocket_however_the_deny_is_spelled() {
+        for spelling in [
+            "ws.internal:*",
+            "ws.internal:8080",
+            "http://ws.internal:8080",
+            "{*} ws.internal:*",
+        ] {
+            let p = EgressPolicy::new(
+                vec![rule("{WS} http://ws.internal:8080")],
+                vec![rule(spelling)],
+            );
+            assert!(
+                matches!(
+                    p.explain_clear("ws.internal", 8080, "/x", "WS"),
+                    Decision::DeniedBy(_)
+                ),
+                "`deny {spelling}` did not refuse a cleartext WebSocket"
+            );
+        }
+        // A deny the operator scoped to particular verbs stays scoped — breadth belongs to the deny
+        // that names no verbs, and reading it the other way would make every method-scoped deny
+        // secretly total. The same half-and-half as the inspected plane.
+        let scoped = EgressPolicy::new(
+            vec![rule("{WS} http://ws.internal:8080")],
+            vec![rule("{GET} ws.internal:*")],
+        );
+        assert!(
+            matches!(
+                scoped.explain_clear("ws.internal", 8080, "/x", "WS"),
+                Decision::AllowedBy(_)
+            ),
+            "a `{{GET}}`-scoped deny must not reach a WebSocket"
+        );
+        assert!(
+            matches!(
+                scoped.explain_clear("ws.internal", 8080, "/x", "GET"),
+                Decision::DeniedBy(_)
+            ),
+            "...while still denying the verb it names"
+        );
+    }
+
     #[test]
     fn explain_clear_honors_method_scope() {
         // An `http://` allow keeps the method vocabulary: `{GET}` permits GET but not POST, and
@@ -2827,6 +2897,42 @@ mod tests {
                 "{bounded:?} is bounded and must not be labelled a catch-all"
             );
         }
+    }
+
+    #[test]
+    fn a_catch_all_regex_that_only_matches_through_the_canonical_url_is_still_labelled() {
+        // The sentinels must be asked the question the matcher answers, not a narrower one. A `re:`
+        // rule matches the request as sent *or* its canonical rebuild, and the rebuild is the one
+        // form with no query string — so a pattern that cannot hold in the presence of a `?` misses
+        // the query-bearing sentinel while matching every real request through the canonical form.
+        // Probing only the sent form let such a rule through unlabelled: no `catch_all` flag in
+        // `sbx net rules`, no "matches every host" note in `sbx test net`, for a rule that opens the
+        // whole network. The label is the whole reason the grammar can refuse a bare `*` and point
+        // its author at `re:.*` instead.
+        let sneaky = classify("re:^https://[^?]*$").expect("a query-free catch-all compiles");
+        assert!(
+            sneaky.opens_every_host(),
+            "a regex matching every request through its canonical form is a catch-all"
+        );
+        // Not a false positive: it really does reach every host, on any port and any path —
+        // including one whose sent form carries the very query the pattern forbids.
+        for (host, port, target) in [
+            ("anything.example.test", 443, "/"),
+            ("other.example.test", 8443, "/deep/path?q=1"),
+        ] {
+            assert!(
+                rule_matches(&sneaky, host, port, target),
+                "`re:^https://[^?]*$` matches {host}:{port}{target}"
+            );
+        }
+        // And the probe is still a probe: matching the canonical form does not make a host-pinned
+        // pattern unbounded (the rebuild resolves the path, never the host).
+        assert!(
+            !classify("re:^https://github\\.com[^?]*$")
+                .unwrap()
+                .opens_every_host(),
+            "a host-pinned pattern must not be labelled a catch-all"
+        );
     }
 
     #[test]

@@ -57,8 +57,10 @@ pub(super) fn handle_cleartext(
     //    it (`explain_clear` never consults the default action or parks; deny wins layer-agnostically).
     //    Evaluated against the effective policy, so an `http://` rule loaded live with `sbx net allow
     //    http://host --session` opens it too. The two denial shapes get distinct reasons, and the
-    //    `denied-default` suggestion names the `http://` scheme (a bare `sbx net allow host` would add
-    //    an https rule that does not open the clear).
+    //    `denied-default` suggestion names the `http://` scheme and, past port 80, the port too
+    //    (a bare `sbx net allow host` would add an https/443 rule that does not open the clear, and
+    //    a scheme with no port would open 80 rather than the port that was refused) — spelled by the
+    //    one shared [`rule_destination`], which the notification for this same refusal also reads.
     let policy = effective_policy(ctx);
     let deciding: Rule = match policy.explain_clear(&host, port, &path, method) {
         Decision::AllowedBy(rule) => rule.clone(),
@@ -115,7 +117,11 @@ pub(super) fn handle_cleartext(
                 &format!(
                     "cleartext `http://{host}:{port}` is not allowed by the network policy. \
                      Allow it: {}",
-                    ctx.allow_suggestion(&format!("http://{host}"))
+                    ctx.allow_suggestion(&rule_destination(
+                        crate::sandbox::control::Proto::Http,
+                        &host,
+                        port
+                    ))
                 ),
             );
         }
