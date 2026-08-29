@@ -21,6 +21,25 @@
 //! the **full exec path** (`/usr/bin/*`, `/nix/store/*/bin/git`); a rule without `/` matches the
 //! target's **basename** (`curl` matches `/usr/bin/curl`), so a tool is named the way a user thinks of
 //! it. Matching is exact otherwise — `curl` never matches `curlish`.
+//!
+//! ## The spelling a rule is matched against
+//!
+//! Both sides are folded to their canonical spelling before anything is compared ([`lexical_path`]):
+//! `//` collapses, `.` drops out, and `..` folds into the component before it. The kernel resolves
+//! the bytes an `execve` carries before it runs anything, so a matcher fed the raw spelling answers
+//! about a path that is not the one that runs — and it does so in both directions. An allowlist
+//! entry `/nix/store/*/bin/cc` matches `/nix/store/../../tmp/evil/bin/cc`, because `*` carries no
+//! path-separator meaning and swallows the `..` run, while the kernel runs `/tmp/evil/bin/cc`; and a
+//! `deny` on `/usr/bin/*` misses `//usr/bin/curl` and `/tmp/../usr/bin/curl`, which the kernel folds
+//! straight back onto `/usr/bin/curl`.
+//!
+//! Two things the folding is not. It resolves **no symlink** — a component that is one makes the
+//! lexical answer differ from the kernel's — so a path rule speaks about a spelling and never about
+//! an inode. And a **relative** target stays relative: it is matched as the process spelled it,
+//! which is what lets a declaration name `./build.sh` and have it match, and it means an absolute
+//! path rule says nothing about a target reached by `chdir` plus a bare name. A rule that must hold
+//! wherever its program is spelled from is a basename rule, which is the form the shipped denylists
+//! use.
 
 /// The process/exec lens mode, resolved from `[proc] mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -82,12 +101,22 @@ impl ProcMode {
     }
 }
 
-/// One compiled exec rule: the raw text (kept for display) plus whether it matches the full path or a
-/// basename.
+/// One compiled exec rule: the raw text (kept for display), the pattern the match is performed
+/// against, and whether it matches the full path or a basename.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcRule {
     raw: String,
+    /// The raw text folded to its canonical spelling, which is what a target is compared against.
+    /// Kept beside the raw text rather than replacing it, because the raw text is what its author
+    /// wrote and what `sbx config show` and the control wire echo back.
+    ///
+    /// Folded for the same reason a target is: the two sides have to meet on one spelling, and a
+    /// declared entry carrying a `/` reaches here exactly as it was written. A rule `./build.sh`
+    /// would otherwise stop matching the target the kernel resolves to the same file.
+    pattern: String,
     /// A rule with a `/` matches the whole exec path; without one, it matches the target's basename.
+    /// Read from the raw text, so folding a rule down to a single component never quietly turns a
+    /// path rule into a basename rule that would admit that name anywhere.
     on_path: bool,
 }
 
@@ -98,6 +127,7 @@ impl ProcRule {
     pub(crate) fn new(raw: &str) -> ProcRule {
         ProcRule {
             raw: raw.to_string(),
+            pattern: lexical_path(raw).into_owned(),
             on_path: raw.contains('/'),
         }
     }
@@ -109,9 +139,13 @@ impl ProcRule {
 
     /// Whether this rule matches an exec target. A path rule globs the whole `path`; a basename rule
     /// globs the final component.
+    ///
+    /// Both sides arrive already folded — the pattern at compile time, the target in
+    /// [`ProcPolicy::decide_chain`] — so what is decided is the path the kernel will resolve rather
+    /// than the one the cage happened to spell.
     fn matches(&self, path: &str, basename: &str) -> bool {
         let subject = if self.on_path { path } else { basename };
-        glob_match(&self.raw, subject)
+        glob_match(&self.pattern, subject)
     }
 }
 
@@ -236,6 +270,10 @@ impl ProcPolicy {
     /// An **empty** chain against a graph matches nothing, which under `confine` is a refusal. That
     /// is the wanted answer for a caller whose program could not be read: the one execve that must
     /// not run is the one nothing can account for.
+    ///
+    /// The target is folded to its canonical spelling here, at the one gate every rule set passes
+    /// through — the config's, the graph's and the live overlay's — so no caller can decide against
+    /// a spelling the kernel will re-resolve. See [`lexical_path`] and the module's rule grammar.
     pub(crate) fn decide_chain(
         &self,
         caller: &[String],
@@ -243,8 +281,9 @@ impl ProcPolicy {
         overlay_allow: &[ProcRule],
         overlay_deny: &[ProcRule],
     ) -> Verdict {
-        let basename = basename(exec_path);
-        let any = |rules: &[ProcRule]| rules.iter().any(|r| r.matches(exec_path, basename));
+        let exec_path = lexical_path(exec_path);
+        let basename = basename(&exec_path);
+        let any = |rules: &[ProcRule]| rules.iter().any(|r| r.matches(&exec_path, basename));
         if any(&self.deny) || any(overlay_deny) {
             return Verdict::Deny;
         }
@@ -276,13 +315,73 @@ impl ProcPolicy {
     }
 }
 
-/// The final path component (the basename), or the whole string when there is no `/`. A trailing slash
-/// yields an empty basename, which matches no non-empty rule — an exec target is never a directory.
+/// The final path component (the basename), or the whole string when there is no `/`. Taken from an
+/// already-folded path ([`lexical_path`]), which carries no trailing slash and no `.` of its own, so
+/// the component this returns is the file the target names. Total for any other input too: a string
+/// ending in `/` yields an empty basename, which matches no non-empty rule.
 fn basename(path: &str) -> &str {
     match path.rfind('/') {
         Some(i) => &path[i + 1..],
         None => path,
     }
+}
+
+/// A path spelled the way the kernel will resolve it: `//` collapsed, `.` components dropped, and
+/// each `..` folded into the component before it.
+///
+/// Every exec target passes through this before it meets a rule, and so does every rule's own
+/// pattern, because a decision taken on the raw spelling is a decision about a different file — see
+/// the module's rule grammar for both directions of that.
+///
+/// Purely lexical, in two senses that are the honest scope of the guard. It resolves no symlink:
+/// this module is I/O-free, the path names a file inside a cage this process is not in, and a
+/// component that *is* a link makes the kernel's answer differ from this one. And a relative path
+/// stays relative, with any leading `..` kept — there is nothing here to fold it into, and the
+/// working directory the kernel would resolve it against is not this module's to know.
+///
+/// `/..` is `/`, which is what the kernel does: the root is its own parent.
+///
+/// Borrowed back unchanged when there is nothing to fold, which is every target on the hot path of a
+/// cage that is not trying anything.
+pub(crate) fn lexical_path(path: &str) -> std::borrow::Cow<'_, str> {
+    let absolute = path.starts_with('/');
+    let body = if absolute { &path[1..] } else { path };
+    if !path.is_empty()
+        && !body
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for part in body.split('/') {
+        match part {
+            // An empty part is a doubled separator (or a trailing one), and `.` names where it
+            // already is.
+            "" | "." => {}
+            ".." => match out.last() {
+                Some(&last) if last != ".." => {
+                    out.pop();
+                }
+                _ if absolute => {}
+                // `part` is the `".."` this arm matched: kept, because a relative path has nothing
+                // above it to fold into.
+                _ => out.push(part),
+            },
+            component => out.push(component),
+        }
+    }
+    let mut folded = String::with_capacity(path.len());
+    for part in &out {
+        if absolute || !folded.is_empty() {
+            folded.push('/');
+        }
+        folded.push_str(part);
+    }
+    if absolute && folded.is_empty() {
+        folded.push('/');
+    }
+    std::borrow::Cow::Owned(folded)
 }
 
 /// A minimal shell-style glob match over bytes: `*` matches any run (including empty), `?` matches
@@ -365,6 +464,97 @@ mod tests {
         let deny = policy(ProcMode::Enforce, &[], &["/usr/bin/*"]);
         assert_eq!(deny.decide(&[], "/usr/bin/ssh"), Verdict::Deny);
         assert_eq!(deny.decide(&[], "/usr/local/bin/ssh"), Verdict::Allow);
+    }
+
+    #[test]
+    fn folding_a_path_stops_at_the_root_and_leaves_a_relative_one_relative() {
+        // The two rules the kernel applies to the bytes an `execve` carries, and the two this
+        // matcher has to apply with it: `..` folds into the component before it, and it stops at the
+        // root rather than walking above it.
+        assert_eq!(lexical_path("/nix/store/../../tmp/evil"), "/tmp/evil");
+        assert_eq!(lexical_path("//usr//bin/curl"), "/usr/bin/curl");
+        assert_eq!(lexical_path("/usr/bin/./curl"), "/usr/bin/curl");
+        assert_eq!(lexical_path("/usr/bin/"), "/usr/bin");
+        assert_eq!(lexical_path("/../.."), "/", "the root is its own parent");
+        assert_eq!(lexical_path("/"), "/");
+        // A relative target has nothing to fold a leading `..` into: the working directory the
+        // kernel would resolve it against is not this module's to know, so it is kept.
+        assert_eq!(lexical_path("a/../../b"), "../b");
+        assert_eq!(lexical_path("./build.sh"), "build.sh");
+        assert_eq!(lexical_path(""), "");
+        // Already canonical: handed straight back, since this runs on every notified `execve`.
+        assert!(matches!(
+            lexical_path("/usr/bin/curl"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn a_crafted_spelling_is_decided_as_the_kernel_resolves_it_and_not_as_it_was_written() {
+        // The target is the bytes the cage wrote, and the kernel folds them before it runs anything.
+        // Deciding on the raw spelling therefore decides about a different file, in both directions.
+        //
+        // The allow direction is the severe one, and it needs only the rule form the docs' own
+        // worked example uses: `*` carries no path-separator meaning, so it swallows a `..` run and
+        // admits a program the rule never named.
+        let confine = ProcPolicy::confined(CallerGraph {
+            callers: std::collections::BTreeMap::from([(
+                "/bin/sh".to_string(),
+                vec![ProcRule::new("/nix/store/*/bin/cc")],
+            )]),
+        });
+        let caller = ["/bin/sh".to_string()];
+        assert_eq!(
+            confine.decide(&caller, "/nix/store/abc-cc/bin/cc"),
+            Verdict::Allow,
+            "the declared program still runs"
+        );
+        assert_eq!(
+            confine.decide(&caller, "/nix/store/../../tmp/evil/bin/cc"),
+            Verdict::Deny,
+            "the kernel runs /tmp/evil/bin/cc, which the allowlist never named"
+        );
+
+        // The deny direction: a path rule must not be walked around by respelling its subject.
+        let deny = policy(ProcMode::Enforce, &[], &["/usr/bin/*", "/opt/tool"]);
+        for spelled in [
+            "//usr/bin/curl",
+            "/usr/bin//curl",
+            "/usr/bin/./curl",
+            "/tmp/../usr/bin/curl",
+        ] {
+            assert_eq!(deny.decide(&[], spelled), Verdict::Deny, "`{spelled}`");
+        }
+        assert_eq!(deny.decide(&[], "/opt/./tool"), Verdict::Deny);
+        // And folding invents no match: a program that really is somewhere else still runs.
+        assert_eq!(deny.decide(&[], "/usr/local/bin/curl"), Verdict::Allow);
+        assert_eq!(deny.decide(&[], "/opt/tool/helper"), Verdict::Allow);
+    }
+
+    #[test]
+    fn a_rule_is_folded_like_its_target_and_still_displays_as_it_was_written() {
+        // A declared entry carrying a `/` reaches the matcher exactly as its author wrote it, so a
+        // task may name `./build.sh` and the cage may spell the same file either way. Folding the
+        // target alone would leave that declaration refusing its own program under `confine`, which
+        // is why both sides are folded — and why the raw text is kept beside the pattern rather than
+        // replaced by it.
+        let p = policy(ProcMode::Enforce, &[], &["./build.sh"]);
+        assert_eq!(p.decide(&[], "./build.sh"), Verdict::Deny);
+        assert_eq!(
+            p.decide(&[], "build.sh"),
+            Verdict::Deny,
+            "the kernel resolves both spellings against the working directory to one file"
+        );
+        assert_eq!(
+            p.decide(&[], "/opt/build.sh"),
+            Verdict::Allow,
+            "a rule that carries a `/` still speaks about the whole path and not about a name"
+        );
+        assert_eq!(
+            p.deny[0].as_str(),
+            "./build.sh",
+            "what `sbx config show` and the control wire echo back is what its author wrote"
+        );
     }
 
     #[test]

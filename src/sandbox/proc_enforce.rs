@@ -654,6 +654,11 @@ fn exec_verdict(
                 .filter(|p| !p.is_empty())
         });
     if let Some(path) = named {
+        // Folded to the spelling the kernel will resolve before either the decision or the record is
+        // taken from it: the policy's own gate folds what it matches, and this is what keeps the
+        // ring — the run's account of what was decided — showing the same path the rules were read
+        // against, rather than the one a cage chose to write.
+        let path = crate::proc_policy::lexical_path(&path).into_owned();
         // Decide against the config policy folded with the live `--session` overlay (deny wins
         // across both). The overlay read-lock is held only for this decision.
         let verdict = cx.overlay.decide(cx.policy, caller, &path);
@@ -846,7 +851,19 @@ fn recv_loop(notif_fd: libc::c_int, stop: &AtomicBool, cx: &Deciding<'_>) {
             cx.pending.sweep();
             last_sweep = Instant::now();
         }
-        if !poll_readable(notif_fd, 250) {
+        // The hang-up is asked of the poll rather than inferred from a failed receive. `POLLHUP` on
+        // the listener is the kernel's own statement that no task behind the filter is left, which
+        // is the condition that ends supervision; an errno is not, and reading one as a hang-up is
+        // what used to end it early. Anything readable is taken first, so a notification pending
+        // alongside the hang-up is still decided before the loop leaves.
+        let events = poll_events(notif_fd, 250);
+        if events & libc::POLLIN == 0 {
+            // A descriptor that can no longer be polled ends the loop too: there is nothing left to
+            // receive from, and re-polling it would spin. A kernel that reports no hang-up simply
+            // keeps the loop polling until the teardown sets `stop`.
+            if events & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                return;
+            }
             continue;
         }
         let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
@@ -855,14 +872,34 @@ fn recv_loop(notif_fd: libc::c_int, stop: &AtomicBool, cx: &Deciding<'_>) {
         // 32-bit request code to whichever the target libc expects (the shipping binary is musl).
         let rc = unsafe { libc::ioctl(notif_fd, notif_recv_code() as libc::Ioctl, &mut req) };
         if rc < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
+            let e = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if recv_ends_supervision(e) {
+                return;
             }
-            return; // ENOENT / hang-up: the cage's filter is gone
+            continue;
         }
         handle_notif(notif_fd, &req, cx);
     }
+}
+
+/// Whether a failed `SECCOMP_IOCTL_NOTIF_RECV` describes the end of supervision, or only the one
+/// notification that was not there.
+///
+/// `ENOENT` is per-notification and not per-listener. `seccomp_unotify(2)` gives it when the kernel
+/// woke this thread for a request that is no longer in `SECCOMP_NOTIFY_INIT` state — the target was
+/// killed by a signal between the wake and the notification lock, so its request is gone while the
+/// listener is untouched and the next receive serves the next `execve`. Read as a hang-up, it ended
+/// the whole run's supervision on one process reaped at the wrong instant: everything parked is
+/// denied, the descriptor is closed, and from then on the cage's filter answers every notified
+/// `execve` — and, under `[fs] scan`, every notified open — with `ENOSYS`. Fail-closed, and fatal
+/// to the session.
+///
+/// `EINTR` is the same story with a signal in place of the reap. What does end supervision is a
+/// descriptor that cannot be received from at all (`EBADF`, `ENOTTY`); the cage's filter going away
+/// is recognised in [`recv_loop`] by the hang-up the poll reports, which is the kernel's own
+/// statement of it.
+fn recv_ends_supervision(e: libc::c_int) -> bool {
+    !matches!(e, libc::EINTR | libc::ENOENT)
 }
 
 /// Decide one notified `execve` and answer it. The path is read from the parked target's memory; an
@@ -1283,27 +1320,40 @@ fn serve_open(
     // `/proc/self/fd/<n>` is itself a link, so the flag cannot ride into the reopen. It is decided
     // here instead, against the same path, and answered the way the kernel would have.
     //
+    // The final component's **type** is what settles it, asked with `lstat`. Asking instead whether
+    // an `O_PATH | O_NOFOLLOW` open fails answers nothing: `open(2)` is explicit that the pair
+    // *succeeds* on a symlink and hands back a descriptor referring to the link itself, so the one
+    // case this guard exists to catch took the success path and the cage was served the probe —
+    // which names the link's target. A program that opened its own log with `O_NOFOLLOW`, the
+    // standard defence against having a file swapped for a link, had that defence removed by being
+    // supervised. It is the same rule the `openat2` `resolve` check above states: a program that
+    // hardened its own path walk must not have the hardening quietly dropped.
+    //
     // Re-walking the path is a second resolution, and the cage may have moved it since. The two
     // outcomes of losing that race are a spurious `ELOOP` and serving the inode that was scanned —
     // never an open the lens did not examine, which is the property being defended.
     if flags & libc::O_NOFOLLOW != 0 {
-        let target = open_target_path(req.pid, dirfd, path);
-        let Ok(c) = std::ffi::CString::new(target.as_os_str().as_encoded_bytes()) else {
+        // Except with `O_PATH`, where the pair is not a refusal at all: the kernel answers it with a
+        // descriptor for the link itself, which is neither `ELOOP` nor the inode the probe holds. It
+        // joins the flags that cannot be carried onto a descriptor, and the real call runs.
+        if flags & libc::O_PATH != 0 {
             return false;
-        };
-        // SAFETY: c is a live NUL-terminated path for the duration of the call.
-        let link_probe = unsafe {
-            libc::open(
-                c.as_ptr(),
-                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if link_probe < 0 {
-            respond_errno(notif_fd, req.id, libc::ELOOP);
-            return true;
         }
-        // SAFETY: link_probe is a fresh owned descriptor this call is done with.
-        unsafe { libc::close(link_probe) };
+        let target = open_target_path(req.pid, dirfd, path);
+        match std::fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                respond_errno(notif_fd, req.id, libc::ELOOP);
+                return true;
+            }
+            Ok(_) => {}
+            // The path no longer resolves from here, which is the race above rather than a link.
+            // Answered `ELOOP` all the same: the cage asked for the stricter walk, and the stricter
+            // of the two answers is the one that cannot serve an inode this call did not establish.
+            Err(_) => {
+                respond_errno(notif_fd, req.id, libc::ELOOP);
+                return true;
+            }
+        }
     }
     // `O_CREAT` on a file that exists is a no-op, and `O_NOFOLLOW` has just been answered. Our own
     // descriptor is always close-on-exec; what the *cage's* copy carries is set on the response.
@@ -2826,10 +2876,18 @@ fn open_target_path(pid: u32, dirfd: libc::c_int, path: &str) -> PathBuf {
     PathBuf::from(base).join(path)
 }
 
-/// Poll a descriptor for readability with a millisecond timeout. `true` = readable (or hung up, so a
-/// following read observes the end), `false` = timed out. A poll error is treated as "not readable"
-/// so the caller re-checks its stop flag rather than spinning.
-fn poll_readable(fd: libc::c_int, timeout_ms: libc::c_int) -> bool {
+/// Poll a descriptor for input with a millisecond timeout and return what the kernel reported.
+///
+/// The events themselves and not a verdict on them, because the receive loop has to tell two of them
+/// apart: `POLLIN` is a notification to decide, while `POLLHUP` on a seccomp listener is the kernel
+/// saying no task behind that filter is left — the one sound signal that supervision is over. A
+/// caller that only asks "is there something to read" cannot distinguish them and has to infer the
+/// hang-up from an errno instead, which is how a single vanished notification once ended a run's
+/// supervision.
+///
+/// `0` for a timeout, and for a poll error too, so a caller re-checks its stop flag rather than
+/// spinning.
+fn poll_events(fd: libc::c_int, timeout_ms: libc::c_int) -> libc::c_short {
     let mut pfd = libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -2837,7 +2895,13 @@ fn poll_readable(fd: libc::c_int, timeout_ms: libc::c_int) -> bool {
     };
     // SAFETY: pfd is a single live pollfd.
     let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-    rc > 0
+    if rc > 0 { pfd.revents } else { 0 }
+}
+
+/// Poll a descriptor for readability with a millisecond timeout. `true` = readable (or hung up, so a
+/// following read observes the end), `false` = timed out.
+fn poll_readable(fd: libc::c_int, timeout_ms: libc::c_int) -> bool {
+    poll_events(fd, timeout_ms) != 0
 }
 
 /// A control buffer for exactly one `SCM_RIGHTS` cmsg, **aligned for a `cmsghdr`**.
@@ -3992,6 +4056,80 @@ mod tests {
         }
     }
 
+    /// An `O_NOFOLLOW` open whose final component *is* a symlink is answered `ELOOP` here, because
+    /// this supervisor answers the flag itself and has to answer it the way the kernel would.
+    ///
+    /// The guard used to ask whether an `O_PATH | O_NOFOLLOW` open **failed**, which is the one
+    /// question that cannot decide this: `open(2)` gives that pair a descriptor referring to the
+    /// symlink rather than an error, so the branch was dead for exactly the case it was written for
+    /// and the open fell through to be served from the probe — which was taken *without*
+    /// `O_NOFOLLOW` on purpose and names the link's target. A program in the cage that opened its
+    /// own file with `O_NOFOLLOW`, the standard defence against having it swapped for a link, had
+    /// that defence removed by being supervised.
+    ///
+    /// The kernel semantics are asserted here too rather than trusted, because the whole defect was
+    /// a belief about them.
+    #[test]
+    fn an_open_that_asked_not_to_follow_a_link_is_refused_when_the_final_component_is_one() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = TmpDir::new();
+        let real = dir.join("real.txt");
+        std::fs::write(&real, b"the file the cage meant to open\n").expect("write the fixture");
+        let link = dir.join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).expect("plant the link");
+
+        let c = std::ffi::CString::new(link.as_os_str().as_encoded_bytes()).expect("link path");
+        // SAFETY: c is a live NUL-terminated path for the duration of the call.
+        let on_the_link = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        assert!(
+            on_the_link >= 0,
+            "`O_PATH|O_NOFOLLOW` succeeds on a symlink — which is why a failed open can never be \
+             the test for one"
+        );
+        // SAFETY: on_the_link is this test's own descriptor, closed exactly once.
+        unsafe { libc::close(on_the_link) };
+
+        let serve = |target: &Path| {
+            // The probe the lens holds: opened without `O_NOFOLLOW`, so on the link it names the
+            // file behind it. That is the descriptor that must not be handed over.
+            let probe = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH)
+                .open(target)
+                .expect("hold the probe");
+            let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
+            req.pid = std::process::id();
+            req.data.nr = libc::SYS_openat as libc::c_int;
+            req.data.args[2] = (libc::O_RDONLY | libc::O_NOFOLLOW) as u64;
+            // An absolute path, resolved through this process's own `/proc/<pid>/root` exactly as a
+            // cage's is resolved through the target's. No notification descriptor: the refusal
+            // under test is formed without one, and the arm that is not refused needs one.
+            serve_open(
+                -1,
+                &req,
+                libc::AT_FDCWD,
+                target.to_str().expect("utf-8 fixture path"),
+                Some(probe),
+            )
+        };
+
+        assert!(
+            serve(&link),
+            "an `O_NOFOLLOW` open of a symlink must be answered here — with the `ELOOP` the kernel \
+             would have given — rather than served from a probe that followed the link"
+        );
+        assert!(
+            !serve(&real),
+            "and a final component that is not a link is not refused: no answer is formed here, so \
+             the open goes on to be served like any other"
+        );
+    }
+
     #[test]
     fn a_name_that_is_not_there_yet_is_made_rather_than_reported_absent() {
         // The probe that examines a path creates nothing, so a creating open finds its name absent
@@ -4635,6 +4773,89 @@ mod tests {
                 "errno {e} describes the supervisor, and the cage must not be told it"
             );
         }
+    }
+
+    /// One vanished notification is not the end of supervision.
+    ///
+    /// `SECCOMP_IOCTL_NOTIF_RECV` answers `ENOENT` when the kernel woke this thread for a request
+    /// that has since left `SECCOMP_NOTIFY_INIT` — its target was killed between the wake and the
+    /// notification lock. The listener is untouched. Treating it as a hang-up ended the run's
+    /// supervision on one process reaped at the wrong instant, and a cage can arrange that instant
+    /// (`fork`; the child `execve`s, the parent kills it) as easily as a `timeout`-wrapped build
+    /// step reaches it by accident. After it, every notified `execve` in the cage meets a filter
+    /// with no supervisor and fails `ENOSYS` — the session dies with nothing saying why.
+    ///
+    /// Written against literals rather than against the function's own list, so a rule that decided
+    /// nothing would not pass by agreeing with itself.
+    #[test]
+    fn a_vanished_notification_does_not_end_supervision_for_the_rest_of_the_run() {
+        for e in [libc::ENOENT, libc::EINTR] {
+            assert!(
+                !recv_ends_supervision(e),
+                "errno {e} describes one notification that is no longer there, not a listener that \
+                 is gone"
+            );
+        }
+        for e in [libc::EBADF, libc::ENOTTY] {
+            assert!(
+                recv_ends_supervision(e),
+                "errno {e} describes a descriptor this loop cannot receive from at all"
+            );
+        }
+    }
+
+    /// The hang-up is a fact the poll reports, and the loop reads it there.
+    ///
+    /// With the receive's errno no longer standing in for the end of supervision, something else has
+    /// to say when the cage's filter has no tasks left: `POLLHUP`, which the kernel raises on a
+    /// seccomp listener once its filter's user count reaches zero. That is why the poll returns the
+    /// events rather than a verdict on them — and why the loop takes `POLLIN` first, so a
+    /// notification pending alongside the hang-up is still decided rather than dropped.
+    ///
+    /// A pipe stands in for the listener: it raises the same two events, and unlike a seccomp
+    /// listener it can be brought to each of them on a host that cannot sandbox at all.
+    #[test]
+    fn the_poll_tells_a_hang_up_apart_from_something_to_read() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a live two-element array, which is what `pipe` fills.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "the pipe opens");
+        let (read_end, write_end) = (fds[0], fds[1]);
+
+        assert_eq!(
+            poll_events(read_end, 0),
+            0,
+            "a descriptor with nothing on it and its peer still there reports neither, and the loop \
+             goes round to re-check its stop flag"
+        );
+
+        // A byte, then the peer closes: both events at once, and the readable one is the one the
+        // loop must act on.
+        let one = [7u8; 1];
+        // SAFETY: writes one byte from a live local into this test's own descriptor.
+        assert_eq!(unsafe { libc::write(write_end, one.as_ptr().cast(), 1) }, 1);
+        // SAFETY: write_end is this test's own descriptor, closed exactly once.
+        unsafe { libc::close(write_end) };
+        let both = poll_events(read_end, 0);
+        assert_ne!(both & libc::POLLIN, 0, "the byte is still there to be read");
+        assert_ne!(
+            both & libc::POLLHUP,
+            0,
+            "and the peer is gone, so both are reported at once"
+        );
+
+        // Drained: the hang-up is now all there is, which is what ends the loop.
+        let mut byte = [0u8; 1];
+        // SAFETY: reads one byte into a live local from this test's own descriptor.
+        assert_eq!(
+            unsafe { libc::read(read_end, byte.as_mut_ptr().cast(), 1) },
+            1
+        );
+        let hup = poll_events(read_end, 0);
+        assert_eq!(hup & libc::POLLIN, 0, "nothing left to read");
+        assert_ne!(hup & libc::POLLHUP, 0, "and the hang-up still stands");
+
+        // SAFETY: read_end is this test's own descriptor, closed exactly once.
+        unsafe { libc::close(read_end) };
     }
 
     /// And the rule reaches the cage through the constructor, so a site that reports a refusal
