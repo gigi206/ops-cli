@@ -444,24 +444,28 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
             return fail(format!(
                 "copy failed: {e}\n       nothing was changed; {} is still in use{}",
                 dir.display(),
-                if swept {
-                    " and the volume was cleared, so this can simply be re-run"
-                } else {
-                    ""
-                }
+                volume_after_failed_copy(swept)
             ));
         }
     };
 
     // Checked against the original, not merely reported. A count that drifted means something
     // was not carried across — most consequentially the hardlinks a store deduplicates into.
+    //
+    // The volume is swept on the way out, exactly as a failed copy sweeps it, and for the same
+    // reason: the tree that was just written is sitting in the mounted volume, and a message that
+    // says only "the original is untouched" leaves the reader unaware of it. Re-running then trips
+    // the "already holds store, projects, apps" refusal instead, whose documented escape (--force)
+    // copies onto the stale tree and fails on the first entry it cannot recreate.
     if copied != before {
+        let swept = volume_was_empty && clear_tree(&mount_point).is_ok();
         return fail(format!(
             "the copy does not match the original, so nothing was switched over:\n\
              \x20      original {before:?}\n\
              \x20      copy     {copied:?}\n\
-             \x20      {} is untouched and still in use",
-            dir.display()
+             \x20      {} is untouched and still in use{}",
+            dir.display(),
+            volume_after_failed_copy(swept)
         ));
     }
     println!("  {}copy verified{}", pal.ok, pal.reset);
@@ -535,6 +539,22 @@ fn volume_is_empty(mount_point: &Path) -> bool {
     std::fs::read_dir(mount_point).is_ok_and(|mut entries| {
         entries.all(|e| e.is_ok_and(|e| e.file_name() == storage::POINTER))
     })
+}
+
+/// What a migration failure has to add about the volume it was copying into.
+///
+/// A copy that does not complete — because it errored, or because its census did not match the
+/// original — leaves whatever it managed to write in the mounted volume. When the volume was empty
+/// before the attempt, sbx clears it and the next `sbx storage migrate` is a plain re-run. When it
+/// was not, the leftovers cannot be swept without destroying what was already there, so they are
+/// named instead: unmentioned, they turn the next attempt into the unrelated-looking
+/// "already holds …" refusal, and `--force` does not rescue it (the copy hits an entry it cannot
+/// recreate over the stale one).
+fn volume_after_failed_copy(swept: bool) -> &'static str {
+    if swept {
+        return " and the volume was cleared, so this can simply be re-run";
+    }
+    "\n       the partial copy is still in the volume — clear it before re-running"
 }
 
 /// Empty a directory of everything it contains, leaving the directory itself.
@@ -1298,5 +1318,29 @@ mod tests {
         // A help request is never a launch, even on a launch verb.
         assert!(!is_launch_invocation("run", &[os("--help")]));
         assert!(!is_launch_invocation("app", &[os("run"), os("-h")]));
+    }
+
+    /// A migration that does not complete has already written into the mounted volume, and the
+    /// failure has to account for it. Where the volume was empty beforehand sbx sweeps it and says
+    /// so; where it was not, the leftovers survive and must be named — silence sent the user into
+    /// a re-run that failed with the unrelated-looking "already holds store, projects, apps"
+    /// refusal, having been told the volume was untouched.
+    #[test]
+    fn a_failed_migration_accounts_for_what_it_left_in_the_volume() {
+        let swept = volume_after_failed_copy(true);
+        assert!(
+            swept.contains("cleared") && swept.contains("re-run"),
+            "{swept}"
+        );
+
+        let kept = volume_after_failed_copy(false);
+        assert!(
+            !kept.is_empty(),
+            "a copy that could not be swept must not pass in silence"
+        );
+        assert!(
+            kept.contains("still in the volume") && kept.contains("clear it"),
+            "the leftovers are named, with what to do about them: {kept}"
+        );
     }
 }

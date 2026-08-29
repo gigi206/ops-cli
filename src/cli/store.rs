@@ -5,9 +5,11 @@
 //! largest single tree — had no inspection verb at all: `sbx gc` reports only what is *reclaimable*,
 //! never what is *there*. This reports the whole data directory, so nothing is unaccounted for.
 //!
-//! Read-only and cheap: a filesystem walk, no nix, no network, no sandbox. Both figures come from
-//! [`sandbox::tree_usage`], so a hardlinked file counts once — which matters here above all, since a
-//! nix store deduplicates identical content into `.links`.
+//! Cheap and all but read-only: a filesystem walk, no nix, no network, no sandbox. The one thing
+//! it writes is the reflink probe — a pair of small files created in the data directory and removed
+//! again — which is what decides whether the reported sizes are exact or an upper bound. Both
+//! figures come from [`sandbox::tree_usage`], so a hardlinked file counts once — which matters here
+//! above all, since a nix store deduplicates identical content into `.links`.
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -40,7 +42,14 @@ struct StoreView {
     /// Whether the data directory's filesystem shares storage between files (reflink/copy-on-write).
     /// When it does, the reported sizes are upper bounds rather than exact; when it does not, each
     /// file's blocks are its own and the sizes are exact.
-    shares_storage: bool,
+    ///
+    /// `None` when the probe could not be carried out — an unwritable data directory, or a
+    /// filesystem with no room left for the probe file. That is not an answer, and reading it as
+    /// "does not share" would print the strongest possible claim about the sizes ("they are exact")
+    /// precisely where the filesystem is least able to say so. This is a report, so it states the
+    /// unknown; the sibling `Preflight` probe keeps the same three-valued answer for the same
+    /// reason.
+    shares_storage: Option<bool>,
     subtrees: Vec<SubtreeView>,
     /// The shared nix store's own detail, absent until it has been provisioned.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,7 +157,10 @@ fn build(data_dir: &Path, store_dir: &Path) -> StoreView {
         inodes: subtrees.iter().map(|s| s.inodes).sum(),
         // Probe the real filesystem, capability rather than name, so the honesty of the sizes is
         // decided by what this filesystem actually does — not a hardcoded list of filesystem types.
-        shares_storage: sandbox::supports_reflink(data_dir),
+        // `reflink_verdict` rather than `supports_reflink`: the latter collapses "could not probe"
+        // into "does not share", which is the answer a caller about to *copy* needs and the wrong
+        // one for a caller about to *describe*.
+        shares_storage: sandbox::reflink_verdict(data_dir),
         subtrees,
         shared_store: shared_store_view(store_dir),
         // Filled in by the caller, which has the environment `build` deliberately does not touch.
@@ -265,19 +277,31 @@ fn render(v: &StoreView, pal: &style::Palette) -> String {
     // storage between files: where it does, a store seeded by a copy-on-write clone reports its full
     // size though it shares most of its storage with the store it was seeded from — and the true
     // footprint is smaller still if the filesystem compresses. No per-file measurement can see
-    // either saving, so the honest thing is to state the bound, not invent a number.
-    if v.shares_storage {
-        let _ = writeln!(
-            s,
-            "{dim}sizes count allocated blocks and a hardlinked file once. this filesystem shares\n  \
-             storage between files, so each size is an upper bound — the real footprint is smaller\n  \
-             (more so if the filesystem compresses).{r}"
-        );
-    } else {
-        let _ = writeln!(
-            s,
-            "{dim}sizes count allocated blocks and a hardlinked file once; on this filesystem they are exact.{r}"
-        );
+    // either saving, so the honest thing is to state the bound, not invent a number. And where the
+    // probe could not run at all, the honest thing is to say that rather than pick a side: the two
+    // definite sentences are the strongest claims this report makes about its own numbers.
+    match v.shares_storage {
+        Some(true) => {
+            let _ = writeln!(
+                s,
+                "{dim}sizes count allocated blocks and a hardlinked file once. this filesystem shares\n  \
+                 storage between files, so each size is an upper bound — the real footprint is smaller\n  \
+                 (more so if the filesystem compresses).{r}"
+            );
+        }
+        Some(false) => {
+            let _ = writeln!(
+                s,
+                "{dim}sizes count allocated blocks and a hardlinked file once; on this filesystem they are exact.{r}"
+            );
+        }
+        None => {
+            let _ = writeln!(
+                s,
+                "{dim}sizes count allocated blocks and a hardlinked file once. whether this filesystem\n  \
+                 shares storage between files could not be probed, so each size may be an upper bound.{r}"
+            );
+        }
     }
     let _ = writeln!(
         s,
@@ -345,7 +369,8 @@ mod tests {
     }
 
     /// The closing note tells the truth about *this* filesystem: exact where storage is not shared,
-    /// an upper bound where it is. A size we cannot measure precisely is never invented.
+    /// an upper bound where it is, and neither of those where the probe could not run. A size we
+    /// cannot measure precisely is never invented, and an answer we do not have is never asserted.
     #[test]
     fn the_note_states_whether_sizes_are_exact_or_an_upper_bound() {
         let one = SubtreeView {
@@ -360,7 +385,7 @@ mod tests {
             bytes: 4096,
             size: "4.0 KiB".into(),
             inodes: 1,
-            shares_storage: false,
+            shares_storage: Some(false),
             subtrees: vec![one],
             shared_store: None,
             volume: None,
@@ -370,7 +395,7 @@ mod tests {
         assert!(!out.contains("upper bound"), "{out}");
 
         let shared = StoreView {
-            shares_storage: true,
+            shares_storage: Some(true),
             ..exact
         };
         let out = render(&shared, &style::Palette::plain());
@@ -378,6 +403,25 @@ mod tests {
         assert!(
             out.contains("compresses"),
             "the note must flag compression, which no per-file measure sees: {out}"
+        );
+
+        // The probe has a third answer, and it is not "does not share". `reflink_verdict` returns
+        // `None` when the probe file could not be written — an unwritable data directory, or a
+        // filesystem with no room left — which is exactly when someone runs `sbx store`. Collapsed
+        // to `false`, that printed "on this filesystem they are exact" for a copy-on-write,
+        // compressing filesystem where every size shown is an over-estimate.
+        let unprobed = StoreView {
+            shares_storage: None,
+            ..shared
+        };
+        let out = render(&unprobed, &style::Palette::plain());
+        assert!(
+            !out.contains("are exact"),
+            "an unprobed filesystem must not be reported as measured exactly: {out}"
+        );
+        assert!(
+            out.contains("could not be probed") && out.contains("may be an upper bound"),
+            "the unknown is stated, with what it means for the numbers: {out}"
         );
     }
 
@@ -397,7 +441,7 @@ mod tests {
             bytes: 4096,
             size: "4.0 KiB".into(),
             inodes: 1,
-            shares_storage: true,
+            shares_storage: Some(true),
             subtrees: vec![one],
             shared_store: None,
             volume: None,

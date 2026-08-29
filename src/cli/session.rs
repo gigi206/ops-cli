@@ -190,18 +190,42 @@ const STOP_DEFAULT_DELAY: Duration = Duration::from_secs(10);
 ///
 /// Sends SIGTERM, then SIGKILL after the grace delay (default 10s; `--delay 0` escalates at once).
 /// Either ids or `--all` is required (not both); a non-UTF-8 operand or a malformed `--delay` value
-/// is a usage error.
+/// is a usage error. A bare `--` ends the options: every token after it is taken as an id.
 fn stop_cmd(args: Vec<OsString>) -> ExitCode {
+    match parse_stop_args(args) {
+        Err(code) => code,
+        Ok(parsed) => {
+            let id_refs: Vec<&str> = parsed.ids.iter().map(String::as_str).collect();
+            sandbox::stop(&id_refs, parsed.delay, parsed.all)
+        }
+    }
+}
+
+/// The parsed form of `sbx session stop`: which sessions to end, and how long to wait between
+/// SIGTERM and SIGKILL.
+struct StopArgs {
+    ids: Vec<String>,
+    delay: Duration,
+    all: bool,
+}
+
+/// Parse `sbx session stop`'s arguments. Kept apart from [`stop_cmd`] so the grammar — the `--`
+/// terminator, the unknown-flag refusal, and the either/or between ids and `--all` — is unit-tested
+/// without signalling anything. `Err` carries the code the caller returns, the refusal already
+/// reported.
+fn parse_stop_args(args: Vec<OsString>) -> Result<StopArgs, ExitCode> {
     let mut delay = STOP_DEFAULT_DELAY;
     let mut all = false;
     let mut ids: Vec<String> = Vec::new();
+    // Set by a bare `--`: everything after it is an id, whatever it looks like.
+    let mut only_ids = false;
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         match arg.to_str() {
-            Some("--delay") => {
+            Some("--delay") if !only_ids => {
                 let Some(value) = it.next() else {
                     diag::error("sbx: --delay needs a value in seconds (e.g. --delay 10).");
-                    return ExitCode::from(2);
+                    return Err(ExitCode::from(2));
                 };
                 match value.to_str().and_then(|v| v.parse::<u64>().ok()) {
                     Some(secs) => delay = Duration::from_secs(secs),
@@ -210,44 +234,47 @@ fn stop_cmd(args: Vec<OsString>) -> ExitCode {
                             "sbx: --delay must be a whole number of seconds, not '{}'.",
                             value.to_string_lossy()
                         ));
-                        return ExitCode::from(2);
+                        return Err(ExitCode::from(2));
                     }
                 }
             }
-            Some("--all") => all = true,
+            Some("--all") if !only_ids => all = true,
+            // The options end here, as they do for `sbx run` and the rule fronts. Taken for an id
+            // instead, `--` named a session that cannot exist — ids are PIDs — so
+            // `sbx session stop -- 1234` stopped 1234 cleanly and then reported a phantom target,
+            // exiting 2 on a stop that had worked.
+            Some("--") if !only_ids => only_ids = true,
             // An unrecognised flag is refused, not taken for an id. It was pushed onto `ids`, so a
             // mistyped `--dry-run` became a session to stop rather than an error — and a verb whose
-            // job is to kill things must not read a flag it does not know as a target. `--` still
-            // ends the options for an id that genuinely starts with a dash.
-            Some(flag) if flag.starts_with('-') && flag != "--" => {
+            // job is to kill things must not read a flag it does not know as a target.
+            Some(flag) if !only_ids && flag.starts_with('-') => {
                 diag::error(&format!(
                     "sbx: unknown option '{flag}' for `session stop` (ids are the PIDs shown by \
                      `sbx session ls`; `--all` stops every session)."
                 ));
-                return ExitCode::from(2);
+                return Err(ExitCode::from(2));
             }
             Some(id) => ids.push(id.to_string()),
             None => {
                 diag::error(
                     "sbx: stop ids must be valid text (the PID shown by `sbx session ls`).",
                 );
-                return ExitCode::from(2);
+                return Err(ExitCode::from(2));
             }
         }
     }
     if all && !ids.is_empty() {
         diag::error("sbx: stop takes either explicit ids or --all, not both.");
-        return ExitCode::from(2);
+        return Err(ExitCode::from(2));
     }
     if !all && ids.is_empty() {
         diag::error(&format!(
             "sbx: usage: {}\n   (ids are the PIDs shown by `sbx session ls`)",
             help::synopsis_of(&["session", "stop"])
         ));
-        return ExitCode::from(2);
+        return Err(ExitCode::from(2));
     }
-    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-    sandbox::stop(&id_refs, delay, all)
+    Ok(StopArgs { ids, delay, all })
 }
 
 /// How long `sbx session logs --follow` waits between polls of the log file. Short enough that a
@@ -529,21 +556,28 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
     // by nobody and followed by nobody. Neither half is reachable from a test: both need a writer
     // appending inside the microseconds between two statements. What is asserted is the ordinary
     // output; this is the reasoning, stated where the bound is.
-    let stream_range = |at: u64, until: u64| -> ExitCode {
+    //
+    // `Err` carries the code the caller returns. A closed downstream pipe is an `Err(SUCCESS)`
+    // rather than a failure: Rust ignores `SIGPIPE`, so a reader that walked away (`… | head`)
+    // surfaces only as this write error, and ending the view here at exit 0 is what keeps a
+    // `--follow` from polling into a pipe nobody holds — the discipline `sbx fs logs`/`sbx logs`
+    // already state and act on.
+    let stream_range = |at: u64, until: u64| -> Result<(), ExitCode> {
         use std::io::{Read as _, Seek as _};
         let Ok(mut f) = std::fs::File::open(&path) else {
             diag::error(&format!(
                 "sbx: cannot read the session log {}",
                 path.display()
             ));
-            return ExitCode::FAILURE;
+            return Err(ExitCode::FAILURE);
         };
         if at > 0 && f.seek(std::io::SeekFrom::Start(at)).is_err() {
-            return ExitCode::FAILURE;
+            return Err(ExitCode::FAILURE);
         }
         let mut out = std::io::stdout();
-        let _ = std::io::copy(&mut f.take(until.saturating_sub(at)), &mut out);
-        ExitCode::SUCCESS
+        std::io::copy(&mut f.take(until.saturating_sub(at)), &mut out)
+            .map(|_| ())
+            .map_err(|_| ExitCode::SUCCESS)
     };
 
     // `--all` with no limit copies the whole file, so it needs no window at all — only the header
@@ -603,21 +637,15 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
     ));
 
     use std::io::Write as _;
-    match (parsed.limit, parsed.all, complete) {
+    let printed = match (parsed.limit, parsed.all, complete) {
         // Every session, unlimited: the whole file is what was asked for, so it is copied rather
         // than held.
-        (None, true, _) => {
-            if stream_range(0, end) == ExitCode::FAILURE {
-                return ExitCode::FAILURE;
-            }
-        }
+        (None, true, _) => stream_range(0, end),
         // One session, unlimited, and longer than the window: stream it from its own header. The
         // forward pass that finds the header holds nothing either.
         (None, false, false) => {
             let at = fallback.as_ref().map(|(_, at)| *at).unwrap_or(0);
-            if stream_range(at, end) == ExitCode::FAILURE {
-                return ExitCode::FAILURE;
-            }
+            stream_range(at, end)
         }
         // Everything else fits in the window by construction.
         (limit, all, _) => {
@@ -627,9 +655,13 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
                 None => body,
             };
             let mut out = std::io::stdout();
-            let _ = out.write_all(body);
-            let _ = out.flush();
+            out.write_all(body)
+                .and_then(|()| out.flush())
+                .map_err(|_| ExitCode::SUCCESS)
         }
+    };
+    if let Err(code) = printed {
+        return code;
     }
 
     if !parsed.follow {
@@ -681,10 +713,18 @@ fn explain_missing_log(data_dir: &Path, id: u32, path: &Path) -> ExitCode {
 /// Liveness is sampled *before* each drain, never after: a session that writes its last words and
 /// exits between the two would otherwise have them dropped. Sampling first means a drain that
 /// follows a dead reading has the complete final file in front of it.
+///
+/// A drain that cannot deliver ends the follow, at exit 0: Rust ignores `SIGPIPE`, so a reader that
+/// walked away (`sbx session logs <id> -f | head`) is announced only by the write error, and
+/// discarding it left this loop opening the log, reading it and failing to write it every 250 ms
+/// until the detached session exited — with the user's shell held on the pipeline the whole time.
 fn follow_log(path: &Path, mut pos: u64, data_dir: &Path, id: u32) -> ExitCode {
+    let mut out = std::io::stdout();
     loop {
         let live = session_is_live(data_dir, id);
-        drain_log(path, &mut pos);
+        if drain_log(path, &mut pos, &mut out).is_err() {
+            return ExitCode::SUCCESS;
+        }
         if !live {
             return ExitCode::SUCCESS;
         }
@@ -692,28 +732,32 @@ fn follow_log(path: &Path, mut pos: u64, data_dir: &Path, id: u32) -> ExitCode {
     }
 }
 
-/// Copy whatever the log has gained since `pos` to stdout, advancing `pos`. Best-effort: a
-/// transient read failure skips one poll rather than ending the follow, and the log is append-only
-/// so a later poll picks up everything that was missed.
-fn drain_log(path: &Path, pos: &mut u64) {
-    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+/// Copy whatever the log has gained since `pos` to `out`, advancing `pos` by what was delivered.
+///
+/// Best-effort on the *read* side: a transient read failure skips one poll rather than ending the
+/// follow, and the log is append-only so a later poll picks up everything that was missed. A
+/// *write* failure is the opposite — it is the only notice this process gets that its reader is
+/// gone — so it is returned rather than swallowed, and `pos` does not move over bytes nobody
+/// received. `out` is a parameter so that discipline is testable without a real pipe.
+fn drain_log<W: std::io::Write>(path: &Path, pos: &mut u64, out: &mut W) -> std::io::Result<()> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
     let Ok(mut file) = std::fs::File::open(path) else {
-        return;
+        return Ok(());
     };
     if file.metadata().map(|m| m.len()).unwrap_or(0) <= *pos {
-        return;
+        return Ok(());
     }
     if file.seek(SeekFrom::Start(*pos)).is_err() {
-        return;
+        return Ok(());
     }
     let mut buf = Vec::new();
     if file.read_to_end(&mut buf).is_err() {
-        return;
+        return Ok(());
     }
-    let mut out = std::io::stdout();
-    let _ = out.write_all(&buf);
-    let _ = out.flush();
+    out.write_all(&buf)?;
+    out.flush()?;
     *pos += buf.len() as u64;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -950,5 +994,76 @@ mod tests {
         assert!(parse_logs_args(&v(&["12", "-n"])).is_err());
         assert!(parse_logs_args(&v(&["12", "-n", "many"])).is_err());
         assert!(parse_logs_args(&v(&["12", "--nope"])).is_err());
+    }
+
+    /// A stdout stand-in that refuses every write, the way a pipe whose reader has exited does.
+    struct ClosedPipe;
+
+    impl std::io::Write for ClosedPipe {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `sbx session logs <id> -f | head` leaves the pipe with no reader. Rust ignores `SIGPIPE`, so
+    /// the EPIPE from this write is the only notice the follow ever gets; discarded, the loop kept
+    /// opening the log, reading it and failing to write it every 250 ms until the detached session
+    /// exited, and the shell waiting on the pipeline was held for as long as the agent ran. Pins
+    /// that the error reaches the caller, and that the cursor does not move over bytes nobody
+    /// received.
+    #[test]
+    fn a_drain_into_a_closed_pipe_reports_the_write_failure_rather_than_swallowing_it() {
+        let dir = crate::testutil::TmpDir::new();
+        let path = dir.join("4242.log");
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+
+        let mut pos = 0u64;
+        assert!(drain_log(&path, &mut pos, &mut ClosedPipe).is_err());
+        assert_eq!(pos, 0, "an undelivered drain must not advance the cursor");
+
+        // The same drain into a reader that is still there delivers everything and advances the
+        // cursor by exactly what it wrote, so the next poll re-prints nothing.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut pos = 0u64;
+        assert!(drain_log(&path, &mut pos, &mut sink).is_ok());
+        assert_eq!((pos, sink.as_slice()), (8, &b"one\ntwo\n"[..]));
+        assert!(drain_log(&path, &mut pos, &mut sink).is_ok());
+        assert_eq!(sink.len(), 8, "nothing was appended, so nothing is re-sent");
+
+        // A log that is not there is not a delivery failure: the follow keeps polling for it.
+        let mut pos = 0u64;
+        assert!(drain_log(&dir.join("no-such.log"), &mut pos, &mut ClosedPipe).is_ok());
+    }
+
+    /// A bare `--` ends the options rather than becoming a target. Ids are PIDs, so `--` can only
+    /// ever name a session that does not exist: `sbx session stop -- 1234` stopped 1234 cleanly and
+    /// then reported "no live session '--'", exiting 2 on a stop that had worked — and a script
+    /// reading the status concluded the stop had failed.
+    #[test]
+    fn a_bare_double_dash_ends_the_options_instead_of_becoming_a_session_id() {
+        let v = |a: &[&str]| -> Vec<OsString> { a.iter().map(OsString::from).collect() };
+
+        let p = parse_stop_args(v(&["--", "1234"])).unwrap();
+        assert_eq!(p.ids, vec!["1234".to_string()]);
+        assert!(!p.all);
+
+        // Everything after it is an id, flag-shaped or not — which is what a terminator is for.
+        let p = parse_stop_args(v(&["--delay", "3", "--", "--all"])).unwrap();
+        assert_eq!(p.ids, vec!["--all".to_string()]);
+        assert_eq!(p.delay, std::time::Duration::from_secs(3));
+        assert!(
+            !p.all,
+            "`--all` after the terminator is an id, not the flag"
+        );
+
+        // Before it, the options still parse and an unknown one is still refused.
+        let p = parse_stop_args(v(&["--all", "--delay", "0"])).unwrap();
+        assert!(p.all && p.ids.is_empty() && p.delay.is_zero());
+        assert!(parse_stop_args(v(&["--dry-run", "1234"])).is_err());
+        // A `--` with nothing after it leaves no target at all, which is a usage error.
+        assert!(parse_stop_args(v(&["--"])).is_err());
     }
 }

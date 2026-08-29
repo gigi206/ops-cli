@@ -43,7 +43,8 @@ pub(crate) fn config_cmd(args: Vec<OsString>) -> ExitCode {
             match other {
                 // The old `sbx config --json` muscle memory: the resolved view (and its --json) is
                 // now `show`, so point straight at it. Other flags belong to a specific subcommand
-                // (get/set/… take -c/--local/--trust), so name no verb and let the page below guide.
+                // (get/set/… take -c/--local, and the verbs that write take --trust), so name no
+                // verb and let the page below guide.
                 Some("--json") => {
                     diag::error("sbx: config: --json is now `sbx config show --json`")
                 }
@@ -654,10 +655,38 @@ fn proc_section(
 /// for everything is shown too, unlike the postures below: silence is exactly the state a reader
 /// wondering "why was I not told" needs to see.
 fn notify_section(view: &config::view::ConfigView, pal: &style::Palette) -> String {
+    let mut o = String::new();
+    write_notify(
+        &mut o,
+        &view.notify,
+        " ",
+        &provenance_tag(view.notify_origin, pal),
+        pal,
+    );
+    o
+}
+
+/// Write the `notify:` row into `o`: the uniform mode (or the per-event breakdown when the events
+/// disagree), followed by the repeat window whenever one is configured.
+///
+/// Written once because `sbx config show` and the per-app view state the same posture over the same
+/// data and differ only in column spacing and in how they spell provenance. Keeping it in one place
+/// is what stops them from drifting: they already had, on the repeat window, which this view named
+/// and the app view dropped — so a reader of one app's configuration could not see that a repeated
+/// refusal waits out a quiet period before it is reported again.
+///
+/// `pad` is the caller's spacing after the label and `tag` its rendered provenance, because the two
+/// views align their columns differently and tag them from different vocabularies
+/// ([`provenance_tag`] vs [`app_provenance_tag`]).
+fn write_notify(
+    o: &mut String,
+    n: &config::view::NotifyView,
+    pad: &str,
+    tag: &str,
+    pal: &style::Palette,
+) {
     use std::fmt::Write as _;
     let (h, dim, r) = (pal.head, pal.dim, pal.reset);
-    let mut o = String::new();
-    let n = &view.notify;
     let uniform = n
         .events
         .first()
@@ -670,24 +699,15 @@ fn notify_section(view: &config::view::ConfigView, pal: &style::Palette) -> Stri
     };
     match uniform {
         Some(mode) => {
-            let _ = writeln!(
-                o,
-                "  {h}notify:{r} {mode}{every}{}",
-                provenance_tag(view.notify_origin, pal)
-            );
+            let _ = writeln!(o, "  {h}notify:{r}{pad}{mode}{every}{tag}");
         }
         None => {
-            let _ = writeln!(
-                o,
-                "  {h}notify:{r} {dim}per event{r}{every}{}",
-                provenance_tag(view.notify_origin, pal)
-            );
+            let _ = writeln!(o, "  {h}notify:{r}{pad}{dim}per event{r}{every}{tag}");
             for (event, mode) in &n.events {
                 let _ = writeln!(o, "      {dim}{event}{r} {mode}");
             }
         }
     }
-    o
 }
 
 /// The cage's clock, rendered only when a layer actually named a zone. Every cage has one, so
@@ -1863,23 +1883,7 @@ fn render_app_detail(
         &mut folded,
     ) {
         let notify_tag = app_provenance_tag(view.notify_origin, pal);
-        let uniform = view
-            .notify
-            .events
-            .first()
-            .filter(|(_, first)| view.notify.events.iter().all(|(_, m)| m == first))
-            .map(|(_, m)| m.clone());
-        match uniform {
-            Some(mode) => {
-                let _ = writeln!(o, "  {h}notify:{r}  {mode}{notify_tag}");
-            }
-            None => {
-                let _ = writeln!(o, "  {h}notify:{r}  {dim}per event{r}{notify_tag}");
-                for (event, mode) in &view.notify.events {
-                    let _ = writeln!(o, "      {dim}{event}{r} {mode}");
-                }
-            }
-        }
+        write_notify(&mut o, &view.notify, "  ", &notify_tag, pal);
     }
 
     // The effective GUI posture — shown whenever somebody set it, `none` included.
@@ -2347,19 +2351,21 @@ fn channel_origin_kind(label: &str) -> config::view::ProvenanceView {
 }
 
 /// Rewrite a dotted `key` to address it under app `name`'s table — the `--app <name>` sugar, so
-/// `set --app demo network shared` writes `app.demo.network`. The name keys a single TOML table
-/// segment, and the segment splitter does not handle quoting, so a name with a `.` (which is a
-/// valid app name otherwise) cannot be addressed this way — it is edited directly with `sbx config
-/// edit`. A name that no app could ever carry is rejected outright.
+/// `set --app demo network shared` writes `app.demo.network`.
+///
+/// The name keys a single TOML table segment, so a name that carries a `.` (which `sbx net … -a`
+/// and the loader both accept) is quoted: `--app my.app` addresses `app."my.app".<key>`, which the
+/// quote-aware key splitter behind every read and write reads back as the one segment `my.app`. A
+/// name that needs no quoting keeps the bare spelling, so the common key is unchanged. Quoting is
+/// unconditionally safe here because a valid app name cannot itself contain a quote — the charset
+/// [`config::is_valid_app_name`] admits is `[A-Za-z0-9._-]` — and a name that no app could ever
+/// carry is rejected outright before any rewriting.
 fn app_prefixed_key(name: &str, key: &str) -> Result<String, String> {
-    if name.contains('.') {
-        return Err(format!(
-            "an app name containing `.` (`{name}`) cannot be addressed with `--app`; \
-             edit it directly with `sbx config edit`"
-        ));
-    }
     if !config::is_valid_app_name(name) {
         return Err(format!("invalid app name `{name}`: 1–64 of [A-Za-z0-9._-]"));
+    }
+    if name.contains('.') {
+        return Ok(format!("app.\"{name}\".{key}"));
     }
     Ok(format!("app.{name}.{key}"))
 }
@@ -2382,6 +2388,7 @@ fn config_get(args: &[OsString]) -> ExitCode {
     let ScopeArgs {
         positionals,
         scope,
+        trust,
         app,
         ..
     } = match split_scope(args) {
@@ -2391,6 +2398,9 @@ fn config_get(args: &[OsString]) -> ExitCode {
             return config_usage("get");
         }
     };
+    if let Some(code) = reject_trust("get", trust) {
+        return code;
+    }
     if positionals.len() != 1 {
         return config_usage("get");
     }
@@ -2430,6 +2440,27 @@ fn reject_app(verb: &str, app: &Option<String>) -> Option<ExitCode> {
     if app.is_some() {
         diag::error(&format!(
             "sbx: config {verb}: `--app` does not apply to `{verb}` (it takes no key)"
+        ));
+        Some(config_usage(verb))
+    } else {
+        None
+    }
+}
+
+/// Reject `--trust` on a verb that writes nothing (`get` reads a value; `path` prints a file path).
+///
+/// [`crate::split_scope`] parses the flag for every verb that takes a scope, so a read-only verb
+/// receives it and has nothing to do with it. Accepting it silently is the worst of the three
+/// options: it tells whoever typed `get` where they meant `set` — or who believes `path --trust`
+/// arms something — that a security setting was recorded when none was, and it is the same
+/// mistaken belief the trust-carrying verbs answer with a note. The neighbouring [`reject_app`]
+/// already refuses an inapplicable flag rather than dropping it; this holds `--trust` to that.
+///
+/// Returns the usage exit code when `--trust` was passed, else `None`.
+fn reject_trust(verb: &str, trust: bool) -> Option<ExitCode> {
+    if trust {
+        diag::error(&format!(
+            "sbx: config {verb}: `--trust` does not apply to `{verb}` (it writes nothing)"
         ));
         Some(config_usage(verb))
     } else {
@@ -2537,9 +2568,10 @@ fn admit_config_write(
 ///
 /// The routing mirrors `sbx net … -a <name>`: a **global** app lives in its own profile file
 /// `apps/<name>.toml` with **top-level** keys, so the key is used as-is; an app declared **inline**
-/// (a project `.sbx.toml` or a `-c` file) is addressed under its `app.<name>.` table. The name
-/// asymmetry is deliberate, not a bug: a `.`-containing app name is addressable at `-g` (it keys the
-/// profile *filename*) but rejected inline (the dotted-key splitter does not handle a quoted segment).
+/// (a project `.sbx.toml` or a `-c` file) is addressed under its `app.<name>.` table, with the name
+/// quoted when it carries a `.` ([`app_prefixed_key`]). Every name the loader accepts is therefore
+/// addressable in both scopes — at `-g` it keys the profile *filename*, inline it keys one table
+/// segment — so the two agree on which apps exist.
 ///
 /// The returned `gated` flag drives the trust note: the global config and the app profiles under
 /// `apps/` are trusted **by location**, so a write to either is never gated (and never re-arms a trust
@@ -2798,8 +2830,8 @@ fn config_path_cmd(args: &[OsString]) -> ExitCode {
         positionals,
         scope,
         scope_explicit,
+        trust,
         app,
-        ..
     } = match split_scope(args) {
         Ok(parsed) => parsed,
         Err(e) => {
@@ -2808,6 +2840,9 @@ fn config_path_cmd(args: &[OsString]) -> ExitCode {
         }
     };
     if let Some(code) = reject_app("path", &app) {
+        return code;
+    }
+    if let Some(code) = reject_trust("path", trust) {
         return code;
     }
     if !positionals.is_empty() {
@@ -2886,6 +2921,10 @@ fn render_resolution_layers(layers: &[config::manage::Layer], pal: &style::Palet
 /// All of that is about a **gated** target. The global config is trusted by location, so it has no
 /// marker to re-arm and none to write: `--trust` there is answered with the note the key-writing
 /// verbs give, and nothing is stored. See [`scope_is_gated`].
+///
+/// A `--trust` on a gated target that could not be recorded fails the verb, exactly as it does for
+/// the key-writing verbs and through the same tail ([`record_trust`]): the editor's changes are on
+/// disk, and their security fields are inert until a marker exists.
 fn config_edit(args: &[OsString]) -> ExitCode {
     let ScopeArgs {
         positionals,
@@ -2995,15 +3034,13 @@ fn config_edit(args: &[OsString]) -> ExitCode {
             ));
         }
     } else if trust_flag {
-        match store_dir.as_deref() {
-            Some(dir) => match trust::trust(dir, &path) {
-                Ok(()) => {
-                    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-                    println!("{}", render_trusted_whole_file(&path, &pal));
-                }
-                Err(e) => diag::warn(&format!("could not trust {e}")),
-            },
-            None => diag::warn("no trust store available; cannot --trust"),
+        // The same tail the key-writing verbs use, and a failure for the same reason: the editor
+        // saved the file, so its security fields are on disk and inert until the marker exists.
+        // Reporting success would tell `sbx config edit --trust && sbx run …` that the gate was
+        // armed when it was not, and the launch that follows would run against a config whose
+        // `[network]`, `[binds]`, `[fs]` and `[secret]` are dropped.
+        if let Err(code) = record_trust(&path, store_dir.as_deref(), "the file was saved") {
+            return code;
         }
     } else if was_trusted {
         // Only warn if the edit actually changed the file (the verdict is now Changed).
@@ -3049,33 +3086,10 @@ fn report_write_trust(
         return ExitCode::SUCCESS;
     }
     if trust_flag {
-        // A `--trust` that could not be recorded is a **failure**, not a warning. The write itself
-        // succeeded, so the security field is on disk — and inert, because the file is still
-        // untrusted and a gated field applies only once it is trusted. Reporting success there
-        // tells a script the security setting took effect when it did not, which is the one
-        // direction this must not be wrong in.
-        match store_dir {
-            Some(dir) => match trust::trust(dir, path) {
-                Ok(()) => {
-                    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-                    println!("{}", render_trusted_whole_file(path, &pal));
-                }
-                Err(e) => {
-                    diag::error(&format!("sbx: could not trust {e}"));
-                    diag::hint(&format!(
-                        "       the field was written but does not apply; run `sbx trust {}`",
-                        path.display()
-                    ));
-                    return ExitCode::FAILURE;
-                }
-            },
-            None => {
-                diag::error("sbx: no trust store available; cannot --trust");
-                diag::hint("       the field was written but does not apply until it is trusted");
-                return ExitCode::FAILURE;
-            }
-        }
-        return ExitCode::SUCCESS;
+        return match record_trust(path, store_dir, "the field was written") {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(code) => code,
+        };
     }
     if was_trusted {
         diag::warn(&format!(
@@ -3095,13 +3109,79 @@ fn report_write_trust(
     ExitCode::SUCCESS
 }
 
+/// Record `--trust` for `path` and report the outcome: the whole-file marker on success, a refusal
+/// on either way it can fail (no trust store to write into, or the store rejecting the file).
+///
+/// One tail shared by `edit` and the key-writing verbs, because the two states the failure leaves
+/// behind are the same state: the file is on disk carrying security fields, and they are inert
+/// until the marker exists. A `--trust` that could not be recorded is therefore a **failure**, not
+/// a warning — reporting success tells a script (`sbx config … --trust && sbx run …`) that the
+/// security setting took effect when it did not, which is the one direction this must not be wrong
+/// in. `edit` had that wrong on its own copy of these three arms, which is why there is now one.
+///
+/// `saved` names what the caller already put on disk — "the field was written", "the file was
+/// saved" — so the remediation hint describes the state the user is actually in.
+fn record_trust(path: &Path, store_dir: Option<&Path>, saved: &str) -> Result<(), ExitCode> {
+    match store_dir {
+        Some(dir) => match trust::trust(dir, path) {
+            Ok(()) => {
+                let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+                println!("{}", render_trusted_whole_file(path, &pal));
+                Ok(())
+            }
+            Err(e) => {
+                diag::error(&format!("sbx: could not trust {e}"));
+                diag::hint(&format!(
+                    "       {saved} but does not apply; run `sbx trust {}`",
+                    path.display()
+                ));
+                Err(ExitCode::FAILURE)
+            }
+        },
+        None => {
+            diag::error("sbx: no trust store available; cannot --trust");
+            diag::hint(&format!(
+                "       {saved} but does not apply until it is trusted"
+            ));
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
 /// Whether a dotted config key names a security-relevant field. The only field applied without
 /// trust (minus the untrusted-env denylist) is the free `env` table — both the baseline `env.*`
 /// and an app's `app.<name>.env.*`; everything else is gated, so setting one on an untrusted file
 /// is worth a note.
+///
+/// The key is read the way the write read it, quotes included: an app name carrying a `.` is one
+/// quoted segment (`app."my.app".env.FOO`), so splitting on every dot would walk through the quotes
+/// and mistake an app's free `env` table for a gated field — sending the user to bless a whole file
+/// to fix a variable that already applies. Anything this cannot take apart is reported as gated,
+/// the answer that over-reports rather than under-reports.
 fn is_security_key(key: &str) -> bool {
-    let segs: Vec<&str> = key.split('.').collect();
-    !matches!(segs.as_slice(), ["env", ..] | ["app", _, "env", ..])
+    let field = strip_app_prefix(key).unwrap_or(key);
+    let free_env_table = field == "env" || field.starts_with("env.");
+    !free_env_table
+}
+
+/// Strip a leading `app.<name>.` from a dotted key, returning what it names inside that app's
+/// table, or `None` when the key does not address an app's field.
+///
+/// `<name>` may be quoted to carry dots, in either of the two spellings TOML allows (`"my.app"`,
+/// `'my.app'`) — the same rule `config::manage::split_key` applies when the write walks the same
+/// key, and the reason this cannot be a plain `split('.')`.
+fn strip_app_prefix(key: &str) -> Option<&str> {
+    let rest = key.strip_prefix("app.")?;
+    let after_name = match rest.chars().next() {
+        Some(quote @ ('"' | '\'')) => {
+            let opened = quote.len_utf8();
+            // An unbalanced quote is not a key any write accepted, so there is no app table here.
+            let closed = opened + rest[opened..].find(quote)?;
+            &rest[closed + quote.len_utf8()..]
+        }
+        _ => &rest[rest.find('.')?..],
+    };
+    after_name.strip_prefix('.')
 }
 
 #[cfg(test)]
@@ -3122,6 +3202,23 @@ mod tests {
         assert!(is_security_key("app.demo-app.cmd"));
         // a bare app table (no field) is gated too
         assert!(is_security_key("app.demo-app"));
+    }
+
+    #[test]
+    fn is_security_key_reads_a_quoted_app_name_as_one_segment() {
+        // An app name may carry a `.` — the loader accepts one and `sbx net allow -a my.app` writes
+        // one — and it is then addressed as a quoted segment. Splitting the key on every dot walked
+        // straight through the quotes, so `app."my.app".env.FOO` had `app"` where the `env` table
+        // should be and the write was answered with a note calling a free variable a security
+        // field, sending the user to bless the whole file to fix something already in effect.
+        assert!(!is_security_key("app.\"my.app\".env.FOO"));
+        assert!(!is_security_key("app.'my.app'.env"));
+        // The quoting must not swallow the field either: the same app's gated fields stay gated.
+        assert!(is_security_key("app.\"my.app\".network"));
+        assert!(is_security_key("app.\"my.app\".cmd"));
+        // A key whose quote never closed is not one any write accepted; report it gated, the answer
+        // that over-reports rather than under-reports.
+        assert!(is_security_key("app.\"my.app.env.FOO"));
     }
 
     #[test]
@@ -3216,11 +3313,11 @@ mod tests {
             (explicit, "app.demo.cmd", true)
         );
 
-        // An app name with a `.` cannot be addressed inline (the dotted-key splitter is naive).
-        assert!(
-            resolve_key_target("set", &Scope::Local, Some("a.b"), "network", cwd).is_err(),
-            "a dotted app name is rejected inline"
-        );
+        // An app name with a `.` is addressed inline as one quoted segment, so every name the
+        // loader accepts is reachable from the key verbs and not only from `sbx net … -a`.
+        let (_, key, _) =
+            resolve_key_target("set", &Scope::Local, Some("a.b"), "network", cwd).unwrap();
+        assert_eq!(key, "app.\"a.b\".network");
 
         // An invalid charset can never key a profile filename (validated before the config home is
         // even resolved, so this arm stays env-independent). A name that merely coincides with a
@@ -3229,6 +3326,96 @@ mod tests {
         assert!(
             resolve_key_target("set", &Scope::Global, Some("bad/name"), "network", cwd).is_err(),
             "an invalid app name cannot name a global-app profile"
+        );
+    }
+
+    /// Whether two exit codes are the same code. [`ExitCode`] carries no `PartialEq` and no
+    /// accessor, but its `Debug` names the status byte it holds, so two codes are equal exactly
+    /// when their debug forms are. Every test that uses this asserts first that two *different*
+    /// codes compare unequal, so a `Debug` that stopped naming the byte fails the assertion rather
+    /// than letting the test pass on a comparison that can no longer distinguish anything.
+    fn same_exit_code(a: ExitCode, b: ExitCode) -> bool {
+        format!("{a:?}") == format!("{b:?}")
+    }
+
+    #[test]
+    fn a_read_only_verb_refuses_trust_instead_of_dropping_it() {
+        // `--trust` rides the shared scope parser, so `get` and `path` are handed a flag they have
+        // no behaviour for, and they used to discard it without a word: `sbx config get -c <file>
+        // --trust` printed the value and exited 0. It is the one flag whose entire meaning is a
+        // security decision, and the neighbouring typo `--truts` is already refused — so silently
+        // accepting it told whoever typed `get` where they meant `set` that a gate had been armed.
+        assert!(
+            !same_exit_code(ExitCode::SUCCESS, ExitCode::from(2)),
+            "two different exit codes must compare unequal, or the assertions below prove nothing"
+        );
+
+        let tmp = crate::testutil::TmpDir::new();
+        let cfg = tmp.join("layer.toml");
+        std::fs::write(&cfg, "network = \"deny\"\n").unwrap();
+        // The read passes the same safety gate a launch applies, which refuses a world-writable
+        // file — so pin the mode rather than inherit whatever umask the run happens to carry.
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let file = cfg.to_str().unwrap();
+        let argv = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+
+        // Without the flag both verbs do their work, so what is refused below is the flag itself.
+        assert!(same_exit_code(
+            config_get(&argv(&["-c", file, "network"])),
+            ExitCode::SUCCESS
+        ));
+        assert!(same_exit_code(
+            config_path_cmd(&argv(&["-c", file])),
+            ExitCode::SUCCESS
+        ));
+
+        // With it, both exit 2 with the verb's usage — the treatment an inapplicable `--app`
+        // already gets.
+        assert!(same_exit_code(
+            config_get(&argv(&["-c", file, "--trust", "network"])),
+            ExitCode::from(2)
+        ));
+        assert!(same_exit_code(
+            config_path_cmd(&argv(&["-c", file, "--trust"])),
+            ExitCode::from(2)
+        ));
+    }
+
+    #[test]
+    fn config_edit_trust_fails_when_the_trust_could_not_be_recorded() {
+        // `edit --trust` treated a trust it could not record as advisory: it warned and returned
+        // success, so `sbx config edit --trust && sbx run agent` proceeded to launch against a
+        // project config whose `[network]`, `[binds]`, `[fs]` and `[secret]` the gate then dropped
+        // — the cage running with open egress on the strength of an exit code that said the
+        // security setting had been applied. The key-writing verbs have always exited 1 here.
+        let _lock = crate::testutil::env_lock();
+        let tmp = crate::testutil::TmpDir::new();
+        let cfg = tmp.join("edited.toml");
+        std::fs::write(&cfg, "[network]\nmode = \"deny\"\n").unwrap();
+
+        // An editor that saves nothing and exits 0, so the run reaches the `--trust` tail; and no
+        // absolute `HOME`/`XDG_STATE_HOME`, which is what leaves `trust::default_store_dir` with
+        // nowhere to write a marker.
+        let _visual = crate::testutil::EnvVar::set("VISUAL", "true");
+        let _editor = crate::testutil::EnvVar::set("EDITOR", "true");
+        let _home = crate::testutil::EnvVar::unset("HOME");
+        let _state = crate::testutil::EnvVar::unset("XDG_STATE_HOME");
+
+        assert!(
+            !same_exit_code(ExitCode::SUCCESS, ExitCode::FAILURE),
+            "two different exit codes must compare unequal, or the assertion below proves nothing"
+        );
+        let args = [
+            OsString::from("-c"),
+            OsString::from(cfg.as_os_str()),
+            OsString::from("--trust"),
+        ];
+        assert!(
+            same_exit_code(config_edit(&args), ExitCode::FAILURE),
+            "a `--trust` that recorded nothing must not report success"
         );
     }
 
@@ -3812,11 +3999,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn render_app_detail_shows_effective_values_tagged_inherited_or_app_set() {
+    /// A representative per-app effective view: an app that sets its command and its allowlist,
+    /// inherits most postures from the baseline, and resolves against a project-pinned channel.
+    /// Built by hand so the render tests need no I/O, and shared so a test that varies one field
+    /// does not restate the other forty.
+    fn sample_app_detail_view() -> config::view::AppDetailView {
         use config::view::*;
-        let p = style::Palette::plain();
-        let view = AppDetailView {
+        AppDetailView {
             open: vec![],
             service: vec![],
             provisions: Vec::new(),
@@ -3905,7 +4094,13 @@ mod tests {
             secrets: vec![],
             secrets_inherited: 0,
             notes: vec![],
-        };
+        }
+    }
+
+    #[test]
+    fn render_app_detail_shows_effective_values_tagged_inherited_or_app_set() {
+        let p = style::Palette::plain();
+        let view = sample_app_detail_view();
 
         // Compact: each scalar carries its effective value + app-context provenance — the headline
         // being that an unset field reads `inherited` (its effective value comes from the baseline).
@@ -3944,7 +4139,43 @@ mod tests {
     }
 
     #[test]
-    fn app_prefixed_key_rewrites_a_simple_name_and_rejects_a_dotted_one() {
+    fn the_per_app_notify_row_names_the_repeat_window_like_the_baseline_row() {
+        // A notify policy carries a quiet period between repeats of one problem. The baseline view
+        // has always named it; the per-app view reproduced the mode logic without it, so an app
+        // announcing one refusal per window read exactly like an app announcing every occurrence,
+        // and a reader asking "why was I told about this only once" found nothing to explain it.
+        // Both rows now render through one writer, so they cannot state the field differently.
+        let p = style::Palette::plain();
+        let notify = || config::view::NotifyView {
+            events: vec![
+                ("egress".to_string(), "always".to_string()),
+                ("exec".to_string(), "always".to_string()),
+            ],
+            repeat_after: "300s".to_string(),
+        };
+
+        let mut view = sample_app_detail_view();
+        view.notify = notify();
+        view.notify_origin = config::view::ProvenanceView::Inherited;
+        let out = render_app_detail(&view, &p, false);
+        assert!(
+            out.contains("notify:  always (a repeat waits 300s)  (inherited)"),
+            "the per-app notify row must name the repeat window:\n{out}"
+        );
+
+        // The same fact on the baseline view, whose rendering this one now shares.
+        let mut base = sample_config_view();
+        base.notify = notify();
+        base.notify_origin = config::view::ProvenanceView::Project;
+        let baseline = render_config(&base, &p, false);
+        assert!(
+            baseline.contains("notify: always (a repeat waits 300s)  (project)"),
+            "the baseline notify row must name the repeat window:\n{baseline}"
+        );
+    }
+
+    #[test]
+    fn app_prefixed_key_quotes_a_dotted_name_and_leaves_a_plain_one_bare() {
         // The `--app` sugar puts the key under the app's table; a dotted leaf key composes.
         assert_eq!(
             app_prefixed_key("demo", "network").unwrap(),
@@ -3954,11 +4185,19 @@ mod tests {
             app_prefixed_key("demo", "env.FOO").unwrap(),
             "app.demo.env.FOO"
         );
-        // A name with a `.` is not one TOML segment under the naive key splitter — point at `edit`.
-        let err = app_prefixed_key("my.app", "cmd").unwrap_err();
-        assert!(err.contains("sbx config edit"), "{err}");
-        // A name no app could ever carry is rejected outright.
+        // A name carrying a `.` is one quoted segment, which is how the key splitter behind every
+        // read and write reads it back. `sbx net allow -a my.app` and the loader both accept such a
+        // name, so refusing it here left an app that could be created and shown but not edited.
+        assert_eq!(
+            app_prefixed_key("my.app", "cmd").unwrap(),
+            "app.\"my.app\".cmd"
+        );
+        // Quoting stays confined to the names that need it: the common spelling is unchanged.
+        assert!(!app_prefixed_key("demo", "cmd").unwrap().contains('"'));
+        // A name no app could ever carry is rejected outright, before any rewriting — so nothing
+        // that would need escaping can reach the quoted form.
         assert!(app_prefixed_key("bad name", "cmd").is_err());
+        assert!(app_prefixed_key("bad\"name", "cmd").is_err());
     }
 
     #[test]

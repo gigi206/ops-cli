@@ -219,10 +219,12 @@ fn candidates(words: &[String]) -> Vec<(String, String)> {
             // under itself would complete a command that does not exist.
             names.push(("help".to_string(), "show usage for a command".to_string()));
         }
-        // Bare on a command path (`sbx run <TAB>`, `sbx net logs <TAB>`), the menu is
-        // the command's own options; past a typed value it belongs to the launched
-        // command, so nothing of sbx's is offered there.
-        if tail_at == before.len() {
+        // On a command path (`sbx run <TAB>`, `sbx net logs -f <TAB>`), the menu is the
+        // command's own options; past a typed *operand* it belongs to the launched
+        // command, so nothing of sbx's is offered there. A flag, and the value it
+        // consumes, leave the line on the command's own grammar — a page whose grammar is
+        // nothing but flags would otherwise go quiet the moment one of them was typed.
+        if !operand_typed(&path, &before[tail_at..]) {
             names.extend(flag_menu(&path));
         }
         names.retain(|(name, _)| name.starts_with(cur));
@@ -272,6 +274,10 @@ enum ValueKind {
     Projects,
     /// A live `[task.<name>]` declaration.
     Tasks,
+    /// A `[bundle.<name>]` block of the global config.
+    Bundles,
+    /// A `[network.groups]` name, what an `@<name>` egress reference resolves against.
+    Groups,
     /// A key of the runtime's own config files.
     ConfigKeys,
     /// A parked-request id (`<session-pid>.<seq>`) of a live observe session.
@@ -351,6 +357,8 @@ fn value_candidates(kind: &ValueKind, prefix: &str) -> Vec<(String, String)> {
         Literal(words) => words.iter().map(|w| (w.clone(), String::new())).collect(),
         // Read from the config files rather than a registry, so no data directory is needed.
         Rules { which, app } => rule_values(*which, app.as_deref()),
+        Bundles => named_globals("bundle", "bundle"),
+        Groups => named_globals("network.groups", "group"),
         // The oracle cannot decide a path; the shell owns file completion for it. The
         // prefix filtering is then the script's job, so the marker is unconditional.
         Files => return vec![(FILES.to_string(), String::new())],
@@ -489,7 +497,7 @@ fn registry_values(kind: &ValueKind) -> Vec<(String, String)> {
         // These name no registry — `value_candidates` answers them without coming here.
         // Answering nothing rather than panicking is what keeps the promise above: a panic
         // would write to stderr, in the middle of the user's prompt.
-        Files | Literal(_) | Rules { .. } => {}
+        Files | Literal(_) | Rules { .. } | Bundles | Groups => {}
     }
     out
 }
@@ -514,6 +522,52 @@ fn config_tokens() -> Vec<(String, bool)> {
         }
     }
     tokens
+}
+
+/// The names one table of the **global** config declares, each with `what` as its
+/// description: the `[bundle.<name>]` blocks a `use` names, or the keys of the
+/// `[network.groups]` table an `@<name>` reference resolves against.
+///
+/// Global-only, because both vocabularies are: a group or a bundle declared in a project
+/// file is dropped on load with a warning, so offering one would complete a name that
+/// grants nothing. Read the way [`config_tokens`] reads — line by line, no parse — since
+/// this runs on a keystroke and must never block on a config.
+///
+/// A section header names the value (`[bundle.ci]`); a key inside the named table does too
+/// (`[network.groups]`, then `ci-hosts = […]`), so both shapes are read. Anything that is
+/// not a bare name is dropped: a continuation line of an array value can hold an `=` of its
+/// own, and a rule is not a name.
+fn named_globals(table: &str, what: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let Some(path) = global_config_file() else {
+        return out;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return out;
+    };
+    let prefix = format!("{table}.");
+    let mut inside = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            let header = header.trim();
+            inside = header == table;
+            if let Some(name) = header.strip_prefix(&prefix) {
+                out.push((name.to_string(), what.to_string()));
+            }
+            continue;
+        }
+        if inside && let Some((key, _)) = line.split_once('=') {
+            out.push((key.trim().trim_matches('"').to_string(), what.to_string()));
+        }
+    }
+    out.retain(|(name, _)| {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    });
+    out
 }
 
 /// The two config files value completion reads: the project file under the current
@@ -575,6 +629,11 @@ fn all_literal_words(slots: &[Operand]) -> Option<Vec<String>> {
 /// nothing but prose contributes nothing; a page with metavariables but also literal
 /// rows (`allow <id> | deny <id>`) leads its value span with those words. A page whose
 /// rows are all literal words (`bash`, `zsh`) is a single literal slot.
+///
+/// A bare literal row is a word of the page's first position whether or not another row
+/// also names a value: the `projects` page documents `list` on one row and `rm <id>...` on
+/// the next, and both are words that position takes. Dropping the wordless one would leave
+/// a verb the CLI accepts that nothing can offer.
 fn operand_slots(path: &[&str]) -> Vec<Operand> {
     let mut slots: Vec<Operand> = Vec::new();
     let mut pure: Vec<String> = Vec::new();
@@ -600,9 +659,7 @@ fn operand_slots(path: &[&str]) -> Vec<Operand> {
         if row_values.is_empty() {
             // A prose row reads as nothing; a page of nothing but `tarball`-style rows
             // becomes one literal slot.
-            if !saw_value_row && !row_literals.is_empty() {
-                pure.extend(row_literals);
-            }
+            pure.extend(row_literals);
             continue;
         }
         saw_value_row = true;
@@ -613,8 +670,20 @@ fn operand_slots(path: &[&str]) -> Vec<Operand> {
             slots.push(Operand::Value(name));
         }
     }
-    if !saw_value_row && !pure.is_empty() {
-        return vec![Operand::Literal(pure)];
+    if !saw_value_row {
+        return if pure.is_empty() {
+            slots
+        } else {
+            vec![Operand::Literal(pure)]
+        };
+    }
+    // The wordless rows join the first position they are words of, beside the literals a
+    // value row already led with.
+    if !pure.is_empty() {
+        match slots.first_mut() {
+            Some(Operand::Literal(words)) => words.extend(pure),
+            _ => slots.insert(0, Operand::Literal(pure)),
+        }
     }
     slots
 }
@@ -692,6 +761,15 @@ fn kind_of_metavar(name: &str, path: &[&str]) -> Option<ValueKind> {
         // `projects show|rm <id>`: a project tree, not a session.
         return Some(ValueKind::Projects);
     }
+    if path.first() == Some(&"bundle") && name == "name" {
+        // `bundle [<name>…]`, `bundle export [<name>…]`: a `[bundle.<name>]` block of the
+        // global config, not the app that `<name>` means everywhere else.
+        return Some(ValueKind::Bundles);
+    }
+    if path.starts_with(&["net", "groups"]) && name == "name" {
+        // `net groups [<name>…]`, `net groups export [<name>…]`: an egress group.
+        return Some(ValueKind::Groups);
+    }
     let base = match name {
         "id" | "pid" | "session" => ValueKind::Sessions,
         "name" | "app" | "profile" | "sketch" => ValueKind::Apps,
@@ -733,24 +811,44 @@ enum PendingWord {
     AppName,
 }
 
-/// The value kind of the word under the cursor: the flag value the typed flags want, or
-/// the operand slot the positional arguments have reached. `None` means the position
-/// takes no completable value — the cursor sits on a flag or a command name.
-fn cursor_value_kind(path: &[&str], before: &[String]) -> Option<ValueKind> {
-    let slots = operand_slots(path);
-    let mut pos: usize = 0;
-    let mut pending_flag: Option<ValueKind> = None;
-    let mut first_positional: Option<String> = None;
-    let mut literal_consumed = false;
-    let mut app: Option<String> = None;
+/// What the words already typed after a command path did to its operand grammar.
+struct Walk {
+    /// The slot the word under the cursor would fill.
+    pos: usize,
+    /// The value the flag just before the cursor takes, when the cursor word is that value.
+    pending_flag: Option<ValueKind>,
+    /// The first word that filled a value slot, for a page whose second value depends on
+    /// its first (`plugins store install <store> <plugin>`).
+    first_positional: Option<String>,
+    /// Whether a word of a literal slot has filled it.
+    literal_consumed: bool,
+    /// The `--app` the line names, which scopes what a value position reads.
+    app: Option<String>,
+    /// Whether any operand of the page's own grammar has been typed. A flag, and the value
+    /// it consumes, are not operands — a line of nothing but flags has none.
+    operand_typed: bool,
+}
+
+/// Walk the words typed between a command path and the cursor, against the page's operand
+/// slots. One walk answers both questions asked of a line: which slot the cursor sits on,
+/// and whether the line has left the command's own grammar.
+fn walk_operands(slots: &[Operand], path: &[&str], before: &[String]) -> Walk {
+    let mut walk = Walk {
+        pos: 0,
+        pending_flag: None,
+        first_positional: None,
+        literal_consumed: false,
+        app: None,
+        operand_typed: false,
+    };
     let mut pending_word: Option<PendingWord> = None;
     for word in before {
         let word = word.as_str();
         // Whatever the last flag's value was, this word consumed it.
-        pending_flag = None;
+        walk.pending_flag = None;
         if let Some(pending) = pending_word.take() {
             if matches!(pending, PendingWord::AppName) {
-                app = Some(word.to_string());
+                walk.app = Some(word.to_string());
             }
             continue;
         }
@@ -761,10 +859,10 @@ fn cursor_value_kind(path: &[&str], before: &[String]) -> Option<ValueKind> {
             };
             let names_app = matches!(name, "--app" | "-a");
             match inline {
-                Some(value) if names_app => app = Some(value.to_string()),
+                Some(value) if names_app => walk.app = Some(value.to_string()),
                 Some(_) => {}
                 None if flag_takes_value(name, path) => {
-                    pending_flag = flag_value_kind(name, path);
+                    walk.pending_flag = flag_value_kind(name, path);
                     pending_word = Some(if names_app {
                         PendingWord::AppName
                     } else {
@@ -775,27 +873,54 @@ fn cursor_value_kind(path: &[&str], before: &[String]) -> Option<ValueKind> {
             }
             continue;
         }
+        walk.operand_typed = true;
         // A word of a literal slot filling it (`allow`, `tarball`, `list`) occupies
         // that slot rather than counting as a positional.
-        if let Some(Operand::Literal(words)) = slots.get(pos)
+        if let Some(Operand::Literal(words)) = slots.get(walk.pos)
             && words.iter().any(|w| w == word)
         {
-            literal_consumed = true;
-            pos += 1;
+            walk.literal_consumed = true;
+            walk.pos += 1;
             continue;
         }
         // A value word of the grammar occupies one value slot; the first one is also
         // remembered when the page's second value depends on it.
-        if first_positional.is_none() {
-            first_positional = Some(word.to_string());
+        if walk.first_positional.is_none() {
+            walk.first_positional = Some(word.to_string());
         }
-        pos += 1;
+        walk.pos += 1;
     }
+    walk
+}
+
+/// Whether the words typed after a command path have left the command's own grammar — a
+/// word of its operand grammar, or of the command it launches. Until then the line is still
+/// the command's, whatever flags it carries.
+fn operand_typed(path: &[&str], before: &[String]) -> bool {
+    walk_operands(&operand_slots(path), path, before).operand_typed
+}
+
+/// The value kind of the word under the cursor: the flag value the typed flags want, or
+/// the operand slot the positional arguments have reached. `None` means the position
+/// takes no completable value — the cursor sits on a flag or a command name.
+fn cursor_value_kind(path: &[&str], before: &[String]) -> Option<ValueKind> {
+    let slots = operand_slots(path);
+    let Walk {
+        pos,
+        pending_flag,
+        first_positional,
+        literal_consumed,
+        app,
+        ..
+    } = walk_operands(&slots, path, before);
     if let Some(kind) = pending_flag {
         return Some(kind);
     }
-    while let Some(Operand::Literal(_)) = slots.get(pos) {
-        pos += 1;
+    // A literal slot the cursor has reached is the vocabulary of that position: the
+    // `allow`/`deny` of `proc pending`, the `list`/`rm` of `projects`. Reading past it would
+    // answer with the value *behind* it — a parked id where only a verb is accepted.
+    if let Some(Operand::Literal(words)) = slots.get(pos) {
+        return Some(ValueKind::Literal(words.clone()));
     }
     let Some(Operand::Value(name)) = slots.get(pos) else {
         // The page's whole remaining grammar is literal — the completion page
@@ -924,9 +1049,15 @@ fn flag_metavar_kind(name: &str) -> Option<ValueKind> {
 
 /// The literal cells of the few flags whose posture the docs write symbolically. The
 /// same cells the parser reads, minus the reference row overrun in the table itself.
+///
+/// Keyed by page, so a flag two pages share is named on both: `run` and `app run` take the
+/// whole override set through one parser (`take_override_flag`), and a posture completed on
+/// one launch page and not on the other would be the same flag behaving as two.
 fn flag_literals(path: &[&str], flag: &str) -> Option<Vec<String>> {
     let cells: &[&str] = match (path, flag) {
-        (["run"], "--net") => &["none", "shared", "ask", "allow", "deny", "allow=", "deny="],
+        (["run"] | ["app", "run"], "--net") => {
+            &["none", "shared", "ask", "allow", "deny", "allow=", "deny="]
+        }
         (["net", "logs"], "--verdict") => &["allow", "deny", "blocked", "error"],
         // `logs --feed` takes a comma-joined subset of a closed set. The names come from the feed
         // table itself rather than a second copy of it, so a feed added there is offered here.
@@ -938,9 +1069,27 @@ fn flag_literals(path: &[&str], flag: &str) -> Option<Vec<String>> {
     Some(cells.iter().map(|c| (*c).to_string()).collect())
 }
 
+/// Whether a token that follows a flag name on an option row is that flag's value grammar
+/// rather than the next thing the row says. The table writes a value either as a
+/// metavariable (`--app <name>`, `--net-learn[=level]`) or, where the shape of the value is
+/// itself the documentation, in the uppercase form `--env KEY=VALUE`. A lowercase word is
+/// prose and belongs to no flag.
+///
+/// The uppercase form is not decorative: a flag whose value is not recognized here does not
+/// consume the word after it, so that word is counted as an operand and shifts the page past
+/// its own slots — the failure [`PendingWord`] describes.
+fn is_value_token(tok: &str) -> bool {
+    tok.starts_with('<')
+        || tok.starts_with('[')
+        || (tok.contains('=')
+            && tok
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c == '=' || c == '_'))
+}
+
 /// The value grammar tail of a flag in one option row: fused to the name
-/// (`--gpu[=true|false]`) or a following `<value>` token (`--app <name>`). An option row
-/// may pair a short and a long spelling; the one that matches decides.
+/// (`--gpu[=true|false]`) or a following value token (`--app <name>`, `--env KEY=VALUE`). An
+/// option row may pair a short and a long spelling; the one that matches decides.
 fn flag_tail<'a>(row: &'a str, flag: &str) -> Option<&'a str> {
     let toks: Vec<&str> = row.split_whitespace().collect();
     for (i, tok) in toks.iter().enumerate() {
@@ -960,7 +1109,7 @@ fn flag_tail<'a>(row: &'a str, flag: &str) -> Option<&'a str> {
                 if next.starts_with('-') {
                     continue;
                 }
-                return (next.starts_with('<') || next.starts_with('[')).then_some(*next);
+                return is_value_token(next).then_some(*next);
             }
             return None;
         }
@@ -1017,18 +1166,57 @@ fn describe(desc: &str) -> String {
 /// The bash script. `-o default` is deliberately gone: asking bash for the filesystem
 /// beside sbx's own answers would drown one in the other. Files appear only where the
 /// [`FILES`] marker asks for them.
+///
+/// The one thing this script has to do beyond forwarding words is undo bash's own word
+/// splitting: readline cuts the line on `$COMP_WORDBREAKS`, whose default holds `:` and `=`,
+/// and both characters live *inside* words of sbx's grammar (`api.example.com:443`,
+/// `--net=allow`). See `the_bash_script_rejoins_a_word_split_on_a_word_break_character`.
 const BASH: &str = r#"# bash completion for sbx. Generated by `sbx completion bash`.
 #
 # The command tree lives in the binary, not here: this function forwards the words typed
 # so far and renders what comes back, so it cannot go stale as sbx grows verbs.
 _sbx_complete() {
-    local cand
+    local cand cur head lead breaks part prev i
     local -a typed
     COMPREPLY=()
-    typed=("${COMP_WORDS[@]:1:COMP_CWORD-1}")
-    # Append the word under the cursor explicitly: it is empty when the cursor sits after
+    # bash splits the line on $COMP_WORDBREAKS, which by default holds `:` and `=`. Both sit
+    # inside words of sbx's own grammar (an egress rule is `host:port`, a flag's value may be
+    # written `--net=allow`), so such a word arrives in three pieces: the oracle would be asked
+    # about the fragment after the last break, and the stray `:` would count as an operand.
+    # Neither character is ever a word of the grammar on its own, so the pieces are rejoined.
+    breaks=""
+    [[ $COMP_WORDBREAKS == *:* ]] && breaks=":"
+    [[ $COMP_WORDBREAKS == *=* ]] && breaks+="="
+    typed=()
+    prev=""
+    # The word under the cursor is included explicitly: it is empty when the cursor sits after
     # a space, and that empty trailing word is what asks sbx for the unfiltered list.
-    typed+=("${COMP_WORDS[COMP_CWORD]-}")
+    for ((i = 1; i <= COMP_CWORD; i++)); do
+        part=${COMP_WORDS[i]-}
+        if [[ ${#typed[@]} -gt 0 && -n $breaks ]] &&
+            [[ ( ${#part} -eq 1 && $breaks == *"$part"* ) || ( ${#prev} -eq 1 && $breaks == *"$prev"* ) ]]; then
+            typed[${#typed[@]} - 1]+=$part
+        else
+            typed+=("$part")
+        fi
+        prev=$part
+    done
+    cur=""
+    ((${#typed[@]})) && cur=${typed[${#typed[@]} - 1]}
+    # Readline replaces only the text after the last break character, so a candidate carrying
+    # the whole word would repeat the half bash keeps on the line.
+    head=""
+    for ((i = ${#cur} - 1; i >= 0; i--)); do
+        part=${cur:i:1}
+        if [[ -n $breaks && $breaks == *"$part"* ]]; then
+            head=${cur:0:i+1}
+            break
+        fi
+    done
+    # The mirror case: a fused `--flag=value` whose `=` this shell does not break on is
+    # replaced whole, so the flag half has to be handed back with the value sbx answers.
+    lead=""
+    [[ -z $head && $cur == -*=* ]] && lead="${cur%%=*}="
     while IFS=$'\t' read -r cand _; do
         if [[ $cand == "__sbx_files__" ]]; then
             # sbx refuses to guess at a path: this word is the shell's to complete.
@@ -1036,10 +1224,11 @@ _sbx_complete() {
             # candidate (word splitting would offer each half as its own); `-o filenames`
             # is what has bash quote it and mark a directory as one.
             compopt -o filenames 2>/dev/null
-            mapfile -t COMPREPLY < <(compgen -f -- "${COMP_WORDS[COMP_CWORD]-}")
+            mapfile -t COMPREPLY < <(compgen -f -- "$cur")
+            ((${#COMPREPLY[@]})) && COMPREPLY=("${COMPREPLY[@]#"$head"}")
             return 0
         fi
-        [ -n "$cand" ] && COMPREPLY+=("$cand")
+        [ -n "$cand" ] && COMPREPLY+=("$lead${cand#"$head"}")
     done < <(sbx __complete -- "${typed[@]}" 2>/dev/null)
 }
 complete -F _sbx_complete sbx
@@ -1165,6 +1354,24 @@ mod tests {
     }
 
     #[test]
+    fn a_value_the_table_writes_in_uppercase_is_still_a_value() {
+        // A flag whose value is not recognized as one does not consume the word after it, and
+        // that word is then counted as an operand — the page reads as already past its own
+        // slots. The table writes a value either as a metavariable or, where the shape of the
+        // value is the documentation, as `KEY=VALUE`; both are the flag's.
+        assert_eq!(flag_tail("-e, --env KEY=VALUE", "--env"), Some("KEY=VALUE"));
+        assert_eq!(flag_tail("-p, --param KEY=VALUE", "-p"), Some("KEY=VALUE"));
+        assert_eq!(flag_tail("-a, --app <name>", "--app"), Some("<name>"));
+        assert_eq!(
+            flag_tail("--gpu[=true|false]", "--gpu"),
+            Some("[=true|false]")
+        );
+        // A lowercase word after a flag is prose, not a value: `--all` takes nothing.
+        assert_eq!(flag_tail("--dead", "--dead"), None);
+        assert_eq!(flag_tail("-- command [args...]", "--"), None);
+    }
+
+    #[test]
     fn the_run_page_yields_only_real_flags() {
         // The worst case in the table: optional-value booleans, inline values, and a
         // bare `--` row all live on this page. Nothing may reach a menu carrying grammar.
@@ -1249,6 +1456,29 @@ mod tests {
     }
 
     #[test]
+    fn a_typed_flag_does_not_close_the_commands_own_flag_menu() {
+        // What ends the menu is a typed *operand*: past one, the line belongs to the launched
+        // command. A flag is not one, and neither is the word a flag consumes — so a page whose
+        // whole grammar is flags (`net logs`, `gc`, `net rules`) has to keep answering. It went
+        // quiet after the first flag instead, and silently: typing `-` still worked, and the
+        // emitted bash drops `-o default`, so the prompt simply stopped.
+        let after_flag = names_at_with(&["net", "logs"], &["-f"], "");
+        assert!(
+            after_flag.contains(&"--verdict".to_string()),
+            "the menu closed after a valueless flag: {after_flag:?}"
+        );
+        let after_value = names_at_with(&["net", "rules"], &["-a", "demo-app"], "");
+        assert!(
+            after_value.contains(&"--json".to_string()),
+            "the menu closed after a flag's own value: {after_value:?}"
+        );
+        assert!(names_at_with(&["gc"], &["--prune"], "").contains(&"--all".to_string()));
+        // A typed operand still closes it: past `sbx run ls` the words are the command's.
+        assert!(names_at_with(&["run"], &["ls"], "").is_empty());
+        assert!(names_at_with(&["completion"], &["bash"], "").is_empty());
+    }
+
+    #[test]
     fn past_a_double_dash_the_line_belongs_to_the_shell() {
         // Everything after `--` runs literally, so none of sbx's own names may appear —
         // and the answer is the marker rather than an empty list, which would leave
@@ -1314,6 +1544,34 @@ mod tests {
                 "upgrade does not offer {want:?}: {targets:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_verb_written_as_an_option_row_is_offered_at_the_position_it_fills() {
+        // Two pages document a verb as an option row rather than as a page of its own:
+        // `projects` (`list`, `rm <id>...`) and `proc pending` (`allow <id> | deny <id>`).
+        // Those words are the only ones their first position accepts — `sbx proc pending` refuses
+        // every other operand — so reading past them answered a position that takes a verb with
+        // the value behind it, and the verbs themselves could never be completed.
+        let projects = names_at(&["projects"], "");
+        for want in ["list", "rm", "show"] {
+            assert!(
+                projects.contains(&want.to_string()),
+                "sbx projects lost {want:?}: {projects:?}"
+            );
+        }
+        // A prefix narrows to the verb, where before it narrowed to a tree id or to nothing.
+        assert_eq!(names_at(&["projects"], "l"), ["list"]);
+        assert_eq!(names_at(&["proc", "pending"], ""), ["allow", "deny"]);
+        // Behind the verb, the value it takes is what the next position offers.
+        assert_eq!(
+            cursor_value_kind(&["projects"], &words(&["rm"])),
+            Some(ValueKind::Projects)
+        );
+        assert_eq!(
+            cursor_value_kind(&["proc", "pending"], &words(&["allow"])),
+            Some(ValueKind::PendingIds)
+        );
     }
 
     #[test]
@@ -1393,6 +1651,37 @@ mod tests {
                 "upgrade --app must complete app names ({spelling:?})"
             );
         }
+    }
+
+    #[test]
+    fn a_launch_override_reads_the_same_on_both_launch_pages() {
+        // `run` and `app run` take the whole override set through one parser, and `app run`
+        // accepts an override *before* the app name. A page that names those flags without their
+        // value grammar makes every one of them valueless: the value word is then counted as the
+        // `<name>` operand, and the profiles are never offered again on that line.
+        let path = &["app", "run"];
+        assert_eq!(cursor_value_kind(path, &[]), Some(ValueKind::Apps));
+        for typed in [
+            vec!["--detach"],
+            vec!["--net", "none"],
+            vec!["--env", "FOO=bar"],
+            vec!["--bind", "/data"],
+            vec!["--limit", "tasks_max=4096"],
+            vec!["--config", "@over.toml"],
+        ] {
+            assert_eq!(
+                cursor_value_kind(path, &words(&typed)),
+                Some(ValueKind::Apps),
+                "`sbx app run {} <TAB>` no longer completes the app name",
+                typed.join(" ")
+            );
+        }
+        // And the flag's own value word answers with the same cells on both pages — one parser
+        // reads it, so a posture completed on one launch page and not the other is one flag
+        // behaving as two.
+        let cells = names_at(&["app", "run", "--net"], "");
+        assert_eq!(cells, names_at(&["run", "--net"], ""));
+        assert!(cells.contains(&"none".to_string()), "{cells:?}");
     }
 
     #[test]
@@ -1514,6 +1803,66 @@ mod tests {
             .map(|(n, _)| n)
             .collect();
         assert!(tasks.contains(&"deploy".to_string()), "tasks: {tasks:?}");
+    }
+
+    #[test]
+    fn a_name_that_is_not_an_app_completes_the_vocabulary_of_its_own_page() {
+        // `<name>` means an application on most pages, and these are the pages where it does not:
+        // an operation to invoke, a `[bundle.<name>]` block, an egress group. Answering them with
+        // the app profiles offers exactly the words those verbs refuse — and for `task run` the
+        // two pages of one vocabulary disagreed, since `task list` already said `<operation>`.
+        assert_eq!(
+            cursor_value_kind(&["task", "run"], &[]),
+            Some(ValueKind::Tasks)
+        );
+        assert_eq!(
+            cursor_value_kind(&["task", "list"], &[]),
+            Some(ValueKind::Tasks)
+        );
+        assert_eq!(
+            cursor_value_kind(&["bundle"], &[]),
+            Some(ValueKind::Bundles)
+        );
+        assert_eq!(
+            cursor_value_kind(&["bundle", "export"], &[]),
+            Some(ValueKind::Bundles)
+        );
+        assert_eq!(
+            cursor_value_kind(&["net", "groups"], &[]),
+            Some(ValueKind::Groups)
+        );
+        assert_eq!(
+            cursor_value_kind(&["net", "groups", "export"], &[]),
+            Some(ValueKind::Groups)
+        );
+    }
+
+    #[test]
+    fn the_global_config_names_its_bundles_and_egress_groups() {
+        let _lock = env_lock();
+        let tmp = TmpDir::new();
+        std::fs::create_dir_all(tmp.join("sbx")).unwrap();
+        std::fs::write(
+            tmp.join("sbx").join("sbx.toml"),
+            "[network]\nmode = \"deny\"\n\n[network.groups]\nci-hosts = [\"github.com\"]\n\
+             anthropic = [\"api.anthropic.com\"]\n\n[bundle.claude]\npackages = [\"nix:jq\"]\n",
+        )
+        .unwrap();
+        let _config_home = EnvVar::set("XDG_CONFIG_HOME", tmp.path());
+
+        // A group is a key of the `[network.groups]` table; a bundle is a section of its own.
+        // Both are global-only, so both are read from the file that is allowed to declare them.
+        let names = |kind: &ValueKind| -> Vec<String> {
+            value_candidates(kind, "")
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect()
+        };
+        assert_eq!(names(&ValueKind::Groups), ["anthropic", "ci-hosts"]);
+        assert_eq!(names(&ValueKind::Bundles), ["claude"]);
+        // The entries of a group are rules, not names: only what a `@<name>` can reference is
+        // offered, and a rule is never a candidate here.
+        assert!(!names(&ValueKind::Groups).contains(&"github.com".to_string()));
     }
 
     // ---- exhaustive sweeps over the whole table ----------------------------------
@@ -1828,6 +2177,73 @@ mod tests {
         // And a candidate really can carry one, or this would be guarding nothing.
         assert!(insertable("api.example.com:443"));
         assert!(insertable("re:token"));
+    }
+
+    /// bash cuts the line into `COMP_WORDS` on `$COMP_WORDBREAKS` before a completion function
+    /// runs, and its default set holds `:` and `=` — both of which live *inside* words of sbx's
+    /// own grammar: an egress rule is `host:port`, and a flag's value may be written `--net=allow`.
+    /// The word under the cursor therefore reached the oracle as nothing but its last fragment,
+    /// while the stray break character was counted as an operand and pushed the page past its own
+    /// slots. zsh splits on neither, so the two shells answered differently for one keystroke.
+    ///
+    /// Driven through a real bash with a stub `sbx`, since what has to hold is the *request* the
+    /// script makes and the candidate it hands back — neither of which is visible in its text. The
+    /// stub also keeps the drive off the binary and off this machine's registries.
+    #[test]
+    fn the_bash_script_rejoins_a_word_split_on_a_word_break_character() {
+        let tmp = TmpDir::new();
+        let script = tmp.join("sbx.bash");
+        let asked = tmp.join("asked");
+        std::fs::write(&script, BASH).expect("the emitted script");
+        let driver = r#"
+sbx() { printf '%s\n' "$@" > "@asked@"; printf 'api.example.com:443\tan egress rule\n'; }
+source "@script@"
+run() {
+    COMPREPLY=()
+    _sbx_complete
+    printf 'ASKED:%s\n' "$(tr '\n' '|' < "@asked@")"
+    printf 'REPLY:%s\n' "${COMPREPLY[*]}"
+}
+# The default breaks: bash hands `api.example.com:44` over as three words.
+COMP_WORDBREAKS=$' \t\n"\'@><=;|&(:'
+COMP_WORDS=(sbx net unallow api.example.com : 44)
+COMP_CWORD=5
+run
+# A shell that does not break on the colon sends the word whole, and keeps it whole.
+COMP_WORDBREAKS=$' \t\n'
+COMP_WORDS=(sbx net unallow api.example.com:44)
+COMP_CWORD=3
+run
+"#
+        .replace("@script@", &script.display().to_string())
+        .replace("@asked@", &asked.display().to_string());
+
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&driver)
+            .output()
+            .expect("drive the emitted bash script");
+        assert!(
+            out.status.success(),
+            "the driver failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = stdout.lines().collect();
+        // The oracle is asked about the word being typed, not about the fragment after the
+        // break — and the candidate carries only the half bash will replace, or the rule the
+        // menu offers would be inserted behind the one already on the line.
+        assert_eq!(
+            lines,
+            [
+                "ASKED:__complete|--|net|unallow|api.example.com:44|",
+                "REPLY:443",
+                "ASKED:__complete|--|net|unallow|api.example.com:44|",
+                "REPLY:api.example.com:443",
+            ],
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]

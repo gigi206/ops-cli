@@ -36,11 +36,26 @@ fn known_target(s: &str) -> Option<&'static str> {
     TARGETS.iter().copied().find(|&t| t == s)
 }
 
-/// The targets `--app <name>` narrows. Both are the in-cage rolls, the ones whose unit of work is
-/// already one app's own cage; every other target rewrites a project-wide lock host-side and has no
-/// per-app unit to select, so naming one there is a usage error rather than a flag that reads as
-/// "only this app" while rolling the project.
+/// The targets `--app <name>` narrows, and each is narrowable for its own reason.
+///
+/// `provision` and `mise` are the in-cage rolls, whose unit of work is already one app's own cage.
+/// `nix` is not one of those — it is a host-side lock rewrite — but an app resolves the base channel
+/// against a lock of its own, so there is a per-app unit to select there too. Every other target
+/// rewrites a project-wide lock with no such unit, so naming an app there is a usage error rather
+/// than a flag that reads as "only this app" while rolling the whole project.
 const APP_SCOPED_TARGETS: &[&str] = &["provision", "mise", "nix"];
+
+/// A list of names as prose: `a`, `a and b`, `a, b and c`.
+///
+/// `join(" and ")` is right for two and renders three as "provision and mise and nix", which is how
+/// the `--app` refusal below reached the user.
+fn prose_list(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
 
 /// The outcome of parsing `sbx upgrade`'s arguments: show help, run with a resolved target, an
 /// optional `--project` path and an optional `--app` selector, or a usage error (already-formatted
@@ -150,9 +165,8 @@ fn parse_upgrade_args(args: &[OsString]) -> ParsedArgs {
     let what = what.unwrap_or("all");
     if app.is_some() && !APP_SCOPED_TARGETS.contains(&what) {
         return ParsedArgs::Error(format!(
-            "sbx: upgrade: --app narrows {} only — `{what}` rewrites a project-wide lock \
-             host-side, which has no per-app unit to select.",
-            APP_SCOPED_TARGETS.join(" and ")
+            "sbx: upgrade: --app narrows {} only — `{what}` has no per-app unit to select.",
+            prose_list(APP_SCOPED_TARGETS)
         ));
     }
     ParsedArgs::Run { what, project, app }
@@ -251,7 +265,8 @@ pub(crate) fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let mut ok = true;
     // Whether this run replaced a locked revision, and so repointed store paths. Tracked across
-    // the two channels that build through nix, and read once at the close (below).
+    // the three channels that build through nix — `nix`, `mise` (its project `nix:` tools) and
+    // `flake` — and read once at the close (below).
     let mut moved_store_paths = false;
     if matches!(what, "nix" | "all") {
         let roll = upgrade_nix_channel(&nix, &layout, &cwd, &cfg, only, &pal);
@@ -350,9 +365,10 @@ enum ClosingNote {
 /// Pure, so the choice is unit-tested without nix — and the three cases are **mutually exclusive
 /// by construction**, which is what keeps one run from printing two notes about the same apps.
 ///
-/// The scope is enforced twice over: only [`upgrade_nix_channel`] and [`upgrade_flake_packages`]
-/// return a [`Roll`] at all, so no other channel can set `moved_store_paths`, and the `all` arm
-/// takes precedence over it here.
+/// The scope is bounded by which channels can report a move at all: [`upgrade_nix_channel`],
+/// [`upgrade_mise_tools`] and [`upgrade_flake_packages`] are the three that return a [`Roll`], and
+/// they are exactly the three the `StoreMoved` arm below names. The `all` arm takes precedence over
+/// that arm here, so a run cannot print two notes about the same apps.
 fn closing_note(what: &str, moved_store_paths: bool) -> ClosingNote {
     match what {
         // The channel that runs the install steps has nothing to point at: it just ran them.
@@ -469,7 +485,7 @@ fn declares_mise_package(cfg: &config::Resolved, app: &config::ResolvedApp) -> b
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Advance {
     /// Rolled inside the app's own cage. The unit of work is already one app, so a per-app verb
-    /// runs it — the same two targets `APP_SCOPED_TARGETS` lets `--app` narrow.
+    /// runs it — the in-cage rolls among the targets `APP_SCOPED_TARGETS` lets `--app` narrow.
     PerApp,
     /// Rewritten in a project-wide lock, host-side. Named by the per-app verb, never rolled by it:
     /// there is no per-app unit to select, so rolling it here would make a command that reads as
@@ -760,11 +776,13 @@ fn apps_with_install_steps(cfg: &config::Resolved) -> Vec<&str> {
 
 /// What a roll that moved nix store paths did to the app homes built against them.
 ///
-/// Only `nix` and `flake` reach this: both resolve through `nix build`, so rolling either
-/// **repoints store paths**, and a home holding a reference into the old path (a virtualenv whose
-/// `bin/python` symlinks into the store, a build linked against a store library) is left dangling.
-/// The other channels are deliberately excluded — `deb`/`appimage`/`tarball`/`binary` place their
-/// own content-hashed artifacts and `mise` already rolls per-home inside a cage, so none of them
+/// `nix`, `flake` and `mise` reach this — the three channels that resolve through `nix build`, so
+/// rolling any of them **repoints store paths**, and a home holding a reference into the old path (a
+/// virtualenv whose `bin/python` symlinks into the store, a build linked against a store library) is
+/// left dangling. `mise` qualifies through the project's `nix:` tools, not through its engine (which
+/// runs out of its own private home, so no app home holds a path into it) and not through its
+/// `mise:` packages (per-home downloads inside a cage). The other channels are deliberately excluded
+/// — `deb`/`appimage`/`tarball`/`binary` place their own content-hashed artifacts, so none of them
 /// moves the paths a home points into, and claiming otherwise would be noise.
 ///
 /// This is a *different* statement from [`provision_channel_note`], which answers "what did `all`
@@ -1657,12 +1675,34 @@ mod tests {
                 message.contains(t),
                 "the refusal names the target: {message}"
             );
+            // The list of narrowable targets is prose, not a `join(" and ")`: a three-element
+            // constant rendered as "provision and mise and nix", which reads as a display bug in
+            // the one sentence that has to be read carefully. And the second clause describes the
+            // target the user typed rather than claiming host-side lock rewrites are never
+            // app-scoped — `nix` is one, and it is in the list this very sentence just gave.
+            assert!(
+                message.contains("provision, mise and nix"),
+                "the narrowable targets read as a list: {message}"
+            );
+            assert!(
+                !message.contains("rewrites a project-wide lock host-side"),
+                "the refusal must not deny what it has just listed: {message}"
+            );
         }
         // The defaulted target is checked too: this resolves to `all`, which is project-wide.
         assert!(matches!(
             parse_upgrade_args(&os(&["--app", "demo-app"])),
             ParsedArgs::Error(_)
         ));
+        // The helper the refusal is built from, at every arity it can meet.
+        assert_eq!(prose_list(&[]), "");
+        assert_eq!(prose_list(&["nix"]), "nix");
+        assert_eq!(prose_list(&["mise", "nix"]), "mise and nix");
+        assert_eq!(
+            prose_list(&["provision", "mise", "nix"]),
+            "provision, mise and nix"
+        );
+
         // Value forms that carry no name, and a repeat.
         for bad in [
             os(&["provision", "--app"]),

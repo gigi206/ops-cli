@@ -305,10 +305,60 @@ const PAGES: &[Page] = &[
                  repeatable (see `sbx help run`)",
             ),
             (
-                "--env / --net / --gui / --proc / --notify / --nixpkgs / --bind / --forward / \
-                 --limit / --package / --seccomp / --device / --gpu / --audio / --dbus",
-                "typed one-shot overrides for a single field each, beating the app's posture; \
-                 see `sbx help run`",
+                "--env KEY=VALUE",
+                "one-shot override of a single cage environment variable; repeatable",
+            ),
+            (
+                "--net <posture>",
+                "one-shot network posture: none | shared | ask | allow | deny, or the list forms \
+                 allow=host1,host2 | deny=host1,host2 (see `sbx help run`)",
+            ),
+            ("--gui <none|offscreen|wayland>", "one-shot display posture"),
+            (
+                "--proc <off|observe|enforce|ask>",
+                "one-shot process/exec posture (a bare mode; --config sets the allow/deny lists)",
+            ),
+            (
+                "--notify <off|once|always>",
+                "one-shot refusal-notification mode, applied to every event",
+            ),
+            ("--nixpkgs <ref>", "one-shot nixpkgs channel or revision"),
+            (
+                "--bind <path[:ro|:rw]>",
+                "one-shot host bind (read-only by default); repeatable",
+            ),
+            (
+                "--forward <port|host:cage[,…]>",
+                "one-shot host loopback forward into the cage; repeatable, folds onto the \
+                 config by cage port",
+            ),
+            (
+                "--limit <key>=<value>",
+                "one-shot cgroup limit: memory_high | memory_max | tasks_max; repeatable",
+            ),
+            (
+                "--package <name>=<backend:locator>",
+                "one-shot package (e.g. hello=nix:hello); repeatable",
+            ),
+            (
+                "--seccomp <token[,token…]>",
+                "one-shot relaxation of the syscall denylist (e.g. ptrace, clone:newuser); repeatable",
+            ),
+            (
+                "--device <path>",
+                "one-shot host device grant, one path per flag (e.g. /dev/kvm); repeatable",
+            ),
+            (
+                "--gpu[=true|false]",
+                "one-shot GPU posture (bare --gpu means true); --gpu=false disables it",
+            ),
+            (
+                "--audio[=true|false]",
+                "one-shot audio posture (bare --audio means true); --audio=false disables it",
+            ),
+            (
+                "--dbus[=true|false]",
+                "one-shot in-cage desktop portal (bare --dbus means true)",
             ),
         ],
         details: "`sbx app run <name>` launches a named application profile (a project [app.<name>]\n\
@@ -933,11 +983,11 @@ const PAGES: &[Page] = &[
     },
     Page {
         path: &["task", "run"],
-        synopsis: "sbx task run <name> [--param KEY=VALUE]... [--env KEY=VALUE]... [--detach] [--session <id>] [--json]",
+        synopsis: "sbx task run <operation> [--param KEY=VALUE]... [--env KEY=VALUE]... [--detach] [--session <id>] [--json]",
         summary: "invoke one declared operation",
         options: &[
             (
-                "<name>",
+                "<operation>",
                 "the operation to run, as `sbx task list` shows it",
             ),
             (
@@ -1383,7 +1433,9 @@ const PAGES: &[Page] = &[
             that matrix: they bootstrap the restrictive posture when there is none, and refuse a\n\
             rule that would sit inert under the current mode. Writing one here would look set and\n\
             decide nothing, so it is refused with the verb to use. Removal is not redirected —\n\
-            `sbx config rm` is in fact the only way to take an `allow`/`deny` rule back out.\n\
+            `sbx config rm` takes an `allow`/`deny` rule back out, and so do `sbx net\n\
+            unallow|undeny|unmute` and `sbx proc unallow|undeny` in the vocabulary the rule was\n\
+            written in (they also drop a list they empty, where `config rm` leaves `allow = []`).\n\
             \n\
             The trust gate hashes the whole file, so a write re-arms it; --trust re-blesses the file\n\
             in one step (the global config and app profiles are trusted by location and need none).\n\
@@ -1960,7 +2012,7 @@ const PAGES: &[Page] = &[
             ),
         ],
         details: "The deliberate command IS the consent — an agent in the cage cannot run it, and the\n\
-            profile stays inert until `sbx app <name>` launches it. The granted posture is\n\
+            profile stays inert until `sbx app run <name>` launches it. The granted posture is\n\
             printed so the act is informed. The bytes are copied verbatim.\n\
             \n\
             Without --force, a profile of that name already on disk is refused rather than\n\
@@ -2084,7 +2136,7 @@ const PAGES: &[Page] = &[
             \n\
             `--yes` is refused while a session of that app is running: the tools live in the home\n\
             that session is using, so deleting them takes an interpreter or a `PATH` entry out from\n\
-            under a command in flight. Stop it with `sbx stop` and retry. The preview deletes\n\
+            under a command in flight. Stop it with `sbx session stop` and retry. The preview deletes\n\
             nothing and stays available.",
     },
     Page {
@@ -2163,7 +2215,7 @@ const PAGES: &[Page] = &[
             A rule that came from a `[network.groups]` group shows as a single `@<name>` reference;\n\
             `--expand` unfolds it to its hosts, each noting its `@<group>` origin (resolve one\n\
             directly with `sbx net groups <name>`). Under `shared`/`none` there are no rules. `--app\n\
-            <name>` shows what `sbx app <name>` would launch with — the same effective policy `sbx\n\
+            <name>` shows what `sbx app run <name>` would launch with — the same effective policy `sbx\n\
             test net --app` tests a URL against. `--source session` instead queries the live sessions\n\
             for the rules loaded into their overlay with `sbx net allow|deny --session` (or a `net\n\
             pending … --session` answer) — this project's sessions by default, or `-a <app>`'s\n\
@@ -3385,7 +3437,7 @@ fn resolve_path<'a>(cmd: &'a str, rest: &'a [OsString]) -> Vec<&'a str> {
 /// excludes `run`/`mise`, which handle a leading help flag themselves.
 ///
 /// A `--` ends sbx's own options: anything after it belongs to a launched command (e.g.
-/// `sbx app <name> -- --help` passes `--help` through to that command), so the help scan stops
+/// `sbx app run <name> -- --help` passes `--help` through to that command), so the help scan stops
 /// at the first `--` — the same rule the `run` arm applies to its command.
 pub fn maybe_help(cmd: &str, rest: &[OsString]) -> Option<ExitCode> {
     let asks_help = rest
@@ -3559,6 +3611,125 @@ mod tests {
                 .next()
                 .is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '_')
         })
+    }
+
+    /// The inline-code spans of one page: its summary, its option rows and their descriptions,
+    /// and its details prose. A command is quoted in a span wherever a page names one, so the
+    /// span is the unit a claim about a command is made in. Read the way [`paint_inline_code`]
+    /// reads them — the odd halves of a split on the backtick.
+    fn code_spans_of(page: &Page) -> Vec<&'static str> {
+        let mut texts: Vec<&'static str> = vec![page.summary, page.details];
+        for &(row, desc) in page.options {
+            texts.push(row);
+            texts.push(desc);
+        }
+        texts
+            .into_iter()
+            .flat_map(|text| text.split('`').skip(1).step_by(2))
+            .collect()
+    }
+
+    /// Whether a quoted word is shaped like a command name. The table writes them lowercase, so
+    /// a flag, a metavariable, a dotted key or an example value is not one and is left alone.
+    fn is_command_word(tok: &str) -> bool {
+        tok.starts_with(|c: char| c.is_ascii_lowercase())
+            && tok.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+    }
+
+    /// No page sends a reader to a command the binary does not have.
+    ///
+    /// A page is where a refusal's remediation is written, so a command named here is read at the
+    /// moment something already failed — and both ways it goes stale are silent. A verb that never
+    /// existed (`sbx stop`, where the verb is `sbx session stop`) is one. A namespace named without
+    /// the subcommand it requires is the other: `sbx app <name>` is not a launch, because an app
+    /// name is never a subcommand — an app may itself be named `run`, and is launched as
+    /// `sbx app run <name>` either way.
+    ///
+    /// Both halves are read out of the table rather than from a list kept here. The head of a
+    /// quoted `sbx …` names a top-level command; and where that command's own page carries no
+    /// options — the namespaces, whose whole grammar is their subcommands — the word after it names
+    /// one of them.
+    #[test]
+    fn no_page_names_a_command_the_binary_does_not_have() {
+        let mut broken: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        for page in PAGES {
+            let named = |what: String| format!("sbx {}: {what}", page.path.join(" "));
+            for span in code_spans_of(page) {
+                let mut words = span.split_whitespace();
+                if words.next() != Some("sbx") {
+                    continue;
+                }
+                let Some(head) = words.next().filter(|w| is_command_word(w)) else {
+                    continue;
+                };
+                // `help` is a real verb, and the one with no page of its own.
+                if head == "help" {
+                    continue;
+                }
+                checked += 1;
+                let head = canonical(&[], head);
+                let Some(owner) = find(&[head]) else {
+                    broken.push(named(format!("`{span}` names no command `{head}`")));
+                    continue;
+                };
+                // A namespace takes a subcommand and nothing else: its page documents no option
+                // or operand of its own, and every word it accepts has a page one level down.
+                if !owner.options.is_empty() || children(&[head]).is_empty() {
+                    continue;
+                }
+                let Some(next) = words
+                    .next()
+                    .filter(|w| is_command_word(w) || w.starts_with(['<', '[']))
+                else {
+                    continue;
+                };
+                if find(&[head, canonical(&[head], next)]).is_none() {
+                    broken.push(named(format!(
+                        "`{span}` names no `{head}` subcommand `{next}`"
+                    )));
+                }
+            }
+        }
+        assert!(
+            broken.is_empty(),
+            "these pages quote a command the dispatcher would refuse:\n{}",
+            broken.join("\n")
+        );
+        // A sweep that read no span at all would pass while guarding nothing.
+        assert!(checked > 150, "only {checked} quoted commands swept");
+    }
+
+    /// The `config add` page redirects a rule *write* to the verb that owns it, and the same
+    /// paragraph tells the reader how a rule comes back out. The second half is a claim about the
+    /// table's own removal verbs, and it went stale the day they were added: the page said
+    /// `sbx config rm` was the only way out, while `sbx net unallow|undeny|unmute` and `sbx proc
+    /// unallow|undeny` each had a page, each was dispatched, and the `config rm` page said so.
+    ///
+    /// Asserted against the removal verbs the table declares rather than a list kept here, so a
+    /// verb added tomorrow is one this paragraph has to account for.
+    #[test]
+    fn the_config_add_page_accounts_for_every_rule_removal_verb() {
+        let page = find(&["config", "add"]).expect("the `config add` page");
+        let mut unnamed: Vec<String> = Vec::new();
+        let mut removals = 0usize;
+        for namespace in ["net", "proc"] {
+            for (verb, _) in subcommands_of(&[namespace]) {
+                if !verb.starts_with("un") {
+                    continue;
+                }
+                removals += 1;
+                if !page.details.contains(verb) {
+                    unnamed.push(format!("sbx {namespace} {verb}"));
+                }
+            }
+        }
+        assert!(
+            unnamed.is_empty(),
+            "the `config add` page describes removal without naming these verbs, which take a \
+             rule back out in the vocabulary it was written in: {unnamed:?}"
+        );
+        assert!(removals >= 5, "only {removals} removal verbs found");
     }
 
     #[test]

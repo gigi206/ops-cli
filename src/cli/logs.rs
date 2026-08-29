@@ -225,8 +225,9 @@ struct Row {
 ///
 /// The head is `None` when this feed cannot be followed — it answered, and its rows are good, but it
 /// handed back no cursor to come back with. Reading that as zero would re-ask for everything on
-/// every poll and print the same rows again; declining to follow shows them once and says the feed
-/// ended, which is the honest reading of a source that cannot tell us what is new.
+/// every poll and print the same rows again; declining to follow shows them once and stops polling
+/// it, which is the honest reading of a source that cannot tell us what is new. It is not the feed
+/// ending, and the view says so: see [`FollowEnd`].
 type FeedRead = fn(&Path, Option<u64>) -> std::io::Result<(Vec<Row>, Option<u64>, u64)>;
 
 /// One feed of the merged view, and where it stands.
@@ -506,6 +507,22 @@ fn write_row(
     }
 }
 
+/// The refusal for a merged view in which every feed that was read turned out to be absent.
+///
+/// `--feed` narrows the list *before* the read, so with a filter in play the unfiltered sentence
+/// would state a property of the whole session on the strength of a subset of it — telling an
+/// operator that a session records nothing while the very next `sbx logs` prints its egress rows.
+/// The filtered wording names what was consulted and claims nothing about the rest.
+fn nothing_recorded_message(pid: u32, filtered: bool, consulted: &[&str]) -> String {
+    if filtered {
+        return format!(
+            "sbx: logs: session {pid} is not recording {}.",
+            consulted.join(", ")
+        );
+    }
+    format!("sbx: logs: session {pid} is recording nothing.")
+}
+
 /// `sbx logs [<id>] [--feed <a,b,…>] [-n <N>] [-f|--follow] [--json]`: one session's feeds,
 /// interleaved in time.
 ///
@@ -619,12 +636,20 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
     // Reading the missing cursor as a missing feed threw those rows away and told the reader the
     // session was recording nothing while holding its record in hand.
     if absent.len() == feeds.len() {
-        diag::error(&format!(
-            "sbx: logs: session {} is recording nothing.",
-            target.pid
+        let consulted: Vec<&str> = absent.iter().map(|(name, _)| *name).collect();
+        diag::error(&nothing_recorded_message(
+            target.pid,
+            only.is_some(),
+            &consulted,
         ));
         for (name, why) in &absent {
             diag::hint(&format!("       {name}: {why}"));
+        }
+        if only.is_some() {
+            diag::hint(
+                "       `--feed` narrowed the read to those; this session's other feeds were not \
+                 consulted.",
+            );
         }
         return ExitCode::from(2);
     }
@@ -683,47 +708,40 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // Nothing left to poll before the first sleep: every feed either did not answer or answered
+    // without a cursor, and what was printed above is the whole of their record. Saying the session
+    // ended here would report a live session as finished, so the follow declines instead.
+    if let Some(end) = follow_end(&feeds, !unfollowable.is_empty()) {
+        if !json {
+            let mut out = std::io::stdout().lock();
+            let (dim, r) = (pal.dim, pal.reset);
+            let _ = writeln!(out, "  {dim}({}){r}", end.note(target.pid));
+        }
+        return ExitCode::SUCCESS;
+    }
+
     // Follow: poll every live feed past its own cursor, sort each round together, and stop when the
     // last one ends. The feeds are independent by construction — each owns its ring and its socket —
     // so one ending is not the session ending, and dropping it while the others run on is the whole
     // reason a cursor can go `None` here rather than the loop returning.
+    //
+    // The round's rows are written **before** its end is acted on. A feed can lose its cursor on a
+    // *successful* read that handed back rows, so returning first discarded the batch just
+    // collected and closed the view with a verdict about a session whose record it was holding.
     loop {
         std::thread::sleep(FOLLOW_INTERVAL);
-        let mut batch = Vec::new();
-        let mut evicted = 0;
-        for feed in &mut feeds {
-            let Some(cursor) = feed.cursor else { continue };
-            match (feed.read)(&feed.socket, Some(cursor)) {
-                Ok((rows, head, dropped)) => {
-                    batch.extend(rows);
-                    evicted += dropped;
-                    feed.cursor = head;
-                }
-                // Whoever stood the feed up unlinks its socket on drop, so a connect failure after a
-                // successful read is that feed ending, not a transient (a local UDS connect does not
-                // fail transiently).
-                Err(_) => feed.cursor = None,
-            }
-        }
-        if feeds.iter().all(|f| f.cursor.is_none()) {
-            if !json {
-                let mut out = std::io::stdout().lock();
-                let (dim, r) = (pal.dim, pal.reset);
-                let _ = writeln!(out, "  {dim}(session {} ended){r}", target.pid);
-            }
-            return ExitCode::SUCCESS;
-        }
-        batch.sort_by_key(|r| r.at_epoch_ms);
+        let round = follow_round(&mut feeds);
         let mut out = std::io::stdout().lock();
         let wrote = (|| -> std::io::Result<()> {
-            if evicted > 0 && !json {
+            if round.evicted > 0 && !json {
                 let (dim, r) = (pal.dim, pal.reset);
+                let evicted = round.evicted;
                 writeln!(
                     out,
                     "  {dim}({evicted} earlier event(s) evicted from a ring before this poll){r}"
                 )?;
             }
-            for row in &batch {
+            for row in &round.rows {
                 write_row(&mut out, target.pid, row, json, &pal)?;
             }
             out.flush()
@@ -732,7 +750,95 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
         if wrote.is_err() {
             return ExitCode::SUCCESS;
         }
+        if let Some(end) = round.end {
+            if !json {
+                let mut out = std::io::stdout().lock();
+                let (dim, r) = (pal.dim, pal.reset);
+                let _ = writeln!(out, "  {dim}({}){r}", end.note(target.pid));
+            }
+            return ExitCode::SUCCESS;
+        }
     }
+}
+
+/// Why a merged `--follow` stops: there is a difference between the feeds *ending* and their never
+/// having been followable, and only one of them says anything about the session.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum FollowEnd {
+    /// Every feed stopped answering — its socket was unlinked when whoever stood it up went away,
+    /// which is the session ending.
+    SessionEnded,
+    /// A feed answered and handed back no cursor: its plane predates the append cursor `--follow`
+    /// polls with, so it is read once and not followed. The session may still be running.
+    NothingFollowable,
+}
+
+impl FollowEnd {
+    /// The parenthetical the view closes with.
+    fn note(self, pid: u32) -> String {
+        match self {
+            FollowEnd::SessionEnded => format!("session {pid} ended"),
+            FollowEnd::NothingFollowable => {
+                format!("nothing further to follow for session {pid}")
+            }
+        }
+    }
+}
+
+/// Whether every feed has stopped carrying a cursor, and what that means — `None` while at least
+/// one is still followable.
+///
+/// `lost_cursor` says whether any feed dropped out on a **successful** read. One that answered and
+/// handed back no cursor was never followable, which is a statement about that plane rather than
+/// about the session, so it must not close the view by declaring the session over.
+fn follow_end(feeds: &[Feed], lost_cursor: bool) -> Option<FollowEnd> {
+    if feeds.iter().any(|f| f.cursor.is_some()) {
+        return None;
+    }
+    Some(match lost_cursor {
+        true => FollowEnd::NothingFollowable,
+        false => FollowEnd::SessionEnded,
+    })
+}
+
+/// What one round of the merged follow produced.
+struct FollowRound {
+    /// The rows every polled feed handed back, merged and sorted on their own timestamps. They are
+    /// carried out of the round rather than written inside it, so a round that also ends the follow
+    /// cannot end it without them.
+    rows: Vec<Row>,
+    /// Events a ring evicted before this poll could see them, summed across the feeds.
+    evicted: u64,
+    /// Set when no feed is left to poll, with the reason.
+    end: Option<FollowEnd>,
+}
+
+/// Poll every feed that still carries a cursor, past that cursor.
+///
+/// A feed drops out in two ways and they are not the same answer: a connect failure is that feed
+/// ending (whoever stood it up unlinks its socket on drop, and a local UDS connect does not fail
+/// transiently), while a successful read that hands back no cursor is a feed that cannot say what
+/// is new and so is read once and not followed. When the last cursor goes, only the first of those
+/// is the session ending.
+fn follow_round(feeds: &mut [Feed]) -> FollowRound {
+    let mut rows = Vec::new();
+    let mut evicted = 0;
+    let mut lost_cursor = false;
+    for feed in feeds.iter_mut() {
+        let Some(cursor) = feed.cursor else { continue };
+        match (feed.read)(&feed.socket, Some(cursor)) {
+            Ok((batch, head, dropped)) => {
+                rows.extend(batch);
+                evicted += dropped;
+                lost_cursor |= head.is_none();
+                feed.cursor = head;
+            }
+            Err(_) => feed.cursor = None,
+        }
+    }
+    rows.sort_by_key(|r| r.at_epoch_ms);
+    let end = follow_end(feeds, lost_cursor);
+    FollowRound { rows, evicted, end }
 }
 
 #[cfg(test)]
@@ -750,5 +856,118 @@ mod tests {
             .map(|f| f.name)
             .collect();
         assert_eq!(built, FEED_NAMES);
+    }
+
+    /// `--feed` narrows the read before it happens, so the refusal that follows it may only speak
+    /// for what it consulted. A session with a filtering `[network] mode` and no `--observe` is
+    /// recording its egress and not its file writes: `sbx logs <pid> --feed fs` told the operator
+    /// the session was recording nothing, one command before `sbx logs <pid>` printed its egress
+    /// rows.
+    #[test]
+    fn a_filtered_read_that_found_nothing_does_not_speak_for_the_whole_session() {
+        // Unfiltered, the sentence is about the session, and it is true: every feed was consulted.
+        assert_eq!(
+            nothing_recorded_message(4242, false, &["proc", "fs"]),
+            "sbx: logs: session 4242 is recording nothing."
+        );
+
+        let filtered = nothing_recorded_message(4242, true, &["fs"]);
+        assert!(
+            !filtered.contains("recording nothing"),
+            "a partial reading must not deliver a whole-session verdict: {filtered}"
+        );
+        assert!(
+            filtered.contains("fs") && filtered.contains("4242"),
+            "the refusal names what was consulted: {filtered}"
+        );
+    }
+
+    /// A feed read that succeeds and hands back no cursor is a plane that cannot say what is new,
+    /// not a feed that ended — and its rows are as good as any other's. The follow loop tested the
+    /// cursors and returned before writing the batch, so the last such read had its rows discarded
+    /// and closed the view with "(session ended)" for a session that was still running.
+    #[test]
+    fn a_round_that_ends_the_follow_still_carries_the_rows_it_just_read() {
+        fn answers_without_a_cursor(
+            _socket: &Path,
+            _after: Option<u64>,
+        ) -> std::io::Result<(Vec<Row>, Option<u64>, u64)> {
+            Ok((
+                vec![Row {
+                    at_epoch_ms: 7,
+                    feed: "task",
+                    token: "exit=0".to_string(),
+                    subject: "sync".to_string(),
+                }],
+                None,
+                0,
+            ))
+        }
+
+        let mut feeds = vec![Feed {
+            name: "task",
+            socket: PathBuf::from("/nonexistent"),
+            absent: "no declared operations",
+            read: answers_without_a_cursor,
+            cursor: Some(0),
+        }];
+        let round = follow_round(&mut feeds);
+        assert_eq!(round.rows.len(), 1, "the rows this round read are carried");
+        assert_eq!(round.rows[0].subject, "sync");
+        assert_eq!(
+            round.end,
+            Some(FollowEnd::NothingFollowable),
+            "a plane that cannot be followed is not the session ending"
+        );
+        assert_eq!(
+            round.end.unwrap().note(4242),
+            "nothing further to follow for session 4242"
+        );
+
+        // A feed that stops answering at all *is* the session ending, and keeps that wording.
+        fn refuses(
+            _socket: &Path,
+            _after: Option<u64>,
+        ) -> std::io::Result<(Vec<Row>, Option<u64>, u64)> {
+            Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+        }
+        let mut feeds = vec![Feed {
+            name: "net",
+            socket: PathBuf::from("/nonexistent"),
+            absent: "no filtering egress posture",
+            read: refuses,
+            cursor: Some(0),
+        }];
+        let round = follow_round(&mut feeds);
+        assert!(round.rows.is_empty());
+        assert_eq!(round.end, Some(FollowEnd::SessionEnded));
+        assert_eq!(round.end.unwrap().note(4242), "session 4242 ended");
+
+        // While one feed still carries a cursor the follow does not end, whatever the others did.
+        fn answers_with_a_cursor(
+            _socket: &Path,
+            _after: Option<u64>,
+        ) -> std::io::Result<(Vec<Row>, Option<u64>, u64)> {
+            Ok((Vec::new(), Some(3), 0))
+        }
+        let mut feeds = vec![
+            Feed {
+                name: "task",
+                socket: PathBuf::from("/nonexistent"),
+                absent: "no declared operations",
+                read: answers_without_a_cursor,
+                cursor: Some(0),
+            },
+            Feed {
+                name: "net",
+                socket: PathBuf::from("/nonexistent"),
+                absent: "no filtering egress posture",
+                read: answers_with_a_cursor,
+                cursor: Some(0),
+            },
+        ];
+        let round = follow_round(&mut feeds);
+        assert_eq!(round.rows.len(), 1);
+        assert_eq!(round.end, None);
     }
 }

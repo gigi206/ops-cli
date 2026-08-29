@@ -374,6 +374,94 @@ pub(crate) fn import_remedy(verb: &str, missing: &[MissingRef]) -> String {
         .join(", ")
 }
 
+/// Refuse a `=value` suffix on a flag that takes none, naming it and printing `path`'s usage.
+///
+/// `None` when the token is not one of `valueless` or carries no suffix, so the caller dispatches
+/// it as usual.
+///
+/// Both launch parsers dispatch on [`crate::flag_name`], which strips a `=value` suffix so that
+/// `--config` and `--config=x` reach one arm. That is right for the value-taking flags and wrong
+/// for the pure booleans: stripped of its suffix, `--detach=false` is indistinguishable from a bare
+/// `--detach`, and the flag a caller spelled `false` switched the posture on. The CLI teaches the
+/// inline spelling elsewhere — `--gpu[=true|false]`, `--audio` and `--dbus` are optional-value
+/// booleans — so a script that writes every flag as `--name=value` arrives here, and a posture flag
+/// that means the opposite of what it says is exactly the silent mis-launch the launch parsers
+/// exist to prevent.
+///
+/// The help flags are deliberately not passed in: a page shown for `--help=x` misleads nobody,
+/// while these decide how the workload runs.
+pub(crate) fn refuse_flag_value(raw: &str, valueless: &[&str], path: &[&str]) -> Option<ExitCode> {
+    let flag = crate::flag_name(raw);
+    if !raw.contains('=') || !valueless.contains(&flag) {
+        return None;
+    }
+    diag::error(&format!("sbx: `{flag}` takes no value"));
+    eprintln!("sbx: usage: {}", crate::help::synopsis_of(path));
+    Some(ExitCode::from(2))
+}
+
+/// The pure booleans `sbx run` reads before the command, which therefore take no `=value`.
+const RUN_VALUELESS_FLAGS: &[&str] = &["--detach", "--observe"];
+
+/// What parsing the head of a `sbx run` line yielded: the command to launch, and the sbx flags
+/// that preceded it.
+struct RunLaunch {
+    cmd: Vec<OsString>,
+    detach: bool,
+    observe: bool,
+    cli: crate::config::CliOverrides,
+}
+
+/// Parse the leading sbx flags of `sbx run`, leaving the command itself in [`RunLaunch::cmd`].
+///
+/// The head carries `--detach` to run in the background, `--observe` for the exec feed, a one-shot
+/// override (the whole-schema `--config <toml|@file>` and the typed `--env`/`--net`/`--gui`/
+/// `--nixpkgs`/`--bind`/`--limit`/`--package`, each repeatable), `--help`/`-h` for this command's
+/// page, and an optional `--` separating sbx's arguments from the command's. The `--` is consumed
+/// before scanning the command, so `sbx run -- --detach` (or `-- --help`) runs the literal
+/// argument.
+///
+/// Kept apart from the dispatch arm so the head rules are unit-tested without launching a cage, the
+/// way [`app`]'s launch parser is — the two read the same flag grammar and must not drift. `Err`
+/// carries the code the caller returns, which for a help flag is a success.
+fn parse_run_launch(mut cmd: Vec<OsString>) -> Result<RunLaunch, ExitCode> {
+    let mut detach = false;
+    let mut observe = false;
+    let mut cli = crate::config::CliOverrides::default();
+    while let Some(raw) = cmd.first().and_then(|a| a.to_str()) {
+        if let Some(code) = refuse_flag_value(raw, RUN_VALUELESS_FLAGS, &["run"]) {
+            return Err(code);
+        }
+        match crate::flag_name(raw) {
+            "--detach" => {
+                detach = true;
+                cmd.remove(0);
+            }
+            "--observe" => {
+                observe = true;
+                cmd.remove(0);
+            }
+            "--help" | "-h" => return Err(crate::help::show(&["run"])),
+            "--" => {
+                cmd.remove(0);
+                break;
+            }
+            // A one-shot override flag, or the start of the command.
+            _ => match crate::take_override_flag(&mut cmd, &mut cli, "run") {
+                Some(Ok(())) => {}
+                Some(Err(c)) => return Err(c),
+                None => break,
+            },
+        }
+    }
+    Ok(RunLaunch {
+        cmd,
+        detach,
+        observe,
+        cli,
+    })
+}
+
 /// Route a resolved command name to its handler. `main` has already peeled off the help paths
 /// (`sbx --help`, `sbx <cmd> --help`) and the no-command usage error, so every name that reaches
 /// here is a concrete command plus its remaining arguments; each family owns its parsing from this
@@ -419,46 +507,13 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         "storage" => storage::storage_cmd(rest),
         "store" => store::store_cmd(rest),
         "path" => crate::path_cmd(&rest),
-        "run" => {
-            let mut cmd: Vec<OsString> = rest;
-            // Leading sbx flags before the command: `--detach` to run in the background, a one-shot
-            // override (the whole-schema `--config <toml|@file>` and the typed `--env`/`--net`/
-            // `--gui`/`--nixpkgs`/`--bind`/`--limit`/`--package`, each repeatable), `--help`/`-h` for
-            // this command's page, and an optional `--` separating sbx's arguments from the
-            // command's. The `--` is consumed before scanning the command, so `sbx run -- --detach`
-            // (or `-- --help`) runs the literal argument.
-            let mut detach = false;
-            let mut observe = false;
-            let mut cli = crate::config::CliOverrides::default();
-            while let Some(raw) = cmd.first().and_then(|a| a.to_str()) {
-                match crate::flag_name(raw) {
-                    "--detach" => {
-                        detach = true;
-                        cmd.remove(0);
-                    }
-                    "--observe" => {
-                        observe = true;
-                        cmd.remove(0);
-                    }
-                    "--help" | "-h" => return crate::help::show(&["run"]),
-                    "--" => {
-                        cmd.remove(0);
-                        break;
-                    }
-                    // A one-shot override flag, or the start of the command.
-                    _ => match crate::take_override_flag(&mut cmd, &mut cli, "run") {
-                        Some(Ok(())) => {}
-                        Some(Err(c)) => return c,
-                        None => break,
-                    },
-                }
-            }
-            let ov = match crate::build_override(cli) {
-                Ok(ov) => ov,
-                Err(c) => return c,
-            };
-            crate::sandbox::run(cmd, detach, observe, ov)
-        }
+        "run" => match parse_run_launch(rest) {
+            Err(code) => code,
+            Ok(launch) => match crate::build_override(launch.cli) {
+                Err(code) => code,
+                Ok(ov) => crate::sandbox::run(launch.cmd, launch.detach, launch.observe, ov),
+            },
+        },
         "mise" => {
             // A passthrough, so a help flag is only sbx's when it leads: `sbx mise --help`
             // shows sbx's page, while `sbx mise help` (and any later `--help`) reaches the
@@ -493,9 +548,44 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{OneFile, OneName, dedupe_names, one_name, parse_one_file, parse_one_name};
+    use super::{
+        OneFile, OneName, dedupe_names, one_name, parse_one_file, parse_one_name, parse_run_launch,
+    };
     use std::ffi::OsString;
     use std::path::PathBuf;
+
+    /// `--detach` and `--observe` decide how the workload runs, so a `=value` suffix has to be
+    /// refused rather than stripped. `flag_name` exists so that `--config` and `--config=x` reach
+    /// one arm; a pure boolean run through it loses its value, and `sbx run --detach=false npm test`
+    /// launched detached — the terminal returning at once, the output going to a log file, and the
+    /// command's exit status never reaching the caller: the opposite of what was asked for.
+    #[test]
+    fn a_valueless_run_flag_refuses_a_value_rather_than_switching_itself_on() {
+        let v = |xs: &[&str]| -> Vec<OsString> { xs.iter().map(OsString::from).collect() };
+
+        // The bare spellings still set the posture and leave the command untouched.
+        let l = parse_run_launch(v(&["--detach", "--observe", "npm", "test"])).unwrap();
+        assert_eq!((l.detach, l.observe), (true, true));
+        assert_eq!(l.cmd, v(&["npm", "test"]));
+
+        // The `=value` spellings are usage errors, whatever the value says — including the one
+        // that agrees with the bare flag, since accepting `=true` would teach the spelling that
+        // silently inverts as `=false`.
+        for bad in [
+            v(&["--detach=false", "npm", "test"]),
+            v(&["--detach=true", "npm", "test"]),
+            v(&["--observe=false", "npm", "test"]),
+        ] {
+            assert!(parse_run_launch(bad.clone()).is_err(), "{bad:?}");
+        }
+
+        // A value-taking flag keeps the inline form — that is what `flag_name` is for — and a
+        // token after `--` stays the command's.
+        let l = parse_run_launch(v(&["--env=A=1", "--", "--detach=false"])).unwrap();
+        assert_eq!(l.cli.env, vec!["A=1".to_string()]);
+        assert!(!l.detach);
+        assert_eq!(l.cmd, v(&["--detach=false"]));
+    }
 
     #[test]
     fn dedupe_names_keeps_the_first_of_each_in_order() {

@@ -98,6 +98,15 @@ impl Plane {
             .map(|(pid, _)| pid.to_string())
             .unwrap_or_else(|| NONE.to_string())
     }
+
+    /// This plane's session as a line under a refusal: the id to hand `--session`, and the project
+    /// that tells one session from another. The same shape [`resolve_task_session`] lists.
+    fn describe(&self) -> String {
+        match &self.session {
+            Some((pid, project)) => format!("{pid}  {}", project.display()),
+            None => NONE.to_string(),
+        }
+    }
 }
 
 /// Which of a session's two sockets a verb speaks to.
@@ -620,8 +629,9 @@ fn task_secrets(args: &[OsString]) -> ExitCode {
 /// `sbx task run <name> [--param k=v]… [--env K=V]… [--session <id>] [--json]`: invoke one operation.
 ///
 /// The exit code is the command's own, so a task composes in a script exactly like the program it
-/// wraps; a *refusal* (an unknown task, a value outside its bound) is exit 2, distinguishable from
-/// the command having run and failed.
+/// wraps; a *refusal* (an unknown task, a value outside its bound) is [`REFUSED_EXIT`], which the
+/// wrapped command could not plausibly return, so a caller can tell it from the command having run
+/// and failed.
 fn task_run(args: &[OsString]) -> ExitCode {
     let mut name: Option<String> = None;
     let mut id: Option<String> = None;
@@ -1156,11 +1166,27 @@ fn filter_by_operation(
     }
 }
 
+/// Whether a target that several planes answered is one this side must not choose between.
+///
+/// An invocation id comes from a per-process counter ([`sandbox::task::next_invocation`]), so every
+/// session numbers its invocations from 1 and the same number names a different run in each:
+/// rendering whichever plane answered first would show a reader another session's invocation under
+/// the id they asked about, complete with its operation, exit code and elapsed time. An operation
+/// *name* means the same thing wherever it is declared, so there the first answer stands and the
+/// rest are named — the read-across-sessions this verb exists to give.
+fn ambiguous_across_sessions(target: &str, answers: usize) -> bool {
+    answers > 1 && target.parse::<u64>().is_ok()
+}
+
 /// `sbx task show <invocation>|<operation> [--session <id>]`: everything about one of them.
 ///
 /// The listings answer "what is there" in one line each; this answers "what is *that*" in full — the
 /// command with its parameters substituted in, the ceilings it runs under, what it may reach, and
 /// which credentials it carries. Host-only, on the same socket as `status` and `stop`.
+///
+/// An id that resolves in more than one session is refused the way the acting verbs refuse an
+/// ambiguous session, naming them and asking for `--session`: ids are drawn per session, so the
+/// alternative is answering about a run the reader did not ask about.
 ///
 /// **Never an environment value.** A task's credentials are resolved for one invocation and held
 /// nowhere this can reach, so their absence here is structural rather than a filter that could be
@@ -1182,19 +1208,26 @@ fn task_show(args: &[OsString]) -> ExitCode {
         Ok(p) => p,
         Err(code) => return code,
     };
-    // Across sessions, the first that knows the target answers. An invocation id belongs to exactly
-    // one session; an operation name can be declared in several, and then `--session` is how a
-    // reader says which — so the others are named rather than silently passed over.
-    let mut found: Option<(&Plane, Vec<(String, String)>)> = None;
-    let mut also = Vec::new();
+    // Every plane that knows the target is asked before any of them is rendered: whether the first
+    // answer may stand depends on how many others there are, and for an id it may not.
+    let mut answers: Vec<(&Plane, Vec<(String, String)>)> = Vec::new();
     for plane in &planes {
-        match sandbox::task_control::read_info(&plane.socket, &target) {
-            Ok(fields) if found.is_none() => found = Some((plane, fields)),
-            Ok(_) => also.push(plane.cell()),
-            Err(_) => {}
+        if let Ok(fields) = sandbox::task_control::read_info(&plane.socket, &target) {
+            answers.push((plane, fields));
         }
     }
-    let Some((plane, fields)) = found else {
+    if ambiguous_across_sessions(&target, answers.len()) {
+        diag::error(&format!(
+            "sbx: task show: invocation `{target}` exists in {} sessions — name one with \
+             `--session`",
+            answers.len()
+        ));
+        for (plane, _) in &answers {
+            diag::hint(&format!("       {}", plane.describe()));
+        }
+        return ExitCode::from(2);
+    }
+    let Some((plane, fields)) = answers.first() else {
         diag::error(&format!(
             "sbx: task show: nothing here is called `{target}`"
         ));
@@ -1203,6 +1236,9 @@ fn task_show(args: &[OsString]) -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
+    // Only an operation name reaches here with more than one answer, so the note below is about a
+    // name declared in several sessions — an id that collided was refused above.
+    let also: Vec<String> = answers.iter().skip(1).map(|(p, _)| p.cell()).collect();
     plane.announce();
     // Where a value came from, when it is not from the operation's own block. Not a row of its own:
     // it says where the row it names got its value, which belongs beside that value rather than
@@ -2059,5 +2095,27 @@ mod tests {
             serde_json::to_value(run_view("q", &admitted)).expect("encode")["id"],
             4
         );
+    }
+
+    /// An invocation id is per session, so `task show <id>` must not answer from whichever plane
+    /// replied first.
+    ///
+    /// Ids are drawn from a per-process counter and every session starts at 1, so the same number
+    /// names a different run in each. Taking the first answer — the lowest pid, since the planes
+    /// come sorted — showed the reader another project's operation, exit code and elapsed time
+    /// under the id they had asked about. An operation *name* carries no such collision: it means
+    /// the same thing wherever it is declared, and reading across sessions is what this verb is
+    /// for, so only the id is refused.
+    #[test]
+    fn an_invocation_id_that_several_sessions_answer_is_refused_rather_than_guessed() {
+        assert!(ambiguous_across_sessions("7", 2));
+        // One answer is not a choice, and no answer is the miss.
+        assert!(!ambiguous_across_sessions("7", 1));
+        assert!(!ambiguous_across_sessions("7", 0));
+        // A name declared in several sessions still reads across them, the others named in a note.
+        assert!(!ambiguous_across_sessions("nightly-dump", 2));
+        // A numeric token is an id first, everywhere this surface reads one (`task stop` says so
+        // too), so an operation that looks like a number is held to the id's rule.
+        assert!(ambiguous_across_sessions("42", 3));
     }
 }

@@ -1,8 +1,10 @@
 //! `sbx plugins <subcommand>`: inspect and manage resolver plugins and the signed plugin stores —
-//! `list`/`info` (host-level inspection), `install`/`rm` (place a local or built-in plugin), and
-//! `store add|publish|update|install|info|list|rm` (the git-hosted, Ed25519-signed catalogue). The
-//! user-facing confirmation renderers it calls (`render_plugin_installed`/`render_store_*`/…) stay
-//! at the crate root, shared with the `app`/`config` confirmations and their common test.
+//! `list`/`info`/`verify` (host-level inspection), `install`/`rm`/`upgrade` (place a local plugin
+//! directory, remove an installed one, move a store-installed one to what its store lists now), and
+//! `store add|publish|update|install|verify|rekey|info|list|rm` (the git-hosted, Ed25519-signed
+//! catalogue). The user-facing confirmation renderers it calls
+//! (`render_plugin_installed`/`render_store_*`/…) stay at the crate root, shared with the
+//! `app`/`config` confirmations and their common test.
 
 use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal;
@@ -17,10 +19,10 @@ use crate::cli::confirm::{
 use crate::plugins::{catalogue, stores};
 use crate::{diag, help, plugins, store, style};
 
-/// `sbx plugins <subcommand>`: inspect the installed resolver plugins. Host-level, like `doctor`
-/// — it reads `<data>/plugins`, not a project's `.sbx.toml`. A read-only diagnostic for now;
-/// installation and the signed plugin store are later increments, so the dispatch only knows the
-/// inspection verbs and names them on anything else (no inert stubs).
+/// `sbx plugins <subcommand>`: inspect and manage the installed plugins. Host-level, like `doctor`
+/// — it reads `<data>/plugins`, not a project's `.sbx.toml`. The inspection verbs, the placement
+/// verbs and the whole `store` tree dispatch from here; anything else is named and answered with
+/// the page, whose Subcommands list is the surface (no inert stubs).
 pub(crate) fn plugins_cmd(args: Vec<OsString>) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("list") | Some("ls") => {
@@ -75,10 +77,10 @@ fn load_plugin_registry() -> Option<(store::Layout, plugins::PluginRegistry, Vec
     Some((layout, registry, warnings))
 }
 
-/// What is installed right now, in the two shapes a store listing has to answer: which install
-/// *names* are taken (and by which origin), and which *schemes* are claimed. Both matter, because
-/// an install refuses on either — so a listing that only knew about names would still let a user
-/// pick an entry that cannot be installed.
+/// What is installed right now, in the three shapes a store listing has to answer: which install
+/// *directories* are taken (and by which origin), which *schemes* are claimed, and which *manifest
+/// names* are. All three matter, because an install refuses on each of them — so a listing that
+/// knew only about directories would still let a user pick an entry that cannot be installed.
 struct InstalledIndex {
     /// Every plugin directory under `<data>/plugins`, keyed by its directory name — the name an
     /// install would take. A directory whose manifest is malformed is included: it holds the name
@@ -90,6 +92,14 @@ struct InstalledIndex {
     /// resolves to nothing, so it is absent from `by_scheme` — but an install is refused on it all
     /// the same, so a listing that stayed silent here would offer an entry that cannot be placed.
     conflicts: std::collections::BTreeMap<String, Vec<String>>,
+    /// Manifest name → the directory name claiming it, for the kinds whose namespace *is* their
+    /// name (a broker, a signer). Separate from `by_name` because the two can differ: an install
+    /// sbx performed names the directory after the manifest, but a hand-placed tree may not, and
+    /// the install checks the manifest name as its own refusal (see `install_inner`).
+    by_plugin_name: std::collections::BTreeMap<String, String>,
+    /// Manifest name → every directory name claiming it, when more than one does — the name-side
+    /// counterpart of `conflicts`, and refused by an install for the same reason.
+    name_conflicts: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// Order two version strings when — and only when — both are plainly ordered: dot-separated
@@ -214,8 +224,8 @@ impl Contested {
 }
 
 impl InstalledIndex {
-    /// Scan the plugins directory: the directory names (with their recorded origins) and the
-    /// schemes the registry resolved.
+    /// Scan the plugins directory: the directory names (with their recorded origins), the schemes
+    /// the registry resolved, and the manifest names the scheme-less kinds claim.
     fn scan(layout: &store::Layout) -> Self {
         let mut warnings = Vec::new();
         let plugins_dir = layout.plugins_dir();
@@ -230,17 +240,22 @@ impl InstalledIndex {
         }
         // Every kind carries a version, and a listing that only read the resolvers would call a
         // broker or a signer versionless whatever its manifest declared. Only the scheme index is
-        // a resolver's alone.
-        for (dir_name, version) in registry
+        // a resolver's alone: the scheme-less kinds claim their *name*, which is indexed here
+        // rather than read off `by_name` below, because the two are not the same key — a
+        // hand-placed tree may declare a manifest name its directory does not carry, and the
+        // manifest name is what an install refuses on.
+        let mut by_plugin_name = std::collections::BTreeMap::new();
+        for (name, dir_name, version) in registry
             .brokers()
-            .map(|p| (p.dir_name(), p.version.clone()))
+            .map(|p| (p.name.clone(), p.dir_name(), p.version.clone()))
             .chain(
                 registry
                     .signers()
-                    .map(|p| (p.dir_name(), p.version.clone())),
+                    .map(|p| (p.name.clone(), p.dir_name(), p.version.clone())),
             )
         {
             versions.insert(dir_name.to_string(), version);
+            by_plugin_name.insert(name, dir_name.to_string());
         }
         // A conflict's claimants are disabled, so they carry no manifest data here — only the key
         // that disabled them, which is what their marker has to say.
@@ -252,13 +267,17 @@ impl InstalledIndex {
             }
             conflicts.insert(scheme.to_string(), claimants.to_vec());
         }
-        // A contested *name* disables its claimants exactly as a contested scheme does. Not folded
-        // into `conflicts`, which is the scheme map an install is checked against: this one only
-        // marks the claimants, so a plugin in place and reaching nothing does not read as working.
+        // A contested *name* disables its claimants exactly as a contested scheme does, and an
+        // install is refused on it for the same reason — so it is recorded twice over: against the
+        // claimants, so a plugin in place and reaching nothing does not read as working, and
+        // against the name itself, so an entry that cannot be placed is not offered. Kept apart
+        // from `conflicts` because they are different namespaces, one per kind of plugin.
+        let mut name_conflicts = std::collections::BTreeMap::new();
         for (name, claimants) in registry.name_conflicts() {
             for dir_name in claimants {
                 disabled.insert(dir_name.clone(), Contested::Name(name.to_string()));
             }
+            name_conflicts.insert(name.to_string(), claimants.to_vec());
         }
 
         let mut by_name = std::collections::BTreeMap::new();
@@ -295,6 +314,8 @@ impl InstalledIndex {
             by_name,
             by_scheme,
             conflicts,
+            by_plugin_name,
+            name_conflicts,
         }
     }
 
@@ -355,13 +376,28 @@ impl InstalledIndex {
             }
             return format!("  {}[installed]{r}", pal.ok);
         }
-        // The name is free, but a scheme is claimed by exactly one plugin — an install would be
-        // refused for the scheme instead, which is far from obvious from a listing.
-        // A broker claims no scheme, so neither of the two scheme collisions below can apply to
-        // one: its namespace is its name, which the `by_name` check above already answered.
+        // A broker and a signer claim no scheme: their namespace is the *manifest* name, which the
+        // `by_name` check above does not answer — that one is keyed by directory, and the two part
+        // company for a hand-placed tree. The install checks the manifest name separately, so this
+        // has to as well, or a listing offers an entry the install refuses.
         let Some(scheme) = scheme else {
+            if let Some(other) = self.by_plugin_name.get(name) {
+                return format!(
+                    "  {}[name taken by the installed plugin '{other}']{r}",
+                    pal.warn
+                );
+            }
+            if let Some(claimants) = self.name_conflicts.get(name) {
+                return format!(
+                    "  {}[name in conflict between {}]{r}",
+                    pal.err,
+                    plugins::quoted_list(claimants)
+                );
+            }
             return String::new();
         };
+        // The name is free, but a scheme is claimed by exactly one plugin — an install would be
+        // refused for the scheme instead, which is far from obvious from a listing.
         if let Some(other) = self.by_scheme.get(scheme) {
             return format!(
                 "  {}[scheme {scheme}:// taken by the installed plugin '{other}']{r}",
@@ -647,21 +683,23 @@ fn plugins_install(source: Option<&OsString>) -> ExitCode {
     }
 }
 
-/// Build whatever `[plugin.<name>] programs` names for the plugin that just claimed `scheme`, and
-/// report it.
+/// Build whatever `[plugin.<name>] programs` names for the plugin just placed, and report it.
 ///
 /// Runs here rather than at launch because a plugin's program is **project-independent**: it is
 /// installed once and any project's secret may route through it, so provisioning it during a launch
 /// would run a project-scoped path to produce a project-independent artifact and re-ask the question
 /// every time. This is also the moment a user expects a build, having just asked for a plugin.
 ///
-/// Re-running the install is therefore how a `programs` entry added *after* installing takes
-/// effect, which is what the launch-time refusal for a missing program tells the user to do.
+/// An install is the *only* way here, and a bare re-install is not one: a placement over a name
+/// already installed is refused rather than repeated. A `programs` entry added *after* installing
+/// therefore takes the two steps that refusal itself names — `sbx plugins rm <name>`, then
+/// installing it again from its source or its store. [`unbuilt_program_line`] is where that
+/// sequence is put in front of the user.
 ///
 /// A build failure fails the command. The install itself already succeeded and is not undone: the
 /// plugin is there, and what could not be built is named so the user can fix the attribute and run
-/// the install again. Reporting success over a program the plugin cannot start would only move the
-/// failure to the first secret.
+/// that same two-step sequence. Reporting success over a program the plugin cannot start would only
+/// move the failure to the first secret.
 fn provision_configured_programs(layout: &store::Layout, plugin_name: &str) -> ExitCode {
     let mut load_warnings = Vec::new();
     let registry = plugins::PluginRegistry::load_quiet(&layout.plugins_dir(), &mut load_warnings);
@@ -749,13 +787,15 @@ fn provision_configured_programs(layout: &store::Layout, plugin_name: &str) -> E
     }
 }
 
-/// `sbx plugins store <subcommand>`: the plugin stores. `list` shows the built-in (embedded)
-/// store and every configured remote store; `add` configures and fetches a remote signed store
-/// (a git repository whose catalogue is verified against a public key); `update` re-fetches one
-/// or all configured stores (re-verifying against the pinned key and refusing a revision that
-/// would roll back); `install` installs a plugin a configured store lists; `verify` confirms a
-/// store's key against one obtained elsewhere; `info` details one configured store; `rm` removes
-/// one.
+/// `sbx plugins store <subcommand>`: the plugin stores, every one of which is configured — sbx
+/// ships no catalogue of its own. `list` shows each configured store and the plugins it lists;
+/// `add` configures and fetches a remote signed store (a git repository whose catalogue is
+/// verified against a public key); `publish` signs a catalogue into a store repository (the
+/// operator's side); `update` re-fetches one or all configured stores (re-verifying against the
+/// pinned key and refusing a revision that would roll back); `install` installs a plugin a
+/// configured store lists; `verify` confirms a store's key against one obtained elsewhere;
+/// `rekey` accepts a deliberate rotation of that key; `info` details one configured store; `rm`
+/// removes one.
 fn plugins_store(args: &[OsString]) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("list") | Some("ls") => plugins_store_list_cmd(&args[1..]),
@@ -1091,12 +1131,42 @@ fn plugins_store_publish(args: &[OsString]) -> ExitCode {
     }
 }
 
+/// Split `store update`'s arguments into the store to re-fetch — `None` for every configured one —
+/// or the first token the verb does not take. Pure, so the accepted shapes are pinned without a
+/// data directory.
+///
+/// A second name and an option this verb does not have are both refused rather than absorbed. A
+/// dropped second name would re-fetch a subset of what was asked and still exit 0, and a token like
+/// `--all` read as a store name reports "cannot update store '--all'" — a failure to find a store,
+/// for what is really a flag that does not exist.
+fn parse_store_update_args(args: &[OsString]) -> Result<Option<&str>, String> {
+    let mut only: Option<&str> = None;
+    for a in args {
+        match a.to_str() {
+            Some(word) if !word.starts_with('-') && only.is_none() => only = Some(word),
+            other => return Err(other.unwrap_or("(non-UTF-8)").to_string()),
+        }
+    }
+    Ok(only)
+}
+
 /// `sbx plugins store update [name]`: re-fetch one configured remote store, or every configured
 /// store when no name is given. Each re-fetch re-verifies the catalogue against the store's
 /// pinned key (a compromised remote cannot rotate it) and refuses a revision that would roll
 /// back, replacing the cache atomically. A deliberate user act. When updating all stores, a
 /// failure on one is reported and the rest still run, with a non-zero exit if any failed.
 fn plugins_store_update(args: &[OsString]) -> ExitCode {
+    let only = match parse_store_update_args(args) {
+        Ok(only) => only,
+        Err(bad) => {
+            diag::error(&format!("sbx: unexpected argument '{bad}'"));
+            eprintln!(
+                "sbx: usage: {}",
+                help::synopsis_of(&["plugins", "store", "update"])
+            );
+            return ExitCode::from(2);
+        }
+    };
     let Some(layout) = store::Layout::from_env() else {
         diag::error(
             "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
@@ -1108,14 +1178,8 @@ fn plugins_store_update(args: &[OsString]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let names: Vec<String> = match args.first() {
-        Some(arg) => {
-            let Some(name) = arg.to_str() else {
-                diag::error("sbx: a store name must be valid UTF-8");
-                return ExitCode::from(2);
-            };
-            vec![name.to_string()]
-        }
+    let names: Vec<String> = match only {
+        Some(name) => vec![name.to_string()],
         None => {
             let all = stores::list(&layout);
             if all.is_empty() {
@@ -1160,16 +1224,45 @@ fn plugins_store_update(args: &[OsString]) -> ExitCode {
     }
 }
 
+/// Split `store install`'s arguments into the store and the plugin it names, `None` when fewer
+/// than those two operands were given (which the caller answers with the synopsis), or the first
+/// token the verb does not take. Pure, so the accepted shapes are pinned without a data directory.
+///
+/// This verb installs exactly one plugin, so a third operand is refused rather than dropped:
+/// `store install mine kp vault` placing `kp` alone and exiting 0 reports a success the user reads
+/// as covering both, and only the next launch tells them otherwise.
+fn parse_store_install_args(args: &[OsString]) -> Result<Option<(&str, &str)>, String> {
+    let mut operands: Vec<&str> = Vec::new();
+    for a in args {
+        match a.to_str() {
+            Some(word) if !word.starts_with('-') && operands.len() < 2 => operands.push(word),
+            other => return Err(other.unwrap_or("(non-UTF-8)").to_string()),
+        }
+    }
+    Ok(match operands.as_slice() {
+        [store, plugin] => Some((*store, *plugin)),
+        _ => None,
+    })
+}
+
 /// `sbx plugins store install <store> <plugin>`: install a resolver plugin a configured store
 /// lists, by name. The store's cached catalogue (verified when the store was added or updated)
 /// pins the plugin's content by hash; the install verifies that hash, reconciles the catalogue's
 /// advertised name and scheme against the plugin's manifest, and places it exactly as a local
 /// install would. A deliberate user act. Reads only the owner-only cache — no fetch, no network.
 fn plugins_store_install(args: &[OsString]) -> ExitCode {
-    let (Some(store_name), Some(plugin_name)) = (
-        args.first().and_then(|a| a.to_str()),
-        args.get(1).and_then(|a| a.to_str()),
-    ) else {
+    let operands = match parse_store_install_args(args) {
+        Ok(operands) => operands,
+        Err(bad) => {
+            diag::error(&format!("sbx: unexpected argument '{bad}'"));
+            eprintln!(
+                "sbx: usage: {}",
+                help::synopsis_of(&["plugins", "store", "install"])
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let Some((store_name, plugin_name)) = operands else {
         diag::error(&format!(
             "sbx: usage: {}",
             help::synopsis_of(&["plugins", "store", "install"])
@@ -1600,22 +1693,24 @@ fn print_listed(
     shown
 }
 
-/// The line closing a source's block: how to install from it, or — under `--installed`, with
-/// nothing shown — that nothing from it is in place. One of the two always prints, so a source is
+/// The line closing a store's block: how to install from it, or — under `--installed`, with
+/// nothing shown — that nothing from it is in place. One of the two always prints, so a store is
 /// never left as a heading with no explanation.
-fn print_source_footer(
+///
+/// A store is the only source a plugin is listed from: sbx ships no catalogue of its own, so the
+/// command and the phrasing are this one case rather than a parameter.
+fn print_store_footer(
     shown: usize,
     only_installed: bool,
     indent: &str,
-    what: &str,
-    install_cmd: &str,
+    store: &str,
     pal: &style::Palette,
 ) {
     let (dim, r) = (pal.dim, pal.reset);
     if !only_installed {
-        println!("{indent}{dim}(install one with: {install_cmd}){r}");
+        println!("{indent}{dim}(install one with: sbx plugins store install {store} <plugin>){r}");
     } else if shown == 0 {
-        println!("{indent}{dim}(nothing from {what} is installed){r}");
+        println!("{indent}{dim}(nothing from this store is installed){r}");
     }
 }
 
@@ -1728,14 +1823,7 @@ fn plugins_store_list(only_installed: bool, only_store: Option<&str>) -> ExitCod
                     "    ",
                     &pal,
                 );
-                print_source_footer(
-                    shown,
-                    only_installed,
-                    "    ",
-                    "this store",
-                    &format!("sbx plugins store install {name} <plugin>"),
-                    &pal,
-                );
+                print_store_footer(shown, only_installed, "    ", name, &pal);
             }
             Err(why) => diag::warn(&format!("store '{name}': {why}")),
         }
@@ -2082,19 +2170,34 @@ fn plugins_verify(name: Option<&str>) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// `sbx plugins info <scheme>`: the full manifest and sandbox grant of the plugin claiming
-/// `scheme`. A built-in scheme is reported as such (not an error); an unknown scheme is a
-/// non-zero "no such plugin". Like `list`, host-level and side-effect-free.
-fn plugins_info(scheme: Option<&str>) -> ExitCode {
-    let Some(scheme) = scheme else {
+/// What `sbx plugins info <key>` reports when nothing installed answers the key.
+///
+/// The verb takes three namespaces — a built-in scheme, the scheme a resolver claims, and the name
+/// a broker or a signer is registered under — so the miss names all three. Naming only the resolver
+/// schemes answers about a namespace the reader may never have been using: a mistyped signer name
+/// then reads as "your signer is not installed as a resolver", which is not a thing.
+fn nothing_answers(key: &str) -> String {
+    format!(
+        "sbx: nothing installed answers '{key}' — no installed resolver plugin claims it as a \
+         scheme, and no broker or signer is installed under that name"
+    )
+}
+
+/// `sbx plugins info <scheme|name>`: the full manifest and sandbox grant of the plugin a key
+/// reaches — a resolver by the scheme it claims, a broker or a signer by its name, neither of which
+/// claims a scheme. A built-in scheme is reported as such (not an error); a key nothing installed
+/// answers is a non-zero "no such plugin" naming all three namespaces, since the reader's key was
+/// in one of them. Like `list`, host-level and side-effect-free.
+fn plugins_info(key: Option<&str>) -> ExitCode {
+    let Some(key) = key else {
         diag::error(&format!(
             "sbx: usage: {}",
             help::synopsis_of(&["plugins", "info"])
         ));
         return ExitCode::from(2);
     };
-    if plugins::builtin_schemes().contains(&scheme) {
-        println!("{scheme}: a built-in resolver (compiled into sbx, not a plugin)");
+    if plugins::builtin_schemes().contains(&key) {
+        println!("{key}: a built-in resolver (compiled into sbx, not a plugin)");
         return ExitCode::SUCCESS;
     }
     let Some((layout, registry, warnings)) = load_plugin_registry() else {
@@ -2109,31 +2212,31 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
     // the scheme index reports a miss, because a plugin that is listed and cannot be inspected
     // reads as a plugin that is not really installed. One name can reach only one of them: the
     // registry disables both when two plugins claim it.
-    if let Some(b) = registry.broker(scheme) {
+    if let Some(b) = registry.broker(key) {
         return info_broker(&layout, b, &pal);
     }
-    if let Some(s) = registry.signer(scheme) {
+    if let Some(s) = registry.signer(key) {
         return info_signer(&layout, s, &pal);
     }
-    let Some(p) = registry.resolver(scheme) else {
+    let Some(p) = registry.resolver(key) else {
         // A key can be absent for four different reasons, and `info <key>` is exactly the command a
         // user runs to learn which: nothing claims it, several plugins claim it as a scheme or
         // several claim it as a name (the answer is the conflict itself, so it is reported in
         // full), or the one that does is malformed (that reason lives in the load warnings,
         // re-emitted here).
-        if let Some(claimants) = registry.conflict(scheme) {
-            print_conflicts(&layout, &registry, Some(scheme), &pal);
+        if let Some(claimants) = registry.conflict(key) {
+            print_conflicts(&layout, &registry, Some(key), &pal);
             diag::error(&format!(
-                "sbx: the scheme '{scheme}' is claimed by {} installed plugins and resolves to \
+                "sbx: the scheme '{key}' is claimed by {} installed plugins and resolves to \
                  nothing until exactly one remains",
                 claimants.len()
             ));
             return ExitCode::FAILURE;
         }
-        if let Some(claimants) = registry.name_conflict(scheme) {
-            print_conflicts(&layout, &registry, Some(scheme), &pal);
+        if let Some(claimants) = registry.name_conflict(key) {
+            print_conflicts(&layout, &registry, Some(key), &pal);
             diag::error(&format!(
-                "sbx: the name '{scheme}' is claimed by {} installed plugins and reaches none of \
+                "sbx: the name '{key}' is claimed by {} installed plugins and reaches none of \
                  them until exactly one remains",
                 claimants.len()
             ));
@@ -2142,9 +2245,8 @@ fn plugins_info(scheme: Option<&str>) -> ExitCode {
         for w in &warnings {
             diag::warn(w);
         }
-        diag::error(&format!(
-            "sbx: no installed resolver plugin claims the scheme '{scheme}'"
-        ));
+        diag::error(&nothing_answers(key));
+        diag::hint("       `sbx plugins list` shows every installed plugin.");
         return ExitCode::FAILURE;
     };
     let (h, n, err, r) = (pal.head, pal.name, pal.err, pal.reset);
@@ -2242,6 +2344,22 @@ fn print_about(
     }
 }
 
+/// The `sbx plugins info` line for a program that `[plugin.<name>] programs` configures and
+/// nothing has built yet, carrying the sequence that builds it.
+///
+/// That sequence is deliberately not "run the install again": `sbx plugins install` takes a
+/// *source directory* rather than an installed plugin's name, and it refuses a name that is
+/// already installed — so both halves of a bare re-install are wrong for the one plugin this line
+/// is ever printed for. What does reach the build is the two-step way out the install's own
+/// refusal names, remove and install again, which comes back through
+/// [`provision_configured_programs`].
+fn unbuilt_program_line(program: &str, attr: &str, dir_name: &str, err: &str, r: &str) -> String {
+    format!(
+        "{program} -> {err}nix:{attr} configured but not built{r} (build it with: sbx plugins rm \
+         {dir_name}, then install it again)"
+    )
+}
+
 /// One `sbx plugins info` grant line per declared program, resolved **here and now** against the
 /// same `PATH` a launch would search, so the listing answers the question a user actually has:
 /// will this plugin find its tool on *this* machine, and which one will it get. A program that
@@ -2251,8 +2369,8 @@ fn print_about(
 /// Four states are possible and each has a different remedy, so each is said rather than collapsed
 /// into "found" and "missing": on `PATH` (any configured package is inert); not on `PATH` but
 /// already provisioned; not on `PATH`, configured, and **not yet built** — the state a user reaches
-/// by adding `programs` after installing, whose remedy is to re-run the install; and neither, which
-/// is what fails a launch. Nothing here builds: the answer must be free to ask.
+/// by adding `programs` after installing, whose remedy [`unbuilt_program_line`] spells out; and
+/// neither, which is what fails a launch. Nothing here builds: the answer must be free to ask.
 ///
 /// Takes the grant's parts rather than a plugin, because every kind of plugin runs a program and
 /// the question is the same for all three: a signer that cannot find its interpreter fails exactly
@@ -2295,10 +2413,7 @@ fn print_grant_programs(
                 return format!("{name} -> {} (provisioned)", path.display());
             }
             match configured.get(name) {
-                Some(attr) => format!(
-                    "{name} -> {err}nix:{attr} configured but not built{r} (run: sbx plugins \
-                     install {dir_name})"
-                ),
+                Some(attr) => unbuilt_program_line(name, attr, dir_name, err, r),
                 None => format!("{name} -> {err}not on PATH{r}"),
             }
         })
@@ -2729,6 +2844,8 @@ mod tests {
             by_name,
             by_scheme,
             conflicts: BTreeMap::new(),
+            by_plugin_name: BTreeMap::new(),
+            name_conflicts: BTreeMap::new(),
         }
     }
 
@@ -2755,6 +2872,29 @@ mod tests {
                 scheme.to_string(),
                 claimants.iter().map(|c| (*c).to_string()).collect(),
             )]),
+            by_plugin_name: BTreeMap::new(),
+            name_conflicts: BTreeMap::new(),
+        }
+    }
+
+    /// An index holding one hand-placed scheme-less plugin whose manifest `name` is not its
+    /// directory name — the only way the two name indexes can disagree, and the case a scan of
+    /// directories alone cannot see.
+    fn hand_placed_broker(dir_name: &str, manifest_name: &str) -> InstalledIndex {
+        InstalledIndex {
+            by_name: BTreeMap::from([(
+                dir_name.to_string(),
+                InstalledPlugin {
+                    origin: Origin::Unknown,
+                    version: None,
+                    digest: None,
+                    disabled_over: None,
+                },
+            )]),
+            by_scheme: BTreeMap::new(),
+            conflicts: BTreeMap::new(),
+            by_plugin_name: BTreeMap::from([(manifest_name.to_string(), dir_name.to_string())]),
+            name_conflicts: BTreeMap::new(),
         }
     }
 
@@ -3034,5 +3174,128 @@ mod tests {
         assert_eq!(move_verb("1.0.0", ""), "upgraded");
         assert_eq!(move_verb("latest", "1.0.0"), "upgraded");
         assert_eq!(move_verb("1.0", "1.0.0"), "upgraded");
+    }
+
+    /// An entry a listing leaves unmarked is one it says can be installed, so the marker has to
+    /// know every namespace an install refuses on — including the one no scheme index covers.
+    ///
+    /// A broker and a signer claim their manifest `name`, and an install refuses a name another
+    /// installed plugin declares. For a hand-placed tree that name need not be the directory name,
+    /// which is what `by_name` is keyed by — so a directory-only index reported the entry as free
+    /// and `plugins store install` then refused it, naming a plugin the listing never mentioned.
+    #[test]
+    fn a_scheme_less_entry_whose_manifest_name_is_taken_is_not_offered_as_installable() {
+        let idx = hand_placed_broker("vault-dev", "vault-broker");
+        assert_eq!(
+            idx.marker("vault-broker", None, Some("1.0.0"), None, "mine", &plain()),
+            "  [name taken by the installed plugin 'vault-dev']",
+            "the marker names the directory `sbx plugins rm` takes, which is the way out"
+        );
+        // The directory name is still answered by the directory index, on its own terms.
+        assert_eq!(
+            idx.marker("vault-dev", None, None, None, "mine", &plain()),
+            "  [name taken by an unknown source]"
+        );
+        // And a name no installed plugin declares stays installable.
+        assert_eq!(idx.marker("kp", None, None, None, "mine", &plain()), "");
+    }
+
+    /// A name two plugins declare disables both and is refused by an install exactly as an
+    /// ambiguous scheme is, so a listing must not offer it either.
+    #[test]
+    fn a_manifest_name_claimed_twice_blocks_the_entry_and_names_every_claimant() {
+        // A contested name resolves to no plugin, so it is absent from `by_plugin_name` — that is
+        // what the registry does with it — and only the conflict map can answer for it.
+        let mut idx = hand_placed_broker("vault-dev", "vault-broker");
+        idx.by_plugin_name.clear();
+        idx.name_conflicts.insert(
+            "vault-broker".to_string(),
+            vec!["vault-dev".to_string(), "vault-fork".to_string()],
+        );
+        assert_eq!(
+            idx.marker("vault-broker", None, None, None, "mine", &plain()),
+            "  [name in conflict between `vault-dev`, `vault-fork`]"
+        );
+    }
+
+    /// The remedy for a program configured after the install has to be one the user can run.
+    ///
+    /// `sbx plugins install` takes a source directory, not an installed plugin's name, and refuses
+    /// a name that is already installed — so `sbx plugins install <name>`, which this line used to
+    /// print, is refused twice over for the one plugin it is ever printed for. What reaches the
+    /// build is the sequence the install's own refusal names.
+    #[test]
+    fn a_program_configured_after_installing_is_told_a_sequence_that_can_run() {
+        let line = unbuilt_program_line("keepassxc-cli", "keepassxc", "kp", "", "");
+        assert!(
+            line.contains("sbx plugins rm kp"),
+            "removing first is what makes the install that builds it possible: {line}"
+        );
+        assert!(
+            !line.contains("plugins install kp"),
+            "an install takes a source directory, never an installed name: {line}"
+        );
+        assert!(
+            line.contains("nix:keepassxc"),
+            "the attribute that would be built is still named: {line}"
+        );
+    }
+
+    /// `plugins info` answers three namespaces, so a miss names three — a mistyped broker or
+    /// signer name told only about resolver schemes is answered about a namespace the reader was
+    /// never using.
+    #[test]
+    fn a_miss_on_a_broker_or_signer_name_is_not_reported_as_an_unclaimed_scheme() {
+        let msg = nothing_answers("aws-sigv4x");
+        assert!(msg.contains("aws-sigv4x"), "{msg}");
+        assert!(
+            msg.contains("broker") && msg.contains("signer"),
+            "the miss must cover the name namespace the verb also accepts: {msg}"
+        );
+    }
+
+    /// The two placement verbs refuse a token they would otherwise drop.
+    ///
+    /// `store install mine kp vault` used to place `kp`, print one success line and exit 0, leaving
+    /// the user to discover at the next launch that `vault` was never installed; `store update
+    /// --all` read the flag as a store name and failed with "cannot update store '--all'", a
+    /// missing store for something that is not one. Both are usage errors, and both say so.
+    #[test]
+    fn the_store_placement_verbs_refuse_a_token_they_do_not_read() {
+        use std::ffi::OsString;
+        let os = |v: &[&str]| -> Vec<OsString> { v.iter().map(OsString::from).collect() };
+        assert_eq!(
+            super::parse_store_install_args(&os(&["mine", "kp"])).unwrap(),
+            Some(("mine", "kp"))
+        );
+        // Fewer than the two operands is the usage case, answered with the synopsis rather than
+        // with a token that was never typed.
+        assert_eq!(
+            super::parse_store_install_args(&os(&["mine"])).unwrap(),
+            None
+        );
+        assert_eq!(super::parse_store_install_args(&os(&[])).unwrap(), None);
+        assert_eq!(
+            super::parse_store_install_args(&os(&["mine", "kp", "vault"])).unwrap_err(),
+            "vault"
+        );
+        assert_eq!(
+            super::parse_store_install_args(&os(&["mine", "kp", "--dry-run"])).unwrap_err(),
+            "--dry-run"
+        );
+
+        assert_eq!(super::parse_store_update_args(&os(&[])).unwrap(), None);
+        assert_eq!(
+            super::parse_store_update_args(&os(&["mine"])).unwrap(),
+            Some("mine")
+        );
+        assert_eq!(
+            super::parse_store_update_args(&os(&["mine", "other"])).unwrap_err(),
+            "other"
+        );
+        assert_eq!(
+            super::parse_store_update_args(&os(&["--all"])).unwrap_err(),
+            "--all"
+        );
     }
 }

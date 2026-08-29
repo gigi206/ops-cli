@@ -42,8 +42,9 @@ pub(crate) fn net_cmd(args: Vec<OsString>) -> ExitCode {
         Some("unallow") => net_remove_rule(config::manage::EgressList::Allow, &args[1..]),
         Some("deny") => net_add_rule(config::manage::EgressList::Deny, &args[1..]),
         Some("undeny") => net_remove_rule(config::manage::EgressList::Deny, &args[1..]),
-        // `mute` adds a `dontaudit` log-suppression rule; `unmute` removes one. Both are
-        // config-level (the same scopes as allow/deny) — a live `--session` mute is not yet wired.
+        // `mute` adds a `dontaudit` log-suppression rule; `unmute` removes one. Both take the
+        // same scopes as allow/deny, and `mute --session` loads the mute into the live overlay on
+        // the same terms as `allow`/`deny` above.
         Some("mute") => net_add_rule(config::manage::EgressList::Mute, &args[1..]),
         Some("unmute") => net_remove_rule(config::manage::EgressList::Mute, &args[1..]),
         Some("pending") => net_pending(&args[1..]),
@@ -567,12 +568,13 @@ fn group_pending(rows: &[sandbox::control::PendingRow]) -> Vec<PendingGroup<'_>>
     groups
 }
 
-/// Render the pending-request listing — a pure presenter (its colored layout is asserted in a test):
-/// the parked requests grouped under a per-session header (the registry label + project, so several
-/// sessions are told apart), each destination a `<pid>.<seq>` id, target, and wait time. Identical
-/// retries of one URL collapse to a single `×N` line. An empty listing says so and points at how
-/// requests arrive (an `ask`-posture launch); under an `--app` filter it names the app, so an empty
-/// result is not mistaken for "nothing parked anywhere" when other apps do have requests.
+/// Render the pending-request listing — a pure presenter (its colored layout is asserted in a
+/// test): the parked requests grouped under a per-session header (the registry label + project, so
+/// several sessions are told apart; a session with nothing parked contributes no header), each
+/// destination a `<pid>.<seq>` id, target, and wait time. Identical retries of one URL collapse to
+/// a single `×N` line. An empty listing says so and points at how requests arrive (an `ask`-posture
+/// launch); under an `--app` filter it names the app, so an empty result is not mistaken for
+/// "nothing parked anywhere" when other apps do have requests.
 fn render_pending(
     sessions: &[sandbox::control::SessionPending],
     context: &[(u32, PathBuf, String)],
@@ -612,6 +614,13 @@ fn render_pending(
     }
     let _ = writeln!(o, "{h}pending egress requests:{r}");
     for session in sessions {
+        // Every reachable control socket answers `LIST`, including a session with nothing parked
+        // (the control plane runs under every filtering posture, not only `ask`). A header claims
+        // the requests below belong to that session, so one with no rows contributes no line at
+        // all — the same skip the live-flow and log listings make.
+        if session.rows.is_empty() {
+            continue;
+        }
         // A per-session header from the registry, so with several agents the user can tell which one
         // each request belongs to (the literal reason the control plane is multi-session).
         write_session_header(&mut o, session.pid, context, pal);
@@ -1189,6 +1198,12 @@ fn net_stats(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The host-column label for the destinations folded past the per-session cap in `sbx net stats`.
+/// Named once because it is both printed in that column and counted into the column's width: a
+/// label wider than the width it is padded to would shift its own counts out from under the
+/// headers they belong to.
+const FOLD_LABEL: &str = "(other hosts)";
+
 /// Render the per-host egress stats table — a pure presenter (its colored layout is asserted in a
 /// test): a project/app header, then one row per destination with its allow/deny/blocked counts,
 /// busiest first (ties broken by host for stable output). An empty result says nothing has been
@@ -1215,12 +1230,23 @@ fn render_stats(
     // Busiest host first; ties by host name so the order is stable run to run.
     let mut rows: Vec<(&String, &sandbox::egress_stats::Counts)> = tally.hosts.iter().collect();
     rows.sort_by(|(ha, a), (hb, b)| b.total().cmp(&a.total()).then(ha.cmp(hb)));
+    // The folded-destinations row below prints its label in the host column, so that label is part
+    // of the column's width: padded to a narrower one it would overflow and push its own counts
+    // right of the ALLOW/DENY/BLOCKED headers they belong to, the one row whose numbers a reader
+    // would then misread.
+    let folded = &tally.overflow;
+    let fold_w = if folded.total() > 0 {
+        FOLD_LABEL.len()
+    } else {
+        0
+    };
     let host_w = rows
         .iter()
         .map(|(host, _)| host.len())
         .max()
-        .unwrap_or(4)
-        .max(4);
+        .unwrap_or(0)
+        .max(4)
+        .max(fold_w);
     let _ = writeln!(
         o,
         "  {dim}{:<host_w$}  {:>6}  {:>6}  {:>7}{r}",
@@ -1236,12 +1262,11 @@ fn render_stats(
     // The destinations past the per-session cap, as one row. Shown only when something was folded,
     // and named rather than left out: a total that silently omitted them would be the one number
     // here nobody could reconcile.
-    let folded = &tally.overflow;
     if folded.total() > 0 {
         let _ = writeln!(
             o,
             "  {dim}{:<host_w$}{r}  {:>6}  {:>6}  {:>7}",
-            "(other hosts)", folded.allow, folded.deny, folded.blocked
+            FOLD_LABEL, folded.allow, folded.deny, folded.blocked
         );
     }
     o
@@ -2421,21 +2446,31 @@ fn net_groups_export(args: &[OsString]) -> ExitCode {
             print!("{fragment}");
             ExitCode::SUCCESS
         }
-        Some(path) => match std::fs::write(path, &fragment) {
-            Ok(()) => {
-                let n = selected.len();
-                let s = if n == 1 { "" } else { "s" };
-                println!("exported {n} egress group{s} to {}", path.display());
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                diag::error(&format!(
-                    "sbx: net groups export: cannot write {}: {e}",
-                    path.display()
-                ));
-                ExitCode::FAILURE
-            }
-        },
+        Some(path) => write_groups_fragment(path, &fragment, selected.len()),
+    }
+}
+
+/// Write an exported `[network.groups]` fragment to the `--out` destination, and report what
+/// landed there. `count` is the number of groups the fragment carries, for the success line.
+///
+/// The write goes through [`config::manage::write_text`] — the writer `sbx bundle export --out`
+/// already uses for the same job — rather than straight through. A fragment exists to be handed
+/// back to `sbx net groups import`, so a write cut short (a full filesystem) would leave a
+/// truncated group list at exactly the path someone later imports as though it were complete; the
+/// shared writer renames a finished temp file into place, and creates the destination's parent
+/// directory so a path into a not-yet-existing backup directory is written rather than refused.
+fn write_groups_fragment(path: &Path, fragment: &str, count: usize) -> ExitCode {
+    match config::manage::write_text(path, fragment, None) {
+        Ok(()) => {
+            let s = if count == 1 { "" } else { "s" };
+            println!("exported {count} egress group{s} to {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            // The error already names the path it failed on, so the action alone is prefixed here.
+            diag::error(&format!("sbx: net groups export: {e}"));
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -3106,8 +3141,10 @@ fn net_remove_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitC
 /// allow|deny <id> --session`, which remembers a decision for a request that already parked. It writes
 /// no file (so it never re-trusts a project the way a config write does) and the rule dies with the
 /// session. Scope: by default the **current project's** sessions; `-a <app>` narrows to that app's;
-/// `--all` widens to every reachable session. Only an `ask`-posture session consults the overlay, so a
-/// filtering-posture session reports the load as skipped (`err not-ask`) rather than a silent no-op.
+/// `--all` widens to every reachable session. The proxy folds the overlay into its effective policy
+/// in every filtering posture (allowlist, denylist, `ask`), so a loaded rule decides immediately
+/// wherever it lands; a session running an sbx whose control server predates `REMEMBER` refuses the
+/// load and is named in the report rather than silently skipped.
 fn net_inject_session(
     list: config::manage::EgressList,
     rule: &str,
@@ -3271,6 +3308,23 @@ fn render_inject(
     o
 }
 
+/// The scope clause an empty `--all --save` drain reports: which sessions were eligible to be
+/// drained in the first place.
+///
+/// The project scope of a `--local` save and the `-a <app>` filter **compose** in the drain
+/// predicate rather than override one another, so both belong in the sentence. Naming only the
+/// project would state that this project has nothing parked when an app filter was the sole reason
+/// nothing was answered — and the operator, reading a true-sounding sentence, stops looking at a
+/// queue that is not empty.
+fn drain_scope_note(local: bool, app: Option<&str>) -> String {
+    match (local, app) {
+        (true, Some(name)) => format!("for app `{name}` in this project"),
+        (true, None) => "for this project".to_string(),
+        (false, Some(name)) => format!("for app `{name}`"),
+        (false, None) => "across any ask-mode session".to_string(),
+    }
+}
+
 /// `sbx net pending allow|deny --all --save [-l|-g|-a <app>]`: drain parked requests *and* persist a
 /// rule per answered host, so the same destinations are pre-decided next launch. The drain is scoped
 /// to match the save target: a `--local` save (the default) writes the **current project's** config,
@@ -3356,13 +3410,7 @@ fn net_pending_drain_and_save(
     if total == 0 {
         let mut out = String::new();
         if unsupported.is_empty() {
-            let scope_note = if local {
-                "for this project".to_string()
-            } else if let Some(name) = app {
-                format!("for app `{name}`")
-            } else {
-                "across any ask-mode session".to_string()
-            };
+            let scope_note = drain_scope_note(local, app);
             out.push_str(&style::dim_prose(
                 &format!("no pending requests {scope_note} — nothing to answer or save"),
                 &pal,
@@ -3708,6 +3756,44 @@ mod tests {
         assert!(render_net_groups(&BTreeMap::new(), &[], &p).contains("none defined"));
     }
 
+    /// An exported fragment is an artifact whose whole purpose is to be handed back to `sbx net
+    /// groups import`, so it is written on the terms the config itself is written on: a complete
+    /// temp file renamed into place, under a destination directory the writer creates. A
+    /// straight-through write refuses a path whose parent does not exist yet, and a write cut short
+    /// leaves a truncated group list at exactly the path someone later imports as though it were
+    /// whole.
+    #[test]
+    fn an_exported_group_fragment_lands_whole_in_a_destination_directory_that_did_not_exist() {
+        let name = format!("sbx-net-groups-export-{}", std::process::id());
+        let base = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("2026-08");
+        let path = dir.join("groups.toml");
+        let fragment = "[network.groups]\nci = [\"api.test\"]\n";
+
+        let _ = write_groups_fragment(&path, fragment, 1);
+
+        let written = std::fs::read_to_string(&path);
+        // What the destination directory holds afterwards: the export and nothing else — the
+        // temp file the writer stages through is renamed onto the destination, not left beside it.
+        let mut left: Vec<String> = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        left.sort();
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(
+            written.ok().as_deref(),
+            Some(fragment),
+            "the fragment must land under a parent directory that did not exist yet"
+        );
+        assert_eq!(left, ["groups.toml"], "no staging file may be left behind");
+    }
+
     #[test]
     fn render_pending_groups_requests_under_a_session_header() {
         use sandbox::control::{PendingRow, SessionPending};
@@ -3778,6 +3864,60 @@ mod tests {
         assert!(out.contains("sbx net pending allow <id>"), "{out}");
         // The footer also advertises the bulk drain.
         assert!(out.contains("sbx net pending allow|deny --all"), "{out}");
+    }
+
+    /// A reachable session with nothing parked contributes no line at all. The session header means
+    /// "the requests below belong to this agent", so a bare one under `pending egress requests:`
+    /// claims a queue the session does not have. Every reachable control socket answers the listing
+    /// query — the control plane runs under every filtering posture, not only `ask` — so an idle
+    /// session beside a busy one is the ordinary multi-session case, not a corner.
+    #[test]
+    fn render_pending_leaves_out_a_session_that_has_nothing_parked() {
+        use sandbox::control::{PendingRow, SessionPending};
+        let p = style::Palette::plain();
+
+        let sessions = [
+            // Reachable, registered, and empty: it answered the query with no rows.
+            SessionPending {
+                pid: 4242,
+                rows: Vec::new(),
+            },
+            SessionPending {
+                pid: 4243,
+                rows: vec![PendingRow {
+                    seq: 1,
+                    host: "api.example.com".into(),
+                    port: 443,
+                    path: "/v1/x".into(),
+                    waiting_secs: 12,
+                }],
+            },
+        ];
+        let context = vec![
+            (
+                4242u32,
+                std::path::PathBuf::from("/home/u/other-proj"),
+                "app:builder".to_string(),
+            ),
+            (
+                4243u32,
+                std::path::PathBuf::from("/home/u/proj"),
+                "app:agent".to_string(),
+            ),
+        ];
+
+        let out = render_pending(&sessions, &context, None, &p);
+        assert!(
+            !out.contains("session 4242"),
+            "a session with nothing parked must not get a header:\n{out}"
+        );
+        // The session that does hold a request still reads exactly as before.
+        assert!(
+            out.contains("session 4243 [app:agent] /home/u/proj")
+                && out.contains("4243.1")
+                && out.contains("api.example.com:443/v1/x"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -5052,6 +5192,26 @@ mod tests {
         );
     }
 
+    /// The empty `--all --save` drain must name every filter that could have emptied it. `--local`
+    /// is the *default* scope, so a lone `-a <app>` composes with it rather than replacing it: a
+    /// note that named only the project would state this project has nothing parked while another
+    /// app in the same project holds parked requests, and an operator reading a true-sounding
+    /// sentence stops looking.
+    #[test]
+    fn the_empty_drain_note_names_the_app_filter_beside_the_default_project_scope() {
+        // The default scope plus `-a`: both filters were active, so both are named.
+        let both = drain_scope_note(true, Some("agent"));
+        assert!(
+            both.contains("agent") && both.contains("this project"),
+            "both active filters must be named: {both:?}"
+        );
+        // The three single-scope spellings still say exactly what they scoped to.
+        assert_eq!(drain_scope_note(true, None), "for this project");
+        assert_eq!(drain_scope_note(false, Some("agent")), "for app `agent`");
+        let any = drain_scope_note(false, None);
+        assert_eq!(any, "across any ask-mode session");
+    }
+
     #[test]
     fn collapse_hosts_folds_repeats_in_first_seen_order_and_preserves_the_total() {
         let hosts = vec![
@@ -5164,5 +5324,55 @@ mod tests {
         let out = render_stats("/home/u/proj", None, &only_folded, &p);
         assert!(!out.contains("nothing recorded yet"), "{out}");
         assert!(out.contains("(other hosts)"), "{out}");
+    }
+
+    /// The fold row prints its label in the host column, so the label is part of that column's
+    /// width. Sized from the recorded hosts alone, a project whose destinations are all short pads
+    /// the wider label into a narrower field, and the one row whose counts nobody can cross-check
+    /// against a host name is also the one row that sits out from under its headers.
+    #[test]
+    fn the_folded_row_stays_under_its_headers_when_every_recorded_host_is_short() {
+        use sandbox::egress_stats::{Counts, Tally};
+        let p = style::Palette::plain();
+        let tally = Tally {
+            // Shorter than `(other hosts)`, which is the whole point of the case.
+            hosts: [(
+                "pypi.org".to_string(),
+                Counts {
+                    allow: 12,
+                    deny: 0,
+                    blocked: 0,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            overflow: Counts {
+                allow: 0,
+                deny: 44,
+                blocked: 2,
+            },
+        };
+        let out = render_stats("/home/u/proj", None, &tally, &p);
+        let row = |needle: &str| -> String {
+            out.lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle} row:\n{out}"))
+                .to_string()
+        };
+        let header = row("HOST");
+        let host = row("pypi.org");
+        let folded = row("(other hosts)");
+
+        // A plain palette emits no escapes and every numeric column has a fixed width, so the rows
+        // line up exactly when they are the same length — no trailing space can hide a shift.
+        assert_eq!(host.len(), header.len(), "host row vs header:\n{out}");
+        assert_eq!(folded.len(), header.len(), "fold row vs header:\n{out}");
+        // And the fold row's counts sit in the columns they are counts of: a right-aligned field
+        // ends where its right-aligned header does.
+        assert_eq!(
+            folded.find("44").map(|i| i + 2),
+            header.find("DENY").map(|i| i + 4),
+            "the folded deny count must end in the DENY column:\n{out}"
+        );
     }
 }

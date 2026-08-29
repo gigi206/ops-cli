@@ -28,16 +28,31 @@ pub(crate) fn test_cmd(args: Vec<OsString>) -> ExitCode {
     }
 }
 
-/// `sbx test net [--app <name>] <url>`: test a URL against the egress policy a launch serves and
-/// report the rule that decides it. A diagnostic for the egress allowlist — it reflects the trust
-/// gate (an untrusted project's policy is dropped, so the *effective* posture is shown), folds in a
-/// named app's overlay when `--app` is given, includes the built-in allow-set the proxy
-/// always unions, and notes a credential the proxy would inject (by header and source, never its
-/// value). A bare host with no scheme is completed to `https://`. No launch, no nix, no network.
-/// Exit status is informational only (success), since "the URL would be denied" is a valid answer.
-fn net_test(args: &[OsString]) -> ExitCode {
-    // An optional `--app/-a <name>`, an optional `--method/-X <verb>` (the HTTP method to test,
-    // default GET), and the positional target (a URL or a bare host), in any order.
+/// The parsed form of `sbx test net`: which app's overlay to fold in, the HTTP method to test, and
+/// the positional target.
+#[derive(Debug)]
+struct NetTestArgs<'a> {
+    app: Option<String>,
+    method: String,
+    target: &'a str,
+}
+
+/// Parse `sbx test net`'s arguments: an optional `--app/-a <name>`, an optional `--method/-X <verb>`
+/// (the HTTP method to test, default GET), and the positional target (a URL or a bare host), in any
+/// order. Pure — it returns its refusal as the lines to print rather than printing them — so the
+/// grammar and the wording of its usage line are unit-tested.
+///
+/// A `-`-prefixed token is refused rather than taken for the target. Without that check the first
+/// unknown flag became the URL and the *next* argument was blamed, so
+/// `sbx test net --app=claude https://api.anthropic.com` reported the one argument that was
+/// correct — and the `--app=` spelling is one `sbx upgrade` accepts, so reaching for it here is an
+/// ordinary mistake rather than a contrived one.
+///
+/// The missing-target usage line names **this** verb. Printing the parent's grammar
+/// (`sbx test <subcommand> <target>`) told the user to supply a subcommand they had already
+/// supplied, and showed neither `--app`, nor `-X`, nor the `tcp://` form.
+fn parse_net_test_args(args: &[OsString]) -> Result<NetTestArgs<'_>, Vec<String>> {
+    let usage = || format!("sbx: usage: {}", help::synopsis_of(&["test", "net"]));
     let mut app: Option<String> = None;
     let mut method: String = "GET".to_string();
     let mut target: Option<&str> = None;
@@ -46,32 +61,65 @@ fn net_test(args: &[OsString]) -> ExitCode {
         match a.to_str() {
             Some("--app") | Some("-a") => {
                 let Some(name) = it.next().and_then(|n| n.to_str()) else {
-                    diag::error("sbx: test net: `--app` needs an app name");
-                    return ExitCode::from(2);
+                    return Err(vec!["sbx: test net: `--app` needs an app name".to_string()]);
                 };
                 app = Some(name.to_string());
             }
             Some("--method") | Some("-X") => {
                 let Some(m) = it.next().and_then(|n| n.to_str()) else {
-                    diag::error("sbx: test net: `--method` needs an HTTP verb (e.g. GET, POST)");
-                    return ExitCode::from(2);
+                    return Err(vec![
+                        "sbx: test net: `--method` needs an HTTP verb (e.g. GET, POST)".to_string(),
+                    ]);
                 };
                 method = m.to_ascii_uppercase();
             }
+            Some(flag) if flag.starts_with('-') => {
+                return Err(vec![
+                    format!("sbx: test net: unknown flag `{flag}`"),
+                    usage(),
+                ]);
+            }
             Some(s) if target.is_none() => target = Some(s),
             Some(s) => {
-                diag::error(&format!("sbx: test net: unexpected argument `{s}`"));
-                return ExitCode::from(2);
+                return Err(vec![format!("sbx: test net: unexpected argument `{s}`")]);
             }
             None => {
-                diag::error("sbx: test net: an argument is not valid UTF-8");
-                return ExitCode::from(2);
+                return Err(vec![
+                    "sbx: test net: an argument is not valid UTF-8".to_string(),
+                ]);
             }
         }
     }
     let Some(target) = target else {
-        diag::error(&format!("sbx: usage: {}", help::synopsis("test")));
-        return ExitCode::from(2);
+        return Err(vec![usage()]);
+    };
+    Ok(NetTestArgs {
+        app,
+        method,
+        target,
+    })
+}
+
+/// `sbx test net [--app <name>] <url>`: test a URL against the egress policy a launch serves and
+/// report the rule that decides it. A diagnostic for the egress allowlist — it reflects the trust
+/// gate (an untrusted project's policy is dropped, so the *effective* posture is shown), folds in a
+/// named app's overlay when `--app` is given, includes the built-in allow-set the proxy
+/// always unions, and notes a credential the proxy would inject (by header and source, never its
+/// value). A bare host with no scheme is completed to `https://`. No launch, no nix, no network.
+/// Exit status is informational only (success), since "the URL would be denied" is a valid answer.
+fn net_test(args: &[OsString]) -> ExitCode {
+    let NetTestArgs {
+        app,
+        method,
+        target,
+    } = match parse_net_test_args(args) {
+        Ok(parsed) => parsed,
+        Err(lines) => {
+            for line in lines {
+                diag::error(&line);
+            }
+            return ExitCode::from(2);
+        }
     };
 
     let cwd = match std::env::current_dir() {
@@ -410,7 +458,18 @@ fn render_l4_decision(target: &str, l4: &allowlist::L4Decision, pal: &style::Pal
 ///
 /// The inspected path terminates TLS with a leaf minted for the CONNECT target's name, and an IP
 /// literal carries no name to mint one for — so `src/sandbox/proxy` answers `403 ip-literal` there,
-/// ahead of the allowlist. The one way an address is reached without a name is the **raw splice**,
+/// ahead of the allowlist.
+///
+/// **The CONNECT plane only.** A client that proxies `https://` in absolute form — the
+/// secure-web-proxy shape, `POST https://1.2.3.4/token` with no tunnel to open — is handled by
+/// `handle_https_forward`, which carries no IP-literal refusal and decides the request by the
+/// ordinary policy. That is the overwhelmingly rare shape (a browser, curl and every HTTP client
+/// library open a tunnel), so the verdict stays the tunnelled one, but the rendered sentence says
+/// which plane it is true of rather than implying the address is unreachable whatever the policy
+/// says: an operator who read it that way was pushed toward declaring a `tcp://` splice, a strictly
+/// wider rule than the one already in place.
+///
+/// The one way an address is reached without a name is the **raw splice**,
 /// which inspects nothing and so needs none: a `tcp://host:port` allow rule, checked here through
 /// the same [`allowlist::EgressPolicy::l4_decision`] the proxy consults first. A `Suppressed`
 /// splice is not one — a deny put that connection back on the inspected path, where this refusal is
@@ -431,11 +490,11 @@ fn refused_as_ip_literal(host: &str, clear: bool, l4: &allowlist::L4Decision) ->
         && !matches!(l4, allowlist::L4Decision::Splice(_))
 }
 
-/// Render the wire's answer for an IP-literal target on the inspected path — a pure presenter (its
-/// color is asserted in a test), shaped like [`render_addr_refusal`]: the verdict is the proxy's
-/// (DENIED), and the reason carries the `ip-literal` token it logs and answers with, plus the rule
-/// that would actually reach the address. Every span is empty under a non-terminal, so a capture is
-/// plain text.
+/// Render the wire's answer for an IP-literal target on the tunnelled (CONNECT) path — a pure
+/// presenter (its color is asserted in a test), shaped like [`render_addr_refusal`]: the verdict is
+/// the proxy's (DENIED), and the reason carries the `ip-literal` token it logs and answers with,
+/// names the plane that answers it, and points at the rule that would actually reach the address.
+/// Every span is empty under a non-terminal, so a capture is plain text.
 fn render_ip_literal_refusal(target: &str, host: &str, port: u16, pal: &style::Palette) -> String {
     use std::fmt::Write as _;
     let (n, err, r) = (pal.name, pal.err, pal.reset);
@@ -446,9 +505,12 @@ fn render_ip_literal_refusal(target: &str, host: &str, port: u16, pal: &style::P
         "  {}",
         style::dim_prose(
             &format!(
-                "the proxy refuses an IP-literal target on the inspected path (`ip-literal`): \
-                 there is no hostname to mint a certificate for, whatever the policy says. Declare \
-                 `tcp://{host}:{port}` to reach the address raw, or name the host"
+                "the proxy answers an IP-literal CONNECT with `ip-literal` ahead of the \
+                 allowlist: there is no hostname to mint a certificate for, so no rule opens \
+                 this tunnel. Only the tunnelled path answers that — a client that proxies the \
+                 request in absolute form instead, with no CONNECT, is decided by the policy \
+                 like any other. Declare `tcp://{host}:{port}` to reach the address raw, or name \
+                 the host"
             ),
             pal
         )
@@ -720,8 +782,11 @@ mod tests {
             &policy.l4_decision("10.0.0.5", 80)
         ));
 
-        // And the verdict a reader sees is the wire's, naming the proxy's own token and the rule
-        // that would reach the address.
+        // And the verdict a reader sees is the wire's, naming the proxy's own token, the plane the
+        // refusal is confined to, and the rule that would reach the address. Naming the plane is
+        // what keeps the line true: the absolute-form request the same URL can be sent as carries
+        // no CONNECT, so it is decided by the policy like any other and this refusal never applies
+        // to it.
         let out = render_ip_literal_refusal(
             "https://10.0.0.5/v1",
             "10.0.0.5",
@@ -730,10 +795,12 @@ mod tests {
         );
         assert_eq!(
             out,
-            "DENIED   https://10.0.0.5/v1\n  the proxy refuses an IP-literal target on the \
-             inspected path (`ip-literal`): there is no hostname to mint a certificate for, \
-             whatever the policy says. Declare `tcp://10.0.0.5:443` to reach the address raw, or \
-             name the host\n"
+            "DENIED   https://10.0.0.5/v1\n  the proxy answers an IP-literal CONNECT with \
+             `ip-literal` ahead of the allowlist: there is no hostname to mint a certificate for, \
+             so no rule opens this tunnel. Only the tunnelled path answers that — a client that \
+             proxies the request in absolute form instead, with no CONNECT, is decided by the \
+             policy like any other. Declare `tcp://10.0.0.5:443` to reach the address raw, or name \
+             the host\n"
         );
     }
     /// The refusal above is only worth having if the command consults it. The reported defect was
@@ -864,6 +931,72 @@ mod tests {
         assert!(
             plain.contains("ALLOWED") && !plain.contains("built-in"),
             "a user-rule allow must not claim the built-in source:\n{plain}"
+        );
+    }
+
+    /// The refusal that fires ahead of the policy has to say which plane it is true of. The
+    /// `403 ip-literal` is the CONNECT handler's answer; a client that proxies the same request in
+    /// absolute form reaches `handle_https_forward`, which has no such check and decides by the
+    /// policy. Told the address was refused "whatever the policy says", an operator whose rule
+    /// already allowed it was steered toward declaring a `tcp://` splice — a strictly wider rule.
+    #[test]
+    fn the_ip_literal_refusal_names_the_plane_whose_answer_it_is() {
+        let out = render_ip_literal_refusal(
+            "https://10.0.0.5/token",
+            "10.0.0.5",
+            443,
+            &style::Palette::plain(),
+        );
+        assert!(out.contains("DENIED"), "{out}");
+        assert!(
+            out.contains("CONNECT"),
+            "the sentence must name the plane that answers `ip-literal`: {out}"
+        );
+        assert!(
+            !out.contains("whatever the policy says"),
+            "and must not claim the refusal holds on every plane: {out}"
+        );
+        // The remedy still names the way an address is legitimately reached.
+        assert!(out.contains("tcp://10.0.0.5:443"), "{out}");
+    }
+
+    /// `sbx test net` takes no flag it does not know, and says so about its own verb. A
+    /// `-`-prefixed token used to become the target, so `--app=claude https://api.anthropic.com`
+    /// blamed the URL — the one argument that was right — and a forgotten URL printed the parent's
+    /// grammar, `sbx test <subcommand> <target>`, which names a subcommand the user had already
+    /// given and shows none of the flags they had just used.
+    #[test]
+    fn net_test_refuses_an_unknown_flag_and_points_at_its_own_grammar() {
+        let v = |xs: &[&str]| -> Vec<OsString> { xs.iter().map(OsString::from).collect() };
+
+        // The ordinary line still parses, in any order.
+        let args = v(&["-X", "post", "--app", "claude", "1.2.3.4"]);
+        let p = parse_net_test_args(&args).expect("a well-formed line parses");
+        assert_eq!(p.target, "1.2.3.4");
+        assert_eq!(p.method, "POST", "the verb is normalized");
+        assert_eq!(p.app.as_deref(), Some("claude"));
+
+        // An unknown flag is refused rather than taken for the URL, and the URL after it is not
+        // what gets blamed.
+        let args = v(&["--app=claude", "https://api.anthropic.com"]);
+        let err = parse_net_test_args(&args).expect_err("an unknown flag is a usage error");
+        assert!(err[0].contains("--app=claude"), "{err:?}");
+        assert!(
+            !err.iter().any(|l| l.contains("api.anthropic.com")),
+            "the correct argument must not be blamed: {err:?}"
+        );
+
+        // A missing target prints this verb's grammar, not the parent's.
+        let args = v(&["-X", "POST", "-a", "claude"]);
+        let err = parse_net_test_args(&args).expect_err("a missing target is a usage error");
+        let usage = err.join("\n");
+        assert!(
+            usage.contains("sbx test net"),
+            "the usage line names the verb that was run: {usage}"
+        );
+        assert!(
+            !usage.contains("<subcommand>"),
+            "and does not ask again for the subcommand already given: {usage}"
         );
     }
 }

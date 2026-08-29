@@ -2745,12 +2745,17 @@ fn config_app_flag_addresses_the_app_table_for_get_set_unset() {
 #[test]
 fn config_app_flag_validates_the_name_and_does_not_apply_to_path_or_edit() {
     let fx = Fixture::new();
-    // A name with a `.` cannot be one TOML table segment under the naive key splitter — the error
-    // points at `sbx config edit`.
+    // A name with a `.` is one quoted TOML segment, so it is addressable like any other name. The
+    // splitter behind every read and write is quote-aware, and `is_valid_app_name` runs before the
+    // quoting, so a name can never carry a quote of its own to escape with.
     let out = fx.run(&["config", "set", "--app", "my.app", "cmd", "x"]);
-    assert_eq!(out.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("sbx config edit"), "stderr:\n{stderr}");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let got = fx.run(&["config", "get", "--app", "my.app", "cmd"]);
+    assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), "x");
 
     // A name no app could carry is rejected outright.
     let out = fx.run(&["config", "set", "--app", "bad name", "cmd", "x"]);

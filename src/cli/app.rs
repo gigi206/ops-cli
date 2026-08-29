@@ -11,7 +11,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::cli::confirm::{render_app_exported, render_app_imported, render_removed};
-use crate::cli::import_remedy;
+use crate::cli::{import_remedy, refuse_flag_value};
 use crate::{
     build_override, config_cwd, egress_write_target, flag_name, net_mode_word, persist_egress_rule,
     session_pids_for_app, take_override_flag,
@@ -151,6 +151,18 @@ fn finish_net_learn(name: &str, synth: sandbox::Synthesis, nl: &NetLearn) -> Exi
     }
 }
 
+/// The pure booleans `sbx app run` reads before the app name, which therefore take no `=value`.
+/// `--net-learn` is not among them: it reads its own optional `=granularity` suffix.
+const APP_LAUNCH_VALUELESS_FLAGS: &[&str] = &[
+    "--detach",
+    "--observe",
+    "--dry-run",
+    "--global",
+    "-g",
+    "--local",
+    "-l",
+];
+
 /// Parse the launch form of `sbx app run`: split sbx's own arguments from the app command's trailing
 /// arguments at the first `--`, then read the app name and `--detach` from the head. Tokens after
 /// `--` are appended verbatim to the app's declared `cmd` (e.g. `sbx app run demo-app -- -c` passes
@@ -194,6 +206,9 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
             ));
             return Err(ExitCode::from(2));
         };
+        if let Some(code) = refuse_flag_value(&raw, APP_LAUNCH_VALUELESS_FLAGS, &["app", "run"]) {
+            return Err(code);
+        }
         match flag_name(&raw) {
             "--detach" => {
                 detach = true;
@@ -1134,6 +1149,23 @@ struct AppPurgeOutcome {
     acted: bool,
 }
 
+/// The refusal for a purge that took nothing off disk, told apart by whether the profile was
+/// *absent* or merely *undeletable*.
+///
+/// The two are different answers and only one of them is a typo. Reporting the undeletable profile
+/// as "no profile" contradicts the `cannot remove <path>` line printed immediately above it, and a
+/// reader takes the last sentence for the verdict — so the name that survived is named again here,
+/// with what to do about it.
+fn nothing_purged_message(name: &str, profile_failed: bool) -> String {
+    if profile_failed {
+        return format!(
+            "sbx: nothing was purged for '{name}': its profile could not be removed (above) \
+             and it has no home on disk"
+        );
+    }
+    format!("sbx: nothing to purge for '{name}' (no profile and no home)")
+}
+
 /// Purge one app: its profile (if any) and its isolated home(s). `sessions` is the batch's single
 /// read of the registry, so the live-app guard costs one listing no matter how many names are given.
 ///
@@ -1221,10 +1253,12 @@ fn app_rm_purge_one(
     }
 
     // 3. Nothing found across either source → a no-op (likely a typo); do not report success.
+    //    A profile that refused to be *deleted* is not "nothing found": the line above has just
+    //    named the file and the error that kept it, and denying its existence on the next line
+    //    leaves the reader with two verdicts that contradict each other — the second one reading
+    //    as the answer. It is still a no-op (nothing came off disk), so the outcome is unchanged.
     if !profile_removed && report.found_nothing() {
-        diag::error(&format!(
-            "sbx: nothing to purge for '{name}' (no profile and no home)"
-        ));
+        diag::error(&nothing_purged_message(name, profile_failed));
         return AppPurgeOutcome {
             ok: false,
             acted: false,
@@ -2293,6 +2327,57 @@ mod tests {
         assert!(parse_app_launch(&v(&["--", "-c"])).is_err());
         assert!(parse_app_launch(&v(&["demo-app", "--config"])).is_err());
         assert!(parse_app_launch(&v(&["demo-app", "--net"])).is_err());
+    }
+
+    /// A profile that refused to be deleted is not an absent one. `--purge` prints
+    /// `cannot remove <path>: Permission denied` and then, when the app has no home either, the
+    /// no-op refusal — which claimed "no profile and no home" about the file the previous line had
+    /// just named. The reader takes the second sentence for the verdict, so it must not deny what
+    /// the first one reported.
+    #[test]
+    fn a_profile_that_would_not_delete_is_not_reported_as_an_absent_one() {
+        let absent = nothing_purged_message("demo-app", false);
+        assert!(absent.contains("no profile and no home"), "{absent}");
+
+        let failed = nothing_purged_message("demo-app", true);
+        assert!(
+            !failed.contains("no profile"),
+            "the refusal must not deny a profile the previous line named: {failed}"
+        );
+        assert!(
+            failed.contains("could not be removed"),
+            "and must say what survived, since that is what the user has to act on: {failed}"
+        );
+        assert!(failed.contains("demo-app"), "{failed}");
+    }
+
+    /// The pure booleans decide the launch posture, so a `=value` suffix is refused rather than
+    /// stripped. Dispatching them through `flag_name` — which exists so that `--config` and
+    /// `--config=x` reach one arm — discarded the value and switched the flag on regardless, so
+    /// `--observe=false` turned the exec feed on and `--net-learn --dry-run=false` wrote the
+    /// learned rules into the profile when a preview was what was asked for.
+    #[test]
+    fn a_valueless_app_launch_flag_refuses_a_value_rather_than_switching_itself_on() {
+        use std::ffi::OsString;
+        let v = |xs: &[&str]| -> Vec<OsString> { xs.iter().map(OsString::from).collect() };
+        for bad in [
+            v(&["demo-app", "--detach=false"]),
+            v(&["demo-app", "--observe=false"]),
+            v(&["demo-app", "--net-learn", "--dry-run=false"]),
+            v(&["demo-app", "--net-learn", "--global=false"]),
+            v(&["demo-app", "--net-learn", "-l=1"]),
+        ] {
+            assert!(parse_app_launch(&bad).is_err(), "{bad:?}");
+        }
+        // The optional-value booleans keep their inline form — they are not these flags, and the
+        // `--gpu=false` grammar is exactly what leads a caller to try `--detach=false` — and so
+        // does `--net-learn`, which reads its own suffix.
+        let a = parse_app_launch(&v(&["demo-app", "--gpu=false", "--net-learn=path"])).unwrap();
+        assert_eq!(a.cli.gpu, vec!["false".to_string()]);
+        assert_eq!(
+            a.net_learn.expect("net-learn set").gran,
+            sandbox::Granularity::Path
+        );
     }
 
     #[test]

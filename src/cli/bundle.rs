@@ -81,6 +81,24 @@ fn bundle_list(args: &[OsString]) -> ExitCode {
                     "deny": b.deny,
                     "mute": b.mute,
                     "secrets": b.secret.as_ref().map(|s| s.hosts.len()).unwrap_or(0),
+                    // Everything below is what a consuming app also folds in. Left out, a `--json`
+                    // audit of an imported fragment reported a bundle as harmless while it carried
+                    // a declared operation, a service or a URI handler.
+                    "provision": b.provision.is_some(),
+                    "tasks": b.task.as_ref()
+                        .map(|t| t.tasks.keys().collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                    "services": b.service.keys().collect::<Vec<_>>(),
+                    "open": b.open.keys().collect::<Vec<_>>(),
+                    "flakes": b.flakes.keys().collect::<Vec<_>>(),
+                    "resolvers": {
+                        "tarball": b.tarball.keys().collect::<Vec<_>>(),
+                        "deb": b.deb.keys().collect::<Vec<_>>(),
+                        "appimage": b.appimage.keys().collect::<Vec<_>>(),
+                        "binary": b.binary.keys().collect::<Vec<_>>(),
+                    },
+                    "accepts_fresh_releases": b.accepts_fresh_releases,
+                    "undescribed": undescribed_sections(b),
                 })
             })
             .collect();
@@ -146,7 +164,9 @@ fn render_bundles(
     for (name, b) in selected {
         if summary {
             // Count what the bundle contributes, so the listing answers "how much does using this
-            // pull in?" without printing the whole thing.
+            // pull in?" without printing the whole thing. The grant phrases come from the same
+            // `grants_of` the import warning is built from, so a bundle cannot read as `empty`
+            // here and grant something there.
             let mut parts = Vec::new();
             if !b.packages.is_empty() {
                 parts.push(format!("{} package(s)", b.packages.len()));
@@ -154,16 +174,7 @@ fn render_bundles(
             if !b.env.is_empty() {
                 parts.push(format!("{} env", b.env.len()));
             }
-            let rules = b.allow.len() + b.deny.len() + b.mute.len();
-            if rules > 0 {
-                parts.push(format!("{rules} egress rule(s)"));
-            }
-            if let Some(creds) = b.secret.as_ref().map(|s| s.hosts.len()).filter(|c| *c > 0) {
-                parts.push(format!("{creds} credential(s)"));
-            }
-            if b.provision.is_some() {
-                parts.push("an install step".to_string());
-            }
+            parts.extend(grants_of(b));
             if parts.is_empty() {
                 parts.push("empty".to_string());
             }
@@ -201,8 +212,149 @@ fn render_bundles(
                 provision.clone().into_argv().join(" ")
             ));
         }
+        // The rest of what a consuming app folds in. It was absent here as well as from the
+        // summary, so the remedy the import warning names — "inspect with `sbx bundle <name>`" —
+        // could not show the largest grant a fragment can carry.
+        for name in &b.accepts_fresh_releases {
+            out.push_str(&format!(
+                "  fresh    {name} (accepted with no cooling-off period)\n"
+            ));
+        }
+        for name in b.flakes.keys() {
+            out.push_str(&format!("  flake    {name} (inline flake source)\n"));
+        }
+        for (table, entries) in [
+            ("tarball", &b.tarball),
+            ("deb", &b.deb),
+            ("appimage", &b.appimage),
+            ("binary", &b.binary),
+        ] {
+            for name in entries.keys() {
+                out.push_str(&format!(
+                    "  resolve  {name} ({table}: where an upgrade looks for a new release)\n"
+                ));
+            }
+        }
+        for scheme in b.open.keys() {
+            out.push_str(&format!(
+                "  open     {scheme}: (URI handler, run in the cage)\n"
+            ));
+        }
+        for name in b.service.keys() {
+            out.push_str(&format!(
+                "  service  {name} (started with the cage and kept running)\n"
+            ));
+        }
+        if let Some(task) = &b.task {
+            for name in task.tasks.keys() {
+                out.push_str(&format!(
+                    "  task     {name} (a declared operation the caged agent can invoke)\n"
+                ));
+            }
+        }
+        for key in undescribed_sections(b) {
+            out.push_str(&format!(
+                "  section  [{key}] — read it in the fragment before importing\n"
+            ));
+        }
     }
     out
+}
+
+/// The bundle sections the listing and the grant note account for by name, keyed as they are in the
+/// TOML.
+///
+/// Compared against what a bundle actually serializes to, so the two readers below cannot fall
+/// behind the schema: the way they fell behind was a field added to `RawBundle` and not added here,
+/// after which the import announced less than it wrote and the listing showed less than it held.
+/// This is the construction `describe_app_posture` already applies to an app profile, for the same
+/// reason — consent is never given to something unstated.
+const DESCRIBED_BUNDLE_SECTIONS: &[&str] = &[
+    "packages",
+    "accepts_fresh_releases",
+    "env",
+    "allow",
+    "deny",
+    "mute",
+    "secret",
+    "provision",
+    "task",
+    "flakes",
+    "open",
+    "service",
+    "tarball",
+    "deb",
+    "appimage",
+    "binary",
+];
+
+/// Every top-level key a bundle declares that neither [`render_bundles`] nor [`grants_of`] renders
+/// a line of its own for — including a key sbx does not know, which `RawBundle` keeps rather than
+/// discards.
+fn undescribed_sections(b: &config::RawBundle) -> Vec<String> {
+    let Ok(toml::Value::Table(table)) = toml::Value::try_from(b) else {
+        return Vec::new();
+    };
+    table
+        .keys()
+        .filter(|k| !DESCRIBED_BUNDLE_SECTIONS.contains(&k.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// What naming this bundle from an app would grant, phrase by phrase — empty when it carries only
+/// the tools it installs and the environment they read, which grant nothing beyond themselves.
+///
+/// Each kind is named apart from the counts it is not comparable with. An install step, a declared
+/// operation and a service are commands that will run; a URI handler is a scheme the cage will act
+/// on; a resolver is where an upgrade will look. None of those is a host or a key, and the
+/// difference is the whole point of the announcement — a `[task]` in particular is a fixed
+/// host-side command an app's caged agent may invoke over the task control socket, with a
+/// credential the caller never holds.
+///
+/// A section with no phrase of its own is named by its key, so the disclosure cannot fall behind
+/// the schema: while this counted egress, credentials and the install step alone, a bundle carrying
+/// nothing but a `[task]` returned no warning at all and was imported in silence.
+fn grants_of(b: &config::RawBundle) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let rules = b.allow.len() + b.deny.len() + b.mute.len();
+    if rules > 0 {
+        parts.push(format!("{rules} egress rule(s)"));
+    }
+    if let Some(creds) = b.secret.as_ref().map(|s| s.hosts.len()).filter(|c| *c > 0) {
+        parts.push(format!("{creds} credential(s)"));
+    }
+    if b.provision.is_some() {
+        parts.push("an install step".to_string());
+    }
+    if let Some(tasks) = b.task.as_ref().map(|t| t.tasks.len()).filter(|n| *n > 0) {
+        parts.push(format!("{tasks} declared operation(s)"));
+    }
+    if !b.service.is_empty() {
+        parts.push(format!("{} service(s)", b.service.len()));
+    }
+    if !b.open.is_empty() {
+        parts.push(format!("{} URI handler(s)", b.open.len()));
+    }
+    if !b.flakes.is_empty() {
+        parts.push(format!("{} inline flake(s)", b.flakes.len()));
+    }
+    let resolvers = b.tarball.len() + b.deb.len() + b.appimage.len() + b.binary.len();
+    if resolvers > 0 {
+        parts.push(format!("{resolvers} upgrade resolver(s)"));
+    }
+    if !b.accepts_fresh_releases.is_empty() {
+        parts.push(format!(
+            "{} freshness exemption(s)",
+            b.accepts_fresh_releases.len()
+        ));
+    }
+    parts.extend(
+        undescribed_sections(b)
+            .into_iter()
+            .map(|key| format!("a `{key}` section")),
+    );
+    parts
 }
 
 /// `sbx bundle export [<name>…] [--out <file>]`: write the bundles as a portable
@@ -495,24 +647,14 @@ pub(crate) fn granting_note(
     let granting: Vec<String> = bundles
         .iter()
         .filter_map(|(name, b)| {
-            let rules = b.allow.len() + b.deny.len() + b.mute.len();
-            let creds = b.secret.as_ref().map(|s| s.hosts.len()).unwrap_or(0);
-            // An install step is named apart from the counts: it is a command that will run in the
-            // consuming app's cage, which is a different kind of grant from a host or a key, and the
-            // one a reader is least likely to expect.
-            let step = b.provision.is_some().then_some(", an install step");
-            (rules > 0 || creds > 0 || step.is_some()).then(|| {
-                format!(
-                    "{name} ({rules} egress rule(s), {creds} credential(s){})",
-                    step.unwrap_or("")
-                )
-            })
+            let grants = grants_of(b);
+            (!grants.is_empty()).then(|| format!("{name} ({})", grants.join(", ")))
         })
         .collect();
     (!granting.is_empty()).then(|| {
         format!(
-            "an app that names these gains their egress, credentials and install steps: {} — \
-             inspect with `sbx bundle <name>`",
+            "an app that names these gains everything they declare: {} — inspect with \
+             `sbx bundle <name>`",
             granting.join(", ")
         )
     })
@@ -709,5 +851,84 @@ mod tests {
         std::fs::write(&path, &fragment).unwrap();
         let parsed = config::read_bundle_fragment(&path).expect("the fragment re-parses");
         assert_eq!(parsed, set, "export → import is lossless");
+    }
+
+    /// A bundle carrying only a `[task]` used to import in complete silence and then show as
+    /// `empty` in the very listing the warning tells the reader to consult. A `[task.<name>]` is a
+    /// fixed host-side command run in an ephemeral sibling cage with a credential the caller never
+    /// holds, folded into every app that names the bundle in `use` — the largest grant a fragment
+    /// can carry, announced by nothing. The disclosure counted egress rules, credentials and the
+    /// install step and stopped there.
+    #[test]
+    fn a_bundle_that_grants_only_a_task_is_announced_and_listed() {
+        let b: config::RawBundle = toml::from_str(concat!(
+            "packages = { helper = \"mise:helper\" }\n",
+            "[task.sync]\n",
+            "cmd = [\"/bin/true\"]\n",
+        ))
+        .expect("the fragment parses");
+        let set: std::collections::BTreeMap<String, config::RawBundle> =
+            [("helper".to_string(), b.clone())].into_iter().collect();
+
+        let note = granting_note(&set).expect("a declared operation is a grant");
+        assert!(
+            note.contains("helper") && note.contains("declared operation"),
+            "the import must name the operation it writes: {note}"
+        );
+
+        // The remedy the note names has to be able to show it, in both renderings.
+        let name = "helper".to_string();
+        let pal = style::Palette::plain();
+        let shown = render_bundles(&[(&name, &b)], false, &pal);
+        assert!(
+            shown.contains("task     sync"),
+            "the full listing names the operation: {shown}"
+        );
+        let summary = render_bundles(&[(&name, &b)], true, &pal);
+        assert!(
+            summary.contains("1 declared operation(s)") && !summary.contains("empty"),
+            "the summary counts it rather than reading as harmless: {summary}"
+        );
+    }
+
+    /// The disclosure is built from what the bundle serializes to, not from a list of sections
+    /// somebody remembered to extend — so a section this code has never heard of still reaches the
+    /// reader instead of arriving unannounced. That is the property the previous shape lacked: it
+    /// fell behind `RawBundle` silently, each time a field was added.
+    #[test]
+    fn a_section_no_reader_here_knows_is_still_named_rather_than_passed_over() {
+        // A key `RawBundle` has no field for: kept by its `rest` map, and named here by its key.
+        let odd: config::RawBundle =
+            toml::from_str("[not_a_known_section]\nk = 1\n").expect("the fragment parses");
+        assert_eq!(undescribed_sections(&odd), vec!["not_a_known_section"]);
+        let set: std::collections::BTreeMap<String, config::RawBundle> =
+            [("odd".to_string(), odd.clone())].into_iter().collect();
+        let note = granting_note(&set).expect("an unrecognised section is not nothing");
+        assert!(note.contains("`not_a_known_section`"), "{note}");
+
+        let name = "odd".to_string();
+        let shown = render_bundles(&[(&name, &odd)], false, &style::Palette::plain());
+        assert!(shown.contains("[not_a_known_section]"), "{shown}");
+
+        // The sections that DO have a line of their own are not reported twice.
+        let known: config::RawBundle = toml::from_str(concat!(
+            "packages = { helper = \"mise:helper\" }\n",
+            "allow = [\"{*} https://api.example.com\"]\n",
+            "service = { db = [\"/bin/true\"] }\n",
+            "open = { helper = [\"/bin/true\"] }\n",
+        ))
+        .expect("the fragment parses");
+        assert!(undescribed_sections(&known).is_empty());
+        let grants = grants_of(&known);
+        assert!(
+            grants.iter().any(|g| g.contains("1 service(s)"))
+                && grants.iter().any(|g| g.contains("1 URI handler(s)"))
+                && grants.iter().any(|g| g.contains("1 egress rule(s)")),
+            "{grants:?}"
+        );
+        assert!(
+            !grants.iter().any(|g| g.contains("section")),
+            "a described section must not also be reported as undescribed: {grants:?}"
+        );
     }
 }
