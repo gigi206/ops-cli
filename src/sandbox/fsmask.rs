@@ -13,13 +13,16 @@
 //! a decoy it could replace would be no mask at all.
 //!
 //! **What this is and is not.** It reduces exposure; it is not a boundary of the same class as
-//! `[network] deny`. Three things it does not cover, each measured rather than assumed:
+//! `[network] deny`. Four things it does not cover, each measured rather than assumed:
 //! a second **hard link** to the same file elsewhere in the project reads the content (a mount
 //! covers a *path*, not an inode); a file appearing **mid-session** outside a denied *directory* is
 //! not covered (mounts are resolved once, at launch — a denied directory, by contrast, stays sealed
-//! for the session); and a path nobody listed is simply open. What the cage cannot do is defeat a
-//! mask from inside: `umount2`, `mount`, `unshare` and the rest of that family are refused by the
-//! mandatory seccomp filter, and it holds no capability in its user namespace.
+//! for the session); a file whose **name is not valid UTF-8** cannot be reached by a *wildcard*
+//! entry at all, since the matcher compares text (naming the file or its directory literally closes
+//! it, and the launch warns rather than passing over it in silence); and a path nobody listed is
+//! simply open. What the cage cannot do is defeat a mask from inside: `umount2`, `mount`, `unshare`
+//! and the rest of that family are refused by the mandatory seccomp filter, and it holds no
+//! capability in its user namespace.
 //!
 //! **Why the mid-session gap is not closed by re-masking a live cage.** Applying a mask after
 //! launch is reachable — a launcher that creates its own user namespace before `execve`ing
@@ -231,7 +234,8 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
     out
 }
 
-/// Resolve one list of entries into the paths it covers, warning on each entry that yields none.
+/// Resolve one list of entries into the paths it covers, warning on each entry that yields none and
+/// on each candidate the matcher could not judge.
 fn resolve_list(
     root: &Path,
     entries: &[String],
@@ -242,14 +246,28 @@ fn resolve_list(
     for entry in entries {
         let dir_only = entry.ends_with('/');
         let body = entry.trim_end_matches('/');
-        let mut hits = match body.rsplit_once('/') {
+        let (mut hits, mut unjudged) = match body.rsplit_once('/') {
             // A wildcard sits only in the last component (the grammar guarantees it), so at most
             // one directory is read, and only when there is a wildcard to match.
             Some((parent, last)) if has_wildcard(last) => match_in_dir(&root.join(parent), last),
             None if has_wildcard(body) => match_in_dir(root, body),
-            _ => vec![root.join(body)],
+            _ => (vec![root.join(body)], Vec::new()),
         };
         hits.sort();
+        // Sorted for the same reason the hits are: the warning list a launch prints must not depend
+        // on the order the kernel happened to hand back the directory.
+        unjudged.sort();
+        // A candidate the matcher could not compare against the pattern is reported, never dropped.
+        // `[fs]` may only take access away, so its one intolerable failure mode is a quiet one: an
+        // entry that covered three of four files reads exactly like one that covered all four.
+        for path in unjudged {
+            warnings.push(format!(
+                "`[fs] {field}` entry `{entry}`: `{}` has a name that is not valid UTF-8, so it \
+                 cannot be matched against the pattern — if the entry meant to close it, that path \
+                 stays open to the cage",
+                path.display()
+            ));
+        }
         let mut matched = 0;
         for candidate in hits {
             match admit(root, &candidate, entry, dir_only) {
@@ -276,21 +294,29 @@ fn resolve_list(
     out
 }
 
-/// The entries of `dir` whose name matches `pattern`, or nothing when the directory cannot be read
-/// (an entry naming a directory that is absent matches nothing, which its own warning covers).
-fn match_in_dir(dir: &Path, pattern: &str) -> Vec<PathBuf> {
+/// The entries of `dir` whose name matches `pattern`, and — separately — the entries that could not
+/// be matched at all. Both are empty when the directory cannot be read (an entry naming a directory
+/// that is absent matches nothing, which its own warning covers).
+///
+/// The second list exists because a Linux filename is arbitrary non-NUL bytes while
+/// [`matches_component`] compares `str`s: a name that is not valid UTF-8 can never match any pattern,
+/// so folding it into "did not match" would turn a path the entry could not cover into one it
+/// deliberately left out. The caller warns about each, which is the whole difference between a mask
+/// with a known gap and a mask that reports success it did not achieve.
+fn match_in_dir(dir: &Path, pattern: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
-    entries
-        .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| matches_component(pattern, n))
-        })
-        .map(|e| e.path())
-        .collect()
+    let (mut hits, mut unjudged) = (Vec::new(), Vec::new());
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        match name.to_str() {
+            Some(n) if matches_component(pattern, n) => hits.push(entry.path()),
+            Some(_) => {}
+            None => unjudged.push(entry.path()),
+        }
+    }
+    (hits, unjudged)
 }
 
 /// Judge one candidate path: it must exist, resolve inside the project, and match the entry's
@@ -687,6 +713,43 @@ mod tests {
         assert!(e.denied.is_empty());
         assert_eq!(e.warnings.len(), 2, "{:?}", e.warnings);
         assert!(e.warnings.iter().all(|w| w.contains("matches nothing")));
+    }
+
+    #[test]
+    fn a_wildcard_says_so_when_a_sibling_name_is_not_valid_utf8() {
+        // A filename on Linux is arbitrary bytes; the pattern matcher compares text. A candidate the
+        // matcher cannot judge used to be dropped as "did not match", so an entry that covered two of
+        // three certificates reported exactly what a complete mask reports — and the third stayed
+        // readable in the cage. A mask that may only take access away must never claim coverage it
+        // does not have, so the gap is named at launch. The UTF-8 siblings must still be masked: the
+        // report is an addition, not a refusal of the whole entry.
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        let odd = std::ffi::OsStr::from_bytes(b"priv\xe9.pem");
+        std::fs::write(root.join("certs").join(odd), b"KEY").unwrap();
+
+        let e = expand(&root, &policy(&["certs/*.pem"], &[]));
+        let paths: Vec<&Path> = e.denied.iter().map(|m| m.path.as_path()).collect();
+        assert_eq!(
+            paths,
+            [root.join("certs/client.pem"), root.join("certs/server.pem")]
+                .iter()
+                .map(|p| p.as_path())
+                .collect::<Vec<_>>(),
+            "the siblings the matcher can judge are still closed"
+        );
+        assert_eq!(
+            e.warnings.len(),
+            1,
+            "exactly the one unjudgeable candidate is reported: {:?}",
+            e.warnings
+        );
+        assert!(
+            e.warnings[0].contains("not valid UTF-8") && e.warnings[0].contains("stays open"),
+            "the warning names the gap and its consequence: {}",
+            e.warnings[0]
+        );
     }
 
     #[test]

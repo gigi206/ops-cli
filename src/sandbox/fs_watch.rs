@@ -70,6 +70,17 @@ pub(crate) const IGNORED_COMPONENTS: &[&str] = &[".git", "node_modules", "target
 /// open file (noise). The reported changes are a completed write (`IN_CLOSE_WRITE`), a create/move-in
 /// (`IN_CREATE`/`IN_MOVED_TO`), a delete (`IN_DELETE`), and a move-out (`IN_MOVED_FROM`); the `*_SELF`
 /// masks let the watcher drop a directory that was itself removed.
+///
+/// `IN_DONT_FOLLOW` is the security-relevant bit: without it the kernel resolves the path through a
+/// final-component symlink (`IN_ONLYDIR` only demands that the *resolved* target be a directory), and
+/// the watcher hands `inotify_add_watch` a path it re-resolves after the fact — the directory named by
+/// an `IN_CREATE|IN_ISDIR` event is looked up again when the poll loop gets to it, up to a poll period
+/// later. The cage owns the project tree, so in that window it can replace the new directory with a
+/// link to anywhere on the host; the flag makes that `add_watch` fail instead of pulling the watch set
+/// out of the project, spending the host-wide `fs.inotify.max_user_watches` budget on the cage's
+/// behalf, and reporting host paths under a project-relative name. The failure is `ENOTDIR`, not
+/// `ELOOP`: with `IN_ONLYDIR` also set the walk stops at the un-followed link and then fails the
+/// "must be a directory" check.
 const WATCH_MASK: u32 = libc::IN_CLOSE_WRITE
     | libc::IN_CREATE
     | libc::IN_DELETE
@@ -78,6 +89,7 @@ const WATCH_MASK: u32 = libc::IN_CLOSE_WRITE
     | libc::IN_DELETE_SELF
     | libc::IN_MOVE_SELF
     | libc::IN_ONLYDIR
+    | libc::IN_DONT_FOLLOW
     | libc::IN_EXCL_UNLINK;
 
 /// A running filesystem-write observer. The thread drains inotify events and pushes each observed
@@ -96,6 +108,11 @@ impl FsWatcher {
     /// watch, so a watch added later (from the background thread) would miss a write the cage makes in
     /// the gap. Only the event loop runs in the spawned thread. Fails (so the caller can degrade the fs
     /// lens without disturbing exec observation) only when the inotify instance itself cannot be created.
+    ///
+    /// The root is canonicalised here rather than assumed canonical: every watch this module installs
+    /// refuses to resolve a symlinked final component (see [`WATCH_MASK`]), so a caller handing in a
+    /// path whose last component is a link would otherwise get an observer that watches nothing at
+    /// all. Reported paths are unaffected — each is stripped of this same prefix.
     pub(crate) fn start(root: &Path, ring: Arc<FsRing>) -> io::Result<FsWatcher> {
         // SAFETY: `inotify_init1` with valid flags returns a new fd or -1.
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
@@ -104,7 +121,7 @@ impl FsWatcher {
         }
         let mut watcher = Watcher {
             fd,
-            root: root.to_path_buf(),
+            root: root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
             wd_paths: HashMap::new(),
             ring,
             warned: Warned::new(),
@@ -225,10 +242,15 @@ impl Watcher {
     /// stack, so a deep tree cannot overflow the thread stack). With `emit`, a synthetic `create` event is
     /// pushed for every entry found — used when a directory appears *after* start, so a file created in it
     /// before its watch was installed is still reported (the inotify create race); the initial walk passes
-    /// `false` so the pre-existing project is not replayed as writes. Symlinks are not followed (an entry's
-    /// type is read without traversing it), so the watch set cannot loop or escape the project tree. On a
-    /// watch-descriptor exhaustion the walk stops and warns once; the directories already watched keep
-    /// working.
+    /// `false` so the pre-existing project is not replayed as writes. On a watch-descriptor exhaustion the
+    /// walk stops and warns once; the directories already watched keep working.
+    ///
+    /// A symlink is never traversed, by two mechanisms that have to hold together: an entry's type is read
+    /// without following it (so a link to a directory is not recursed into), and [`WATCH_MASK`] carries
+    /// `IN_DONT_FOLLOW` (so a path whose final component turned into a link between its discovery and this
+    /// walk is refused instead of resolved). The second is what covers the re-resolution window, and it
+    /// also guards the enumeration: a failed `add_watch` `continue`s before the `read_dir` below, which
+    /// *would* follow the link. The pairing is why the two are not independent choices.
     fn add_tree(&mut self, start: &Path, emit: bool) {
         let mut stack = vec![start.to_path_buf()];
         while let Some(dir) = stack.pop() {
@@ -240,8 +262,10 @@ impl Watcher {
                     self.warned.warn_limit_once();
                     return;
                 }
-                // The directory vanished between discovery and the watch, or is otherwise unwatchable:
-                // skip it, keep watching the rest.
+                // The directory vanished between discovery and the watch, was replaced by a symlink
+                // (refused by `IN_DONT_FOLLOW`), or is otherwise unwatchable: skip it — without
+                // enumerating it, which is what keeps the walk inside the project — and keep watching
+                // the rest.
                 Err(_) => continue,
             }
             let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -543,5 +567,55 @@ mod tests {
             wait_for(&ring, Duration::from_secs(3), |e| e.path == "late/f.txt"),
             "a write under a directory created after start was observed"
         );
+    }
+
+    #[test]
+    fn a_directory_replaced_by_a_symlink_is_neither_watched_nor_walked_through() {
+        // The escape this pins: the watcher re-resolves a directory's *path* when it installs the
+        // watch, up to a poll period after the kernel reported the create, so the cage can swap that
+        // directory for a link in between. `IN_DONT_FOLLOW` is what makes the `add_watch` fail rather
+        // than watch the link's target, and because the failure arm `continue`s before `read_dir`, the
+        // same flag also stops the enumeration that would walk the target and report its contents as
+        // project-relative creates. Without the flag `inotify_add_watch` resolves the link and both
+        // halves succeed, so every assertion below is reached only by the fixed code.
+        let project = TmpDir::new();
+        let root = project.path().canonicalize().unwrap();
+        let elsewhere = TmpDir::new();
+        let outside = elsewhere.path().canonicalize().unwrap();
+        std::fs::create_dir(outside.join("host-only")).unwrap();
+        let link = root.join("late");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        // SAFETY: `inotify_init1` with valid flags returns a new fd or -1.
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(fd >= 0, "an inotify instance could be created");
+
+        let err = add_watch(fd, &link).expect_err("a watch is never installed through a symlink");
+        assert_ne!(
+            err.raw_os_error(),
+            Some(libc::ENOSPC),
+            "the refusal is a per-path skip, not the watch-descriptor exhaustion that ends the walk"
+        );
+
+        let ring = Arc::new(FsRing::new(100));
+        let mut watcher = Watcher {
+            fd,
+            root: root.clone(),
+            wd_paths: HashMap::new(),
+            ring: ring.clone(),
+            warned: Warned::new(),
+        };
+        watcher.add_tree(&link, true);
+        assert!(
+            watcher.wd_paths.is_empty(),
+            "no watch descriptor is recorded for a path that leaves the project tree"
+        );
+        assert!(
+            ring.snapshot(None).events.is_empty(),
+            "nothing behind the link is reported as a project-relative change"
+        );
+
+        // SAFETY: closing the inotify fd this test opened; it removes any watch with it.
+        unsafe { libc::close(fd) };
     }
 }

@@ -47,11 +47,12 @@ use crate::store::Layout;
 use std::ffi::OsString;
 use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::os::unix::fs::DirBuilderExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -120,6 +121,10 @@ pub(crate) struct Forward {
 /// host port is the remap form's job, and the message says so. The `[::1]` bind is best-effort — it
 /// catches a `localhost` callback the browser sends over IPv6, but a host with IPv6 disabled simply
 /// keeps the v4 path.
+///
+/// A failure part-way through leaves nothing running: the [`Forwarder`] guard is constructed before
+/// the first bind and every listener is registered in it as it is spawned, so an error returns by
+/// dropping the guard — which is the same teardown a successful launch gets.
 pub(crate) fn start(
     layout: &Layout,
     mut ports: Vec<ForwardPort>,
@@ -160,7 +165,19 @@ pub(crate) fn start(
         .create(&dir)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    let mut accepts: Vec<JoinHandle<()>> = Vec::new();
+    // The guard owns the partial state from here on, before the first bind can fail. Every listener
+    // is registered in it as it is spawned, so an error on a later port drops the guard on the way
+    // out — which stops and joins the accept loops already running, closes their listeners (freeing
+    // the host ports) and removes the directory. Built at the end of the loop instead, an early
+    // return left those threads detached and their ports bound for the life of the process: a
+    // multi-app run (`sbx upgrade`) continues past a failed launch, so the next app to declare that
+    // port was refused by sbx's own listener under a message blaming "another login, or a host
+    // service".
+    let mut guard = Forwarder {
+        dir: dir.clone(),
+        shutdown: shutdown.clone(),
+        accepts: Vec::new(),
+    };
     let mut forwards = Vec::with_capacity(ports.len());
 
     for &fwd in &ports {
@@ -169,6 +186,14 @@ pub(crate) fn start(
         // **cage** port, which is what identifies a forward — so two entries can never name one
         // socket, and the name matches the `TCP-CONNECT` the in-cage `socat` is given.
         let host_sock = dir.join(format!("p-{}.sock", fwd.cage));
+        // A predecessor with this pid that was `SIGKILL`ed never ran `Forwarder::drop`, so its
+        // socket file can still be sitting in the directory this launch reuses (the directory is
+        // keyed by pid). `socat UNIX-LISTEN` refuses a path that already exists, and the in-cage
+        // forwarder runs with its output on `/dev/null` — the forward would simply never carry a
+        // byte and say nothing about why. Clearing the name is the same pre-bind removal the egress
+        // control socket does, and it is confined to this pid's own directory, which no live
+        // process can be using.
+        let _ = std::fs::remove_file(&host_sock);
 
         // v4 loopback is mandatory — `127.0.0.1`, never the wildcard, so the port is never exposed
         // on an external interface. Fail-closed on any bind error, naming the port and both likely
@@ -187,13 +212,17 @@ pub(crate) fn start(
                 ),
             )
         })?;
-        accepts.push(spawn_accept(v4, host_sock.clone(), shutdown.clone()));
+        guard
+            .accepts
+            .push(spawn_accept(v4, host_sock.clone(), shutdown.clone()));
 
         // v6 loopback (`::1`) is best-effort: many hosts resolve `localhost` to `::1` first, so
         // binding it too catches an IPv6 callback. A host with IPv6 disabled (or the address
         // already taken) simply skips it — v4 stays the primary path.
         if let Ok(v6) = TcpListener::bind(("::1", host)) {
-            accepts.push(spawn_accept(v6, host_sock.clone(), shutdown.clone()));
+            guard
+                .accepts
+                .push(spawn_accept(v6, host_sock.clone(), shutdown.clone()));
         }
 
         forwards.push(Forward {
@@ -204,21 +233,15 @@ pub(crate) fn start(
 
     // One bind carries the whole per-launch dir; the in-cage forwarder creates its per-port socket
     // files inside it, and the host connects to the same inode. Writable so the cage can create and
-    // unlink its sockets.
+    // unlink its sockets — which is why the host resolves one of those names exactly once, in
+    // `dial_cage_socket`, rather than on every connection.
     let binds = vec![ExtraBind {
-        src: dir.clone(),
+        src: dir,
         dest: PathBuf::from(CAGE_FORWARD_DIR),
         writable: true,
     }];
 
-    Ok((
-        Forwarder {
-            dir,
-            shutdown,
-            accepts,
-        },
-        Wiring { binds, forwards },
-    ))
+    Ok((guard, Wiring { binds, forwards }))
 }
 
 /// Put `listener` into non-blocking mode and spawn its accept loop. Non-blocking so the loop can
@@ -233,40 +256,46 @@ fn spawn_accept(listener: TcpListener, sock: PathBuf, shutdown: Arc<AtomicBool>)
 /// so the loop polls the `shutdown` flag and returns when the guard signals teardown (dropping the
 /// listener, freeing the port). The in-cage socket may not exist yet when the host accepts (the cage
 /// forwarder binds it after the cage starts); a connect then fails and the connection is dropped —
-/// the browser retries, and a dev server is up long before the user curls. A `MAX_CONCURRENT_CONNS`
-/// cap refuses beyond (fail-closed).
+/// the browser retries, and a dev server is up long before the user curls.
+///
+/// The ceiling and the accept-error policy are [`super::conncap`]'s, not this loop's own: the slot
+/// is taken by the operation that tests it ([`super::conncap::ConnCap::take`]), and an accept that
+/// fails for anything but "nothing pending" names this plane and pauses
+/// ([`super::conncap::accept_backoff`]) instead of being folded into the idle case, where a listener
+/// that had stopped accepting read as an idle port for the rest of the session.
 fn accept_loop(listener: TcpListener, sock: PathBuf, shutdown: Arc<AtomicBool>) {
-    let live = Arc::new(AtomicUsize::new(0));
+    let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return;
         }
         let stream = match listener.accept() {
             Ok((s, _)) => s,
-            // No pending connection (non-blocking) or a transient error: nap and re-poll the flag.
-            Err(_) => {
+            // The listener is non-blocking, so "nothing pending" is the ordinary idle state: nap
+            // and re-poll the shutdown flag. It is matched first because it is the only error this
+            // loop is entitled to swallow.
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 std::thread::sleep(ACCEPT_POLL);
+                continue;
+            }
+            // Anything else is a real failure — host fd exhaustion (`EMFILE`) above all, which is
+            // when a machine can least afford a spinning thread. Every other plane in this tree
+            // says so on stderr; a silent one leaves a forward that answers TCP and carries nothing
+            // with no diagnosis anywhere.
+            Err(e) => {
+                super::conncap::accept_backoff("forward", &e);
                 continue;
             }
         };
         // The accepted stream inherits nothing from the non-blocking listener on Linux, but make it
         // explicit: the bridge uses a simple blocking read/write loop.
         let _ = stream.set_nonblocking(false);
-        if live.load(Ordering::Relaxed) >= MAX_CONCURRENT_CONNS {
-            // Refuse beyond the cap: dropping the stream closes it (fail-closed).
-            continue;
-        }
-        live.fetch_add(1, Ordering::Relaxed);
-        let live = live.clone();
+        // Past the ceiling the stream is dropped, which closes it (fail-closed) rather than pinning
+        // another thread.
+        let Some(slot) = cap.take() else { continue };
         let sock = sock.clone();
         std::thread::spawn(move || {
-            struct Dec<'a>(&'a AtomicUsize);
-            impl Drop for Dec<'_> {
-                fn drop(&mut self) {
-                    self.0.fetch_sub(1, Ordering::Relaxed);
-                }
-            }
-            let _dec = Dec(&live);
+            let _slot = slot;
             let _ = bridge(stream, &sock);
         });
     }
@@ -281,13 +310,16 @@ fn accept_loop(listener: TcpListener, sock: PathBuf, shutdown: Arc<AtomicBool>) 
 /// when *both* directions had ended. A cage service that goes away (socat dies with the cage) EOFs
 /// the cage→host direction while a host client that is merely idle — a browser holding a keep-alive
 /// connection — sends nothing and closes nothing, so the host→cage copy stayed blocked in `read`
-/// forever, pinning its thread and, through `accept_loop`'s `Dec` guard, one of the
-/// [`MAX_CONCURRENT_CONNS`] slots for the life of the process.
+/// forever, pinning its thread and, through the [`super::conncap::ConnSlot`] `accept_loop` holds
+/// for it, one of the [`MAX_CONCURRENT_CONNS`] slots for the life of the process.
 ///
 /// So the cage→host direction runs inline and decides: when it ends, both sockets are shut down
 /// `Both`, which returns the spawned copy's blocked read and makes the join always complete.
+///
+/// The cage side is reached through [`dial_cage_socket`], never by dialing the path directly: the
+/// name lives in a directory the cage can write.
 fn bridge(client: TcpStream, sock: &Path) -> io::Result<()> {
-    let uds = UnixStream::connect(sock)?;
+    let uds = dial_cage_socket(sock)?;
     // Two handles per socket (read + write), plus one each to force the teardown after the inline
     // copy ends. `try_clone` dups the fd, so every handle refers to the same socket.
     let mut client_rd = client.try_clone()?;
@@ -311,6 +343,50 @@ fn bridge(client: TcpStream, sock: &Path) -> io::Result<()> {
     let _ = uds_shut.shutdown(Shutdown::Both);
     let _ = t.join();
     Ok(())
+}
+
+/// Connect to the in-cage forwarder's socket, refusing to follow a name the cage has replaced.
+///
+/// The per-launch directory is bound into the cage **read-write** — the in-cage `socat` has to
+/// create and unlink its own sockets there — so every name inside it belongs to the workload, and
+/// the host dials one of those names once per accepted connection. A path-based `connect(2)`
+/// resolves symlinks in the **host's** mount namespace, so `unlink p-9119.sock; ln -s
+/// /var/run/docker.sock p-9119.sock` would splice a host client into a host daemon of the cage's
+/// choosing: not an exfiltration channel back into the cage (its netns is empty, so it cannot dial
+/// the forward itself), but a confused deputy — the host client's bytes reach a service it never
+/// asked for, and the forward's one guarantee, that this port reaches the caged service, is gone.
+/// The targets need no guessing either: a bind mount shows its source in the cage's own
+/// `/proc/self/mountinfo`.
+///
+/// Re-checking the name before each dial would only narrow the window, since the cage can swap it
+/// back and forth as fast as it likes. So the name is resolved **once** and the connection is made
+/// to what that resolution pinned. `O_PATH` opens the entry without opening what it holds — a
+/// socket cannot be opened for I/O at all — and `O_NOFOLLOW` beside it makes the descriptor refer
+/// to a symlink *itself* rather than to its target, so reading the type off that descriptor refuses
+/// a link, a regular file, a fifo or a directory left at the name instead of dialing through it.
+/// Only a real socket gets past, and the connect then names the pinned inode through
+/// `/proc/self/fd`, so what the cage does to the name afterwards cannot move the connection.
+///
+/// A missing socket keeps its old meaning — the cage forwarder may simply not have bound it yet,
+/// and the caller drops that connection for the client to retry.
+fn dial_cage_socket(sock: &Path) -> io::Result<UnixStream> {
+    // `read(true)` is only there because `OpenOptions` requires an access mode; `O_PATH` makes the
+    // kernel ignore it, which is what lets this open a socket at all.
+    let pinned = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(sock)?;
+    if !pinned.metadata()?.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "`{}` is not a socket — the cage replaced the forward's socket with something \
+                 else, and this port reaches nothing until it puts one back",
+                sock.display()
+            ),
+        ));
+    }
+    UnixStream::connect(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
 }
 
 /// Wrap `cmd` so the cage starts the in-cage forwarders before running it: a static bash that
@@ -653,6 +729,175 @@ mod tests {
             "the bridge must return once the cage side closes — an idle client that never closes \
              would otherwise pin the copy thread and its connection slot forever",
         );
+        drop(client);
+    }
+
+    /// A bind that fails part-way through must leave nothing bound. The accept loops are detached
+    /// threads, so anything not owned by the returned guard is unreachable the moment `start`
+    /// returns `Err`: the port stays bound and its loop keeps polling for the life of the process.
+    /// That bites the multi-app runs, which continue past a failed launch in the same process — the
+    /// next app declaring that host port is then refused by sbx's own leaked listener, under a
+    /// message blaming "another login, or a host service on :<port>".
+    #[test]
+    fn a_failed_bind_frees_the_ports_it_already_bound_in_the_same_call() {
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        // A port nothing can bind: held for the whole test by an unrelated listener.
+        let held = TcpListener::bind(("127.0.0.1", 0)).expect("an ephemeral port");
+        let taken = held.local_addr().expect("the bound address").port();
+
+        // The forwards are bound in cage-port order, so the lower cage port binds first and the
+        // higher one is the failure. A port picked by binding and releasing can be won by anything
+        // else on the machine in between (a sibling test included); losing that race says nothing
+        // about what this asserts, so a first bind that fails is retried with a fresh port.
+        let mut left = 5;
+        let good = loop {
+            let probe = TcpListener::bind(("127.0.0.1", 0)).expect("an ephemeral port");
+            let good = probe.local_addr().expect("the bound address").port();
+            drop(probe);
+            let msg = match start(
+                &layout,
+                vec![
+                    ForwardPort {
+                        host: good,
+                        cage: 9119,
+                    },
+                    ForwardPort {
+                        host: taken,
+                        cage: 9219,
+                    },
+                ],
+            ) {
+                Ok(_) => panic!("a taken host port must fail the whole call"),
+                Err(e) => e.to_string(),
+            };
+            if msg.contains(&format!("cannot bind host port {good} for forward")) && left > 0 {
+                left -= 1;
+                continue;
+            }
+            assert!(
+                msg.contains(&format!("cannot bind host port {taken} for forward")),
+                "the second forward is the one that failed: {msg}"
+            );
+            break good;
+        };
+
+        // The first listener was live when the second failed. The guard owning it is dropped on the
+        // way out, which stops its accept loop and closes it — so the port is free. Retried briefly
+        // only to absorb scheduling; a leaked listener never frees it.
+        let mut freed = false;
+        for _ in 0..50 {
+            if TcpListener::bind(("127.0.0.1", good)).is_ok() {
+                freed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            freed,
+            "a failed `start` must not hold the ports it already bound for the life of the process"
+        );
+        // The per-launch directory goes with them, by the same drop.
+        assert!(
+            !layout
+                .data_dir()
+                .join("forward")
+                .join(format!("fwd-{}", std::process::id()))
+                .exists(),
+            "a failed `start` must not leave its socket directory behind"
+        );
+        drop(held);
+    }
+
+    /// The per-launch directory is keyed by pid alone, so a launch can inherit the directory of a
+    /// `SIGKILL`ed predecessor that reused the pid — `Forwarder::drop` never ran for it. The
+    /// in-cage `socat UNIX-LISTEN` refuses a path that already exists and reports it into
+    /// `/dev/null`, so the leftover would silently cost the session every byte of that forward.
+    /// `start` clears the name it is about to hand the cage.
+    #[test]
+    fn a_stale_socket_left_by_a_dead_predecessor_is_cleared_before_the_cage_binds() {
+        use std::os::unix::net::UnixListener;
+
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let mut left = 5;
+        let (guard, port) = loop {
+            let probe = TcpListener::bind(("127.0.0.1", 0)).expect("an ephemeral port");
+            let port = probe.local_addr().expect("the bound address").port();
+            drop(probe);
+            // What the killed predecessor left behind, at the exact name this launch will use.
+            let stale = wiring_host_socket(&layout, port);
+            std::fs::create_dir_all(stale.parent().expect("the socket sits in a directory"))
+                .expect("stage the predecessor's directory");
+            std::fs::write(&stale, b"").expect("stage the predecessor's socket file");
+            match start(&layout, vec![ForwardPort::same(port)]) {
+                Ok((guard, _wiring)) => break (guard, port),
+                // The probed port was taken between the probe and the bind — see
+                // `start_on_free_ports`.
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse && left > 0 => left -= 1,
+                Err(e) => panic!("start binds the port it was given: {e:?}"),
+            }
+        };
+
+        // The in-cage forwarder's bind is the thing that must succeed; here the test stands in for
+        // it, because `UNIX-LISTEN` and `UnixListener::bind` fail on an existing path alike.
+        let sock = wiring_host_socket(&layout, port);
+        let bound = UnixListener::bind(&sock).expect(
+            "the cage's socat must be able to bind its socket: a leftover file at that name \
+             fails its `UNIX-LISTEN` into `/dev/null`, and the forward carries nothing all session",
+        );
+        drop(bound);
+        drop(guard);
+    }
+
+    /// The forward directory is bound into the cage read-**write** — the in-cage `socat` creates
+    /// and unlinks its own sockets there — so the cage owns every name in it, and the host dials one
+    /// of those names for each connection it accepts. A name replaced by a symlink must be refused
+    /// rather than followed: following it splices a host-side client into a host service of the
+    /// cage's choosing, and the forward's one guarantee — that this port reaches the caged service —
+    /// is gone.
+    #[test]
+    fn a_forward_socket_the_cage_replaced_with_a_symlink_is_never_dialed() {
+        use std::os::unix::net::UnixListener;
+
+        let tmp = TmpDir::new();
+        // Stand in for the host service the cage would like the forward aimed at.
+        let target = tmp.path().join("host-service.sock");
+        let victim = UnixListener::bind(&target).expect("bind the stand-in host service");
+        victim
+            .set_nonblocking(true)
+            .expect("the victim is polled, never waited on");
+        // The name the host dials, pointed elsewhere — what the cage can do the moment socat has
+        // bound it.
+        let name = tmp.path().join("p-9119.sock");
+        std::os::unix::fs::symlink(&target, &name).expect("plant the link");
+
+        let host = TcpListener::bind("127.0.0.1:0").expect("bind a host listener");
+        let client = TcpStream::connect(host.local_addr().unwrap()).expect("connect to the port");
+        let (accepted, _) = host.accept().expect("accept the host connection");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dialed = name.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(bridge(accepted, &dialed).is_err());
+        });
+        let refused = rx.recv_timeout(Duration::from_secs(10)).expect(
+            "the bridge must refuse the link outright — following it connects the host client to \
+             the service the link names, and the copy then sits on that connection",
+        );
+        assert!(refused, "a symlinked socket name must not be dialed");
+        assert!(
+            matches!(victim.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+            "nothing may reach the service the link pointed at"
+        );
+
+        // And the real shape is untouched: a socket at the name is dialed, through the descriptor
+        // the name resolved to.
+        std::fs::remove_file(&name).expect("clear the link");
+        let cage = UnixListener::bind(&name).expect("bind the stand-in cage socket");
+        let _dialed = dial_cage_socket(&name).expect("a real socket at the name is dialed");
+        cage.accept()
+            .expect("the dial reached the socket at the name");
         drop(client);
     }
 
