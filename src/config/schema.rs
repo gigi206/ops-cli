@@ -783,8 +783,14 @@ pub(crate) struct RawBrokerConfig {
     /// speaks, the way `[ssh_agent] allow` names keys. A trusted project may set them, since it
     /// narrows or widens what the cage may do with a resource the *global* config already agreed
     /// to expose. An untrusted project's table is dropped whole.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) allow: Vec<String>,
+    ///
+    /// An `Option` rather than a plain list because the project layer *replaces* this field, so
+    /// "the project said nothing about the policy" and "the project set an empty one" have to be
+    /// distinguishable: as a bare `Vec` they were the same value, and a project table written for
+    /// another field (a `socket`, which is dropped) silently cleared the global config's policy and
+    /// was then attributed to the project by `sbx config`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) allow: Option<Vec<String>>,
     /// Where the credential this broker puts on the wire comes from: one `scheme://locator`
     /// resolver reference, or a fallback chain tried in order — the same sources a `[secret]`
     /// declaration takes.
@@ -1050,7 +1056,13 @@ pub(crate) struct RawServiceTable {
     /// One expansion, and only one: an argument beginning with `~/` is rewritten against the cage's
     /// home, so a service can name a path under a home whose location it cannot know. Nothing else
     /// is substituted — a `$VAR` stays the four characters it is.
-    pub(crate) cmd: RawCmd,
+    ///
+    /// Optional at the parse layer for [`RawBindTable::path`]'s reason: [`RawService`] is untagged,
+    /// so a table whose `cmd` line is missing or mistyped matches no variant, and that failure is
+    /// the *whole* config layer's (env, packages, apps and all). Absent here is refused one entry
+    /// at a time by `validate_service`, which names the service that runs nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cmd: Option<RawCmd>,
     /// Start the service only when an environment condition holds:
     /// `{ env = "NAME", not = "0" }`.
     ///
@@ -1112,7 +1124,13 @@ pub(crate) enum RawEnable {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawEnableCond {
     /// The environment variable to read, by name.
-    pub(crate) env: String,
+    ///
+    /// Optional at the parse layer for the reason [`RawServiceTable::cmd`] gives: [`RawEnable`] is
+    /// untagged, and a condition written without its `env` would otherwise fail the whole config
+    /// layer over one qualifier. Absent is answered downstream by `service_enable`, which drops the
+    /// condition alone and starts the service unconditionally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) env: Option<String>,
     /// Start the service when the variable holds this value, or any one of these values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) is: Option<RawValues>,
@@ -1156,7 +1174,12 @@ impl RawValues {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawServiceReady {
     /// The port the service listens on, reached at `127.0.0.1` inside the cage.
-    pub(crate) tcp: u16,
+    ///
+    /// Held as an `i64` — like [`RawForward::Port`] and for the same reason: [`RawService`] is
+    /// untagged, so a value this layer refuses (`tcp = 70000`, a port typed with one digit too
+    /// many) matches no variant and takes the *whole* config layer down with it. The range is
+    /// checked downstream by `service_ready`, which names the service and drops only the gate.
+    pub(crate) tcp: i64,
     /// How long to wait before giving up and starting the app regardless — a duration like `"30s"`,
     /// the same grammar as `ask_timeout`. Omitted, [`super::types::READY_TIMEOUT_DEFAULT`] applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1167,7 +1190,13 @@ pub(crate) struct RawServiceReady {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RawOpenTable {
     /// The argv to run, the URI appended last.
-    pub(crate) cmd: RawCmd,
+    ///
+    /// Optional at the parse layer for the reason [`RawServiceTable::cmd`] gives: [`RawOpen`] is
+    /// untagged, so a table missing its `cmd` would fail the whole config layer instead of the one
+    /// handler. Absent is refused by `validate_open`, which names the scheme that opens with
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cmd: Option<RawCmd>,
     /// How it is launched. `"exec"` (the default) replaces the router, so the caller's wait ends
     /// when the handler does. `"detach"` starts it in the background and returns 0 at once.
     ///
@@ -1520,6 +1549,14 @@ pub(crate) struct RawTask {
     /// which is exactly why the bundle's name has to be carried rather than recovered afterwards.
     #[serde(skip)]
     pub(crate) from_bundle: Option<String>,
+    /// Every key of this table sbx does not know, kept so it can be reported by
+    /// `warn_unknown_task_keys`. Unknown keys stay ignored, as everywhere else in this schema; what
+    /// the bag buys is that the reader is told. The cost of the silence is highest here, and it is
+    /// the reason this table has one: `spawn` absent means no exec supervision at all, so a
+    /// misspelling of it reads as a confined command and is none — the same failure
+    /// [`RawTaskExecNode::rest`] exists to avoid one level down.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
 /// The shapes `spawn` accepts. A string is one program with nothing under it, a list is several,
@@ -1819,10 +1856,11 @@ pub(crate) struct NetworkTable {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) websocket_secret: Option<String>,
     /// The per-body capture cap in KiB, meaningful only with `capture = "bodies"`. It is ignored
-    /// otherwise, with a warning when `capture` is absent. Absent means the default (8); the value
-    /// is clamped to the ceiling (1024) rather than refused, since asking for more retains fewer
-    /// exchanges rather than more bytes. The head side has its own independent bound, so a header
-    /// flood cannot eat the body budget.
+    /// otherwise, and named in a warning whenever the effective level is not `bodies` — `off` and
+    /// `headers` ignore it exactly as a missing `capture` does. Absent means the default (8); the
+    /// value is clamped to the ceiling (1024) rather than refused, since asking for more retains
+    /// fewer exchanges rather than more bytes. The head side has its own independent bound, so a
+    /// header flood cannot eat the body budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) capture_max_kb: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2631,8 +2669,9 @@ mod tests {
     fn parses_the_network_posture_string_form() {
         let cfg = parse(b"network = \"none\"\n").unwrap();
         assert_eq!(cfg.network, Some(NetworkField::Posture("none".into())));
-        // unset means no declared posture — the loader treats that as the default
-        // (shared) rather than an explicit choice.
+        // unset means no declared posture — the loader treats that as the built-in default
+        // (`NetworkPolicy::default()`, the deny-by-default allowlist) rather than an explicit
+        // choice.
         assert_eq!(parse(b"").unwrap().network, None);
     }
 
@@ -2950,6 +2989,95 @@ mod tests {
         // a field a newer sbx understands must not break an older one
         let cfg = parse(b"some_future_field = 42\n[env]\nA = \"1\"\n").unwrap();
         assert_eq!(cfg.env.get("A").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn a_service_or_open_table_missing_its_cmd_still_parses() {
+        // `RawOpen`/`RawService` are untagged, so a required field in their table form is one whose
+        // absence fails the *document*: the `[env]` beside it, every package, every app and every
+        // `[fs]` mask go with it, over a table nobody had read yet. Optional here and refused per
+        // entry downstream — the trade `RawBindTable::path` already makes.
+        let cfg = parse(
+            br#"
+            [env]
+            KEEP = "yes"
+
+            [open.https]
+            mode = "detach"
+
+            [service.gateway]
+            ready = { tcp = 8100 }
+            enable = { is = "1" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.env.get("KEEP").map(String::as_str), Some("yes"));
+        let Some(RawOpen::Detailed(open)) = cfg.open.get("https") else {
+            panic!("expected the `[open]` table form: {:?}", cfg.open)
+        };
+        assert!(open.cmd.is_none(), "the handler names no program");
+        let Some(RawService::Detailed(service)) = cfg.service.get("gateway") else {
+            panic!("expected the `[service]` table form: {:?}", cfg.service)
+        };
+        assert!(service.cmd.is_none(), "nor does the service");
+        let Some(RawEnable::One(cond)) = &service.enable else {
+            panic!("expected one start condition: {:?}", service.enable)
+        };
+        assert!(cond.env.is_none(), "and the condition names no variable");
+    }
+
+    #[test]
+    fn a_ready_port_outside_a_ports_range_still_parses() {
+        // `tcp` is signed for `RawForward::Port`'s reason: held as a `u16`, a port typed with one
+        // digit too many matched neither `RawService` variant, and that refusal was the whole
+        // layer's. The range is answered downstream, where the drop costs only the gate.
+        let cfg = parse(
+            br#"
+            [env]
+            KEEP = "yes"
+
+            [service.gateway]
+            cmd = ["hermes", "gateway", "run"]
+            ready = { tcp = 70000 }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.env.get("KEEP").map(String::as_str), Some("yes"));
+        let Some(RawService::Detailed(service)) = cfg.service.get("gateway") else {
+            panic!("expected the `[service]` table form: {:?}", cfg.service)
+        };
+        assert_eq!(service.ready.as_ref().map(|r| r.tcp), Some(70000));
+    }
+
+    #[test]
+    fn a_task_keeps_its_unknown_keys_so_a_misspelled_control_can_be_named() {
+        // `spawn` absent means no exec supervision at all, so a `spwan` parsing into silence left a
+        // command the author believed confined running unconfined. The key is kept for the report,
+        // exactly as `RawTaskExecNode` keeps a node's.
+        let cfg = parse(
+            br#"
+            [task.deploy]
+            cmd = ["git"]
+            spwan = ["ssh"]
+            "#,
+        )
+        .unwrap();
+        let section = cfg.task.as_ref().expect("the section parsed");
+        let task = &section.tasks["deploy"];
+        assert!(task.spawn.is_none(), "no supervisor is declared");
+        assert!(task.rest.contains_key("spwan"), "the key is kept");
+        assert_eq!(task.rest.len(), 1, "and nothing else is");
+    }
+
+    #[test]
+    fn a_broker_policy_tells_an_unset_list_apart_from_an_empty_one() {
+        // A project table replaces this field, so the two have to be different values: a table
+        // written for another key leaves the global policy standing, while `allow = []` is a
+        // narrowing a project is entitled to declare.
+        let unset = parse(b"[broker.gpg]\nsocket = \"/tmp/x.sock\"\n").unwrap();
+        assert_eq!(unset.broker["gpg"].allow, None);
+        let empty = parse(b"[broker.gpg]\nallow = []\n").unwrap();
+        assert_eq!(empty.broker["gpg"].allow, Some(Vec::new()));
     }
 
     #[test]

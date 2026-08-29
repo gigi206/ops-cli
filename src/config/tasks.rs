@@ -579,8 +579,12 @@ fn validate_task_name(name: &str) -> Result<(), String> {
     validate_secret_name(name).map(|_| ())
 }
 
-/// Validate the parameter declarations, keeping declaration order. Each must carry exactly one bound
-/// (`match` or `enum`): an unbounded parameter is what turns a fixed command into an oracle.
+/// Validate the parameter declarations. The order is the section's **key** order, not the file's:
+/// `RawTask::params` is a `BTreeMap`, so what the author wrote is already gone by the time this
+/// runs, and it is key order that a caller sees in a task's listing and in its contract. Nothing
+/// depends on it — a parameter is addressed by name — but the promise has to match what is
+/// delivered. Each declaration must carry exactly one bound (`match` or `enum`): an unbounded
+/// parameter is what turns a fixed command into an oracle.
 fn validate_params(raw: BTreeMap<String, RawTaskParam>) -> Result<Vec<TaskParam>, String> {
     let mut out = Vec::with_capacity(raw.len());
     for (name, param) in raw {
@@ -638,7 +642,10 @@ fn compile_bound(
              unbounded value can carry a comparison and turn the exit status into an oracle"
         )),
         (Some(pattern), true) => {
-            regex::Regex::new(pattern)
+            // Built in the form [`check_value`] compiles, so anything the anchoring makes
+            // unbuildable is reported here rather than at a live call. The bound keeps the author's
+            // own source: it is what a task's contract renders, and what a reader has to recognise.
+            regex::Regex::new(&anchored(pattern))
                 .map_err(|e| format!("parameter `{name}` has an invalid `match` regex: {e}"))?;
             Ok(ParamBound::Pattern(pattern.to_string()))
         }
@@ -646,9 +653,29 @@ fn compile_bound(
     }
 }
 
+/// A declared pattern in the form the bound is actually decided by: anchored so a match must span
+/// the whole value.
+///
+/// Anchoring is not the same as asking whether a match *happens* to span the value, which is what
+/// this replaced. `Regex::find` returns the leftmost-**first** match, not the longest one at that
+/// offset — the regex crate documents exactly this, with `sam|samwise` matching `sam` in
+/// `samwise` — so a value was refused by a pattern that plainly admits it whole whenever an
+/// alternation's earlier branch was a prefix of a later one: `match = "prod|prod-eu|staging"`
+/// rejected `prod-eu`. With a `default` written that way the refusal landed at load and took the
+/// whole task out of the list. `\A`/`\z` put the question to the engine, which then considers the
+/// later branch.
+///
+/// The author's pattern goes inside a non-capturing group so a top-level alternation binds to the
+/// whole of it, and no inline flag is added: `(?s:…)` would quietly let the author's `.` match a
+/// newline, which *widens* the bound rather than anchoring it. An author's own `^`/`$` still behave
+/// — outside multi-line mode they mean the positions `\A`/`\z` mean.
+fn anchored(pattern: &str) -> String {
+    format!(r"\A(?:{pattern})\z")
+}
+
 /// Whether a value satisfies a bound. A pattern must match the **whole** value: an unanchored regex
-/// would accept anything containing a match, so the check anchors it here rather than trusting the
-/// author to have written `^…$`.
+/// would accept anything containing a match, so the check anchors it here (see [`anchored`]) rather
+/// than trusting the author to have written `^…$`.
 pub(crate) fn check_value(name: &str, value: &str, bound: &ParamBound) -> Result<(), String> {
     // Before the bound, because it is a fact about the value rather than about what was declared:
     // a NUL cannot be an argument whatever a pattern admits, and a pattern written with `.` admits
@@ -664,13 +691,14 @@ pub(crate) fn check_value(name: &str, value: &str, bound: &ParamBound) -> Result
     }
     match bound {
         ParamBound::Pattern(pattern) => {
-            let re = regex::Regex::new(pattern)
+            let re = regex::Regex::new(&anchored(pattern))
                 .map_err(|e| format!("parameter `{name}` has an invalid `match` regex: {e}"))?;
-            match re.find(value) {
-                Some(m) if m.start() == 0 && m.end() == value.len() => Ok(()),
-                _ => Err(format!(
+            if re.is_match(value) {
+                Ok(())
+            } else {
+                Err(format!(
                     "parameter `{name}` does not match its declared pattern"
-                )),
+                ))
             }
         }
         ParamBound::Choices(choices) => {
@@ -924,7 +952,7 @@ fn stranded_injection(
     })
 }
 
-/// Classify the task's egress entries. The same grammar as `[network] allow`, so a task's rules read/// Classify the task's egress entries. The same grammar as `[network] allow`, so a task's rules read
+/// Classify the task's egress entries. The same grammar as `[network] allow`, so a task's rules read
 /// like any other egress rule.
 fn validate_task_network(raw: &[String]) -> Result<Vec<Rule>, String> {
     raw.iter()
@@ -1207,6 +1235,91 @@ mod tests {
         assert!(
             check_value("sql", "SELECT; DROP TABLE t", &bound).is_err(),
             "a containing value must not pass an unanchored pattern"
+        );
+    }
+
+    /// A bound must not refuse a value its own pattern accepts.
+    ///
+    /// `Regex::find` returns the leftmost-**first** match, not the longest one at that offset, so
+    /// requiring the found span to cover the value asked a question the engine was not answering:
+    /// against `prod-eu`, `prod|prod-eu|staging` reported `prod` (0..4) and the value was refused by
+    /// a pattern that plainly admits it whole. The same declaration carrying
+    /// `default = "prod-eu"` failed validation, and a task whose validation fails is dropped at
+    /// load — so a correct declaration disappeared from the task list altogether.
+    #[test]
+    fn an_alternation_accepts_the_branch_a_shorter_earlier_one_is_a_prefix_of() {
+        let bound =
+            compile_bound("target", Some("prod|prod-eu|staging"), &[]).expect("the pattern builds");
+        for good in ["prod", "prod-eu", "staging"] {
+            assert!(
+                check_value("target", good, &bound).is_ok(),
+                "`{good}` is exactly one of the declared branches"
+            );
+        }
+        // Anchoring must not have loosened while it was corrected: a value that merely *contains*
+        // a match is still refused, from either end.
+        for bad in ["prod-eu-2", "xprod", "prod staging", ""] {
+            assert!(
+                check_value("target", bad, &bound).is_err(),
+                "`{bad}` is not the whole of any branch"
+            );
+        }
+
+        // The load-time half: a `default` on the longer branch no longer costs the task its place.
+        let mut raw = raw_task();
+        raw.cmd = vec!["psql".into(), "{target}".into()];
+        raw.params = [(
+            "target".to_string(),
+            RawTaskParam::Table(RawTaskParamTable {
+                pattern: Some("prod|prod-eu|staging".into()),
+                choices: vec![],
+                default: Some("prod-eu".into()),
+            }),
+        )]
+        .into_iter()
+        .collect();
+        let task = validate(raw).expect("a declaration whose default matches its own pattern");
+        assert_eq!(task.params[0].default.as_deref(), Some("prod-eu"));
+        assert_eq!(
+            task.params[0].bound,
+            ParamBound::Pattern("prod|prod-eu|staging".to_string()),
+            "the bound keeps the author's own source, which the task's contract renders"
+        );
+    }
+
+    /// The validated parameters come out in the section's **key** order, because `RawTask::params`
+    /// is a `BTreeMap` and the authored order does not survive parsing. `validate_params` used to
+    /// promise declaration order, which nothing on this path could deliver. Nothing depends on the
+    /// order — a parameter is addressed by name — but a caller reading a task's contract sees it,
+    /// so the promise and the behaviour are pinned together here: giving the section an
+    /// order-preserving map later is then a deliberate change with a failing test attached, not a
+    /// silent one that leaves the prose wrong again.
+    #[test]
+    fn the_validated_parameters_come_out_in_key_order_not_in_declaration_order() {
+        let mut raw = raw_task();
+        raw.cmd = vec![
+            "psql".into(),
+            "{since}".into(),
+            "{until}".into(),
+            "{format}".into(),
+        ];
+        raw.params = [
+            ("since".to_string(), RawTaskParam::Pattern("[0-9-]+".into())),
+            ("until".to_string(), RawTaskParam::Pattern("[0-9-]+".into())),
+            (
+                "format".to_string(),
+                RawTaskParam::Pattern("csv|json".into()),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let task = validate(raw).expect("the declaration is valid");
+        assert_eq!(
+            task.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["format", "since", "until"]
         );
     }
 

@@ -690,15 +690,24 @@ pub(super) fn validate_network_table(
     // `sbx net logs --with-headers/--with-body`. Never a verdict. An unknown level is dropped with a
     // warning and the capture stays off — fail-closed, since the value names how much plaintext the
     // launch retains.
+    let mut capture = None;
     if let Some(raw) = &table.capture {
         match crate::sandbox::control::CaptureLevel::parse(raw) {
-            Some(level) => policy = policy.with_capture(level, table.capture_max_kb),
+            Some(level) => {
+                policy = policy.with_capture(level, table.capture_max_kb);
+                capture = Some(level);
+            }
             None => warnings.push(format!(
                 "{source_label}: ignoring unknown capture level `{raw}` (expected \"off\", \
                  \"headers\", or \"bodies\") — the traffic capture stays off"
             )),
         }
-    } else if table.capture_max_kb.is_some() {
+    }
+    // `capture_max_kb` bounds a captured *body*, so it is inert under `off` and `headers` exactly as
+    // it is with no `capture` at all. The check keys off the effective level rather than the
+    // absence of the key — the same rule `ask_timeout`/`ask_notice` follow above — because the two
+    // levels that ignore the ceiling are the ones an author is likeliest to have paired it with.
+    if table.capture_max_kb.is_some() && !capture.is_some_and(|level| level.captures_bodies()) {
         warnings.push(format!(
             "{source_label}: `capture_max_kb` is only meaningful with `capture = \"bodies\"` — ignored"
         ));
@@ -769,7 +778,7 @@ pub(super) fn validate_open(
             continue;
         }
         let (cmd, mode) = match entry {
-            schema::RawOpen::Argv(cmd) => (cmd, None),
+            schema::RawOpen::Argv(cmd) => (Some(cmd), None),
             schema::RawOpen::Detailed(table) => (table.cmd, table.mode),
         };
         let mode = match mode.as_deref() {
@@ -783,7 +792,10 @@ pub(super) fn validate_open(
                 continue;
             }
         };
-        let argv = cmd.into_argv();
+        // An absent `cmd` lands here rather than at the parse layer (see
+        // [`schema::RawOpenTable::cmd`]), so the entry that names no program is dropped alone —
+        // the whole layer used to go with it.
+        let argv = cmd.map(schema::RawCmd::into_argv).unwrap_or_default();
         if argv.is_empty() || argv[0].is_empty() {
             warnings.push(format!(
                 "{source}: ignoring `[open]` entry `{scheme}` — it names no program to open with"
@@ -826,10 +838,13 @@ pub(super) fn validate_service(
             continue;
         }
         let (cmd, enable, ready) = match entry {
-            schema::RawService::Argv(cmd) => (cmd, None, None),
+            schema::RawService::Argv(cmd) => (Some(cmd), None, None),
             schema::RawService::Detailed(table) => (table.cmd, table.enable, table.ready),
         };
-        let argv = cmd.into_argv();
+        // An absent `cmd` lands here rather than at the parse layer (see
+        // [`schema::RawServiceTable::cmd`]), so the entry that names no program is dropped alone —
+        // the whole layer used to go with it.
+        let argv = cmd.map(schema::RawCmd::into_argv).unwrap_or_default();
         if argv.is_empty() || argv[0].is_empty() {
             warnings.push(format!(
                 "{source}: ignoring `[service]` entry `{name}` — it names no program to run"
@@ -889,32 +904,31 @@ fn service_enable(
                 Some("it lists no condition".to_string())
             } else {
                 raw.iter().find_map(|c| {
-                    if c.env.is_empty() {
-                        Some("a condition names no variable".to_string())
-                    } else {
-                        match (&c.is, &c.not) {
-                            (Some(_), Some(_)) => Some(format!(
-                                "the condition on `{}` sets both `is` and `not`, which cannot \
-                             both be it",
-                                c.env
-                            )),
-                            (None, None) => Some(format!(
-                                "the condition on `{}` sets neither `is` nor `not`, so it \
-                             compares nothing",
-                                c.env
-                            )),
-                            (Some(schema::RawValues::Any(v)), None)
-                            | (None, Some(schema::RawValues::Any(v)))
-                                if v.is_empty() =>
-                            {
-                                Some(format!(
-                                    "the condition on `{}` lists no value, so it compares \
-                                 nothing",
-                                    c.env
-                                ))
-                            }
-                            _ => None,
+                    // An omitted `env` arrives as `None` rather than failing the parse of the whole
+                    // layer (see [`schema::RawEnableCond::env`]); it reads the same as an empty one
+                    // here, since neither names a variable to compare.
+                    let Some(var) = c.env.as_deref().filter(|v| !v.is_empty()) else {
+                        return Some("a condition names no variable".to_string());
+                    };
+                    match (&c.is, &c.not) {
+                        (Some(_), Some(_)) => Some(format!(
+                            "the condition on `{var}` sets both `is` and `not`, which cannot \
+                             both be it"
+                        )),
+                        (None, None) => Some(format!(
+                            "the condition on `{var}` sets neither `is` nor `not`, so it \
+                             compares nothing"
+                        )),
+                        (Some(schema::RawValues::Any(v)), None)
+                        | (None, Some(schema::RawValues::Any(v)))
+                            if v.is_empty() =>
+                        {
+                            Some(format!(
+                                "the condition on `{var}` lists no value, so it compares \
+                                 nothing"
+                            ))
                         }
+                        _ => None,
                     }
                 })
             };
@@ -936,7 +950,9 @@ fn service_enable(
                             (None, None) => unreachable!(),
                         };
                         EnvCondition {
-                            var: c.env,
+                            // Refused above: the scan drops the whole condition unless every
+                            // member names a variable.
+                            var: c.env.unwrap_or_default(),
                             equals,
                             values,
                         }
@@ -949,55 +965,51 @@ fn service_enable(
 
 /// The readiness gate of one `[service]` entry, or `None` to start the app without waiting.
 ///
-/// Every way the gate can be unreadable — a port of 0, an unparseable timeout, a timeout outside
-/// the accepted range — drops the gate with a warning rather than failing the config, matching how
-/// [`service_enable`] treats an unreadable condition.
+/// Every way the gate can be unreadable — a port outside 1-65535, an unparseable timeout, a timeout
+/// outside the accepted range — drops the gate with a warning rather than failing the config,
+/// matching how [`service_enable`] treats an unreadable condition.
 fn service_ready(
     warnings: &mut Vec<String>,
     source: &str,
     name: &str,
     ready: Option<schema::RawServiceReady>,
 ) -> Option<ServiceReady> {
-    match ready {
-        None => None,
-        Some(gate) => {
-            if gate.tcp == 0 {
+    let gate = ready?;
+    // The port is an `i64` at the parse layer (see [`schema::RawServiceReady::tcp`]), so every
+    // integer TOML accepts arrives here and costs this gate alone rather than the whole config
+    // layer. Zero is refused beside the out-of-range values, and for the same reason: nothing
+    // listens on it, so the gate would wait for a connection that cannot arrive.
+    let Some(tcp) = u16::try_from(gate.tcp).ok().filter(|port| *port != 0) else {
+        warnings.push(format!(
+            "{source}: ignoring `ready` of `[service]` entry `{name}` — {} is not a port a \
+             service can listen on (1-65535)",
+            gate.tcp
+        ));
+        return None;
+    };
+    let timeout = match gate.timeout.as_deref() {
+        None => Some(READY_TIMEOUT_DEFAULT),
+        Some(raw) => match parse_duration(raw) {
+            Ok(d) => d,
+            Err(reason) => {
                 warnings.push(format!(
-                    "{source}: ignoring `ready` of `[service]` entry `{name}` — port 0 is not \
-                 a port a service can listen on"
+                    "{source}: `ready.timeout` of `[service]` entry `{name}` is invalid — \
+                     {reason}; using the default"
                 ));
-                None
-            } else {
-                let timeout = match gate.timeout.as_deref() {
-                    None => Some(READY_TIMEOUT_DEFAULT),
-                    Some(raw) => match parse_duration(raw) {
-                        Ok(d) => d,
-                        Err(reason) => {
-                            warnings.push(format!(
-                                "{source}: `ready.timeout` of `[service]` entry `{name}` is \
-                             invalid — {reason}; using the default"
-                            ));
-                            Some(READY_TIMEOUT_DEFAULT)
-                        }
-                    },
-                };
-                // `parse_duration` reads `0` as "no bound"; a readiness gate that never gives up
-                // would hang the launch on a service that never binds, which is the one outcome
-                // the gate exists to avoid.
-                match timeout {
-                    Some(timeout) => Some(ServiceReady {
-                        tcp: gate.tcp,
-                        timeout,
-                    }),
-                    None => {
-                        warnings.push(format!(
-                            "{source}: ignoring `ready` of `[service]` entry `{name}` — a \
-                         timeout of 0 would wait forever on a service that never binds"
-                        ));
-                        None
-                    }
-                }
+                Some(READY_TIMEOUT_DEFAULT)
             }
+        },
+    };
+    // `parse_duration` reads `0` as "no bound"; a readiness gate that never gives up would hang the
+    // launch on a service that never binds, which is the one outcome the gate exists to avoid.
+    match timeout {
+        Some(timeout) => Some(ServiceReady { tcp, timeout }),
+        None => {
+            warnings.push(format!(
+                "{source}: ignoring `ready` of `[service]` entry `{name}` — a timeout of 0 would \
+                 wait forever on a service that never binds"
+            ));
+            None
         }
     }
 }
@@ -1040,6 +1052,58 @@ mod tests {
                 && warnings[0].ends_with("to filter."),
             "{:?}",
             warnings[0]
+        );
+    }
+
+    /// `capture_max_kb` bounds a captured *body*, so it is inert under `off` and `headers` exactly
+    /// as it is with no `capture` at all. The guard keyed off the absence of `capture` while its
+    /// message named the level, so two of the three ways to write the mistake passed in silence —
+    /// including `capture = "headers"` beside a ceiling, which reads as bodies being kept.
+    #[test]
+    fn a_body_ceiling_is_named_under_every_capture_level_that_ignores_it() {
+        let warnings_for = |text: &str| -> Vec<String> {
+            let table: schema::NetworkTable = toml::from_str(text).expect("a table");
+            let mut warnings = Vec::new();
+            validate_network(
+                &mut warnings,
+                "t",
+                NetworkField::Table(table),
+                &NetGroups::new(),
+                &NetworkPolicy::default(),
+            );
+            warnings
+        };
+        let base = "mode = \"deny\"\nallow = [\"api.example.com\"]\ncapture_max_kb = 256\n";
+        for level in ["", "capture = \"off\"\n", "capture = \"headers\"\n"] {
+            let warnings = warnings_for(&format!("{base}{level}"));
+            assert!(
+                warnings.iter().any(|w| w.contains("capture_max_kb")),
+                "a ceiling beside `{level}` bounds nothing, so it is named: {warnings:?}"
+            );
+        }
+        // Under `bodies` the ceiling is the setting doing the work, so nothing is said — or the
+        // check above would pass by warning about every capture.
+        let bodies = warnings_for(&format!("{base}capture = \"bodies\"\n"));
+        assert!(bodies.is_empty(), "{bodies:?}");
+    }
+
+    /// A readiness gate names a port, and a port a service cannot listen on costs the gate alone.
+    /// The value reaches this validator as an `i64` precisely so the range is answered here, where
+    /// the service can be named, rather than at the parse layer where it failed the untagged
+    /// `RawService` and took the whole config layer with it.
+    #[test]
+    fn a_ready_gate_on_an_impossible_port_costs_the_gate_and_not_the_service() {
+        let raw: BTreeMap<String, schema::RawService> =
+            toml::from_str("[gateway]\ncmd = [\"hermes\"]\nready = { tcp = 70000 }\n")
+                .expect("a `[service]` table whose port is out of range");
+        let mut warnings = Vec::new();
+        let out = validate_service(&mut warnings, "t", raw);
+        let gateway = out.get("gateway").expect("the service stands");
+        assert!(gateway.ready.is_none(), "only the gate is dropped");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("70000") && warnings[0].contains("1-65535"),
+            "the port is named with the range it is outside: {warnings:?}"
         );
     }
 }

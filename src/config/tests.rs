@@ -2417,7 +2417,7 @@ fn an_app_ssh_agent_grant_is_its_own_and_unions_onto_the_baseline() {
 fn raw_broker(socket: Option<&str>, allow: &[&str]) -> crate::config::schema::RawBrokerConfig {
     crate::config::schema::RawBrokerConfig {
         socket: socket.map(str::to_string),
-        allow: allow.iter().map(|s| (*s).to_string()).collect(),
+        allow: Some(allow.iter().map(|s| (*s).to_string()).collect()),
         secret: None,
         rest: Default::default(),
     }
@@ -4095,7 +4095,10 @@ fn a_trusted_layer_resolves_a_handler_and_its_mode() {
                 (
                     "cursor".to_string(),
                     schema::RawOpen::Detailed(schema::RawOpenTable {
-                        cmd: schema::RawCmd::Argv(vec!["cursor".into(), "--open-url".into()]),
+                        cmd: Some(schema::RawCmd::Argv(vec![
+                            "cursor".into(),
+                            "--open-url".into(),
+                        ])),
                         mode: Some("detach".into()),
                     }),
                 ),
@@ -4134,7 +4137,7 @@ fn a_handler_sbx_cannot_honor_is_dropped_rather_than_guessed() {
                 (
                     "https".to_string(),
                     schema::RawOpen::Detailed(schema::RawOpenTable {
-                        cmd: schema::RawCmd::Argv(vec!["chromium".into()]),
+                        cmd: Some(schema::RawCmd::Argv(vec!["chromium".into()])),
                         mode: Some("background".into()),
                     }),
                 ),
@@ -4198,9 +4201,9 @@ fn a_trusted_layer_resolves_a_service_with_its_condition_and_gate() {
                 (
                     "chroma".to_string(),
                     schema::RawService::Detailed(schema::RawServiceTable {
-                        cmd: schema::RawCmd::Argv(vec!["chroma".into(), "run".into()]),
+                        cmd: Some(schema::RawCmd::Argv(vec!["chroma".into(), "run".into()])),
                         enable: Some(schema::RawEnable::One(schema::RawEnableCond {
-                            env: "NO_CHROMA".into(),
+                            env: Some("NO_CHROMA".into()),
                             is: None,
                             not: Some(schema::RawValues::One("1".into())),
                         })),
@@ -4254,7 +4257,7 @@ fn a_service_sbx_cannot_honor_is_dropped_and_a_bad_qualifier_only_costs_its_qual
                 (
                     "gated".to_string(),
                     schema::RawService::Detailed(schema::RawServiceTable {
-                        cmd: schema::RawCmd::Argv(vec!["daemon".into()]),
+                        cmd: Some(schema::RawCmd::Argv(vec!["daemon".into()])),
                         enable: None,
                         // A wait that never gives up would hang the launch on a service that never
                         // binds, which is the one outcome the gate exists to avoid.
@@ -4296,9 +4299,9 @@ fn a_condition_disjoins_over_the_values_of_one_variable() {
             service: BTreeMap::from([(
                 "daemon".to_string(),
                 schema::RawService::Detailed(schema::RawServiceTable {
-                    cmd: schema::RawCmd::Argv(vec!["daemon".into()]),
+                    cmd: Some(schema::RawCmd::Argv(vec!["daemon".into()])),
                     enable: Some(schema::RawEnable::One(schema::RawEnableCond {
-                        env: "SWITCH".into(),
+                        env: Some("SWITCH".into()),
                         is: None,
                         not: Some(schema::RawValues::Any(vec![
                             "0".into(),
@@ -4342,7 +4345,7 @@ fn an_enable_condition_that_compares_nothing_is_dropped_alone() {
     // starting is what the profile asks for when nothing says otherwise.
     let entry = |enable: schema::RawEnableCond| {
         schema::RawService::Detailed(schema::RawServiceTable {
-            cmd: schema::RawCmd::Argv(vec!["daemon".into()]),
+            cmd: Some(schema::RawCmd::Argv(vec!["daemon".into()])),
             enable: Some(schema::RawEnable::One(enable)),
             ready: None,
         })
@@ -4353,7 +4356,7 @@ fn an_enable_condition_that_compares_nothing_is_dropped_alone() {
                 (
                     "both".to_string(),
                     entry(schema::RawEnableCond {
-                        env: "A".into(),
+                        env: Some("A".into()),
                         is: Some(schema::RawValues::One("1".into())),
                         not: Some(schema::RawValues::One("0".into())),
                     }),
@@ -4361,7 +4364,7 @@ fn an_enable_condition_that_compares_nothing_is_dropped_alone() {
                 (
                     "neither".to_string(),
                     entry(schema::RawEnableCond {
-                        env: "B".into(),
+                        env: Some("B".into()),
                         is: None,
                         not: None,
                     }),
@@ -4369,7 +4372,7 @@ fn an_enable_condition_that_compares_nothing_is_dropped_alone() {
                 (
                     "nameless".to_string(),
                     entry(schema::RawEnableCond {
-                        env: String::new(),
+                        env: Some(String::new()),
                         is: Some(schema::RawValues::One("1".into())),
                         not: None,
                     }),
@@ -4377,7 +4380,7 @@ fn an_enable_condition_that_compares_nothing_is_dropped_alone() {
                 (
                     "good".to_string(),
                     entry(schema::RawEnableCond {
-                        env: "C".into(),
+                        env: Some("C".into()),
                         is: None,
                         not: Some(schema::RawValues::One("0".into())),
                     }),

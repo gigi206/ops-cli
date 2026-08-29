@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use toml_edit::{Array, DocumentMut, Item, Table, TableLike, Value, value};
+use toml_edit::{Array, DocumentMut, Item, RawString, Table, TableLike, Value, value};
 
 /// Which config file an operation targets.
 pub(crate) enum Scope {
@@ -459,16 +459,14 @@ pub(crate) fn add(path: &Path, key: &str, entry: &str) -> Result<bool, ManageErr
     // a list of *ports*, so a string entry there would fail validation and leave the field with no
     // way in at all. The guess is validated below and retried as a string, so an over-eager one
     // (a host that looks like a number) is never committed.
-    list.push_formatted(scalar_value(entry));
-    // Keep the rendering readable: `toml_edit` leaves an appended entry flush against the previous
-    // one, so a list built by repeated `add` would read `["a","b"]`.
-    space_entries(list);
+    append_entry(list, scalar_value(entry));
     if validate_layer(&doc).is_err() {
+        // Replace the slot rather than take it out and append again: it already carries the decor
+        // [`append_entry`] gave it, and a second append would move the trailing comment a second
+        // time. `Array::replace` keeps the existing element's decor, which is exactly that slot's.
         let list = list_at(&mut doc, key)?;
         let last = list.len() - 1;
-        list.remove(last);
-        list.push_formatted(Value::from(entry));
-        space_entries(list);
+        list.replace(last, entry);
         if let Err(detail) = validate_layer(&doc) {
             return Err(ManageError::InvalidValue(key.to_string(), detail));
         }
@@ -490,8 +488,7 @@ pub(crate) fn remove(path: &Path, key: &str, entry: &str) -> Result<bool, Manage
     else {
         return Ok(false);
     };
-    list.remove(idx);
-    space_entries(list);
+    remove_entry(list, idx);
     match validate_layer(&doc) {
         Ok(()) => {
             write_doc(path, &doc)?;
@@ -574,11 +571,82 @@ fn render_value(v: &Value) -> String {
     v.to_string().trim().to_string()
 }
 
-/// Put one space before every entry but the first, so a list stays readable however it was built.
-fn space_entries(list: &mut Array) {
-    for (i, entry) in list.iter_mut().enumerate() {
-        entry.decor_mut().set_prefix(if i == 0 { "" } else { " " });
+/// Append `entry` to `list`, keeping the shape the list already has.
+///
+/// In `toml_edit` an array element's decor prefix holds the whitespace **and the comments** written
+/// after the *previous* entry's comma, and the array's trailing decor holds those written after the
+/// last one. Rewriting every prefix to `""`/`" "` — the shape this replaced, which existed only to
+/// space out a list built by repeated `add` — therefore deleted every annotation in a hand-written
+/// list and folded it onto one line, against this module's promise to preserve comments and
+/// formatting.
+///
+/// So only the appended entry is decorated, and a single-line list needs no decoration at all: an
+/// element whose decor is unset is rendered by `toml_edit` with its own `, ` separator, which is
+/// that shape exactly. A multi-line list gets the entry on a line of its own at the indent of the
+/// line above it, and the trailing decor moves ahead of it — so a comment written beside what used
+/// to be the last entry stays beside *that* entry instead of sliding onto the new one.
+fn append_entry(list: &mut Array, mut entry: Value) {
+    let trailing = list.trailing().as_str().unwrap_or_default().to_string();
+    let last_prefix = list
+        .len()
+        .checked_sub(1)
+        .and_then(|i| list.get(i))
+        .and_then(|v| v.decor().prefix())
+        .and_then(RawString::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if !trailing.contains('\n') && !last_prefix.contains('\n') {
+        list.push_formatted(entry);
+        return;
     }
+    // Split the trailing decor at its last newline: what precedes it was written beside the entry
+    // that is currently last and moves ahead of the new one, what follows it is the closing
+    // bracket's own indent and stays behind it.
+    let (kept, closing_indent) = match trailing.rfind('\n') {
+        Some(i) => trailing.split_at(i + 1),
+        None => ("", trailing.as_str()),
+    };
+    let mut prefix = kept.to_string();
+    if !prefix.ends_with('\n') {
+        prefix.push('\n');
+    }
+    // The entries' own indent, read off the last line of the entry above so a comment on the lines
+    // before it is not copied along with it.
+    prefix.push_str(last_prefix.rsplit('\n').next().unwrap_or_default());
+    entry.decor_mut().set_prefix(prefix);
+    list.push_formatted(entry);
+    list.set_trailing(format!("\n{closing_indent}"));
+}
+
+/// Remove the entry at `idx` from `list` together with the decor that belongs to it, leaving every
+/// other entry — and every comment written beside it — exactly as it was.
+///
+/// The prefix belongs to the *position*, not to the value: it holds what was written after the
+/// previous entry's comma, so it documents the entry before it rather than the one it hangs off,
+/// and the array's trailing decor plays that role for the last entry. A removal therefore keeps the
+/// prefix of the slot it empties — the entry that shifts up inherits it — and drops the decor of
+/// the slot after it, which is where the removed entry's own comment lived.
+fn remove_entry(list: &mut Array, idx: usize) {
+    let prefix = list
+        .get(idx)
+        .and_then(|v| v.decor().prefix())
+        .cloned()
+        // An unset prefix renders as `toml_edit`'s default for the position, so the entry taking
+        // that position must render the same way.
+        .unwrap_or_else(|| RawString::from(if idx == 0 { "" } else { " " }));
+    list.remove(idx);
+    if let Some(next) = list.get_mut(idx) {
+        next.decor_mut().set_prefix(prefix);
+        return;
+    }
+    // The last entry is gone, and with it the comment that documented it. What is left of the
+    // trailing decor is the line the closing bracket sits on.
+    let trailing = list.trailing().as_str().unwrap_or_default();
+    let stripped = match trailing.rfind('\n') {
+        Some(i) => format!("\n{}", &trailing[i + 1..]),
+        None => String::new(),
+    };
+    list.set_trailing(stripped);
 }
 
 /// Parse a command-line value that is written as a TOML array (`'["a", "b"]'`), for `set` on a list
@@ -619,7 +687,11 @@ fn put_value(doc: &mut DocumentMut, key: &str, v: Value) -> Result<bool, ManageE
         table = table
             .get_mut(seg)
             .and_then(Item::as_table_like_mut)
-            .ok_or_else(|| ManageError::NotScalar(key.to_string()))?;
+            // The obstacle is the parent, not the leaf: on `network = "deny"`, `set network.stats`
+            // must say that `network` is a bare posture, not that `network.stats` "is an array or
+            // table" — nothing of that name is in the file. Same variant, same wording as
+            // [`list_at`], so the two edit paths answer the same shape the same way.
+            .ok_or_else(|| ManageError::ParentNotTable(seg.to_string(), key.to_string()))?;
     }
     match table.get_mut(leaf[0].as_str()) {
         // A new key: insert it with default formatting.
@@ -749,10 +821,15 @@ fn validate_layer(doc: &DocumentMut) -> Result<(), String> {
 /// Validated before it commits, like [`set`], [`add`] and [`remove`] — [`validate_layer`]'s own doc
 /// names "a `set`/`unset` that leaves the layer unparseable" as the thing it exists to prevent, and
 /// this was the one of the four that did not ask. A removal can make a layer unparseable as readily
-/// as a bad value can: several schema tables carry a required field with no `#[serde(default)]`
-/// (`RawServiceTable.cmd`, `RawServiceReady.tcp`, `RawOpenTable.cmd`, `RawInlineFlake.flake`), and
-/// `RawOpen`/`RawService` are `#[serde(untagged)]`, so a table left without its required field
-/// matches no variant at all.
+/// as a bad value can: a schema table carrying a required field with no `#[serde(default)]` stops
+/// parsing when that field is taken away, and the loader then drops the whole layer with only a
+/// warning. `RawInlineFlake.flake` and `RawServiceReady.tcp` are the two such fields; the tables
+/// that used to join them — `RawServiceTable.cmd` and `RawOpenTable.cmd` — were given defaults
+/// precisely so a hand-edited file costs its own entry rather than the file, which is the same
+/// tolerance this guard extends to an edit sbx makes itself.
+///
+/// The check is the layer's own parser rather than a list of field names, so it stays right as the
+/// schema's required set changes.
 pub(crate) fn unset(path: &Path, key: &str) -> Result<bool, ManageError> {
     let mut doc = read_or_empty(path)?;
     let segments = split_key(key)?;
@@ -883,7 +960,7 @@ pub(crate) fn add_egress_rule(
         }
     };
 
-    let text = write_doc(path, &doc)?;
+    let text = commit_rule(path, &doc, &outcome)?;
     Ok(Written { outcome, text })
 }
 
@@ -973,8 +1050,28 @@ pub(crate) fn add_proc_rule(
         }
     };
 
-    let text = write_doc(path, &doc)?;
+    let text = commit_rule(path, &doc, &outcome)?;
     Ok(Written { outcome, text })
+}
+
+/// Write `doc` unless the rule was already there, and return the text a caller attests to.
+///
+/// The write is skipped precisely when nothing changed, which is what [`Written`] already promises
+/// ("nothing was written, so what is attested to is the document as read") and what
+/// [`remove_rule_from`] already does for its own no-op. Writing anyway made an idempotent
+/// `sbx net allow <rule>` fail on a config the invoker can read but not write — a `--local` project
+/// file in a read-only checkout, a `--global` config in a directory sbx does not own — reporting a
+/// write error for an operation that decided "already present, no change". It also touched the
+/// file's mtime and inode on every repeat, for nothing.
+fn commit_rule(
+    path: &Path,
+    doc: &DocumentMut,
+    outcome: &AddOutcome,
+) -> Result<String, ManageError> {
+    match outcome {
+        AddOutcome::AlreadyPresent => Ok(doc.to_string()),
+        AddOutcome::Added { .. } => write_doc(path, doc),
+    }
 }
 
 /// Guard the `mode` of a `[proc]` table/bare-string before appending an allow/deny rule to it. A
@@ -1263,17 +1360,27 @@ fn split_key(key: &str) -> Result<Vec<String>, ManageError> {
     // and every secret does, since it is keyed by host: `secret."api.example.com".from`. Splitting
     // on every dot used to walk straight through the quotes and build `secret.'"api'.example…`,
     // a nonsense table the schema happened to accept, so the write was reported as a success.
+    //
+    // TOML spells a quoted key two ways — basic (`"…"`) and literal (`'…'`) — so the state is which
+    // quote opened the segment, not merely whether one did. Tracking the basic form alone sent
+    // `secret.'api.example.com'.from` down the very path described above, splitting it into
+    // `secret`, `'api`, `example`, `com'`, `from` and writing a table the schema accepts while the
+    // credential the user named stays undeclared.
     let mut segments = Vec::new();
     let mut current = String::new();
-    let mut quoted = false;
+    let mut quote: Option<char> = None;
     for c in key.chars() {
-        match c {
-            '"' => quoted = !quoted,
-            '.' if !quoted => segments.push(std::mem::take(&mut current)),
-            c => current.push(c),
+        match (c, quote) {
+            // The closing half of the pair that opened this segment.
+            (c, Some(open)) if c == open => quote = None,
+            // Inside a quoted segment the other quote character, and a dot, are ordinary text.
+            (c, Some(_)) => current.push(c),
+            ('"' | '\'', None) => quote = Some(c),
+            ('.', None) => segments.push(std::mem::take(&mut current)),
+            (c, None) => current.push(c),
         }
     }
-    if quoted {
+    if quote.is_some() {
         // An unbalanced quote would otherwise swallow the rest of the key into one segment.
         return Err(ManageError::BadKey(key.to_string()));
     }
@@ -2411,22 +2518,23 @@ mod tests {
     /// `validate_layer`'s doc names "a `set`/`unset` that leaves the layer unparseable" as the thing
     /// it exists to prevent — because the loader drops the WHOLE layer with only a warning, silently
     /// reverting every security field it carried. `set`, `add` and `remove` asked; `unset` did not,
-    /// and a removal invalidates a layer as readily as a bad value does: `RawOpen`/`RawService` are
-    /// `#[serde(untagged)]` and their tables carry required fields with no `#[serde(default)]`.
+    /// and a removal invalidates a layer as readily as a bad value does: a table whose required
+    /// field is taken away stops parsing, and takes the document with it.
     ///
     /// The CLI reported such a write as a success and exited 0, so the revert was invisible on both
     /// sides.
     #[test]
     fn unset_refuses_a_removal_that_would_make_the_loader_drop_the_layer() {
         let tmp = crate::testutil::TmpDir::new();
-        let before = "network = \"deny\"\n\n[open.https]\ncmd = [\"firefox\"]\nmode = \"detach\"\n";
+        let before = "network = \"deny\"\n\n[flakes.hello]\nflake = \"{ outputs = _: {}; }\"\nattr = \"default\"\n";
         let p = doc_at(tmp.path(), before);
 
-        // `[open.https]` without `cmd` matches neither `RawOpen` variant, so the whole layer — the
-        // `network = "deny"` posture included — would stop parsing.
-        let err = unset(&p, "open.https.cmd").expect_err("the removal must be refused");
+        // `RawInlineFlake.flake` has no `#[serde(default)]`, so a `[flakes.hello]` left without it
+        // stops parsing — and the whole layer, the `network = "deny"` posture included, goes with
+        // it.
+        let err = unset(&p, "flakes.hello.flake").expect_err("the removal must be refused");
         assert!(
-            matches!(&err, ManageError::InvalidValue(key, _) if key == "open.https.cmd"),
+            matches!(&err, ManageError::InvalidValue(key, _) if key == "flakes.hello.flake"),
             "got {err:?}"
         );
         assert_eq!(
@@ -2436,7 +2544,7 @@ mod tests {
         );
 
         // The ordinary removal still goes through, so the guard is not simply refusing everything.
-        assert!(unset(&p, "open.https.mode").unwrap(), "mode is optional");
+        assert!(unset(&p, "flakes.hello.attr").unwrap(), "attr is optional");
         assert_eq!(get(&p, "network").unwrap().as_deref(), Some("deny"));
     }
 
@@ -3007,5 +3115,211 @@ mod tests {
         assert!(body.contains("deny = [\"ssh\"]"), "{body}");
         // The `[app]` / `[app.demo-app]` parents are implicit — no bare empty header.
         assert!(!body.contains("[app]\n"), "no empty [app] header:\n{body}");
+    }
+
+    /// A config file is written by a person, and the reason a path is masked is written beside it.
+    /// `toml_edit` keeps an array's comments in the decor *prefix* of the element that follows them
+    /// and in the array's trailing decor, so normalising every prefix to `""`/`" "` — which is how a
+    /// list built by repeated `add` was kept readable — deleted every annotation in a hand-written
+    /// list and folded it onto one line. That is the opposite of what this module's header promises,
+    /// and the shipped `examples/net-groups/*.toml` are written in exactly this shape.
+    ///
+    /// What is pinned is that each comment stays beside the entry it documents: a comment on a
+    /// non-final entry must survive, and the one written beside the entry that *was* last must not
+    /// slide onto the entry appended after it.
+    #[test]
+    fn adding_to_a_commented_multiline_list_keeps_every_comment_with_its_own_entry() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(
+            tmp.path(),
+            "[fs]\ndeny = [\n    \".env\", # local secrets\n    \"config/prod.key\", # never \
+             readable in the cage\n]\n",
+        );
+        assert!(add(&p, "fs.deny", "id_rsa").unwrap());
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            after.contains("\n    \".env\", # local secrets\n"),
+            "a comment on a non-final entry survives, on its own line:\n{after}"
+        );
+        assert!(
+            after.contains("\n    \"config/prod.key\", # never readable in the cage\n"),
+            "and the comment beside the entry that was last stays with that entry:\n{after}"
+        );
+        assert!(
+            after.contains("\n    \"id_rsa\",\n"),
+            "the appended entry takes a line of its own at the list's indent:\n{after}"
+        );
+        assert!(
+            super::super::schema::parse(after.as_bytes()).is_ok(),
+            "and the layer still parses:\n{after}"
+        );
+
+        // Removal answers the same way from the other side: the entry's own annotation goes with
+        // it, and the annotation of the entry that survives stays where it was written.
+        let q = tmp.path().join("removed.toml");
+        std::fs::write(
+            &q,
+            "[fs]\ndeny = [\n    \".env\", # local secrets\n    \"config/prod.key\", # never \
+             readable in the cage\n]\n",
+        )
+        .unwrap();
+        assert!(remove(&q, "fs.deny", ".env").unwrap());
+        let after = std::fs::read_to_string(&q).unwrap();
+        assert!(
+            after.contains("\n    \"config/prod.key\", # never readable in the cage\n"),
+            "the surviving entry keeps its own comment and its own line:\n{after}"
+        );
+        assert!(
+            !after.contains("local secrets"),
+            "the removed entry's comment goes with it, rather than re-anchoring:\n{after}"
+        );
+    }
+
+    /// The single-line shape is the one `add` was originally written for, and it must not change:
+    /// `toml_edit` renders an element whose decor is unset with its own `, ` separator, so the
+    /// list a `sbx config add` builds from nothing still reads `["a", "b"]`.
+    #[test]
+    fn a_single_line_list_keeps_its_shape_when_an_entry_is_appended_or_taken_out() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "[fs]\ndeny = [\"a.key\", \"b.key\"]\n");
+        assert!(add(&p, "fs.deny", "c.key").unwrap());
+        assert!(
+            std::fs::read_to_string(&p)
+                .unwrap()
+                .contains(r#"deny = ["a.key", "b.key", "c.key"]"#),
+            "{}",
+            std::fs::read_to_string(&p).unwrap()
+        );
+        // The retry path: `2024` is guessed as an integer, which `[fs] deny` (a list of strings)
+        // rejects, so the entry is rewritten in the slot the first attempt already placed and
+        // decorated — not appended a second time.
+        assert!(add(&p, "fs.deny", "2024").unwrap());
+        assert!(
+            std::fs::read_to_string(&p)
+                .unwrap()
+                .contains(r#"deny = ["a.key", "b.key", "c.key", "2024"]"#),
+            "{}",
+            std::fs::read_to_string(&p).unwrap()
+        );
+        // Taking the *first* entry out must not leave the next one carrying a separator's leading
+        // space (`[ "b.key", …]`), which is what the position-keyed decor is for.
+        assert!(remove(&p, "fs.deny", "a.key").unwrap());
+        assert!(
+            std::fs::read_to_string(&p)
+                .unwrap()
+                .contains(r#"deny = ["b.key", "c.key", "2024"]"#),
+            "{}",
+            std::fs::read_to_string(&p).unwrap()
+        );
+    }
+
+    /// `set` must name the *parent* that blocks the descent, as `rm` already does. On
+    /// `network = "deny"`, `sbx config set network.stats false` answered "network.stats is not a
+    /// single value (it is an array or table)" — about a key that is not in the file, and is
+    /// neither of those things — while `sbx config rm network.allow x` on the same file correctly
+    /// said the posture is in its bare form. The remedy only helps if it names the obstacle.
+    #[test]
+    fn set_names_the_parent_that_holds_a_single_value_as_rm_already_does() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "network = \"deny\"\n");
+        let err = set(&p, "network.stats", "false").unwrap_err();
+        assert!(matches!(err, ManageError::ParentNotTable(_, _)), "{err}");
+        assert!(
+            err.to_string().contains("network holds a single value"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "network = \"deny\"\n",
+            "a refused set writes nothing"
+        );
+    }
+
+    /// A literal-quoted key segment is the other spelling TOML gives a key that carries a dot, and
+    /// it must address the same table the basic-quoted one does. Splitting on every dot inside it
+    /// built `secret."'api".example."com'"` — a table the schema accepts, so the write was reported
+    /// as a success while the credential the user named stayed undeclared and was never injected.
+    #[test]
+    fn a_literal_quoted_key_segment_keeps_its_dots_like_a_basic_quoted_one() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = tmp.path().join(".sbx.toml");
+        assert!(set(&p, "secret.'api.example.com'.from", "env://K").is_ok());
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            after.contains(r#"[secret."api.example.com"]"#),
+            "the host stays one segment, spelled the way TOML writes it back:\n{after}"
+        );
+        assert!(
+            !after.contains("'api"),
+            "no segment may be split mid-quote:\n{after}"
+        );
+        // The basic-quoted spelling addresses the very same key, so the two cannot drift apart.
+        assert_eq!(
+            get(&p, r#"secret."api.example.com".from"#)
+                .unwrap()
+                .as_deref(),
+            Some("env://K")
+        );
+        // A quote of the other kind inside a quoted segment is ordinary text, not a delimiter.
+        assert_eq!(
+            split_key(r#"env."IT'S""#).unwrap(),
+            vec!["env".to_string(), "IT'S".to_string()]
+        );
+        // And an unbalanced literal quote is refused, as an unbalanced basic one already was.
+        assert!(matches!(
+            set(&p, "secret.'api.example.com.from", "x"),
+            Err(ManageError::BadKey(_))
+        ));
+    }
+
+    /// An `AlreadyPresent` add must not touch the file. [`Written`] says so in as many words
+    /// ("nothing was written, so what is attested to is the document as read") and
+    /// [`remove_rule_from`] already behaves that way for its own no-op, but the add paths wrote
+    /// unconditionally — so `sbx net allow <rule>` failed with a write error on a config the
+    /// invoker can read but not write, for an operation that had decided to change nothing.
+    ///
+    /// The write is observable in the **inode**: [`write_doc`] installs a fresh one by rename, so
+    /// an unchanged inode is the assertion that no write happened. Comparing the bytes would not
+    /// do it — a rewrite of the same document produces the same bytes.
+    #[test]
+    fn an_already_present_rule_leaves_the_file_untouched() {
+        use std::os::unix::fs::MetadataExt as _;
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(
+            tmp.path(),
+            "[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n\n[proc]\nmode = \"enforce\"\n\
+             deny = [\"curl\"]\n",
+        );
+        let before = std::fs::read_to_string(&p).unwrap();
+        let ino = std::fs::metadata(&p).unwrap().ino();
+
+        let written = add_egress_rule(&p, None, EgressList::Allow, "github.com").unwrap();
+        assert_eq!(written.outcome, AddOutcome::AlreadyPresent);
+        assert_eq!(
+            written.text, before,
+            "the attested text is the document as read"
+        );
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().ino(),
+            ino,
+            "an already-present egress rule must not rewrite the file"
+        );
+
+        let written = add_proc_rule(&p, None, ProcList::Deny, "curl").unwrap();
+        assert_eq!(written.outcome, AddOutcome::AlreadyPresent);
+        assert_eq!(std::fs::metadata(&p).unwrap().ino(), ino, "nor a proc rule");
+
+        // The negative control: a rule that is genuinely new still writes.
+        assert!(matches!(
+            add_egress_rule(&p, None, EgressList::Allow, "crates.io")
+                .unwrap()
+                .outcome,
+            AddOutcome::Added { .. }
+        ));
+        assert_ne!(
+            std::fs::metadata(&p).unwrap().ino(),
+            ino,
+            "a real addition still rewrites the file"
+        );
     }
 }

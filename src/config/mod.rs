@@ -310,9 +310,11 @@ pub(crate) struct Resolved {
     /// presence and the gating verdict. Discovered in [`load()`] (it is I/O), so the
     /// pure [`resolve`] always leaves it `None`.
     pub(crate) mise: Option<MiseConfig>,
-    /// The resolved network posture: the default (`Shared`) unless the global config
-    /// or a trusted project asked for `"none"`. An untrusted project's choice is
-    /// dropped with a warning — it may not narrow or widen the network.
+    /// The resolved network posture: [`NetworkPolicy`]'s built-in default — the deny-by-default
+    /// filtering allowlist, which reaches only the proxy's self-equip set — unless the global
+    /// config or a trusted project declared one of its own (`none`, `shared`, or one of the
+    /// filtering modes). An untrusted project's choice is dropped with a warning: it may neither
+    /// narrow nor widen the network.
     pub(crate) network: NetworkPolicy,
     /// Which layer supplied the winning `network` posture (`Default` when neither config set it).
     /// A display affordance for `sbx config`; the launcher ignores it.
@@ -337,7 +339,7 @@ pub(crate) struct Resolved {
     pub(crate) proc: crate::proc_policy::ProcPolicy,
     /// Which layer supplied the winning `proc` posture (`Default` when neither config set it).
     pub(crate) proc_origin: Provenance,
-    /// The resolved refusal-notification policy: the default (`once` for every event) unless the
+    /// The resolved refusal-notification policy: the default (`always` for every event) unless the
     /// global config or a trusted project set one. An untrusted project's choice is dropped with a
     /// warning — it may not silence the announcement of the refusals it provokes.
     pub(crate) notify: crate::notify::NotifyPolicy,
@@ -470,6 +472,11 @@ pub(crate) struct Resolved {
     /// the effective set from this, not from the posture-cleared `secrets`, so a baseline credential
     /// the baseline posture would clear is still inheritable. The baseline launch/display use
     /// `secrets`; only the per-app fold reads this.
+    ///
+    /// A one-shot override's `[secret]` section is applied to this set as well as to `secrets`
+    /// ([`Resolved::apply_override`]): the `--app` view re-derives from here *after* an override
+    /// has been folded in, so a set that stopped at the last config layer would describe an app as
+    /// injecting nothing for a host the launch does inject for.
     pub(crate) declared_secrets: Vec<HeaderSecret>,
     /// Declared operations a caller may invoke — each a fixed command sbx runs in an ephemeral
     /// sibling cage with a credential the caller never holds. A security field, gated like
@@ -500,7 +507,6 @@ pub(crate) enum AppHomeScope {
     Project,
 }
 
-/// An app's resolved overlay over the sandbox baseline: the command to run plus the extra
 /// One bundle's install step, as the fold hands it to a launch: the step itself and the bundle
 /// that declared it.
 ///
@@ -516,6 +522,7 @@ pub(crate) struct BundleProvision {
     pub(crate) argv: Vec<String>,
 }
 
+/// An app's resolved overlay over the sandbox baseline: the command to run plus the extra
 /// environment, binds, packages, network posture, and credentials it declares — each
 /// already gated by the trust of the layer that supplied it (the global config, trusted by
 /// location, or a project layer by its verdict). `sbx app <name>` folds this onto the
@@ -1179,9 +1186,26 @@ impl Resolved {
             if let Some(raw_defaults) = &section.defaults {
                 warn_resolver_bindings(&mut self.warnings, OVERRIDE_SOURCE, raw_defaults, &plugins);
             }
+            // Both halves of the credential pair, because both are read after this: `secrets` is
+            // what this launch injects, and `declared_secrets` is the pre-clear set an app overlay
+            // — and the `--app` view, which runs after the override — re-derives its effective
+            // credentials from. Applying to one of them left the view reporting an app that
+            // injects nothing for a host the launch does inject for.
+            //
+            // The declared set takes the diagnostics: it is the one that holds every credential a
+            // layer wrote, so its collision warnings are the complete ones, and repeating them for
+            // the effective set would say the same thing twice.
+            apply_secret_section(
+                &mut self.declared_secrets,
+                &mut self.warnings,
+                OVERRIDE_SOURCE,
+                section.hosts.clone(),
+                &defaults,
+                &plugins,
+            );
             apply_secret_section(
                 &mut self.secrets,
-                &mut self.warnings,
+                &mut Vec::new(),
                 OVERRIDE_SOURCE,
                 section.hosts,
                 &defaults,
@@ -1840,7 +1864,7 @@ fn resolve(
         None => crate::proc_policy::ProcPolicy::off(),
     };
     // The notification policy is trusted by location at the global layer. `parent` is the built-in
-    // default (every event `once`) — the global layer has no lower config to inherit from.
+    // default (every event `always`) — the global layer has no lower config to inherit from.
     let mut notify_origin = Provenance::Default;
     let mut notify = match global.notify.and_then(|v| {
         warn_unknown_notify_keys(&mut warnings, GLOBAL_CONFIG, &v);
@@ -1996,6 +2020,7 @@ fn resolve(
         if let Some(raw_defaults) = &section.defaults {
             task_defaults = task_defaults.merged_with(raw_defaults, &layer, &mut warnings);
         }
+        warn_unknown_task_keys(&mut warnings, GLOBAL_CONFIG, &section);
         tasks::apply_task_section(
             &mut tasks,
             &mut warnings,
@@ -2092,8 +2117,16 @@ fn resolve(
                     }
                     match broker_cfg.get_mut(&name) {
                         Some(bound) => {
-                            bound.allow = table.allow;
-                            broker_origin.insert(name, Provenance::Project);
+                            // Only a project that actually wrote `allow` replaces the global
+                            // policy. The two cases a bare list could not tell apart are opposite
+                            // intentions — a table written for its `socket` alone (dropped just
+                            // above) would otherwise clear the policy the global config declared,
+                            // and `sbx config` would then attribute the empty list to the project.
+                            // An explicit `allow = []` is still a project choice and still lands.
+                            if let Some(allow) = table.allow {
+                                bound.allow = Some(allow);
+                                broker_origin.insert(name, Provenance::Project);
+                            }
                         }
                         None => warnings.push(format!(
                             "{PROJECT_CONFIG}: ignoring `[broker.{name}]` — no `[broker.{name}] \
@@ -2456,6 +2489,7 @@ fn resolve(
                 if let Some(raw_defaults) = &section.defaults {
                     task_defaults = task_defaults.merged_with(raw_defaults, &layer, &mut warnings);
                 }
+                warn_unknown_task_keys(&mut warnings, PROJECT_CONFIG, &section);
                 tasks::apply_task_section(
                     &mut tasks,
                     &mut warnings,
@@ -2931,7 +2965,8 @@ fn union_forward(base: &mut Vec<ForwardPort>, extra: Vec<ForwardPort>) {
 ///
 /// Covers the top level and the tables where the silence costs the most: a limit that is not in
 /// effect, and a grant that is not granted. A `[task.<name>]`/`[app.<name>]` entry's own fields are
-/// not walked here — those carry a `cmd` whose absence already fails loudly.
+/// reported by [`warn_unknown_task_keys`] and [`warn_unknown_app_keys`] instead, each called where
+/// the layer that supplied the entry — and the trust gate it passed — is known.
 pub(super) fn warn_unknown_keys(warnings: &mut Vec<String>, source: &str, raw: &schema::RawConfig) {
     let mut report = |section: &str, keys: &BTreeMap<String, schema::RawIgnored>| {
         for key in keys.keys() {
@@ -2990,6 +3025,36 @@ fn warn_unknown_app_keys(
              (check the spelling; a field that exists only on the baseline, like `timezone`, is \
              declared at the top level of `{GLOBAL_CONFIG}` or `{PROJECT_CONFIG}`, never on an app)"
         ));
+    }
+}
+
+/// Report the keys a `[task.<name>]` entry declared that sbx does not know, the task-scoped half of
+/// [`warn_unknown_keys`].
+///
+/// A task is where an ignored key costs the most, because one of this table's fields is what
+/// stands the exec supervisor up: `spawn` absent means no supervision at all, so `spwan = ["ssh"]`
+/// reads as a command confined to two programs and is a command that may `execve` anything in the
+/// cage. The same misspelling one level down, in a `[task.<name>.exec.<program>]` node, is already
+/// refused by name — a node that means less than it says is the failure that field exists to
+/// avoid, and it is no less a failure on the task itself.
+///
+/// The key is named and the task still loads, as everywhere else in this schema: refusing unknown
+/// keys is what would stop a config written for a newer sbx from loading on an older one.
+///
+/// Called per layer rather than from [`warn_unknown_keys`], so a section an untrusted project never
+/// gets to declare is not also reported key by key.
+fn warn_unknown_task_keys(
+    warnings: &mut Vec<String>,
+    source: &str,
+    section: &schema::RawTaskSection,
+) {
+    for (name, task) in &section.tasks {
+        for key in task.rest.keys() {
+            warnings.push(format!(
+                "{source}: ignoring unknown key `{key}` under `[task.{name}]` — sbx does not know \
+                 this field (check the spelling; a newer sbx's fields are ignored here on purpose)"
+            ));
+        }
     }
 }
 
@@ -3532,6 +3597,7 @@ fn resolve_app(
         // ceilings come from the baseline's `[task.defaults]`; an app tunes a task's own `timeout`
         // and `max_output` on the task itself.
         if let Some(section) = app.task {
+            warn_unknown_task_keys(&mut warnings, &source, &section);
             tasks::apply_task_section(
                 &mut tasks,
                 &mut warnings,
@@ -3847,6 +3913,7 @@ fn resolve_app(
         // program of its choosing with a credential attached.
         if let Some(section) = app.task {
             if trusted {
+                warn_unknown_task_keys(&mut warnings, &source, &section);
                 tasks::apply_task_section(
                     &mut tasks,
                     &mut warnings,
@@ -4196,7 +4263,7 @@ fn resolve_brokers(
             origin: origins.get(&name).copied().unwrap_or(Provenance::Global),
             name,
             socket,
-            allow: table.allow,
+            allow: table.allow.unwrap_or_default(),
             secret,
             // Filled by `apply_plugin_host_config` once `[plugin.*]` is layered and gated; a
             // binding resolved with no such table keeps the empty answer.
@@ -5589,23 +5656,23 @@ mod bad_fields_cost_a_field {
 
     /// Parse a config the way the loader does, failing with the parser's own message — which is the
     /// assertion in half these tests: the file must still load.
-    fn cfg(text: &str) -> RawConfig {
+    pub(super) fn cfg(text: &str) -> RawConfig {
         schema::parse(text.as_bytes())
             .unwrap_or_else(|e| panic!("this config must still parse — {e}\n---\n{text}"))
     }
 
     /// Resolve a global-only config.
-    fn global(text: &str) -> Resolved {
+    pub(super) fn global(text: &str) -> Resolved {
         resolve(cfg(text), None, &PluginRegistry::default())
     }
 
     /// Resolve a global config under a project one at the given trust.
-    fn layered(g: &str, p: &str, state: TrustState) -> Resolved {
+    pub(super) fn layered(g: &str, p: &str, state: TrustState) -> Resolved {
         resolve(cfg(g), Some((cfg(p), state)), &PluginRegistry::default())
     }
 
     /// Whether any warning contains every one of `parts`.
-    fn warned(r: &Resolved, parts: &[&str]) -> bool {
+    pub(super) fn warned(r: &Resolved, parts: &[&str]) -> bool {
         r.warnings
             .iter()
             .any(|w| parts.iter().all(|part| w.contains(part)))
@@ -5650,6 +5717,100 @@ mod bad_fields_cost_a_field {
         );
         // A real ceiling still lands, so the check is not a blanket refusal.
         assert_eq!(global("[fs]\nscan_max_kb = 64\n").fs.scan_max_kb, Some(64));
+    }
+
+    #[test]
+    fn a_service_or_handler_sbx_cannot_read_costs_the_entry_and_not_the_file() {
+        // `RawOpen`/`RawService` are untagged, so an entry sbx cannot read matched no variant and
+        // failed the parse of the whole document. Three spellings of that mistake, in one file: a
+        // handler whose `cmd` line was forgotten, a readiness gate on a port that is not one, and a
+        // start condition naming no variable. Each costs its own entry now, the way `forward =
+        // [70000]` already did, and the `[env]` beside them survives to prove the layer did.
+        let r = global(
+            "[env]\nFOO = \"bar\"\n\n\
+             [open.https]\nmode = \"detach\"\n\n\
+             [service.gateway]\ncmd = [\"hermes\", \"gateway\"]\nready = { tcp = 70000 }\n\n\
+             [service.chroma]\ncmd = [\"chroma\", \"run\"]\nenable = { is = \"1\" }\n",
+        );
+        assert!(
+            r.env.iter().any(|(k, v)| k == "FOO" && v == "bar"),
+            "the rest of the layer survives all three: {:?}",
+            r.warnings
+        );
+        assert!(
+            !r.open.contains_key("https"),
+            "the handler that names no program is dropped"
+        );
+        assert!(
+            warned(&r, &["`[open]` entry `https`", "names no program"]),
+            "and named: {:?}",
+            r.warnings
+        );
+        let gateway = r.service.get("gateway").expect("the service stands");
+        assert!(
+            gateway.ready.is_none(),
+            "only the gate on an impossible port is dropped"
+        );
+        assert!(
+            warned(&r, &["`[service]` entry `gateway`", "70000", "1-65535"]),
+            "the port is named with the range it is outside: {:?}",
+            r.warnings
+        );
+        let chroma = r.service.get("chroma").expect("this one stands too");
+        assert!(
+            chroma.enable.is_empty(),
+            "a condition that compares nothing starts the service unconditionally"
+        );
+        assert!(
+            warned(&r, &["`[service]` entry `chroma`", "names no variable"]),
+            "and says so: {:?}",
+            r.warnings
+        );
+        // The well-formed spellings still resolve, so none of the above passes by refusing
+        // everything.
+        let ok = global(
+            "[open.https]\ncmd = [\"firefox\"]\nmode = \"detach\"\n\n\
+             [service.gateway]\ncmd = [\"hermes\"]\nready = { tcp = 8100 }\n\
+             enable = { env = \"GATEWAY\", not = \"0\" }\n",
+        );
+        assert_eq!(ok.open["https"].mode, OpenMode::Detach);
+        assert_eq!(ok.service["gateway"].ready.map(|g| g.tcp), Some(8100));
+        assert_eq!(ok.service["gateway"].enable.len(), 1);
+        assert!(ok.warnings.is_empty(), "{:?}", ok.warnings);
+    }
+
+    #[test]
+    fn a_misspelled_task_key_is_named_like_the_exec_node_one_level_down() {
+        // `spawn` is the field that stands a task's exec supervisor up — absent means no
+        // supervision at all — so a `spwan` parsing into silence left a command the author
+        // believed confined to `git` plus `ssh` free to `execve` anything in the cage, with its
+        // credential in the environment. The same misspelling inside
+        // `[task.<name>.exec.<program>]` was already refused by name; the task's own table is now
+        // walked too.
+        let r = global("[task.deploy]\ncmd = [\"git\"]\nspwan = [\"ssh\"]\n");
+        assert_eq!(r.tasks.len(), 1, "the task still loads: {:?}", r.warnings);
+        assert!(
+            r.tasks[0].spawn.is_none(),
+            "and it really is unsupervised — which is why the key has to be named"
+        );
+        assert!(
+            warned(&r, &["unknown key `spwan`", "[task.deploy]"]),
+            "the key is named: {:?}",
+            r.warnings
+        );
+        // Spelled right, the supervisor is declared and nothing is said, so the report cannot be
+        // satisfied by complaining about every task.
+        let ok = global("[task.deploy]\ncmd = [\"git\"]\nspawn = [\"ssh\"]\n");
+        assert!(
+            ok.tasks[0].spawn.is_some(),
+            "the well-spelled field takes effect: {:?}",
+            ok.warnings
+        );
+        assert!(
+            !ok.warnings.iter().any(|w| w.contains("unknown key")),
+            "{:?}",
+            ok.warnings
+        );
     }
 
     #[test]
@@ -5833,6 +5994,96 @@ mod bad_fields_cost_a_field {
             !ok.warnings.iter().any(|w| w.contains("[fs] scan")),
             "{:?}",
             ok.warnings
+        );
+    }
+}
+
+/// What a later layer replaces, and what it leaves standing.
+///
+/// A layer that says nothing about a field must leave that field — and the provenance `sbx config`
+/// reports for it — exactly as it found them: "unset" and "set to nothing" are different
+/// declarations, and a shape that cannot tell them apart makes the quieter one silently
+/// destructive. The other half of the same rule is that a layer which *does* declare something
+/// leaves every view of it in step, so what a launch does and what `sbx config` says it does cannot
+/// drift apart.
+#[cfg(test)]
+mod a_layer_replaces_only_what_it_declares {
+    // The fixtures next door parse and resolve a layered pair exactly as the loader does, so they
+    // are reused here rather than written a second time.
+    use super::bad_fields_cost_a_field::{cfg, global, layered};
+    use super::*;
+
+    /// The headers a credential set writes, in declaration order — the whole of what the two halves
+    /// of the pair have to agree on.
+    fn headers(set: &[HeaderSecret]) -> Vec<&str> {
+        set.iter().map(|s| s.header.as_str()).collect()
+    }
+
+    #[test]
+    fn a_project_broker_table_that_sets_no_policy_leaves_the_global_one_standing() {
+        // The split this table exists for: the global config says which host resource is exposed, a
+        // trusted project says only what may be done with it. So a project table written for its
+        // `socket` — dropped, and named — declares nothing sbx reads, and as a bare list that was
+        // indistinguishable from `allow = []`: the global policy was replaced by an empty one and
+        // `sbx config` put the project's name against it.
+        let r = layered(
+            "[broker.gpg]\nsocket = \"/tmp/gpg.sock\"\nallow = [\"sign\"]\n",
+            "[broker.gpg]\nsocket = \"/tmp/mine.sock\"\n",
+            TrustState::Trusted,
+        );
+        assert_eq!(r.brokers.len(), 1);
+        assert_eq!(
+            r.brokers[0].allow,
+            vec!["sign".to_string()],
+            "the policy the global config declared still stands: {:?}",
+            r.warnings
+        );
+        assert_eq!(
+            r.brokers[0].origin,
+            Provenance::Global,
+            "and is still attributed to the layer that wrote it"
+        );
+
+        // An empty policy the project really did write is a project choice and still lands — the
+        // two cases are told apart, not both refused.
+        let cleared = layered(
+            "[broker.gpg]\nsocket = \"/tmp/gpg.sock\"\nallow = [\"sign\"]\n",
+            "[broker.gpg]\nallow = []\n",
+            TrustState::Trusted,
+        );
+        assert!(
+            cleared.brokers[0].allow.is_empty(),
+            "{:?}",
+            cleared.brokers[0].allow
+        );
+        assert_eq!(cleared.brokers[0].origin, Provenance::Project);
+    }
+
+    #[test]
+    fn a_one_shot_credential_lands_in_both_halves_of_the_secret_pair() {
+        // `secrets` is what this launch injects; `declared_secrets` is the pre-clear set an app
+        // overlay — and the `--app` view, which runs after the override — re-derives an app's
+        // effective credentials from. An override that reached only the first left `sbx config show
+        // --app` reporting that the app injects nothing for a host the very same launch injects
+        // for, which is the one thing that view exists to make visible.
+        let mut r = global("network = \"deny\"\n");
+        assert!(r.declared_secrets.is_empty(), "nothing is declared yet");
+        let over = cfg("[secret.\"api.example.com\"]\n\
+             from = \"env://DEMO_API_KEY\"\n\
+             header = \"x-api-key\"\n\
+             type = \"raw\"\n");
+        r.apply_override(Override::for_test(over))
+            .expect("the override applies");
+        assert_eq!(
+            headers(&r.secrets),
+            vec!["x-api-key"],
+            "the launch injects the override's credential: {:?}",
+            r.warnings
+        );
+        assert_eq!(
+            headers(&r.declared_secrets),
+            headers(&r.secrets),
+            "and the half the app view reads says the same"
         );
     }
 }

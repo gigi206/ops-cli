@@ -1747,7 +1747,7 @@ fn app_detail_view(
     // Collections: the overlay's own entries, plus how many baseline entries are inherited. A
     // baseline entry shadowed by a same-key/-name/-target overlay entry is not inherited (it is the
     // app's own) — `merge_app` dedups env/packages/binds and folds secrets through the same
-    // `(to, header)` upsert, so the inherited counts mirror that.
+    // destination-and-shared-header upsert, so the inherited counts mirror that.
     let env_inherited = baseline
         .env
         .iter()
@@ -1873,16 +1873,37 @@ fn app_detail_view(
             baseline
                 .declared_secrets
                 .iter()
-                .filter(|b| {
-                    !app.secrets
-                        .iter()
-                        .any(|a| a.to == b.to && a.header.eq_ignore_ascii_case(&b.header))
-                })
+                .filter(|b| !shadows_baseline_secret(&app.secrets, b))
                 .count()
         },
 
         notes,
     }
+}
+
+/// Whether one of the app's own credentials shadows the baseline credential `baseline` — the same
+/// question [`super::secrets::upsert_secret`] answers when it folds the two lists for a launch: the
+/// same destination, and any header in common.
+///
+/// The comparison has to go through [`super::HeaderSecret::headers`] rather than the `header`
+/// field. `header` is only the label the inventory names a credential by, and for a *signed*
+/// declaration it is merely the first header the plugin's manifest lists — so an app credential
+/// whose signer writes the baseline's header at any later position read as unrelated, and the
+/// baseline one was counted as inherited while the launch replaced it. `sbx config show --app
+/// <name>` then claimed two credentials went on the wire where one does.
+fn shadows_baseline_secret(
+    app_secrets: &[super::HeaderSecret],
+    baseline: &super::HeaderSecret,
+) -> bool {
+    app_secrets.iter().any(|a| {
+        a.to == baseline.to
+            && a.headers().iter().any(|ah| {
+                baseline
+                    .headers()
+                    .iter()
+                    .any(|bh| ah.eq_ignore_ascii_case(bh))
+            })
+    })
 }
 
 /// A scalar app field's provenance for the detail view, as a three-way answer: the app layer that
@@ -2383,6 +2404,79 @@ mod tests {
             shape: crate::config::HeaderShape::new("Bearer ", false),
             signer: None,
         }
+    }
+
+    /// The inherited-credential count must ask what a declaration *writes*, not what it is named
+    /// by.
+    ///
+    /// `upsert_secret` — the fold `merge_app` runs to build the launch's credential set — shadows a
+    /// baseline credential when the app's own one names the same destination and **any** header in
+    /// common. A signed declaration's `header` field is only the first header its plugin's manifest
+    /// lists, so comparing that field alone missed the shadow whenever the app's signer writes the
+    /// baseline's header at a later position: `sbx config show --app <name>` then counted the
+    /// baseline credential as inherited while the launch replaces it, claiming two credentials go
+    /// on the wire where one does.
+    #[test]
+    fn a_signed_app_credential_shadows_a_baseline_one_it_shares_any_header_with() {
+        let signer = |sets: &[&str]| crate::plugins::signer::SignerPlugin {
+            name: "sigv4".to_string(),
+            dir: std::path::PathBuf::from("/data/plugins/sigv4"),
+            exec: std::path::PathBuf::from("/data/plugins/sigv4/sign"),
+            sandbox: Default::default(),
+            signer: crate::plugins::signer::SignerSpec {
+                sets_headers: sets.iter().map(|s| (*s).to_string()).collect(),
+                sees_headers: Vec::new(),
+                reads_secret: false,
+                body_digest: None,
+            },
+            version: None,
+            description: None,
+            host: Default::default(),
+        };
+        let baseline = a_header_secret();
+        assert_eq!(
+            baseline.header, "Authorization",
+            "the baseline credential writes the header the signer below also writes"
+        );
+        // A signed declaration whose manifest leads with a different header: `header` is
+        // `X-Amz-Date`, so the shared `Authorization` is invisible to a `header`-only comparison.
+        let mut signed = a_header_secret();
+        signed.header = "X-Amz-Date".to_string();
+        signed.signer = Some(Box::new(signer(&["X-Amz-Date", "Authorization"])));
+
+        assert!(
+            shadows_baseline_secret(std::slice::from_ref(&signed), &baseline),
+            "the app's signer writes the baseline's header, so the launch replaces it"
+        );
+
+        // Pinned against the fold itself, so the view and the launch cannot drift apart: what the
+        // detail view calls "not inherited" is exactly what `upsert_secret` overwrites.
+        let mut folded = vec![baseline.clone()];
+        let mut warnings = Vec::new();
+        crate::config::secrets::upsert_secret(
+            &mut folded,
+            &mut warnings,
+            "app demo",
+            signed.clone(),
+        );
+        assert_eq!(
+            folded.len(),
+            1,
+            "merge_app injects one credential for this host, not two"
+        );
+
+        // The negative control: a signer for the same host that shares no header with the baseline
+        // adds a credential rather than replacing one, and must still count as inherited.
+        let mut unrelated = a_header_secret();
+        unrelated.header = "X-Amz-Date".to_string();
+        unrelated.signer = Some(Box::new(signer(&["X-Amz-Date", "X-Amz-Content-Sha256"])));
+        assert!(
+            !shadows_baseline_secret(std::slice::from_ref(&unrelated), &baseline),
+            "no shared header means no shadow"
+        );
+        let mut folded = vec![baseline];
+        crate::config::secrets::upsert_secret(&mut folded, &mut warnings, "app demo", unrelated);
+        assert_eq!(folded.len(), 2, "and the fold keeps both");
     }
 
     #[test]
