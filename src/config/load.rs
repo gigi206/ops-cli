@@ -282,12 +282,17 @@ pub(super) fn sbx_control_plane_roots() -> Vec<PathBuf> {
     if let Some(dir) = global_path().and_then(|p| p.parent().map(Path::to_path_buf)) {
         roots.push(dir);
     }
-    // Canonicalize best-effort: a config bind is compared canonicalized (symlinks resolved), so the
-    // roots must be too, or a symlinked `$HOME` component would let a bind slip past the guard. A
-    // root that does not exist yet keeps its raw form (nothing to resolve).
+    // A config bind is compared canonicalized (symlinks resolved), so the roots must be too, or a
+    // symlinked `$HOME` component would let a bind slip past the guard. `canonicalize` is
+    // all-or-nothing and these roots are routinely absent — the trust store is created by the first
+    // `sbx trust`, so "does not exist yet" is its normal state indefinitely — which is why each is
+    // resolved as far as it exists with the missing tail re-appended. A root left in its raw form
+    // matches neither containment test: `control_plane_mode` would leave a read-write bind over it
+    // alone and `control_plane_pins` would emit no pin, handing the cage a writable, unpinned trust
+    // store to plant a marker in.
     roots
         .into_iter()
-        .map(|r| r.canonicalize().unwrap_or(r))
+        .map(|r| trust::canonicalize_existing_prefix(&r))
         .collect()
 }
 
@@ -739,11 +744,43 @@ fn describe_raw_bind(bind: &RawBind) -> String {
     }
 }
 
+/// Reduce one report line to a single safe display line: every control character (a newline, a
+/// carriage return, an ANSI escape introducer) becomes a space and runs of whitespace collapse.
+///
+/// Applied to the assembled report rather than to each interpolated value, so a field added later
+/// is covered without anyone remembering to. The values come verbatim out of a profile nothing has
+/// validated at this point — the charset and shape validators run at resolution, long after the
+/// import — and the report is the only text that states what the import granted. A bind path
+/// carrying a newline forges a whole extra line that reads like a genuine one; an escape sequence
+/// moves the cursor up and erases the grants already printed. That is the same reason
+/// [`super::secrets::validate_secret_name`] narrows its charset and
+/// [`super::secrets::sanitize_description`] cleans free text.
+///
+/// Unlike `sanitize_description`, nothing is truncated: a line is long here because the profile
+/// grants that much, and dropping its tail would conceal exactly what the report exists to show.
+fn one_display_line(line: &str) -> String {
+    let cleaned: String = line
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut out = String::with_capacity(cleaned.len());
+    for word in cleaned.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
+}
+
 /// Build the posture summary for a raw app profile: the command, the persistent-home scope, the
 /// extra tools, the binds (each read-only or read-write, a `(rw)` marker flagging the latter), the
 /// network posture, and each injected credential by destination and source *locator*. A profile
 /// never carries a plaintext secret — only a locator (`env://VAR`, a `key`) — so this is safe to
 /// display and to share.
+///
+/// Every line leaves through [`one_display_line`]: the values are the profile's own bytes, and this
+/// report is what the user judges the import by.
 fn describe_app_posture(app: &RawApp) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(cmd) = &app.cmd {
@@ -898,7 +935,7 @@ fn describe_app_posture(app: &RawApp) -> Vec<String> {
         ));
     }
     lines.extend(undescribed_sections(app));
-    lines
+    lines.into_iter().map(|l| one_display_line(&l)).collect()
 }
 
 /// Every top-level key the profile declares that [`describe_app_posture`] does not render a line
@@ -1834,6 +1871,112 @@ mod tests {
             &mut w3
         ));
         assert!(w3.is_empty(), "no warning for the safe cases: {w3:?}");
+    }
+
+    #[test]
+    fn a_control_plane_root_that_does_not_exist_yet_is_still_resolved_into_the_bind_namespace() {
+        // The roots are compared against canonicalized bind paths, so a root left in the namespace
+        // its environment variable was written in matches nothing: `control_plane_mode` leaves a
+        // read-write bind over it untouched and `control_plane_pins` emits no pin for it, so the
+        // launcher never freezes it and the cage can plant a trust marker that approves any config
+        // it likes. `Path::canonicalize` fails unless the WHOLE path exists, and the trust store is
+        // created only by the first `sbx trust` — so on a host whose state directory has a
+        // symlinked component (`/home` on its own volume, a `$HOME` dataset) the raw and the
+        // resolved form differ for as long as the user has never trusted a project.
+        let tmp = TmpDir::new();
+        let real = tmp.path().join("real-state");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("state");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // The state base is the one under test. The other two are pinned only to keep the root set
+        // out of the environment the suite happens to run in: both are elsewhere, and neither is
+        // created or read here. The data base is named explicitly (rather than derived from a home)
+        // because an explicit one is also what stops the layout from following a volume pointer,
+        // which would mount a filesystem from inside a unit test; it is short by construction, so
+        // the socket-path bound on that variable cannot refuse it either.
+        let _lock = crate::testutil::env_lock();
+        let _state_home = crate::testutil::EnvVar::set("XDG_STATE_HOME", &link);
+        let _data_dir = crate::testutil::EnvVar::set("SBX_DATA_DIR", "/sbx-roots-fixture/data");
+        let _config_home =
+            crate::testutil::EnvVar::set("XDG_CONFIG_HOME", "/sbx-roots-fixture/cfg");
+
+        let resolved = real
+            .canonicalize()
+            .expect("the fixture directory exists")
+            .join("sbx")
+            .join("trusted");
+        assert!(
+            !resolved.exists(),
+            "the fixture needs a root that has not been created yet"
+        );
+        let roots = sbx_control_plane_roots();
+        assert!(
+            roots.contains(&resolved),
+            "the trust store root must be expressed in the namespace binds are compared in, \
+             got {roots:?}"
+        );
+        // And it is genuinely protected now: a read-write bind over the symlinked parent is seen
+        // to contain it, so the launcher gets a pin for it.
+        let bind = Bind {
+            path: real.canonicalize().unwrap(),
+            writable: true,
+        };
+        assert!(
+            control_plane_pins_for(std::slice::from_ref(&bind), &roots)
+                .iter()
+                .any(|p| p.path == resolved && !p.writable),
+            "the not-yet-created root must be pinned read-only inside a bind that contains it"
+        );
+    }
+
+    #[test]
+    fn the_import_consent_report_cannot_be_rewritten_by_the_profile_it_describes() {
+        // Every value in this report is copied verbatim out of a profile nothing has validated,
+        // and the report is the only text stating what the import granted. A bind path carrying a
+        // newline forges an extra line that reads exactly like a genuine one; an escape sequence in
+        // the command rewrites the lines already printed. Both are neutralised on the assembled
+        // report, so a field added later cannot reintroduce the hole.
+        let preview = validate_profile(
+            b"cmd = [\"demo\", \"\\u001B[14A\\u001B[0Jwiped\"]\n\
+              binds = [\"/data\\nnetwork: none\"]\n\
+              gpu = true\n",
+        )
+        .expect("the fixture profile is importable");
+
+        assert!(
+            preview
+                .summary
+                .iter()
+                .all(|l| !l.chars().any(char::is_control)),
+            "no rendered line may carry a control character: {:?}",
+            preview.summary
+        );
+        // Neutralised, not dropped: the forged text stays inside the line that declared it, where a
+        // reader can see which field it came from.
+        assert!(
+            preview
+                .summary
+                .contains(&"binds: /data network: none".to_string()),
+            "the forged line must fold back into its own field: {:?}",
+            preview.summary
+        );
+        assert!(
+            preview
+                .summary
+                .iter()
+                .any(|l| l.starts_with("command: demo ")
+                    && l.contains("[14A")
+                    && l.contains("wiped")),
+            "the escape's payload is shown as text, not executed: {:?}",
+            preview.summary
+        );
+        // The grant that the forgery existed to conceal is still stated.
+        assert!(
+            preview.summary.iter().any(|l| l.starts_with("gpu: true")),
+            "a real grant must survive the sanitiser: {:?}",
+            preview.summary
+        );
     }
 
     #[test]

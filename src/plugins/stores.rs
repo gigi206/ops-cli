@@ -207,14 +207,17 @@ fn read_repo_pubkey(checkout: &Path) -> Result<[u8; 32], String> {
     decode_key(&hex)
 }
 
-/// What [`verify_key`] found: either the store's key was confirmed against one the user supplied
-/// from elsewhere (and its record now says so), or it had been supplied out of band all along and
-/// there was nothing left to confirm.
+/// What [`verify_key`] found. The supplied key matched in both cases — a mismatch is an error, not
+/// a variant — and they differ only in whether that clears a standing caution: a key accepted on
+/// first use is now confirmed and its record says so, or it had been supplied out of band all
+/// along and there was nothing left to record.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Verified {
     /// The supplied key matched the pinned one, which is no longer marked as merely accepted.
     Confirmed,
-    /// The store was already configured from a key the user supplied — an idempotent no-op.
+    /// The supplied key matched, and the store was already configured from a key the user supplied
+    /// — there was no standing caution to clear, so nothing was written. An idempotent no-op, not a
+    /// skipped comparison: a key that does not match is refused whichever way the store was pinned.
     AlreadyPinned,
 }
 
@@ -229,15 +232,19 @@ pub(crate) enum Verified {
 ///
 /// A mismatch is refused loudly and changes nothing: the store is not the one the supplied key
 /// belongs to. No fetch and no network — only the owner-only cache is read and rewritten.
+///
+/// The comparison comes **before** the idempotence check, and the order is the whole command. A
+/// key supplied out of band at `add` time is not thereby the right key: the usual way to end up
+/// pinned to an attacker's key is to have pasted it from a page the attacker controls, and this is
+/// the one command that exists to catch that. Returning early on a pinned store would answer
+/// `verified`, with exit 0, to a key nothing had looked at — so `AlreadyPinned` means "it matched,
+/// and there was no standing caution left to clear", never "I did not look".
 pub(crate) fn verify_key(
     layout: &crate::store::Layout,
     name: &str,
     supplied: [u8; 32],
 ) -> Result<Verified, String> {
     let cfg = read_configured(layout, name)?;
-    if !cfg.tofu {
-        return Ok(Verified::AlreadyPinned);
-    }
     if cfg.pubkey != supplied {
         return Err(format!(
             "the key pinned for store `{name}` is not the one you supplied — this store is not \
@@ -246,6 +253,9 @@ pub(crate) fn verify_key(
             crate::plugins::catalogue::to_hex(&cfg.pubkey),
             crate::plugins::catalogue::to_hex(&supplied)
         ));
+    }
+    if !cfg.tofu {
+        return Ok(Verified::AlreadyPinned);
     }
 
     // `store.toml` carries the trust anchor: a partial write would leave the store unreadable
@@ -390,7 +400,8 @@ pub(crate) fn publish(dir: &Path, key_path: &Path, rev: Option<u64>) -> Result<P
 
     // Build the catalogue: each plugin pinned by the digest of its own subdirectory (`dir_digest`,
     // the exact function a consumer reproduces at install time).
-    let mut entries = std::collections::BTreeMap::new();
+    let mut entries: std::collections::BTreeMap<String, crate::plugins::catalogue::CatalogueEntry> =
+        std::collections::BTreeMap::new();
     let mut listing = Vec::new();
     for p in &listed {
         // The name becomes the catalogue key and, on a consumer, the install directory. The loader
@@ -416,6 +427,22 @@ pub(crate) fn publish(dir: &Path, key_path: &Path, rev: Option<u64>) -> Result<P
             .replace(std::path::MAIN_SEPARATOR, "/");
         let sha256 =
             crate::plugins::catalogue::to_hex(&crate::plugins::catalogue::dir_digest(p.dir)?);
+        // The catalogue is keyed by the manifest `name`, so two plugins declaring one name would
+        // collapse to whichever the iteration reaches last while the confirmation below still
+        // listed both — a store that publishes one tree under the name of another, past every
+        // signature and digest check. The loader refuses that *within* a namespace (two brokers,
+        // two signers), but a resolver is indexed by its scheme and a broker or signer by its name,
+        // so a resolver and a signer sharing a name reach here unremarked. The key is formed here,
+        // so it is checked here; and brokers and signers are chained after the resolvers, which
+        // makes which of the two survives the collision the attacker's to choose.
+        if let Some(previous) = entries.get(p.name) {
+            return Err(format!(
+                "refusing to publish — `{}` and `{path}` both declare `name = \"{}\"`, and a \
+                 catalogue entry is keyed by that name, so only one of them would be published \
+                 (give one of them a different `name`)",
+                previous.path, p.name
+            ));
+        }
         // What the publish confirmation shows, spelled here rather than by the renderer: a resolver
         // by the namespace it answers for, `scheme://` and all, and a broker by its type — it has
         // no namespace to name, and a `broker://` would read as one it claimed.
@@ -2097,6 +2124,47 @@ mod tests {
         assert!(leaked.is_empty(), "a temp record leaked: {leaked:?}");
     }
 
+    /// Write a configured store's trust anchor straight into the owner-only cache: `store.toml`
+    /// alone, no checkout and no git. Enough for the paths that only consult the pinned key, and it
+    /// lets those run on a host without git rather than skipping.
+    fn pin_store(layout: &crate::store::Layout, name: &str, pubkey: &[u8; 32], tofu: bool) {
+        let dir = layout.store_path(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(STORE_TOML),
+            store_toml("https://example.invalid/store.git", pubkey, tofu),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn verify_key_compares_the_supplied_key_even_when_the_store_was_pinned_out_of_band() {
+        // `store verify` exists to catch a mis-pin, and the realistic mis-pin is a `--key` pasted
+        // from a page the attacker controls — which records the store as `pinned`, not `tofu`.
+        // Answering `verified` on that path without comparing anything would report success for the
+        // very case the command was written for, and the user would take it as proof of the store.
+        let data = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        let pinned = pubkey_of(&keypair());
+        pin_store(&layout, "vendor", &pinned, false);
+
+        // The genuine key, obtained out of band, against a store pinned to someone else's.
+        let genuine = pubkey_of(&keypair());
+        let err = verify_key(&layout, "vendor", genuine)
+            .expect_err("a key that is not the pinned one must be refused");
+        assert!(err.contains("is not the one you supplied"), "{err}");
+        let cfg = read_configured(&layout, "vendor").expect("the record still reads");
+        assert_eq!(cfg.pubkey, pinned, "a mismatch changes nothing");
+        assert!(!cfg.tofu);
+
+        // The matching key on the same store is still the idempotent no-op: there was no standing
+        // caution to clear, so nothing is written — but it got there by comparing.
+        assert_eq!(
+            verify_key(&layout, "vendor", pinned).unwrap(),
+            Verified::AlreadyPinned
+        );
+    }
+
     #[test]
     fn a_changed_store_key_is_named_by_update_and_rotated_only_on_purpose() {
         let Some(git) = git_or_skip() else { return };
@@ -2515,6 +2583,50 @@ mod tests {
         assert!(
             !key.exists(),
             "nothing is signed for a tree that cannot publish"
+        );
+    }
+
+    /// The name collision the loader cannot see. A resolver is indexed by its scheme and a signer
+    /// by its name, so two plugins under one name land in different indexes and nothing warns —
+    /// while the catalogue, keyed by name alone, keeps whichever comes last. Brokers and signers
+    /// are chained after the resolvers, so that is always the one the reviewer did not intend: a
+    /// store publishes the signer's tree under the resolver's trusted name, and every downstream
+    /// signature, revision floor and per-plugin digest checks out.
+    #[test]
+    fn publish_refuses_a_resolver_and_a_signer_that_share_one_name() {
+        let repo = crate::testutil::TmpDir::new();
+        write_source_plugin(repo.path(), "pass", "secret-store");
+        let signer = repo.path().join("plugins/pgsign");
+        std::fs::create_dir_all(&signer).unwrap();
+        std::fs::write(
+            signer.join("plugin.toml"),
+            "name = \"pass\"\ntype = \"signer\"\nexec = \"resolve\"\n\
+             [signer]\nsets_headers = [\"Authorization\"]\n",
+        )
+        .unwrap();
+        let exec = signer.join("resolve");
+        std::fs::write(&exec, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let key = repo.path().join("store.key");
+
+        let err = publish(repo.path(), &key, Some(1)).unwrap_err();
+        assert!(
+            err.contains("plugins/pass")
+                && err.contains("plugins/pgsign")
+                && err.contains("name = \"pass\""),
+            "the refusal must name the claim and both claimants: {err}"
+        );
+        assert!(
+            !err.contains("internal error"),
+            "refused where the key is formed, not by the round-trip guard: {err}"
+        );
+        assert!(
+            !key.exists(),
+            "nothing is signed for a tree that cannot publish"
+        );
+        assert!(
+            !repo.path().join(CATALOGUE).exists(),
+            "and no catalogue is left behind for the operator to commit"
         );
     }
 

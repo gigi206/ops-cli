@@ -2,10 +2,12 @@
 //!
 //! A project's `.sbx.toml` is attacker-controlled, so its security-relevant
 //! fields are honored only once the user has vouched for the file's *contents*.
-//! `sbx trust` records a marker keyed by the config's canonical path, holding a
-//! SHA-256 of the whole file. Any later edit changes that hash, so the marker no
-//! longer matches and the project must be re-trusted — exactly like `direnv
-//! allow` re-arming when `.envrc` changes.
+//! `sbx trust` records a marker keyed by the config's location — its directory
+//! canonicalized, its own name kept as written, see [`canonical_string`] for why
+//! the leaf is deliberately not resolved — holding a SHA-256 of the whole file.
+//! Any later edit changes that hash, so the marker no longer matches and the
+//! project must be re-trusted — exactly like `direnv allow` re-arming when
+//! `.envrc` changes.
 //!
 //! Hashing the whole file (not a parsed subset of "security fields") keeps this
 //! gate independent of the config schema and faithful to direnv: any change at
@@ -176,25 +178,79 @@ fn store_dir_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> 
     None
 }
 
+/// Canonicalize the longest existing prefix of `path`, re-appending verbatim the components that
+/// do not exist yet. A path that exists in full is plain `canonicalize`; one whose tail has not
+/// been created is still expressed in the symlink-resolved namespace of the part that does exist.
+///
+/// `Path::canonicalize` is all-or-nothing — it fails unless every component resolves — so a path
+/// naming something not created yet comes back untouched, and an unresolved path compared against
+/// a canonical one matches nothing. Two callers need the difference: the trust marker key (a
+/// config trusted while it exists must derive the same key once it is deleted) and sbx's own
+/// control-plane roots (a root the user has not created yet must still be recognised inside a bind
+/// that contains it).
+///
+/// Best effort by construction: a path with no existing ancestor at all — or one whose components
+/// cannot be walked, such as a trailing `..` — is returned unchanged, which is the same answer
+/// `canonicalize` refused to give.
+pub(crate) fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+    // An empty path is what `Path::new("cfg.toml").parent()` yields, and it denotes the current
+    // directory, which `canonicalize` will not resolve under that spelling. Naming it explicitly is
+    // what keeps a relative path keyed by an absolute one.
+    let dot = Path::new(".");
+    let start = if path.as_os_str().is_empty() {
+        dot
+    } else {
+        path
+    };
+    let mut missing: Vec<&OsStr> = Vec::new();
+    let mut cursor = start;
+    loop {
+        if let Ok(mut resolved) = cursor.canonicalize() {
+            for name in missing.iter().rev() {
+                resolved.push(name);
+            }
+            return resolved;
+        }
+        match (cursor.parent(), cursor.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name);
+                cursor = if parent.as_os_str().is_empty() {
+                    dot
+                } else {
+                    parent
+                };
+            }
+            // Nothing left to walk up to, or a component that carries no name to re-append (a
+            // trailing `.` or `..`): hand back what was asked for rather than a half-built path.
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 /// Canonicalized path string used as the marker key, or `None` when that path is not valid UTF-8.
 ///
-/// When the file itself cannot be canonicalized (typically: it no longer exists), its parent is
-/// canonicalized and the file name re-appended, so `sbx trust` (file present) and a later
-/// `sbx untrust` (file deleted) still derive the same key. Only when even the parent is gone does
-/// it fall back to the raw path. Never panics.
+/// The **final component is never resolved**: only the directories above it are canonicalized, and
+/// the file name is re-appended verbatim. That is a security property rather than a convenience.
+/// `realpath(3)` resolves the leaf too, and the config's bytes are read through the same leaf — so
+/// a hostile repository shipping its `.sbx.toml` as a symlink to another project's config (git
+/// records symlinks, so one survives a clone) would key on *that* project's marker, match its
+/// stored hash, and inherit its verdict, while the secrets, egress allowances and binds it unlocks
+/// are applied to the hostile tree. Keying on the path the user is standing in keeps a trust
+/// decision the property of one directory, which is the whole model.
+///
+/// The parent is canonicalized as far as it exists ([`canonicalize_existing_prefix`]), so `sbx
+/// trust` (file present) and a later `sbx untrust` (file deleted) still derive the same key, and a
+/// relative path still keys by its absolute location. Never panics.
 ///
 /// The conversion is `into_string`, not `to_string_lossy`: this string is what tells one config
 /// apart from another, and a lossy one does not — see [`marker_path`] for what that costs.
 fn canonical_string(config_path: &Path) -> Option<String> {
-    let resolved = config_path.canonicalize().unwrap_or_else(|_| {
-        match (config_path.parent(), config_path.file_name()) {
-            (Some(parent), Some(name)) => parent
-                .canonicalize()
-                .map(|p| p.join(name))
-                .unwrap_or_else(|_| config_path.to_path_buf()),
-            _ => config_path.to_path_buf(),
-        }
-    });
+    let resolved = match (config_path.parent(), config_path.file_name()) {
+        (Some(parent), Some(name)) => canonicalize_existing_prefix(parent).join(name),
+        // No file name to hold apart from its directory (a root, a trailing `..`): there is no leaf
+        // to protect, so resolve what was given.
+        _ => canonicalize_existing_prefix(config_path),
+    };
     resolved.into_os_string().into_string().ok()
 }
 
@@ -624,9 +680,9 @@ mod tests {
 
     #[test]
     fn untrust_finds_the_marker_after_the_config_is_deleted() {
-        // canonical_string falls back to canonicalising the parent and
-        // re-appending the file name, so a config present when trusted and gone
-        // when untrusted still derives the same marker key.
+        // canonical_string canonicalises the parent and re-appends the file name,
+        // so a config present when trusted and gone when untrusted still derives
+        // the same marker key.
         let store = TmpDir::new();
         let proj = TmpDir::new();
         let cfg = proj.join(".sbx.toml");
@@ -639,6 +695,73 @@ mod tests {
             untrust(store.path(), &cfg).unwrap(),
             "the marker keyed by the now-deleted config must still be found"
         );
+    }
+
+    #[test]
+    fn a_symlinked_config_does_not_inherit_the_trust_of_the_file_it_points_at() {
+        // The marker key names the directory whose launch the config governs, not wherever the
+        // config's final component resolves to. Git records symlinks, so a hostile repository can
+        // ship `.sbx.toml` as one pointing at a project the user has already trusted; the safety
+        // gate follows it (a symlink's own mode is meaningless on Linux, and the target is a
+        // perfectly ordinary user-owned file), so the bytes read — and therefore the content hash
+        // — are the trusted project's exactly. Resolving the leaf made the key the trusted
+        // project's too, and the verdict came back `Trusted`: another project's secrets, egress
+        // allowances and binds applied to a cage rooted in the hostile tree.
+        let store = TmpDir::new();
+        let trusted = TmpDir::new();
+        let hostile = TmpDir::new();
+
+        let real = trusted.join(".sbx.toml");
+        std::fs::write(&real, b"network = \"allow\"\nbinds = [\"/etc/ssh\"]\n").unwrap();
+        trust(store.path(), &real).unwrap();
+        assert_eq!(state(store.path(), &real), TrustState::Trusted);
+
+        let planted = hostile.join(".sbx.toml");
+        std::os::unix::fs::symlink(&real, &planted).unwrap();
+        assert_eq!(
+            std::fs::read(&planted).unwrap(),
+            std::fs::read(&real).unwrap(),
+            "the fixture only bites while both paths read the same bytes"
+        );
+        assert_eq!(
+            state(store.path(), &planted),
+            TrustState::Untrusted,
+            "a config in a directory that was never trusted must not read as trusted"
+        );
+
+        // The two keys are distinct, so blessing the planted one records a second marker rather
+        // than overwriting the first: a trust decision belongs to one directory.
+        assert_ne!(
+            marker_path(store.path(), &real).expect("a UTF-8 fixture path"),
+            marker_path(store.path(), &planted).expect("a UTF-8 fixture path"),
+            "two directories must not share one trust record"
+        );
+        trust(store.path(), &planted).unwrap();
+        assert_eq!(state(store.path(), &real), TrustState::Trusted);
+        assert_eq!(state(store.path(), &planted), TrustState::Trusted);
+    }
+
+    #[test]
+    fn canonicalize_existing_prefix_resolves_what_exists_and_keeps_what_does_not() {
+        // `canonicalize` is all-or-nothing, so a path naming something not created yet used to come
+        // back in whatever namespace it was written in. Both callers compare their result against
+        // canonicalized paths, so an unresolved one silently matches nothing.
+        let tmp = TmpDir::new();
+        let real = tmp.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canon_real = real.canonicalize().expect("the fixture directory exists");
+
+        // A fully existing path is plain canonicalization.
+        assert_eq!(canonicalize_existing_prefix(&link), canon_real);
+        // A tail that does not exist yet is re-appended to the resolved prefix, however deep.
+        assert_eq!(
+            canonicalize_existing_prefix(&link.join("sbx").join("trusted")),
+            canon_real.join("sbx").join("trusted")
+        );
+        // A relative path is still keyed by an absolute one — the empty parent means "here".
+        assert!(canonicalize_existing_prefix(Path::new("nowhere-at-all")).is_absolute());
     }
 
     #[test]
