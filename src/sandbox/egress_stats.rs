@@ -127,6 +127,12 @@ pub(crate) struct Tally {
     pub(crate) overflow: Counts,
 }
 
+/// The line prefixes the session-file format reserves for its own lines: the two identity headers
+/// and the folded-counter line. [`parse`] recognises a line by these, so a destination whose name
+/// begins with one would write a row that reads back as that line instead of as a counter row —
+/// see [`Tally::bump`], which is where a name that could spell one is refused a row.
+const RESERVED_PREFIXES: [&str; 3] = ["project=", "app=", "overflow="];
+
 impl Tally {
     /// Count one request for `host`, giving it a row while there is room and folding it into
     /// [`Self::overflow`] once there is not. A host that already has a row always keeps counting
@@ -139,9 +145,18 @@ impl Tally {
     /// on whitespace before its target is read, and an HTTP/2 `:authority` is re-checked against the
     /// CONNECT host it must equal. That is an invariant held three parsers away from here, by code
     /// with its own reasons to change; the format's own rule belongs to the format.
+    ///
+    /// The delimiters are not the format's only structure: a line is also claimed by its **prefix**
+    /// ([`RESERVED_PREFIXES`]), and those survive sanitising because `=` is not a control character.
+    /// A destination the cage names `project=…` is real — a CONNECT authority is not validated as a
+    /// hostname, and a host-mismatch is counted against the name the client asked for — so it is
+    /// refused a row of its own and folded like a destination past the cap: its requests are still
+    /// counted, and nothing it can spell reaches the file as a line the reader would take for the
+    /// session's identity.
     fn bump(&mut self, host: &str, kind: StatKind) {
         let host = super::observe_feed::sanitize(host);
-        if self.hosts.contains_key(&host) || self.hosts.len() < MAX_HOSTS {
+        let has_room = self.hosts.contains_key(&host) || self.hosts.len() < MAX_HOSTS;
+        if has_room && !RESERVED_PREFIXES.iter().any(|p| host.starts_with(*p)) {
             self.hosts.entry(host).or_default().bump(kind);
         } else {
             self.overflow.bump(kind);
@@ -346,8 +361,9 @@ pub(crate) struct SessionStats {
 /// row per destination (host first; a host carries no tab, so the four fields are unambiguous).
 ///
 /// Both halves of that are held upstream rather than here, each where the value enters: a host is
-/// sanitised by [`Tally::bump`], and an identity the header cannot carry writes no file at all
-/// ([`identity_is_recordable`]). This function is therefore total over what reaches it.
+/// sanitised — and kept clear of the format's own line prefixes — by [`Tally::bump`], and an
+/// identity the header cannot carry writes no file at all ([`identity_is_recordable`]). This
+/// function is therefore total over what reaches it.
 fn serialize(project: &str, app: Option<&str>, tally: &Tally) -> String {
     let mut out = String::new();
     out.push_str(&format!("project={project}\n"));
@@ -372,20 +388,32 @@ fn serialize(project: &str, app: Option<&str>, tally: &Tally) -> String {
 /// Parse a session file's contents, or `None` if it carries no `project=` header (an unrelated or
 /// truncated file). A malformed counter row is skipped, not fatal — a partially-written file still
 /// yields the rows it can (self-healing).
+///
+/// **The identity is the first line that states it.** [`serialize`] writes both headers before any
+/// row, so the first is always the real one; taking a later `project=`/`app=` line instead would let
+/// anything further down the file rename the session — and what is further down is destination
+/// names, which the caller in the cage chooses. Losing the whole session's counters to an
+/// unqueryable identity is durable audit evasion, since this file is the only persistent record of
+/// what the proxy decided. [`Tally::bump`] closes the same hole from the write side; this closes it
+/// for every file, including one written before that rule existed.
 fn parse(contents: &str) -> Option<SessionStats> {
     let mut project = None;
     let mut app = None;
     let mut tally = Tally::default();
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix("project=") {
-            project = Some(rest.to_string());
+            if project.is_none() {
+                project = Some(rest.to_string());
+            }
         } else if let Some(rest) = line.strip_prefix("app=") {
-            app = Some(rest.to_string());
+            if app.is_none() {
+                app = Some(rest.to_string());
+            }
         } else if let Some(rest) = line.strip_prefix("overflow=") {
             // Read on the same terms as a counter row: three numbers, and a malformed one skipped
-            // rather than fatal. Recognized by prefix like the two headers above, and carrying the
-            // same theoretical ambiguity they do (a destination literally named `overflow=…`), which
-            // costs that destination its row and nothing else.
+            // rather than fatal. Recognized by prefix like the two headers above; a destination that
+            // could be mistaken for one never reaches this file with a row of its own, so a line
+            // here is either the fold or damage, and damage is skipped.
             let mut f = rest.split('\t');
             let (Some(a), Some(d), Some(b), None) = (f.next(), f.next(), f.next(), f.next()) else {
                 continue;
@@ -496,6 +524,39 @@ fn rollup_name(project: &str, app: Option<&str>) -> String {
 /// The finished files of one project+app, and the counters they add up to.
 type Group = (Vec<PathBuf>, Tally);
 
+/// The lock file whose `flock` serialises [`compact`] across processes.
+///
+/// A file **beside** the session files rather than one of them, and named outside their prefix: every
+/// reader of this directory — [`session_files`], [`reset`], [`compact`] itself, and `sbx gc`'s
+/// runtime sweep — selects on `stats-`, so nothing here ever reads, folds or removes it.
+const COMPACT_LOCK: &str = ".compact.lock";
+
+/// Take the fold lock without blocking, or `None` when another process holds it (or the directory
+/// cannot carry the file). The handle is held only for its `Drop`: closing the fd releases the
+/// `flock`.
+///
+/// Non-blocking on purpose. This runs on **every** launch, so waiting would put an unbounded stall
+/// on the launch path for pure housekeeping; a process that cannot take the lock has nothing to do,
+/// because the process holding it is doing exactly this work.
+fn lock_compact(egress_dir: &Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(egress_dir.join(COMPACT_LOCK))
+        .ok()?;
+    // SAFETY: `flock` on a valid owned fd. `LOCK_NB` returns `EWOULDBLOCK` instead of blocking when
+    // another open file description holds the lock. The fd lives in the returned handle, so the lock
+    // is held until the caller drops it.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return None;
+    }
+    Some(file)
+}
+
 /// Fold the counters of every finished session into one file per project+app, and return the files
 /// that were (or, in a dry run, would be) folded away.
 ///
@@ -503,9 +564,23 @@ type Group = (Vec<PathBuf>, Tally);
 /// folded directory answers `sbx net stats` exactly as the unfolded one did. What it buys is a
 /// bound — a session per file, kept forever, is a directory that only grows.
 ///
+/// That equivalence holds only while one fold runs at a time. The body is a read-merge-write-unlink
+/// over a directory every launch shares (`build()` folds on each one), and two concurrent folds
+/// corrupt the rollup in either direction: one can read a session file, watch the other fold and
+/// unlink it, then write a rollup that counts it twice; or it can miss a file the other has already
+/// folded away and overwrite the rollup with a total that never held it. Both are written into the
+/// rollup permanently and can only be cleared by `sbx net stats --reset`, which discards everything.
+/// So the whole body runs under an exclusive [`lock_compact`], and a process that finds it held
+/// simply does not fold.
+///
 /// Best-effort throughout. A file that cannot be read or parsed is left where it is, and a group
 /// whose rollup cannot be written keeps its sources: the counters are worth more than the tidiness.
 pub(crate) fn compact(egress_dir: &Path, prune: bool) -> Vec<PathBuf> {
+    // Held for the whole function: the dry run takes it too, or it would report files a fold running
+    // beside it is in the middle of removing.
+    let Some(_lock) = lock_compact(egress_dir) else {
+        return Vec::new();
+    };
     let Ok(entries) = std::fs::read_dir(egress_dir) else {
         return Vec::new();
     };
@@ -686,6 +761,20 @@ mod tests {
         .unwrap();
     }
 
+    /// The names of the stats files under an egress directory, sorted. Filtered to the `stats-`
+    /// prefix every reader of this directory selects on, so the fold's own lock file — a sibling of
+    /// the data, never read as data — is not counted as one.
+    fn stats_names(egress: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(egress)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("stats-"))
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Folding is invisible: the aggregate a caller reads is the same before and after, and what
     /// changes is only how many files hold it.
     #[test]
@@ -710,11 +799,7 @@ mod tests {
             before,
             "folding must not change a single counter"
         );
-        let remaining: Vec<String> = std::fs::read_dir(egress)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
+        let remaining = stats_names(egress);
         assert_eq!(
             remaining.len(),
             1,
@@ -762,10 +847,55 @@ mod tests {
             compact(egress, true).is_empty(),
             "a folded directory has nothing left to fold"
         );
-        assert_eq!(std::fs::read_dir(egress).unwrap().count(), 1);
+        assert_eq!(stats_names(egress).len(), 1);
         assert_eq!(
             aggregate(egress, "/p", None).hosts["api.example.com"].allow,
             7
+        );
+    }
+
+    /// The fold is a read-merge-write-unlink over a directory every launch shares, and `build()`
+    /// runs it on each one — two terminals starting a session at the same time is the ordinary case.
+    /// Unserialised, one process reads a session file, the other folds and unlinks it, and the first
+    /// then writes a rollup counting it twice (or, the other way round, one that never held it).
+    /// Either lands in the rollup permanently and survives every later fold.
+    ///
+    /// So the fold takes an exclusive lock and, finding it held, does nothing at all: the holder is
+    /// already doing exactly this work. `flock` is per open file description, so a second open in
+    /// this same process contends exactly as another process would — which is what lets the test
+    /// stand a concurrent fold up without one.
+    #[test]
+    fn a_fold_already_running_elsewhere_makes_this_one_stand_down() {
+        let dir = TmpDir::new();
+        let egress = dir.path();
+        session_file(egress, 1, 11, "/p", "api.example.com", 3);
+
+        let held = lock_compact(egress).expect("the fold lock");
+        assert!(
+            compact(egress, true).is_empty(),
+            "a fold that cannot take the lock must report folding nothing"
+        );
+        assert_eq!(
+            stats_names(egress),
+            ["stats-1-11"],
+            "and must leave every source where the holder expects it"
+        );
+        assert_eq!(
+            aggregate(egress, "/p", None).hosts["api.example.com"].allow,
+            3,
+            "the counters are read exactly once, whoever folds"
+        );
+
+        drop(held);
+        assert_eq!(
+            compact(egress, true).len(),
+            1,
+            "once the lock is free the fold proceeds as always"
+        );
+        assert_eq!(
+            aggregate(egress, "/p", None).hosts["api.example.com"].allow,
+            3,
+            "and folding still changes no counter"
         );
     }
 
@@ -805,6 +935,53 @@ mod tests {
             .find(|(h, _)| h.starts_with("a.test"))
             .expect("the destination still has a row of its own");
         assert_eq!((counts.deny, counts.allow), (1, 0), "row {name}");
+    }
+
+    /// A line of this file is claimed by its **prefix** as well as by its delimiters, and `=` is not
+    /// a control character, so sanitising leaves a destination free to spell one. The cage can
+    /// reach the counter with such a name — a CONNECT authority is never validated as a hostname,
+    /// and a host-mismatch is counted against the name the client asked for — and a row that reads
+    /// back as `project=` renames the whole session to something no `sbx net stats`, no `--reset`
+    /// and no fold will ever match again. That is durable audit evasion: this file is the only
+    /// persistent record of what the proxy decided (`sbx net log` is an in-memory ring).
+    ///
+    /// Both halves are pinned, because each holds on its own: the row never reaches the file, and a
+    /// file that carries one anyway still reads back with the identity its first line stated.
+    #[test]
+    fn a_destination_named_like_a_header_cannot_rename_the_session() {
+        let dir = TmpDir::new();
+        let egress = dir.path();
+        let path = egress.join("stats-1-11");
+        let stats = EgressStats::new(path.clone(), "/home/u/proj".into(), None);
+        stats.record("api.example.com", StatKind::Allow);
+        stats.record("project=/tmp/x", StatKind::Blocked);
+        stats.record("app=other", StatKind::Blocked);
+        stats.flush_final();
+
+        let parsed = parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            parsed.project, "/home/u/proj",
+            "the session still answers to the project it ran in"
+        );
+        assert_eq!(parsed.app, None, "and to no app it never belonged to");
+        assert_eq!(
+            parsed.tally.hosts.len(),
+            1,
+            "a name that could spell a header line gets no row: {:?}",
+            parsed.tally.hosts
+        );
+        // Folded rather than dropped, like a destination past the cap: what `sbx net stats` adds up
+        // is still every request the proxy decided.
+        assert_eq!(parsed.tally.overflow.blocked, 2);
+        assert_eq!(
+            aggregate(egress, "/home/u/proj", None).hosts["api.example.com"].allow,
+            1,
+            "the session must stay visible to the project that owns it"
+        );
+
+        // The read side holds alone, for a file written before that rule existed — or by hand.
+        let forged = "project=/home/u/proj\napi.example.com\t1\t0\t0\nproject=/tmp/x\t0\t0\t1\n";
+        assert_eq!(parse(forged).unwrap().project, "/home/u/proj");
     }
 
     /// A project path a session file cannot carry records nothing, rather than a header a reader
@@ -857,9 +1034,9 @@ mod tests {
 
         assert_eq!(compact(egress, false).len(), 2);
         assert_eq!(
-            std::fs::read_dir(egress).unwrap().count(),
-            2,
-            "a dry run must leave the directory exactly as it found it"
+            stats_names(egress),
+            ["stats-1-11", "stats-1-12"],
+            "a dry run must leave every counter file exactly as it found it"
         );
     }
 
@@ -881,7 +1058,7 @@ mod tests {
             aggregate(egress, "/b", None).hosts["api.example.com"].allow,
             4
         );
-        assert_eq!(std::fs::read_dir(egress).unwrap().count(), 2);
+        assert_eq!(stats_names(egress).len(), 2);
     }
 
     #[test]

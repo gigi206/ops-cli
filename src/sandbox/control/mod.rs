@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::allowlist::Rule;
+use crate::sandbox::locks::{locked, read_locked, write_locked};
 
 mod capture;
 mod client;
@@ -116,7 +117,7 @@ impl PendingState {
         on_enqueue: impl FnOnce(u64),
     ) -> Verdict {
         let (seq, rx) = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = locked(&self.inner);
             if inner.entries.len() >= cap {
                 return Verdict::Deny;
             }
@@ -142,13 +143,13 @@ impl PendingState {
         };
         // On a real answer the control side already removed the entry; on a timeout/disconnect it
         // is still present. Removing is idempotent, so this cleans up either case.
-        self.inner.lock().unwrap().entries.remove(&seq);
+        locked(&self.inner).entries.remove(&seq);
         verdict
     }
 
     /// The currently-parked requests, oldest id first (the `BTreeMap` orders by sequence).
     pub(crate) fn list(&self) -> Vec<PendingRow> {
-        let inner = self.inner.lock().unwrap();
+        let inner = locked(&self.inner);
         inner
             .entries
             .iter()
@@ -173,7 +174,7 @@ impl PendingState {
     /// representative id decides the whole group at once. A *different* destination stays parked — this
     /// is not the blanket [`answer_all`](PendingState::answer_all) drain.
     pub(crate) fn answer_like(&self, seq: u64, verdict: Verdict) -> Option<(String, u16, usize)> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = locked(&self.inner);
         let (host, port, path) = {
             let e = inner.entries.get(&seq)?;
             (e.host.clone(), e.port, e.path.clone())
@@ -202,7 +203,7 @@ impl PendingState {
     /// self-`remove` does not contend (the entry is already gone — taken with the rest of the map).
     pub(crate) fn answer_all(&self, verdict: Verdict) -> Vec<(String, u16)> {
         let entries = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = locked(&self.inner);
             std::mem::take(&mut inner.entries)
         };
         entries
@@ -223,6 +224,17 @@ impl PendingState {
 /// effective policy** it evaluates per request — so an overlay allow/deny is enforced through the
 /// same allow/deny/path/method/deny-wins machinery as a config rule, in every filtering posture
 /// (allowlist, denylist, and `ask`), not only when a request would otherwise park.
+///
+/// Its lock recovers from a poisoning panic ([`crate::sandbox::locks`]) on the argument
+/// [`super::proc_enforce::ProcOverlay`] gives rather than the module's, because it is the same
+/// shape: **live policy**, not a record kept for a reader, so it owes that argument here. Two things
+/// settle it. The lists cannot be left incomplete by an unwind — every mutation is a `contains`
+/// followed by a `push`, neither of which can unwind, so a poisoned overlay holds exactly what a
+/// completed [`remember_rule`](Self::remember_rule) put there. And the alternative is worse in the
+/// direction that matters: [`is_empty`](Self::is_empty) and [`snapshot`](Self::snapshot) are taken
+/// on **every** request the proxy decides, so propagating the panic would end each deciding thread
+/// in turn and leave a session whose live `--session` allows, denies and mutes are unreachable while
+/// the rest of the plane keeps running.
 #[derive(Default)]
 pub(crate) struct ManualRules {
     inner: RwLock<ManualInner>,
@@ -254,7 +266,7 @@ impl ManualRules {
     /// `sbx net allow|deny <rule> --session` path. Deduped, so re-loading the same rule does not
     /// stack. A deny takes precedence over an allow at decision time (deny wins in the policy).
     pub(crate) fn remember_rule(&self, verdict: Verdict, rule: Rule) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = write_locked(&self.inner);
         let list = match verdict {
             Verdict::Allow => &mut inner.allow,
             Verdict::Deny => &mut inner.deny,
@@ -270,7 +282,7 @@ impl ManualRules {
     /// off [`Verdict`] deliberately — a mute is not a park answer, so it never touches the
     /// allow/deny/ask verdict paths.
     pub(crate) fn remember_mute(&self, rule: Rule) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = write_locked(&self.inner);
         if !inner.mute.contains(&rule) {
             inner.mute.push(rule);
         }
@@ -280,21 +292,21 @@ impl ManualRules {
     /// policy and evaluate its immutable config policy directly (no per-request allocation). Includes
     /// the mute overlay, so a live `--session` mute is folded in like an allow/deny.
     pub(crate) fn is_empty(&self) -> bool {
-        let inner = self.inner.read().unwrap();
+        let inner = read_locked(&self.inner);
         inner.allow.is_empty() && inner.deny.is_empty() && inner.mute.is_empty()
     }
 
     /// A snapshot of the manual verdict rules `(allow, deny)` — cloned out so the read lock is not
     /// held across the fold into the effective policy, listing, or I/O.
     pub(crate) fn snapshot(&self) -> (Vec<Rule>, Vec<Rule>) {
-        let inner = self.inner.read().unwrap();
+        let inner = read_locked(&self.inner);
         (inner.allow.clone(), inner.deny.clone())
     }
 
     /// A snapshot of the manual **mute** rules — cloned out (like [`Self::snapshot`]) so the read
     /// lock is not held across the fold into the effective policy.
     pub(crate) fn mute_snapshot(&self) -> Vec<Rule> {
-        self.inner.read().unwrap().mute.clone()
+        read_locked(&self.inner).mute.clone()
     }
 }
 
@@ -686,7 +698,7 @@ impl LogRing {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let mut g = self.inner.lock().unwrap();
+        let mut g = locked(&self.inner);
         let seq = g.next_seq;
         g.next_seq += 1;
         // The three free-form values are sanitised **here**, on the way in, for the reason
@@ -705,6 +717,10 @@ impl LogRing {
         // This is not the decision's view of any of them: every verdict is reached on the raw value,
         // and only what is *reported* passes through here. Sanitising is idempotent, and it runs
         // after the caller's secret redaction so a masked query stays masked.
+        //
+        // What it does **not** close is the wire line's own tokenisation: it maps a control byte to a
+        // space, and a space is what the reader splits `key=value` tokens on. That is a second
+        // property, settled a second time, where the line is built — see `head_field`.
         let event = LogEvent {
             seq,
             at_epoch_ms,
@@ -739,7 +755,7 @@ impl LogRing {
     /// sequence order, so a reverse scan finds the target quickly (the amend usually lands on the
     /// newest events).
     pub(crate) fn set_status(&self, seq: u64, status: u16) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = locked(&self.inner);
         let g = &mut *guard;
         if let Some(ev) = g.events.iter_mut().rev().find(|e| e.seq == seq) {
             ev.status = Some(status);
@@ -760,7 +776,7 @@ impl LogRing {
     /// [`capture_settled`](LogRing::capture_settled) instead of amending on its own. Called right
     /// after the event is pushed, only when the launch captures.
     pub(crate) fn expect_capture(&self, seq: u64) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = locked(&self.inner);
         if let Some(ev) = g.events.iter_mut().rev().find(|e| e.seq == seq) {
             ev.awaiting_capture = true;
         }
@@ -770,7 +786,7 @@ impl LogRing {
     /// actually stored; with none, the event is amended only if a status is waiting to be shown (so
     /// an exchange with nothing new is not re-emitted at all).
     pub(crate) fn capture_settled(&self, seq: u64, filed: bool) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = locked(&self.inner);
         let g = &mut *guard;
         if let Some(ev) = g.events.iter_mut().rev().find(|e| e.seq == seq) {
             ev.awaiting_capture = false;
@@ -789,7 +805,7 @@ impl LogRing {
     /// opening is visible while it is open), and the frames that cross afterwards are a second thing
     /// to show. Every other exchange settles once and is never re-emitted again.
     pub(crate) fn capture_grew(&self, seq: u64) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = locked(&self.inner);
         let g = &mut *guard;
         if let Some(ev) = g.events.iter_mut().rev().find(|e| e.seq == seq) {
             ev.amend_seq = Some(g.next_amend);
@@ -809,7 +825,7 @@ impl LogRing {
     /// A repeat of an already-recorded (name, direction) is dropped rather than amending again, so a
     /// second caller cannot turn the alarm into a stream.
     pub(crate) fn secret_seen(&self, seq: u64, name: &str, way: SecretWay) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = locked(&self.inner);
         let g = &mut *guard;
         if let Some(ev) = g.events.iter_mut().rev().find(|e| e.seq == seq) {
             if ev
@@ -844,7 +860,7 @@ impl LogRing {
         after_amend: Option<u64>,
         include_muted: bool,
     ) -> LogSnapshot {
-        let g = self.inner.lock().unwrap();
+        let g = locked(&self.inner);
         let head = g.next_seq - 1;
         let amend_head = g.next_amend - 1;
         let cursor = after.unwrap_or(0);
@@ -966,11 +982,12 @@ impl FlowGuard {
 impl Drop for FlowGuard {
     fn drop(&mut self) {
         // Remove the flow from the live view the instant its tunnel closes (a detached guard has no
-        // registry and nothing to remove).
-        if let Some(registry) = &self.registry
-            && let Ok(mut g) = registry.inner.lock()
-        {
-            g.flows.remove(&self.id);
+        // registry and nothing to remove). Recovering rather than skipping the removal on a poisoned
+        // lock is what keeps the registry a view of what is *open*: a skipped removal leaves a closed
+        // tunnel listed by `sbx net live` for the rest of the session, with no way for it to ever go
+        // away. `locked` cannot panic, so this is also safe to run while a thread is unwinding.
+        if let Some(registry) = &self.registry {
+            locked(&registry.inner).flows.remove(&self.id);
         }
     }
 }
@@ -996,7 +1013,7 @@ impl FlowRegistry {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let mut g = self.inner.lock().unwrap();
+        let mut g = locked(&self.inner);
         let id = g.next_id;
         g.next_id += 1;
         g.flows.insert(
@@ -1021,7 +1038,7 @@ impl FlowRegistry {
     /// A snapshot of every currently-open flow, oldest-open first (ascending id). Reads each flow's
     /// live byte counters — a value climbing between two snapshots is a transfer in progress.
     pub(crate) fn snapshot(&self) -> Vec<FlowSnapshot> {
-        let g = self.inner.lock().unwrap();
+        let g = locked(&self.inner);
         g.flows
             .values()
             .map(|e| FlowSnapshot {
@@ -1304,7 +1321,8 @@ fn dispatch(
         }
         Some("FLOWS") => {
             // The tunnels open right now (one `flow …` line each, then `ok`). `host` is emitted last
-            // so the reader can split every other field on its first `=`; a host carries no space.
+            // so the reader can split every other field on its first `=`, and is made token-safe by
+            // `format_flow_line` — the cage names it.
             let mut out = String::new();
             for f in flows.snapshot() {
                 out.push_str(&format_flow_line(&f));
@@ -1317,8 +1335,13 @@ fn dispatch(
 }
 
 /// Format one open flow as a control-wire line, `host` last (the reader splits each token on its
-/// first `=`; a host has no space and no `=`). A flow has no method/path — it is a live tunnel, not a
-/// decided request.
+/// first `=`). A flow has no method/path — it is a live tunnel, not a decided request.
+///
+/// The host is the authority of a permitted request, so it is cage-chosen text like the event line's
+/// and gets the same two treatments: [`super::sanitize`] against a control byte that would end the
+/// line, and [`head_field`] against whitespace that would split the token or an `=` that would name
+/// a field of its own. Unlike the event log, the registry stores what it was given, so both are
+/// applied here — the flow view is volatile and nothing else reads the stored form.
 fn format_flow_line(f: &FlowSnapshot) -> String {
     format!(
         "flow proto={} port={} start={} up={} down={} host={}\n",
@@ -1327,7 +1350,7 @@ fn format_flow_line(f: &FlowSnapshot) -> String {
         f.start_epoch_ms,
         f.up,
         f.down,
-        f.host,
+        head_field(&super::sanitize(&f.host)),
     )
 }
 
@@ -1367,9 +1390,56 @@ fn format_sighting_lines(ev: &LogEvent) -> String {
     out
 }
 
+/// Make `value` safe to occupy one whitespace-split `key=value` token of a control-wire line.
+///
+/// [`super::sanitize`] is not that, and cannot be: it maps every control character to a **space**,
+/// which is the separator the reader splits on, and it leaves `=` alone. The reader takes a line as
+/// `split_whitespace()` then `split_once('=')` per token, so a value carrying a space splits into a
+/// token of its own — and that token either rewrites a field the event already stated (a later
+/// `verdict=allow` wins over the real one) or, carrying no `=` at all, makes the parse fail and
+/// *erase the whole event*. A cage chooses the host, the method and the request target of a logged
+/// request, so it chooses whether its own row survives.
+///
+/// Whitespace is not only the control characters `sanitize` produces: `split_whitespace` splits on
+/// Unicode White_Space, and U+00A0 or U+2000‥200A reach here untouched because they are not control
+/// characters. This asks `char::is_whitespace`, which is the same set the reader splits on.
+///
+/// The same two characters [`super::proc_control`]'s `head_token` and [`super::task_control`]'s
+/// `head_field` replace, for the same reason and at the same price: a legitimate value carrying a
+/// space renders with an underscore, which is a value this line could not have carried either way.
+fn head_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c.is_whitespace() || c == '=' {
+            true => '_',
+            false => c,
+        })
+        .collect()
+}
+
+/// [`head_field`] for the **last** token on a line, whose value the reader takes as everything past
+/// its first `=`. An `=` is therefore free there and must stay: a request target's query string is
+/// the one logged value that legitimately carries one, and rewriting it would change what the row
+/// says the cage asked for. Whitespace still has to go — it would end the token early whatever its
+/// position.
+fn trailing_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c.is_whitespace() {
+            true => '_',
+            false => c,
+        })
+        .collect()
+}
+
 /// Format one event as a control-wire line. Fields are `key=value` tokens split on their first `=`;
 /// `method`/`path` are omitted when absent, and `path` is emitted **last** so a query string's `=`
-/// round-trips (it is the only field that can carry one, and an HTTP request-target has no spaces).
+/// round-trips (it is the only field that can carry one).
+///
+/// The three cage-chosen fields go through [`head_field`]/[`trailing_field`] on the way out. They
+/// reach the ring already stripped of control characters ([`LogRing::push`]), which is what stops
+/// them forging a *second line*; this is what stops them forging, or deleting, a *token* of their
+/// own line. Both are needed, and neither substitutes for the other.
 fn format_event_line(ev: &LogEvent) -> String {
     let mut line = format!(
         "event seq={} at={} port={} verdict={} proto={} reason={}",
@@ -1398,11 +1468,11 @@ fn format_event_line(ev: &LogEvent) -> String {
         line.push_str(&format!(" l7={}", ev.rpc.as_str()));
     }
     if let Some(method) = &ev.method {
-        line.push_str(&format!(" method={method}"));
+        line.push_str(&format!(" method={}", head_field(method)));
     }
-    line.push_str(&format!(" host={}", ev.host));
+    line.push_str(&format!(" host={}", head_field(&ev.host)));
     if let Some(path) = &ev.path {
-        line.push_str(&format!(" path={path}"));
+        line.push_str(&format!(" path={}", trailing_field(path)));
     }
     line.push('\n');
     line
@@ -1707,6 +1777,85 @@ mod tests {
         assert!(
             reg.snapshot().is_empty(),
             "no flow remains once every guard is dropped"
+        );
+    }
+
+    /// A panic in one unrelated handler must not take the whole control plane with it.
+    ///
+    /// Every lock here guards something a reader depends on — the decision ring `sbx net log` reads,
+    /// the queue a parked request is answered through, the live `--session` overlay every request is
+    /// decided against, the registry `sbx net live` lists — and `std`'s default is to answer `Err`
+    /// from every later take once a holder has panicked. Taking that as a panic of its own is how one
+    /// fault in a single proxy connection becomes a session whose log stops recording, whose parked
+    /// requests can no longer be answered and whose closed tunnels never leave the live view. See
+    /// [`crate::sandbox::locks`] for why these are the recovering class and what makes it sound.
+    #[test]
+    fn a_poisoned_control_plane_lock_keeps_serving_rather_than_panicking_again() {
+        // Poison a lock the only way it can be poisoned: panic on another thread while a guard on it
+        // is still held, so the unwind marks it. The assertion is the fixture's own — a body that
+        // released the guard before panicking would poison nothing and prove nothing.
+        fn poisoning(hold_and_panic: impl FnOnce() + Send + 'static) {
+            let panicked = std::thread::spawn(hold_and_panic).join();
+            assert!(
+                panicked.is_err(),
+                "the fixture must actually poison the lock"
+            );
+        }
+
+        // The event ring: the row pushed after the poisoning is still recorded, and still readable.
+        let log = Arc::new(LogRing::new(LOG_RING_CAP));
+        push_event(&log, "before.test", LogVerdict::Allow, "allowed");
+        let poisoner = Arc::clone(&log);
+        poisoning(move || {
+            let _held = locked(&poisoner.inner);
+            panic!("an unrelated holder gives up mid-flight");
+        });
+        push_event(&log, "after.test", LogVerdict::Deny, "denied-default");
+        let hosts: Vec<String> = log
+            .snapshot(None, None, false)
+            .events
+            .iter()
+            .map(|e| e.host.clone())
+            .collect();
+        assert_eq!(hosts, vec!["before.test", "after.test"]);
+
+        // The pending queue: still listable and still answerable, which is what a parked proxy
+        // thread is waiting on.
+        let pending = Arc::new(PendingState::new());
+        let poisoner = Arc::clone(&pending);
+        poisoning(move || {
+            let _held = locked(&poisoner.inner);
+            panic!("an unrelated holder gives up mid-flight");
+        });
+        assert!(pending.list().is_empty());
+        assert!(pending.answer_all(Verdict::Deny).is_empty());
+
+        // The live overlay: a rule loaded after the poisoning is still folded into the policy.
+        let manual = Arc::new(ManualRules::new());
+        let poisoner = Arc::clone(&manual);
+        poisoning(move || {
+            let _held = write_locked(&poisoner.inner);
+            panic!("an unrelated holder gives up mid-flight");
+        });
+        manual.remember(Verdict::Allow, "api.test", 443);
+        assert!(!manual.is_empty());
+        assert_eq!(manual.snapshot().0.len(), 1);
+
+        // The flow registry: a tunnel opened after the poisoning appears, and closing it removes it
+        // — the half that skipped the removal instead of recovering, which would have left a closed
+        // tunnel listed for the rest of the session.
+        let flows = Arc::new(FlowRegistry::new());
+        let poisoner = Arc::clone(&flows);
+        poisoning(move || {
+            let _held = locked(&poisoner.inner);
+            panic!("an unrelated holder gives up mid-flight");
+        });
+        let guard = flows.register("api.test", 8443, Proto::Https);
+        assert_eq!(flows.snapshot().len(), 1);
+        drop(guard);
+        assert!(
+            flows.snapshot().is_empty(),
+            "a closed tunnel must leave the live view even after a poisoning"
         );
     }
 
@@ -2143,6 +2292,93 @@ mod tests {
         assert_eq!(e.host, " [1A [2Kevil.test");
         assert_eq!(e.method.as_deref(), Some("GET  X: forged"));
         assert_eq!(e.path.as_deref(), Some("/a pending id=1"));
+    }
+
+    /// Sanitising the ring closes the *line*; this closes the line's own **tokens**.
+    ///
+    /// The reader takes an event line as `split_whitespace()` then `split_once('=')` per token, so a
+    /// space inside a cage-chosen value either erases the whole event (a token with no `=` fails the
+    /// parse) or rewrites a field the event already stated (a later `verdict=` wins). Both are
+    /// reachable: `sanitize` maps a control byte — an HTAB, which the tunnelled-request guard
+    /// deliberately admits as an ordinary request-target byte — to exactly that space, and Unicode
+    /// whitespace such as U+00A0 is not a control character and reaches the line untouched. The
+    /// stake is an allowed, credential-bearing request that leaves no row in `sbx net log` while
+    /// `sbx net stats` still counts it, so the two disagree and the log reads as the broken one.
+    #[test]
+    fn a_cage_chosen_field_cannot_split_or_rewrite_a_token_of_its_own_event_line() {
+        let ring = LogRing::new(LOG_RING_CAP);
+        ring.push(
+            false,
+            // U+00A0: whitespace to the reader, not a control character, so `sanitize` keeps it.
+            "h.test\u{a0}port=1",
+            443,
+            // An HTAB, which `sanitize` turns into the reader's own separator.
+            Some("GET\tX"),
+            // A query string's `=` must survive; the space before it must not.
+            Some("/x?a=1\u{a0}verdict=allow"),
+            LogVerdict::Blocked,
+            "method-not-allowed",
+            Proto::Other,
+            HttpVer::Unknown,
+            RpcKind::None,
+        );
+        let snap = ring.snapshot(None, None, false);
+        let line = format_event_line(&snap.events[0]);
+        let line = line.trim_end();
+
+        // The reader's own contract, applied here so the assertion is the parse and not a guess at
+        // it: every token past the marker splits on an `=`, and the last write of a key wins.
+        let mut tokens = line.split_whitespace();
+        assert_eq!(
+            tokens.next(),
+            Some("event"),
+            "the line opens with its marker"
+        );
+        let mut fields: BTreeMap<&str, &str> = BTreeMap::new();
+        for token in tokens {
+            let (key, value) = token.split_once('=').unwrap_or_else(|| {
+                panic!("`{token}` carries no `=`, which erases the event: {line}")
+            });
+            fields.insert(key, value);
+        }
+        assert_eq!(
+            fields.get("verdict"),
+            Some(&"blocked"),
+            "a cage-chosen value must not restate a field of the row recording it: {line}"
+        );
+        assert_eq!(fields.get("port"), Some(&"443"), "{line}");
+        assert_eq!(fields.get("method"), Some(&"GET_X"), "{line}");
+        assert_eq!(fields.get("host"), Some(&"h.test_port_1"), "{line}");
+        // The path is the line's last token, so its value is everything past the first `=` — the one
+        // place a query string's `=` survives, and it has to, or the row would misreport the request.
+        assert_eq!(fields.get("path"), Some(&"/x?a=1_verdict=allow"), "{line}");
+    }
+
+    /// The flow line carries the same hazard as the event line and gets the same treatment: `sbx net
+    /// live` lists the authority of a permitted tunnel, which the cage named. A host holding a space
+    /// would split into a token of its own and drop the whole flow from the view, and one holding a
+    /// control byte would end the line early.
+    #[test]
+    fn a_flow_line_host_cannot_split_or_end_the_line_it_is_written_on() {
+        let flow = FlowSnapshot {
+            host: "api.test\u{a0}port=1\x1b[2K".to_string(),
+            port: 8443,
+            proto: Proto::Https,
+            start_epoch_ms: 1_700_000_000_000,
+            up: 1,
+            down: 2,
+        };
+        let line = format_flow_line(&flow);
+        assert!(
+            line.ends_with('\n') && line.matches('\n').count() == 1,
+            "a flow is exactly one line: {line:?}"
+        );
+        let parsed = parse_flow_line(line.trim_end()).expect("the reader parses its own line");
+        assert_eq!(
+            parsed.port, 8443,
+            "the port must not be rewritten: {line:?}"
+        );
+        assert_eq!(parsed.host, "api.test_port_1_[2K");
     }
 
     #[test]

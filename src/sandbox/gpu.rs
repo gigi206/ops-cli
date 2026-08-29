@@ -11,7 +11,8 @@
 //!    driver path never depends on the host (`/run/opengl-driver` on NixOS, absent
 //!    elsewhere) and does not drift across `sbx upgrade` (same pinned nixpkgs as the
 //!    app → same mesa, no ABI skew with the app's own libgbm/libEGL);
-//! 2. the render node(s) under `/dev/dri`, granted through the device-bind mechanism;
+//! 2. the render node(s) under `/dev/dri` — the `renderD*` nodes alone, never the `card*`
+//!    primary nodes beside them — granted through the device-bind mechanism;
 //! 3. the minimal `/sys` DRM subtree the driver reads to enumerate the device,
 //!    read-only and scoped to the GPU device directories (not all of `/sys`).
 //!
@@ -32,10 +33,46 @@ use std::path::{Path, PathBuf};
 /// the error path complains about) and the GLVND EGL vendor JSON. Keyed on `lib/dri`.
 const MESA: (&str, &str, &str) = ("mesa", "lib/dri", "mesa");
 
-/// The device directory the render nodes live under. The whole directory is granted (its
-/// `card*` and `renderD*` nodes) via the device-bind mechanism: a Wayland client renders
-/// offscreen on a render node and hands the buffer to the compositor.
+/// The device directory the DRM nodes live under. Not itself the grant: [`render_nodes`] enumerates
+/// the `renderD*` entries in it, and those are what `gpu = true` binds.
 pub(crate) const DRI_DIR: &str = "/dev/dri";
+
+/// The DRM **render** nodes this host offers, as paths to bind into the cage under `gpu = true`.
+///
+/// Render nodes exist precisely so GPU access can be handed out without the primary node: a
+/// `renderD*` node offers rendering, buffer allocation and compute, and offers neither modesetting
+/// nor the GEM flink namespace. That is the whole of what a Wayland client needs — it renders
+/// offscreen and hands the buffer to the compositor — so it is the whole of what is granted.
+///
+/// Binding the containing directory instead would carry the `card*` primary nodes in with them, and
+/// a primary node with no DRM master (a second GPU on a hybrid-graphics host, say) makes its first
+/// opener the master: modesetting on a display the user is looking at, and an authenticated handle
+/// on that device's flink namespace. Neither is offscreen rendering, and `gpu = true` says it grants
+/// the render nodes. A `card*` node reaches a cage only when a trusted config names it under
+/// `[devices]`, where the grant is written down.
+///
+/// Best-effort, like [`drm_sys_paths`]: a host with no readable `/dev/dri` yields nothing and the
+/// cage falls back to software rendering, as it did before any of this existed.
+pub(crate) fn render_nodes() -> Vec<PathBuf> {
+    render_nodes_in(Path::new(DRI_DIR))
+}
+
+/// [`render_nodes`] over a named directory, so the enumeration is testable without the host's own
+/// devices deciding the answer.
+fn render_nodes_in(dri_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dri_dir) else {
+        return Vec::new();
+    };
+    let mut nodes: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|node| is_render_node(&node.file_name().to_string_lossy()))
+        .map(|node| node.path())
+        .collect();
+    // `read_dir` returns whatever order the filesystem holds; the bind list a launch emits should
+    // not depend on it.
+    nodes.sort();
+    nodes
+}
 
 /// The provisioned GPU userspace: the mesa store root to seed into the project store (so the
 /// cage reads the drivers through `/nix`) and the env pointing the cage's libgbm/libEGL at them.
@@ -123,15 +160,23 @@ pub(crate) fn drm_sys_paths() -> Vec<PathBuf> {
     paths
 }
 
-/// Whether a `/sys/class/drm` entry is a primary DRM node (`card<N>` or `renderD<N>`), as opposed
-/// to a connector (`card1-DP-1`, `card1-eDP-1`) whose device resolves to a covered subpath. Pure.
+/// Whether a `/sys/class/drm` entry is a DRM node (`card<N>` or `renderD<N>`), as opposed to a
+/// connector (`card1-DP-1`, `card1-eDP-1`) whose device resolves to a covered subpath. Pure.
 fn is_drm_node(name: &str) -> bool {
-    for prefix in ["renderD", "card"] {
-        if let Some(rest) = name.strip_prefix(prefix) {
-            return !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit());
-        }
-    }
-    false
+    is_render_node(name) || numbered_node(name, "card")
+}
+
+/// Whether a device name is a DRM **render** node (`renderD<N>`) — the half of the DRM node space
+/// [`render_nodes`] grants, as against the `card<N>` primary nodes it does not. Pure.
+fn is_render_node(name: &str) -> bool {
+    numbered_node(name, "renderD")
+}
+
+/// Whether `name` is `<prefix>` followed by at least one digit and nothing else. Written once
+/// because the two node kinds are spelled the same way and a second copy could drift from it.
+fn numbered_node(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[cfg(test)]
@@ -157,6 +202,40 @@ mod tests {
         );
     }
 
+    /// `gpu = true` grants the render nodes and only the render nodes.
+    ///
+    /// The grant used to be `/dev/dri` itself, which is a `--dev-bind` of the whole directory: the
+    /// `card*` primary nodes came in with the `renderD*` ones the driver actually needs. That is the
+    /// split render nodes exist to make — a primary node carries modesetting and the GEM flink
+    /// namespace, and an unprivileged opener of one that has no DRM master becomes its master — so
+    /// handing over the directory gives that up for a use case (a Wayland client rendering offscreen
+    /// and handing the buffer to the compositor) that never touches a `card*` node. Both the module
+    /// header and the shipped guide say "the render node(s)"; this is what makes that true.
+    #[test]
+    fn the_gpu_grant_enumerates_render_nodes_and_never_the_primary_nodes() {
+        let dri = crate::testutil::TmpDir::new();
+        for node in [
+            "renderD129",
+            "card0",
+            "renderD128",
+            "card1",
+            "by-path",
+            "renderD",
+            "cardX",
+        ] {
+            std::fs::write(dri.join(node), b"").expect("stage a device node");
+        }
+
+        assert_eq!(
+            render_nodes_in(dri.path()),
+            vec![dri.join("renderD128"), dri.join("renderD129")],
+            "only the numbered render nodes are granted, in a fixed order"
+        );
+
+        // A host with no `/dev/dri` at all grants nothing, and the cage renders in software.
+        assert!(render_nodes_in(&dri.join("absent")).is_empty());
+    }
+
     #[test]
     fn is_drm_node_accepts_primary_nodes_and_rejects_connectors() {
         assert!(is_drm_node("card0"));
@@ -171,5 +250,14 @@ mod tests {
         assert!(!is_drm_node("renderD"));
         assert!(!is_drm_node("version"));
         assert!(!is_drm_node("cardX"));
+
+        // The render half of the same space, which is what the device grant is drawn from.
+        assert!(is_render_node("renderD128"));
+        assert!(
+            !is_render_node("card0"),
+            "a primary node is not a render node"
+        );
+        assert!(!is_render_node("renderD"));
+        assert!(!is_render_node("card1-DP-1"));
     }
 }

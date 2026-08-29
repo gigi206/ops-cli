@@ -1151,7 +1151,7 @@ impl TaskEngine {
         invocation: u64,
         scan_margin: usize,
     ) -> io::Result<RawOutput> {
-        let (argv, _seccomp) = super::launch::seccomp_argv(spec)?;
+        let (argv, memfds) = super::launch::seccomp_argv(spec)?;
         let (prog, args) = super::cgroup::wrap(&self.bwrap, argv, &self.limits, spec.cage_slug());
         // A stop that arrived while the credentials were resolving is honored by not starting the
         // command at all — the earliest point at which it can be, and the only one where "stopped"
@@ -1166,14 +1166,16 @@ impl TaskEngine {
                 stopped: true,
             });
         }
-        let mut child = Command::new(prog)
-            .args(args)
-            // No stdin at all: a task is non-interactive, and an inherited stdin would be a channel
-            // into a credential-bearing command.
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let mut child = spawn_launcher(
+            Command::new(prog)
+                .args(args)
+                // No stdin at all: a task is non-interactive, and an inherited stdin would be a
+                // channel into a credential-bearing command.
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+            memfds,
+        )?;
         self.note_pid(invocation, child.id());
 
         // Read both streams on their own threads so neither can block the other by filling its pipe
@@ -2106,6 +2108,37 @@ struct RawOutput {
     stopped: bool,
 }
 
+/// Spawn a cage launcher, then close this process's copies of the descriptors bwrap was told to
+/// read.
+///
+/// [`super::launch::seccomp_argv`] returns the compiled seccomp filters and the `--args` file as
+/// anonymous in-memory files that are deliberately **not** close-on-exec ([`super::memfd`]), because
+/// bwrap has to still be able to read them after the exec. A descriptor that survives one exec
+/// survives every exec this process makes while it is open, and `Command::spawn` closes nothing in
+/// the child that it was not told about — so every one of these that is still open when a *sibling*
+/// cage is spawned is inherited by that sibling's command.
+///
+/// That is not a theoretical cost here: the `--args` file of a task invocation holds its
+/// `--setenv <VAR> <plaintext>` credential pairs, [`MAX_LIVE`] invocations may run at once, and a
+/// task cage runs a program from the project tree — a tree the agent's own cage may write. Holding
+/// the descriptors for the run would therefore hand one invocation's resolved credential to any
+/// other invocation started during it, walking around the pid namespace that keeps a task's
+/// `/proc/<pid>/environ` out of the agent's reach.
+///
+/// `spawn` has already forked and exec'd by the time it returns, so the descriptors have done their
+/// whole job and this is the earliest moment they can go. What remains is the fork window itself: a
+/// sibling spawning between this `spawn` and this `drop` still inherits them. Closing that residual
+/// means creating the file close-on-exec and clearing the flag only on the child's own copy, which
+/// is a property of [`super::memfd`] rather than of any call site.
+pub(super) fn spawn_launcher(
+    command: &mut Command,
+    memfds: Vec<std::fs::File>,
+) -> io::Result<std::process::Child> {
+    let child = command.spawn()?;
+    drop(memfds);
+    Ok(child)
+}
+
 /// Read a stream up to `cap` bytes, reporting whether it was cut. Reading continues past the cap
 /// (draining the pipe) so the command is never blocked on a full pipe — only the *kept* bytes are
 /// bounded.
@@ -2997,6 +3030,65 @@ mod smoke {
 mod tests {
     use super::*;
     use crate::config::{Encoding, ParamBound, TaskParam, TaskSecret};
+
+    // --- what a launcher leaves open ---
+
+    /// Whether this process still holds the file identified by `(dev, ino)` open.
+    ///
+    /// Asked by identity rather than by descriptor number: a number freed by a close is reused
+    /// immediately, and the harness runs other tests on other threads, so a number-based check would
+    /// answer about whatever opened next.
+    fn holds_open(dev: u64, ino: u64) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::read_dir("/proc/self/fd")
+            .expect("/proc/self/fd")
+            .flatten()
+            .any(|entry| {
+                std::fs::metadata(entry.path())
+                    .map(|m| m.dev() == dev && m.ino() == ino)
+                    .unwrap_or(false)
+            })
+    }
+
+    /// A launcher's `--args` file holds the invocation's resolved credential in plaintext and is
+    /// deliberately **not** close-on-exec, so bwrap can still read it after the exec. A descriptor
+    /// with that property survives *every* exec this process makes while it is open — so one kept
+    /// for the length of a run is inherited by every sibling cage spawned during it, and a task cage
+    /// runs a program from the project tree, which the agent's own cage may write. That walks around
+    /// the pid namespace keeping a task's `/proc/<pid>/environ` out of the agent's reach.
+    ///
+    /// The descriptors have done their whole job once `spawn` has forked, which is why they are
+    /// taken by value here and the caller is handed back only the child.
+    #[test]
+    fn a_launchers_credential_memfds_do_not_outlive_the_fork_that_carries_them() {
+        use std::os::unix::fs::MetadataExt;
+
+        let args = super::super::memfd::write(c"sbx-args", b"--setenv\0DB_PASSWORD\0hunter2\0")
+            .expect("an anonymous file");
+        let meta = args.metadata().expect("the anonymous file's identity");
+        let (dev, ino) = (meta.dev(), meta.ino());
+        assert!(
+            holds_open(dev, ino),
+            "the fixture must start with the descriptor open"
+        );
+
+        let mut child = spawn_launcher(
+            Command::new("/bin/sh")
+                .args(["-c", ":"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+            vec![args],
+        )
+        .expect("a launcher that exists");
+
+        assert!(
+            !holds_open(dev, ino),
+            "the invocation's credential file is still open, so every cage spawned while this one \
+             runs inherits it"
+        );
+        let _ = child.wait();
+    }
 
     // --- how many run at once ---
 

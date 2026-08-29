@@ -51,6 +51,10 @@
 //! → DETACH <name>                 ← id <n>, then `ok` — or `err <reason>`
 //!   param/env payloads, then run
 //! → RESULT <id>                   ← the same shape a `RUN` answers with, or `err <reason>`
+//! → INFO <id-or-name>             ← field <key>\t<value>… then `ok`, or `err <reason>` — a live
+//!                                    invocation's state and declaration, a finished one's log
+//!                                    entry and the declaration it ran under, or an operation's
+//!                                    declaration alone
 //! ```
 //!
 //! `DETACH` and `RESULT` are on **this** socket rather than the crossing one, and that placement is
@@ -148,7 +152,8 @@ const MAX_CONCURRENT_CONNS: usize = 32;
 const CAGE_FIRST_REQUEST: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The most one request may make sbx hold, keys and values together, before anything about it has
-/// been validated.
+/// been validated. Held literally: [`read_payloads`] refuses a payload that is not valid UTF-8
+/// rather than expanding it, so what a field is charged is what a field costs.
 ///
 /// The per-payload ceiling alone does not bound a request: a caller sending a thousand empty
 /// payloads costs nothing per payload and a map entry each time. So what is bounded is the whole
@@ -394,26 +399,26 @@ fn head_field(text: &str) -> String {
 /// The session's bounded, in-RAM invocation log. Never written to disk and never readable from the
 /// cage — it is the supervisor's own record for the session's lifetime, and it dies with it.
 ///
-/// # The lock cannot be poisoned, and that is a property to keep
+/// # The lock recovers from a poisoning, and its critical sections are what make that sound
 ///
-/// Every method here takes the lock with an `expect`, which an audit read as five places a panic in
-/// one connection thread would turn into a plane that answers nothing. It cannot: a mutex is
-/// poisoned by a panic that unwinds *while the guard is held*, and none of the critical sections in
-/// this file or in [`TaskResults`] can unwind. Enumerated, because that is the only way to know it:
-/// stamping a time (`duration_since` is matched, `saturating_sub` cannot overflow), counting,
-/// pushing and popping a `VecDeque`, and cloning entries out of it. No indexing, no slicing, no
-/// arithmetic that can overflow, no `unwrap` on anything fallible, and nothing that calls out.
+/// Every method here takes the lock through [`crate::sandbox::locks::locked`], which hands back what
+/// the lock was guarding rather than propagating a previous holder's panic. This is the recovering
+/// class that module names: an entry that is not appended is gone, a record that silently loses
+/// entries is the one failure this ring exists to prevent, and `sbx task status` reading through a
+/// second panic would destroy the record instead of reporting it.
+///
+/// Recovering is sound only because no critical section here can leave the data half-written, and
+/// none of them can unwind at all. Enumerated, because that is the only way to know it: stamping a
+/// time (`duration_since` is matched, `saturating_sub` cannot overflow), counting, pushing and
+/// popping a `VecDeque`, and cloning entries out of it. No indexing, no slicing, no arithmetic that
+/// can overflow, no `unwrap` on anything fallible, and nothing that calls out. So a poisoned guard
+/// holds a `VecDeque` that is valid, at worst without the entry that was being appended.
 ///
 /// What would break it: moving fallible or panicking work **inside** a guard — a helper called with
 /// the lock held, a slice index, an `unwrap`. Keep the work outside and hold the lock only for the
-/// container operation, which is what every method here does.
-///
-/// Why `expect` rather than the degrade the proxy's certificate cache chose (its module is private
-/// to `proxy`, so this names it rather than linking it): a leaf that
-/// cannot be read from a cache can be minted again, so continuing there costs a signature. An entry
-/// that is not appended here is gone, and a record that silently loses entries is the one failure
-/// this ring exists to prevent. If the invariant above ever breaks, a caller being told so loudly
-/// is the better of two bad answers.
+/// container operation, which is what every method here does. Taking the lock any other way — an
+/// `unwrap`, an `expect`, a degrade to `.ok()` — would re-decide here a question
+/// [`crate::sandbox::locks`] decides once for the whole program.
 #[derive(Default)]
 pub(crate) struct TaskLog {
     inner: Mutex<Inner>,
@@ -528,9 +533,10 @@ type Held = Result<TaskOutcome, String>;
 /// session, which is also the longest a detached invocation can live — the plane runs in the session's
 /// process, so nothing is ever waiting for a result whose session is gone.
 ///
-/// Its lock cannot be poisoned either, by the same enumeration and for the same reason: the two
-/// critical sections below hold it for a `VecDeque` push, pop and scan, and nothing else. See
-/// [`TaskLog`] for the invariant and what would break it.
+/// Its lock recovers from a poisoning for the same reason and by the same enumeration: the two
+/// critical sections below hold it for a `VecDeque` push, pop and scan, and nothing else, so
+/// [`crate::sandbox::locks::locked`] can hand back a record a panic touched. See [`TaskLog`] for the
+/// enumeration in full and for what would break it.
 #[derive(Default)]
 pub(crate) struct TaskResults {
     inner: Mutex<std::collections::VecDeque<(u64, Held)>>,
@@ -891,7 +897,16 @@ fn read_payloads(reader: &mut impl io::BufRead) -> io::Result<Result<Payloads, &
         // payload and then never ends its line is the same unbounded read as one that never ends
         // its first, and this one is easy to miss because nothing is done with what it returns.
         let _ = read_request_line(reader);
-        let value = String::from_utf8_lossy(&buf).into_owned();
+        // Refused rather than repaired. `String::from_utf8_lossy` replaces each invalid byte with a
+        // three-byte U+FFFD, so a payload charged `len` above was retained as up to three times that
+        // and the ceiling admitted three times what it says it admits — on a thread that belongs to
+        // sbx, outside the cgroup bounding the cage's own memory. Refusing keeps the charge exact by
+        // construction, and it is also the honest answer: a bound is checked against the value that
+        // arrived, and a rewritten copy is not that value. Every legitimate sender writes a `String`,
+        // so nothing but a probe reaches this.
+        let Ok(value) = String::from_utf8(buf) else {
+            return Ok(Err("payload is not valid UTF-8"));
+        };
         match kind {
             "param" => params.insert(key.to_string(), value),
             "env" => env.insert(key.to_string(), value),
@@ -1215,15 +1230,19 @@ fn write_outcome(writer: &mut UnixStream, id: u64, outcome: &TaskOutcome) -> io:
     writeln!(writer, "ok")
 }
 
-/// Serve one connection on the session's host-only socket: `LOG` (optionally `after=<seq>`),
-/// `STATUS`, or `STOP <id>`.
+/// Serve one connection on the session's host-only socket: `STATUS`, `DETACH <name>`,
+/// `RESULT <id>`, `INFO <id-or-name>`, `STOP <id>`, or `LOG` (optionally `after=<seq>`).
 ///
-/// All three are here rather than on the crossing socket, and that placement *is* the access
-/// control: this socket is never bound into a cage, so the in-cage client cannot express these verbs
-/// however it is called. The reasons differ by verb and both matter. `LOG`: the recorded party does
-/// not get to read the record. `STATUS`/`STOP`: ids are per session, so an in-cage caller reaching
+/// All six are here rather than on the crossing socket, and that placement *is* the access control:
+/// this socket is never bound into a cage, so the in-cage client cannot express these verbs however
+/// it is called. The reasons differ by verb and each matters. `LOG`: the recorded party does not get
+/// to read the record. `STATUS`/`STOP`/`INFO`: ids are per session, so an in-cage caller reaching
 /// them could see and end an invocation *another* caller started — the human at the terminal — and
 /// nothing in the cage distinguishes the two, since a task plane has no per-caller identity.
+///
+/// `DETACH`/`RESULT`: a detached invocation is one nobody is waiting for, so putting its start
+/// within reach of a cage would let a caller create invocations it cannot then see or end, and hold
+/// several at once — which having to wait is what prevents.
 fn serve_host(
     stream: UnixStream,
     engine: &Arc<TaskEngine>,
@@ -1806,6 +1825,46 @@ mod tests {
 
         drop(theirs);
         let _ = flood.join();
+    }
+
+    /// What a field is charged must be what a field costs.
+    ///
+    /// `String::from_utf8_lossy` replaces every invalid byte with a three-byte U+FFFD, so a payload
+    /// declared and charged `len` was retained as up to `3 * len`: [`MAX_REQUEST_BYTES`] — the one
+    /// bound between the cage and a thread whose memory is sbx's, outside the cgroup bounding the
+    /// cage's — admitted three times what its own doc says it admits, across all
+    /// [`MAX_CONCURRENT_CONNS`] connections at once and with nothing recorded anywhere. Refusing the
+    /// payload keeps the charge exact by construction; the second half pins that this is a refusal
+    /// of bytes that are not text and not of text that is merely multi-byte.
+    #[test]
+    fn a_payload_that_is_not_utf8_is_refused_rather_than_expanded_past_the_ceiling() {
+        let mut request = Vec::new();
+        request.extend_from_slice(b"param k 4\n");
+        request.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        request.extend_from_slice(b"\nrun\n");
+        assert_eq!(
+            read_payloads_of(request).expect("the read itself succeeds"),
+            Err("payload is not valid UTF-8")
+        );
+
+        // Multi-byte text is not what this refuses, and what is stored is exactly what was charged.
+        let value = "SELECT 1\nFROM café".as_bytes();
+        let mut request = Vec::new();
+        request.extend_from_slice(format!("param sql {}\n", value.len()).as_bytes());
+        request.extend_from_slice(value);
+        request.extend_from_slice(b"\nrun\n");
+        let (params, _) = read_payloads_of(request)
+            .expect("the read itself succeeds")
+            .expect("valid UTF-8 is admitted");
+        assert_eq!(
+            params.get("sql").map(String::len),
+            Some(value.len()),
+            "the stored value must weigh what the ceiling was told it weighs"
+        );
+        assert_eq!(
+            params.get("sql").map(String::as_str),
+            Some("SELECT 1\nFROM café")
+        );
     }
 
     /// One payload under the ceiling is admitted; the request they add up to is bounded too.

@@ -116,8 +116,15 @@ pub(crate) struct Egress {
 }
 
 impl Egress {
-    /// A snapshot of every egress decision this session logged, newest last. Taken after the cage
-    /// exits (no more requests can arrive), it is the run's full record for `--net-learn`.
+    /// A snapshot of every egress decision **this ring** holds, newest last. Taken after the cage
+    /// exits (no more requests can arrive), it is the run's record for `--net-learn`.
+    ///
+    /// It is the session's record, not the agent proxy's alone: a declared operation's
+    /// per-invocation proxy appends to this same ring ([`Self::event_log`] says why), under a policy
+    /// of its own that is deliberately narrower, and a [`super::control::LogEvent`] carries nothing
+    /// naming the proxy that pushed it. So a consumer that turns refusals into *policy* must not
+    /// read a refusal here as necessarily the agent plane's — [`super::netlearn`] states the gate it
+    /// applies for that reason.
     pub(crate) fn observed_events(&self) -> Vec<super::control::LogEvent> {
         // The run's full record includes muted refusals (`--all`) — a `mute` rule only suppresses a
         // live log *view*, it never removes a decision from what `--net-learn` observed.
@@ -134,6 +141,12 @@ impl Egress {
     /// proxy made was invisible for the life of the session. Sharing the session's ring is the same
     /// answer [`crate::sandbox::task::TaskEngine::with_signer_log`] already gives for what a task's
     /// proxy signs.
+    ///
+    /// What it costs: the merged ring is the *display* record of a session, and the two planes it
+    /// merges do not share a policy. Everything that reads it for display is right to; a reader that
+    /// writes policy from it — `--net-learn`, through [`Self::observed_events`] — cannot separate the
+    /// two, because an event names no proxy. Until it can, that is a property of the ring, and the
+    /// consumer holds the line.
     pub(crate) fn event_log(&self) -> Arc<super::control::LogRing> {
         Arc::clone(&self.log)
     }

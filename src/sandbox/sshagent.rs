@@ -579,14 +579,23 @@ fn refused_message_name(kind: u8, payload: &[u8]) -> String {
     // `ssh-add -D` sends both spellings of the same command. Left unnamed, one wipe attempt would
     // read as a refusal in words plus a mysterious bare type number; named identically, it would
     // read as two attempts. Marked, it reads as what it is: one command, twice on the wire.
+    //
+    // The *constrained* twins are filed with their plain forms, being the same commands: 24 and 25
+    // are key-adds (`SSH_AGENTC_ADD_RSA_ID_CONSTRAINED` and `SSH2_AGENTC_ADD_ID_CONSTRAINED`, what
+    // `ssh-add -c` or `-t` sends), and 26 is a smartcard add
+    // (`SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED`, what `ssh-add -s <provider> -c` sends). Getting
+    // that wrong is not a policy failure — the allowlist refuses every one of them either way — but
+    // a record failure, and this record exists so that an operator reading it afterwards sees what
+    // was actually attempted. An attempted key implant filed as an attempted key removal reads as
+    // housekeeping noise, which is the opposite of what it is.
     let what = match kind {
-        7 | 17 | 25 => "to add a key to your agent",
-        8 | 18 | 26 => "to remove a key from your agent",
+        7 | 17 | 24 | 25 => "to add a key to your agent",
+        8 | 18 => "to remove a key from your agent",
         19 => "to remove every key from your agent",
         9 => "to remove every key from your agent (the SSH-1 spelling of the same command)",
         22 => "to lock your agent",
         23 => "to unlock your agent",
-        20 | 21 => "to add or drop a smartcard in your agent",
+        20 | 21 | 26 => "to add or drop a smartcard in your agent",
         EXTENSION => {
             let named = extension_name(payload).is_some();
             return format!(
@@ -1068,9 +1077,10 @@ mod tests {
     #[test]
     fn every_message_type_outside_the_allowlist_is_refused_and_never_forwarded() {
         let filter = Filter::new(&["work-key".into()]);
-        // Add, add-constrained, remove, remove-all, lock, unlock, both smartcard verbs — and a type
-        // this code has never heard of, which is the point of an allowlist.
-        for kind in [17u8, 25, 18, 19, 22, 23, 20, 21, 200, 0] {
+        // Add, add-constrained (both spellings), remove, remove-all, lock, unlock, both smartcard
+        // verbs and the constrained smartcard add — and a type this code has never heard of, which
+        // is the point of an allowlist.
+        for kind in [17u8, 24, 25, 18, 19, 22, 23, 20, 21, 26, 200, 0] {
             let mut host = FakeAgent::new(vec![vec![6u8]]);
             let reply = respond(
                 &[kind, 0, 0, 0, 0],
@@ -1797,6 +1807,41 @@ mod tests {
             !named.contains("evil@example"),
             "the extension's own name never reaches the record: {named}"
         );
+    }
+
+    /// The constrained key-adds are recorded as key-adds, which is the one thing this record is for.
+    ///
+    /// OpenSSH numbers each add twice: `SSH_AGENTC_ADD_RSA_ID_CONSTRAINED` (24) beside
+    /// `SSH_AGENTC_ADD_RSA_IDENTITY` (7), `SSH2_AGENTC_ADD_ID_CONSTRAINED` (25) beside
+    /// `SSH2_AGENTC_ADD_IDENTITY` (17), and `SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED` (26) beside
+    /// `SSH_AGENTC_ADD_SMARTCARD_KEY` (20). 26 sat in the *remove* arm, so an attempt to plant a
+    /// key — the most alarming thing this broker can witness, and what `ssh-add -s <provider> -c`
+    /// sends — was filed as an attempted removal; 24 sat in no arm at all and read as a type the
+    /// broker had never heard of. The allowlist refuses every one of them whatever they are called,
+    /// so nothing was ever granted: what was wrong was the account of it.
+    #[test]
+    fn a_constrained_key_add_is_recorded_as_a_key_add_and_not_as_a_removal() {
+        for kind in [7u8, 17, 24, 25] {
+            assert_eq!(
+                refused_message_name(kind, &[]),
+                "an attempt to add a key to your agent",
+                "message type {kind} is a key-add"
+            );
+        }
+        for kind in [20u8, 21, 26] {
+            assert_eq!(
+                refused_message_name(kind, &[]),
+                "an attempt to add or drop a smartcard in your agent",
+                "message type {kind} is a smartcard verb"
+            );
+        }
+        for kind in [8u8, 18] {
+            assert_eq!(
+                refused_message_name(kind, &[]),
+                "an attempt to remove a key from your agent",
+                "message type {kind} is a key-removal"
+            );
+        }
     }
 
     #[test]

@@ -16,12 +16,25 @@
 //! `dbus = true` the cage gets a private bus and no host bus at all, so the relay is its *only*
 //! route to the host daemon and everything the relay forwards is capability it would otherwise not
 //! have. What it forwards is the notifications interface alone (no keyring, no portal, no other host
-//! service). The residual accepted is notification **spoofing**: the cage picks the app name, icon
-//! and text of a toast the user reads as the desktop's. Notification **hijacking** is not accepted —
-//! `Notify`'s `replaces_id` and `CloseNotification` are checked against the ids the host daemon
-//! actually returned for this cage's own calls ([`OwnedIds`]), so the cage cannot overwrite or
-//! dismiss a notification it never raised, sbx's own refusal toasts ([`super::notify_sink`])
-//! included.
+//! service). The residual accepted is notification **spoofing**: the cage picks the *text* of a
+//! toast the user reads as the desktop's. Three things are held back from it, because each of them
+//! turns spoofing into something else:
+//!
+//! - **Identity.** The application name is written by the supervisor first and by the cage only
+//!   after it ([`relayed_app_name`]). sbx raises its own refusal toasts on this same host daemon,
+//!   under `sbx` or `sbx · <session>` ([`super::notify_sink`]), and those carry the copy-and-paste
+//!   command that widens a launch's network policy — so a cage free to spell its own `app_name`
+//!   could ask the user, in sbx's own voice, to open a hole for it.
+//! - **Host files.** The icon a daemon renders is a path *the daemon* opens, host-side, in its own
+//!   process. A relayed `app_icon` is therefore reduced to a bare theme name and the hints that name
+//!   a file are dropped ([`relayed_app_icon`], [`HOST_PATH_HINTS`]); a caged app has no host path
+//!   worth naming in any case, since everything it can see is inside the cage.
+//! - **Other applications' notifications.** `Notify`'s `replaces_id` and `CloseNotification` are
+//!   checked against the ids the host daemon actually returned for this cage's own calls
+//!   ([`OwnedIds`]), so the cage can neither overwrite nor dismiss a notification it never raised,
+//!   sbx's own refusal toasts included; and the host's `ActionInvoked`/`NotificationClosed` cross
+//!   back onto the private bus only for those same ids, so the rest of the desktop's notification
+//!   traffic is not a stream the cage can subscribe to.
 //!
 //! Lifecycle: [`NotifyRelay::start`] spawns a dedicated thread that drives the async work with
 //! `async_io::block_on` (the pure-Rust async-io backend — no tokio, and the runtime never leaves this
@@ -89,8 +102,9 @@ pub(crate) trait HostNotifications {
     fn notification_closed(&self, id: u32, reason: u32) -> zbus::Result<()>;
 }
 
-/// One `Notify` as it leaves the relay: the caged app's arguments, with `replaces_id` already
-/// settled by the guard in [`Served::notify`] rather than as the cage spelled it.
+/// One `Notify` as it leaves the relay — which is not one `Notify` as the cage made it. The fields
+/// the guards in [`Served::notify`] settle (`replaces_id`, `app_name`, `app_icon` and the hints that
+/// name a host file) already hold what will go on the host bus, not what the cage spelled.
 struct NotifyCall {
     app_name: String,
     replaces_id: u32,
@@ -182,10 +196,17 @@ impl OwnedIds {
         locked(&self.0).insert(id);
     }
 
-    /// Forget an id the host reported closed. Keeps the set to the cage's *live* notifications, so a
-    /// long-running app does not accumulate ids for the whole launch.
-    fn forget(&self, id: u32) {
-        locked(&self.0).remove(&id);
+    /// Rule on a host `NotificationClosed` for `id`: whether it named one of this cage's own
+    /// notifications — and therefore crosses back onto the private bus — while dropping the id from
+    /// the live set either way. Keeps the set to the cage's *live* notifications, so a long-running
+    /// app does not accumulate ids for the whole launch, and so an id the host later recycles for
+    /// another application is not still claimed as the cage's.
+    ///
+    /// One method rather than a test and a `forget` spelled out at the call site, because the order
+    /// is the whole of it: forgetting first answers `false` for the cage's own notification, and the
+    /// app never learns its own toast was dismissed.
+    fn closing(&self, id: u32) -> bool {
+        id != 0 && locked(&self.0).remove(&id)
     }
 
     /// Whether `id` is one of this cage's own live notifications. `0` is never owned — in the
@@ -195,12 +216,63 @@ impl OwnedIds {
     }
 }
 
+/// What the supervisor writes at the front of every relayed notification's application name.
+///
+/// The daemon gives the sending application a line of its own and shows it whole, so this is the
+/// one field of a toast whose author the user can rely on. sbx's own refusal toasts occupy the same
+/// line under `sbx` or `sbx · <session>` ([`super::notify_sink`]) and carry the command that widens
+/// a launch's network policy; a cage that could spell that line could ask the user to run it.
+///
+/// Deliberately not a name beginning with `sbx`: the point is that the two are told apart at a
+/// glance, and a marker that starts the same way as the thing it is distinguishing from is not one.
+const RELAYED_BY: &str = "sandboxed";
+
+/// Hints that name a **file for the host daemon to open**, dropped from every relayed call.
+///
+/// A notification daemon fetches an `image-path` (and its deprecated `image_path` spelling) and a
+/// `sound-file` itself, host-side, in its own process — so a hint forwarded verbatim points a host
+/// process at a host path the cage chose, sbx's own mark under the data directory included. Nothing
+/// legitimate is lost: a caged app's paths name files inside the cage, where the host daemon cannot
+/// follow them anyway.
+///
+/// The in-band pixel hints (`image-data`, `icon_data`) are deliberately **not** here: they carry the
+/// image rather than a path to one, so they open nothing, and they are how an ordinary application
+/// puts an avatar or a cover on its own notification.
+const HOST_PATH_HINTS: &[&str] = &["image-path", "image_path", "sound-file"];
+
+/// The application name a relayed notification is announced under: [`RELAYED_BY`], then whatever the
+/// caged app called itself. The cage writes the tail of the line and can never reach in front of the
+/// head, so no toast the relay forwards presents itself as sbx's own or as another application's.
+fn relayed_app_name(app_name: &str) -> String {
+    if app_name.is_empty() {
+        RELAYED_BY.to_string()
+    } else {
+        format!("{RELAYED_BY} · {app_name}")
+    }
+}
+
+/// The icon a relayed notification is announced with: a bare freedesktop theme name, or none.
+///
+/// `app_icon` is either a theme name the daemon resolves or a filename the daemon **opens**, and the
+/// daemon is a host process — so a path here is the cage naming a host file for something else to
+/// read. Anything shaped like a path or a URI is therefore dropped and the toast simply carries no
+/// icon; a bare name is kept, since resolving it against the user's own theme reaches nothing the
+/// cage chose. See [`HOST_PATH_HINTS`] for the hints that carry the same thing by another route.
+fn relayed_app_icon(app_icon: &str) -> &str {
+    // A path and a URI both carry a separator; a theme name never does.
+    if app_icon.contains('/') {
+        return "";
+    }
+    app_icon
+}
+
 /// The interface served on the **private** bus: every method is forwarded to the host proxy. A
 /// forwarding error becomes an `fdo` error reply so the caged app sees a clean failure rather than a
 /// dropped call.
 struct Served {
     host: Box<dyn HostBus>,
-    /// Shared with the signal pump in [`run`], which forgets an id when the host reports it closed.
+    /// Shared with the signal pump in [`run`], which rules the host's close signals on it and drops
+    /// each id as it goes.
     ours: Arc<OwnedIds>,
 }
 
@@ -226,16 +298,20 @@ impl Served {
         } else {
             0
         };
+        // The identity fields are the supervisor's to write, not the cage's: see the module header
+        // for what a verbatim `app_name` and a verbatim icon path each buy an agent inside the cage.
+        let mut relayed_hints = hints;
+        relayed_hints.retain(|hint, _| !HOST_PATH_HINTS.contains(&hint.as_str()));
         let id = self
             .host
             .notify(NotifyCall {
-                app_name,
+                app_name: relayed_app_name(&app_name),
                 replaces_id,
-                app_icon,
+                app_icon: relayed_app_icon(&app_icon).to_string(),
                 summary,
                 body,
                 actions,
-                hints,
+                hints: relayed_hints,
                 expire_timeout,
             })
             .await
@@ -247,9 +323,9 @@ impl Served {
     async fn close_notification(&self, id: u32) -> fdo::Result<()> {
         // Same rule as `replaces_id`: an id outside the set is either foreign — the cage must not
         // dismiss what it never raised — or one of the cage's own that the host has already closed
-        // (`forget` dropped it then). Answered `Ok` rather than as an error because of the second
-        // case: an app closing a notification that has just expired must not start seeing failures,
-        // and closing an already-closed notification is a no-op on the host daemon too.
+        // (`OwnedIds::closing` dropped it then). Answered `Ok` rather than as an error because of
+        // the second case: an app closing a notification that has just expired must not start seeing
+        // failures, and closing an already-closed notification is a no-op on the host daemon too.
         if !self.ours.owns(id) {
             return Ok(());
         }
@@ -369,22 +445,35 @@ async fn run(
                 Some(sig) => if let Ok(a) = sig.args() {
                     // Verbatim id → the app matches the signal to its own notification.
                     let (id, key) = (a.id, a.action_key.to_string());
-                    let _ = private_conn
-                        .emit_signal(None::<&str>, OBJECT, IFACE, "ActionInvoked", &(id, key.as_str()))
-                        .await;
+                    // The host daemon's signals are desktop-wide: they fire for every application on
+                    // the user's session, not for this cage. `emit_signal(None, …)` is a broadcast
+                    // and the private bus lets any process receive it, so a foreign signal relayed
+                    // in is a live host→cage channel — which buttons a human is clicking elsewhere,
+                    // and an id counter whose deltas count the desktop's notification volume. The
+                    // set that decides `replaces_id` decides this too, at no functional cost: the
+                    // cage's own click-to-focus and action buttons are precisely the owned ids.
+                    if ours.owns(id) {
+                        let _ = private_conn
+                            .emit_signal(None::<&str>, OBJECT, IFACE, "ActionInvoked", &(id, key.as_str()))
+                            .await;
+                    }
                 },
                 None => break,
             },
             sig = closed.next().fuse() => match sig {
                 Some(sig) => if let Ok(a) = sig.args() {
                     let (id, reason) = (a.id, a.reason);
-                    // Whoever raised it, this id now names nothing: drop it so the set stays the
-                    // cage's live notifications, and an id the host later recycles for another app's
-                    // notification is not still claimed as the cage's.
-                    ours.forget(id);
-                    let _ = private_conn
-                        .emit_signal(None::<&str>, OBJECT, IFACE, "NotificationClosed", &(id, reason))
-                        .await;
+                    // Whoever raised it, this id now names nothing, so it leaves the set either way;
+                    // only the cage's own closures cross back. A desktop-wide close signal tells a
+                    // watching agent whether a human dismissed a toast (reason 2) or it expired
+                    // unread (reason 1) — a presence-and-attention oracle, and one that answers for
+                    // sbx's *own* refusal toasts, so the cage could tell whether its blocked request
+                    // was seen before deciding what to try next.
+                    if ours.closing(id) {
+                        let _ = private_conn
+                            .emit_signal(None::<&str>, OBJECT, IFACE, "NotificationClosed", &(id, reason))
+                            .await;
+                    }
                 },
                 None => break,
             },
@@ -406,15 +495,16 @@ mod tests {
     /// cage asked for. No session bus, so the whole cage-facing path runs on any machine.
     #[derive(Clone, Default)]
     struct FakeHost {
-        /// The `replaces_id` of every forwarded `Notify`, in order.
-        replaced: Arc<Mutex<Vec<u32>>>,
+        /// Every forwarded `Notify` as it actually reached the daemon, in order — what the relay
+        /// put on the host bus, never what the cage asked it to.
+        calls: Arc<Mutex<Vec<NotifyCall>>>,
         /// The id of every forwarded `CloseNotification`, in order.
         closed: Arc<Mutex<Vec<u32>>>,
     }
 
     impl FakeHost {
         fn replaced(&self) -> Vec<u32> {
-            locked(&self.replaced).clone()
+            locked(&self.calls).iter().map(|c| c.replaces_id).collect()
         }
 
         fn closed(&self) -> Vec<u32> {
@@ -424,10 +514,10 @@ mod tests {
 
     impl HostBus for FakeHost {
         fn notify(&self, call: NotifyCall) -> BoxFuture<'_, zbus::Result<u32>> {
-            let mut replaced = locked(&self.replaced);
-            replaced.push(call.replaces_id);
-            let id = FIRST_ID + replaced.len() as u32 - 1;
-            drop(replaced);
+            let mut calls = locked(&self.calls);
+            calls.push(call);
+            let id = FIRST_ID + calls.len() as u32 - 1;
+            drop(calls);
             Box::pin(std::future::ready(Ok(id)))
         }
 
@@ -457,17 +547,36 @@ mod tests {
 
     /// One `Notify` as the caged app makes it, answered with the id the relay returns to the cage.
     fn notify(served: &Served, replaces_id: u32) -> u32 {
+        notify_as(served, "caged-app", replaces_id, "", HashMap::new())
+    }
+
+    /// The same, with the identity fields the cage chooses spelled out: the application name it
+    /// claims, the icon it names, and the hints it sends.
+    fn notify_as(
+        served: &Served,
+        app_name: &str,
+        replaces_id: u32,
+        app_icon: &str,
+        hints: HashMap<String, OwnedValue>,
+    ) -> u32 {
         async_io::block_on(served.notify(
-            "caged-app".to_string(),
+            app_name.to_string(),
             replaces_id,
-            String::new(),
+            app_icon.to_string(),
             "summary".to_string(),
             "body".to_string(),
             Vec::new(),
-            HashMap::new(),
+            hints,
             -1,
         ))
         .expect("the recording host accepts every call forwarded to it")
+    }
+
+    /// A hint value, as a caged app would send one.
+    fn hint(value: &str) -> OwnedValue {
+        zbus::zvariant::Value::from(value)
+            .try_into()
+            .expect("a string is a hint value")
     }
 
     #[test]
@@ -540,7 +649,136 @@ mod tests {
         );
 
         // Once the host reports it closed the id names nothing, and may be recycled for someone else.
-        ours.forget(7);
+        assert!(ours.closing(7), "the cage's own notification closing");
         assert!(!ours.owns(7), "a closed id is no longer the cage's");
+    }
+
+    /// A host signal crosses into the cage only for a notification the cage itself raised.
+    ///
+    /// The host daemon's `ActionInvoked` and `NotificationClosed` fire for every application on the
+    /// user's desktop, and the relay re-emitted both onto the private bus unfiltered — a broadcast
+    /// any process in the cage can subscribe to. What that carried is small but real: whether a
+    /// human dismissed a toast or let it expire (a presence-and-attention oracle, answered for
+    /// sbx's own refusal toasts as much as for anyone's), other applications' action keys, and an id
+    /// stream whose deltas count how many notifications the rest of the desktop raised. The set that
+    /// already decides `replaces_id` is the filter, and it costs the cage nothing it is entitled to:
+    /// its own click-to-focus and action buttons are precisely the ids it owns.
+    ///
+    /// The close rule is the one with an order inside it — ownership has to be read *before* the id
+    /// is dropped, or the cage never learns that its own notification was dismissed.
+    #[test]
+    fn a_host_signal_crosses_into_the_cage_only_for_a_notification_the_cage_raised() {
+        let ours = OwnedIds::default();
+        ours.record(FIRST_ID);
+
+        // `ActionInvoked`: the cage's own button click crosses back; another application's does not.
+        assert!(ours.owns(FIRST_ID), "the cage's own notification");
+        assert!(
+            !ours.owns(FIRST_ID + 1),
+            "a button clicked on another application's notification is not the cage's business"
+        );
+
+        // `NotificationClosed`: a foreign close is dropped, and the cage's own crosses back.
+        assert!(
+            !ours.closing(FIRST_ID + 1),
+            "the desktop closing someone else's notification must not reach the cage"
+        );
+        assert!(
+            ours.closing(FIRST_ID),
+            "the cage must still learn that its own notification was dismissed"
+        );
+        // And once only: the id now names nothing and the host may recycle it for another app.
+        assert!(
+            !ours.closing(FIRST_ID),
+            "a closed id is no longer the cage's"
+        );
+        assert!(!ours.owns(FIRST_ID), "nor may it be replaced afterwards");
+    }
+
+    /// The application name a relayed toast is announced under is written by the supervisor first.
+    ///
+    /// `app_name` is the one line of a notification a desktop shows whole and attributes to a
+    /// sender, and sbx raises its own refusal toasts on this same daemon under `sbx · <session>`,
+    /// with a body that ends "· allow it: sbx net allow <host>". Forwarded verbatim, a caged agent
+    /// could reproduce that line exactly and ask the user, in the supervisor's voice, to widen the
+    /// network policy for a host it picked. The cage still names itself — that is what the line is
+    /// for — but only after a marker it cannot get in front of.
+    #[test]
+    fn notify_announces_a_relayed_toast_under_a_name_the_cage_cannot_write_the_front_of() {
+        let host = FakeHost::default();
+        let served = served(&host);
+
+        notify_as(&served, "Slack", 0, "", HashMap::new());
+        // sbx's own line, spelled by the cage exactly as `notify_sink` composes it.
+        notify_as(&served, "sbx · kiro@ops-cli[4242]", 0, "", HashMap::new());
+        notify_as(&served, "", 0, "", HashMap::new());
+
+        let calls = locked(&host.calls);
+        let announced: Vec<&str> = calls.iter().map(|c| c.app_name.as_str()).collect();
+        assert_eq!(
+            announced,
+            vec![
+                "sandboxed · Slack",
+                "sandboxed · sbx · kiro@ops-cli[4242]",
+                "sandboxed"
+            ],
+            "every relayed name is the supervisor's marker followed by the cage's own"
+        );
+        for name in announced {
+            assert!(
+                !name.starts_with("sbx"),
+                "no relayed toast may occupy the line sbx's own announcements use: {name}"
+            );
+        }
+    }
+
+    /// A relayed toast names no host file for the daemon to open.
+    ///
+    /// The daemon resolves `app_icon` and the `image-path`/`sound-file` hints **itself**, host-side,
+    /// in its own process — the cage needs no access to the file it names. Forwarded verbatim they
+    /// let a caged agent point a host process at a host path of its choosing, sbx's own mark under
+    /// the data directory included, which is what would make a forged refusal toast look right. A
+    /// bare theme name is kept (it resolves against the user's own theme and reaches nothing the
+    /// cage chose), and hints that carry an image rather than a path to one are left alone.
+    #[test]
+    fn notify_forwards_no_host_path_for_the_daemon_to_open() {
+        let host = FakeHost::default();
+        let served = served(&host);
+
+        let mut hints = HashMap::new();
+        hints.insert(
+            "image-path".to_string(),
+            hint("/home/user/.local/share/sbx/sbx.png"),
+        );
+        hints.insert("image_path".to_string(), hint("/etc/hostname"));
+        hints.insert("sound-file".to_string(), hint("/home/user/secret.wav"));
+        hints.insert("category".to_string(), hint("device.error"));
+        notify_as(
+            &served,
+            "Slack",
+            0,
+            "/home/user/.local/share/sbx/sbx.png",
+            hints,
+        );
+        // A theme name is not a path, and is what `app_icon` is for.
+        notify_as(&served, "Slack", 0, "dialog-warning", HashMap::new());
+
+        let calls = locked(&host.calls);
+        assert_eq!(
+            calls[0].app_icon, "",
+            "an `app_icon` naming a host file must not reach the daemon, which opens the path in \
+             its own process"
+        );
+        let mut forwarded: Vec<&str> = calls[0].hints.keys().map(String::as_str).collect();
+        forwarded.sort_unstable();
+        assert_eq!(
+            forwarded,
+            vec!["category"],
+            "every hint naming a file the daemon opens must be dropped, and nothing else"
+        );
+        assert_eq!(
+            calls[1].app_icon, "dialog-warning",
+            "a bare theme name resolves against the user's own theme and is still forwarded"
+        );
     }
 }

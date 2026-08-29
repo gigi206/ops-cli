@@ -169,7 +169,7 @@ pub(crate) use projects::{
 };
 #[cfg(test)]
 pub(crate) use projectstore::PROJECT_MARKER;
-pub(crate) use projectstore::{reflink_verdict, supports_reflink};
+pub(crate) use projectstore::reflink_verdict;
 pub(crate) use proxy::{
     AddrRefusal, builtin_allow_rules, header_name_eq, ip_refusal, names_exact_host,
     union_with_builtin,

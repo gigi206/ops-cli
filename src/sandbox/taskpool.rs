@@ -95,17 +95,54 @@ fn split_version(token: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// The version directory to put on a task's path for `token`, given what the pool realized for it.
+/// Whether an installed version directory `dir` answers the declared version `wanted`, and which:
+/// exactly, or as one of mise's **partial** versions — `22` and `22.3` both name `22.3.0`.
 ///
-/// - an explicit `@version` selects that directory, or nothing (a pool holding another version of
-///   the tool does not satisfy a request for this one);
+/// Compared segment-wise rather than as a string prefix, or `2` would answer `22.3.0` and a
+/// declaration would be served by a version it never named.
+fn answers_version(dir: &str, wanted: &str) -> bool {
+    dir == wanted
+        || dir
+            .strip_prefix(wanted)
+            .is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// The installed version that answers `token`'s declared version, given what the pool realized for
+/// the tool — the half of the satisfaction rule that reads `installs/`.
+///
+/// - an exact `@version` selects the directory of that name;
+/// - a **partial** `@version` (`22`, `22.3`) selects the concrete version it names. mise records the
+///   spec verbatim and materializes the partial as a *symlink* beside the concrete directory, and
+///   [`inspect::mise_installed_in`] keeps only real directories — so looking for a directory called
+///   `22` can never find one, however successfully the tool installed;
+/// - a named alias (`latest`, and mise's channel aliases) resolves like a bare token, for the same
+///   reason and because the alias the config records is what a shim resolves through. `mise use -g
+///   node@latest` and `mise use -g node` write the same `[tools]` entry, so they must not be two
+///   different questions here;
 /// - a bare token prefers mise's `latest` alias — which is exactly what a bare request resolved to
 ///   — and otherwise takes the highest concrete version, so a pool that accumulated two versions
-///   puts a *chosen* one on the path rather than an arbitrary one.
+///   answers with a *chosen* one rather than an arbitrary one.
+///
+/// Nothing is put on a task's `PATH` from this: [`shims_incage`] is. What this decides is whether
+/// the pool holds the tool the declaration asked for, and a spelling it can never answer is a token
+/// reported missing on every launch, forever.
 fn version_dir(tool: &InstalledTool, wanted: Option<&str>) -> Option<String> {
     match wanted {
-        Some(v) => tool.versions.iter().find(|d| d.as_str() == v).cloned(),
-        None => {
+        // The alias or the exact version, whenever mise materialized it as a real directory.
+        Some(v) if tool.versions.iter().any(|d| d == v) => Some(v.to_string()),
+        // A version-shaped spec is honoured as declared: only a concrete version it names answers
+        // it, so `node@22` is never served by an installed `node@24`.
+        Some(v) if v.starts_with(|c: char| c.is_ascii_digit()) => {
+            let concrete = inspect::concrete_versions(tool);
+            // `mise_installed_in` sorts ascending, so the last match is the highest.
+            concrete
+                .iter()
+                .rev()
+                .find(|d| answers_version(d.as_str(), v))
+                .cloned()
+        }
+        // A bare token, or a named alias mise resolved to something concrete.
+        Some(_) | None => {
             if tool.versions.iter().any(|d| d == "latest") {
                 return Some("latest".to_string());
             }
@@ -181,6 +218,46 @@ fn wanted_spec(wanted: Option<&str>) -> &str {
     wanted.unwrap_or("latest")
 }
 
+/// Reduce `tokens` to one version spec per tool, and report the spellings that had to go as
+/// `(dropped, kept)` pairs.
+///
+/// One pool is one global mise config and one `shims/` directory. `mise use -g` writes a single
+/// `[tools]` entry per tool, [`recorded_specs`] reads back a single spec per tool, and mise cannot
+/// put two versions of one tool on one `PATH` either — so two tasks declaring `mise:node@22` and
+/// `mise:node@24` are not two installs. They are one entry, and whichever spelling the config does
+/// not hold can never satisfy [`bins_for`].
+///
+/// Left to run, that is not a token that merely fails: [`ensure`]'s warm short-circuit never fires,
+/// so every launch of the project pays a full bwrap + mise install-cage run before the agent starts,
+/// and the install rewrites the one `[tools]` entry to whatever it was last asked for — so the pin
+/// flips launch to launch and the two tasks take turns failing.
+///
+/// Declaration order decides: the first spelling of a tool is the one the pool is filled for. That
+/// is the half that stops the loop; naming the rest is the half the author can act on, since only a
+/// declaration change can actually resolve it. A repeat of the *same* spec is not a conflict — a
+/// bare token and an explicit `@latest` are one request, which is what [`wanted_spec`] says.
+fn one_spec_per_tool(tokens: &[String]) -> (Vec<String>, Vec<(String, String)>) {
+    let mut kept: Vec<String> = Vec::new();
+    let mut conflicting: Vec<(String, String)> = Vec::new();
+    for token in tokens {
+        let (locator, wanted) = split_version(token);
+        // Taken by value rather than held as a reference: the `None` arm appends to the same vector
+        // the search read.
+        let first = kept
+            .iter()
+            .find(|k| split_version(k.as_str()).0 == locator)
+            .cloned();
+        match first {
+            Some(first) if wanted_spec(split_version(&first).1) != wanted_spec(wanted) => {
+                conflicting.push((token.clone(), first));
+            }
+            Some(_) => {}
+            None => kept.push(token.clone()),
+        }
+    }
+    (kept, conflicting)
+}
+
 /// Resolve `tokens` against the pool realized on disk. Pure filesystem reads; no mise, no network.
 ///
 /// A token counts as satisfied only when **both** halves agree: the tool is realized under
@@ -227,8 +304,10 @@ pub(crate) enum PoolOutcome {
     /// the common one: a pool is filled once per project, not once per launch.
     Warm,
     /// An install ran. `installed` are the tokens it was asked for; `still_missing` are the ones the
-    /// pool still does not satisfy afterwards (mise reported success for the run as a whole, or the
-    /// run failed, but these tools are not there).
+    /// pool still does not satisfy afterwards, measured against the **whole** declaration (mise
+    /// reported success for the run as a whole, or the run failed, but these tools are not there —
+    /// and a spelling dropped by [`one_spec_per_tool`] is one of them, since the pool genuinely does
+    /// not hold it).
     Installed {
         installed: Vec<String>,
         still_missing: Vec<String>,
@@ -246,6 +325,10 @@ pub(crate) enum PoolOutcome {
 ///
 /// `base_mounts` and `base_env` are the task cage's, so the pool is built by the same userland that
 /// will run the tools — the one thing an install pool must not get wrong.
+///
+/// Tokens naming two versions of one tool are reduced to one first (see [`one_spec_per_tool`]) and
+/// the rest reported: a pool cannot hold both, and filling it for the whole set would make the
+/// install cage run on every launch of the project without ever converging.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ensure(
     bwrap: &Path,
@@ -260,7 +343,18 @@ pub(crate) fn ensure(
     if tokens.is_empty() {
         return Ok(PoolOutcome::Warm);
     }
-    let missing = bins_for(pool, tokens).missing;
+    // A tool the declarations disagree about is filled for one of them and reported for the rest:
+    // one pool records one version per tool, so carrying the conflict forward would run this install
+    // cage on every launch of the project without ever converging.
+    let (fillable, conflicting) = one_spec_per_tool(tokens);
+    for (dropped, kept) in &conflicting {
+        crate::diag::warn(&format!(
+            "the task tool pool holds one version of each tool, so `{dropped}` cannot be installed \
+             beside `{kept}` — the pool is filled for `{kept}`, and every task declaring \
+             `{dropped}` will fail to find it until the declarations agree"
+        ));
+    }
+    let missing = bins_for(pool, &fillable).missing;
     if missing.is_empty() {
         return Ok(PoolOutcome::Warm);
     }
@@ -271,7 +365,7 @@ pub(crate) fn ensure(
     // lock is taken *before* the missing set is recomputed below, so the second session sees what
     // the first installed and does nothing rather than redoing it.
     let _lock = lock_pool(pool)?;
-    let missing = bins_for(pool, tokens).missing;
+    let missing = bins_for(pool, &fillable).missing;
     if missing.is_empty() {
         return Ok(PoolOutcome::Warm);
     }
@@ -284,7 +378,7 @@ pub(crate) fn ensure(
     // failed run surfaces them rather than swallowing them behind a generic message. No credential
     // is ever in scope here — a pool install carries none — so this needs no substitution pass.
     if !output.ok {
-        let tail = String::from_utf8_lossy(&output.stderr);
+        let tail = String::from_utf8_lossy(output.diagnostics());
         let tail = tail.trim();
         crate::diag::warn(&format!(
             "the task tool pool did not install {} — {}",
@@ -487,10 +581,33 @@ pub(crate) fn task_env(home: &str) -> Vec<(String, String)> {
     ]
 }
 
-/// One install run's result: whether it succeeded, and its stderr for the message when it did not.
+/// One install run's result: whether it succeeded, and the tail of each of its streams for the
+/// message when it did not.
 pub(crate) struct InstallRun {
     pub(crate) ok: bool,
     pub(crate) stderr: Vec<u8>,
+    /// The tail of the run's **stdout**. Kept because the stream that explains a failed install is
+    /// not always mise's own: a backend it wraps (`npm`, `pipx`) reports its resolution failure on
+    /// stdout while mise's stderr carries only progress that trims away to nothing.
+    ///
+    /// [`InstallRun::diagnostics`] is what a message should quote.
+    pub(crate) stdout: Vec<u8>,
+}
+
+impl InstallRun {
+    /// The stream to quote when the install failed: the stderr tail, or the stdout tail when stderr
+    /// carried nothing but whitespace.
+    ///
+    /// Both streams are already tee'd live to sbx's own stderr, so this decides the *summary* line,
+    /// not whether the operator ever sees the diagnostic. That line is the part that has to answer
+    /// "registry outage or typo'd token", and answering it with `no output` while the explanation
+    /// sits in the other buffer is the one outcome keeping two tails exists to prevent.
+    pub(crate) fn diagnostics(&self) -> &[u8] {
+        match self.stderr.trim_ascii().is_empty() {
+            true => &self.stdout,
+            false => &self.stderr,
+        }
+    }
 }
 
 /// How much of the install's own output is kept for the failure message. Only a tail: the useful
@@ -502,21 +619,27 @@ const DIAGNOSTIC_TAIL: usize = 8 * 1024;
 /// **Both** of mise's streams are piped and forwarded to sbx's own stderr as they arrive — live, so
 /// a minutes-long cold install shows its progress instead of looking hung, and onto stderr so a
 /// piped `sbx run` keeps its stdout. The tail of each is kept for the message when the install
-/// fails: mise's diagnostics are the only way to tell a registry outage from a typo'd token.
+/// fails: mise's diagnostics are the only way to tell a registry outage from a typo'd token, and
+/// which stream carries them depends on the backend — see [`InstallRun::diagnostics`].
 fn run(
     bwrap: &Path,
     spec: &SandboxSpec,
     limits: &super::cgroup::Limits,
     slug: &str,
 ) -> io::Result<InstallRun> {
-    let (argv, _seccomp) = super::launch::seccomp_argv(spec)?;
+    let (argv, memfds) = super::launch::seccomp_argv(spec)?;
     let (prog, args) = super::cgroup::wrap(bwrap, argv, limits, slug);
-    let mut child = Command::new(prog)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    // Through [`super::task::spawn_launcher`], which states why: an install runs for minutes, and
+    // these descriptors are not close-on-exec, so every cage this process spawns while one is open
+    // inherits it — including the credential-bearing task cages the pool is being filled for.
+    let mut child = super::task::spawn_launcher(
+        Command::new(prog)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+        memfds,
+    )?;
 
     let mut out_pipe = child.stdout.take().expect("stdout piped");
     let mut err_pipe = child.stderr.take().expect("stderr piped");
@@ -539,8 +662,9 @@ fn run(
         }
     };
     let mut stderr = reader.join().unwrap_or_default();
-    // Joined so the forwarding thread cannot outlive the run and interleave into a later message.
-    let _ = out_reader.join();
+    // Joined so the forwarding thread cannot outlive the run and interleave into a later message —
+    // and its tail is kept, not dropped: it is the half a wrapped backend writes its failure to.
+    let stdout = out_reader.join().unwrap_or_default();
     if timed_out {
         stderr.extend_from_slice(
             format!(
@@ -553,6 +677,7 @@ fn run(
     Ok(InstallRun {
         ok: !timed_out && status.success(),
         stderr,
+        stdout,
     })
 }
 
@@ -726,6 +851,143 @@ mod tests {
             "an alias symlink is not a version directory"
         );
         assert!(bins_for(&pool, &["ripgrep".to_string()]).missing.is_empty());
+    }
+
+    /// A declared alias or partial version must be satisfiable by the concrete install it names.
+    ///
+    /// mise records the spec verbatim (`node = "22"`) and materializes `latest`, `22` and `22.3` as
+    /// **symlinks** beside `22.3.0`, which the install reader skips — so a rule that looked for a
+    /// directory of that name could never find one. The two halves of the satisfaction rule then
+    /// disagreed permanently: the config half passed, the installs half could not, and the token was
+    /// reported missing forever. The cost is not one failed task: `ensure`'s warm short-circuit
+    /// never fires, so every launch of the project pays a bwrap + mise install-cage run before the
+    /// agent starts, and the task still gets no shims on its `PATH`.
+    #[test]
+    fn a_declared_alias_or_partial_version_is_satisfied_by_the_concrete_install_it_names() {
+        let base = TmpDir::new();
+        let pool = base.join("task-mise");
+        realize_at(&pool, "node", Some("node"), &["22.3.0"], "latest");
+        let tool_dir = installs_dir(&pool).join("node");
+        for alias in ["latest", "22", "22.3"] {
+            std::os::unix::fs::symlink("./22.3.0", tool_dir.join(alias)).unwrap();
+        }
+
+        // `mise use -g node@latest` records `latest`; the explicit spelling and the bare token are
+        // one request, so they must be one answer here too.
+        for token in ["node@latest", "node"] {
+            assert!(
+                bins_for(&pool, &[token.to_string()]).missing.is_empty(),
+                "`{token}` is installed and recorded, so it is not missing"
+            );
+        }
+
+        // `mise use -g node@22` records `22`, and `22` names `22.3.0`.
+        record(&pool, &[("node", "22")]);
+        assert!(bins_for(&pool, &["node@22".to_string()]).missing.is_empty());
+        record(&pool, &[("node", "22.3")]);
+        assert!(
+            bins_for(&pool, &["node@22.3".to_string()])
+                .missing
+                .is_empty()
+        );
+
+        // And a version the pool does not hold stays missing: the partial match is segment-wise, so
+        // `2` does not answer `22.3.0` and `24` is not served by it either.
+        for absent in ["node@24", "node@2"] {
+            let (_, wanted) = split_version(absent);
+            record(&pool, &[("node", wanted.unwrap())]);
+            assert_eq!(
+                bins_for(&pool, &[absent.to_string()]).missing,
+                vec![absent.to_string()],
+                "a version the pool does not hold must not be served by another one"
+            );
+        }
+    }
+
+    /// One pool is one global mise config and one `shims/` directory, so a locator carries one
+    /// version spec. Two tasks naming different versions of the same tool are therefore not two
+    /// installs: whichever spelling the config does not record can never satisfy `bins_for`, so
+    /// without detection `ensure` never reaches its warm short-circuit and every launch of the
+    /// project runs the install cage again — rewriting the one `[tools]` entry each time, so the two
+    /// tasks take turns failing. Filling for the first declaration and reporting the rest is what
+    /// makes the state converge.
+    #[test]
+    fn one_tool_declared_at_two_versions_is_filled_for_one_of_them_and_reported() {
+        let (fillable, conflicting) = one_spec_per_tool(&[
+            "node@22.3.0".to_string(),
+            "aqua:cli/gh".to_string(),
+            "node@24.4.1".to_string(),
+            "node@22.3.0".to_string(),
+        ]);
+        assert_eq!(
+            fillable,
+            vec!["node@22.3.0".to_string(), "aqua:cli/gh".to_string()],
+            "declaration order decides, and an exact repeat is not a conflict"
+        );
+        assert_eq!(
+            conflicting,
+            vec![("node@24.4.1".to_string(), "node@22.3.0".to_string())]
+        );
+
+        // A bare token and an explicit `@latest` are one request, not a conflict.
+        let (fillable, conflicting) =
+            one_spec_per_tool(&["node".to_string(), "node@latest".to_string()]);
+        assert_eq!(fillable, vec!["node".to_string()]);
+        assert!(conflicting.is_empty(), "{conflicting:?}");
+
+        // The payload: a pool already filled for the first spelling is warm, and does not reach for
+        // bwrap or mise at all. Paths that do not exist prove it — running either would fail loudly.
+        let base = TmpDir::new();
+        let pool = base.join("task-mise");
+        realize_at(&pool, "node", Some("node"), &["22.3.0"], "22.3.0");
+        let outcome = ensure(
+            Path::new("/nonexistent/bwrap"),
+            &[],
+            &[],
+            Path::new("/nonexistent/mise"),
+            &pool,
+            &["node@22.3.0".to_string(), "node@24.4.1".to_string()],
+            &super::super::cgroup::Limits::default(),
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            PoolOutcome::Warm,
+            "an unsatisfiable second version must not turn every launch into an install cage"
+        );
+    }
+
+    /// The failure summary must quote whichever stream actually carried the diagnostic.
+    ///
+    /// mise wraps backends that write their own failure to stdout (`npm`, `pipx`) while mise's
+    /// stderr carries only progress that trims away to nothing — and the stdout tail was read into a
+    /// buffer and then dropped, so `ensure` and `sbx upgrade` both reported `no output` for a
+    /// failure whose explanation had just been in hand. `InstallRun` now cannot be built without a
+    /// stdout tail, so the buffer cannot be discarded again.
+    #[test]
+    fn the_failure_summary_falls_back_to_the_stdout_tail_when_stderr_carried_nothing() {
+        let backend_spoke_on_stdout = InstallRun {
+            ok: false,
+            stderr: b"  \n \n".to_vec(),
+            stdout: b"npm error 404 Not Found - GET https://registry.example/no-such".to_vec(),
+        };
+        assert_eq!(
+            backend_spoke_on_stdout.diagnostics(),
+            b"npm error 404 Not Found - GET https://registry.example/no-such"
+        );
+
+        // mise's own stderr wins whenever it has something to say, so the ordinary failure message
+        // is unchanged.
+        let mise_spoke = InstallRun {
+            ok: false,
+            stderr: b"mise ERROR failed to resolve tool".to_vec(),
+            stdout: b"downloading...".to_vec(),
+        };
+        assert_eq!(
+            mise_spoke.diagnostics(),
+            b"mise ERROR failed to resolve tool"
+        );
     }
 
     #[test]

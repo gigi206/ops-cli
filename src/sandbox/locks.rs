@@ -23,12 +23,13 @@
 //! rather than these helpers, and keep it: `proxy/pool.rs` and `proxy/dns.rs`. Named rather than
 //! linked because both are private to the proxy, so a doc link from here would resolve to nothing.
 //!
-//! One site recovers on neither argument, and says so where it lives: `ProcOverlay` in
-//! `sandbox/proc_enforce.rs` guards **live policy**, which is neither a record nor a resource. It
-//! recovers because its list cannot be left incomplete by an unwind and because the panic's
-//! alternative — ending the thread that decides every `execve` — removes the policy entirely rather
-//! than weakening it. A lock that guards a decision rather than data owes that argument in full at
-//! its own definition; it does not inherit one from here.
+//! Two sites recover on neither argument, and each says so where it lives, because a lock that
+//! guards a decision rather than data owes that argument in full at its own definition and does not
+//! inherit one from here. `ProcOverlay` in `sandbox/proc_enforce.rs` and `ManualRules` in
+//! `sandbox/control` are the live `--session` exec and egress rule overlays: **live policy**, which
+//! is neither a record nor a resource. Both recover because their lists cannot be left incomplete by
+//! an unwind, and because the panic's alternative — ending the thread that decides every `execve`,
+//! or the thread that decides a request — removes the policy entirely rather than weakening it.
 //!
 //! The line between the two cases above is what the data is *for*, not what type it has. A record whose reader
 //! would act on it as if nothing had happened is the case to look at twice: recovery must not turn

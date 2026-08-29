@@ -637,6 +637,10 @@ struct Collected {
 /// `inspect_replies`: without the plugin seeing the replies, nothing here can know when to stop.
 ///
 /// `first` is a frame already taken from the host (the greeting), or `None` to read one now.
+///
+/// `deadline` is the exchange's whole wall-clock budget, set by the caller and shared with every
+/// other read of the same exchange — see [`relay_one`] for why the socket's read timeout is not that
+/// bound, and [`super::deadline`] for why the two go together.
 fn collect_reply<H: Read + Write>(
     spec: &BrokerSpec,
     decider: &mut dyn Decider,
@@ -644,6 +648,7 @@ fn collect_reply<H: Read + Write>(
     seq: u64,
     first: Option<Vec<u8>>,
     marker: Option<&SecretMarker>,
+    deadline: std::time::Instant,
 ) -> Result<Collected, String> {
     let mut out = Vec::new();
     let mut label = None;
@@ -657,9 +662,14 @@ fn collect_reply<H: Read + Write>(
     loop {
         let frame = match pending.take() {
             Some(f) => f,
-            None => read_frame(host, spec.framing, spec.max_frame, true)
-                .map_err(|e| format!("cannot read the host resource: {e}"))?
-                .ok_or("the host resource closed mid-exchange")?,
+            None => read_frame(
+                &mut super::deadline::Deadlined::new(host, deadline),
+                spec.framing,
+                spec.max_frame,
+                true,
+            )
+            .map_err(|e| format!("cannot read the host resource: {e}"))?
+            .ok_or("the host resource closed mid-exchange")?,
         };
         // The tripwire. A host resource that reflects the credential would put it in the cage,
         // which is the one thing this whole design exists to prevent. Block, never strip: a
@@ -749,11 +759,19 @@ fn collect_reply<H: Read + Write>(
 /// [`MAX_QUERIES_PER_FRAME`], and reaching it refuses the frame rather than truncating the
 /// exchange.
 ///
-/// **The caller sets the deadline on `host` before calling.** Every path here that writes to the
-/// host resource then reads its reply would otherwise wait on it forever, and a host resource that
-/// hangs would hang the cage: the socket named in the config is whatever the machine offers, not
-/// something sbx vouches for. A read timeout on the stream turns that into an error, which lands
-/// on the fail-closed path with every other one.
+/// **The caller sets the read timeout on `host` before calling, and the exchange carries a
+/// wall-clock budget of its own.** Every path here that writes to the host resource then reads its
+/// reply would otherwise wait on it forever, and a host resource that hangs would hang the cage: the
+/// socket named in the config is whatever the machine offers, not something sbx vouches for.
+///
+/// The two bounds answer different questions and neither replaces the other. `SO_RCVTIMEO` ends a
+/// `read` that never returns; it does not end an *exchange*, because a frame arrives across several
+/// reads — a length then a body, or a line a byte at a time — and every piece starts the timeout
+/// afresh, so a resource producing one byte just inside it holds this connection, its plugin process
+/// and one of the broker's slots for as long as it cares to keep dribbling. The budget below closes
+/// that: `host_deadline` is declared as how long *one exchange* may take, so that is what it is spent
+/// on, across every read the exchange makes. See [`super::deadline`]. Either bound landing turns into
+/// an error on the fail-closed path with every other one.
 ///
 /// Every error path is fail-closed: whatever goes wrong with the plugin, the frame is refused and
 /// the caller is told, never forwarded on a guess.
@@ -771,6 +789,9 @@ pub(crate) fn relay_one<H: Read + Write>(
     // the only thing that changes direction inside one exchange is a query's answer, below.
     let mut ask_dir = Direction::Up;
     let mut queries = 0u32;
+    // One budget for the whole exchange — the queries a plugin asks for and the reply run that ends
+    // it — because that is the unit `host_deadline` is declared in. See the note above.
+    let deadline = std::time::Instant::now() + spec.host_deadline;
 
     loop {
         let answer = decider.ask(&Ask {
@@ -800,9 +821,14 @@ pub(crate) fn relay_one<H: Read + Write>(
                 }
                 write_frame(host, spec.framing, &bytes, true)
                     .map_err(|e| format!("cannot reach the host resource: {e}"))?;
-                let reply = read_frame(host, spec.framing, spec.max_frame, true)
-                    .map_err(|e| format!("cannot read the host resource: {e}"))?
-                    .ok_or("the host resource closed mid-exchange")?;
+                let reply = read_frame(
+                    &mut super::deadline::Deadlined::new(host, deadline),
+                    spec.framing,
+                    spec.max_frame,
+                    true,
+                )
+                .map_err(|e| format!("cannot read the host resource: {e}"))?
+                .ok_or("the host resource closed mid-exchange")?;
                 // The same tripwire `collect_reply` puts on every frame coming back from the host,
                 // on the one other frame that comes back from it. The guard above refuses the
                 // *marker* in a query — the plugin arranging for the answer to carry the secret —
@@ -852,7 +878,7 @@ pub(crate) fn relay_one<H: Read + Write>(
                         secret_placed: substituted.is_some(),
                     });
                 }
-                let reply = collect_reply(spec, decider, host, seq, None, marker)?;
+                let reply = collect_reply(spec, decider, host, seq, None, marker, deadline)?;
                 return Ok(Relayed {
                     secret_placed: substituted.is_some(),
                     outcome: if reply.refused {
@@ -1132,8 +1158,10 @@ const MAX_CONCURRENT_CONNS: usize = 32;
 /// as far as ten minutes for the one reason that a pinentry waits on a person to type. How long a
 /// cage may say nothing after connecting has no such reason behind it: the client connected because
 /// it had something to send. Taking that ten minutes as the silence budget too would let a
-/// passphrase prompt's allowance become ten minutes of holding a plugin process and a host
-/// connection for a caller that never spoke.
+/// passphrase prompt's allowance become ten minutes of holding a thread and one of
+/// [`MAX_CONCURRENT_CONNS`] slots for a caller that never spoke — and, on a greeting protocol,
+/// where the plugin and the host connection have to stand before the cage may speak (see
+/// [`serve_conn`]), ten minutes of holding those too.
 ///
 /// Applied as the *lower* of the two, so a protocol that answers faster than this keeps its own
 /// tighter number and none can exceed this one. Fixed rather than configurable because nothing has
@@ -1245,8 +1273,59 @@ fn cage_socket(
     (dir, path)
 }
 
-/// Serve one cage connection: start the plugin, open the host resource, and relay frames until
-/// either side is done.
+/// Read the cage's **first** frame, under the budget a connection is given to say something.
+///
+/// `Ok(None)` is a connection that closed, or wrote something that was not a frame, without asking
+/// anything: ordinary, and passed over in silence, since a probe for the socket's existence does
+/// exactly that. `Err` is the budget spent, which is the one shape that costs the session something
+/// and is therefore reported — a broker quietly losing its slots to connections that never spoke is
+/// exactly what an operator would otherwise have no way to see. `holding` names what the silence was
+/// costing, which differs by protocol.
+///
+/// Both halves are needed and neither replaces the other: the socket timeout so a connection that
+/// sends nothing at all does not block in `read` for good, the wall-clock budget so one that trickles
+/// a byte per timeout does not extend the wait a frame's length at a time (see [`super::deadline`]).
+/// Both are lifted once the frame is in — a broker connection that sits idle *between* requests is
+/// the ordinary case, not a fault.
+fn cage_first_frame(
+    reader: &mut impl Read,
+    cage: &std::os::unix::net::UnixStream,
+    spec: &crate::plugins::broker::BrokerSpec,
+    holding: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let silence = spec.host_deadline.min(CAGE_FIRST_FRAME);
+    let deadline = std::time::Instant::now() + silence;
+    let _ = cage.set_read_timeout(Some(silence));
+    // Under `pgwire` the connection's first message from the client carries no type byte (the
+    // startup packet); every later one does. Ignored by the other framings.
+    let read = {
+        let mut bounded = super::deadline::Deadlined::new(reader, deadline);
+        read_frame(&mut bounded, spec.framing, spec.max_frame, false)
+    };
+    let _ = cage.set_read_timeout(None);
+    match read {
+        Ok(frame) => Ok(frame),
+        // A failed read with the budget spent is a read the budget ended: a fact about the clock
+        // rather than a string to match on.
+        Err(_) if std::time::Instant::now() >= deadline => Err(format!(
+            "a connection said nothing for {silence:?} and was closed; it was holding {holding}"
+        )),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Serve one cage connection: hear the cage out, start the plugin, open the host resource, and relay
+/// frames until either side is done.
+///
+/// The order is the point. Standing the plugin up is a `bwrap` spawn — new user, mount and pid
+/// namespaces — plus a handshake round trip, and opening the host resource puts a connection in
+/// front of the user's own agent or daemon; both used to happen before the cage had said anything,
+/// so a cage looping `connect()`/`close()` drove that cost at whatever rate the machine allowed,
+/// host-side, where its own cgroup limits do not reach. Hearing the first frame first makes a
+/// connection that never speaks cost an accept and no more. A greeting protocol cannot be served
+/// that way — the host speaks first and the plugin has to rule on the greeting before the cage may
+/// send anything — so there the first frame is read inside [`serve_exchanges`] instead, under the
+/// same budget. The ssh-agent broker beside this one has always had this order.
 fn serve_conn(
     cage: std::os::unix::net::UnixStream,
     bwrap: &std::path::Path,
@@ -1256,6 +1335,25 @@ fn serve_conn(
     ring: &super::broker_control::BrokerRing,
     secret: Option<(&str, usize)>,
 ) -> Result<(), String> {
+    let spec = &plugin.broker;
+    // Nothing is stood up until the cage has spoken. `&UnixStream` reads without buffering, which is
+    // what `read_frame` is written for: a buffered reader would swallow bytes the rest of the
+    // connection is owed, and the rest of the connection reads through a reader of its own.
+    let first = if spec.host_greets {
+        None
+    } else {
+        let mut reader = &cage;
+        let frame = cage_first_frame(
+            &mut reader,
+            &cage,
+            spec,
+            "a thread and one of the broker's connection slots",
+        )?;
+        // Connected and closed without asking anything: ordinary — a probe for the socket's
+        // existence does exactly that — and it cost an accept.
+        let Some(frame) = frame else { return Ok(()) };
+        Some(frame)
+    };
     // Drawn per connection: two cages, or two connections of one cage, never share a marker.
     let marker = match secret {
         Some((secret, min_len)) => Some(
@@ -1267,10 +1365,9 @@ fn serve_conn(
     let marker = marker.as_ref();
     let mut decider =
         PluginProcess::start(bwrap, plugin, allow, marker).map_err(|e| e.to_string())?;
-    let spec = &plugin.broker;
-    // One connection, whichever kind of endpoint was named. Both carry the deadline `relay_one`
-    // documents as the caller's to set: without it a wedged host resource wedges the cage waiting
-    // on it.
+    // One connection, whichever kind of endpoint was named. Both carry the read timeout `relay_one`
+    // documents as the caller's to set — the complement to the exchange budget it keeps itself:
+    // without the pair, a wedged or trickling host resource wedges the cage waiting on it.
     let mut host: Box<dyn ReadWrite> = match host_socket {
         crate::config::BrokerTarget::Unix(path) => {
             let stream = std::os::unix::net::UnixStream::connect(path)
@@ -1299,6 +1396,7 @@ fn serve_conn(
         ring,
         marker,
         &plugin.name,
+        first,
     )
 }
 
@@ -1345,6 +1443,12 @@ fn write_to_cage(
 /// Split from [`serve_conn`] so the loop can be driven by a scripted plugin and a stand-in host:
 /// what ends a connection and what merely produces no bytes are decided here, and neither is
 /// visible from a single exchange.
+///
+/// `first` is the cage's opening frame where the caller already read it — which is the ordinary
+/// case, because nothing is stood up for a connection until the cage has spoken (see
+/// [`serve_conn`]). It is `None` on a greeting protocol, where the host speaks first and the plugin
+/// must rule on the greeting before the cage may send anything, so the wait for the cage's first
+/// word necessarily happens here, with the plugin and the host connection already standing.
 #[allow(clippy::too_many_arguments)]
 fn serve_exchanges(
     spec: &crate::plugins::broker::BrokerSpec,
@@ -1354,6 +1458,7 @@ fn serve_exchanges(
     ring: &super::broker_control::BrokerRing,
     marker: Option<&SecretMarker>,
     name: &str,
+    first: Option<Vec<u8>>,
 ) -> Result<(), String> {
     let mut cage_r = io::BufReader::new(cage.try_clone().map_err(|e| e.to_string())?);
     let mut cage_w = cage;
@@ -1364,10 +1469,18 @@ fn serve_exchanges(
     // the cage's first message. Skipping this on a greeting protocol would answer every message
     // with the reply to the one before it.
     if spec.host_greets {
-        let greeting = read_frame(host, spec.framing, spec.max_frame, true)
-            .map_err(|e| format!("cannot read the host resource's greeting: {e}"))?
-            .ok_or("the host resource closed before greeting")?;
-        let greeted = collect_reply(spec, decider, host, 0, Some(greeting), marker)?;
+        // An exchange of its own, so it carries an exchange's budget — the same one `relay_one`
+        // gives every later frame, and for the same reason.
+        let deadline = std::time::Instant::now() + spec.host_deadline;
+        let greeting = read_frame(
+            &mut super::deadline::Deadlined::new(host, deadline),
+            spec.framing,
+            spec.max_frame,
+            true,
+        )
+        .map_err(|e| format!("cannot read the host resource's greeting: {e}"))?
+        .ok_or("the host resource closed before greeting")?;
+        let greeted = collect_reply(spec, decider, host, 0, Some(greeting), marker, deadline)?;
         for bytes in &greeted.frames {
             if !write_to_cage(&mut cage_w, spec, bytes, marker, ring, name) {
                 return Ok(());
@@ -1405,48 +1518,33 @@ fn serve_exchanges(
     // startup packet); every later one does. Ignored by the other framings.
     let mut cage_typed = false;
 
-    // The cage's **first** frame is the one with a deadline on it. Everything a connection stands
-    // up — the plugin process, the connection to the host resource, a thread, one of
-    // `MAX_CONCURRENT_CONNS` slots — is already standing before the cage has said anything, which is
-    // the reason `host_deadline` gives for bounding the other leg: a wedged resource "holds a
-    // thread, a plugin process and two connections while it waits". It holds exactly the same when
-    // the side saying nothing is the cage, and that side is the one sbx does not trust.
-    //
-    // Both halves are needed, and neither replaces the other: the socket timeout so a connection
-    // that sends nothing at all does not block in `read` for good, the budget so one that trickles a
-    // byte per timeout does not extend the wait a frame's length at a time. Both are lifted once the
-    // frame is in — a broker connection that sits idle *between* requests is the ordinary case, not
-    // a fault.
-    let silence = spec.host_deadline.min(CAGE_FIRST_FRAME);
-    let mut first_deadline = Some(std::time::Instant::now() + silence);
-    let _ = cage_w.set_read_timeout(Some(silence));
+    // The cage's **first** frame, and the budget it has to arrive within. On a greeting protocol
+    // the wait lands here, with the plugin process, the connection to the host resource, a thread
+    // and one of `MAX_CONCURRENT_CONNS` slots already standing — the same cost `host_deadline`'s own
+    // documentation gives as the reason for bounding the other leg, borne here because the side
+    // saying nothing is the one sbx does not trust.
+    let mut pending = Some(match first {
+        Some(frame) => frame,
+        None => match cage_first_frame(
+            &mut cage_r,
+            &cage_w,
+            spec,
+            "a plugin process, a connection to the host resource, a thread and one of the broker's \
+             connection slots",
+        )? {
+            Some(frame) => frame,
+            None => return Ok(()),
+        },
+    });
 
     loop {
-        let read = match first_deadline {
-            Some(deadline) => {
-                let mut bounded = super::deadline::Deadlined::new(&mut cage_r, deadline);
-                let out = read_frame(&mut bounded, spec.framing, spec.max_frame, cage_typed);
-                first_deadline = None;
-                let _ = cage_w.set_read_timeout(None);
-                // A failed read with the budget spent is a read the budget ended: a fact about the
-                // clock rather than a string to match on. Reported, unlike an ordinary close,
-                // because a broker quietly losing its slots to connections that never spoke is
-                // exactly the thing an operator would otherwise have no way to see.
-                if out.is_err() && std::time::Instant::now() >= deadline {
-                    return Err(format!(
-                        "a connection said nothing for {:?} and was closed; it was holding a plugin \
-                         process and a connection to the host resource",
-                        silence
-                    ));
-                }
-                out
-            }
-            None => read_frame(&mut cage_r, spec.framing, spec.max_frame, cage_typed),
-        };
-        let frame = match read {
-            Ok(Some(f)) => f,
-            // A clean end, or a frame that is not one: either way the client is done with us.
-            Ok(None) | Err(_) => return Ok(()),
+        let frame = match pending.take() {
+            Some(frame) => frame,
+            None => match read_frame(&mut cage_r, spec.framing, spec.max_frame, cage_typed) {
+                Ok(Some(f)) => f,
+                // A clean end, or a frame that is not one: either way the client is done with us.
+                Ok(None) | Err(_) => return Ok(()),
+            },
         };
         seq += 1;
         let (answer, ends) = match relay_one(&frame, seq, spec, decider, host, marker, cage_typed) {
@@ -1680,7 +1778,19 @@ pub(crate) fn start(
                     continue;
                 }
             };
-            let Some(slot) = cap.take() else { continue };
+            let Some(slot) = cap.take() else {
+                // A connection refused for want of a thread is a fact about the session, not about
+                // the request: without this line the client simply sees the socket close and the
+                // pressure that produced it appears nowhere. The ssh-agent broker beside this one
+                // records the same refusal for the same reason.
+                ring.push(
+                    super::broker_control::BrokerKind::Refuse,
+                    &plugin.name,
+                    "a connection beyond the broker's concurrency ceiling",
+                    None,
+                );
+                continue;
+            };
             let (bwrap, plugin, allow, host_socket, ring, secret) = (
                 bwrap.clone(),
                 plugin.clone(),
@@ -1847,6 +1957,37 @@ mod tests {
                     write_frame(&mut self.outbox, Framing::LengthU32Be, &reply, false).unwrap();
                 }
             }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A host resource that answers a byte at a time: the shape a socket read timeout does not
+    /// bound, since every piece of a message starts a fresh one. The reply is staged whole and
+    /// handed back one byte per `read`, with a pause in between, so the wall clock the exchange
+    /// spends is the sender's to choose.
+    struct TricklingHost {
+        outbox: Vec<u8>,
+        read_at: usize,
+        per_byte: std::time::Duration,
+    }
+
+    impl Read for TricklingHost {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.is_empty() || self.read_at >= self.outbox.len() {
+                return Ok(0);
+            }
+            std::thread::sleep(self.per_byte);
+            buf[0] = self.outbox[self.read_at];
+            self.read_at += 1;
+            Ok(1)
+        }
+    }
+
+    impl Write for TricklingHost {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             Ok(buf.len())
         }
         fn flush(&mut self) -> io::Result<()> {
@@ -3061,10 +3202,12 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
 
     /// A connection that opens and says nothing is closed, and a trickle does not buy it time.
     ///
-    /// By the time the cage's first frame is waited on, the connection is already holding a plugin
-    /// process, a connection to the host resource, a thread and one of the broker's connection
-    /// slots. `host_deadline`'s own documentation gives the reason for bounding the other leg in
-    /// exactly those terms; the side that says nothing here is the one sbx does not trust.
+    /// Driven with `first: None`, which is the greeting-protocol shape: there the plugin process,
+    /// the connection to the host resource, a thread and one of the broker's connection slots are
+    /// all standing by the time the cage's first frame is waited on, because the host has to speak
+    /// and be ruled on first. `host_deadline`'s own documentation gives the reason for bounding the
+    /// other leg in exactly those terms; the side that says nothing here is the one sbx does not
+    /// trust.
     ///
     /// Two halves, and the second is the one a socket timeout alone would miss: a timeout bounds
     /// one `read`, so a sender that produces a byte just inside it resets the bound on every byte
@@ -3114,7 +3257,16 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
                 let mut plugin = ScriptedPlugin::new(Vec::new());
                 let mut host = FakeHost::with(Vec::new());
                 let ring = super::super::broker_control::BrokerRing::new(8);
-                let out = serve_exchanges(&served, &mut plugin, &mut host, cage, &ring, None, "x");
+                let out = serve_exchanges(
+                    &served,
+                    &mut plugin,
+                    &mut host,
+                    cage,
+                    &ring,
+                    None,
+                    "x",
+                    None,
+                );
                 let _ = tx.send((out, host.seen));
             });
 
@@ -3138,6 +3290,110 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
             );
             assert!(seen.is_empty(), "nothing was ever put to the host resource");
         }
+    }
+
+    /// Nothing is stood up for a connection until the cage has spoken, and hearing it out first
+    /// costs the frames behind it nothing.
+    ///
+    /// A connection used to arrive with a `bwrap` spawn (new user, mount and pid namespaces), a
+    /// plugin handshake and a `connect()` to the user's own agent or daemon already behind it,
+    /// before `read` was ever called on the cage. The concurrency ceiling bounds how many of those
+    /// stand at once and nothing bounded the *rate*, so a cage looping `connect()`/`close()` drove
+    /// host-side process creation for free — the cost class threads parked host-side belong to,
+    /// outside the cage's own cgroup. Reading the first frame up front makes that loop cost an
+    /// accept and no more.
+    ///
+    /// The second half is what the reordering could have broken. The first frame is read straight
+    /// from the socket rather than through a buffered reader, because the rest of the connection
+    /// reads through a reader of its own: a `BufReader` here would draw the frames behind it into a
+    /// buffer that is then dropped, and a client that pipelined two requests would have the second
+    /// silently swallowed.
+    #[test]
+    fn the_cages_first_frame_is_read_up_front_and_the_frame_behind_it_still_arrives() {
+        let spec = spec(None);
+        let (cage, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let mut client = theirs;
+        // Two requests, pipelined, as a client that does not wait between them sends them.
+        write_frame(&mut client, spec.framing, b"first", false).expect("first frame");
+        write_frame(&mut client, spec.framing, b"second", false).expect("second frame");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-close");
+
+        let mut reader = &cage;
+        let first = cage_first_frame(
+            &mut reader,
+            &cage,
+            &spec,
+            "a thread and one of the broker's connection slots",
+        )
+        .expect("a frame arrived inside the budget")
+        .expect("and it was a frame, not a close");
+        assert_eq!(first, b"first".to_vec());
+        assert!(
+            cage.read_timeout().expect("the socket's timeout").is_none(),
+            "the silence budget is lifted once the frame is in: a broker connection sitting idle \
+             between requests is the ordinary case"
+        );
+
+        let mut plugin =
+            ScriptedPlugin::new(vec![ScriptedPlugin::forward(), ScriptedPlugin::forward()]);
+        let mut host = FakeHost::with(vec![vec![0xa1], vec![0xa2]]);
+        let ring = super::super::broker_control::BrokerRing::new(8);
+        serve_exchanges(
+            &spec,
+            &mut plugin,
+            &mut host,
+            cage,
+            &ring,
+            None,
+            "x",
+            Some(first),
+        )
+        .expect("served");
+
+        assert_eq!(
+            host.seen,
+            vec![b"first".to_vec(), b"second".to_vec()],
+            "the frame read up front is relayed, and the one queued behind it is not lost with it"
+        );
+    }
+
+    /// A host resource that answers a byte at a time does not hold an exchange past its deadline.
+    ///
+    /// `host_deadline` is declared as how long *one exchange* may take, and the read timeout the
+    /// caller sets on the socket does not enforce that. `SO_RCVTIMEO` bounds a single `read`, while
+    /// a frame arrives across several — a four-byte length, then a body whose size the sender chose
+    /// — and each one starts the timeout afresh. A resource producing one byte just inside it
+    /// therefore pinned the cage's connection, a plugin process, a host connection and one of the
+    /// broker's slots for as long as it cared to keep dribbling, all host-side, where the cage's own
+    /// cgroup limits do not reach. Below, the budget is two hundred milliseconds and the trickle
+    /// would take two seconds.
+    #[test]
+    fn a_trickling_host_resource_does_not_hold_an_exchange_past_its_deadline() {
+        let mut spec = spec(None);
+        spec.host_deadline = std::time::Duration::from_millis(200);
+
+        let mut outbox = Vec::new();
+        write_frame(&mut outbox, spec.framing, &[b'r'; 100], false).expect("stage a reply");
+        let mut host = TricklingHost {
+            outbox,
+            read_at: 0,
+            per_byte: std::time::Duration::from_millis(20),
+        };
+        let mut plugin = ScriptedPlugin::new(vec![ScriptedPlugin::forward()]);
+
+        let started = std::time::Instant::now();
+        let why = relay_one(b"ask", 7, &spec, &mut plugin, &mut host, None, false)
+            .expect_err("a trickle must not buy the exchange unbounded time");
+        assert!(
+            why.contains(super::super::deadline::READ_DEADLINE_PASSED),
+            "the refusal must name the budget that ended it, not a later symptom: {why}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the exchange must end on its own budget, not on the sender's schedule"
+        );
     }
 
     /// A greeting the plugin refuses ends the connection, whatever the manifest's `deny_frame`
@@ -3171,7 +3427,8 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         write_frame(&mut host.outbox, spec.framing, b"GREETING", true).expect("stage the greeting");
 
         let ring = super::super::broker_control::BrokerRing::new(8);
-        serve_exchanges(&spec, &mut plugin, &mut host, cage, &ring, None, "x").expect("served");
+        serve_exchanges(&spec, &mut plugin, &mut host, cage, &ring, None, "x", None)
+            .expect("served");
 
         assert!(
             host.seen.is_empty(),
@@ -3234,6 +3491,7 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
                 &ring,
                 Some(&marker),
                 "x",
+                None,
             )
             .expect("served");
 
@@ -3295,7 +3553,8 @@ printf '{"ok":false,"error":"this build brokers nothing"}\n'"#,
         ]);
         let mut host = FakeHost::with_runs(vec![vec![], vec![b"answered".to_vec()]]);
         let ring = super::super::broker_control::BrokerRing::new(8);
-        serve_exchanges(&spec, &mut plugin, &mut host, cage, &ring, None, "x").expect("served");
+        serve_exchanges(&spec, &mut plugin, &mut host, cage, &ring, None, "x", None)
+            .expect("served");
 
         assert_eq!(
             host.seen,

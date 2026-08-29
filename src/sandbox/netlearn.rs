@@ -15,6 +15,15 @@
 //!
 //! So the reason whitelist is the security boundary of this feature.
 //!
+//! One gate sits beside it, because the reason alone does not say **which plane** was refused. The
+//! events come from one ring per session, and a declared operation's per-invocation proxy shares it
+//! (its own control socket is not one `sbx net logs` finds) while enforcing a deliberately narrower
+//! policy of its own. So a refusal is skipped when the policy being learned would have *asked a
+//! person* about that destination rather than refusing it: under `ask` the agent's plane parks and
+//! logs the operator's answer, never a learnable `denied-default`, so such an event is not the
+//! agent's — and an answer the posture puts to a person is not one a run may pre-empt by producing
+//! a refusal somewhere else.
+//!
 //! # Plane
 //!
 //! A rule's scheme names a plane, so it is taken from the refusal's `proto` and never guessed from
@@ -93,8 +102,9 @@ pub(crate) struct Synthesis {
 
 /// Turn the refusals in `events` into the allowlist rules that would admit them at the requested
 /// `gran`ularity. Skips any the current `policy` already allows (subsumption against the effective
-/// policy the run actually used, not string-dedup). Never emits a rule the write path would reject,
-/// and never drops a learnable refusal without a note.
+/// policy the run actually used, not string-dedup), and any it would put to a person instead of
+/// refusing ([`would_ask`]). Never emits a rule the write path would reject, and never drops a
+/// learnable refusal without a note.
 pub(crate) fn synthesize(
     events: &[LogEvent],
     policy: &EgressPolicy,
@@ -110,6 +120,14 @@ pub(crate) fn synthesize(
             continue;
         }
         if already_allowed(policy, e) {
+            continue;
+        }
+        if would_ask(policy, e) {
+            notes.push(format!(
+                "skipped an egress refusal for `{}:{}` — this posture asks a person about that \
+                 destination, so the answer is theirs to give, not this run's to learn",
+                e.host, e.port
+            ));
             continue;
         }
         if host_token(&e.host, e.port, e.proto).is_none() {
@@ -225,22 +243,49 @@ fn build_exact(events: &[&LogEvent], rules: &mut BTreeSet<String>, notes: &mut V
     }
 }
 
-/// Whether the current policy already admits the destination this event names — using the event's own
-/// path/verb (a missing verb reads as `GET`, the read default). Defensive: a refused event was not
-/// admitted, but a manual edit between iterations could have added it.
+/// What the current policy makes of the destination this event names — using the event's own
+/// path/verb (a missing verb reads as `GET`, the read default).
 ///
-/// Subsumption is asked of the plane that actually refused: a cleartext refusal goes to
+/// Asked of the plane that actually refused: a cleartext refusal goes to
 /// [`EgressPolicy::explain_clear`], everything else to [`EgressPolicy::explain`]. Asking the inspected
 /// plane about a cleartext refusal would report an `https://` rule as already covering it and drop the
 /// `http://` rule that is the only thing which can open it.
-fn already_allowed(policy: &EgressPolicy, e: &LogEvent) -> bool {
+fn verdict_for<'a>(policy: &'a EgressPolicy, e: &LogEvent) -> Decision<'a> {
     let path = e.path.as_deref().unwrap_or("/");
     let method = e.method.as_deref().unwrap_or("GET");
-    let decision = match e.proto {
+    match e.proto {
         Proto::Http => policy.explain_clear(&e.host, e.port, path, method),
         _ => policy.explain(&e.host, e.port, path, method),
-    };
-    matches!(decision, Decision::AllowedBy(_) | Decision::AllowedDefault)
+    }
+}
+
+/// Whether the current policy already admits the destination this event names. Defensive: a refused
+/// event was not admitted, but a manual edit between iterations could have added it.
+fn already_allowed(policy: &EgressPolicy, e: &LogEvent) -> bool {
+    matches!(
+        verdict_for(policy, e),
+        Decision::AllowedBy(_) | Decision::AllowedDefault
+    )
+}
+
+/// Whether this policy would **park** the destination for a live human decision rather than refuse
+/// it outright ([`Decision::Ask`], an `ask` posture with no rule either way).
+///
+/// Such a refusal cannot have come from the plane being learned: under `ask` the session's own proxy
+/// parks the request and logs the operator's answer (`asked-denied`), which is not [`LEARNABLE`] —
+/// it never emits `denied-default` for a destination the policy would park. What does emit one is a
+/// declared operation's per-invocation proxy, which is hardwired to deny-by-default and shares the
+/// session's event ring so its decisions reach `sbx net logs`. Learning from those would turn a
+/// refusal belonging to a task's deliberately narrower policy into an `allow` rule in the **agent's**
+/// profile — a destination the operator was never asked about, or answered `deny` for.
+///
+/// It is not a special case for that plumbing: a rule the operator is asked about is theirs to
+/// decide, and a run cannot pre-answer the question by being run. What still learns normally is
+/// everything an `ask` posture genuinely refuses on its own — a WebSocket (opt-in, so it never
+/// reaches the default action) and a cleartext request (opt-in for the same reason) both return a
+/// real denial from the policy above and are learned as ever.
+fn would_ask(policy: &EgressPolicy, e: &LogEvent) -> bool {
+    matches!(verdict_for(policy, e), Decision::Ask)
 }
 
 /// Whether this refusal was a WebSocket (evaluated under the `WS` pseudo-verb). A WebSocket is a
@@ -314,7 +359,7 @@ fn dedup_stable(notes: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allowlist::classify;
+    use crate::allowlist::{DefaultAction, classify};
     use crate::sandbox::control::{LogEvent, LogVerdict};
 
     fn ev(
@@ -906,6 +951,67 @@ mod tests {
             out.notes.iter().any(|n| n.contains("unusable host")),
             "the drop must be surfaced: {:?}",
             out.notes
+        );
+    }
+
+    /// Under an `ask` posture a `denied-default` for an undecided destination is not the agent's:
+    /// its own plane parks such a request and logs the operator's answer (`asked-denied`, not
+    /// learnable). One thing does emit it — a declared operation's per-invocation proxy, hardwired
+    /// to deny-by-default and sharing the session's event ring so `sbx net logs` can show it — and
+    /// learning from that writes into the **app profile** a destination the operator was never asked
+    /// about, or answered `deny` for. Whichever produced it, the answer belongs to the person the
+    /// posture asks.
+    ///
+    /// The two halves that must not move with it: the deny posture the feature exists for still
+    /// learns the identical refusal, and what an `ask` posture genuinely refuses on its own — the
+    /// opt-in capabilities, which never reach the default action — is still learned.
+    #[test]
+    fn a_refusal_the_posture_would_put_to_a_person_is_never_learned() {
+        let asking = || {
+            EgressPolicy::new(vec![classify("api.internal").unwrap()], vec![])
+                .with_default(DefaultAction::Ask)
+        };
+        let refused = ev("evil.test", 443, Some("GET"), Some("/x"), "denied-default");
+
+        let out = synthesize(
+            std::slice::from_ref(&refused),
+            &asking(),
+            Granularity::Domain,
+        );
+        assert!(
+            out.rules.is_empty(),
+            "an `ask` posture's answer must not be pre-empted by a refusal: {:?}",
+            out.rules
+        );
+        assert!(
+            out.notes.iter().any(|n| n.contains("evil.test")),
+            "and the skip must be surfaced, not silent: {:?}",
+            out.notes
+        );
+
+        // The posture the feature exists for is untouched: the same refusal under deny-by-default
+        // still learns its rule, so the gate cannot be satisfied by learning nothing.
+        assert_eq!(
+            synthesize(&[refused], &empty_policy(), Granularity::Domain).rules,
+            vec!["{*} https://evil.test".to_string()]
+        );
+
+        // A WebSocket is opt-in, so it never reaches the default action: under `ask` the policy
+        // refuses it outright rather than parking it, and that refusal is genuinely the agent's.
+        assert_eq!(
+            synthesize(
+                &[ev(
+                    "chat.test",
+                    443,
+                    Some("WS"),
+                    Some("/socket"),
+                    "denied-default"
+                )],
+                &asking(),
+                Granularity::Domain,
+            )
+            .rules,
+            vec!["{WS} https://chat.test".to_string()]
         );
     }
 

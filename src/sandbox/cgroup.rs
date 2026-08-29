@@ -359,17 +359,40 @@ pub(crate) fn scope_launcher_pid(name: &str) -> Option<u32> {
         .ok()
 }
 
+/// This user's own slice — the root every scope walk starts from.
+///
+/// `/sys/fs/cgroup/user.slice` is the parent of *every* logged-in user's slice and is world-readable
+/// on a normal systemd host, so a walk rooted there returns other uids' cage scopes alongside this
+/// one's. That matters because both consumers of [`cage_scope_dirs`] read a directory and then act
+/// through *this* user's manager: [`sweep_stale_scopes`] decides reclaimability from a
+/// `cgroup.procs` it found and then issues `systemctl --user stop <name>`, and the teardown's member
+/// lookup takes the first directory whose name embeds the target pid and treats its `cgroup.procs`
+/// as the cage's members. Scope names are not unique across users — they are derived from a project
+/// slug and a launcher pid, both of which two users can share — so a foreign directory answering for
+/// a local unit is a decision read from one uid's cgroup and applied to another's.
+fn user_slice_root(uid: u32) -> PathBuf {
+    PathBuf::from(format!("/sys/fs/cgroup/user.slice/user-{uid}.slice"))
+}
+
 /// Every cage scope's cgroup directory under this user's slice.
 ///
 /// The user manager decides where it registers a scope — under `user@<uid>.service/app.slice/` for a
-/// desktop session, elsewhere for a login session — so the walk starts at the user slice rather than
-/// assuming a path. A cage scope is a leaf here: nothing below one is another cage's scope, so the
+/// desktop session, elsewhere for a login session — so the walk starts at this user's slice rather
+/// than assuming a path below it. See [`user_slice_root`] for why the *user's* slice and not the
+/// common parent. A cage scope is a leaf here: nothing below one is another cage's scope, so the
 /// walk does not descend into it. Unreadable directories are skipped rather than aborting the walk,
 /// since every consumer is best-effort and a partial view does less than the whole, never something
 /// wrong.
 pub(crate) fn cage_scope_dirs() -> Vec<PathBuf> {
+    // SAFETY: `getuid` always succeeds and only reads the caller's id.
+    cage_scope_dirs_under(&user_slice_root(unsafe { libc::getuid() }))
+}
+
+/// The walk [`cage_scope_dirs`] performs, against an explicit root so the tree-shape rules — a cage
+/// scope is a leaf, an unreadable directory is skipped — are exercised without a real cgroupfs.
+fn cage_scope_dirs_under(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    let mut stack = vec![PathBuf::from("/sys/fs/cgroup/user.slice")];
+    let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -561,6 +584,7 @@ pub(crate) fn probe(limits: &Limits) -> LimitReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TmpDir;
     use std::process::Command;
 
     #[test]
@@ -957,6 +981,46 @@ mod tests {
                 dir.display()
             );
         }
+    }
+
+    /// The walk is confined to the launching user's own slice.
+    ///
+    /// A cage scope's unit name carries a project slug and a launcher pid, neither of which is
+    /// unique across users, while `/sys/fs/cgroup/user.slice` holds every logged-in user's slice and
+    /// is world-readable. A walk rooted at that common parent therefore hands both consumers a
+    /// directory that may belong to another uid, and both then act through *this* user's manager:
+    /// the sweep stops a unit by name after reading a foreign `cgroup.procs`, and the teardown reads
+    /// its member pids from the first directory whose name embeds the target pid. Scoping the walk
+    /// is what keeps a decision and the action it drives on the same side of the uid boundary.
+    #[test]
+    fn the_scope_walk_is_rooted_at_this_users_own_slice() {
+        assert_eq!(
+            user_slice_root(1000),
+            PathBuf::from("/sys/fs/cgroup/user.slice/user-1000.slice"),
+            "the root names the uid, so two users' scopes never share one walk"
+        );
+
+        // A stand-in cgroup tree with two users, each holding an identically-named cage scope —
+        // the collision the naming scheme permits.
+        let tmp = TmpDir::new();
+        let slices = tmp.join("user.slice");
+        let mine = slices.join("user-1000.slice/user@1000.service/app.slice/sbx-web-4711.scope");
+        let theirs = slices.join("user-1001.slice/user@1001.service/app.slice/sbx-web-4711.scope");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::create_dir_all(&theirs).unwrap();
+
+        assert_eq!(
+            cage_scope_dirs_under(&slices.join("user-1000.slice")),
+            vec![mine],
+            "walking this user's slice finds this user's scope and nothing else"
+        );
+        // teeth: the common parent really does reach the other user's identically-named scope, so
+        // rooting the walk there is what put a foreign cgroup in front of the sweep and the
+        // teardown.
+        assert!(
+            cage_scope_dirs_under(&slices).contains(&theirs),
+            "the shared parent reaches another user's scope, which is why it is not the root"
+        );
     }
 
     /// The profile properties must produce the intended kernel limits, not merely

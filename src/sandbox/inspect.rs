@@ -126,7 +126,7 @@ pub(crate) fn mise_installed_in(installs: &Path) -> Vec<InstalledTool> {
 /// provider the munged directory name hides. Parsed line-wise (the file is a tiny flat table), so no
 /// TOML dependency. `None` when the metadata is absent or unparsable.
 fn backend_token(tool_dir: &Path) -> Option<String> {
-    let body = std::fs::read_to_string(tool_dir.join(".mise.backend.toml")).ok()?;
+    let body = read_cage_metadata(&tool_dir.join(".mise.backend.toml"))?;
     let value = |key: &str| {
         body.lines().find_map(|line| {
             let rest = line.trim().strip_prefix(key)?.trim_start();
@@ -139,6 +139,49 @@ fn backend_token(tool_dir: &Path) -> Option<String> {
         })
     };
     value("short").or_else(|| value("full"))
+}
+
+/// How much of a cage-written metadata file is read. A `.mise.backend.toml` is a flat table of two
+/// or three short lines, so a few KiB is orders of magnitude more than one ever needs — and a
+/// ceiling is required, because the size is the payload's to choose.
+const CAGE_METADATA_CAP: u64 = 8 * 1024;
+
+/// Read a small metadata file that lives inside the cage's writable home.
+///
+/// The payload owns every component of these paths, so the **open** is as much its choice as the
+/// content is, and it is the half a content filter does not cover. `read_to_string` on such a path
+/// follows a symlink the payload planted and blocks in `open(2)` on a FIFO it created: a `/dev/zero`
+/// link is read until the host is out of memory (NUL bytes are valid UTF-8, so nothing stops the
+/// buffer growing), and a reader-less FIFO wedges the caller — which for `sbx gc --prune`, a
+/// scripted `sbx app show`, or `taskpool::bins_for` on the launch path means a host command that
+/// never returns and nobody there to interrupt it. A symlink is also a read primitive in its own
+/// right: it aims the reader at any file the invoking user can read, and what that file says is then
+/// displayed as the tool's backend.
+///
+/// So: `O_NOFOLLOW` refuses a symlink at the final component outright, `O_NONBLOCK` keeps a FIFO's
+/// open from blocking, the file type is checked on the **descriptor** — a check on the path would
+/// answer about whatever was there at that instant, and the payload can swap the entry before the
+/// open — and the read stops at [`CAGE_METADATA_CAP`]. `None` for anything that is not a readable
+/// regular file, which reads the same as absent metadata.
+///
+/// Every future reader of a path under the cage's writable home belongs on this function rather
+/// than on `std::fs::read_to_string`.
+fn read_cage_metadata(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut body = String::new();
+    file.take(CAGE_METADATA_CAP)
+        .read_to_string(&mut body)
+        .ok()?;
+    Some(body)
 }
 
 /// One isolated home an app has on disk. An app's mise-installed tools are per-home, so `sbx app
@@ -336,6 +379,13 @@ pub(crate) fn flake_built(home: &Path, name: &str) -> Option<String> {
 /// The realized label of a `flake:` package's out-link within one out-link directory `dir`, or `None`
 /// when `dir` has no matching out-link. Factored out so [`flake_built`] can try the current and legacy
 /// directories in turn.
+///
+/// The label is run through [`crate::sandbox::sanitize`] for the same reason every name in
+/// [`mise_installed_in`] is: the out-link directory sits in the cage's own writable home and the
+/// link is written by the in-cage `nix build`, so its target — and therefore this label — is text
+/// the payload chooses. A symlink target may hold anything but `/` and NUL, so it can carry the
+/// escape sequences that let one line of `sbx app show` erase the lines above it and assert a
+/// package is built, trusted, or at a version it is not.
 fn flake_built_in(dir: &Path, name: &str) -> Option<String> {
     let prefix = format!("{name}-");
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
@@ -348,6 +398,7 @@ fn flake_built_in(dir: &Path, name: &str) -> Option<String> {
             .ok()
             .and_then(|t| t.file_name().map(|f| f.to_string_lossy().into_owned()))
             .and_then(|base| base.split_once('-').map(|(_, rest)| rest.to_string()))
+            .map(|detail| crate::sandbox::sanitize(&detail))
             .unwrap_or_else(|| "built".to_string());
         return Some(detail);
     }
@@ -565,6 +616,80 @@ mod tests {
         );
     }
 
+    /// The cage's metadata file is opened defensively, not just filtered afterwards.
+    ///
+    /// `<home>/.local/share/mise/installs/<tool>/.mise.backend.toml` is a path the payload owns
+    /// end to end, and `mise_installed_in` is reached by `sbx app show`, `sbx projects show`,
+    /// `sbx gc --prune` and `taskpool::bins_for` on the launch path — three of which nobody is
+    /// sitting in front of to interrupt. Sanitising the parsed value defends the *content*; this
+    /// pins the *open*, which is the half that decides whether the host command returns at all.
+    #[test]
+    fn a_cage_chosen_backend_file_is_read_only_when_it_is_a_bounded_regular_file() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = crate::testutil::TmpDir::new();
+        let tmp = dir.path();
+        let installs = tmp.join(".local/share/mise/installs");
+
+        // A symlink is a read primitive: it aims the reader at any file the invoking user can
+        // read, and `sbx app show` then displays what that file said as the tool's backend.
+        let bait = tmp.join("elsewhere.toml");
+        std::fs::write(&bait, "short = \"npm:read-from-elsewhere\"\n").unwrap();
+        std::fs::create_dir_all(installs.join("node")).unwrap();
+        std::os::unix::fs::symlink(&bait, installs.join("node/.mise.backend.toml")).unwrap();
+
+        // A FIFO is the variant that never returns: `open(2)` on one with no writer blocks, and an
+        // unattended `sbx gc --prune` then hangs with no diagnostic. Reaching the assertion below
+        // at all is what this half of the test proves.
+        std::fs::create_dir_all(installs.join("python")).unwrap();
+        let fifo = installs.join("python/.mise.backend.toml");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `mkfifo` only creates a FIFO at the given path and touches nothing else.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+        // A regular file whose real value sits past the ceiling: the payload cannot make the host
+        // read (and hold) a file of its own choosing in size.
+        std::fs::create_dir_all(installs.join("ruby")).unwrap();
+        let padded = format!(
+            "pad = \"{}\"\nshort = \"npm:past-the-ceiling\"\n",
+            "A".repeat(2 * CAGE_METADATA_CAP as usize)
+        );
+        std::fs::write(installs.join("ruby/.mise.backend.toml"), padded).unwrap();
+
+        // The honest case, so the guard is not simply refusing everything.
+        std::fs::create_dir_all(installs.join("bare-tool")).unwrap();
+        std::fs::write(
+            installs.join("bare-tool/.mise.backend.toml"),
+            "short = \"npm:bare-tool\"\n",
+        )
+        .unwrap();
+
+        let tools = mise_installed(tmp);
+        let token = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} is listed"))
+                .token
+                .clone()
+        };
+        assert_eq!(token("node"), None, "a symlinked metadata file is not read");
+        assert_eq!(
+            token("python"),
+            None,
+            "a FIFO is neither read nor waited on"
+        );
+        assert_eq!(
+            token("ruby"),
+            None,
+            "the read stops at the ceiling, so a value buried past it never arrives"
+        );
+        assert_eq!(
+            token("bare-tool").as_deref(),
+            Some("npm:bare-tool"),
+            "an ordinary metadata file still reads back"
+        );
+    }
+
     #[test]
     fn mise_installed_is_empty_without_a_mise_dir() {
         let dir = crate::testutil::TmpDir::new();
@@ -741,6 +866,35 @@ mod tests {
         )
         .unwrap();
         assert!(flake_built(home, "other").is_some());
+    }
+
+    /// The out-link label is a value the cage chose, so it is filtered like every other one.
+    ///
+    /// `<home>/.local/state/sbx/flake/` is inside the cage's writable home and the link is written
+    /// by the in-cage `nix build`, so the payload picks its target. A symlink target may hold any
+    /// byte but `/` and NUL, and the label is the part of the target's basename after the first
+    /// dash — so an unfiltered one carries escape sequences straight into `sbx app show`, the exact
+    /// command an operator runs to check declared-versus-built state, where an erase sequence
+    /// rewrites the rows above it. This is the same filter `mise_installed_in` applies two hundred
+    /// lines up, on the same threat.
+    #[test]
+    fn flake_built_filters_the_out_link_label_the_cage_chose() {
+        let scratch = crate::testutil::TmpDir::new();
+        let home = scratch.path();
+        let flake = home.join(crate::sandbox::binds::FLAKE_ROOTS_REL);
+        std::fs::create_dir_all(&flake).unwrap();
+        std::os::unix::fs::symlink(
+            "/nix/store/aaaa-x-1.0\u{1b}[2K\rdemo-app  built 2.0  (trusted)",
+            flake.join("demo-app"),
+        )
+        .unwrap();
+        let label = flake_built(home, "demo-app").expect("the out-link is found");
+        assert!(
+            !label.contains('\u{1b}') && !label.contains('\r'),
+            "a control character reached `sbx app show`: {label:?}"
+        );
+        // Filtered, not dropped: the honest part of the label still reads back.
+        assert!(label.starts_with("x-1.0 "), "unexpected label: {label:?}");
     }
 
     #[test]

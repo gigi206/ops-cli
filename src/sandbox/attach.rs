@@ -47,6 +47,7 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::{Component, Path, PathBuf};
 
 /// A handle to a running cage: a **pidfd** for one of its live processes. A pidfd plus a
 /// single [`setns`](libc::setns) with a *combined* namespace mask is the only way an
@@ -169,41 +170,93 @@ pub(super) fn build_env(environ: &[u8], term: Option<&str>) -> Vec<CString> {
     out
 }
 
-/// Locate a live process *inside* the cage of session `session_pid`. The recorded pid
-/// is the cage's host-side anchor — bubblewrap on the exec path, the sbx supervisor on
-/// the egress path — and the cage processes are always its descendants (verified on
-/// both paths). Among the descendants, one in a *child* user namespace is inside the
-/// cage; the payload (not bubblewrap itself) is preferred so its `environ` is the cage
-/// environment. Returns `None` if the cage has no live in-namespace process (it just
-/// exited, or the host lacks user namespaces).
-pub(super) fn find_cage_pid(session_pid: u32) -> Option<u32> {
+/// One descendant of the session pid, with everything [`choose_cage_pid`] judges it on.
+struct Candidate {
+    pid: u32,
+    /// The `user:[<inode>]` link of `/proc/<pid>/ns/user`; `None` once the process is gone.
+    userns: Option<String>,
+    /// `/proc/<pid>/comm`; `None` once the process is gone.
+    comm: Option<String>,
+    /// Whether this process is in the session's *own* cage rather than a sibling plugin fence —
+    /// see [`in_session_cage`].
+    in_session_cage: bool,
+}
+
+/// Locate a live process *inside* the cage of session `session_pid`, whose project root is
+/// `project`. The recorded pid is the cage's host-side anchor — bubblewrap on the exec path, the
+/// sbx supervisor on the egress path — and the cage processes are always its descendants (verified
+/// on both paths). Among the descendants, one in a *child* user namespace that carries the
+/// session's project is inside the cage; the payload (not bubblewrap itself) is preferred so its
+/// `environ` is the cage environment. Returns `None` if the cage has no live in-namespace process
+/// (it just exited, or the host lacks user namespaces).
+pub(super) fn find_cage_pid(session_pid: u32, project: &Path) -> Option<u32> {
     let host = userns_link(std::process::id())?;
     let parents = parent_map();
-    let candidates: Vec<(u32, Option<String>, Option<String>)> = descendants(session_pid, &parents)
+    let candidates: Vec<Candidate> = descendants(session_pid, &parents)
         .into_iter()
-        .map(|p| (p, userns_link(p), comm(p)))
+        .map(|pid| Candidate {
+            pid,
+            userns: userns_link(pid),
+            comm: comm(pid),
+            in_session_cage: in_session_cage(pid, project),
+        })
         .collect();
     choose_cage_pid(&candidates, &host)
 }
 
-/// Pick the cage process from `(pid, userns_link, comm)` candidates: skip any in the
-/// host user namespace (`host_userns`), prefer the first non-`bwrap` process in a child
-/// user namespace (the payload, whose `environ` is the cage's), and fall back to a
+/// Whether `pid`'s mount namespace carries `project` — the mark that tells the session's own cage
+/// apart from a sibling plugin fence.
+///
+/// "Any descendant in a child user namespace" is not the cage. The recorded pid is the sbx
+/// supervisor, and the supervisor is also the parent of every broker and signer plugin fence: each
+/// of those is its own `bwrap` with its own user namespace, and a broker fence is spawned *on the
+/// caged agent's request*, whenever it opens a broker connection. [`descendants`] walks the
+/// highest-numbered direct child's subtree first, so a fence spawned after the payload is normally
+/// reached ahead of it — which would hand the operator a shell in the credential-brokering cage the
+/// design exists to keep separate, while the agent it meant to inspect stayed invisible, at a
+/// moment the agent picks.
+///
+/// What separates them is what they mount. Every payload cage binds its project at the project's
+/// own absolute path (a structural mount of `binds::build_spec`, and the same path the session
+/// record stores), while a plugin fence's mounts are fixed by `resolver::cage_spec` — the host
+/// `/usr`, `/proc`, `/dev`, a `/tmp` tmpfs, the plugin's own directory and its manifest's grant
+/// paths — and carry no workspace. The probe goes through `/proc/<pid>/root`, so the rest of the
+/// path is resolved inside that process's own mount namespace.
+///
+/// In-cage code cannot forge or drop the mark: creating a mount namespace needs `unshare`, adding a
+/// mount needs `mount`, and removing this one needs `umount2` — the cage's seccomp denylist refuses
+/// all three. The one residual is an operator-installed plugin whose manifest grants a path
+/// containing the project; its fence would then also carry the mark, which is a plugin the operator
+/// chose to trust with the workspace.
+fn in_session_cage(pid: u32, project: &Path) -> bool {
+    let mut probe = PathBuf::from(format!("/proc/{pid}/root"));
+    // Component-wise: `project` is absolute, and pushing an absolute path would replace the
+    // `/proc/<pid>/root` prefix instead of extending it.
+    probe.extend(
+        project
+            .components()
+            .filter(|c| matches!(c, Component::Normal(_))),
+    );
+    std::fs::metadata(probe).is_ok_and(|m| m.is_dir())
+}
+
+/// Pick the cage process from the candidates: skip any in the host user namespace (`host_userns`)
+/// and any that is not in this session's own cage ([`in_session_cage`]), prefer the first
+/// non-`bwrap` process left (the payload, whose `environ` is the cage's), and fall back to a
 /// child-namespace `bwrap` if that is all there is. Pure.
-fn choose_cage_pid(
-    candidates: &[(u32, Option<String>, Option<String>)],
-    host_userns: &str,
-) -> Option<u32> {
+fn choose_cage_pid(candidates: &[Candidate], host_userns: &str) -> Option<u32> {
     let mut fallback = None;
-    for (pid, userns, comm) in candidates {
-        let Some(userns) = userns else { continue };
-        if userns == host_userns {
+    for candidate in candidates {
+        let Some(userns) = &candidate.userns else {
+            continue;
+        };
+        if userns == host_userns || !candidate.in_session_cage {
             continue;
         }
-        if comm.as_deref() != Some("bwrap") {
-            return Some(*pid);
+        if candidate.comm.as_deref() != Some("bwrap") {
+            return Some(candidate.pid);
         }
-        fallback.get_or_insert(*pid);
+        fallback.get_or_insert(candidate.pid);
     }
     fallback
 }
@@ -395,43 +448,98 @@ unsafe fn confine_and_exec(
 mod tests {
     use super::*;
 
+    /// Build a candidate; `in_session_cage` says whether it carries the session's project mount.
+    fn candidate(pid: u32, userns: Option<&str>, comm: Option<&str>, mine: bool) -> Candidate {
+        Candidate {
+            pid,
+            userns: userns.map(str::to_string),
+            comm: comm.map(str::to_string),
+            in_session_cage: mine,
+        }
+    }
+
     #[test]
     fn choose_prefers_the_payload_over_bwrap_and_skips_the_host_namespace() {
-        let host = "user:[4026531837]".to_string();
-        let child = "user:[4026533809]".to_string();
+        let host = "user:[4026531837]";
+        let child = "user:[4026533809]";
         // Order: an outer bwrap in the host ns, the inner bwrap in the child ns, then
         // the payload in the child ns. The payload must win despite bwrap coming first.
         let candidates = vec![
-            (100, Some(host.clone()), Some("bwrap".to_string())),
-            (101, Some(child.clone()), Some("bwrap".to_string())),
-            (102, Some(child.clone()), Some("sleep".to_string())),
-            (103, Some(child.clone()), Some("socat".to_string())),
+            candidate(100, Some(host), Some("bwrap"), true),
+            candidate(101, Some(child), Some("bwrap"), true),
+            candidate(102, Some(child), Some("sleep"), true),
+            candidate(103, Some(child), Some("socat"), true),
         ];
-        assert_eq!(choose_cage_pid(&candidates, &host), Some(102));
+        assert_eq!(choose_cage_pid(&candidates, host), Some(102));
     }
 
     #[test]
     fn choose_falls_back_to_bwrap_when_it_is_the_only_in_cage_process() {
-        let host = "user:[4026531837]".to_string();
-        let child = "user:[4026533809]".to_string();
+        let host = "user:[4026531837]";
+        let child = "user:[4026533809]";
         let candidates = vec![
-            (100, Some(host.clone()), Some("bwrap".to_string())),
-            (101, Some(child.clone()), Some("bwrap".to_string())),
+            candidate(100, Some(host), Some("bwrap"), true),
+            candidate(101, Some(child), Some("bwrap"), true),
         ];
-        assert_eq!(choose_cage_pid(&candidates, &host), Some(101));
+        assert_eq!(choose_cage_pid(&candidates, host), Some(101));
     }
 
     #[test]
     fn choose_returns_none_when_every_candidate_is_in_the_host_namespace() {
         // No process left a child user namespace: the cage is gone, so there is
         // nothing to attach to.
-        let host = "user:[4026531837]".to_string();
+        let host = "user:[4026531837]";
         let candidates = vec![
-            (100, Some(host.clone()), Some("bwrap".to_string())),
-            (200, Some(host.clone()), Some("sbx".to_string())),
-            (300, None, None),
+            candidate(100, Some(host), Some("bwrap"), true),
+            candidate(200, Some(host), Some("sbx"), true),
+            candidate(300, None, None, false),
         ];
-        assert_eq!(choose_cage_pid(&candidates, &host), None);
+        assert_eq!(choose_cage_pid(&candidates, host), None);
+    }
+
+    /// A plugin fence is never mistaken for the agent's cage.
+    ///
+    /// The session pid is the sbx supervisor, so a broker or signer fence — its own `bwrap`, its
+    /// own user namespace — is a sibling subtree of the payload's, not a stranger. A broker fence
+    /// is spawned when the caged agent opens a broker connection, and [`descendants`] walks the
+    /// highest-numbered direct child's subtree first, so the agent can arrange for a fence to be
+    /// the first candidate at the moment an operator attaches. "In a child user namespace and not
+    /// `bwrap`" accepts it; only the session's own project mount tells the two apart, and it has to
+    /// beat *both* the payload preference and the `bwrap` fallback.
+    #[test]
+    fn a_plugin_fence_is_never_chosen_over_the_agents_own_cage() {
+        let host = "user:[4026531837]";
+        let fence = "user:[4026534000]";
+        let cage = "user:[4026533809]";
+        // The fence subtree comes first, exactly as the highest-pid-first walk yields it.
+        let candidates = vec![
+            candidate(200, Some(fence), Some("bwrap"), false),
+            candidate(201, Some(fence), Some("sbx-broker-ssh"), false),
+            candidate(101, Some(cage), Some("bwrap"), true),
+            candidate(102, Some(cage), Some("claude"), true),
+        ];
+        assert_eq!(
+            choose_cage_pid(&candidates, host),
+            Some(102),
+            "the agent's payload must win over a fence's plugin process that comes first"
+        );
+
+        // And with the payload already gone, the fallback is the cage's own bwrap — never the
+        // fence's, which would hand the operator a shell in the credential-brokering cage.
+        let candidates = vec![
+            candidate(200, Some(fence), Some("bwrap"), false),
+            candidate(201, Some(fence), Some("sbx-broker-ssh"), false),
+            candidate(101, Some(cage), Some("bwrap"), true),
+        ];
+        assert_eq!(choose_cage_pid(&candidates, host), Some(101));
+
+        // With nothing but the fence left there is no cage to enter, and saying so is the only
+        // safe answer: attaching into a fence is worse than reporting that the session is gone.
+        let candidates = vec![
+            candidate(200, Some(fence), Some("bwrap"), false),
+            candidate(201, Some(fence), Some("sbx-broker-ssh"), false),
+        ];
+        assert_eq!(choose_cage_pid(&candidates, host), None);
     }
 
     #[test]

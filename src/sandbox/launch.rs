@@ -1388,7 +1388,7 @@ pub(crate) fn upgrade_mise_packages(
                 }
                 [only] => {
                     // The token is redundant with the name column, so show just the version delta.
-                    let delta = only.split_once(' ').map_or(*only, |(_, v)| v);
+                    let delta = only.split_once(' ').map_or(only.as_str(), |(_, v)| v);
                     println!(
                         "{}",
                         roll_line(&name, width, &format!("{ok_c}{delta}{r}"), pal)
@@ -1424,9 +1424,7 @@ pub(crate) fn upgrade_mise_packages(
                 )
             );
             crate::diag::warn(&format!("`{}`: mise upgrade exited {code}", home.label()));
-            for line in out.lines() {
-                eprintln!("       {line}");
-            }
+            echo_cage_output(&out);
             failed += 1;
             ok = false;
         }
@@ -1637,9 +1635,7 @@ pub(crate) fn upgrade_provision_steps(
                 )
             );
             crate::diag::warn(&format!("`{}`: install step exited {code}", home.label()));
-            for line in out.lines() {
-                eprintln!("       {line}");
-            }
+            echo_cage_output(&out);
             failed += 1;
             ok = false;
         }
@@ -1751,13 +1747,19 @@ fn roll_task_pool(
     match outcome? {
         None => Ok(false),
         Some(run) if run.ok => Ok(true),
+        // The tail line is the pool cage's own stderr — mise's, and through it whatever a
+        // registry backend's installer printed. It lands on the roll report's aligned status
+        // column, beside sbx's own lines, so it is sanitised like every other value the cage
+        // chose (see [`crate::sandbox::sanitize`]).
         Some(run) => Err(format!(
             "mise upgrade failed: {}",
-            String::from_utf8_lossy(&run.stderr)
-                .trim()
-                .lines()
-                .last()
-                .unwrap_or("no output")
+            crate::sandbox::sanitize(
+                String::from_utf8_lossy(&run.stderr)
+                    .trim()
+                    .lines()
+                    .last()
+                    .unwrap_or("no output")
+            )
         )),
     }
 }
@@ -2650,10 +2652,12 @@ pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    // Locate a live process inside the cage (the session pid is the cage's host-side anchor). A
-    // `None` here means the cage has no in-namespace process left — it exited between `sbx session ls` and
-    // now, or the host has no user namespaces (then it never had a cage).
-    let Some(cage_pid) = super::attach::find_cage_pid(target.pid) else {
+    // Locate a live process inside the cage (the session pid is the cage's host-side anchor). The
+    // record's project is what identifies *this session's* cage among the supervisor's other
+    // sandboxed children — the broker and signer plugin fences — since only the payload cage mounts
+    // it. A `None` here means the cage has no in-namespace process left — it exited between
+    // `sbx session ls` and now, or the host has no user namespaces (then it never had a cage).
+    let Some(cage_pid) = super::attach::find_cage_pid(target.pid, &target.project) else {
         crate::diag::error(&format!(
             "sbx session attach: session '{id}' has no live process to enter — it may have just exited \
              (run `sbx session ls`)."
@@ -3830,9 +3834,11 @@ fn build(
     // resolves through `/nix` — the base userland, every provisioned tool, and (under the
     // GUI hole) the fonts and certutil — then back `/nix` with it read-write. The cage reads and
     // writes only its own store, so an agent that installs a toolchain writes into the project's
-    // copy and the shared store is never in the cage. Which store backs `/nix` is sbx's
+    // copy. Which store backs `/nix` is sbx's
     // decision, not a configurable field, so an untrusted project cannot keep the shared
-    // store mounted or widen its access.
+    // store mounted or widen its access. The shared store reaches the cage only through the
+    // read-only plumbing pins below (see [`plumbing_pins`]), which is the one place a cage sees
+    // any of it — and only as bytes it cannot write.
     let project_store = match seed_project_store(prep, &packages.roots, &tools.roots, &gui_roots) {
         Ok(s) => s,
         Err(e) => {
@@ -3868,7 +3874,10 @@ fn build(
     // Exec enforcement (`[proc] mode = enforce|ask`): stand up the seccomp user-notification
     // supervisor and wrap the command with the in-cage shim, **innermost** — so only the agent
     // command and its children are filtered, not the provisioning/egress plumbing wrapped around it
-    // below. Its guard forces the supervised path (a live parent for the supervisor thread).
+    // below. What makes that exemption safe rather than a hole is `plumbing_pins`: the programs
+    // those outer preambles run are pinned read-only from the shared store, so an unfiltered
+    // preamble cannot be an agent-supplied one. Its guard forces the supervised path (a live parent
+    // for the supervisor thread).
     // Fail-closed: if the supervisor cannot be stood up, the launch is refused rather than running the
     // command unenforced.
     // The refusal notifier (`[notify]`), stood up before the first lens that can refuse anything and
@@ -4811,6 +4820,24 @@ fn build(
     extra_binds.extend(gui_binds);
     extra_binds.extend(inline_flake_binds);
     extra_binds.extend(proc_binds);
+    // The store paths every wrap's preamble runs from, pinned read-only over the project's
+    // writable store. Emitted here, with the launcher's other extra binds, because that is what
+    // puts them *after* the structural `/nix` — a pin emitted before it would be covered by it,
+    // exactly as for the `[fs]` masks below. See [`plumbing_pins`] for what they protect.
+    //
+    // The two GUI holes add programs of their own to that set — the portal's `dbus-daemon` and the
+    // desktop-database updater it runs first, and the CA import's `certutil` — and each exists only
+    // under `gui = "wayland"`, so they are collected from the layers here rather than carried on
+    // `Userland` with the ones every posture has.
+    let mut gui_programs: Vec<&Path> = Vec::new();
+    if let Some(p) = &portal {
+        gui_programs.push(&p.dbus_daemon);
+        gui_programs.push(&p.update_desktop_db);
+    }
+    if let Some(ct) = &ca_trust {
+        gui_programs.push(&ct.certutil);
+    }
+    extra_binds.extend(plumbing_pins(&prep.userland, &gui_programs, &prep.layout));
 
     // Close the project paths `[fs]` names. Emitted among the launcher's extra binds — that is,
     // *after* the structural mounts — because a mask emitted before the project's own mount would
@@ -4990,14 +5017,21 @@ fn build(
     // task plane serves — so the file never advertises an operation the socket would refuse to run.
     // Informational only; bound read-only by `build_spec`.
     let egress_contract = super::contract::cage_contract(&prep.cfg.network, &prep.cfg.tasks);
-    // The device grant: the resolved `[devices]` plus, under `gpu = true`, the render node
-    // directory (`/dev/dri`), so the cage can reach the GPU. Both become `--dev-bind-try` mounts.
-    // Deduped: a trusted `[devices] allow = ["/dev/dri"]` alongside `gpu = true` must not emit the
-    // bind twice (harmless to bwrap, but tidy).
+    // The device grant: the resolved `[devices]` plus, under `gpu = true`, this host's DRM **render**
+    // nodes (`/dev/dri/renderD*`), so the cage can reach the GPU. Both become `--dev-bind-try`
+    // mounts. Never the whole `/dev/dri` directory: that carries the `card*` primary nodes in with
+    // them, and a primary node with no DRM master makes its first opener the master — modesetting
+    // and a GEM flink namespace, neither of which offscreen rendering needs. See
+    // [`super::gpu::render_nodes`]. A `card*` node reaches a cage only when a trusted config names
+    // it under `[devices]`.
+    // Deduped: a trusted `[devices] allow = [...]` alongside `gpu = true` must not emit a bind twice.
     let mut devices = prep.cfg.devices.clone();
-    let dri = PathBuf::from(super::gpu::DRI_DIR);
-    if prep.cfg.gpu && !devices.contains(&dri) {
-        devices.push(dri);
+    if prep.cfg.gpu {
+        for node in super::gpu::render_nodes() {
+            if !devices.contains(&node) {
+                devices.push(node);
+            }
+        }
     }
     // A command with nothing declared ahead of it is passed through untouched, so the ordinary
     // launch keeps the process it would have had — the same pid, the same signals, the same exit
@@ -5290,6 +5324,75 @@ fn collect_roots(
     roots.extend(tool_roots.iter().cloned());
     roots.extend(font_roots.iter().cloned());
     roots
+}
+
+/// The store paths this launch's own in-cage plumbing runs from, re-bound **read-only** from the
+/// shared store over the project's writable one.
+///
+/// Every wrap but [`WrapLayer::ProcEnforce`] prepends a preamble that runs an sbx-chosen program by
+/// absolute store path — the shell each of them wraps its script in, `socat` for the egress and
+/// loopback forwarders, `mise` for an equip lane, `nix` for an inline flake build, and under the
+/// GUI holes the portal's bus daemon and the CA import's `certutil` (`gui_programs`) — and every one
+/// of those preambles runs *before* the enforcement shim installs its filter, which is what makes
+/// the shim's innermost position affordable. That reasoning only holds while those programs are
+/// sbx's own bytes. They are not: `/nix` is the project's own store, bound read-write so an agent
+/// can self-equip into it, and the seed places every path owner-writable — so in-cage code can
+/// replace `bin/bash` or `bin/socat` in it and have its replacement execute as the cage's first
+/// process, outside the `[proc]` exec policy and the `[fs] scan` content lens that the same launch
+/// reports as active. Nothing re-copies or re-checks a store path that is already there, so one
+/// write persists across every later launch of that project.
+///
+/// Pinning them closes that. The source is sbx's **shared** store — the copy no cage has ever been
+/// able to write — rather than the project's, because shadowing the project's copy with itself
+/// would pin whatever an earlier session left there. The base loader is pinned alongside the
+/// programs: every one of them is interpreted by it, so a writable loader would substitute the same
+/// code one level down. The rest of the seeded closure stays writable, which is the point of a
+/// per-project store; what this fixes is the set sbx itself execs before the cage is filtered.
+///
+/// Each pin covers the whole store path, not the binary file inside it: binding only the file would
+/// leave its directory writable, and a directory that can be renamed aside can be rebuilt around a
+/// forged binary at the same path. Pure, so the set is unit-tested without a store.
+fn plumbing_pins(
+    userland: &Userland,
+    gui_programs: &[&Path],
+    layout: &Layout,
+) -> Vec<binds::ExtraBind> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for logical in [
+        userland.shell_bin.as_path(),
+        userland.socat_bin.as_path(),
+        userland.mise_bin.as_path(),
+        userland.nix_bin.as_path(),
+        userland.base_loader.as_path(),
+    ]
+    .into_iter()
+    .chain(gui_programs.iter().copied())
+    {
+        if let Some(root) = store_root_of(logical)
+            && !roots.contains(&root)
+        {
+            roots.push(root);
+        }
+    }
+    roots
+        .into_iter()
+        .map(|root| binds::ExtraBind {
+            src: crate::store::physical_path(layout, &root),
+            dest: root,
+            writable: false,
+        })
+        .collect()
+}
+
+/// The store path an in-sandbox logical path belongs to: `/nix/store/<name>` for any
+/// `/nix/store/<name>/…`. `None` for anything else, so a path that does not resolve through the
+/// store is never mistaken for one and mounted over.
+fn store_root_of(logical: &Path) -> Option<PathBuf> {
+    let store = Path::new("/nix/store");
+    match logical.strip_prefix(store).ok()?.components().next()? {
+        std::path::Component::Normal(name) => Some(store.join(name)),
+        _ => None,
+    }
 }
 
 /// Resolve a trusted project's mise `[env]` into environment entries. Empty when
@@ -5622,12 +5725,41 @@ fn run_status(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) 
     }
 }
 
+/// How much of one captured stream is kept. The report parses a handful of summary lines out of
+/// it and shows the rest only when the run failed, so a quarter of a megabyte per stream is far
+/// past anything useful — but it is a ceiling, and the reason there has to be one is that the bytes
+/// are the cage's: `Command::output()` grows a host-side buffer to whatever the cage decides to
+/// print, and neither the cgroup limits (which govern the cage, not this supervisor) nor anything
+/// else on this path bounds it.
+const CAPTURED_CAP: usize = 256 * 1024;
+
+/// The wall-clock ceiling on one captured cage run. Deliberately generous — a group's cold
+/// re-install of a whole toolchain legitimately takes many minutes — but present, so a wedged
+/// registry connection or a command that never exits ends the run with a diagnostic instead of
+/// hanging `sbx upgrade` with nothing to break it. Fixed, not a configurable knob: it bounds sbx's
+/// own supervisor, so a project must not be able to widen it.
+const CAPTURED_TIMEOUT: Duration = Duration::from_secs(1800);
+
+/// How often the captured run checks for exit while enforcing [`CAPTURED_TIMEOUT`]. Coarse: an
+/// upgrade is a minutes-long operation, so quarter-second granularity costs nothing and spins far
+/// less.
+const CAPTURED_POLL: Duration = Duration::from_millis(250);
+
 /// Fork-and-wait like [`run_status`], but **capture** the cage's stdout and stderr instead of
 /// inheriting the terminal, returning `(exit code, combined output)`. Reserved for `sbx upgrade`,
 /// where a clean per-app summary is shown on success and the captured output is surfaced only on
 /// failure — never on the interactive/detached launch paths, which need live inherited stdio. The
 /// two streams are concatenated (stdout then stderr) because mise splits its output across both: a
 /// roll's `X → Y` summary goes to stdout, its `up to date` line to stderr.
+///
+/// Both bounds the run holds — [`CAPTURED_CAP`] per stream and [`CAPTURED_TIMEOUT`] on the wall
+/// clock — are here because the process being read is the cage. `Command::output()` reads both
+/// pipes to EOF with no ceiling and no deadline, which hands a hostile or merely broken cage the
+/// supervisor's memory and its liveness; the runners that already face the same output — the task
+/// engine and the pool install — cap and time-bound it for exactly this reason. Each stream is
+/// still drained past the cap on its own thread, so the cage is never blocked on a full pipe and
+/// neither stream can starve the other; only the kept bytes are bounded, and the caller is told in
+/// the output itself when something was cut or killed.
 fn run_captured(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) -> (i32, String) {
     let (argv, _seccomp) = match seccomp_argv(spec) {
         Ok(v) => v,
@@ -5638,14 +5770,116 @@ fn run_captured(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits
     let (holder_prog, holder_argv) =
         super::netns::holder_wrap(bwrap, argv, spec.netns_dummy.as_ref());
     let (prog, args) = super::cgroup::wrap(&holder_prog, holder_argv, limits, &spec.cage_slug);
-    match Command::new(prog).args(args).output() {
-        Ok(out) => {
-            let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-            combined.push_str(&String::from_utf8_lossy(&out.stderr));
-            (status_code(out.status), combined)
+    let mut child = match Command::new(prog)
+        .args(args)
+        // No stdin, as `output()` gave it: this path is non-interactive, and the terminal it
+        // reports to is the operator's.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => return (1, format!("failed to launch the sandbox: {e}")),
+    };
+    let mut out_pipe = child.stdout.take().expect("stdout piped");
+    let mut err_pipe = child.stderr.take().expect("stderr piped");
+    let out_reader = std::thread::spawn(move || drain_capped(&mut out_pipe, CAPTURED_CAP));
+    let err_reader = std::thread::spawn(move || drain_capped(&mut err_pipe, CAPTURED_CAP));
+
+    let deadline = std::time::Instant::now() + CAPTURED_TIMEOUT;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                // Killing bwrap tears the whole cage down with it: it is the pid-namespace init
+                // for everything inside, so nothing outlives the ceiling.
+                timed_out = true;
+                let _ = child.kill();
+                match child.wait() {
+                    Ok(status) => break status,
+                    Err(e) => return (1, format!("cannot reap the sandbox: {e}")),
+                }
+            }
+            Ok(None) => std::thread::sleep(CAPTURED_POLL),
+            Err(e) => return (1, format!("cannot wait for the sandbox: {e}")),
         }
-        Err(e) => (1, format!("failed to launch the sandbox: {e}")),
+    };
+    // A reader thread that panicked leaves no bytes rather than taking the upgrade down: the exit
+    // status is the part the report most needs, and losing a stream is the safe direction.
+    let (stdout, out_cut) = out_reader.join().unwrap_or_default();
+    let (stderr, err_cut) = err_reader.join().unwrap_or_default();
+    let mut combined = String::from_utf8_lossy(&stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&stderr));
+    // Said in the output rather than only in the exit code, because the output is what the report
+    // shows a reader when the run failed — and a truncated tail otherwise reads as a command that
+    // simply stopped talking. Neither note carries the ` → ` marker [`mise_transitions`] keys on,
+    // so neither can be mistaken for a version roll.
+    if out_cut || err_cut {
+        combined.push_str(&format!(
+            "\n(sbx: the cage's output passed its {CAPTURED_CAP}-byte ceiling and was truncated)\n"
+        ));
     }
+    if timed_out {
+        combined.push_str(&format!(
+            "\n(sbx: the run passed its {}s ceiling and was killed)\n",
+            CAPTURED_TIMEOUT.as_secs()
+        ));
+    }
+    (status_code(status), combined)
+}
+
+/// Read `pipe` to EOF keeping at most `cap` bytes, reporting whether anything was dropped.
+///
+/// Reading continues past the cap so the writer is never blocked on a full pipe — a cage held there
+/// would never exit, which is the hang the cap exists to prevent. Only the kept bytes are bounded.
+/// The task engine's own reader has the same shape plus a margin for its redaction scanner, which
+/// this path has no use for: nothing here is scanned for credentials.
+fn drain_capped(pipe: &mut impl io::Read, cap: usize) -> (Vec<u8>, bool) {
+    let mut kept = Vec::new();
+    let mut cut = false;
+    let mut buf = [0u8; 8192];
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if kept.len() < cap {
+                    let take = (cap - kept.len()).min(n);
+                    kept.extend_from_slice(&buf[..take]);
+                    cut |= take < n;
+                } else {
+                    cut = true;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            // A read error leaves what was already kept: the caller's report is better off with a
+            // partial capture than with none.
+            Err(_) => break,
+        }
+    }
+    (kept, cut)
+}
+
+/// Echo a cage's captured output to the launching terminal, one indented line at a time.
+///
+/// Reserved for the `sbx upgrade` report — the one path that interleaves sbx's own lines (a trust
+/// warning, a failure verdict) with bytes the cage produced. Those bytes are chosen inside the
+/// cage: mise's own diagnostics, but also the output of whatever third-party installer its
+/// registry, `aqua:` and `npm:` backends fetched and ran. Each line goes through
+/// [`crate::sandbox::sanitize`], so an escape sequence among them cannot erase the lines sbx
+/// printed above it or drive the operator's terminal. Line-wise rather than over the whole buffer,
+/// because `sanitize` replaces every control character — the newlines included — with a space.
+fn echo_cage_output(out: &str) {
+    for line in out.lines().map(cage_output_line) {
+        eprintln!("{line}");
+    }
+}
+
+/// One line of [`echo_cage_output`]'s report: the cage's bytes, sanitised, under the report's
+/// indent. Pure formatting, so what the filter lets through is unit-tested without a cage.
+fn cage_output_line(line: &str) -> String {
+    format!("       {}", crate::sandbox::sanitize(line))
 }
 
 /// The version-transition lines mise prints for a successful roll — `<token> <from> → <to>`, one per
@@ -5653,11 +5887,19 @@ fn run_captured(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits
 /// is unique to these lines; mise's install/download progress and the `mise use -g` equip preamble
 /// carry no arrow. Empty when nothing rolled (see [`mise_up_to_date`]). Pure — unit-tested against
 /// real mise output.
-fn mise_transitions(captured: &str) -> Vec<&str> {
+///
+/// Each surviving line goes through [`crate::sandbox::sanitize`] here rather than at the two places
+/// that print one, because every one of these lines is a value the cage chose: the token half is
+/// whatever the config asked mise to install, and the version half is whatever the backend
+/// answered — for the registry, `aqua:` and `npm:` backends, a remote package server's string. The
+/// roll report interleaves them with sbx's own trust and failure lines on the launching terminal,
+/// so an escape sequence in one erases what sbx said above it.
+fn mise_transitions(captured: &str) -> Vec<String> {
     captured
         .lines()
         .map(str::trim)
         .filter(|l| l.contains(" → "))
+        .map(crate::sandbox::sanitize)
         .collect()
 }
 
@@ -5921,7 +6163,10 @@ fn keep_passthrough(vars: impl IntoIterator<Item = (String, String)>) -> Vec<(St
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum WrapLayer {
     /// The exec-enforcement shim. Innermost, so it filters the agent command and its children and
-    /// not the provisioning and egress plumbing wrapped around it.
+    /// not the provisioning and egress plumbing wrapped around it. That exemption is only sound
+    /// while the plumbing is sbx's own bytes, which is what [`plumbing_pins`] holds: every program
+    /// an outer preamble execs is re-bound read-only from the shared store, out of the cage's
+    /// reach.
     ProcEnforce,
     /// A mise equip lane. Both lanes fetch, so they sit inside the egress wrap: under an allowlist
     /// the forwarder is up before either install runs.
@@ -6808,6 +7053,68 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
         ));
     }
 
+    /// The `sbx upgrade` report never replays the cage's bytes unfiltered.
+    ///
+    /// `run_captured` hands back the combined output of a process that ran *inside* the cage:
+    /// mise's own lines, and through its registry/`aqua:`/`npm:` backends whatever third-party
+    /// installer it fetched and ran. The report interleaves those with sbx's own trust warnings and
+    /// failure verdicts on the operator's terminal, so a CSI erase among them rewrites what sbx
+    /// just said and an OSC-52 sequence writes to the operator's clipboard. Both readers of that
+    /// buffer — the roll's transition summary and the failure dump — have to filter it, which is
+    /// the doctrine [`crate::sandbox::sanitize`] states and `mise_token_display` already applies to
+    /// the sibling announcement.
+    #[test]
+    fn the_upgrade_report_cannot_be_rewritten_by_the_bytes_the_cage_printed() {
+        // A rolled version carrying an erase sequence and a forged line behind it.
+        let captured = "Upgraded 1 tool:\n  aqua:example/demo 1.0 → 2.0\u{1b}[2K\rsbx: trusted\n";
+        let rolled = mise_transitions(captured);
+        assert_eq!(rolled.len(), 1);
+        assert!(
+            !rolled[0].contains('\u{1b}') && !rolled[0].contains('\r'),
+            "a control character reached the roll line: {:?}",
+            rolled[0]
+        );
+        // Filtered, not truncated: the version delta a reader came for survives intact.
+        assert!(rolled[0].starts_with("aqua:example/demo 1.0 → 2.0"));
+
+        // The failure dump is the wider surface — there every captured line reaches the terminal.
+        let dumped = cage_output_line("mise \u{1b}]52;c;cGF5bG9hZA==\u{7}installed");
+        assert!(
+            !dumped.contains('\u{1b}') && !dumped.contains('\u{7}'),
+            "a control character reached the failure dump: {dumped:?}"
+        );
+        assert!(dumped.starts_with("       mise "));
+    }
+
+    /// A captured cage run bounds what it keeps without bounding what it reads.
+    ///
+    /// `sbx upgrade` is the one path that reads a cage's output into the supervisor's own memory.
+    /// Reading it to EOF with no ceiling — which `Command::output()` does — makes that memory a
+    /// function of what the cage chooses to print, and the cgroup limits do not cover it: they
+    /// govern the transient scope the cage runs in, not the sbx process reading it. So the keep has
+    /// to be capped. It must not be capped by *stopping*, though: a reader that stopped at the cap
+    /// would leave the cage blocked writing into a full pipe and never exiting, which is the hang
+    /// the cap exists to prevent.
+    #[test]
+    fn a_captured_run_bounds_what_it_keeps_without_leaving_the_cage_blocked_on_a_full_pipe() {
+        let flood = vec![b'A'; 1024 * 1024];
+        let mut src = std::io::Cursor::new(flood.clone());
+        let (kept, cut) = drain_capped(&mut src, 4096);
+        assert_eq!(kept.len(), 4096, "only the cap is kept");
+        assert!(cut, "the caller is told the output was cut");
+        assert_eq!(
+            src.position(),
+            flood.len() as u64,
+            "the stream is still drained to EOF, so the cage is never blocked on a full pipe"
+        );
+
+        // Under the cap nothing is lost and nothing is reported as cut.
+        let mut small = std::io::Cursor::new(b"ok\n".to_vec());
+        let (kept, cut) = drain_capped(&mut small, 4096);
+        assert_eq!(kept, b"ok\n".to_vec());
+        assert!(!cut);
+    }
+
     #[test]
     fn mise_roll_recap_names_what_rolled_and_tallies_the_rest() {
         // The headline case: two advanced out of many — the recap names them and tallies the
@@ -7559,6 +7866,84 @@ Upgraded 2 tools:\n  aqua:example/demo-tool 0.144.4 → 0.144.5\n  pipx:demo-age
             !collect_roots(&userland, &pkg_roots, &tool_roots, &[])
                 .contains(&PathBuf::from("/nix/store/dejavu"))
         );
+    }
+
+    /// Every program a wrap's preamble execs is pinned read-only, from sbx's own store.
+    ///
+    /// The exec-enforcement shim is the innermost wrap, so each preamble around it runs before any
+    /// filter exists. Those preambles name absolute paths in `/nix` — the project's own store,
+    /// bound read-write — so without these pins in-cage code replaces `bash`, `socat`, `mise`,
+    /// `nix` or the loader they all run under, and its replacement is the cage's first process,
+    /// unfiltered by the `[proc]` policy and the `[fs] scan` lens the launch reports as active.
+    /// What the pin has to get right is all three of: the whole store path (not the file, whose
+    /// directory would stay renameable), read-only, and sourced from the **shared** store — a pin
+    /// taken from the project's copy would freeze a trojan already planted there.
+    #[test]
+    fn the_programs_every_wrap_preamble_execs_are_pinned_read_only_from_the_shared_store() {
+        let userland = Userland {
+            base_roots: vec![],
+            interp_src: PathBuf::from("/store/nix-ld"),
+            interp_dest: PathBuf::from("/lib64/ld-linux-x86-64.so.2"),
+            ca_bundle_src: PathBuf::from("/store/cacert/etc/ssl/certs/ca-bundle.crt"),
+            base_loader: PathBuf::from("/nix/store/hash-glibc/lib/ld-linux-x86-64.so.2"),
+            foreign_lib_paths: vec![],
+            bin_paths: vec![],
+            shell_bin: PathBuf::from("/nix/store/hash-bash/bin/bash"),
+            env_bin: PathBuf::from("/nix/store/hash-coreutils/bin/env"),
+            socat_bin: PathBuf::from("/nix/store/hash-socat/bin/socat"),
+            mise_bin: PathBuf::from("/nix/store/hash-mise/bin/mise"),
+            nix_bin: PathBuf::from("/nix/store/hash-nix/bin/nix"),
+            locale_archive: PathBuf::from("/nix/store/hash-locales/lib/locale/locale-archive"),
+            zoneinfo_src: PathBuf::from("/nix/store/hash-tzdata/share/zoneinfo"),
+        };
+        let layout = crate::store::Layout::under(Path::new("/data/sbx"));
+        // The two GUI holes contribute a preamble program each; they exist only under
+        // `gui = "wayland"`, so they arrive as an explicit list rather than on `Userland`.
+        let certutil = PathBuf::from("/nix/store/hash-nss-tools/bin/certutil");
+        let dbus = PathBuf::from("/nix/store/hash-dbus/bin/dbus-daemon");
+        let gui_programs = [certutil.as_path(), dbus.as_path()];
+        let pins = plumbing_pins(&userland, &gui_programs, &layout);
+
+        for program in [
+            &userland.shell_bin,
+            &userland.socat_bin,
+            &userland.mise_bin,
+            &userland.nix_bin,
+            &userland.base_loader,
+            &certutil,
+            &dbus,
+        ] {
+            let pin = pins
+                .iter()
+                .find(|b| program.starts_with(&b.dest))
+                .unwrap_or_else(|| panic!("{} is left on the writable store", program.display()));
+            assert!(
+                !pin.writable,
+                "{} is pinned writable, which pins nothing",
+                pin.dest.display()
+            );
+            assert_ne!(
+                &pin.dest, program,
+                "the pin must cover the whole store path, not just the binary: a writable \
+                 directory around it can be renamed aside and rebuilt with a forged binary"
+            );
+            assert_eq!(
+                pin.src,
+                PathBuf::from("/data/sbx/store/nix/store").join(pin.dest.file_name().unwrap()),
+                "the pinned bytes must come from sbx's own store, not the project's copy"
+            );
+        }
+
+        // Seven distinct store paths, so no pin is dropped by the de-duplication that keeps a
+        // shared root from being mounted twice — and a launch with no GUI hole pins only the five
+        // every posture runs.
+        assert_eq!(pins.len(), 7);
+        assert_eq!(plumbing_pins(&userland, &[], &layout).len(), 5);
+
+        // A path that does not resolve through the store is not a store path and must not be
+        // mounted over — the pin set is derived, never assumed.
+        assert_eq!(store_root_of(Path::new("/opt/sbx/proc-shim")), None);
+        assert_eq!(store_root_of(Path::new("/nix/store")), None);
     }
 
     #[test]
