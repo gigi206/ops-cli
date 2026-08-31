@@ -287,7 +287,7 @@ impl Confirmer {
     fn allows(&self, prompt: &str) -> bool {
         // A poisoned gate means another prompt's thread panicked; take the lock anyway rather than
         // turning one panic into a broker that can never confirm again.
-        let _held = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        let _held = super::locks::locked(&self.gate);
         std::process::Command::new(&self.askpass)
             .arg(prompt)
             // What OpenSSH's own agent sets so a helper draws a yes/no dialog rather than a

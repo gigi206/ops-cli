@@ -284,7 +284,7 @@ pub(crate) fn write_pins(
             body.push_str(&format!("{key}\t{}\t{}\n", pin.hash, pin.url));
         }
     }
-    super::binds::write_atomic(&path, body.as_bytes())
+    super::atomicfile::write_atomic(&path, body.as_bytes())
 }
 
 /// The pinned content hashes for a project's packages under one backend, keyed by the declared
@@ -499,6 +499,78 @@ pub(crate) fn select_release_asset(
         })
         .or_else(|| native.first().filter(|_| native.len() == 1))
         .map(|(_, url)| url.clone())
+}
+
+/// Split a `github:<owner>/<repo>` locator into its two halves, or `None` for any other locator
+/// shape (a direct URL, an `apt:` root).
+///
+/// One definition because every prebuilt backend that offers the `github:` form parses it
+/// identically, and a backend that grew its own copy would be free to disagree about what counts as
+/// the form.
+pub(crate) fn github_locator(locator: &str) -> Option<(&str, &str)> {
+    locator.strip_prefix("github:")?.split_once('/')
+}
+
+/// The artefact URL a `github:<owner>/<repo>` release names, given the API document, checked against
+/// this backend's own charset barrier.
+///
+/// Pure, so the barrier can be tested without a network. [`github_release_asset`] is this plus the
+/// fetch.
+pub(crate) fn validate_release_asset(
+    kind: &dyn Kind,
+    json: &serde_json::Value,
+    owner: &str,
+    repo: &str,
+    system: &str,
+) -> io::Result<String> {
+    let ext = format!(".{}", kind.name());
+    let artefact = kind.artefact();
+    let url = select_release_asset(json, system, &ext).ok_or_else(|| {
+        io::Error::other(format!(
+            "no linux {} {artefact} asset in the latest release of {owner}/{repo}",
+            arch_label(system)
+        ))
+    })?;
+    if !kind.url_validator()(&url, false) {
+        return Err(io::Error::other(format!(
+            "the latest release of {owner}/{repo} selected an asset URL that is not a \
+             valid `https://` {artefact} URL: {url}"
+        )));
+    }
+    Ok(url)
+}
+
+/// The artefact URL a `github:<owner>/<repo>` locator's newest release names, validated.
+///
+/// **`allow_insecure_http` deliberately does not reach here, and `deb:`'s `apt:` sibling is the
+/// contrast that argues it.** An `apt:` locator names its own repository root, so a user who wrote
+/// `apt:http://…` chose plaintext and the `.deb` URL derived from that root inherits the choice;
+/// the flag must follow it there or the opt-in would not work at all. A `github:` locator names no
+/// scheme. This URL is a field in a JSON document fetched from `api.github.com` over TLS, chosen by
+/// GitHub and not by the config, so a plaintext value in it is an anomaly in a third party's answer
+/// rather than a posture anyone here asked for. Opting into plaintext for your own server is not
+/// opting into following whatever scheme a remote API hands back, and one switch cannot honestly
+/// mean both.
+///
+/// `appimage:` used to pass the launch's flag through, which made the same release asset https-only
+/// for one backend and plaintext-acceptable for the other. That is why the query, the selection and
+/// the barrier are one function rather than one per backend.
+///
+/// The asset extension comes from [`Kind::name`] rather than from a parameter: `deb` and `appimage`
+/// are exactly the `.deb` / `.appimage` suffixes in use, and passing both would invite the mismatch
+/// this consolidation exists to prevent.
+pub(crate) fn github_release_asset(
+    kind: &dyn Kind,
+    nix: &Path,
+    layout: &Layout,
+    owner: &str,
+    repo: &str,
+    system: &str,
+    fresh: bool,
+) -> io::Result<String> {
+    let api = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
+    let json = super::nixhub::fetch_url_json(nix, layout, &api, fresh)?;
+    validate_release_asset(kind, &json, owner, repo, system)
 }
 
 /// One prebuilt host-side package backend: `deb:`, `appimage:` or `tarball:`. The three share their

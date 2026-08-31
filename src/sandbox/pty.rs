@@ -1,6 +1,7 @@
 //! Interactive-terminal (pty) supervision primitives: the stdin/stdout pump loop,
-//! double-Ctrl+C escalation, the SIGWINCH resize relay, the raw-mode guard, and child
-//! teardown. Pure file-descriptor and terminal machinery — no launch or config state.
+//! double-Ctrl+C escalation, the SIGWINCH resize relay, the raw-mode guard, child teardown, and the
+//! open-fork-relay sequence that assembles them. Pure file-descriptor and terminal machinery — no
+//! launch or config state.
 
 use std::io;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -350,6 +351,104 @@ impl Drop for RawMode {
     fn drop(&mut self) {
         unsafe { libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.original) };
     }
+}
+
+/// Open a pty, fork, and relay the terminal until the child exits — the machinery `launch::supervise` and
+/// `launch::supervise_attach` share, which is every line of the two but the child itself. Returns the
+/// child's exit code in the shell convention.
+///
+/// The parent keeps the pty master and never execs, so the master is set close-on-exec: it must
+/// never reach the payload, which could otherwise read or inject its own terminal stream. The child
+/// branch closes it outright before handing `slave` to `child`.
+///
+/// Everything `child` captured is dropped in the parent as soon as the fork returns, so a handle the
+/// parent must not hold for the whole session — the attach path's `CageHandle`, which owns a
+/// pidfd — is released there. The forked child holds its own copies.
+///
+/// `gui` is passed on to [`pump`]: a graphical cage reads a doubled Ctrl+C as the way out.
+///
+/// # Safety
+///
+/// `child` runs between `fork` and `exec` and must therefore touch only async-signal-safe code — no
+/// allocation, no locks — and must not return. Everything it uses has to be prepared before the
+/// call.
+pub(super) unsafe fn fork_with_pty(
+    gui: bool,
+    child: impl FnOnce(libc::c_int) -> std::convert::Infallible,
+) -> io::Result<i32> {
+    // Carry the real terminal's window size onto the pty so the inner shell wraps correctly from
+    // the start.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let winp = if unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) } == 0 {
+        &ws as *const libc::winsize
+    } else {
+        std::ptr::null()
+    };
+
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    // SAFETY: out-params are valid; name/termios are null (defaults), winp is null or a valid
+    // winsize.
+    if unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            winp,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    // The master must never reach the sandbox. The parent keeps it (and never execs), so
+    // close-on-exec is exactly right; the slave's controlling-terminal setup is the child's.
+    unsafe {
+        let flags = libc::fcntl(master, libc::F_GETFD);
+        libc::fcntl(master, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+    }
+
+    // SAFETY: the child branch below runs only `close` and the caller's closure, whose contract is
+    // the async-signal-safety this function documents.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let e = io::Error::last_os_error();
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+        return Err(e);
+    }
+    if pid == 0 {
+        unsafe { libc::close(master) };
+        child(slave);
+    } else {
+        // Release what the child captured: it has its own copies across the fork, and a handle the
+        // parent keeps for the session is a handle held open for no reason (the attach path's
+        // pidfd).
+        drop(child);
+    }
+
+    // Parent: drop the slave, go raw, relay.
+    unsafe { libc::close(slave) };
+    let _raw = RawMode::enable(0)?;
+    // Install the resize relay *after* the fork so the child never inherits the handler. sbx keeps
+    // the real controlling terminal (only the child `setsid`'d, via `login_tty` or the attach
+    // entry), so it receives `SIGWINCH` from the launching terminal naturally; the handler wakes
+    // `pump` to copy the new size onto the pty master. Best effort: if it cannot be installed the
+    // session still runs, only without dynamic resize (the startup size is already set by
+    // `openpty`).
+    let winch = WinchRelay::install().ok();
+    if winch.is_some() {
+        // Close a resize that raced startup (between `openpty` and now).
+        copy_winsize(0, master);
+    }
+    let winch_fd = winch.as_ref().map_or(-1, WinchRelay::read_fd);
+    let status = pump(master, pid, winch_fd, gui);
+    drop(winch);
+    unsafe { libc::close(master) };
+    status
 }
 
 #[cfg(test)]

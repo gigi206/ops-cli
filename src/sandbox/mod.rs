@@ -8,6 +8,8 @@
 
 // Launch core: the SandboxSpec -> bwrap-argv -> cage pipeline, plus the terminal.
 mod argv;
+// Installing a file so no reader ever sees half of it: temp sibling, then rename.
+mod atomicfile;
 mod binds;
 // Making a directory under a tree the cage can write, with symlinks refused — the rule several
 // host-side placements share, stated once.
@@ -136,7 +138,7 @@ pub(crate) use flake::{
 };
 pub(crate) use gc::{
     InstalledApp, classify_tree, human_bytes, installed_app_homes, prune_app_tools,
-    purge_app_homes, tree_size, tree_usage,
+    purge_app_homes, tree_size, tree_usage, tree_usage_parts,
 };
 pub(crate) use launch::{
     SessionHeader, app, attach, detach_log_path, effective_lock_target, gc, parse_session_header,

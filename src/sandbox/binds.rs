@@ -1433,10 +1433,10 @@ fn current_identity() -> Identity {
 /// and return their paths, ready to bind read-only. The shell field matches the
 /// in-sandbox `/bin/sh`, and `$HOME` matches the writable home bind.
 ///
-/// Written through [`write_atomic`], like every other file staged in this directory and for the same
-/// reason: concurrent cages of one project share it, and these two are bound read-only into each of
-/// them, so an in-place rewrite could show a running cage a truncated `passwd` — every `getpwuid` in
-/// it failing for as long as the window lasts.
+/// Written through [`super::atomicfile::write_atomic`], like every other file staged in this
+/// directory and for the same reason: concurrent cages of one project share it, and these two are
+/// bound read-only into each of them, so an in-place rewrite could show a running cage a truncated
+/// `passwd` — every `getpwuid` in it failing for as long as the window lasts.
 fn materialize_etc(etc_dir: &Path, id: &Identity) -> io::Result<(PathBuf, PathBuf)> {
     use std::fs::{DirBuilder, Permissions};
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -1449,53 +1449,12 @@ fn materialize_etc(etc_dir: &Path, id: &Identity) -> io::Result<(PathBuf, PathBu
 
     let passwd = etc_dir.join("passwd");
     let group = etc_dir.join("group");
-    write_atomic(
+    super::atomicfile::write_atomic(
         &passwd,
         passwd_contents(id, SANDBOX_HOME, SANDBOX_SHELL).as_bytes(),
     )?;
-    write_atomic(&group, group_contents(id).as_bytes())?;
+    super::atomicfile::write_atomic(&group, group_contents(id).as_bytes())?;
     Ok((passwd, group))
-}
-
-/// Write `bytes` to `path` atomically: a unique temp sibling (named by pid, so concurrent launches
-/// do not collide on it) written then renamed over `path`. A concurrent cage that binds this file
-/// read-only then sees either the complete old or complete new content — never a torn half-write —
-/// and, because the rename installs a fresh inode, a cage already bound to the prior inode keeps its
-/// own view rather than observing a later launch's overwrite.
-///
-/// The temp is a **hidden** sibling, and that is not cosmetic: the router directory bound at
-/// [`OPEN_ROUTER_DIR`] leads the cage's `PATH`, so a temp named after the file it replaces would put
-/// a second resolvable name in front of the project's tools for as long as the write lasts.
-///
-/// The owner-only parent is created if it is missing, and **on either failure — the write (ENOSPC)
-/// or the rename — the temp is removed**, so a failed write leaves nothing behind. One answer to
-/// that question for every file sbx stages this way: the cage's synthetic identity and egress
-/// contract here, the per-project pin locks ([`super::flake`], [`super::nixhub`],
-/// [`super::prebuilt`]), the staged audio shim and the desktop mark.
-pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::fs::DirBuilder;
-    use std::os::unix::fs::DirBuilderExt;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, bytes).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
-}
-
-/// [`write_atomic`], skipped when the file already holds exactly `bytes` — which is the ordinary
-/// case for content that changes only across sbx releases (the staged audio shim, the desktop
-/// mark). Answers whether the file was written.
-pub(super) fn write_atomic_if_changed(path: &Path, bytes: &[u8]) -> io::Result<bool> {
-    if std::fs::read(path).is_ok_and(|on_disk| on_disk == bytes) {
-        return Ok(false);
-    }
-    write_atomic(path, bytes)?;
-    Ok(true)
 }
 
 /// Build a launch-ready [`SandboxSpec`] for `cwd` under sbx's `data_dir`. This is
@@ -1549,7 +1508,7 @@ pub(crate) fn build_spec(
     // (outside every writable mount, so it has no writable alias the agent could use to
     // rewrite it); an interactive `sbx run` binds it read-only and points bash's `--rcfile` at it.
     let shell_rc = rt.etc_dir.join("bashrc");
-    write_atomic(&shell_rc, SHELL_RC_CONTENTS.as_bytes())?;
+    super::atomicfile::write_atomic(&shell_rc, SHELL_RC_CONTENTS.as_bytes())?;
 
     // Materialize the generated egress contract beside the rc (same outside-every-writable-
     // mount placement, for the same reason: the agent must not be able to rewrite the
@@ -1557,7 +1516,7 @@ pub(crate) fn build_spec(
     // atomically (temp + rename) because this directory is shared by concurrent cages of the
     // same project — an in-place write could show a running cage a torn, half-written file.
     let contract = rt.etc_dir.join("egress-contract.md");
-    write_atomic(&contract, egress_contract.as_bytes())?;
+    super::atomicfile::write_atomic(&contract, egress_contract.as_bytes())?;
 
     // Materialize the URL router beside the other synthetic files (outside every writable mount, so
     // it has no writable alias the agent could rewrite), then make it executable so a tool calling
@@ -1574,7 +1533,7 @@ pub(crate) fn build_spec(
         .mode(0o700)
         .create(&open_router)?;
     let xdg_open = open_router.join("xdg-open");
-    write_atomic(&xdg_open, super::openuri::router(open).as_bytes())?;
+    super::atomicfile::write_atomic(&xdg_open, super::openuri::router(open).as_bytes())?;
     std::fs::set_permissions(&xdg_open, std::fs::Permissions::from_mode(0o755))?;
 
     // The portal's route to the same router: a desktop-entry directory and the mime defaults naming
@@ -1597,18 +1556,18 @@ pub(crate) fn build_spec(
             .recursive(true)
             .mode(0o700)
             .create(&open_apps)?;
-        write_atomic(
+        super::atomicfile::write_atomic(
             &open_apps.join(super::openuri::DESKTOP_FILE),
             super::openuri::desktop_entry(open, OPEN_ROUTER_INCAGE).as_bytes(),
         )?;
         // The index the portal reads to find the claimants of a scheme. Generated because the
         // directory carrying it is read-only in the cage, so `update-desktop-database` cannot
         // produce it there.
-        write_atomic(
+        super::atomicfile::write_atomic(
             &open_apps.join("mimeinfo.cache"),
             super::openuri::mimeinfo_cache(open).as_bytes(),
         )?;
-        write_atomic(&open_mimeapps, super::openuri::mimeapps(open).as_bytes())?;
+        super::atomicfile::write_atomic(&open_mimeapps, super::openuri::mimeapps(open).as_bytes())?;
         // bwrap creates a missing mountpoint, but it would create it in the *host* home this bind
         // exposes — leaving a stray empty file or directory behind after the cage is gone. Creating
         // the parents here (owner-only, like the mise pool) keeps that placement sbx's decision
@@ -1675,7 +1634,7 @@ pub(crate) fn build_spec(
     // relies on). It maps `localhost` and the cage's own `sbx-<slug>` hostname to loopback;
     // the hostname matches the `--hostname` the launch sets, both from this same slug.
     let hosts = rt.etc_dir.join("hosts");
-    write_atomic(
+    super::atomicfile::write_atomic(
         &hosts,
         hosts_contents(&super::naming::cage_hostname(&slug), &tcp.destinations).as_bytes(),
     )?;
@@ -1689,7 +1648,7 @@ pub(crate) fn build_spec(
     let ssh_config_src =
         match super::egress::ssh_config_contents(&userland.socat_bin, &tcp.connect_only) {
             Some(contents) => {
-                write_atomic(&ssh_config, contents.as_bytes())?;
+                super::atomicfile::write_atomic(&ssh_config, contents.as_bytes())?;
                 Some(ssh_config.as_path())
             }
             None => {
@@ -1704,7 +1663,7 @@ pub(crate) fn build_spec(
     // desktop app's fingerprinting reads a distinct, persistent id instead of hashing an empty
     // string (identical in every hermetic cage).
     let machine_id = rt.etc_dir.join("machine-id");
-    write_atomic(&machine_id, machine_id_contents(&rt.home_src).as_bytes())?;
+    super::atomicfile::write_atomic(&machine_id, machine_id_contents(&rt.home_src).as_bytes())?;
 
     let paths = SandboxPaths {
         project: &project,

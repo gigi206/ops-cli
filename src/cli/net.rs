@@ -2436,7 +2436,7 @@ fn write_groups_fragment(path: &Path, fragment: &str, count: usize) -> ExitCode 
 }
 
 /// Keep every egress group a forced import is about to replace, and say what the incoming fragment
-/// no longer declares — [`crate::keep_replaced_fragments`] with this family's nouns and exporter.
+/// no longer declares — [`super::keep_replaced_fragments`] with this family's nouns and exporter.
 ///
 /// A group is a key inside the shared global config, not a file of its own, so what stands in for a
 /// per-file copy is the fragment `sbx net groups export` already emits: the replaced group is
@@ -2448,7 +2448,7 @@ fn keep_replaced_groups(
     incoming: &std::collections::BTreeMap<String, Vec<String>>,
     force: bool,
 ) -> Result<Vec<String>, String> {
-    crate::keep_replaced_fragments(
+    super::keep_replaced_fragments(
         config_path,
         incoming,
         || config::net_groups().0,
@@ -3374,7 +3374,7 @@ mod tests {
     #[test]
     fn the_group_overwrite_warning_names_a_few_losses_and_counts_the_rest() {
         let kept = std::path::Path::new("/config/sbx/ci.group.replaced");
-        let one = crate::render_replaced_fragment(
+        let one = crate::cli::render_replaced_fragment(
             "egress group",
             "ci",
             &["\"{GET} https://x\",".to_string()],
@@ -3383,13 +3383,13 @@ mod tests {
         assert!(one.contains("`ci`") && one.contains("1 line"), "{one}");
         assert!(one.contains("ci.group.replaced"), "{one}");
         let many: Vec<String> = (0..5).map(|i| format!("\"e{i}\",")).collect();
-        let lots = crate::render_replaced_fragment("egress group", "ci", &many, kept);
+        let lots = crate::cli::render_replaced_fragment("egress group", "ci", &many, kept);
         assert!(
             lots.contains("5 lines") && lots.contains("(and 2 more)"),
             "{lots}"
         );
         // A group that differs only in layout still names where the previous fragment went.
-        let none = crate::render_replaced_fragment("egress group", "ci", &[], kept);
+        let none = crate::cli::render_replaced_fragment("egress group", "ci", &[], kept);
         assert!(
             none.contains("only in layout") && none.contains(".replaced"),
             "{none}"

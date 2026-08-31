@@ -443,7 +443,7 @@ fn bundle_export(args: &[OsString]) -> ExitCode {
 }
 
 /// Keep every bundle a forced import is about to replace, and say what the incoming fragment no
-/// longer declares — [`crate::keep_replaced_fragments`] with this family's nouns and exporter.
+/// longer declares — [`super::keep_replaced_fragments`] with this family's nouns and exporter.
 ///
 /// A bundle is a table inside the shared global config, not a file of its own, so the copy an app
 /// profile gets (`<name>.toml.replaced`, beside it) has no equivalent here. What stands in for it is
@@ -455,7 +455,7 @@ fn keep_replaced_bundles(
     incoming: &std::collections::BTreeMap<String, config::RawBundle>,
     force: bool,
 ) -> Result<Vec<String>, String> {
-    crate::keep_replaced_fragments(
+    super::keep_replaced_fragments(
         config_path,
         incoming,
         || config::bundles().0,
@@ -672,7 +672,7 @@ mod tests {
     #[test]
     fn the_bundle_overwrite_warning_names_a_few_losses_and_counts_the_rest() {
         let kept = Path::new("/config/sbx/demo.bundle.replaced");
-        let one = crate::render_replaced_fragment(
+        let one = crate::cli::render_replaced_fragment(
             "bundle",
             "demo",
             &["allow = [\"x\"]".to_string()],
@@ -681,7 +681,7 @@ mod tests {
         assert!(one.contains("`demo`") && one.contains("1 line"), "{one}");
         assert!(one.contains("demo.bundle.replaced"), "{one}");
         let many: Vec<String> = (0..5).map(|i| format!("k{i} = {i}")).collect();
-        let lots = crate::render_replaced_fragment("bundle", "demo", &many, kept);
+        let lots = crate::cli::render_replaced_fragment("bundle", "demo", &many, kept);
         assert!(
             lots.contains("5 lines") && lots.contains("(and 2 more)"),
             "{lots}"
@@ -691,7 +691,7 @@ mod tests {
             "{lots}"
         );
         // A bundle that differs only in layout still names where the previous fragment went.
-        let none = crate::render_replaced_fragment("bundle", "demo", &[], kept);
+        let none = crate::cli::render_replaced_fragment("bundle", "demo", &[], kept);
         assert!(
             none.contains("only in layout") && none.contains(".replaced"),
             "{none}"

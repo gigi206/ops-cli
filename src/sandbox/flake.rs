@@ -124,7 +124,7 @@ fn write_pins(
     for (declared, pin) in entries {
         body.push_str(&format!("{declared}\t{}\t{}\n", pin.rev, pin.locked_ref));
     }
-    super::binds::write_atomic(&path, body.as_bytes())
+    super::atomicfile::write_atomic(&path, body.as_bytes())
 }
 
 /// Resolve a declared `flake:` reference to its current immutable pin via `nix flake metadata`.

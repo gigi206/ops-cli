@@ -65,9 +65,7 @@ enum AppImageSource {
 
 /// Parse a declared locator (already validated by `config::parse_backend`) into its source shape.
 fn parse_source(locator: &str) -> AppImageSource {
-    if let Some(path) = locator.strip_prefix("github:")
-        && let Some((owner, repo)) = path.split_once('/')
-    {
+    if let Some((owner, repo)) = prebuilt::github_locator(locator) {
         return AppImageSource::Github {
             owner: owner.to_string(),
             repo: repo.to_string(),
@@ -129,45 +127,13 @@ pub(crate) fn resolve_source(
     let url = match parse_source(locator) {
         AppImageSource::Url(url) => url,
         AppImageSource::Github { owner, repo } => {
-            let api = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
-            let json = super::nixhub::fetch_url_json(nix, layout, &api, fresh)?;
-            github_asset_url(&json, system, &owner, &repo)?
+            prebuilt::github_release_asset(&AppImage, nix, layout, &owner, &repo, system, fresh)?
         }
     };
     // A re-resolve (`fresh`) is an `sbx upgrade` step — capture nix's output and fold the cause
     // into the error; a first launch streams the download progress live.
     let hash = prebuilt::prefetch_hash(nix, layout, &url, fresh)?;
     Ok((url, hash))
-}
-
-/// The `.AppImage` asset URL a `github:<owner>/<repo>` locator's newest release names, validated.
-///
-/// **`allow_insecure_http` deliberately does not reach here**, exactly as in the `deb:` twin
-/// (`deb::github_asset_url`, whose docstring carries the full argument). A `github:`
-/// locator names no scheme: this URL is a field in a JSON document fetched from `api.github.com`
-/// over TLS and chosen by GitHub, so a plaintext value in it is an anomaly in a third party's
-/// answer rather than a posture the config asked for. This backend used to pass the launch's flag
-/// through, which made the same release asset https-only for `deb:` and plaintext-acceptable for
-/// `appimage:` — one switch cannot honestly mean both, and it does not mean this.
-fn github_asset_url(
-    json: &serde_json::Value,
-    system: &str,
-    owner: &str,
-    repo: &str,
-) -> io::Result<String> {
-    let url = prebuilt::select_release_asset(json, system, ".appimage").ok_or_else(|| {
-        io::Error::other(format!(
-            "no linux {} `.AppImage` asset in the latest release of {owner}/{repo}",
-            prebuilt::arch_label(system)
-        ))
-    })?;
-    if !crate::config::is_valid_appimage_url(&url, false) {
-        return Err(io::Error::other(format!(
-            "the latest release of {owner}/{repo} selected an asset URL that is not a valid \
-             `https://` `.AppImage` URL: {url}"
-        )));
-    }
-    Ok(url)
 }
 
 /// The generated nix expression building one `appimage:` package: fetch the pinned `.AppImage`,
@@ -342,8 +308,9 @@ mod tests {
             prebuilt::select_release_asset(&http_asset, "x86_64-linux", ".appimage").as_deref(),
             Some("http://e/demo-app-1.0-x86_64.AppImage")
         );
-        let err = github_asset_url(&http_asset, "x86_64-linux", "o", "r")
-            .expect_err("a plaintext asset URL is refused, whatever the launch allows");
+        let err =
+            prebuilt::validate_release_asset(&AppImage, &http_asset, "o", "r", "x86_64-linux")
+                .expect_err("a plaintext asset URL is refused, whatever the launch allows");
         assert!(
             err.to_string().contains("https://"),
             "the refusal does not say what it wanted: {err}"
@@ -356,7 +323,8 @@ mod tests {
             ]
         });
         assert_eq!(
-            github_asset_url(&https_asset, "x86_64-linux", "o", "r").expect("TLS asset passes"),
+            prebuilt::validate_release_asset(&AppImage, &https_asset, "o", "r", "x86_64-linux")
+                .expect("TLS asset passes"),
             "https://e/demo-app-1.0-x86_64.AppImage"
         );
     }

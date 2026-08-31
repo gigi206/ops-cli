@@ -283,6 +283,106 @@ pub(crate) fn settings_dropped_by(previous: &str, incoming: &str) -> Vec<String>
     out
 }
 
+/// Keep every fragment a forced import is about to replace, and say what the incoming one no longer
+/// declares — one warning per replaced entry, for the caller to surface once the write succeeded.
+///
+/// A bundle and an egress group are both entries *inside* the shared global config rather than files
+/// of their own, so what stands in for a per-file copy is the portable fragment the family's export
+/// verb already emits: the replaced entry is written back out beside the config as
+/// `<name>.<suffix>.replaced`, and re-declaring it is that family's `import` on the file. The name
+/// ends in neither `.toml` nor a profile path, so nothing reads it as configuration.
+///
+/// Only an entry whose declaration actually CHANGES is kept: re-importing an identical fragment
+/// leaves no copy and reports nothing. An error here fails the import closed, before the write, so
+/// an entry is never overwritten with no way back.
+///
+/// `noun` names the entry in the warning (`bundle`, `egress group`) and `suffix` names it both in
+/// the kept file and in the refusal; `declared` is read only once there is something to compare
+/// against, and `export_one` renders one entry in its family's portable form.
+pub(crate) fn keep_replaced_fragments<T>(
+    config_path: &Path,
+    incoming: &std::collections::BTreeMap<String, T>,
+    declared: impl FnOnce() -> std::collections::BTreeMap<String, T>,
+    force: bool,
+    noun: &str,
+    suffix: &str,
+    export_one: impl Fn(&str, &T) -> Result<String, String>,
+) -> Result<Vec<String>, String> {
+    if !force {
+        return Ok(Vec::new());
+    }
+    let Some(dir) = config_path.parent() else {
+        return Ok(Vec::new());
+    };
+    let declared = declared();
+    let mut notes = Vec::new();
+    for (name, new) in incoming {
+        let Some(old) = declared.get(name) else {
+            continue; // added, not replaced
+        };
+        let (before, after) = (export_one(name, old)?, export_one(name, new)?);
+        if before == after {
+            continue;
+        }
+        let kept = dir.join(format!("{name}.{suffix}.replaced"));
+        keep_replaced_file(&kept, before.as_bytes()).map_err(|e| {
+            format!(
+                "cannot keep the {suffix} being replaced at {}: {e}",
+                kept.display()
+            )
+        })?;
+        notes.push(render_replaced_fragment(
+            noun,
+            name,
+            &settings_dropped_by(&before, &after),
+            &kept,
+        ));
+    }
+    Ok(notes)
+}
+
+/// The overwrite warning for one replaced fragment: what its replacement no longer declares, and
+/// where the previous one is. A few dropped lines are named in full (the point is to recognize one's
+/// own edit); beyond that the count stands in, because the kept fragment is the better place to read
+/// the rest. `noun` is what the sentence calls the entry — a `bundle`, an `egress group`.
+pub(crate) fn render_replaced_fragment(
+    noun: &str,
+    name: &str,
+    dropped: &[String],
+    kept: &Path,
+) -> String {
+    const NAMED: usize = 3;
+    let kept = kept.display();
+    if dropped.is_empty() {
+        return format!(
+            "replaced {noun} `{name}`, which differed only in layout — the previous fragment is \
+             kept at {kept}"
+        );
+    }
+    let named = dropped
+        .iter()
+        .take(NAMED)
+        .map(|l| format!("`{l}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = dropped.len().saturating_sub(NAMED);
+    let more = if rest > 0 {
+        format!(" (and {rest} more)")
+    } else {
+        String::new()
+    };
+    format!(
+        "replaced {noun} `{name}`, which declared {} the new one does not: {named}{more} — the \
+         previous fragment is kept at {kept}, so a per-machine entry can be read back and \
+         re-imported",
+        if dropped.len() == 1 {
+            "1 line".to_string()
+        } else {
+            format!("{} lines", dropped.len())
+        },
+    )
+}
+
 /// Fold a name repeated in one multi-name removal (`sbx app rm`, `sbx plugins rm`) down to a single
 /// removal, keeping the order the user typed. Without this the second pass over a name finds
 /// nothing left to remove and reports a phantom failure over work that in fact succeeded.

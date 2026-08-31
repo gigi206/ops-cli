@@ -576,7 +576,7 @@ impl ResolutionLock {
                 pin.commit, pin.attr, pin.version
             ));
         }
-        super::binds::write_atomic(path, body.as_bytes())
+        super::atomicfile::write_atomic(path, body.as_bytes())
     }
 }
 

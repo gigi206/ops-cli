@@ -1151,8 +1151,10 @@ impl TaskEngine {
         invocation: u64,
         scan_margin: usize,
     ) -> io::Result<RawOutput> {
-        let (argv, memfds) = super::launch::seccomp_argv(spec)?;
-        let (prog, args) = super::cgroup::wrap(&self.bwrap, argv, &self.limits, spec.cage_slug());
+        // The same assembly a launch makes, rather than a second spelling of it: a task cage never
+        // carries a netns dummy, so the holder step the shared form adds is a no-op here — and stays
+        // correct rather than silently absent if one ever does.
+        let (prog, args, memfds) = super::launch::cage_command(&self.bwrap, spec, &self.limits)?;
         // A stop that arrived while the credentials were resolving is honored by not starting the
         // command at all — the earliest point at which it can be, and the only one where "stopped"
         // means nothing ran.

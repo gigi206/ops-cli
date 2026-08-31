@@ -1576,8 +1576,9 @@ fn build_app_show(
             // Size the app's own directory (the parent of `home`), matching `sbx app list`; the mise
             // data dir is broken out so the tools' share of the home is visible.
             let app_dir = h.dir.parent().unwrap_or(&h.dir);
-            let bytes = sandbox::tree_size(app_dir);
-            let tools_bytes = sandbox::tree_size(&h.dir.join(".local/share/mise"));
+            let (whole, parts) =
+                sandbox::tree_usage_parts(app_dir, &[h.dir.join(".local/share/mise")]);
+            let (bytes, tools_bytes) = (whole.bytes, parts[0].bytes);
             AppHomeShow {
                 location: if h.global {
                     "global".to_string()

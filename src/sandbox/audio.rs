@@ -260,7 +260,7 @@ fn stage_pyshim(data_dir: &Path) -> io::Result<PathBuf> {
 /// harmless (last writer wins with the same content). Returns the staged file path.
 fn stage_atomically(dir: &Path, name: &str, content: &str) -> io::Result<PathBuf> {
     let file = dir.join(name);
-    super::binds::write_atomic_if_changed(&file, content.as_bytes())?;
+    super::atomicfile::write_atomic_if_changed(&file, content.as_bytes())?;
     Ok(file)
 }
 

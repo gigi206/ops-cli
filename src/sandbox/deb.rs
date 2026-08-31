@@ -63,9 +63,7 @@ fn parse_source(locator: &str) -> DebSource {
             packages_url: url.to_string(),
         };
     }
-    if let Some(path) = locator.strip_prefix("github:")
-        && let Some((owner, repo)) = path.split_once('/')
-    {
+    if let Some((owner, repo)) = prebuilt::github_locator(locator) {
         return DebSource::Github {
             owner: owner.to_string(),
             repo: repo.to_string(),
@@ -128,9 +126,7 @@ pub(crate) fn resolve_source(
     let url = match parse_source(locator) {
         DebSource::Url(url) => url,
         DebSource::Github { owner, repo } => {
-            let api = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
-            let json = super::nixhub::fetch_url_json(nix, layout, &api, fresh)?;
-            github_asset_url(&json, system, &owner, &repo)?
+            prebuilt::github_release_asset(&Deb, nix, layout, &owner, &repo, system, fresh)?
         }
         DebSource::Apt { packages_url } => {
             resolve_apt_deb_url(nix, layout, &packages_url, fresh, allow_insecure_http)?
@@ -666,38 +662,6 @@ fn apt_repo_root(packages_url: &str) -> Option<&str> {
     packages_url.split_once("/dists/").map(|(root, _)| root)
 }
 
-/// The `.deb` asset URL a `github:<owner>/<repo>` locator's newest release names, validated.
-///
-/// **`allow_insecure_http` deliberately does not reach here, and the `apt:` sibling is the contrast
-/// that argues it.** An `apt:` locator names its own repository root, so a user who wrote
-/// `apt:http://…` chose plaintext and the `.deb` URL derived from that root inherits the choice; the
-/// flag must follow it there or the opt-in would not work at all. A `github:` locator names no
-/// scheme. This URL is a field in a JSON document fetched from `api.github.com` over TLS, chosen by
-/// GitHub and not by the config, so a plaintext value in it is an anomaly in a third party's answer
-/// rather than a posture anyone here asked for. Opting into plaintext for your own server is not
-/// opting into following whatever scheme a remote API hands back, and one switch cannot honestly
-/// mean both.
-fn github_asset_url(
-    json: &serde_json::Value,
-    system: &str,
-    owner: &str,
-    repo: &str,
-) -> io::Result<String> {
-    let url = prebuilt::select_release_asset(json, system, ".deb").ok_or_else(|| {
-        io::Error::other(format!(
-            "no linux {} `.deb` asset in the latest release of {owner}/{repo}",
-            prebuilt::arch_label(system)
-        ))
-    })?;
-    if !crate::config::is_valid_deb_url(&url, false) {
-        return Err(io::Error::other(format!(
-            "the latest release of {owner}/{repo} selected an asset URL that is not a \
-             valid `https://` `.deb` URL: {url}"
-        )));
-    }
-    Ok(url)
-}
-
 /// The generated nix expression building one `deb:` package: fetch the pinned `.deb`, unpack it, and
 /// autoPatchelf it against [`prebuilt::ELECTRON_LIBS`] from the pinned `nixpkgs`. The install phase
 /// is generic for an Electron layout — it locates the app directory by its `resources/` signature
@@ -1010,14 +974,15 @@ mod tests {
             prebuilt::select_release_asset(&http_asset, "x86_64-linux", ".deb").as_deref(),
             Some("http://e/demo-app_1.0_amd64.deb")
         );
-        let err = github_asset_url(&http_asset, "x86_64-linux", "o", "r")
+        let err = prebuilt::validate_release_asset(&Deb, &http_asset, "o", "r", "x86_64-linux")
             .expect_err("a plaintext asset URL is refused");
         assert!(
             err.to_string().contains("https://"),
             "the refusal does not say what it wanted: {err}"
         );
         // The `apt:` sibling is the contrast: there the flag *does* follow the declared root, which
-        // is why this one has to be argued rather than assumed. See `github_asset_url`'s docstring.
+        // is why this one has to be argued rather than assumed. See
+        // `prebuilt::github_release_asset`'s docstring.
         let https_asset = serde_json::json!({
             "assets": [
                 { "name": "demo-app_1.0_amd64.deb",
@@ -1025,7 +990,8 @@ mod tests {
             ]
         });
         assert_eq!(
-            github_asset_url(&https_asset, "x86_64-linux", "o", "r").expect("TLS asset passes"),
+            prebuilt::validate_release_asset(&Deb, &https_asset, "o", "r", "x86_64-linux")
+                .expect("TLS asset passes"),
             "https://e/demo-app_1.0_amd64.deb"
         );
     }
