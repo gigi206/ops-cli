@@ -15,10 +15,22 @@
 //! would surface at the read-only `/etc/passwd`. [`project_runtime`] places them
 //! in a sibling of the writable home for exactly this reason.
 
+mod nesting;
+mod runtime;
+mod synthetic;
+
 use super::spec::{Mount, NetPolicy, SandboxSpec, SpecError};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
+
+pub(crate) use self::nesting::structural_nesting_warning;
+pub(crate) use self::runtime::{
+    Runtime, home_src, project_id, project_identity, project_runtime_id,
+};
+use self::runtime::{canonicalize_project, project_runtime};
+pub(super) use self::synthetic::hosts_contents;
+use self::synthetic::{SHELL_RC_CONTENTS, current_identity, machine_id_contents, materialize_etc};
 
 /// The sandbox's `$HOME` inside the sandbox. Distinct from the host's, and the
 /// passwd entry and the writable home bind all agree on it.
@@ -256,32 +268,6 @@ pub(crate) struct Overlay<'a> {
     /// cage's mise accepts a release with no cooling-off period for them. Empty for almost every
     /// cage; when it is empty no variable is set at all, so mise keeps its own default.
     pub(crate) fresh_release_tokens: &'a [String],
-}
-
-/// Host-side paths backing one project's sandbox. The writable home and the
-/// read-only synthetic `/etc` are deliberately *siblings*: nothing read-write
-/// contains the identity files (see the module integrity note).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProjectRuntime {
-    /// The sandbox `$HOME` on the host, bound read-write.
-    pub(crate) home_src: PathBuf,
-    /// Directory holding the synthetic `passwd`/`group`, bound read-only.
-    pub(crate) etc_dir: PathBuf,
-    /// For a **global app** only: the host path of the per-project mise data pool, bound writable
-    /// as mise's primary [`MISE_PROJECT_INCAGE`] so a `nix:` self-equip's install aligns with the
-    /// per-project `/nix` store. `None` for `sbx run` and a per-project app, whose home — and thus
-    /// mise's data dir — is already per-project, so they keep the single-pool wiring.
-    pub(crate) mise_project_src: Option<PathBuf>,
-}
-
-/// The synthetic sandbox identity. Same uid/gid as the host (the same-uid model),
-/// but a synthetic name and no other host accounts — uid resolution works
-/// without leaking `/etc/passwd`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Identity {
-    pub(crate) uid: u32,
-    pub(crate) gid: u32,
-    pub(crate) user: String,
 }
 
 /// Host-side locations of one sandbox's mount sources, passed to [`assemble`].
@@ -905,105 +891,6 @@ pub(super) const STRUCTURAL_DESTS: &[&str] = &[
     super::contract::EGRESS_CONTRACT_INCAGE,
 ];
 
-/// How a config bind's destination overlaps a structural mount destination.
-enum Nesting {
-    /// The bind sits at or under the structural path: the cage mounts over it, so the bind is
-    /// shadowed and never appears inside.
-    Shadowed,
-    /// The bind contains the structural path: the cage mounts that path over part of the bound
-    /// directory, so that sub-path inside the cage is sbx's, not the bind's.
-    Contains,
-}
-
-/// If the canonical config-bind destination `dest` *nests* with a fixed structural mount
-/// destination — it is a strict ancestor or descendant of one — return that structural path and
-/// the relationship. An *exact* match is deliberately not reported: that collision is reconciled
-/// correctly by [`assemble`] (the structural mount wins — the control that stops a config bind
-/// displacing `/nix`). A nesting overlap is *not* reconciled — a descendant is shadowed by the
-/// later mount and vanishes; an ancestor over-exposes the host directory around the structural
-/// files — so it is the footgun worth surfacing.
-fn structural_nesting_conflict(dest: &Path) -> Option<(&'static str, Nesting)> {
-    STRUCTURAL_DESTS.iter().find_map(|s| {
-        let structural = Path::new(s);
-        if dest == structural {
-            None
-        } else if dest.starts_with(structural) {
-            Some((*s, Nesting::Shadowed))
-        } else if structural.starts_with(dest) {
-            Some((*s, Nesting::Contains))
-        } else {
-            None
-        }
-    })
-}
-
-/// A warning when a config bind's canonical destination `dest` nests with one of the cage's own
-/// structural mounts, or `None` when it does not. `writable` marks a `mode = "rw"` bind, which the
-/// `Contains` case flags specially: a read-write ancestor bind grants the cage write-through to the
-/// host files around the structural mount. The `binds` field is trusted-only, so this is an
-/// ergonomics tripwire (the launch does not drop the bind), not a security control — it tells the
-/// user their bind will not behave as a naive reading suggests.
-pub(crate) fn structural_nesting_warning(
-    dest: &Path,
-    writable: bool,
-    project: Option<&Path>,
-) -> Option<String> {
-    // The project is a structural mount too — it is emitted with them, after every config bind —
-    // but its path is a per-launch value rather than a constant, so it cannot live in the list
-    // above. Only the shadowed direction is worth a word. A bind that *contains* the project is
-    // the ordinary case (a bind of `$HOME`), and the project still lands correctly inside it.
-    //
-    // An exact collision warns here where it does not for the constants, and that difference is
-    // the point: `[[binds]] path = "<project>", mode = "ro"` reads as making the project
-    // read-only, and what actually happens is that the project's own read-write mount replaces it.
-    // A bind that does the opposite of what it says is worth more than a bind that does nothing.
-    if let Some(project) = project
-        && dest.starts_with(project)
-    {
-        let what = if dest == project {
-            "is the project itself".to_string()
-        } else {
-            "sits inside the project".to_string()
-        };
-        return Some(format!(
-            "bind `{}` {what}, which the cage mounts after it and over it — the bind has no \
-             effect, whatever its mode. To narrow a path inside the project, use an `[fs] deny` \
-             mask: those are applied after the project rather than before it",
-            dest.display()
-        ));
-    }
-    structural_nesting_conflict(dest).map(|(structural, nesting)| match nesting {
-        Nesting::Shadowed => {
-            // A `/dev/*` path is the common case worth steering: a plain bind of a device node is
-            // both shadowed here *and* (were it not) `nodev` — visible but unusable. `[devices]` is
-            // the field that actually exposes a host device with device access.
-            let dev_hint = if structural == "/dev" {
-                " — to expose a host device with device access, use `[devices]` instead"
-            } else {
-                ""
-            };
-            format!(
-                "bind `{}` sits at or under the sandbox's own mount `{structural}` — the cage mounts \
-                 over it, so the bind is shadowed and will not appear inside{dev_hint}",
-                dest.display()
-            )
-        }
-        Nesting::Contains => {
-            let write_note = if writable {
-                " — and being read-write, the cage can write through to the host files around it"
-            } else {
-                ""
-            };
-            format!(
-                "bind `{}` contains the sandbox's own mount `{structural}` — the cage mounts that \
-                 path over part of it, so `{structural}` inside the cage is sbx's, not your \
-                 bind's{write_note}",
-                dest.display()
-            )
-        }
-    })
-}
-
 /// mise's data directory inside the cage, relative to the sandbox `$HOME`. The
 /// in-cage mise keeps its plugins, installs and state here — under the writable
 /// per-project home, so they persist across launches and never touch the host's
@@ -1092,22 +979,6 @@ pub(crate) fn flake_inline_incage(name: &str) -> PathBuf {
 /// dir on PATH. Under `/opt/sbx`, beside the mise plugin, colliding with no structural
 /// mount.
 pub(crate) const SHELL_RC_INCAGE: &str = "/opt/sbx/bashrc";
-
-/// The synthetic interactive-shell rc: set a default prompt that names the cage, show the
-/// egress contract once (to stderr, so a captured stdout stays clean), source the home's own
-/// `.bashrc` if the agent has written one, then activate mise so its activated tools manage
-/// PATH/env. Static (no per-project data, so the same bytes back every cage), bound read-only
-/// from outside every writable mount, so the agent cannot rewrite what its own shell sources.
-///
-/// The prompt uses `\h`, which resolves to the cage's `sbx-<slug>` hostname, so an interactive `sbx run`
-/// reads `(sbx-<slug>) <cwd>$` instead of the bare `bash-<v>$` default — set *before* the
-/// `.bashrc` source so a home's own `PS1` still wins. The contract `cat` is guarded on the
-/// variable being set and readable, so it is a no-op where the handle is absent.
-const SHELL_RC_CONTENTS: &str = "\
-PS1='(\\h) \\w\\$ '\n\
-[ -r \"$SBX_EGRESS_CONTRACT\" ] && cat \"$SBX_EGRESS_CONTRACT\" >&2\n\
-[ -r \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\n\
-command -v mise >/dev/null 2>&1 && eval \"$(mise activate bash)\"\n";
 
 /// The structural environment that turns the cage's mise into a working
 /// self-equip front-end. Lowest precedence (a trusted config may still override
@@ -1236,225 +1107,6 @@ fn join_paths(dirs: &[PathBuf]) -> String {
         .map(|p| p.to_string_lossy())
         .collect::<Vec<_>>()
         .join(":")
-}
-
-/// The synthetic `/etc/passwd`: the sandbox user (same uid/gid as the host) plus
-/// `nobody`. No other host account appears.
-fn passwd_contents(id: &Identity, home: &str, shell: &str) -> String {
-    format!(
-        "{user}:x:{uid}:{gid}:{user}:{home}:{shell}\n\
-         nobody:x:65534:65534:nobody:/:/sbin/nologin\n",
-        user = id.user,
-        uid = id.uid,
-        gid = id.gid,
-    )
-}
-
-/// The synthetic `/etc/group`: the sandbox group plus `nogroup`.
-fn group_contents(id: &Identity) -> String {
-    format!(
-        "{user}:x:{gid}:\nnogroup:x:65534:\n",
-        user = id.user,
-        gid = id.gid,
-    )
-}
-
-/// The synthetic `/etc/hosts`: `localhost` (and the cage's own `sbx-<slug>` hostname) mapped to
-/// loopback, so a name lookup of either resolves via the file without reaching DNS — which the
-/// cage's empty netns has no resolver for. Only loopback mappings appear; no host entry is
-/// leaked. The hostname is placed on the `localhost` lines so a tool that resolves its own
-/// hostname (`gethostname` → `getaddrinfo`) also gets a loopback answer instead of a DNS failure.
-///
-/// Each `tcp://` destination is added on its own loopback address, where the cage's forwarder
-/// listens for it. That is what lets a declaration name the real host (`psql -h db.internal`) and
-/// have it work: the name resolves inside the cage to somewhere the cage can actually reach, while
-/// the request that leaves still carries the name, so the egress policy matches on what the author
-/// wrote. These are still loopback addresses — nothing here reveals where the destination really is.
-pub(super) fn hosts_contents(hostname: &str, tcp: &[super::egress::TcpDestination]) -> String {
-    let mut out = format!(
-        "127.0.0.1\tlocalhost {hostname}\n\
-         ::1\tlocalhost ip6-localhost ip6-loopback {hostname}\n"
-    );
-    // `map_name` is already false for a destination this file maps itself; the hostname check is the
-    // belt to that suspenders, since a second line for a name written above would never be read.
-    for dest in tcp
-        .iter()
-        .filter(|d| d.map_name && d.host != hostname && d.host != "localhost")
-    {
-        out.push_str(&format!("{}\t{}\n", dest.cage_addr, dest.host));
-    }
-    out
-}
-
-/// A synthetic `/etc/machine-id` (systemd format: 32 lowercase hex digits, newline-terminated),
-/// deterministically derived from the cage's own home path so it is **stable across launches of the
-/// same app-home and unique per home** — never the host's real machine-id (which the hermetic cage
-/// does not carry, and which would leak a host identifier). A hermetic cage otherwise has no
-/// `/etc/machine-id`, `/var/lib/dbus/machine-id`, or MAC, so a desktop app that fingerprints the
-/// machine (some editors read `cat /var/lib/dbus/machine-id /etc/machine-id || hostname` to build
-/// a device id) falls back to hashing an empty string — producing the *same* id in every such cage,
-/// which the app's server-side anti-abus then reads as one machine running countless accounts. A
-/// per-home synthetic id gives each app a distinct, persistent machine identity instead. The input is
-/// domain-separated so the raw home path is not recoverable from the id.
-fn machine_id_contents(home_src: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(b"sbx-cage-machine-id\0");
-    h.update(home_src.as_os_str().as_encoded_bytes());
-    let digest = h.finalize();
-    let mut id = String::with_capacity(33);
-    for byte in &digest[..16] {
-        id.push_str(&format!("{byte:02x}"));
-    }
-    id.push('\n');
-    id
-}
-
-/// Which persistent runtime a launch uses — the writable `$HOME` and its sibling synthetic
-/// `/etc`. `sbx run` use the project's shared default; an app gets a dedicated,
-/// persistent home so its config, login state, and history never bleed into the project shell
-/// or another app. An app's home is either shared across projects (`GlobalApp`, one identity
-/// everywhere) or keyed per-project (`ProjectApp`, isolated per project).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Runtime<'a> {
-    /// The project's default shared home — `sbx run`.
-    ProjectDefault,
-    /// `sbx app <name>` with one home per app, shared across every project.
-    GlobalApp(&'a str),
-    /// `sbx app <name>` with a home per (project, app).
-    ProjectApp(&'a str),
-}
-
-/// Host-side runtime paths for `project` under sbx's data directory, for the given
-/// [`Runtime`]. The home and the synthetic `/etc` are always siblings so the latter sits
-/// outside every read-write bind (module integrity note). An app name is a validated single
-/// path component (the config app-name check), so joining it cannot traverse out of the data
-/// directory.
-fn project_runtime(data_dir: &Path, project: &Path, runtime: Runtime) -> ProjectRuntime {
-    let project_base = || data_dir.join("projects").join(project_id(project));
-    let (base, mise_project_src) = match runtime {
-        Runtime::ProjectDefault => (project_base(), None),
-        // A global app's home is project-independent — keyed only by the app name, so the same
-        // identity is reused in every project. Its mise data pool, however, is keyed per (project,
-        // app) — `projects/<id>/apps/<name>/mise`, the same base a per-project app roots its home
-        // under, plus `/mise` — so a `nix:` self-equip's install record aligns with the per-project
-        // `/nix` store and never points at another project's store. App-keyed (not project-keyed),
-        // so a tool the agent self-equips in app A stays private to app A, preserving per-app
-        // isolation for mise install records exactly as before the split.
-        Runtime::GlobalApp(name) => (
-            data_dir.join("apps").join(name),
-            Some(project_base().join("apps").join(name).join("mise")),
-        ),
-        // A per-project app's home nests under the project, isolating its state per project — its
-        // mise data dir is therefore already per-project-aligned, so it keeps the single-pool wiring.
-        Runtime::ProjectApp(name) => (project_base().join("apps").join(name), None),
-    };
-    ProjectRuntime {
-        home_src: base.join("home"),
-        etc_dir: base.join("etc"),
-        mise_project_src,
-    }
-}
-
-/// The host path of the cage's persistent `$HOME` for this launch — the exact directory
-/// [`build_spec`] binds writable as the home (derived identically: canonicalise the cwd, then
-/// [`project_runtime`]). Lets a host-side helper place a file the cage reads through the home bind
-/// (the live-theme keyfile the in-cage portal watches).
-pub(crate) fn home_src(data_dir: &Path, cwd: &Path, runtime: Runtime) -> io::Result<PathBuf> {
-    let project = canonicalize_project(cwd)?;
-    Ok(project_runtime(data_dir, &project, runtime).home_src)
-}
-
-/// A collision-resistant directory name for a canonical project path, stable within a given binary
-/// build. Housekeeping hashes a running session's recorded canonical path with this to match it
-/// against a runtime tree's id, so it can skip a tree a live session still holds. The hash is
-/// `DefaultHasher`, whose output std does not guarantee equal across toolchain/std versions, so a
-/// future build could re-key a project's trees (GC/re-seed heals the orphaned ones); switch to a
-/// specified hash here if cross-build stability is ever required.
-pub(crate) fn project_id(project: &Path) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    project.hash(&mut h);
-    format!("{:016x}", h.finish())
-}
-
-/// The stable per-project identity sbx keys runtime state on. The writable home,
-/// the synthetic identity, and a project's garbage-collection roots all derive from
-/// it, so housekeeping can reclaim a project's tools alongside the rest of its
-/// runtime. Canonicalises first, so a relative or symlinked `cwd` maps to the same
-/// identity as the real path (the same pin [`canonicalize_project`] applies to the
-/// bind source).
-pub(crate) fn project_runtime_id(cwd: &Path) -> io::Result<String> {
-    Ok(project_identity(cwd)?.0)
-}
-
-/// The per-project identity together with the canonical project path it derives from. The id keys
-/// the project's runtime tree (home, store, gcroots); the canonical path is what a launch records
-/// in a durable marker so housekeeping can later recognise — and reclaim — that tree once the
-/// project directory is gone (the id alone is a one-way hash). Canonicalises once, so id and path
-/// agree and both match the bind source's pinned location.
-pub(crate) fn project_identity(cwd: &Path) -> io::Result<(String, PathBuf)> {
-    let canonical = canonicalize_project(cwd)?;
-    let id = project_id(&canonical);
-    Ok((id, canonical))
-}
-
-/// Resolve `path` to a real, existing directory, following symlinks in the host
-/// namespace. Canonicalising up front *narrows* the bind-source TOCTOU window:
-/// the source is pinned to its real location, so a later project-controlled
-/// symlink swap no longer trivially redirects the bind. It is not an absolute
-/// guarantee — a parent component swapped between this call and the actual bind
-/// still races — but the broader confinement of arbitrary, config-declared bind
-/// paths is enforced where those binds are introduced.
-fn canonicalize_project(path: &Path) -> io::Result<PathBuf> {
-    let canon = path.canonicalize()?;
-    if !canon.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("project path is not a directory: {}", canon.display()),
-        ));
-    }
-    Ok(canon)
-}
-
-/// The host identity to reflect into the sandbox (same-uid model). Reads ambient
-/// process state, so it is kept out of the pure assembly.
-fn current_identity() -> Identity {
-    // SAFETY: `getuid`/`getgid` always succeed and only read the caller's ids.
-    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-    Identity {
-        uid,
-        gid,
-        user: "sandbox".to_string(),
-    }
-}
-
-/// Materialise the synthetic `passwd`/`group` into `etc_dir` (created owner-only)
-/// and return their paths, ready to bind read-only. The shell field matches the
-/// in-sandbox `/bin/sh`, and `$HOME` matches the writable home bind.
-///
-/// Written through [`super::atomicfile::write_atomic`], like every other file staged in this
-/// directory and for the same reason: concurrent cages of one project share it, and these two are
-/// bound read-only into each of them, so an in-place rewrite could show a running cage a truncated
-/// `passwd` — every `getpwuid` in it failing for as long as the window lasts.
-fn materialize_etc(etc_dir: &Path, id: &Identity) -> io::Result<(PathBuf, PathBuf)> {
-    use std::fs::{DirBuilder, Permissions};
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(etc_dir)?;
-    std::fs::set_permissions(etc_dir, Permissions::from_mode(0o700))?;
-
-    let passwd = etc_dir.join("passwd");
-    let group = etc_dir.join("group");
-    super::atomicfile::write_atomic(
-        &passwd,
-        passwd_contents(id, SANDBOX_HOME, SANDBOX_SHELL).as_bytes(),
-    )?;
-    super::atomicfile::write_atomic(&group, group_contents(id).as_bytes())?;
-    Ok((passwd, group))
 }
 
 /// Build a launch-ready [`SandboxSpec`] for `cwd` under sbx's `data_dir`. This is

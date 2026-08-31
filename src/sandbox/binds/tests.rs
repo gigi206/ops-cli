@@ -1,3 +1,4 @@
+use super::synthetic::{Identity, group_contents, passwd_contents};
 use super::*;
 use crate::testutil::TmpDir;
 use std::os::unix::fs::PermissionsExt;

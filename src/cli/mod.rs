@@ -1152,18 +1152,14 @@ mod tests {
     /// Every dispatcher under `src/cli`, found by the idiom they all share — `match` on the first
     /// argument read as a string — rather than by a list kept here. Finding them is the whole
     /// point: a list would go stale exactly like the one this replaces.
+    ///
+    /// The corpus comes from [`crate::testutil::cli_sources`], which descends into the verb
+    /// directories: a family split across `<verb>.rs` and `<verb>/` keeps its dispatcher in the
+    /// module root by convention, and this scan is what would have to notice if one ever did not.
     fn dispatch_heads() -> Vec<Head> {
         const IDIOM: &str = ".first().and_then(|a| a.to_str())";
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli");
         let mut heads = Vec::new();
-        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-            .expect("src/cli must be readable")
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e == "rs"))
-            .collect();
-        files.sort();
-        for file in files {
+        for file in crate::testutil::cli_sources() {
             let text = std::fs::read_to_string(&file).expect("a cli source must be readable");
             let lines: Vec<&str> = text.lines().collect();
             for (n, line) in lines.iter().enumerate() {

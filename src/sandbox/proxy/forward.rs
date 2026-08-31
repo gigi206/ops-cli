@@ -116,27 +116,14 @@ pub(super) fn handle_https_forward(
         }
     };
 
-    // 5b. A credential-injected host cannot also host a WebSocket, for the reason the tunneled path
-    //     states in full: the injected secret rides the handshake, and once the upgrade completes the
-    //     frames are opaque and cannot be redacted. Refused fail-closed here, before any egress, so
-    //     no `allow` is recorded. Reached only when a `{WS}` rule already permitted the upgrade —
-    //     an upgrade to a non-`{WS}` host was denied by method above.
-    if ws_upgrade && !matching_injection_ids(&creds, &host, port, &path).is_empty() {
-        ctx.outcome(
-            crate::sandbox::control::Proto::Https,
-            &host,
-            port,
-            Some(verb),
-            Some(&path),
-            StatKind::Blocked,
-            "ws-injection-refused",
-        );
-        return write_refusal(
-            &mut client,
-            "403 Forbidden",
-            "ws-injection-refused",
-            "a WebSocket to a credential-injected host is refused: its frames cannot be redacted",
-        );
+    // 5b. The same refusal the tunneled plane makes, from the same `refuse_ws_into_injected_host`:
+    //     a credential-injected host cannot also host a WebSocket, and the refusal comes before any
+    //     egress so no `allow` is recorded. Reached only when a `{WS}` rule already permitted the
+    //     upgrade — an upgrade to a non-`{WS}` host was denied by method above.
+    if ws_upgrade
+        && refuse_ws_into_injected_host(&mut client, ctx, &creds, &host, port, verb, &path)?
+    {
+        return Ok(());
     }
 
     // 6. Resolve host-side, then the SSRF guard against the deciding rule. A resolution failure for an
@@ -570,16 +557,7 @@ pub(super) fn handle_https_forward(
     if let Some(code) = parse_status_code(&resp_head)
         && code >= 200
     {
-        ctx.set_status(allow_seq, code);
-        // A `401` from a host this request carried a credential to is the destination itself saying
-        // the value is no longer accepted — the one signal worth re-resolving on, and a truer one
-        // than any declared expiry. Gated on a *refreshable* injection, so a refusal from a host we
-        // inject nothing into can never make an in-cage agent drive sbx's resolver, and a host whose
-        // credential is signed per request never spends a resolver run on a value that cannot be
-        // stale.
-        if code == 401 && any_refreshable(&creds, &injected_ids) {
-            ctx.credential_refused();
-        }
+        note_final_status(ctx, allow_seq, &creds, &injected_ids, code);
     }
     // Count upstream→client (`down`) through the body; the head was counted as it was relayed.
     // Teed ahead of the reflection masking — the capture masks its own buffers at filing time.

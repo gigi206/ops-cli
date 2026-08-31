@@ -125,6 +125,36 @@ pub(crate) fn force_remove(path: &Path) {
     }
 }
 
+/// Every `.rs` source under `src/cli`, sorted, subdirectories included.
+///
+/// Two guards read the dispatcher sources — the routed-subcommand check in [`crate::cli`] and the
+/// alias check in [`crate::help`] — and both must see the same corpus. The walk descends because
+/// a verb family that outgrew one file keeps its dispatcher in `<verb>.rs` and everything else in a
+/// `<verb>/` beside it: a flat listing would read the root, skip the children, and report the
+/// silence as a pass.
+pub(crate) fn cli_sources() -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli"),
+        &mut out,
+    );
+    out.sort();
+    out
+}
+
 /// A sorted `(relative path, size)` fingerprint of a tree — sensitive to any
 /// addition, removal, or size change, enough to assert a store never moved.
 pub(crate) fn fingerprint(root: &Path) -> Vec<(PathBuf, u64)> {
@@ -217,6 +247,21 @@ pub(crate) fn resolved(
         apps: apps.into_iter().map(|(n, a)| (n.to_string(), a)).collect(),
         warnings: vec![],
     }
+}
+
+/// The baseline config with only the two `nixpkgs` pins set — the global channel and the project's.
+///
+/// The pair decides which revision a launch resolves against, and the tests that vary it are spread
+/// across the launch tree (the lock target, the package groups, the equip tokens). Written once here
+/// so those three do not each carry their own copy of the same two-line fixture.
+pub(crate) fn resolved_channels(
+    global: Option<&str>,
+    project: Option<&str>,
+) -> crate::config::Resolved {
+    let mut cfg = resolved(vec![], vec![]);
+    cfg.nixpkgs_global = global.map(String::from);
+    cfg.nixpkgs_project = project.map(String::from);
+    cfg
 }
 
 /// An app overlay declaring only `packages`, for a test that asserts how the baseline and an app's

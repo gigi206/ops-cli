@@ -2285,7 +2285,7 @@ mod tests {
         // base channel lock byte-identical, and rolling the base must leave the engine
         // lock byte-identical. Proven deterministically with revision sources, which
         // resolve without nix — so a bogus nix path is never invoked. The roll mechanics
-        // are already covered by store.rs's `refresh*` tests (which `LockTarget::engine`
+        // are already covered by store/channel.rs's `refresh*` tests (which `LockTarget::engine`
         // reuses verbatim); what is net-new here is that the two commands write two
         // distinct files.
         let bogus_nix = Path::new("/nonexistent-nix");

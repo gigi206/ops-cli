@@ -1,5 +1,17 @@
+use super::cagepath::*;
+use super::notify::*;
+use super::open_lens::*;
+use super::open_serve::*;
+use super::pending::*;
+use super::report::*;
+use super::target::*;
 use super::*;
+use std::os::unix::net::UnixStream;
+use std::sync::Mutex;
+use std::time::Duration;
+
 use crate::proc_policy::ProcMode;
+use crate::sandbox::locks::{locked, write_locked};
 use crate::testutil::TmpDir;
 
 #[test]
@@ -2615,14 +2627,13 @@ fn an_open_the_lens_cannot_name_is_counted_because_it_leaves_nothing_else_behind
     // Unlike an exec, an open the lens could not name leaves no trace at all: this lens records
     // the refusals it decided, never the decisions it could not take. The counter is the only
     // thing that remembers it happened, which is the whole reason it exists.
-    let policy = ProcPolicy::new(ProcMode::Enforce, &[], &[]);
     let (pid, addr) = UNREADABLE;
 
     let armed = DecidingParts::with_lens();
     for _ in 0..2 {
         assert!(
             matches!(
-                open_name(&armed.cx(&policy), pid, addr, None),
+                open_name(armed.lens.is_some(), &armed.undecidable, pid, addr, None),
                 OpenName::Unreadable
             ),
             "an open whose path cannot be read has no name to decide against"
@@ -2637,7 +2648,7 @@ fn an_open_the_lens_cannot_name_is_counted_because_it_leaves_nothing_else_behind
     // And a cage that never asked for the lens is not told it lost something it never had.
     let bare = DecidingParts::new();
     assert!(matches!(
-        open_name(&bare.cx(&policy), pid, addr, None),
+        open_name(bare.lens.is_some(), &bare.undecidable, pid, addr, None),
         OpenName::Unreadable
     ));
     assert_eq!(bare.undecidable.open.load(Ordering::Relaxed), 0);

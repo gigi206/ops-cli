@@ -196,6 +196,7 @@ mod ssrf;
 mod tunnel;
 mod websocket;
 mod wire;
+mod wsframe;
 pub(crate) use ca::Ca;
 use ca::upstream_server_name;
 use capture::{CaptureGuard, tee_request_body, tee_response};
@@ -1340,6 +1341,76 @@ fn injected_names(injected: &[(String, String)]) -> Vec<&str> {
 /// spending a resolver run. See [`HeaderInjection::refreshable`].
 fn any_refreshable(creds: &CredentialSet, ids: &[usize]) -> bool {
     ids.iter().any(|&i| creds.injections[i].refreshable())
+}
+
+/// Record a request's FINAL status on its `allow` event, and act on a `401`.
+///
+/// A `401` from a host this request carried a credential to is the destination itself saying the
+/// value is no longer accepted — the one signal worth re-resolving on, and a truer one than any
+/// declared expiry. Gated on a *refreshable* injection, so a refusal from a host sbx injects nothing
+/// into can never make an in-cage agent drive sbx's resolver, and a host whose credential is signed
+/// per request never spends a resolver run on a value that cannot be stale.
+///
+/// Each inspected plane still decides *when* it holds a final status, because they read it from
+/// different places: the two HTTP/1.1 planes parse a status line and skip the interim `1xx` they
+/// already relayed, while the h2 plane takes the response's `:status` directly. What happens once
+/// they hold one is a single decision, and lives here — written out per plane it had already
+/// drifted, the h2 copy recording the status without the refresh, so an injected token that went
+/// stale mid-session stayed stale for every later stream on that plane while the very same
+/// credential refreshed on the other two.
+fn note_final_status(
+    ctx: &ProxyCtx,
+    seq: Option<u64>,
+    creds: &CredentialSet,
+    injected_ids: &[usize],
+    code: u16,
+) {
+    ctx.set_status(seq, code);
+    if code == 401 && any_refreshable(creds, injected_ids) {
+        ctx.credential_refused();
+    }
+}
+
+/// Refuse a WebSocket upgrade into a credential-injected host, and say whether it did.
+///
+/// A credential-injected host cannot also host a WebSocket: the injected secret rides the handshake,
+/// but once the upgrade completes the frames are opaque and cannot be redacted, so a value the host
+/// reflects in a frame would re-enter the cage. The refusal is fail-closed and comes before any
+/// egress, so no `allow` is recorded, rather than open an unredactable channel carrying an injected
+/// secret. Reached only when a `{WS}` rule already permitted the upgrade to this host — an upgrade
+/// to a non-`{WS}` host was denied by method before this.
+///
+/// The `Blocked` outcome and the `403` are recorded and written here, on the caller's own client
+/// socket `w`, so the two inspected HTTP/1.1 planes refuse with one status, one tag and one message;
+/// each caller has only to end its own turn on `true`.
+fn refuse_ws_into_injected_host<W: Write>(
+    w: &mut W,
+    ctx: &ProxyCtx,
+    creds: &CredentialSet,
+    host: &str,
+    port: u16,
+    method: &str,
+    target: &str,
+) -> io::Result<bool> {
+    if matching_injection_ids(creds, host, port, target).is_empty() {
+        return Ok(false);
+    }
+    ctx.outcome(
+        crate::sandbox::control::Proto::Https,
+        host,
+        port,
+        Some(method),
+        Some(target),
+        StatKind::Blocked,
+        "ws-injection-refused",
+    );
+    write_refusal(
+        w,
+        "403 Forbidden",
+        "ws-injection-refused",
+        "a WebSocket to a credential-injected host is refused: its frames cannot be redacted",
+    )?;
+    Ok(true)
 }
 
 /// The reason token a request refused for want of a signature carries: the `x-sbx-egress-reason`

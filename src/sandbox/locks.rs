@@ -25,7 +25,7 @@
 //!
 //! Three sites recover on neither argument, and each says so where it lives, because a lock that
 //! guards a decision rather than data owes that argument in full at its own definition and does not
-//! inherit one from here. `ProcOverlay` in `sandbox/proc_enforce.rs` and `ManualRules` in
+//! inherit one from here. `ProcOverlay` in `sandbox/proc_enforce/overlay.rs` and `ManualRules` in
 //! `sandbox/control` are the live `--session` exec and egress rule overlays: **live policy**, which
 //! is neither a record nor a resource. Both recover because their lists cannot be left incomplete by
 //! an unwind, and because the panic's alternative — ending the thread that decides every `execve`,

@@ -1,3 +1,4 @@
+use super::cagepath::*;
 use super::*;
 
 #[test]

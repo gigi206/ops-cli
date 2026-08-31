@@ -23,8 +23,8 @@ use super::capture::CapBuf;
 use super::inject::{HeaderLookup, RequestFacts, pairs_for as injection_values};
 use super::{
     AskPosture, ProxyCtx, SIGNER_REFUSED, SecretNeedle, StatKind, carries_secret, decide_https,
-    header_name_eq, is_connection_bound_challenge, matching_injection_ids, redact_in_place,
-    resolve_checked, signer_refusal_message, upstream_server_name,
+    header_name_eq, is_connection_bound_challenge, matching_injection_ids, note_final_status,
+    redact_in_place, resolve_checked, signer_refusal_message, upstream_server_name,
 };
 use crate::allowlist::{self, Rule};
 use crate::sandbox::control::{HttpVer, LogVerdict, Proto, RpcKind};
@@ -641,17 +641,9 @@ async fn relay(
         }
     };
     let (mut rparts, up_body) = resp.into_parts();
-    ctx.set_status(seq, rparts.status.as_u16());
-    // A `401` from a host this stream carried a credential to is the destination itself saying the
-    // value is no longer accepted — the one signal worth re-resolving on. Both HTTP/1.1 planes have
-    // always done this beside their own `set_status`; this one only recorded the status, so an
-    // injected token that went stale mid-session stayed stale for every later stream on the h2 plane
-    // while the very same credential refreshed on the other two. Same gate as theirs: a *refreshable*
-    // injection this request actually carried, so a refusal from a host sbx injects nothing into can
-    // never let an in-cage agent drive the resolver.
-    if rparts.status.as_u16() == 401 && super::any_refreshable(&creds, &injected_ids) {
-        ctx.credential_refused();
-    }
+    // The h2 response's `:status` is already final, so it goes straight to the decision the two
+    // HTTP/1.1 planes reach through their own status-line parse.
+    note_final_status(ctx, seq, &creds, &injected_ids, rparts.status.as_u16());
     // Stop sharing a connection the upstream has just bound an identity to — see
     // [`binds_identity_to_the_connection`].
     if binds_identity_to_the_connection(&rparts.headers) {

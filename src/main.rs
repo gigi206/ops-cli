@@ -745,7 +745,7 @@ fn local_save_refusal(path: &Path, exists: bool) -> String {
 /// delta it authored, never content the user has not approved.** `sbx net allow --local` and
 /// `sbx proc allow --local` re-trust unconditionally after writing, so they must be admitted here
 /// first; `sbx config set|add|rm|unset --trust` blesses only when asked, so it is admitted only when
-/// the flag is passed (see `cli::config::admit_config_write`). The one deliberate exception is
+/// the flag is passed (see `cli::config::edit::admit_config_write`). The one deliberate exception is
 /// `sbx config edit --trust`, where the editor showed the user the file: what you have seen may be
 /// blessed.
 ///
