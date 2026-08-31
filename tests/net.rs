@@ -1638,11 +1638,7 @@ fn net_pending_all_save_global_app_writes_the_profile_and_names_it_not_the_globa
     std::fs::create_dir_all(&egress).unwrap();
     std::fs::create_dir_all(&sessions).unwrap();
     let pid = std::process::id();
-    let start_ticks: u64 = {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-        let after = &stat[stat.rfind(')').unwrap() + 1..];
-        after.split_whitespace().nth(19).unwrap().parse().unwrap()
-    };
+    let start_ticks = common::start_ticks(pid);
     let project_hex: String = fx
         .proj
         .path()
@@ -1752,12 +1748,7 @@ fn net_pending_all_save_local_drains_this_project_and_writes_its_config() {
     std::fs::create_dir_all(&sessions).unwrap();
 
     let pid = std::process::id();
-    let start_ticks: u64 = {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-        // Everything after the last ')' starts at field 3 (state); starttime is field 22 → index 19.
-        let after = &stat[stat.rfind(')').unwrap() + 1..];
-        after.split_whitespace().nth(19).unwrap().parse().unwrap()
-    };
+    let start_ticks = common::start_ticks(pid);
     // The project path is hex-encoded in the record (so a non-UTF-8/newline path round-trips).
     use std::os::unix::ffi::OsStrExt;
     let project = fx.proj.path().canonicalize().unwrap();
@@ -2026,11 +2017,7 @@ fn net_pending_all_app_scoped_drains_a_registered_app_session() {
     std::fs::create_dir_all(&sessions).unwrap();
 
     let pid = std::process::id();
-    let start_ticks: u64 = {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-        let after = &stat[stat.rfind(')').unwrap() + 1..];
-        after.split_whitespace().nth(19).unwrap().parse().unwrap()
-    };
+    let start_ticks = common::start_ticks(pid);
     let project = fx.proj.path().canonicalize().unwrap();
     let project_hex: String = project
         .as_os_str()
@@ -2170,11 +2157,7 @@ fn net_pending_by_id_accepts_an_app_scope_and_rejects_a_mismatch() {
     std::fs::create_dir_all(&sessions).unwrap();
 
     let pid = std::process::id();
-    let start_ticks: u64 = {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-        let after = &stat[stat.rfind(')').unwrap() + 1..];
-        after.split_whitespace().nth(19).unwrap().parse().unwrap()
-    };
+    let start_ticks = common::start_ticks(pid);
     let project = fx.proj.path().canonicalize().unwrap();
     let project_hex: String = project
         .as_os_str()

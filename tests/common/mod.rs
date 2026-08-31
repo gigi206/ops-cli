@@ -93,6 +93,26 @@ pub fn stdout_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// A process's start-time ticks — field 22 of `/proc/<pid>/stat`.
+///
+/// This is what pairs with a pid to name one *incarnation* of a process across pid reuse, so it is
+/// what a fabricated session record has to carry for sbx to accept the record as live. Seven
+/// suites fabricate such records; they read the field through here.
+///
+/// Field 2 (`comm`) is the process name in parentheses and may itself contain spaces and `)`, so
+/// splitting the whole line on whitespace is wrong. Everything after the *final* `)` is clean, and
+/// field 3 (state) is the first token there — which puts field 22 twentieth.
+pub fn start_ticks(pid: u32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read /proc stat");
+    let after = &stat[stat.rfind(')').expect("a stat line carries a comm field") + 1..];
+    after
+        .split_whitespace()
+        .nth(19)
+        .expect("a stat line carries field 22")
+        .parse()
+        .expect("start ticks are a number")
+}
+
 /// The candidate names the completion oracle offers after `path`, for the given cursor word.
 pub fn oracle(path: &[String], cursor: &str) -> Vec<String> {
     let mut argv: Vec<String> = vec!["__complete".into(), "--".into()];

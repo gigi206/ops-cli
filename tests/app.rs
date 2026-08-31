@@ -1,15 +1,23 @@
-//! Integration tests for `sbx app show`: the built binary reports one app's realized-on-disk detail
-//! — its profile source, home size, and each declared package annotated with whether it is actually
-//! installed (a `mise:` tool from the app home, a `deb:` build from a project tree's pins, a `nix:`
-//! package from the project trees that gcrooted it). Read-only: no sandbox, no nix, no network, so a
-//! lightweight fixture of fabricated files is enough.
+//! Integration tests for the host-side `sbx app` verbs: what they report about an app, and what
+//! they remove.
+//!
+//! `show` reports one app's realized-on-disk detail — its profile source, home size, and each
+//! declared package annotated with whether it is actually installed (a `mise:` tool from the app
+//! home, a `deb:` build from a project tree's pins, a `nix:` package from the project trees that
+//! gcrooted it). `rm --purge` takes the installed homes away again, and must take exactly those:
+//! not a second app's, and not the shared per-project store, which belongs to `sbx gc`.
+//!
+//! None of it launches a cage, so none of it needs a capable host: every fixture is fabricated
+//! files under a redirected data dir. Which is what makes the reports and the removals assertable
+//! here at all — an e2e that had to provision first could only skip on most machines.
 
 #[macro_use]
 mod common;
 use common::project::Project;
 
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 impl Project {
     /// Fabricate a global app home with a mise tool installed at `<munged>/<version>/`.
@@ -925,5 +933,250 @@ fn show_without_a_name_is_a_usage_error() {
         text(&out).contains("sbx app show <name>"),
         "should print the synopsis:\n{}",
         text(&out)
+    );
+}
+
+// --- `sbx app rm --purge`: the host-side removal of an app's installed homes.
+//
+// These moved here from `tests/run.rs`, which is the launch suite: they neither launch nor need
+// a capable host, they stand up fabricated app homes on disk and ask what the management verb
+// does with them. On the way they picked up the shared harness, so they now run from an empty
+// project directory rather than from wherever cargo was invoked.
+
+/// Materialize a non-empty file at `path`, creating parents. A helper for the app-purge e2es, which
+/// stand up fake app homes on disk (the purge is host-side filesystem work — no sandbox needed).
+fn touch_under(path: &Path) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, b"x").unwrap();
+}
+
+#[test]
+fn sbx_app_rm_purge_removes_the_installed_homes_and_lists_them() {
+    let fx = Project::new("app");
+    let sbx_dir = fx.data_home.path().join("sbx");
+    // The target app 'claude': a global home (with a sibling etc) and one per-project home.
+    touch_under(&sbx_dir.join("apps/claude/home/state"));
+    touch_under(&sbx_dir.join("apps/claude/etc/passwd"));
+    touch_under(&sbx_dir.join("projects/testproj/apps/claude/home/state"));
+    // A different app and unrelated project state that must all survive the purge.
+    touch_under(&sbx_dir.join("apps/codex/home/state"));
+    touch_under(&sbx_dir.join("projects/testproj/store/nix/keepme"));
+
+    // `sbx app list` shows one row per app with its installed home, so a user can see what there is
+    // to purge. The unified table carries the `HOME` column header and a row for each installed app.
+    let listed = fx.run(&["app", "list"]);
+    assert!(listed.status.success(), "app list failed: {listed:?}");
+    let list_out = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        list_out.contains("HOME") && list_out.contains("claude") && list_out.contains("codex"),
+        "app list did not report the installed homes:\n{list_out}"
+    );
+
+    // Purge 'claude': profile absent (fine), both homes removed, everything else intact.
+    let purged = fx.run(&["app", "rm", "claude", "--purge"]);
+    assert!(purged.status.success(), "purge failed: {purged:?}");
+    let purge_out = String::from_utf8_lossy(&purged.stdout);
+    assert!(
+        purge_out.contains("purged"),
+        "no purge summary:\n{purge_out}"
+    );
+    assert!(
+        !sbx_dir.join("apps/claude").exists(),
+        "global home survived"
+    );
+    assert!(
+        !sbx_dir.join("projects/testproj/apps/claude").exists(),
+        "per-project home survived"
+    );
+    assert!(
+        sbx_dir.join("apps/codex/home/state").exists(),
+        "codex was collateral"
+    );
+    assert!(
+        sbx_dir.join("projects/testproj/store/nix/keepme").exists(),
+        "the shared per-project store was touched — purge must leave it to `sbx gc`"
+    );
+
+    // A second purge finds nothing and says so (a typo/no-op must not report success).
+    let again = fx.run(&["app", "rm", "claude", "--purge"]);
+    assert!(!again.status.success(), "a no-op purge reported success");
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains("nothing to purge"),
+        "no-op purge did not explain itself: {again:?}"
+    );
+}
+
+#[test]
+fn sbx_app_rm_purges_several_apps_in_one_call() {
+    let fx = Project::new("app");
+    let sbx_dir = fx.data_home.path().join("sbx");
+    // Two target apps, one with a global home and one with a per-project home, plus a third that
+    // is not named and must survive.
+    touch_under(&sbx_dir.join("apps/agent-one/home/state"));
+    touch_under(&sbx_dir.join("projects/testproj/apps/agent-two/home/state"));
+    touch_under(&sbx_dir.join("apps/agent-three/home/state"));
+
+    // Three names with an absent one in the middle: each app is purged on its own, so the failing
+    // name is reported without stopping the one after it, and the call exits non-zero.
+    let out = fx.run(&[
+        "app",
+        "rm",
+        "agent-one",
+        "absent-app",
+        "agent-two",
+        "--purge",
+    ]);
+    assert!(
+        !out.status.success(),
+        "an app with nothing to purge must colour the exit code: {out:?}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("nothing to purge for 'absent-app'"),
+        "the failing name is not the one reported: {out:?}"
+    );
+    assert!(
+        !sbx_dir.join("apps/agent-one").exists(),
+        "the app named before the failing one was not purged"
+    );
+    assert!(
+        !sbx_dir.join("projects/testproj/apps/agent-two").exists(),
+        "the failing name stopped the batch — the name after it was skipped"
+    );
+    assert!(
+        sbx_dir.join("apps/agent-three/home/state").exists(),
+        "an app that was not named was collateral"
+    );
+    // Each purged app reports its own summary…
+    assert_eq!(
+        stdout.matches("purged app").count(),
+        2,
+        "one summary line per purged app expected:\n{stdout}"
+    );
+    // …while the closing store note is batch-level: the store it points at is shared by every app
+    // in the project, so one call prints it once however many apps it purged.
+    assert_eq!(
+        stdout.matches("nix:/flake: tool closures").count(),
+        1,
+        "the shared-store note must be printed once per call:\n{stdout}"
+    );
+}
+
+#[test]
+fn sbx_app_rm_counts_a_repeated_name_once() {
+    let fx = Project::new("app");
+    let sbx_dir = fx.data_home.path().join("sbx");
+    touch_under(&sbx_dir.join("apps/agent-one/home/state"));
+
+    // The same app named twice is one removal: a second pass would find nothing left and report a
+    // phantom "nothing to purge" over work that in fact succeeded.
+    let out = fx.run(&["app", "rm", "agent-one", "agent-one", "--purge"]);
+    assert!(
+        out.status.success(),
+        "a repeated name reported a failure: {out:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("nothing to purge"),
+        "the repeat was purged twice: {out:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout)
+            .matches("purged app")
+            .count(),
+        1,
+        "the repeat produced a second summary line: {out:?}"
+    );
+    assert!(
+        !sbx_dir.join("apps/agent-one").exists(),
+        "the home survived the purge"
+    );
+}
+
+#[test]
+fn sbx_app_rm_gc_is_skipped_when_the_call_purged_nothing() {
+    // Nothing on disk for any name: the sweep has no reclamation to make, so it must not run —
+    // which is also what keeps this test free of nix and of a capable host.
+    let fx = Project::new("app");
+    let out = fx.run(&["app", "rm", "absent-app", "--purge", "--gc"]);
+    assert!(
+        !out.status.success(),
+        "a call that purged nothing must not report success: {out:?}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("swept this project's store"),
+        "the sweep ran for a call that purged nothing:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("nix:/flake: tool closures"),
+        "a store note was printed with no purge to point it at:\n{stdout}"
+    );
+}
+
+#[test]
+fn sbx_app_rm_gc_requires_purge() {
+    // `--gc` sweeps the store a purged home referenced, so it is meaningless without `--purge`.
+    // This errors before any work, so it needs no capable host and no data setup.
+    let fx = Project::new("app");
+    let out = fx.run(&["app", "rm", "agent", "--gc"]);
+    assert!(
+        !out.status.success(),
+        "`--gc` without `--purge` should be a usage error"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "usage error should exit 2: {out:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("requires `--purge`"),
+        "the error should explain the --gc/--purge relationship: {out:?}"
+    );
+}
+
+#[test]
+fn sbx_app_rm_purge_refuses_while_a_session_is_live() {
+    let fx = Project::new("app");
+    let sbx_dir = fx.data_home.path().join("sbx");
+    touch_under(&sbx_dir.join("apps/agent/home/state"));
+
+    // A real live process to anchor a session record: the guard is decided by a start-time match
+    // against /proc, so a fabricated record must name a genuinely-running pid.
+    let mut child = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id();
+    let start_ticks = common::start_ticks(pid);
+
+    // A session record tagging that live pid as `sbx app agent` (runtime `global-app:agent`); the
+    // record format is the module's `key=value` text, project hex-encoded (`/x` = 2f78).
+    let sessions = sbx_dir.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{pid}-{start_ticks}")),
+        format!(
+            "kind=run\npid={pid}\nstart={start_ticks}\nruntime=global-app:agent\nproject=2f78\n"
+        ),
+    )
+    .unwrap();
+
+    let out = fx.run(&["app", "rm", "agent", "--purge"]);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        !out.status.success(),
+        "purge did not refuse a live app: {out:?}"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("running session"),
+        "refusal did not name the live session: {err}"
+    );
+    // Nothing was removed — the home is still there for a retry after the session stops.
+    assert!(
+        sbx_dir.join("apps/agent/home/state").exists(),
+        "purge removed the home despite the live session"
     );
 }

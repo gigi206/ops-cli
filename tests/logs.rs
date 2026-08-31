@@ -25,18 +25,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-/// Read a process's start-time ticks (`/proc/<pid>/stat` field 22) for the fabricated record.
-fn read_start_ticks(pid: u32) -> u64 {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read stat");
-    let after = &stat[stat.rfind(')').unwrap() + 1..];
-    after.split_whitespace().nth(19).unwrap().parse().unwrap()
-}
-
 /// Write the session record the `logs` views resolve, pointing at a live `pid`. The on-disk format
 /// is stable, and fabricating it isolates the view under test from the registration machinery.
 fn write_session_record(data: &Path, pid: u32, project: &Path) {
     use std::os::unix::ffi::OsStrExt;
-    let start = read_start_ticks(pid);
+    let start = common::start_ticks(pid);
     let dir = data.join("sbx").join("sessions");
     std::fs::create_dir_all(&dir).unwrap();
     let hex: String = project

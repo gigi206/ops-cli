@@ -1,6 +1,11 @@
-//! Integration tests for `sbx config`, exercising the built binary end to end:
-//! global+project layering and the trust gate, against redirected config/state
-//! dirs and a temp project as the working directory.
+//! Integration tests for the surfaces built on layered configuration, exercising the built binary
+//! end to end against redirected config/state dirs and a temp project as the working directory.
+//!
+//! `sbx config` itself — global+project layering and the trust gate — is most of it. The `sbx
+//! plugins` list/info/install cases live here too, and deliberately: a plugin is reached through
+//! the same layered resolution, and what those tests assert is which registry a launch sees and
+//! what the trust gate does to it. `tests/plugins.rs` covers the other half of that surface, the
+//! provenance and store machinery, against a single-directory home.
 
 #[macro_use]
 mod common;
