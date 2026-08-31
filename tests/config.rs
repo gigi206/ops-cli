@@ -5,53 +5,14 @@
 #[macro_use]
 mod common;
 use common::fixture::TmpDir;
+use common::project::Project;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
 
-/// One project sandbox under test: a project dir (the working directory), the
-/// redirected config-home (global config), state-home (trust store) and data-home
-/// (per-project runtime), plus a scratch root for real bind targets.
-struct Fixture {
-    proj: TmpDir,
-    config_home: TmpDir,
-    state_home: TmpDir,
-    data_home: TmpDir,
-    bind_dir: TmpDir,
-}
-
-impl Fixture {
-    fn new() -> Self {
-        Fixture {
-            proj: TmpDir::new("cfg"),
-            config_home: TmpDir::new("cfg"),
-            state_home: TmpDir::new("cfg"),
-            data_home: TmpDir::new("cfg"),
-            bind_dir: TmpDir::new("cfg"),
-        }
-    }
-
-    fn write_global(&self, body: &str) {
-        let dir = self.config_home.path().join("sbx");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("sbx.toml"), body).unwrap();
-    }
-
-    fn write_project(&self, body: &str) {
-        std::fs::write(self.proj.path().join(".sbx.toml"), body).unwrap();
-    }
-
+impl Project {
     fn write_mise(&self, body: &str) {
         std::fs::write(self.proj.path().join(".mise.toml"), body).unwrap();
-    }
-
-    /// Drop an imported app profile under the profiles directory
-    /// (`<config>/sbx/apps/<name>.toml`) — the artifact `sbx app import` produces, trusted by
-    /// location beside the global config.
-    fn write_profile(&self, name: &str, body: &str) {
-        let dir = self.config_home.path().join("sbx").join("apps");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{name}.toml")), body).unwrap();
     }
 
     /// Stage a resolver plugin under the data dir (`<data>/plugins/<name>/plugin.toml`), the
@@ -82,7 +43,7 @@ impl Fixture {
     /// deliberately outside the data dir, so the install must copy it in.
     fn source_plugin(&self, dirname: &str, manifest: &str, exec_mode: u32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let dir = self.bind_dir.path().join(dirname);
+        let dir = self.scratch().join(dirname);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("plugin.toml"), manifest).unwrap();
         let exec = dir.join("resolve");
@@ -94,47 +55,15 @@ impl Fixture {
     /// Create a real directory to bind, returning its absolute path. Binds are
     /// canonicalized and missing ones dropped, so a bind target must exist.
     fn bind_target(&self, name: &str) -> PathBuf {
-        let p = self.bind_dir.path().join(name);
+        let p = self.scratch().join(name);
         std::fs::create_dir_all(&p).unwrap();
         p
-    }
-
-    /// An `sbx` invocation in the project dir with the redirected dirs.
-    fn sbx(&self, args: &[&str]) -> Command {
-        self.sbx_in(self.proj.path(), args)
-    }
-
-    /// [`sbx`](Self::sbx) from another directory, with the same redirected homes — so a test can ask
-    /// what changes when only the working directory does. The project config lives in `proj`, so
-    /// running from elsewhere is running with no project config at all, which is what a user does
-    /// whenever they launch a global app from outside a project.
-    fn sbx_in(&self, dir: &Path, args: &[&str]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
-        cmd.args(args)
-            .current_dir(dir)
-            .env("XDG_CONFIG_HOME", self.config_home.path())
-            .env("XDG_STATE_HOME", self.state_home.path())
-            .env("XDG_DATA_HOME", self.data_home.path())
-            // Pin a deterministic UTF-8 locale so an assertion on a provisioned tool's output
-            // (e.g. GNU `hello`) does not depend on the developer's own `LANG` — the cage now
-            // honors the host locale, so a French host would otherwise see a translated message.
-            .env("LC_ALL", "C.UTF-8")
-            .env_remove("LANG");
-        cmd
-    }
-
-    fn run(&self, args: &[&str]) -> Output {
-        self.sbx(args).output().expect("spawn sbx")
-    }
-
-    fn run_in(&self, dir: &Path, args: &[&str]) -> Output {
-        self.sbx_in(dir, args).output().expect("spawn sbx")
     }
 }
 
 #[test]
 fn no_config_files_resolves_to_empty_defaults() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let out = fx.run(&["config", "show"]);
     assert!(out.status.success(), "config must succeed with no files");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -147,7 +76,7 @@ fn no_config_files_resolves_to_empty_defaults() {
 fn config_json_is_a_valid_document_carrying_the_resolved_model() {
     // The machine-readable surface a script or a future management front-end consumes: the same
     // resolved model the human render shows, as one parseable JSON document on stdout.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("[env]\nFOO = \"bar\"\n\n[packages]\njq = \"nix:jq\"\n");
 
     let out = fx.run(&["config", "show", "--json"]);
@@ -187,9 +116,9 @@ fn config_show_reflects_and_tags_an_ambient_override() {
     // launch in this environment does — and tag the overridden value's provenance as `override`
     // (distinct from the persisted `default`/`global`/`project`). No project config, so the baseline
     // network is the default `shared`; the ambient override isolates it.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let out = fx
-        .sbx(&["config", "show"])
+        .cmd(&["config", "show"])
         .env("SBX_CONFIG", "network=\"none\"")
         .output()
         .expect("spawn sbx");
@@ -203,7 +132,7 @@ fn config_show_reflects_and_tags_an_ambient_override() {
     // A set-but-invalid ambient override is surfaced (as an error note), never silently ignored: the
     // baseline stands, so the view neither lies that a bad value took effect nor hides the mistake.
     let bad = fx
-        .sbx(&["config", "show"])
+        .cmd(&["config", "show"])
         .env("SBX_CONFIG", "network=\"nonee\"")
         .output()
         .expect("spawn sbx");
@@ -226,9 +155,9 @@ fn config_show_reflects_and_tags_an_ambient_override() {
 /// no launch would ever run.
 #[test]
 fn config_show_says_so_when_the_ambient_override_will_not_parse() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let out = fx
-        .sbx(&["config", "show"])
+        .cmd(&["config", "show"])
         .env("SBX_CONFIG", "network = [[[")
         .output()
         .expect("spawn sbx");
@@ -245,10 +174,10 @@ fn config_show_says_so_when_the_ambient_override_will_not_parse() {
 /// launch would not use.
 #[test]
 fn config_show_app_reflects_an_ambient_override() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_profile("demo", "cmd = [\"true\"]\n");
     let out = fx
-        .sbx(&["config", "show", "--app", "demo"])
+        .cmd(&["config", "show", "--app", "demo"])
         .env("SBX_NET", "none")
         .output()
         .expect("spawn sbx");
@@ -266,9 +195,9 @@ fn config_show_reflects_an_ambient_typed_override() {
     // The typed ambient variables (`SBX_NET` here) must reach `sbx config show` too — it reads the
     // same `collect` the launch does, so a stale `SBX_NET` cannot silently change a launch's posture
     // without the view admitting it. No project config, so the baseline network is `shared`.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let out = fx
-        .sbx(&["config", "show"])
+        .cmd(&["config", "show"])
         .env("SBX_NET", "none")
         .output()
         .expect("spawn sbx");
@@ -286,9 +215,9 @@ fn config_show_reflects_an_ambient_seccomp_and_device_override() {
     // (via the same `collect` a launch uses) and be tagged `(override)` — so a stale variable cannot
     // silently widen a launch without the view admitting it. No project config → the baseline is the
     // full mandatory denylist and a minimal /dev, so both lines appear only because of the override.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let out = fx
-        .sbx(&["config", "show"])
+        .cmd(&["config", "show"])
         .env("SBX_SECCOMP", "ptrace,unshare")
         .env("SBX_DEVICE", "/dev/kvm")
         .output()
@@ -312,9 +241,9 @@ fn config_show_reflects_an_ambient_proc_override() {
     // silently change a launch's enforcement without the view admitting it. No project config → the
     // baseline is `off`, and the baseline view shows the proc line only when it is not `off`, so the
     // line appears solely because of the override.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let out = fx
-        .sbx(&["config", "show"])
+        .cmd(&["config", "show"])
         .env("SBX_PROC", "enforce")
         .output()
         .expect("spawn sbx");
@@ -328,7 +257,7 @@ fn config_show_reflects_an_ambient_proc_override() {
     // A set-but-invalid ambient proc mode is fatal (no safe fallback for a security posture) and
     // surfaced; the baseline `off` stands, so the view neither lies nor hides the mistake.
     let bad = fx
-        .sbx(&["config", "show"])
+        .cmd(&["config", "show"])
         .env("SBX_PROC", "enfroce")
         .output()
         .expect("spawn sbx");
@@ -345,9 +274,9 @@ fn config_show_reflects_an_ambient_notify_override() {
     // `--notify`/`SBX_NOTIFY` decides whether a refusal is ever heard, so a stale ambient value must
     // reach `sbx config show` through the same `collect` a launch uses, tagged `(override)`. The
     // baseline is `always`, so `off` is the direction worth proving: a silenced session admits it.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let out = fx
-        .sbx(&["config", "show"])
+        .cmd(&["config", "show"])
         .env("SBX_NOTIFY", "off")
         .output()
         .expect("spawn sbx");
@@ -361,7 +290,7 @@ fn config_show_reflects_an_ambient_notify_override() {
     // A set-but-invalid ambient mode is fatal, like `proc`: falling back to the baseline could run
     // the launch quieter than the invoker asked for.
     let bad = fx
-        .sbx(&["config", "show"])
+        .cmd(&["config", "show"])
         .env("SBX_NOTIFY", "alwyas")
         .output()
         .expect("spawn sbx");
@@ -375,7 +304,7 @@ fn config_show_reflects_an_ambient_notify_override() {
 
 #[test]
 fn config_show_rejects_an_unknown_argument() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let out = fx.run(&["config", "show", "--bogus"]);
     assert_eq!(
         out.status.code(),
@@ -395,7 +324,7 @@ fn bare_config_reveals_its_subcommands() {
     // `sbx config` with no subcommand must not silently render the resolved view (which would
     // hide that `show`/`get`/set/… exist) — it prints the config page, listing the subcommands,
     // to stderr and exits non-zero, the way bare `sbx` does.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let out = fx.run(&["config"]);
     assert_eq!(
         out.status.code(),
@@ -418,7 +347,7 @@ fn bare_config_reveals_its_subcommands() {
 fn config_a_misplaced_flag_points_at_show() {
     // A flag with no subcommand (the old `sbx config --json` muscle memory) is a usage error that
     // names the right form, rather than being silently accepted.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let out = fx.run(&["config", "--json"]);
     assert_eq!(out.status.code(), Some(2), "a bare flag is a usage error");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -430,7 +359,7 @@ fn config_a_misplaced_flag_points_at_show() {
 
 #[test]
 fn a_mise_file_is_withheld_until_the_project_is_trusted() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("[env]\nA = \"1\"\n");
     fx.write_mise("[tools]\nnode = \"20\"\n");
 
@@ -455,7 +384,7 @@ fn a_mise_file_is_withheld_until_the_project_is_trusted() {
 
 #[test]
 fn editing_the_mise_file_re_arms_the_project_trust() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("[env]\nA = \"1\"\n");
     fx.write_mise("[tools]\nnode = \"20\"\n");
     assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
@@ -474,7 +403,7 @@ fn editing_the_mise_file_re_arms_the_project_trust() {
 
 #[test]
 fn a_mise_file_without_an_sbx_toml_warns_and_is_not_honored() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_mise("[tools]\nnode = \"20\"\n");
 
     let out = fx.run(&["config", "show"]);
@@ -495,7 +424,7 @@ fn a_mise_file_without_an_sbx_toml_warns_and_is_not_honored() {
 
 #[test]
 fn the_global_config_is_honored_in_full() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let shared = fx.bind_target("shared");
     fx.write_global(&format!(
         "binds = [\"{}\"]\n[env]\nGLOBALVAR = \"g\"\n",
@@ -525,7 +454,7 @@ fn the_global_config_is_honored_in_full() {
 fn env_provenance_names_the_winning_layer_on_a_same_key_override() {
     // When both layers set the same key, the project applies last and wins — the provenance
     // tag must name the *winning* layer, not the one that declared it first.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_global("[env]\nFOO = \"g\"\n");
     fx.write_project("[env]\nFOO = \"p\"\n");
 
@@ -544,7 +473,7 @@ fn env_provenance_names_the_winning_layer_on_a_same_key_override() {
 
 #[test]
 fn an_untrusted_project_keeps_env_but_drops_binds() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("binds = [\"/etc/ssh\"]\n[env]\nPROJVAR = \"p\"\n");
 
     let out = fx.run(&["config", "show"]);
@@ -571,7 +500,7 @@ fn an_untrusted_project_keeps_env_but_drops_binds() {
 
 #[test]
 fn trusting_the_project_applies_its_binds() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let extra = fx.bind_target("extra");
     fx.write_project(&format!(
         "binds = [\"{}\"]\n[env]\nPROJVAR = \"p\"\n",
@@ -611,7 +540,7 @@ fn network_mute_is_trusted_gated_and_surfaced_in_the_views() {
     // A `[network] mute` (SELinux `dontaudit`) suppresses a denied request's log line. It is a
     // security-relevant network sub-field, so it rides the whole-`[network]` trust gate, and it must
     // be *visible* (never a silent suppression) in both read-only views once it applies.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project(
         "[network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\nmute = [\"play.googleapis.com\"]\n",
     );
@@ -648,7 +577,7 @@ fn network_http2_is_trusted_gated_and_surfaced_in_config_show() {
     // `[network] http2` names the hosts the proxy speaks HTTP/2 to (for gRPC). It is a
     // security-relevant network sub-field, so it rides the whole-`[network]` trust gate; it must be
     // dropped for an untrusted project and *visible* (never a silent transport switch) once trusted.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project(
         "[network]\nmode = \"deny\"\nallow = [\"{POST} grpc.example.com:9001\"]\n\
          http2 = [\"grpc.example.com:9001\"]\n",
@@ -674,7 +603,7 @@ fn network_http2_is_trusted_gated_and_surfaced_in_config_show() {
 
     // A malformed http2 entry is dropped with a warning (fail-closed — that host keeps HTTP/1.1),
     // while the valid one is kept.
-    let fx2 = Fixture::new();
+    let fx2 = Project::new("cfg");
     fx2.write_project(
         "[network]\nmode = \"deny\"\nallow = [\"{POST} grpc.example.com:9001\"]\n\
          http2 = [\"grpc.example.com:9001\", \"grpc.example.com:99999\"]\n",
@@ -699,7 +628,7 @@ fn network_transport_settings_are_trusted_gated_and_surfaced_in_config_show() {
     // and how long a resolved address stands — so both ride the whole-`[network]` trust gate, and
     // both must be *visible* once trusted. The rendering rule is asymmetric on purpose: reuse is the
     // default, so only its absence is printed, while a DNS cache is not, so any setting prints.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project(
         "[network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\n\
          pool = false\ndns_cache_ttl = 30\n",
@@ -729,7 +658,7 @@ fn network_transport_settings_are_trusted_gated_and_surfaced_in_config_show() {
 
     // The default posture prints nothing: reuse is on, so there is no exception to report, and an
     // unset cache has no line either. This is what keeps the two lines meaningful.
-    let fx2 = Fixture::new();
+    let fx2 = Project::new("cfg");
     fx2.write_project("[network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\n");
     assert!(fx2.run(&["trust", ".sbx.toml"]).status.success());
     let out = fx2.run(&["config", "show"]);
@@ -745,7 +674,7 @@ fn network_transport_settings_are_trusted_gated_and_surfaced_in_config_show() {
 
     // `dns_cache_ttl = 0` is a *setting*, not an absence: it must say the cache is off rather than
     // fall silent like an unset field.
-    let fx3 = Fixture::new();
+    let fx3 = Project::new("cfg");
     fx3.write_project(
         "[network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\ndns_cache_ttl = 0\n",
     );
@@ -777,7 +706,7 @@ fn a_bind_that_nests_with_a_structural_mount_is_warned_but_kept() {
     // A trusted bind of `/etc` is an ancestor of the cage's synthetic `/etc/passwd`, so the cage
     // layers its own files over part of it — the bind will not behave as a naive reading suggests.
     // The bind is still honored (trusted field, not dropped), but the overlap is surfaced.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("binds = [\"/etc\"]\n");
     assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
@@ -803,7 +732,7 @@ fn a_bind_that_nests_with_a_structural_mount_is_warned_but_kept() {
 fn a_read_write_bind_is_honored_and_marked() {
     // A trusted `mode = "rw"` bind resolves read-write, and `sbx config show` marks it `(rw)` so a
     // writable host hole is visible; `--json` carries `writable: true`.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let rw = fx.bind_target("writable");
     fx.write_project(&format!(
         "binds = [{{ path = \"{}\", mode = \"rw\" }}]\n",
@@ -832,7 +761,7 @@ fn a_bind_path_expands_a_leading_home_variable() {
     // unrecognized `$VAR` at the head is refused (no arbitrary interpolation into a mount source).
     // Driven through the built binary with a controlled child `HOME`, so the assertion is
     // deterministic and free of any process-global environment race.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let home = TmpDir::new("cfg");
     std::fs::create_dir_all(home.path().join("sub")).unwrap();
     std::fs::create_dir_all(home.path().join("other")).unwrap();
@@ -844,7 +773,7 @@ fn a_bind_path_expands_a_leading_home_variable() {
     );
 
     let out = fx
-        .sbx(&["config", "show", "--json"])
+        .cmd(&["config", "show", "--json"])
         .env("HOME", home.path())
         .output()
         .expect("spawn sbx");
@@ -897,10 +826,10 @@ fn app_export_preserves_a_tilde_bind_verbatim_for_portability() {
     // author's expanded home path — otherwise a shared profile would hard-code one machine's home
     // and lose portability, the reason `~` exists. Correct by construction (export serializes the
     // untouched raw declaration), locked here against a future "canonicalize everything" refactor.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("[app.demo]\ncmd = \"sh\"\nbinds = [{ path = \"~/sub\", mode = \"rw\" }]\n");
     let out = fx
-        .sbx(&["app", "export", "demo"])
+        .cmd(&["app", "export", "demo"])
         .env("HOME", "/home/someone")
         .output()
         .expect("spawn sbx");
@@ -926,7 +855,7 @@ fn a_bind_declared_in_both_layers_is_deduplicated_and_the_project_mode_wins() {
     // must resolve to ONE bind, read-write — the launch would otherwise mount the dest twice and
     // `sbx config` would double-list it while the cage silently got the project's mode. Last
     // declaration (project) wins, matching how the launch's later mount wins.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let shared = fx.bind_target("shared");
     let canon = shared.canonicalize().unwrap();
     fx.write_global(&format!("binds = [\"{}\"]\n", shared.display()));
@@ -958,7 +887,7 @@ fn a_read_write_bind_over_sbx_own_config_dir_is_forced_read_only() {
     // read-write bind over it would let in-cage untrusted code rewrite the trusted-by-location
     // global config for a future launch. Even from a trusted project the bind is forced read-only,
     // with a warning naming sbx's control plane. The dir exists because the global config does.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_global("[env]\nGLOBALVAR = \"g\"\n");
     let sbx_config_dir = fx.config_home.path().join("sbx");
     fx.write_project(&format!(
@@ -991,7 +920,7 @@ fn a_read_write_bind_over_sbx_own_config_dir_is_forced_read_only() {
 
 #[test]
 fn the_network_posture_is_a_trust_gated_security_field() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("network = \"none\"\n");
 
     // Untrusted: the posture is dropped to the default (the `deny` allowlist), and the drop is
@@ -1021,7 +950,7 @@ fn the_network_posture_is_a_trust_gated_security_field() {
 
 #[test]
 fn the_network_allowlist_is_a_trust_gated_security_field() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project(
         "[network]\nmode = \"deny\"\nallow = [\"github.com\", \"*.nixos.org\", \"example.com/exact\"]\ndeny = [\"evil.nixos.org\"]\n",
     );
@@ -1083,7 +1012,7 @@ fn the_network_allowlist_is_a_trust_gated_security_field() {
 #[test]
 fn the_egress_stats_toggle_is_shown_and_trust_gated() {
     // A trusted project that turns its audit off reads `stats: off`.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\nstats = false\n");
     assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let out = fx.run(&["config", "show"]);
@@ -1097,7 +1026,7 @@ fn the_egress_stats_toggle_is_shown_and_trust_gated() {
     // The gate: an untrusted project's `stats = false` is dropped with its whole `[network]` table,
     // so the global filtering posture's recording stays on — a project cannot disable the auditing
     // of its own egress.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_global("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n");
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\nstats = false\n");
     // deliberately NOT trusting the project
@@ -1113,7 +1042,7 @@ fn the_egress_stats_toggle_is_shown_and_trust_gated() {
 fn the_redaction_floor_is_shown_and_trust_gated() {
     // A trusted project may move the floor its own credentials are watched from, and `config show`
     // reports it with the layer it came from.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("[redact]\nmin_len = 4\n");
     assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let out = fx.run(&["config", "show"]);
@@ -1127,7 +1056,7 @@ fn the_redaction_floor_is_shown_and_trust_gated() {
     // The gate: an untrusted project's `[redact]` is dropped, so the built-in floor stands. Raising
     // it is how a project would stop sbx watching for the credentials sbx injects on its behalf,
     // and the drop is explained rather than silent.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("[redact]\nmin_len = 64\n");
     // deliberately NOT trusting the project
     let out = fx.run(&["config", "show"]);
@@ -1146,7 +1075,7 @@ fn the_redaction_floor_is_shown_and_trust_gated() {
 
 #[test]
 fn the_allow_mode_is_a_denylist_default_allow_with_deny_carve_outs() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // Allow-by-default (a denylist) with one deny carve-out, in the table form.
     fx.write_project("[network]\nmode = \"allow\"\ndeny = [\"evil.example/secret\"]\n");
 
@@ -1200,7 +1129,7 @@ fn the_allow_mode_is_a_denylist_default_allow_with_deny_carve_outs() {
 
 #[test]
 fn editing_a_trusted_project_re_arms_the_gate() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("binds = [\"/etc/ssh\"]\n");
     assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
@@ -1223,7 +1152,7 @@ fn editing_a_trusted_project_re_arms_the_gate() {
 fn a_malformed_project_config_is_ignored_not_fatal() {
     // The threat-model case: an attacker-controlled project ships garbage. It must
     // neither crash the command nor apply anything — just warn, naming the file.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("binds = = not toml\n");
     let out = fx.run(&["config", "show"]);
     assert!(
@@ -1247,7 +1176,7 @@ fn a_config_that_fails_the_safety_gate_is_named_once_and_dropped() {
     use std::os::unix::fs::PermissionsExt as _;
     // The refusal a user is most likely to meet, and it used to print the path twice: the gate names
     // the file it failed on, so whoever renders that error must not prefix it again.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("network = \"shared\"\n");
     let path = fx.proj.path().join(".sbx.toml");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
@@ -1271,7 +1200,7 @@ fn a_config_that_fails_the_safety_gate_is_named_once_and_dropped() {
 #[test]
 fn a_world_writable_project_config_is_skipped() {
     use std::os::unix::fs::PermissionsExt;
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("binds = [\"/etc/ssh\"]\n[env]\nPROJVAR = \"p\"\n");
     let cfg = fx.proj.path().join(".sbx.toml");
     std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o666)).unwrap();
@@ -1298,9 +1227,9 @@ fn the_trust_gate_reaches_the_sandbox_through_a_real_launch() {
     // the project is trusted. Bind a host path that is neither structural nor under
     // `/tmp` (the sandbox's tmpfs would shadow a `/tmp` bind that is deliberately
     // emitted before it). Skip where the host cannot sandbox or the path is absent.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let can_sandbox = fx
-        .sbx(&["run", "--", "true"])
+        .cmd(&["run", "--", "true"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
@@ -1315,7 +1244,7 @@ fn the_trust_gate_reaches_the_sandbox_through_a_real_launch() {
 
     // Untrusted: the security bind must not reach the sandbox.
     let untrusted = fx
-        .sbx(&["run", "--", "/bin/sh", "-c", probe])
+        .cmd(&["run", "--", "/bin/sh", "-c", probe])
         .output()
         .expect("spawn sbx run");
     assert!(
@@ -1328,7 +1257,7 @@ fn the_trust_gate_reaches_the_sandbox_through_a_real_launch() {
     // Trust it, and the same bind is now visible inside.
     assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let trusted = fx
-        .sbx(&["run", "--", "/bin/sh", "-c", probe])
+        .cmd(&["run", "--", "/bin/sh", "-c", probe])
         .output()
         .expect("spawn sbx run");
     assert!(
@@ -1343,7 +1272,7 @@ fn the_trust_gate_reaches_the_sandbox_through_a_real_launch() {
 fn config_shows_packages_with_their_trust_verdict() {
     // `sbx config` reports declared tools and whether each would be provisioned,
     // without realising anything — so this needs no nix.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("[packages]\nnode = \"nix:nodejs_20\"\n");
 
     // Untrusted: shown, but marked withheld.
@@ -1378,9 +1307,9 @@ fn a_trusted_project_package_lands_on_the_sandbox_path() {
     // End-to-end: a declared tool is provisioned into sbx's store and reachable on
     // PATH inside the sandbox — but only once the project is trusted. Uses `hello`
     // (tiny, in the signed cache). Skipped where the host cannot sandbox.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let can_sandbox = fx
-        .sbx(&["run", "--", "true"])
+        .cmd(&["run", "--", "true"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
@@ -1395,7 +1324,7 @@ fn a_trusted_project_package_lands_on_the_sandbox_path() {
     // Untrusted: the tool is withheld, so it is not on PATH.
     let probe = "command -v hello >/dev/null 2>&1 && echo PRESENT || echo ABSENT";
     let untrusted = fx
-        .sbx(&["run", "--", "/bin/sh", "-c", probe])
+        .cmd(&["run", "--", "/bin/sh", "-c", probe])
         .output()
         .expect("spawn sbx run");
     assert!(
@@ -1408,7 +1337,7 @@ fn a_trusted_project_package_lands_on_the_sandbox_path() {
     // Trust it, and the tool is provisioned and runs.
     assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let trusted = fx
-        .sbx(&["run", "--", "hello"])
+        .cmd(&["run", "--", "hello"])
         .output()
         .expect("spawn sbx run");
     assert!(
@@ -1425,9 +1354,9 @@ fn a_trusted_package_that_cannot_be_realised_fails_the_launch_naming_it() {
     // realised (a non-existent attribute, or — same path — a lib-only output with no
     // `bin/`) is a hard failure that names the tool, never a silent drop. Skipped
     // where the host cannot sandbox.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let can_sandbox = fx
-        .sbx(&["run", "--", "true"])
+        .cmd(&["run", "--", "true"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
@@ -1443,7 +1372,7 @@ fn a_trusted_package_that_cannot_be_realised_fails_the_launch_naming_it() {
     assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     let out = fx
-        .sbx(&["run", "--", "true"])
+        .cmd(&["run", "--", "true"])
         .output()
         .expect("spawn sbx run");
     assert!(
@@ -1461,7 +1390,7 @@ fn a_trusted_package_that_cannot_be_realised_fails_the_launch_naming_it() {
 fn config_shows_the_nixpkgs_source_and_gates_a_project_override() {
     // `sbx config` shows which nixpkgs source the tools resolve against, without
     // resolving a revision — so this needs no nix.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
 
     // default when nothing overrides it
     let out = fx.run(&["config", "show"]);
@@ -1501,7 +1430,7 @@ fn config_shows_the_locked_revision_once_resolved() {
     // Once a revision is locked, the source line shows it — routed through the same
     // channel decision a launch uses. Seeded directly here (`sbx config` never
     // resolves), so the check stays network-free.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let lock_dir = fx.data_home.path().join("sbx");
     std::fs::create_dir_all(&lock_dir).unwrap();
     let rev = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
@@ -1526,7 +1455,7 @@ fn upgrade_in_a_trusted_pinned_project_rolls_the_per_project_lock() {
     // current directory resolves against — a trusted pin's own per-project lock, not
     // the global one. A 40-hex revision pin resolves to itself, so this needs no nix
     // call (only nix on PATH, which `upgrade` gates on); skipped if nix is absent.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let rev = "205fd4226592cc83fd4c0885a3e4c9c400efabb5";
     fx.write_project(&format!("nixpkgs = \"{rev}\"\n"));
     assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
@@ -1560,7 +1489,7 @@ fn upgrade_with_an_untrusted_pin_falls_back_to_the_global_lock() {
     // An untrusted project pin is a dropped security field, so `sbx upgrade` rolls the
     // global channel instead — and says why. A global revision override keeps this
     // network-free (it resolves to itself). Skipped if nix is absent.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let global_rev = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
     let project_rev = "205fd4226592cc83fd4c0885a3e4c9c400efabb5";
     fx.write_global(&format!("nixpkgs = \"{global_rev}\"\n"));
@@ -1618,12 +1547,12 @@ fn a_trusted_pin_to_a_different_channel_runs_a_tool_from_that_channel() {
     // (`nixos-23.11`) makes the glibc genuinely differ from the default rolling
     // channel. Trust+pin first, so even the capability probe runs on the pinned base
     // (one base closure, not two). Skipped where the host cannot sandbox.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("nixpkgs = \"nixos-23.11\"\n[packages]\nhello = \"nix:hello\"\n");
     assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     let can_sandbox = fx
-        .sbx(&["run", "--", "true"])
+        .cmd(&["run", "--", "true"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
@@ -1635,7 +1564,7 @@ fn a_trusted_pin_to_a_different_channel_runs_a_tool_from_that_channel() {
     }
 
     let out = fx
-        .sbx(&["run", "--", "hello"])
+        .cmd(&["run", "--", "hello"])
         .output()
         .expect("spawn sbx run");
     assert!(
@@ -1653,7 +1582,7 @@ fn a_trusted_pin_to_a_different_channel_runs_a_tool_from_that_channel() {
 
 #[test]
 fn a_registered_resolver_plugin_scheme_is_honored_in_a_secret() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_plugin(
         "pass",
         "type = \"resolver\"\nscheme = \"pass\"\nexec = \"resolve\"\n",
@@ -1680,7 +1609,7 @@ fn a_registered_resolver_plugin_scheme_is_honored_in_a_secret() {
 
 #[test]
 fn an_unregistered_resolver_scheme_drops_the_secret_with_a_warning() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // no plugin claims `vault`
     fx.write_project(
         "[network]\nmode = \"deny\"\nallow = [\"api.github.com\"]\n\n\
@@ -1705,7 +1634,7 @@ fn an_unregistered_resolver_scheme_drops_the_secret_with_a_warning() {
 
 #[test]
 fn plugins_list_shows_installed_plugins_builtins_and_drop_warnings() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // a valid, runnable plugin
     fx.write_plugin(
         "pass",
@@ -1769,7 +1698,7 @@ fn plugins_list_shows_installed_plugins_builtins_and_drop_warnings() {
 
 #[test]
 fn plugins_list_flags_a_non_runnable_executable() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_plugin(
         "pass",
         "type=\"resolver\"\nscheme=\"pass\"\nexec=\"resolve\"\n",
@@ -1790,7 +1719,7 @@ fn plugins_list_flags_a_non_runnable_executable() {
 
 #[test]
 fn plugins_info_reports_builtin_unknown_and_a_plugin() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_plugin(
         "pass",
         "type=\"resolver\"\nscheme=\"pass\"\nexec=\"resolve\"\nversion=\"0.1.0\"\n\
@@ -1838,7 +1767,7 @@ fn plugins_info_reports_builtin_unknown_and_a_plugin() {
 /// to reconstruct the path from the layout.
 #[test]
 fn plugins_info_names_the_writable_state_grant_and_its_location() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_plugin(
         "rotating",
         "type=\"resolver\"\nscheme=\"rotating\"\nexec=\"resolve\"\n\
@@ -1864,7 +1793,7 @@ fn plugins_info_explains_a_dropped_conflicting_scheme() {
     // `info <scheme>` is the command a user runs to learn why their plugin is not picked up. When
     // two plugins claim one scheme, both are dropped — so the registry has no entry for it, and the
     // answer is the conflict itself (with the plugins to remove), not a bare "no plugin claims it".
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_plugin(
         "v1",
         "type=\"resolver\"\nscheme=\"vault\"\nexec=\"resolve\"\n",
@@ -1903,7 +1832,7 @@ fn plugins_info_explains_a_dropped_conflicting_scheme() {
 
 #[test]
 fn plugins_install_then_list_then_remove_through_the_binary() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
 
     // Nothing installed and no store configured — both stated rather than left blank, so the
     // `(none)` this test ends on is a transition and not a binary that always says it.
@@ -1969,7 +1898,7 @@ fn plugins_install_then_list_then_remove_through_the_binary() {
 
 #[test]
 fn plugins_install_refuses_a_colliding_scheme_through_the_binary() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let alpha = fx.source_plugin(
         "alpha-src",
         "name=\"alpha\"\ntype=\"resolver\"\nscheme=\"vault\"\nexec=\"resolve\"\n",
@@ -2006,7 +1935,7 @@ fn plugins_install_refuses_a_colliding_scheme_through_the_binary() {
 
 #[test]
 fn plugins_install_refuses_a_path_that_is_not_a_plugin() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let out = fx.run(&["plugins", "install", "nope"]);
     assert!(
         !out.status.success(),
@@ -2063,11 +1992,11 @@ fn publish_then_add_and_install_through_a_real_clone() {
         skip_incapable!("skipping publish e2e: git is not available");
         return;
     }
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
 
     // A store source repository with one resolver plugin (scheme distinct from its name, so the
     // install-time reconciliation is exercised, not bypassed).
-    let repo = fx.bind_dir.path().join("store");
+    let repo = fx.scratch().join("store");
     let plugin = repo.join("plugins/pass");
     std::fs::create_dir_all(&plugin).unwrap();
     std::fs::write(
@@ -2084,7 +2013,7 @@ fn publish_then_add_and_install_through_a_real_clone() {
     }
 
     // Publish: sign the tree (generating the key on first use).
-    let keyfile = fx.bind_dir.path().join("store.key");
+    let keyfile = fx.scratch().join("store.key");
     let publish = fx.run(&[
         "plugins",
         "store",
@@ -2135,7 +2064,7 @@ fn publish_then_add_and_install_through_a_real_clone() {
 
 #[test]
 fn an_app_overlay_shows_in_config_and_its_security_fields_gate_by_trust() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let bind = fx.bind_target("appdir");
     fx.write_project(&format!(
         "[app.probe]\n\
@@ -2209,7 +2138,7 @@ fn an_app_overlay_shows_in_config_and_its_security_fields_gate_by_trust() {
 
 #[test]
 fn an_imported_profile_is_a_trusted_by_location_app() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // A profile dropped beside the global config is honored in full — its security `network`
     // field included — even with no project trust, exactly like a global `[app.<name>]`.
     fx.write_profile(
@@ -2231,7 +2160,7 @@ fn an_imported_profile_is_a_trusted_by_location_app() {
 
 #[test]
 fn an_app_allowlist_shows_counts_by_default_and_rules_under_details() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // A profile (trusted by location) whose allowlist lives in the app overlay — the common case,
     // since the baseline stays `shared`. The compact view shows the rule counts; `--details`
     // expands the individual rules plus the always-allowed built-in set (which the
@@ -2278,7 +2207,7 @@ fn an_app_allowlist_shows_counts_by_default_and_rules_under_details() {
 
 #[test]
 fn config_show_app_shows_the_effective_config_with_inheritance() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // A baseline `[limits]` (global, trusted by location) the app inherits, plus a profile (also
     // trusted by location) that sets its own command, network, and one limit. `config show --app`
     // then tells the inheritance story end-to-end, in three parts: a field the app set reads
@@ -2389,7 +2318,7 @@ fn an_apps_channel_is_the_working_directorys_channel_and_the_view_names_it() {
     // so the same app resolves against a project's trusted pin when run from that project and
     // against the global channel when run from anywhere else. The app view is where someone asks
     // what an app will run with, so it has to say which of the two it got.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_profile("demo", "cmd = \"demo-agent\"\n");
     fx.write_project("nixpkgs = \"nixos-24.11\"\n");
     assert!(
@@ -2447,7 +2376,7 @@ fn an_apps_channel_is_the_working_directorys_channel_and_the_view_names_it() {
 
 #[test]
 fn a_mode_less_app_network_inherits_the_baseline_mode() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // The headline scenario: the global config sets `ask`; a profile (trusted by location) lists
     // its own hosts but omits `mode`, so it inherits `ask` while keeping its own allow-list — the
     // whole point of making `mode` optional. (If it did not inherit, it would fall back to `deny`.)
@@ -2486,7 +2415,7 @@ fn a_mode_less_app_network_inherits_the_baseline_mode() {
 
 #[test]
 fn config_show_app_with_a_narrowed_network_drops_the_inherited_secret() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // A baseline credential (global, trusted by location) under a network allowlist, and two apps:
     // `wide` inherits the allowlist (so the launch injects the secret), `narrow` cuts the network
     // to none (so the launch injects nothing). The per-app view must match the launch — it must not
@@ -2534,7 +2463,7 @@ fn config_show_app_with_a_narrowed_network_drops_the_inherited_secret() {
 
 #[test]
 fn config_show_compact_app_section_is_secret_posture_aware() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // The compact `apps:` roster in the full `config show` must agree with the launch (and the
     // `--app` detail view): an app declaring its own credential injects it only under an allowlist.
     // `wired` keeps an allowlist (injects); `solo` declares the same credential but cuts the network
@@ -2575,7 +2504,7 @@ fn config_show_compact_app_section_is_secret_posture_aware() {
 
 #[test]
 fn config_show_single_source_views_restrict_to_one_layer() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // A free env var and a security field in the global config; a different free env var in the
     // project. Each single-source view shows what *that* layer contributes (over the defaults), so
     // its provenance tags read as that layer's own additions.
@@ -2629,7 +2558,7 @@ fn config_show_single_source_views_restrict_to_one_layer() {
 
 #[test]
 fn config_show_rejects_conflicting_source_and_app_flags() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // Two different source flags is a user error, not last-wins.
     let out = fx.run(&["config", "show", "--global", "--local"]);
     assert_eq!(
@@ -2653,7 +2582,7 @@ fn config_show_rejects_conflicting_source_and_app_flags() {
 
 #[test]
 fn config_app_flag_addresses_the_app_table_for_get_set_unset() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // `set --app` writes under the app's table — sugar for the dotted key `app.<name>.<key>`.
     let out = fx.run(&["config", "set", "--app", "demo", "cmd", "mytool"]);
     assert!(out.status.success(), "set --app must succeed");
@@ -2685,7 +2614,7 @@ fn config_app_flag_addresses_the_app_table_for_get_set_unset() {
 
 #[test]
 fn config_app_flag_validates_the_name_and_does_not_apply_to_path_or_edit() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // A name with a `.` is one quoted TOML segment, so it is addressable like any other name. The
     // splitter behind every read and write is quote-aware, and `is_valid_app_name` runs before the
     // quoting, so a name can never carry a quote of its own to escape with.
@@ -2719,7 +2648,7 @@ fn config_app_flag_validates_the_name_and_does_not_apply_to_path_or_edit() {
 
 #[test]
 fn config_short_flags_alias_their_long_forms() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_global("[env]\nGLOBAL_VAR = \"g\"\n");
     fx.write_project("[env]\nPROJECT_VAR = \"p\"\n");
 
@@ -2783,7 +2712,7 @@ fn config_set_get_unset_on_a_global_app_route_to_its_profile_file() {
     // with top-level keys (a global app is a profile, never an inline `[app.*]`). This is the one
     // routing that unlocks every network posture on a global app via the CLI; assert it end-to-end
     // (the value RESOLVES through `config show --app`, not merely that the file holds the string).
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // A global baseline posture, so an inherited app mode has something concrete to resolve to.
     fx.write_global("network = \"ask\"\n");
 
@@ -2854,7 +2783,7 @@ fn unset_network_mode_on_a_global_app_yields_an_inheriting_table() {
     // The mode-less (inherit) table — the shape the `[network] mode` optional feature added — is now
     // reachable on a global app via the CLI: bootstrap a rule (which sets an explicit `mode = "deny"`),
     // then drop the mode. The app then inherits the parent layer's mode while keeping its own rules.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_global("network = \"ask\"\n"); // the mode the app will inherit
     fx.write_profile("demo", "cmd = \"agent\"\n");
 
@@ -2897,7 +2826,7 @@ fn config_set_on_a_full_profile_survives_validation_and_resolves() {
     // cmd + [packages] + [secret] + [network], the shape the shipped profiles carry — must survive
     // a `config set` untouched and still resolve. A minimal network-only profile would hide a
     // validation mismatch on the real-world fields.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_profile(
         "agent",
         "cmd = \"agent\"\n\
@@ -2964,7 +2893,7 @@ fn a_local_write_still_warns_when_it_re_arms_a_trusted_project() {
     // The trust note is scope-aware: suppressed for the global config / profiles (trusted by
     // location), but a project write that re-arms a trusted `.sbx.toml` MUST still warn — the guard
     // that the note-suppression above did not silence the case that matters.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("network = \"deny\"\n");
     assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
@@ -2983,7 +2912,7 @@ fn the_secret_inventory_names_the_source_of_a_task_wire_injection_too() {
     // matters when auditing what leaves the machine. A task's `inject` is the same declaration as a
     // launch-wide one, read from the same host-side chain, so the inventory has to answer for it as
     // well; it used to print the destination alone and say nothing about the source.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project(
         r#"
 [secret."api.example.com"]
@@ -3033,7 +2962,7 @@ fn setting_a_key_to_the_value_it_already_holds_leaves_the_trust_gate_alone() {
     // writes nothing new re-arms nothing — and saying it did would tell someone their security
     // fields had stopped applying when they had not, sending them to `sbx trust` for no reason.
     // `add`/`rm` already treat an unchanged file this way; `set` has to agree.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("network = \"ask\"\n");
     assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let before = std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap();
@@ -3067,7 +2996,7 @@ fn setting_a_key_to_the_value_it_already_holds_leaves_the_trust_gate_alone() {
 
 #[test]
 fn an_app_secret_shows_a_count_by_default_and_its_destination_under_details() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // A profile whose credential lives in the app overlay — the common case, since the shipped
     // profiles inject host-side from the overlay while the baseline carries no secret. The compact
     // view shows a count; `--details` expands each by destination and source. The value never
@@ -3107,7 +3036,7 @@ fn an_app_secret_shows_a_count_by_default_and_its_destination_under_details() {
 
 #[test]
 fn an_app_env_and_binds_show_counts_by_default_and_expand_under_details() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // A baseline (global) env, to prove the app section shows the overlay's *own* additions, not
     // the baseline-merged set: BASE_ONLY is baseline-only and must not be duplicated into the app
     // block; SHARED collides on a key and the app shows its own value, not the baseline's.
@@ -3168,7 +3097,7 @@ fn an_app_env_and_binds_show_counts_by_default_and_expand_under_details() {
 
 #[test]
 fn an_imported_profile_keeps_its_command_and_posture_under_an_untrusted_project() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // The flagship case: an imported profile (trusted by location) runs *on* untrusted code without
     // the repo hijacking it. The profile sets the command and a network allowlist.
     fx.write_profile(
@@ -3204,7 +3133,7 @@ fn an_imported_profile_keeps_its_command_and_posture_under_an_untrusted_project(
 
 #[test]
 fn sbx_app_import_places_validates_renames_and_removes_a_profile() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // A portable profile authored as a standalone file (the app's fields at the top level).
     std::fs::write(
         fx.proj.path().join("demo-app.toml"),
@@ -3277,7 +3206,7 @@ fn sbx_app_import_places_validates_renames_and_removes_a_profile() {
 /// same as a silent one.
 #[test]
 fn a_forced_import_names_what_it_dropped_and_keeps_the_profile_it_replaced() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     std::fs::write(
         fx.proj.path().join("demo-app.toml"),
         "cmd = \"demo-app\"\n[network]\nmode = \"deny\"\nallow = [\"api.example.com\"]\n",
@@ -3349,7 +3278,7 @@ fn a_forced_import_names_what_it_dropped_and_keeps_the_profile_it_replaced() {
 
 #[test]
 fn sbx_app_import_refuses_a_wrapped_profile_and_an_invalid_name() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // A file mistakenly wrapped in `[app.<name>]` has no top-level cmd → refused with a hint.
     std::fs::write(
         fx.proj.path().join("wrapped.toml"),
@@ -3380,7 +3309,7 @@ fn sbx_app_import_refuses_a_wrapped_profile_and_an_invalid_name() {
 
 #[test]
 fn sbx_app_export_emits_a_profile_verbatim_an_inline_app_serialized_and_round_trips() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
 
     // (a) An imported profile exports verbatim — comments and formatting survive.
     let profile_body = "# my demo-app profile\n\
@@ -3456,7 +3385,7 @@ fn the_shipped_profiles_import_and_resolve() {
     // dropped (the schema is deliberately additive for forward-compatibility, so this is not an
     // error). The value checks below therefore anchor on *intent*, read from the raw file text —
     // never from the parse, which is exactly what would have swallowed the field.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/app");
     let mut imported = Vec::new();
     for entry in std::fs::read_dir(&dir).expect("examples/app/ dir exists") {
@@ -3578,7 +3507,7 @@ fn the_shipped_profiles_import_and_resolve() {
 #[test]
 fn bundle_export_writes_the_same_file_through_the_flag_as_through_a_redirect() {
     use std::os::unix::fs::PermissionsExt as _;
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_global(
         r#"
 [bundle.demo]
@@ -3621,7 +3550,7 @@ fn install_steps_arrive_in_use_order_and_name_the_bundle_that_declared_them() {
     // carried, in the order the app named them. The bundle travels with each step because
     // everything a launch will say about it — the note before it runs, the error if it fails —
     // names it, and "an install step failed" with no author is not actionable.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_global(
         r#"
 [bundle.alpha]
@@ -3682,7 +3611,7 @@ fn a_bundle_folds_into_a_profile_and_the_profile_still_wins() {
     // The end-to-end shape the feature exists for: an orchestrator profile names one bundle and
     // gets that tool, its environment and its egress without restating them — while everything it
     // declares itself still overrides the bundle.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_global(
         r#"
 [bundle.demo-agent]
@@ -3763,7 +3692,7 @@ allow = ["{*} https://orchestrator.example.com"]
 /// fragment no longer declares, and keep the previous bundle in the portable form that imports back.
 #[test]
 fn a_forced_bundle_import_names_what_it_dropped_and_keeps_the_bundle_it_replaced() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let frag = fx.proj.path().join("fragment.toml");
     std::fs::write(
         &frag,
@@ -3854,7 +3783,7 @@ fn sbx_bundle_import_export_round_trips_and_the_imported_bundle_is_usable() {
     // The portability loop, end to end: a fragment someone else wrote is imported into the global
     // config, listed, re-exported, and — the point of importing it — actually applies to an app
     // that names it. A round-trip that could not then be *used* would be a nice no-op.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let frag = fx.proj.path().join("fragment.toml");
     std::fs::write(
         &frag,
@@ -3931,7 +3860,7 @@ fn a_bundle_credential_is_dropped_when_the_app_has_no_filtering_posture() {
     // credential surviving into that cage would be the worst pairing available: no allowlist
     // bounding the destination, and a key to send. It must be dropped by the posture re-check, and
     // said out loud — the same note a directly-declared secret gets.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_global(
         r#"
 [bundle.keyed]
@@ -3987,7 +3916,7 @@ fn an_untrusted_project_cannot_use_a_bundle_to_graft_trusted_egress_onto_its_app
     // carries egress rules and credentials, so an untrusted project naming one would be choosing
     // which trusted reach to graft onto an app it controls. Dropped until the project is trusted,
     // and the drop is reported where someone inspecting that app will read it.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_global(
         r#"
 [bundle.demo-agent]
@@ -4034,7 +3963,7 @@ mode = "deny"
 
 #[test]
 fn sbx_app_rm_of_an_absent_profile_points_at_sbx_toml() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let out = fx.run(&["app", "rm", "nope"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("sbx.toml"));
@@ -4042,7 +3971,7 @@ fn sbx_app_rm_of_an_absent_profile_points_at_sbx_toml() {
 
 #[test]
 fn sbx_app_rm_takes_several_names_and_one_failure_spares_the_rest() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_profile("demo-one", "cmd = \"demo-app\"\n");
     fx.write_profile("demo-two", "cmd = \"demo-app\"\n");
 
@@ -4070,7 +3999,7 @@ fn sbx_app_rm_takes_several_names_and_one_failure_spares_the_rest() {
 
 #[test]
 fn sbx_app_rm_rejects_an_invalid_name_before_removing_anything() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_profile("demo-one", "cmd = \"demo-app\"\n");
 
     // A path-shaped name is a usage error, and it is caught before the valid name ahead of it is
@@ -4092,7 +4021,7 @@ fn sbx_app_rm_rejects_an_invalid_name_before_removing_anything() {
 
 #[test]
 fn config_get_set_unset_round_trip() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // set creates the file; get reads it back; unset removes it; get then exits 1.
     assert!(
         fx.run(&["config", "set", "env.FOO", "bar"])
@@ -4114,7 +4043,7 @@ fn config_get_set_unset_round_trip() {
 
 #[test]
 fn config_set_preserves_comments_and_warns_when_it_re_arms_trust() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("# a comment to keep\nnixpkgs = \"nixos-23.11\"\n");
     assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
@@ -4140,7 +4069,7 @@ fn config_set_preserves_comments_and_warns_when_it_re_arms_trust() {
 
 #[test]
 fn config_set_with_trust_applies_a_security_field_at_once() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // Setting a security field then trusting in one step: the resolved view honors it.
     let out = fx.run(&["config", "set", "network", "none", "--trust"]);
     assert!(out.status.success());
@@ -4159,7 +4088,7 @@ fn config_set_with_trust_applies_a_security_field_at_once() {
 
 #[test]
 fn config_set_a_security_field_on_an_untrusted_project_is_noted_and_withheld() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let out = fx.run(&["config", "set", "network", "none"]);
     assert!(out.status.success());
     assert!(
@@ -4176,7 +4105,7 @@ fn config_set_a_security_field_on_an_untrusted_project_is_noted_and_withheld() {
 
 #[test]
 fn config_path_reports_the_target_file_per_scope() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     // An explicit scope prints a single bare path — the scripting contract.
     let local = fx.run(&["config", "path", "--local"]);
     assert!(local.status.success());
@@ -4197,7 +4126,7 @@ fn config_path_reports_the_target_file_per_scope() {
 
 #[test]
 fn config_path_lists_the_resolution_order_by_default() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
 
     // No files exist yet (the common first-run state): the overview still succeeds and lists both
     // layers as absent, rather than printing one bare path that does not exist.
@@ -4231,7 +4160,7 @@ fn config_path_lists_the_resolution_order_by_default() {
 fn config_set_global_creates_a_missing_config_dir() {
     // A fresh fixture has no <config>/sbx/ directory yet: the first `set --global` must create it,
     // not fail to write.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let out = fx.run(&["config", "set", "env.G", "1", "--global"]);
     assert!(
         out.status.success(),
@@ -4245,7 +4174,7 @@ fn config_set_global_creates_a_missing_config_dir() {
 
 #[test]
 fn config_set_into_a_non_scalar_field_is_refused() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("binds = [\"/tmp\"]\n");
     let out = fx.run(&["config", "set", "binds", "/var"]);
     assert!(
@@ -4269,7 +4198,7 @@ fn config_show_lists_declared_operations_only_once_trusted() {
     // `[task]` had no static surface at all: `sbx task ls` reads a *running* session, so the only
     // way to learn a block survived validation was to launch one. It is also trust-gated, and this
     // pins both halves — invisible until trusted, listed with its origin after.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project(
         "[task.build]\ndescription = \"Build the project\"\ncmd = [\"cargo\", \"build\"]\n\n\
          [task.fmt]\ncmd = [\"cargo\", \"fmt\"]\n",
@@ -4316,7 +4245,7 @@ fn config_set_add_and_rm_edit_a_list_through_the_real_binary() {
     // `add`/`rm` move one entry without restating the rest, and a no-op says so. The no-op case is
     // the one worth an e2e rather than a unit test: it must leave the file (and therefore its trust
     // marker) untouched, which is what keeps a repeated command from disarming a trusted config.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("nixpkgs = \"nixos-23.11\"\n");
     let read = || std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap();
 
@@ -4375,13 +4304,13 @@ fn config_set_add_and_rm_edit_a_list_through_the_real_binary() {
 #[test]
 fn config_edit_runs_the_editor_and_warns_when_it_re_arms_trust() {
     use std::os::unix::fs::PermissionsExt;
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("nixpkgs = \"nixos-23.11\"\n");
     assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
     // A non-interactive "editor": a script that appends a line to its file argument, standing in
     // for a real $EDITOR so the test stays headless.
-    let editor = fx.bind_dir.path().join("fake-editor.sh");
+    let editor = fx.scratch().join("fake-editor.sh");
     std::fs::write(
         &editor,
         "#!/bin/sh\nprintf '\\n[env]\\nEDITED = \"yes\"\\n' >> \"$1\"\n",
@@ -4390,7 +4319,7 @@ fn config_edit_runs_the_editor_and_warns_when_it_re_arms_trust() {
     std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let out = fx
-        .sbx(&["config", "edit"])
+        .cmd(&["config", "edit"])
         .env("EDITOR", &editor)
         .env_remove("VISUAL")
         .output()
@@ -4416,8 +4345,8 @@ fn config_edit_global_trust_writes_no_marker_and_says_why() {
     // `--trust` here used to write one anyway and print "the whole file is now trusted", which is a
     // gate the reader does not have — the marker is never read back, so the sentence describes
     // nothing. The four key-writing verbs already answered this case; `edit` never computed it.
-    let fx = Fixture::new();
-    let editor = fx.bind_dir.path().join("global-editor.sh");
+    let fx = Project::new("cfg");
+    let editor = fx.scratch().join("global-editor.sh");
     std::fs::write(
         &editor,
         "#!/bin/sh\nprintf '[env]\\nGLOBAL = \"yes\"\\n' >> \"$1\"\n",
@@ -4426,7 +4355,7 @@ fn config_edit_global_trust_writes_no_marker_and_says_why() {
     std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let out = fx
-        .sbx(&["config", "edit", "--global", "--trust"])
+        .cmd(&["config", "edit", "--global", "--trust"])
         .env("EDITOR", &editor)
         .env_remove("VISUAL")
         .output()
@@ -4499,7 +4428,7 @@ fn a_key_write_refuses_to_bless_a_project_the_user_never_approved() {
     ];
 
     for args in cases {
-        let fx = Fixture::new();
+        let fx = Project::new("cfg");
         fx.write_project(hostile);
         let out = fx.run(args);
 
@@ -4547,7 +4476,7 @@ fn a_key_write_refuses_a_file_that_changed_since_it_was_approved() {
     // you approved — the edit is precisely what `--trust` would bless unread. The message says so in
     // its own words rather than claiming the file "is not trusted", which the user would rightly
     // dispute: they trusted it themselves.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("[packages]\ngood = \"nix:hello\"\n");
     assert!(
         fx.run(&["trust", ".sbx.toml"]).status.success(),
@@ -4585,7 +4514,7 @@ fn a_one_shot_config_file_is_admitted_by_scope_like_any_other() {
     //
     // Both answers are pinned, because an over-broad guard would be just as wrong as none: an
     // absent file still bootstraps, since sbx's write is then the whole content.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     let existing = fx.proj.path().join("other.toml");
     std::fs::write(&existing, "[packages]\nevil = \"nix:hello\"\n").unwrap();
 
@@ -4638,7 +4567,7 @@ fn a_key_write_still_re_trusts_a_project_the_user_had_approved() {
     // exists so a write to a file you already vetted does not need a second command. The trust gate
     // hashes the whole file, so sbx's own edit re-arms it; blessing that delta is blessing sbx's
     // work, not a stranger's.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("[packages]\ngood = \"nix:hello\"\n");
     assert!(
         fx.run(&["trust", ".sbx.toml"]).status.success(),
@@ -4667,7 +4596,7 @@ fn an_untrusted_seccomp_relaxation_is_dropped_but_trusting_applies_it() {
     // project's relaxation is dropped (loosening the kernel-attack-surface control), and applied
     // only once the project is trusted. Also exercises the input ergonomics: a comma-separated
     // string, a separate entry, and a fine-grained `clone:newns` selector all resolve.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("[seccomp]\nallow = [\"ptrace,unshare\", \"clone:newns\"]\n");
 
     let out = fx.run(&["config", "show"]);
@@ -4708,7 +4637,7 @@ fn a_dangerous_seccomp_token_carries_a_caution_and_an_unknown_one_is_dropped() {
     // The global config is trusted by location, so its `[seccomp]` applies with no trust step.
     // `umount2` and a bare `clone` each reopen a real escape surface — accepted, but flagged with a
     // caution; an unknown syscall name is dropped (fail-closed — it loosens nothing).
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_global("[seccomp]\nallow = [\"umount2\", \"clone\", \"bogus_syscall\"]\n");
     let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -4732,7 +4661,7 @@ fn a_global_apps_seccomp_relaxation_survives_an_untrusted_projects_widening() {
     // The flagship property, for seccomp: a globally-declared app (a profile, trusted by location)
     // keeps its relaxation, and an untrusted project cannot add a dangerous lift to it — so an
     // agent can run *on* untrusted code without that code widening the app's syscall surface.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_profile("dbg", "cmd = \"dbg\"\n[seccomp]\nallow = [\"ptrace\"]\n");
     // The untrusted project tries to widen the SAME app with `unshare`.
     fx.write_project("[app.dbg.seccomp]\nallow = [\"unshare\"]\n");
@@ -4757,7 +4686,7 @@ fn a_global_apps_seccomp_relaxation_survives_an_untrusted_projects_widening() {
 #[test]
 fn config_json_carries_the_seccomp_relaxation() {
     // The machine-readable model carries the resolved relaxation, like every other field.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_global("[seccomp]\nallow = [\"ptrace\", \"clone:newns\"]\n");
     let out = fx.run(&["config", "show", "--json"]);
     assert!(out.status.success(), "config --json should exit 0");
@@ -4777,7 +4706,7 @@ fn an_untrusted_devices_grant_is_dropped_but_trusting_applies_it() {
     // `[devices] allow` exposes host device nodes in the cage — a security field, so an untrusted
     // project's grant is dropped (a device widens the kernel attack surface) and applied only once
     // the project is trusted. The resolved grant is sorted.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("[devices]\nallow = [\"/dev/net/tun\", \"/dev/dri\"]\n");
 
     let out = fx.run(&["config", "show"]);
@@ -4816,7 +4745,7 @@ fn an_untrusted_devices_grant_is_dropped_but_trusting_applies_it() {
 fn a_malformed_device_entry_is_dropped_and_the_valid_one_kept() {
     // The global config is trusted by location, so its `[devices]` applies with no trust step. A
     // path outside `/dev/` is dropped (fail-closed), the valid device kept.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_global("[devices]\nallow = [\"/etc/shadow\", \"/dev/kvm\"]\n");
     let out = fx.run(&["config", "show"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -4836,7 +4765,7 @@ fn a_global_apps_devices_grant_survives_an_untrusted_projects_widening() {
     // The flagship property, for devices: a globally-declared app (a profile, trusted by location)
     // keeps its device grant, and an untrusted project cannot add a device to it — so an agent can
     // run *on* untrusted code without that code widening the app's kernel attack surface.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_profile("gpu", "cmd = \"gpu\"\n[devices]\nallow = [\"/dev/dri\"]\n");
     // The untrusted project tries to widen the SAME app with /dev/kvm.
     fx.write_project("[app.gpu.devices]\nallow = [\"/dev/kvm\"]\n");
@@ -4861,7 +4790,7 @@ fn a_global_apps_devices_grant_survives_an_untrusted_projects_widening() {
 #[test]
 fn config_json_carries_the_devices_grant() {
     // The machine-readable model carries the resolved grant, sorted, like every other field.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_global("[devices]\nallow = [\"/dev/kvm\", \"/dev/dri\"]\n");
     let out = fx.run(&["config", "show", "--json"]);
     assert!(out.status.success(), "config --json should exit 0");
@@ -4881,7 +4810,7 @@ fn an_untrusted_gpu_posture_is_dropped_but_trusting_applies_it() {
     // `gpu = true` opens a render node and the `/sys` device tree — a security field, so an
     // untrusted project's posture is dropped (it widens the kernel attack surface) and applied only
     // once the project is trusted.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("gpu = true\n");
 
     let out = fx.run(&["config", "show"]);
@@ -4921,7 +4850,7 @@ fn a_global_apps_gpu_posture_survives_an_untrusted_projects_override() {
     // The flagship property, for gpu: a globally-declared app (a profile, trusted by location) keeps
     // its GPU posture, and an untrusted project cannot flip it — so an agent can run *on* untrusted
     // code without that code opening or closing the app's GPU access.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_profile("viz", "cmd = \"viz\"\ngpu = true\n");
     // The untrusted project tries to turn the SAME app's GPU off.
     fx.write_project("[app.viz]\ngpu = false\n");
@@ -4944,7 +4873,7 @@ fn an_untrusted_audio_posture_is_dropped_but_trusting_applies_it() {
     // `audio = true` opens the PulseAudio bus (the microphone and every system-audio `.monitor`
     // source) — a security field, so an untrusted project's posture is dropped and applied only once
     // the project is trusted.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("audio = true\n");
 
     let out = fx.run(&["config", "show"]);
@@ -4984,7 +4913,7 @@ fn a_global_apps_audio_posture_survives_an_untrusted_projects_override() {
     // The flagship property, for audio: a globally-declared app (a profile, trusted by location)
     // keeps its audio posture, and an untrusted project cannot flip it — so an agent can run *on*
     // untrusted code without that code opening or closing the app's microphone access.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_profile("rec", "cmd = \"rec\"\naudio = true\n");
     // The untrusted project tries to turn the SAME app's audio off.
     fx.write_project("[app.rec]\naudio = false\n");
@@ -5007,7 +4936,7 @@ fn an_untrusted_dbus_posture_is_dropped_but_trusting_applies_it() {
     // `dbus = true` stands up a private in-cage portal (a session bus, near the keyring and the
     // portals) — a security field, so an untrusted project's posture is dropped and applied only
     // once trusted.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("dbus = true\n");
 
     let out = fx.run(&["config", "show"]);
@@ -5046,7 +4975,7 @@ fn an_untrusted_dbus_posture_is_dropped_but_trusting_applies_it() {
 fn a_global_apps_dbus_posture_survives_an_untrusted_projects_override() {
     // The flagship property, for dbus: a globally-declared app (a profile, trusted by location) keeps
     // its in-cage portal posture, and an untrusted project cannot flip it.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_profile("viz", "cmd = \"viz\"\ndbus = true\n");
     // The untrusted project tries to turn the SAME app's D-Bus off.
     fx.write_project("[app.viz]\ndbus = false\n");
@@ -5070,7 +4999,7 @@ fn a_stale_string_dbus_value_is_rejected_never_silently_opening_a_portal() {
     // stale `dbus = "incage"` in a project is a type error, so the whole project layer is dropped
     // (fail-closed) — it must NEVER silently apply, leaving the cage with no portal. (Re-import the
     // shipped profiles after this cutover; a stale profile string is rejected the same way.)
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("dbus = \"incage\"\n");
     let trusted = fx.run(&["trust", ".sbx.toml"]);
     assert!(trusted.status.success(), "trust failed");
@@ -5093,7 +5022,7 @@ fn fs_scan_is_honored_untrusted_and_surfaced_in_config_show() {
     // file and how far the scan read. Both have to be there, or the surface says less than the
     // launch enforces. Same ungated path as the masks: `scan` only ever closes content of the
     // project it is declared in, so an untrusted project may set it.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project(
         "[network]\nmode = \"deny\"\n\n[fs]\nscan = [\"sk-[A-Za-z0-9]{20,}\"]\nscan_max_kb = 256\n",
     );
@@ -5111,7 +5040,7 @@ fn fs_scan_is_honored_untrusted_and_surfaced_in_config_show() {
     );
 
     // Unset leaves the built-in ceiling, and says so rather than leaving a reader to guess.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("[fs]\nscan = [\"AKIA[0-9A-Z]{16}\"]\n");
     let stdout = String::from_utf8_lossy(&fx.run(&["config", "show"]).stdout).into_owned();
     assert!(
@@ -5121,7 +5050,7 @@ fn fs_scan_is_honored_untrusted_and_surfaced_in_config_show() {
 
     // A pattern that is not a regex is dropped with a warning naming what is lost, and is never
     // presented as effective — the same fail-open honesty a refused mask gets.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("[fs]\nscan = [\"(unclosed\"]\n");
     let out = fx.run(&["config", "show"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -5141,7 +5070,7 @@ fn fs_masks_are_honored_untrusted_and_surfaced_in_config_show() {
     // project, because it can only close paths of the project it is declared in. Dropping it there
     // would leave open exactly the file that project asked to close. Run through the real binary, so
     // the whole path is exercised: parse, gate, view, render.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project(
         "[network]\nmode = \"deny\"\n\n[fs]\ndeny = [\"prod.key\"]\nreadonly = [\"Cargo.lock\"]\n",
     );
@@ -5166,7 +5095,7 @@ fn fs_masks_are_honored_untrusted_and_surfaced_in_config_show() {
     assert!(stdout.contains("fs deny: prod.key"), "{stdout}");
 
     // A refused entry is dropped with a warning that says what the drop costs: the path stays open.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("[fs]\ndeny = [\"**/*.pem\"]\n");
     let out = fx.run(&["config", "show"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -5186,16 +5115,16 @@ fn an_unusable_data_directory_is_explained_once_not_once_per_layer() {
     // long for the sockets sbx binds under it was refused — correctly — once per layer: nine
     // identical lines for `sbx config show`, seven for `--app`. The refusal is one fact about the
     // environment and must read as one.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
 
     // The overlong component is named here rather than inherited from the fixture root, so the
     // refusal fires whatever the build tree measures. A test that relied on the root being long
     // enough would quietly stop exercising anything on a shorter checkout.
-    let long = fx.bind_dir.path().join("d".repeat(120));
+    let long = fx.scratch().join("d".repeat(120));
     std::fs::create_dir_all(&long).unwrap();
 
     let out = fx
-        .sbx(&["config", "show"])
+        .cmd(&["config", "show"])
         .env("XDG_DATA_HOME", &long)
         .output()
         .expect("spawn sbx");
@@ -5221,7 +5150,7 @@ fn a_posture_nobody_configured_folds_and_one_a_layer_set_stays() {
     // fields that tell one app from another. What decides is who set the value, so the pair here
     // differs only in that: `notify` is set by the baseline (visible, `inherited`), `gui` by
     // nobody (folded, named on the summary line). Both are untouched by the app itself.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_global("[notify]\nmode = \"off\"\n");
     fx.write_profile("demo", "cmd = \"demo-agent\"\n");
 
@@ -5267,7 +5196,7 @@ fn a_posture_nobody_configured_folds_and_one_a_layer_set_stays() {
     // The whole set, on a profile that declares nothing but its command: all eleven fold, in order.
     // This is the guard for the wiring itself — a posture added to the view without its fold would
     // print at its default forever, and only a test that pins the complete list would notice.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_profile("bare", "cmd = \"demo-agent\"\n");
     let out = fx.run(&["config", "show", "--app", "bare"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -5286,7 +5215,7 @@ fn an_apps_own_entries_are_named_not_counted() {
     // catalogue and says nothing about *this* app. The names are the distinguishing part, and they
     // fit on a line: measured across every shipped bundle and profile, the widest own collection is
     // six packages and four variables.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_global("[env]\nBASE_ONLY = \"1\"\n");
     let target = fx.bind_target("workspace");
     fx.write_profile(
@@ -5334,7 +5263,7 @@ fn the_network_policy_is_listed_but_its_machinery_stays_behind_details() {
     // What rides `--details` is what decides nothing about reachability: `mute` only silences an
     // already-permitted request in the log, `http2` picks a transport, and the built-in set is the
     // same for every app on the machine.
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_profile(
         "demo",
         "cmd = \"demo-agent\"\n[network]\nmode = \"deny\"\n\
@@ -5383,7 +5312,7 @@ fn the_network_policy_is_listed_but_its_machinery_stays_behind_details() {
 /// after which every launch honoured a config the user never saw a byte of.
 #[test]
 fn config_edit_trusts_nothing_when_the_editor_never_ran() {
-    let fx = Fixture::new();
+    let fx = Project::new("cfg");
     fx.write_project("nixpkgs = \"nixos-23.11\"\n");
 
     // The state a cloned, never-reviewed project starts in.
@@ -5397,7 +5326,7 @@ fn config_edit_trusts_nothing_when_the_editor_never_ran() {
     );
 
     let out = fx
-        .sbx(&["config", "edit", "--trust"])
+        .cmd(&["config", "edit", "--trust"])
         .env("EDITOR", "sbx-no-such-editor-by-construction")
         .env_remove("VISUAL")
         .output()

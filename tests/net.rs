@@ -4,69 +4,18 @@
 
 #[macro_use]
 mod common;
-use common::fixture::TmpDir;
+use common::project::Project;
 
-use std::process::{Command, Output};
+use std::process::Output;
 
-/// One project under test: the working dir plus the redirected config-home (global config),
-/// state-home (trust store) and data-home (per-project runtime).
-struct Fixture {
-    proj: TmpDir,
-    config_home: TmpDir,
-    state_home: TmpDir,
-    data_home: TmpDir,
-}
-
-impl Fixture {
-    fn new() -> Self {
-        Fixture {
-            proj: TmpDir::new("net"),
-            config_home: TmpDir::new("net"),
-            state_home: TmpDir::new("net"),
-            data_home: TmpDir::new("net"),
-        }
-    }
-
-    fn write_global(&self, body: &str) {
-        let dir = self.config_home.path().join("sbx");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("sbx.toml"), body).unwrap();
-    }
-
-    /// Write an imported app profile `apps/<name>.toml` (a top-level `RawApp`) beside the global
-    /// config. Global apps live only as profile files — an inline `[app.<name>]` in `sbx.toml` is
-    /// forbidden — so any test that needs a global app routes through here.
-    fn write_profile(&self, name: &str, body: &str) {
-        let dir = self.config_home.path().join("sbx").join("apps");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{name}.toml")), body).unwrap();
-    }
-
-    fn write_project(&self, body: &str) {
-        std::fs::write(self.proj.path().join(".sbx.toml"), body).unwrap();
-    }
-
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_sbx"))
-            .args(args)
-            .current_dir(self.proj.path())
-            .env("XDG_CONFIG_HOME", self.config_home.path())
-            .env("XDG_STATE_HOME", self.state_home.path())
-            .env("XDG_DATA_HOME", self.data_home.path())
-            .output()
-            .expect("spawn sbx")
-    }
-
-    /// Same, with no resolvable trust store: a relative `XDG_STATE_HOME` is ignored rather than
-    /// resolved against the cwd, and with `HOME` cleared there is no absolute base left. This is
-    /// the only way to reach the trust-store branch of a `--local` write from the outside.
+impl Project {
+    /// An `sbx net` run with no resolvable trust store: a relative `XDG_STATE_HOME` is ignored
+    /// rather than resolved against the cwd, and with `HOME` cleared there is no absolute base
+    /// left. This is the only way to reach the trust-store branch of a `--local` write from the
+    /// outside.
     fn run_without_a_trust_store(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_sbx"))
-            .args(args)
-            .current_dir(self.proj.path())
-            .env("XDG_CONFIG_HOME", self.config_home.path())
+        self.cmd(args)
             .env("XDG_STATE_HOME", "relative/state")
-            .env("XDG_DATA_HOME", self.data_home.path())
             .env_remove("HOME")
             .output()
             .expect("spawn sbx")
@@ -75,7 +24,7 @@ impl Fixture {
 
 #[test]
 fn net_rules_lists_config_and_builtin_rules_tagged_by_source() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     fx.write_project(
         "[network]\nmode = \"deny\"\nallow = [\"github.com\", \"*.nixos.org\"]\ndeny = [\"evil.nixos.org\"]\n",
     );
@@ -135,7 +84,7 @@ fn net_rules_lists_config_and_builtin_rules_tagged_by_source() {
 
 #[test]
 fn net_rules_json_emits_the_mode_and_tagged_rules() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n");
     assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
@@ -151,7 +100,7 @@ fn net_rules_json_emits_the_mode_and_tagged_rules() {
 
 #[test]
 fn net_rules_under_a_non_filtering_posture_has_no_rules() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     fx.write_project("network = \"shared\"\n");
     assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
     let out = fx.run(&["net", "rules"]);
@@ -180,7 +129,7 @@ fn net_rules_reflects_the_trust_gate() {
     // The gate teeth: a GLOBAL filtering posture (trusted by location) stands, while an UNTRUSTED
     // project's attempt to add its own rule is dropped — so the listing shows the global rule and
     // the built-in set, but never the untrusted project's rule.
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     fx.write_global("[network]\nmode = \"deny\"\nallow = [\"global.example\"]\n");
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"project.example\"]\n");
     // deliberately NOT trusting the project.
@@ -208,7 +157,7 @@ fn net_rules_reflects_the_trust_gate() {
 
 #[test]
 fn net_rejects_an_unknown_subcommand_and_source() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // an unknown `net` subcommand
     let out = fx.run(&["net", "bogus"]);
     assert_eq!(out.status.code(), Some(2));
@@ -227,7 +176,7 @@ fn net_rejects_an_unknown_subcommand_and_source() {
 
 #[test]
 fn net_rules_source_session_is_accepted_and_empty_without_live_sessions() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // `--source session` is a live query, valid even with no config and no running sessions: it
     // succeeds with an empty listing under the session header (not the unknown-source error).
     let out = fx.run(&["net", "rules", "--source", "session"]);
@@ -251,7 +200,7 @@ fn net_rules_source_session_is_accepted_and_empty_without_live_sessions() {
 
 #[test]
 fn net_pending_session_flag_without_a_live_session_is_refused() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // `--session` (like a bare answer) needs a live session; absent one it is a pointed refusal, not
     // a crash. Combined `--session --save` parses too (both extracted before the scope parser).
     let out = fx.run(&[
@@ -273,7 +222,7 @@ fn net_pending_session_flag_without_a_live_session_is_refused() {
 
 #[test]
 fn net_allow_bootstraps_a_local_allowlist_retrusts_and_rules_shows_it() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // A fresh project (no .sbx.toml): `allow` bootstraps a deny-by-default allowlist and re-trusts.
     let out = fx.run(&["net", "allow", "github.com"]);
     assert!(
@@ -304,7 +253,7 @@ fn net_allow_bootstraps_a_local_allowlist_retrusts_and_rules_shows_it() {
 
 #[test]
 fn net_mute_and_unmute_round_trip_through_config() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // A mute needs a filtering posture (nothing to suppress otherwise) — bootstrap one first.
     assert!(
         fx.run(&["net", "allow", "api.example.com"])
@@ -365,7 +314,7 @@ fn net_mute_and_unmute_round_trip_through_config() {
 /// routed, so this is the first thing that exercises them at all.
 #[test]
 fn net_unallow_and_undeny_round_trip_through_config() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // `allow` bootstraps the filtering posture a `deny` then needs.
     assert!(
         fx.run(&["net", "allow", "api.example.com"])
@@ -435,7 +384,7 @@ fn net_unallow_and_undeny_round_trip_through_config() {
 /// specifically — the add path had this test, the removal path reached it only through `unmute`.
 #[test]
 fn net_unallow_refuses_an_untrusted_existing_project() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"a.com\", \"b.com\"]\n");
     let out = fx.run(&["net", "unallow", "b.com"]);
     assert_eq!(out.status.code(), Some(2));
@@ -458,7 +407,7 @@ fn net_unallow_refuses_an_untrusted_existing_project() {
 /// would report a no-op for a rule that is plainly there.
 #[test]
 fn a_removal_reaches_an_app_scope_in_the_project_and_in_its_profile() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
 
     // The project's own app table.
     assert!(
@@ -521,7 +470,7 @@ fn a_removal_reaches_an_app_scope_in_the_project_and_in_its_profile() {
 /// told an `undeny` user about a command they had not run.
 #[test]
 fn a_removal_verb_names_itself_when_it_refuses_a_session_flag() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     for verb in ["unallow", "undeny", "unmute"] {
         let out = fx.run(&["net", verb, "api.example.com", "--session"]);
         assert_eq!(
@@ -543,7 +492,7 @@ fn a_removal_verb_names_itself_when_it_refuses_a_session_flag() {
 /// operational error. The add path has no equivalent, since it creates the file it then trusts.
 #[test]
 fn a_removal_with_no_project_config_is_a_no_op_that_re_trusts_nothing() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     let out = fx.run(&["net", "unmute", "play.example.com"]);
     assert!(
         out.status.success(),
@@ -572,7 +521,7 @@ fn a_removal_with_no_project_config_is_a_no_op_that_re_trusts_nothing() {
 /// field apart in the shared gate, so pin each to the path that owns it.
 #[test]
 fn an_unresolvable_trust_store_refuses_a_local_write_in_that_path_s_own_words() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
 
     let add = fx.run_without_a_trust_store(&["net", "allow", "api.example.com"]);
     assert_eq!(add.status.code(), Some(1), "a missing store is operational");
@@ -606,7 +555,7 @@ fn an_unresolvable_trust_store_refuses_a_local_write_in_that_path_s_own_words() 
 fn net_mute_with_no_posture_is_refused() {
     // A mute on a fresh project (no filtering posture) is inert, so it is refused with guidance —
     // never a silently-written rule that suppresses nothing.
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     let refused = fx.run(&["net", "mute", "play.googleapis.com"]);
     assert!(
         !refused.status.success(),
@@ -633,7 +582,7 @@ fn net_mute_with_no_posture_is_refused() {
 
 #[test]
 fn net_allow_persists_a_tcp_rule_that_reloads_as_a_splice() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // `net allow tcp://…` is a security-rule write: it must validate, persist, re-trust, and reload
     // as a raw-splice rule. Bootstrap a fresh project with the tcp:// rule.
     let out = fx.run(&["net", "allow", "tcp://ssh.example.com:22"]);
@@ -664,7 +613,7 @@ fn net_allow_persists_a_tcp_rule_that_reloads_as_a_splice() {
 fn net_allow_rejects_a_portless_tcp_rule() {
     // A raw splice must name the port it opens — a port-less `tcp://` rule is refused at the CLI
     // (exit 2), with a message pointing at the fix. (A bare L7 host, by contrast, defaults to 443.)
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     let out = fx.run(&["net", "allow", "tcp://ssh.example.com"]);
     assert_eq!(
         out.status.code(),
@@ -686,7 +635,7 @@ fn net_allow_rejects_a_portless_tcp_rule() {
 
 #[test]
 fn a_host_with_both_a_tcp_and_an_l7_rule_warns() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // The same host:port carries a raw tcp:// allow AND an inspected (L7) path deny — the splice is
     // uninspected, so the L7 deny silently does not apply. The config load must warn about it.
     fx.write_project(
@@ -718,7 +667,7 @@ fn a_host_with_both_a_tcp_and_an_l7_rule_warns() {
 
 #[test]
 fn net_deny_on_a_fresh_project_is_refused_with_guidance() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     let out = fx.run(&["net", "deny", "evil.com"]);
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -730,7 +679,7 @@ fn net_deny_on_a_fresh_project_is_refused_with_guidance() {
 
 #[test]
 fn net_allow_refuses_an_untrusted_existing_project() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // A pre-existing, never-trusted project config: appending must not silently bless it.
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"a.com\"]\n");
     let out = fx.run(&["net", "allow", "b.com"]);
@@ -751,7 +700,7 @@ fn net_allow_refuses_an_untrusted_existing_project() {
 
 #[test]
 fn net_allow_global_writes_the_global_config_without_a_trust_gate() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // `--global` is trusted by location: no re-trust line, and it works from an untrusted project.
     let out = fx.run(&["net", "allow", "cdn.example.com", "--global"]);
     assert!(out.status.success());
@@ -770,7 +719,7 @@ fn net_allow_global_writes_the_global_config_without_a_trust_gate() {
 
 #[test]
 fn net_allow_accepts_a_group_reference_and_persists_it_verbatim() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // A `@<group>` reference is an alias for a `[network.groups]` group (expanded at load time), not a
     // classifiable host rule, so the write path validates it as a group *name* rather than through
     // `classify` (which rejects the `@`) and persists it verbatim — a group can be added the same
@@ -805,7 +754,7 @@ fn net_allow_accepts_a_group_reference_and_persists_it_verbatim() {
 fn a_net_table_defines_no_group_and_is_named_as_an_unknown_section() {
     // One network namespace: groups live under the posture, in `[network]`. A `[net]` table is an
     // unknown section like any other — named, ignored, and pointed nowhere in particular.
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     fx.write_global("[net.groups]\nmcp = [\"{*} mcp.context7.com:443\"]\n");
 
     let out = fx.run(&["net", "groups"]);
@@ -831,7 +780,7 @@ fn a_net_table_defines_no_group_and_is_named_as_an_unknown_section() {
 
 #[test]
 fn net_groups_lists_resolves_and_errors_on_unknown() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     fx.write_global(
         "[network.groups]\n\
          mcp = [\"{*} mcp.context7.com:443\", \"{*} mcp.exa.ai:443\"]\n\
@@ -885,7 +834,7 @@ fn net_groups_lists_resolves_and_errors_on_unknown() {
 
 #[test]
 fn net_rules_collapses_a_group_and_expands_on_demand() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // A group defined globally, referenced by an app profile beside it.
     fx.write_global(
         "[network.groups]\nmcp = [\"{*} mcp.context7.com:443\", \"{*} mcp.exa.ai:443\"]\n",
@@ -939,7 +888,7 @@ fn net_rules_collapses_a_group_and_expands_on_demand() {
 
 #[test]
 fn net_groups_export_import_round_trips_between_configs() {
-    let src = Fixture::new();
+    let src = Project::new("net");
     src.write_global(
         "[network.groups]\n\
          mcp = [\"{*} mcp.context7.com:443\"]\n\
@@ -962,7 +911,7 @@ fn net_groups_export_import_round_trips_between_configs() {
     );
 
     // Import it into a *different* config, then it resolves there.
-    let dst = Fixture::new();
+    let dst = Project::new("net");
     let out = dst.run(&["net", "groups", "import", frag.to_str().unwrap()]);
     assert!(
         out.status.success(),
@@ -998,7 +947,7 @@ fn net_groups_export_import_round_trips_between_configs() {
 /// contract `sbx app import` and `sbx bundle import` carry.
 #[test]
 fn a_forced_group_import_names_what_it_dropped_and_keeps_the_group_it_replaced() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     let frag = fx.proj.path().join("group.toml");
     std::fs::write(
         &frag,
@@ -1085,7 +1034,7 @@ fn a_forced_group_import_names_what_it_dropped_and_keeps_the_group_it_replaced()
 
 #[test]
 fn net_groups_import_flags_entries_that_will_not_resolve() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // A fragment whose group carries a malformed and a nested entry — the import succeeds (names are
     // valid), but the consent moment flags that those entries will not resolve.
     let frag = fx.proj.path().join("frag.toml");
@@ -1108,7 +1057,7 @@ fn net_groups_import_flags_entries_that_will_not_resolve() {
 
 #[test]
 fn net_allow_app_writes_the_apps_network_table_and_retrusts() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     let out = fx.run(&["net", "allow", "api.anthropic.com", "--app", "claude"]);
     assert!(
         out.status.success(),
@@ -1142,7 +1091,7 @@ fn net_allow_app_writes_the_apps_network_table_and_retrusts() {
 
 #[test]
 fn net_allow_app_save_global_writes_to_profile_and_preserves_profile_fields() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // A full claude-code-style profile: cmd, packages, binds, env, and an `[network] mode="ask"`
     // allowlist of 7 hosts. An app-scoped `--save -g` must AMEND the profile's allow array in place
     // — preserving mode/cmd/packages/binds/env — and must NOT write a shadowing `[app.claude-code…]`
@@ -1222,7 +1171,7 @@ fn net_allow_app_save_global_writes_to_profile_and_preserves_profile_fields() {
 
 #[test]
 fn net_allow_app_save_global_creates_profile_when_absent() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     fx.write_global("[network]\nmode = \"shared\"\n");
     // No profile exists for `newapp`. An app-scoped `--save -g` creates a minimal profile carrying
     // a deny-by-default allowlist with the host (the Absent bootstrap).
@@ -1256,7 +1205,7 @@ fn net_allow_app_save_global_creates_profile_when_absent() {
 
 #[test]
 fn inline_app_in_global_sbx_toml_is_dropped_with_migration_guidance() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // Simulate the pre-fix bad state: a hand-written `[app.foo]` in the global config. It must be
     // dropped inert (never shadow a profile of the same name) with a per-app migration warning, and
     // `sbx net rules --app foo` must report no such app rather than launch a half-stub.
@@ -1285,7 +1234,7 @@ fn inline_app_in_global_sbx_toml_is_dropped_with_migration_guidance() {
 
 #[test]
 fn net_allow_app_save_local_still_writes_project_sbx_toml() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     fx.write_global("[network]\nmode = \"shared\"\n");
     fx.write_profile(
         "claude",
@@ -1309,7 +1258,7 @@ fn net_allow_app_save_local_still_writes_project_sbx_toml() {
 
 #[test]
 fn net_allow_rejects_an_explicit_file_scope() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // `-c <file>` is neither the trusted-by-location global nor the trust-gated project path, so a
     // write to it would be silently dropped at launch — refuse it outright.
     let out = fx.run(&["net", "allow", "github.com", "-c", ".sbx.toml"]);
@@ -1323,7 +1272,7 @@ fn net_allow_rejects_an_explicit_file_scope() {
 
 #[test]
 fn net_allow_rejects_an_invalid_rule_before_writing() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // A `*` catch-all is refused by classification (the fail-closed validation), no file written.
     let out = fx.run(&["net", "allow", "*"]);
     assert_eq!(out.status.code(), Some(2));
@@ -1340,7 +1289,7 @@ fn a_catch_all_rule_carries_its_reach_from_the_config_to_the_listing() {
     // the listing view, rendered, and serialized. `re:` rather than `re:.*` on purpose — the empty
     // pattern is the spelling a reader is least likely to recognise as "every host", which is the
     // reason the label exists at all.
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"re:\", \"github.com\"]\n");
     assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
 
@@ -1378,7 +1327,7 @@ fn the_catch_all_refusal_names_each_verbs_own_way_out() {
     // One syntax check serves four entry points, and each must send its author the way *they* were
     // going. Pinned through the real binary because the wiring is what breaks: the grammar knows
     // how to phrase each refusal only if the CLI hands it the verb it was called with.
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     let stderr = |out: &Output| String::from_utf8_lossy(&out.stderr).to_string();
 
     // `allow *` wants everything open, and is pointed at the posture that really opens it.
@@ -1411,7 +1360,7 @@ fn the_catch_all_refusal_names_each_verbs_own_way_out() {
     // And a tested target is a request, not a declaration: there is no list to advise about. This
     // needs its own project with a **filtering** posture: the default is `shared`, where the tester
     // answers "every URL is reachable" without ever looking at the target it was handed.
-    let filtered = Fixture::new();
+    let filtered = Project::new("net");
     filtered.write_project("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n");
     assert!(filtered.run(&["trust", ".sbx.toml"]).status.success());
     let target = stderr(&filtered.run(&["test", "net", "https://*"]));
@@ -1425,7 +1374,7 @@ fn the_catch_all_refusal_names_each_verbs_own_way_out() {
 
 #[test]
 fn ask_mode_renders_across_config_rules_and_the_tester() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // A trusted `ask` posture with a timeout and one auto-allow / one auto-deny carve-out.
     fx.write_project(
         "[network]\nmode = \"ask\"\nask_timeout = \"90s\"\nallow = [\"github.com\"]\ndeny = [\"evil.com\"]\n",
@@ -1466,7 +1415,7 @@ fn ask_mode_renders_across_config_rules_and_the_tester() {
 
 #[test]
 fn net_pending_lists_nothing_when_no_session_is_parked() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     let out = fx.run(&["net", "pending"]);
     assert!(out.status.success());
     assert!(
@@ -1485,7 +1434,7 @@ fn net_pending_lists_nothing_when_no_session_is_parked() {
 
 #[test]
 fn net_pending_answer_rejects_a_malformed_id() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     let out = fx.run(&["net", "pending", "allow", "not-an-id"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(
@@ -1497,7 +1446,7 @@ fn net_pending_answer_rejects_a_malformed_id() {
 
 #[test]
 fn net_pending_answer_an_absent_session_is_refused() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // A well-formed id whose session does not exist (no control socket) → a pointed refusal, exit 2.
     let out = fx.run(&["net", "pending", "allow", "4294967295.1"]);
     assert_eq!(out.status.code(), Some(2));
@@ -1510,7 +1459,7 @@ fn net_pending_answer_an_absent_session_is_refused() {
 
 #[test]
 fn net_pending_answer_rejects_a_scope_without_save() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // A scope flag (here --global) is meaningless without --save — flagged, not silently ignored.
     let out = fx.run(&["net", "pending", "allow", "123.1", "--global"]);
     assert_eq!(out.status.code(), Some(2));
@@ -1523,7 +1472,7 @@ fn net_pending_answer_rejects_a_scope_without_save() {
 
 #[test]
 fn net_pending_all_drains_nothing_when_no_session_is_parked() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // With no live session, `--all` is a clean no-op (exit 0), not an error — it answered nothing.
     let out = fx.run(&["net", "pending", "allow", "--all"]);
     assert!(
@@ -1545,7 +1494,7 @@ fn net_pending_all_drains_nothing_when_no_session_is_parked() {
 
 #[test]
 fn net_pending_all_rejects_a_stray_id_a_scope_without_save_and_a_file_scope() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
 
     // A stray positional id alongside `--all` is a usage error (the two address different things).
     let out = fx.run(&["net", "pending", "deny", "--all", "123.1"]);
@@ -1586,7 +1535,7 @@ fn net_pending_all_rejects_a_stray_id_a_scope_without_save_and_a_file_scope() {
 
 #[test]
 fn net_pending_all_save_local_refuses_an_untrusted_project_before_draining() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // An untrusted project config in the cwd: a `--local` bulk save must refuse UP FRONT — before the
     // irreversible drain — rather than answer everything then fail to save with nothing persisted.
     fx.write_project("[network]\nmode = \"ask\"\nallow = [\"x.test\"]\n");
@@ -1612,7 +1561,7 @@ fn net_pending_all_save_global_drains_and_persists_each_host() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
 
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     let egress = fx.data_home.path().join("sbx").join("egress");
     std::fs::create_dir_all(&egress).unwrap();
     let pid = 55555u32; // a fake session: --global drains every socket, no registry/project filter
@@ -1667,7 +1616,7 @@ fn net_pending_all_save_global_app_writes_the_profile_and_names_it_not_the_globa
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::net::UnixListener;
 
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // A global baseline exists (so the "no inline stub" assertion is meaningful), plus the app's real
     // profile: a cmd and an ask-mode allowlist the drain must preserve.
     fx.write_global("[network]\nmode = \"shared\"\n");
@@ -1795,7 +1744,7 @@ fn net_pending_all_save_local_drains_this_project_and_writes_its_config() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
 
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     let data = fx.data_home.path().join("sbx");
     let egress = data.join("egress");
     let sessions = data.join("sessions");
@@ -1868,7 +1817,7 @@ fn net_pending_all_save_local_drains_this_project_and_writes_its_config() {
 
 #[test]
 fn net_pending_all_accepts_an_app_filter_and_lists_accept_it_too() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
 
     // The user's exact shape — `-a <app> --all --session` — is now ACCEPTED (it used to error with
     // "takes no id or scope"). With no live session for that app it is a clean no-op that names the
@@ -1917,7 +1866,7 @@ fn net_stats_aggregates_a_projects_sessions_and_filters_by_app() {
     // Hand-author session stat files keyed by this project's canonical path (the header
     // `egress::start` writes), then prove `sbx net stats` sums them for the project, scopes to an
     // app, carries the counts in `--json`, and `--reset` clears only this project's files.
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     let egress = fx.data_home.path().join("sbx").join("egress");
     std::fs::create_dir_all(&egress).unwrap();
     let proj = fx.proj.path().canonicalize().unwrap();
@@ -2012,7 +1961,7 @@ fn net_pending_all_drains_a_live_session_through_the_socket() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
 
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // The control socket lives at <data>/egress/control-<pid>.sock, and <data> is $XDG_DATA_HOME/sbx
     // (the dir `fx.run` redirects). Binding it at the right place is itself the proof the path wiring
     // is correct — a wrong path yields an empty drain ("no pending requests") and the assert fails.
@@ -2069,7 +2018,7 @@ fn net_pending_all_app_scoped_drains_a_registered_app_session() {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::net::UnixListener;
 
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     let data = fx.data_home.path().join("sbx");
     let egress = data.join("egress");
     let sessions = data.join("sessions");
@@ -2139,7 +2088,7 @@ fn net_pending_all_names_an_older_session_instead_of_claiming_empty() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
 
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     let egress = fx.data_home.path().join("sbx").join("egress");
     std::fs::create_dir_all(&egress).unwrap();
     let pid = 44444u32;
@@ -2172,7 +2121,7 @@ fn net_pending_all_save_names_an_older_session_and_saves_nothing() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
 
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     let egress = fx.data_home.path().join("sbx").join("egress");
     std::fs::create_dir_all(&egress).unwrap();
     let pid = 45454u32;
@@ -2213,7 +2162,7 @@ fn net_pending_by_id_accepts_an_app_scope_and_rejects_a_mismatch() {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::net::UnixListener;
 
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     let data = fx.data_home.path().join("sbx");
     let egress = data.join("egress");
     let sessions = data.join("sessions");
@@ -2298,7 +2247,7 @@ fn net_pending_list_collapses_identical_retries_in_text_and_json() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
 
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     let egress = fx.data_home.path().join("sbx").join("egress");
     std::fs::create_dir_all(&egress).unwrap();
     let pid = 44444u32; // not registered → the `(unregistered)` header path; irrelevant to grouping
@@ -2354,7 +2303,7 @@ fn net_pending_list_collapses_identical_retries_in_text_and_json() {
 
 #[test]
 fn test_net_targets_an_app_effective_policy() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // A global config (trusted by location, so no `sbx trust` needed): a baseline allowlist that
     // does NOT list the app's host. The app itself lives as an imported profile `apps/demo.toml`
     // (a global app is a profile file, never an inline `[app.demo]` in `sbx.toml`), whose own
@@ -2428,7 +2377,7 @@ fn test_net_targets_an_app_effective_policy() {
 
 #[test]
 fn net_rules_targets_an_app_effective_policy() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // A global config (trusted by location): a baseline allowlist listing one host. The app lives
     // as an imported profile `apps/demo.toml` (a global app is a profile file), whose OWN network
     // overlay lists a different host and a path-scoped deny. `--app` must list the app's effective
@@ -2525,7 +2474,7 @@ fn net_rules_targets_an_app_effective_policy() {
 
 #[test]
 fn test_net_reflects_the_built_in_set_both_directions() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // A trusted project allowlist that lists one host which is ALSO a built-in self-equip host.
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"github.com\"]\n");
     assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
@@ -2552,7 +2501,7 @@ fn test_net_reflects_the_built_in_set_both_directions() {
 
 #[test]
 fn test_net_method_scopes_a_rule_to_its_verbs() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // a GET/HEAD-only allow for the host
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"{GET,HEAD} api.test:443\"]\n");
     assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
@@ -2584,7 +2533,7 @@ fn test_net_method_scopes_a_rule_to_its_verbs() {
 
 #[test]
 fn test_net_reports_a_tcp_rule_as_a_raw_splice() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     // a tcp:// (raw L4) allow for a specific host:port
     fx.write_project("[network]\nmode = \"deny\"\nallow = [\"tcp://ssh.example.com:22\"]\n");
     assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
@@ -2624,7 +2573,7 @@ fn test_net_reports_a_tcp_rule_as_a_raw_splice() {
 fn test_net_reports_a_deny_suppressed_splice() {
     // deny wins even over a `tcp://` allow: a host-level deny suppresses the raw splice, and the
     // tester says *why* (a covered host that does not splice must not read as "no rule covers it").
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     fx.write_project(
         "[network]\nmode = \"deny\"\n\
          allow = [\"tcp://evil.com:443\"]\ndeny = [\"re:^https://evil\\\\.com\"]\n",
@@ -2644,7 +2593,7 @@ fn an_app_is_read_by_default_while_the_baseline_shell_stays_open() {
     // The Mode-A vs Mode-B contrast: a trusted baseline allowlist is all-verbs for `sbx run`/`sbx
     // shell` (Mode A), but an app (Mode B) that inherits that same allowlist is read-by-default
     // ({GET,HEAD}) — so a POST the bare `sbx test net` allows is denied under `--app`.
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     fx.write_project(
         "[network]\nmode = \"deny\"\nallow = [\"shared.test\"]\n\
          [app.agent]\ncmd = \"true\"\n",
@@ -2693,7 +2642,7 @@ fn an_app_is_read_by_default_while_the_baseline_shell_stays_open() {
 fn an_app_declares_a_write_host_with_a_star_prefix() {
     // An app's own allowlist: an unscoped host inherits the {GET,HEAD} default; a `{*}` host opts
     // back out to every verb (the way a profile declares its API/write hosts).
-    let fx = Fixture::new();
+    let fx = Project::new("net");
     fx.write_project(
         "[app.agent]\ncmd = \"true\"\n\
          [app.agent.network]\nmode = \"deny\"\nallow = [\"read.test\", \"{*} write.test\"]\n",
@@ -2747,7 +2696,7 @@ fn an_app_declares_a_write_host_with_a_star_prefix() {
 // exit 2 with a pointed message; the no-session case is a clean exit 0 with a persist hint.
 #[test]
 fn net_allow_session_validates_flags_and_reports_when_no_session_is_reachable() {
-    let fx = Fixture::new();
+    let fx = Project::new("net");
 
     // A config-scope flag has no meaning with `--session` (it writes no file) → refused, pointing at
     // the session-scope flags.

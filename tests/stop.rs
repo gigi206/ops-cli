@@ -12,7 +12,7 @@ mod common;
 use common::fixture::TmpDir;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 fn sbx() -> Command {
@@ -182,10 +182,8 @@ fn sbx_run(project: &Path, data: &Path, state: &Path, args: &[&str]) -> std::pro
 
 /// Whether the host can launch a sandbox (also warms the userland cache so later launches start
 /// promptly, and seeds the project store once).
-fn host_can_sandbox(project: &Path, data: &Path, state: &Path) -> bool {
+fn sandbox_probe(project: &Path, data: &Path, state: &Path) -> Output {
     sbx_run(project, data, state, &["run", "--", "true"])
-        .status
-        .success()
 }
 
 /// The session record file for `pid`, once it appears under `<data>/sbx/sessions/`. `None` if it
@@ -270,12 +268,10 @@ fn stop_tears_down_a_supervised_app_session() {
     )
     .unwrap();
 
-    if !host_can_sandbox(project.path(), data.path(), state.path()) {
-        skip_incapable!(
-            "skipping sbx stop supervised e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
-        );
-        return;
-    }
+    probe_or_skip!(
+        "sbx stop supervised e2e",
+        sandbox_probe(project.path(), data.path(), state.path())
+    );
 
     // Trust so the app's allowlist takes effect — otherwise the network field is dropped, the app
     // falls back to the default posture, and the launch would take the exec path instead of the
@@ -384,12 +380,10 @@ fn stop_all_stops_every_session() {
     )
     .unwrap();
 
-    if !host_can_sandbox(project.path(), data.path(), state.path()) {
-        skip_incapable!(
-            "skipping sbx stop --all e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
-        );
-        return;
-    }
+    probe_or_skip!(
+        "sbx stop --all e2e",
+        sandbox_probe(project.path(), data.path(), state.path())
+    );
     let trusted = sbx_run(
         project.path(),
         data.path(),

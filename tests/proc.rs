@@ -159,16 +159,19 @@ fn sbx_isolated() -> Command {
     cmd
 }
 
-/// Whether the host can launch a sandbox (also warms the userland cache so the real launch below
-/// starts promptly).
-fn host_can_sandbox(project: &Path, data: &Path) -> bool {
+/// A launch that does nothing, run only to find out whether this host can build a cage at all. On
+/// a capable host it also warms the userland cache, so the real launch below starts promptly.
+///
+/// Hands back the launch's own [`Output`] rather than a verdict, so `probe_or_skip!` can quote
+/// what the refusal said: "host cannot sandbox" on its own names no cause, and the cause is the
+/// only part a reader of a skipped run does not already know.
+fn sandbox_probe(project: &Path, data: &Path) -> Output {
     sbx_isolated()
         .args(["run", "--", "true"])
         .current_dir(project)
         .env("XDG_DATA_HOME", data)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .expect("spawn sbx run")
 }
 
 /// Read a process's start-time ticks (`/proc/<pid>/stat` field 22) for the fabricated record.
@@ -268,10 +271,10 @@ fn detached_observe_records_exec_events_for_proc_logs() {
     // bound socket, and the `sbx proc logs` client. Skipped, not failed, where the host cannot
     // sandbox.
     let (project, data) = (TmpDir::new("p"), TmpDir::new("p"));
-    if !host_can_sandbox(project.path(), data.path()) {
-        skip_incapable!("skipping detached --observe e2e: host cannot sandbox");
-        return;
-    }
+    probe_or_skip!(
+        "detached --observe e2e",
+        sandbox_probe(project.path(), data.path())
+    );
 
     // Detached + observed: spawns `sleep 30`, which lives well past the poll tick and our reads.
     let started = sbx_isolated()
@@ -327,15 +330,13 @@ fn proc_ls_shows_a_real_cage_process_tree() {
     // `sleep` is a descendant of the recorded pid in host pid-space), give it a fabricated session
     // record, and assert `sbx proc ls` shows the cage's `sleep`. Teeth: a stunted walk — e.g. if the
     // scope reparented the cage away from the recorded pid — would not contain `sleep`. Skipped, not
-    // failed, where the host cannot sandbox; but once `host_can_sandbox` proves it can, a missing
+    // failed, where the host cannot sandbox; but once the probe proves it can, a missing
     // `sleep` is a real failure of the walk, not a skip.
     let (project, data) = (TmpDir::new("p"), TmpDir::new("p"));
-    if !host_can_sandbox(project.path(), data.path()) {
-        skip_incapable!(
-            "skipping proc-ls cage e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
-        );
-        return;
-    }
+    probe_or_skip!(
+        "proc-ls cage e2e",
+        sandbox_probe(project.path(), data.path())
+    );
 
     let mut cage = sbx_isolated()
         .args(["run", "--", "sleep", "300"])
@@ -386,10 +387,10 @@ fn run_observe_streams_exec_events() {
     // path, no observer) emits no feed. Non-interactive (stdin null) so it takes the foreground
     // path, not the pty one. Skipped, not failed, where the host cannot sandbox.
     let (project, data) = (TmpDir::new("p"), TmpDir::new("p"));
-    if !host_can_sandbox(project.path(), data.path()) {
-        skip_incapable!("skipping run --observe e2e: host cannot sandbox");
-        return;
-    }
+    probe_or_skip!(
+        "run --observe e2e",
+        sandbox_probe(project.path(), data.path())
+    );
 
     // A command that spawns a recognizable child living well past the ~300ms poll tick.
     let observed = sbx_isolated()
@@ -438,10 +439,10 @@ fn enforce_blocks_a_denied_binary_in_a_real_cage() {
         "[proc]\nmode = \"enforce\"\ndeny = [\"id\"]\n",
     )
     .unwrap();
-    if !host_can_sandbox(project.path(), data.path()) {
-        skip_incapable!("skipping proc enforce e2e: host cannot sandbox");
-        return;
-    }
+    probe_or_skip!(
+        "proc enforce e2e",
+        sandbox_probe(project.path(), data.path())
+    );
 
     // Trust the project so the security-gated `[proc]` applies; isolate the trust state alongside the
     // data dir so the run below reads the same marker.
@@ -507,10 +508,10 @@ fn an_override_config_proc_enforces_without_trusting_the_project() {
     // `id` (it prints `uid=…`), so the block appears *only* because the override reached the cage.
     // Skipped, not failed, where the host cannot sandbox.
     let (project, data) = (TmpDir::new("p"), TmpDir::new("p"));
-    if !host_can_sandbox(project.path(), data.path()) {
-        skip_incapable!("skipping override-proc enforce e2e: host cannot sandbox");
-        return;
-    }
+    probe_or_skip!(
+        "override-proc enforce e2e",
+        sandbox_probe(project.path(), data.path())
+    );
 
     // Control: no override, no project `[proc]` → `id` runs and prints its uid.
     let control = sbx_isolated()
@@ -568,10 +569,10 @@ fn a_typed_proc_off_override_disables_a_trusted_projects_enforcement() {
         "[proc]\nmode = \"enforce\"\ndeny = [\"id\"]\n",
     )
     .unwrap();
-    if !host_can_sandbox(project.path(), data.path()) {
-        skip_incapable!("skipping typed-proc-off e2e: host cannot sandbox");
-        return;
-    }
+    probe_or_skip!(
+        "typed-proc-off e2e",
+        sandbox_probe(project.path(), data.path())
+    );
     let trusted = sbx_isolated()
         .args(["trust"])
         .current_dir(project.path())
@@ -628,10 +629,10 @@ fn app_run_observe_streams_exec_events() {
         "[app.probe]\ncmd = [\"sh\", \"-c\", \"sleep 1\"]\n",
     )
     .unwrap();
-    if !host_can_sandbox(project.path(), data.path()) {
-        skip_incapable!("skipping app run --observe e2e: host cannot sandbox");
-        return;
-    }
+    probe_or_skip!(
+        "app run --observe e2e",
+        sandbox_probe(project.path(), data.path())
+    );
 
     let observed = sbx_isolated()
         .args(["app", "run", "--observe", "probe"])
@@ -990,10 +991,10 @@ fn deny_session_loads_a_rule_into_a_running_enforcing_cage() {
         "[proc]\nmode = \"enforce\"\n",
     )
     .unwrap();
-    if !host_can_sandbox(project.path(), data.path()) {
-        skip_incapable!("skipping proc --session e2e: host cannot sandbox");
-        return;
-    }
+    probe_or_skip!(
+        "proc --session e2e",
+        sandbox_probe(project.path(), data.path())
+    );
     let trusted = sbx_isolated()
         .args(["trust"])
         .current_dir(project.path())

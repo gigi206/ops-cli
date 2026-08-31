@@ -1,14 +1,23 @@
-//! Helpers shared by the integration tests that sweep the **whole** command tree.
+//! What every integration suite shares: how a test says it did not run, where it puts its files,
+//! and what the command tree is.
 //!
-//! `tests/help.rs` and `tests/completion.rs` each assert a property over every command and
-//! subcommand, so both need the same answer to "what is the command tree?". That answer lives here,
-//! in one definition: two copies drift, and a sweep walking a stale tree reports a coverage it does
-//! not have — which is exactly what a hand-written list did here before, missing a third of the
-//! surface while its header claimed to enumerate all of it.
+//! Three things live here, each because a second copy of it drifts:
+//!
+//! * The **skip macros**, and the two gates built on them — `probe_or_skip!` for a host that
+//!   cannot build a cage, `need_reachable!` for a remote that is not answering. A gate has to
+//!   return from the test, so both are macros: a helper returning `bool` leaves the `return` at the
+//!   call site, and a site that leaves it out does not fail, it runs the body anyway and reports a
+//!   defect that is really an absent prerequisite.
+//! * The **fixture directory**, in [`fixture`].
+//! * The **command tree**. `tests/help.rs` and `tests/completion.rs` each assert a property over
+//!   every command and subcommand, so both need the same answer to "what is the command tree?".
+//!   Two copies drift, and a sweep walking a stale tree reports a coverage it does not have —
+//!   which is exactly what a hand-written list did here before, missing a third of the surface
+//!   while its header claimed to enumerate all of it.
 //!
 //! A shared test module is compiled *into* each test binary rather than linked once, so an item
-//! only one sweep needs is dead code in the other — hence the module-wide allow, which says nothing
-//! about the crate itself.
+//! only one suite needs is dead code in the others — hence the module-wide allow, which says
+//! nothing about the crate itself.
 #![allow(dead_code)]
 
 // The skip macros, included rather than linked: an integration test is its own crate and cannot see
@@ -17,8 +26,58 @@
 // worse than no count at all. Reach them with `#[macro_use] mod common;`.
 include!("../../src/testskip.rs");
 
+/// Gate a test on this host being able to build a cage, skipping it — with the probe's own
+/// diagnosis — when it cannot.
+///
+/// `$probe` is an expression yielding a [`std::process::Output`] from a launch the test does not
+/// otherwise need, conventionally `sbx run -- true`; on a capable host it also seeds the base
+/// userland, so the gate doubles as the warm-up the real launch would otherwise pay for. The macro
+/// expands to that `Output`, for the callers that go on to read what the probe printed.
+///
+/// A macro rather than a helper returning `bool`, because the gate has to leave the **test**. A
+/// helper leaves the `return` at the call site, where it can be forgotten -- and a forgotten
+/// `return` does not fail: it runs the body against a host that cannot support it and reports a
+/// real defect. `$what` names the test in the skip line, which is the only record a skipped run
+/// leaves behind.
+#[allow(unused_macros)]
+macro_rules! probe_or_skip {
+    ($what:literal, $probe:expr $(,)?) => {{
+        let probe = $probe;
+        if !probe.status.success() {
+            skip_incapable!(
+                concat!("skipping ", $what, ": host cannot sandbox ({})"),
+                String::from_utf8_lossy(&probe.stderr).trim()
+            );
+            return;
+        }
+        probe
+    }};
+}
+
+/// Gate a test on a remote it needs being available, skipping it when the remote is not.
+///
+/// `$available` is the caller's own predicate — the binary cache answers, GitHub still has quota,
+/// a public echo server is up — and reads in the positive, so the macro name and the condition
+/// agree. The reason is written out at each site rather than derived, because "unreachable" alone
+/// does not say which remote went missing.
+///
+/// A macro for the reason `probe_or_skip!` is one: the gate returns from the test, and that
+/// `return` must not be something a site can leave out.
+#[allow(unused_macros)]
+macro_rules! need_reachable {
+    ($available:expr, $($reason:tt)+) => {
+        if !$available {
+            skip_unreachable!($($reason)+);
+            return;
+        }
+    };
+}
+
 /// The fixture directory every suite creates its trees under, in one definition.
 pub mod fixture;
+
+/// The project-under-test harness the host-side verb suites drive, in one definition.
+pub mod project;
 
 use std::process::{Command, Output};
 

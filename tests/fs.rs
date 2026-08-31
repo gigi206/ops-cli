@@ -130,16 +130,19 @@ fn sbx_isolated() -> Command {
     cmd
 }
 
-/// Whether the host can launch a sandbox (also warms the userland cache so the real launch below
-/// starts promptly).
-fn host_can_sandbox(project: &Path, data: &Path) -> bool {
+/// A launch that does nothing, run only to find out whether this host can build a cage at all. On
+/// a capable host it also warms the userland cache, so the real launch below starts promptly.
+///
+/// Hands back the launch's own [`Output`] rather than a verdict, so `probe_or_skip!` can quote
+/// what the refusal said: "host cannot sandbox" on its own names no cause, and the cause is the
+/// only part a reader of a skipped run does not already know.
+fn sandbox_probe(project: &Path, data: &Path) -> Output {
     sbx_isolated()
         .args(["run", "--", "true"])
         .current_dir(project)
         .env("XDG_DATA_HOME", data)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .expect("spawn sbx run")
 }
 
 /// Extract the pid from the detached-launch line `sbx: started `run` as detached session <pid> …`.
@@ -165,10 +168,10 @@ fn detached_observe_records_fs_writes_for_fs_logs() {
     // detached path, the fs ring, the bound socket, and the `sbx fs logs` client. Skipped, not failed,
     // where the host cannot sandbox.
     let (project, data) = (TmpDir::new("f"), TmpDir::new("f"));
-    if !host_can_sandbox(project.path(), data.path()) {
-        skip_incapable!("skipping detached fs --observe e2e: host cannot sandbox");
-        return;
-    }
+    probe_or_skip!(
+        "detached fs --observe e2e",
+        sandbox_probe(project.path(), data.path())
+    );
 
     // Detached + observed: write a marker into the project (the cage's cwd is the project, bound rw at
     // its own path), then `sleep 30` so the session lives well past our reads.
@@ -234,10 +237,10 @@ fn fs_scan_lets_the_cage_make_files_inside_it_and_nowhere_else() {
     // Both halves have teeth. Creating has to work, `..` included; and it must not become a way out,
     // since a file made through a walk that left the cage's mounts would land on the host.
     let (project, data, outside) = (TmpDir::new("f"), TmpDir::new("f"), TmpDir::new("f"));
-    if !host_can_sandbox(project.path(), data.path()) {
-        skip_incapable!("skipping `[fs] scan` creation e2e: host cannot sandbox");
-        return;
-    }
+    probe_or_skip!(
+        "`[fs] scan` creation e2e",
+        sandbox_probe(project.path(), data.path())
+    );
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[fs]\nscan = [\"sk-[A-Za-z0-9]{12,}\"]\n",
@@ -353,10 +356,10 @@ fn fs_scan_leaves_the_cage_its_own_proc_self() {
     // Teeth: the answer has to be the *cage's*. A supervisor answering with its own entry satisfies
     // "the read succeeded" while handing over something from outside the cage entirely.
     let (project, data) = (TmpDir::new("f"), TmpDir::new("f"));
-    if !host_can_sandbox(project.path(), data.path()) {
-        skip_incapable!("skipping `[fs] scan` `/proc/self` e2e: host cannot sandbox");
-        return;
-    }
+    probe_or_skip!(
+        "`[fs] scan` `/proc/self` e2e",
+        sandbox_probe(project.path(), data.path())
+    );
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[fs]\nscan = [\"sk-[A-Za-z0-9]{12,}\"]\n",
@@ -403,10 +406,10 @@ fn fs_scan_never_serves_the_cage_an_object_from_outside_it() {
     // the fix bought that by refusing more, since a secret named through an absolute link must still
     // be scanned and refused rather than quietly let past on a second, unexamined resolution.
     let (project, data) = (TmpDir::new("f"), TmpDir::new("f"));
-    if !host_can_sandbox(project.path(), data.path()) {
-        skip_incapable!("skipping `[fs] scan` boundary e2e: host cannot sandbox");
-        return;
-    }
+    probe_or_skip!(
+        "`[fs] scan` boundary e2e",
+        sandbox_probe(project.path(), data.path())
+    );
 
     std::fs::write(
         project.path().join(".sbx.toml"),
@@ -474,10 +477,10 @@ fn fs_scan_closes_a_matching_file_inside_a_real_cage() {
     // resolves. Teeth: if the resolution were wrong, every open would fail to resolve and be allowed,
     // so the secret would come back in stdout and this test fails rather than silently passing.
     let (project, data) = (TmpDir::new("f"), TmpDir::new("f"));
-    if !host_can_sandbox(project.path(), data.path()) {
-        skip_incapable!("skipping `[fs] scan` cage e2e: host cannot sandbox");
-        return;
-    }
+    probe_or_skip!(
+        "`[fs] scan` cage e2e",
+        sandbox_probe(project.path(), data.path())
+    );
 
     std::fs::write(
         project.path().join(".sbx.toml"),

@@ -16,16 +16,20 @@ use common::fixture::TmpDir;
 use std::os::fd::FromRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 fn sbx() -> Command {
     Command::new(env!("CARGO_BIN_EXE_sbx"))
 }
 
-/// Whether the host can launch a sandbox (also warms the userland cache so the
-/// shell starts promptly).
-fn host_can_sandbox(project: &Path, data: &Path) -> bool {
+/// A launch that does nothing, run only to find out whether this host can build a cage at all. On
+/// a capable host it also warms the userland cache, so the shell starts promptly.
+///
+/// Hands back the launch's own [`Output`] rather than a verdict, so `probe_or_skip!` can quote
+/// what the refusal said: "host cannot sandbox" on its own names no cause, and the cause is the
+/// only part a reader of a skipped run does not already know.
+fn sandbox_probe(project: &Path, data: &Path) -> Output {
     sbx()
         .arg("run")
         .arg("--")
@@ -33,8 +37,7 @@ fn host_can_sandbox(project: &Path, data: &Path) -> bool {
         .current_dir(project)
         .env("XDG_DATA_HOME", data)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .expect("spawn sbx run")
 }
 
 #[test]
@@ -43,12 +46,10 @@ fn an_interactive_run_with_no_command_gives_the_sandbox_a_controlling_terminal()
     let data = TmpDir::prefixed("sh", "data");
     std::fs::write(project.path().join("MARKER"), b"x").unwrap();
 
-    if !host_can_sandbox(project.path(), data.path()) {
-        skip_incapable!(
-            "skipping interactive sbx run smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
-        );
-        return;
-    }
+    probe_or_skip!(
+        "interactive sbx run smoke",
+        sandbox_probe(project.path(), data.path())
+    );
 
     // A no-command `sbx run` opens an interactive shell when stdin is a terminal; give it a
     // pty and drive it through the master end.
@@ -139,12 +140,10 @@ fn an_interactive_observed_run_records_events_for_proc_logs() {
     // process. Skipped, not failed, where the host cannot sandbox.
     let project = TmpDir::prefixed("sh", "obs-proj");
     let data = TmpDir::prefixed("sh", "obs-data");
-    if !host_can_sandbox(project.path(), data.path()) {
-        skip_incapable!(
-            "skipping interactive-observe smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
-        );
-        return;
-    }
+    probe_or_skip!(
+        "interactive-observe smoke",
+        sandbox_probe(project.path(), data.path())
+    );
 
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
@@ -261,12 +260,10 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
     )
     .unwrap();
 
-    if !host_can_sandbox(project.path(), data.path()) {
-        skip_incapable!(
-            "skipping sbx app resize smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
-        );
-        return;
-    }
+    probe_or_skip!(
+        "sbx app resize smoke",
+        sandbox_probe(project.path(), data.path())
+    );
 
     // An outer pty sized 24x80. sbx runs on the slave; the test drives the master.
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };

@@ -14,7 +14,7 @@ mod common;
 use common::fixture::TmpDir;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 fn sbx() -> Command {
@@ -45,10 +45,8 @@ fn sbx_run(project: &Path, data: &Path, state: &Path, args: &[&str]) -> std::pro
 
 /// Whether the host can launch a sandbox (also warms the userland cache so later launches start
 /// promptly, and seeds the project store once).
-fn host_can_sandbox(project: &Path, data: &Path, state: &Path) -> bool {
+fn sandbox_probe(project: &Path, data: &Path, state: &Path) -> Output {
     sbx_run(project, data, state, &["run", "--", "true"])
-        .status
-        .success()
 }
 
 /// Whether any process on the host has `needle` in its argv. Used to see an in-cage process from
@@ -158,12 +156,10 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
     )
     .unwrap();
 
-    if !host_can_sandbox(project.path(), data.path(), state.path()) {
-        skip_incapable!(
-            "skipping sbx detach e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
-        );
-        return;
-    }
+    probe_or_skip!(
+        "sbx detach e2e",
+        sandbox_probe(project.path(), data.path(), state.path())
+    );
 
     // Trust so the app's allowlist takes effect — otherwise `sup` falls back to the default posture
     // and would not exercise the supervised path.

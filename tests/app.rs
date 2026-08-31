@@ -6,61 +6,12 @@
 
 #[macro_use]
 mod common;
-use common::fixture::TmpDir;
+use common::project::Project;
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::process::Command;
 
-struct Fixture {
-    proj: TmpDir,
-    config_home: TmpDir,
-    state_home: TmpDir,
-    data_home: TmpDir,
-}
-
-impl Fixture {
-    fn new() -> Self {
-        Fixture {
-            proj: TmpDir::new("app"),
-            config_home: TmpDir::new("app"),
-            state_home: TmpDir::new("app"),
-            data_home: TmpDir::new("app"),
-        }
-    }
-
-    fn sbx(&self, args: &[&str]) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_sbx"))
-            .args(args)
-            .current_dir(self.proj.path())
-            .env("XDG_CONFIG_HOME", self.config_home.path())
-            .env("XDG_STATE_HOME", self.state_home.path())
-            .env("XDG_DATA_HOME", self.data_home.path())
-            .env("LC_ALL", "C.UTF-8")
-            .env_remove("LANG")
-            .output()
-            .expect("spawn sbx")
-    }
-
-    /// Write an imported profile `<config>/sbx/apps/<name>.toml` (trusted by location).
-    fn write_profile(&self, name: &str, body: &str) {
-        let dir = self.config_home.path().join("sbx/apps");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{name}.toml")), body).unwrap();
-    }
-
-    /// Where `sbx app import` places a profile.
-    fn profile_path(&self, name: &str) -> PathBuf {
-        self.config_home
-            .path()
-            .join(format!("sbx/apps/{name}.toml"))
-    }
-
-    /// The global config bundles and groups are merged into, or empty when nothing wrote it.
-    fn global_config(&self) -> String {
-        std::fs::read_to_string(self.config_home.path().join("sbx/sbx.toml")).unwrap_or_default()
-    }
-
+impl Project {
     /// Fabricate a global app home with a mise tool installed at `<munged>/<version>/`.
     fn install_mise_tool(&self, app: &str, munged: &str, version: &str) {
         let ver = self.data_home.path().join(format!(
@@ -164,7 +115,7 @@ fn demo_profile() -> String {
 
 #[test]
 fn show_reports_declared_vs_installed_across_backends() {
-    let fx = Fixture::new();
+    let fx = Project::new("app");
     fx.write_profile("demo-app", &demo_profile());
     // mise:aqua:demo/tool munges to aqua-demo-tool on disk.
     fx.install_mise_tool("demo-app", "aqua-demo-tool", "1.2.3");
@@ -172,7 +123,7 @@ fn show_reports_declared_vs_installed_across_backends() {
     // The `nix:hello` package is keyed on its declared name `core`; gcroot it in the one tree.
     fx.build_nix("aaaaaaaaaaaaaaaa", "core");
 
-    let out = fx.sbx(&["app", "show", "demo-app"]);
+    let out = fx.run(&["app", "show", "demo-app"]);
     assert!(out.status.success(), "sbx app show failed: {}", text(&out));
     let s = String::from_utf8_lossy(&out.stdout);
 
@@ -203,13 +154,13 @@ fn show_reports_declared_vs_installed_across_backends() {
 
 #[test]
 fn show_json_carries_each_packages_installed_state() {
-    let fx = Fixture::new();
+    let fx = Project::new("app");
     fx.write_profile("demo-app", &demo_profile());
     fx.install_mise_tool("demo-app", "aqua-demo-tool", "1.2.3");
     fx.pin_deb("bbbbbbbbbbbbbbbb", DEB_URL, "sha256-00112233abcdef");
     fx.build_nix("bbbbbbbbbbbbbbbb", "core");
 
-    let out = fx.sbx(&["app", "show", "demo-app", "--json"]);
+    let out = fx.run(&["app", "show", "demo-app", "--json"]);
     assert!(
         out.status.success(),
         "sbx app show --json failed: {}",
@@ -248,7 +199,7 @@ fn show_json_carries_each_packages_installed_state() {
 
 #[test]
 fn show_detects_a_remote_flake_built_into_the_per_project_store() {
-    let fx = Fixture::new();
+    let fx = Project::new("app");
     // A profile whose only package is a remote flake. A remote `flake:` builds host-side into the
     // per-project store, gcrooted by its declared name (like `nix:`), not the cage home — so its
     // realized signal is the per-tree gcroot, which `sbx app show` reads via `nix_built_trees`.
@@ -258,7 +209,7 @@ fn show_detects_a_remote_flake_built_into_the_per_project_store() {
     );
     fx.build_nix("aaaaaaaaaaaaaaaa", "agent");
 
-    let out = fx.sbx(&["app", "show", "demo-app"]);
+    let out = fx.run(&["app", "show", "demo-app"]);
     assert!(out.status.success(), "sbx app show failed: {}", text(&out));
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -270,7 +221,7 @@ fn show_detects_a_remote_flake_built_into_the_per_project_store() {
         "the flake must not read `not installed`:\n{s}"
     );
 
-    let out = fx.sbx(&["app", "show", "demo-app", "--json"]);
+    let out = fx.run(&["app", "show", "demo-app", "--json"]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
     let flake = v["packages"]
         .as_array()
@@ -289,7 +240,7 @@ fn show_detects_a_remote_flake_built_into_the_per_project_store() {
 
 #[test]
 fn show_detects_an_inline_flake_built_into_the_home() {
-    let fx = Fixture::new();
+    let fx = Project::new("app");
     // An inline `[flakes.<name>]` flake builds in-cage into a home out-link exactly like a `flake:`
     // package (keyed `<name>-<hash>`), so its realized signal is that warm out-link — not the vague
     // "per-project" the catch-all would otherwise report.
@@ -305,7 +256,7 @@ fn show_detects_an_inline_flake_built_into_the_home() {
         "abcd1234abcd1234abcd1234abcd1234abcd1234-agent-2.0",
     );
 
-    let out = fx.sbx(&["app", "show", "demo-app"]);
+    let out = fx.run(&["app", "show", "demo-app"]);
     assert!(out.status.success(), "sbx app show failed: {}", text(&out));
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -313,7 +264,7 @@ fn show_detects_an_inline_flake_built_into_the_home() {
         "an inline flake's warm out-link should read `built <pname-version>`, not per-project:\n{s}"
     );
 
-    let out = fx.sbx(&["app", "show", "demo-app", "--json"]);
+    let out = fx.run(&["app", "show", "demo-app", "--json"]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
     let flake = v["packages"]
         .as_array()
@@ -333,7 +284,7 @@ fn show_detects_an_inline_flake_built_into_the_home() {
 
 #[test]
 fn show_lists_installed_tools_no_declaration_accounts_for() {
-    let fx = Fixture::new();
+    let fx = Project::new("app");
     fx.write_profile("demo-app", &demo_profile());
     // The declared tool is installed…
     fx.install_mise_tool("demo-app", "aqua-demo-tool", "1.2.3");
@@ -342,7 +293,7 @@ fn show_lists_installed_tools_no_declaration_accounts_for() {
     fx.install_mise_tool("demo-app", "npm-extra-thing", "9.9.9");
     fx.set_tool_token("demo-app", "npm-extra-thing", "npm:extra-thing");
 
-    let out = fx.sbx(&["app", "show", "demo-app"]);
+    let out = fx.run(&["app", "show", "demo-app"]);
     assert!(out.status.success(), "sbx app show failed: {}", text(&out));
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -362,7 +313,7 @@ fn show_lists_installed_tools_no_declaration_accounts_for() {
     );
 
     // --json carries the orphan by the same `mise:`-prefixed name.
-    let out = fx.sbx(&["app", "show", "demo-app", "--json"]);
+    let out = fx.run(&["app", "show", "demo-app", "--json"]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
     let orphans = v["orphans"].as_array().expect("orphans array");
     assert_eq!(orphans.len(), 1, "one orphan: {v}");
@@ -371,11 +322,11 @@ fn show_lists_installed_tools_no_declaration_accounts_for() {
 
 #[test]
 fn show_marks_a_declared_but_unbuilt_package_not_installed() {
-    let fx = Fixture::new();
+    let fx = Project::new("app");
     fx.write_profile("demo-app", &demo_profile());
     // No mise install, no deb pin: the launchable-but-unrealized state.
 
-    let out = fx.sbx(&["app", "show", "demo-app"]);
+    let out = fx.run(&["app", "show", "demo-app"]);
     assert!(out.status.success(), "sbx app show failed: {}", text(&out));
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -400,10 +351,10 @@ fn show_marks_a_declared_but_unbuilt_package_not_installed() {
 
 #[test]
 fn show_of_an_unknown_app_fails_and_lists_the_declared_ones() {
-    let fx = Fixture::new();
+    let fx = Project::new("app");
     fx.write_profile("demo-app", &demo_profile());
 
-    let out = fx.sbx(&["app", "show", "nope"]);
+    let out = fx.run(&["app", "show", "nope"]);
     assert_eq!(
         out.status.code(),
         Some(1),
@@ -430,10 +381,10 @@ fn show_of_an_unknown_app_fails_and_lists_the_declared_ones() {
 /// on the file being named, which is what a reader opens.
 #[test]
 fn a_profile_with_no_command_is_told_where_the_command_goes() {
-    let fx = Fixture::new();
+    let fx = Project::new("app");
     fx.write_profile("ghost", "[network]\nmode = \"deny\"\n");
 
-    let out = fx.sbx(&["app", "run", "ghost"]);
+    let out = fx.run(&["app", "run", "ghost"]);
     let s = text(&out);
     assert!(
         s.contains("declares no command"),
@@ -447,8 +398,8 @@ fn a_profile_with_no_command_is_told_where_the_command_goes() {
 
 /// A demo-app fixture with one declared mise tool installed and one undeclared leftover, plus a home
 /// mise config listing both — the shape `sbx app prune` acts on.
-fn fixture_with_a_leftover() -> Fixture {
-    let fx = Fixture::new();
+fn fixture_with_a_leftover() -> Project {
+    let fx = Project::new("app");
     fx.write_profile(
         "demo-app",
         "cmd = \"demo\"\n\n[packages]\nkeep = \"mise:aqua:demo/keep\"\n",
@@ -468,7 +419,7 @@ fn fixture_with_a_leftover() -> Fixture {
 #[test]
 fn prune_previews_the_undeclared_tool_by_provider_and_removes_nothing() {
     let fx = fixture_with_a_leftover();
-    let out = fx.sbx(&["app", "prune", "demo-app"]);
+    let out = fx.run(&["app", "prune", "demo-app"]);
     assert!(out.status.success(), "prune preview failed: {}", text(&out));
     let s = String::from_utf8_lossy(&out.stdout);
     // The undeclared tool is named by its real provider token, not the munged dir.
@@ -517,7 +468,7 @@ fn prune_yes_refuses_while_a_session_of_that_app_is_live() {
     )
     .unwrap();
 
-    let out = fx.sbx(&["app", "prune", "demo-app", "--yes"]);
+    let out = fx.run(&["app", "prune", "demo-app", "--yes"]);
     assert!(
         !out.status.success(),
         "a prune under a live session must refuse: {}",
@@ -534,7 +485,7 @@ fn prune_yes_refuses_while_a_session_of_that_app_is_live() {
     );
 
     // The preview is unaffected: it deletes nothing, so there is nothing to refuse.
-    let preview = fx.sbx(&["app", "prune", "demo-app"]);
+    let preview = fx.run(&["app", "prune", "demo-app"]);
     assert!(
         preview.status.success()
             && String::from_utf8_lossy(&preview.stdout).contains("would prune"),
@@ -554,7 +505,7 @@ fn start_ticks(pid: u32) -> Option<u64> {
 #[test]
 fn prune_yes_removes_the_undeclared_tool_and_its_config_entry_only() {
     let fx = fixture_with_a_leftover();
-    let out = fx.sbx(&["app", "prune", "demo-app", "--yes"]);
+    let out = fx.run(&["app", "prune", "demo-app", "--yes"]);
     assert!(out.status.success(), "prune --yes failed: {}", text(&out));
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("pruned 1"),
@@ -589,7 +540,7 @@ fn prune_yes_removes_the_undeclared_tool_and_its_config_entry_only() {
 
 #[test]
 fn prune_reports_nothing_when_all_installed_tools_are_declared() {
-    let fx = Fixture::new();
+    let fx = Project::new("app");
     fx.write_profile(
         "demo-app",
         "cmd = \"demo\"\n\n[packages]\nkeep = \"mise:aqua:demo/keep\"\n",
@@ -597,7 +548,7 @@ fn prune_reports_nothing_when_all_installed_tools_are_declared() {
     fx.install_mise_tool("demo-app", "aqua-demo-keep", "1.0.0");
     fx.set_tool_token("demo-app", "aqua-demo-keep", "aqua:demo/keep");
 
-    let out = fx.sbx(&["app", "prune", "demo-app"]);
+    let out = fx.run(&["app", "prune", "demo-app"]);
     assert!(out.status.success());
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("no undeclared mise tools"),
@@ -611,7 +562,7 @@ fn prune_reports_nothing_when_all_installed_tools_are_declared() {
 /// absent tool, or dropped egress rules. These four exercise what the import says about it.
 #[test]
 fn import_names_the_bundle_file_that_sits_beside_the_profile() {
-    let fx = Fixture::new();
+    let fx = Project::new("app");
     let bundle = fx.catalogue(
         "bundle",
         "demo-tool",
@@ -619,7 +570,7 @@ fn import_names_the_bundle_file_that_sits_beside_the_profile() {
     );
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
 
-    let out = fx.sbx(&["app", "import", profile.to_str().unwrap()]);
+    let out = fx.run(&["app", "import", profile.to_str().unwrap()]);
     assert!(out.status.success(), "{}", text(&out));
     let t = text(&out);
     // The command as the reader must type it, with the file — not a `<file>` placeholder they then
@@ -632,7 +583,7 @@ fn import_names_the_bundle_file_that_sits_beside_the_profile() {
 
 #[test]
 fn import_keeps_the_placeholder_when_no_file_backs_the_reference() {
-    let fx = Fixture::new();
+    let fx = Project::new("app");
     // A file IS at the path the layout implies — it just declares a different bundle. This is the
     // case the content gate exists for: the guess is plausible and running it would change nothing.
     fx.catalogue(
@@ -642,7 +593,7 @@ fn import_keeps_the_placeholder_when_no_file_backs_the_reference() {
     );
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
 
-    let out = fx.sbx(&["app", "import", profile.to_str().unwrap()]);
+    let out = fx.run(&["app", "import", profile.to_str().unwrap()]);
     assert!(out.status.success(), "{}", text(&out));
     let t = text(&out);
     assert!(
@@ -657,7 +608,7 @@ fn import_keeps_the_placeholder_when_no_file_backs_the_reference() {
 
 #[test]
 fn import_reports_an_egress_group_the_profile_references_and_nothing_defines() {
-    let fx = Fixture::new();
+    let fx = Project::new("app");
     let group = fx.catalogue(
         "net-groups",
         "demo-lane",
@@ -669,7 +620,7 @@ fn import_reports_an_egress_group_the_profile_references_and_nothing_defines() {
         "cmd = \"demo\"\n[network]\nmode = \"deny\"\nallow = [\"@demo-lane\"]\n",
     );
 
-    let out = fx.sbx(&["app", "import", profile.to_str().unwrap()]);
+    let out = fx.run(&["app", "import", profile.to_str().unwrap()]);
     assert!(out.status.success(), "{}", text(&out));
     let t = text(&out);
     assert!(
@@ -681,11 +632,11 @@ fn import_reports_an_egress_group_the_profile_references_and_nothing_defines() {
     // Control: once the group is defined, the same import says nothing about it. Without this the
     // test above would pass on a warning printed unconditionally.
     assert!(
-        fx.sbx(&["net", "groups", "import", group.to_str().unwrap()])
+        fx.run(&["net", "groups", "import", group.to_str().unwrap()])
             .status
             .success()
     );
-    let again = fx.sbx(&["app", "import", "--force", profile.to_str().unwrap()]);
+    let again = fx.run(&["app", "import", "--force", profile.to_str().unwrap()]);
     let t = text(&again);
     // Discriminate on the remedy, not on the group's name: the granted posture legitimately prints
     // `allow @demo-lane` on every import, so asserting the name is absent would assert nothing.
@@ -701,7 +652,7 @@ fn import_reports_an_egress_group_the_profile_references_and_nothing_defines() {
 /// overwritten with no copy and nothing said — which is the one outcome the copy exists to prevent.
 #[test]
 fn a_forced_import_refuses_when_the_profile_it_would_replace_cannot_be_read() {
-    let fx = Fixture::new();
+    let fx = Project::new("app");
     let dest = fx.profile_path("demo-app");
     std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
     // Present and unreadable, for every uid: a read of a directory is `EISDIR`, where a mode of
@@ -713,7 +664,7 @@ fn a_forced_import_refuses_when_the_profile_it_would_replace_cannot_be_read() {
     let source = fx.proj.path().join("demo-app.toml");
     std::fs::write(&source, "cmd = \"new\"\n").unwrap();
 
-    let out = fx.sbx(&["app", "import", "--force", source.to_str().unwrap()]);
+    let out = fx.run(&["app", "import", "--force", source.to_str().unwrap()]);
     assert!(
         !out.status.success(),
         "a profile that cannot be read must refuse the import: {}",
@@ -732,7 +683,7 @@ fn a_forced_import_refuses_when_the_profile_it_would_replace_cannot_be_read() {
 
 #[test]
 fn bundle_import_reports_the_groups_the_bundle_itself_references() {
-    let fx = Fixture::new();
+    let fx = Project::new("app");
     // The majority case in the shipped catalogue: the group is referenced by the BUNDLE, which an
     // app profile cannot see into — `validate_profile` resolves nothing from disk. If this import
     // stays silent, the reference surfaces only as an app quietly reaching less than it names.
@@ -747,7 +698,7 @@ fn bundle_import_reports_the_groups_the_bundle_itself_references() {
         "[bundle.demo-tool]\nallow = [\"@demo-lane\"]\n[bundle.demo-tool.packages]\ntool = \"nix:hello\"\n",
     );
 
-    let out = fx.sbx(&["bundle", "import", bundle.to_str().unwrap()]);
+    let out = fx.run(&["bundle", "import", bundle.to_str().unwrap()]);
     assert!(out.status.success(), "{}", text(&out));
     let t = text(&out);
     assert!(
@@ -762,7 +713,7 @@ fn bundle_import_reports_the_groups_the_bundle_itself_references() {
 /// which is why it is a flag and not the default.
 #[test]
 fn with_deps_imports_the_bundle_and_the_group_it_reaches_through_it() {
-    let fx = Fixture::new();
+    let fx = Project::new("app");
     fx.catalogue(
         "net-groups",
         "demo-lane",
@@ -775,7 +726,7 @@ fn with_deps_imports_the_bundle_and_the_group_it_reaches_through_it() {
     );
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
 
-    let out = fx.sbx(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
+    let out = fx.run(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
     assert!(out.status.success(), "{}", text(&out));
     let t = text(&out);
     let cfg = fx.global_config();
@@ -803,7 +754,7 @@ fn with_deps_imports_the_bundle_and_the_group_it_reaches_through_it() {
 
     // Nothing is left to ask for afterwards — the warnings and the writes agree on what "missing"
     // means, which they cannot if each side keeps its own filter.
-    let again = fx.sbx(&[
+    let again = fx.run(&[
         "app",
         "import",
         "--force",
@@ -819,14 +770,14 @@ fn with_deps_imports_the_bundle_and_the_group_it_reaches_through_it() {
     // Renaming the app does not rename what it references: the plan follows `use` and the source
     // path, never the name the profile is being filed under. Two names in play, only one of which
     // the references answer to.
-    let fx = Fixture::new();
+    let fx = Project::new("app");
     fx.catalogue(
         "bundle",
         "demo-tool",
         "[bundle.demo-tool.packages]\ntool = \"nix:hello\"\n",
     );
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
-    let out = fx.sbx(&[
+    let out = fx.run(&[
         "app",
         "import",
         profile.to_str().unwrap(),
@@ -845,7 +796,7 @@ fn with_deps_imports_the_bundle_and_the_group_it_reaches_through_it() {
 
 #[test]
 fn with_deps_writes_nothing_at_all_when_a_reference_has_no_file() {
-    let fx = Fixture::new();
+    let fx = Project::new("app");
     // A file IS at the implied path; it declares a different bundle. The reference cannot be
     // followed, and following the rest would leave the app short of exactly what it names.
     fx.catalogue(
@@ -855,7 +806,7 @@ fn with_deps_writes_nothing_at_all_when_a_reference_has_no_file() {
     );
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
 
-    let out = fx.sbx(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
+    let out = fx.run(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
     assert_eq!(
         out.status.code(),
         Some(2),
@@ -877,7 +828,7 @@ fn with_deps_writes_nothing_at_all_when_a_reference_has_no_file() {
 
 #[test]
 fn with_deps_refuses_a_name_that_would_be_dropped_at_load() {
-    let fx = Fixture::new();
+    let fx = Project::new("app");
     // Nothing upstream refuses this: a profile's `use` is not validated against the name charset,
     // and the fragment declares what it declares. Merged as-is, the bundle would be dropped when the
     // config is read and the app would launch short of the tool it names, with nothing said — the
@@ -889,7 +840,7 @@ fn with_deps_refuses_a_name_that_would_be_dropped_at_load() {
     );
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"bad name!\"]\n");
 
-    let out = fx.sbx(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
+    let out = fx.run(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
     assert_eq!(
         out.status.code(),
         Some(2),
@@ -909,7 +860,7 @@ fn with_deps_refuses_a_name_that_would_be_dropped_at_load() {
     // The same rule on the other name source, which is a separate check over a separate loop: a
     // group name comes from an `@<name>` entry, not from `use`. Deleting one guard leaves the other
     // one's tests green, so both are pinned here.
-    let fx = Fixture::new();
+    let fx = Project::new("app");
     fx.catalogue(
         "net-groups",
         "bad name!",
@@ -920,7 +871,7 @@ fn with_deps_refuses_a_name_that_would_be_dropped_at_load() {
         "demo-app",
         "cmd = \"demo\"\n[network]\nmode = \"deny\"\nallow = [\"@bad name!\"]\n",
     );
-    let out = fx.sbx(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
+    let out = fx.run(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
     assert_eq!(
         out.status.code(),
         Some(2),
@@ -940,7 +891,7 @@ fn with_deps_refuses_a_name_that_would_be_dropped_at_load() {
 
 #[test]
 fn with_deps_merges_only_the_referenced_name_from_a_fragment() {
-    let fx = Fixture::new();
+    let fx = Project::new("app");
     // One file, two bundles. Only the one the profile names may land: a catalogue fragment is not a
     // manifest of what the reader asked for, and writing the rest widens the import past the
     // reference — the very thing that made this opt-in.
@@ -952,7 +903,7 @@ fn with_deps_merges_only_the_referenced_name_from_a_fragment() {
     );
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
 
-    let out = fx.sbx(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
+    let out = fx.run(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
     assert!(out.status.success(), "{}", text(&out));
     let cfg = fx.global_config();
     assert!(
@@ -967,8 +918,8 @@ fn with_deps_merges_only_the_referenced_name_from_a_fragment() {
 
 #[test]
 fn show_without_a_name_is_a_usage_error() {
-    let fx = Fixture::new();
-    let out = fx.sbx(&["app", "show"]);
+    let fx = Project::new("app");
+    let out = fx.run(&["app", "show"]);
     assert_eq!(out.status.code(), Some(2), "bare `app show` should exit 2");
     assert!(
         text(&out).contains("sbx app show <name>"),

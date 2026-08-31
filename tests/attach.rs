@@ -11,7 +11,7 @@ use common::fixture::TmpDir;
 
 use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 fn sbx() -> Command {
@@ -57,7 +57,7 @@ fn attach_to_an_unknown_id_reports_and_exits_two() {
 
 /// Whether the host can launch a sandbox (also warms the userland cache so later launches start
 /// promptly, and creates the project's default home).
-fn host_can_sandbox(project: &Path, data: &Path) -> bool {
+fn sandbox_probe(project: &Path, data: &Path) -> Output {
     sbx()
         .arg("run")
         .arg("--")
@@ -65,8 +65,7 @@ fn host_can_sandbox(project: &Path, data: &Path) -> bool {
         .current_dir(project)
         .env("XDG_DATA_HOME", data)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .expect("spawn sbx run")
 }
 
 /// The session record file for `pid`, once it appears under `<data>/sbx/sessions/` (the launch
@@ -164,12 +163,10 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
     )
     .unwrap();
 
-    if !host_can_sandbox(project.path(), data.path()) {
-        skip_incapable!(
-            "skipping sbx attach app e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
-        );
-        return;
-    }
+    probe_or_skip!(
+        "sbx attach app e2e",
+        sandbox_probe(project.path(), data.path())
+    );
 
     // Launch the app in the background: it registers a global-app session and `exec`s into the
     // cage running `sleep`, so the spawned pid is the session's pid throughout.

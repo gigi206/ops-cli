@@ -364,6 +364,11 @@ pub(crate) fn assert_nix_parses(instantiate: &Path, emitter: &str, expr: &str) {
 /// names the host capability, because several sites fail for either and say so ("host cannot
 /// sandbox (no userns/bwrap, or the base cache is unreachable)"). Those are enforceable on their
 /// host half, so they keep the enforceable macro.
+///
+/// The integration suites' two gate macros are not exceptions but the property made structural: a
+/// site written with `probe_or_skip!` cannot name an off-host reason, because the macro writes the
+/// reason itself around the caller's label, and a site written with `need_reachable!` reaches only
+/// the counted macro. What this sweep still reads is every skip written out by hand.
 #[test]
 fn an_off_host_skip_is_never_written_with_the_enforceable_macro() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
