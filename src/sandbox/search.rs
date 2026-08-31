@@ -227,8 +227,12 @@ fn render(
             out.push_str(&format!(
                 "  [tools]     \"{n}nix:{pkg}{r}\" = \"{n}{latest}{r}\"   (or \"latest\")\n"
             ));
+            // Quoted like the `[tools]` line above it, and for the same reason: a nixhub name is
+            // frequently an attribute path (`python312Packages.numpy`), and a bare dotted key in
+            // TOML declares nested tables rather than a literal name — the line would parse as
+            // something else entirely, or not at all.
             out.push_str(&format!(
-                "  [packages]  {n}{pkg}{r} = \"{n}nix:{attr}{r}\"\n"
+                "  [packages]  \"{n}{pkg}{r}\" = \"{n}nix:{attr}{r}\"\n"
             ));
             push_related(&mut out, pkg, matches, pal);
         }
@@ -432,7 +436,12 @@ mod tests {
         // both declaration forms, pinned to the newest version / its attribute (the
         // `[packages]` form now carries the mandatory `nix:` backend prefix)
         assert!(out.contains("\"nix:jq\" = \"1.8.1\""));
-        assert!(out.contains("jq = \"nix:jq\""));
+        // Both keys are quoted. A nixhub name is frequently an attribute path
+        // (`python312Packages.numpy`), and a bare dotted key under `[packages]` is not a literal
+        // name in TOML — it opens nested tables — so a line copied out of this report would
+        // declare something the user did not ask for. Quoting is unconditional rather than
+        // name-dependent, so there is one form to read and one to copy.
+        assert!(out.contains("\"jq\" = \"nix:jq\""));
         // the sibling hits follow as a compact footer, the exact one excluded
         assert!(out.contains("related: ") && out.contains("jq-lsp"));
         assert!(

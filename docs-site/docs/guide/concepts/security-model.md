@@ -43,10 +43,15 @@ to emulation (which would isolate nothing while looking sandboxed). See
 
 ## The synthetic identity
 
-Inside the cage the process sees a synthetic identity, `uid=1000(sandbox)`, with a
+Inside the cage the process sees a synthetic identity: the name `sandbox`, with a
 synthetic `/etc/passwd` and `/etc/group` generated **outside** every writable mount,
 so the identity's integrity holds even when the agent can write elsewhere. The host
 home and the rest of the host filesystem are not present.
+
+The **uid and gid are the host's own**, not a remapped `1000`: sbx uses the same-uid
+model, so a file the cage writes into a bind belongs to the user who launched it and
+needs no ownership translation on the way out. What the cage does not get is any other
+account, so uid resolution works without `/etc/passwd` being present.
 
 The cage also carries a synthetic `/etc/machine-id` (and its `/var/lib/dbus/machine-id`
 alias), **deterministic per app-home and unique per home**, never the host's real one.

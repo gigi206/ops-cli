@@ -461,7 +461,7 @@ fn same_file(target: &Path, canonical_image: &Option<PathBuf>) -> bool {
     std::fs::canonicalize(target).is_ok_and(|t| &t == canonical_image)
 }
 
-/// Report where the volume stands, without changing anything./// Report where the volume stands, without changing anything.
+/// Report where the volume stands, without changing anything.
 pub(crate) fn state(image: &Path) -> io::Result<State> {
     if !image.is_file() {
         return Ok(State::Absent);

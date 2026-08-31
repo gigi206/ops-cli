@@ -4193,6 +4193,22 @@ fn resolve_brokers(
                 "{GLOBAL_CONFIG}: ignoring unknown key `{key}` in `[broker.{name}]`"
             ));
         }
+        // The name reaches a filesystem path: a launch binds `<data>/broker/<pid>/<name>.sock`, and
+        // that is the one socket family under the data directory whose width a user chooses. The
+        // data-directory cap reserves a fixed budget for every family, so a name past this length
+        // would be approved here and then fail at `bind` with `sun_path` — a message about a socket
+        // for a mistake that is about a name. Refused per entry, so a config that also carries
+        // other brokers keeps them.
+        if name.len() > crate::store::BROKER_NAME_MAX {
+            warnings.push(format!(
+                "`[broker.{name}]` has a name of {} characters, more than the {} a broker name may \
+                 carry — its host socket would not fit the length the kernel allows. Shorten the \
+                 name; the broker is not started",
+                name.len(),
+                crate::store::BROKER_NAME_MAX
+            ));
+            continue;
+        }
         let Some(raw) = table.socket else {
             warnings.push(format!(
                 "`[broker.{name}]` names no `socket`, so nothing says which host resource it \

@@ -294,12 +294,23 @@ fn path_cmd(args: &[OsString]) -> ExitCode {
         }
     }
     let layout = store::Layout::from_env();
+    // `from_env` answers `None` for three different reasons, and only one of them is the "this
+    // machine has no XDG base" that the view renders as `(no base)`: the other two are refusals —
+    // a volume that could not be mounted, and a resolved data directory the socket-length check
+    // rejects. Both have already printed their own diagnostic and both mean sbx cannot operate, so
+    // reporting the layout as merely absent and exiting 0 tells a script the opposite of what
+    // happened. A base that resolves while `from_env` still declines is exactly that case.
+    let refused = layout.is_none() && store::Layout::default_data_dir().is_some();
     let view = paths::view(layout.as_ref());
     if json {
         match serde_json::to_string_pretty(&view) {
             Ok(s) => {
                 println!("{s}");
-                ExitCode::SUCCESS
+                if refused {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                }
             }
             Err(e) => {
                 eprintln!("sbx: path: failed to serialize: {e}");
@@ -309,7 +320,11 @@ fn path_cmd(args: &[OsString]) -> ExitCode {
     } else {
         let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
         print!("{}", paths::render(&view, &pal));
-        ExitCode::SUCCESS
+        if refused {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        }
     }
 }
 
@@ -324,22 +339,54 @@ fn take_flag_value(
 ) -> Result<(), ExitCode> {
     let token = head.remove(0);
     // `--flag=value`: the value is inline (split on the first `=`, so `--env=K=V` keeps `K=V`).
-    if let Some((_, inline)) = token.to_str().and_then(|s| s.split_once('=')) {
-        sink.push(inline.to_string());
-        return Ok(());
+    //
+    // The `=` is found in the bytes, not in a UTF-8 view of the whole token: a token whose *value*
+    // half is not text would otherwise fail `to_str()` as a whole and fall through to the
+    // next-argument path, which then consumes an unrelated argument as this flag's value. Reaching
+    // the refusal below instead is what makes the message name the real mistake.
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = token.as_os_str().as_bytes();
+        if let Some(eq) = bytes.iter().position(|b| *b == b'=') {
+            let inline = std::ffi::OsStr::from_bytes(&bytes[eq + 1..]);
+            let Some(text) = inline.to_str() else {
+                diag::error(&format!(
+                    "sbx: {verb}: `{flag}` value is not valid text: {inline:?} — sbx reads \
+                     override values as UTF-8"
+                ));
+                return Err(ExitCode::from(2));
+            };
+            sink.push(text.to_string());
+            return Ok(());
+        }
     }
     // `--flag value`: the value is the next argument.
-    match head.first().and_then(|a| a.to_str()) {
-        Some(v) => {
-            let v = v.to_string();
-            head.remove(0);
-            sink.push(v);
-            Ok(())
-        }
+    //
+    // Absent and present-but-not-text are answered apart. Folding them — which one `and_then`
+    // does — tells a user who supplied a value that they supplied none, and these flags take
+    // *paths*: on Linux a path is bytes, which is why the entry point reads `args_os` in the first
+    // place. A `--bind` on a directory whose name is not UTF-8 is a legitimate invocation, and the
+    // refusal has to name the real reason for it to be actionable.
+    match head.first() {
         None => {
             diag::error(&format!("sbx: {verb}: `{flag}` needs a value"));
             Err(ExitCode::from(2))
         }
+        Some(raw) => match raw.to_str() {
+            Some(v) => {
+                let v = v.to_string();
+                head.remove(0);
+                sink.push(v);
+                Ok(())
+            }
+            None => {
+                diag::error(&format!(
+                    "sbx: {verb}: `{flag}` value is not valid text: {raw:?} — sbx reads override \
+                     values as UTF-8"
+                ));
+                Err(ExitCode::from(2))
+            }
+        },
     }
 }
 
@@ -576,7 +623,10 @@ fn local_save_refusal(path: &Path, exists: bool) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         return format!(
-            "this project has no {config} yet, and trusting the one a `--local` save would write              also trusts {names} beside it — content sbx did not write and you have not reviewed.              Create the config (`touch {config}` is enough), review {names}, run `sbx trust \
+            "this project has no {config} yet, and trusting the one a `--local` save would write \
+             also trusts {names} beside it — content sbx did not write and you have not \
+             reviewed. Create the config (`touch {config}` is enough), review {names}, run \
+             `sbx trust \
              {config}`, then retry",
             config = config::PROJECT_CONFIG,
         );
@@ -588,7 +638,7 @@ fn local_save_refusal(path: &Path, exists: bool) -> String {
     )
 }
 
-/// The write-side trust gate for a save that blesses what it writes:/// The write-side trust gate for a save that blesses what it writes: an existing-but-untrusted (or
+/// The write-side trust gate for a save that blesses what it writes: an existing-but-untrusted (or
 /// changed) config must not be silently blessed, the user reviews and re-trusts it first. An absent
 /// config (bootstrap) or an already-trusted one is fine, so sbx's edit is the sole delta from the
 /// trusted bytes. Pure on its three inputs, so the refuse/allow matrix is unit-testable without a
@@ -1048,6 +1098,49 @@ mod tests {
         std::fs::write(&f, b"1\n").unwrap();
         assert_eq!(read_sysctl(f.to_str().unwrap()).as_deref(), Some("1"));
         assert_eq!(read_sysctl(dir.join("nope").to_str().unwrap()), None);
+    }
+
+    /// A path on Linux is bytes, which is why the entry point reads `args_os`. So a `--bind` on a
+    /// directory whose name is not UTF-8 is a legitimate invocation, and both spellings of it have
+    /// to be refused by their real reason.
+    ///
+    /// The inline arm is the one this pins: `--bind=<bytes>` used to fail `to_str()` as a whole
+    /// token and fall through to the next-argument path, consuming an unrelated argument as the
+    /// value — an observable wrong outcome, and what the middle block asserts. The
+    /// separate-argument arm refused before and refuses now; what changed there is only the
+    /// message, which goes to stderr and is not reachable from here. It is kept because the two
+    /// spellings must not drift apart again.
+    #[test]
+    fn a_flag_value_that_is_not_text_is_refused_as_such_in_both_spellings() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = OsString::from_vec(vec![b'/', 0x80, b'x']);
+
+        // `--bind <value>`: the value is present, so it must not be reported as absent.
+        let mut head = vec![OsString::from("--bind"), bad.clone()];
+        let mut sink = Vec::new();
+        assert!(take_flag_value(&mut head, &mut sink, "run", "--bind").is_err());
+        assert!(sink.is_empty(), "nothing is accepted from a refused value");
+        assert_eq!(head.len(), 1, "the refused value is left for the report");
+
+        // `--bind=<value>`: the whole token is not text, so the inline branch must still claim it
+        // rather than let the next argument stand in for the value.
+        let mut inline = OsString::from("--bind=");
+        inline.push(&bad);
+        let mut head = vec![inline, OsString::from("--unrelated")];
+        let mut sink = Vec::new();
+        assert!(take_flag_value(&mut head, &mut sink, "run", "--bind").is_err());
+        assert!(sink.is_empty());
+        assert_eq!(
+            head,
+            vec![OsString::from("--unrelated")],
+            "the following argument must not be consumed as the value"
+        );
+
+        // The ordinary text value still goes through, so the guard is not refusing everything.
+        let mut head = vec![OsString::from("--bind"), OsString::from("/tmp/x")];
+        let mut sink = Vec::new();
+        assert!(take_flag_value(&mut head, &mut sink, "run", "--bind").is_ok());
+        assert_eq!(sink, vec!["/tmp/x".to_string()]);
     }
 
     #[test]

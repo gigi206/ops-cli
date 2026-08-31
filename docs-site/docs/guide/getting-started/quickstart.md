@@ -26,8 +26,9 @@ never a silent fallback.
 sbx run -- id
 ```
 
-You should see a synthetic identity (`uid=1000(sandbox)`), not your host user. The
-host home and the rest of the host filesystem are **absent** from the cage: the
+You should see the synthetic user name `sandbox` rather than your own, on your own
+uid and gid: sbx uses the same-uid model, so what the cage writes into a bind belongs
+to you. The host home and the rest of the host filesystem are **absent** from the cage: the
 [security model](../concepts/security-model) is confidentiality by absence. The
 command's exit status is propagated.
 

@@ -260,6 +260,13 @@ pub(crate) fn provision(
         .join(&id)
         .join("nix-tools");
 
+    // Reconcile the out-links before provisioning: one per declared tool is added below, and
+    // nothing ever removed one, so a tool dropped from the mise file left its root behind and
+    // pinned that closure against every `sbx gc` for good. `gc::project_keep_roots` names this
+    // directory as a keep-set and `gc::prune_project_package_roots` reads only the level above it,
+    // so neither side reclaims here — the declaration is the only thing that knows what belongs.
+    prune_tool_roots(&roots, &declared.nix);
+
     let mut lock = ResolutionLock::read(&lock_path);
     let mut bins = Vec::with_capacity(declared.nix.len());
     let mut tool_roots = Vec::with_capacity(declared.nix.len());
@@ -352,6 +359,39 @@ pub(crate) enum ToolUpgrade {
     /// omission. `mise_managed` distinguishes a tool for another mise backend (equipped
     /// in-cage, so mise tracks its freshness) from a malformed `nix:` token (unresolvable).
     Ignored { token: String, mise_managed: bool },
+}
+
+/// Remove the out-links under a project's `nix-tools/` gcroot directory that no longer answer to a
+/// declared tool — the reconciliation [`super::gc::prune_project_package_roots`] performs one level
+/// up, for the family it does not descend into.
+///
+/// Only symlinks are considered, so nothing else the directory carries is touched, and a removal
+/// that fails is skipped rather than propagated: a stale root costs disk, and failing a launch over
+/// one would trade a bounded cost for a total one. A multi-output sibling (`<pkg>-man`, `<pkg>-dev`,
+/// which `nix build --out-link` creates alongside the package) is kept by the same `<name>-` prefix
+/// rule the sibling uses, or a live tool's extra outputs would be unrooted on every launch.
+fn prune_tool_roots(roots: &Path, declared: &[NixTool]) {
+    let Ok(entries) = std::fs::read_dir(roots) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_symlink()) {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let kept = declared.iter().any(|t| {
+            name == t.pkg
+                || name
+                    .strip_prefix(t.pkg.as_str())
+                    .is_some_and(|r| r.starts_with('-'))
+        });
+        if !kept {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Re-resolve a trusted project's declared `nix:` tools against nixhub and rewrite the
@@ -661,17 +701,61 @@ fn fetch_url_bytes(nix: &Path, layout: &Layout, url: &str, fresh: bool) -> io::R
     if fresh {
         cmd.args(["--option", "tarball-ttl", "0"]);
     }
-    let out = cmd
+    // Read bounded rather than through `output()`, which buffers the whole of stdout in sbx's own
+    // address space at the speed of the writer. These bodies are remote and their size is the
+    // endpoint's choice: a nixhub answer, a GitHub release document, an apt index. The ceiling is
+    // the one `resolver` already derives for an answer sbx reads off a pipe, for the same reason —
+    // a deadline stops an endpoint that answers *forever*, not one that answers fast.
+    //
+    // What this does NOT bound, and the honest limit of it: `fetchurl` has already written the body
+    // into sbx's nix store (disk) and `readFile` has already materialised it as a nix string (nix's
+    // RSS) before the first byte reaches this pipe. Bounding those means asking nix for the store
+    // path and stat'ing it instead of reading the contents, which is a different expression and a
+    // change to every caller's shape.
+    let mut child = cmd
         .args(["eval", "--impure", "--raw", "--expr", &expr])
-        .output()?;
-    if !out.status.success() {
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    // stderr is drained on its own thread. Two pipes need two readers: nix filling stderr while sbx
+    // reads stdout would block on a pipe nobody drains, and sbx would block on the one it drains.
+    let mut err_pipe = child.stderr.take().expect("stderr is piped");
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut err_pipe, &mut buf);
+        buf
+    });
+    let mut body = Vec::new();
+    {
+        use std::io::Read;
+        let mut pipe = child.stdout.take().expect("stdout is piped");
+        // One byte past the ceiling, so a body sitting exactly on it is still served and only one
+        // that crosses it is refused.
+        pipe.by_ref()
+            .take(MAX_METADATA_BYTES as u64 + 1)
+            .read_to_end(&mut body)?;
+    }
+    let status = child.wait()?;
+    let stderr = err_reader.join().unwrap_or_default();
+    if !status.success() {
         return Err(io::Error::other(format!(
             "fetching {url} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            String::from_utf8_lossy(&stderr).trim()
         )));
     }
-    Ok(out.stdout)
+    if body.len() > MAX_METADATA_BYTES {
+        return Err(io::Error::other(format!(
+            "fetching {url} failed: the answer is larger than the {MAX_METADATA_BYTES} bytes sbx \
+             reads for metadata"
+        )));
+    }
+    Ok(body)
 }
+
+/// The most sbx will read from one metadata fetch. Derived from the ceiling `resolver` already
+/// applies to an answer read off a pipe, so the two limits move together rather than drifting: both
+/// exist because a deadline cannot stop an endpoint that answers quickly and without end.
+const MAX_METADATA_BYTES: usize = crate::plugins::broker::MAX_FRAME_CEILING;
 
 /// The expression [`fetch_url_bytes`] evaluates. A function of its own so a test can hand it to
 /// nix rather than assert on its text: a URL is interpolated into a nix string literal here, and
@@ -805,6 +889,54 @@ fn is_commit(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool dropped from the mise file left its gcroot out-link behind, and nothing on the gc
+    /// side reclaims it: `project_keep_roots` names `nix-tools/` as a keep-set, and
+    /// `prune_project_package_roots` reads only the directory above it. The closure stayed pinned
+    /// against every `sbx gc` for the life of the data directory. Only the declaration knows what
+    /// belongs, so the reconciliation lives beside it.
+    #[test]
+    fn a_tool_root_that_is_no_longer_declared_is_unpinned() {
+        let tmp = crate::testutil::TmpDir::new();
+        let roots = tmp.join("nix-tools");
+        let target = tmp.join("store-path");
+        std::fs::create_dir_all(&roots).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        for link in ["kept", "kept-man", "gone", "gone-dev"] {
+            std::os::unix::fs::symlink(&target, roots.join(link)).unwrap();
+        }
+        // A plain file beside the links, to pin that only symlinks are considered.
+        std::fs::write(roots.join("notes"), b"x").unwrap();
+
+        prune_tool_roots(
+            &roots,
+            &[NixTool {
+                pkg: "kept".to_string(),
+                version: "latest".to_string(),
+            }],
+        );
+
+        assert!(
+            roots.join("kept").exists(),
+            "the declared tool stays rooted"
+        );
+        assert!(
+            roots.join("kept-man").exists(),
+            "a multi-output sibling of a declared tool stays rooted"
+        );
+        assert!(
+            !roots.join("gone").exists(),
+            "the undeclared tool's root is removed"
+        );
+        assert!(
+            !roots.join("gone-dev").exists(),
+            "and so is its multi-output sibling"
+        );
+        assert!(
+            roots.join("notes").exists(),
+            "a non-symlink entry is left alone"
+        );
+    }
 
     fn files(entries: &[(&str, &str)]) -> Vec<(String, Vec<u8>)> {
         entries

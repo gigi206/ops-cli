@@ -26,9 +26,10 @@ use std::path::{Path, PathBuf};
 
 const FLAKE_LOCK: &str = "flake-packages.lock";
 
-/// A locked flake package: the immutable revision (40-hex, which keys the out-link) and the
-/// immutable build reference (the locked URL plus any `#<attr>` from the declared ref) the
-/// launch builds.
+/// A locked flake package: the immutable revision (40-hex, recorded and displayed only — nothing
+/// here is keyed by it, as the module header explains) and the immutable build reference (the
+/// locked URL plus any `#<attr>` from the declared ref), which is what the launch actually builds
+/// and what the out-link is named beside.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FlakePin {
     pub(crate) rev: String,

@@ -262,7 +262,6 @@ pub(crate) fn keep_replaced_file(dest: &Path, bytes: &[u8]) -> std::io::Result<(
 }
 
 /// The settings a replaced file carried that the incoming one does not — what a `--force` import
-/// drops, whether the file is an app profile or a bundle fragment./// The settings a replaced file carried that the incoming one does not — what a `--force` import
 /// drops, whether the file is an app profile or a bundle fragment.
 ///
 /// Blank lines and comments are skipped: prose is rewritten constantly and reporting it would bury

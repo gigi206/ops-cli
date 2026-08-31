@@ -240,7 +240,11 @@ struct BaseView {
     label: &'static str,
     /// The env-var contract for the base, e.g. `"$XDG_DATA_HOME/sbx (else ~/.local/share/sbx)"`.
     env_hint: &'static str,
-    /// The resolved base directory (`<xdg>/sbx`). `None` only when no `$HOME`/XDG base resolves.
+    /// The resolved base directory (`<xdg>/sbx`). `None` when no `$HOME`/XDG base resolves — and
+    /// also when one resolved but sbx refused the directory it named (a volume that could not be
+    /// mounted, or a path too long for the sockets bound under it). Those refusals print their own
+    /// diagnostic and make `sbx path` exit non-zero, so this field alone does not distinguish
+    /// them.
     root: Option<PathBuf>,
     /// Whether the base directory itself exists on disk.
     exists: bool,

@@ -315,12 +315,29 @@ const SUN_PATH_MAX: usize = 107;
 /// reserve for. With a 7-digit pid and a 5-digit port:
 ///   `/egress/proxy-<pid>.sock`         (26)  egress proxy, bound into the cage
 ///   `/egress/control-<pid>.sock`       (28)  egress live control
-///   `/fs/control-<pid>.sock`           (24)  exec-enforcement control
-///   `/forward/fwd-<pid>/p-<port>.sock` (33)  port forwarding — the widest, a per-launch subdir
-///                                            holding one socket per forwarded port
+///   `/fs/control-<pid>.sock`           (24)  filesystem-observation control
+///   `/broker/<pid>/<name>.sock`        (33)  a broker plugin's host socket, one per declared
+///                                            `[broker.<name>]`, in a per-launch subdir — the only
+///                                            family whose width depends on a user-chosen name,
+///                                            which is why that name is capped
+///                                            ([`BROKER_NAME_MAX`])
+///   `/forward/fwd-<pid>/p-<port>.sock` (33)  port forwarding — a per-launch subdir holding one
+///                                            socket per forwarded port
 /// A new feature whose host socket path is wider than this must widen the sample below, or a
 /// data directory the cap accepts would still overrun `sun_path` at that feature's first launch.
 const LONGEST_SOCKET_SUFFIX: usize = "/forward/fwd-1234567/p-65535.sock".len();
+
+/// The most a broker name may measure, so `<data>/broker/<pid>/<name>.sock` stays inside
+/// [`LONGEST_SOCKET_SUFFIX`] and the data-directory cap keeps the promise it makes.
+///
+/// Derived rather than written down: every other socket family is fixed-width, so this one is the
+/// only place a user's choice can push a bind past `sun_path`. Without it,
+/// [`check_data_dir_override`] tells the user a directory fits "because sbx binds sockets under
+/// it", and a launch declaring a long-named broker then fails on `UnixListener::bind` with a
+/// message about a socket rather than about the directory — the exact outcome that check exists to
+/// prevent, on a directory it approved.
+pub(crate) const BROKER_NAME_MAX: usize =
+    LONGEST_SOCKET_SUFFIX - "/broker/".len() - 7 - "/".len() - ".sock".len();
 
 /// The most a data directory may measure and still host those sockets.
 const DATA_DIR_MAX: usize = SUN_PATH_MAX - LONGEST_SOCKET_SUFFIX;
@@ -675,10 +692,11 @@ fn engine_probe(path: &Path) -> EngineProbe {
     match host_exec_verdict(meta.uid(), meta.mode(), euid) {
         Ok(()) => EngineProbe::Trusted,
         Err(why) => {
-            eprintln!(
-                "sbx: ignoring untrusted engine binary {}: {why}",
-                path.display()
-            );
+            // States the fact, not the disposition: this probe serves all three tiers, and they
+            // dispose of an untrusted binary differently — the override is refused outright, a
+            // lower tier is skipped in favour of the next. Each tier says which below, so neither
+            // has to be implied by a word chosen here.
+            eprintln!("sbx: untrusted engine binary {}: {why}", path.display());
             EngineProbe::Untrusted
         }
     }
@@ -707,7 +725,19 @@ fn pick_engine_bin(
     if let Some(nix) = override_nix {
         match probe(nix) {
             EngineProbe::Absent => {}
-            EngineProbe::Untrusted => return None,
+            EngineProbe::Untrusted => {
+                // Refused, not skipped: an override is a deliberate choice, and quietly running a
+                // different engine against the same store would be worse than stopping. Said here
+                // because the caller only learns `None`, and reports it as the engine being
+                // missing — which it is not.
+                eprintln!(
+                    "sbx: refusing {ENGINE_OVERRIDE_ENV}={} — sbx will not silently substitute \
+                     another engine. Fix the file's ownership or permissions, or unset the \
+                     variable.",
+                    nix.display()
+                );
+                return None;
+            }
             EngineProbe::Trusted => {
                 let bin = engine_sibling(nix, name);
                 return matches!(probe(bin.as_path()), EngineProbe::Trusted).then_some(bin);
@@ -905,7 +935,17 @@ fn pick_bwrap(
     if let Some(bin) = override_bin {
         match probe(bin) {
             EngineProbe::Absent => {}
-            EngineProbe::Untrusted => return None,
+            // Refused rather than skipped, for the reason `pick_engine_bin`'s override tier gives:
+            // the caller sees only `None` and would otherwise report the engine as missing.
+            EngineProbe::Untrusted => {
+                eprintln!(
+                    "sbx: refusing {BWRAP_OVERRIDE_ENV}={} — sbx will not silently substitute \
+                     another engine. Fix the file's ownership or permissions, or unset the \
+                     variable.",
+                    bin.display()
+                );
+                return None;
+            }
             EngineProbe::Trusted => return Some((bin.to_path_buf(), BwrapSource::Override)),
         }
     }
@@ -1336,8 +1376,10 @@ fn resolve_ref(
 /// Force a fresh resolution of `source`, ignoring any matching lock, and rewrite
 /// `lock_path` — the explicit roll-forward. Records the previous revision (only when
 /// the lock already pinned this same source) so the caller can report the change. A
-/// 40-hex source resolves to itself with no nix call, so refreshing a fixed pin is a
-/// well-defined no-op.
+/// 40-hex source resolves to itself without a channel lookup, so refreshing a fixed pin rewrites
+/// the lock with the revision it already carried. Not a no-op end to end: the pinned form is still
+/// witnessed against the repository, which is a nix-driven HTTPS request that degrades silently
+/// when it cannot run.
 fn refresh_ref(nix: &Path, layout: &Layout, source: &str, lock_path: &Path) -> io::Result<Upgrade> {
     ensure(layout)?;
     let previous = read_lock(lock_path).and_then(|(s, r)| (s == source).then_some(r));
@@ -1350,8 +1392,9 @@ fn refresh_ref(nix: &Path, layout: &Layout, source: &str, lock_path: &Path) -> i
     })
 }
 
-/// Resolve a source to its revision: a 40-hex source already *is* the revision (an
-/// exact pin, needing no nix); a branch/channel is resolved via `nix flake metadata`.
+/// Resolve a source to its revision: a 40-hex source already *is* the revision, so it needs no
+/// channel resolution — though it is still witnessed against the repository below, which does spawn
+/// nix; a branch/channel is resolved via `nix flake metadata`.
 ///
 /// `fresh` is passed to the witness the pinned form goes through, so it asks with the same currency
 /// as the caller: an upgrade re-asks, a launch may reuse a cached answer. Checking a fresh claim
@@ -2314,6 +2357,55 @@ mod tests {
         );
     }
 
+    /// The constant is only worth what the real path builders measure against it. The existing
+    /// cap tests restate `LONGEST_SOCKET_SUFFIX` and so would pass unchanged if a feature started
+    /// binding a wider path — which is how the broker family, the one whose width a user chooses,
+    /// went unaccounted for: a data directory `check_data_dir_override` approved would then fail at
+    /// `bind` with `sun_path`, saying "socket" for a mistake about a directory.
+    #[test]
+    fn every_socket_family_fits_the_budget_the_data_dir_cap_reserves() {
+        // A data directory exactly at the cap, and the widest pid the kernel hands out.
+        let data = PathBuf::from(format!("/{}", "d".repeat(DATA_DIR_MAX - 1)));
+        assert_eq!(data.as_os_str().len(), DATA_DIR_MAX);
+        let pid = 4_194_304u32; // kernel.pid_max's documented ceiling: 7 digits
+        assert_eq!(pid.to_string().len(), 7);
+
+        // The broker family, built by the function a launch actually calls, with the longest name
+        // the config layer now admits.
+        let name = "b".repeat(crate::store::BROKER_NAME_MAX);
+        let broker = data
+            .join("broker")
+            .join(pid.to_string())
+            .join(format!("{name}.sock"));
+        assert!(
+            broker.as_os_str().len() <= SUN_PATH_MAX,
+            "a broker socket at the cap overruns sun_path: {} > {SUN_PATH_MAX} ({})",
+            broker.as_os_str().len(),
+            broker.display()
+        );
+
+        // One character more does not fit, so the cap is the real boundary rather than slack.
+        let over = data
+            .join("broker")
+            .join(pid.to_string())
+            .join(format!("{name}b.sock"));
+        assert!(
+            over.as_os_str().len() > SUN_PATH_MAX,
+            "the name cap is looser than sun_path requires"
+        );
+
+        // The forward family, the other per-launch subdir, against its widest port.
+        let forward = data
+            .join("forward")
+            .join(format!("fwd-{pid}"))
+            .join("p-65535.sock");
+        assert!(
+            forward.as_os_str().len() <= SUN_PATH_MAX,
+            "a forward socket at the cap overruns sun_path: {}",
+            forward.as_os_str().len()
+        );
+    }
+
     #[test]
     fn a_data_dir_override_too_long_to_host_a_unix_socket_is_refused() {
         // The bound is what is left of `sun_path` once the widest socket name sbx
@@ -2862,7 +2954,7 @@ mod tests {
 
     #[test]
     fn a_revision_source_is_used_without_invoking_nix_and_is_locked() {
-        // A 40-hex source is already a revision: it pins directly, with no nix call,
+        // A 40-hex source is already a revision: it pins directly, with no channel lookup,
         // and is recorded so later runs reuse it.
         let base = TmpDir::new();
         let layout = Layout::under(&base.join("sbx"));
@@ -2986,9 +3078,12 @@ mod tests {
     }
 
     #[test]
-    fn refresh_of_a_revision_pin_is_a_noop_without_nix() {
-        // A 40-hex source resolves to itself with no nix call, so refreshing a fixed
-        // pin reports the same revision as previous and new — an explicit no-op.
+    fn refresh_of_a_revision_pin_reports_itself_even_when_the_witness_cannot_run() {
+        // A 40-hex source resolves to itself without a channel lookup, so refreshing a fixed pin
+        // reports the same revision as previous and new. `BOGUS_NIX` is the point: the pinned form
+        // is still witnessed against the repository, and that witness spawns nix — this pins that
+        // a witness which cannot run degrades to the pin rather than failing the refresh. It is
+        // not, as the name used to say, a path that never reaches nix at all.
         let base = TmpDir::new();
         let layout = Layout::under(&base.join("sbx"));
         std::fs::create_dir_all(layout.data_dir()).unwrap();
@@ -2996,7 +3091,7 @@ mod tests {
 
         let up = LockTarget::global(&layout, Some(REV))
             .refresh(Path::new(BOGUS_NIX), &layout)
-            .expect("a revision pin refreshes without nix");
+            .expect("a revision pin refreshes even when the witness cannot run");
         assert_eq!(up.source, REV);
         assert_eq!(up.previous.as_deref(), Some(REV));
         assert_eq!(up.revision, REV);

@@ -99,8 +99,9 @@ depends on the request itself (a signature over the method, path and query). Nam
 [`sign`](../configuration/secret#sign-a-credential-computed-from-the-request) on a secret. See
 [The signer type](../plugins/signer).
 
-**Synthetic identity**, the `uid=1000(sandbox)` user (and synthetic `/etc/passwd`) the
-cage presents, generated outside every writable mount.
+**Synthetic identity**, the `sandbox` user (and synthetic `/etc/passwd`) the cage
+presents, generated outside every writable mount. The uid and gid are the host's own
+(the same-uid model); only the name and the account set are synthetic.
 
 **Trust gate**, the mechanism binding a project config's security fields to a content
 hash, on the direnv model. See [The trust gate](../concepts/trust).

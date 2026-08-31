@@ -859,7 +859,18 @@ where
     let mut lock = pins(ctx.layout, project_id.as_str(), &lock_file);
     let ((url, hash), minted) = pinned_or_mint(&mut lock, key, mint)?;
     if minted {
-        write_pins(ctx.layout, project_id.as_str(), &lock_file, &lock)?;
+        // Written ADDITIVELY, the way `nixhub::provision` persists a freshly-resolved pin and for
+        // the same reason: minting is the slow part (a download and a hash, or a resolve command in
+        // a cage), so a concurrent cold provision of the same project has a wide window to pin a
+        // *different* package while this one is still working. Writing the snapshot taken before
+        // the mint would drop that pin, and the package would silently re-resolve and re-pin on the
+        // next launch — a second trust-on-first-use, and a network round-trip on a path documented
+        // as offline. Re-reading and merging just this key keeps the other one.
+        let mut disk = pins(ctx.layout, project_id.as_str(), &lock_file);
+        if let Some(entry) = lock.get(key) {
+            disk.insert(key.to_string(), entry.clone());
+        }
+        write_pins(ctx.layout, project_id.as_str(), &lock_file, &disk)?;
     }
     build_pinned(kind, ctx, project_id.as_str(), name, &url, &hash, libs)
 }
@@ -1148,6 +1159,58 @@ mod tests {
         assert_eq!(hash, "sha256-CCCC");
         assert_eq!(lock["deb:demo"].url, "https://e/demo.deb");
         assert_eq!(lock["deb:demo"].hash, "sha256-CCCC");
+    }
+
+    /// Minting is the slow part — a download and a hash, or a resolve command in a cage — so a
+    /// concurrent cold provision of the same project has a wide window to pin a *different*
+    /// package while this one works. Writing back the snapshot taken before the mint dropped that
+    /// pin, and the package then re-resolved and re-pinned on the next launch: a second
+    /// trust-on-first-use and a network round-trip on a path documented as offline. The write is
+    /// additive against what is on disk at the moment it happens.
+    #[test]
+    fn a_pin_written_after_a_slow_mint_keeps_one_a_concurrent_launch_recorded() {
+        let tmp = TmpDir::new();
+        let layout = crate::store::Layout::under(tmp.path());
+        let lock_file = "prebuilt.lock";
+        let id = "proj";
+        std::fs::create_dir_all(lock_path(&layout, id, lock_file).parent().unwrap()).unwrap();
+
+        // This launch's snapshot: empty, taken before its mint.
+        let stale: BTreeMap<String, Pin> = BTreeMap::new();
+
+        // A concurrent launch pins a different package while the mint is still running.
+        let mut theirs: BTreeMap<String, Pin> = BTreeMap::new();
+        theirs.insert(
+            "deb:other".to_string(),
+            Pin {
+                url: "https://e/other.deb".to_string(),
+                hash: "sha256-OOOO".to_string(),
+            },
+        );
+        write_pins(&layout, id, lock_file, &theirs).unwrap();
+
+        // This launch's mint completes and records only its own key against the current disk.
+        let mut mine = stale.clone();
+        mine.insert(
+            "deb:demo".to_string(),
+            Pin {
+                url: "https://e/demo.deb".to_string(),
+                hash: "sha256-DDDD".to_string(),
+            },
+        );
+        let mut disk = pins(&layout, id, lock_file);
+        disk.insert("deb:demo".to_string(), mine["deb:demo"].clone());
+        write_pins(&layout, id, lock_file, &disk).unwrap();
+
+        let back = pins(&layout, id, lock_file);
+        assert_eq!(
+            back["deb:demo"].hash, "sha256-DDDD",
+            "this launch's pin is recorded"
+        );
+        assert_eq!(
+            back["deb:other"].hash, "sha256-OOOO",
+            "the concurrent launch's pin survives — writing the pre-mint snapshot would drop it"
+        );
     }
     use super::super::appimage::AppImage;
     use super::super::deb::Deb;

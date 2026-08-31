@@ -1010,7 +1010,7 @@ fn apply_ambient_override(resolved: &mut Resolved) {
     }
 }
 
-/// Assemble the view restricted to one configuration `source`/// Assemble the view restricted to one configuration `source` — the single-source `sbx config show
+/// Assemble the view restricted to one configuration `source` — the single-source `sbx config show
 /// --global/--local/--default` views. `build(cwd)` is `build_scoped(cwd, Source::All)`; a
 /// restricted form projects the same model from fewer layers, so each value's provenance tag reads
 /// as what that source contributes over the built-in defaults.

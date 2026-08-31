@@ -37,9 +37,16 @@ pub(crate) struct ResolveCage<'a> {
     pub(crate) shell_bin: &'a Path,
     /// The host-side physical path of sbx's CA bundle, bound so the command's HTTPS is hermetic.
     pub(crate) ca_bundle: &'a Path,
-    /// The `PATH` bin directories (logical store paths): sbx's base tools plus the app's `nix:` package
-    /// bins, so a resolve command can use a tool the base does not carry by declaring it (e.g.
-    /// `yq = "nix:yq-go"`).
+    /// The `PATH` bin directories (logical store paths): sbx's base tools plus the **project's**
+    /// baseline `[packages]` `nix:`/`flake:` bins, so a resolve command can use a tool the base does
+    /// not carry by declaring it (e.g. `yq = "nix:yq-go"`).
+    ///
+    /// Narrower than what a launch puts on `PATH`, and deliberately: the mise `nix:` tools, the
+    /// direct prebuilt bins and any app overlay are not here, because assembling them means
+    /// provisioning them, which is the expensive half of a launch and not something `sbx upgrade`
+    /// should do for every resolver reference. A resolve command that reaches for one of those
+    /// fails at upgrade — loudly, one `re-resolve failed` line per package — while launches keep
+    /// working off the pin already recorded.
     pub(crate) bins: Vec<PathBuf>,
 }
 
@@ -56,11 +63,11 @@ pub(crate) struct UpgradeCage {
 }
 
 impl UpgradeCage {
-    /// Assemble the resolver sandbox for `sbx upgrade` — the same hermetic base userland plus the
-    /// project's `nix:` package bins a launch gives a resolve command, so a command runs identically
-    /// at first launch and at upgrade. Best-effort: `None` when the host cannot resolve an engine or
-    /// a sandbox, and the caller then reports each resolver reference as un-rollable rather than
-    /// silently frozen.
+    /// Assemble the resolver sandbox for `sbx upgrade`: the same hermetic base userland a launch
+    /// gives a resolve command, plus the project's baseline `[packages]` bins. Not the launch cage's
+    /// whole `PATH` — see [`ResolveCage::bins`] for what is left out and why. Best-effort: `None`
+    /// when the host cannot resolve an engine or a sandbox, and the caller then reports each
+    /// resolver reference as un-rollable rather than silently frozen.
     pub(crate) fn build(
         nix: &Path,
         layout: &Layout,
@@ -79,8 +86,10 @@ impl UpgradeCage {
             crate::store::resolve_engine_ref(nix, layout, cfg.nixpkgs_global.as_deref()).ok()?;
         let userland = super::fhs::resolve_userland(nix, layout, &nixpkgs, &engine_ref).ok()?;
         let mut bins = userland.bin_paths.clone();
-        // The app's `nix:` bins, so a resolve command using e.g. `jq` resolves at upgrade time
-        // exactly as it does at launch. Best-effort — the base tools are always present regardless.
+        // The project's baseline `[packages]` bins, so a resolve command using e.g. `jq` finds it
+        // here as it does at launch. Best-effort — the base tools are always present regardless.
+        // This is the baseline layer only; `cfg.apps` is not walked and the mise/prebuilt layers are
+        // not provisioned, so the set is narrower than a launch's.
         if let Ok(p) = super::packages::provision(nix, layout, project, &nixpkgs, &cfg.packages) {
             bins.extend(p.bins);
         }
