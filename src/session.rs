@@ -477,14 +477,36 @@ fn descendants(root: u32) -> Vec<(u32, u64)> {
             start_of.insert(pid, start);
         }
     }
+    walk_descendants(&children, &start_of, root)
+}
+
+/// The graph half of [`descendants`]: walk `root`'s subtree of a `parent -> children` map, pairing
+/// each pid with its start time. Split out because the `/proc` half cannot be exercised in a test —
+/// a cycle in the parent graph is not something a test can arrange on a live kernel — and the walk
+/// is where the termination guarantee lives.
+fn walk_descendants(
+    children: &HashMap<u32, Vec<u32>>,
+    start_of: &HashMap<u32, u64>,
+    root: u32,
+) -> Vec<(u32, u64)> {
     let mut out = Vec::new();
+    // The visited set both sibling walkers carry (`observe::descendants_of` and
+    // `sandbox::observe_feed::descendant_pids`), for the reason they state: `/proc` is read pid by
+    // pid without a consistent snapshot, so a process that exits and whose pid is reused mid-walk
+    // can produce a parent edge pointing back into the part already walked. Following that edge
+    // walks the same subtree again, and a full cycle never terminates — in `sbx session stop`, a
+    // hang with signals still to deliver. The root is seeded so a back-edge onto it is refused too.
+    let mut seen = std::collections::BTreeSet::new();
+    seen.insert(root);
     let mut stack = vec![root];
     while let Some(parent) = stack.pop() {
         let Some(kids) = children.get(&parent) else {
             continue;
         };
         for &kid in kids {
-            if let Some(&start) = start_of.get(&kid) {
+            if let Some(&start) = start_of.get(&kid)
+                && seen.insert(kid)
+            {
                 out.push((kid, start));
                 stack.push(kid);
             }
@@ -1187,6 +1209,34 @@ mod tests {
         assert_eq!(s.stop(Duration::from_millis(300)), StopOutcome::Killed);
         let _ = child.wait();
         assert!(!is_alive(&s));
+    }
+
+    /// `/proc` is read pid by pid with no consistent snapshot, so the parent graph the walk is
+    /// handed can carry an edge back into a subtree already visited — a pid the kernel reused
+    /// between two reads. Following it walks that subtree again, and a full cycle never terminates:
+    /// `sbx session stop` hangs with signals still to deliver, which is the one moment a user
+    /// cannot wait. The two sibling walkers in this codebase both carry a visited set for exactly
+    /// this; this one did not.
+    #[test]
+    fn a_cycle_in_the_parent_graph_does_not_make_the_walk_spin() {
+        // 1 -> 2 -> 3 -> 2: the back-edge closes a loop below the root.
+        let children: HashMap<u32, Vec<u32>> =
+            HashMap::from([(1, vec![2]), (2, vec![3]), (3, vec![2])]);
+        let start_of: HashMap<u32, u64> = HashMap::from([(2, 20), (3, 30)]);
+
+        let mut out = walk_descendants(&children, &start_of, 1);
+        out.sort_unstable();
+        assert_eq!(
+            out,
+            vec![(2, 20), (3, 30)],
+            "each descendant is reported once, and the walk returns"
+        );
+
+        // A back-edge onto the root itself is refused too, so the root is never reported as its own
+        // descendant.
+        let onto_root: HashMap<u32, Vec<u32>> = HashMap::from([(1, vec![2]), (2, vec![1])]);
+        let starts: HashMap<u32, u64> = HashMap::from([(1, 10), (2, 20)]);
+        assert_eq!(walk_descendants(&onto_root, &starts, 1), vec![(2, 20)]);
     }
 
     #[test]

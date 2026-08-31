@@ -12,7 +12,17 @@ pub(crate) struct InstalledTool {
     /// The directory name mise gives the tool under `installs/` — the *munged* form of its declared
     /// token (see [`mise_munge`]), e.g. `aqua-example-demo-tool`. Sanitised on the way in, because
     /// the cage writes this directory itself (see [`mise_installed_in`]).
+    ///
+    /// For display and for matching only. Sanitising is not reversible — a name carrying a byte the
+    /// filter drops or replaces no longer names the directory it came from — so anything that has
+    /// to reach the filesystem uses [`InstalledTool::dir_name`] instead.
     pub(crate) name: String,
+    /// The directory name exactly as it is on disk, for the one use the sanitised form cannot
+    /// serve: naming the path again. `sbx app prune` joins this to delete an undeclared tool, and a
+    /// tool whose real name is not sanitise-stable would otherwise be looked for at a path that
+    /// does not exist — never removed, and (before the report was corrected) named as pruned
+    /// anyway. Never rendered: a terminal only ever sees `name` or `token`.
+    pub(crate) dir_name: std::ffi::OsString,
     /// The real backend token mise recorded for this tool (`pipx:demo-agent`, `aqua:example/demo-tool`,
     /// …), read from its `.mise.backend.toml`. `None` when that metadata is absent. Preferred over
     /// the munged directory name for display *and* for an exact match against a declared token, and
@@ -100,7 +110,8 @@ pub(crate) fn mise_installed_in(installs: &Path) -> Vec<InstalledTool> {
         // it here, at the one place it enters the model, rather than at each renderer — the human
         // table and `--json` and anything added later then all get the filtered form, and a name
         // carrying `\r` or an ANSI escape cannot forge a line of `sbx app show`.
-        let name = crate::sandbox::sanitize(&entry.file_name().to_string_lossy());
+        let dir_name = entry.file_name();
+        let name = crate::sandbox::sanitize(&dir_name.to_string_lossy());
         let token = backend_token(&entry.path());
         let mut versions: Vec<String> = match std::fs::read_dir(entry.path()) {
             Ok(vs) => vs
@@ -113,6 +124,7 @@ pub(crate) fn mise_installed_in(installs: &Path) -> Vec<InstalledTool> {
         versions.sort();
         tools.push(InstalledTool {
             name,
+            dir_name,
             token,
             versions,
         });
@@ -527,12 +539,14 @@ mod tests {
     fn concrete_versions_drops_the_latest_alias_but_keeps_it_when_alone() {
         let with_concrete = InstalledTool {
             name: "t".into(),
+            dir_name: "t".into(),
             token: None,
             versions: vec!["latest".into(), "2.1.209".into()],
         };
         assert_eq!(concrete_versions(&with_concrete), vec!["2.1.209"]);
         let alias_only = InstalledTool {
             name: "t".into(),
+            dir_name: "t".into(),
             token: None,
             versions: vec!["latest".into()],
         };

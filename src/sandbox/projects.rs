@@ -45,6 +45,7 @@ fn reap_dead_trees(
     if report.dead.is_empty()
         && report.unidentified.is_empty()
         && report.reaped_unidentified.is_empty()
+        && report.failed.is_empty()
     {
         println!("{h}sbx projects rm:{r} {dim}no dead project trees to reclaim.{r}");
         return;
@@ -122,6 +123,17 @@ fn reap_dead_trees(
             tree.dir.display(),
             super::gc::human_bytes(tree.bytes)
         );
+    }
+
+    // A tree the recursive delete could not get past. Named rather than folded into the reclaimed
+    // count, and its bytes deliberately excluded from `freed`: a removal can fail part-way, so what
+    // is left is neither the whole tree nor nothing, and a figure either way would be wrong.
+    for (dir, error) in &report.failed {
+        crate::diag::error(&format!(
+            "sbx projects rm: could not remove {}: {error}. What is left is neither the whole \
+             tree nor nothing — inspect it before retrying.",
+            dir.display()
+        ));
     }
 }
 
@@ -716,6 +728,19 @@ pub(crate) fn projects_rm(
                         )
                     );
                 }
+            }
+            // A recursive delete fails on a tree holding a mount point or a subdirectory another
+            // uid owns, and it can fail part-way. Reporting it as removed would state a figure the
+            // disk does not agree with, and would hide the one tree that keeps failing by naming
+            // it reclaimed on every run.
+            super::gc::ReapOneOutcome::Failed { dir, error } => {
+                crate::diag::error(&format!(
+                    "sbx projects rm: could not remove {n}{}{r}: {error}. \
+                     What is left is neither the whole tree nor nothing — inspect it before \
+                     retrying.",
+                    dir.display()
+                ));
+                had_error = true;
             }
         }
     }

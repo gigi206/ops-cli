@@ -170,10 +170,20 @@ fn run_loop(
     inline: bool,
 ) {
     let pal = crate::style::Palette::for_stream(color);
+    // Holds only the pids still alive at the last tick, not every pid ever observed. Two reasons,
+    // and the first is the one that costs correctness: a pid the kernel reuses after its first
+    // holder exits would otherwise be remembered forever and its `execve` never reported — a gap
+    // the observed workload can arrange, by churning short-lived processes until the counter wraps
+    // onto a number the lens has already retired. The second is that a long run's set would grow
+    // without bound. Retaining against the live set costs one pass over a collection whose size is
+    // the cage's process count.
     let mut seen: BTreeSet<u32> = BTreeSet::new();
     while !stop.load(Ordering::Relaxed) {
         let table = observe::read_proc_table();
-        for pid in descendant_pids(&table, root) {
+        let live = descendant_pids(&table, root);
+        let live_set: BTreeSet<u32> = live.iter().copied().collect();
+        seen.retain(|pid| live_set.contains(pid));
+        for pid in live {
             if seen.insert(pid)
                 && let Some(info) = table.get(&pid)
                 && !is_plumbing(&info.comm)

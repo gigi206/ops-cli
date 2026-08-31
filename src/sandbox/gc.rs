@@ -446,6 +446,14 @@ pub(crate) struct ReapReport {
     /// Markerless trees reclaimed under the `--markerless` opt-in. Empty unless the caller passed
     /// `prune_unidentified`; the trees in this list have already been removed.
     pub(crate) reaped_unidentified: Vec<UnidentifiedTree>,
+    /// Trees a prune was asked to reclaim and could not (the tree directory, and the reason),
+    /// reported rather than swallowed — the same shape [`AppPurgeReport`] uses, for the same
+    /// reason. A recursive removal fails on a tree holding a mount point, or a subdirectory another
+    /// uid owns, and it can fail *part-way*: what is left behind is then neither the whole tree nor
+    /// nothing. Announcing those bytes as freed states a figure the disk does not agree with, and
+    /// hides the one tree that keeps failing, since it is named as reclaimed on every run. Always
+    /// empty in a dry run, where nothing was attempted.
+    pub(crate) failed: Vec<(PathBuf, io::Error)>,
 }
 
 /// A reclaimable dead project tree: the recorded project path that is gone, and the tree's size.
@@ -478,15 +486,40 @@ pub(crate) struct UnidentifiedTree {
 /// The two switches are **independent**: `prune` reaps the dead (marker-identified, gone) trees and
 /// `prune_unidentified` reaps the markerless ones, so a caller can sweep either category alone or
 /// both. With neither set the call is a pure dry run — it computes the same sets and changes nothing.
+///
+/// What a prune reports is what it removed: a tree whose removal fails lands in
+/// [`ReapReport::failed`] with its error, never in `dead`/`reaped_unidentified`.
 pub(crate) fn reap_dead_projects(
     projects_dir: &Path,
     live_ids: &BTreeSet<String>,
     prune: bool,
     prune_unidentified: bool,
 ) -> ReapReport {
+    reap_dead_projects_with(
+        projects_dir,
+        live_ids,
+        prune,
+        prune_unidentified,
+        &force_remove_dir_all,
+    )
+}
+
+/// [`reap_dead_projects`] with the removal injected, so the failure branch — a tree the recursive
+/// delete cannot get past — is testable on any host, the way [`sweep_runtime_dirs_with`] makes the
+/// sweep testable without spawning processes. A real removal fails only on conditions a unit test
+/// cannot create (a mount point inside the tree, a subdirectory owned by another uid), and that
+/// branch is the one that decides whether `sbx projects rm` tells the truth about what it freed.
+fn reap_dead_projects_with(
+    projects_dir: &Path,
+    live_ids: &BTreeSet<String>,
+    prune: bool,
+    prune_unidentified: bool,
+    remove: &dyn Fn(&Path) -> io::Result<()>,
+) -> ReapReport {
     let mut dead = Vec::new();
     let mut unidentified = Vec::new();
     let mut reaped_unidentified = Vec::new();
+    let mut failed = Vec::new();
     let entries = match std::fs::read_dir(projects_dir) {
         Ok(e) => e,
         // No projects tree yet — nothing to reap.
@@ -495,6 +528,7 @@ pub(crate) fn reap_dead_projects(
                 dead,
                 unidentified,
                 reaped_unidentified,
+                failed,
             };
         }
     };
@@ -510,12 +544,17 @@ pub(crate) fn reap_dead_projects(
         {
             continue;
         }
-        match read_marker(&dir) {
+        // Read before the match rather than in its scrutinee, so an arm is free to consume `dir`.
+        let marker = read_marker(&dir);
+        match marker {
             // Identified, and the project is gone with its parent still present — reclaimable.
             Some(path) if project_is_gone(&path) => {
                 let bytes = tree_size(&dir);
-                if prune {
-                    let _ = force_remove_dir_all(&dir);
+                // Reclaimed is what the removal did, not what it was asked to do: the failure
+                // carries the tree and its reason into `failed`, for the reason that field gives.
+                if prune && let Err(e) = remove(&dir) {
+                    failed.push((dir, e));
+                    continue;
                 }
                 dead.push(DeadTree { path, bytes });
             }
@@ -527,7 +566,10 @@ pub(crate) fn reap_dead_projects(
             None => {
                 let bytes = tree_size(&dir);
                 if prune_unidentified {
-                    let _ = force_remove_dir_all(&dir);
+                    if let Err(e) = remove(&dir) {
+                        failed.push((dir, e));
+                        continue;
+                    }
                     reaped_unidentified.push(UnidentifiedTree { bytes, dir });
                 } else {
                     unidentified.push(UnidentifiedTree { bytes, dir });
@@ -539,6 +581,7 @@ pub(crate) fn reap_dead_projects(
         dead,
         unidentified,
         reaped_unidentified,
+        failed,
     }
 }
 
@@ -567,6 +610,12 @@ pub(crate) enum ReapOneOutcome {
     Live,
     /// The tree was identified and (when `prune`) removed. `bytes` is its measured size.
     Tree { dir: PathBuf, bytes: u64 },
+    /// The tree was identified and the removal failed — the directory, and the reason. Its own
+    /// outcome rather than a `Tree` with a discarded error: the caller prints `removed` for a
+    /// `Tree`, so folding the two would announce a reclamation that did not happen (and, since a
+    /// recursive delete can fail part-way, a byte figure that is wrong in either direction). Never
+    /// returned in a dry run, where nothing is attempted.
+    Failed { dir: PathBuf, error: io::Error },
 }
 
 /// Whether `id` is safe to use as a project-tree directory name — a single, ordinary path
@@ -587,12 +636,24 @@ pub(crate) fn is_safe_tree_id(id: &str) -> bool {
 /// needs no marker and no deadness check: it works on markerless trees too, and on trees a marker
 /// would call idle (the user named it, overriding the "keep" default). The only guard is the
 /// live-session one — a tree a running session holds is refused, the same guard [`reap_dead_projects`]
-/// applies. Destructive only when `prune`.
+/// applies. Destructive only when `prune`, and a removal that fails is reported as
+/// [`ReapOneOutcome::Failed`] rather than as a removal.
 pub(crate) fn reap_one(
     projects_dir: &Path,
     id: &str,
     live_ids: &BTreeSet<String>,
     prune: bool,
+) -> ReapOneOutcome {
+    reap_one_with(projects_dir, id, live_ids, prune, &force_remove_dir_all)
+}
+
+/// [`reap_one`] with the removal injected, for the reason [`reap_dead_projects_with`] gives.
+fn reap_one_with(
+    projects_dir: &Path,
+    id: &str,
+    live_ids: &BTreeSet<String>,
+    prune: bool,
+    remove: &dyn Fn(&Path) -> io::Result<()>,
 ) -> ReapOneOutcome {
     // The id names a directory *under* `projects_dir` and reaches `force_remove_dir_all` — so it
     // must be a single, ordinary path component. Reject anything with a separator, a `..`, or an
@@ -610,8 +671,8 @@ pub(crate) fn reap_one(
         return ReapOneOutcome::Live;
     }
     let bytes = tree_size(&dir);
-    if prune {
-        let _ = force_remove_dir_all(&dir);
+    if prune && let Err(error) = remove(&dir) {
+        return ReapOneOutcome::Failed { dir, error };
     }
     ReapOneOutcome::Tree { dir, bytes }
 }
@@ -878,10 +939,21 @@ pub(crate) fn prune_app_tools(home: &Path, declared: &[&str], apply: bool) -> Ve
         if declared.iter().any(|d| tool.is(d)) {
             continue; // declared — keep it.
         }
-        let dir = installs.join(&tool.name);
+        // Joined from the on-disk name, never the sanitised display form: sanitising is not
+        // reversible, so a directory whose real name carries a filtered byte would be looked for at
+        // a path that does not exist and silently never removed.
+        let dir = installs.join(&tool.dir_name);
         let bytes = tree_size(&dir);
+        // Reported only when the install actually went — the rule [`prune_rev_dirs`] states, at the
+        // verb that prints a freed total. A failed removal named as pruned tells the user bytes
+        // were reclaimed that are still on the disk, and hides the one install that keeps failing,
+        // since it is named as gone on every run. With `apply` off this is a plan, and every
+        // candidate belongs in it.
         if apply {
-            removed_any |= force_remove_dir_all(&dir).is_ok();
+            if force_remove_dir_all(&dir).is_err() {
+                continue;
+            }
+            removed_any = true;
         }
         pruned.push(PrunedTool {
             token: tool.label().to_string(),
@@ -930,8 +1002,13 @@ fn prune_mise_config(path: &Path, declared: &[&str]) {
 /// The state of one project tree, for `sbx path`'s per-project annotation. The non-destructive,
 /// finer-grained counterpart of [`reap_dead_projects`] (which folds `Live` and `Idle` into "keep"):
 /// `Live` (a running session holds it), `Idle` (no session, the marker points at a project
-/// directory that still exists), `Dead` (the marker points at a gone path — reclaimable by `sbx gc
-/// --all`), or `Markerless` (no marker — a pre-marker orphan, identity unknown).
+/// directory that still exists), `Dead` (the marker points at a gone path — reclaimable by
+/// `sbx projects rm --dead`), or `Markerless` (no marker — a pre-marker orphan, identity unknown).
+///
+/// `sbx gc` is deliberately not the verb named here: it sweeps the shared store and the runtime
+/// dirs, and leaves a per-project tree alone whatever its state, because a tree carries a project's
+/// own home and store rather than reproducible cache. Reclaiming one is always an explicit
+/// `sbx projects rm`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TreeState {
     Live,
@@ -1378,6 +1455,36 @@ mod tests {
                 .file_type()
                 .is_symlink(),
             "the planted link itself must be left alone, not removed"
+        );
+    }
+
+    /// A tool directory whose real name is not sanitise-stable must still be removed. The cage
+    /// writes `installs/` itself, so it chooses these names, and `mise_installed_in` sanitises them
+    /// on the way in — a filter that is not reversible. Deleting through the sanitised form looks
+    /// for a path that does not exist: the removal fails, and the tool is silently left installed
+    /// on every run, which is exactly the state a payload wants for a tool it planted.
+    #[test]
+    fn prune_removes_a_tool_whose_real_directory_name_does_not_survive_sanitising() {
+        let tmp = TmpDir::new();
+        let home = tmp.path().join("home");
+        let installs = home.join(".local/share/mise/installs");
+        // A name carrying a control byte: `sanitize` rewrites it, so the sanitised form names no
+        // directory on disk.
+        let planted = "drop\u{7}me";
+        assert_ne!(
+            crate::sandbox::sanitize(planted),
+            planted,
+            "the fixture only tests anything if this name is actually rewritten"
+        );
+        std::fs::create_dir_all(installs.join(planted).join("1.0")).unwrap();
+        std::fs::write(installs.join(planted).join("1.0").join("bin"), b"x").unwrap();
+
+        let pruned = prune_app_tools(&home, &[], true);
+
+        assert_eq!(pruned.len(), 1, "the planted tool is prunable");
+        assert!(
+            !installs.join(planted).exists(),
+            "the tool must be removed by its real name, not looked for under the sanitised one"
         );
     }
 
