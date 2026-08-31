@@ -854,11 +854,9 @@ fn the_guide_writes_no_em_dash_outside_the_output_it_quotes() {
 /// shrink. Keyed by `(file under `src/`, item name)` rather than by line so it survives every edit
 /// that does not change what is documented.
 const UNDOCUMENTED_MODULE_ITEMS: &[(&str, &str)] = &[
-    ("allowlist/mod.rs", "EgressPolicy"),
     ("cli/app.rs", "merged"),
     ("cli/app.rs", "nothing_written"),
     ("cli/app.rs", "parse_app_rm"),
-    ("cli/completion.rs", "completion_cmd"),
     ("cli/gc.rs", "run"),
     ("cli/logs.rs", "read_broker_rows"),
     ("cli/logs.rs", "read_fs_rows"),
@@ -902,7 +900,6 @@ const UNDOCUMENTED_MODULE_ITEMS: &[(&str, &str)] = &[
     ("plugins/stores.rs", "RawStoreToml"),
     ("sandbox/argv.rs", "lit"),
     ("sandbox/argv.rs", "path"),
-    ("sandbox/binds.rs", "build_spec"),
     ("sandbox/broker.rs", "hex_digit"),
     ("sandbox/control/capture.rs", "CaptureInner"),
     ("sandbox/control/mod.rs", "FlowEntry"),
@@ -932,7 +929,6 @@ const UNDOCUMENTED_MODULE_ITEMS: &[(&str, &str)] = &[
     ("sandbox/proxy/ssrf.rs", "classify_ip"),
     ("sandbox/proxy/ssrf.rs", "classify_v4"),
     ("sandbox/proxy/ssrf.rs", "classify_v6"),
-    ("sandbox/proxy/websocket.rs", "relay_websocket"),
     ("sandbox/seccomp.rs", "write_to_memfd"),
     ("sandbox/task_control.rs", "Inner"),
     ("sandbox/theme_relay.rs", "HostSettings"),

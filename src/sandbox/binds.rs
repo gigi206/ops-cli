@@ -1457,22 +1457,6 @@ fn materialize_etc(etc_dir: &Path, id: &Identity) -> io::Result<(PathBuf, PathBu
     Ok((passwd, group))
 }
 
-/// Build a launch-ready [`SandboxSpec`] for `cwd` under sbx's `data_dir`. This is
-/// the I/O orchestration around the pure [`assemble`]: it canonicalises the
-/// project root (pinning the bind source — see the module integrity note),
-/// materialises the per-project writable home and read-only synthetic identity,
-/// and hands resolved paths to `assemble`. The persistent runtime directories
-/// are created owner-only; they outlive the process by design (later housekeeping
-/// reclaims them).
-///
-/// `cwd` is bound **read-write at its own path** as the work surface — correct
-/// when the user chose the directory. This is the shared chokepoint where that
-/// surface is granted, so a caller launching an *untrusted* actor must first
-/// confine the project root (e.g. refuse `$HOME` or `/`); otherwise `cd ~` would
-/// expose the whole home read-write.
-// The I/O orchestrator threads resolved inputs into the pure `assemble`; the grouping
-// discipline (`SandboxPaths`) keeps that *audited* core at the argument limit, so the
-// wrapper carrying one more resolved slice is the right place to absorb it.
 /// Write `bytes` to `path` atomically: a unique temp sibling (named by pid, so concurrent launches
 /// do not collide on it) written then renamed over `path`. A concurrent cage that binds this file
 /// read-only then sees either the complete old or complete new content — never a torn half-write —
@@ -1488,6 +1472,24 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     })
 }
 
+/// Build a launch-ready [`SandboxSpec`] for `cwd` under sbx's `data_dir`. This is
+/// the I/O orchestration around the pure [`assemble`]: it canonicalises the
+/// project root (pinning the bind source — see the module integrity note),
+/// materialises the per-project writable home and read-only synthetic identity,
+/// and hands resolved paths to `assemble`. The persistent runtime directories
+/// are created owner-only; they outlive the process by design (later housekeeping
+/// reclaims them).
+///
+/// `cwd` is bound **read-write at its own path** as the work surface — correct
+/// when the user chose the directory. This is the shared chokepoint where that
+/// surface is granted, so a caller launching an *untrusted* actor must first
+/// confine the project root (e.g. refuse `$HOME` or `/`); otherwise `cd ~` would
+/// expose the whole home read-write.
+///
+/// It carries one argument more than clippy's threshold, deliberately: the grouping discipline
+/// (`SandboxPaths`) keeps the *audited* core — the pure [`assemble`] — at the limit, so the I/O
+/// wrapper around it is the right place to absorb the extra resolved slice rather than widening
+/// the surface a security review reads.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_spec(
     data_dir: &Path,

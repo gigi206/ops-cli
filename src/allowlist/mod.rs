@@ -837,13 +837,6 @@ impl WebsocketSecret {
     }
 }
 
-/// A classified egress policy: an allow list, a deny list, and a default action for a request
-/// that matches neither. Deny always wins. Under [`DefaultAction::Deny`] an empty allow list
-/// permits nothing; under [`DefaultAction::Allow`] the allow list's only remaining effect is the
-/// SSRF private-host exception (every public host is already permitted). Under
-/// [`DefaultAction::Ask`] `ask_timeout` bounds how long a parked request waits for a decision
-/// (`None` = wait indefinitely until answered); it is inert under the other defaults. The `ask`
-/// park notice is printed to stderr by default; a policy may suppress it (the request still parks).
 /// A `[network] http2` entry: an exact host or a `*.domain` subdomain wildcard, plus an optional
 /// port. The egress proxy speaks HTTP/2 (ALPN `h2`, for gRPC) to a CONNECT target matching one of
 /// these; a `None` port matches any port, a `Some(port)` only that port. It selects the transport
@@ -962,6 +955,13 @@ pub(crate) const DEFAULT_MAX_CONNECTIONS: usize = 512;
 /// [`DEFAULT_DNS_CACHE_TTL`]: the proxy enforces it, `sbx config show --details` reports it.
 pub(crate) const DEFAULT_BODY_MAX: u64 = 64 * 1024 * 1024;
 
+/// A classified egress policy: an allow list, a deny list, and a default action for a request
+/// that matches neither. Deny always wins. Under [`DefaultAction::Deny`] an empty allow list
+/// permits nothing; under [`DefaultAction::Allow`] the allow list's only remaining effect is the
+/// SSRF private-host exception (every public host is already permitted). Under
+/// [`DefaultAction::Ask`] `ask_timeout` bounds how long a parked request waits for a decision
+/// (`None` = wait indefinitely until answered); it is inert under the other defaults. The `ask`
+/// park notice is printed to stderr by default; a policy may suppress it (the request still parks).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EgressPolicy {
     allow: Vec<Rule>,

@@ -1003,23 +1003,6 @@ pub(super) fn read_plaintext<D: rustls::SideData>(
     }
 }
 
-/// Relay an established bidirectional connection (a WebSocket) between the cage `client` and the
-/// `upstream`, both TLS-terminated, until each direction closes. The handshake was inspected and
-/// allowed; from here every byte is opaque (masked frames), relayed verbatim both ways.
-///
-/// Single-threaded and **non-blocking**: the two rustls `Connection`s cannot be read and written from
-/// two threads without aliasing UB, so one thread multiplexes both directions with `poll`. Each
-/// direction reads plaintext from its source and buffers it into the destination's rustls send buffer,
-/// which is then drained to the socket; a source is not read while its destination still has unflushed
-/// output (`wants_write()`), so the buffering is bounded and neither direction couples head-of-line
-/// onto the other — a stalled reader on one side cannot block the other. Idle time is parked in `poll`
-/// (never in a read), so a live-but-idle channel is never cut; a dead peer that neither sends nor
-/// closes is bounded by the connection cap, as for the L4 splice. Each read-side EOF half-closes only
-/// that direction (a `close_notify` to the peer), so the reverse direction drains fully before teardown.
-/// The bytes each side already read past its head (`*_pending`) are the tunnel's first frames, not a
-/// preamble: they go through the outbound gate before anything is written on, and are seeded into the
-/// send buffers only once that gate has let them by.
-#[allow(clippy::too_many_arguments)]
 /// Everything an established tunnel reports its activity to, gathered so the relay and its decoders
 /// pass one value rather than five. They travel together because they answer one question between
 /// them — what crossed this tunnel — for three different readers: `sbx net live` (the byte
@@ -1149,6 +1132,22 @@ struct SeededPending {
     crossed: bool,
 }
 
+/// Relay an established bidirectional connection (a WebSocket) between the cage `client` and the
+/// `upstream`, both TLS-terminated, until each direction closes. The handshake was inspected and
+/// allowed; from here every byte is opaque (masked frames), relayed verbatim both ways.
+///
+/// Single-threaded and **non-blocking**: the two rustls `Connection`s cannot be read and written from
+/// two threads without aliasing UB, so one thread multiplexes both directions with `poll`. Each
+/// direction reads plaintext from its source and buffers it into the destination's rustls send buffer,
+/// which is then drained to the socket; a source is not read while its destination still has unflushed
+/// output (`wants_write()`), so the buffering is bounded and neither direction couples head-of-line
+/// onto the other — a stalled reader on one side cannot block the other. Idle time is parked in `poll`
+/// (never in a read), so a live-but-idle channel is never cut; a dead peer that neither sends nor
+/// closes is bounded by the connection cap, as for the L4 splice. Each read-side EOF half-closes only
+/// that direction (a `close_notify` to the peer), so the reverse direction drains fully before teardown.
+/// The bytes each side already read past its head (`*_pending`) are the tunnel's first frames, not a
+/// preamble: they go through the outbound gate before anything is written on, and are seeded into the
+/// send buffers only once that gate has let them by.
 pub(super) fn relay_websocket(
     mut client: StreamOwned<ServerConnection, UnixStream>,
     client_pending: &[u8],

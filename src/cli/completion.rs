@@ -45,6 +45,12 @@ const DESC_WIDTH: usize = 64;
 /// completion for that word.
 const FILES: &str = "__sbx_files__";
 
+/// `sbx completion <shell>` — emit the completion script for `bash` or `zsh` on stdout.
+///
+/// The script is generated from the same help table every other surface derives from, so a verb or
+/// flag added there is completable without a second declaration. Naming no shell, or naming one sbx
+/// does not emit, prints the page and exits 2 rather than emitting something a shell would source
+/// and misbehave on.
 pub(crate) fn completion_cmd(args: Vec<OsString>) -> ExitCode {
     let Some(shell) = args.first() else {
         eprint!("{}", help::page_usage(&["completion"]).unwrap_or_default());
