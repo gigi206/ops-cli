@@ -120,24 +120,11 @@ fn write_pins(
     entries: &BTreeMap<String, FlakePin>,
 ) -> io::Result<()> {
     let path = lock_path(layout, project_id);
-    if let Some(parent) = path.parent() {
-        use std::fs::DirBuilder;
-        use std::os::unix::fs::DirBuilderExt;
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
-    }
     let mut body = String::new();
     for (declared, pin) in entries {
         body.push_str(&format!("{declared}\t{}\t{}\n", pin.rev, pin.locked_ref));
     }
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    if let Err(e) = std::fs::write(&tmp, body) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    std::fs::rename(&tmp, &path)
+    super::binds::write_atomic(&path, body.as_bytes())
 }
 
 /// Resolve a declared `flake:` reference to its current immutable pin via `nix flake metadata`.

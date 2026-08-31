@@ -23,7 +23,7 @@ use crate::sandbox::task_control::{TASK_SOCKET_ENV, client};
 use std::io::IsTerminal;
 
 use crate::style::{Align, print_table};
-use crate::{diag, help, sandbox, store, style};
+use crate::{diag, help, layout_or_fail, print_json, sandbox, store, style};
 
 /// The exit code `sbx task run` returns when the plane **refused** an invocation — an unknown
 /// operation, a value outside its declared bound, an unlisted variable, an exhausted quota. Distinct
@@ -180,15 +180,6 @@ fn one_plane(layout: &store::Layout, pid: u32, side: Side) -> Plane {
         host: Some(host),
         session: Some((pid, session_project(layout.data_dir(), pid))),
     }
-}
-
-fn layout_or_fail() -> Result<store::Layout, ExitCode> {
-    store::Layout::from_env().ok_or_else(|| {
-        diag::error(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
-        );
-        ExitCode::FAILURE
-    })
 }
 
 fn resolve_named(id: &str, verb: &str) -> Result<u32, ExitCode> {
@@ -744,18 +735,12 @@ fn run_detached(
             detached: result.error.is_none(),
             error: result.error.as_deref(),
         };
-        return match serde_json::to_string_pretty(&view) {
-            Ok(doc) => {
-                println!("{doc}");
-                match result.error {
-                    Some(_) => ExitCode::from(REFUSED_EXIT),
-                    None => ExitCode::SUCCESS,
-                }
-            }
-            Err(e) => {
-                diag::error(&format!("sbx: task run: failed to serialize: {e}"));
-                ExitCode::FAILURE
-            }
+        if let Err(code) = print_json("task run", &view) {
+            return code;
+        }
+        return match result.error {
+            Some(_) => ExitCode::from(REFUSED_EXIT),
+            None => ExitCode::SUCCESS,
         };
     }
     if let Some(error) = &result.error {
@@ -1044,12 +1029,8 @@ fn run_view<'a>(name: &'a str, result: &'a client::RunResult) -> RunView<'a> {
 /// prose off stderr to learn that nothing ran.
 fn run_as_json(name: &str, result: &client::RunResult) -> ExitCode {
     let view = run_view(name, result);
-    match serde_json::to_string_pretty(&view) {
-        Ok(doc) => println!("{doc}"),
-        Err(e) => {
-            diag::error(&format!("sbx: task run: failed to serialize: {e}"));
-            return ExitCode::FAILURE;
-        }
+    if let Err(code) = print_json("task run", &view) {
+        return code;
     }
     match result.error {
         Some(_) => ExitCode::from(REFUSED_EXIT),

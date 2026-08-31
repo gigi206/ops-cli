@@ -2761,73 +2761,25 @@ fn supervise_attach(
     let mut envp: Vec<*const libc::c_char> = envp_owned.iter().map(|c| c.as_ptr()).collect();
     envp.push(std::ptr::null());
 
-    // Carry the real terminal's window size onto the pty so the inner shell wraps correctly from
-    // the start (as `supervise` does).
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    let winp = if unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) } == 0 {
-        &ws as *const libc::winsize
-    } else {
-        std::ptr::null()
-    };
-    let mut master: libc::c_int = -1;
-    let mut slave: libc::c_int = -1;
-    if unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            winp,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    // The master must never reach the cage; the parent keeps it and never execs.
-    unsafe {
-        let flags = libc::fcntl(master, libc::F_GETFD);
-        libc::fcntl(master, libc::F_SETFD, flags | libc::FD_CLOEXEC);
-    }
-
-    // SAFETY: between fork and exec the child calls only async-signal-safe code — `close`, then
-    // `attach::enter_and_exec`, which uses only raw syscalls — and argv/envp/filters/pidfd are all
-    // prebuilt above. The parent is single-threaded here (attach starts no egress proxy thread).
-    let child = unsafe { libc::fork() };
-    if child < 0 {
-        let e = io::Error::last_os_error();
+    // The child of the fork below: it calls only async-signal-safe code — `attach::enter_and_exec`
+    // uses raw syscalls only — on the argv/envp/filters/pidfd prepared above, and never returns.
+    // The capture is by value, so the parent's copy of the cage handle (and its pidfd) is released
+    // as soon as the fork returns rather than held for the session; the child has its own.
+    let in_child = move |slave: libc::c_int| -> std::convert::Infallible {
         unsafe {
-            libc::close(master);
-            libc::close(slave);
-        }
-        return Err(e);
-    }
-    if child == 0 {
-        unsafe {
-            libc::close(master);
             super::attach::enter_and_exec(
                 &cage,
                 &filters,
                 super::attach::TtyMode::Pty(slave),
                 argv.as_ptr(),
                 envp.as_ptr(),
-            );
+            )
         }
-    }
-
-    // Parent: drop the slave and the cage handle (the child holds its own copies across the fork),
-    // keep the master, go raw, relay — identical to `supervise`'s tail (no GUI double-Ctrl+C here).
-    unsafe { libc::close(slave) };
-    drop(cage);
-    let _raw = RawMode::enable(0)?;
-    let winch = WinchRelay::install().ok();
-    if winch.is_some() {
-        copy_winsize(0, master);
-    }
-    let winch_fd = winch.as_ref().map_or(-1, WinchRelay::read_fd);
-    let status = pump(master, child, winch_fd, false);
-    drop(winch);
-    unsafe { libc::close(master) };
-    status
+    };
+    // SAFETY: the closure honours the async-signal-safe contract above, and the parent is
+    // single-threaded here (attach starts no egress proxy thread). No GUI double-Ctrl+C on this
+    // path, so the relay runs with `gui` false.
+    unsafe { fork_with_pty(false, in_child) }
 }
 
 /// Run an attach command with **inherited** stdio (no pty): fork a child that joins the cage's
@@ -5702,8 +5654,8 @@ fn run_supervised(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limi
 /// cages and need the code of each rather than exec-replacing the launcher. A failure to
 /// prepare or spawn surfaces a pointed error and yields `1`, matching the supervised path.
 fn run_status(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) -> i32 {
-    let (argv, _seccomp) = match seccomp_argv(spec) {
-        Ok(v) => v,
+    let (prog, args, _keep_open) = match cage_command(bwrap, spec, limits) {
+        Ok(cmd) => cmd,
         Err(e) => {
             // Not only the filter: this step also builds the descriptor carrying the cage's
             // environment, and naming the wrong one would send a reader looking at `[seccomp]`.
@@ -5711,11 +5663,6 @@ fn run_status(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) 
             return 1;
         }
     };
-    // For a graphical isolated cage, route the launch through the netns holder so the namespace
-    // carries a `dummy0` interface (see `super::netns`); a no-op `(bwrap, argv)` otherwise.
-    let (holder_prog, holder_argv) =
-        super::netns::holder_wrap(bwrap, argv, spec.netns_dummy.as_ref());
-    let (prog, args) = super::cgroup::wrap(&holder_prog, holder_argv, limits, &spec.cage_slug);
     match Command::new(prog).args(args).status() {
         Ok(status) => status_code(status),
         Err(e) => {
@@ -5761,15 +5708,10 @@ const CAPTURED_POLL: Duration = Duration::from_millis(250);
 /// neither stream can starve the other; only the kept bytes are bounded, and the caller is told in
 /// the output itself when something was cut or killed.
 fn run_captured(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) -> (i32, String) {
-    let (argv, _seccomp) = match seccomp_argv(spec) {
-        Ok(v) => v,
+    let (prog, args, _keep_open) = match cage_command(bwrap, spec, limits) {
+        Ok(cmd) => cmd,
         Err(e) => return (1, format!("cannot prepare the sandbox: {e}")),
     };
-    // For a graphical isolated cage, route the launch through the netns holder so the namespace
-    // carries a `dummy0` interface (see `super::netns`); a no-op `(bwrap, argv)` otherwise.
-    let (holder_prog, holder_argv) =
-        super::netns::holder_wrap(bwrap, argv, spec.netns_dummy.as_ref());
-    let (prog, args) = super::cgroup::wrap(&holder_prog, holder_argv, limits, &spec.cage_slug);
     let mut child = match Command::new(prog)
         .args(args)
         // No stdin, as `output()` gave it: this path is non-interactive, and the terminal it
@@ -5973,6 +5915,30 @@ pub(super) fn seccomp_argv(spec: &SandboxSpec) -> io::Result<(Vec<OsString>, Vec
     Ok((argv, memfds))
 }
 
+/// The runnable command for `spec`: the bwrap argv with its seccomp prefix, routed through the netns
+/// holder, then wrapped in the resource-limit scope — the three steps every launch path takes
+/// between a `SandboxSpec` and a process, in the one order that is correct.
+///
+/// The middle step is the one a new launch path would forget it needs: for a graphical isolated cage
+/// it routes the launch through the netns holder so the namespace carries a `dummy0` interface (see
+/// [`super::netns`]), and for every other spec `holder_wrap` is a byte-for-byte passthrough.
+///
+/// The returned files are the memfds behind the seccomp filters and the cage's environment. They are
+/// not close-on-exec and bwrap reads them at the exec, so the caller must keep them alive until the
+/// process it starts has been replaced — dropping them early closes the descriptors bwrap is told to
+/// read.
+pub(super) fn cage_command(
+    bwrap: &Path,
+    spec: &SandboxSpec,
+    limits: &super::cgroup::Limits,
+) -> io::Result<(PathBuf, Vec<OsString>, Vec<File>)> {
+    let (argv, keep_open) = seccomp_argv(spec)?;
+    let (holder_prog, holder_argv) =
+        super::netns::holder_wrap(bwrap, argv, spec.netns_dummy.as_ref());
+    let (prog, args) = super::cgroup::wrap(&holder_prog, holder_argv, limits, &spec.cage_slug);
+    Ok((prog, args, keep_open))
+}
+
 /// A process's exit code in the shell convention: its own code, or 128 + the signal that
 /// killed it (matching the pty supervisor's `pump`).
 pub(super) fn status_code(status: std::process::ExitStatus) -> i32 {
@@ -5993,55 +5959,40 @@ fn exec(bwrap: &Path, spec: &SandboxSpec, limits: &super::cgroup::Limits) -> io:
             "internal error: a private-tty sandbox must be launched through the pty supervisor",
         );
     }
-    let (argv, _seccomp) = match seccomp_argv(spec) {
-        Ok(v) => v,
+    // `_keep_open` stays alive until the exec replaces this process (or, on failure, until this
+    // returns), so bwrap can read the inherited filter descriptors.
+    let (prog, args, _keep_open) = match cage_command(bwrap, spec, limits) {
+        Ok(cmd) => cmd,
         Err(e) => return e,
     };
-    // `_seccomp` stays alive until the exec replaces this process (or, on failure,
-    // until this returns), so bwrap can read the inherited filter descriptors.
-    // For a graphical isolated cage, route the launch through the netns holder so the namespace
-    // carries a `dummy0` interface (see `super::netns`); a no-op `(bwrap, argv)` otherwise.
-    let (holder_prog, holder_argv) =
-        super::netns::holder_wrap(bwrap, argv, spec.netns_dummy.as_ref());
-    let (prog, args) = super::cgroup::wrap(&holder_prog, holder_argv, limits, &spec.cage_slug);
     Command::new(prog).args(args).exec()
 }
 
-/// Run `spec` under a pty supervisor and return its exit status code. sbx opens
-/// a pty, launches bwrap with the *slave* as its controlling terminal (via
-/// `login_tty`), keeps the *master* itself, puts the real terminal in raw mode,
-/// and relays bytes both ways until the session ends.
-fn supervise(
-    bwrap: &Path,
-    spec: &SandboxSpec,
-    limits: &super::cgroup::Limits,
+/// Open a pty, fork, and relay the terminal until the child exits — the machinery [`supervise`] and
+/// [`supervise_attach`] share, which is every line of the two but the child itself. Returns the
+/// child's exit code in the shell convention.
+///
+/// The parent keeps the pty master and never execs, so the master is set close-on-exec: it must
+/// never reach the payload, which could otherwise read or inject its own terminal stream. The child
+/// branch closes it outright before handing `slave` to `child`.
+///
+/// Everything `child` captured is dropped in the parent as soon as the fork returns, so a handle the
+/// parent must not hold for the whole session — the attach path's `CageHandle`, which owns a
+/// pidfd — is released there. The forked child holds its own copies.
+///
+/// `gui` is passed on to [`pump`]: a graphical cage reads a doubled Ctrl+C as the way out.
+///
+/// # Safety
+///
+/// `child` runs between `fork` and `exec` and must therefore touch only async-signal-safe code — no
+/// allocation, no locks — and must not return. Everything it uses has to be prepared before the
+/// call.
+unsafe fn fork_with_pty(
     gui: bool,
+    child: impl FnOnce(libc::c_int) -> std::convert::Infallible,
 ) -> io::Result<i32> {
-    // Build the bwrap argv (seccomp prefix + the hardened spec), then wrap it in
-    // the resource-limit scope: the program may become `systemd-run` with bwrap
-    // spliced in after `--`. Compose as C strings *before* forking — nothing
-    // between fork and exec may allocate.
-    //
-    // The anonymous files behind it — the seccomp filters and the cage's environment — are created
-    // here, *before* the fork, so the child inherits their descriptors; the parent holds them alive
-    // through `pump` so bwrap can still read them after the exec.
-    let (bwrap_argv, _keep_open) = seccomp_argv(spec)?;
-    // Route a graphical isolated cage through the netns holder (dummy interface; see `super::netns`);
-    // a no-op passthrough otherwise.
-    let (holder_prog, holder_argv) =
-        super::netns::holder_wrap(bwrap, bwrap_argv, spec.netns_dummy.as_ref());
-    let (program, full_argv) =
-        super::cgroup::wrap(&holder_prog, holder_argv, limits, &spec.cage_slug);
-    let program_c = cstring(program.as_os_str().as_bytes())?;
-    let mut argv_owned = vec![program_c.clone()];
-    for arg in &full_argv {
-        argv_owned.push(cstring(arg.as_bytes())?);
-    }
-    let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|c| c.as_ptr()).collect();
-    argv.push(std::ptr::null());
-
-    // Carry the real terminal's window size onto the pty so the inner shell
-    // wraps correctly from the start.
+    // Carry the real terminal's window size onto the pty so the inner shell wraps correctly from
+    // the start.
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     let winp = if unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) } == 0 {
         &ws as *const libc::winsize
@@ -6051,8 +6002,8 @@ fn supervise(
 
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
-    // SAFETY: out-params are valid; name/termios are null (defaults), winp is
-    // null or a valid winsize.
+    // SAFETY: out-params are valid; name/termios are null (defaults), winp is null or a valid
+    // winsize.
     if unsafe {
         libc::openpty(
             &mut master,
@@ -6066,18 +6017,17 @@ fn supervise(
         return Err(io::Error::last_os_error());
     }
 
-    // The master must never reach the sandbox: with it the sandbox could read or
-    // inject its own terminal stream. The parent keeps it (and never execs), so
-    // close-on-exec is exactly right; `login_tty` handles the slave.
+    // The master must never reach the sandbox. The parent keeps it (and never execs), so
+    // close-on-exec is exactly right; the slave's controlling-terminal setup is the child's.
     unsafe {
         let flags = libc::fcntl(master, libc::F_GETFD);
         libc::fcntl(master, libc::F_SETFD, flags | libc::FD_CLOEXEC);
     }
 
-    // SAFETY: between fork and exec the child calls only async-signal-safe
-    // functions (`close`, `login_tty`, `execv`, `_exit`); the argv is prebuilt.
-    let child = unsafe { libc::fork() };
-    if child < 0 {
+    // SAFETY: the child branch below runs only `close` and the caller's closure, whose contract is
+    // the async-signal-safety this function documents.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
         let e = io::Error::last_os_error();
         unsafe {
             libc::close(master);
@@ -6085,38 +6035,77 @@ fn supervise(
         }
         return Err(e);
     }
-    if child == 0 {
-        unsafe {
-            libc::close(master);
-            // login_tty: setsid + make the slave our controlling terminal +
-            // dup it onto stdin/out/err. This is what gives the sandbox a
-            // controlling terminal (and thus job control).
-            if libc::login_tty(slave) == 0 {
-                libc::execv(program_c.as_ptr(), argv.as_ptr());
-            }
-            // only reached if login_tty or execv failed
-            libc::_exit(127);
-        }
+    if pid == 0 {
+        unsafe { libc::close(master) };
+        child(slave);
+    } else {
+        // Release what the child captured: it has its own copies across the fork, and a handle the
+        // parent keeps for the session is a handle held open for no reason (the attach path's
+        // pidfd).
+        drop(child);
     }
 
-    // Parent: keep the master, drop the slave, go raw, relay.
+    // Parent: drop the slave, go raw, relay.
     unsafe { libc::close(slave) };
     let _raw = RawMode::enable(0)?;
     // Install the resize relay *after* the fork so the child never inherits the handler. sbx keeps
-    // the real controlling terminal (only the child `setsid`'d, via `login_tty`), so it receives
-    // `SIGWINCH` from the launching terminal naturally; the handler wakes `pump` to copy the new
-    // size onto the pty master. Best effort: if it cannot be installed the session still runs, only
-    // without dynamic resize (the startup size is already set by `openpty`).
+    // the real controlling terminal (only the child `setsid`'d, via `login_tty` or the attach
+    // entry), so it receives `SIGWINCH` from the launching terminal naturally; the handler wakes
+    // `pump` to copy the new size onto the pty master. Best effort: if it cannot be installed the
+    // session still runs, only without dynamic resize (the startup size is already set by
+    // `openpty`).
     let winch = WinchRelay::install().ok();
     if winch.is_some() {
         // Close a resize that raced startup (between `openpty` and now).
         copy_winsize(0, master);
     }
     let winch_fd = winch.as_ref().map_or(-1, WinchRelay::read_fd);
-    let status = pump(master, child, winch_fd, gui);
+    let status = pump(master, pid, winch_fd, gui);
     drop(winch);
     unsafe { libc::close(master) };
     status
+}
+
+/// Run `spec` under a pty supervisor and return its exit status code. sbx opens
+/// a pty, launches bwrap with the *slave* as its controlling terminal (via
+/// `login_tty`), keeps the *master* itself, puts the real terminal in raw mode,
+/// and relays bytes both ways until the session ends.
+fn supervise(
+    bwrap: &Path,
+    spec: &SandboxSpec,
+    limits: &super::cgroup::Limits,
+    gui: bool,
+) -> io::Result<i32> {
+    // The command is built *before* the fork — nothing between fork and exec may allocate, and the
+    // anonymous files behind it (the seccomp filters and the cage's environment) must be created
+    // here so the child inherits their descriptors. `_keep_open` holds them through `pump`, so bwrap
+    // can still read them after the exec.
+    let (program, full_argv, _keep_open) = cage_command(bwrap, spec, limits)?;
+    let program_c = cstring(program.as_os_str().as_bytes())?;
+    let mut argv_owned = vec![program_c.clone()];
+    for arg in &full_argv {
+        argv_owned.push(cstring(arg.as_bytes())?);
+    }
+    let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|c| c.as_ptr()).collect();
+    argv.push(std::ptr::null());
+
+    // The child of the fork below: it calls only async-signal-safe functions (`login_tty`, `execv`,
+    // `_exit`) on the prebuilt argv, and never returns.
+    let in_child = move |slave: libc::c_int| -> std::convert::Infallible {
+        unsafe {
+            // login_tty: setsid + make the slave our controlling terminal + dup it onto
+            // stdin/out/err. This is what gives the sandbox a controlling terminal (and thus job
+            // control).
+            if libc::login_tty(slave) == 0 {
+                libc::execv(program_c.as_ptr(), argv.as_ptr());
+            }
+            // only reached if login_tty or execv failed
+            libc::_exit(127)
+        }
+    };
+    // SAFETY: the closure honours the async-signal-safe contract above, and `_keep_open` holds the
+    // filter/environment descriptors open for the whole relay.
+    unsafe { fork_with_pty(gui, in_child) }
 }
 
 /// `CString` from raw bytes, mapping an interior NUL to an I/O error.

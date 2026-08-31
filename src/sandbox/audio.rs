@@ -259,23 +259,9 @@ fn stage_pyshim(data_dir: &Path) -> io::Result<PathBuf> {
 /// forever. An atomic `rename` replaces in place; a concurrent launch writing the identical bytes is
 /// harmless (last writer wins with the same content). Returns the staged file path.
 fn stage_atomically(dir: &Path, name: &str, content: &str) -> io::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
     let file = dir.join(name);
-    if std::fs::read(&file).is_ok_and(|existing| existing == content.as_bytes()) {
-        return Ok(file);
-    }
-    let tmp = dir.join(format!(".tmp-{}", std::process::id()));
-    if let Err(e) = std::fs::write(&tmp, content) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    match std::fs::rename(&tmp, &file) {
-        Ok(()) => Ok(file),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    super::binds::write_atomic_if_changed(&file, content.as_bytes())?;
+    Ok(file)
 }
 
 /// The host PulseAudio socket to bind, derived from the host `$XDG_RUNTIME_DIR`. A PipeWire host

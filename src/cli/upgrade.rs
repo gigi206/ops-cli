@@ -14,7 +14,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::{config, diag, help, sandbox, short_rev, store, style, trust};
+use crate::{config, diag, help, layout_or_fail, sandbox, short_rev, store, style, trust};
 
 /// The known upgrade targets. Kept as one list so the parser and the error message cannot drift.
 /// Visible to the sibling modules so the completion tests can walk it and assert the page offers
@@ -194,11 +194,9 @@ pub(crate) fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
         }
     };
 
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     let Some(nix) = store::resolve_nix(Some(&layout)) else {
         diag::error("sbx: nix not found — cannot upgrade. See `sbx doctor`.");
@@ -226,12 +224,9 @@ pub(crate) fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
                 return ExitCode::from(2);
             }
         },
-        None => match std::env::current_dir() {
+        None => match crate::config_cwd() {
             Ok(d) => d,
-            Err(e) => {
-                diag::error(&format!("sbx: cannot read the current directory: {e}"));
-                return ExitCode::FAILURE;
-            }
+            Err(code) => return code,
         },
     };
 

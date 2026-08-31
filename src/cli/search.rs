@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
-use crate::{diag, help, sandbox, store, style};
+use crate::{diag, help, layout_or_fail, sandbox, store, style};
 
 /// Parse `sbx search`'s arguments: exactly one query word.
 ///
@@ -49,11 +49,9 @@ pub(crate) fn run(args: Vec<OsString>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     let Some(nix) = store::resolve_nix(Some(&layout)) else {
         diag::error(

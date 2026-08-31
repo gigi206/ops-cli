@@ -1009,7 +1009,9 @@ impl Resolved {
             // deliberate rather than overlooked — an override is typed for one launch by someone
             // watching it, and a config line is what sits there unremarked for months. Threading
             // the root through is the fix if that ever stops being true.
-            for bind in canonicalize_binds(resolved_binds, &roots, None, &mut self.warnings) {
+            // No per-layer re-keying either: an override's provenance is the constant
+            // `Provenance::Override`, recorded below against the canonical path directly.
+            for bind in canonicalize_binds(resolved_binds, &roots, None, None, &mut self.warnings) {
                 self.bind_layer
                     .insert(bind.path.clone(), Provenance::Override);
                 if let Some(existing) = self.binds.iter_mut().find(|b| b.path == bind.path) {
@@ -4449,15 +4451,42 @@ fn apply_tools(
                 .map(|(k, _)| k.clone())
                 .collect()
         };
-    let tarball_names = collect_sentinel(&packages, TARBALL_RESOLVE_SENTINEL);
-    let deb_names = collect_sentinel(&packages, DEB_RESOLVE_SENTINEL);
-    let appimage_names = collect_sentinel(&packages, APPIMAGE_RESOLVE_SENTINEL);
-    let binary_names = collect_sentinel(&packages, BINARY_RESOLVE_SENTINEL);
+    // One row per prebuilt backend, rather than each of the steps below fanned out four times: a
+    // fifth backend is a row here, and the three things it needs — its sentinel, its table label,
+    // and the `Backend` a `resolve` command builds — cannot be added to one step and forgotten in
+    // another. A sentinel missing from the `retain` below is the sharpest of those: it would reach
+    // `apply_packages`, which rejects the bare prefix and warns about a package the user declared
+    // correctly. The constructors are bound as `fn` pointers first because the array needs one
+    // element type and each closure has its own.
+    let tarball_resolve: fn(Vec<String>) -> Backend = |command| Backend::TarballResolve { command };
+    let deb_resolve: fn(Vec<String>) -> Backend = |command| Backend::DebResolve { command };
+    let appimage_resolve: fn(Vec<String>) -> Backend =
+        |command| Backend::AppImageResolve { command };
+    let binary_resolve: fn(Vec<String>) -> Backend = |command| Backend::BinaryResolve { command };
+    let backends = [
+        (
+            tarball,
+            TARBALL_RESOLVE_SENTINEL,
+            "tarball",
+            tarball_resolve,
+        ),
+        (deb, DEB_RESOLVE_SENTINEL, "deb", deb_resolve),
+        (
+            appimage,
+            APPIMAGE_RESOLVE_SENTINEL,
+            "appimage",
+            appimage_resolve,
+        ),
+        (binary, BINARY_RESOLVE_SENTINEL, "binary", binary_resolve),
+    ];
+    let resolve_names: Vec<BTreeSet<String>> = backends
+        .iter()
+        .map(|(_, sentinel, _, _)| collect_sentinel(&packages, sentinel))
+        .collect();
     packages.retain(|_, v| {
-        v.as_str() != TARBALL_RESOLVE_SENTINEL
-            && v.as_str() != DEB_RESOLVE_SENTINEL
-            && v.as_str() != APPIMAGE_RESOLVE_SENTINEL
-            && v.as_str() != BINARY_RESOLVE_SENTINEL
+        !backends
+            .iter()
+            .any(|(_, sentinel, _, _)| v.as_str() == *sentinel)
     });
 
     for name in packages.keys() {
@@ -4478,84 +4507,28 @@ fn apply_tools(
         allow_insecure_http,
     );
     apply_flakes(out, warnings, source, flakes, state, protect_trusted);
-    apply_resolvers(
-        out,
-        warnings,
-        source,
-        tarball.clone(),
-        &tarball_names,
-        state,
-        protect_trusted,
-        TARBALL_RESOLVE_SENTINEL,
-        "tarball",
-        |command| Backend::TarballResolve { command },
-    );
-    apply_resolvers(
-        out,
-        warnings,
-        source,
-        deb.clone(),
-        &deb_names,
-        state,
-        protect_trusted,
-        DEB_RESOLVE_SENTINEL,
-        "deb",
-        |command| Backend::DebResolve { command },
-    );
-    apply_resolvers(
-        out,
-        warnings,
-        source,
-        appimage.clone(),
-        &appimage_names,
-        state,
-        protect_trusted,
-        APPIMAGE_RESOLVE_SENTINEL,
-        "appimage",
-        |command| Backend::AppImageResolve { command },
-    );
-    apply_resolvers(
-        out,
-        warnings,
-        source,
-        binary.clone(),
-        &binary_names,
-        state,
-        protect_trusted,
-        BINARY_RESOLVE_SENTINEL,
-        "binary",
-        |command| Backend::BinaryResolve { command },
-    );
-    // After the packages exist, since `libs` decorates a package rather than declaring one: the
-    // table it comes from may pair with either declaration form, so both must already be in `out`.
-    apply_prebuilt_libs(
-        out,
-        warnings,
-        source,
-        &tarball,
-        "tarball",
-        protect_trusted,
-        state,
-    );
-    apply_prebuilt_libs(out, warnings, source, &deb, "deb", protect_trusted, state);
-    apply_prebuilt_libs(
-        out,
-        warnings,
-        source,
-        &appimage,
-        "appimage",
-        protect_trusted,
-        state,
-    );
-    apply_prebuilt_libs(
-        out,
-        warnings,
-        source,
-        &binary,
-        "binary",
-        protect_trusted,
-        state,
-    );
+    // Each table is cloned rather than moved: `apply_resolvers` consumes it, and the `libs` pass
+    // below reads the same table after every package is in `out`.
+    for ((tables, sentinel, label, make_backend), names) in backends.iter().zip(&resolve_names) {
+        apply_resolvers(
+            out,
+            warnings,
+            source,
+            tables.clone(),
+            names,
+            state,
+            protect_trusted,
+            sentinel,
+            label,
+            *make_backend,
+        );
+    }
+    // A second pass, after the packages exist, since `libs` decorates a package rather than
+    // declaring one: the table it comes from may pair with either declaration form, so both must
+    // already be in `out`.
+    for (tables, _, label, _) in &backends {
+        apply_prebuilt_libs(out, warnings, source, tables, label, protect_trusted, state);
+    }
 }
 
 /// Attach a `[<label>.<name>]` table's `libs` to the package it names — the extra nixpkgs attributes

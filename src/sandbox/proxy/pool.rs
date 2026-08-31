@@ -107,15 +107,28 @@ impl UpstreamPool {
     /// keeping every connection marginally alive. Each is probed before it is handed over, and a
     /// connection that fails the probe is dropped here rather than returned to the pool.
     pub(super) fn checkout(&self, key: &PoolKey) -> Option<UpstreamTls> {
-        let mut idle = self.idle.lock().ok()?;
-        Self::sweep(&mut idle, self.max_idle);
-        let slot = idle.get_mut(key)?;
-        while let Some(parked) = slot.pop() {
+        // The expiry walk runs once, ahead of any candidate: it is a walk of the whole map, and
+        // repeating it per candidate would make the work under this guard grow with the number of
+        // connections that turn out to be dead.
+        {
+            let mut idle = self.idle.lock().ok()?;
+            Self::sweep(&mut idle, self.max_idle);
+        }
+        // One candidate per lock scope. The probe below is three socket calls, and dropping a
+        // candidate that fails it closes a TCP connection — neither is the pool's state, and neither
+        // belongs under the pool's mutex. That mutex is shared by every proxy thread of a launch and
+        // [`Self::park`] takes it at the end of every relayed response, so a syscall held under it is
+        // a syscall the next request waits behind. `park` already probes before it locks; this is the
+        // same discipline on the taking side.
+        loop {
+            let parked = {
+                let mut idle = self.idle.lock().ok()?;
+                idle.get_mut(key)?.pop()?
+            };
             if still_live(&parked.stream.sock) {
                 return Some(parked.stream);
             }
         }
-        None
     }
 
     /// Offer a finished connection back to the pool. It is kept only if it is genuinely idle and

@@ -554,6 +554,9 @@ impl FrameTee {
         // Accumulated rather than returned on the spot: a filled capture sink no longer ends the
         // decode, because a scan may still want the rest of this chunk.
         let mut filled = false;
+        // Scratch for the masked direction, reused across every frame of this read — see the
+        // payload branch below for why only one direction needs it.
+        let mut unmasked: Vec<u8> = Vec::new();
         let mut at = 0;
         while at < chunk.len() {
             if self.payload_left == 0 {
@@ -607,12 +610,24 @@ impl FrameTee {
             }
             let take = self.payload_left.min((chunk.len() - at) as u64) as usize;
             if self.keeps || (self.control && self.scan.is_some()) {
-                let mut piece = chunk[at..at + take].to_vec();
-                if let Some(key) = self.mask {
-                    for (n, byte) in piece.iter_mut().enumerate() {
-                        *byte ^= key[(self.mask_at as usize + n) % 4];
+                // The payload as its sender wrote it. The copy this made of every piece existed
+                // only to give the unmask loop somewhere to write, and a frame carrying no mask key
+                // has nothing to undo — RFC 6455 §5.3 masks one direction of a tunnel, so the
+                // direction carrying a streamed response was copying every byte for nothing. A frame
+                // that does carry a key is unmasked into a buffer reused for the whole read, which
+                // is one allocation where there was one per frame. The key is read off the frame
+                // header either way, so a peer that masks when it should not is still handled.
+                let piece: &[u8] = match self.mask {
+                    None => &chunk[at..at + take],
+                    Some(key) => {
+                        unmasked.clear();
+                        unmasked.extend_from_slice(&chunk[at..at + take]);
+                        for (n, byte) in unmasked.iter_mut().enumerate() {
+                            *byte ^= key[(self.mask_at as usize + n) % 4];
+                        }
+                        &unmasked
                     }
-                }
+                };
                 if self.control {
                     // A control frame's payload is application data the cage chose (RFC 6455 §5.5.2
                     // and §5.5.3 both allow one), so the scan reads it — but it is not part of the
@@ -642,9 +657,9 @@ impl FrameTee {
                         self.done = true;
                         break;
                     }
-                    self.pending.extend_from_slice(&piece);
+                    self.pending.extend_from_slice(piece);
                 } else {
-                    filled |= self.consume(&piece);
+                    filled |= self.consume(piece);
                     if self.spent() {
                         self.done = true;
                     }
@@ -860,12 +875,19 @@ pub(super) fn reserialize_upgrade(head: &Head, injections: &[(String, String)]) 
 /// `capture` is the traffic capture of the handshake, already carrying the client's request head. A
 /// declined upgrade is captured like any other response (head and body); an accepted one is captured
 /// up to and including the `101` and filed there — see the `101` branch for why it cannot wait.
+///
+/// `redactions` is the response-side reflection backstop, non-empty only for a host an injection
+/// targets — the same set [`relay_response_head`] applies to every other relayed head. Both
+/// handshake answers pass through it, because an upstream that echoes the injected credential in a
+/// header of its own does so as readily here as anywhere else. It reaches no further than the heads:
+/// the frames past a `101` are a byte-exact pipe by design, and this function's own contract.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn relay_upgrade(
     mut br: BufReader<StreamOwned<ServerConnection, UnixStream>>,
     mut upstream: StreamOwned<ClientConnection, TcpStream>,
     inner: &Head,
     injected: &[(String, String)],
+    redactions: &[SecretNeedle],
     ctx: &ProxyCtx,
     allow_seq: Option<u64>,
     capture: Option<&CaptureGuard>,
@@ -892,10 +914,20 @@ pub(super) fn relay_upgrade(
         {
             ctx.set_status(allow_seq, code);
         }
-        br.get_mut().write_all(&resp_head)?;
-        down.fetch_add(resp_head.len() as u64, Ordering::Relaxed);
-        // A declined upgrade is an ordinary response — capture its head, then tee its body like any
-        // other. The guard files when this handler returns.
+        // A declined upgrade is an ordinary response and is relayed as one: sbx's own
+        // `Connection: close` in place of whatever the upstream said about its socket — this leg is
+        // shut down at the end of this branch, and an upstream that answered `keep-alive` anyway
+        // would have told the cage it could send a second request into a connection already going
+        // away — and the reflection mask over the head. Written out here rather than routed through
+        // [`relay_response_head`], which treats a `101` as an interim head to relay and read past.
+        write_head_to_client(
+            force_close_in_head(&resp_head),
+            br.get_mut(),
+            &down,
+            redactions,
+        )?;
+        // Capture the head, then tee the body like any other response. The guard files when this
+        // handler returns.
         if let Some(c) = capture {
             c.push_response(&resp_head);
         }
@@ -904,11 +936,14 @@ pub(super) fn relay_upgrade(
         let framing = response_framing(&resp_head, "GET");
         // Count the declined response body (`down`) as it streams back to the client.
         let counted = CountingReader::new(FramedBody::new(up_br, framing), down.clone());
-        let mut body: Box<dyn Read + '_> = match capture {
-            Some(c) => Box::new(CaptureReader::new(counted, c.response_sink())),
-            None => Box::new(counted),
-        };
-        pump_to_eof(&mut body, br.get_mut())?;
+        let mut body = tee_response(counted, capture);
+        // Teed ahead of the masking, as on every other plane: the capture masks its own buffers at
+        // filing time, so what is stored is masked either way.
+        if redactions.is_empty() {
+            pump_to_eof(&mut body, br.get_mut())?;
+        } else {
+            pump_redacting(&mut body, br.get_mut(), redactions)?;
+        }
         finish_tls(br.get_mut());
         return Ok(());
     }
@@ -916,10 +951,12 @@ pub(super) fn relay_upgrade(
     // What the peers agreed for payload compression, decided by this response alone.
     let deflate = negotiated_deflate(&resp_head);
     ctx.set_status(allow_seq, 101);
-    // Relay the `101` to the client so it completes the WebSocket handshake.
-    br.get_mut().write_all(&resp_head)?;
+    // Relay the `101` to the client so it completes the WebSocket handshake. Its own hop headers
+    // stand — rewriting the `Connection: Upgrade` out of it would undo the switch the two peers just
+    // agreed — but it is masked like any other head sbx relays. The masking is equal-length, so what
+    // the client parses is the head the upstream sent.
+    write_head_to_client(resp_head.clone(), br.get_mut(), &down, redactions)?;
     br.get_mut().flush()?;
-    down.fetch_add(resp_head.len() as u64, Ordering::Relaxed);
     // Capture the handshake and file it here rather than letting the guard file on return: a
     // WebSocket tunnel can stay open for hours and the log event carries exactly one amendment, so a
     // capture held open would keep the `101` out of `sbx net logs` until the tunnel closed. What is

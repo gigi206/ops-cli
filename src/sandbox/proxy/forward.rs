@@ -503,14 +503,11 @@ pub(super) fn handle_https_forward(
             let _ = client.flush();
         }
         // Teed as it is relayed — a pass-through, so the forwarded stream is unchanged.
-        match &capture {
-            Some(c) => copy_exact(
-                &mut CaptureReader::new(&mut client, c.request_body_sink()),
-                &mut upstream,
-                body_len,
-            )?,
-            None => copy_exact(&mut client, &mut upstream, body_len)?,
-        }
+        copy_exact(
+            &mut tee_request_body(&mut client, capture.as_ref()),
+            &mut upstream,
+            body_len,
+        )?;
         flow.up.fetch_add(body_len, Ordering::Relaxed);
         upstream.flush().ok();
         // The request is fully forwarded; the response may idle between bursts, so lift the timeout.
@@ -525,14 +522,10 @@ pub(super) fn handle_https_forward(
     drop(budget);
 
     // 10. Relay the response head, then stream its framed body to the plaintext client and close.
-    //     Mask a reflected secret only for a response from an injection-target host (every other
-    //     response streams untouched) — decided before the head is read, because the masking covers
-    //     the head as much as the body and the head is relayed first.
-    let masks_reflection = !creds.needles.is_empty()
-        && creds
-            .injections
-            .iter()
-            .any(|inj| names_exact_host(&host, Some(&inj.rule)));
+    //     A reflected secret is masked only for a response from an injection-target host, by the
+    //     same question the tunneled plane asks (`CredentialSet::masks_reflection_for`); it is
+    //     decided before the head is read, because the masking covers the head as much as the body.
+    let masks_reflection = creds.masks_reflection_for(&host);
     let head_masking: &[SecretNeedle] = if masks_reflection {
         &creds.needles
     } else {
@@ -592,11 +585,8 @@ pub(super) fn handle_https_forward(
     // Teed ahead of the reflection masking — the capture masks its own buffers at filing time.
     let mut framed = FramedBody::new(&mut up_br, framing);
     {
-        let response = CountingReader::new(&mut framed, flow.down.clone());
-        let mut response: Box<dyn Read + '_> = match &capture {
-            Some(c) => Box::new(CaptureReader::new(response, c.response_sink())),
-            None => Box::new(response),
-        };
+        let counted = CountingReader::new(&mut framed, flow.down.clone());
+        let mut response = tee_response(counted, capture.as_ref());
         if masks_reflection {
             pump_redacting(&mut response, &mut client, &creds.needles)?;
         } else {

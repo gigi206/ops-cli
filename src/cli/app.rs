@@ -14,9 +14,9 @@ use crate::cli::confirm::{render_app_exported, render_app_imported, render_remov
 use crate::cli::{import_remedy, refuse_flag_value};
 use crate::{
     build_override, config_cwd, egress_write_target, flag_name, net_mode_word, persist_egress_rule,
-    session_pids_for_app, take_override_flag,
+    print_json, session_pids_for_app, take_override_flag,
 };
-use crate::{config, diag, help, sandbox, session, store, style, trust};
+use crate::{config, diag, help, layout_or_fail, sandbox, session, store, style, trust};
 
 /// `sbx app <subcommand>`: launch or manage named application profiles. `run <name>` launches an
 /// app (an `[app.<name>]` table from the global or project config, or an imported `<name>.toml`
@@ -646,10 +646,7 @@ fn write_deps(plan: &DepPlan) -> Result<(), ExitCode> {
     if plan.bundles.is_empty() && plan.groups.is_empty() {
         return Ok(());
     }
-    let cwd = std::env::current_dir().map_err(|e| {
-        diag::error(&format!("sbx: cannot read the current directory: {e}"));
-        ExitCode::FAILURE
-    })?;
+    let cwd = config_cwd()?;
     let path = config::manage::scope_path(&config::manage::Scope::Global, &cwd).map_err(|e| {
         diag::error(&format!("sbx: app import --with-deps: {e}"));
         ExitCode::from(1)
@@ -872,12 +869,9 @@ fn app_export(args: &[OsString]) -> ExitCode {
         diag::error(&format!("sbx: '{name}' is not a valid app name"));
         return ExitCode::from(2);
     }
-    let cwd = match std::env::current_dir() {
+    let cwd = match config_cwd() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the current directory: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     let bytes = match config::export_profile(&cwd, name) {
         Ok(b) => b,
@@ -1065,11 +1059,9 @@ fn app_rm_profiles(names: &[&str]) -> ExitCode {
 fn app_rm_purge(names: &[&str], gc: bool) -> ExitCode {
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
 
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot locate sbx's data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
 
     // Read once for the batch, and fail closed for all of it: without the registry no name can be
@@ -1406,6 +1398,41 @@ fn app_list() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// What a read-only `sbx app <verb> <name>` needs before it can say anything about the app: the
+/// configuration resolved for the working directory, the data-directory layout, and the app's
+/// installed home(s) on disk.
+struct AppTarget {
+    resolved: config::Resolved,
+    layout: store::Layout,
+    homes: Vec<sandbox::inspect::AppHome>,
+}
+
+/// Resolve the app `name` for a read-only `sbx app` verb, or report why it cannot be. An app that is
+/// neither declared for this directory nor installed on disk does not exist, and the refusal —
+/// tagged with `verb` — names the apps that *are* declared, or says that none is: that sentence is
+/// what separates a misspelled name from the wrong directory, so both verbs owe it.
+fn open_app(verb: &str, name: &str) -> Result<AppTarget, ExitCode> {
+    let cwd = config_cwd()?;
+    let layout = layout_or_fail()?;
+    let resolved = config::load(&cwd);
+    let homes = sandbox::inspect::app_home_dirs(layout.data_dir(), name);
+    if !resolved.apps.contains_key(name) && homes.is_empty() {
+        diag::error(&format!("sbx: {verb}: no app named {name:?}"));
+        let declared: Vec<String> = resolved.apps.keys().cloned().collect();
+        if declared.is_empty() {
+            diag::error("sbx: no apps are declared for this directory");
+        } else {
+            diag::error(&format!("sbx: declared apps: {}", declared.join(", ")));
+        }
+        return Err(ExitCode::FAILURE);
+    }
+    Ok(AppTarget {
+        resolved,
+        layout,
+        homes,
+    })
+}
+
 /// `sbx app show <name>`: the realized-on-disk detail for one app — its profile source, its
 /// isolated home(s) with size (and the mise-data breakdown), and each declared package annotated
 /// with whether it is **actually installed**: a `mise:` tool is read from the app home; a `deb:` /
@@ -1421,43 +1448,22 @@ fn app_show(args: &[OsString]) -> ExitCode {
             Ok(parsed) => parsed,
             Err(code) => return code,
         };
-    let cwd = match config_cwd() {
-        Ok(c) => c,
+    let AppTarget {
+        resolved,
+        layout,
+        homes,
+    } = match open_app("app show", name) {
+        Ok(t) => t,
         Err(code) => return code,
     };
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error("sbx: app show: cannot locate sbx's data directory.");
-        return ExitCode::FAILURE;
-    };
-
-    let resolved = config::load(&cwd);
     let app = resolved.apps.get(name);
-    let homes = sandbox::inspect::app_home_dirs(layout.data_dir(), name);
-    // An app that is neither declared for this directory nor has an installed home on disk does not
-    // exist — surface the declared set, like `config show --app`.
-    if app.is_none() && homes.is_empty() {
-        diag::error(&format!("sbx: app show: no app named {name:?}"));
-        let declared: Vec<String> = resolved.apps.keys().cloned().collect();
-        if declared.is_empty() {
-            diag::error("sbx: no apps are declared for this directory");
-        } else {
-            diag::error(&format!("sbx: declared apps: {}", declared.join(", ")));
-        }
-        return ExitCode::FAILURE;
-    }
 
     let view = build_app_show(name, app, &resolved.network, &homes, layout.data_dir());
     if json {
-        return match serde_json::to_string_pretty(&view) {
-            Ok(doc) => {
-                println!("{doc}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                diag::error(&format!("sbx: app show: cannot serialize: {e}"));
-                ExitCode::FAILURE
-            }
-        };
+        if let Err(code) = print_json("app show", &view) {
+            return code;
+        }
+        return ExitCode::SUCCESS;
     }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     print!("{}", render_app_show(&view, &pal));
@@ -1903,26 +1909,15 @@ fn app_prune(args: &[OsString]) -> ExitCode {
             Ok(parsed) => parsed,
             Err(code) => return code,
         };
-    let cwd = match config_cwd() {
-        Ok(c) => c,
+    let AppTarget {
+        resolved,
+        layout,
+        homes,
+    } = match open_app("app prune", name) {
+        Ok(t) => t,
         Err(code) => return code,
     };
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error("sbx: app prune: cannot locate sbx's data directory.");
-        return ExitCode::FAILURE;
-    };
-
-    let resolved = config::load(&cwd);
     let app = resolved.apps.get(name);
-    let homes = sandbox::inspect::app_home_dirs(layout.data_dir(), name);
-    if app.is_none() && homes.is_empty() {
-        diag::error(&format!("sbx: app prune: no app named {name:?}"));
-        let declared: Vec<String> = resolved.apps.keys().cloned().collect();
-        if !declared.is_empty() {
-            diag::error(&format!("sbx: declared apps: {}", declared.join(", ")));
-        }
-        return ExitCode::FAILURE;
-    }
     // The app's declared `mise:` tokens; a tool matching none of them is undeclared. A home-only app
     // (no config) declares nothing, so every mise tool in its home is prunable.
     let declared: Vec<&str> = app

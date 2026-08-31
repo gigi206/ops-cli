@@ -158,23 +158,13 @@ struct ProjectTreeView {
     current: bool,
 }
 
-/// The project id of the current working directory, so the tree you are standing in can be marked
-/// `*` in the listing and guarded against an accidental `sbx projects rm <that-id>`. Best-effort:
-/// `None` when the cwd cannot be read or canonicalized. Hashed the way a launch hashes its cwd, so
-/// the value matches the runtime tree's directory name.
-fn current_tree_id() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    let canonical = cwd.canonicalize().ok()?;
-    Some(super::binds::project_id(&canonical))
-}
-
 /// Gather the per-project runtime trees under `<data>/projects/`, classified and sized, sorted by
 /// id — the shared core of `sbx projects [list]` (text or JSON). Live ids come from the session
 /// registry (the same self-healing housekeep `sbx session ls` runs), so a tree in use reads `live`. Pure
 /// host-side filesystem work — no sandbox, no nix.
 fn collect_project_trees(layout: &crate::store::Layout) -> Vec<ProjectTreeView> {
     let live_ids = super::launch::session_housekeeping(layout);
-    let current = current_tree_id();
+    let current = crate::current_project_id();
     let projects_dir = layout.data_dir().join("projects");
     let mut rows: Vec<ProjectTreeView> = match std::fs::read_dir(&projects_dir) {
         Ok(rd) => rd
@@ -276,9 +266,9 @@ struct ProjectShowView {
 pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -> ExitCode {
     use crate::config::Backend;
 
-    let Some(layout) = crate::store::Layout::from_env() else {
-        crate::diag::error("sbx projects show: cannot locate sbx's data directory.");
-        return ExitCode::FAILURE;
+    let layout = match crate::layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     // The same guard `sbx projects rm` applies before its own `join`, and for the same reason a
     // read verb still needs it: `Path::join` replaces the base with an absolute argument and walks
@@ -305,9 +295,10 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
     let live_ids = super::launch::session_housekeeping(&layout);
     let class = super::gc::classify_tree(&dir, &live_ids);
 
-    let total_bytes = super::gc::tree_size(&dir);
-    let store_bytes = super::gc::tree_size(&dir.join("store"));
-    let home_bytes = super::gc::tree_size(&dir.join("home"));
+    // One walk for all three figures: `store` and `home` are inside the tree, so sizing them
+    // separately visited every one of their inodes twice.
+    let (total, parts) = super::gc::tree_usage_parts(&dir, &[dir.join("store"), dir.join("home")]);
+    let (total_bytes, store_bytes, home_bytes) = (total.bytes, parts[0].bytes, parts[1].bytes);
     let other_bytes = total_bytes
         .saturating_sub(store_bytes)
         .saturating_sub(home_bytes);
@@ -442,16 +433,10 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
     };
 
     if json {
-        return match serde_json::to_string_pretty(&view) {
-            Ok(doc) => {
-                println!("{doc}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                crate::diag::error(&format!("sbx projects show: failed to serialize: {e}"));
-                ExitCode::FAILURE
-            }
-        };
+        if let Err(code) = crate::print_json("projects show", &view) {
+            return code;
+        }
+        return ExitCode::SUCCESS;
     }
     print!("{}", render_project_show(&view, pal));
     ExitCode::SUCCESS
@@ -564,23 +549,17 @@ fn render_project_show(v: &ProjectShowView, pal: &crate::style::Palette) -> Stri
 /// (richer than `sbx path`'s projects section: it adds each tree's on-disk size), in aligned text
 /// or `--json`.
 pub(crate) fn projects_list(json: bool, pal: &crate::style::Palette) -> ExitCode {
-    let Some(layout) = crate::store::Layout::from_env() else {
-        crate::diag::error("sbx projects: cannot locate sbx's data directory.");
-        return ExitCode::FAILURE;
+    let layout = match crate::layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     let rows = collect_project_trees(&layout);
 
     if json {
-        return match serde_json::to_string_pretty(&rows) {
-            Ok(s) => {
-                println!("{s}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                crate::diag::error(&format!("sbx projects: failed to serialize: {e}"));
-                ExitCode::FAILURE
-            }
-        };
+        if let Err(code) = crate::print_json("projects", &rows) {
+            return code;
+        }
+        return ExitCode::SUCCESS;
     }
 
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
@@ -640,7 +619,7 @@ pub(crate) fn rm_apply(targeted: bool, bulk: bool, dry_run: bool, yes: bool) -> 
 
 /// Whether `sbx projects rm <id>` must refuse `id` because it is the tree of the current working
 /// directory — deleting the store and home you are standing in — unless `--force` overrides it.
-/// `current` is [`current_tree_id`]; `None` (cwd unresolvable) never guards.
+/// `current` is [`crate::current_project_id`]; `None` (cwd unresolvable) never guards.
 fn rm_refuses_current(id: &str, current: Option<&str>, force: bool) -> bool {
     !force && current == Some(id)
 }
@@ -662,12 +641,12 @@ pub(crate) fn projects_rm(
     pal: &crate::style::Palette,
 ) -> ExitCode {
     let (h, n, ok, dim, r) = (pal.head, pal.name, pal.ok, pal.dim, pal.reset);
-    let Some(layout) = crate::store::Layout::from_env() else {
-        crate::diag::error("sbx projects rm: cannot locate sbx's data directory.");
-        return ExitCode::FAILURE;
+    let layout = match crate::layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     let live_ids = super::launch::session_housekeeping(&layout);
-    let current = current_tree_id();
+    let current = crate::current_project_id();
     let projects_dir = layout.data_dir().join("projects");
     let mut had_error = false;
 

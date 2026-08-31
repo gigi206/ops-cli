@@ -1177,12 +1177,52 @@ pub(crate) fn tree_usage(path: &Path) -> TreeUsage {
     usage.bytes += root.blocks() * 512;
     usage.inodes += 1;
     let mut seen = std::collections::HashSet::new();
-    accumulate_usage(path, &mut seen, &mut usage);
+    accumulate_usage(path, &[], &mut seen, &mut usage);
     usage
+}
+
+/// The on-disk usage of a tree with the usage of named subtrees broken out of it, in **one** walk.
+///
+/// Every `parts` entry must be a path inside `root`. Each comes back with the figures [`tree_usage`]
+/// would report for that subtree alone, and the total is what [`tree_usage`] would report for the
+/// whole tree — so a caller that wants both a tree and a breakdown of it no longer lstats the
+/// nested part twice (a seeded nix store and a mise pool are 10^4–10^5 inodes each). The remainder
+/// a caller derives as `total - parts` is exact rather than a difference of independently
+/// deduplicated figures, because the hardlink set is shared across the whole walk.
+///
+/// A part that does not exist reports zero. A part nested inside another part is not supported: the
+/// two would each count the shared entries once, and the total would count them once.
+pub(crate) fn tree_usage_parts(root: &Path, parts: &[PathBuf]) -> (TreeUsage, Vec<TreeUsage>) {
+    use std::os::unix::fs::MetadataExt;
+    let mut total = TreeUsage::default();
+    let mut split = vec![TreeUsage::default(); parts.len()];
+    // The root counts as part of what the tree occupies — removing the tree removes it too.
+    let Ok(meta) = root.symlink_metadata() else {
+        return (total, split);
+    };
+    total.bytes += meta.blocks() * 512;
+    total.inodes += 1;
+    let mut seen = std::collections::HashSet::new();
+    // The named subtrees first, each into its own figures, so a part reports exactly what it would
+    // have on its own; the walk of the rest then skips them rather than visiting them again.
+    for (usage, part) in split.iter_mut().zip(parts) {
+        let Ok(meta) = part.symlink_metadata() else {
+            continue;
+        };
+        usage.bytes += meta.blocks() * 512;
+        usage.inodes += 1;
+        accumulate_usage(part, &[], &mut seen, usage);
+        total.bytes += usage.bytes;
+        total.inodes += usage.inodes;
+    }
+    // ...and the rest of the tree, skipping the parts already accounted for above.
+    accumulate_usage(root, parts, &mut seen, &mut total);
+    (total, split)
 }
 
 fn accumulate_usage(
     path: &Path,
+    skip: &[PathBuf],
     seen: &mut std::collections::HashSet<(u64, u64)>,
     usage: &mut TreeUsage,
 ) {
@@ -1192,13 +1232,16 @@ fn accumulate_usage(
     };
     for entry in entries.flatten() {
         let child = entry.path();
+        if skip.contains(&child) {
+            continue;
+        }
         match entry.file_type() {
             Ok(t) if t.is_dir() => {
                 if let Ok(m) = child.symlink_metadata() {
                     usage.bytes += m.blocks() * 512;
                     usage.inodes += 1;
                 }
-                accumulate_usage(&child, seen, usage);
+                accumulate_usage(&child, skip, seen, usage);
             }
             Ok(_) => {
                 let Ok(m) = child.symlink_metadata() else {
@@ -1513,6 +1556,42 @@ mod tests {
             !installs.join("drop-me").exists(),
             "the undeclared one goes"
         );
+    }
+
+    /// The breakdown a report asks for — a tree, and two of its subtrees — has to add up: each part
+    /// reports what sizing it alone would report, the total reports what sizing the whole tree
+    /// alone would report, and what is left over is the rest of the tree. Sizing the tree and then
+    /// each part separately walked the nested inodes twice.
+    #[test]
+    fn tree_usage_parts_splits_a_tree_without_walking_it_twice() {
+        let tmp = TmpDir::new();
+        let root = tmp.path().join("tree");
+        for sub in ["store", "home", "other"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+            std::fs::write(root.join(sub).join("payload"), vec![b'x'; 4096]).unwrap();
+        }
+
+        let parts = [root.join("store"), root.join("home")];
+        let (total, split) = tree_usage_parts(&root, &parts);
+
+        assert_eq!(
+            split[0],
+            tree_usage(&root.join("store")),
+            "store, on its own"
+        );
+        assert_eq!(split[1], tree_usage(&root.join("home")), "home, on its own");
+        assert_eq!(total, tree_usage(&root), "the whole tree, walked once");
+        // The remainder is `other/` and its payload, plus the root directory itself.
+        assert_eq!(
+            total.inodes - split[0].inodes - split[1].inodes,
+            3,
+            "what is left over is the rest of the tree, counted once"
+        );
+
+        // A part that is not there reports zero rather than borrowing from the total.
+        let (again, missing) = tree_usage_parts(&root, &[root.join("absent")]);
+        assert_eq!(missing[0], TreeUsage::default());
+        assert_eq!(again, total);
     }
 
     /// A hardlinked file occupies one inode and one set of blocks however many names point at it,

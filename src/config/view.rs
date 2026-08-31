@@ -1094,16 +1094,7 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
     };
     let limits = limits_view(&resolved.limits, &resolved.limits_origin);
 
-    let secrets = resolved
-        .secrets
-        .iter()
-        .map(|s| SecretView {
-            header: s.headers().join(", "),
-            to: s.to.to_string(),
-            shape: s.shape_label(),
-            sources: s.describe_sources(),
-        })
-        .collect();
+    let secrets = secret_views(&resolved.secrets);
 
     let apps = resolved
         .apps
@@ -1538,20 +1529,32 @@ fn app_view(
         ssh_agent: app.ssh_agent.clone(),
         limits: app_limits_view(&app.limits),
         secrets: if injects {
-            app.secrets
-                .iter()
-                .map(|s| SecretView {
-                    header: s.headers().join(", "),
-                    to: s.to.to_string(),
-                    shape: s.shape_label(),
-                    sources: s.describe_sources(),
-                })
-                .collect()
+            secret_views(&app.secrets)
         } else {
             Vec::new()
         },
         notes: app.warnings.clone(),
     }
+}
+
+/// Project a resolved credential list for display: which header carries it, where it goes, the
+/// shape it was declared in and where its value is read from — never the value, which sbx reads
+/// only host-side at launch.
+///
+/// One projection for all three views (baseline, app roster, app detail), because the roster and
+/// the detail view are exactly the pair a reader compares: a field added to [`SecretView`] in one
+/// of them and not the others would show the same credential two different ways. *Which* list a
+/// view shows is the part that genuinely differs, so that stays with each caller.
+fn secret_views(secrets: &[super::HeaderSecret]) -> Vec<SecretView> {
+    secrets
+        .iter()
+        .map(|s| SecretView {
+            header: s.headers().join(", "),
+            to: s.to.to_string(),
+            shape: s.shape_label(),
+            sources: s.describe_sources(),
+        })
+        .collect()
 }
 
 /// Project an app overlay's *own* limit overrides — only the fields it set — or `None` when it
@@ -1857,15 +1860,7 @@ fn app_detail_view(
         secrets: if secrets_dropped {
             Vec::new()
         } else {
-            app.secrets
-                .iter()
-                .map(|s| SecretView {
-                    header: s.headers().join(", "),
-                    to: s.to.to_string(),
-                    shape: s.shape_label(),
-                    sources: s.describe_sources(),
-                })
-                .collect()
+            secret_views(&app.secrets)
         },
         secrets_inherited: if secrets_dropped {
             0

@@ -8,7 +8,7 @@ use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use crate::fold_app_overlay;
-use crate::{allowlist, config, diag, help, sandbox, style};
+use crate::{allowlist, config, config_cwd, diag, help, sandbox, style};
 
 /// `sbx test <kind> <target>`: probe whether an access would be allowed and explain why —
 /// a diagnostic surface meant to grow with sbx's access controls (currently the network
@@ -122,12 +122,9 @@ fn net_test(args: &[OsString]) -> ExitCode {
         }
     };
 
-    let cwd = match std::env::current_dir() {
+    let cwd = match config_cwd() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the current directory: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     let mut resolved = config::load(&cwd);
     for w in &resolved.warnings {

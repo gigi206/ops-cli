@@ -17,7 +17,7 @@ use crate::cli::confirm::{
     render_store_rekeyed, render_store_tofu, render_store_updated, render_store_verified,
 };
 use crate::plugins::{catalogue, stores};
-use crate::{diag, help, plugins, store, style};
+use crate::{diag, help, layout_or_fail, plugins, store, style};
 
 /// `sbx plugins <subcommand>`: inspect and manage the installed plugins. Host-level, like `doctor`
 /// — it reads `<data>/plugins`, not a project's `.sbx.toml`. The inspection verbs, the placement
@@ -68,13 +68,14 @@ pub(crate) fn plugins_cmd(args: Vec<OsString>) -> ExitCode {
 /// could not be located. Shared by `list` and `info`; the layout is returned alongside so a caller
 /// can also read each plugin's recorded origin, and the validation warnings so it can surface them
 /// (the diagnostic for a plugin that was discovered but dropped as malformed).
-fn load_plugin_registry() -> Option<(store::Layout, plugins::PluginRegistry, Vec<String>)> {
-    let layout = store::Layout::from_env()?;
+fn load_plugin_registry() -> Result<(store::Layout, plugins::PluginRegistry, Vec<String>), ExitCode>
+{
+    let layout = layout_or_fail()?;
     let mut warnings = Vec::new();
     // The quiet form: a scheme conflict is rendered from the registry itself here (naming every
     // claimant and the way out), so relaying it as a warning too would say it twice.
     let registry = plugins::PluginRegistry::load_quiet(&layout.plugins_dir(), &mut warnings);
-    Some((layout, registry, warnings))
+    Ok((layout, registry, warnings))
 }
 
 /// What is installed right now, in the three shapes a store listing has to answer: which install
@@ -424,11 +425,9 @@ impl InstalledIndex {
 /// "discovered" and "runnable" is visible. Discovery warnings (a malformed manifest, an ambiguous
 /// scheme) go to stderr. No nix, no network, no launch.
 fn plugins_list() -> ExitCode {
-    let Some((layout, registry, warnings)) = load_plugin_registry() else {
-        diag::error(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
-        );
-        return ExitCode::FAILURE;
+    let (layout, registry, warnings) = match load_plugin_registry() {
+        Ok(loaded) => loaded,
+        Err(code) => return code,
     };
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
@@ -655,11 +654,9 @@ fn plugins_install(source: Option<&OsString>) -> ExitCode {
         ));
         return ExitCode::from(2);
     };
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     match plugins::install(&layout, Path::new(source)) {
         Ok(installed) => {
@@ -879,11 +876,9 @@ fn plugins_store_add(args: &[OsString]) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     let Some(git) = store::resolve_git() else {
         diag::error("sbx: git is not on PATH — a remote plugin store is a git repository");
@@ -1167,11 +1162,9 @@ fn plugins_store_update(args: &[OsString]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     let Some(git) = store::resolve_git() else {
         diag::error("sbx: git is not on PATH — a remote plugin store is a git repository");
@@ -1269,11 +1262,9 @@ fn plugins_store_install(args: &[OsString]) -> ExitCode {
         ));
         return ExitCode::from(2);
     };
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     match stores::install_plugin(&layout, store_name, plugin_name) {
         Ok(installed) => {
@@ -1308,11 +1299,9 @@ fn plugins_store_info(name: Option<&str>) -> ExitCode {
         ));
         return ExitCode::from(2);
     };
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     let cfg = match stores::read_configured(&layout, name) {
         Ok(cfg) => cfg,
@@ -1396,11 +1385,9 @@ fn plugins_store_verify(args: &[OsString]) -> ExitCode {
         eprintln!("{usage}");
         return ExitCode::from(2);
     };
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     let pubkey = match stores::parse_pubkey_arg(key) {
         Ok(k) => k,
@@ -1475,11 +1462,9 @@ fn plugins_store_rekey(args: &[OsString]) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     let Some(git) = store::resolve_git() else {
         diag::error("sbx: git is not on PATH — a remote plugin store is a git repository");
@@ -1571,11 +1556,9 @@ fn plugins_store_remove(name: Option<&str>) -> ExitCode {
         ));
         return ExitCode::from(2);
     };
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     match stores::remove(&layout, name) {
         Ok(()) => {
@@ -1872,11 +1855,9 @@ fn plugins_remove(args: &[OsString]) -> ExitCode {
         }
     }
     crate::cli::dedupe_names(&mut names);
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let mut had_error = false;
@@ -1983,11 +1964,9 @@ fn plugins_upgrade(args: &[OsString]) -> ExitCode {
             }
         }
     }
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     let index = InstalledIndex::scan(&layout);
     let targets: Vec<String> = match name {
@@ -2101,11 +2080,9 @@ fn plugins_upgrade(args: &[OsString]) -> ExitCode {
 /// and does not fail the command: nothing was attested, which is a different answer from "this was
 /// tampered with" and calls for a different action (reinstall, which records one).
 fn plugins_verify(name: Option<&str>) -> ExitCode {
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     let index = InstalledIndex::scan(&layout);
     let names: Vec<String> = match name {
@@ -2200,11 +2177,9 @@ fn plugins_info(key: Option<&str>) -> ExitCode {
         println!("{key}: a built-in resolver (compiled into sbx, not a plugin)");
         return ExitCode::SUCCESS;
     }
-    let Some((layout, registry, warnings)) = load_plugin_registry() else {
-        diag::error(
-            "sbx: cannot locate the data directory (set $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
-        );
-        return ExitCode::FAILURE;
+    let (layout, registry, warnings) = match load_plugin_registry() {
+        Ok(loaded) => loaded,
+        Err(code) => return code,
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     // A broker and a signer claim no scheme, so each is looked up by the name it is registered

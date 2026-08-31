@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::cli::import_remedy;
-use crate::{config, diag, help, style};
+use crate::{config, config_cwd, diag, help, style};
 
 /// `sbx bundle` — dispatch. `export`/`import` are reserved subcommand verbs, so a bundle named
 /// `export` is listable and usable in a `use` list but not resolvable by bare name here (use the
@@ -443,95 +443,30 @@ fn bundle_export(args: &[OsString]) -> ExitCode {
 }
 
 /// Keep every bundle a forced import is about to replace, and say what the incoming fragment no
-/// longer declares. Returns one warning per replaced bundle, for the caller to surface once the
-/// write succeeded.
+/// longer declares — [`crate::keep_replaced_fragments`] with this family's nouns and exporter.
 ///
 /// A bundle is a table inside the shared global config, not a file of its own, so the copy an app
 /// profile gets (`<name>.toml.replaced`, beside it) has no equivalent here. What stands in for it is
 /// the fragment `sbx bundle export` already emits: the replaced bundle is written back out in the
 /// same portable form, as `<name>.bundle.replaced` beside the config, so re-declaring it is
-/// `sbx bundle import` on that file. The name ends in neither `.toml` nor a profile path, so
-/// nothing reads it as configuration.
-///
-/// Only a bundle whose declaration actually CHANGES is kept: re-importing an identical fragment
-/// leaves no copy and reports nothing. An error here fails the import closed, before the write, so
-/// a bundle is never overwritten with no way back.
+/// `sbx bundle import` on that file.
 fn keep_replaced_bundles(
     config_path: &Path,
     incoming: &std::collections::BTreeMap<String, config::RawBundle>,
     force: bool,
 ) -> Result<Vec<String>, String> {
-    if !force {
-        return Ok(Vec::new());
-    }
-    let Some(dir) = config_path.parent() else {
-        return Ok(Vec::new());
-    };
-    let (declared, _) = config::bundles();
-    let mut notes = Vec::new();
-    for (name, new) in incoming {
-        let Some(old) = declared.get(name) else {
-            continue; // added, not replaced
-        };
-        let one = |n: &String, b: &config::RawBundle| {
+    crate::keep_replaced_fragments(
+        config_path,
+        incoming,
+        || config::bundles().0,
+        force,
+        "bundle",
+        "bundle",
+        |name, bundle| {
             config::manage::export_bundles(&std::collections::BTreeMap::from([(
-                n.clone(),
-                b.clone(),
+                name.to_string(),
+                bundle.clone(),
             )]))
-        };
-        let (before, after) = (one(name, old)?, one(name, new)?);
-        if before == after {
-            continue;
-        }
-        let kept = dir.join(format!("{name}.bundle.replaced"));
-        crate::cli::keep_replaced_file(&kept, before.as_bytes()).map_err(|e| {
-            format!(
-                "cannot keep the bundle being replaced at {}: {e}",
-                kept.display()
-            )
-        })?;
-        notes.push(render_replaced_bundle(
-            name,
-            &crate::cli::settings_dropped_by(&before, &after),
-            &kept,
-        ));
-    }
-    Ok(notes)
-}
-
-/// The overwrite warning for one bundle: what its replacement no longer declares, and where the
-/// previous fragment is. A few dropped lines are named in full (the point is to recognize one's own
-/// edit); beyond that the count stands in, because the kept fragment is the better place to read
-/// the rest.
-fn render_replaced_bundle(name: &str, dropped: &[String], kept: &Path) -> String {
-    const NAMED: usize = 3;
-    let kept = kept.display();
-    if dropped.is_empty() {
-        return format!(
-            "replaced bundle `{name}`, which differed only in layout — the previous fragment is \
-             kept at {kept}"
-        );
-    }
-    let named = dropped
-        .iter()
-        .take(NAMED)
-        .map(|l| format!("`{l}`"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let rest = dropped.len().saturating_sub(NAMED);
-    let more = if rest > 0 {
-        format!(" (and {rest} more)")
-    } else {
-        String::new()
-    };
-    format!(
-        "replaced bundle `{name}`, which declared {} the new one does not: {named}{more} — the \
-         previous fragment is kept at {kept}, so a per-machine entry can be read back and \
-         re-imported",
-        if dropped.len() == 1 {
-            "1 line".to_string()
-        } else {
-            format!("{} lines", dropped.len())
         },
     )
 }
@@ -566,12 +501,9 @@ fn bundle_import(args: &[OsString]) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let cwd = match std::env::current_dir() {
+    let cwd = match config_cwd() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the current directory: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     let path = match config::manage::scope_path(&config::manage::Scope::Global, &cwd) {
         Ok(p) => p,
@@ -740,11 +672,16 @@ mod tests {
     #[test]
     fn the_bundle_overwrite_warning_names_a_few_losses_and_counts_the_rest() {
         let kept = Path::new("/config/sbx/demo.bundle.replaced");
-        let one = render_replaced_bundle("demo", &["allow = [\"x\"]".to_string()], kept);
+        let one = crate::render_replaced_fragment(
+            "bundle",
+            "demo",
+            &["allow = [\"x\"]".to_string()],
+            kept,
+        );
         assert!(one.contains("`demo`") && one.contains("1 line"), "{one}");
         assert!(one.contains("demo.bundle.replaced"), "{one}");
         let many: Vec<String> = (0..5).map(|i| format!("k{i} = {i}")).collect();
-        let lots = render_replaced_bundle("demo", &many, kept);
+        let lots = crate::render_replaced_fragment("bundle", "demo", &many, kept);
         assert!(
             lots.contains("5 lines") && lots.contains("(and 2 more)"),
             "{lots}"
@@ -754,7 +691,7 @@ mod tests {
             "{lots}"
         );
         // A bundle that differs only in layout still names where the previous fragment went.
-        let none = render_replaced_bundle("demo", &[], kept);
+        let none = crate::render_replaced_fragment("bundle", "demo", &[], kept);
         assert!(
             none.contains("only in layout") && none.contains(".replaced"),
             "{none}"

@@ -17,9 +17,9 @@
 //! yields [`Origin::Unknown`] rather than an error. An unknown origin is the honest answer for a
 //! plugin installed before origins were recorded, and it must never be able to break a listing.
 
-use super::ensure_owner_only;
+use super::{ensure_owner_only, unique, write_owner_only};
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// The directory holding one record per installed plugin. Dot-prefixed so it cannot collide with
 /// a plugin (an install name may not begin with a dot) and is skipped by discovery.
@@ -120,26 +120,28 @@ impl Origin {
     }
 
     /// The record's TOML form. Only [`Origin::Unknown`] has none — an unknown origin is the
-    /// *absence* of a record, so it is never written.
+    /// *absence* of a record, so it is never written. A value that cannot be rendered as a TOML
+    /// string costs its own field and no more, per [`push_field`].
     fn to_toml(&self) -> Option<String> {
         match self {
             Origin::Local { path, sha256 } => {
                 let mut s = String::from("kind = \"local\"\n");
                 if let Some(p) = path {
-                    s.push_str(&format!("path = \"{}\"\n", escape(p)));
+                    push_field(&mut s, "path", p);
                 }
                 if let Some(hash) = sha256 {
-                    s.push_str(&format!("sha256 = \"{}\"\n", escape(hash)));
+                    push_field(&mut s, "sha256", hash);
                 }
                 Some(s)
             }
             Origin::Store { store, url, sha256 } => {
-                let mut s = format!("kind = \"store\"\nstore = \"{}\"\n", escape(store));
+                let mut s = String::from("kind = \"store\"\n");
+                push_field(&mut s, "store", store);
                 if let Some(url) = url {
-                    s.push_str(&format!("url = \"{}\"\n", escape(url)));
+                    push_field(&mut s, "url", url);
                 }
                 if let Some(hash) = sha256 {
-                    s.push_str(&format!("sha256 = \"{}\"\n", escape(hash)));
+                    push_field(&mut s, "sha256", hash);
                 }
                 Some(s)
             }
@@ -247,40 +249,25 @@ fn path_of(layout: &crate::store::Layout, plugin: &str) -> PathBuf {
     dir(layout).join(format!("{plugin}.toml"))
 }
 
-/// Escape the two characters that would break a TOML basic string. Control characters are already
-/// excluded by the callers' own validation (a store URL, a store name, a hex hash); a local path
-/// is the one free-form field, and a control byte in it is dropped on read.
-fn escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// Write a file owner-readable/writable only, creating it fresh.
-fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-    f.write_all(bytes)
-        .map_err(|e| format!("cannot write {}: {e}", path.display()))
-}
-
-/// A per-call-unique suffix for the temp record, so two installs in one process never collide.
+/// Append one `key = "<value>"` line to a record, or nothing at all when the value cannot be
+/// rendered as a TOML string.
 ///
-/// A monotonic process-local counter — no clock or RNG.
-fn unique() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    SEQ.fetch_add(1, Ordering::Relaxed)
+/// Dropping the single field is what keeps the rest of the record readable. A local path is the one
+/// free-form value here — an install records the directory it was handed, which no gate constrains
+/// — and a newline in it would produce a record [`parse`] cannot read at all, costing the
+/// provenance *and* the install digest beside it. The read side already degrades an unprintable
+/// field to `None`, so refusing it on the way out is the same answer reached one step earlier.
+fn push_field(out: &mut String, key: &str, value: &str) {
+    if let Ok(quoted) = super::toml_quoted(value) {
+        out.push_str(&format!("{key} = {quoted}\n"));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::Layout;
+    use std::path::Path;
 
     fn layout(base: &Path) -> Layout {
         Layout::under(&base.join("sbx"))
@@ -389,6 +376,27 @@ mod tests {
                 store: "mine".to_string(),
                 url: None,
                 sha256: None,
+            }
+        );
+    }
+
+    #[test]
+    fn an_unserializable_field_is_dropped_and_the_record_survives() {
+        let tmp = crate::testutil::TmpDir::new();
+        let layout = layout(tmp.path());
+        // An install records the directory it was handed and nothing constrains that path, so a
+        // newline in it must cost the path alone — not the whole record, and with it the digest
+        // `integrity` reads back.
+        let origin = Origin::Local {
+            path: Some("/home/u/we\nird/kp".to_string()),
+            sha256: Some("d".repeat(64)),
+        };
+        record(&layout, "kp", &origin).unwrap();
+        assert_eq!(
+            read(&layout, "kp"),
+            Origin::Local {
+                path: None,
+                sha256: Some("d".repeat(64)),
             }
         );
     }

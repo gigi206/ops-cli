@@ -323,7 +323,7 @@ fn view_with_roots(
     // `current` in the render — the answer to "which of these am I in right now?". `None` when the
     // cwd cannot be canonicalized (it was deleted mid-run, or no cwd at all) — then no tree is
     // marked. Hashed the way [`sandbox::project_id`] hashes a launch's cwd.
-    let current_id = current_project_id();
+    let current_id = crate::current_project_id();
     let bases = [
         (
             "data",
@@ -360,16 +360,6 @@ fn view_with_roots(
             })
             .collect(),
     }
-}
-
-/// The project id of the current working directory, so `sbx path` can mark the tree you're in.
-///
-/// Best-effort: returns `None` when the cwd cannot be read or canonicalized (deleted mid-run, or
-/// no cwd), in which case no tree is marked `current`.
-fn current_project_id() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    let canonical = cwd.canonicalize().ok()?;
-    Some(sandbox::project_id(&canonical))
 }
 
 /// The set of project ids a running session holds, for the per-project `live` annotation. Reads

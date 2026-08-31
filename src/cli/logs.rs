@@ -27,7 +27,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use crate::sandbox::lens::Snapshot;
-use crate::{diag, help, resolve_session_target, session, store, style};
+use crate::{diag, help, layout_or_fail, live_sessions, resolve_session_target, style};
 
 /// How often a `--follow` view asks the session for what is new. Short enough to read as live,
 /// long enough that watching a busy agent is not itself a load.
@@ -90,18 +90,13 @@ pub(crate) fn run<E>(args: &[OsString], view: &LogView<E>) -> ExitCode {
         }
     }
 
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
-    let sessions = match session::Registry::at(layout.data_dir()).list() {
+    let sessions = match live_sessions(layout.data_dir()) {
         Ok(s) => s,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the session registry: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     let target = match resolve_session_target(&sessions, id, view.session_verb) {
         Ok(t) => t,
@@ -578,18 +573,13 @@ pub(crate) fn run_merged(args: &[OsString]) -> ExitCode {
         }
     }
 
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
-    let sessions = match session::Registry::at(layout.data_dir()).list() {
+    let sessions = match live_sessions(layout.data_dir()) {
         Ok(s) => s,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the session registry: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     let target = match resolve_session_target(&sessions, id, "logs") {
         Ok(t) => t,

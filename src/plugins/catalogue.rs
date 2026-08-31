@@ -208,6 +208,17 @@ pub(crate) fn dir_digest(root: &Path) -> Result<[u8; 32], String> {
     Ok(h.finalize().into())
 }
 
+/// [`dir_digest`] in the form every record stores it in: lowercase hex.
+///
+/// Both sides of every content comparison go through here — the `sha256` a publisher writes into a
+/// catalogue and an installer's origin record on the writing side, [`verify_entry`] and
+/// [`crate::plugins::integrity`] on the reading side. Hashing and encoding as one step is what
+/// keeps a comparison from being between two strings produced by two encoders that merely happen
+/// to agree.
+pub(crate) fn dir_digest_hex(root: &Path) -> Result<String, String> {
+    Ok(to_hex(&dir_digest(root)?))
+}
+
 fn collect_files(
     root: &Path,
     dir: &Path,
@@ -274,7 +285,7 @@ fn repo_rel(rel: &Path) -> Result<String, String> {
 /// the content half of the trust chain, checked after the signature gate. Fail-closed
 /// and named, so a mismatch points at the offending plugin.
 pub(crate) fn verify_entry(entry: &CatalogueEntry, root: &Path) -> Result<(), String> {
-    let got = to_hex(&dir_digest(root)?);
+    let got = dir_digest_hex(root)?;
     if got == entry.sha256 {
         Ok(())
     } else {
@@ -349,21 +360,30 @@ pub(crate) fn serialize_catalogue(cat: &Catalogue) -> Result<String, String> {
     let mut out = format!("rev = {}\n", cat.rev);
     for (name, entry) in &cat.plugins {
         out.push('\n');
-        out.push_str(&format!("[plugin.{}]\n", toml_quoted(name)?));
+        out.push_str(&format!("[plugin.{}]\n", super::toml_quoted(name)?));
         // The type is always written, even for a resolver: a signed listing should say what it
         // lists rather than leave a reader to infer it from which fields are present. The scheme
         // is written only where there is one, which is what keeps the bytes deterministic.
-        out.push_str(&format!("type = {}\n", toml_quoted(entry.kind.token())?));
+        out.push_str(&format!(
+            "type = {}\n",
+            super::toml_quoted(entry.kind.token())?
+        ));
         if let Some(scheme) = &entry.scheme {
-            out.push_str(&format!("scheme = {}\n", toml_quoted(scheme)?));
+            out.push_str(&format!("scheme = {}\n", super::toml_quoted(scheme)?));
         }
-        out.push_str(&format!("version = {}\n", toml_quoted(&entry.version)?));
+        out.push_str(&format!(
+            "version = {}\n",
+            super::toml_quoted(&entry.version)?
+        ));
         out.push_str(&format!(
             "description = {}\n",
-            toml_quoted(&entry.description)?
+            super::toml_quoted(&entry.description)?
         ));
-        out.push_str(&format!("path = {}\n", toml_quoted(&entry.path)?));
-        out.push_str(&format!("sha256 = {}\n", toml_quoted(&entry.sha256)?));
+        out.push_str(&format!("path = {}\n", super::toml_quoted(&entry.path)?));
+        out.push_str(&format!(
+            "sha256 = {}\n",
+            super::toml_quoted(&entry.sha256)?
+        ));
     }
     Ok(out)
 }
@@ -379,23 +399,6 @@ fn validate_free_text(field: &str, s: &str) -> Result<(), String> {
         )),
         None => Ok(()),
     }
-}
-
-/// Render a string as a TOML basic string (`"..."`), refusing any control character and escaping
-/// the two characters a basic string cannot carry raw (`\` and `"`). The same rules apply to a
-/// quoted bare key, so this renders both a `[plugin."<name>"]` key and a field value.
-fn toml_quoted(s: &str) -> Result<String, String> {
-    if let Some(bad) = s.chars().find(|c| c.is_control()) {
-        return Err(format!(
-            "value `{}` contains a control character (U+{:04X}) and cannot be serialized",
-            s.escape_default(),
-            bad as u32
-        ));
-    }
-    Ok(format!(
-        "\"{}\"",
-        s.replace('\\', "\\\\").replace('"', "\\\"")
-    ))
 }
 
 /// Decode a lowercase-hex string back to bytes, trimming surrounding ASCII whitespace

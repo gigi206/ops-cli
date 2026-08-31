@@ -599,8 +599,11 @@ fn warn_once(message: &str) {
     use std::sync::{Mutex, OnceLock};
     static SAID: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
     let said = SAID.get_or_init(|| Mutex::new(BTreeSet::new()));
-    // A poisoned lock is not a reason to lose a warning: recover the set and speak anyway.
-    let mut said = said.lock().unwrap_or_else(|e| e.into_inner());
+    // A poisoned lock is not a reason to lose a warning: the set is a record kept for a reader, and
+    // its only mutation is the single `insert` below, so an unwind cannot leave it half-written.
+    // That is the "recovers" half of `sandbox::locks`'s rule, which is where the choice is made
+    // rather than re-argued here.
+    let mut said = crate::sandbox::locks::locked(said);
     if said.insert(message.to_string()) {
         crate::diag::warn(message);
     }

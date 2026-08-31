@@ -51,9 +51,12 @@ pub(crate) enum ManageError {
     ListNeedsArray(String),
     /// `add`/`rm` was aimed at a key that holds a single value, not a list.
     NotAList(String),
-    /// A key on the way to the list holds a single value rather than a table, so the list cannot be
-    /// reached. `network = "deny"` under `network.allow` is the case worth a distinct message: the
-    /// posture has a table form, and the egress verb promotes it.
+    /// A key on the way to the leaf holds a single value rather than a table, so the leaf cannot be
+    /// reached. Every writing verb answers with it, because they share one descent
+    /// ([`parent_table_mut`]): `add`/`rm` on the way to a list, `set` on the way to a scalar.
+    ///
+    /// `network = "deny"` under `network.allow` is the case worth a distinct message: the posture
+    /// has a table form, and the egress verb promotes it.
     ParentNotTable(String, String),
     /// `add` was aimed at a `[network]` or `[proc]` rule list. Those have their own verbs, and those
     /// carry a posture matrix this generic path does not: an `allow` on a config with no posture
@@ -335,15 +338,9 @@ pub(crate) fn get(path: &Path, key: &str) -> Result<Option<String>, ManageError>
     let segments = split_key(key)?;
     let (parents, leaf) = segments.split_at(segments.len() - 1);
 
-    let mut table: &dyn TableLike = doc.as_table();
-    for seg in parents.iter().map(String::as_str) {
-        // Descend through both regular and inline tables, so a key inside `network = { ... }` is
-        // read, not misreported as absent.
-        match table.get(seg).and_then(Item::as_table_like) {
-            Some(t) => table = t,
-            None => return Ok(None),
-        }
-    }
+    let Some(table) = existing_parent(&doc, parents) else {
+        return Ok(None);
+    };
     match table.get(leaf[0].as_str()) {
         None => Ok(None),
         Some(Item::Value(v)) if v.is_str() => Ok(v.as_str().map(str::to_string)),
@@ -506,24 +503,7 @@ fn list_at<'d>(doc: &'d mut DocumentMut, key: &str) -> Result<&'d mut Array, Man
     let segments = split_key(key)?;
     let (parents, leaf) = segments.split_at(segments.len() - 1);
 
-    let mut table: &mut dyn TableLike = doc.as_table_mut();
-    for seg in parents.iter().map(String::as_str) {
-        if !table.contains_key(seg) {
-            // Implicit: a parent created only to reach the list must not render as an empty header
-            // of its own. Without this, `add network.groups.infra …` writes a bare `[network]`
-            // above `[network.groups]`, which reads like a posture someone meant to fill in.
-            let mut created = Table::new();
-            created.set_implicit(true);
-            table.insert(seg, Item::Table(created));
-        }
-        table = table
-            .get_mut(seg)
-            .and_then(Item::as_table_like_mut)
-            // The parent is a value, not a table — `network = "deny"` on the way to `network.allow`
-            // is the case that matters, and saying "the list is a single value" about the *leaf*
-            // would point at the wrong key entirely.
-            .ok_or_else(|| ManageError::ParentNotTable(seg.to_string(), key.to_string()))?;
-    }
+    let table = parent_table_mut(doc, parents, key)?;
     if !table.contains_key(leaf[0].as_str()) {
         table.insert(leaf[0].as_str(), Item::Value(Value::Array(Array::new())));
     }
@@ -672,27 +652,7 @@ fn put_value(doc: &mut DocumentMut, key: &str, v: Value) -> Result<bool, ManageE
     let segments = split_key(key)?;
     let (parents, leaf) = segments.split_at(segments.len() - 1);
 
-    let mut table: &mut dyn TableLike = doc.as_table_mut();
-    for seg in parents.iter().map(String::as_str) {
-        // Create a missing parent as a regular table; descend through an existing regular OR inline
-        // table, so a scalar can be set inside `network = { ... }` instead of failing as non-scalar.
-        // Implicit, so a parent created only to reach the leaf does not render as an empty header of
-        // its own: `set task.build.description …` wrote a bare `[task]` above `[task.build]`, which
-        // reads like a table someone meant to fill.
-        if !table.contains_key(seg) {
-            let mut created = Table::new();
-            created.set_implicit(true);
-            table.insert(seg, Item::Table(created));
-        }
-        table = table
-            .get_mut(seg)
-            .and_then(Item::as_table_like_mut)
-            // The obstacle is the parent, not the leaf: on `network = "deny"`, `set network.stats`
-            // must say that `network` is a bare posture, not that `network.stats` "is an array or
-            // table" — nothing of that name is in the file. Same variant, same wording as
-            // [`list_at`], so the two edit paths answer the same shape the same way.
-            .ok_or_else(|| ManageError::ParentNotTable(seg.to_string(), key.to_string()))?;
-    }
+    let table = parent_table_mut(doc, parents, key)?;
     match table.get_mut(leaf[0].as_str()) {
         // A new key: insert it with default formatting.
         None => {
@@ -835,15 +795,9 @@ pub(crate) fn unset(path: &Path, key: &str) -> Result<bool, ManageError> {
     let segments = split_key(key)?;
     let (parents, leaf) = segments.split_at(segments.len() - 1);
 
-    let mut table: &mut dyn TableLike = doc.as_table_mut();
-    for seg in parents.iter().map(String::as_str) {
-        // Descend through both regular and inline tables, so a key inside `network = { ... }` is
-        // removed, not reported as already-absent.
-        match table.get_mut(seg).and_then(Item::as_table_like_mut) {
-            Some(t) => table = t,
-            None => return Ok(false),
-        }
-    }
+    let Some(table) = existing_parent_mut(&mut doc, parents) else {
+        return Ok(false);
+    };
     let existed = table.remove(leaf[0].as_str()).is_some();
     if existed {
         if let Err(detail) = validate_layer(&doc) {
@@ -1389,6 +1343,69 @@ fn split_key(key: &str) -> Result<Vec<String>, ManageError> {
         return Err(ManageError::BadKey(key.to_string()));
     }
     Ok(segments)
+}
+
+/// Descend `parents` (a split key's segments up to its leaf) to the table that holds the leaf,
+/// creating any missing parent on the way. This is the descent every *writing* verb makes, written
+/// once so `set` and `add`/`rm` can never answer the same shape differently.
+///
+/// A created parent is **implicit**, so one made only to reach the leaf does not render as an empty
+/// header of its own: `add network.groups.infra …` would otherwise write a bare `[network]` above
+/// `[network.groups]`, and `set task.build.description …` a bare `[task]` above `[task.build]` —
+/// each of which reads like a table someone meant to fill in. An *existing* parent is descended
+/// through whether it is a regular or an inline table, so a leaf inside `network = { … }` is
+/// reached rather than refused as non-scalar.
+///
+/// `key` is the whole dotted key, carried only for the error, and the error names the **parent**:
+/// on a file holding `network = "deny"`, both `add network.allow …` and `set network.stats …` must
+/// say that `network` is a bare posture. Saying the leaf "is an array or table" would point at the
+/// wrong key entirely — nothing of that name is in the file.
+fn parent_table_mut<'d>(
+    doc: &'d mut DocumentMut,
+    parents: &[String],
+    key: &str,
+) -> Result<&'d mut dyn TableLike, ManageError> {
+    let mut table: &mut dyn TableLike = doc.as_table_mut();
+    for seg in parents.iter().map(String::as_str) {
+        if !table.contains_key(seg) {
+            let mut created = Table::new();
+            created.set_implicit(true);
+            table.insert(seg, Item::Table(created));
+        }
+        table = table
+            .get_mut(seg)
+            .and_then(Item::as_table_like_mut)
+            .ok_or_else(|| ManageError::ParentNotTable(seg.to_string(), key.to_string()))?;
+    }
+    Ok(table)
+}
+
+/// Descend `parents` to the table that holds the leaf without creating anything; `None` when a
+/// parent is absent or holds something that is not a table. Both regular and inline tables are
+/// descended, so a key inside `network = { … }` is found rather than reported as absent.
+///
+/// This is the descent the verbs that only *read* the leaf make — `get`, so a missing parent is
+/// "no such key" rather than a materialized table in a file the caller never asked to write.
+fn existing_parent<'d>(doc: &'d DocumentMut, parents: &[String]) -> Option<&'d dyn TableLike> {
+    let mut table: &dyn TableLike = doc.as_table();
+    for seg in parents.iter().map(String::as_str) {
+        table = table.get(seg).and_then(Item::as_table_like)?;
+    }
+    Some(table)
+}
+
+/// [`existing_parent`] for a verb that removes the leaf it finds (`unset`). Rust cannot be generic
+/// over mutability, so the same descent is spelled twice; a missing parent still means the key was
+/// already absent, and nothing is created on the way to discovering that.
+fn existing_parent_mut<'d>(
+    doc: &'d mut DocumentMut,
+    parents: &[String],
+) -> Option<&'d mut dyn TableLike> {
+    let mut table: &mut dyn TableLike = doc.as_table_mut();
+    for seg in parents.iter().map(String::as_str) {
+        table = table.get_mut(seg).and_then(Item::as_table_like_mut)?;
+    }
+    Some(table)
 }
 
 /// Parse the file into an editable document, treating an absent file as an empty one (so a `set`

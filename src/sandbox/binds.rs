@@ -1462,14 +1462,40 @@ fn materialize_etc(etc_dir: &Path, id: &Identity) -> io::Result<(PathBuf, PathBu
 /// read-only then sees either the complete old or complete new content — never a torn half-write —
 /// and, because the rename installs a fresh inode, a cage already bound to the prior inode keeps its
 /// own view rather than observing a later launch's overwrite.
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+///
+/// The temp is a **hidden** sibling, and that is not cosmetic: the router directory bound at
+/// [`OPEN_ROUTER_DIR`] leads the cage's `PATH`, so a temp named after the file it replaces would put
+/// a second resolvable name in front of the project's tools for as long as the write lasts.
+///
+/// The owner-only parent is created if it is missing, and **on either failure — the write (ENOSPC)
+/// or the rename — the temp is removed**, so a failed write leaves nothing behind. One answer to
+/// that question for every file sbx stages this way: the cage's synthetic identity and egress
+/// contract here, the per-project pin locks ([`super::flake`], [`super::nixhub`],
+/// [`super::prebuilt`]), the staged audio shim and the desktop mark.
+pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::fs::DirBuilder;
+    use std::os::unix::fs::DirBuilderExt;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
+    std::fs::write(&tmp, bytes).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
+}
+
+/// [`write_atomic`], skipped when the file already holds exactly `bytes` — which is the ordinary
+/// case for content that changes only across sbx releases (the staged audio shim, the desktop
+/// mark). Answers whether the file was written.
+pub(super) fn write_atomic_if_changed(path: &Path, bytes: &[u8]) -> io::Result<bool> {
+    if std::fs::read(path).is_ok_and(|on_disk| on_disk == bytes) {
+        return Ok(false);
+    }
+    write_atomic(path, bytes)?;
+    Ok(true)
 }
 
 /// Build a launch-ready [`SandboxSpec`] for `cwd` under sbx's `data_dir`. This is

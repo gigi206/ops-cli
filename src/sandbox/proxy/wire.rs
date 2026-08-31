@@ -3,6 +3,10 @@
 //! Pure, self-contained helpers the CONNECT/MITM and cleartext paths share: request-head
 //! parsing, request-line/authority splitting, byte-counting stream wrappers, and
 //! chunked-transfer decoding. None of these touch the proxy's policy or connection state.
+//!
+//! One of them, [`is_connection_bound_challenge`], is read by the HTTP/2 plane as well. It answers
+//! what an authentication challenge *means* rather than how a head is spelled, and both pools have
+//! to answer it the same way, so it lives here once instead of on each side of the version split.
 
 use super::*;
 
@@ -17,19 +21,20 @@ pub(super) fn head_expects_continue(head: &Head) -> bool {
 /// Whether two header names denote the same header for stripping: case-insensitive, and
 /// treating `_` and `-` as equivalent (some servers fold `X_API_KEY` onto `X-Api-Key`). So a
 /// client cannot dodge the strip-and-replace with an alternate spelling of a header sbx injects.
+///
+/// The folding maps one byte to one byte, so two names of different lengths can never normalize
+/// alike and the comparison is exact byte by byte. Normalizing into two buffers first — which is
+/// what this did — answered the same question at the price of two heap allocations per call, on a
+/// loop that runs once per client header per injected name of every forwarded request.
 pub(crate) fn header_name_eq(a: &str, b: &str) -> bool {
-    let norm = |s: &str| -> Vec<u8> {
-        s.bytes()
-            .map(|c| {
-                if c == b'_' {
-                    b'-'
-                } else {
-                    c.to_ascii_lowercase()
-                }
-            })
-            .collect()
+    let fold = |c: u8| {
+        if c == b'_' {
+            b'-'
+        } else {
+            c.to_ascii_lowercase()
+        }
     };
-    norm(a) == norm(b)
+    a.len() == b.len() && a.bytes().zip(b.bytes()).all(|(x, y)| fold(x) == fold(y))
 }
 
 /// Parse a head's bytes into its request (or status) line and headers. A non-UTF-8 or empty head is
@@ -548,10 +553,11 @@ pub(super) fn response_framing(head: &[u8], request_method: &str) -> BodyFraming
 ///   - the protocol version persists: HTTP/1.1 does by default, HTTP/1.0 only when it asks to;
 ///   - no `close` token in `Connection` — that token is the upstream announcing this is the last
 ///     response it will serve on the connection;
-///   - no `WWW-Authenticate` naming a **connection-bound** scheme (`NTLM`, `Negotiate`). Those bind
-///     an authenticated identity to the TCP connection rather than to the request, so handing the
-///     connection to a later request would hand it an authentication state it never asked for and
-///     cannot see. A proxy that injects credentials of its own has no business blurring that line.
+///   - no `WWW-Authenticate` naming a **connection-bound** scheme
+///     ([`is_connection_bound_challenge`]). Those bind an authenticated identity to the TCP
+///     connection rather than to the request, so handing the connection to a later request would
+///     hand it an authentication state it never asked for and cannot see. A proxy that injects
+///     credentials of its own has no business blurring that line.
 ///
 /// A head that will not parse is not reusable either: an unreadable head is exactly the case where
 /// nothing about the connection's state is known.
@@ -575,11 +581,7 @@ pub(super) fn response_keeps_alive(head: &[u8]) -> bool {
         .headers
         .iter()
         .filter(|(k, _)| k.eq_ignore_ascii_case("www-authenticate"))
-        .flat_map(|(_, v)| v.split(','))
-        .any(|challenge| {
-            let scheme = challenge.split_whitespace().next().unwrap_or("");
-            scheme.eq_ignore_ascii_case("ntlm") || scheme.eq_ignore_ascii_case("negotiate")
-        });
+        .any(|(_, v)| is_connection_bound_challenge(v));
     if connection_bound_auth {
         return false;
     }
@@ -588,6 +590,24 @@ pub(super) fn response_keeps_alive(head: &[u8]) -> bool {
         "HTTP/1.0" => connection_token("keep-alive"),
         _ => false,
     }
+}
+
+/// Whether one `WWW-Authenticate` value names a scheme that binds an authenticated identity to the
+/// **connection** rather than to the request: `NTLM` or `Negotiate`.
+///
+/// Both of the proxy's connection pools ask this, and neither may answer it differently. The
+/// HTTP/1.1 pool refuses to park such a connection ([`response_keeps_alive`]); the HTTP/2 tunnel
+/// stops sharing one, since a stream that inherited the connection would inherit an identity it
+/// never asked for and cannot see. Adding a third scheme changes what an authenticated connection
+/// is, so it is one edit here rather than one per protocol version.
+///
+/// A single header value may carry several challenges separated by commas, and a challenge's scheme
+/// is its first token, so the value is split before each leading token is read.
+pub(super) fn is_connection_bound_challenge(value: &str) -> bool {
+    value.split(',').any(|challenge| {
+        let scheme = challenge.split_whitespace().next().unwrap_or("");
+        scheme.eq_ignore_ascii_case("ntlm") || scheme.eq_ignore_ascii_case("negotiate")
+    })
 }
 
 /// A response head rewritten as the **client** should see it: every `Connection` and `Keep-Alive`

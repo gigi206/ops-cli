@@ -353,19 +353,10 @@ fn marks() -> &'static Marks {
 /// ordinary case: the file is only rewritten on the first launch after the mark itself changes.
 fn write_mark(path: &std::path::Path, bytes: &[u8]) -> Option<String> {
     let named = path.to_str()?.to_string();
-    if std::fs::read(path).is_ok_and(|on_disk| on_disk == bytes) {
-        return Some(named);
-    }
-    std::fs::create_dir_all(path.parent()?).ok()?;
-    // The pid makes the temporary name private to this process, so two launches writing the mark at
-    // once cannot interleave into one file. Whichever renames last wins, and both wrote the same
-    // bytes.
-    let tmp = path.with_extension(format!("png.{}", std::process::id()));
-    std::fs::write(&tmp, bytes).ok()?;
-    if std::fs::rename(&tmp, path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return None;
-    }
+    // Both properties are [`super::binds::write_atomic_if_changed`]'s: the temp sibling it renames
+    // is named by pid, so two launches writing the mark at once cannot interleave into one file
+    // (whichever renames last wins, and both wrote the same bytes).
+    super::binds::write_atomic_if_changed(path, bytes).ok()?;
     Some(named)
 }
 

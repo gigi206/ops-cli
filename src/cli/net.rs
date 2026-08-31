@@ -5,11 +5,10 @@
 //! their argument parsers and view models, and the whole egress-observability
 //! rendering layer (pending prompts, live flows, the log stream, rule/group tables,
 //! and drain/stats summaries). Cross-cutting domain and plumbing helpers — session
-//! record readers (`session_pids_*`, `pending_session_context`), the shared egress
-//! writers (`persist_egress_rule`, `egress_write_target`), the rule-write admission and its
-//! local-save trust gate (`open_rule_write`/`precheck_local_save`), and formatting shared with other
-//! families (`format_log_time`, `net_mode_word`, `short_rev`) — stay at the crate root
-//! and are reached from here via `crate::`.
+//! record readers (`session_pids_*`, `pending_session_context`), the shared egress writers
+//! (`persist_egress_rule`, `persist_removal`, `egress_write_target`), the local-save trust gate
+//! (`precheck_local_save`), and formatting shared with other families (`format_log_time`,
+//! `net_mode_word`, `short_rev`) — stay at the crate root and are reached from here via `crate::`.
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -18,12 +17,13 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use crate::{
-    RuleWrite, egress_data_dir, egress_write_target, fold_app_overlay, format_log_time,
-    interval_seconds, net_mode_word, open_rule_write, pending_session_context, persist_egress_rule,
-    precheck_local_save, session_app_of, session_pids_for_app, session_pids_for_project,
-    split_one_rule, split_scope, split_session_flags,
+    ALL_NEEDS_SESSION, SESSION_IGNORES_FILE_SCOPE, config_cwd, egress_dir_or_fail,
+    egress_write_target, fold_app_overlay, format_log_time, in_scope, interval_seconds,
+    net_mode_word, pending_session_context, persist_egress_rule, precheck_local_save,
+    removal_takes_no_session_flags, report_rule_write, session_app_of, session_pids_for_app,
+    session_pids_for_project, session_scope_pids, split_one_rule, split_scope, split_session_flags,
 };
-use crate::{allowlist, config, diag, help, sandbox, style, trust};
+use crate::{allowlist, config, diag, help, sandbox, style};
 
 /// `sbx net <subcommand>`: the interactive-egress namespace. `rules` lists the effective egress
 /// rules (optionally for one app), `allow`/`deny` persist a rule to a config file, `pending`
@@ -165,12 +165,9 @@ fn net_pending_list(args: &[OsString]) -> ExitCode {
             }
         }
     }
-    let data_dir = match egress_data_dir() {
+    let data_dir = match egress_dir_or_fail() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     let (sessions, context) = collect_pending(&data_dir, app.as_deref());
     let ctx_of = |pid: u32| context.iter().find(|(p, _, _)| *p == pid);
@@ -273,12 +270,9 @@ fn net_pending_watch(args: &[OsString]) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    let data_dir = match egress_data_dir() {
+    let data_dir = match egress_dir_or_fail() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     let pal = style::Palette::for_stream(is_tty);
     let (dim, r) = (pal.dim, pal.reset);
@@ -488,12 +482,9 @@ fn net_live(args: &[OsString]) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    let data_dir = match egress_data_dir() {
+    let data_dir = match egress_dir_or_fail() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     let pal = style::Palette::for_stream(is_tty);
     let (dim, r) = (pal.dim, pal.reset);
@@ -834,12 +825,9 @@ fn net_pending_answer(verdict: sandbox::control::Verdict, args: &[OsString]) -> 
         return ExitCode::from(2);
     }
 
-    let data_dir = match egress_data_dir() {
+    let data_dir = match egress_dir_or_fail() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     // `--app <name>` on the by-id path asserts the id belongs to that app. The id already names the
     // exact session, so this is a consistency check, not a filter: if the registry knows this session
@@ -941,12 +929,9 @@ fn net_pending_answer_all(
         sandbox::control::Verdict::Allow => "allowed",
         sandbox::control::Verdict::Deny => "denied",
     };
-    let data_dir = match egress_data_dir() {
+    let data_dir = match egress_dir_or_fail() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     let context = pending_session_context(&data_dir);
     // `--app <name>` scopes the drain to that app's session pids (from the registry); an unregistered
@@ -1124,12 +1109,9 @@ fn net_stats(args: &[OsString]) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let cwd = match std::env::current_dir() {
+    let cwd = match config_cwd() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the current directory: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     // The canonical project identity is exactly what `egress::start` writes into each session file's
     // `project=` header, so a read here matches what a launch recorded — no canonicalization drift.
@@ -1140,12 +1122,9 @@ fn net_stats(args: &[OsString]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let egress_dir = match egress_data_dir() {
+    let egress_dir = match egress_dir_or_fail() {
         Ok(d) => d.join("egress"),
-        Err(e) => {
-            diag::error(&format!("sbx: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
 
     if reset {
@@ -1331,19 +1310,7 @@ fn parse_log_args(args: &[OsString]) -> Result<LogView, String> {
                 v.with_headers = true;
             }
             Some("--follow") | Some("-f") => v.follow = true,
-            Some("-i") | Some("--interval") => {
-                let val = it.next().ok_or("`--interval` needs a value in seconds")?;
-                let secs: u64 = val.to_str().and_then(|s| s.parse().ok()).ok_or_else(|| {
-                    format!(
-                        "invalid interval `{}` — expected a whole number of seconds",
-                        val.to_string_lossy()
-                    )
-                })?;
-                if secs == 0 {
-                    return Err("interval must be at least 1 second".into());
-                }
-                v.interval_secs = secs;
-            }
+            Some("-i") | Some("--interval") => v.interval_secs = interval_seconds(it.next())?,
             Some("-a") | Some("--app") => {
                 let name = it.next().ok_or("`--app` needs an app name")?;
                 v.app = Some(name.to_string_lossy().into_owned());
@@ -1480,12 +1447,9 @@ fn net_logs(args: &[OsString]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let data_dir = match egress_data_dir() {
+    let data_dir = match egress_dir_or_fail() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     if view.follow {
@@ -2193,12 +2157,9 @@ fn net_rules(args: &[OsString]) -> ExitCode {
         }
     }
 
-    let cwd = match std::env::current_dir() {
+    let cwd = match config_cwd() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the current directory: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     // `--source session` is live runtime state, not config: query the running sessions for the rules
     // loaded into their live overlay, rather than reading the static config policy. Scoped to this
@@ -2475,94 +2436,29 @@ fn write_groups_fragment(path: &Path, fragment: &str, count: usize) -> ExitCode 
 }
 
 /// Keep every egress group a forced import is about to replace, and say what the incoming fragment
-/// no longer declares. Returns one warning per replaced group, for the caller to surface once the
-/// write succeeded.
+/// no longer declares — [`crate::keep_replaced_fragments`] with this family's nouns and exporter.
 ///
 /// A group is a key inside the shared global config, not a file of its own, so what stands in for a
 /// per-file copy is the fragment `sbx net groups export` already emits: the replaced group is
 /// written back out in the same portable form, as `<name>.group.replaced` beside the config, so
 /// re-declaring it is `sbx net groups import` on that file. The name is read as configuration by
 /// nothing (the loader reads `sbx.toml` and `apps/*.toml`).
-///
-/// Only a group whose entries actually CHANGE is kept: re-importing an identical fragment leaves no
-/// copy and reports nothing. An error here fails the import closed, before the write, so a group is
-/// never overwritten with no way back. The bundle importer does the same thing for the same reason
-/// — see `cli::bundle::keep_replaced_bundles`.
 fn keep_replaced_groups(
     config_path: &std::path::Path,
     incoming: &std::collections::BTreeMap<String, Vec<String>>,
     force: bool,
 ) -> Result<Vec<String>, String> {
-    if !force {
-        return Ok(Vec::new());
-    }
-    let Some(dir) = config_path.parent() else {
-        return Ok(Vec::new());
-    };
-    let (declared, _) = config::net_groups();
-    let mut notes = Vec::new();
-    for (name, new) in incoming {
-        let Some(old) = declared.get(name) else {
-            continue; // added, not replaced
-        };
-        let one = |entries: &Vec<String>| {
-            config::manage::export_net_groups(&std::collections::BTreeMap::from([(
-                name.clone(),
-                entries.clone(),
-            )]))
-        };
-        let (before, after) = (one(old), one(new));
-        if before == after {
-            continue;
-        }
-        let kept = dir.join(format!("{name}.group.replaced"));
-        crate::cli::keep_replaced_file(&kept, before.as_bytes()).map_err(|e| {
-            format!(
-                "cannot keep the group being replaced at {}: {e}",
-                kept.display()
-            )
-        })?;
-        notes.push(render_replaced_group(
-            name,
-            &crate::cli::settings_dropped_by(&before, &after),
-            &kept,
-        ));
-    }
-    Ok(notes)
-}
-
-/// The overwrite warning for one egress group: the entries its replacement no longer declares, and
-/// where the previous fragment is. A few are named in full (the point is to recognize one's own
-/// edit); beyond that the count stands in, because the kept fragment holds the rest.
-fn render_replaced_group(name: &str, dropped: &[String], kept: &std::path::Path) -> String {
-    const NAMED: usize = 3;
-    let kept = kept.display();
-    if dropped.is_empty() {
-        return format!(
-            "replaced egress group `{name}`, which differed only in layout — the previous fragment \
-             is kept at {kept}"
-        );
-    }
-    let named = dropped
-        .iter()
-        .take(NAMED)
-        .map(|l| format!("`{l}`"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let rest = dropped.len().saturating_sub(NAMED);
-    let more = if rest > 0 {
-        format!(" (and {rest} more)")
-    } else {
-        String::new()
-    };
-    format!(
-        "replaced egress group `{name}`, which declared {} the new one does not: {named}{more} — \
-         the previous fragment is kept at {kept}, so a per-machine entry can be read back and \
-         re-imported",
-        if dropped.len() == 1 {
-            "1 line".to_string()
-        } else {
-            format!("{} lines", dropped.len())
+    crate::keep_replaced_fragments(
+        config_path,
+        incoming,
+        || config::net_groups().0,
+        force,
+        "egress group",
+        "group",
+        |name, entries| {
+            Ok(config::manage::export_net_groups(
+                &std::collections::BTreeMap::from([(name.to_string(), entries.clone())]),
+            ))
         },
     )
 }
@@ -2596,12 +2492,9 @@ fn net_groups_import(args: &[OsString]) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let cwd = match std::env::current_dir() {
+    let cwd = match config_cwd() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the current directory: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     let path = match config::manage::scope_path(&config::manage::Scope::Global, &cwd) {
         Ok(p) => p,
@@ -2763,12 +2656,9 @@ fn render_net_groups(
 /// merged, deduped rules. No config read, no launch, no nix.
 fn net_rules_manual(cwd: &Path, app: Option<&str>, filter: Option<&str>, json: bool) -> ExitCode {
     use config::view::{NetRuleKind, NetRuleView, RuleSourceView};
-    let data_dir = match egress_data_dir() {
+    let data_dir = match egress_dir_or_fail() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     // Which sessions to query: `-a <app>` selects that app's session(s) (from the registry, across
     // projects — an app's live rules are the same wherever it runs); otherwise this project's
@@ -3023,10 +2913,7 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
         // `--session` writes no config file, so the file-scope flags do not apply — point at the
         // session-scope flags instead of silently ignoring a `--global` the user expected to matter.
         if parsed.scope_explicit {
-            diag::error(
-                "sbx: --session loads a live rule and writes no file, so --local/--global/-c do not \
-                 apply — use -a <app> or --all to scope the session(s)",
-            );
+            diag::error(SESSION_IGNORES_FILE_SCOPE);
             return ExitCode::from(2);
         }
         // A `@group` is expanded from the config at launch; the live overlay has no group vocabulary,
@@ -3038,50 +2925,32 @@ fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode
             );
             return ExitCode::from(2);
         }
-        let cwd = match std::env::current_dir() {
+        let cwd = match config_cwd() {
             Ok(d) => d,
-            Err(e) => {
-                diag::error(&format!("sbx: cannot read the current directory: {e}"));
-                return ExitCode::FAILURE;
-            }
+            Err(code) => return code,
         };
         return net_inject_session(list, &rule, all, parsed.app.as_deref(), &cwd);
     }
 
     // `--all` is a session-scope widener, meaningless for a config write (which targets one file).
     if all {
-        diag::error(
-            "sbx: --all only applies with --session (it widens a live rule to every session); a config \
-             write targets one file — drop --all",
-        );
+        diag::error(ALL_NEEDS_SESSION);
         return ExitCode::from(2);
     }
 
     // `sbx net allow|deny` resolves a `--local` scope against the cwd, as one expects of a command
     // run in a project.
-    let cwd = match std::env::current_dir() {
+    let cwd = match config_cwd() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the current directory: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
-    match persist_egress_rule(list, &rule, &parsed.scope, parsed.app.as_deref(), &cwd) {
-        Ok(message) => {
-            println!(
-                "{}",
-                style::prose(
-                    &message,
-                    &style::Palette::for_stream(std::io::stdout().is_terminal())
-                )
-            );
-            ExitCode::SUCCESS
-        }
-        Err((code, message)) => {
-            diag::error(&format!("sbx: {message}"));
-            ExitCode::from(code)
-        }
-    }
+    report_rule_write(persist_egress_rule(
+        list,
+        &rule,
+        &parsed.scope,
+        parsed.app.as_deref(),
+        &cwd,
+    ))
 }
 
 /// `sbx net unallow|undeny|unmute <rule> [--local|--global|-c <file>] [-a <app>]`: remove one egress
@@ -3102,38 +2971,24 @@ fn net_remove_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitC
         .iter()
         .any(|a| matches!(a.to_str(), Some("--session") | Some("--all")))
     {
-        diag::error(&format!(
-            "sbx: net {verb}: --session/--all do not apply — this removes a rule from a config file"
-        ));
+        diag::error(&removal_takes_no_session_flags("net", verb));
         return ExitCode::from(2);
     }
     let (parsed, rule) = match split_one_rule("net", verb, args) {
         Ok(v) => v,
         Err(code) => return code,
     };
-    let cwd = match std::env::current_dir() {
+    let cwd = match config_cwd() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the current directory: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
-    match persist_egress_removal(list, &rule, &parsed.scope, parsed.app.as_deref(), &cwd) {
-        Ok(message) => {
-            println!(
-                "{}",
-                style::prose(
-                    &message,
-                    &style::Palette::for_stream(std::io::stdout().is_terminal())
-                )
-            );
-            ExitCode::SUCCESS
-        }
-        Err((code, message)) => {
-            diag::error(&format!("sbx: {message}"));
-            ExitCode::from(code)
-        }
-    }
+    report_rule_write(persist_egress_removal(
+        list,
+        &rule,
+        &parsed.scope,
+        parsed.app.as_deref(),
+        &cwd,
+    ))
 }
 
 /// `sbx net allow|deny <rule> --session [-a <app>] [--all]`: load a rule into the **live overlay** of
@@ -3160,39 +3015,20 @@ fn net_inject_session(
         EgressList::Deny => "deny",
         EgressList::Mute => "mute",
     };
-    let data_dir = match egress_data_dir() {
+    let data_dir = match egress_dir_or_fail() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
-    // Two composing pid filters: the project (unless `--all` widens machine-wide) and the app (`-a`).
-    // A session must pass every active filter to receive the rule.
-    let project_pids = if all {
-        None
-    } else {
-        let canonical = match sandbox::project_identity(cwd) {
-            Ok((_, c)) => c,
-            Err(e) => {
-                diag::error(&format!(
-                    "sbx: cannot resolve the current project directory: {e}"
-                ));
-                return ExitCode::FAILURE;
-            }
-        };
-        Some(session_pids_for_project(&data_dir, &canonical))
+    let (project_pids, app_pids) = match session_scope_pids(&data_dir, all, app, cwd) {
+        Ok(filters) => filters,
+        Err(code) => return code,
     };
-    let app_pids = app.map(|name| session_pids_for_app(&data_dir, name));
 
     let context = pending_session_context(&data_dir);
     let mut loaded: Vec<u32> = Vec::new();
     let mut refused: Vec<u32> = Vec::new();
     for pid in sandbox::control::session_pids(&data_dir) {
-        if app_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
-            continue;
-        }
-        if project_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
+        if !in_scope(pid, &project_pids, &app_pids) {
             continue;
         }
         // A mute loads through the dedicated mute overlay (`REMEMBER MUTE`); allow/deny load a
@@ -3349,22 +3185,16 @@ fn net_pending_drain_and_save(
     }
     let local = matches!(scope, Scope::Local);
 
-    let data_dir = match egress_data_dir() {
+    let data_dir = match egress_dir_or_fail() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
 
     // For a `--local` save, resolve the current project up front — its canonical root scopes the drain
     // AND is the save base — and pre-flight the trust gate before the irreversible drain.
-    let cwd = match std::env::current_dir() {
+    let cwd = match config_cwd() {
         Ok(c) => c,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the current directory: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     let project_canonical = if local {
         if let Err((code, msg)) = precheck_local_save(&cwd) {
@@ -3395,8 +3225,7 @@ fn net_pending_drain_and_save(
     // Both filters must pass: `--app` and `--local` compose rather than override, so a session is
     // drained only when every active scope accepts it.
     let (answered, unsupported) = drain_sessions(&data_dir, verdict, session, |pid| {
-        app_pids.as_ref().is_none_or(|p| p.contains(&pid))
-            && project_pids.as_ref().is_none_or(|p| p.contains(&pid))
+        in_scope(pid, &project_pids, &app_pids)
     });
     // The flat host list the rule-writing below turns into rules, derived from what was answered
     // rather than accumulated a second time, so the two can never disagree about order.
@@ -3522,53 +3351,17 @@ fn persist_egress_removal(
     app: Option<&str>,
     base: &Path,
 ) -> Result<String, (u8, String)> {
-    use config::manage::{self, RemoveOutcome};
-    let (verb, noun) = removal_words(list);
     // A project `.sbx.toml` edit is trust-gated and re-trusted, exactly like the add path — removing
-    // a rule still rewrites the file, so it must not silently bless an untrusted one. The missing-
-    // store sentence is shorter here than on the add path, and stays so: it is user-visible.
-    let RuleWrite {
-        path,
-        app_key,
-        target,
-        store,
-    } = open_rule_write(
+    // a rule still rewrites the file, so it must not silently bless an untrusted one.
+    crate::persist_removal(
         "net",
-        verb,
-        "cannot determine the trust store (set XDG_STATE_HOME or HOME)",
+        removal_words(list),
+        rule,
         scope,
         app,
         base,
-    )?;
-    let gated = store.is_some();
-
-    let outcome =
-        manage::remove_egress_rule(&path, app_key, list, rule).map_err(|e| (2, e.to_string()))?;
-
-    match outcome {
-        RemoveOutcome::NotPresent => Ok(format!("{noun} {rule} was not in {target} — no change")),
-        RemoveOutcome::Removed => {
-            // Re-trust only after an actual change (the file bytes changed). Fail-safe ordering: a
-            // crash between the write and the trust leaves a correct-but-untrusted file the next
-            // launch drops — never a security hole.
-            if let Some(store) = &store {
-                trust::trust(store, &path).map_err(|e| {
-                    (
-                        1,
-                        format!(
-                            "removed the rule but could not re-trust {e} — run `sbx trust {}`",
-                            config::PROJECT_CONFIG
-                        ),
-                    )
-                })?;
-            }
-            let mut msg = format!("removed {noun} {rule} from {target}");
-            if gated {
-                msg.push_str(&format!("\nre-trusted {}", config::PROJECT_CONFIG));
-            }
-            Ok(msg)
-        }
-    }
+        |path, app_key| config::manage::remove_egress_rule(path, app_key, list, rule),
+    )
 }
 
 #[cfg(test)]
@@ -3581,17 +3374,22 @@ mod tests {
     #[test]
     fn the_group_overwrite_warning_names_a_few_losses_and_counts_the_rest() {
         let kept = std::path::Path::new("/config/sbx/ci.group.replaced");
-        let one = render_replaced_group("ci", &["\"{GET} https://x\",".to_string()], kept);
+        let one = crate::render_replaced_fragment(
+            "egress group",
+            "ci",
+            &["\"{GET} https://x\",".to_string()],
+            kept,
+        );
         assert!(one.contains("`ci`") && one.contains("1 line"), "{one}");
         assert!(one.contains("ci.group.replaced"), "{one}");
         let many: Vec<String> = (0..5).map(|i| format!("\"e{i}\",")).collect();
-        let lots = render_replaced_group("ci", &many, kept);
+        let lots = crate::render_replaced_fragment("egress group", "ci", &many, kept);
         assert!(
             lots.contains("5 lines") && lots.contains("(and 2 more)"),
             "{lots}"
         );
         // A group that differs only in layout still names where the previous fragment went.
-        let none = render_replaced_group("ci", &[], kept);
+        let none = crate::render_replaced_fragment("egress group", "ci", &[], kept);
         assert!(
             none.contains("only in layout") && none.contains(".replaced"),
             "{none}"

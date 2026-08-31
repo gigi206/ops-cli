@@ -88,6 +88,15 @@ pub(crate) fn redact_named(
     let mut out = buf.to_vec();
     let mut count = 0;
     for needle in order {
+        // A needle that does not occur is skipped rather than rebuilt around: the loop below would
+        // allocate a second full-size buffer, copy the whole of `out` into it and free the original
+        // to produce byte-identical bytes, once per needle. The usual case is that none of a
+        // launch's needles appears in the output at all, so this is the path that runs. An empty
+        // needle lands here too — `find_in` declines it — which is where its termination now comes
+        // from.
+        if needle.find_in(&out, 0).is_none() {
+            continue;
+        }
         let len = needle.as_bytes().len();
         let replacement = placeholder.render(needle.name()).into_bytes();
         let mut next = Vec::with_capacity(out.len());

@@ -7,7 +7,9 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use crate::{diag, format_age, help, sandbox, session, store, style, uptime_seconds};
+use crate::{
+    diag, format_age, help, layout_or_fail, live_sessions, sandbox, session, style, uptime_seconds,
+};
 
 /// `sbx session <subcommand>` (alias `sbx sessions`): the namespace grouping every operation on a
 /// live sandbox session — `ls` lists them, `attach` runs a shell or a command inside one, `stop`
@@ -67,18 +69,13 @@ fn session_mode(s: &session::Session) -> &'static str {
 /// the registry re-validates and prunes dead records as a side effect, so the
 /// list is always current without a daemon.
 fn list_sessions() -> ExitCode {
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
-    let sessions = match session::Registry::at(layout.data_dir()).list() {
+    let sessions = match live_sessions(layout.data_dir()) {
         Ok(s) => s,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the session registry: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     if sessions.is_empty() {
         println!("sbx: no active sandbox sessions.");
@@ -536,11 +533,9 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     let data_dir = layout.data_dir();
     let path = sandbox::detach_log_path(data_dir, parsed.id);

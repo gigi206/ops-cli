@@ -327,25 +327,7 @@ impl EgressStats {
         }
         let body = serialize(&self.project, self.app.as_deref(), tally);
         let seq = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
-        let tmp = self.path.with_extension(format!("tmp.{seq}"));
-        // Owner-only: the counters live under the 0700 egress dir, but tighten the file too.
-        let write = || -> io::Result<()> {
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            f.write_all(body.as_bytes())
-        };
-        // On ANY failure — open, write (e.g. ENOSPC), or rename — remove the temp, so a failed flush
-        // never leaks a `.tmp.<seq>` orphan that the aggregate read and `reset` both skip by name.
-        let result = write().and_then(|()| std::fs::rename(&tmp, &self.path));
-        if result.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        result
+        write_stats_file(&self.path, &seq.to_string(), &body)
     }
 }
 
@@ -584,15 +566,32 @@ pub(crate) fn compact(egress_dir: &Path, prune: bool) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(egress_dir) else {
         return Vec::new();
     };
+    // The files this pass may touch, by name alone — none of them read yet.
+    let finished: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("stats-") && !name.contains(".tmp.") && is_finished(&name) {
+                Some((name, entry.path()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    // A fold with no session file left to fold is a no-op, and learning that costs names alone. A
+    // rollup passes the filter above — it starts with `stats-`, and `is_finished` is true for it
+    // unconditionally — so without this pre-pass every launch reads and parses every rollup in the
+    // directory only to find each group already exactly its own file.
+    if !finished
+        .iter()
+        .any(|(name, _)| !name.starts_with(ROLLUP_PREFIX))
+    {
+        return Vec::new();
+    }
     // Group the finished files by the project+app they belong to, carrying their parsed counters.
     let mut groups: BTreeMap<(String, Option<String>), Group> = BTreeMap::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy().into_owned();
-        if !name.starts_with("stats-") || name.contains(".tmp.") || !is_finished(&name) {
-            continue;
-        }
-        let Ok(contents) = std::fs::read_to_string(entry.path()) else {
+    for (_, path) in finished {
+        let Ok(contents) = std::fs::read_to_string(&path) else {
             continue;
         };
         let Some(session) = parse(&contents) else {
@@ -601,7 +600,7 @@ pub(crate) fn compact(egress_dir: &Path, prune: bool) -> Vec<PathBuf> {
         let slot = groups
             .entry((session.project, session.app))
             .or_insert_with(|| (Vec::new(), Tally::default()));
-        slot.0.push(entry.path());
+        slot.0.push(path);
         slot.1.merge(&session.tally);
     }
 
@@ -634,9 +633,23 @@ pub(crate) fn compact(egress_dir: &Path, prune: bool) -> Vec<PathBuf> {
 /// Write a folded file atomically (temp + rename), so a reader never sees it half-written and an
 /// interrupted fold leaves the sources still standing.
 fn write_rollup(target: &Path, project: &str, app: Option<&str>, tally: &Tally) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     let body = serialize(project, app, tally);
-    let tmp = target.with_extension(format!("tmp.{}", std::process::id()));
+    write_stats_file(target, &std::process::id().to_string(), &body)
+}
+
+/// Write one counters file atomically: an owner-only temp sibling named `<target>.tmp.<suffix>`,
+/// then a rename over `target`, so a reader never sees a torn file and a crash mid-write leaves the
+/// previous good one in place. On ANY failure — open, write (e.g. ENOSPC), or rename — the temp is
+/// removed, so a failed write never leaks an orphan.
+///
+/// The `.tmp.` in that name is load-bearing: [`compact`], [`session_files`] and [`reset`] all skip
+/// the intermediates by it, so a writer that spelled its temp differently would have its orphans
+/// read back as session files. What the suffix carries is only what tells two writers apart — a
+/// per-instance sequence number for the session flush, the pid for the fold.
+fn write_stats_file(target: &Path, tmp_suffix: &str, body: &str) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = target.with_extension(format!("tmp.{tmp_suffix}"));
+    // Owner-only: the counters live under the 0700 egress dir, but tighten the file too.
     let write = || -> io::Result<()> {
         let mut f = std::fs::OpenOptions::new()
             .write(true)

@@ -515,6 +515,30 @@ impl CredentialSet {
             Form::Fixed { .. } => None,
         })
     }
+
+    /// Whether a response from `host` is scanned for a reflected credential before it is relayed
+    /// into the cage.
+    ///
+    /// A configured secret can only re-enter the cage by being *reflected* by a host an injection
+    /// targets (an echo or debug endpoint, or one that stores the credential and later returns it),
+    /// so the mask is scoped to exactly those hosts. Every other response — notably the large
+    /// built-in downloads — is relayed untouched, which is what keeps the scan off the traffic that
+    /// could never carry a reflection back.
+    ///
+    /// The empty-needle short-circuit is load-bearing rather than tidy: it is what keeps a launch
+    /// with no secrets from paying for the injection walk on every response it relays.
+    ///
+    /// Every inspected plane asks this one question of one function, because the answer decides
+    /// whether a secret crosses back into the cage: widening it (a `Subdomain` rule, which
+    /// [`names_exact_host`](super::names_exact_host) answers `false` for today) must widen it for
+    /// HTTP/1.1 and HTTP/2 together, and a plane left behind is a plane relaying the value in clear.
+    pub(crate) fn masks_reflection_for(&self, host: &str) -> bool {
+        !self.needles.is_empty()
+            && self
+                .injections
+                .iter()
+                .any(|inj| super::names_exact_host(host, Some(&inj.rule)))
+    }
 }
 
 /// The live credential state, shared by every consumer that scans or injects: the HTTP/1.1 path, the

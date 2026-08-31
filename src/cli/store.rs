@@ -16,7 +16,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::{diag, help, paths, sandbox, storage, store, style};
+use crate::{diag, help, layout_or_fail, paths, print_json, sandbox, storage, store, style};
 
 /// One top-level subtree of the data directory.
 #[derive(serde::Serialize)]
@@ -102,24 +102,18 @@ pub(crate) fn store_cmd(args: Vec<OsString>) -> ExitCode {
             }
         }
     }
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error("sbx store: cannot locate sbx's data directory.");
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     let mut view = build(layout.data_dir(), &layout.store_dir());
     view.volume = volume_view();
 
     if json {
-        return match serde_json::to_string_pretty(&view) {
-            Ok(s) => {
-                println!("{s}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                diag::error(&format!("sbx store: failed to serialize: {e}"));
-                ExitCode::FAILURE
-            }
-        };
+        if let Err(code) = print_json("store", &view) {
+            return code;
+        }
+        return ExitCode::SUCCESS;
     }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     print!("{}", render(&view, &pal));

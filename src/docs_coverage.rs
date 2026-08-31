@@ -879,7 +879,6 @@ const UNDOCUMENTED_MODULE_ITEMS: &[(&str, &str)] = &[
     ("cli/storage.rs", "storage_cmd"),
     ("cli/storage.rs", "up"),
     ("cli/task.rs", "RunOutputView"),
-    ("cli/task.rs", "layout_or_fail"),
     ("cli/task.rs", "listing_args"),
     ("cli/task.rs", "no_sessions"),
     ("cli/task.rs", "one_plane"),

@@ -176,20 +176,14 @@ pub(super) fn handle_cleartext(
             s
         }
         Err(_) => {
-            ctx.push_log(
+            return refuse_unreachable(
+                &mut client,
+                ctx,
                 crate::sandbox::control::Proto::Http,
                 &host,
                 port,
                 Some(method),
                 Some(&path),
-                crate::sandbox::control::LogVerdict::Error,
-                "upstream-unreachable",
-            );
-            return write_refusal(
-                &mut client,
-                "502 Bad Gateway",
-                "upstream-unreachable",
-                &format!("`{host}:{port}` is allowed but could not be reached"),
             );
         }
     };
@@ -248,14 +242,11 @@ pub(super) fn handle_cleartext(
         let _ = client.flush();
     }
     // Teed as it is relayed — a pass-through, so the forwarded stream is unchanged.
-    match &capture {
-        Some(c) => copy_exact(
-            &mut CaptureReader::new(&mut client, c.request_body_sink()),
-            &mut upstream,
-            body_len,
-        )?,
-        None => copy_exact(&mut client, &mut upstream, body_len)?,
-    }
+    copy_exact(
+        &mut tee_request_body(&mut client, capture.as_ref()),
+        &mut upstream,
+        body_len,
+    )?;
     flow.up.fetch_add(body_len, Ordering::Relaxed);
     upstream.flush().ok();
 
@@ -293,10 +284,7 @@ pub(super) fn handle_cleartext(
         ctx.set_status(allow_seq, code);
     }
     // Count upstream→client (`down`) through the body; the head was counted as it was relayed.
-    let response = CountingReader::new(FramedBody::new(up_br, framing), flow.down.clone());
-    let mut response: Box<dyn Read + '_> = match &capture {
-        Some(c) => Box::new(CaptureReader::new(response, c.response_sink())),
-        None => Box::new(response),
-    };
+    let counted = CountingReader::new(FramedBody::new(up_br, framing), flow.down.clone());
+    let mut response = tee_response(counted, capture.as_ref());
     pump_to_eof(&mut response, &mut client)
 }

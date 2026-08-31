@@ -198,7 +198,7 @@ mod websocket;
 mod wire;
 pub(crate) use ca::Ca;
 use ca::upstream_server_name;
-use capture::{CaptureGuard, CaptureReader};
+use capture::{CaptureGuard, tee_request_body, tee_response};
 use cleartext::handle_cleartext;
 use ctx::effective_policy;
 pub(crate) use ctx::{ProxyCtx, builtin_allow_rules, union_with_builtin};
@@ -850,6 +850,44 @@ fn acquire_upstream(
     connect_upstream(ip, port, host, ctx).map(|stream| (stream, false))
 }
 
+/// Refuse a request because the upstream the policy allowed could not be reached at all: an `error`
+/// line naming the host, and a `502` telling the agent that the refusal is a transport failure and
+/// not a verdict.
+///
+/// Every transport that opens an upstream of its own ends here — the two inspected-TLS planes
+/// through [`refuse_upstream`], [`handle_cleartext`] and [`splice_l4`] directly — because the reason
+/// token and the sentence beside it state one fact that does not depend on what carried the request.
+/// What genuinely differs is passed in: the `proto` the attempt is recorded under, and the request
+/// it belongs to, which a raw splice does not have (it refuses before any HTTP is spoken).
+///
+/// The HTTP/2 plane keeps its own refusal. It answers a stream with a header-only `502` carrying the
+/// reason and no body, so there is no sentence for it to share.
+fn refuse_unreachable<W: Write>(
+    w: &mut W,
+    ctx: &ProxyCtx,
+    proto: super::control::Proto,
+    host: &str,
+    port: u16,
+    method: Option<&str>,
+    target: Option<&str>,
+) -> io::Result<()> {
+    ctx.push_log(
+        proto,
+        host,
+        port,
+        method,
+        target,
+        super::control::LogVerdict::Error,
+        "upstream-unreachable",
+    );
+    write_refusal(
+        w,
+        "502 Bad Gateway",
+        "upstream-unreachable",
+        &format!("`{host}:{port}` is allowed but could not be reached"),
+    )
+}
+
 /// Refuse a request because its validated upstream could not be opened. Both shapes are a `502`,
 /// with distinct reasons so "the host is down" reads differently from "its certificate was
 /// rejected". Written straight to whichever client leg asked — the decrypted tunnel on the
@@ -864,10 +902,18 @@ fn refuse_upstream<W: Write>(
     err: UpstreamError,
 ) -> io::Result<()> {
     let (reason, detail) = match err {
-        UpstreamError::Unreachable => (
-            "upstream-unreachable",
-            format!("`{host}:{port}` is allowed but could not be reached"),
-        ),
+        // The shape every plane can produce, answered in the one place that spells it.
+        UpstreamError::Unreachable => {
+            return refuse_unreachable(
+                w,
+                ctx,
+                super::control::Proto::Https,
+                host,
+                port,
+                Some(method),
+                Some(target),
+            );
+        }
         UpstreamError::CertRejected => (
             "upstream-cert-rejected",
             format!(
@@ -1530,16 +1576,12 @@ fn relay_response_head<R: BufRead, W: Write>(
         // offer of another request when it does not, and in both cases with the upstream's hop
         // headers dropped rather than passed off as this leg's. An interim `1xx` is not a head sbx
         // speaks about, so it crosses untouched.
-        let mut wire = match client_leg {
+        let wire = match client_leg {
             _ if !final_head => head.clone(),
             ClientLeg::MayReuse { idle } if persistent => offer_reuse_in_head(&head, idle),
             ClientLeg::Close | ClientLeg::MayReuse { .. } => force_close_in_head(&head),
         };
-        if !redactions.is_empty() {
-            redact_in_place(&mut wire, redactions);
-        }
-        client.write_all(&wire)?;
-        down.fetch_add(wire.len() as u64, Ordering::Relaxed);
+        write_head_to_client(wire, client, down, redactions)?;
         if interim {
             client.flush().ok();
             continue;
@@ -1553,6 +1595,32 @@ fn relay_response_head<R: BufRead, W: Write>(
             persistent,
         });
     }
+}
+
+/// Write one response head to the client leg: masked on the way out, and counted as it crosses.
+///
+/// `wire` is the head **as the client should see it**, and shaping it is the caller's because the
+/// answer is not the same for every head. A final head carries sbx's own statement about this leg
+/// ([`ClientLeg`]); an interim `1xx` and a WebSocket `101` cross with the upstream's own hop headers,
+/// because neither is a head sbx speaks about — rewriting a `101` would undo the very upgrade the
+/// two peers just agreed.
+///
+/// What is *not* the caller's is the pair below it. A head that reaches the cage unmasked is a
+/// reflected credential re-entering it, and the counter has to measure what was written rather than
+/// what arrived, since the two differ by exactly the rewrite. Both were spelled out again by the
+/// upgrade relay, which had quietly lost them; they belong to every head this proxy relays.
+fn write_head_to_client<W: Write>(
+    mut wire: Vec<u8>,
+    client: &mut W,
+    down: &AtomicU64,
+    redactions: &[SecretNeedle],
+) -> io::Result<()> {
+    if !redactions.is_empty() {
+        redact_in_place(&mut wire, redactions);
+    }
+    client.write_all(&wire)?;
+    down.fetch_add(wire.len() as u64, Ordering::Relaxed);
+    Ok(())
 }
 
 /// What one relayed response head left behind — see [`relay_response_head`].

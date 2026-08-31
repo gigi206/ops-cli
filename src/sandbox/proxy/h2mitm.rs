@@ -23,8 +23,8 @@ use super::capture::CapBuf;
 use super::inject::{HeaderLookup, RequestFacts, pairs_for as injection_values};
 use super::{
     AskPosture, ProxyCtx, SIGNER_REFUSED, SecretNeedle, StatKind, carries_secret, decide_https,
-    header_name_eq, matching_injection_ids, redact_in_place, resolve_checked,
-    signer_refusal_message, upstream_server_name,
+    header_name_eq, is_connection_bound_challenge, matching_injection_ids, redact_in_place,
+    resolve_checked, signer_refusal_message, upstream_server_name,
 };
 use crate::allowlist::{self, Rule};
 use crate::sandbox::control::{HttpVer, LogVerdict, Proto, RpcKind};
@@ -666,17 +666,10 @@ async fn relay(
         c.push_response(&capture_response_head(rparts.status, &rparts.headers));
     }
 
-    // Response-side leak backstop: a configured secret can only re-enter the cage by being
-    // *reflected* by a host an injection targets (an echo/debug endpoint, or one that stores and
-    // later returns the credential). So mask the reflected value out — but only for a response
-    // from such a host (parity with the HTTP/1.1 `masks_reflection`); every other response
-    // streams untouched (no scan cost, and the mutate-on-match is confined to the one host the
-    // reflection threat lives on).
-    let masks_reflection = !creds.needles.is_empty()
-        && creds
-            .injections
-            .iter()
-            .any(|inj| super::names_exact_host(host, Some(&inj.rule)));
+    // Response-side leak backstop, scoped to a host an injection targets. It is the HTTP/1.1
+    // planes' question asked of the same function (`CredentialSet::masks_reflection_for`), so
+    // parity here is structural rather than maintained by hand.
+    let masks_reflection = creds.masks_reflection_for(host);
     if masks_reflection {
         redact_header_map(&mut rparts.headers, &creds.needles);
     }
@@ -938,9 +931,20 @@ async fn relay_body_redacting(
         if let Some(cap) = &cap {
             cap.push(&chunk);
         }
-        let mut buf = chunk.to_vec();
-        redact_in_place(&mut buf, needles);
-        let sent = send_masked(&mut dst, buf).await?;
+        // Copy only a frame that has something to change. `redact_in_place` writes into an owned
+        // buffer, so a frame with no occurrence in it was copied whole — a 16 KiB memcpy per DATA
+        // frame — only to be handed back unaltered. The scan that decides is one pass of the same
+        // prebuilt finders the masking would have run anyway, and the no-match frame, which is
+        // nearly every frame (the premise of a reflection backstop is that reflection is rare), now
+        // relays exactly as the unmasked path relays it: the `Bytes` split under flow control, no
+        // copy at all.
+        let sent = if needles.iter().any(|n| n.find_in(&chunk, 0).is_some()) {
+            let mut buf = chunk.to_vec();
+            redact_in_place(&mut buf, needles);
+            send_masked(&mut dst, buf).await?
+        } else {
+            send_granted(&mut dst, chunk).await? == len
+        };
         // Return the consumed receive-window for the original chunk so the sender keeps sending.
         let _ = src.flow_control().release_capacity(len);
         if !sent {
@@ -998,6 +1002,15 @@ fn head_carries_secret(
 /// trailer of an injection-target host.
 fn redact_header_map(headers: &mut http::HeaderMap, needles: &[SecretNeedle]) {
     for value in headers.values_mut() {
+        // A value carrying nothing to mask is left exactly as it arrived: the copy and the
+        // `HeaderValue` round trip below are the price of changing a value, and almost no value of
+        // almost any response has to change.
+        if !needles
+            .iter()
+            .any(|n| n.find_in(value.as_bytes(), 0).is_some())
+        {
+            continue;
+        }
         let mut bytes = value.as_bytes().to_vec();
         redact_in_place(&mut bytes, needles);
         if let Ok(v) = http::HeaderValue::from_bytes(&bytes) {
@@ -1151,6 +1164,10 @@ async fn open_upstream(
 /// for the same reason this one stops sharing it — handing it to a later stream would hand that
 /// stream an identity it never asked for and cannot see.
 ///
+/// Which schemes those are is [`is_connection_bound_challenge`]'s to say, so the two pools cannot
+/// come to disagree about it; what is decided here is only that an HTTP/2 challenge is read out of
+/// an HPACK header map rather than off a parsed head.
+///
 /// The streams already riding it are not recalled, which is inherent to multiplexing and true of any
 /// HTTP/2 client. What this stops is every stream after.
 fn binds_identity_to_the_connection(headers: &http::HeaderMap) -> bool {
@@ -1158,11 +1175,7 @@ fn binds_identity_to_the_connection(headers: &http::HeaderMap) -> bool {
         .get_all("www-authenticate")
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .any(|challenge| {
-            let scheme = challenge.split_whitespace().next().unwrap_or("");
-            scheme.eq_ignore_ascii_case("ntlm") || scheme.eq_ignore_ascii_case("negotiate")
-        })
+        .any(is_connection_bound_challenge)
 }
 
 /// Refuse a stream over its upstream: the client gets the `502` and its reason, and the exchange

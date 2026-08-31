@@ -16,7 +16,7 @@ use crate::cli::confirm::{
     render_config_same_value, render_config_unchanged, render_config_write, render_list_edit,
     render_list_unchanged, render_trusted_whole_file,
 };
-use crate::{ScopeArgs, config_cwd, net_mode_word, short_rev, split_scope};
+use crate::{ScopeArgs, config_cwd, net_mode_word, print_json, short_rev, split_scope};
 use crate::{config, diag, help, style, trust};
 
 /// `sbx config [--json]` and the management verbs `get`/`set`/`unset`/`path`. With no verb it
@@ -159,12 +159,9 @@ fn config_show(args: &[OsString]) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let cwd = match std::env::current_dir() {
+    let cwd = match config_cwd() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the current directory: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
 
     // `--app <name>` focuses on one app's *effective* configuration with provenance, instead of the
@@ -184,12 +181,8 @@ fn config_show(args: &[OsString]) -> ExitCode {
         // The whole resolved model, warnings and all, as one JSON document — already exhaustive
         // (every app's rules in full), so `--details` is moot here whatever order the flags came.
         // Nothing goes to stderr — stdout stays pure JSON, the contract a consuming tool relies on.
-        match serde_json::to_string_pretty(&view) {
-            Ok(doc) => println!("{doc}"),
-            Err(e) => {
-                diag::error(&format!("sbx: cannot serialize the configuration: {e}"));
-                return ExitCode::FAILURE;
-            }
+        if let Err(code) = print_json("config", &view) {
+            return code;
         }
         return ExitCode::SUCCESS;
     }
@@ -223,12 +216,8 @@ fn config_show_app(cwd: &Path, name: &str, json: bool, details: bool) -> ExitCod
     };
 
     if json {
-        match serde_json::to_string_pretty(&view) {
-            Ok(doc) => println!("{doc}"),
-            Err(e) => {
-                diag::error(&format!("sbx: cannot serialize the app configuration: {e}"));
-                return ExitCode::FAILURE;
-            }
+        if let Err(code) = print_json("config show --app", &view) {
+            return code;
         }
         return ExitCode::SUCCESS;
     }
@@ -3419,10 +3408,45 @@ mod tests {
         );
     }
 
-    /// A representative resolved view: an untrusted project that withholds a `nix:` package and its
-    /// mise file, a project-pinned base channel (with a locked revision) beside the default engine,
-    /// and an allowlist carrying a deny rule. Built by hand so the render tests need no I/O.
-    fn sample_config_view() -> config::view::ConfigView {
+    /// One declared app at an inert default, named `name` and running a command of the same name —
+    /// the counterpart of `blank_config_view` for the nested app view, so an app a test builds
+    /// carries only the fields that test is about.
+    fn blank_app_view(name: &str) -> config::view::AppView {
+        use config::view::*;
+        AppView {
+            open: vec![],
+            service: vec![],
+            provisions: Vec::new(),
+            fs_deny: Vec::new(),
+            fs_readonly: Vec::new(),
+            fs_scan: Vec::new(),
+            ssh_agent: Vec::new(),
+            name: name.into(),
+            cmd: Some(name.into()),
+            home_scope: "global (shared across projects)".into(),
+            env: vec![],
+            binds: vec![],
+            packages: vec![],
+            network: None,
+            gui: None,
+            gpu: None,
+            allow_insecure_http: None,
+            audio: None,
+            dbus: None,
+            forward: vec![],
+            seccomp: vec![],
+            devices: vec![],
+            limits: None,
+            secrets: vec![],
+            notes: vec![],
+        }
+    }
+
+    /// Every field of a resolved view at an inert default: the shape a render test that cares about
+    /// one section starts from, so a field added to `ConfigView` lands in one place here rather than
+    /// in every literal. `sample_config_view` and the section tests set only what they are about,
+    /// and struct-update syntax still fails to compile on a new field — in exactly one spot.
+    fn blank_config_view() -> config::view::ConfigView {
         use config::view::*;
         ConfigView {
             timezone: "UTC".to_string(),
@@ -3440,61 +3464,23 @@ mod tests {
             notify_origin: Default::default(),
             ssh_agent_confirm: false,
             cwd: "/proj".into(),
-            env: vec![EnvVar {
-                key: "EDITOR".into(),
-                value: "vim".into(),
-                layer: Some(ProvenanceView::Project),
-            }],
-            binds: vec![BindView {
-                path: "/data".into(),
-                writable: false,
-                layer: Some(ProvenanceView::Global),
-            }],
-            packages: vec![PackageView {
-                name: "jq".into(),
-                backend: "nix".into(),
-                locator: "jq".into(),
-                realised: "host-side, durable".into(),
-                trusted: false,
-                withheld_reason: Some("the project is untrusted".into()),
-                pinned_rev: None,
-            }],
-            mise: Some(MiseView {
-                name: ".mise.toml".into(),
-                trusted: false,
-                withheld_reason: Some("the project is untrusted".into()),
-            }),
+            env: vec![],
+            binds: vec![],
+            packages: vec![],
+            mise: None,
             tools: ToolsView::default(),
             nixpkgs: ChannelView {
-                source: "nixos-23.11".into(),
-                origin: "project pin".into(),
-                locked_rev: Some("9ae611a455b90cf061d8f332b977e387bda8e1ca".into()),
+                source: "nixos-unstable".into(),
+                origin: "default".into(),
+                locked_rev: None,
             },
             engine: ChannelView {
                 source: "nixos-unstable".into(),
                 origin: "default".into(),
                 locked_rev: None,
             },
-            network: NetworkView::Allowlist {
-                default_action: config::view::NetDefaultView::Deny,
-                ask_timeout: None,
-                ask_notice: None,
-                allow: vec!["github.com".into()],
-                deny: vec!["evil.com".into()],
-                mute: vec![],
-                http2: vec![],
-                capture: "off".to_string(),
-                capture_max_kb: None,
-                websocket_secret: "warn".to_string(),
-                pool: true,
-                ca_roots: true,
-                dns_cache_ttl: None,
-                idle_timeout: None,
-                max_connections: None,
-                body_max_mb: None,
-                builtin: vec!["cache.nixos.org".into()],
-            },
-            network_origin: ProvenanceView::Project,
+            network: NetworkView::Shared,
+            network_origin: ProvenanceView::Default,
             egress_stats: true,
             redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
             redact_min_len_origin: Default::default(),
@@ -3523,6 +3509,65 @@ mod tests {
             secrets: vec![],
             apps: vec![],
             warnings: vec![],
+        }
+    }
+
+    /// A representative resolved view: an untrusted project that withholds a `nix:` package and its
+    /// mise file, a project-pinned base channel (with a locked revision) beside the default engine,
+    /// and an allowlist carrying a deny rule. Built by hand so the render tests need no I/O.
+    fn sample_config_view() -> config::view::ConfigView {
+        use config::view::*;
+        ConfigView {
+            env: vec![EnvVar {
+                key: "EDITOR".into(),
+                value: "vim".into(),
+                layer: Some(ProvenanceView::Project),
+            }],
+            binds: vec![BindView {
+                path: "/data".into(),
+                writable: false,
+                layer: Some(ProvenanceView::Global),
+            }],
+            packages: vec![PackageView {
+                name: "jq".into(),
+                backend: "nix".into(),
+                locator: "jq".into(),
+                realised: "host-side, durable".into(),
+                trusted: false,
+                withheld_reason: Some("the project is untrusted".into()),
+                pinned_rev: None,
+            }],
+            mise: Some(MiseView {
+                name: ".mise.toml".into(),
+                trusted: false,
+                withheld_reason: Some("the project is untrusted".into()),
+            }),
+            nixpkgs: ChannelView {
+                source: "nixos-23.11".into(),
+                origin: "project pin".into(),
+                locked_rev: Some("9ae611a455b90cf061d8f332b977e387bda8e1ca".into()),
+            },
+            network: NetworkView::Allowlist {
+                default_action: config::view::NetDefaultView::Deny,
+                ask_timeout: None,
+                ask_notice: None,
+                allow: vec!["github.com".into()],
+                deny: vec!["evil.com".into()],
+                mute: vec![],
+                http2: vec![],
+                capture: "off".to_string(),
+                capture_max_kb: None,
+                websocket_secret: "warn".to_string(),
+                pool: true,
+                ca_roots: true,
+                dns_cache_ttl: None,
+                idle_timeout: None,
+                max_connections: None,
+                body_max_mb: None,
+                builtin: vec!["cache.nixos.org".into()],
+            },
+            network_origin: ProvenanceView::Project,
+            ..blank_config_view()
         }
     }
 
@@ -4302,34 +4347,11 @@ mod tests {
         use config::view::*;
         let p = style::Palette::plain();
         let app = AppView {
-            open: vec![],
-            service: vec![],
             provisions: vec![AppProvisionView {
                 bundle: "demo-agent".into(),
                 cmd: "npm install -g demo".into(),
             }],
-            fs_deny: Vec::new(),
-            fs_readonly: Vec::new(),
-            fs_scan: Vec::new(),
-            ssh_agent: Vec::new(),
-            name: "demo-app".into(),
-            cmd: Some("demo-app".into()),
-            home_scope: "global (shared across projects)".into(),
-            env: vec![],
-            binds: vec![],
-            packages: vec![],
-            network: None,
-            gui: None,
-            gpu: None,
-            allow_insecure_http: None,
-            audio: None,
-            dbus: None,
-            forward: vec![],
-            seccomp: vec![],
-            devices: vec![],
-            limits: None,
-            secrets: vec![],
-            notes: vec![],
+            ..blank_app_view("demo-app")
         };
         let listed = apps_section(std::slice::from_ref(&app), &p, false).expect("one app");
         assert!(
@@ -4357,31 +4379,8 @@ mod tests {
         use config::view::*;
         let p = style::Palette::plain();
         let app = |name: &str, limits: Option<AppLimitsView>| AppView {
-            open: vec![],
-            service: vec![],
-            provisions: Vec::new(),
-            fs_deny: Vec::new(),
-            fs_readonly: Vec::new(),
-            fs_scan: Vec::new(),
-            ssh_agent: Vec::new(),
-            name: name.into(),
-            cmd: Some(name.into()),
-            home_scope: "global (shared across projects)".into(),
-            env: vec![],
-            binds: vec![],
-            packages: vec![],
-            network: None,
-            gui: None,
-            gpu: None,
-            allow_insecure_http: None,
-            audio: None,
-            dbus: None,
-            forward: vec![],
-            seccomp: vec![],
-            devices: vec![],
             limits,
-            secrets: vec![],
-            notes: vec![],
+            ..blank_app_view(name)
         };
         let mut view = sample_config_view();
         view.apps = vec![
@@ -4421,23 +4420,6 @@ mod tests {
         use config::view::*;
         let rev = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
         let view = ConfigView {
-            timezone: "UTC".to_string(),
-            timezone_origin: Default::default(),
-            open: vec![],
-            service: vec![],
-            plugins: vec![],
-            fs_deny: Vec::new(),
-            tasks: Vec::new(),
-            fs_origin: Default::default(),
-            fs_readonly: Vec::new(),
-            fs_scan: Vec::new(),
-            fs_scan_max_kb: None,
-            notify: Default::default(),
-            notify_origin: Default::default(),
-            ssh_agent_confirm: false,
-            cwd: "/proj".into(),
-            env: vec![],
-            binds: vec![],
             packages: vec![
                 PackageView {
                     name: "pinned-tool".into(),
@@ -4458,59 +4440,7 @@ mod tests {
                     pinned_rev: None,
                 },
             ],
-            mise: None,
-            tools: ToolsView::default(),
-            nixpkgs: ChannelView {
-                source: "nixos-unstable".into(),
-                origin: "default".into(),
-                locked_rev: None,
-            },
-            engine: ChannelView {
-                source: "nixos-unstable".into(),
-                origin: "default".into(),
-                locked_rev: None,
-            },
-            network: NetworkView::Shared,
-            network_origin: ProvenanceView::Default,
-            egress_stats: true,
-            redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
-            redact_min_len_origin: Default::default(),
-            proc: Default::default(),
-            proc_origin: Default::default(),
-            gui: GuiView::None,
-            gui_origin: ProvenanceView::Default,
-            gpu: false,
-            allow_insecure_http: false,
-            audio: false,
-            dbus: false,
-            gpu_origin: ProvenanceView::Default,
-            allow_insecure_http_origin: ProvenanceView::Default,
-            audio_origin: ProvenanceView::Default,
-            dbus_origin: ProvenanceView::Default,
-            forward: vec![],
-            forward_origin: ProvenanceView::Default,
-            seccomp: vec![],
-            seccomp_origin: ProvenanceView::Default,
-            devices: vec![],
-            devices_origin: ProvenanceView::Default,
-            ssh_agent: vec![],
-            brokers: Vec::new(),
-            ssh_agent_origin: Default::default(),
-            limits: Default::default(),
-            secrets: vec![],
             apps: vec![AppView {
-                open: vec![],
-                service: vec![],
-                provisions: Vec::new(),
-                fs_deny: Vec::new(),
-                fs_readonly: Vec::new(),
-                fs_scan: Vec::new(),
-                ssh_agent: Vec::new(),
-                name: "demo-app".into(),
-                cmd: Some("demo-app".into()),
-                home_scope: "global (shared across projects)".into(),
-                env: vec![],
-                binds: vec![],
                 packages: vec![PackageView {
                     name: "pinned-tool".into(),
                     backend: "flake".into(),
@@ -4520,20 +4450,9 @@ mod tests {
                     withheld_reason: None,
                     pinned_rev: Some(rev.into()),
                 }],
-                network: None,
-                gui: None,
-                gpu: None,
-                allow_insecure_http: None,
-                audio: None,
-                dbus: None,
-                forward: vec![],
-                seccomp: vec![],
-                devices: vec![],
-                limits: None,
-                secrets: vec![],
-                notes: vec![],
+                ..blank_app_view("demo-app")
             }],
-            warnings: vec![],
+            ..blank_config_view()
         };
         let out = render_config(&view, &style::Palette::plain(), false);
         assert!(
@@ -4564,78 +4483,7 @@ mod tests {
         // a profile's app-overlay allowlist surfaces what `sbx app <name>` can actually reach.
         use config::view::*;
         let view = ConfigView {
-            timezone: "UTC".to_string(),
-            timezone_origin: Default::default(),
-            open: vec![],
-            service: vec![],
-            plugins: vec![],
-            fs_deny: Vec::new(),
-            tasks: Vec::new(),
-            fs_origin: Default::default(),
-            fs_readonly: Vec::new(),
-            fs_scan: Vec::new(),
-            fs_scan_max_kb: None,
-            notify: Default::default(),
-            notify_origin: Default::default(),
-            ssh_agent_confirm: false,
-            cwd: "/proj".into(),
-            env: vec![],
-            binds: vec![],
-            packages: vec![],
-            mise: None,
-            tools: ToolsView::default(),
-            nixpkgs: ChannelView {
-                source: "nixos-unstable".into(),
-                origin: "default".into(),
-                locked_rev: None,
-            },
-            engine: ChannelView {
-                source: "nixos-unstable".into(),
-                origin: "default".into(),
-                locked_rev: None,
-            },
-            network: NetworkView::Shared,
-            network_origin: ProvenanceView::Default,
-            egress_stats: true,
-            redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
-            redact_min_len_origin: Default::default(),
-            proc: Default::default(),
-            proc_origin: Default::default(),
-            gui: GuiView::None,
-            gui_origin: ProvenanceView::Default,
-            gpu: false,
-            allow_insecure_http: false,
-            audio: false,
-            dbus: false,
-            gpu_origin: ProvenanceView::Default,
-            allow_insecure_http_origin: ProvenanceView::Default,
-            audio_origin: ProvenanceView::Default,
-            dbus_origin: ProvenanceView::Default,
-            forward: vec![],
-            forward_origin: ProvenanceView::Default,
-            seccomp: vec![],
-            seccomp_origin: ProvenanceView::Default,
-            devices: vec![],
-            devices_origin: ProvenanceView::Default,
-            ssh_agent: vec![],
-            brokers: Vec::new(),
-            ssh_agent_origin: Default::default(),
-            limits: Default::default(),
-            secrets: vec![],
             apps: vec![AppView {
-                open: vec![],
-                service: vec![],
-                provisions: Vec::new(),
-                fs_deny: Vec::new(),
-                fs_readonly: Vec::new(),
-                fs_scan: Vec::new(),
-                ssh_agent: Vec::new(),
-                name: "demo-app".into(),
-                cmd: Some("demo-app".into()),
-                home_scope: "global (shared across projects)".into(),
-                env: vec![],
-                binds: vec![],
-                packages: vec![],
                 network: Some(AppNetworkView::Allowlist {
                     default_action: config::view::NetDefaultView::Deny,
                     ask_timeout: None,
@@ -4644,19 +4492,9 @@ mod tests {
                     deny: vec!["github.com/secret".into()],
                     builtin: vec!["cache.nixos.org".into()],
                 }),
-                gui: None,
-                gpu: None,
-                allow_insecure_http: None,
-                audio: None,
-                dbus: None,
-                forward: vec![],
-                seccomp: vec![],
-                devices: vec![],
-                limits: None,
-                secrets: vec![],
-                notes: vec![],
+                ..blank_app_view("demo-app")
             }],
-            warnings: vec![],
+            ..blank_config_view()
         };
 
         // Default: a compact count, both numbers present even at zero deny, no expanded rule.
@@ -4703,97 +4541,17 @@ mod tests {
         // with or without `--details` — the default render is enough to pin them.
         use config::view::*;
         let app = |name: &str, network: Option<AppNetworkView>, gui: Option<GuiView>| AppView {
-            open: vec![],
-            service: vec![],
-            provisions: Vec::new(),
-            fs_deny: Vec::new(),
-            fs_readonly: Vec::new(),
-            fs_scan: Vec::new(),
-            ssh_agent: Vec::new(),
-            name: name.into(),
-            cmd: Some(name.into()),
-            home_scope: "global (shared across projects)".into(),
-            env: vec![],
-            binds: vec![],
-            packages: vec![],
             network,
             gui,
-            gpu: None,
-            allow_insecure_http: None,
-            audio: None,
-            dbus: None,
-            forward: vec![],
-            seccomp: vec![],
-            devices: vec![],
-            limits: None,
-            secrets: vec![],
-            notes: vec![],
+            ..blank_app_view(name)
         };
         let view = ConfigView {
-            timezone: "UTC".to_string(),
-            timezone_origin: Default::default(),
-            open: vec![],
-            service: vec![],
-            plugins: vec![],
-            fs_deny: Vec::new(),
-            tasks: Vec::new(),
-            fs_origin: Default::default(),
-            fs_readonly: Vec::new(),
-            fs_scan: Vec::new(),
-            fs_scan_max_kb: None,
-            notify: Default::default(),
-            notify_origin: Default::default(),
-            ssh_agent_confirm: false,
-            cwd: "/proj".into(),
-            env: vec![],
-            binds: vec![],
-            packages: vec![],
-            mise: None,
-            tools: ToolsView::default(),
-            nixpkgs: ChannelView {
-                source: "nixos-unstable".into(),
-                origin: "default".into(),
-                locked_rev: None,
-            },
-            engine: ChannelView {
-                source: "nixos-unstable".into(),
-                origin: "default".into(),
-                locked_rev: None,
-            },
-            network: NetworkView::Shared,
-            network_origin: ProvenanceView::Default,
-            egress_stats: true,
-            redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
-            redact_min_len_origin: Default::default(),
-            proc: Default::default(),
-            proc_origin: Default::default(),
-            gui: GuiView::None,
-            gui_origin: ProvenanceView::Default,
-            gpu: false,
-            allow_insecure_http: false,
-            audio: false,
-            dbus: false,
-            gpu_origin: ProvenanceView::Default,
-            allow_insecure_http_origin: ProvenanceView::Default,
-            audio_origin: ProvenanceView::Default,
-            dbus_origin: ProvenanceView::Default,
-            forward: vec![],
-            forward_origin: ProvenanceView::Default,
-            seccomp: vec![],
-            seccomp_origin: ProvenanceView::Default,
-            devices: vec![],
-            devices_origin: ProvenanceView::Default,
-            ssh_agent: vec![],
-            brokers: Vec::new(),
-            ssh_agent_origin: Default::default(),
-            limits: Default::default(),
-            secrets: vec![],
             apps: vec![
                 app("shared-app", Some(AppNetworkView::Shared), None),
                 app("none-app", Some(AppNetworkView::Isolated), None),
                 app("gui-app", None, Some(GuiView::Wayland)),
             ],
-            warnings: vec![],
+            ..blank_config_view()
         };
 
         let out = render_config(&view, &style::Palette::plain(), false);
@@ -4821,88 +4579,7 @@ mod tests {
         // profile's credential surfaces in `sbx config` (the baseline `secrets` section is empty).
         use config::view::*;
         let view = ConfigView {
-            timezone: "UTC".to_string(),
-            timezone_origin: Default::default(),
-            open: vec![],
-            service: vec![],
-            plugins: vec![],
-            fs_deny: Vec::new(),
-            tasks: Vec::new(),
-            fs_origin: Default::default(),
-            fs_readonly: Vec::new(),
-            fs_scan: Vec::new(),
-            fs_scan_max_kb: None,
-            notify: Default::default(),
-            notify_origin: Default::default(),
-            ssh_agent_confirm: false,
-            cwd: "/proj".into(),
-            env: vec![],
-            binds: vec![],
-            packages: vec![],
-            mise: None,
-            tools: ToolsView::default(),
-            nixpkgs: ChannelView {
-                source: "nixos-unstable".into(),
-                origin: "default".into(),
-                locked_rev: None,
-            },
-            engine: ChannelView {
-                source: "nixos-unstable".into(),
-                origin: "default".into(),
-                locked_rev: None,
-            },
-            network: NetworkView::Shared,
-            network_origin: ProvenanceView::Default,
-            egress_stats: true,
-            redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
-            redact_min_len_origin: Default::default(),
-            proc: Default::default(),
-            proc_origin: Default::default(),
-            gui: GuiView::None,
-            gui_origin: ProvenanceView::Default,
-            gpu: false,
-            allow_insecure_http: false,
-            audio: false,
-            dbus: false,
-            gpu_origin: ProvenanceView::Default,
-            allow_insecure_http_origin: ProvenanceView::Default,
-            audio_origin: ProvenanceView::Default,
-            dbus_origin: ProvenanceView::Default,
-            forward: vec![],
-            forward_origin: ProvenanceView::Default,
-            seccomp: vec![],
-            seccomp_origin: ProvenanceView::Default,
-            devices: vec![],
-            devices_origin: ProvenanceView::Default,
-            ssh_agent: vec![],
-            brokers: Vec::new(),
-            ssh_agent_origin: Default::default(),
-            limits: Default::default(),
-            secrets: vec![],
             apps: vec![AppView {
-                open: vec![],
-                service: vec![],
-                provisions: Vec::new(),
-                fs_deny: Vec::new(),
-                fs_readonly: Vec::new(),
-                fs_scan: Vec::new(),
-                ssh_agent: Vec::new(),
-                name: "demo-app".into(),
-                cmd: Some("demo-app".into()),
-                home_scope: "global (shared across projects)".into(),
-                env: vec![],
-                binds: vec![],
-                packages: vec![],
-                network: None,
-                gui: None,
-                gpu: None,
-                allow_insecure_http: None,
-                audio: None,
-                dbus: None,
-                forward: vec![],
-                seccomp: vec![],
-                devices: vec![],
-                limits: None,
                 secrets: vec![
                     SecretView {
                         header: "x-api-key".into(),
@@ -4917,9 +4594,9 @@ mod tests {
                         sources: "env DEMO_TOKEN".into(),
                     },
                 ],
-                notes: vec![],
+                ..blank_app_view("demo-app")
             }],
-            warnings: vec![],
+            ..blank_config_view()
         };
 
         // Default: a compact count, no destination or source expanded.
@@ -4956,75 +4633,7 @@ mod tests {
         // profile's overlay env/binds surface, mirroring the baseline `env`/`binds` sections.
         use config::view::*;
         let view = ConfigView {
-            timezone: "UTC".to_string(),
-            timezone_origin: Default::default(),
-            open: vec![],
-            service: vec![],
-            plugins: vec![],
-            fs_deny: Vec::new(),
-            tasks: Vec::new(),
-            fs_origin: Default::default(),
-            fs_readonly: Vec::new(),
-            fs_scan: Vec::new(),
-            fs_scan_max_kb: None,
-            notify: Default::default(),
-            notify_origin: Default::default(),
-            ssh_agent_confirm: false,
-            cwd: "/proj".into(),
-            env: vec![],
-            binds: vec![],
-            packages: vec![],
-            mise: None,
-            tools: ToolsView::default(),
-            nixpkgs: ChannelView {
-                source: "nixos-unstable".into(),
-                origin: "default".into(),
-                locked_rev: None,
-            },
-            engine: ChannelView {
-                source: "nixos-unstable".into(),
-                origin: "default".into(),
-                locked_rev: None,
-            },
-            network: NetworkView::Shared,
-            network_origin: ProvenanceView::Default,
-            egress_stats: true,
-            redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
-            redact_min_len_origin: Default::default(),
-            proc: Default::default(),
-            proc_origin: Default::default(),
-            gui: GuiView::None,
-            gui_origin: ProvenanceView::Default,
-            gpu: false,
-            allow_insecure_http: false,
-            audio: false,
-            dbus: false,
-            gpu_origin: ProvenanceView::Default,
-            allow_insecure_http_origin: ProvenanceView::Default,
-            audio_origin: ProvenanceView::Default,
-            dbus_origin: ProvenanceView::Default,
-            forward: vec![],
-            forward_origin: ProvenanceView::Default,
-            seccomp: vec![],
-            seccomp_origin: ProvenanceView::Default,
-            devices: vec![],
-            devices_origin: ProvenanceView::Default,
-            ssh_agent: vec![],
-            brokers: Vec::new(),
-            ssh_agent_origin: Default::default(),
-            limits: Default::default(),
-            secrets: vec![],
             apps: vec![AppView {
-                open: vec![],
-                service: vec![],
-                provisions: Vec::new(),
-                fs_deny: Vec::new(),
-                fs_readonly: Vec::new(),
-                fs_scan: Vec::new(),
-                ssh_agent: Vec::new(),
-                name: "demo-app".into(),
-                cmd: Some("demo-app".into()),
-                home_scope: "global (shared across projects)".into(),
                 env: vec![
                     AppEnvVar {
                         key: "DEMO_API_KEY".into(),
@@ -5040,21 +4649,9 @@ mod tests {
                     writable: false,
                     layer: None,
                 }],
-                packages: vec![],
-                network: None,
-                gui: None,
-                gpu: None,
-                allow_insecure_http: None,
-                audio: None,
-                dbus: None,
-                forward: vec![],
-                seccomp: vec![],
-                devices: vec![],
-                limits: None,
-                secrets: vec![],
-                notes: vec![],
+                ..blank_app_view("demo-app")
             }],
-            warnings: vec![],
+            ..blank_config_view()
         };
 
         // Default: compact counts, no values or paths expanded.
@@ -5091,77 +4688,7 @@ mod tests {
         use config::view::*;
         let rev = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
         let view = ConfigView {
-            timezone: "UTC".to_string(),
-            timezone_origin: Default::default(),
-            open: vec![],
-            service: vec![],
-            plugins: vec![],
-            fs_deny: Vec::new(),
-            tasks: Vec::new(),
-            fs_origin: Default::default(),
-            fs_readonly: Vec::new(),
-            fs_scan: Vec::new(),
-            fs_scan_max_kb: None,
-            notify: Default::default(),
-            notify_origin: Default::default(),
-            ssh_agent_confirm: false,
-            cwd: "/proj".into(),
-            env: vec![],
-            binds: vec![],
-            packages: vec![],
-            mise: None,
-            tools: ToolsView::default(),
-            nixpkgs: ChannelView {
-                source: "nixos-unstable".into(),
-                origin: "default".into(),
-                locked_rev: None,
-            },
-            engine: ChannelView {
-                source: "nixos-unstable".into(),
-                origin: "default".into(),
-                locked_rev: None,
-            },
-            network: NetworkView::Shared,
-            network_origin: ProvenanceView::Default,
-            egress_stats: true,
-            redact_min_len: crate::sandbox::redact::MIN_LEN_DEFAULT,
-            redact_min_len_origin: Default::default(),
-            proc: Default::default(),
-            proc_origin: Default::default(),
-            gui: GuiView::None,
-            gui_origin: ProvenanceView::Default,
-            gpu: false,
-            allow_insecure_http: false,
-            audio: false,
-            dbus: false,
-            gpu_origin: ProvenanceView::Default,
-            allow_insecure_http_origin: ProvenanceView::Default,
-            audio_origin: ProvenanceView::Default,
-            dbus_origin: ProvenanceView::Default,
-            forward: vec![],
-            forward_origin: ProvenanceView::Default,
-            seccomp: vec![],
-            seccomp_origin: ProvenanceView::Default,
-            devices: vec![],
-            devices_origin: ProvenanceView::Default,
-            ssh_agent: vec![],
-            brokers: Vec::new(),
-            ssh_agent_origin: Default::default(),
-            limits: Default::default(),
-            secrets: vec![],
             apps: vec![AppView {
-                open: vec![],
-                service: vec![],
-                provisions: Vec::new(),
-                fs_deny: Vec::new(),
-                fs_readonly: Vec::new(),
-                fs_scan: Vec::new(),
-                ssh_agent: Vec::new(),
-                name: "demo-app".into(),
-                cmd: Some("demo-app".into()),
-                home_scope: "global (shared across projects)".into(),
-                env: vec![],
-                binds: vec![],
                 packages: vec![
                     PackageView {
                         name: "admitted-tool".into(),
@@ -5191,20 +4718,9 @@ mod tests {
                         pinned_rev: Some(rev.into()),
                     },
                 ],
-                network: None,
-                gui: None,
-                gpu: None,
-                allow_insecure_http: None,
-                audio: None,
-                dbus: None,
-                forward: vec![],
-                seccomp: vec![],
-                devices: vec![],
-                limits: None,
-                secrets: vec![],
-                notes: vec![],
+                ..blank_app_view("demo-app")
             }],
-            warnings: vec![],
+            ..blank_config_view()
         };
 
         // Default: one compact line — the withheld marker and the flake pin inline, no full lines.

@@ -139,63 +139,37 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     // provenance is re-keyed from the raw declared path to the canonical one as we go,
     // so a lookup against the displayed (canonical) path resolves.
     let sbx_roots = sbx_control_plane_roots();
+    // The canonical project root, because the bind paths are canonical: a symlinked project root
+    // would otherwise never match its own binds.
+    let project = cwd.canonicalize().ok();
     let declared = std::mem::take(&mut resolved.binds);
     let raw_layer = std::mem::take(&mut resolved.bind_layer);
-    let mut canon_binds: Vec<Bind> = Vec::with_capacity(declared.len());
     let mut canon_layer = BTreeMap::new();
-    for bind in declared {
-        let Some(canon) = canonicalize_one(&bind.path, &mut resolved.warnings) else {
-            continue;
-        };
-        // A read-write bind overlapping sbx's own control plane is either forced read-only (a bind
-        // at or under a root — fail closed: writing there is host-side code execution or a forged
-        // trust/config, beyond the accepted self-harm class) or kept read-write with its
-        // control-plane paths pinned in place by the launcher (a bind that merely contains a root).
-        let writable = control_plane_mode(
-            canon.as_path(),
-            bind.writable,
-            &sbx_roots,
-            &mut resolved.warnings,
-        );
-        if let Some(layer) = raw_layer.get(&bind.path) {
-            canon_layer.insert(canon.clone(), *layer);
-        }
-        // Merge by canonical path: the last declaration of a path wins (project over global),
-        // updated in place so a destination is never mounted twice — matching how `merge_app`
-        // folds an app's binds, so `sbx config` shows exactly what the launch mounts.
-        if let Some(existing) = canon_binds.iter_mut().find(|b| b.path == canon) {
-            existing.writable = writable;
-        } else {
-            canon_binds.push(Bind {
-                path: canon,
-                writable,
-            });
-        }
-    }
-    // Nesting warnings once per effective bind (after dedup, so the reported mode is the one the
-    // launch will use): a bind that nests with a structural mount will not behave as declared (a
-    // descendant is shadowed, an ancestor over-exposes). Trusted-only field, so this warns
-    // without dropping the bind.
-    // Compared against the *canonical* project, because the bind paths above are canonical: a
-    // symlinked project root would otherwise never match its own binds.
-    let project = cwd.canonicalize().ok();
-    for bind in &canon_binds {
-        if let Some(w) = crate::sandbox::structural_nesting_warning(
-            &bind.path,
-            bind.writable,
-            project.as_deref(),
-        ) {
-            resolved.warnings.push(w);
-        }
-    }
+    let canon_binds = canonicalize_binds(
+        declared,
+        &sbx_roots,
+        project.as_deref(),
+        Some(LayerRekey {
+            declared: &raw_layer,
+            canonical: &mut canon_layer,
+        }),
+        &mut resolved.warnings,
+    );
     resolved.binds = canon_binds;
     resolved.bind_layer = canon_layer;
 
-    // Each app's binds are canonicalized the same way, into that app's own warnings — so an
-    // app overlay also advertises only the binds the launch would actually make.
+    // Each app's binds go through the same fold, into that app's own warnings — so an app overlay
+    // also advertises only the binds the launch would actually make. No re-keying: the per-layer
+    // provenance map is the baseline's.
     for app in resolved.apps.values_mut() {
         let declared = std::mem::take(&mut app.binds);
-        app.binds = canonicalize_binds(declared, &sbx_roots, project.as_deref(), &mut app.warnings);
+        app.binds = canonicalize_binds(
+            declared,
+            &sbx_roots,
+            project.as_deref(),
+            None,
+            &mut app.warnings,
+        );
     }
 
     // I/O-level notes (unsafe/unparseable files) come first, then the gating notes.
@@ -229,16 +203,37 @@ fn canonicalize_one(p: &Path, warnings: &mut Vec<String>) -> Option<PathBuf> {
     }
 }
 
+/// The per-layer bind provenance, re-keyed as its binds are canonicalized: `declared` is the map as
+/// the layers wrote it (keyed by the declared path), `canonical` receives the same entry under the
+/// canonical path, so a lookup against the *displayed* bind resolves.
+///
+/// The two travel together because neither is any use alone — a re-key needs both ends — and a
+/// caller that has no per-layer map to carry (an app overlay, a `--bind` override) passes no
+/// [`LayerRekey`] at all rather than a pair of empty maps.
+pub(super) struct LayerRekey<'a> {
+    declared: &'a BTreeMap<PathBuf, Provenance>,
+    canonical: &'a mut BTreeMap<PathBuf, Provenance>,
+}
+
 /// Canonicalize each bind source, dropping with a warning any that cannot be resolved; resolving a
 /// read-write bind that overlaps an sbx control-plane root (forced read-only when it is at or under
 /// one, kept read-write with its control-plane paths pinned when it merely contains one — see
 /// [`control_plane_mode`]); de-duplicating by canonical path (last wins); and warning (without
-/// dropping) any whose destination nests with a structural mount. The same treatment the baseline
-/// binds get, so an app overlay advertises exactly what its launch would mount.
+/// dropping) any whose destination nests with a structural mount.
+///
+/// The one definition of that fold, for the baseline binds, each app overlay's binds and the
+/// `--bind` overrides alike — so an app overlay advertises exactly what its launch would mount, and
+/// a change to how a bind overlapping the control plane is treated cannot land on one of the three
+/// and miss the others.
+///
+/// `project` is the **canonical** project root (the bind paths here are canonical, so a symlinked
+/// root would otherwise never match its own binds), and `layer` re-keys the caller's per-layer
+/// provenance as the canonical paths are produced.
 pub(super) fn canonicalize_binds(
     binds: Vec<Bind>,
     roots: &[PathBuf],
     project: Option<&Path>,
+    mut layer: Option<LayerRekey<'_>>,
     warnings: &mut Vec<String>,
 ) -> Vec<Bind> {
     let mut out: Vec<Bind> = Vec::with_capacity(binds.len());
@@ -246,7 +241,19 @@ pub(super) fn canonicalize_binds(
         let Some(canon) = canonicalize_one(&bind.path, warnings) else {
             continue;
         };
+        // A read-write bind overlapping sbx's own control plane is either forced read-only (a bind
+        // at or under a root — fail closed: writing there is host-side code execution or a forged
+        // trust/config, beyond the accepted self-harm class) or kept read-write with its
+        // control-plane paths pinned in place by the launcher (a bind that merely contains a root).
         let writable = control_plane_mode(canon.as_path(), bind.writable, roots, warnings);
+        if let Some(rekey) = layer.as_mut()
+            && let Some(provenance) = rekey.declared.get(&bind.path).copied()
+        {
+            rekey.canonical.insert(canon.clone(), provenance);
+        }
+        // Merge by canonical path: the last declaration of a path wins (project over global),
+        // updated in place so a destination is never mounted twice — matching how `merge_app`
+        // folds an app's binds, so `sbx config` shows exactly what the launch mounts.
         if let Some(existing) = out.iter_mut().find(|b| b.path == canon) {
             existing.writable = writable;
         } else {
@@ -256,6 +263,10 @@ pub(super) fn canonicalize_binds(
             });
         }
     }
+    // Nesting warnings once per effective bind (after dedup, so the reported mode is the one the
+    // launch will use): a bind that nests with a structural mount will not behave as declared (a
+    // descendant is shadowed, an ancestor over-exposes). Trusted-only field, so this warns without
+    // dropping the bind.
     for bind in &out {
         if let Some(w) =
             crate::sandbox::structural_nesting_warning(&bind.path, bind.writable, project)

@@ -265,9 +265,61 @@ fn interval_seconds(value: Option<&OsString>) -> Result<u64, String> {
 /// Resolve the working directory, mapping a failure to an error exit. Shared by the verbs.
 fn config_cwd() -> Result<PathBuf, ExitCode> {
     std::env::current_dir().map_err(|e| {
-        eprintln!("sbx: cannot read the current directory: {e}");
+        diag::error(&format!("sbx: cannot read the current directory: {e}"));
         ExitCode::FAILURE
     })
+}
+
+/// The project id of the current working directory — the name the runtime tree of the project you
+/// are standing in carries — so a listing can mark that tree and a removal can refuse it. The cwd is
+/// hashed the way a launch hashes its own ([`sandbox::project_id`]), so the two always agree about
+/// which tree is this project's. Best-effort: `None` when the cwd cannot be read or canonicalized
+/// (deleted mid-run, or no cwd), in which case nothing is marked and nothing is refused.
+fn current_project_id() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let canonical = cwd.canonicalize().ok()?;
+    Some(sandbox::project_id(&canonical))
+}
+
+/// Resolve sbx's on-disk layout, mapping an unresolvable data directory to an error exit. Shared by
+/// every verb that reads or writes under the data directory: one condition deserves one sentence,
+/// and the remedy — the variables that decide where the directory is — has to be in it.
+fn layout_or_fail() -> Result<store::Layout, ExitCode> {
+    store::Layout::from_env().ok_or_else(|| {
+        diag::error(
+            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
+        );
+        ExitCode::FAILURE
+    })
+}
+
+/// The live sessions the registry holds, mapping an unreadable registry to an error exit — the read
+/// every session-scoped verb (`sbx logs`, `sbx proc`, `sbx session`, `sbx fs`) opens with. Takes the
+/// data directory rather than a [`store::Layout`] so the callers that resolved it through
+/// [`egress_data_dir`] reach the same failure text, and so the layout stays alive at the call site,
+/// which needs it after the read.
+fn live_sessions(data_dir: &Path) -> Result<Vec<session::Session>, ExitCode> {
+    session::Registry::at(data_dir).list().map_err(|e| {
+        diag::error(&format!("sbx: cannot read the session registry: {e}"));
+        ExitCode::FAILURE
+    })
+}
+
+/// Print `view` as a pretty JSON document on stdout, or report that it could not be serialized —
+/// the tail every `--json` verb ends with. `verb` tags the refusal (`sbx: app show: cannot
+/// serialize: …`), so one condition keeps one wording across the whole CLI. The success exit code
+/// stays with the caller: a verb that renders a *refusal* as a document still exits non-zero on it.
+fn print_json<T: serde::Serialize>(verb: &str, view: &T) -> Result<(), ExitCode> {
+    match serde_json::to_string_pretty(view) {
+        Ok(doc) => {
+            println!("{doc}");
+            Ok(())
+        }
+        Err(e) => {
+            diag::error(&format!("sbx: {verb}: cannot serialize: {e}"));
+            Err(ExitCode::FAILURE)
+        }
+    }
 }
 
 /// `sbx path [--json]`: show every on-disk location sbx uses, grouped by XDG base
@@ -303,19 +355,13 @@ fn path_cmd(args: &[OsString]) -> ExitCode {
     let refused = layout.is_none() && store::Layout::default_data_dir().is_some();
     let view = paths::view(layout.as_ref());
     if json {
-        match serde_json::to_string_pretty(&view) {
-            Ok(s) => {
-                println!("{s}");
-                if refused {
-                    ExitCode::FAILURE
-                } else {
-                    ExitCode::SUCCESS
-                }
-            }
-            Err(e) => {
-                eprintln!("sbx: path: failed to serialize: {e}");
-                ExitCode::FAILURE
-            }
+        if let Err(code) = print_json("path", &view) {
+            return code;
+        }
+        if refused {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
         }
     } else {
         let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
@@ -527,6 +573,15 @@ fn egress_data_dir() -> Result<PathBuf, String> {
         })
 }
 
+/// The same directory, mapped to an error exit rather than a message — the form every verb that
+/// reaches for a control socket uses, so the one condition keeps the one wording.
+fn egress_dir_or_fail() -> Result<PathBuf, ExitCode> {
+    egress_data_dir().map_err(|e| {
+        diag::error(&format!("sbx: {e}"));
+        ExitCode::FAILURE
+    })
+}
+
 /// The human context of the ask-mode control sockets, cross-referenced from the session registry:
 /// `(pid, project root, display label)` per live session. Best-effort — a session not in the
 /// registry (a race, or one that failed to register) simply lists without context, and a `--save`
@@ -583,6 +638,48 @@ fn session_pids_for_project(data_dir: &Path, project: &Path) -> std::collections
         .filter(|s| s.project == project)
         .map(|s| s.pid)
         .collect()
+}
+
+/// The pids one `--session` scope filter selects, or `None` when that filter is not active — the
+/// pair [`session_scope_pids`] resolves and [`in_scope`] tests a session against.
+type ScopeFilter = Option<std::collections::HashSet<u32>>;
+
+/// The two composing pid filters a `--session` rule load is scoped by: the project the command was
+/// run in (unless `--all` widens the load machine-wide) and the app named by `-a`. `None` is "no
+/// filter of this kind"; a session must pass every active one to receive the rule, which
+/// [`in_scope`] decides.
+///
+/// Shared by `sbx net allow|deny|mute --session` and `sbx proc allow|deny --session` because the
+/// scope is the security-relevant half of those commands: how far `--all` widens a live rule is not
+/// a rule two independent copies may come to answer differently.
+fn session_scope_pids(
+    data_dir: &Path,
+    all: bool,
+    app: Option<&str>,
+    cwd: &Path,
+) -> Result<(ScopeFilter, ScopeFilter), ExitCode> {
+    let project_pids = if all {
+        None
+    } else {
+        let canonical = sandbox::project_identity(cwd)
+            .map(|(_, canonical)| canonical)
+            .map_err(|e| {
+                diag::error(&format!(
+                    "sbx: cannot resolve the current project directory: {e}"
+                ));
+                ExitCode::FAILURE
+            })?;
+        Some(session_pids_for_project(data_dir, &canonical))
+    };
+    let app_pids = app.map(|name| session_pids_for_app(data_dir, name));
+    Ok((project_pids, app_pids))
+}
+
+/// Whether the live session `pid` is in scope for a `--session` rule load: it must pass every filter
+/// [`session_scope_pids`] left active, an absent one selecting everything.
+fn in_scope(pid: u32, project_pids: &ScopeFilter, app_pids: &ScopeFilter) -> bool {
+    let passes = |filter: &ScopeFilter| filter.as_ref().is_none_or(|p| p.contains(&pid));
+    passes(project_pids) && passes(app_pids)
 }
 
 /// An event's wall-clock time of day as local `hh:mm:ss` — a stable, correlatable stamp for a log
@@ -835,6 +932,51 @@ fn open_rule_write<'a>(
     })
 }
 
+/// Why `--session` refuses the config-scope flags: it loads a rule into the live overlay of a
+/// running session and writes no file, so a `--local`/`--global`/`-c` the user expected to matter
+/// would be silently ignored. Shared by `sbx net allow|deny|mute` and `sbx proc allow|deny`, whose
+/// `--session` semantics are identical by design — as is this refusal, so it is written once.
+const SESSION_IGNORES_FILE_SCOPE: &str = "sbx: --session loads a live rule and writes no file, so --local/--global/-c do not apply — \
+     use -a <app> or --all to scope the session(s)";
+
+/// Why `--all` without `--session` is refused: it widens a *live* load to every session, and a
+/// config write targets exactly one file. The egress and proc add paths refuse it identically.
+const ALL_NEEDS_SESSION: &str = "sbx: --all only applies with --session (it widens a live rule to every session); a config \
+     write targets one file — drop --all";
+
+/// Why a removal verb refuses `--session`/`--all`: it removes a rule from a config file, and the
+/// live overlay has no retraction for those flags to aim at (a loaded rule dies with its session).
+/// `family` is the command namespace — `net` or `proc` — and `verb` the removal verb as typed.
+fn removal_takes_no_session_flags(family: &str, verb: &str) -> String {
+    format!(
+        "sbx: {family} {verb}: --session/--all do not apply — this removes a rule from a config \
+         file"
+    )
+}
+
+/// Report a rule write's outcome: the success line on stdout through the prose renderer (so its
+/// spans land only on a terminal), or the refusal on stderr with the exit code the writer chose.
+/// Every `sbx net`/`sbx proc` add and remove path ends here, which is what keeps one persist result
+/// from reaching the process differently than another.
+fn report_rule_write(result: Result<String, (u8, String)>) -> ExitCode {
+    match result {
+        Ok(message) => {
+            println!(
+                "{}",
+                style::prose(
+                    &message,
+                    &style::Palette::for_stream(std::io::stdout().is_terminal())
+                )
+            );
+            ExitCode::SUCCESS
+        }
+        Err((code, message)) => {
+            diag::error(&format!("sbx: {message}"));
+            ExitCode::from(code)
+        }
+    }
+}
+
 /// What an unresolvable trust store means on an *add* path, where the rule would be written but
 /// could not be trusted, so it would not take effect. The removal path states the fact alone; the
 /// difference is user-visible and deliberate.
@@ -972,6 +1114,167 @@ fn persist_proc_rule(
             msg
         }
     })
+}
+
+/// Remove a rule from the scoped config file, trust-gating a project write and re-trusting it after
+/// — the shared writer behind `sbx net unallow|undeny|unmute` and `sbx proc unallow|undeny`. A rule
+/// that is not present is a reported no-op: no write, no re-trust. `family` names the command
+/// namespace for the admission, `words` is the removal verb and the rule noun exactly as each
+/// family's `removal_words` yields them, and `remove` performs the edit — the one step the two
+/// families do differently.
+///
+/// Same scope vocabulary, trust gate and exit codes as the add path ([`persist_egress_rule`]): a
+/// `-c <file>` scope or an untrusted project config is code `2`; a trust-store, write or re-trust
+/// failure is code `1`. The missing-store sentence is deliberately shorter than the add path's and
+/// stays so: it is user-visible, and a removal has no "written but untrusted, so it takes no effect"
+/// consequence to explain — a rule that is removed is gone from the file either way.
+fn persist_removal<E: std::fmt::Display>(
+    family: &str,
+    words: (&str, &str),
+    rule: &str,
+    scope: &config::manage::Scope,
+    app: Option<&str>,
+    base: &Path,
+    remove: impl FnOnce(&Path, Option<&str>) -> Result<config::manage::RemoveOutcome, E>,
+) -> Result<String, (u8, String)> {
+    use config::manage::RemoveOutcome;
+    let (verb, noun) = words;
+    let RuleWrite {
+        path,
+        app_key,
+        target,
+        store,
+    } = open_rule_write(
+        family,
+        verb,
+        "cannot determine the trust store (set XDG_STATE_HOME or HOME)",
+        scope,
+        app,
+        base,
+    )?;
+    let gated = store.is_some();
+
+    let outcome = remove(&path, app_key).map_err(|e| (2, e.to_string()))?;
+
+    match outcome {
+        RemoveOutcome::NotPresent => Ok(format!("{noun} {rule} was not in {target} — no change")),
+        RemoveOutcome::Removed => {
+            // Re-trust only after an actual change (the file bytes changed). Fail-safe ordering: a
+            // crash between the write and the trust leaves a correct-but-untrusted file the next
+            // launch drops — never a security hole.
+            if let Some(store) = &store {
+                trust::trust(store, &path).map_err(|e| {
+                    (
+                        1,
+                        format!(
+                            "removed the rule but could not re-trust {e} — run `sbx trust {}`",
+                            config::PROJECT_CONFIG
+                        ),
+                    )
+                })?;
+            }
+            let mut msg = format!("removed {noun} {rule} from {target}");
+            if gated {
+                msg.push_str(&format!("\nre-trusted {}", config::PROJECT_CONFIG));
+            }
+            Ok(msg)
+        }
+    }
+}
+
+/// Keep every fragment a forced import is about to replace, and say what the incoming one no longer
+/// declares — one warning per replaced entry, for the caller to surface once the write succeeded.
+///
+/// A bundle and an egress group are both entries *inside* the shared global config rather than files
+/// of their own, so what stands in for a per-file copy is the portable fragment the family's export
+/// verb already emits: the replaced entry is written back out beside the config as
+/// `<name>.<suffix>.replaced`, and re-declaring it is that family's `import` on the file. The name
+/// ends in neither `.toml` nor a profile path, so nothing reads it as configuration.
+///
+/// Only an entry whose declaration actually CHANGES is kept: re-importing an identical fragment
+/// leaves no copy and reports nothing. An error here fails the import closed, before the write, so
+/// an entry is never overwritten with no way back.
+///
+/// `noun` names the entry in the warning (`bundle`, `egress group`) and `suffix` names it both in
+/// the kept file and in the refusal; `declared` is read only once there is something to compare
+/// against, and `export_one` renders one entry in its family's portable form.
+fn keep_replaced_fragments<T>(
+    config_path: &Path,
+    incoming: &std::collections::BTreeMap<String, T>,
+    declared: impl FnOnce() -> std::collections::BTreeMap<String, T>,
+    force: bool,
+    noun: &str,
+    suffix: &str,
+    export_one: impl Fn(&str, &T) -> Result<String, String>,
+) -> Result<Vec<String>, String> {
+    if !force {
+        return Ok(Vec::new());
+    }
+    let Some(dir) = config_path.parent() else {
+        return Ok(Vec::new());
+    };
+    let declared = declared();
+    let mut notes = Vec::new();
+    for (name, new) in incoming {
+        let Some(old) = declared.get(name) else {
+            continue; // added, not replaced
+        };
+        let (before, after) = (export_one(name, old)?, export_one(name, new)?);
+        if before == after {
+            continue;
+        }
+        let kept = dir.join(format!("{name}.{suffix}.replaced"));
+        cli::keep_replaced_file(&kept, before.as_bytes()).map_err(|e| {
+            format!(
+                "cannot keep the {suffix} being replaced at {}: {e}",
+                kept.display()
+            )
+        })?;
+        notes.push(render_replaced_fragment(
+            noun,
+            name,
+            &cli::settings_dropped_by(&before, &after),
+            &kept,
+        ));
+    }
+    Ok(notes)
+}
+
+/// The overwrite warning for one replaced fragment: what its replacement no longer declares, and
+/// where the previous one is. A few dropped lines are named in full (the point is to recognize one's
+/// own edit); beyond that the count stands in, because the kept fragment is the better place to read
+/// the rest. `noun` is what the sentence calls the entry — a `bundle`, an `egress group`.
+fn render_replaced_fragment(noun: &str, name: &str, dropped: &[String], kept: &Path) -> String {
+    const NAMED: usize = 3;
+    let kept = kept.display();
+    if dropped.is_empty() {
+        return format!(
+            "replaced {noun} `{name}`, which differed only in layout — the previous fragment is \
+             kept at {kept}"
+        );
+    }
+    let named = dropped
+        .iter()
+        .take(NAMED)
+        .map(|l| format!("`{l}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = dropped.len().saturating_sub(NAMED);
+    let more = if rest > 0 {
+        format!(" (and {rest} more)")
+    } else {
+        String::new()
+    };
+    format!(
+        "replaced {noun} `{name}`, which declared {} the new one does not: {named}{more} — the \
+         previous fragment is kept at {kept}, so a per-machine entry can be read back and \
+         re-imported",
+        if dropped.len() == 1 {
+            "1 line".to_string()
+        } else {
+            format!("{} lines", dropped.len())
+        },
+    )
 }
 
 /// A short revision for display — the first seven hex characters, like git.

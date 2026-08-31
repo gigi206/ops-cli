@@ -575,8 +575,18 @@ pub(super) fn serve_tunneled_request(
     //         allowlist + the inspected handshake. Masking a frame would mean rewriting the relayed
     //         stream (decode, mask, re-frame, re-mask), which is a far larger change to the one path
     //         that must stay a byte-exact pipe; the traffic capture decodes frames only to copy them
-    //         aside, and masks its own buffers, without touching what is relayed.
+    //         aside, and masks its own buffers, without touching what is relayed. The two handshake
+    //         *heads* are not frames and are not covered by that: they are relayed under the same
+    //         reflection mask any other head gets.
     if ws_upgrade {
+        // The heads of this exchange are masked by the same rule an ordinary response's head is —
+        // the upgrade is the one exchange whose bytes cannot be masked once it is open, so the
+        // handshake is where the question has to be asked rather than after it.
+        let head_masking: &[SecretNeedle] = if creds.masks_reflection_for(connect_host) {
+            &creds.needles
+        } else {
+            &[]
+        };
         // The capture follows the handshake into the upgrade relay, which files it at the `101` (it
         // cannot wait for a tunnel that may stay open for hours — see [`relay_upgrade`]).
         return Turn::closing(relay_upgrade(
@@ -584,6 +594,7 @@ pub(super) fn serve_tunneled_request(
             upstream,
             &inner,
             &injected,
+            head_masking,
             ctx,
             allow_seq,
             capture.as_ref(),
@@ -751,14 +762,11 @@ pub(super) fn serve_tunneled_request(
             let _ = client.flush();
         }
         // The body is teed as it is relayed — a pass-through, so the forwarded stream is unchanged.
-        match &capture {
-            Some(c) => copy_exact(
-                &mut CaptureReader::new(&mut br, c.request_body_sink()),
-                &mut upstream,
-                body_len,
-            )?,
-            None => copy_exact(&mut br, &mut upstream, body_len)?,
-        }
+        copy_exact(
+            &mut tee_request_body(&mut br, capture.as_ref()),
+            &mut upstream,
+            body_len,
+        )?;
         // Count the forwarded body (`copy_exact` moved exactly `body_len` bytes upstream).
         flow.up.fetch_add(body_len, Ordering::Relaxed);
         upstream.flush().ok();
@@ -774,18 +782,11 @@ pub(super) fn serve_tunneled_request(
     drop(forwarded);
     drop(budget);
 
-    // 9b. Response-side leak backstop: a configured secret can only re-enter the cage by being
-    //     *reflected* by a host an injection targets (an echo/debug endpoint, or one that stores
-    //     and later returns the credential). So mask the reflected value out of the response — but
-    //     only for a response from such a host. Every other response (notably the large built-in
-    //     downloads) is streamed untouched, which both avoids the scan cost and confines the
-    //     mutate-on-match to the one host the reflection threat actually lives on. Decided here
-    //     because it covers the head as much as the body, and the head is relayed first.
-    let masks_reflection = !creds.needles.is_empty()
-        && creds
-            .injections
-            .iter()
-            .any(|inj| names_exact_host(connect_host, Some(&inj.rule)));
+    // 9b. Response-side leak backstop, scoped to a host an injection targets — the threat it
+    //     answers and why the scoping is what it is belong to `CredentialSet::masks_reflection_for`,
+    //     which every inspected plane asks. What is this plane's is the placement: decided here
+    //     because the mask covers the head as much as the body, and the head is relayed first.
+    let masks_reflection = creds.masks_reflection_for(connect_host);
     let head_masking: &[SecretNeedle] = if masks_reflection {
         &creds.needles
     } else {
@@ -867,11 +868,8 @@ pub(super) fn serve_tunneled_request(
     //     head was counted as it was relayed.
     let mut framed = FramedBody::new(&mut up_br, framing);
     {
-        let response = CountingReader::new(&mut framed, flow.down.clone());
-        let mut response: Box<dyn Read + '_> = match &capture {
-            Some(c) => Box::new(CaptureReader::new(response, c.response_sink())),
-            None => Box::new(response),
-        };
+        let counted = CountingReader::new(&mut framed, flow.down.clone());
+        let mut response = tee_response(counted, capture.as_ref());
         if masks_reflection {
             pump_redacting(&mut response, br.get_mut(), &creds.needles)?;
         } else {

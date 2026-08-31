@@ -11,11 +11,15 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use crate::cli::logs;
-use crate::{config, diag, help, observe, proc_policy, sandbox, session, store, style};
 use crate::{
-    egress_data_dir, format_log_time, interval_seconds, persist_proc_rule, resolve_session_target,
-    session_pids_for_app, session_pids_for_project, split_one_rule, split_scope,
-    split_session_flags,
+    ALL_NEEDS_SESSION, SESSION_IGNORES_FILE_SCOPE, egress_dir_or_fail, format_log_time, in_scope,
+    interval_seconds, persist_proc_rule, removal_takes_no_session_flags, report_rule_write,
+    resolve_session_target, session_pids_for_app, session_pids_for_project, session_scope_pids,
+    split_one_rule, split_scope, split_session_flags,
+};
+use crate::{
+    config, config_cwd, diag, help, layout_or_fail, live_sessions, observe, proc_policy, sandbox,
+    style,
 };
 
 /// `sbx proc <subcommand>`: observe what a running sandbox is doing inside its cage. `ls` snapshots
@@ -70,22 +74,16 @@ fn proc_add_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCode 
         diag::error(&format!("sbx: invalid rule {rule:?}: {e}"));
         return ExitCode::from(2);
     }
-    let cwd = match std::env::current_dir() {
+    let cwd = match config_cwd() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the current directory: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
 
     if session {
         // `--session` writes no config file, so the file-scope flags do not apply — point at the
         // session-scope flags rather than silently ignore a `--global` the user expected to matter.
         if parsed.scope_explicit {
-            diag::error(
-                "sbx: --session loads a live rule and writes no file, so --local/--global/-c do not \
-                 apply — use -a <app> or --all to scope the session(s)",
-            );
+            diag::error(SESSION_IGNORES_FILE_SCOPE);
             return ExitCode::from(2);
         }
         return proc_inject_session(list, &rule, all, parsed.app.as_deref(), &cwd);
@@ -93,29 +91,17 @@ fn proc_add_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCode 
 
     // `--all` is a session-scope widener, meaningless for a config write (which targets one file).
     if all {
-        diag::error(
-            "sbx: --all only applies with --session (it widens a live rule to every session); a config \
-             write targets one file — drop --all",
-        );
+        diag::error(ALL_NEEDS_SESSION);
         return ExitCode::from(2);
     }
 
-    match persist_proc_rule(list, &rule, &parsed.scope, parsed.app.as_deref(), &cwd) {
-        Ok(message) => {
-            println!(
-                "{}",
-                style::prose(
-                    &message,
-                    &style::Palette::for_stream(std::io::stdout().is_terminal())
-                )
-            );
-            ExitCode::SUCCESS
-        }
-        Err((code, message)) => {
-            diag::error(&format!("sbx: {message}"));
-            ExitCode::from(code)
-        }
-    }
+    report_rule_write(persist_proc_rule(
+        list,
+        &rule,
+        &parsed.scope,
+        parsed.app.as_deref(),
+        &cwd,
+    ))
 }
 
 /// The removal verb and the rule noun for one process/exec list: `sbx proc unallow` takes an `allow`
@@ -147,9 +133,7 @@ fn proc_remove_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCo
         .iter()
         .any(|a| matches!(a.to_str(), Some("--session") | Some("--all")))
     {
-        diag::error(&format!(
-            "sbx: proc {verb}: --session/--all do not apply — this removes a rule from a config file"
-        ));
+        diag::error(&removal_takes_no_session_flags("proc", verb));
         return ExitCode::from(2);
     }
     let (parsed, rule) = match split_one_rule("proc", verb, args) {
@@ -160,29 +144,17 @@ fn proc_remove_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCo
     // The rule is NOT validated here, unlike the add path. A config file may already hold a rule a
     // later grammar would refuse, and refusing to remove it would leave the user no way out but a
     // hand edit; matching is an exact string compare, so an invalid rule simply matches nothing.
-    let cwd = match std::env::current_dir() {
+    let cwd = match config_cwd() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the current directory: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
-    match persist_proc_removal(list, &rule, &parsed.scope, parsed.app.as_deref(), &cwd) {
-        Ok(message) => {
-            println!(
-                "{}",
-                style::prose(
-                    &message,
-                    &style::Palette::for_stream(std::io::stdout().is_terminal())
-                )
-            );
-            ExitCode::SUCCESS
-        }
-        Err((code, message)) => {
-            diag::error(&format!("sbx: {message}"));
-            ExitCode::from(code)
-        }
-    }
+    report_rule_write(persist_proc_removal(
+        list,
+        &rule,
+        &parsed.scope,
+        parsed.app.as_deref(),
+        &cwd,
+    ))
 }
 
 /// Remove a process/exec `rule` from the scoped config file — the removal sibling of
@@ -197,54 +169,15 @@ fn persist_proc_removal(
     app: Option<&str>,
     base: &Path,
 ) -> Result<String, (u8, String)> {
-    use config::manage::{self, RemoveOutcome};
-    let (verb, noun) = removal_words(list);
-    // The missing-store sentence is shorter than the add path's, which explains a consequence a
-    // removal does not have: a rule that is written but cannot be trusted takes no effect, while a
-    // rule that is removed is gone from the file either way.
-    let crate::RuleWrite {
-        path,
-        app_key,
-        target,
-        store,
-    } = crate::open_rule_write(
+    crate::persist_removal(
         "proc",
-        verb,
-        "cannot determine the trust store (set XDG_STATE_HOME or HOME)",
+        removal_words(list),
+        rule,
         scope,
         app,
         base,
-    )?;
-    let gated = store.is_some();
-
-    let outcome =
-        manage::remove_proc_rule(&path, app_key, list, rule).map_err(|e| (2, e.to_string()))?;
-
-    match outcome {
-        RemoveOutcome::NotPresent => Ok(format!("{noun} {rule} was not in {target} — no change")),
-        RemoveOutcome::Removed => {
-            // Re-trust only after an actual change. Fail-safe ordering: a crash between the write
-            // and the trust leaves a correct-but-untrusted file the next launch drops.
-            if let Some(store) = &store {
-                // Fully qualified: inside `cli`, a bare `trust` would bind the sibling `cli::trust`
-                // command module, not the crate-root trust store.
-                crate::trust::trust(store, &path).map_err(|e| {
-                    (
-                        1,
-                        format!(
-                            "removed the rule but could not re-trust {e} — run `sbx trust {}`",
-                            config::PROJECT_CONFIG
-                        ),
-                    )
-                })?;
-            }
-            let mut msg = format!("removed {noun} {rule} from {target}");
-            if gated {
-                msg.push_str(&format!("\nre-trusted {}", config::PROJECT_CONFIG));
-            }
-            Ok(msg)
-        }
-    }
+        |path, app_key| config::manage::remove_proc_rule(path, app_key, list, rule),
+    )
 }
 
 /// `sbx proc allow|deny <rule> --session [-a <app>] [--all]`: load a rule into the **live overlay** of
@@ -268,45 +201,24 @@ fn proc_inject_session(
         config::manage::ProcList::Allow => "allow",
         config::manage::ProcList::Deny => "deny",
     };
-    let data_dir = match egress_data_dir() {
+    let data_dir = match egress_dir_or_fail() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
-    // Two composing pid filters: the project (unless `--all` widens machine-wide) and the app (`-a`).
-    let project_pids = if all {
-        None
-    } else {
-        let canonical = match sandbox::project_identity(cwd) {
-            Ok((_, c)) => c,
-            Err(e) => {
-                diag::error(&format!(
-                    "sbx: cannot resolve the current project directory: {e}"
-                ));
-                return ExitCode::FAILURE;
-            }
-        };
-        Some(session_pids_for_project(&data_dir, &canonical))
+    let (project_pids, app_pids) = match session_scope_pids(&data_dir, all, app, cwd) {
+        Ok(filters) => filters,
+        Err(code) => return code,
     };
-    let app_pids = app.map(|name| session_pids_for_app(&data_dir, name));
 
-    let sessions = match session::Registry::at(&data_dir).list() {
+    let sessions = match live_sessions(&data_dir) {
         Ok(s) => s,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the session registry: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     let mut loaded: Vec<u32> = Vec::new();
     let mut inert: Vec<u32> = Vec::new();
     for s in sessions {
         let pid = s.pid;
-        if app_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
-            continue;
-        }
-        if project_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
+        if !in_scope(pid, &project_pids, &app_pids) {
             continue;
         }
         let socket = sandbox::proc_control::proc_control_socket(&data_dir, pid);
@@ -389,12 +301,9 @@ fn proc_rules(args: &[OsString]) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    let data_dir = match egress_data_dir() {
+    let data_dir = match egress_dir_or_fail() {
         Ok(d) => d,
-        Err(e) => {
-            diag::error(&format!("sbx: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_pids = if all {
@@ -420,20 +329,14 @@ fn proc_rules(args: &[OsString]) -> ExitCode {
         .as_deref()
         .map(|n| session_pids_for_app(&data_dir, n));
 
-    let sessions = match session::Registry::at(&data_dir).list() {
+    let sessions = match live_sessions(&data_dir) {
         Ok(s) => s,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the session registry: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     let mut rows: Vec<(u32, &'static str, String)> = Vec::new();
     for s in sessions {
         let pid = s.pid;
-        if app_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
-            continue;
-        }
-        if project_pids.as_ref().is_some_and(|p| !p.contains(&pid)) {
+        if !in_scope(pid, &project_pids, &app_pids) {
             continue;
         }
         let socket = sandbox::proc_control::proc_control_socket(&data_dir, pid);
@@ -478,18 +381,13 @@ fn proc_pending_list(args: &[OsString]) -> ExitCode {
     if let Err(code) = crate::cli::reject_extra(&["proc", "pending"], args) {
         return code;
     }
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
-    let sessions = match session::Registry::at(layout.data_dir()).list() {
+    let sessions = match live_sessions(layout.data_dir()) {
         Ok(s) => s,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the session registry: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, dim, r) = (pal.head, pal.dim, pal.reset);
@@ -535,11 +433,9 @@ fn proc_pending_answer(args: &[OsString], allow: bool) -> ExitCode {
         ));
         return ExitCode::from(2);
     };
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     let socket = sandbox::proc_control::proc_control_socket(layout.data_dir(), pid);
     let verb = if allow { "allowed" } else { "denied" };
@@ -620,18 +516,13 @@ fn proc_ls(args: &[OsString]) -> ExitCode {
         }
     }
 
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
-    let sessions = match session::Registry::at(layout.data_dir()).list() {
+    let sessions = match live_sessions(layout.data_dir()) {
         Ok(s) => s,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the session registry: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
 
     let target = match resolve_session_target(&sessions, id, "proc") {
@@ -729,18 +620,13 @@ fn proc_live(args: &[OsString]) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    let Some(layout) = store::Layout::from_env() else {
-        diag::error(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME).",
-        );
-        return ExitCode::FAILURE;
+    let layout = match layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
-    let sessions = match session::Registry::at(layout.data_dir()).list() {
+    let sessions = match live_sessions(layout.data_dir()) {
         Ok(s) => s,
-        Err(e) => {
-            diag::error(&format!("sbx: cannot read the session registry: {e}"));
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     let target = match resolve_session_target(&sessions, parsed.id.as_deref(), "proc") {
         Ok(t) => t,

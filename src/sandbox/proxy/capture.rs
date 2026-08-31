@@ -172,6 +172,57 @@ impl<R: Read> Read for CaptureReader<R> {
     }
 }
 
+/// A relayed stream that is teed into a capture sink when the launch captures, and is the bare
+/// stream when it does not.
+///
+/// The choice is the same on every plane and is made once per direction of an exchange, so it is
+/// answered here rather than at each relay: whether a stream is watched is a property of the launch,
+/// not of the transport that happens to be carrying it, and four planes deciding it separately is
+/// four places a plane can quietly stop capturing.
+///
+/// An enum rather than a `Box<dyn Read>`, which is what the relays reached for: every consumer that
+/// stacks on this is already generic over its reader, so the branch costs neither an allocation nor
+/// an indirect call — and the uncaptured launch, which is the common one, pays nothing at all for a
+/// capture it never asked for.
+pub(super) enum MaybeTee<R> {
+    /// Teed into the exchange's sink as it is relayed.
+    Tee(CaptureReader<R>),
+    /// Relayed with nothing watching.
+    Plain(R),
+}
+
+impl<R: Read> Read for MaybeTee<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        match self {
+            MaybeTee::Tee(r) => r.read(out),
+            MaybeTee::Plain(r) => r.read(out),
+        }
+    }
+}
+
+/// Tee a response stream into this exchange's response sink, when the exchange is captured.
+///
+/// The sink takes head and body as one buffer, so a plane hands it the stream it is already relaying
+/// and the split happens at filing time — see [`CaptureGuard`].
+pub(super) fn tee_response<R: Read>(inner: R, capture: Option<&CaptureGuard>) -> MaybeTee<R> {
+    match capture {
+        Some(c) => MaybeTee::Tee(CaptureReader::new(inner, c.response_sink())),
+        None => MaybeTee::Plain(inner),
+    }
+}
+
+/// Tee a request body into this exchange's request-body sink, when the exchange is captured.
+///
+/// Only a body the proxy *streams* passes through here. A body it holds — one a signer asked to
+/// digest, or a chunked one it re-frames — is already in memory when the capture wants it and is
+/// handed over directly ([`CaptureGuard::set_request_body`]).
+pub(super) fn tee_request_body<R: Read>(inner: R, capture: Option<&CaptureGuard>) -> MaybeTee<R> {
+    match capture {
+        Some(c) => MaybeTee::Tee(CaptureReader::new(inner, c.request_body_sink())),
+        None => MaybeTee::Plain(inner),
+    }
+}
+
 /// The in-flight capture of one exchange: the sinks the relay tees into, and the filing that
 /// happens when the exchange ends however it ends.
 ///
@@ -427,18 +478,20 @@ fn split_response(raw: CaptureBytes, body_cap: Option<usize>) -> (CaptureBytes, 
 
 /// The offset of the end of an HTTP head in `bytes` and the length of the blank-line separator,
 /// looking for `CRLF CRLF` first and tolerating a bare `LF LF`.
+///
+/// `bytes` is a whole capture sink — head plus the body prefix the launch asked to keep, so tens of
+/// kilobytes and up to a megabyte at the highest `body_kb` — while the answer is normally settled a
+/// few hundred bytes in. Only an `LF LF` strictly *before* the `CRLF CRLF` can win the tie-break, so
+/// the second search stops at the first hit of the first rather than walking the rest of the body to
+/// find nothing.
 fn find_head_end(bytes: &[u8]) -> Option<(usize, usize)> {
-    let crlf = bytes
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| (i, 4));
-    let lf = bytes.windows(2).position(|w| w == b"\n\n").map(|i| (i, 2));
-    match (crlf, lf) {
-        (Some(c), Some(l)) => Some(if c.0 <= l.0 { c } else { l }),
-        (Some(c), None) => Some(c),
-        (None, Some(l)) => Some(l),
-        (None, None) => None,
-    }
+    let crlf = memchr::memmem::find(bytes, b"\r\n\r\n").map(|i| (i, 4));
+    // `+ 1` so a pair that straddles that offset is still seen; a match at or after it loses the
+    // tie-break anyway.
+    let upto = crlf.map_or(bytes.len(), |(i, _)| (i + 1).min(bytes.len()));
+    memchr::memmem::find(&bytes[..upto], b"\n\n")
+        .map(|i| (i, 2))
+        .or(crlf)
 }
 
 #[cfg(test)]

@@ -24,18 +24,26 @@ fn root() -> &'static Path {
 
 /// The suites that carry a host-capability skip: the population both runs mean to name.
 ///
-/// `skip_incapable!` and not `skip_unreachable!`, and the distinction is the whole rule. The first
-/// says *this host* lacks userns, bwrap, nix or systemd — exactly what these runs provide, so a
+/// A host-capability skip, and not an off-host one — the distinction is the whole rule. The first
+/// says *this host* lacks userns, bwrap, nix or systemd, exactly what these runs provide, so a
 /// suite carrying one belongs in them. The second says something outside the host is unavailable (a
 /// cache, a registry, the network), which no runner setting makes dependable and which therefore
 /// says nothing about whether the cage was exercised.
 ///
+/// The host kind is written two ways and both are read here. `skip_incapable!` is the macro itself;
+/// `probe_or_skip!` is the gate the integration suites write around it, which runs a launch that
+/// does nothing and reports that launch's own refusal through `skip_incapable!` when it fails. A
+/// suite that adopted the gate did not stop needing a cage, and a scan reading only the inner
+/// spelling would drop four suites and then report the omission against the runs rather than
+/// against itself.
+///
 /// **The distinction has no subject in today's tree, and that is written here rather than left to be
-/// rediscovered.** Measured on 2026-08-21: only `run` carries a `skip_unreachable!` (62 of them),
-/// and it carries 106 `skip_incapable!` besides, so relaxing this predicate to any `skip_` selects
-/// the same fifteen suites and a mutation doing so survives. The rule is still the right one — it is
-/// the one both runs state — and it starts to bite the day a suite carries only the unenforceable
-/// kind. Until then this test cannot tell the two apart, and a reader should not assume it can.
+/// rediscovered.** Measured on 2026-08-31: only `run` carries an off-host skip (7
+/// `skip_unreachable!` and 57 `need_reachable!`), and it carries 28 `skip_incapable!` and 78
+/// `probe_or_skip!` besides, so relaxing this predicate to any skip at all selects the same fifteen
+/// suites and a mutation doing so survives. The rule is still the right one — it is the one both
+/// runs state — and it starts to bite the day a suite carries only the unenforceable kind. Until
+/// then this test cannot tell the two apart, and a reader should not assume it can.
 fn suites_carrying_a_cage_skip() -> BTreeSet<String> {
     let dir = root().join("tests");
     let mut out = BTreeSet::new();
@@ -45,7 +53,7 @@ fn suites_carrying_a_cage_skip() -> BTreeSet<String> {
             continue;
         }
         let text = std::fs::read_to_string(&path).expect("an integration suite is readable");
-        if text.contains("skip_incapable!")
+        if (text.contains("skip_incapable!") || text.contains("probe_or_skip!"))
             && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
         {
             out.insert(stem.to_string());
@@ -102,14 +110,14 @@ fn both_cage_runs_name_every_suite_that_carries_a_cage_skip() {
         let extra: Vec<_> = named.difference(&expected).cloned().collect();
         assert!(
             missing.is_empty(),
-            "{run} does not name {missing:?}, which carry a `skip_incapable!` and so are exactly \
-             the suites a hosted runner passes without running. Add them to its list."
+            "{run} does not name {missing:?}, which carry a host-capability skip and so are \
+             exactly the suites a hosted runner passes without running. Add them to its list."
         );
         assert!(
             extra.is_empty(),
-            "{run} names {extra:?}, which carry no `skip_incapable!`. Either the suite lost its \
-             skip and the name should go, or the skip was spelled `skip_unreachable!`, which no \
-             runner setting can satisfy."
+            "{run} names {extra:?}, which carry no `skip_incapable!` and no `probe_or_skip!`. \
+             Either the suite lost its skip and the name should go, or the skip was spelled \
+             `skip_unreachable!`, which no runner setting can satisfy."
         );
     }
 }

@@ -123,20 +123,14 @@ pub(super) fn splice_l4(
             s
         }
         Err(_) => {
-            ctx.push_log(
+            return refuse_unreachable(
+                &mut client,
+                ctx,
                 crate::sandbox::control::Proto::Tcp,
                 connect_host,
                 port,
                 None,
                 None,
-                crate::sandbox::control::LogVerdict::Error,
-                "upstream-unreachable",
-            );
-            return write_refusal(
-                &mut client,
-                "502 Bad Gateway",
-                "upstream-unreachable",
-                &format!("`{connect_host}:{port}` is allowed but could not be reached"),
             );
         }
     };

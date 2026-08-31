@@ -1469,11 +1469,7 @@ fn install_inner(
             // The digest is of the tree *as placed*, not of the source: the staged copy had its
             // modes canonicalized, so only what was actually installed can later be compared
             // against it. A tree that cannot be hashed leaves no digest rather than a wrong one.
-            let origin = origin.with_digest(
-                catalogue::dir_digest(&dest)
-                    .ok()
-                    .map(|d| catalogue::to_hex(&d)),
-            );
+            let origin = origin.with_digest(catalogue::dir_digest_hex(&dest).ok());
             if let Err(why) = origin::record(layout, &name, &origin) {
                 crate::diag::warn(&format!(
                     "plugin `{name}` is installed, but its origin could not be recorded \
@@ -1543,9 +1539,9 @@ pub(crate) fn integrity(layout: &crate::store::Layout, dir_name: &str) -> Integr
     let Some(recorded) = origin::read(layout, dir_name).digest().map(str::to_string) else {
         return Integrity::Unrecorded;
     };
-    match catalogue::dir_digest(&layout.plugins_dir().join(dir_name)) {
+    match catalogue::dir_digest_hex(&layout.plugins_dir().join(dir_name)) {
         Err(why) => Integrity::Unreadable(why),
-        Ok(digest) if catalogue::to_hex(&digest) == recorded => Integrity::Intact,
+        Ok(got) if got == recorded => Integrity::Intact,
         Ok(_) => Integrity::Modified,
     }
 }
@@ -1716,12 +1712,69 @@ pub(super) fn ensure_owner_only(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// A per-call-unique suffix for a staging/trash temp directory, so two installs (or an install and
-/// a removal) in one process never collide. A monotonic process-local counter — no clock or RNG.
-fn unique() -> u64 {
+/// Write `bytes` to a file created fresh and readable only by its owner.
+///
+/// Stated once for the same reason [`ensure_owner_only`] is: every module in the plugins tree
+/// writes files into that owner-only tree — [`stores`] the cache's `store.toml` and
+/// `catalogue.lock`, [`origin`] the provenance records — and a hardening change applied to one
+/// copy would protect some of those files and not others, with nothing to say which.
+///
+/// Both flags carry weight. The mode keeps a file that records a trust anchor unreadable by other
+/// users from the moment it exists, rather than after a later `chmod`. Refusing to open anything
+/// that is already there is what keeps the write from following a symlink planted at the name, and
+/// from clobbering a file it did not create — which is why the callers write into a private staging
+/// tree or a fresh temp name and rename the result into place.
+pub(super) fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    f.write_all(bytes)
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// A per-call-unique suffix for a staging directory or a temp file, so two operations in one
+/// process never collide on a name — two installs, an install and a removal, two store fetches, two
+/// origin records. A monotonic process-local counter — no clock or RNG.
+///
+/// One counter serves the whole plugins tree: a counter per module is safe only for as long as no
+/// two modules ever stage under the same prefix, and one counter needs no such argument.
+pub(super) fn unique() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Render a string as a TOML basic string (`"..."`), refusing any control character and escaping
+/// the two characters a basic string cannot carry raw (`\` and `"`). The same rules apply to a
+/// quoted bare key, so this renders both a `[plugin."<name>"]` key and a field value.
+///
+/// One renderer for every record the plugins tree writes — the signed catalogue, a store's
+/// `store.toml`, an origin record — because all three are read back by the same TOML parser: a
+/// writer that escapes less than that parser requires produces a record which cannot be read at
+/// all, and a record lost that way takes every field with it, not the offending one. Refusing a
+/// control character instead of escaping it is the fail-closed half, and it is what stops a
+/// manifest, a URL, or a path from smuggling a second key/value into a record.
+///
+/// The catalogue's bytes are the bytes a signature is taken over, so a change here changes what a
+/// publisher signs and what a consumer reproduces: this renderer is part of that format, not an
+/// implementation detail behind it.
+pub(super) fn toml_quoted(s: &str) -> Result<String, String> {
+    if let Some(bad) = s.chars().find(|c| c.is_control()) {
+        return Err(format!(
+            "value `{}` contains a control character (U+{:04X}) and cannot be serialized",
+            s.escape_default(),
+            bad as u32
+        ));
+    }
+    Ok(format!(
+        "\"{}\"",
+        s.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
 }
 
 #[cfg(test)]

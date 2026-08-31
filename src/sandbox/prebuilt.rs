@@ -273,14 +273,6 @@ pub(crate) fn write_pins(
     lock: &BTreeMap<String, Pin>,
 ) -> io::Result<()> {
     let path = lock_path(layout, project_id, lock_file);
-    if let Some(parent) = path.parent() {
-        use std::fs::DirBuilder;
-        use std::os::unix::fs::DirBuilderExt;
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
-    }
     let mut body = String::new();
     for (key, pin) in lock {
         // A pin whose locator is its own download URL keeps the compact two-column form,
@@ -292,15 +284,7 @@ pub(crate) fn write_pins(
             body.push_str(&format!("{key}\t{}\t{}\n", pin.hash, pin.url));
         }
     }
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&tmp, body)?;
-    match std::fs::rename(&tmp, &path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    super::binds::write_atomic(&path, body.as_bytes())
 }
 
 /// The pinned content hashes for a project's packages under one backend, keyed by the declared

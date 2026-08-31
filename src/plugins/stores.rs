@@ -15,7 +15,7 @@
 //! and places nothing. Authenticity rests entirely on the signature: git moves bytes and
 //! checks their integrity, never their origin, so the transport is not a trust boundary.
 
-use super::ensure_owner_only;
+use super::{ensure_owner_only, unique, write_owner_only};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::path::{Path, PathBuf};
@@ -30,6 +30,12 @@ const CATALOGUE_SIG: &str = "catalogue.toml.sig";
 const STORE_TOML: &str = "store.toml";
 const CATALOGUE_LOCK: &str = "catalogue.lock";
 const CHECKOUT: &str = "checkout";
+
+/// The staging-tree name prefixes, one per fetching verb. They differ on purpose: a tree left
+/// behind under the data directory names the verb that leaked it, so an aborted fetch and an
+/// aborted probe are told apart rather than pooled under one name.
+const STAGE_PREFIX: &str = ".store-stage";
+const PROBE_PREFIX: &str = ".store-probe";
 
 /// The public-key file a store repository carries at its root, read only by a trust-on-first-use
 /// add (`--trust`) to learn the key it then pins. A pinned add (`--key`) ignores it entirely, and
@@ -113,22 +119,10 @@ fn add_inner(
         ));
     }
 
-    // The trust-by-location root must be owner-only before anything is placed under it.
-    ensure_owner_only(layout.data_dir())?;
-
     // Stage the whole store directory (its checkout, config, and lock) in a private sibling
     // of the final location, so a crash or a concurrent add never leaves a half-built store
-    // at the real name. The guard removes the stage on every exit path.
-    let stage = Stage(layout.data_dir().join(format!(
-        ".store-stage-{}-{}",
-        std::process::id(),
-        unique()
-    )));
-    let _ = std::fs::remove_dir_all(&stage.0);
-    ensure_owner_only(&stage.0)?;
-
-    let checkout = stage.0.join(CHECKOUT);
-    clone(git, url, &checkout)?;
+    // at the real name.
+    let (stage, checkout) = staged_clone(layout, STAGE_PREFIX, url, git)?;
 
     // The key to verify against: the one the user pinned, or — on trust on first use — the one the
     // store ships, learned only now. Either way the catalogue must verify against it, so a TOFU pin
@@ -138,27 +132,14 @@ fn add_inner(
         TrustChoice::Tofu => (read_repo_pubkey(&checkout)?, true),
     };
 
-    // Verify before trusting: read the catalogue and its detached signature, check the
-    // signature against the key, and parse the *same* bytes. Only a verified catalogue is ever
-    // cached, so a later read of the cache can trust it by location.
-    let catalogue_bytes = read_file(&checkout.join(CATALOGUE))?;
-    let signature = read_signature(&checkout.join(CATALOGUE_SIG))?;
+    // Verify before trusting: check the signature against the key and parse the *same* bytes.
+    // Only a verified catalogue is ever cached, so a later read of the cache can trust it by
+    // location.
+    let (catalogue_bytes, signature) = catalogue_and_signature(&checkout)?;
     let catalogue =
         crate::plugins::catalogue::verified_catalogue(&catalogue_bytes, &signature, &pubkey)?;
 
-    // The cached tree is a plain content tree, not a working git repository — drop the
-    // `.git` directory so no git metadata (or hooks) sits in the trusted data dir; the next
-    // update re-clones from scratch.
-    let _ = std::fs::remove_dir_all(checkout.join(".git"));
-
-    write_file(
-        &stage.0.join(STORE_TOML),
-        store_toml(url, &pubkey, tofu).as_bytes(),
-    )?;
-    write_file(
-        &stage.0.join(CATALOGUE_LOCK),
-        format!("{}\n", catalogue.rev).as_bytes(),
-    )?;
+    seal_stage(&stage, url, &pubkey, tofu, catalogue.rev)?;
 
     ensure_owner_only(&layout.stores_dir())?;
     match std::fs::rename(&stage.0, &dest) {
@@ -264,7 +245,7 @@ pub(crate) fn verify_key(
     let dir = layout.store_path(name);
     let tmp = dir.join(format!(".store-toml-{}-{}", std::process::id(), unique()));
     let _ = std::fs::remove_file(&tmp);
-    write_file(&tmp, store_toml(&cfg.url, &cfg.pubkey, false).as_bytes())?;
+    write_owner_only(&tmp, store_toml(&cfg.url, &cfg.pubkey, false)?.as_bytes())?;
     if let Err(e) = std::fs::rename(&tmp, dir.join(STORE_TOML)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("cannot record the confirmation: {e}"));
@@ -287,16 +268,7 @@ pub(crate) fn shipped_pubkey(
     git: &Path,
 ) -> Result<[u8; 32], String> {
     validate_url(url)?;
-    ensure_owner_only(layout.data_dir())?;
-    let stage = Stage(layout.data_dir().join(format!(
-        ".store-probe-{}-{}",
-        std::process::id(),
-        unique()
-    )));
-    let _ = std::fs::remove_dir_all(&stage.0);
-    ensure_owner_only(&stage.0)?;
-    let checkout = stage.0.join(CHECKOUT);
-    clone(git, url, &checkout)?;
+    let (_stage, checkout) = staged_clone(layout, PROBE_PREFIX, url, git)?;
     read_repo_pubkey(&checkout)
 }
 
@@ -425,8 +397,7 @@ pub(crate) fn publish(dir: &Path, key_path: &Path, rev: Option<u64>) -> Result<P
             .to_str()
             .ok_or_else(|| format!("plugin `{}` has a non-UTF-8 path", p.name))?
             .replace(std::path::MAIN_SEPARATOR, "/");
-        let sha256 =
-            crate::plugins::catalogue::to_hex(&crate::plugins::catalogue::dir_digest(p.dir)?);
+        let sha256 = crate::plugins::catalogue::dir_digest_hex(p.dir)?;
         // The catalogue is keyed by the manifest `name`, so two plugins declaring one name would
         // collapse to whichever the iteration reaches last while the confirmation below still
         // listed both — a store that publishes one tree under the name of another, past every
@@ -597,19 +568,15 @@ fn load_or_generate_key(path: &Path) -> Result<Ed25519KeyPair, String> {
     }
 }
 
-/// Write a freshly generated private key owner-only, refusing to clobber an existing file (so a
-/// race that creates the key between the read and the write never overwrites it).
+/// Write a freshly generated private key owner-only through the shared writer, whose `create_new`
+/// is what refuses to clobber an existing file — so a race that creates the key between the read
+/// and the write never overwrites it. Unlike the cache's bookkeeping, this file is written at its
+/// final name rather than staged and renamed, so that refusal is the whole guard.
+///
+/// The wrapper is what keeps the signing key named in the failure: the shared writer reports a path
+/// and an errno, which does not say that the file it could not place is the store's identity.
 fn write_private_key(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| format!("cannot create the signing key `{}`: {e}", path.display()))?;
-    f.write_all(bytes)
-        .map_err(|e| format!("cannot write the signing key `{}`: {e}", path.display()))
+    write_owner_only(path, bytes).map_err(|e| format!("cannot write the signing key: {e}"))
 }
 
 /// Write (or overwrite) one of the operator's store-repository files. Unlike the owner-only cache
@@ -866,16 +833,7 @@ pub(crate) fn rekey(
 ) -> Result<Rekeyed, String> {
     let cfg = read_configured(layout, name)?;
 
-    ensure_owner_only(layout.data_dir())?;
-    let stage = Stage(layout.data_dir().join(format!(
-        ".store-stage-{}-{}",
-        std::process::id(),
-        unique()
-    )));
-    let _ = std::fs::remove_dir_all(&stage.0);
-    ensure_owner_only(&stage.0)?;
-    let checkout = stage.0.join(CHECKOUT);
-    clone(git, &cfg.url, &checkout)?;
+    let (stage, checkout) = staged_clone(layout, STAGE_PREFIX, &cfg.url, git)?;
 
     let (pubkey, tofu) = match trust {
         TrustChoice::Pinned(k) => (k, false),
@@ -889,8 +847,7 @@ pub(crate) fn rekey(
 
     // The new key must actually verify what the store now serves; otherwise the rotation would
     // leave a store pinned to a key that signs nothing it holds.
-    let catalogue_bytes = read_file(&checkout.join(CATALOGUE))?;
-    let signature = read_signature(&checkout.join(CATALOGUE_SIG))?;
+    let (catalogue_bytes, signature) = catalogue_and_signature(&checkout)?;
     let catalogue =
         crate::plugins::catalogue::verified_catalogue(&catalogue_bytes, &signature, &pubkey)
             .map_err(|why| {
@@ -904,15 +861,7 @@ pub(crate) fn rekey(
         ));
     }
 
-    let _ = std::fs::remove_dir_all(checkout.join(".git"));
-    write_file(
-        &stage.0.join(STORE_TOML),
-        store_toml(&cfg.url, &pubkey, tofu).as_bytes(),
-    )?;
-    write_file(
-        &stage.0.join(CATALOGUE_LOCK),
-        format!("{}\n", catalogue.rev).as_bytes(),
-    )?;
+    seal_stage(&stage, &cfg.url, &pubkey, tofu, catalogue.rev)?;
     swap_into_place(&stage.0, &layout.store_path(name))?;
 
     Ok(Rekeyed {
@@ -949,22 +898,11 @@ pub(crate) fn update(
 ) -> Result<Updated, String> {
     let cfg = read_configured(layout, name)?;
 
-    ensure_owner_only(layout.data_dir())?;
-    let stage = Stage(layout.data_dir().join(format!(
-        ".store-stage-{}-{}",
-        std::process::id(),
-        unique()
-    )));
-    let _ = std::fs::remove_dir_all(&stage.0);
-    ensure_owner_only(&stage.0)?;
-
-    let checkout = stage.0.join(CHECKOUT);
-    clone(git, &cfg.url, &checkout)?;
+    let (stage, checkout) = staged_clone(layout, STAGE_PREFIX, &cfg.url, git)?;
 
     // Verify against the pinned key, then enforce the rollback floor — in that order, so a
     // fetch signed by the wrong key is refused before its `rev` is even consulted.
-    let catalogue_bytes = read_file(&checkout.join(CATALOGUE))?;
-    let signature = read_signature(&checkout.join(CATALOGUE_SIG))?;
+    let (catalogue_bytes, signature) = catalogue_and_signature(&checkout)?;
     let catalogue = crate::plugins::catalogue::verified_catalogue(
         &catalogue_bytes,
         &signature,
@@ -997,15 +935,7 @@ pub(crate) fn update(
         ));
     }
 
-    let _ = std::fs::remove_dir_all(checkout.join(".git"));
-    write_file(
-        &stage.0.join(STORE_TOML),
-        store_toml(&cfg.url, &cfg.pubkey, cfg.tofu).as_bytes(),
-    )?;
-    write_file(
-        &stage.0.join(CATALOGUE_LOCK),
-        format!("{}\n", catalogue.rev).as_bytes(),
-    )?;
+    seal_stage(&stage, &cfg.url, &cfg.pubkey, cfg.tofu, catalogue.rev)?;
 
     // The store is already configured, so the cache directory exists: exchange the staged tree
     // with it atomically. After the swap the old tree sits at the stage path, where the guard
@@ -1230,37 +1160,90 @@ fn validate_url(url: &str) -> Result<(), String> {
 /// The `store.toml` recording a configured store's origin and trust anchor: the git URL it is
 /// fetched from, the hex public key its catalogue must verify against, and how that key was first
 /// trusted (`"tofu"` or `"pinned"`, informational).
-fn store_toml(url: &str, pubkey: &[u8; 32], tofu: bool) -> String {
-    // The URL is a TOML basic string; a store URL is a plain ASCII git URL, but escape the
-    // two characters that would break the string just in case.
-    let url = url.replace('\\', "\\\\").replace('"', "\\\"");
-    format!(
-        "url = \"{url}\"\npubkey = \"{}\"\ntrust = \"{}\"\n",
+///
+/// The URL is rendered by the tree's shared TOML renderer, which escapes the two characters a basic
+/// string cannot carry raw and refuses a control character outright rather than writing a record
+/// that would not parse back. [`validate_url`] already refuses one when the URL is supplied, so
+/// this is the backstop for a hand-edited `store.toml` being rewritten — never the refusal a user
+/// normally meets.
+fn store_toml(url: &str, pubkey: &[u8; 32], tofu: bool) -> Result<String, String> {
+    Ok(format!(
+        "url = {}\npubkey = \"{}\"\ntrust = \"{}\"\n",
+        super::toml_quoted(url)?,
         crate::plugins::catalogue::to_hex(pubkey),
         if tofu { "tofu" } else { "pinned" }
-    )
+    ))
 }
 
-/// Write a file owner-readable/writable only, creating it fresh.
-fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-    f.write_all(bytes)
-        .map_err(|e| format!("cannot write {}: {e}", path.display()))
+/// Clone `url` into a fresh, private staging tree under the data directory, returning the guard
+/// that owns the tree and the path of the `checkout/` inside it.
+///
+/// The order is the invariant. The trust-by-location root must be owner-only *before* anything is
+/// placed under it, and the stage itself must be owner-only before an untrusted repository is
+/// written into it — otherwise the window between the two is one in which another user can read,
+/// or plant, what is about to be trusted. Staging in a private sibling rather than at the real
+/// name is what keeps a crash or a concurrent fetch from ever leaving a half-built store where a
+/// reader would trust it by location, and the guard removes the tree on every exit path, including
+/// the early returns of everything the caller does next.
+///
+/// `prefix` names the tree after the verb that staged it (see [`STAGE_PREFIX`]).
+fn staged_clone(
+    layout: &crate::store::Layout,
+    prefix: &str,
+    url: &str,
+    git: &Path,
+) -> Result<(Stage, PathBuf), String> {
+    ensure_owner_only(layout.data_dir())?;
+    let stage = Stage(layout.data_dir().join(format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        unique()
+    )));
+    let _ = std::fs::remove_dir_all(&stage.0);
+    ensure_owner_only(&stage.0)?;
+
+    let checkout = stage.0.join(CHECKOUT);
+    clone(git, url, &checkout)?;
+    Ok((stage, checkout))
 }
 
-/// A per-call-unique suffix for the staging directory, so two adds in one process never
-/// collide. A monotonic process-local counter — no clock or RNG.
-fn unique() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    SEQ.fetch_add(1, Ordering::Relaxed)
+/// Read a fresh checkout's catalogue and its detached signature as a pair, so every verb verifies
+/// a signature against the very bytes it then parses.
+///
+/// The verification itself stays with the caller, which is not tidiness: a missing or unreadable
+/// file is a plain failure of the fetch, while a signature that does not verify is the failure each
+/// verb dresses in its own terms (the key you supplied, or the pinned key the store no longer uses).
+/// Folding the two together would put the first kind of failure into the second kind's words.
+fn catalogue_and_signature(checkout: &Path) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let catalogue_bytes = read_file(&checkout.join(CATALOGUE))?;
+    let signature = read_signature(&checkout.join(CATALOGUE_SIG))?;
+    Ok((catalogue_bytes, signature))
+}
+
+/// Turn a verified staging tree into a complete store cache, ready to be placed: drop the
+/// fetched repository's git metadata, then write the two bookkeeping files the cache carries
+/// beside its checkout — the trust anchor (`store.toml`) and the rollback floor
+/// (`catalogue.lock`).
+///
+/// The cached tree is a plain content tree, not a working git repository: the `.git` directory
+/// goes so no git metadata (or hooks) sits in the trusted data dir, and the next update re-clones
+/// from scratch. Both files are written into the stage rather than into the live cache, so the
+/// tree that lands at the real name is complete the instant it becomes visible.
+fn seal_stage(
+    stage: &Stage,
+    url: &str,
+    pubkey: &[u8; 32],
+    tofu: bool,
+    rev: u64,
+) -> Result<(), String> {
+    let _ = std::fs::remove_dir_all(stage.0.join(CHECKOUT).join(".git"));
+
+    write_owner_only(
+        &stage.0.join(STORE_TOML),
+        store_toml(url, pubkey, tofu)?.as_bytes(),
+    )?;
+    let floor = format!("{rev}\n");
+    write_owner_only(&stage.0.join(CATALOGUE_LOCK), floor.as_bytes())
 }
 
 /// A staging directory removed when it goes out of scope, so a fetch never leaks its tree —
@@ -2132,7 +2115,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(STORE_TOML),
-            store_toml("https://example.invalid/store.git", pubkey, tofu),
+            store_toml("https://example.invalid/store.git", pubkey, tofu).unwrap(),
         )
         .unwrap();
     }

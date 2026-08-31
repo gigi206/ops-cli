@@ -569,14 +569,6 @@ impl ResolutionLock {
     /// Write the lock atomically (temp + rename), creating the owner-only parent — so a
     /// concurrent launch reading it sees the old or the new file, never a torn one.
     fn write(&self, path: &Path) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            use std::fs::DirBuilder;
-            use std::os::unix::fs::DirBuilderExt;
-            DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent)?;
-        }
         let mut body = String::new();
         for ((pkg, version, system), pin) in &self.entries {
             body.push_str(&format!(
@@ -584,12 +576,7 @@ impl ResolutionLock {
                 pin.commit, pin.attr, pin.version
             ));
         }
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        if let Err(e) = std::fs::write(&tmp, body) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-        std::fs::rename(&tmp, path)
+        super::binds::write_atomic(path, body.as_bytes())
     }
 }
 
