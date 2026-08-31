@@ -15,36 +15,15 @@
 //! No sandbox, no privilege, no network — a `sleep` stands in for the session's process, since all
 //! the resolver wants is a pid that is alive.
 
+#[macro_use]
+mod common;
+use common::fixture::TmpDir;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-
-// The fixtures' root, one definition shared with the unit tests.
-include!("../src/testroot.rs");
-
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new() -> Self {
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut d = fixture_root();
-        d.push(format!("l-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        TmpDir(d)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// Read a process's start-time ticks (`/proc/<pid>/stat` field 22) for the fabricated record.
 fn read_start_ticks(pid: u32) -> u64 {
@@ -190,7 +169,7 @@ fn read_feed(data: &Path, args: &[&str]) -> String {
 /// The filesystem lens: its own socket directory, its own header, and a row of `kind` then path.
 #[test]
 fn the_filesystem_lens_reads_its_own_socket_and_renders_its_own_rows() {
-    let (data, project) = (TmpDir::new(), TmpDir::new());
+    let (data, project) = (TmpDir::new("l"), TmpDir::new("l"));
     let child = Standin::new();
     write_session_record(data.path(), child.pid(), project.path());
     serve_lens(
@@ -233,7 +212,7 @@ fn the_filesystem_lens_reads_its_own_socket_and_renders_its_own_rows() {
 /// the enforcement verdict.
 #[test]
 fn the_process_lens_reads_its_own_socket_and_renders_its_own_rows() {
-    let (data, project) = (TmpDir::new(), TmpDir::new());
+    let (data, project) = (TmpDir::new("l"), TmpDir::new("l"));
     let child = Standin::new();
     write_session_record(data.path(), child.pid(), project.path());
     serve_lens(
@@ -264,7 +243,7 @@ fn the_process_lens_reads_its_own_socket_and_renders_its_own_rows() {
 /// The ssh-agent lens: a third socket directory, a third header, and a row of `kind` then detail.
 #[test]
 fn the_ssh_agent_lens_reads_its_own_socket_and_renders_its_own_rows() {
-    let (data, project) = (TmpDir::new(), TmpDir::new());
+    let (data, project) = (TmpDir::new("l"), TmpDir::new("l"));
     let child = Standin::new();
     write_session_record(data.path(), child.pid(), project.path());
     serve_lens(
@@ -303,7 +282,7 @@ fn the_ssh_agent_lens_reads_its_own_socket_and_renders_its_own_rows() {
 /// what the socket was actually asked.
 #[test]
 fn a_follow_walks_its_cursor_reports_the_gap_and_stops_when_the_session_ends() {
-    let (data, project) = (TmpDir::new(), TmpDir::new());
+    let (data, project) = (TmpDir::new("l"), TmpDir::new("l"));
     let child = Standin::new();
     write_session_record(data.path(), child.pid(), project.path());
     let asked = serve_script(
@@ -346,7 +325,7 @@ fn a_follow_walks_its_cursor_reports_the_gap_and_stops_when_the_session_ends() {
 /// borrowed a sibling's name here would be reporting the wrong command to the user.
 #[test]
 fn each_view_refuses_a_bad_argument_in_its_own_name() {
-    let data = TmpDir::new();
+    let data = TmpDir::new("l");
     for (args, verb) in [
         (["fs", "logs", "--nope"], "fs logs"),
         (["proc", "logs", "--nope"], "proc logs"),
@@ -431,7 +410,7 @@ fn serve_task_without_a_cursor(data: &Path, pid: u32, events: &[&str]) {
 /// `head=`.
 #[test]
 fn a_feed_that_answers_without_a_cursor_is_still_a_recording_session() {
-    let dir = TmpDir::new();
+    let dir = TmpDir::new("l");
     let data = dir.path();
     let standin = Standin::new();
     let pid = standin.pid();
@@ -473,7 +452,7 @@ fn a_feed_that_answers_without_a_cursor_is_still_a_recording_session() {
 /// when it *ended* at .500: filed at the finish it would sort last, after the write it preceded.
 #[test]
 fn the_merged_view_orders_every_feed_by_when_it_happened() {
-    let dir = TmpDir::new();
+    let dir = TmpDir::new("l");
     let data = dir.path();
     let standin = Standin::new();
     let pid = standin.pid();
@@ -564,7 +543,7 @@ fn the_merged_view_orders_every_feed_by_when_it_happened() {
 /// reader that lies by omission about a credential channel.
 #[test]
 fn the_broker_feed_shows_every_broker_of_one_session() {
-    let dir = TmpDir::new();
+    let dir = TmpDir::new("l");
     let data = dir.path();
     let standin = Standin::new();
     let pid = standin.pid();
@@ -594,7 +573,7 @@ fn the_broker_feed_shows_every_broker_of_one_session() {
 /// that showed fewer feeds than asked for would read as a quiet session.
 #[test]
 fn the_merged_view_narrows_by_feed_and_refuses_a_name_no_feed_answers_to() {
-    let dir = TmpDir::new();
+    let dir = TmpDir::new("l");
     let data = dir.path();
     let standin = Standin::new();
     let pid = standin.pid();
@@ -637,7 +616,7 @@ fn the_merged_view_narrows_by_feed_and_refuses_a_name_no_feed_answers_to() {
 /// an agent that did nothing rather than one nobody was watching.
 #[test]
 fn the_merged_view_refuses_a_session_that_records_nothing() {
-    let dir = TmpDir::new();
+    let dir = TmpDir::new("l");
     let data = dir.path();
     let standin = Standin::new();
     let pid = standin.pid();

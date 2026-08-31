@@ -4,34 +4,13 @@
 //! package from the project trees that gcrooted it). Read-only: no sandbox, no nix, no network, so a
 //! lightweight fixture of fabricated files is enough.
 
+#[macro_use]
+mod common;
+use common::fixture::TmpDir;
+
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
-
-// The fixtures' root, one definition shared with the unit tests.
-include!("../src/testroot.rs");
-
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new() -> Self {
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut d = fixture_root();
-        d.push(format!("app-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        TmpDir(d)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 struct Fixture {
     proj: TmpDir,
@@ -43,10 +22,10 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         Fixture {
-            proj: TmpDir::new(),
-            config_home: TmpDir::new(),
-            state_home: TmpDir::new(),
-            data_home: TmpDir::new(),
+            proj: TmpDir::new("app"),
+            config_home: TmpDir::new("app"),
+            state_home: TmpDir::new("app"),
+            data_home: TmpDir::new("app"),
         }
     }
 

@@ -9,10 +9,10 @@
 
 #[macro_use]
 mod common;
+use common::fixture::TmpDir;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 fn sbx() -> Command {
@@ -28,49 +28,6 @@ fn sbx() -> Command {
 
 // The fixtures' root, one definition shared with the unit tests.
 include!("../src/testroot.rs");
-
-/// A unique temp dir removed on drop.
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new(tag: &str) -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = fixture_root();
-        d.push(format!("s-{tag}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        TmpDir(d)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        force_remove(&self.0);
-    }
-}
-
-/// Remove a tree that may contain read-only directories (a provisioned nix store makes its
-/// directories `0555`): add write on the way down before deleting.
-fn force_remove(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if meta.is_dir() {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                force_remove(&entry.path());
-            }
-        }
-        let _ = std::fs::remove_dir(path);
-    } else {
-        let _ = std::fs::remove_file(path);
-    }
-}
 
 /// Kills and reaps a backgrounded child on drop, so a panicking assertion never leaks the running
 /// cage — a `TmpDir` cleans directories, not processes.
@@ -125,7 +82,7 @@ impl Drop for FingerprintCleanup {
 
 #[test]
 fn stop_with_no_or_bad_arguments_is_a_usage_error() {
-    let data = TmpDir::new("usage");
+    let data = TmpDir::prefixed("s", "usage");
     // No id: usage error, exit 2.
     let no_id = sbx()
         .arg("session")
@@ -150,7 +107,7 @@ fn stop_with_no_or_bad_arguments_is_a_usage_error() {
 
 #[test]
 fn stop_an_unknown_id_reports_and_exits_two() {
-    let data = TmpDir::new("noid");
+    let data = TmpDir::prefixed("s", "noid");
     let out = sbx()
         .args(["session", "stop", "999999"])
         .env("XDG_DATA_HOME", data.path())
@@ -173,7 +130,7 @@ fn stop_an_unknown_id_reports_and_exits_two() {
 fn stop_all_together_with_an_id_is_a_usage_error() {
     // `--all` and explicit ids are mutually exclusive: passing both is ambiguous, so it is rejected
     // before any signalling (exit 2), not silently resolved one way.
-    let data = TmpDir::new("all-and-id");
+    let data = TmpDir::prefixed("s", "all-and-id");
     let out = sbx()
         .args(["session", "stop", "--all", "123"])
         .env("XDG_DATA_HOME", data.path())
@@ -192,7 +149,7 @@ fn stop_all_together_with_an_id_is_a_usage_error() {
 fn stop_all_with_no_sessions_is_a_no_op_success() {
     // Stopping every session when there are none is not an error — there is simply nothing to do,
     // like `sbx gc` with nothing to reclaim. No sandbox is needed (the registry is just empty).
-    let data = TmpDir::new("all-empty");
+    let data = TmpDir::prefixed("s", "all-empty");
     let out = sbx()
         .args(["session", "stop", "--all"])
         .env("XDG_DATA_HOME", data.path())
@@ -300,9 +257,9 @@ fn stop_tears_down_a_supervised_app_session() {
     // only if the supervisor were killed without the cage following, the failure mode this path
     // alone can exhibit. The unusual sleep duration is a unique fingerprint in the host's process
     // table.
-    let project = TmpDir::new("sup-proj");
-    let data = TmpDir::new("sup-data");
-    let state = TmpDir::new("sup-state");
+    let project = TmpDir::prefixed("s", "sup-proj");
+    let data = TmpDir::prefixed("s", "sup-data");
+    let state = TmpDir::prefixed("s", "sup-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[app.probe]\n\
@@ -415,9 +372,9 @@ fn stop_all_stops_every_session() {
     // fingerprints in the host's process table. Both apps use the default posture (the exec path),
     // which keeps the fixture to one provisioning and is enough to prove the fan-out — the
     // supervised teardown itself is covered by `stop_tears_down_a_supervised_app_session`.
-    let project = TmpDir::new("all-proj");
-    let data = TmpDir::new("all-data");
-    let state = TmpDir::new("all-state");
+    let project = TmpDir::prefixed("s", "all-proj");
+    let data = TmpDir::prefixed("s", "all-data");
+    let state = TmpDir::prefixed("s", "all-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[app.one]\n\

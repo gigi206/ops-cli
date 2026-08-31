@@ -11,62 +11,16 @@
 
 #[macro_use]
 mod common;
+use common::fixture::TmpDir;
 
 use std::os::fd::FromRawFd;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 fn sbx() -> Command {
     Command::new(env!("CARGO_BIN_EXE_sbx"))
-}
-
-// The fixtures' root, one definition shared with the unit tests.
-include!("../src/testroot.rs");
-
-/// A unique temp dir removed on drop.
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new(tag: &str) -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = fixture_root();
-        d.push(format!("sh-{tag}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        TmpDir(d)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        force_remove(&self.0);
-    }
-}
-
-/// Remove a tree that may contain read-only directories: a provisioned nix store
-/// makes its directories `0555`, so add write on the way down before deleting.
-fn force_remove(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if meta.is_dir() {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                force_remove(&entry.path());
-            }
-        }
-        let _ = std::fs::remove_dir(path);
-    } else {
-        let _ = std::fs::remove_file(path);
-    }
 }
 
 /// Whether the host can launch a sandbox (also warms the userland cache so the
@@ -85,8 +39,8 @@ fn host_can_sandbox(project: &Path, data: &Path) -> bool {
 
 #[test]
 fn an_interactive_run_with_no_command_gives_the_sandbox_a_controlling_terminal() {
-    let project = TmpDir::new("proj");
-    let data = TmpDir::new("data");
+    let project = TmpDir::prefixed("sh", "proj");
+    let data = TmpDir::prefixed("sh", "data");
     std::fs::write(project.path().join("MARKER"), b"x").unwrap();
 
     if !host_can_sandbox(project.path(), data.path()) {
@@ -183,8 +137,8 @@ fn an_interactive_observed_run_records_events_for_proc_logs() {
     // populate the ring + control socket even though nothing echoes to the TUI-owned terminal. Drive
     // the shell to spawn a recognizable `sleep`, then read it back with `sbx proc logs` from this
     // process. Skipped, not failed, where the host cannot sandbox.
-    let project = TmpDir::new("obs-proj");
-    let data = TmpDir::new("obs-data");
+    let project = TmpDir::prefixed("sh", "obs-proj");
+    let data = TmpDir::prefixed("sh", "obs-data");
     if !host_can_sandbox(project.path(), data.path()) {
         skip_incapable!(
             "skipping interactive-observe smoke: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
@@ -299,8 +253,8 @@ fn an_interactive_app_gets_a_controlling_terminal_and_live_resize() {
     // shell variables (`$Y`, `$W`): the echoed command carries `CTTY=$Y` / `WINCH=$W`, while only
     // the executed branch prints the expanded `CTTY=YES` / `WINCH=FIRED`. So the assertions have
     // teeth — they fail on a launch with no controlling terminal or no resize delivery.
-    let project = TmpDir::new("appterm-proj");
-    let data = TmpDir::new("appterm-data");
+    let project = TmpDir::prefixed("sh", "appterm-proj");
+    let data = TmpDir::prefixed("sh", "appterm-data");
     std::fs::write(
         project.path().join(".sbx.toml"),
         b"[app.term]\ncmd = [\"bash\", \"--norc\", \"-i\"]\n",

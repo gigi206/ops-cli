@@ -4,69 +4,10 @@
 
 #[macro_use]
 mod common;
+use common::fixture::TmpDir;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU32, Ordering};
-
-// The fixtures' root, one definition shared with the unit tests.
-include!("../src/testroot.rs");
-
-/// A unique temp dir removed on drop.
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new() -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        // What this suite needs of its root is that nothing it binds nests with one of the cage's
-        // structural mounts, `/tmp` among them: such a bind trips the bind-nesting warning, and
-        // several assertions here rest on not seeing one. The shared root satisfies that — it sits
-        // under the cache home, which is no structural mount — so this suite takes it like every
-        // other, and its trees stop being watched by whatever language server is open on the
-        // checkout.
-        //
-        // The name is kept short for a measured reason: one of these dirs becomes
-        // `$XDG_DATA_HOME`, and a data directory over 74 bytes is refused outright (it could not
-        // host the sockets sbx binds under it). With the previous `sbx-config-it-<pid>-<n>` and a
-        // 7-digit pid, this suite sat *at* that cap — a four-digit counter, an eight-digit pid or
-        // a longer checkout path would have taken the store away from every test in it, without
-        // any test saying so.
-        let mut d = fixture_root();
-        d.push(format!("cfg-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        TmpDir(d)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        force_remove(&self.0);
-    }
-}
-
-/// Remove a tree that may contain read-only directories: a provisioned nix store
-/// makes its directories `0555`, so add write on the way down before deleting.
-fn force_remove(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if meta.is_dir() {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                force_remove(&entry.path());
-            }
-        }
-        let _ = std::fs::remove_dir(path);
-    } else {
-        let _ = std::fs::remove_file(path);
-    }
-}
 
 /// One project sandbox under test: a project dir (the working directory), the
 /// redirected config-home (global config), state-home (trust store) and data-home
@@ -82,11 +23,11 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         Fixture {
-            proj: TmpDir::new(),
-            config_home: TmpDir::new(),
-            state_home: TmpDir::new(),
-            data_home: TmpDir::new(),
-            bind_dir: TmpDir::new(),
+            proj: TmpDir::new("cfg"),
+            config_home: TmpDir::new("cfg"),
+            state_home: TmpDir::new("cfg"),
+            data_home: TmpDir::new("cfg"),
+            bind_dir: TmpDir::new("cfg"),
         }
     }
 
@@ -892,7 +833,7 @@ fn a_bind_path_expands_a_leading_home_variable() {
     // Driven through the built binary with a controlled child `HOME`, so the assertion is
     // deterministic and free of any process-global environment race.
     let fx = Fixture::new();
-    let home = TmpDir::new();
+    let home = TmpDir::new("cfg");
     std::fs::create_dir_all(home.path().join("sub")).unwrap();
     std::fs::create_dir_all(home.path().join("other")).unwrap();
     // Global config (trusted by location): `~` and `$HOME` expand and are honored; the unsupported
@@ -2464,7 +2405,7 @@ fn an_apps_channel_is_the_working_directorys_channel_and_the_view_names_it() {
     );
 
     // The same app, same profile, same homes — only the directory differs.
-    let elsewhere = TmpDir::new();
+    let elsewhere = TmpDir::new("cfg");
     let outside = String::from_utf8_lossy(
         &fx.run_in(elsewhere.path(), &["config", "show", "--app", "demo"])
             .stdout,

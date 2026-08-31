@@ -17,6 +17,9 @@
 // worse than no count at all. Reach them with `#[macro_use] mod common;`.
 include!("../../src/testskip.rs");
 
+/// The fixture directory every suite creates its trees under, in one definition.
+pub mod fixture;
+
 use std::process::{Command, Output};
 
 /// Run the binary under test with `args`.

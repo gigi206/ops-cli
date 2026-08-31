@@ -9,37 +9,10 @@
 
 #[macro_use]
 mod common;
+use common::fixture::TmpDir;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
-
-// The fixtures' root, one definition shared with the unit tests.
-include!("../src/testroot.rs");
-
-/// A unique temp dir removed on drop, so the commands' data-dir writes land in a throwaway
-/// location instead of the real `$HOME`.
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new() -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = fixture_root();
-        d.push(format!("plugins-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        TmpDir(d)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// Run `sbx <args>` with a throwaway home (data, state, config all redirected), returning stdout.
 /// The stream is a pipe, so the output is plain text and can be asserted verbatim.
@@ -80,8 +53,8 @@ fn local_plugin(root: &Path, name: &str, scheme: &str) -> PathBuf {
 
 #[test]
 fn the_listings_say_where_each_installed_plugin_came_from() {
-    let home = TmpDir::new();
-    let src = TmpDir::new();
+    let home = TmpDir::new("plugins");
+    let src = TmpDir::new("plugins");
 
     // No store configured: the section is stated as empty rather than omitted — an omitted section
     // reads as "there is nothing to configure here".
@@ -127,8 +100,8 @@ fn the_listings_say_where_each_installed_plugin_came_from() {
 
 #[test]
 fn a_plugin_installed_without_a_record_reads_as_unknown() {
-    let home = TmpDir::new();
-    let src = TmpDir::new();
+    let home = TmpDir::new("plugins");
+    let src = TmpDir::new("plugins");
     // A plugin placed by hand (or installed before origins were recorded) has no record. The
     // listing must say so plainly instead of guessing a source.
     let source = local_plugin(src.path(), "kp", "kp");
@@ -192,8 +165,8 @@ fn adding_a_store_with_no_trust_anchor_shows_the_key_it_ships_and_configures_not
         skip_incapable!("skipping: git is not on PATH");
         return;
     }
-    let home = TmpDir::new();
-    let repo = TmpDir::new();
+    let home = TmpDir::new("plugins");
+    let repo = TmpDir::new("plugins");
     // A real signed store: publish a plugin directory, then commit it so it can be cloned.
     local_plugin(&repo.path().join("plugins"), "kp", "kp");
     let published = run(
@@ -277,8 +250,8 @@ fn confirming_a_key_accepted_on_first_use_ends_the_standing_caution() {
         skip_incapable!("skipping: git is not on PATH");
         return;
     }
-    let home = TmpDir::new();
-    let repo = TmpDir::new();
+    let home = TmpDir::new("plugins");
+    let repo = TmpDir::new("plugins");
     local_plugin(&repo.path().join("plugins"), "kp", "kp");
     let published = run(
         &[
@@ -421,8 +394,8 @@ fn upgrading_follows_the_digest_and_keeps_what_is_installed_when_it_cannot() {
         skip_incapable!("skipping: git is not on PATH");
         return;
     }
-    let home = TmpDir::new();
-    let repo = TmpDir::new();
+    let home = TmpDir::new("plugins");
+    let repo = TmpDir::new("plugins");
     let plugins = repo.path().join("plugins");
     versioned_plugin(&plugins, "kp", "kp", "1.0.0", "one");
     let key = home.path().join("signing-key");
@@ -508,8 +481,8 @@ fn a_store_that_changes_its_key_is_named_and_rotated_only_deliberately() {
         skip_incapable!("skipping: git is not on PATH");
         return;
     }
-    let home = TmpDir::new();
-    let repo = TmpDir::new();
+    let home = TmpDir::new("plugins");
+    let repo = TmpDir::new("plugins");
     local_plugin(&repo.path().join("plugins"), "kp", "kp");
     let key1 = home.path().join("key1");
     let (url, first) = signed_store(home.path(), repo.path(), key1.to_str().unwrap(), None);
@@ -576,9 +549,9 @@ fn the_markers_and_the_installed_filter_agree_on_what_is_in_place() {
         skip_incapable!("skipping: git is not on PATH");
         return;
     }
-    let home = TmpDir::new();
-    let repo = TmpDir::new();
-    let src = TmpDir::new();
+    let home = TmpDir::new("plugins");
+    let repo = TmpDir::new("plugins");
+    let src = TmpDir::new("plugins");
     local_plugin(&repo.path().join("plugins"), "kp", "kp");
     local_plugin(&repo.path().join("plugins"), "otp", "otp");
     let key_file = home.path().join("signing-key");
@@ -648,9 +621,9 @@ fn a_plugin_holding_a_stores_scheme_blocks_that_entry_visibly() {
         skip_incapable!("skipping: git is not on PATH");
         return;
     }
-    let home = TmpDir::new();
-    let repo = TmpDir::new();
-    let src = TmpDir::new();
+    let home = TmpDir::new("plugins");
+    let repo = TmpDir::new("plugins");
+    let src = TmpDir::new("plugins");
     local_plugin(&repo.path().join("plugins"), "kp", "kp");
     let key_file = home.path().join("signing-key");
     let (url, key) = signed_store(home.path(), repo.path(), key_file.to_str().unwrap(), None);
@@ -698,7 +671,7 @@ fn a_verb_given_without_its_argument_prints_usage_instead_of_crashing() {
     // Each of these takes exactly one argument, and the dispatch slices the argv past it to reject
     // extras — a slice that is out of range when the argument is simply missing. The user-visible
     // symptom was a panic (exit 101) on the most ordinary typo there is: the verb on its own.
-    let home = TmpDir::new();
+    let home = TmpDir::new("plugins");
     for verb in [
         &["plugins", "rm"][..],
         &["plugins", "info"],
@@ -724,8 +697,8 @@ fn a_verb_given_without_its_argument_prints_usage_instead_of_crashing() {
 
 #[test]
 fn plugins_rm_takes_several_names_and_one_failure_spares_the_rest() {
-    let home = TmpDir::new();
-    let src = TmpDir::new();
+    let home = TmpDir::new("plugins");
+    let src = TmpDir::new("plugins");
     // Two installed plugins on distinct schemes (a scheme claimed twice would disable both).
     let one = local_plugin(src.path(), "demo-one", "one");
     let two = local_plugin(src.path(), "demo-two", "two");
@@ -756,8 +729,8 @@ fn plugins_rm_takes_several_names_and_one_failure_spares_the_rest() {
 
 #[test]
 fn plugins_rm_rejects_an_unsafe_name_before_removing_anything() {
-    let home = TmpDir::new();
-    let src = TmpDir::new();
+    let home = TmpDir::new("plugins");
+    let src = TmpDir::new("plugins");
     let one = local_plugin(src.path(), "demo-one", "one");
     run(&["plugins", "install", one.to_str().unwrap()], home.path());
 
@@ -778,8 +751,8 @@ fn plugins_rm_rejects_an_unsafe_name_before_removing_anything() {
 
 #[test]
 fn a_plugin_edited_after_install_is_reported_by_every_inspection_path() {
-    let home = TmpDir::new();
-    let src = TmpDir::new();
+    let home = TmpDir::new("plugins");
+    let src = TmpDir::new("plugins");
     let source = local_plugin(src.path(), "kp", "kp");
     run(
         &["plugins", "install", source.to_str().unwrap()],
@@ -844,8 +817,8 @@ fn a_plugin_edited_after_install_is_reported_by_every_inspection_path() {
 
 #[test]
 fn a_scheme_claimed_twice_disables_every_claimant_until_one_remains() {
-    let home = TmpDir::new();
-    let src = TmpDir::new();
+    let home = TmpDir::new("plugins");
+    let src = TmpDir::new("plugins");
     // One plugin installed the supported way…
     let a = local_plugin(src.path(), "vault-a", "vault");
     run(&["plugins", "install", a.to_str().unwrap()], home.path());
@@ -946,8 +919,8 @@ fn local_broker(root: &Path, name: &str, extra: &str) -> PathBuf {
 /// where a resolver that cannot find its CLI does.
 #[test]
 fn every_kind_of_plugin_shows_the_grant_it_declared() {
-    let home = TmpDir::new();
-    let src = TmpDir::new();
+    let home = TmpDir::new("plugins");
+    let src = TmpDir::new("plugins");
     // `sh` because the assertion is that the PATH probe ran and resolved something, and it is the
     // one program a machine running these tests certainly has.
     let grant = "[sandbox]\nprograms=[\"sh\"]\nallow_env=[\"DEMO_TOKEN\"]\n";
@@ -1007,8 +980,8 @@ fn every_kind_of_plugin_shows_the_grant_it_declared() {
 /// pages, so only the emitted answer says which registry a page ended up pointed at.
 #[test]
 fn completing_a_plugin_name_offers_every_kind_and_never_a_store() {
-    let home = TmpDir::new();
-    let src = TmpDir::new();
+    let home = TmpDir::new("plugins");
+    let src = TmpDir::new("plugins");
     let sources = [
         local_plugin(src.path(), "demo-resolver", "demo"),
         local_signer(src.path(), "demo-signer", "Authorization", ""),
@@ -1062,8 +1035,8 @@ fn completing_a_plugin_name_offers_every_kind_and_never_a_store() {
 /// leave, so it belongs on the page someone reads before installing.
 #[test]
 fn a_signer_that_asks_for_a_body_digest_says_so_on_its_page() {
-    let home = TmpDir::new();
-    let src = TmpDir::new();
+    let home = TmpDir::new("plugins");
+    let src = TmpDir::new("plugins");
     let source = local_signer(
         src.path(),
         "demo-digest",
@@ -1087,8 +1060,8 @@ fn a_signer_that_asks_for_a_body_digest_says_so_on_its_page() {
 /// inspected by that name rather than by a scheme it does not claim.
 #[test]
 fn a_signer_installs_under_its_name_and_states_the_auth_point_it_holds() {
-    let home = TmpDir::new();
-    let src = TmpDir::new();
+    let home = TmpDir::new("plugins");
+    let src = TmpDir::new("plugins");
     let source = local_signer(src.path(), "demo-sigv4", "Authorization", "");
     run(
         &["plugins", "install", source.to_str().unwrap()],

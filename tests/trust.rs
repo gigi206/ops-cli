@@ -1,39 +1,15 @@
 //! Integration tests for `sbx trust` / `sbx untrust`, exercising the built
 //! binary end to end against a redirected trust store.
 
-use std::path::{Path, PathBuf};
+#[macro_use]
+mod common;
+use common::fixture::TmpDir;
+
+use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 fn sbx() -> Command {
     Command::new(env!("CARGO_BIN_EXE_sbx"))
-}
-
-// The fixtures' root, one definition shared with the unit tests.
-include!("../src/testroot.rs");
-
-/// A unique temp dir removed on drop, so the trust store and the project config
-/// land in throwaway locations instead of the real `$HOME`/`$XDG_STATE_HOME`.
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new() -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = fixture_root();
-        d.push(format!("trust-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        TmpDir(d)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
 
 /// Count the marker files under a redirected trust store.
@@ -47,8 +23,8 @@ fn marker_count(state_home: &Path) -> usize {
 
 #[test]
 fn trust_then_untrust_records_and_revokes_a_marker() {
-    let state = TmpDir::new();
-    let proj = TmpDir::new();
+    let state = TmpDir::new("trust");
+    let proj = TmpDir::new("trust");
     let cfg = proj.path().join(".sbx.toml");
     std::fs::write(&cfg, b"network = \"isolated\"\n").unwrap();
 
@@ -89,8 +65,8 @@ fn trust_then_untrust_records_and_revokes_a_marker() {
 
 #[test]
 fn show_reports_untrusted_then_trusted_then_changed() {
-    let state = TmpDir::new();
-    let proj = TmpDir::new();
+    let state = TmpDir::new("trust");
+    let proj = TmpDir::new("trust");
     let cfg = proj.path().join(".sbx.toml");
     std::fs::write(&cfg, b"network = \"isolated\"\n").unwrap();
 
@@ -124,8 +100,8 @@ fn show_reports_untrusted_then_trusted_then_changed() {
 
 #[test]
 fn trust_covers_a_sibling_mise_file_and_editing_it_re_arms() {
-    let state = TmpDir::new();
-    let proj = TmpDir::new();
+    let state = TmpDir::new("trust");
+    let proj = TmpDir::new("trust");
     let cfg = proj.path().join(".sbx.toml");
     let mise = proj.path().join(".mise.toml");
     std::fs::write(&cfg, b"[env]\nA = \"1\"\n").unwrap();
@@ -159,8 +135,8 @@ fn trust_covers_a_sibling_mise_file_and_editing_it_re_arms() {
 #[test]
 fn trust_refuses_a_world_writable_mise_file() {
     use std::os::unix::fs::PermissionsExt;
-    let state = TmpDir::new();
-    let proj = TmpDir::new();
+    let state = TmpDir::new("trust");
+    let proj = TmpDir::new("trust");
     let cfg = proj.path().join(".sbx.toml");
     let mise = proj.path().join(".mise.toml");
     std::fs::write(&cfg, b"x = 1\n").unwrap();
@@ -185,8 +161,8 @@ fn trust_refuses_a_world_writable_mise_file() {
 #[test]
 fn trust_refuses_a_world_writable_config() {
     use std::os::unix::fs::PermissionsExt;
-    let state = TmpDir::new();
-    let proj = TmpDir::new();
+    let state = TmpDir::new("trust");
+    let proj = TmpDir::new("trust");
     let cfg = proj.path().join(".sbx.toml");
     std::fs::write(&cfg, b"x = 1\n").unwrap();
     std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o666)).unwrap();
@@ -208,7 +184,7 @@ fn trust_refuses_a_world_writable_config() {
 
 #[test]
 fn an_unresolvable_store_is_a_hard_failure() {
-    let proj = TmpDir::new();
+    let proj = TmpDir::new("trust");
     let cfg = proj.path().join(".sbx.toml");
     std::fs::write(&cfg, b"x = 1\n").unwrap();
 

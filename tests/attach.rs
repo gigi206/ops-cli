@@ -7,11 +7,11 @@
 
 #[macro_use]
 mod common;
+use common::fixture::TmpDir;
 
 use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 fn sbx() -> Command {
@@ -28,54 +28,11 @@ fn sbx() -> Command {
 // The fixtures' root, one definition shared with the unit tests.
 include!("../src/testroot.rs");
 
-/// A unique temp dir removed on drop.
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new(tag: &str) -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = fixture_root();
-        d.push(format!("a-{tag}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        TmpDir(d)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        force_remove(&self.0);
-    }
-}
-
-/// Remove a tree that may contain read-only directories (a provisioned nix store makes its
-/// directories `0555`): add write on the way down before deleting.
-fn force_remove(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if meta.is_dir() {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                force_remove(&entry.path());
-            }
-        }
-        let _ = std::fs::remove_dir(path);
-    } else {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
 #[test]
 fn attach_to_an_unknown_id_reports_and_exits_two() {
     // No tty needed: `attach` resolves the target before the terminal check, so an unknown id is a
     // clean exit-2 with a pointer to `sbx session ls` — never a panic or a misparse of garbage.
-    let data = TmpDir::new("noid");
+    let data = TmpDir::prefixed("a", "noid");
     for id in ["999999", "not-a-pid"] {
         let out = sbx()
             .arg("session")
@@ -199,8 +156,8 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
     // `$HOME` must land in the app's home (`<data>/apps/probe/home`) and NOT in the project's
     // default home (which the warm-up launch created). A naive attach would use the project home
     // and fail both halves.
-    let project = TmpDir::new("proj");
-    let data = TmpDir::new("data");
+    let project = TmpDir::prefixed("a", "proj");
+    let data = TmpDir::prefixed("a", "data");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[app.probe]\ncmd = [\"sleep\", \"300\"]\n",

@@ -6,36 +6,12 @@
 //! the color pass touched. It exercises only the cheap, side-effect-free commands (no sandbox, no
 //! nix, no network) so it runs everywhere and fast.
 
-use std::path::{Path, PathBuf};
+#[macro_use]
+mod common;
+use common::fixture::TmpDir;
+
+use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
-
-// The fixtures' root, one definition shared with the unit tests.
-include!("../src/testroot.rs");
-
-/// A unique temp dir removed on drop, so a command's data-dir reads land in a throwaway location
-/// instead of the real `$HOME`.
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new() -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = fixture_root();
-        d.push(format!("color-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        TmpDir(d)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// Run `sbx <args>` with a throwaway home (data, state, config all redirected) and a clean cwd,
 /// capturing stdout (a pipe — so color must be off). `NO_COLOR`/`TERM` are also neutralised so the
@@ -70,8 +46,8 @@ fn assert_no_ansi(out: &std::process::Output, label: &str) {
 
 #[test]
 fn captured_output_carries_no_ansi_escapes() {
-    let home = TmpDir::new();
-    let cwd = TmpDir::new();
+    let home = TmpDir::new("color");
+    let cwd = TmpDir::new("color");
     // A real project config so `trust`/`untrust` take their confirmation path (recording then
     // revoking a marker), not an early read error — the colored confirmation lines must still be
     // plain when captured.
@@ -130,8 +106,8 @@ fn transactional_confirmations_are_plain_when_captured() {
     // Drive each cheap, host-agnostic one end to end (no nix, no network) so a miswired caller —
     // one that prints raw ANSI, or derives a stderr line's palette from the wrong stream — cannot
     // slip past with the presenter unit tests alone.
-    let home = TmpDir::new();
-    let cwd = TmpDir::new();
+    let home = TmpDir::new("color");
+    let cwd = TmpDir::new("color");
     // A minimal importable profile: a top-level app with a command.
     std::fs::write(cwd.path().join("probe.toml"), "cmd = \"true\"\n").unwrap();
 
@@ -243,8 +219,8 @@ fn app_targeted_net_test_is_plain_when_captured() {
     // `sbx test net --app <name>` renders spans the flat read-only loop never reaches: the app
     // scope label, the built-in-built-in tag, and the credential-injection note. A miswired
     // renderer (raw `colored()` instead of the captured-stream palette) would leak ANSI here only.
-    let home = TmpDir::new();
-    let cwd = TmpDir::new();
+    let home = TmpDir::new("color");
+    let cwd = TmpDir::new("color");
     // A global app lives as a profile file (trusted by location; an inline `[app.<name>]` in the
     // global config is forbidden): a top-level `RawApp` with its own allowlist and injected credential.
     let apps_dir = home.path().join("sbx").join("apps");
@@ -301,8 +277,8 @@ fn a_captured_warning_is_plain_with_exactly_one_prefix() {
     // plain `.contains("warning:")` cannot give: the mechanical conversion stripped the literal
     // `sbx: warning:` from ~30 sites, and a missed strip would double the prefix while every
     // substring assertion still passed.
-    let home = TmpDir::new();
-    let cwd = TmpDir::new();
+    let home = TmpDir::new("color");
+    let cwd = TmpDir::new("color");
     std::fs::write(cwd.path().join("mise.toml"), "[tools]\nnode = \"20\"\n").unwrap();
 
     let out = run(&["config", "show"], home.path(), cwd.path());

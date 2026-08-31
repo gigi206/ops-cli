@@ -2,60 +2,13 @@
 
 #[macro_use]
 mod common;
+use common::fixture::TmpDir;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 fn sbx() -> Command {
     Command::new(env!("CARGO_BIN_EXE_sbx"))
-}
-
-// The fixtures' root, one definition shared with the unit tests.
-include!("../src/testroot.rs");
-
-/// A unique temp dir removed on drop, so the binary's lock writes land in a throwaway
-/// location instead of the real `$HOME`.
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new() -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = fixture_root();
-        d.push(format!("upg-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        TmpDir(d)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        force_remove(&self.0);
-    }
-}
-
-/// Remove a tree that may contain read-only directories: a provisioned nix store
-/// makes its directories `0555`, so add write on the way down before deleting.
-fn force_remove(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if meta.is_dir() {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                force_remove(&entry.path());
-            }
-        }
-        let _ = std::fs::remove_dir(path);
-    } else {
-        let _ = std::fs::remove_file(path);
-    }
 }
 
 #[test]
@@ -100,9 +53,9 @@ fn upgrade_flake_pins_and_locks_a_declared_flake_package() {
     // launch). Teeth: the lock records a 40-hex revision for the declared reference, and a second
     // run moments later re-resolves to the *same* revision ("unchanged" — idempotent). Needs nix
     // and the network (github); skipped (not failed) where the resolution cannot run.
-    let data = TmpDir::new();
-    let proj = TmpDir::new();
-    let state = TmpDir::new();
+    let data = TmpDir::new("upg");
+    let proj = TmpDir::new("upg");
+    let state = TmpDir::new("upg");
     let reference = "github:numtide/flake-utils";
     std::fs::write(
         proj.path().join(".sbx.toml"),
@@ -200,8 +153,8 @@ fn upgrade_flake_pins_and_locks_a_declared_flake_package() {
 fn upgrade_resolves_and_locks_the_default_channel() {
     // A real resolution of the rolling channel: needs nix and the network. Skipped
     // (not failed) where the first `sbx upgrade` cannot run.
-    let data = TmpDir::new();
-    let proj = TmpDir::new();
+    let data = TmpDir::new("upg");
+    let proj = TmpDir::new("upg");
     let run = || {
         sbx()
             .args(["upgrade", "nix"])
@@ -271,7 +224,7 @@ fn app_upgrade(config: &Path, data: &Path, proj: &Path, name: &str) -> std::proc
 /// where `sbx upgrade nix` would have to be skipped for want of one.
 #[test]
 fn app_upgrade_names_the_project_wide_channels_and_rolls_nothing_itself() {
-    let (config, data, proj) = (TmpDir::new(), TmpDir::new(), TmpDir::new());
+    let (config, data, proj) = (TmpDir::new("upg"), TmpDir::new("upg"), TmpDir::new("upg"));
     write_profile(
         config.path(),
         "reader",
@@ -302,7 +255,7 @@ fn app_upgrade_names_the_project_wide_channels_and_rolls_nothing_itself() {
 /// The two refusals a name can earn, each with its own answer and its own exit code.
 #[test]
 fn app_upgrade_refuses_a_name_that_is_not_a_launchable_app() {
-    let (config, data, proj) = (TmpDir::new(), TmpDir::new(), TmpDir::new());
+    let (config, data, proj) = (TmpDir::new("upg"), TmpDir::new("upg"), TmpDir::new("upg"));
     write_profile(config.path(), "ghost", "[packages]\nx = \"nix:hello\"\n");
 
     // A name no app carries — the typo, pointed at the listing.
@@ -325,7 +278,7 @@ fn app_upgrade_refuses_a_name_that_is_not_a_launchable_app() {
 /// which would read as a roll that happened.
 #[test]
 fn app_upgrade_says_when_an_app_declares_nothing_to_advance() {
-    let (config, data, proj) = (TmpDir::new(), TmpDir::new(), TmpDir::new());
+    let (config, data, proj) = (TmpDir::new("upg"), TmpDir::new("upg"), TmpDir::new("upg"));
     write_profile(config.path(), "bare", "cmd = [\"bare\"]\n");
 
     let out = app_upgrade(config.path(), data.path(), proj.path(), "bare");
@@ -348,7 +301,7 @@ fn app_upgrade_says_when_an_app_declares_nothing_to_advance() {
 /// pin a claim the binary does not make.
 #[test]
 fn a_routing_answer_survives_an_unusable_data_directory() {
-    let (config, data, proj) = (TmpDir::new(), TmpDir::new(), TmpDir::new());
+    let (config, data, proj) = (TmpDir::new("upg"), TmpDir::new("upg"), TmpDir::new("upg"));
     write_profile(
         config.path(),
         "reader",

@@ -502,9 +502,11 @@ fn no_test_gives_up_through_a_bare_print() {
 ///
 /// That is the shape this sweep exists for. The hole was closed once by moving twenty-one roots to
 /// one definition, and closing it took editing a single file — so re-opening it takes editing a
-/// single file too.
+/// single file too. Since then the twenty-one `TmpDir` declarations behind those roots have
+/// themselves collapsed to two, one per half of the suite, so what this sweep now guards is that no
+/// third one appears with a root of its own.
 ///
-/// Two shapes are refused. A suite that declares its own `TmpDir` without reaching [`fixture_root`]
+/// Two shapes are refused. A file that declares its own `TmpDir` without reaching [`fixture_root`]
 /// has a root of its own, wherever it points today; and a line of code naming the in-workspace tree
 /// outright has one whether or not it declares a type. Prose may still name it — a comment
 /// explaining where fixtures used to live is not a fixture.
@@ -524,7 +526,8 @@ fn every_fixture_root_is_the_shared_one() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     // Assembled at runtime, so this file does not match its own needle.
     let in_workspace = format!("target/{}", "test-tmp");
-    let (mut own_root, mut hardcoded, mut declaring, mut files) = (Vec::new(), Vec::new(), 0, 0);
+    let (mut own_root, mut hardcoded, mut declaring, mut reaching, mut files) =
+        (Vec::new(), Vec::new(), 0, 0, 0);
     let mut used_exception = std::collections::BTreeSet::new();
 
     let mut stack = vec![root.join("src"), root.join("tests")];
@@ -550,6 +553,12 @@ fn every_fixture_root_is_the_shared_one() {
                 .to_string();
             let excused = ROOTED_IN_THE_WORKSPACE.contains(&rel.as_str());
 
+            // Counted apart: a file that *reaches* a fixture tree names `TmpDir`, whether it
+            // declares the type or uses the shared one. The precondition below rests on that count
+            // rather than on the number of declarations, which is now two by design.
+            if text.contains("TmpDir") {
+                reaching += 1;
+            }
             if text.contains("struct TmpDir") {
                 declaring += 1;
                 if !text.contains("fixture_root()") {
@@ -601,9 +610,17 @@ fn every_fixture_root_is_the_shared_one() {
     // The preconditions, asserted rather than assumed: a sweep that read nothing, or one that
     // stopped recognising how a fixture directory is declared, would pass while guarding nothing.
     assert!(files > 100, "the sweep read only {files} source files");
+    // Two declarers by design — `testutil` for the unit tests, `tests/common/fixture.rs` for the
+    // integration ones — so counting declarations would now assert almost nothing. What has to stay
+    // large is the number of files that reach a fixture tree at all: that is the population this
+    // rule governs, and a sweep that stopped recognising them would pass while guarding nothing.
     assert!(
-        declaring >= 20,
+        declaring >= 2,
         "only {declaring} files declare a fixture directory — has the sweep gone stale?"
+    );
+    assert!(
+        reaching >= 80,
+        "only {reaching} files reach a fixture tree — has the sweep gone stale?"
     );
 }
 

@@ -5,55 +5,14 @@
 
 #[macro_use]
 mod common;
+use common::fixture::TmpDir;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 // The fixtures' root, one definition shared with the unit tests.
 include!("../src/testroot.rs");
-
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new() -> Self {
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut d = fixture_root();
-        d.push(format!("f-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        TmpDir(d)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        force_remove(&self.0);
-    }
-}
-
-/// Remove a tree that may contain read-only directories (a provisioned nix store makes its
-/// directories `0555`): add write on the way down before deleting.
-fn force_remove(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if meta.is_dir() {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                force_remove(&entry.path());
-            }
-        }
-        let _ = std::fs::remove_dir(path);
-    } else {
-        let _ = std::fs::remove_file(path);
-    }
-}
 
 /// Run `sbx <args>` with an isolated, empty data directory so the session registry is empty and the
 /// outcome is deterministic regardless of the host's real sessions.
@@ -69,7 +28,7 @@ fn sbx(args: &[&str], data: &Path, cwd: &Path) -> Output {
 
 #[test]
 fn fs_logs_with_no_sessions_reports_none_and_exits_2() {
-    let (data, proj) = (TmpDir::new(), TmpDir::new());
+    let (data, proj) = (TmpDir::new("f"), TmpDir::new("f"));
     let out = sbx(&["fs", "logs"], data.path(), proj.path());
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {err}");
@@ -78,7 +37,7 @@ fn fs_logs_with_no_sessions_reports_none_and_exits_2() {
 
 #[test]
 fn fs_logs_rejects_a_second_id() {
-    let (data, proj) = (TmpDir::new(), TmpDir::new());
+    let (data, proj) = (TmpDir::new("f"), TmpDir::new("f"));
     let out = sbx(&["fs", "logs", "1", "2"], data.path(), proj.path());
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {err}");
@@ -87,7 +46,7 @@ fn fs_logs_rejects_a_second_id() {
 
 #[test]
 fn fs_with_no_subcommand_prints_usage() {
-    let (data, proj) = (TmpDir::new(), TmpDir::new());
+    let (data, proj) = (TmpDir::new("f"), TmpDir::new("f"));
     let out = sbx(&["fs"], data.path(), proj.path());
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {err}");
@@ -96,7 +55,7 @@ fn fs_with_no_subcommand_prints_usage() {
 
 #[test]
 fn fs_unknown_subcommand_is_an_error() {
-    let (data, proj) = (TmpDir::new(), TmpDir::new());
+    let (data, proj) = (TmpDir::new("f"), TmpDir::new("f"));
     let out = sbx(&["fs", "bogus"], data.path(), proj.path());
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {err}");
@@ -134,7 +93,7 @@ fn fs_logs_reports_an_unobserved_session() {
     // `sbx fs logs` reports it as unobserved (exit 2) rather than showing an empty feed. Fabricate a
     // record pointing at a plain live process (a `sleep`) — no cage, no socket — to isolate the
     // socket-missing path from the launch machinery. No sandbox needed.
-    let (data, project) = (TmpDir::new(), TmpDir::new());
+    let (data, project) = (TmpDir::new("f"), TmpDir::new("f"));
     let mut child = Command::new("sleep")
         .arg("30")
         .stdin(Stdio::null())
@@ -205,7 +164,7 @@ fn detached_observe_records_fs_writes_for_fs_logs() {
     // exercises the whole chain: the synchronous initial inotify watch, force-supervision on the
     // detached path, the fs ring, the bound socket, and the `sbx fs logs` client. Skipped, not failed,
     // where the host cannot sandbox.
-    let (project, data) = (TmpDir::new(), TmpDir::new());
+    let (project, data) = (TmpDir::new("f"), TmpDir::new("f"));
     if !host_can_sandbox(project.path(), data.path()) {
         skip_incapable!("skipping detached fs --observe e2e: host cannot sandbox");
         return;
@@ -274,7 +233,7 @@ fn fs_scan_lets_the_cage_make_files_inside_it_and_nowhere_else() {
     //
     // Both halves have teeth. Creating has to work, `..` included; and it must not become a way out,
     // since a file made through a walk that left the cage's mounts would land on the host.
-    let (project, data, outside) = (TmpDir::new(), TmpDir::new(), TmpDir::new());
+    let (project, data, outside) = (TmpDir::new("f"), TmpDir::new("f"), TmpDir::new("f"));
     if !host_can_sandbox(project.path(), data.path()) {
         skip_incapable!("skipping `[fs] scan` creation e2e: host cannot sandbox");
         return;
@@ -393,7 +352,7 @@ fn fs_scan_leaves_the_cage_its_own_proc_self() {
     //
     // Teeth: the answer has to be the *cage's*. A supervisor answering with its own entry satisfies
     // "the read succeeded" while handing over something from outside the cage entirely.
-    let (project, data) = (TmpDir::new(), TmpDir::new());
+    let (project, data) = (TmpDir::new("f"), TmpDir::new("f"));
     if !host_can_sandbox(project.path(), data.path()) {
         skip_incapable!("skipping `[fs] scan` `/proc/self` e2e: host cannot sandbox");
         return;
@@ -443,7 +402,7 @@ fn fs_scan_never_serves_the_cage_an_object_from_outside_it() {
     // Teeth on both sides. The first arm fails if anything from outside crosses; the second fails if
     // the fix bought that by refusing more, since a secret named through an absolute link must still
     // be scanned and refused rather than quietly let past on a second, unexamined resolution.
-    let (project, data) = (TmpDir::new(), TmpDir::new());
+    let (project, data) = (TmpDir::new("f"), TmpDir::new("f"));
     if !host_can_sandbox(project.path(), data.path()) {
         skip_incapable!("skipping `[fs] scan` boundary e2e: host cannot sandbox");
         return;
@@ -514,7 +473,7 @@ fn fs_scan_closes_a_matching_file_inside_a_real_cage() {
     // own `/proc` links. The unit tests fix the shape of that path; only a real cage proves it
     // resolves. Teeth: if the resolution were wrong, every open would fail to resolve and be allowed,
     // so the secret would come back in stdout and this test fails rather than silently passing.
-    let (project, data) = (TmpDir::new(), TmpDir::new());
+    let (project, data) = (TmpDir::new("f"), TmpDir::new("f"));
     if !host_can_sandbox(project.path(), data.path()) {
         skip_incapable!("skipping `[fs] scan` cage e2e: host cannot sandbox");
         return;

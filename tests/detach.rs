@@ -11,10 +11,10 @@
 
 #[macro_use]
 mod common;
+use common::fixture::TmpDir;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 fn sbx() -> Command {
@@ -30,49 +30,6 @@ fn sbx() -> Command {
 
 // The fixtures' root, one definition shared with the unit tests.
 include!("../src/testroot.rs");
-
-/// A unique temp dir removed on drop.
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new(tag: &str) -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = fixture_root();
-        d.push(format!("d-{tag}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        TmpDir(d)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        force_remove(&self.0);
-    }
-}
-
-/// Remove a tree that may contain read-only directories (a provisioned nix store makes its
-/// directories `0555`): add write on the way down before deleting.
-fn force_remove(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if meta.is_dir() {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                force_remove(&entry.path());
-            }
-        }
-        let _ = std::fs::remove_dir(path);
-    } else {
-        let _ = std::fs::remove_file(path);
-    }
-}
 
 /// Run `sbx <args>` to completion in `project` with isolated data/state, returning its output.
 fn sbx_run(project: &Path, data: &Path, state: &Path, args: &[&str]) -> std::process::Output {
@@ -186,9 +143,9 @@ fn detach_runs_an_agent_in_the_background_then_stop_ends_it() {
     // supervised path — the daemon hosts the proxy thread, the registered pid is the supervisor),
     // `plain` has none (the exec path — the daemon becomes bubblewrap). The unusual sleep durations
     // are unique fingerprints in the host process table.
-    let project = TmpDir::new("proj");
-    let data = TmpDir::new("data");
-    let state = TmpDir::new("state");
+    let project = TmpDir::prefixed("d", "proj");
+    let data = TmpDir::prefixed("d", "data");
+    let state = TmpDir::prefixed("d", "state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[app.sup]\n\

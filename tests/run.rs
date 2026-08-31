@@ -5,10 +5,10 @@
 
 #[macro_use]
 mod common;
+use common::fixture::TmpDir;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 fn sbx() -> Command {
     // Isolate XDG_CONFIG_HOME from the user's real `~/.config/sbx`: these e2es must not read the
@@ -43,63 +43,6 @@ impl Drop for KillOnDrop {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
-    }
-}
-
-struct TmpDir(PathBuf);
-
-/// How much of a fixture's tag survives into its directory name. With the prefix, a pid and the
-/// counter, this keeps a fixture directory at 25 bytes or so — inside the budget an `…/sbx` data
-/// dir has under a checkout at a normal depth.
-const TAG_MAX: usize = 10;
-
-impl TmpDir {
-    fn new(tag: &str) -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = fixture_root();
-        // A short prefix on purpose: a launch's egress proxy binds a Unix socket under this
-        // data dir (`…/<dir>/sbx/egress/proxy-<pid>.sock`), and `sun_path` caps the whole path
-        // at 108 bytes. A longer prefix plus a 7-digit pid (counted twice — here and in the
-        // socket name) tips a deep checkout over the limit, so keep this terse.
-        //
-        // The tag is a fixture label, not an identity — the counter alone makes the name unique —
-        // so it is capped here rather than trusted. A test that picks a descriptive tag would
-        // otherwise push its own data dir past the budget and fail with sbx's "path too long"
-        // refusal, which reads as a product bug rather than as a fixture that named itself.
-        let tag: String = tag.chars().take(TAG_MAX).collect();
-        d.push(format!("r-{tag}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        TmpDir(d)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        force_remove(&self.0);
-    }
-}
-
-/// Remove a tree that may contain read-only directories: a provisioned nix store
-/// makes its directories `0555`, so add write on the way down before deleting.
-fn force_remove(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if meta.is_dir() {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                force_remove(&entry.path());
-            }
-        }
-        let _ = std::fs::remove_dir(path);
-    } else {
-        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -173,8 +116,8 @@ fn run_detach_without_a_command_is_a_usage_error() {
 
 #[test]
 fn run_executes_commands_in_a_hermetic_sandbox() {
-    let project = TmpDir::new("proj");
-    let data = TmpDir::new("data");
+    let project = TmpDir::prefixed("r", "proj");
+    let data = TmpDir::prefixed("r", "data");
     std::fs::write(project.path().join("MARKER"), b"x").unwrap();
 
     // capability probe: a capable host runs `true` to success; otherwise skip.
@@ -256,9 +199,9 @@ fn the_cage_resolves_localhost_via_a_synthetic_hosts_file() {
     // empty netns where only `/etc/hosts` can answer): `curl -v http://localhost:1` must resolve
     // to 127.0.0.1 (then a connection error, nothing listening), NOT report "could not resolve
     // host". `curl` is in the base toolset.
-    let project = TmpDir::new("hosts-proj");
-    let data = TmpDir::new("hosts-data");
-    let state = TmpDir::new("hosts-state");
+    let project = TmpDir::prefixed("r", "hosts-proj");
+    let data = TmpDir::prefixed("r", "hosts-data");
+    let state = TmpDir::prefixed("r", "hosts-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[network]\nmode = \"none\"\n",
@@ -334,8 +277,8 @@ fn a_malformed_one_shot_override_is_a_hard_error_and_does_not_launch() {
     // Fail-closed: a malformed `--config` is a usage error (exit 2) surfaced before any sandbox
     // work — never a silent drop that would launch a different posture than asked. Needs no capable
     // host (it fails at parse time).
-    let project = TmpDir::new("ov-bad-proj");
-    let data = TmpDir::new("ov-bad-data");
+    let project = TmpDir::prefixed("r", "ov-bad-proj");
+    let data = TmpDir::prefixed("r", "ov-bad-data");
     let bad_toml = sbx()
         .args(["run", "--config", "x = = not toml", "--", "true"])
         .current_dir(project.path())
@@ -383,8 +326,8 @@ fn a_one_shot_override_beats_an_app_overlay_through_the_real_dispatch() {
     // own `env` overlay — proving the dispatch applies the override *after* `merge_app`, the load-
     // bearing ordering a unit test that calls the two by hand cannot cover. Skips (never fails) when
     // the host cannot sandbox.
-    let project = TmpDir::new("ov-app-proj");
-    let data = TmpDir::new("ov-app-data");
+    let project = TmpDir::prefixed("r", "ov-app-proj");
+    let data = TmpDir::prefixed("r", "ov-app-data");
     std::fs::write(
         project.path().join(".sbx.toml"),
         b"[app.greet]\ncmd = [\"printenv\", \"APPVAR\"]\n[app.greet.env]\nAPPVAR = \"from-app\"\n",
@@ -430,8 +373,8 @@ fn a_one_shot_env_override_reaches_the_cage_and_the_cli_beats_the_environment() 
     // `--config` all reach the cage environment, and the documented precedence holds — the command
     // line beats the environment. Observed by `printenv` inside the cage. Skips (never fails) when
     // the host cannot sandbox.
-    let project = TmpDir::new("ov-env-proj");
-    let data = TmpDir::new("ov-env-data");
+    let project = TmpDir::prefixed("r", "ov-env-proj");
+    let data = TmpDir::prefixed("r", "ov-env-data");
 
     // capability probe
     let probe = run_in(project.path(), data.path(), &["true"]);
@@ -493,8 +436,8 @@ fn a_cage_environment_value_is_never_substituted_from_the_host() {
     // in a position to substitute. Where no user manager can create one, the cage is launched
     // directly, the property holds trivially, and a green run proves nothing — so that case is
     // reported rather than left to look like coverage.
-    let project = TmpDir::new("nosub-proj");
-    let data = TmpDir::new("nosub-data");
+    let project = TmpDir::prefixed("r", "nosub-proj");
+    let data = TmpDir::prefixed("r", "nosub-data");
     let scoped = std::process::Command::new("systemd-run")
         .arg("--version")
         .output()
@@ -550,11 +493,11 @@ fn a_writable_bind_writes_through_to_the_host_while_a_read_only_bind_refuses() {
     // write fails with `EROFS` and leaves no new host file) — so "refused" cannot be confused with
     // "not mounted". `binds` is trusted-only, so the project is trusted first. Skips (never fails)
     // when the host cannot sandbox.
-    let project = TmpDir::new("rwbind-proj");
-    let data = TmpDir::new("rwbind-data");
-    let state = TmpDir::new("rwbind-state");
-    let rw = TmpDir::new("rwbind-rw");
-    let ro = TmpDir::new("rwbind-ro");
+    let project = TmpDir::prefixed("r", "rwbind-proj");
+    let data = TmpDir::prefixed("r", "rwbind-data");
+    let state = TmpDir::prefixed("r", "rwbind-state");
+    let rw = TmpDir::prefixed("r", "rwbind-rw");
+    let ro = TmpDir::prefixed("r", "rwbind-ro");
     // Canonical paths: `load` canonicalizes each bind source, so the cage dest is the canonical
     // path — write to and read from exactly that, or the in-cage path would not match the mount.
     let rw_dir = std::fs::canonicalize(rw.path()).unwrap();
@@ -687,7 +630,7 @@ fn a_read_write_home_bind_keeps_the_control_plane_pinned_in_place() {
     // membership + enforcement tests); the base cage carries no `umount` binary, so this e2e
     // exercises the reachable filesystem attack (rename/remove), not a raw syscall. Skips (never
     // fails) where the host cannot sandbox.
-    let home = TmpDir::new("cp");
+    let home = TmpDir::prefixed("r", "cp");
     // A fabricated `$HOME` with sbx's XDG roots inside it, so the control plane lives under the
     // read-write bind. Canonical, because `load` canonicalizes the bind source and the roots.
     //
@@ -815,8 +758,8 @@ echo "F:$(touch /nix/.sbx-store-writeprobe 2>/dev/null && echo OK || echo FAIL)"
 
 #[test]
 fn sbx_app_launches_the_apps_command_with_its_overlay() {
-    let project = TmpDir::new("appproj");
-    let data = TmpDir::new("appdata");
+    let project = TmpDir::prefixed("r", "appproj");
+    let data = TmpDir::prefixed("r", "appdata");
     // Two untrusted apps: `probe` runs the synthetic-identity check; `greet` carries a free
     // `env` overlay (which applies even untrusted, like the baseline `env`).
     std::fs::write(
@@ -891,9 +834,9 @@ fn app_run_treats_a_subcommand_verb_as_an_app_name() {
     // while the bare `sbx app list` still runs the list subcommand. Same token, disambiguated only
     // by its position after `run` — proof that an app may be named like a subcommand and is reached
     // as `sbx app run <name>`. Host-side (config resolution), no sandbox needed.
-    let project = TmpDir::new("apprun-verb-proj");
-    let data = TmpDir::new("apprun-verb-data");
-    let state = TmpDir::new("apprun-verb-state");
+    let project = TmpDir::prefixed("r", "apprun-verb-proj");
+    let data = TmpDir::prefixed("r", "apprun-verb-data");
+    let state = TmpDir::prefixed("r", "apprun-verb-state");
 
     // `sbx app run list` — `list` is the app name here, not the subcommand.
     let launched = app_in(project.path(), data.path(), "list");
@@ -923,8 +866,8 @@ fn app_run_treats_a_subcommand_verb_as_an_app_name() {
 
 #[test]
 fn an_app_home_persists_across_launches_and_is_isolated_from_the_project_shell() {
-    let project = TmpDir::new("apphome-proj");
-    let data = TmpDir::new("apphome-data");
+    let project = TmpDir::prefixed("r", "apphome-proj");
+    let data = TmpDir::prefixed("r", "apphome-data");
     // `counter` appends a line to a file in its own `$HOME` and prints the running count, so a
     // second launch reveals whether the home persisted. The default home scope is global —
     // one home per app — and this single project exercises persistence; isolation from the
@@ -985,9 +928,9 @@ fn an_app_home_persists_across_launches_and_is_isolated_from_the_project_shell()
 
 #[test]
 fn an_imported_profile_launches_trusted_by_location() {
-    let project = TmpDir::new("import-proj");
-    let data = TmpDir::new("import-data");
-    let config = TmpDir::new("import-config");
+    let project = TmpDir::prefixed("r", "import-proj");
+    let data = TmpDir::prefixed("r", "import-data");
+    let config = TmpDir::prefixed("r", "import-config");
     // A portable profile authored as a standalone file: it prints a free env var, so a successful
     // launch proves the profile was loaded (from the config dir, trusted by location) and run.
     std::fs::write(
@@ -1039,9 +982,9 @@ fn an_imported_profile_launches_trusted_by_location() {
 
 #[test]
 fn a_trusted_mise_env_reaches_the_sandbox_only_once_trusted() {
-    let project = TmpDir::new("mise-proj");
-    let data = TmpDir::new("mise-data");
-    let state = TmpDir::new("mise-state");
+    let project = TmpDir::prefixed("r", "mise-proj");
+    let data = TmpDir::prefixed("r", "mise-data");
+    let state = TmpDir::prefixed("r", "mise-state");
     // a mise file declares an env var; the (empty) .sbx.toml anchors it
     std::fs::write(project.path().join(".sbx.toml"), b"").unwrap();
     std::fs::write(
@@ -1281,10 +1224,10 @@ fn stage_signer(
 /// not provision), or the echo service is down.
 #[test]
 fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds_it() {
-    let root = TmpDir::new("signer-e2e");
-    let project = TmpDir::new("signer-e2e-proj");
-    let data = TmpDir::new("signer-e2e-data");
-    let state = TmpDir::new("signer-e2e-state");
+    let root = TmpDir::prefixed("r", "signer-e2e");
+    let project = TmpDir::prefixed("r", "signer-e2e-proj");
+    let data = TmpDir::prefixed("r", "signer-e2e-data");
+    let state = TmpDir::prefixed("r", "signer-e2e-state");
     let key = "the-real-signing-key-8f2a-e2e";
 
     let write_config = |signer: &str| {
@@ -1662,10 +1605,10 @@ fn a_signer_plugin_forms_the_credential_of_every_request_and_its_manifest_bounds
 /// not provision).
 #[test]
 fn an_http2_caller_is_told_why_its_request_was_not_signed() {
-    let root = TmpDir::new("h2-refusal-e2e");
-    let project = TmpDir::new("h2-refusal-proj");
-    let data = TmpDir::new("h2-refusal-data");
-    let state = TmpDir::new("h2-refusal-state");
+    let root = TmpDir::prefixed("r", "h2-refusal-e2e");
+    let project = TmpDir::prefixed("r", "h2-refusal-proj");
+    let data = TmpDir::prefixed("r", "h2-refusal-data");
+    let state = TmpDir::prefixed("r", "h2-refusal-state");
 
     std::fs::write(
         project.path().join(".sbx.toml"),
@@ -1808,10 +1751,10 @@ fn an_http2_caller_is_told_why_its_request_was_not_signed() {
 /// not provision), or the echo service is down.
 #[test]
 fn a_signer_that_asked_for_a_body_digest_is_told_it_and_the_body_still_arrives() {
-    let root = TmpDir::new("digest-e2e");
-    let project = TmpDir::new("digest-proj");
-    let data = TmpDir::new("digest-data");
-    let state = TmpDir::new("digest-state");
+    let root = TmpDir::prefixed("r", "digest-e2e");
+    let project = TmpDir::prefixed("r", "digest-proj");
+    let data = TmpDir::prefixed("r", "digest-data");
+    let state = TmpDir::prefixed("r", "digest-state");
 
     std::fs::write(
         project.path().join(".sbx.toml"),
@@ -1966,10 +1909,10 @@ fn comm_settles(pid: u32, want: impl Fn(&str) -> bool) -> String {
 /// Skips (never fails) where the host cannot sandbox.
 #[test]
 fn a_launch_execs_into_the_cage_unless_something_host_side_must_outlive_it() {
-    let project = TmpDir::new("sup");
-    let data = TmpDir::new("supd");
-    let state = TmpDir::new("sups");
-    let config = TmpDir::new("supc");
+    let project = TmpDir::prefixed("r", "sup");
+    let data = TmpDir::prefixed("r", "supd");
+    let state = TmpDir::prefixed("r", "sups");
+    let config = TmpDir::prefixed("r", "supc");
     // `network = "none"` is what leaves nothing host-side: no filtering proxy, so no guard.
     std::fs::write(project.path().join(".sbx.toml"), "network = \"none\"\n").unwrap();
 
@@ -2079,9 +2022,9 @@ fn a_gui_wayland_launch_connects_to_the_host_compositor() {
     // fails to connect. `wayland-info` dumps the compositor registry and exits 0 on a good
     // connection. Skips (never fails) when the host cannot sandbox, has no compositor, or the
     // cache is unreachable (wayland-utils is provisioned on the first launch).
-    let project = TmpDir::new("gui-proj");
-    let data = TmpDir::new("gui-data");
-    let state = TmpDir::new("gui-state");
+    let project = TmpDir::prefixed("r", "gui-proj");
+    let data = TmpDir::prefixed("r", "gui-data");
+    let state = TmpDir::prefixed("r", "gui-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "gui = \"wayland\"\nnetwork = \"none\"\n\
@@ -2152,11 +2095,11 @@ fn a_gui_isolated_cage_gets_a_dummy_interface_a_non_gui_one_does_not() {
     // while its egress is unchanged (the dummy has no route). Gated to `gui = "wayland"`: a non-gui
     // isolated cage keeps a loopback-only namespace. Skips (never fails) when the host cannot sandbox
     // or the dummy mechanism is unavailable (e.g. the `dummy` kernel module cannot be created here).
-    let data = TmpDir::new("dummy-data");
-    let state = TmpDir::new("dummy-state");
+    let data = TmpDir::prefixed("r", "dummy-data");
+    let state = TmpDir::prefixed("r", "dummy-state");
 
     // A GUI isolated cage: expect `lo` + `dummy0` in its network namespace.
-    let gui = TmpDir::new("dummy-gui");
+    let gui = TmpDir::prefixed("r", "dummy-gui");
     std::fs::write(
         gui.path().join(".sbx.toml"),
         "gui = \"wayland\"\nnetwork = \"none\"\n",
@@ -2193,7 +2136,7 @@ fn a_gui_isolated_cage_gets_a_dummy_interface_a_non_gui_one_does_not() {
     }
 
     // Teeth on the gating: a NON-gui isolated cage keeps a loopback-only namespace (no dummy).
-    let plain = TmpDir::new("dummy-plain");
+    let plain = TmpDir::prefixed("r", "dummy-plain");
     std::fs::write(plain.path().join(".sbx.toml"), "network = \"none\"\n").unwrap();
     let t2 = sbx_in(
         plain.path(),
@@ -2227,9 +2170,9 @@ fn a_gui_dummy_interface_opens_no_egress_the_allowlist_still_filters() {
     // present. Guards against a future "give dummy0 a default route to be safe" change silently
     // opening egress (the `network = "none"` gating e2e cannot see that). Skips (never fails) when
     // the host cannot sandbox, the dummy mechanism is unavailable, or the cache is unreachable.
-    let project = TmpDir::new("dummy-egress-proj");
-    let data = TmpDir::new("dummy-egress-data");
-    let state = TmpDir::new("dummy-egress-state");
+    let project = TmpDir::prefixed("r", "dummy-egress-proj");
+    let data = TmpDir::prefixed("r", "dummy-egress-data");
+    let state = TmpDir::prefixed("r", "dummy-egress-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "gui = \"wayland\"\n[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
@@ -2329,9 +2272,9 @@ fn a_gui_wayland_launch_provisions_fonts_the_cage_can_find() {
     // points fontconfig at exactly that seeded directory. Skips (never fails) when the host cannot
     // sandbox or the cache is unreachable (the fonts and fontconfig are provisioned host-side on
     // the first launch).
-    let project = TmpDir::new("gui-fonts-proj");
-    let data = TmpDir::new("gui-fonts-data");
-    let state = TmpDir::new("gui-fonts-state");
+    let project = TmpDir::prefixed("r", "gui-fonts-proj");
+    let data = TmpDir::prefixed("r", "gui-fonts-data");
+    let state = TmpDir::prefixed("r", "gui-fonts-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "gui = \"wayland\"\nnetwork = \"none\"\n\
@@ -2440,9 +2383,9 @@ fn an_offscreen_gui_posture_provisions_fonts_without_exposing_a_display() {
     // only list the hole's seeded DejaVu by store path; and `WAYLAND_DISPLAY` must be unset, which
     // separates this posture from `wayland` (where the same font assertion also holds). Skips
     // (never fails) when the host cannot sandbox or the cache is unreachable.
-    let project = TmpDir::new("gui-off-proj");
-    let data = TmpDir::new("gui-off-data");
-    let state = TmpDir::new("gui-off-state");
+    let project = TmpDir::prefixed("r", "gui-off-proj");
+    let data = TmpDir::prefixed("r", "gui-off-data");
+    let state = TmpDir::prefixed("r", "gui-off-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "gui = \"offscreen\"\nnetwork = \"none\"\n\
@@ -2553,9 +2496,9 @@ fn a_trusted_dbus_stands_up_an_in_cage_portal() {
     // (`org.freedesktop.secrets`) must be ABSENT on the private bus. `gdbus` comes from the
     // project's own `nix:glib.bin`. Skips (never fails) when the host cannot sandbox, has no
     // compositor, or the cache is unreachable (the portal stack is provisioned on the first launch).
-    let project = TmpDir::new("portal-proj");
-    let data = TmpDir::new("portal-data");
-    let state = TmpDir::new("portal-state");
+    let project = TmpDir::prefixed("r", "portal-proj");
+    let data = TmpDir::prefixed("r", "portal-data");
+    let state = TmpDir::prefixed("r", "portal-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "gui = \"wayland\"\ndbus = true\nnetwork = \"none\"\n\
@@ -2644,9 +2587,9 @@ fn a_trusted_in_cage_notifications_relay_attaches_and_forwards() {
     // never attached. It exits the instant the name has an owner, so a healthy run is unaffected.
     // `gdbus` comes from the project's own `nix:glib.bin`. Skips (never fails) when the host cannot
     // sandbox, has no compositor, no session bus, or the cache is unreachable.
-    let project = TmpDir::new("relay-proj");
-    let data = TmpDir::new("relay-data");
-    let state = TmpDir::new("relay-state");
+    let project = TmpDir::prefixed("r", "relay-proj");
+    let data = TmpDir::prefixed("r", "relay-data");
+    let state = TmpDir::prefixed("r", "relay-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "gui = \"wayland\"\ndbus = true\nnetwork = \"none\"\n\
@@ -2771,9 +2714,9 @@ fn a_keyfile_rewrite_makes_the_in_cage_portal_re_emit_setting_changed() {
     // theme-relay spike; here the cage writes the same file, isolating the portal-emits-on-change
     // half deterministically. `gdbus` comes from the project's own `nix:glib.bin`.) Skips (never
     // fails) when the host cannot sandbox, has no compositor, or the cache is unreachable.
-    let project = TmpDir::new("theme-proj");
-    let data = TmpDir::new("theme-data");
-    let state = TmpDir::new("theme-state");
+    let project = TmpDir::prefixed("r", "theme-proj");
+    let data = TmpDir::prefixed("r", "theme-data");
+    let state = TmpDir::prefixed("r", "theme-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "gui = \"wayland\"\ndbus = true\nnetwork = \"none\"\n\
@@ -2877,9 +2820,9 @@ fn catrust_purges_stale_cas_so_the_nss_db_never_accumulates() {
     // accumulation). `gui = "wayland"` + a filtering posture is what gates catrust on (no real
     // compositor needed — the CA import does not render). Skips when the host cannot sandbox or the
     // cache is unreachable (nss.tools is provisioned on the first launch).
-    let project = TmpDir::new("catrust-proj");
-    let data = TmpDir::new("catrust-data");
-    let state = TmpDir::new("catrust-state");
+    let project = TmpDir::prefixed("r", "catrust-proj");
+    let data = TmpDir::prefixed("r", "catrust-data");
+    let state = TmpDir::prefixed("r", "catrust-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "gui = \"wayland\"\n[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\
@@ -2959,9 +2902,9 @@ fn catrust_purges_stale_cas_so_the_nss_db_never_accumulates() {
 /// overwriting the profile's chosen name.
 #[test]
 fn a_trailing_argument_reaches_a_shell_profile_without_being_eaten_as_argv0() {
-    let project = TmpDir::new("argv0-proj");
-    let data = TmpDir::new("argv0-data");
-    let state = TmpDir::new("argv0-state");
+    let project = TmpDir::prefixed("r", "argv0-proj");
+    let data = TmpDir::prefixed("r", "argv0-data");
+    let state = TmpDir::prefixed("r", "argv0-state");
     // `nofill` declares no element after its script; `ownfill` declares `chosen-zero`. Both echo
     // the two facts under test, so one launch each settles both directions.
     // Written with TOML-escaped quotes: the script itself must be quoted inside a basic string, and
@@ -3041,8 +2984,8 @@ fn a_cage_carries_the_zone_database_and_the_config_moves_its_clock() {
     // cage did, so the default-path assertions are the *link* and the *database contents* — neither
     // of which existed before — and the configured-path assertion is a zone name nothing else in
     // the system produces.
-    let project = TmpDir::new("tz-proj");
-    let data = TmpDir::new("tz-data");
+    let project = TmpDir::prefixed("r", "tz-proj");
+    let data = TmpDir::prefixed("r", "tz-data");
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
@@ -3161,9 +3104,9 @@ fn a_network_allowlist_filters_egress_through_the_proxy() {
     // path (it cannot exec-replace while the proxy thread outlives the cage), this also covers
     // exit-status propagation there. Skips (never fails) when the host cannot sandbox or the
     // cache is unreachable.
-    let project = TmpDir::new("egress-proj");
-    let data = TmpDir::new("egress-data");
-    let state = TmpDir::new("egress-state");
+    let project = TmpDir::prefixed("r", "egress-proj");
+    let data = TmpDir::prefixed("r", "egress-data");
+    let state = TmpDir::prefixed("r", "egress-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
@@ -3317,9 +3260,9 @@ fn a_designated_http2_host_is_man_in_the_middled_as_http2() {
     //     — proving the policy fires on h2, not just the transport. (It is refused before any
     //     upstream contact, so example.com's reachability does not matter.)
     // Skips (never fails) when the host cannot sandbox or the cache is unreachable.
-    let project = TmpDir::new("h2-proj");
-    let data = TmpDir::new("h2-data");
-    let state = TmpDir::new("h2-state");
+    let project = TmpDir::prefixed("r", "h2-proj");
+    let data = TmpDir::prefixed("r", "h2-data");
+    let state = TmpDir::prefixed("r", "h2-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\
@@ -3423,9 +3366,9 @@ fn a_configured_secret_injects_and_tripwires_on_the_http2_path() {
     //   B. The outbound tripwire fires: a request that itself carries the secret value verbatim (in a
     //      client header) is refused `outbound-secret` — a secret must not leave the cage, whatever
     //      the verdict.
-    let project = TmpDir::new("h2-secret-proj");
-    let data = TmpDir::new("h2-secret-data");
-    let state = TmpDir::new("h2-secret-state");
+    let project = TmpDir::prefixed("r", "h2-secret-proj");
+    let data = TmpDir::prefixed("r", "h2-secret-data");
+    let state = TmpDir::prefixed("r", "h2-secret-state");
     let secret = "s3cr3t-h2-inject-9q2z7w1k";
     std::fs::write(
         project.path().join(".sbx.toml"),
@@ -3534,9 +3477,9 @@ fn a_secret_is_injected_masked_and_stripped_on_the_http2_grpc_path() {
     // `x-sbx-test` value (an equal-length `*` run) that is neither the real secret nor the decoy
     // proves injection-reached + masking + no-leak + strip in one shot. Skips (never fails) when the
     // host cannot sandbox, the cache is unreachable (grpcurl won't provision), or grpcb.in is down.
-    let project = TmpDir::new("h2-grpc-proj");
-    let data = TmpDir::new("h2-grpc-data");
-    let state = TmpDir::new("h2-grpc-state");
+    let project = TmpDir::prefixed("r", "h2-grpc-proj");
+    let data = TmpDir::prefixed("r", "h2-grpc-data");
+    let state = TmpDir::prefixed("r", "h2-grpc-state");
     let secret = "s3cr3t-grpc-inject-7w1k9q2z";
     let decoy = "DECOY-CLIENT-VALUE-must-be-stripped";
     std::fs::write(
@@ -3626,9 +3569,9 @@ fn net_learn_synthesizes_a_rule_for_a_refused_host_and_writes_it() {
     // host (`example.com`) must appear as a `{*} https://…` rule the run never had, proving the whole
     // chain (empty-netns forwarder → MITM proxy → verdict logged → teardown snapshot → synthesis).
     // Skips (never fails) when the host cannot sandbox or the cache is unreachable.
-    let project = TmpDir::new("netlearn-proj");
-    let data = TmpDir::new("netlearn-data");
-    let state = TmpDir::new("netlearn-state");
+    let project = TmpDir::prefixed("r", "netlearn-proj");
+    let data = TmpDir::prefixed("r", "netlearn-data");
+    let state = TmpDir::prefixed("r", "netlearn-state");
     // Baseline `deny` allowlist (allow only the cache, so provisioning works); an inline app whose
     // command reaches a host the allowlist does not cover. `curl` is in the base toolset.
     let original_config = "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\n\
@@ -3814,9 +3757,9 @@ fn a_forward_bridges_a_host_loopback_port_into_the_cage() {
             got
         };
 
-    let proj_a = TmpDir::new("ingr-a");
-    let data = TmpDir::new("ingr-data");
-    let state = TmpDir::new("ingr-state");
+    let proj_a = TmpDir::prefixed("r", "ingr-a");
+    let data = TmpDir::prefixed("r", "ingr-data");
+    let state = TmpDir::prefixed("r", "ingr-state");
 
     // Capability + cache probe on the first project (also seeds the store for the socat closure).
     std::fs::write(
@@ -3855,9 +3798,9 @@ fn a_forward_bridges_a_host_loopback_port_into_the_cage() {
     // Teeth: a second project with the SAME cage server but NO `forward` must be unreachable from
     // the host — nothing binds the host port, so the connect is refused. This is what proves the
     // forwarder (not an ambient route) is the bridge.
-    let proj_b = TmpDir::new("ingr-b");
-    let data_b = TmpDir::new("ingr-datb");
-    let state_b = TmpDir::new("ingr-statb");
+    let proj_b = TmpDir::prefixed("r", "ingr-b");
+    let data_b = TmpDir::prefixed("r", "ingr-datb");
+    let state_b = TmpDir::prefixed("r", "ingr-statb");
     let without = run_server_and_probe(proj_b.path(), data_b.path(), state_b.path(), false);
     assert!(
         without.is_none(),
@@ -3876,9 +3819,9 @@ fn a_cleartext_http_rule_forwards_plaintext_egress_through_the_proxy() {
     // suggestion. This exercises the seam a proxy unit test cannot — the `method != CONNECT`
     // absolute-form entry point through the real launch. Skips (never fails) when the host cannot
     // sandbox or the cache is unreachable.
-    let project = TmpDir::new("clear-proj");
-    let data = TmpDir::new("clear-data");
-    let state = TmpDir::new("clear-state");
+    let project = TmpDir::prefixed("r", "clear-proj");
+    let data = TmpDir::prefixed("r", "clear-data");
+    let state = TmpDir::prefixed("r", "clear-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[network]\nmode = \"deny\"\nallow = [\"http://cache.nixos.org\"]\n",
@@ -3987,9 +3930,9 @@ fn sbx_net_logs_reads_a_running_sessions_live_egress() {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    let project = TmpDir::new("logs-proj");
-    let data = TmpDir::new("logs-data");
-    let state = TmpDir::new("logs-state");
+    let project = TmpDir::prefixed("r", "logs-proj");
+    let data = TmpDir::prefixed("r", "logs-data");
+    let state = TmpDir::prefixed("r", "logs-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
@@ -4144,9 +4087,9 @@ fn sbx_net_logs_follow_streams_a_running_sessions_egress() {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    let project = TmpDir::new("logsf-proj");
-    let data = TmpDir::new("logsf-data");
-    let state = TmpDir::new("logsf-state");
+    let project = TmpDir::prefixed("r", "logsf-proj");
+    let data = TmpDir::prefixed("r", "logsf-data");
+    let state = TmpDir::prefixed("r", "logsf-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
@@ -4299,9 +4242,9 @@ fn a_tcp_rule_splices_a_raw_stream_through_the_cage() {
     // the cage. The CONNECT target `127.0.0.1` is resolved/connected by the host proxy in the *host*
     // netns (where loopback is the upstream), never by the empty-netns cage. Skips (never fails) when
     // the host cannot sandbox.
-    let project = TmpDir::new("tcp-splice-proj");
-    let data = TmpDir::new("tcp-splice-data");
-    let state = TmpDir::new("tcp-splice-state");
+    let project = TmpDir::prefixed("r", "tcp-splice-proj");
+    let data = TmpDir::prefixed("r", "tcp-splice-data");
+    let state = TmpDir::prefixed("r", "tcp-splice-state");
 
     // A host-side minimal plain-HTTP upstream on loopback — the splice's destination. Detached: it
     // answers each connection with a fixed body and closes; the process exit reaps it.
@@ -4389,9 +4332,9 @@ fn a_network_allow_mode_serves_filtered_egress_through_the_proxy() {
     // verdict under allow-by-default while deny-by-default blocks it — are the deterministic proxy
     // unit tests, because a loopback test upstream cannot stand in for an unlisted *public* host.
     // Skips (never fails) when the host cannot sandbox or the cache is unreachable.
-    let project = TmpDir::new("allowmode-proj");
-    let data = TmpDir::new("allowmode-data");
-    let state = TmpDir::new("allowmode-state");
+    let project = TmpDir::prefixed("r", "allowmode-proj");
+    let data = TmpDir::prefixed("r", "allowmode-data");
+    let state = TmpDir::prefixed("r", "allowmode-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[network]\nmode = \"allow\"\ndeny = [\"example.com/nix-cache-info\"]\n",
@@ -4515,9 +4458,9 @@ fn a_gui_wayland_launch_composes_with_a_network_allowlist() {
     // split across two launches they would only re-prove Slice A and 6.2d, not coexistence. Skips
     // (never fails) when the host cannot sandbox, has no compositor, or the cache is unreachable
     // (the tools and fonts are provisioned host-side on the first launch).
-    let project = TmpDir::new("gui-net-proj");
-    let data = TmpDir::new("gui-net-data");
-    let state = TmpDir::new("gui-net-state");
+    let project = TmpDir::prefixed("r", "gui-net-proj");
+    let data = TmpDir::prefixed("r", "gui-net-data");
+    let state = TmpDir::prefixed("r", "gui-net-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "gui = \"wayland\"\n\
@@ -4611,8 +4554,8 @@ fn a_shared_network_launch_trusts_sbx_own_cacert() {
     // (TLS verified against sbx's bundle), and the *same* fetch with the CA file forced empty
     // FAILS — so the fetch succeeds *because of* the configured trust anchor, not some ambient
     // cert path. Skips (never fails) when the host cannot sandbox or the cache is unreachable.
-    let project = TmpDir::new("cacert-proj");
-    let data = TmpDir::new("cacert-data");
+    let project = TmpDir::prefixed("r", "cacert-proj");
+    let data = TmpDir::prefixed("r", "cacert-data");
 
     // capability probe; also seeds the project store so a later TLS failure is a real fault.
     let probe = run_in(project.path(), data.path(), &["true"]);
@@ -4678,8 +4621,8 @@ fn the_curated_base_tools_run_in_the_cage() {
     // realised. One launch probes each tool; `set -e` fails on the first missing or broken one.
     // No network: the tools are seeded into the project store. Skips when the host cannot
     // sandbox.
-    let project = TmpDir::new("tools-proj");
-    let data = TmpDir::new("tools-data");
+    let project = TmpDir::prefixed("r", "tools-proj");
+    let data = TmpDir::prefixed("r", "tools-data");
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
@@ -4730,9 +4673,9 @@ fn a_usr_bin_env_shebang_resolves_in_the_cage() {
     // not the shebang path; running the script by its own path proves the `/usr/bin/env` facade
     // specifically. Skips (never fails) when the host cannot sandbox or the cache is unreachable
     // (node is fetched on the first launch).
-    let project = TmpDir::new("env-proj");
-    let data = TmpDir::new("env-data");
-    let state = TmpDir::new("env-state");
+    let project = TmpDir::prefixed("r", "env-proj");
+    let data = TmpDir::prefixed("r", "env-data");
+    let state = TmpDir::prefixed("r", "env-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[packages]\nnodejs = \"nix:nodejs\"\n",
@@ -4806,9 +4749,9 @@ fn a_tarball_resolve_command_runs_in_a_hermetic_cage_and_its_output_is_validated
     // in the real base userland (a `printf` builtin under `/bin/sh`) and captured+validated its stdout.
     // Teeth: the printed token appears AND the validation rejection appears. Skips (never fails) when
     // the host cannot sandbox or the cache is unreachable (the base userland is fetched on first launch).
-    let project = TmpDir::new("resolve-proj");
-    let data = TmpDir::new("resolve-data");
-    let state = TmpDir::new("resolve-state");
+    let project = TmpDir::prefixed("r", "resolve-proj");
+    let data = TmpDir::prefixed("r", "resolve-data");
+    let state = TmpDir::prefixed("r", "resolve-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[packages]\ndemo = \"tarball:resolve\"\n\n\
@@ -4880,9 +4823,9 @@ fn a_deb_resolve_command_runs_in_a_hermetic_cage_and_its_output_is_validated() {
     // userland (`printf` under `/bin/sh`) and captured+validated its stdout. Teeth: the printed token
     // appears AND the `.deb` validation rejection appears. Skips (never fails) when the host cannot
     // sandbox or the cache is unreachable (the base userland is fetched on first launch).
-    let project = TmpDir::new("deb-resolve-proj");
-    let data = TmpDir::new("deb-resolve-data");
-    let state = TmpDir::new("deb-resolve-state");
+    let project = TmpDir::prefixed("r", "deb-resolve-proj");
+    let data = TmpDir::prefixed("r", "deb-resolve-data");
+    let state = TmpDir::prefixed("r", "deb-resolve-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[packages]\ndemo = \"deb:resolve\"\n\n\
@@ -4955,9 +4898,9 @@ fn sbx_upgrade_deb_runs_a_deb_resolve_command_through_the_upgrade_cage() {
     // validated its stdout. Network-light: validation rejects before any `.deb` prefetch; only the
     // base userland seed (already paid by the probe) costs. Skips when the host cannot sandbox or the
     // cache is unreachable.
-    let project = TmpDir::new("deb-up-proj");
-    let data = TmpDir::new("deb-up-data");
-    let state = TmpDir::new("deb-up-state");
+    let project = TmpDir::prefixed("r", "deb-up-proj");
+    let data = TmpDir::prefixed("r", "deb-up-data");
+    let state = TmpDir::prefixed("r", "deb-up-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[packages]\ndemo = \"deb:resolve\"\n\n\
@@ -5030,9 +4973,9 @@ fn an_appimage_resolve_command_runs_in_a_hermetic_cage_and_its_output_is_validat
     // ran the command in the real base userland (`printf` under `/bin/sh`) and captured+validated its
     // stdout. Teeth: the printed token appears AND the `.AppImage` validation rejection appears. Skips
     // (never fails) when the host cannot sandbox or the cache is unreachable.
-    let project = TmpDir::new("ai-resolve-proj");
-    let data = TmpDir::new("ai-resolve-data");
-    let state = TmpDir::new("ai-resolve-state");
+    let project = TmpDir::prefixed("r", "ai-resolve-proj");
+    let data = TmpDir::prefixed("r", "ai-resolve-data");
+    let state = TmpDir::prefixed("r", "ai-resolve-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[packages]\ndemo = \"appimage:resolve\"\n\n\
@@ -5099,9 +5042,9 @@ fn sbx_upgrade_appimage_runs_an_appimage_resolve_command_through_the_upgrade_cag
     // `has_resolve_ref`, distinct code from the launch-time provisioning) and re-run the command. An
     // `appimage:resolve` that `printf`s an INVALID URL makes the upgrade FAIL, naming the token in the
     // roll summary's `re-resolve failed` line. Network-light: validation rejects before any prefetch.
-    let project = TmpDir::new("ai-up-proj");
-    let data = TmpDir::new("ai-up-data");
-    let state = TmpDir::new("ai-up-state");
+    let project = TmpDir::prefixed("r", "ai-up-proj");
+    let data = TmpDir::prefixed("r", "ai-up-data");
+    let state = TmpDir::prefixed("r", "ai-up-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[packages]\ndemo = \"appimage:resolve\"\n\n\
@@ -5168,8 +5111,8 @@ fn a_synthetic_xdg_open_surfaces_the_url_and_exits_zero() {
     // `/usr/bin/xdg-open` as a `/bin/sh` stub that prints its argument to stderr and exits 0,
     // so the call is non-fatal and the user is told what to open. This runs the real stub in a
     // real cage — teeth: exit 0 AND the URL on stderr — and needs no packages or network.
-    let project = TmpDir::new("xdg-proj");
-    let data = TmpDir::new("xdg-data");
+    let project = TmpDir::prefixed("r", "xdg-proj");
+    let data = TmpDir::prefixed("r", "xdg-data");
     // capability probe (also seeds the base store); skip if the host cannot sandbox.
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
@@ -5205,9 +5148,9 @@ fn a_bin_bash_shebang_resolves_in_the_cage() {
     // is the only path through `/bin/bash`, which is the facade this proves. No `[packages]`
     // or network are needed beyond the base store seed. Skips (never fails) when the host
     // cannot sandbox or the cache is unreachable (the base closure is fetched on first launch).
-    let project = TmpDir::new("bash-proj");
-    let data = TmpDir::new("bash-data");
-    let state = TmpDir::new("bash-state");
+    let project = TmpDir::prefixed("r", "bash-proj");
+    let data = TmpDir::prefixed("r", "bash-data");
+    let state = TmpDir::prefixed("r", "bash-state");
     // an executable script whose shebang names `/bin/bash` directly
     let script = project.path().join("sb.sh");
     std::fs::write(&script, "#!/bin/bash\necho BASH-SHEBANG-OK\n").unwrap();
@@ -5262,9 +5205,9 @@ fn the_cage_self_equips_via_mise_under_a_network_allowlist() {
     // Short tags: the egress proxy's Unix socket lives under the data dir, and its full path
     // must fit a `sockaddr_un` (~108 bytes). The tree `fixture_root()` returns is already deep, so
     // a long tag would overflow `SUN_LEN`. (Production's `~/.local/share/sbx` is short.)
-    let project = TmpDir::new("ma-proj");
-    let data = TmpDir::new("ma-data");
-    let state = TmpDir::new("ma-state");
+    let project = TmpDir::prefixed("r", "ma-proj");
+    let data = TmpDir::prefixed("r", "ma-data");
+    let state = TmpDir::prefixed("r", "ma-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
@@ -5345,8 +5288,8 @@ fn the_cage_auto_equips_a_non_nix_mise_tool_at_launch() {
     // installed it into the project's own store, and resolved it through the shims dir — the
     // whole auto-equip chain. Skips (never fails) when the host cannot sandbox or the network
     // is unreachable (the tool is fetched from upstream on first launch).
-    let project = TmpDir::new("equip-proj");
-    let data = TmpDir::new("equip-data");
+    let project = TmpDir::prefixed("r", "equip-proj");
+    let data = TmpDir::prefixed("r", "equip-data");
     // anchored on an (empty) .sbx.toml; the tool is fresh-from-upstream via mise's aqua backend
     std::fs::write(project.path().join(".sbx.toml"), "").unwrap();
     std::fs::write(
@@ -5393,9 +5336,9 @@ fn the_cage_auto_equips_a_non_nix_tool_under_a_network_allowlist() {
     // runs, so mise's reqwest trusted the proxy's per-session CA and the forwarder bridged the
     // empty netns. Short tags keep the egress socket path under `SUN_LEN`. Skips (never fails)
     // when the host cannot sandbox or the cache is unreachable.
-    let project = TmpDir::new("aql-proj");
-    let data = TmpDir::new("aql-data");
-    let state = TmpDir::new("aql-state");
+    let project = TmpDir::prefixed("r", "aql-proj");
+    let data = TmpDir::prefixed("r", "aql-data");
+    let state = TmpDir::prefixed("r", "aql-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n",
@@ -5464,9 +5407,9 @@ fn a_fresh_mise_package_app_runs_under_its_own_allowlist() {
     // equip path end-to-end, (2) the nixpkgs unfree blocker is gone (this is an aqua standalone
     // binary, not nixpkgs), and (3) the app's allowlist permits the release fetch. Short tags keep
     // the egress socket under `SUN_LEN`. Skips (never fails) without sandbox or network.
-    let project = TmpDir::new("fmp-proj");
-    let data = TmpDir::new("fmp-data");
-    let state = TmpDir::new("fmp-state");
+    let project = TmpDir::prefixed("r", "fmp-proj");
+    let data = TmpDir::prefixed("r", "fmp-data");
+    let state = TmpDir::prefixed("r", "fmp-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[app.cc]\n\
@@ -5616,10 +5559,10 @@ fn a_global_app_splits_mise_pools_across_two_projects() {
     //     pool, so the agent reuses the one app-global copy rather than re-installing rg per project.
     // Old (single-pool) behaviour would show (app-global 2, per-project pools 0); the split shows
     // (app-global 1, two pools of 1). Skips (never fails) without a sandbox or the network.
-    let project_a = TmpDir::new("m2a-proj");
-    let project_b = TmpDir::new("m2b-proj");
-    let data = TmpDir::new("m2-data");
-    let state = TmpDir::new("m2-state");
+    let project_a = TmpDir::prefixed("r", "m2a-proj");
+    let project_b = TmpDir::prefixed("r", "m2b-proj");
+    let data = TmpDir::prefixed("r", "m2-data");
+    let state = TmpDir::prefixed("r", "m2-state");
     let toml = "[app.ag]\n\
                 cmd = [\"sh\", \"-c\", \"mise use -g nix:jq && jq --version && rg --version\"]\n\
                 [app.ag.packages]\n\
@@ -5728,8 +5671,8 @@ fn a_global_apps_project_mise_tool_lands_in_the_per_project_pool() {
     // project's `mise.toml`, must install into `projects/<id>/apps/ag/mise/installs` and be ABSENT
     // from the app-global home (which holds only the app's own `[packages]` — here none). This is the
     // Lane-2 landing check §6 folds into Increment 3. Skips (never fails) without a sandbox or network.
-    let project = TmpDir::new("l2-proj");
-    let data = TmpDir::new("l2-data");
+    let project = TmpDir::prefixed("r", "l2-proj");
+    let data = TmpDir::prefixed("r", "l2-data");
     // a global app (home_scope defaults to global) whose cmd runs the project tool; the tool itself is
     // declared in the project's mise.toml (Lane 2 — the open self-equip toolchain), not `[packages]`.
     std::fs::write(
@@ -5839,9 +5782,9 @@ fn sbx_upgrade_mise_rolls_a_mise_package_in_cage() {
     // home is the upgrade cage itself — proven by the `rg` shim appearing in that home's mise data
     // dir after `sbx upgrade mise` and *before* any `sbx run`. The aqua release fetch rides the
     // host network (the default `shared` posture). Skips (never fails) without sandbox or network.
-    let project = TmpDir::new("umr-proj");
-    let data = TmpDir::new("umr-data");
-    let state = TmpDir::new("umr-state");
+    let project = TmpDir::prefixed("r", "umr-proj");
+    let data = TmpDir::prefixed("r", "umr-data");
+    let state = TmpDir::prefixed("r", "umr-state");
 
     // Capability probe against an *empty* project (nothing equipped); also seeds the store once.
     let probe = run_in(project.path(), data.path(), &["true"]);
@@ -5937,9 +5880,9 @@ fn sbx_upgrade_mise_rolls_a_global_apps_app_global_tool() {
     // pin. Teeth: with no `sbx app run` first, only the upgrade cage can equip rg, and it must appear
     // in the app-global home, ABSENT from any per-project pool. Skips (never fails) without a sandbox
     // or the network.
-    let project = TmpDir::new("ugm-proj");
-    let data = TmpDir::new("ugm-data");
-    let state = TmpDir::new("ugm-state");
+    let project = TmpDir::prefixed("r", "ugm-proj");
+    let data = TmpDir::prefixed("r", "ugm-data");
+    let state = TmpDir::prefixed("r", "ugm-state");
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
@@ -6036,10 +5979,10 @@ fn a_flake_package_builds_host_side_into_the_shared_store_and_a_fresh_project_re
     // fetches over the HOST network (host-side, like `nix:`/`deb:`), so it needs no cage allowlist —
     // which also removes the "a flake whose build self-fetches is blocked under the allowlist" wall.
     // Short tags keep the egress socket under `SUN_LEN`. Skips (never fails) without sandbox or network.
-    let proj_a = TmpDir::new("flka-proj");
-    let proj_b = TmpDir::new("flkb-proj");
-    let data = TmpDir::new("flk-data");
-    let state = TmpDir::new("flk-state");
+    let proj_a = TmpDir::prefixed("r", "flka-proj");
+    let proj_b = TmpDir::prefixed("r", "flkb-proj");
+    let data = TmpDir::prefixed("r", "flk-data");
+    let state = TmpDir::prefixed("r", "flk-state");
     let flake = "flake:github:NixOS/nixpkgs/9ae611a455b90cf061d8f332b977e387bda8e1ca#hello";
     let toml = format!("[app.fk]\ncmd = [\"hello\"]\n[app.fk.packages]\nhello = \"{flake}\"\n");
     std::fs::write(proj_a.path().join(".sbx.toml"), &toml).unwrap();
@@ -6141,9 +6084,9 @@ fn an_inline_flake_builds_in_cage_and_an_edit_rebuilds() {
     //
     // Short tags keep the egress socket under `SUN_LEN`. Skips (never fails) without sandbox or
     // network.
-    let project = TmpDir::new("ifk-proj");
-    let data = TmpDir::new("ifk-data");
-    let state = TmpDir::new("ifk-state");
+    let project = TmpDir::prefixed("r", "ifk-proj");
+    let data = TmpDir::prefixed("r", "ifk-data");
+    let state = TmpDir::prefixed("r", "ifk-state");
     const REV: &str = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
     // `body` is the `default` output expression; the rest of the flake is fixed. A quoted heredoc
     // delimiter is not needed — the whole file is an sbx-owned literal here, no shell interpolation.
@@ -6266,9 +6209,9 @@ fn a_locked_flake_package_builds_the_pinned_ref_host_side() {
     // (like `nix:`), not the retired in-cage `home/.local/state/sbx/flake/` out-link. Skips (never
     // fails) without sandbox or network.
     let rev = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
-    let project = TmpDir::new("lfk-proj");
-    let data = TmpDir::new("lfk-data");
-    let state = TmpDir::new("lfk-state");
+    let project = TmpDir::prefixed("r", "lfk-proj");
+    let data = TmpDir::prefixed("r", "lfk-data");
+    let state = TmpDir::prefixed("r", "lfk-state");
     std::fs::write(
         project.path().join(".sbx.toml"),
         format!(
@@ -6492,9 +6435,9 @@ fn sbx_gc_keeps_a_current_flake_build_and_reclaims_a_rolled_away_one() {
     //            `prune_project_package_roots_keeps_declared_and_multi_output_siblings`.)
     // Skips (never fails) without sandbox or network.
     let rev = "9ae611a455b90cf061d8f332b977e387bda8e1ca";
-    let project = TmpDir::new("gc-proj");
-    let data = TmpDir::new("gc-data");
-    let state = TmpDir::new("gc-state");
+    let project = TmpDir::prefixed("r", "gc-proj");
+    let data = TmpDir::prefixed("r", "gc-data");
+    let state = TmpDir::prefixed("r", "gc-state");
     let cfg = |attr: &str| {
         format!(
             "[packages]\nhello = \"flake:github:NixOS/nixpkgs/{rev}#{attr}\"\n\
@@ -6677,10 +6620,10 @@ fn sbx_projects_rm_dead_reaps_a_deleted_projects_tree() {
     // `--gc` then runs the shared-store collection in the same command. Skips (never fails) without
     // sandbox or network.
     use std::os::unix::ffi::OsStrExt;
-    let project = TmpDir::new("gca-proj");
-    let scratch = TmpDir::new("gca-scratch");
-    let data = TmpDir::new("gca-data");
-    let state = TmpDir::new("gca-state");
+    let project = TmpDir::prefixed("r", "gca-proj");
+    let scratch = TmpDir::prefixed("r", "gca-scratch");
+    let data = TmpDir::prefixed("r", "gca-data");
+    let state = TmpDir::prefixed("r", "gca-state");
 
     // A launch seeds the store and writes the marker; the probe both checks sandbox capability and
     // does that seeding.
@@ -6792,9 +6735,9 @@ fn a_secret_is_resolved_host_side_and_never_enters_the_cage() {
     // "it reaches the upstream" half is proven by the in-crate proxy TLS-MITM tests; this is the
     // no-leak half, which needs no echo service and no successful egress.) Skips (never fails)
     // when the host cannot sandbox.
-    let project = TmpDir::new("secret-proj");
-    let data = TmpDir::new("secret-data");
-    let state = TmpDir::new("secret-state");
+    let project = TmpDir::prefixed("r", "secret-proj");
+    let data = TmpDir::prefixed("r", "secret-data");
+    let state = TmpDir::prefixed("r", "secret-state");
     let secret_value = "sbx-e2e-secret-must-not-leak-4b7x";
     std::fs::write(
         project.path().join(".sbx.toml"),
@@ -6878,9 +6821,9 @@ fn a_resolver_plugin_resolves_a_secret_host_side_and_never_enters_the_cage() {
     // plaintext wired into the egress proxy, never the sandbox environment. So a launch that runs
     // the resolver must succeed, and `printenv` inside the cage must show neither the locator nor
     // the resolved value. Skips (never fails) when the host cannot sandbox.
-    let project = TmpDir::new("rplugin-proj");
-    let data = TmpDir::new("rplugin-data");
-    let state = TmpDir::new("rplugin-state");
+    let project = TmpDir::prefixed("r", "rplugin-proj");
+    let data = TmpDir::prefixed("r", "rplugin-data");
+    let state = TmpDir::prefixed("r", "rplugin-state");
     let secret_value = "sbx-plugin-e2e-secret-7q2z";
 
     // install a resolver plugin: a manifest plus an executable that returns a constant plaintext.
@@ -6978,9 +6921,9 @@ fn an_outbound_secret_is_refused_at_the_proxy() {
     // an agent that learned it. The refusal fires before any DNS/connect, so it holds offline; the
     // positive control (a clean fetch still works) is gated on the cache being reachable. Skips
     // (never fails) when the host cannot sandbox.
-    let project = TmpDir::new("leak-proj");
-    let data = TmpDir::new("leak-data");
-    let state = TmpDir::new("leak-state");
+    let project = TmpDir::prefixed("r", "leak-proj");
+    let data = TmpDir::prefixed("r", "leak-data");
+    let state = TmpDir::prefixed("r", "leak-state");
     // a filename-safe value (it rides in a URL path below) that appears nowhere in normal traffic
     let secret_value = "sbx-e2e-leak-canary-9z3k";
     std::fs::write(
@@ -7092,8 +7035,8 @@ fn an_outbound_secret_is_refused_at_the_proxy() {
 #[test]
 fn the_cage_runs_under_a_resource_limit_scope() {
     const TASK_CAP: &str = "16384"; // mirrors sandbox::cgroup::TASKS_MAX
-    let project = TmpDir::new("cg-proj");
-    let data = TmpDir::new("cg-data");
+    let project = TmpDir::prefixed("r", "cg-proj");
+    let data = TmpDir::prefixed("r", "cg-data");
 
     // capability probe (also primes the base userland so the sleep launches fast)
     let probe = run_in(project.path(), data.path(), &["true"]);
@@ -7153,9 +7096,9 @@ fn the_cage_runs_under_a_resource_limit_scope() {
 fn a_trusted_limits_override_lands_in_the_cage_scope() {
     const OVERRIDE_CAP: &str = "4096"; // distinct from the default sandbox::cgroup::TASKS_MAX (16384)
     const DEFAULT_CAP: &str = "16384";
-    let project = TmpDir::new("cglim-proj");
-    let data = TmpDir::new("cglim-data");
-    let state = TmpDir::new("cglim-state");
+    let project = TmpDir::prefixed("r", "cglim-proj");
+    let data = TmpDir::prefixed("r", "cglim-data");
+    let state = TmpDir::prefixed("r", "cglim-state");
 
     // A trusted project lowers the task cap below the default. `[limits]` is a security field,
     // honored only after `sbx trust`.
@@ -7245,9 +7188,9 @@ fn a_trusted_limits_override_lands_in_the_cage_scope() {
 /// non-regression that a `[seccomp]` config never breaks a launch.
 #[test]
 fn a_trusted_seccomp_relaxation_launches_a_working_cage() {
-    let project = TmpDir::new("sec-proj");
-    let data = TmpDir::new("sec-data");
-    let state = TmpDir::new("sec-state");
+    let project = TmpDir::prefixed("r", "sec-proj");
+    let data = TmpDir::prefixed("r", "sec-data");
+    let state = TmpDir::prefixed("r", "sec-state");
 
     // A relaxation mixing a whole-syscall lift (comma-separated in one string) and a fine-grained
     // selector — the union of both must thread through. `[seccomp]` is a security field, so it
@@ -7323,9 +7266,9 @@ fn a_trusted_devices_grant_binds_a_host_device_into_the_cage() {
         return;
     };
 
-    let project = TmpDir::new("dev-proj");
-    let data = TmpDir::new("dev-data");
-    let state = TmpDir::new("dev-state");
+    let project = TmpDir::prefixed("r", "dev-proj");
+    let data = TmpDir::prefixed("r", "dev-data");
+    let state = TmpDir::prefixed("r", "dev-state");
 
     std::fs::write(
         project.path().join(".sbx.toml"),
@@ -7402,9 +7345,9 @@ fn a_trusted_gpu_posture_grants_the_render_node_and_sys_to_the_cage() {
         return;
     }
 
-    let project = TmpDir::new("gpu-proj");
-    let data = TmpDir::new("gpu-data");
-    let state = TmpDir::new("gpu-state");
+    let project = TmpDir::prefixed("r", "gpu-proj");
+    let data = TmpDir::prefixed("r", "gpu-data");
+    let state = TmpDir::prefixed("r", "gpu-state");
 
     std::fs::write(project.path().join(".sbx.toml"), b"gpu = true\n").unwrap();
     let check = "test -e /dev/dri && echo DRI-PRESENT || echo DRI-ABSENT; \
@@ -7506,9 +7449,9 @@ fn a_trusted_audio_posture_binds_the_pulseaudio_socket_into_the_cage() {
         }
     }
 
-    let project = TmpDir::new("audio-proj");
-    let data = TmpDir::new("audio-data");
-    let state = TmpDir::new("audio-state");
+    let project = TmpDir::prefixed("r", "audio-proj");
+    let data = TmpDir::prefixed("r", "audio-data");
+    let state = TmpDir::prefixed("r", "audio-state");
 
     // `alsa-utils` gives the cage `arecord`, so the e2e can attempt a real ALSA capture through the
     // shim (best-effort). A `[packages]` backend is trusted-only, so it is also dropped untrusted.
@@ -7627,9 +7570,9 @@ fn a_trusted_audio_posture_equips_a_python_portaudio_tool() {
         }
     }
 
-    let project = TmpDir::new("pa-proj");
-    let data = TmpDir::new("pa-data");
-    let state = TmpDir::new("pa-state");
+    let project = TmpDir::prefixed("r", "pa-proj");
+    let data = TmpDir::prefixed("r", "pa-data");
+    let state = TmpDir::prefixed("r", "pa-state");
 
     // `python312` + `uv` give the cage an interpreter and installer, so the e2e can install an
     // UNPATCHED PyPI `sounddevice` — the nixpkgs one is patched to hardcode the store path, which
@@ -7770,9 +7713,9 @@ fn a_typed_one_shot_security_override_reaches_the_cage() {
         return;
     };
 
-    let project = TmpDir::new("ovr1-proj");
-    let data = TmpDir::new("ovr1-data");
-    let state = TmpDir::new("ovr1-state");
+    let project = TmpDir::prefixed("r", "ovr1-proj");
+    let data = TmpDir::prefixed("r", "ovr1-data");
+    let state = TmpDir::prefixed("r", "ovr1-state");
     let check = format!("test -e {device} && echo DEV-PRESENT || echo DEV-ABSENT");
 
     // Baseline (also seeds the base userland): no flag, no config → the device is ABSENT from the
@@ -7838,9 +7781,9 @@ fn a_typed_one_shot_security_override_reaches_the_cage() {
 fn a_trusted_app_limits_override_lands_in_the_cage_scope() {
     const OVERRIDE_CAP: &str = "2048"; // distinct from the default (16384) and the baseline e2e's 4096
     const DEFAULT_CAP: &str = "16384";
-    let project = TmpDir::new("applim-proj");
-    let data = TmpDir::new("applim-data");
-    let state = TmpDir::new("applim-state");
+    let project = TmpDir::prefixed("r", "applim-proj");
+    let data = TmpDir::prefixed("r", "applim-data");
+    let state = TmpDir::prefixed("r", "applim-state");
 
     // A trusted app caps tasks below the default — on its overlay, not the baseline. `[limits]` is a
     // security field, so the app must be trusted for the cap to apply.
@@ -7927,9 +7870,9 @@ fn a_trusted_app_limits_override_lands_in_the_cage_scope() {
 fn a_typed_one_shot_limit_flag_lands_in_the_cage_scope() {
     const OVERRIDE_CAP: &str = "8192"; // distinct from the default TASKS_MAX (16384)
     const DEFAULT_CAP: &str = "16384";
-    let project = TmpDir::new("cgtyped-proj");
-    let data = TmpDir::new("cgtyped-data");
-    let state = TmpDir::new("cgtyped-state");
+    let project = TmpDir::prefixed("r", "cgtyped-proj");
+    let data = TmpDir::prefixed("r", "cgtyped-data");
+    let state = TmpDir::prefixed("r", "cgtyped-state");
 
     // Capability probe (also primes the base userland so the measured launch starts fast). No
     // project config and no `sbx trust` — the one-shot override is trusted by invocation.
@@ -8130,8 +8073,8 @@ fn sbx_attach_joins_the_live_cage_with_the_confinement_reapplied() {
     // `2` is `Seccomp_filters` (both denylists loaded, not just one).
     const CONFINE: &str = "CONFINE=2-1-0000000000000000-2";
 
-    let project = TmpDir::new("attach-proj");
-    let data = TmpDir::new("attach-data");
+    let project = TmpDir::prefixed("r", "attach-proj");
+    let data = TmpDir::prefixed("r", "attach-data");
 
     // Capability probe (also warms the base userland so the background agent and the attach start
     // fast). No config, no trust — a real attach provisions nothing and re-resolves no config.
@@ -8274,8 +8217,8 @@ fn sbx_attach_runs_a_command_inheriting_stdio_and_propagating_status() {
     // Assembled at runtime from /proc inside the joined command, so it cannot leak in from the argv.
     const CONFINE: &str = "CONFINE=2-1-0000000000000000-2";
 
-    let project = TmpDir::new("attachcmd-proj");
-    let data = TmpDir::new("attachcmd-data");
+    let project = TmpDir::prefixed("r", "attachcmd-proj");
+    let data = TmpDir::prefixed("r", "attachcmd-data");
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
@@ -8409,9 +8352,9 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
-    let project = TmpDir::new("attachkill-proj");
-    let data = TmpDir::new("attachkill-data");
-    let state = TmpDir::new("attachkill-state");
+    let project = TmpDir::prefixed("r", "attachkill-proj");
+    let data = TmpDir::prefixed("r", "attachkill-data");
+    let state = TmpDir::prefixed("r", "attachkill-state");
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
@@ -8575,7 +8518,7 @@ fn sbx_data(data: &Path, args: &[&str]) -> Output {
 
 #[test]
 fn sbx_app_rm_purge_removes_the_installed_homes_and_lists_them() {
-    let data = TmpDir::new("purge-data");
+    let data = TmpDir::prefixed("r", "purge-data");
     let sbx_dir = data.path().join("sbx");
     // The target app 'claude': a global home (with a sibling etc) and one per-project home.
     touch_under(&sbx_dir.join("apps/claude/home/state"));
@@ -8631,7 +8574,7 @@ fn sbx_app_rm_purge_removes_the_installed_homes_and_lists_them() {
 
 #[test]
 fn sbx_app_rm_purges_several_apps_in_one_call() {
-    let data = TmpDir::new("purge-many-data");
+    let data = TmpDir::prefixed("r", "purge-many-data");
     let sbx_dir = data.path().join("sbx");
     // Two target apps, one with a global home and one with a per-project home, plus a third that
     // is not named and must survive.
@@ -8690,7 +8633,7 @@ fn sbx_app_rm_purges_several_apps_in_one_call() {
 
 #[test]
 fn sbx_app_rm_counts_a_repeated_name_once() {
-    let data = TmpDir::new("purge-dup-data");
+    let data = TmpDir::prefixed("r", "purge-dup-data");
     let sbx_dir = data.path().join("sbx");
     touch_under(&sbx_dir.join("apps/agent-one/home/state"));
 
@@ -8725,7 +8668,7 @@ fn sbx_app_rm_counts_a_repeated_name_once() {
 fn sbx_app_rm_gc_is_skipped_when_the_call_purged_nothing() {
     // Nothing on disk for any name: the sweep has no reclamation to make, so it must not run —
     // which is also what keeps this test free of nix and of a capable host.
-    let data = TmpDir::new("gc-nothing-data");
+    let data = TmpDir::prefixed("r", "gc-nothing-data");
     let out = sbx_data(data.path(), &["app", "rm", "absent-app", "--purge", "--gc"]);
     assert!(
         !out.status.success(),
@@ -8746,7 +8689,7 @@ fn sbx_app_rm_gc_is_skipped_when_the_call_purged_nothing() {
 fn sbx_app_rm_gc_requires_purge() {
     // `--gc` sweeps the store a purged home referenced, so it is meaningless without `--purge`.
     // This errors before any work, so it needs no capable host and no data setup.
-    let data = TmpDir::new("gc-needs-purge");
+    let data = TmpDir::prefixed("r", "gc-needs-purge");
     let out = sbx_data(data.path(), &["app", "rm", "agent", "--gc"]);
     assert!(
         !out.status.success(),
@@ -8765,7 +8708,7 @@ fn sbx_app_rm_gc_requires_purge() {
 
 #[test]
 fn sbx_app_rm_purge_refuses_while_a_session_is_live() {
-    let data = TmpDir::new("purge-live-data");
+    let data = TmpDir::prefixed("r", "purge-live-data");
     let sbx_dir = data.path().join("sbx");
     touch_under(&sbx_dir.join("apps/agent/home/state"));
 
@@ -8820,8 +8763,8 @@ fn sbx_app_rm_purge_refuses_while_a_session_is_live() {
 /// sandbox or the binary cache is unreachable.
 #[test]
 fn gc_prune_drops_a_superseded_seed_root_and_keeps_the_current_base() {
-    let project = TmpDir::new("gcsup-proj");
-    let data = TmpDir::new("gcsup-data");
+    let project = TmpDir::prefixed("r", "gcsup-proj");
+    let data = TmpDir::prefixed("r", "gcsup-data");
 
     // Seed the project store (capability probe): a successful `true` provisions and roots the base
     // userland — creating both the store's direct seed roots and the `<data>/gcroots/base/<rev>`
@@ -8907,8 +8850,8 @@ fn gc_prune_drops_a_superseded_seed_root_and_keeps_the_current_base() {
 /// is exercised. Skips (never fails) where the host cannot sandbox or the cache is unreachable.
 #[test]
 fn upgrade_hints_at_reclaimable_superseded_builds() {
-    let project = TmpDir::new("uphint-proj");
-    let data = TmpDir::new("uphint-data");
+    let project = TmpDir::prefixed("r", "uphint-proj");
+    let data = TmpDir::prefixed("r", "uphint-data");
 
     let probe = run_in(project.path(), data.path(), &["true"]);
     if !probe.status.success() {
@@ -8971,8 +8914,8 @@ fn fs_masks_close_a_project_path_while_its_name_stays_visible() {
     // The cage cannot undo any of it either — `rm` over a mask is `EBUSY` and a hard link out of one
     // is `EXDEV`, which is what makes the mask hold against in-cage code rather than merely against
     // an honest reader. Skips (never fails) where the host cannot sandbox.
-    let project = TmpDir::new("fsmask-proj");
-    let data = TmpDir::new("fsmask-data");
+    let project = TmpDir::prefixed("r", "fsmask-proj");
+    let data = TmpDir::prefixed("r", "fsmask-data");
     let p = project.path();
     std::fs::create_dir_all(p.join("certs")).unwrap();
     std::fs::create_dir_all(p.join("secrets")).unwrap();
@@ -9088,9 +9031,9 @@ fn a_task_reads_the_key_its_own_unmask_names_and_nothing_else() {
     //
     // Trust matters here in one direction only: `[fs]` applies whatever the project's trust, but
     // `[task]` is a security field, so the project has to be trusted for the tasks to exist at all.
-    let project = TmpDir::new("unmask-proj");
-    let data = TmpDir::new("unmask-data");
-    let state = TmpDir::new("unmask-state");
+    let project = TmpDir::prefixed("r", "unmask-proj");
+    let data = TmpDir::prefixed("r", "unmask-data");
+    let state = TmpDir::prefixed("r", "unmask-state");
     let p = project.path();
     std::fs::create_dir_all(p.join("certs")).unwrap();
     std::fs::write(p.join("prod.key"), b"THE-KEY\n").unwrap();
@@ -9176,8 +9119,8 @@ fn a_one_shot_config_mask_closes_the_path_and_unions_with_the_project() {
     // blob resolved, printed, and then never reached the cage. The failure was silent and in the
     // dangerous direction (the file the invoker asked to close stayed readable), which is why the
     // whole path is pinned here through the real binary rather than at the fold alone.
-    let project = TmpDir::new("fsov-proj");
-    let data = TmpDir::new("fsov-data");
+    let project = TmpDir::prefixed("r", "fsov-proj");
+    let data = TmpDir::prefixed("r", "fsov-data");
     let p = project.path();
     std::fs::write(p.join(".env"), b"SECRET=hunter2\n").unwrap();
     std::fs::write(p.join("from-file.key"), b"FILE-KEY\n").unwrap();
@@ -9258,9 +9201,9 @@ fn a_one_shot_config_mask_closes_the_path_and_unions_with_the_project() {
 /// cage that cannot reach that resource, which is the safe direction.
 #[test]
 fn a_broker_that_cannot_be_provided_warns_and_the_launch_still_succeeds() {
-    let project = TmpDir::new("brk");
-    let data = TmpDir::new("brkd");
-    let config = TmpDir::new("brkc");
+    let project = TmpDir::prefixed("r", "brk");
+    let data = TmpDir::prefixed("r", "brkd");
+    let config = TmpDir::prefixed("r", "brkc");
     std::fs::write(project.path().join(".sbx.toml"), "").unwrap();
 
     let probe = run_in(project.path(), data.path(), &["true"]);

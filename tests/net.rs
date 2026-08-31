@@ -2,35 +2,11 @@
 //! the built binary end to end against redirected config/state/data dirs and a temp project as
 //! the working directory. Read-only and host-side: no launch, no nix, no network.
 
-use std::path::{Path, PathBuf};
+#[macro_use]
+mod common;
+use common::fixture::TmpDir;
+
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU32, Ordering};
-
-// The fixtures' root, one definition shared with the unit tests.
-include!("../src/testroot.rs");
-
-/// A unique temp dir removed on drop.
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new() -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = fixture_root();
-        d.push(format!("net-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        TmpDir(d)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// One project under test: the working dir plus the redirected config-home (global config),
 /// state-home (trust store) and data-home (per-project runtime).
@@ -44,10 +20,10 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         Fixture {
-            proj: TmpDir::new(),
-            config_home: TmpDir::new(),
-            state_home: TmpDir::new(),
-            data_home: TmpDir::new(),
+            proj: TmpDir::new("net"),
+            config_home: TmpDir::new("net"),
+            state_home: TmpDir::new("net"),
+            data_home: TmpDir::new("net"),
         }
     }
 

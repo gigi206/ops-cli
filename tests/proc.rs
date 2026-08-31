@@ -6,55 +6,14 @@
 
 #[macro_use]
 mod common;
+use common::fixture::TmpDir;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 // The fixtures' root, one definition shared with the unit tests.
 include!("../src/testroot.rs");
-
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new() -> Self {
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut d = fixture_root();
-        d.push(format!("p-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        TmpDir(d)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        force_remove(&self.0);
-    }
-}
-
-/// Remove a tree that may contain read-only directories (a provisioned nix store makes its
-/// directories `0555`): add write on the way down before deleting.
-fn force_remove(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if meta.is_dir() {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                force_remove(&entry.path());
-            }
-        }
-        let _ = std::fs::remove_dir(path);
-    } else {
-        let _ = std::fs::remove_file(path);
-    }
-}
 
 /// Run `sbx <args>` with an isolated, empty data directory so the session registry is empty and
 /// the outcome is deterministic regardless of the host's real sessions.
@@ -75,7 +34,7 @@ fn sbx(args: &[&str], data: &Path, cwd: &Path) -> Output {
 /// what `--all` is for asking. Both siblings (`sbx proc pending`, `sbx net rules`) already refuse.
 #[test]
 fn proc_rules_refuses_a_project_it_cannot_resolve_rather_than_listing_everything() {
-    let base = TmpDir::new();
+    let base = TmpDir::new("p");
     let (work, data) = (base.path().join("work"), base.path().join("data"));
     std::fs::create_dir_all(&work).unwrap();
     std::fs::create_dir_all(&data).unwrap();
@@ -106,7 +65,7 @@ fn proc_rules_refuses_a_project_it_cannot_resolve_rather_than_listing_everything
 
 #[test]
 fn proc_ls_with_no_sessions_reports_none_and_exits_2() {
-    let (data, proj) = (TmpDir::new(), TmpDir::new());
+    let (data, proj) = (TmpDir::new("p"), TmpDir::new("p"));
     let out = sbx(&["proc", "ls"], data.path(), proj.path());
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {err}");
@@ -115,7 +74,7 @@ fn proc_ls_with_no_sessions_reports_none_and_exits_2() {
 
 #[test]
 fn proc_ls_unknown_pid_is_a_pointed_error() {
-    let (data, proj) = (TmpDir::new(), TmpDir::new());
+    let (data, proj) = (TmpDir::new("p"), TmpDir::new("p"));
     // A pid above the kernel ceiling cannot name a live session.
     let out = sbx(&["proc", "ls", "4294967295"], data.path(), proj.path());
     let err = String::from_utf8_lossy(&out.stderr);
@@ -129,7 +88,7 @@ fn proc_ls_unknown_pid_is_a_pointed_error() {
 
 #[test]
 fn proc_ls_rejects_a_second_id() {
-    let (data, proj) = (TmpDir::new(), TmpDir::new());
+    let (data, proj) = (TmpDir::new("p"), TmpDir::new("p"));
     let out = sbx(&["proc", "ls", "1", "2"], data.path(), proj.path());
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {err}");
@@ -138,7 +97,7 @@ fn proc_ls_rejects_a_second_id() {
 
 #[test]
 fn proc_with_no_subcommand_prints_usage() {
-    let (data, proj) = (TmpDir::new(), TmpDir::new());
+    let (data, proj) = (TmpDir::new("p"), TmpDir::new("p"));
     let out = sbx(&["proc"], data.path(), proj.path());
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {err}");
@@ -150,7 +109,7 @@ fn proc_with_no_subcommand_prints_usage() {
 
 #[test]
 fn proc_unknown_subcommand_is_an_error() {
-    let (data, proj) = (TmpDir::new(), TmpDir::new());
+    let (data, proj) = (TmpDir::new("p"), TmpDir::new("p"));
     let out = sbx(&["proc", "bogus"], data.path(), proj.path());
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {err}");
@@ -160,7 +119,7 @@ fn proc_unknown_subcommand_is_an_error() {
 #[test]
 fn proc_live_needs_a_terminal_without_json() {
     // Captured stdout is a pipe, not a tty, so the human redraw is refused with a pointer to --json.
-    let (data, proj) = (TmpDir::new(), TmpDir::new());
+    let (data, proj) = (TmpDir::new("p"), TmpDir::new("p"));
     let out = sbx(&["proc", "live"], data.path(), proj.path());
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {err}");
@@ -169,7 +128,7 @@ fn proc_live_needs_a_terminal_without_json() {
 
 #[test]
 fn proc_live_json_with_no_session_exits_2() {
-    let (data, proj) = (TmpDir::new(), TmpDir::new());
+    let (data, proj) = (TmpDir::new("p"), TmpDir::new("p"));
     let out = sbx(&["proc", "live", "--json"], data.path(), proj.path());
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {err}");
@@ -179,7 +138,7 @@ fn proc_live_json_with_no_session_exits_2() {
 #[test]
 fn proc_live_rejects_a_zero_interval() {
     // The interval is parsed before anything else, so a zero busy-loop is refused up front.
-    let (data, proj) = (TmpDir::new(), TmpDir::new());
+    let (data, proj) = (TmpDir::new("p"), TmpDir::new("p"));
     let out = sbx(
         &["proc", "live", "--json", "-i", "0"],
         data.path(),
@@ -240,7 +199,7 @@ fn write_session_record(data: &Path, pid: u32, project: &Path) {
 
 #[test]
 fn proc_logs_with_no_sessions_reports_none_and_exits_2() {
-    let (data, proj) = (TmpDir::new(), TmpDir::new());
+    let (data, proj) = (TmpDir::new("p"), TmpDir::new("p"));
     let out = sbx(&["proc", "logs"], data.path(), proj.path());
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {err}");
@@ -249,7 +208,7 @@ fn proc_logs_with_no_sessions_reports_none_and_exits_2() {
 
 #[test]
 fn proc_logs_rejects_a_second_id() {
-    let (data, proj) = (TmpDir::new(), TmpDir::new());
+    let (data, proj) = (TmpDir::new("p"), TmpDir::new("p"));
     let out = sbx(&["proc", "logs", "1", "2"], data.path(), proj.path());
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {err}");
@@ -262,7 +221,7 @@ fn proc_logs_reports_an_unobserved_session() {
     // reports it as unobserved (exit 2) rather than showing an empty feed. Fabricate a record
     // pointing at a plain live process (a `sleep`) — no cage, no socket — to isolate the
     // socket-missing path from the launch machinery. No sandbox needed.
-    let (data, project) = (TmpDir::new(), TmpDir::new());
+    let (data, project) = (TmpDir::new("p"), TmpDir::new("p"));
     let mut child = Command::new("sleep")
         .arg("30")
         .stdin(Stdio::null())
@@ -308,7 +267,7 @@ fn detached_observe_records_exec_events_for_proc_logs() {
     // inline `--observe` feed cannot cover: force-supervision on the detached path, the ring, the
     // bound socket, and the `sbx proc logs` client. Skipped, not failed, where the host cannot
     // sandbox.
-    let (project, data) = (TmpDir::new(), TmpDir::new());
+    let (project, data) = (TmpDir::new("p"), TmpDir::new("p"));
     if !host_can_sandbox(project.path(), data.path()) {
         skip_incapable!("skipping detached --observe e2e: host cannot sandbox");
         return;
@@ -370,7 +329,7 @@ fn proc_ls_shows_a_real_cage_process_tree() {
     // scope reparented the cage away from the recorded pid — would not contain `sleep`. Skipped, not
     // failed, where the host cannot sandbox; but once `host_can_sandbox` proves it can, a missing
     // `sleep` is a real failure of the walk, not a skip.
-    let (project, data) = (TmpDir::new(), TmpDir::new());
+    let (project, data) = (TmpDir::new("p"), TmpDir::new("p"));
     if !host_can_sandbox(project.path(), data.path()) {
         skip_incapable!(
             "skipping proc-ls cage e2e: host cannot sandbox (no userns/bwrap, or the base cache is unreachable)"
@@ -426,7 +385,7 @@ fn run_observe_streams_exec_events() {
     // each process the command spawns. Teeth: the same run WITHOUT `--observe` (the exec-replace
     // path, no observer) emits no feed. Non-interactive (stdin null) so it takes the foreground
     // path, not the pty one. Skipped, not failed, where the host cannot sandbox.
-    let (project, data) = (TmpDir::new(), TmpDir::new());
+    let (project, data) = (TmpDir::new("p"), TmpDir::new("p"));
     if !host_can_sandbox(project.path(), data.path()) {
         skip_incapable!("skipping run --observe e2e: host cannot sandbox");
         return;
@@ -473,7 +432,7 @@ fn enforce_blocks_a_denied_binary_in_a_real_cage() {
     // EPERM and never produces its output. `[proc]` is security-gated, so the project must be trusted
     // (an untrusted config drops it — proven separately). Skipped, not failed, where the host cannot
     // sandbox; once it can, a denied `id` that still runs is a real enforcement failure.
-    let (project, data) = (TmpDir::new(), TmpDir::new());
+    let (project, data) = (TmpDir::new("p"), TmpDir::new("p"));
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[proc]\nmode = \"enforce\"\ndeny = [\"id\"]\n",
@@ -547,7 +506,7 @@ fn an_override_config_proc_enforces_without_trusting_the_project() {
     // `sbx trust`** — the invoker outranks the config layer. Teeth: the control run (no override) runs
     // `id` (it prints `uid=…`), so the block appears *only* because the override reached the cage.
     // Skipped, not failed, where the host cannot sandbox.
-    let (project, data) = (TmpDir::new(), TmpDir::new());
+    let (project, data) = (TmpDir::new("p"), TmpDir::new("p"));
     if !host_can_sandbox(project.path(), data.path()) {
         skip_incapable!("skipping override-proc enforce e2e: host cannot sandbox");
         return;
@@ -603,7 +562,7 @@ fn a_typed_proc_off_override_disables_a_trusted_projects_enforcement() {
     // the parity with `--gpu=false`). A trusted project denies `id`; the baseline run blocks it, but
     // `--proc off` lets it run — proving the typed flag reached the cage. Skipped, not failed, where
     // the host cannot sandbox.
-    let (project, data) = (TmpDir::new(), TmpDir::new());
+    let (project, data) = (TmpDir::new("p"), TmpDir::new("p"));
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[proc]\nmode = \"enforce\"\ndeny = [\"id\"]\n",
@@ -663,7 +622,7 @@ fn app_run_observe_streams_exec_events() {
     // through the app path the same way, forcing supervision and streaming `[sbx:exec]`. Teeth: the
     // same app run without `--observe` emits no feed. Skipped, not failed, where the host cannot
     // sandbox.
-    let (project, data) = (TmpDir::new(), TmpDir::new());
+    let (project, data) = (TmpDir::new("p"), TmpDir::new("p"));
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[app.probe]\ncmd = [\"sh\", \"-c\", \"sleep 1\"]\n",
@@ -723,7 +682,12 @@ fn sbx_config_write(
 
 #[test]
 fn proc_deny_bootstraps_enforce_writes_the_config_and_retrusts() {
-    let (proj, state, config, data) = (TmpDir::new(), TmpDir::new(), TmpDir::new(), TmpDir::new());
+    let (proj, state, config, data) = (
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+    );
     let out = sbx_config_write(
         &["proc", "deny", "curl"],
         proj.path(),
@@ -761,7 +725,12 @@ fn proc_deny_bootstraps_enforce_writes_the_config_and_retrusts() {
 /// now, so this also pins that `sbx proc deny` really goes through it.
 #[test]
 fn proc_deny_refuses_an_untrusted_existing_project() {
-    let (proj, state, config, data) = (TmpDir::new(), TmpDir::new(), TmpDir::new(), TmpDir::new());
+    let (proj, state, config, data) = (
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+    );
     std::fs::write(
         proj.path().join(".sbx.toml"),
         "[proc]\nmode = \"enforce\"\ndeny = [\"ssh\"]\n",
@@ -792,7 +761,12 @@ fn proc_deny_refuses_an_untrusted_existing_project() {
 /// layer these verbs edit, so it could not see the change either way.
 #[test]
 fn proc_unallow_and_undeny_round_trip_through_config() {
-    let (proj, state, config, data) = (TmpDir::new(), TmpDir::new(), TmpDir::new(), TmpDir::new());
+    let (proj, state, config, data) = (
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+    );
     // `ask` is the one posture that carries both lists: an `allow` is inert (and refused) under
     // `enforce`. Trusted up front, because a pre-existing untrusted config is refused by design.
     std::fs::write(
@@ -867,7 +841,12 @@ fn proc_unallow_and_undeny_round_trip_through_config() {
 /// config nobody has trusted is refused, and nothing is written.
 #[test]
 fn proc_unallow_refuses_an_untrusted_existing_project() {
-    let (proj, state, config, data) = (TmpDir::new(), TmpDir::new(), TmpDir::new(), TmpDir::new());
+    let (proj, state, config, data) = (
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+    );
     std::fs::write(
         proj.path().join(".sbx.toml"),
         "[proc]\nmode = \"ask\"\nallow = [\"git\"]\n",
@@ -897,7 +876,12 @@ fn proc_unallow_refuses_an_untrusted_existing_project() {
 /// the user never ran.
 #[test]
 fn a_proc_removal_verb_names_itself_when_it_refuses_a_session_flag() {
-    let (proj, state, config, data) = (TmpDir::new(), TmpDir::new(), TmpDir::new(), TmpDir::new());
+    let (proj, state, config, data) = (
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+    );
     for verb in ["unallow", "undeny"] {
         let out = sbx_config_write(
             &["proc", verb, "curl", "--session"],
@@ -921,7 +905,12 @@ fn a_proc_removal_verb_names_itself_when_it_refuses_a_session_flag() {
 
 #[test]
 fn proc_allow_with_no_posture_is_refused_and_writes_nothing() {
-    let (proj, state, config, data) = (TmpDir::new(), TmpDir::new(), TmpDir::new(), TmpDir::new());
+    let (proj, state, config, data) = (
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+    );
     let out = sbx_config_write(
         &["proc", "allow", "git"],
         proj.path(),
@@ -942,7 +931,12 @@ fn proc_allow_with_no_posture_is_refused_and_writes_nothing() {
 fn proc_deny_session_with_a_config_scope_flag_is_refused() {
     // `--session` writes no file, so a file-scope flag does not apply — refuse rather than silently
     // ignore it (mirrors `sbx net`). No launch needed.
-    let (proj, state, config, data) = (TmpDir::new(), TmpDir::new(), TmpDir::new(), TmpDir::new());
+    let (proj, state, config, data) = (
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+    );
     let out = sbx_config_write(
         &["proc", "deny", "curl", "--session", "--local"],
         proj.path(),
@@ -962,7 +956,12 @@ fn proc_deny_session_with_a_config_scope_flag_is_refused() {
 fn proc_deny_session_with_no_live_session_is_reported() {
     // With no enforcing session in scope, a `--session` load has nothing to reach — exit 1 with a
     // pointer to launching one or writing config. Deterministic (empty data dir → empty registry).
-    let (proj, state, config, data) = (TmpDir::new(), TmpDir::new(), TmpDir::new(), TmpDir::new());
+    let (proj, state, config, data) = (
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+        TmpDir::new("p"),
+    );
     let out = sbx_config_write(
         &["proc", "deny", "curl", "--session"],
         proj.path(),
@@ -985,7 +984,7 @@ fn deny_session_loads_a_rule_into_a_running_enforcing_cage() {
     // `--session deny` must load into that one session. The decide-reflects-the-overlay property is
     // unit-tested; this proves the CLI → session enumeration → proc control socket → overlay chain
     // end to end. Skipped, not failed, where the host cannot sandbox.
-    let (project, data) = (TmpDir::new(), TmpDir::new());
+    let (project, data) = (TmpDir::new("p"), TmpDir::new("p"));
     std::fs::write(
         project.path().join(".sbx.toml"),
         "[proc]\nmode = \"enforce\"\n",

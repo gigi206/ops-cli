@@ -4,37 +4,11 @@
 //! trust gate, no network — so the assertions exercise the layout against
 //! redirected XDG data/config/state dirs and a temp project as the cwd.
 
-use std::path::PathBuf;
+#[macro_use]
+mod common;
+use common::fixture::TmpDir;
+
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
-
-static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-// The fixtures' root, one definition shared with the unit tests.
-include!("../src/testroot.rs");
-
-/// A unique temp dir removed on drop, on the repo disk (not tmpfs).
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new() -> Self {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = fixture_root();
-        d.push(format!("path-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        TmpDir(d)
-    }
-
-    fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 struct Fixture {
     proj: TmpDir,
@@ -46,10 +20,10 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         Fixture {
-            proj: TmpDir::new(),
-            config_home: TmpDir::new(),
-            state_home: TmpDir::new(),
-            data_home: TmpDir::new(),
+            proj: TmpDir::new("path"),
+            config_home: TmpDir::new("path"),
+            state_home: TmpDir::new("path"),
+            data_home: TmpDir::new("path"),
         }
     }
 

@@ -15,39 +15,11 @@
 
 #[macro_use]
 mod common;
+use common::fixture::TmpDir;
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
-
-static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-// The fixtures' root, one definition shared with the unit tests.
-include!("../src/testroot.rs");
-
-/// A unique temp dir removed on drop, on the repo disk (not tmpfs).
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new() -> Self {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = fixture_root();
-        d.push(format!("sbx-projects-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        TmpDir(d)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 struct Fixture {
     proj: TmpDir,
@@ -59,10 +31,10 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         Fixture {
-            proj: TmpDir::new(),
-            config_home: TmpDir::new(),
-            state_home: TmpDir::new(),
-            data_home: TmpDir::new(),
+            proj: TmpDir::new("projects"),
+            config_home: TmpDir::new("projects"),
+            state_home: TmpDir::new("projects"),
+            data_home: TmpDir::new("projects"),
         }
     }
 

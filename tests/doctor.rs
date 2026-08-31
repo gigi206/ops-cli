@@ -2,10 +2,9 @@
 
 #[macro_use]
 mod common;
+use common::fixture::TmpDir;
 
-use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 fn sbx() -> Command {
     // Isolate XDG_CONFIG_HOME from the user's real `~/.config/sbx` so an e2e never depends on
@@ -21,55 +20,11 @@ fn sbx() -> Command {
 // The fixtures' root, one definition shared with the unit tests.
 include!("../src/testroot.rs");
 
-/// A unique temp dir removed on drop, so the binary's store bootstrap lands in a
-/// throwaway location instead of the real `$HOME`.
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new() -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = fixture_root();
-        d.push(format!("dr-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        TmpDir(d)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        force_remove(&self.0);
-    }
-}
-
-/// Remove a tree that may contain read-only directories: a provisioned nix store
-/// makes its directories `0555`, so add write on the way down before deleting.
-fn force_remove(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if meta.is_dir() {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                force_remove(&entry.path());
-            }
-        }
-        let _ = std::fs::remove_dir(path);
-    } else {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
 #[test]
 fn doctor_prints_the_preflight_structure() {
     // Redirect sbx's data dir to a throwaway location so the asserted store path
     // is deterministic and independent of the real `$HOME`.
-    let data = TmpDir::new();
+    let data = TmpDir::new("dr");
     let out = sbx()
         .arg("doctor")
         .env("XDG_DATA_HOME", data.path())
@@ -114,7 +69,7 @@ fn doctor_proves_the_boundary_by_a_real_launch_where_supported() {
     // on a real `sbx run`: if that succeeds, the engine, the namespace, and nix
     // are all present, so doctor must be fully green. Skipped, not failed,
     // elsewhere.
-    let data = TmpDir::new();
+    let data = TmpDir::new("dr");
     let can_sandbox = sbx()
         .args(["run", "--", "true"])
         .env("XDG_DATA_HOME", data.path())
@@ -154,7 +109,7 @@ fn a_failed_launch_with_a_working_namespace_blames_bubblewrap() {
     // namespace probe is known to say Ok; only then is the stub's failure
     // unambiguously the engine. Skipped, not failed, where the host cannot
     // sandbox.
-    let data = TmpDir::new();
+    let data = TmpDir::new("dr");
     let can_sandbox = sbx()
         .args(["run", "--", "true"])
         .env("XDG_DATA_HOME", data.path())
@@ -169,7 +124,7 @@ fn a_failed_launch_with_a_working_namespace_blames_bubblewrap() {
     }
 
     // A stub bwrap, first on PATH, that always fails with a recognizable message.
-    let stub_dir = TmpDir::new();
+    let stub_dir = TmpDir::new("dr");
     let stub = stub_dir.path().join("bwrap");
     std::fs::write(&stub, "#!/bin/sh\necho boom >&2\nexit 1\n").expect("write stub bwrap");
     {
@@ -211,7 +166,7 @@ fn doctor_reports_the_locked_channel_revision() {
     // With a channel lock present, doctor surfaces its source and revision read-only —
     // closing the gap where doctor was blind to the resolved revision. Seeded directly
     // (doctor never resolves), so this needs no nix.
-    let data = TmpDir::new();
+    let data = TmpDir::new("dr");
     let lock_dir = data.path().join("sbx");
     std::fs::create_dir_all(&lock_dir).unwrap();
     let rev = "9ae611a455b90cf061d8f332b977e387bda8e1ca";

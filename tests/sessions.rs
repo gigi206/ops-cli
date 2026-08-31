@@ -8,10 +8,10 @@
 
 #[macro_use]
 mod common;
+use common::fixture::TmpDir;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 /// The in-sandbox `$HOME` (a fixed mountpoint inside every sandbox).
 const SANDBOX_HOME: &str = "/home/sandbox";
@@ -29,49 +29,6 @@ fn sbx() -> Command {
 
 // The fixtures' root, one definition shared with the unit tests.
 include!("../src/testroot.rs");
-
-/// A unique temp dir removed on drop.
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new(tag: &str) -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = fixture_root();
-        d.push(format!("sn-{tag}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        TmpDir(d)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        force_remove(&self.0);
-    }
-}
-
-/// Remove a tree that may contain read-only directories: a provisioned nix store
-/// makes its directories `0555`, so add write on the way down before deleting.
-fn force_remove(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if meta.is_dir() {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                force_remove(&entry.path());
-            }
-        }
-        let _ = std::fs::remove_dir(path);
-    } else {
-        let _ = std::fs::remove_file(path);
-    }
-}
 
 /// Run `sbx <args...>` in `project` against `data`, returning (success, stdout).
 fn run(args: &[&str], project: &Path, data: &Path) -> (bool, String) {
@@ -91,7 +48,7 @@ fn run(args: &[&str], project: &Path, data: &Path) -> (bool, String) {
 fn ls_reports_no_sessions_on_an_empty_registry() {
     // A fresh data dir holds no records; `sbx session ls` must succeed and say so. Needs
     // no sandbox, so it always runs.
-    let data = TmpDir::new("data");
+    let data = TmpDir::prefixed("sn", "data");
     let out = sbx()
         .arg("session")
         .arg("ls")
@@ -110,8 +67,8 @@ fn ls_reports_no_sessions_on_an_empty_registry() {
 
 #[test]
 fn a_second_sandbox_shares_the_projects_persistent_home() {
-    let project = TmpDir::new("proj");
-    let data = TmpDir::new("data");
+    let project = TmpDir::prefixed("sn", "proj");
+    let data = TmpDir::prefixed("sn", "data");
 
     // Skip where the host cannot sandbox (this first run also warms the userland).
     if !run(&["run", "--", "true"], project.path(), data.path()).0 {

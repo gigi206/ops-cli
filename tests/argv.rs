@@ -9,34 +9,12 @@
 //! writes outside its throwaway data directory. Verbs that legitimately take a positional (say
 //! `test net <target>`) are swept with a *second* one, since the first is a valid argument.
 
-use std::path::{Path, PathBuf};
+#[macro_use]
+mod common;
+use common::fixture::TmpDir;
+
+use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
-
-// The fixtures' root, one definition shared with the unit tests.
-include!("../src/testroot.rs");
-
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new() -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut d = fixture_root();
-        d.push(format!("argv-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        TmpDir(d)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// Run `sbx <args>` against a throwaway home and return its exit code with both streams.
 fn run(args: &[&str], home: &Path) -> (i32, String) {
@@ -83,7 +61,7 @@ const READ_ONLY_VERBS: &[&[&str]] = &[
 
 #[test]
 fn no_read_only_verb_accepts_a_surplus_flag() {
-    let home = TmpDir::new();
+    let home = TmpDir::new("argv");
     let mut accepted = Vec::new();
     for verb in READ_ONLY_VERBS {
         let mut args = verb.to_vec();
@@ -107,7 +85,7 @@ const VERBS_TAKING_AN_OPTIONAL_PATH: &[&[&str]] = &[&["untrust"]];
 
 #[test]
 fn a_verb_taking_a_path_still_refuses_an_unknown_flag() {
-    let home = TmpDir::new();
+    let home = TmpDir::new("argv");
     for verb in VERBS_TAKING_AN_OPTIONAL_PATH {
         let mut args = verb.to_vec();
         args.push("--zzz-not-a-flag");
@@ -125,7 +103,7 @@ fn a_verb_taking_a_path_still_refuses_an_unknown_flag() {
 
 #[test]
 fn no_read_only_verb_accepts_a_surplus_argument() {
-    let home = TmpDir::new();
+    let home = TmpDir::new("argv");
     let mut accepted = Vec::new();
     for verb in READ_ONLY_VERBS {
         let mut args = verb.to_vec();
@@ -144,7 +122,7 @@ fn no_read_only_verb_accepts_a_surplus_argument() {
 
 #[test]
 fn a_verb_that_takes_a_positional_still_refuses_a_second_one() {
-    let home = TmpDir::new();
+    let home = TmpDir::new("argv");
     // The first token is a legitimate argument, so only the second can be surplus.
     let cases: &[&[&str]] = &[
         &["untrust", ".sbx.toml", "zzz-surplus"],
@@ -168,7 +146,7 @@ fn a_verb_that_takes_a_positional_still_refuses_a_second_one() {
 
 #[test]
 fn a_refusal_names_the_offending_token_and_prints_the_usage() {
-    let home = TmpDir::new();
+    let home = TmpDir::new("argv");
     // A refusal that only said "usage" would leave the user re-reading their own command line.
     let (code, out) = run(&["plugins", "store", "list", "--intalled"], home.path());
     assert_eq!(code, 2, "{out}");
