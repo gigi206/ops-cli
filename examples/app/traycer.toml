@@ -1,0 +1,99 @@
+# traycer — Traycer's CLI, the headless half of an orchestrator that drives other coding agents,
+# sandboxed by sbx.
+#
+#   sbx bundle import examples/bundle/traycer.toml
+#   sbx app import    examples/app/traycer.toml
+#   sbx app run traycer
+#
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The packages it installs and the hosts it reaches
+# come from a shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/traycer.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
+# requirements silently falls behind the agent.
+#
+# WHAT IT IS. Traycer is an orchestrator: it plans a task and then drives a coding agent to carry it
+# out, through a HOST process that owns the workspace, the terminal, the files and the agent runs.
+# This profile is the CLI (`traycer`), which is both the way to use it headlessly and the program
+# the desktop shell delegates the host's lifecycle to. `examples/app/traycer-desktop.toml` is the
+# windowed half.
+#
+# WHICH AGENT IT DRIVES IS YOURS TO NAME, and the profile wires none. Traycer's documentation lists
+# sixteen supported agents and marks NO default, so choosing one here would be inventing a vendor
+# position. Fourteen of the sixteen already ship a bundle beside this one — `claude-code`, `codex`,
+# `opencode`, `cursor-agent`, `grok`, `qwen-code`, `kiro`, `droid`, `kimi`, `copilot`, `kilocode`,
+# `amp`, `devin` and `pi` — so naming one is a word in `use`:
+#     use = ["traycer", "claude-code"]
+# That is the same shape the seven orchestrator profiles here already use, and it gets the agent's
+# own packages, egress and credentials without restating them. Without any of them, Traycer's own
+# provider (sign-in and credits) is what remains.
+#
+# CREDENTIAL POSTURE — an account, and two ways to reach it, both headless:
+#
+#   - **Device login (`traycer login`)** — the CLI asks `authn.traycer.ai` for a device code and
+#     prints a short code with `app.traycer.ai/device`, which you approve in your OWN host-side
+#     browser. Nothing listens in the cage and no `localhost` callback crosses the empty netns: the
+#     flow is entirely outbound, so it works in-cage as it stands.
+#   - **A token you already hold (`traycer login --token -`)** — reads it from stdin rather than
+#     argv, so it never reaches a process listing. Prefer this in a script:
+#         printf '%s' "$TRAYCER_TOKEN" | sbx app run traycer -- login --token -
+#
+# Either way the session persists in this app's isolated `$HOME`, so it lives in the cage though
+# never in your project shell. `traycer whoami` says which account is signed in, `traycer logout`
+# ends it.
+#
+# THE HOST DOWNLOADS ITSELF. `traycer host install` / `host ensure` fetch the `host-v*` release from
+# GitHub on first use, which is why the bundle's allowlist opens `github.com`,
+# `objects.githubusercontent.com` and `api.github.com` read-only. That binary is Traycer's to roll,
+# not `sbx upgrade`'s; the bundle's header states the limit and what would change it. `traycer host
+# status` and `traycer host logs` are where to look when a run does nothing.
+#
+# EGRESS — honest scope. The hosts in the bundle are GROUNDED, each read out of Traycer's own
+# published source: `authn.traycer.ai` and `platform.traycer.ai` are the client's `authnBaseUrl` and
+# `cloudUiBaseUrl`, `app.traycer.ai/device` is the device-code verification URI, and the GitHub trio
+# is where the host artifact comes from. What is NOT grounded is the traffic of a real run: which
+# host the model requests take once an agent is driving, and whether a REMOTE host is reached over
+# `wss://relay.traycer.ai/attach` (the relay endpoint the clients bake in) rather than the local one
+# this profile runs. If a request is refused, the proxy NAMES the host: add it to `allow` (or check
+# ahead with `sbx test net <url>`, or run once with `--net-learn` to have the refusals propose the
+# rules), and watch `sbx net logs -a traycer`.
+cmd = ["traycer"]
+
+# Your host Traycer config and session, mounted read-write at their real absolute paths. `binds` is
+# a security field, honored only because this profile lives in your trusted config dir; `mode = "rw"`
+# lets the caged `traycer` read and write these host files. Uncomment to share your host setup with
+# the cage instead of the app's isolated home (the default).
+#binds = [
+#    { path = "~/.traycer", mode = "rw" },
+#]
+
+# --- The agent's requirements come from its bundle ------------------------------------------------
+# `use` pulls in the `traycer` BUNDLE — the CLI package, the node it runs on, and the hosts it
+# reaches — from one declaration shared with the bundle file itself, so this profile cannot fall
+# behind when the agent's requirements change.
+#
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
+#     sbx bundle import examples/bundle/traycer.toml
+# Without it the launch warns that the bundle is undeclared and the tooling is simply absent.
+#
+# Add the agent you want driven as a second entry, as the header explains:
+#     use = ["traycer", "claude-code"]
+use = ["traycer"]
+
+# No `[packages]` here: what the bundle installs comes from it — see `use` above.
+
+# An app is read-by-default ({GET,HEAD}); a host the agent WRITES to is opened to all verbs with
+# `{*}`. The download hosts stay `{GET}` (least privilege — the agent can only *read* from them).
+[network]
+mode = "deny"
+allow = [
+    # Every host this agent reaches arrives with the `traycer` bundle (`use` above) and is unioned
+    # into this list at resolution — inspect them with `sbx bundle traycer`, and see the launch's own
+    # view with `sbx config show --app traycer`. A host the flow reaches that is not in the union is
+    # refused and named: watch `sbx net logs -a traycer`.
+    #
+    # A REMOTE host, rather than the one this cage runs, is attached over the relay's WebSocket.
+    # Name it with `{WS}` if you use that, and only then:
+    #"{WS} wss://relay.traycer.ai",
+]

@@ -1,0 +1,69 @@
+# `traycer` — Traycer's CLI: the packages it needs, the hosts it reaches, and the one artifact it
+# fetches for itself.
+#
+#   sbx bundle import examples/bundle/traycer.toml
+#   # then in an app profile:   use = ["traycer"]
+#
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#
+# Derived from `examples/app/traycer.toml`, whose namesake profile names this bundle in `use` (thin
+# profile): the bundle is the single source of truth for the agent's packages, env and egress, while
+# the profile keeps its own command, posture and credential choices. A test pins the two artifacts
+# together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
+#
+# WHICH ARTIFACT THIS INSTALLS, and why it is the npm one. Traycer publishes its CLI twice: as
+# `@traycerai/cli` on npm, and as a standalone `traycer-cli-linux-x64` in its GitHub releases. Both
+# are the same program; the npm build is a single bundled Node script of 5.6 MB that runs on the
+# cage's own node, and the standalone is 128 MB because it carries a Node runtime with it. The npm
+# one is taken here for the reason every `mise:` package in this directory is taken: `sbx upgrade
+# mise` rolls it, the version is pinned in the project's own store, and it declares no install
+# script, so mise's `--ignore-scripts` install costs nothing (measured on the published tarball:
+# the package has no `scripts` field and no dependencies at all).
+#
+# THE HOST IS NOT PINNED HERE, and that is a deliberate limit rather than an oversight. Traycer is
+# three programs: this CLI, the desktop shell, and a HOST process that owns the workspace, terminal,
+# file and agent operations the other two drive. The CLI owns the host's whole lifecycle through its
+# own verbs (`traycer host install`, `host ensure`, `host update`, `host uninstall`), downloading the
+# `host-v*` release itself into a location it manages. sbx could pin that tarball instead — the
+# track publishes `traycer-host-linux-x64.tar.gz` and the resolve command in
+# `examples/bundle/traycer-desktop.toml` would only need its prefix changed — but nothing documented
+# lets the CLI be pointed at a host binary it did not place, so a pinned copy would sit unused beside
+# the one the CLI fetches anyway. The allowlist below therefore opens the GitHub release hosts, and
+# the host binary rolls on Traycer's schedule, not on `sbx upgrade`. THE TRIGGER TO REVISIT: a
+# `traycer host` flag or setting that names an existing binary. Then the tarball moves into
+# `[packages]` and those three GitHub entries leave this list.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.traycer]
+allow = [
+    # The npm registry, because a `mise:npm:` package is installed inside the cage.
+    "@npm-registry",
+    # Sign-in and the account, both opened to every verb: the CLI POSTs the device-code request and
+    # then polls for the token, and the platform host carries the account and subscription state.
+    "{*} https://authn.traycer.ai",
+    "{*} https://platform.traycer.ai",
+    # The page a device login sends you to approve on your own browser, read-only from the cage.
+    "{GET} https://app.traycer.ai",
+    # Where `traycer host install` / `host update` read the released host versions and fetch the
+    # `host-v*` artifact. Read-only: the CLI downloads from these, it never uploads.
+    "{GET} https://api.github.com",
+    "{GET} https://github.com",
+    "{GET} https://objects.githubusercontent.com",
+]
+mute = [
+    # npm's audit call on install, refused by the allowlist and not worth a line in the log.
+    "@npm-audit",
+]
+
+[bundle.traycer.packages]
+# mise's npm backend needs a node runtime inside the cage.
+nodejs = "nix:nodejs"
+traycer = "mise:npm:@traycerai/cli"

@@ -1,0 +1,82 @@
+# `traycer-desktop` — the Traycer desktop shell: what it needs to be installed and to reach its own
+# services.
+#
+#   sbx bundle import examples/bundle/traycer-desktop.toml
+#   # then in an app profile:   use = ["traycer-desktop"]
+#
+# Derived from `examples/app/traycer-desktop.toml`, whose namesake profile names this bundle in
+# `use` (thin profile): the bundle is the single source of truth for the app's packages, env and
+# egress, while the profile keeps its own command, posture and credential choices. A test pins the
+# two artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. An Electron app needs `gui = "wayland"` and
+# `gpu = true` to map a window at all, so a consuming profile that names this bundle without them
+# gets a package it cannot display.
+#
+# DISTINCT FROM THE `traycer` BUNDLE, deliberately. That one carries the CLI (`mise:npm:`); this one
+# carries the desktop artifact, a GitHub-release `.deb` that `sbx upgrade deb` rolls forward. It
+# needs no node and no npm registry of its own: the desktop ships its own copy of the CLI and
+# delegates the host's lifecycle to it, which is why their egress is the same shape.
+#
+# WHY A `deb:resolve` RESOLVER RATHER THAN THE `deb:github:` SHORTHAND, which would otherwise be the
+# obvious choice. That shorthand asks `api.github.com/repos/<owner>/<repo>/releases/latest`, and this
+# repository publishes THREE tracks from one release stream — `cli-v*`, `desktop-v*` and `host-v*` —
+# so `/latest` answers with whichever track was published last, not with the one you asked for.
+# Measured on the current releases: `desktop-v1.2.0` and `host-v1.2.0` are two seconds apart
+# (13:39:21 and 13:39:19), and `/latest` returned the desktop by that margin. A release-candidate of
+# any track lands between two stable ones as well, so a bare "newest" is wrong twice over. The
+# resolve command below is what a correct answer looks like: filter by the track's tag prefix, drop
+# every prerelease and draft, take the newest of what remains by publication date, and select the
+# asset by its exact name. Its last line refuses ambiguity rather than picking: a release carrying
+# no such asset, or more than one, resolves to nothing and the launch says so.
+#
+# ONE WRITTEN LIMIT: `per_page=100` reads the first page only. That covers this repository
+# comfortably today (its 100 most recent releases hold eleven stable `desktop-v*` ones), and it is a
+# page, not a promise. THE TRIGGER: if the resolve stops finding a stable release, the track has
+# scrolled off page one and the command needs a `page=2` or a narrower query.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.traycer-desktop]
+allow = [
+    # Sign-in and the account, both opened to every verb: the shell POSTs the device-code request
+    # and then polls for the token, and the platform host carries the account and subscription
+    # state. These two are the clients' own `authnBaseUrl` and `cloudUiBaseUrl`.
+    "{*} https://authn.traycer.ai",
+    "{*} https://platform.traycer.ai",
+    # The asset host the window preconnects to, and the page a device login sends you to approve on
+    # your own browser. Read-only from the cage.
+    "{GET} https://assets.traycer.ai",
+    "{GET} https://app.traycer.ai",
+    # Where the bundled CLI reads the released host versions and fetches the `host-v*` artifact.
+    # Read-only: it downloads from these, it never uploads.
+    "{GET} https://api.github.com",
+    "{GET} https://github.com",
+    "{GET} https://objects.githubusercontent.com",
+]
+
+[bundle.traycer-desktop.packages]
+# The desktop's own linux-amd64 `.deb`, resolved from the `desktop-v*` track — see the header for
+# why the `deb:github:` shorthand cannot serve a repository that publishes three tracks.
+traycer-desktop = "deb:resolve"
+
+# The vendor's own release stream, and the whole of what sbx knows about Traycer's packaging: the
+# backend is agnostic, so every fact about this vendor lives here rather than in sbx.
+#
+# This runs host-side in sbx's hermetic resolve cage, not in the app's cage, so it uses the host
+# network rather than the `allow` list above — that list governs the app's own egress at runtime.
+[bundle.traycer-desktop.deb.traycer-desktop]
+resolve = [
+    "sh",
+    "-c",
+    '''
+curl -fsSL "https://api.github.com/repos/traycerai/traycer/releases?per_page=100" \
+  | jq -r '[.[] | select(.draft == false and .prerelease == false and (.tag_name | startswith("desktop-v")))]
+      | sort_by(.published_at) | reverse | .[0].assets
+      | [.[] | select(.name == "traycer-desktop-linux-amd64.deb") | .browser_download_url]
+      | if length == 1 then .[0] else empty end'
+''',
+]

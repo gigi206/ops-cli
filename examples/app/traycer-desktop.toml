@@ -1,0 +1,76 @@
+# traycer-desktop — the Traycer desktop shell (Electron), the windowed half of an orchestrator that
+# drives other coding agents, sandboxed by sbx.
+#
+#   sbx bundle import examples/bundle/traycer-desktop.toml
+#   sbx app import    examples/app/traycer-desktop.toml
+#   sbx app run traycer-desktop
+#
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The `.deb` it installs, the resolver that rolls it
+# and the hosts it reaches come from a shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/traycer-desktop.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
+# requirements silently falls behind the app.
+#
+# DISTINCT FROM THE `traycer` PROFILE. That one is the CLI, headless, and the natural fit for a
+# sandbox. This one maps a window: it is the same product with a planning and inspection surface,
+# and it delegates the host's lifecycle to its own bundled copy of the CLI. Run either, or both;
+# they keep separate app homes and separate sign-ins unless you bind a shared one.
+#
+# WHICH AGENT IT DRIVES IS YOURS TO NAME, exactly as for the CLI: Traycer lists sixteen supported
+# agents and marks no default, fourteen of which ship a bundle beside this one. Name one in `use`:
+#     use = ["traycer-desktop", "claude-code"]
+#
+# ELECTRON POSTURE. `gui = "wayland"` and `gpu = true` are what let it map a window at all, and the
+# flags on the command are the ones every Electron profile here carries: `--no-sandbox` because
+# Chromium's own sandbox needs a user namespace the cage has already spent, `--ozone-platform=
+# wayland` to match `gui`, `--disable-dev-shm-usage` because the cage's `/dev/shm` is small, and
+# `--use-system-ca` so the egress proxy's CA is trusted from the system store rather than only from
+# the NSS database Chromium would otherwise read.
+#
+# CREDENTIAL POSTURE — an account, reached by a device login. The shell asks `authn.traycer.ai` for
+# a device code and shows a short code with `app.traycer.ai/device` to approve in a browser. In a
+# cage with no browser of its own, approve it on the host: the flow is entirely outbound, so nothing
+# has to listen inside. The session persists in this app's isolated `$HOME`.
+#
+# EGRESS — honest scope. The hosts in the bundle are GROUNDED, read out of Traycer's own published
+# source (`authnBaseUrl`, `cloudUiBaseUrl`, the preconnect list, and the GitHub trio the bundled CLI
+# fetches the host from). What is NOT grounded is the traffic of a real session: which host the model
+# requests take once an agent is driving, and whether a REMOTE host is attached over
+# `wss://relay.traycer.ai/attach` rather than the local one. If a request is refused, the proxy NAMES
+# the host: add it to `allow` (or check ahead with `sbx test net <url>`, or run once with
+# `--net-learn` to have the refusals propose the rules), and watch `sbx net logs -a traycer-desktop`.
+cmd = [
+    "traycer-desktop",
+    "--no-sandbox",
+    "--ozone-platform=wayland",
+    "--disable-dev-shm-usage",
+    "--use-system-ca",
+]
+gui = "wayland"
+gpu = true
+dbus = true
+
+# --- The app's requirements come from its bundle --------------------------------------------------
+# `use` pulls in the `traycer-desktop` BUNDLE — the `.deb`, its `deb:` resolver and the hosts the
+# shell reaches — from one declaration shared with the bundle file itself, so this profile cannot
+# fall behind when the app's requirements change.
+#
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
+#     sbx bundle import examples/bundle/traycer-desktop.toml
+# Without it the launch warns that the bundle is undeclared and the tooling is simply absent.
+use = ["traycer-desktop"]
+
+# No `[packages]` here: what the bundle installs comes from it — see `use` above.
+
+[network]
+mode = "deny"
+allow = [
+    # Every host this app reaches arrives with the `traycer-desktop` bundle (`use` above) and is
+    # unioned into this list at resolution — inspect them with `sbx bundle traycer-desktop`, and see
+    # the launch's own view with `sbx config show --app traycer-desktop`. A host the flow reaches
+    # that is not in the union is refused and named: watch `sbx net logs -a traycer-desktop`.
+    #
+    # A REMOTE host, rather than the one this cage runs, is attached over the relay's WebSocket.
+    # Name it with `{WS}` if you use that, and only then:
+    #"{WS} wss://relay.traycer.ai",
+]

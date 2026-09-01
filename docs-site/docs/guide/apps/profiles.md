@@ -67,7 +67,7 @@ sbx app import <file> [--as <name>] [--force]
   [bundle](../configuration/bundles) in `use`, or an
   [egress group](../networking/) as `@<name>`, resolves both against the global config; an
   undeclared one is reported here, with the sibling file to import when one can be found.
-  All 71 shipped profiles name a bundle, so a starter profile takes two imports. Either
+  All 73 shipped profiles name a bundle, so a starter profile takes two imports. Either
   order works: nothing resolves until `sbx app run <name>`. With `--with-deps` the import
   follows those references instead of naming them, which merges into your global config and
   is therefore opt-in.

@@ -1003,8 +1003,11 @@ async fn send_masked(dst: &mut h2::SendStream<Bytes>, data: Vec<u8>) -> Result<b
 /// `:authority` are not members of [`http::HeaderMap`] — the `http` crate lifts each onto
 /// [`Request`] itself — so a blob built from `headers()` alone leaves all three unscanned, while
 /// the HTTP/1.1 scan reads them as ordinary bytes of the raw head it is handed. Of the three
-/// `:method` is the widest channel: an HTTP/2 method is an RFC 9110 token, whose charset
-/// (letters, digits and ``!#$%&'*+-.^_`|~``) admits a hex digest or a `ghp_`-style token whole.
+/// `:method` is the widest channel: an HTTP/2 method is an RFC 9110 token, and that charset is
+/// letters, digits and sixteen punctuation marks, which admits a hex digest or a `ghp_`-style
+/// token whole. (The charset is not spelled out here: it contains a backtick, and the guard that
+/// checks every ``sbx <verb>`` this tree quotes pairs backticks across the whole file, so one
+/// inside a span silently re-pairs every span after it.)
 fn head_carries_secret(
     req: &Request<h2::RecvStream>,
     needles: &[SecretNeedle],
