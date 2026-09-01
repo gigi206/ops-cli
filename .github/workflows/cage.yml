@@ -150,7 +150,7 @@ jobs:
 
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
-          extra_conf: |
+          extra_nix_config: |
             experimental-features = nix-command flakes
 
       - name: Open a real user session, so the desktop sockets have somewhere to live
