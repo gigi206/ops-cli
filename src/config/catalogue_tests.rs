@@ -1004,6 +1004,67 @@ fn every_shipped_bundle_carries_the_counts_its_row_states() {
     );
 }
 
+#[test]
+fn every_shipped_service_is_named_in_the_bundles_table() {
+    // The one item of the third column that starts a PROCESS. A `[bundle.<name>.service.<svc>]`
+    // declares an auxiliary daemon sbx runs in the cage beside the app for as long as the launch
+    // lasts, so folding such a bundle in does more than add a tool and its hosts: it puts a second
+    // program in there, listening. That is the least safe thing on this page to leave unsaid, which
+    // is the reason the install-step guard above gives for itself, and it applies here with more
+    // force: a step exits, a service stays up.
+    //
+    // Its own test rather than a branch of that one, for the reason written there: the two watch
+    // different fields, and a single guard failing for either would name the wrong fact half the
+    // time.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let page = std::fs::read_to_string(root.join("docs-site/docs/guide/configuration/bundles.md"))
+        .expect("the bundles page exists");
+    let mut wrong = Vec::new();
+    let mut carriers = 0;
+    for entry in std::fs::read_dir(root.join("examples/bundle"))
+        .expect("examples/bundle/ dir exists")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+        let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
+        let Some(bundle) = raw.bundle.get(&name) else {
+            continue;
+        };
+        let declared = !bundle.service.is_empty();
+        if declared {
+            carriers += 1;
+        }
+        // An equivalence, like the resolver guard and for its reason: a row promising a daemon the
+        // bundle does not declare misleads as much as one that hides the daemon it does.
+        let named = page
+            .lines()
+            .find(|line| line.starts_with(&format!("| `{name}` |")))
+            .is_some_and(|line| line.contains("a background service"));
+        if declared && !named {
+            wrong.push(format!(
+                "`{name}` starts a process in the cage its row does not name"
+            ));
+        } else if named && !declared {
+            wrong.push(format!(
+                "`{name}`'s row promises a background service the bundle does not declare"
+            ));
+        }
+    }
+    assert!(
+        carriers > 0,
+        "no shipped bundle declares a service, so this guard now asserts nothing"
+    );
+    wrong.sort();
+    assert!(
+        wrong.is_empty(),
+        "the bundles table does not say which bundles run a process beside the app: {wrong:#?}"
+    );
+}
+
 /// The shipped `provision` of `<bundle>`, as the script a shell would run.
 fn shipped_install_step(name: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
