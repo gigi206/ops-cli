@@ -155,7 +155,7 @@ fn derivation_expr(
     extracted = pkgs.appimageTools.extractType2 {
       pname = "@NAME@";
       version = "0";
-      src = pkgs.fetchurl { url = "@URL@"; hash = "@HASH@"; };
+      src = pkgs.fetchurl { name = "@NAME@-download"; url = "@URL@"; hash = "@HASH@"; };
     };
 in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
   name = "@NAME@";

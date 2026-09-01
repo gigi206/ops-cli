@@ -121,7 +121,7 @@ fn derivation_expr(
     const TEMPLATE: &str = r#"let pkgs = (builtins.getFlake "@NIXPKGS@").legacyPackages.@SYSTEM@;
 in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
   name = "@NAME@";
-  src = pkgs.fetchurl { url = "@URL@"; hash = "@HASH@"; };
+  src = pkgs.fetchurl { name = "@NAME@-download"; url = "@URL@"; hash = "@HASH@"; };
   nativeBuildInputs = with pkgs; [ gzip gnutar makeWrapper autoPatchelfHook ];
   buildInputs = with pkgs; [ @LIBS@ ];
   # Ignore ALL unresolved deps (not just the musl loader the `deb:` backend lists). A raw vendor

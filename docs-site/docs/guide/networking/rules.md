@@ -123,6 +123,19 @@ allow = ["github.com/orgs/acme/*"]  # /orgs/acme and everything under it…
 The URL host must be **concrete** (an exact host or an IP): a `*.domain` with a
 path is not expressible here; use `re:` for that.
 
+`*` means the subtree **only** at the end. Anywhere else it is refused rather than
+read as a literal segment:
+
+```toml
+deny = ["api.test/*/secrets"]      # refused: `*` is not a path pattern
+deny = ["re:^https://api\\.test/[^/]+/secrets$"]   # this is how to write it
+```
+
+That rule looks like it closes the secrets page of every organisation, and as a
+literal segment it would have closed nothing at all, silently. A rule that cannot
+mean what it says is an error you are shown, the same way a wildcard host, an
+invalid port, an unsupported scheme and a query string are.
+
 ### Path canonicalization
 
 The in-cage agent controls the raw request, so a naive string match on the path

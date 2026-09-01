@@ -612,6 +612,10 @@ fn each_open_form_keeps_its_mode_where_its_own_abi_puts_it() {
     let mut args = [0u64; 6];
     args[2] = 0o600;
     args[3] = 0o640;
+    // `open` is x86_64-only; aarch64 offers `openat` alone. Guarded the way the sibling
+    // assertion in `open_path_tests.rs` is, so the whole tree compiles for that target and not
+    // only the binary.
+    #[cfg(target_arch = "x86_64")]
     assert_eq!(
         open_mode(
             std::process::id(),
@@ -830,6 +834,10 @@ fn send_scm_rights(sock: &UnixStream, fds: &[libc::c_int]) {
 #[test]
 fn each_open_form_states_the_path_walk_it_asked_for() {
     let mut args = [0u64; 6];
+    // `open` is x86_64-only; aarch64 offers `openat` alone. Guarded the way the sibling
+    // assertion in `open_path_tests.rs` is, so the whole tree compiles for that target and not
+    // only the binary.
+    #[cfg(target_arch = "x86_64")]
     assert_eq!(
         open_resolve(
             std::process::id(),
@@ -1234,6 +1242,10 @@ fn each_open_form_keeps_its_flags_where_its_own_abi_puts_them() {
     let mut args = [0u64; 6];
     args[1] = 0x111;
     args[2] = 0x222;
+    // `open` is x86_64-only; aarch64 offers `openat` alone. Guarded the way the sibling
+    // assertion in `open_path_tests.rs` is, so the whole tree compiles for that target and not
+    // only the binary.
+    #[cfg(target_arch = "x86_64")]
     assert_eq!(
         open_flags(
             std::process::id(),

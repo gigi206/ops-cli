@@ -2510,6 +2510,34 @@ fn speaks_http2_only_for_designated_hosts() {
     assert!(!EgressPolicy::new(vec![], vec![]).speaks_http2("grpc.example.com", 9001));
 }
 
+/// A `*` inside a path rule is refused at parse time, rather than becoming a literal segment.
+///
+/// `deny = ["api.test/*/secrets"]` reads as "the secrets page of every organisation" and matched
+/// only the path that really contains a star, so the rule refused nothing and said nothing. A
+/// `deny` that silently means less than it says is the worst direction for this grammar to fail
+/// in, and it refuses every other unmeaning rule loudly: a wildcard host, a bad port, an
+/// unsupported scheme, a query string.
+#[test]
+fn a_wildcard_inside_a_path_rule_is_refused_rather_than_read_as_a_literal() {
+    let err = classify("api.test/*/secrets").unwrap_err();
+    assert!(
+        err.contains('*') && err.contains("re:"),
+        "the refusal names the problem and the escape hatch: {err}"
+    );
+    // The two forms that do work are untouched, so the refusal cannot be satisfied by rejecting
+    // stars outright.
+    assert!(
+        classify("api.test/orgs/*").is_ok(),
+        "a trailing `/*` is the subtree form and stays valid"
+    );
+    assert!(
+        classify("re:^https://api\\.test/[^/]+/secrets$").is_ok(),
+        "and the pattern is expressible where patterns work"
+    );
+    // A rule with no star at all is still a rule.
+    assert!(classify("api.test/orgs/secrets").is_ok());
+}
+
 /// A query string written into a path rule is refused at parse time.
 ///
 /// The request side drops a query before matching and the rule side kept it, so

@@ -716,7 +716,7 @@ fn derivation_expr(
     const TEMPLATE: &str = r#"let pkgs = (builtins.getFlake "@NIXPKGS@").legacyPackages.@SYSTEM@;
 in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
   name = "@NAME@";
-  src = pkgs.fetchurl { url = "@URL@"; hash = "@HASH@"; };
+  src = pkgs.fetchurl { name = "@NAME@-download"; url = "@URL@"; hash = "@HASH@"; };
   nativeBuildInputs = with pkgs; [ dpkg makeWrapper autoPatchelfHook ];
   buildInputs = with pkgs; [ @LIBS@ ];
   autoPatchelfIgnoreMissingDeps = [ "libc.musl-x86_64.so.1" ];

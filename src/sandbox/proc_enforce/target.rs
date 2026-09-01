@@ -76,6 +76,9 @@ pub(super) fn open_flags(
     args: &[u64; 6],
     notif: Option<(libc::c_int, u64)>,
 ) -> Option<u64> {
+    // `open` exists on x86_64 and not on aarch64, where the kernel offers only `openat`, so
+    // naming it unconditionally does not compile there. The same guard [`open_args`] carries.
+    #[cfg(target_arch = "x86_64")]
     if nr as libc::c_long == libc::SYS_open {
         return Some(args[1]);
     }
@@ -104,6 +107,9 @@ pub(super) fn open_mode(
     args: &[u64; 6],
     notif: Option<(libc::c_int, u64)>,
 ) -> Option<u64> {
+    // `open` exists on x86_64 and not on aarch64, where the kernel offers only `openat`, so
+    // naming it unconditionally does not compile there. The same guard [`open_args`] carries.
+    #[cfg(target_arch = "x86_64")]
     if nr as libc::c_long == libc::SYS_open {
         return Some(args[2]);
     }
@@ -139,7 +145,14 @@ pub(super) fn open_resolve(
     args: &[u64; 6],
     notif: Option<(libc::c_int, u64)>,
 ) -> Option<u64> {
-    if nr as libc::c_long == libc::SYS_open || nr as libc::c_long == libc::SYS_openat {
+    // Split rather than joined by `||`, because only one half exists on every architecture: see
+    // [`open_flags`]. Both mean the same thing here -- neither call carries a `resolve` word, so
+    // the walk the supervisor performed is the walk the caller asked for.
+    #[cfg(target_arch = "x86_64")]
+    if nr as libc::c_long == libc::SYS_open {
+        return Some(0);
+    }
+    if nr as libc::c_long == libc::SYS_openat {
         return Some(0);
     }
     if nr as libc::c_long == libc::SYS_openat2 {

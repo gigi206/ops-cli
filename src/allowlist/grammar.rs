@@ -579,6 +579,24 @@ fn parse_path_rule(
         ));
     }
     let subtree = path.ends_with("/*");
+    // A `*` anywhere but the trailing `/*` is a literal segment, and silently so: `deny =
+    // ["api.test/*/secrets"]`, written to close that page for every organisation, matched only the
+    // path that literally contains a star and refused nothing. That is a `deny` that reads as
+    // narrower than it is, which is the direction this grammar refuses everywhere else -- a
+    // wildcard host, an invalid port, an unsupported scheme and a query string are all errors their
+    // author is shown. Refused here for the same reason, naming the two forms that do work.
+    let literal = if subtree {
+        &path[..path.len() - 2]
+    } else {
+        path
+    };
+    if literal.contains('*') {
+        return Err(format!(
+            "entry `{s}` writes `*` inside a path rule — a path rule matches its segments \
+             literally, so this would match only a path that really contains a star. Use `re:` \
+             for a pattern, or a trailing `/*` to cover a subtree"
+        ));
+    }
     Ok(RuleKind::Url {
         host: canonical_host(host),
         ports,

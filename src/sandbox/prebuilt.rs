@@ -1228,6 +1228,52 @@ pub(crate) fn upgrade_project(
 #[cfg(test)]
 mod tests {
 
+    /// Every backend's `fetchurl` names its own download, and this counts the four rather than
+    /// trusting them to agree.
+    ///
+    /// `fetchurl` derives a store-path name from the URL's last segment when it is not given one,
+    /// and a store-path name may not carry a `%`. The URL validators accept percent-encoding
+    /// explicitly (`is_injection_free_url` lists `%` among its permitted characters), so such a URL
+    /// pins correctly and then fails to build on **every** launch, which is the worst shape a
+    /// failure can take: the pin is written, the lock looks healthy, and nothing works.
+    ///
+    /// Only `binary:` carried a `name`. It is the backend whose URLs have no extension, so it met
+    /// the problem first and fixed it alone, which is exactly how three siblings keep a defect that
+    /// one of them has already solved.
+    #[test]
+    fn every_prebuilt_backend_names_the_download_it_fetches() {
+        for (backend, source) in [
+            ("binary", include_str!("binary.rs")),
+            ("tarball", include_str!("tarball.rs")),
+            ("deb", include_str!("deb.rs")),
+            ("appimage", include_str!("appimage.rs")),
+        ] {
+            let production = source
+                .rsplit_once("#[cfg(test)]")
+                .map_or(source, |(before, _)| before);
+            let fetches: Vec<&str> = production
+                .match_indices("pkgs.fetchurl {")
+                .map(|(at, _)| {
+                    let rest = &production[at..];
+                    &rest[..rest.find('}').map_or(rest.len(), |e| e + 1)]
+                })
+                .collect();
+            assert!(
+                !fetches.is_empty(),
+                "{backend} builds no `fetchurl` expression, so this guard is reading the wrong \
+                 thing rather than passing"
+            );
+            for fetch in fetches {
+                assert!(
+                    fetch.contains("name ="),
+                    "{backend} lets `fetchurl` derive the store name from the URL: a \
+                     percent-encoded URL pins and then fails to build forever. Pass \
+                     `name = \"@NAME@-download\"` as `binary.rs` does: {fetch}"
+                );
+            }
+        }
+    }
+
     /// The offline invariant, stated by `provision_resolve`'s docstring and until now pinned by
     /// nothing: on a warm launch the pinned `(url, hash)` is reused and the mint — the resolve
     /// command, the release query, the prefetch — is **not run**. A regression here would put a
