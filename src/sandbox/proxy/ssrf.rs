@@ -330,6 +330,28 @@ pub(super) fn checked_address(
 /// them — walking it cannot reach an address the guard refused, which is the property that makes
 /// the walk safe rather than a second chance at the same question. The last error is the one
 /// reported: a caller that could reach none of them is told about the last thing it tried, and the
+/// Open one TCP connection to `ip:port`, bounded by `timeout`.
+///
+/// The bound is the whole point, and it is what every caller here was missing. `TcpStream::connect`
+/// has no deadline of its own: a destination that drops SYN silently -- a firewall configured to
+/// blackhole rather than reject, which is the common shape -- holds the calling thread for the
+/// kernel's own retry schedule, which is on the order of two minutes. These are the proxy's
+/// synchronous planes, so that thread is one of a bounded pool serving the cage; enough such
+/// requests and the pool is gone, and every later egress attempt is refused with the connection cap
+/// while nothing is actually connected.
+///
+/// `ctx.timeout` is the right bound because it is already what the sockets below get for reads and
+/// writes: a caller that would not wait this long for a byte has no reason to wait longer for the
+/// handshake that precedes it. The asynchronous h2 plane already wraps its own connect in
+/// `tokio::time::timeout(ctx.timeout, ..)`; this is that rule for the three synchronous ones.
+pub(super) fn dial_bounded(
+    ip: IpAddr,
+    port: u16,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::net::TcpStream> {
+    std::net::TcpStream::connect_timeout(&std::net::SocketAddr::new(ip, port), timeout)
+}
+
 /// refusal it renders is the same one a single-address failure produced.
 pub(super) fn first_reachable<T, E>(
     ips: &[IpAddr],
@@ -370,6 +392,59 @@ pub(crate) fn names_exact_host(host: &str, deciding: Option<&Rule>) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// A destination that never answers gives the dial back on the deadline instead of holding the
+    /// thread for the kernel's retry schedule.
+    ///
+    /// `192.0.2.0/24` is TEST-NET-1, reserved by RFC 5737 and routed nowhere, so the SYN goes
+    /// unanswered rather than refused. Without a bound this call returns after the kernel has
+    /// finished retrying, which is on the order of two minutes; the assertion is on the clock
+    /// because that duration is the entire finding. A host that answers instantly with
+    /// `EHOSTUNREACH` also satisfies it, which is correct: what must never happen is the wait.
+    #[test]
+    fn a_dial_to_a_blackholed_address_ends_on_its_deadline() {
+        let start = std::time::Instant::now();
+        let got = dial_bounded(
+            IpAddr::from([192, 0, 2, 1]),
+            443,
+            std::time::Duration::from_millis(200),
+        );
+        let waited = start.elapsed();
+        assert!(
+            got.is_err(),
+            "nothing may answer on a reserved address, so this must not connect"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "the dial waited {waited:?} for a deadline of 200ms, so it is not the deadline that \
+             ended it"
+        );
+    }
+
+    /// No synchronous plane opens an upstream connection without a deadline.
+    ///
+    /// The three of them each spelled `TcpStream::connect(..)`, whose only bound is the kernel's,
+    /// while the asynchronous h2 plane wrapped its own in `tokio::time::timeout`. Counted rather
+    /// than trusted, because the two forms look alike and the difference only shows against a
+    /// destination that is deliberately silent.
+    #[test]
+    fn no_synchronous_plane_dials_without_a_deadline() {
+        for (name, source) in [
+            ("proxy/mod.rs", include_str!("mod.rs")),
+            ("proxy/cleartext.rs", include_str!("cleartext.rs")),
+            ("proxy/splice.rs", include_str!("splice.rs")),
+        ] {
+            let production = source
+                .rsplit_once("#[cfg(test)]")
+                .map_or(source, |(before, _)| before);
+            assert_eq!(
+                production.matches("TcpStream::connect(").count(),
+                0,
+                "{name} opens an upstream with no deadline — use `ssrf::dial_bounded`, which is \
+                 the one definition of that dial"
+            );
+        }
+    }
     use super::*;
 
     #[test]

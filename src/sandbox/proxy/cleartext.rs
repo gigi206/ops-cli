@@ -166,8 +166,9 @@ pub(super) fn handle_cleartext(
 
     // 7. Open the plaintext upstream to the checked address (no TLS, no certificate — an `http://`
     //    connection is cleartext by definition; the empty netns + the allowlist are the boundary).
-    let mut upstream = match super::ssrf::first_reachable(&ips, |ip| TcpStream::connect((ip, port)))
-    {
+    let mut upstream = match super::ssrf::first_reachable(&ips, |ip| {
+        super::ssrf::dial_bounded(ip, port, ctx.timeout)
+    }) {
         Ok(s) => {
             let _ = s.set_read_timeout(Some(ctx.timeout));
             let _ = s.set_write_timeout(Some(ctx.timeout));

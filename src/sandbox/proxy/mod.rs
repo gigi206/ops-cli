@@ -811,7 +811,7 @@ fn connect_upstream(
     host: &str,
     ctx: &ProxyCtx,
 ) -> Result<StreamOwned<ClientConnection, TcpStream>, UpstreamError> {
-    let sock = TcpStream::connect((ip, port)).map_err(|_| UpstreamError::Unreachable)?;
+    let sock = ssrf::dial_bounded(ip, port, ctx.timeout).map_err(|_| UpstreamError::Unreachable)?;
     sock.set_read_timeout(Some(ctx.timeout))
         .map_err(|_| UpstreamError::Unreachable)?;
     sock.set_write_timeout(Some(ctx.timeout))
