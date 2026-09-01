@@ -902,6 +902,108 @@ fn every_shipped_resolver_table_is_named_in_the_bundles_table() {
     );
 }
 
+#[test]
+fn every_shipped_bundle_carries_the_counts_its_row_states() {
+    // The two numeric items of the same column, and the last of it nothing read. They are what a
+    // reader weighs before folding a bundle in: how much egress it will add to the app's allowlist,
+    // and how many variables it will set in the launch. Hand-maintained counts drift the way every
+    // other cell here did, and a count is the worst of them to check by eye, since a row that is
+    // merely out of date looks exactly like one that is right.
+    //
+    // The egress figure is the three lists a bundle contributes to the consuming app's `[network]`
+    // table, `allow` + `mute` + `deny`, because that is the number the reader is deciding about: all
+    // three land in that app, and a bundle that muted twenty hosts has added twenty entries to it
+    // whatever the verb. The variables are its `[bundle.<name>.env]` map.
+    //
+    // Both directions again, and both wordings: a clause whose number no longer matches the file,
+    // and a clause standing where the bundle declares nothing at all. The singular forms are the
+    // table's own (`1 egress entry`, `1 env var`), so a row cannot satisfy this by pluralising a
+    // single entry.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let page = std::fs::read_to_string(root.join("docs-site/docs/guide/configuration/bundles.md"))
+        .expect("the bundles page exists");
+    let mut wrong = Vec::new();
+    let mut checked = 0;
+    for entry in std::fs::read_dir(root.join("examples/bundle"))
+        .expect("examples/bundle/ dir exists")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+        let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
+        let Some(bundle) = raw.bundle.get(&name) else {
+            continue;
+        };
+        let egress = bundle.allow.len() + bundle.mute.len() + bundle.deny.len();
+        let vars = bundle.env.len();
+        let carries = page
+            .lines()
+            .find(|line| line.starts_with(&format!("| `{name}` |")))
+            .and_then(|line| line.split('|').nth(3))
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        // The cell is a comma-separated list of clauses, each naming one thing the bundle carries.
+        let clauses: Vec<&str> = carries
+            .split(", ")
+            .map(str::trim)
+            .filter(|clause| !clause.is_empty())
+            .collect();
+        let stated = [
+            (
+                "egress entr",
+                egress,
+                match egress {
+                    1 => "1 egress entry".to_string(),
+                    n => format!("{n} egress entries"),
+                },
+            ),
+            (
+                "env var",
+                vars,
+                match vars {
+                    1 => "1 env var".to_string(),
+                    n => format!("{n} env vars"),
+                },
+            ),
+        ];
+        for (marker, count, want) in stated {
+            let said: Vec<&str> = clauses
+                .iter()
+                .copied()
+                .filter(|clause| clause.contains(marker))
+                .collect();
+            let holds = if count == 0 {
+                said.is_empty()
+            } else {
+                said.len() == 1 && said[0] == want
+            };
+            if !holds {
+                let declares = match count {
+                    0 => "nothing of the kind".to_string(),
+                    _ => format!("`{want}`"),
+                };
+                wrong.push(format!(
+                    "`{name}`: the row states {said:?} where the bundle declares {declares}"
+                ));
+            }
+        }
+        checked += 1;
+    }
+    assert!(
+        checked >= 36,
+        "expected the shipped bundles to be checked, saw {checked}"
+    );
+    wrong.sort();
+    assert!(
+        wrong.is_empty(),
+        "the bundles table counts these bundles wrong: {wrong:#?}"
+    );
+}
+
 /// The shipped `provision` of `<bundle>`, as the script a shell would run.
 fn shipped_install_step(name: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
