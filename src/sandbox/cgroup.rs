@@ -210,14 +210,34 @@ fn delegated_controllers() -> Vec<String> {
     };
     // SAFETY: `getuid` always succeeds and only reads the caller's id.
     let uid = unsafe { libc::getuid() };
-    let Some(service) = delegation_root(path, uid) else {
-        return Vec::new();
-    };
+    let service = controller_source(path, uid);
     let file = format!("/sys/fs/cgroup{service}/cgroup.controllers");
     match std::fs::read_to_string(&file) {
         Ok(s) => s.split_whitespace().map(str::to_owned).collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// The cgroup whose `cgroup.controllers` bounds what a scope can enforce, for a process whose own
+/// cgroup is `cgroup_path`.
+///
+/// [`delegation_root`] answers this wherever the caller sits inside the user's own slice. Where it
+/// does not, a user manager may still be running and `systemd-run --user` still register its scope
+/// under `user@<uid>.service`: WSL2 starts every process launched through `wsl.exe` under
+/// `/init.scope`, outside that slice entirely, so consulting only the caller's own path found no
+/// controller and dropped the limits for every launch on such a host. The canonical service path is
+/// therefore the fallback, and whether it names a real delegation root is left to the read: a host
+/// with no user manager has no such directory, yields no controller, and degrades as it did before.
+///
+/// **The limit, written because dropping a gate widens what the others carry.** The caller's own
+/// cgroup no longer stands between a launch and `systemd-run`, so the bus socket [`limiter`] checks
+/// is what now separates the shape this comment used to exclude, a container that bind-mounts the
+/// host's `/sys/fs/cgroup` and `/run/user/<uid>`, from a launch that execs a launcher no manager
+/// will answer. That is the residual [`limiter`] already names for a socket left by a crashed
+/// manager, and it ends the same way: the launch stops at `systemd-run`, which names itself.
+fn controller_source(cgroup_path: &str, uid: u32) -> String {
+    delegation_root(cgroup_path, uid)
+        .unwrap_or_else(|| format!("/user.slice/user-{uid}.slice/user@{uid}.service"))
 }
 
 /// The cgroup path of the user manager's delegation root (`user@<uid>.service`) for a process whose
@@ -624,6 +644,42 @@ mod tests {
         assert!(
             p.iter()
                 .any(|(c, v)| *c == "pids" && v.starts_with("TasksMax="))
+        );
+    }
+
+    /// A caller outside the user's slice still reaches the manager's delegation root.
+    ///
+    /// WSL2 places every process launched through `wsl.exe` under `/init.scope`, a cgroup carrying
+    /// neither `/user@` nor this user's slice, so [`delegation_root`] finds no root to read there.
+    /// That host's `systemd-run --user` nevertheless creates a scope under `user@<uid>.service` and
+    /// accepts the limit properties, with `cpu`, `memory` and `pids` all delegated.
+    ///
+    /// Reading nothing was therefore not the same as having nothing delegated, and every cage
+    /// launched under WSL2 ran uncapped on a host that would have enforced the caps.
+    #[test]
+    fn a_caller_outside_the_user_slice_still_names_the_canonical_delegation_root() {
+        // The WSL2 shape: launched through `wsl.exe`, outside the user slice entirely.
+        assert_eq!(
+            controller_source("/init.scope", 1000),
+            "/user.slice/user-1000.slice/user@1000.service"
+        );
+        // The two shapes `delegation_root` already answered are untouched by the fallback.
+        assert_eq!(
+            controller_source(
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope",
+                1000
+            ),
+            "/user.slice/user-1000.slice/user@1000.service"
+        );
+        assert_eq!(
+            controller_source("/user.slice/user-1000.slice/session-5.scope", 1000),
+            "/user.slice/user-1000.slice/user@1000.service"
+        );
+        // A caller under another user's slice names its OWN manager, never the other user's: the
+        // path is built from the running uid, so it cannot cross the uid boundary.
+        assert_eq!(
+            controller_source("/user.slice/user-42.slice/session-1.scope", 1000),
+            "/user.slice/user-1000.slice/user@1000.service"
         );
     }
 
