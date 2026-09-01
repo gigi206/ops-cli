@@ -1546,6 +1546,46 @@ pub(crate) fn integrity(layout: &crate::store::Layout, dir_name: &str) -> Integr
     }
 }
 
+/// A plugin's private state directory, `<data>/plugin-state/<name>`.
+///
+/// The **one** definition of that shape. It is spelled from the data directory and the plugin's
+/// installed directory *name* rather than from its manifest `name`, because the directory name is
+/// what [`validate_install_name`] already held to a single safe path component: a manifest `name`
+/// has been through no such gate, and this path is a sink.
+///
+/// It lives here, next to the remover, because the creator and the remover drifting apart is the
+/// whole of the defect this closes. A plugin's tree is removed by [`remove`] while its state is
+/// created by the launcher ([`crate::sandbox::resolver`]), so the two ends are in different
+/// modules and only a shared definition keeps them naming the same directory.
+pub(crate) fn state_dir_in(data_dir: &Path, name: &OsStr) -> PathBuf {
+    data_dir.join("plugin-state").join(name)
+}
+
+/// Drop the private state directory of the plugin named `name`, best effort.
+///
+/// Renamed aside before the recursive delete, the way [`remove`] treats the plugin tree itself: the
+/// rename is the atomic part, so a delete that fails part-way cannot leave a directory that is
+/// still reachable under the plugin's name and still holds what was in it.
+///
+/// Best effort by choice. The tree, the origin record and the out-links are already gone by the
+/// time this runs, so a failure here must not report the plugin as still installed; what it costs
+/// is a directory the next install of that name would inherit, which is the case a failure cannot
+/// avoid anyway.
+fn forget_state(layout: &crate::store::Layout, name: &str) {
+    let dir = state_dir_in(layout.data_dir(), OsStr::new(name));
+    if !dir.exists() {
+        return;
+    }
+    let trash = layout.data_dir().join(format!(
+        ".plugin-state-rm-{}-{}",
+        std::process::id(),
+        unique()
+    ));
+    if std::fs::rename(&dir, &trash).is_ok() {
+        let _ = std::fs::remove_dir_all(&trash);
+    }
+}
+
 /// Remove an installed resolver plugin by name. The name is validated as a safe path component
 /// first (so `..`/`/` can never escape the plugins directory), and the target must actually look
 /// like a plugin (carry a `plugin.toml`) so a typo cannot delete an unrelated directory. The
@@ -1582,6 +1622,19 @@ pub(crate) fn remove(layout: &crate::store::Layout, name: &str) -> Result<(), St
     // the store, invisibly: nix's own root is indirect, so it stays valid exactly as long as the
     // link does, and nothing else would ever name the plugin it was built for.
     programs::forget(layout, name);
+    // And the private state directory, which is outside the tree for the third time and is the one
+    // of the three that holds a **secret**: a `state = true` plugin persists what it resolved
+    // there, so a rotating refresh token outlives the plugin unless this runs. The name is the
+    // only key, so the next plugin installed under it — from any store — would be handed the
+    // previous one's live credential in a writable bind, which is not what `plugins rm` says it
+    // did.
+    forget_state(layout, name);
+    // And the private state directory, which is outside the tree for the third time and is the one
+    // of the three that holds a **secret**: a `state = true` plugin persists what it resolved
+    // there, so a rotating refresh token outlives the plugin unless this runs. The name is the
+    // only key, so the next plugin installed under it — from any store — would be handed the
+    // previous one's live credential in a writable bind, which is not what `plugins rm` says it
+    // did.
     Ok(())
 }
 
@@ -3302,6 +3355,52 @@ mod tests {
             "the refusal names both sides of the mismatch: {err}"
         );
         assert!(!layout.plugins_dir().join("gpg-agent").exists());
+    }
+
+    /// `plugins rm` must take the plugin's private state directory with it, because that is where
+    /// a `state = true` plugin keeps what it resolved.
+    ///
+    /// The name is the only key the state is filed under, so leaving it behind does not merely
+    /// waste a directory: the next plugin installed under that name, from any store at all, is
+    /// handed the previous one's live credential in a writable bind. The credential here stands in
+    /// for a rotating refresh token, and the second install stands in for a different author's
+    /// plugin that happens to claim the same name.
+    #[test]
+    fn remove_takes_the_plugins_private_state_with_it() {
+        let data = crate::testutil::TmpDir::new();
+        let src_root = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(data.path());
+        let source = source_plugin(
+            src_root.path(),
+            "oauth",
+            "type=\"resolver\"\nscheme=\"oauth\"\nexec=\"resolve\"\n[sandbox]\nstate=true\n",
+            0o755,
+        );
+        install(&layout, &source).expect("install");
+
+        // Stand in for what the plugin persists on its first run: the launcher creates this
+        // directory, so the test writes it by the same shared rule the launcher uses.
+        let state = state_dir_in(layout.data_dir(), OsStr::new("oauth"));
+        fs::create_dir_all(&state).unwrap();
+        fs::write(state.join("token"), b"refresh-token-live").unwrap();
+
+        remove(&layout, "oauth").expect("remove");
+
+        assert!(
+            !state.exists(),
+            "the private state outlived the plugin it belonged to: {state:?}"
+        );
+        // And the aside-rename is cleaned up like the plugin tree's own.
+        let leaked: Vec<_> = fs::read_dir(data.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".plugin-state-rm-")
+            })
+            .collect();
+        assert!(leaked.is_empty(), "a state removal temp leaked: {leaked:?}");
     }
 
     #[test]

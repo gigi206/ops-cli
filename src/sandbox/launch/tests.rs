@@ -230,6 +230,41 @@ fn the_guardless_launch_paths_ask_the_predicate_and_not_the_observe_flag() {
     }
 }
 
+/// Every warning a config produced reaches the terminal through [`crate::diag::warn_config`], which
+/// filters it, and never through the unfiltered [`crate::diag::warn`].
+///
+/// The text of such a warning names the key or value it is complaining about, and for an untrusted
+/// project that name is the project's to spell. Control bytes in it reach the launching terminal at
+/// the exact moment sbx is reporting what it refused, so an escape run can erase the trust warnings
+/// printed just above. The repo already found this once, in the `[tools]` table, and answered it
+/// with `mise_token_display` plus a regression test; every other table printed its warnings raw.
+///
+/// Counted rather than trusted to stay converted, because the failure is silent: a new warning
+/// producer with a plain `warn` looks exactly like a correct one, and there are nine of these loops
+/// across four files. The loop variable is the tell — a `warn` whose argument is a bare `warning`
+/// or `w` is printing somebody else's string.
+#[test]
+fn no_config_warning_reaches_the_terminal_unfiltered() {
+    for (name, source) in [
+        ("launch/build.rs", include_str!("build.rs")),
+        ("launch/reclaim.rs", include_str!("reclaim.rs")),
+        ("launch/detach.rs", include_str!("detach.rs")),
+        ("main.rs", include_str!("../../main.rs")),
+    ] {
+        let production = source
+            .rsplit_once("#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        for raw in ["warn(warning)", "warn(w)"] {
+            assert_eq!(
+                production.matches(raw).count(),
+                0,
+                "{name} prints a config-chosen warning through the unfiltered `warn`; use \
+                 `diag::warn_config`, the rule `mise_token_display` already applies to `[tools]`"
+            );
+        }
+    }
+}
+
 #[test]
 fn no_pin_targets_the_global_lock_ignoring_any_stale_project_lock() {
     // Without a current pin the decision is the global channel, so the per-project

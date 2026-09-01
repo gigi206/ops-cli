@@ -59,16 +59,13 @@ const CAGE_STATE: &str = "/run/sbx-state";
 /// Derived from the plugin's own installed directory rather than from its manifest `name`: the
 /// directory name is what the installer already validated as a safe path component, so it cannot
 /// traverse, and two plugins cannot collide on it the way two manifests could.
+///
+/// The shape itself is [`crate::plugins::state_dir_in`], which `plugins::remove` also uses to drop
+/// this directory. Creator and remover share one definition on purpose: they sit in different
+/// modules, and the state surviving a `plugins rm` — with whatever the plugin persisted in it — is
+/// exactly what their drifting apart looks like.
 pub(crate) fn state_dir(plugin: &ResolverPlugin) -> Option<PathBuf> {
-    let name = plugin.dir.file_name()?;
-    Some(
-        plugin
-            .dir
-            .parent()?
-            .parent()?
-            .join("plugin-state")
-            .join(name),
-    )
+    state_dir_of(&plugin.dir)
 }
 
 /// Run `plugin` to resolve `reff`, returning its raw stdout on success (the caller classifies
@@ -109,8 +106,10 @@ pub(super) struct CagePlan<'a> {
 
 /// The private state directory for a plugin installed at `dir`, by the rule [`state_dir`] applies.
 fn state_dir_of(dir: &Path) -> Option<PathBuf> {
-    let name = dir.file_name()?;
-    Some(dir.parent()?.parent()?.join("plugin-state").join(name))
+    Some(crate::plugins::state_dir_in(
+        dir.parent()?.parent()?,
+        dir.file_name()?,
+    ))
 }
 
 /// A plugin's caged process and the socket that is both its stdin and its stdout.

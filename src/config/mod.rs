@@ -208,6 +208,16 @@ pub(crate) fn is_reserved_env_key(key: &str) -> bool {
                 | "PYTHONSTARTUP"
                 | "PERL5OPT"
                 | "RUBYOPT"
+                // The two XDG base directories the in-cage portal resolves a URI scheme through.
+                // `sandbox::openuri` freezes the OpenURI route by binding the generated desktop
+                // entry and `mimeapps.list` read-only at the locations the XDG lookup prefers, and
+                // that only outranks everything else while these stay unset: setting either points
+                // the lookup at a directory the project ships, whose `.desktop` then answers a
+                // sign-in click the *user* made. The cage's `--clearenv` and its three-name
+                // passthrough already keep the host's values out; what they do not cover is an
+                // untrusted `[env]`, which is this denylist's half of the same question.
+                | "XDG_DATA_HOME"
+                | "XDG_CONFIG_HOME"
         )
         // Exported shell functions, whole. bash runs `BASH_FUNC_<name>%%` definitions when it
         // starts, so this is `BASH_ENV`'s hole without the file: a prefix, because the name half

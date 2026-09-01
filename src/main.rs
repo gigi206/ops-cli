@@ -548,7 +548,7 @@ fn fold_app_overlay(resolved: &mut config::Resolved, name: &str) -> Result<(), S
     let before = resolved.warnings.len();
     resolved.merge_app(app_cfg);
     for w in &resolved.warnings[before..] {
-        diag::warn(w);
+        diag::warn_config(w);
     }
     Ok(())
 }

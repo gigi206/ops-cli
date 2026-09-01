@@ -17,6 +17,23 @@ pub(crate) fn warn(msg: &str) {
     );
 }
 
+/// Print a warning whose text a **config file chose** part of, with that part filtered.
+///
+/// [`warn`]'s text is sbx's own from end to end, so it needs no filter. A configuration warning is
+/// not: it names the key or value it is complaining about, and for an untrusted project's
+/// `.sbx.toml` that name is the project's to spell — including control bytes and escape sequences,
+/// which reach the launching terminal exactly when sbx is telling the user what it refused. That is
+/// the one moment the user is reading, so it is the one worth forging: an escape run can erase the
+/// trust warnings printed above it.
+///
+/// The same reasoning already produced `mise_token_display` for the `[tools]` table, with a
+/// regression test beside it (`sandbox::launch::equip`, not linked here: it is `pub(super)` in a
+/// private module, so no path to it resolves from this one). This is that rule for every other
+/// table, so a new warning producer does not have to rediscover it.
+pub(crate) fn warn_config(msg: &str) {
+    warn(&crate::sandbox::sanitize(msg));
+}
+
 /// Print `sbx: note: <msg>` to stderr — an advisory. The prefix is bold (not the caution hue): a
 /// note explains a silent no-op (e.g. why a security field did not apply), so it must stay visible
 /// without reading as a problem. Same `` `identifier` `` highlighting as [`warn`].

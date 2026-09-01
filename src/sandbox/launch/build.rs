@@ -297,7 +297,7 @@ pub(super) fn build(
     cmd: Vec<OsString>,
 ) -> Result<(SandboxSpec, Option<LaunchGuard>), ExitCode> {
     for warning in &prep.cfg.warnings {
-        crate::diag::warn(warning);
+        crate::diag::warn_config(warning);
     }
 
     // Reclaim the per-launch runtime files of launches that are gone, before standing up our own.
@@ -331,7 +331,7 @@ pub(super) fn build(
         }
     };
     for warning in &packages.warnings {
-        crate::diag::warn(warning);
+        crate::diag::warn_config(warning);
     }
 
     // Provision a trusted project's `nix:` mise tools — the exact-pinned dev toolchain.
@@ -339,7 +339,7 @@ pub(super) fn build(
     // tool wins over the coarser package layer on a name clash.
     let tools = mise_tools(prep)?;
     for warning in &tools.warnings {
-        crate::diag::warn(warning);
+        crate::diag::warn_config(warning);
     }
     let mut bin_paths = tools.bins;
     bin_paths.extend(packages.bins);
@@ -1037,7 +1037,7 @@ pub(super) fn build(
         let registry =
             crate::plugins::PluginRegistry::load(&prep.layout.plugins_dir(), &mut plugin_warnings);
         for w in &plugin_warnings {
-            crate::diag::warn(w);
+            crate::diag::warn_config(w);
         }
         // The session's decision record, stood up once and shared by every broker below — one ring
         // and one socket, whatever the config declares. The guard lives as long as the brokers do,
@@ -1669,7 +1669,7 @@ pub(super) fn build(
     // point: they are the only binds here meant to land on one.
     let fs_masks = crate::sandbox::fsmask::expand(&prep.cwd, &prep.cfg.fs);
     for warning in &fs_masks.warnings {
-        crate::diag::warn(warning);
+        crate::diag::warn_config(warning);
     }
     if let Some(reason) = &fs_masks.refused {
         eprintln!("sbx: {reason}");

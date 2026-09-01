@@ -993,19 +993,37 @@ async fn send_masked(dst: &mut h2::SendStream<Bytes>, data: Vec<u8>) -> Result<b
 }
 
 /// Whether the client's decoded request head carries any configured secret value verbatim — the
-/// outbound leak tripwire, HTTP/2 form. Reconstructs a byte blob of the `:path` plus each
-/// `name: value` header line and reuses the HTTP/1.1 [`carries_secret`] scan. Scanned before sbx's
-/// own injection is added, so an injected credential can never self-trip it.
+/// outbound leak tripwire, HTTP/2 form. Reconstructs a byte blob of the request line's three
+/// pseudo-headers plus each `name: value` header line, and reuses the HTTP/1.1 [`carries_secret`]
+/// scan. Scanned before sbx's own injection is added, so an injected credential can never
+/// self-trip it.
+///
+/// **The pseudo-headers are read through their own accessors, and that is the whole reason this
+/// function exists rather than a loop over `headers()`.** In HTTP/2 `:method`, `:scheme` and
+/// `:authority` are not members of [`http::HeaderMap`] — the `http` crate lifts each onto
+/// [`Request`] itself — so a blob built from `headers()` alone leaves all three unscanned, while
+/// the HTTP/1.1 scan reads them as ordinary bytes of the raw head it is handed. Of the three
+/// `:method` is the widest channel: an HTTP/2 method is an RFC 9110 token, whose charset
+/// (letters, digits and ``!#$%&'*+-.^_`|~``) admits a hex digest or a `ghp_`-style token whole.
 fn head_carries_secret(
     req: &Request<h2::RecvStream>,
     needles: &[SecretNeedle],
     dest: &str,
 ) -> bool {
     let mut blob = Vec::new();
+    blob.extend_from_slice(req.method().as_str().as_bytes());
+    blob.push(b' ');
+    if let Some(scheme) = req.uri().scheme_str() {
+        blob.extend_from_slice(scheme.as_bytes());
+        blob.extend_from_slice(b"://");
+    }
+    if let Some(authority) = req.uri().authority() {
+        blob.extend_from_slice(authority.as_str().as_bytes());
+    }
     if let Some(pq) = req.uri().path_and_query() {
         blob.extend_from_slice(pq.as_str().as_bytes());
-        blob.push(b'\n');
     }
+    blob.push(b'\n');
     for (name, value) in req.headers().iter() {
         blob.extend_from_slice(name.as_str().as_bytes());
         blob.extend_from_slice(b": ");
@@ -1460,6 +1478,124 @@ mod tests {
             received, PAYLOAD,
             "and arrive, in as many frames as the window takes"
         );
+    }
+
+    /// A secret the cage writes into `:method` must trip the outbound tripwire, exactly as one in a
+    /// header does.
+    ///
+    /// The two planes disagreed here, and the asymmetry was structural rather than accidental: the
+    /// HTTP/1.1 tripwire is handed the raw head, whose first line already carries the method, while
+    /// the HTTP/2 one rebuilds a blob and rebuilt it from `headers()`, which in HTTP/2 holds no
+    /// pseudo-header at all. An RFC 9110 method token accepts the charset a hex digest or a
+    /// `ghp_`-style token is made of, so `:method` was a complete exfiltration channel on the one
+    /// plane whose only content control is this scan.
+    ///
+    /// Driven over an in-memory duplex like its SSRF sibling below, so the refusal is reached
+    /// through the real [`stream`] path rather than by calling the predicate directly.
+    #[test]
+    fn a_secret_carried_in_the_h2_method_is_refused_like_one_in_a_header() {
+        use crate::allowlist::{EgressPolicy, classify};
+        use crate::sandbox::proxy::{Credentials, SecretNeedle};
+        use std::time::Duration;
+
+        // A value that is both a credential and a valid method token — the overlap the finding
+        // turns on.
+        const SECRET: &str = "ghp_0123456789abcdefghijklmnopqrstuvwx";
+
+        // `carry` puts the secret in the method; the control puts it in a header, which the
+        // pre-fix code already refused. Both must come back `outbound-secret`, and the control is
+        // what proves the harness can tell the two outcomes apart.
+        fn refusal_reason(in_method: bool) -> (StatusCode, Vec<String>) {
+            use crate::sandbox::control::{LOG_RING_CAP, LogRing};
+            let log = Arc::new(LogRing::new(LOG_RING_CAP));
+            let ctx = ProxyCtx::new(
+                Arc::new(super::super::Ca::ephemeral().unwrap()),
+                EgressPolicy::new(vec![classify("grpc.test:*").unwrap()], vec![]),
+            )
+            .unwrap()
+            .with_log(Arc::clone(&log))
+            .with_shared_credentials(Arc::new(Credentials::new(
+                Vec::new(),
+                vec![SecretNeedle::named("token", SECRET.as_bytes().to_vec())],
+                crate::sandbox::redact::MIN_LEN_DEFAULT,
+            )));
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let status = rt.block_on(async {
+                let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+                let client = async {
+                    let (mut send, conn) = h2::client::handshake(client_io).await.unwrap();
+                    let driver = tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
+                    let method = if in_method {
+                        Method::from_bytes(SECRET.as_bytes()).unwrap()
+                    } else {
+                        Method::POST
+                    };
+                    let mut builder = Request::builder()
+                        .method(method)
+                        .uri("https://grpc.test/pkg.Svc/Method")
+                        .header("content-type", "application/grpc");
+                    if !in_method {
+                        builder = builder.header("x-leak", SECRET);
+                    }
+                    let req = builder.body(()).unwrap();
+                    let (resp, _body) = send.send_request(req, true).unwrap();
+                    let status = resp.await.unwrap().status();
+                    driver.abort();
+                    status
+                };
+                let proxy = async {
+                    let mut conn = h2::server::handshake(server_io).await.unwrap();
+                    let (req, respond) = conn.accept().await.unwrap().unwrap();
+                    stream(
+                        req,
+                        respond,
+                        "grpc.test",
+                        443,
+                        &ctx,
+                        &UpstreamPool::default(),
+                    )
+                    .await;
+                    while conn.accept().await.is_some() {}
+                };
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    tokio::select! {
+                        status = client => status,
+                        () = proxy => panic!("the proxy leg ended before the client had its answer"),
+                    }
+                })
+                .await
+                .expect("the in-memory h2 exchange must not stall")
+            });
+            let reasons = log
+                .snapshot(None, None, false)
+                .events
+                .into_iter()
+                .map(|e| e.reason)
+                .collect();
+            (status, reasons)
+        }
+
+        let (status, reasons) = refusal_reason(false);
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the header control is refused"
+        );
+        assert_eq!(reasons, vec!["outbound-secret".to_string()]);
+
+        let (status, reasons) = refusal_reason(true);
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a secret in `:method` is refused too"
+        );
+        assert_eq!(reasons, vec!["outbound-secret".to_string()]);
     }
 
     /// An SSRF refusal on the HTTP/2 path must be *accounted for* the way the HTTP/1.1 one is, not

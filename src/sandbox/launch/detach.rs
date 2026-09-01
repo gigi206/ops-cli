@@ -331,6 +331,10 @@ fn note_trust_drops(
     use std::io::Write as _;
     let mut sink = log;
     for note in trust_drop_notes(warnings, wiring.map(|w| &w.needles)) {
+        // Filtered for the same reason the terminal sites are ([`crate::diag::warn_config`]): a
+        // detached session's log is read back by `sbx logs`, which is a terminal too, and the note
+        // carries a key an untrusted project spelled.
+        let note = crate::sandbox::sanitize(&note);
         let _ = writeln!(
             sink,
             "{SESSION_LOG_TRUST_DROP_OPEN}{note}{SESSION_LOG_HEADER_CLOSE}"

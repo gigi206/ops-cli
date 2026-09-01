@@ -4891,6 +4891,12 @@ fn reserved_key_predicate_covers_the_ld_family_and_startup_hooks() {
         "PYTHONSTARTUP",
         "PERL5OPT",
         "RUBYOPT",
+        // The XDG base directories: not code-load paths, but the lookup the in-cage portal uses
+        // to resolve a URI scheme, so setting one outranks the read-only route sbx froze.
+        "XDG_DATA_HOME",
+        "XDG_CONFIG_HOME",
+        // and through the indirect form, which materializes the suffix as-is.
+        "SBX_ENV_XDG_DATA_HOME",
         // An exported shell function, which bash runs when it starts. A prefix, because the name
         // half is the attacker's to spell.
         "BASH_FUNC_ls%%",

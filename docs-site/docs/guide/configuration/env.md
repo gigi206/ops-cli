@@ -53,6 +53,21 @@ few structural keys:
   `RESOLV_HOST_CONF`, `HOSTALIASES`.
 - Shell/exec hooks: `BASH_ENV`, `ENV`, `IFS`, and the interactive-prompt hooks
   `PROMPT_COMMAND` and `PS1` (bash evaluates `$(...)` in both before each prompt).
+- Exported shell functions, whole: anything starting with `BASH_FUNC_`. Bash runs a
+  `BASH_FUNC_<name>%%` definition when it starts, which is `BASH_ENV`'s hole without
+  the file. A prefix rather than a name at a time, because the name half is the
+  project's to spell.
+- Interpreter pre-load hooks: `NODE_OPTIONS`, `PYTHONSTARTUP`, `PERL5OPT`, `RUBYOPT`.
+  Each names a file its interpreter runs before the program, so setting one runs code
+  in your later `sbx run` without needing a shell startup at all.
+- The two XDG base directories the in-cage portal resolves a URI scheme through:
+  `XDG_DATA_HOME` and `XDG_CONFIG_HOME`. When `[open]` declares handlers, sbx freezes
+  the route by binding the generated desktop entry and `mimeapps.list` read-only at the
+  locations the XDG lookup prefers, and that only outranks everything else while these
+  stay unset. Setting either points the lookup at a directory the project ships, whose
+  `.desktop` would then answer a sign-in click you made. The rest of the `XDG_*` family
+  stays free: they are data paths whose worst case is the cage sabotaging its own
+  lookup.
 - Structural: `HOME`, `PATH`.
 - The nix-config injection set (`NIX_CONFIG`, `NIX_USER_CONF_FILES`, `NIX_CONF_DIR`).
 - Proxy control, matched case-insensitively: `http_proxy`/`https_proxy`/`all_proxy`/

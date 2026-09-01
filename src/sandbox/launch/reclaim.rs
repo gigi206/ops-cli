@@ -374,7 +374,7 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
 
     // Surface what the trust gate dropped or withheld, exactly as a launch would.
     for warning in &prep.cfg.warnings {
-        crate::diag::warn(warning);
+        crate::diag::warn_config(warning);
     }
 
     // Provision the project's declared tools and seed its store: the seed gc-roots the base and
@@ -594,7 +594,7 @@ fn equip_for_gc(prep: &Prepared) -> Result<crate::sandbox::projectstore::Project
         ExitCode::FAILURE
     })?;
     for warning in &packages.warnings {
-        crate::diag::warn(warning);
+        crate::diag::warn_config(warning);
     }
 
     // The prebuilt backends are host-side like `nix:`, so their roots must be part of the gc seed
@@ -639,7 +639,7 @@ fn equip_for_gc(prep: &Prepared) -> Result<crate::sandbox::projectstore::Project
 
     let tools = mise_tools(prep)?;
     for warning in &tools.warnings {
-        crate::diag::warn(warning);
+        crate::diag::warn_config(warning);
     }
 
     let font_layer = if prep.cfg.gui.renders() {

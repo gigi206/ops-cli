@@ -179,9 +179,17 @@ pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Resul
 /// The cage environment pointing a D-Bus/portal client at the private bus and the GTK backend:
 /// the bus address, the keyfile GSettings backend (no dconf daemon in the cage), the settings
 /// portal opt-in, the portal directory carrying the GTK backend's `gtk.portal`, and the config
-/// directory carrying the generated `portals.conf`. `XDG_*` are data paths, not code-load paths,
-/// so an untrusted `[env]` that re-points them only sabotages the cage's own portal lookup
+/// directory carrying the generated `portals.conf`. Most of `XDG_*` are data paths, not code-load
+/// paths, so an untrusted `[env]` that re-points them only sabotages the cage's own portal lookup
 /// (self-DoS), never an escape — like `WAYLAND_DISPLAY`, they need no denylist entry.
+///
+/// **`XDG_DATA_HOME` and `XDG_CONFIG_HOME` are the exception, and they are reserved**
+/// ([`crate::config::is_reserved_env_key`]). The self-DoS reasoning holds only while nothing
+/// *else* is resolved through those two directories, and [`super::openuri`] is: it freezes the
+/// OpenURI route by binding its desktop entry and `mimeapps.list` read-only at the locations the
+/// XDG lookup prefers, which outranks a copy elsewhere only while these stay unset. Re-pointing
+/// them substitutes the handler that answers a sign-in click the user made, which is not the
+/// cage sabotaging itself.
 pub(crate) fn env(gtk_root: &Path) -> Vec<(String, String)> {
     vec![
         (
