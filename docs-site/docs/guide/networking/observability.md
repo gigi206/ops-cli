@@ -222,6 +222,11 @@ mute  = ["play.googleapis.com", "*.datadoghq.com", "antigravity-unleash.goog"]
   and every `allow` are always shown.
 - **`--all` brings them back**, each tagged `muted`. Muted refusals live in a
   **separate** ring, so a chatty muted host can never push a real event off the log.
+- **It reads its verbs the way a `deny` does.** A mute naming no verb silences that
+  host's refusals whatever the verb, a `WS` upgrade included, which is usually the
+  loudest of them since a refused WebSocket is retried in a loop. One that names verbs
+  still means exactly those. Only an `allow` requires `WS` to be spelled out, because
+  an allow is the only list that hands that capability out.
 
 `mute` uses the **same grammar** as `allow`/`deny`: a host, `*.domain`, an exact
 `host/path`, a `{VERB}` method prefix, a `re:` regex, ports, and `@group` references, and is **trusted/global-only** like the rest of the `[network]` table (an untrusted

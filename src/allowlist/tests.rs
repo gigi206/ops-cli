@@ -1337,6 +1337,54 @@ fn canonical_segments_normalizes_the_path() {
     assert_eq!(canonical_segments("/"), [] as [&str; 0]);
     // a double-encoded slash stays literal (single-level decode)
     assert_eq!(canonical_segments("/a%252fb"), ["a%2fb"]);
+
+    // A `;parameter` names no resource of its own: a servlet container serves `/secret;jsessionid`
+    // as `/secret`, so comparing the raw spelling let a deny miss the resource it named.
+    assert_eq!(canonical_segments("/secret;jsessionid=abc"), ["secret"]);
+    assert_eq!(canonical_segments("/a;x/b;y"), ["a", "b"]);
+    assert_eq!(
+        canonical_segments("/;x/secret"),
+        ["secret"],
+        "a segment that is nothing but parameters is empty, and empties are dropped"
+    );
+    // No origin server is given a fragment, so a target carrying one names the resource before it.
+    assert_eq!(canonical_segments("/secret#frag"), ["secret"]);
+    assert_eq!(canonical_segments("/secret?x=1#frag"), ["secret"]);
+
+    // Both cuts happen after decoding, which over-normalizes a *literal* `%3B`/`%23`. Pinned here
+    // rather than left to prose: it is the cost of closing the escape above, and a change of mind
+    // has to change this assertion deliberately. See `canonical_segments`' own note for why the
+    // two errors are not symmetric.
+    assert_eq!(
+        canonical_segments("/secret%3Bx"),
+        ["secret"],
+        "an encoded `;` is treated as a delimiter — the fail-closed side of the trade"
+    );
+    assert_eq!(canonical_segments("/secret%23x"), ["secret"]);
+}
+
+#[test]
+fn a_deny_refuses_the_path_spellings_a_server_folds_back_onto_it() {
+    // The finding this closes: `deny host/secret` compared the raw target, so any spelling the
+    // origin folds back onto `/secret` walked past it. The rule and the request are canonicalized
+    // by the same function, so closing it for one closes it for both.
+    let p = EgressPolicy::new(vec![rule("api.test")], vec![rule("api.test/secret")]);
+    for spelling in [
+        "/secret",
+        "/secret;jsessionid=abc",
+        "/secret#frag",
+        "/secret%3Bx",
+        "/./secret",
+        "/pub/../secret",
+    ] {
+        assert!(
+            !p.permits("api.test", 443, spelling),
+            "`deny api.test/secret` must refuse `{spelling}`"
+        );
+    }
+    // And it still refuses only what it names: a sibling path is untouched.
+    assert!(p.permits("api.test", 443, "/secretarial"));
+    assert!(p.permits("api.test", 443, "/public"));
 }
 
 #[test]
@@ -1668,6 +1716,38 @@ fn mute_honors_method_and_path_scope_like_a_verdict_rule() {
     assert!(!policy.muted("play.googleapis.com", 443, None, None));
 }
 
+/// A `mute` is a `dontaudit` log filter, not an allowance: it grants nothing, refuses nothing, and
+/// the refusal it hides is still counted in `sbx net stats`. So its method set is read the way a
+/// deny's is. Reading it as an allowance's meant the `WS` opt-in narrowed the operator's own rule
+/// against the one verb they most want quiet: a refused WebSocket is retried in a loop, which is
+/// precisely the noise a mute is written for.
+///
+/// Scope is what must survive the change, and it is the second half of the test: a mute that names
+/// its verbs still means them, and an unknown verb still shows the log.
+#[test]
+fn a_bare_host_mute_silences_a_websocket_and_a_scoped_one_still_means_its_verbs() {
+    let bare = EgressPolicy::new(vec![], vec![]).with_mute(vec![rule("chat.example.com")]);
+    assert!(
+        bare.muted("chat.example.com", 443, Some("/ws"), Some("WS")),
+        "a bare-host mute names a host to silence, and a refused WebSocket is that host's noise"
+    );
+    // The `{*}` form too: it means every HTTP verb, and a mute is not where the WS carve-out lives.
+    let any = EgressPolicy::new(vec![], vec![]).with_mute(vec![rule("{*} chat.example.com")]);
+    assert!(any.muted("chat.example.com", 443, Some("/ws"), Some("WS")));
+
+    // Scope survives: a mute that lists its verbs still excludes the ones it did not list.
+    let scoped =
+        EgressPolicy::new(vec![], vec![]).with_mute(vec![rule("{POST} chat.example.com/log")]);
+    assert!(!scoped.muted("chat.example.com", 443, Some("/log"), Some("WS")));
+    assert!(scoped.muted("chat.example.com", 443, Some("/log"), Some("POST")));
+    // And one that names WS explicitly still works, as it did before.
+    let ws = EgressPolicy::new(vec![], vec![]).with_mute(vec![rule("{WS} chat.example.com")]);
+    assert!(ws.muted("chat.example.com", 443, Some("/ws"), Some("WS")));
+    assert!(!ws.muted("chat.example.com", 443, Some("/x"), Some("GET")));
+    // An unknown verb keeps failing toward showing the log.
+    assert!(!scoped.muted("chat.example.com", 443, Some("/log"), None));
+}
+
 #[test]
 fn mute_covers_cleartext_port_80_and_is_transport_agnostic() {
     // A bare-host mute is a pure log-noise filter: it silences the host's refusals on EVERY port
@@ -1683,6 +1763,10 @@ fn mute_covers_cleartext_port_80_and_is_transport_agnostic() {
     assert!(policy.muted("update.googleapis.com", 8080, Some("/x"), Some("GET")));
     // A different host is still not muted.
     assert!(!policy.muted("api.example.com", 80, Some("/x"), Some("GET")));
+    // A WebSocket upgrade is a transport too, and this test's name has always claimed to cover
+    // one. It did not: the `WS` verb was read through the allow side's opt-in, so the bare-host
+    // mute below silenced every port and scheme and then let the loudest refusal of all through.
+    assert!(policy.muted("update.googleapis.com", 443, Some("/ws"), Some("WS")));
 
     // Transport-agnostic on the RULE side too: an `http://` mute (an `L7Clear` rule, previously
     // ignored by `muted`) now silences the host on both schemes.

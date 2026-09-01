@@ -316,8 +316,7 @@ pub(super) fn handle_https_forward(
     // 7a. Whether this request may share its upstream leg with others, on the same terms as the
     //     tunneled path: the launch has to have asked for reuse, and the request has to be HTTP/1.1.
     //     Only a request the proxy can send again takes a parked connection.
-    let keep_alive =
-        ctx.pool.is_some() && head.request_line.split_whitespace().nth(2) == Some("HTTP/1.1");
+    let keep_alive = ctx.pool.is_some() && request_line_is_http11(&head.request_line);
     let pool_key = keep_alive.then(|| PoolKey::new(&host, port, &injected_ids));
     let replayable = chunked || body_len == 0 || held.is_some();
 

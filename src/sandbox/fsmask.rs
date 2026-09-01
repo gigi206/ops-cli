@@ -168,8 +168,20 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
         return out;
     };
 
-    out.denied = resolve_list(&root, &policy.deny, "deny", &mut out.warnings);
-    out.readonly = resolve_list(&root, &policy.readonly, "readonly", &mut out.warnings);
+    out.denied = resolve_list(
+        &root,
+        &policy.deny,
+        "deny",
+        &mut out.warnings,
+        &mut out.refused,
+    );
+    out.readonly = resolve_list(
+        &root,
+        &policy.readonly,
+        "readonly",
+        &mut out.warnings,
+        &mut out.refused,
+    );
 
     // A denied *directory* already covers everything under it: the cage sees an empty directory, so
     // nothing inside is nameable. Any other mask below one is therefore redundant — and worse than
@@ -241,6 +253,7 @@ fn resolve_list(
     entries: &[String],
     field: &str,
     warnings: &mut Vec<String>,
+    refused: &mut Option<String>,
 ) -> Vec<Masked> {
     let mut out: Vec<Masked> = Vec::new();
     for entry in entries {
@@ -269,7 +282,39 @@ fn resolve_list(
             ));
         }
         let mut matched = 0;
+        let mut unresolvable = false;
         for candidate in hits {
+            // "Not there" and "cannot be looked at" are different answers, and `Path::exists` gives
+            // the same one to both: it is `metadata(..).is_ok()`, false for an absent path and
+            // equally false for a path whose parent the caller cannot traverse — including when the
+            // caller owns that parent. The cage runs as the user's own uid and holds the project
+            // tree writable, so it can `chmod 000` a directory and have the next launch read its own
+            // masked path as absent: the entry matches nothing, the launch says so as a warning
+            // about a seemingly stale config entry, no mount is laid, and the session after that
+            // puts the mode back and reads the file. That is the mask switched off by the thing it
+            // exists to close.
+            //
+            // `NotFound` alone is "not there". Every other error refuses the launch, because an
+            // entry that cannot be resolved is indistinguishable from one hidden to defeat it, and
+            // the whole point of the entry is that the path not be reachable. The first refusal is
+            // the one reported: they are all the same failure, and a launch stops on any of them.
+            match std::fs::symlink_metadata(&candidate) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    refused.get_or_insert_with(|| {
+                        format!(
+                            "`[fs] {field}` entry `{entry}`: cannot look at `{}` ({e}) — an entry \
+                             that cannot be resolved is refused rather than reported as matching \
+                             nothing, because an unreadable path and one hidden to defeat the mask \
+                             are the same answer from here",
+                            candidate.display()
+                        )
+                    });
+                    unresolvable = true;
+                    continue;
+                }
+            }
             match admit(root, &candidate, entry, dir_only) {
                 Ok(Some(masked)) => {
                     matched += 1;
@@ -284,7 +329,10 @@ fn resolve_list(
                 )),
             }
         }
-        if matched == 0 {
+        // Not said of an entry that could not be resolved: "matches nothing" reads as a stale
+        // config line the author may delete, which is the opposite of what happened. That entry
+        // matched something it was not allowed to look at, and the launch is refusing over it.
+        if matched == 0 && !unresolvable {
             warnings.push(format!(
                 "`[fs] {field}` entry `{entry}` matches nothing in this project — nothing is closed \
                  by it"
@@ -319,9 +367,10 @@ fn match_in_dir(dir: &Path, pattern: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
     (hits, unjudged)
 }
 
-/// Judge one candidate path: it must exist, resolve inside the project, and match the entry's
-/// file/directory intent. `Ok(None)` is "not there", which the caller reports per entry rather than
-/// per path.
+/// Judge one candidate path that is known to be there: it must resolve inside the project and match
+/// the entry's file/directory intent. Whether the path is there at all is [`resolve_list`]'s
+/// question, because the two ways to answer "no" have different consequences and only one of them
+/// is a warning. `Ok(None)` is left for a candidate that vanished between the two calls.
 ///
 /// The containment check is on the **canonical** path, and it is the load-bearing one. `[fs]` is
 /// honored from any source, including an untrusted project, on the grounds that it can only take
@@ -334,9 +383,6 @@ fn admit(
     entry: &str,
     dir_only: bool,
 ) -> Result<Option<Masked>, String> {
-    if !candidate.exists() {
-        return Ok(None);
-    }
     let canon = candidate
         .canonicalize()
         .map_err(|e| format!("cannot resolve `{}` ({e})", candidate.display()))?;
@@ -713,6 +759,55 @@ mod tests {
         assert!(e.denied.is_empty());
         assert_eq!(e.warnings.len(), 2, "{:?}", e.warnings);
         assert!(e.warnings.iter().all(|w| w.contains("matches nothing")));
+    }
+
+    /// A mask the cage can switch off is not a mask. `Path::exists` answers false for a path whose
+    /// parent is not traversable exactly as it does for one that is absent, and the cage owns the
+    /// project tree under the user's own uid, so `chmod 000` on a directory used to turn a masked
+    /// path into "matches nothing": a warning about a seemingly stale config entry, no mount, and
+    /// the file readable again the moment the mode goes back.
+    ///
+    /// The launch must refuse instead. `NotFound` stays the one error that means "not there" — the
+    /// sibling test above covers it and must keep passing, or this fix would have closed the hole
+    /// by refusing every absent entry, which is a different and much louder change.
+    #[test]
+    fn an_entry_hidden_behind_an_unreadable_parent_refuses_the_launch() {
+        // root traverses whatever it likes, so the premise does not hold there.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("secrets.env"), b"SECRET").unwrap();
+
+        // Sanity: the entry is honoured while the parent can be traversed.
+        let ok = expand(&root, &policy(&["sub/secrets.env"], &[]));
+        assert_eq!(ok.denied.len(), 1);
+        assert!(ok.refused.is_none());
+
+        // The cage makes its own directory untraversable, as it may.
+        std::fs::set_permissions(&sub, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+        let hidden = expand(&root, &policy(&["sub/secrets.env"], &[]));
+        // Restore before asserting, so a failure does not leave the fixture undeletable.
+        std::fs::set_permissions(&sub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        assert!(
+            hidden.refused.is_some(),
+            "an entry the cage hid must refuse the launch, not warn: {:?}",
+            hidden.warnings
+        );
+        assert!(
+            !hidden
+                .warnings
+                .iter()
+                .any(|w| w.contains("matches nothing")),
+            "and it must not read as a stale config entry: {:?}",
+            hidden.warnings
+        );
     }
 
     #[test]

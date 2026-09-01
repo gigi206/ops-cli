@@ -430,9 +430,26 @@ unsafe fn confine_and_exec(
                     libc::_exit(127);
                 }
             }
-            // A non-interactive command: keep sbx's own stdin/stdout/stderr so bytes pass
-            // through unmodified (no controlling terminal, no pty line translation).
-            TtyMode::Inherit => {}
+            // A non-interactive command: keep sbx's own stdin/stdout/stderr so bytes pass through
+            // unmodified (no pty line translation). The stdio is inherited; the **session** is not.
+            //
+            // A controlling terminal is a property of the session and survives `fork`, so without
+            // this the joined process kept `sbx session attach`'s own ctty. `--dev /dev` gives the
+            // cage `/dev/tty`, the 5:0 device that resolves to the opener's controlling terminal
+            // whatever the mount namespace, so in-cage code could open it, read the user's
+            // keystrokes, write to it and drive its termios — and keep it after sbx exited. Nothing
+            // in the seccomp filter closes that: it refuses `TIOCSTI`, which is a different attack
+            // on the same device.
+            //
+            // Every other launch path leaves the session for this reason (`argv.rs` emits
+            // `--new-session`), and its one documented exception is the private pty above, where
+            // `login_tty` does the `setsid` itself. Fatal on failure, like the confinement steps
+            // below: entering without leaving the session is entering unconfined in this respect.
+            TtyMode::Inherit => {
+                if libc::setsid() < 0 {
+                    libc::_exit(126);
+                }
+            }
         }
         // Re-apply the cage confinement — NONE of it survived `setns`. `no_new_privs`
         // before seccomp: an unprivileged filter install requires it.
@@ -695,11 +712,38 @@ mod tests {
         );
     }
 
+    /// Both arms of `confine_and_exec` must leave `sbx session attach`'s session. The pty arm does
+    /// it through `login_tty`; the inherited-stdio arm has to say so itself, and used to be empty.
+    /// A controlling terminal survives `fork`, and `--dev /dev` puts `/dev/tty` in the cage, so a
+    /// process that kept the ctty can read the user's keystrokes from it — an exposure seccomp does
+    /// not close, since it refuses `TIOCSTI` and this needs no ioctl at all.
+    ///
+    /// Pinned against the source because the defect is an arm that does *nothing*: there is no
+    /// call to observe from a test, only the absence of one, and an empty arm reads as deliberate.
+    #[test]
+    fn both_tty_arms_leave_the_launching_session() {
+        // The production half only: this test quotes the shapes it looks for.
+        let source = include_str!("attach.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a production half");
+        assert!(
+            source.contains("if libc::setsid() < 0 {"),
+            "the inherited-stdio arm must leave the session; the pty arm's `login_tty` does it \
+             for that one"
+        );
+        assert!(
+            source.contains("libc::login_tty(slave)"),
+            "and the pty arm still takes its own controlling terminal"
+        );
+    }
+
     /// Every capability drop on the attach path is checked, and both processes that hold what the
     /// join granted perform one. A discarded return here fails nothing else in the suite: the
     /// drops succeed on every host that runs it, and the exposure — a file-capability binary in
     /// the cage gaining privilege across the entered shell's `execve` — appears only on a host
     /// where one of them does not. So the shape is pinned against the source.
+
     #[test]
     fn the_capability_drops_the_join_makes_necessary_are_checked_not_attempted() {
         // The production half only: this test quotes the shapes it looks for, and would otherwise

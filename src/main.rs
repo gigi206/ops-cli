@@ -348,8 +348,8 @@ fn path_cmd(args: &[OsString]) -> ExitCode {
     let layout = store::Layout::from_env();
     // `from_env` answers `None` for several different reasons, and only one of them is the "this
     // machine has no XDG base" that the view renders as `(no base)`: the rest are refusals — a
-    // relative or overlong `$SBX_DATA_DIR`, a volume that could not be mounted, and a resolved data
-    // directory the socket-length check rejects. Each has already printed its own diagnostic and
+    // relative or overlong `$SBX_DATA_DIR`, a relative `$HOME` the lookup reached, a volume that
+    // could not be mounted, and a resolved data directory the socket-length check rejects. Each has already printed its own diagnostic and
     // each means sbx cannot operate, so reporting the layout as merely absent and exiting 0 tells a
     // script the opposite of what happened. Which case this is belongs to the store, which owns the
     // guards, not to the render.
@@ -1129,6 +1129,10 @@ fn persist_proc_rule(
 /// failure is code `1`. The missing-store sentence is deliberately shorter than the add path's and
 /// stays so: it is user-visible, and a removal has no "written but untrusted, so it takes no effect"
 /// consequence to explain — a rule that is removed is gone from the file either way.
+///
+/// The re-trust hashes the text [`config::manage::RemoveOutcome::Removed`] hands back rather than
+/// reading the file again, so the verdict is keyed to the bytes sbx wrote. The no-op arm carries no
+/// text and takes no re-trust, which is one statement made once: nothing was written.
 fn persist_removal<E: std::fmt::Display>(
     family: &str,
     words: (&str, &str),
@@ -1159,12 +1163,15 @@ fn persist_removal<E: std::fmt::Display>(
 
     match outcome {
         RemoveOutcome::NotPresent => Ok(format!("{noun} {rule} was not in {target} — no change")),
-        RemoveOutcome::Removed => {
+        RemoveOutcome::Removed { text } => {
             // Re-trust only after an actual change (the file bytes changed). Fail-safe ordering: a
             // crash between the write and the trust leaves a correct-but-untrusted file the next
             // launch drops — never a security hole.
+            //
+            // Attested from the text `remove` composed, never from a second read of the path — the
+            // add path states the reasoning in full at its own `trust_written` call.
             if let Some(store) = &store {
-                trust::trust(store, &path).map_err(|e| {
+                trust::trust_written(store, &path, text.as_bytes()).map_err(|e| {
                     (
                         1,
                         format!(
@@ -1299,6 +1306,39 @@ fn read_sysctl(path: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
+
+    /// A verb that writes a project config and then re-trusts it must attest to the text it
+    /// composed, never to a second read of the path. The project tree is bind-mounted read-write
+    /// into the cage, so a payload writing between sbx's write and that read would have its own
+    /// config attested and applied at the next launch — the write succeeds either way, which is
+    /// what makes the defect invisible at the call site.
+    ///
+    /// All three writing paths here now hold their own text (the two `Written` add paths and
+    /// `RemoveOutcome::Removed`), so this file has no remaining reason to name the re-reading form.
+    /// Pinned as a count rather than an absence alone: a fourth verb added later either carries its
+    /// text or fails here.
+    ///
+    /// `sbx trust` and `sbx config edit` legitimately hash the path and live in `cli/`, not here —
+    /// there the bytes on disk are exactly what the user is approving.
+    #[test]
+    fn every_re_trust_in_this_file_attests_to_the_text_it_wrote() {
+        // The production half only, cut at the LAST `#[cfg(test)]` rather than the first: the four
+        // test-module declarations sit at the top of this file, so splitting on the first would
+        // leave twelve lines to search and the assertions below would pass having read nothing.
+        let (source, _) = include_str!("main.rs")
+            .rsplit_once("#[cfg(test)]")
+            .expect("the file has a test module");
+        assert_eq!(
+            source.matches("trust::trust(").count(),
+            0,
+            "a re-trust after sbx's own write must hash the composed text, not read the file back"
+        );
+        assert_eq!(
+            source.matches("trust::trust_written(").count(),
+            3,
+            "the two add paths and the removal path each attest to what they wrote"
+        );
+    }
 
     #[test]
     fn read_sysctl_trims_value_and_handles_absence() {

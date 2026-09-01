@@ -371,10 +371,12 @@ fn is_verb(method: &str) -> bool {
     !method.is_empty() && method.bytes().all(|b| b.is_ascii_uppercase())
 }
 
-/// The exact request path for an `exact` rule: the canonical segments (query dropped, percent-decoded,
-/// dot-segments resolved — the same canonicalization the matcher applies) rejoined as `/a/b`, or `/`
-/// for the root. Canonicalizing here keeps the rule's path identical to what a live request reduces
-/// to, so the exact match is faithful.
+/// The exact request path for an `exact` rule: the canonical segments (query and fragment dropped,
+/// percent-decoded, `;parameters` dropped, dot-segments resolved — the same canonicalization the
+/// matcher applies) rejoined as `/a/b`, or `/` for the root. Canonicalizing here keeps the rule's
+/// path identical to what a live request reduces to, so the exact match is faithful. Dropping the
+/// parameters is what keeps a learned rule usable: an observed `/v1/chat;jsessionid=…` would
+/// otherwise be written into the allowlist bound to one expired session.
 fn exact_path(raw: Option<&str>) -> String {
     let segs = canonical_segments(raw.unwrap_or("/"));
     if segs.is_empty() {

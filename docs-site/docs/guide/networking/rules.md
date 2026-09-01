@@ -129,14 +129,22 @@ The in-cage agent controls the raw request, so a naive string match on the path
 would be trivial to evade. Every request path is **canonicalized once** before any
 rule sees it:
 
+- the query string and the fragment dropped;
 - percent-decoded (a single level: `%2f` → `/`, but a double-encoded `%252f` stays
   literal, matching a server that decodes once);
-- `.`/`..` segments resolved;
-- the query string dropped.
+- each segment's `;parameters` dropped;
+- `.`/`..` segments resolved.
 
-So `deny github.com/secret` also catches `/secret?x=1`, `/secret/`, `/%73ecret`, and
-`/foo/../secret`: all the same resource. A *different* sub-resource
+So `deny github.com/secret` also catches `/secret?x=1`, `/secret/`, `/%73ecret`,
+`/foo/../secret`, `/secret#frag`, and `/secret;jsessionid=abc`: all the same resource.
+That last one is why parameters are dropped, since a servlet container serves it as
+`/secret` while the raw spelling matched nothing. A *different* sub-resource
 (`/secret/sub`) is a deliberate carve-in: write `/secret/*` to include the subtree.
+
+Both the fragment and the parameters are cut **after** decoding, so an encoded `%23` or
+`%3B` counts as the delimiter it decodes to. That is deliberate and it cuts one way: a
+rule may cover one spelling more than a strict reading would give it, and no spelling a
+server folds back onto a denied path escapes the deny.
 For a query-specific or otherwise arbitrary pattern, use `re:` (which is decoded but
 **not** `.`/`..`-resolved: see below).
 

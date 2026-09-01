@@ -34,14 +34,14 @@ impl Layout {
     /// ask for, so the refusal yields `None` and is reported on stderr. Every command
     /// that needs the data directory then stops; the one that merely inventories on-disk
     /// locations reports the base as unresolved rather than inventing one. An overlong
-    /// `$SBX_DATA_DIR` is refused the same way — see [`check_data_dir_override`].
+    /// `$SBX_DATA_DIR` is refused the same way — see [`check_data_dir_override`]. So is a relative
+    /// `$HOME` when the lookup reaches it, and for the same reason: it would resolve the data
+    /// directory against the working directory, which for `sbx run` is the project.
     pub(crate) fn from_env() -> Option<Self> {
         let over = std::env::var_os("SBX_DATA_DIR");
-        let data_dir = data_dir_from(
-            over.as_deref(),
-            std::env::var_os("XDG_DATA_HOME").as_deref(),
-            std::env::var_os("HOME").as_deref(),
-        );
+        let xdg = std::env::var_os("XDG_DATA_HOME");
+        let home = std::env::var_os("HOME");
+        let data_dir = data_dir_from(over.as_deref(), xdg.as_deref(), home.as_deref());
         if data_dir.is_none() {
             // The decision came from `data_dir_from`; the wording comes from the same
             // check it consulted, so the two cannot describe different refusals. The gate
@@ -52,6 +52,14 @@ impl Layout {
                 && refusal_unspoken()
             {
                 crate::diag::error(&format!("sbx: {why}"));
+            } else if relative_home_refused(xdg.as_deref(), home.as_deref()) && refusal_unspoken() {
+                // The one refusal with no variable of sbx's own to name. It is spoken for the same
+                // reason the others are: `data_dir_refused` reports it as a refusal, and that
+                // classification rests on the diagnostic having been printed.
+                crate::diag::error(
+                    "sbx: $HOME must be an absolute path — a relative one resolves sbx's data \
+                     directory against the working directory, which for `sbx run` is the project",
+                );
             }
         }
         let mut data_dir = data_dir?;
@@ -293,6 +301,18 @@ pub(crate) fn data_dir_refused() -> bool {
     )
 }
 
+/// Whether `$HOME` is what [`data_dir_from`] declined: present, non-empty, relative, and actually
+/// reached — an absolute `$XDG_DATA_HOME` answers first, so a relative `$HOME` behind one is never
+/// consulted and is no refusal. Named once because two readers must agree: the diagnostic
+/// [`Layout::from_env`] prints, and the classification [`data_dir_refused`] makes from it. An empty
+/// value names no directory at all and stays an absence.
+fn relative_home_refused(xdg: Option<&OsStr>, home: Option<&OsStr>) -> bool {
+    if xdg.is_some_and(|x| Path::new(x).is_absolute()) {
+        return false;
+    }
+    home.is_some_and(|h| !h.is_empty() && !Path::new(h).is_absolute())
+}
+
 /// Pure core of [`data_dir_refused`], mirroring [`data_dir_from`]'s split so the decision is
 /// testable without touching the environment.
 ///
@@ -306,6 +326,13 @@ fn refusal_from(sbx: Option<&OsStr>, xdg: Option<&OsStr>, home: Option<&OsStr>) 
     if let Some(sbx) = sbx.filter(|s| !s.is_empty())
         && check_data_dir_override(sbx).is_err()
     {
+        return true;
+    }
+    // A relative `$HOME` is declined rather than resolved, and it is the one decline that yields
+    // no base at all — so it cannot be recognised by "a base resolved" below. Reporting it as an
+    // absence would tell a script the environment named nothing, when it named something sbx
+    // refused to trust.
+    if relative_home_refused(xdg, home) {
         return true;
     }
     data_dir_from(None, xdg, home).is_some()
@@ -432,7 +459,14 @@ fn data_dir_from(
             return Some(p.join("sbx"));
         }
     }
-    Some(PathBuf::from(home?).join(".local/share/sbx"))
+    // `$HOME` is held to the same rule as the two variables checked above it, and for the same
+    // reason: a relative value resolves the data directory against the process's working
+    // directory, which for `sbx run` is the project — the untrusted side. The store, the engine
+    // set, the plugin tree, the proxy CA and the control sockets all hang off this path, and a
+    // store is trusted by *location*, so the location may not be chosen by the tree being
+    // confined. Yielding `None` is the fail-closed answer the caller already handles.
+    let home = PathBuf::from(home?);
+    home.is_absolute().then(|| home.join(".local/share/sbx"))
 }
 
 /// Create the store's directory skeleton if absent and tighten its permissions
@@ -571,6 +605,28 @@ mod tests {
             Some(PathBuf::from("/home/u/.local/share/sbx"))
         );
         assert_eq!(data_dir_from(None, None, None), None);
+        // A relative `$HOME` is refused rather than resolved against the working directory, which
+        // for `sbx run` is the project. Yielding a base here would put the store, the engines, the
+        // proxy CA and the control sockets under the tree sbx is confining.
+        assert_eq!(
+            data_dir_from(None, None, Some(OsStr::new("relative/home"))),
+            None,
+            "a relative $HOME must not resolve the data directory against the cwd"
+        );
+        assert_eq!(
+            data_dir_from(None, None, Some(OsStr::new(""))),
+            None,
+            "an empty $HOME names no directory at all"
+        );
+        // And it is refused even when a relative XDG_DATA_HOME sent the lookup here.
+        assert_eq!(
+            data_dir_from(
+                None,
+                Some(OsStr::new("rel/xdg")),
+                Some(OsStr::new("rel/home"))
+            ),
+            None
+        );
     }
 
     /// A refusal and an absent base both leave [`Layout::from_env`] holding `None`, and the
@@ -597,6 +653,22 @@ mod tests {
 
         // An override sbx accepts is not a refusal: `from_env` returns a layout for it.
         assert!(!refusal_from(Some(OsStr::new("/vol/data")), None, None));
+        // A relative `$HOME` is a refusal, not an absence: the environment named a directory and
+        // sbx declined it. Reporting "(no base)" and exiting 0 would tell a script the opposite.
+        assert!(refusal_from(None, None, Some(OsStr::new("rel/home"))));
+        assert!(refusal_from(
+            None,
+            Some(OsStr::new("rel/xdg")),
+            Some(OsStr::new("rel/home"))
+        ));
+        // ...unless an absolute XDG answered first, in which case `$HOME` was never consulted.
+        assert!(refusal_from(
+            None,
+            Some(OsStr::new("/xdg")),
+            Some(OsStr::new("rel/home"))
+        ));
+        // An empty or absent `$HOME` names no directory at all and stays an absence.
+        assert!(!refusal_from(None, None, Some(OsStr::new(""))));
     }
 
     #[test]

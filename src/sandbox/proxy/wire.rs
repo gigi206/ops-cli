@@ -250,6 +250,23 @@ pub(super) fn request_line_parts(line: &str) -> Option<(String, String)> {
     Some((method.to_string(), target.to_string()))
 }
 
+/// Whether a request line declares `HTTP/1.1` — the version whose connections persist by default,
+/// and so the question every connection-reuse decision asks of the client's leg.
+///
+/// Split on **SP**, for the reason [`request_line_parts`] gives at length: `split_whitespace` also
+/// ends a token at HTAB and at U+00A0, U+2000‥U+200A, U+3000 and the rest, while an origin server
+/// splits the line on SP alone. That is not academic for this field. `request_line_parts` admits
+/// `GET /a\u{a0}HTTP/1.1 X` as three SP tokens whose version is `X`, and `split_whitespace` reads
+/// `HTTP/1.1` out of the *target* — so the proxy would park a connection for reuse that the
+/// upstream declared it would not keep, and hand a later request a leg the origin considers closed.
+///
+/// One definition because three callers ask it (the tunneled request, the absolute-form plane, and
+/// [`Head::keeps_alive`](super::Head)); a fourth added later inherits the split rather than copying
+/// the wrong one.
+pub(super) fn request_line_is_http11(line: &str) -> bool {
+    line.split(' ').nth(2) == Some("HTTP/1.1")
+}
+
 /// Split a CONNECT authority `host:port` (port required) into its parts, handling a bracketed
 /// IPv6 literal.
 pub(super) fn split_authority(authority: &str) -> Option<(String, u16)> {
@@ -436,6 +453,19 @@ pub(super) fn read_chunk_size_line<R: BufRead>(r: &mut R) -> io::Result<u64> {
 /// `;extensions`), requiring a CRLF/LF terminator so a line cut short by an EOF is a malformed-body
 /// error rather than a silent short read. Split out from [`read_chunk_size_line`] so a relay that
 /// must forward the line verbatim can parse the copy it already holds.
+///
+/// The size field is `1*HEXDIG` and nothing else (RFC 9112 §7.1), checked byte by byte rather than
+/// handed to Rust's integer parser, which accepts more than the grammar does. This is the same
+/// refusal [`content_length`] makes and for the same reason, so the two framing readers cannot be
+/// laxer than one another: `+a` parses as ten there too, and `str::trim` strips not only SP and
+/// HTAB but U+00A0 and U+3000, so `\u{a0}a` read as ten while an origin server reads those bytes
+/// as part of the size and refuses the line.
+///
+/// The consequence is sharper here than for a header. [`FramedBody`] relays the size line to the
+/// cage **verbatim** while framing the body from its own reading of it, so a laxity is sbx and
+/// the cage's HTTP client deciding where the message ends from two grammars over the same
+/// bytes. Refusing the field is what fails closed: the caller degrades to a close-delimited
+/// relay instead of leaving the connection at a position the two disagree about.
 pub(super) fn parse_chunk_size(line: &[u8]) -> io::Result<u64> {
     if !line.ends_with(b"\n") {
         return Err(invalid("chunk size line has no line terminator"));
@@ -445,9 +475,14 @@ pub(super) fn parse_chunk_size(line: &[u8]) -> io::Result<u64> {
         Some(i) => &s[..i],
         None => s,
     };
+    if size_field.is_empty() || !size_field.iter().all(u8::is_ascii_hexdigit) {
+        return Err(invalid("chunk size is not hexadecimal"));
+    }
+    // ASCII hex digits by the check above, so this conversion cannot fail and the parse sees
+    // exactly the digits: no sign, no padding, nothing `trim` would have taken off.
     let size_str =
         std::str::from_utf8(size_field).map_err(|_| invalid("chunk size is not ASCII"))?;
-    u64::from_str_radix(size_str.trim(), 16).map_err(|_| invalid("chunk size is not hexadecimal"))
+    u64::from_str_radix(size_str, 16).map_err(|_| invalid("chunk size does not fit in 64 bits"))
 }
 
 /// Read a response head from a buffered reader, **tolerantly**: like [`read_head_buffered`], but an
@@ -1420,6 +1455,54 @@ mod tests {
         assert!(!head.headers.iter().any(|(k, _)| k == "nonsense"));
     }
 
+    /// The version token decides whether a connection may be reused, and it has to be read the way
+    /// the origin reads it. The middle case is the one with teeth: `request_line_parts` **accepts**
+    /// it (three SP tokens, target `/a\u{a0}HTTP/1.1`, version `X`), and `split_whitespace` finds a
+    /// `HTTP/1.1` inside the target — so the proxy parked a connection for reuse whose declared
+    /// version says it will not be kept. The upstream validation does not save this: the line is
+    /// well-formed by the SP grammar, the two readers just disagree about which token is which.
+    #[test]
+    fn the_version_token_is_read_on_sp_like_the_origin_reads_it() {
+        assert!(request_line_is_http11("GET /a HTTP/1.1"));
+        assert!(
+            !request_line_is_http11("GET /a\u{a0}HTTP/1.1 X"),
+            "the version is `X`; the `HTTP/1.1` sits inside the target and must not be read as one"
+        );
+        assert!(
+            request_line_is_http11("GET /a\u{a0}b HTTP/1.1"),
+            "a Unicode space inside the target does not move the version token"
+        );
+        assert!(!request_line_is_http11("GET /a HTTP/1.0"));
+        assert!(!request_line_is_http11("GET /a"));
+        assert!(!request_line_is_http11(""));
+        // The premise the middle case rests on, asserted rather than assumed: that line is one the
+        // parser admits, so the disagreement is reachable rather than theoretical.
+        assert_eq!(
+            request_line_parts("GET /a\u{a0}HTTP/1.1 X"),
+            Some(("GET".to_string(), "/a\u{a0}HTTP/1.1".to_string()))
+        );
+    }
+
+    /// Every reader of the request line's version token goes through [`request_line_is_http11`].
+    /// The three that exist were written independently and all three had the same defect, so the
+    /// rule is pinned by a count rather than by three comments: a fourth reader either calls the
+    /// helper or fails here.
+    #[test]
+    fn no_plane_reads_the_version_token_with_a_unicode_aware_split() {
+        for (name, src) in [
+            ("proxy/mod.rs", include_str!("mod.rs")),
+            ("proxy/tunnel.rs", include_str!("tunnel.rs")),
+            ("proxy/forward.rs", include_str!("forward.rs")),
+        ] {
+            assert_eq!(
+                src.matches("request_line.split_whitespace").count(),
+                0,
+                "{name} reads the version token with a split the origin does not use — call \
+                 `request_line_is_http11` instead"
+            );
+        }
+    }
+
     #[test]
     fn request_line_parts_requires_all_three_tokens() {
         assert_eq!(
@@ -1632,9 +1715,58 @@ mod tests {
         // a non-hex size is refused rather than mis-parsed.
         let mut r: &[u8] = b"zz\r\n";
         assert!(read_chunk_size_line(&mut r).is_err());
+        // and so are the forms an integer parser would take but the grammar does not — asserted
+        // here too, at the reader, because `zz` alone fails under any reading and so cannot tell
+        // this grammar from a laxer one. The full set is pinned on `parse_chunk_size` itself.
+        for lax in [&b"+a\r\n"[..], b" a\r\n", b"\xc2\xa0a\r\n"] {
+            let mut r: &[u8] = lax;
+            assert!(
+                read_chunk_size_line(&mut r).is_err(),
+                "`{}` must be refused at the reader as well",
+                String::from_utf8_lossy(lax)
+            );
+        }
         // an EOF mid-line (no terminator) is a malformed-body error, not a silent short read.
         let mut r: &[u8] = b"5";
         assert!(read_chunk_size_line(&mut r).is_err());
+    }
+
+    /// The size field is `1*HEXDIG` and nothing else. Every spelling below parses as a number
+    /// through Rust's integer parser and is not a chunk size, so accepting one meant sbx framing
+    /// the body from a grammar the origin does not share, while relaying the very same line to the
+    /// cage verbatim. The Unicode entries are the ones that make `str::trim` the wrong tool: it
+    /// strips far more than SP and HTAB, and this file already refuses that reading for the request
+    /// line.
+    #[test]
+    fn a_chunk_size_is_hex_digits_and_nothing_the_integer_parser_would_also_take() {
+        for bad in [
+            &b"+a\r\n"[..],
+            b" a\r\n",
+            b"a \r\n",
+            b"\ta\r\n",
+            b"\xc2\xa0a\r\n",     // U+00A0, which `str::trim` also strips
+            b"\xe3\x80\x80a\r\n", // U+3000, likewise
+            b"0xa\r\n",
+            b"\r\n",         // empty size field
+            b";ext\r\n",     // extensions with no size before them
+            b"a\r\n\r\n; x", // the field ends at the first line, not at the last `;`
+        ] {
+            assert!(
+                parse_chunk_size(bad).is_err(),
+                "`{}` is not a chunk size and must be refused",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // The grammar it does accept is untouched: hex in either case, the `;extensions` the line
+        // may carry after the size, and a lone LF terminator.
+        assert_eq!(parse_chunk_size(b"1a\r\n").unwrap(), 0x1a);
+        assert_eq!(parse_chunk_size(b"1A\r\n").unwrap(), 0x1a);
+        assert_eq!(parse_chunk_size(b"5;ext=1\r\n").unwrap(), 5);
+        assert_eq!(parse_chunk_size(b"0\n").unwrap(), 0);
+        // A size too large for the framing to hold is refused as such, not read as hex junk: the
+        // two failures are different facts and the message says which one happened.
+        let over = format!("{}\r\n", "f".repeat(17));
+        assert!(parse_chunk_size(over.as_bytes()).is_err());
     }
 
     #[test]

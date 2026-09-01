@@ -441,8 +441,13 @@ IP: a public address is reachable subject to policy; a **private/loopback/CGNAT*
 address is refused **unless** the deciding rule names that *exact* host (an explicit
 IP-literal or exact-host allow: a deliberate internal target). A `*.domain`, regex,
 or built-in match does not grant the internal exception, and **cloud-metadata and
-link-local** addresses are *always* refused (no exception, ever). A v4-mapped-v6
-address is unwrapped first, so the guard cannot be dodged by an alternate encoding.
+link-local** addresses are *always* refused (no exception, ever).
+
+Every v6 spelling that carries a v4 inside it is unwrapped first and classified by the
+address it embeds, so the guard cannot be dodged by an alternate encoding: v4-mapped
+(`::ffff:127.0.0.1`), v4-compatible (`::127.0.0.1`), NAT64 (`64:ff9b::`), 6to4
+(`2002::/16`) and Teredo (`2001:0::/32`). Two addresses only look like that last shape
+and keep their own classes: `::1` is the loopback and `::` is refused outright.
 
 ### Fail-closed upstream validation
 

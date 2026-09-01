@@ -129,9 +129,18 @@ for the details and [The trust gate](trust) for why it matters.
 ## What the trust gate protects
 
 An untrusted project's `.sbx.toml` **cannot** touch security-relevant fields: binds,
-network, secrets, packages, GUI, limits, app definitions. The two free fields, `env` (minus a
+network, secrets, packages, GUI, limits. The two free fields, `env` (minus a
 reserved-key denylist) and `timezone`, apply from an untrusted project, and so does
-[`[fs]`](../configuration/fs), which can only close a path. Trust is bound to
+[`[fs]`](../configuration/fs), whose masks can only close a path (its one ceiling,
+`scan_max_kb`, is gated like the rest).
+
+App definitions sit between the two, and the line is the app's provenance rather than the
+field's. An untrusted project defines its **own** app freely, command included: there is
+nothing trusted for it to steer. What it may not do is supply the `cmd` or the `home_scope`
+of an app a trusted layer defined, even when that layer named neither. A profile publishing
+a posture and no command is exactly the case the gate exists for, since `sbx app <name>`
+would otherwise run the repository's command under the profile's network, binds and display
+access. Trust is bound to
 the file's content hash on the direnv model, so any edit re-arms the gate. See
 [The trust gate](trust).
 
@@ -230,7 +239,7 @@ written, the second stops `core.hooksPath` from being pointed at a directory the
 does not cover. Naming the **directory** is what makes the first one hold: a mask is a
 mount, resolved once at launch, so a directory refuses a hook created halfway through the
 session as well as one that was already there. Committing still works, which
-`readonly = [".git/"]` would break, since git writes `.git/index.lock`. And because `[fs]` is honored from **any** source and no
+`readonly = [".git/"]` would break, since git writes `.git/index.lock`. And because an `[fs]` mask is honored from **any** source and no
 layer can undo one below it, this holds for a project you never trusted.
 
 The other carriers stay open deliberately: the `package.json`, the `Makefile` and the

@@ -382,17 +382,23 @@ fn resolve_app(
             }
         }
     };
-    // Whether the current `cmd` came from a trusted layer. An untrusted project may define its
-    // *own* app's command, but may not override the command of an app a trusted layer defined
-    // — else `sbx app <name>` against an untrusted repo would silently run the repo's command
-    // under the trusted app's posture (an integrity-of-intent hijack).
-    let mut cmd_trusted = false;
-    // The persistent-home keying, defaulting to one global home per app. Integrity-gated by
-    // `home_scope_trusted` for the same reason as `cmd`: an untrusted project may set the scope
-    // of its own app, but must not flip a trusted app from `Project` to `Global` — that would
-    // route the untrusted run into the home a trusted run shares.
+    // Whether a trusted layer defined this app **at all** — a global profile file, trusted by its
+    // location. It gates the two fields that steer what an app *is* rather than what it may reach:
+    // `cmd` and `home_scope`.
+    //
+    // The question is the app's provenance, not the field's. Gating on "did a trusted layer set
+    // this field" left the hole open in the shape that matters: a profile publishing a posture
+    // (network, binds, gui) and **no** `cmd` was completed by an untrusted project, and
+    // `sbx app <name>` then ran that repo's command under the trusted app's posture — the
+    // integrity-of-intent hijack the field-level flag was written to stop, arriving through the
+    // app the flag says nothing about. An untrusted project still defines its *own* app freely:
+    // there is nothing trusted to steer when no trusted layer named it.
+    let defined_by_a_trusted_layer = global.is_some();
+    // The persistent-home keying, defaulting to one global home per app. Gated by
+    // `defined_by_a_trusted_layer` for the same reason as `cmd`: an untrusted project may set the
+    // scope of its own app, but must not choose it for a trusted one — `Global` routes the
+    // untrusted run into the home a trusted run shares.
     let mut home_scope = AppHomeScope::Global;
-    let mut home_scope_trusted = false;
     // Per-field provenance of the scalar overlay fields, for the per-app `sbx config` view: which
     // app layer set each, recorded at the same point the value is. A scalar the overlay never sets
     // stays `Default` here and the view shows it inherited from the baseline; `home_scope_origin`
@@ -595,14 +601,12 @@ fn resolve_app(
         }
         if let Some(c) = app.cmd {
             cmd = c.into_argv();
-            cmd_trusted = true;
             cmd_origin = Provenance::Global;
         }
         if let Some(raw) = app.home_scope
             && let Some(scope) = validate_home_scope(&mut warnings, &source, &raw)
         {
             home_scope = scope;
-            home_scope_trusted = true;
             home_scope_origin = Some(Provenance::Global);
         }
     }
@@ -829,10 +833,23 @@ fn resolve_app(
                 union_devices,
             );
         }
-        // `[fs]` is ungated here for the reason it is ungated everywhere: an app's masks only take
-        // access away from that app's own cage, so an untrusted project declaring them buys nothing.
+        // `[fs]` masks are ungated here for the reason they are ungated everywhere: an app's masks
+        // only take access away from that app's own cage, so an untrusted project declaring them
+        // buys nothing.
+        //
+        // `scan_max_kb` is the exception, and the only
+        // gated key in the table: it is not a mask but a ceiling on how many bytes of a file the
+        // content lens *reads* before letting the open through, so lowering it closes fewer files.
+        // An untrusted project setting `scan_max_kb = 1` therefore widens what its cage may read
+        // past, which is the one direction the exemption above does not cover. Stripped and named
+        // rather than left to lose a fold, so the author reads why the ceiling did not apply — and
+        // stripped *before* `declares_nothing`, so a layer whose only key was this one contributes
+        // nothing and does not move the provenance.
         if let Some(raw) = app.fs {
-            let project_fs = apply_fs(&mut warnings, &source, Some(raw));
+            let mut project_fs = apply_fs(&mut warnings, &source, Some(raw));
+            if !gate.trusted && project_fs.scan_max_kb.take().is_some() {
+                gate.refuse("`[fs] scan_max_kb`", &mut warnings);
+            }
             if !project_fs.declares_nothing() {
                 fs_origin = Provenance::Project;
             }
@@ -913,24 +930,30 @@ fn resolve_app(
             }
         }
         if let Some(c) = app.cmd {
-            if trusted || !cmd_trusted {
+            if trusted || !defined_by_a_trusted_layer {
                 cmd = c.into_argv();
                 cmd_origin = Provenance::Project;
             } else {
-                gate.refuse("`cmd` override of a trusted app", &mut warnings);
+                // Not phrased as an override: the trusted profile may have declared no `cmd` at
+                // all, which is exactly the case this refusal exists for.
+                gate.refuse("`cmd` for an app a trusted layer defines", &mut warnings);
             }
         }
         if let Some(raw) = app.home_scope {
             // A trusted project may set any scope; an untrusted one may set its own app's scope
-            // (nothing trusted to override) but not flip a trusted app — which could only widen
-            // it to the shared `Global` home, the contamination vector.
-            if trusted || !home_scope_trusted {
+            // (nothing trusted to steer) but not choose it for a trusted app — `Global` is the
+            // shared home, the contamination vector, and a profile that named no scope takes the
+            // built-in default rather than the project's word for it.
+            if trusted || !defined_by_a_trusted_layer {
                 if let Some(scope) = validate_home_scope(&mut warnings, &source, &raw) {
                     home_scope = scope;
                     home_scope_origin = Some(Provenance::Project);
                 }
             } else {
-                gate.refuse("`home_scope` override of a trusted app", &mut warnings);
+                gate.refuse(
+                    "`home_scope` for an app a trusted layer defines",
+                    &mut warnings,
+                );
             }
         }
     }

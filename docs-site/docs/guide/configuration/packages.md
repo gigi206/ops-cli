@@ -620,9 +620,18 @@ An apt repository signs the list of what it publishes. `deb:apt:` reads that sig
 Alongside the `Packages` index, an apt repository publishes an `InRelease`: a signed file that
 carries the digest of every index under the same suite. `sbx` fetches it, verifies the signature,
 looks up the digest it attests for the very index just downloaded, and compares it against those
-bytes before a single line of the index is read. The chain runs from the signature to the index
-digest to the `.deb` content hash already in the lock, so what the resolve selects is what the
-repository signed.
+bytes before a single line of the index is read.
+
+The chain then runs one hop further, to the artifact. Each `Packages` stanza publishes the `SHA256:`
+of the `.deb` it names, so once the index is attested that digest is attested with it: `sbx` hands it
+to the fetch, and a `.deb` whose bytes do not match is refused before it enters the store. What the
+resolve selects is therefore what the repository signed, not merely what the URL served, and that
+matters because the `pool/` tree an index points into is commonly a different bucket from the signed
+`dists/`. An attested index that names a file without publishing its digest is refused rather than
+quietly falling back, since a signature that cannot reach the artifact is not a chain.
+
+On the first-pin path, where no key is pinned yet and nothing is attested, the `.deb` is pinned on
+what arrived, which is the trust level a plain `deb:` URL has always had.
 
 The signing key is learned once and enforced afterwards. On a first encounter `sbx` reads the
 fingerprint the signature names, fetches the matching key **from `keys.openpgp.org`**, checks that

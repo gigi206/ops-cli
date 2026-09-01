@@ -123,18 +123,22 @@ pub(crate) fn resolve_source(
     fresh: bool,
     allow_insecure_http: bool,
 ) -> io::Result<(String, String)> {
-    let url = match parse_source(locator) {
-        DebSource::Url(url) => url,
-        DebSource::Github { owner, repo } => {
-            prebuilt::github_release_asset(&Deb, nix, layout, &owner, &repo, system, fresh)?
-        }
+    // `expected` is `Some` only for an apt repository whose index a pinned key attests: that is the
+    // one source here that publishes a digest sbx did not compute itself. A plain URL and a GitHub
+    // asset pin what arrived, which is what the lock has always recorded for them.
+    let (url, expected) = match parse_source(locator) {
+        DebSource::Url(url) => (url, None),
+        DebSource::Github { owner, repo } => (
+            prebuilt::github_release_asset(&Deb, nix, layout, &owner, &repo, system, fresh)?,
+            None,
+        ),
         DebSource::Apt { packages_url } => {
             resolve_apt_deb_url(nix, layout, &packages_url, fresh, allow_insecure_http)?
         }
     };
     // A re-resolve (`fresh`) is an `sbx upgrade` step — capture nix's output and fold the cause
     // into the error; a first launch streams the download progress live.
-    let hash = prebuilt::prefetch_hash(nix, layout, &url, fresh)?;
+    let hash = prebuilt::prefetch_hash(nix, layout, &url, fresh, expected.as_deref())?;
     Ok((url, hash))
 }
 
@@ -152,18 +156,20 @@ fn resolve_apt_deb_url(
     packages_url: &str,
     fresh: bool,
     allow_insecure_http: bool,
-) -> io::Result<String> {
+) -> io::Result<(String, Option<String>)> {
     let index = super::nixhub::fetch_url_text(nix, layout, packages_url, fresh)?;
     // Between the fetch and the selection, and over this very buffer: what the signature attests
     // and what the selection reads are the same bytes, with no second fetch to diverge from.
-    if let Attested::Unpinned(why) = attest_index(nix, layout, packages_url, &index, fresh)? {
+    let attested = attest_index(nix, layout, packages_url, &index, fresh)?;
+    if let Attested::Unpinned(why) = &attested {
         crate::diag::warn(&format!(
             "the apt repository at {packages_url} is trusted on TLS alone, because {why}; the \
-             `.deb` it selects is pinned by content hash, but nothing attests that this index is \
-             the one the repository published"
+             `.deb` it selects is pinned on what the URL served, and nothing attests either that \
+             index or that artifact — on this path the pin records what arrived, not what the \
+             repository promised"
         ));
     }
-    let (version, filename) = select_latest_apt_deb(&index).map_err(|e| {
+    let (version, filename, sha256) = select_latest_apt_deb(&index).map_err(|e| {
         io::Error::other(format!(
             "the apt Packages index at {packages_url} could not be resolved: {e}"
         ))
@@ -181,7 +187,24 @@ fn resolve_apt_deb_url(
              a valid `.deb` URL: {url}"
         )));
     }
-    Ok(url)
+    // The digest travels only out of an **attested** index. On the unpinned first-pin path it is
+    // worth no more than the index carrying it, and passing it would dress trust-on-first-use up as
+    // attestation — the very reading the old warning invited.
+    //
+    // An attested index whose winning stanza publishes no `SHA256:` is refused rather than quietly
+    // demoted to that first-pin trust: the signature says the repository stands behind this index,
+    // and an index that names an artifact without its digest does not let the signature reach it.
+    // Falling through would mean the chain silently stops where the prose says it holds.
+    let expected = match &attested {
+        Attested::Yes => Some(sha256.ok_or_else(|| {
+            io::Error::other(format!(
+                "the attested apt index at {packages_url} publishes no `SHA256:` for `{filename}` \
+                 (version {version}), so its signature cannot reach the `.deb` it names"
+            ))
+        })?),
+        Attested::Unpinned(_) => None,
+    };
+    Ok((url, expected))
 }
 
 /// The `InRelease` that attests an apt repository's indexes: the signed file at the root of the
@@ -588,25 +611,34 @@ fn parse_valid_until(stamp: &str) -> Option<u64> {
 /// SAME `Package:` — a multi-package Debian mirror is refused (it is ambiguous which app to track).
 /// The highest `Version:` wins, compared as dotted **decimal** components (`1.21459.0` > `1.18286.2`);
 /// a version carrying a non-numeric component is **refused** rather than mis-ordered — this is
-/// deliberately not full dpkg ordering (no epochs, no `~`). Returns `(version, filename)` of the
-/// winner, `filename` being the path relative to the repo root. Pure, so it is unit-tested against a
-/// captured index.
-fn select_latest_apt_deb(index: &str) -> Result<(String, String), String> {
-    let mut stanzas: Vec<(String, String, String)> = Vec::new();
+/// deliberately not full dpkg ordering (no epochs, no `~`). Returns `(version, filename, sha256)`
+/// of the winner, `filename` being the path relative to the repo root and `sha256` the digest the
+/// stanza publishes for that file (`None` when the stanza omits it). Pure, so it is unit-tested
+/// against a captured index.
+///
+/// The digest is what carries the repository's signature the last hop, to the artifact itself. The
+/// index is checked against the `InRelease` a pinned key signed; reading `Filename:` and dropping
+/// `SHA256:` ended that chain one step short of the object it exists to authenticate, leaving the
+/// `.deb` pinned on whatever the `pool/` tree served — commonly a different bucket from the signed
+/// `dists/`.
+fn select_latest_apt_deb(index: &str) -> Result<(String, String, Option<String>), String> {
+    let mut stanzas: Vec<(String, String, String, Option<String>)> = Vec::new();
     let (mut pkg, mut ver, mut file): (Option<String>, Option<String>, Option<String>) =
         (None, None, None);
+    let mut sha: Option<String> = None;
     // Group RFC822 stanzas on blank lines by iterating `lines()` (which strips both `\n` and `\r\n`)
     // rather than splitting on `"\n\n"` — so an apt `Packages` served with CRLF still parses into
     // separate stanzas instead of collapsing into one. A trailing sentinel flushes the final stanza
     // when the file does not end in a blank line.
     for line in index.lines().chain(std::iter::once("")) {
         if line.trim().is_empty() {
+            let digest = sha.take().filter(|d| !d.is_empty());
             if let (Some(p), Some(v), Some(f)) = (pkg.take(), ver.take(), file.take())
                 && !p.is_empty()
                 && !v.is_empty()
                 && !f.is_empty()
             {
-                stanzas.push((p, v, f));
+                stanzas.push((p, v, f, digest));
             }
         } else if let Some(v) = line.strip_prefix("Package:") {
             pkg = Some(v.trim().to_string());
@@ -614,13 +646,15 @@ fn select_latest_apt_deb(index: &str) -> Result<(String, String), String> {
             ver = Some(v.trim().to_string());
         } else if let Some(v) = line.strip_prefix("Filename:") {
             file = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("SHA256:") {
+            sha = Some(v.trim().to_ascii_lowercase());
         }
     }
     let first = stanzas
         .first()
         .ok_or("no package stanza (Package/Version/Filename) found")?;
     let name = first.0.clone();
-    if stanzas.iter().any(|(p, _, _)| *p != name) {
+    if stanzas.iter().any(|(p, _, _, _)| *p != name) {
         return Err(format!(
             "the index names more than one package (e.g. `{name}`); `deb:apt:` tracks a \
              single-application repo"
@@ -641,7 +675,7 @@ fn select_latest_apt_deb(index: &str) -> Result<(String, String), String> {
         }
     }
     let winner = &stanzas[best_idx];
-    Ok((winner.1.clone(), winner.2.clone()))
+    Ok((winner.1.clone(), winner.2.clone(), winner.3.clone()))
 }
 
 /// Parse a dotted-decimal version (`1.21459.0`) into comparable numeric components. Returns `None` if
@@ -1154,19 +1188,22 @@ mod tests {
 Package: demo-app
 Version: 1.18286.2
 Filename: pool/main/d/demo-app/demo-app_1.18286.2_amd64.deb
+SHA256: 1111111111111111111111111111111111111111111111111111111111111111
 
 Package: demo-app
 Version: 1.21459.0
 Filename: pool/main/d/demo-app/demo-app_1.21459.0_amd64.deb
+SHA256: 2222222222222222222222222222222222222222222222222222222222222222
 
 Package: demo-app
 Version: 1.17377.0
 Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
+SHA256: 3333333333333333333333333333333333333333333333333333333333333333
 ";
 
     #[test]
     fn select_latest_apt_deb_picks_the_highest_version_not_the_last_line() {
-        let (version, filename) = select_latest_apt_deb(APT_INDEX).expect("resolves");
+        let (version, filename, sha) = select_latest_apt_deb(APT_INDEX).expect("resolves");
         // 1.21459.0 > 1.18286.2 numerically (a lexical/`sort`-style compare would pick 1.18286.2);
         // and it is not the last stanza, so file order is not what won.
         assert_eq!(version, "1.21459.0");
@@ -1174,6 +1211,24 @@ Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
             filename,
             "pool/main/d/demo-app/demo-app_1.21459.0_amd64.deb"
         );
+        // The winner's OWN digest, not the first stanza's: this is what carries the repository's
+        // signature the last hop, to the artifact, so reading it off the wrong stanza would pin the
+        // right file against another file's hash and fail every fetch.
+        assert_eq!(sha.as_deref(), Some("2".repeat(64).as_str()));
+    }
+
+    /// A stanza that publishes no `SHA256:` yields `None` rather than an empty string, so the caller
+    /// can tell "the index named no digest" from "the index named one". What is done with that
+    /// answer is `resolve_apt_deb_url`'s call, and it differs by whether the index was attested.
+    #[test]
+    fn select_latest_apt_deb_reports_a_missing_digest_as_absent() {
+        let no_digest = "Package: demo-app\nVersion: 1.0.0\nFilename: pool/d.deb\n";
+        let (_, _, sha) = select_latest_apt_deb(no_digest).expect("resolves");
+        assert_eq!(sha, None);
+        // An empty field is the same answer: a header with nothing after it names no digest.
+        let empty = "Package: demo-app\nVersion: 1.0.0\nFilename: pool/d.deb\nSHA256:\n";
+        let (_, _, sha) = select_latest_apt_deb(empty).expect("resolves");
+        assert_eq!(sha, None);
     }
 
     #[test]
@@ -1182,7 +1237,7 @@ Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
         // same newest version — grouping on `lines()` (not `split("\n\n")`) makes it CRLF-safe. A
         // `\n\n`-based parser would collapse this to one block and return the LAST stanza (1.17377.0).
         let crlf = APT_INDEX.replace('\n', "\r\n");
-        let (version, _) = select_latest_apt_deb(&crlf).expect("resolves");
+        let (version, _, _) = select_latest_apt_deb(&crlf).expect("resolves");
         assert_eq!(version, "1.21459.0");
     }
 
@@ -1216,7 +1271,7 @@ Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
         let data = TmpDir::new();
         let layout = Layout::under(data.path());
         const INDEX: &str = "https://downloads.claude.ai/claude-desktop/apt/stable/dists/stable/main/binary-amd64/Packages";
-        let url = match resolve_apt_deb_url(&nix, &layout, INDEX, true, false) {
+        let (url, _) = match resolve_apt_deb_url(&nix, &layout, INDEX, true, false) {
             Ok(u) => u,
             Err(e) => {
                 skip_unreachable!("skipping deb:apt live resolve (network/nix): {e}");
@@ -1300,7 +1355,9 @@ Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
         write_pinned_key(&pin, include_str!("openpgp/key.asc")).expect("the pin is written");
         let err = match resolve_apt_deb_url(&nix, &layout, INDEX, true, false) {
             Err(e) => e.to_string(),
-            Ok(url) => panic!("a repository whose pinned key no longer signs it resolved to {url}"),
+            Ok((url, _)) => {
+                panic!("a repository whose pinned key no longer signs it resolved to {url}")
+            }
         };
         // Refused at the signature, which is the enforcement: this is the whole value of pinning,
         // and a resolve that merely warned here would leave the TOFU open at every upgrade.
@@ -1310,7 +1367,24 @@ Filename: pool/main/d/demo-app/demo-app_1.17377.0_amd64.deb
         // index failing under another name.
         std::fs::remove_file(&pin).expect("the pin is removed");
         match resolve_apt_deb_url(&nix, &layout, INDEX, true, false) {
-            Ok(url) => assert!(url.ends_with("_amd64.deb"), "{url}"),
+            Ok((url, expected)) => {
+                assert!(url.ends_with("_amd64.deb"), "{url}");
+                // The digest travels, and the reason is worth stating: removing the pin does not
+                // make this index unattested, it makes the next resolve a **first pin** — the key
+                // is learned again and the signature checked against it, so `Attested::Yes`. That
+                // verdict means "the signature is by the pinned key", not "the key is one you had
+                // reason to trust", which is the distinction the guide draws about a first pin.
+                //
+                // Carrying the digest there is still worth it, and for a reason the key does not
+                // touch: it binds the artifact to the index that named it, closing the gap between
+                // the signed `dists/` and the `pool/` tree it points into, commonly a different
+                // bucket. `Attested::Unpinned` is the case where no digest travels, and it is
+                // reached only when no key could be learned at all.
+                assert!(
+                    expected.is_some(),
+                    "a first pin attests the index, so its digest must reach the fetch"
+                );
+            }
             Err(e) => skip_unreachable!("skipping deb:apt pin enforcement (network/nix): {e}"),
         }
     }

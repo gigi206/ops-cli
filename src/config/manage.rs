@@ -1065,8 +1065,15 @@ fn new_proc_table(mode: &str, list: ProcList, rule: &str) -> Table {
 /// The result of removing an egress rule.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RemoveOutcome {
-    /// The rule was present and removed.
-    Removed,
+    /// The rule was present and removed, carrying the document sbx composed and wrote.
+    ///
+    /// The text rides the variant rather than the enum so that "removed" and "there is a text to
+    /// attest" are the same fact. A caller re-trusting a project config must hash *these* bytes,
+    /// not a second read of the path: the project tree is bind-mounted read-write into the cage,
+    /// so a payload writing between sbx's write and that read would have its own config attested
+    /// and applied at the next launch. The no-op arm carries nothing because it wrote nothing,
+    /// which makes "re-trust after a no-op" unspellable rather than merely unused.
+    Removed { text: String },
     /// The rule was not present (nothing changed): an idempotent no-op.
     NotPresent,
 }
@@ -1170,8 +1177,8 @@ fn remove_rule_from(
     if !removed {
         return Ok(RemoveOutcome::NotPresent);
     }
-    write_doc(path, &doc)?;
-    Ok(RemoveOutcome::Removed)
+    let text = write_doc(path, &doc)?;
+    Ok(RemoveOutcome::Removed { text })
 }
 
 /// The egress rules the `list` of one config file holds, under `[app.<name>]` when an app is named.
@@ -2623,9 +2630,15 @@ mod tests {
         );
 
         // Remove it → gone; a second removal is a reported no-op.
+        let removed =
+            remove_egress_rule(&p, None, EgressList::Mute, "play.googleapis.com").unwrap();
+        let RemoveOutcome::Removed { text } = &removed else {
+            panic!("the rule was present, so it is removed: {removed:?}");
+        };
         assert_eq!(
-            remove_egress_rule(&p, None, EgressList::Mute, "play.googleapis.com").unwrap(),
-            RemoveOutcome::Removed
+            *text,
+            std::fs::read_to_string(&p).unwrap(),
+            "the text handed back is the document that was written"
         );
         let body = std::fs::read_to_string(&p).unwrap();
         assert!(

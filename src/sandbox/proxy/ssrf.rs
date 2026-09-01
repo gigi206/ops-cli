@@ -53,10 +53,19 @@ fn classify_ip(ip: IpAddr) -> IpClass {
 
 /// The IPv4 address an IPv6 address embeds through a translation/transition form, or `None`.
 ///
-/// Covers IPv4-mapped (`::ffff:a.b.c.d`), NAT64 well-known (`64:ff9b::/96`, the v4 in the low 32
-/// bits), 6to4 (`2002:AABB:CCDD::/16`), and Teredo (`2001:0::/32`, the client v4 in the last two
-/// segments, bit-inverted). The host's stack actually routing these is what makes the SSRF real;
-/// classifying them by their embedded v4 keeps the metadata/internal guard sound where it does.
+/// Covers IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`), NAT64 well-known
+/// (`64:ff9b::/96`, the v4 in the low 32 bits), 6to4 (`2002:AABB:CCDD::/16`), and Teredo
+/// (`2001:0::/32`, the client v4 in the last two segments, bit-inverted). The host's stack actually
+/// routing these is what makes the SSRF real; classifying them by their embedded v4 keeps the
+/// metadata/internal guard sound where it does.
+///
+/// **`::` and `::1` are deliberately not unwrapped**, though they match the IPv4-compatible shape.
+/// They denote the unspecified and loopback addresses in their own right, and [`classify_v6`]
+/// already answers for both (`Blocked` and `Private`). Unwrapping them is not a wash: `::1` becomes
+/// `0.0.0.1`, which is not loopback, not private and not unspecified, so [`classify_v4`] calls it
+/// `Public` and the loopback guard comes off for the one spelling most likely to be tried. This is
+/// why the check below is written out rather than delegated to `Ipv6Addr::to_ipv4`, which unwraps
+/// those two along with everything else.
 fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     if let Some(v4) = v6.to_ipv4_mapped() {
         return Some(v4);
@@ -64,6 +73,13 @@ fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     let s = v6.segments();
     let v4_of =
         |hi: u16, lo: u16| Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
+    // IPv4-compatible `::a.b.c.d` (RFC 4291 §2.5.5.1): 96 zero bits, then the v4. Deprecated as a
+    // transition mechanism and still unwrapped by host stacks, which is what makes it reachable —
+    // `::127.0.0.1` is not `::1`, not `fe80::/10` and not `fc00::/7`, so the v6 classifier called
+    // it public while every other spelling of that address is refused.
+    if s[..6] == [0, 0, 0, 0, 0, 0] && !(s[6] == 0 && matches!(s[7], 0 | 1)) {
+        return Some(v4_of(s[6], s[7]));
+    }
     // NAT64 well-known prefix 64:ff9b::/96 — the v4 is the low 32 bits.
     if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
         return Some(v4_of(s[6], s[7]));
@@ -442,6 +458,39 @@ mod tests {
         assert!(matches!(c("2606:4700:4700::1111"), IpClass::Public));
         // the pre-existing v4-mapped case still folds to its v4 class
         assert!(matches!(c("::ffff:127.0.0.1"), IpClass::Private));
+
+        // IPv4-compatible `::a.b.c.d`, the one v4 spelling this function did not unwrap:
+        // `::127.0.0.1` is not `::1`, not `fe80::/10` and not `fc00::/7`, so the v6 classifier
+        // called it public while every other spelling of that address is refused.
+        assert!(matches!(c("::127.0.0.1"), IpClass::Private));
+        assert!(matches!(c("::169.254.169.254"), IpClass::Blocked));
+        assert!(matches!(c("::10.0.0.1"), IpClass::Private));
+        // ...and one that carries a genuinely public v4 still reads public, so the unwrap is not a
+        // blanket refusal of the shape.
+        assert!(matches!(c("::1.1.1.1"), IpClass::Public));
+    }
+
+    /// `::` and `::1` match the IPv4-compatible shape and must **not** be unwrapped: they denote
+    /// the unspecified and loopback addresses themselves. The teeth are on `::1`. Unwrapping it
+    /// yields `0.0.0.1`, which is not loopback, not private and not unspecified, so the v4
+    /// classifier calls it `Public` — swapping `to_ipv4_mapped` for `to_ipv4` to close the
+    /// compatible-form gap would have opened the loopback in the same edit, and both assertions
+    /// below would read `Public`. `::` survives that swap by accident (`0.0.0.0` is unspecified on
+    /// both sides), which is exactly why it cannot be the case the guard is trusted on.
+    #[test]
+    fn the_two_addresses_that_look_ipv4_compatible_keep_their_own_class() {
+        let c = |s: &str| classify_ip(s.parse::<IpAddr>().unwrap());
+        assert!(
+            matches!(c("::1"), IpClass::Private),
+            "the v6 loopback is private, not a compatible-form embedding of 0.0.0.1"
+        );
+        assert!(
+            matches!(c("::"), IpClass::Blocked),
+            "the unspecified address is blocked"
+        );
+        // The neighbour on either side of the carve-out is unwrapped normally, so the exclusion is
+        // exactly two addresses wide and not a hole in the range.
+        assert!(matches!(c("::2"), IpClass::Public));
     }
 
     /// The ranges IANA set aside for something other than the public Internet are not public

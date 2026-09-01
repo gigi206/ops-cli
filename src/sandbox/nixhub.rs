@@ -21,7 +21,7 @@ use super::packages::Provisioned;
 use crate::store::{self, Layout};
 use std::collections::{BTreeMap, HashSet};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The mise backend prefix sbx resolves through nix; the remainder of the tool token
 /// is the nixhub/nixpkgs package name.
@@ -224,13 +224,6 @@ pub(crate) fn provision(
             "tool `{token}` has a malformed `nix:` name or version and cannot be resolved — fix the declaration or use `[packages]`"
         ));
     }
-    if declared.nix.is_empty() {
-        return Ok(Provisioned {
-            bins: Vec::new(),
-            roots: Vec::new(),
-            warnings,
-        });
-    }
     if !trusted {
         for tool in &declared.nix {
             warnings.push(format!(
@@ -245,27 +238,34 @@ pub(crate) fn provision(
         });
     }
 
+    // Reconcile the tool roots *before* the empty-declaration return below. Dropping the last
+    // `nix:` tool empties the declaration this reconciles against, so it is precisely the shape a
+    // return placed above here would skip — and the one that leaves a root behind for good.
+    //
+    // The id is read best-effort, on the ground [`prune_tool_roots`] already states for a removal
+    // that fails: a project whose directory cannot be canonicalised has no root tree to reconcile,
+    // and failing a launch over housekeeping would trade a bounded cost for a total one. The
+    // provisioning path below reads it again, where a failure *is* fatal because a declared tool
+    // could not otherwise be placed.
+    if let Ok(id) = super::binds::project_runtime_id(project) {
+        prune_tool_roots(&tool_roots_dir(layout, &id), &declared.nix);
+    }
+
+    if declared.nix.is_empty() {
+        return Ok(Provisioned {
+            bins: Vec::new(),
+            roots: Vec::new(),
+            warnings,
+        });
+    }
+
     let id = super::binds::project_runtime_id(project)?;
     let lock_path = layout
         .data_dir()
         .join("projects")
         .join(&id)
         .join(TOOLS_LOCK);
-    // A subdirectory of the project's gcroots, distinct from native `[packages]` roots
-    // so the two tool sources cannot collide on a shared name.
-    let roots = layout
-        .data_dir()
-        .join("gcroots")
-        .join("projects")
-        .join(&id)
-        .join("nix-tools");
-
-    // Reconcile the out-links before provisioning: one per declared tool is added below, and
-    // nothing ever removed one, so a tool dropped from the mise file left its root behind and
-    // pinned that closure against every `sbx gc` for good. `gc::project_keep_roots` names this
-    // directory as a keep-set and `gc::prune_project_package_roots` reads only the level above it,
-    // so neither side reclaims here — the declaration is the only thing that knows what belongs.
-    prune_tool_roots(&roots, &declared.nix);
+    let roots = tool_roots_dir(layout, &id);
 
     let mut lock = ResolutionLock::read(&lock_path);
     let mut bins = Vec::with_capacity(declared.nix.len());
@@ -359,6 +359,19 @@ pub(crate) enum ToolUpgrade {
     /// omission. `mise_managed` distinguishes a tool for another mise backend (equipped
     /// in-cage, so mise tracks its freshness) from a malformed `nix:` token (unresolvable).
     Ignored { token: String, mise_managed: bool },
+}
+
+/// The directory holding a project's `nix:` mise tool gcroots: a subdirectory of the project's own
+/// gcroots, kept distinct from the native `[packages]` roots one level up so the two tool sources
+/// cannot collide on a shared name. Named in one place because two readers depend on it agreeing —
+/// the reconciliation in [`provision`] and the out-links it writes afterwards.
+fn tool_roots_dir(layout: &Layout, id: &str) -> PathBuf {
+    layout
+        .data_dir()
+        .join("gcroots")
+        .join("projects")
+        .join(id)
+        .join("nix-tools")
 }
 
 /// Remove the out-links under a project's `nix-tools/` gcroot directory that no longer answer to a
@@ -922,6 +935,47 @@ mod tests {
         assert!(
             roots.join("notes").exists(),
             "a non-symlink entry is left alone"
+        );
+    }
+
+    /// The reconciliation has to run on an *empty* declaration, because that is the state a
+    /// project reaches by dropping its **last** `nix:` tool — the one shape that leaves a root
+    /// behind for good. This enters through [`provision`], which is the whole point: the sibling
+    /// test above calls [`prune_tool_roots`] directly and so cannot observe an early return
+    /// placed above the call. Nothing on this path consults nix, so a non-existent one suffices.
+    #[test]
+    fn dropping_the_last_nix_tool_unpins_its_root() {
+        use crate::store::Layout;
+        use crate::testutil::TmpDir;
+
+        let data = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let project = TmpDir::new();
+        let id = super::super::binds::project_runtime_id(project.path()).expect("project id");
+        let roots = tool_roots_dir(&layout, &id);
+        let target = data.join("store-path");
+        std::fs::create_dir_all(&roots).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, roots.join("dropped")).unwrap();
+
+        let out = provision(
+            Path::new("/nonexistent/nix"),
+            &layout,
+            project.path(),
+            &files(&[("mise.toml", "[tools]\n")]),
+            true,
+            &current_system(),
+        )
+        .expect("an empty declaration provisions nothing and fails nothing");
+
+        assert!(
+            out.bins.is_empty() && out.roots.is_empty(),
+            "an empty declaration provisions nothing"
+        );
+        assert!(
+            !roots.join("dropped").exists(),
+            "the root of the last dropped tool must be unpinned, not left to pin its closure \
+             against every `sbx gc`"
         );
     }
 

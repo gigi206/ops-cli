@@ -472,8 +472,16 @@ impl Rule {
     /// and scheme (a bare-host mute covers the host's cleartext `:80` noise as well as `:443`), and
     /// the rule's own layer is irrelevant. Method and path scope are still honored, so a
     /// `{POST} host/log` mute stays precise.
+    ///
+    /// The method set is read as a **deny's** ([`Methods::admits_deny`]), not as an allowance's.
+    /// A mute grants nothing and refuses nothing: it filters a log line after the verdict, and the
+    /// refusal is still counted in `sbx net stats`. The `WS` opt-in exists to stop an *allow*
+    /// handing out a capability nobody asked for, so consulting it here does what
+    /// [`Methods::admits_deny`] describes for a deny rule — it narrows the operator's own rule
+    /// against the one verb they most want silenced, since a refused WebSocket is retried in a loop
+    /// and is the noisiest thing anyone writes a mute for.
     fn matches_mute(&self, req: &Request, method: &str) -> bool {
-        self.methods.admits(method) && self.kind.matches_any_port(req)
+        self.methods.admits_deny(method) && self.kind.matches_any_port(req)
     }
 
     /// Whether this rule's host match admits **every** host: the reach a bare `*` would have if the
@@ -590,16 +598,35 @@ fn path_matches(req_segs: &[String], rule_path: &str, subtree: bool) -> bool {
     }
 }
 
-/// Canonicalize a raw request target into path segments for matching: drop the query,
-/// percent-decode, then resolve `.`/`..` and drop empty segments. The result is what
-/// segment-prefix matching compares, so an encoded or dot-laden path cannot slip past a
-/// rule. (Single-level decoding — a double-encoded `%252f` stays literal, matching a
-/// server that decodes once.)
+/// Canonicalize a raw request target into path segments for matching: drop the query and the
+/// fragment, percent-decode, drop each segment's `;parameters`, then resolve `.`/`..` and drop
+/// empty segments. The result is what segment-prefix matching compares, so an encoded or
+/// dot-laden path cannot slip past a rule. (Single-level decoding — a double-encoded `%252f`
+/// stays literal, matching a server that decodes once.)
+///
+/// `;parameters` are dropped because they name no resource of their own: a servlet container
+/// serves `/secret;jsessionid=…` as `/secret`, so a `deny host/secret` that compared the raw
+/// spelling refused nothing. The fragment is dropped for the same reason — no origin server is
+/// given one, so a target carrying it names the resource before it.
+///
+/// **Both cuts happen after decoding, and that is a deliberate over-normalization.** A literal
+/// `%23` or `%3B` in a path decodes to a character this function then treats as a delimiter, so
+/// `/secret%3Bx` canonicalizes to `secret` although a server reading it literally would serve a
+/// different resource. The alternative — cutting before the decode — leaves the escape open: the
+/// same `/secret%3Bx` reaches a servlet container as `/secret`, and the deny misses. The two
+/// errors are not symmetric here. A missed deny is an escape; a widened allow admits one extra
+/// canonical form of a path the operator already named, which the origin answers or does not, so
+/// this fails closed.
+///
+/// Cutting at both depths is deliberately **not** done: one delimiter normalized twice, at two
+/// depths, produces a third behaviour that neither rule nor request was written against.
 pub(crate) fn canonical_segments(target: &str) -> Vec<String> {
     let path = target.split('?').next().unwrap_or("");
     let decoded = percent_decode(path);
+    let decoded = decoded.split('#').next().unwrap_or("");
     let mut out: Vec<String> = Vec::new();
     for seg in decoded.split('/') {
+        let seg = seg.split(';').next().unwrap_or("");
         match seg {
             "" | "." => {}
             ".." => {
@@ -1388,8 +1415,10 @@ impl EgressPolicy {
     /// names a *host* to silence, so a bare-host mute suppresses that host's refusals on every port
     /// and scheme — its cleartext `http://…:80` noise (a component updater, an NTP-over-HTTP probe)
     /// as well as its `:443` traffic, and whether the rule was written bare, `https://`, `http://`,
-    /// or `tcp://`. Method and path scope are still honored, so a `{POST} host/log` mute stays
-    /// precise. A method-less request (an early-CONNECT block) is matched with an empty method, so a
+    /// or `tcp://`, and whether the refusal was an HTTP verb or a `WS` upgrade — the method set is
+    /// read the way a deny's is, because a mute is not an allowance (see [`Rule::matches_mute`]).
+    /// Method and path scope are still honored, so a `{POST} host/log` mute stays precise. A
+    /// method-less request (an early-CONNECT block) is matched with an empty method, so a
     /// method-scoped mute rule does not match it — failing toward *showing* the log, the safe
     /// direction when the verb is unknown.
     pub(crate) fn muted(

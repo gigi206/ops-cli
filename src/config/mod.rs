@@ -199,7 +199,20 @@ pub(crate) fn is_reserved_env_key(key: &str) -> bool {
                 | "LIBGL_DRIVERS_PATH"
                 | "GBM_BACKENDS_PATH"
                 | "__EGL_VENDOR_LIBRARY_DIRS"
+                // Interpreter pre-load hooks, the same shape as `BASH_ENV`/`ENV` above: each names
+                // a file the interpreter runs before the program, so an untrusted `[env]` setting
+                // one runs code in the user's later `sbx run` without needing a prompt or a shell
+                // startup at all. `config/tasks.rs` already refuses these for a task; the reason
+                // it gives there — that the command is sbx's choice — holds here too.
+                | "NODE_OPTIONS"
+                | "PYTHONSTARTUP"
+                | "PERL5OPT"
+                | "RUBYOPT"
         )
+        // Exported shell functions, whole. bash runs `BASH_FUNC_<name>%%` definitions when it
+        // starts, so this is `BASH_ENV`'s hole without the file: a prefix, because the name half
+        // is the attacker's to choose and reserving one spelling at a time cannot keep up.
+        || key.starts_with("BASH_FUNC_")
         // sbx's own namespace, whole. The rule above is that the keys sbx sets are the keys it
         // protects, and `SBX_*` is the larger half of that: sbx *reads* this prefix as its override
         // channel (`SBX_NET`, `SBX_BIND`, `SBX_SECCOMP`, `SBX_CONFIG`, `SBX_ENV_<name>`, …, see
@@ -638,7 +651,10 @@ impl Resolved {
         union_devices(&mut self.devices, app.devices);
         // The app's `[fs]` masks union onto the baseline's — an app closes more of the project, and
         // can never reopen what the baseline closed. Ungated, so this holds whatever the project's
-        // trust: the union direction, not the gate, is what makes it safe.
+        // trust: the union direction, not the gate, is what makes it safe. That reading is exact
+        // for the masks alone; `scan_max_kb` widens rather than closes, and an untrusted layer's is
+        // already stripped where the app is resolved (`apps::resolve`), so nothing gated reaches
+        // here.
         self.fs.union(app.fs);
         // The app's ssh-agent grant unions onto the baseline's, for the same reason and with the
         // same property: an app adds a key it needs, and cannot take away one the trusted baseline
@@ -2259,13 +2275,25 @@ fn resolve(
                 union_devices,
             );
         }
-        // `[fs]` is the one table with no trust gate: it can only take access away from the cage
-        // the project itself declares, so an untrusted project closing its own files off gains
-        // nothing it could turn on the user — while dropping it would leave a file the project
-        // asked to close wide open, which is the failure that actually matters. Unions onto the
-        // global set, like `[devices]`.
+        // `[fs]` is the one table whose *masks* need no trust gate: they can only take access away
+        // from the cage the project itself declares, so an untrusted project closing its own files
+        // off gains nothing it could turn on the user — while dropping them would leave a file the
+        // project asked to close wide open, which is the failure that actually matters. Unions onto
+        // the global set, like `[devices]`.
+        //
+        // `scan_max_kb` is the exception, and the only
+        // gated key in the table: it is not a mask but a ceiling on how many bytes of a file the
+        // content lens *reads* before letting the open through, so lowering it closes fewer files.
+        // An untrusted project setting `scan_max_kb = 1` therefore widens what its cage may read
+        // past, which is the one direction the exemption above does not cover. Stripped and named
+        // rather than left to lose a fold, so the author reads why the ceiling did not apply — and
+        // stripped *before* `declares_nothing`, so a layer whose only key was this one contributes
+        // nothing and does not move the provenance.
         if let Some(raw) = proj.fs {
-            let project_fs = apply_fs(&mut warnings, PROJECT_CONFIG, Some(raw));
+            let mut project_fs = apply_fs(&mut warnings, PROJECT_CONFIG, Some(raw));
+            if !gate.trusted && project_fs.scan_max_kb.take().is_some() {
+                gate.refuse("`[fs] scan_max_kb`", &mut warnings);
+            }
             if !project_fs.declares_nothing() {
                 fs_origin = Provenance::Project;
             }

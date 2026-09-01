@@ -473,9 +473,8 @@ pub(super) fn serve_tunneled_request(
     //     protocol upgrade — an upgrade takes the connection over entirely. The key pairs the
     //     verified host and port with the exact credential set above, so a connection that carried a
     //     secret is only ever offered to a request that receives the same secret.
-    let keep_alive = ctx.pool.is_some()
-        && !ws_upgrade
-        && inner.request_line.split_whitespace().nth(2) == Some("HTTP/1.1");
+    let keep_alive =
+        ctx.pool.is_some() && !ws_upgrade && request_line_is_http11(&inner.request_line);
     let pool_key = keep_alive.then(|| PoolKey::new(connect_host, port, &injected_ids));
     // Taking a parked connection is limited to a request the proxy can send a second time, because a
     // connection the upstream closed while it was parked only shows up after the write. That means a

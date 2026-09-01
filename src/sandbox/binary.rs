@@ -94,7 +94,7 @@ pub(crate) fn resolve_source(
     fresh: bool,
 ) -> io::Result<(String, String)> {
     let url = locator.to_string();
-    let hash = prebuilt::prefetch_hash(nix, layout, &url, fresh)?;
+    let hash = prebuilt::prefetch_hash(nix, layout, &url, fresh, None)?;
     Ok((url, hash))
 }
 

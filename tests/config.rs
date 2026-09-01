@@ -5025,8 +5025,14 @@ fn a_stale_string_dbus_value_is_rejected_never_silently_opening_a_portal() {
 fn fs_scan_is_honored_untrusted_and_surfaced_in_config_show() {
     // A refusal at the open sends a reader straight to `config show` to ask which shape closed the
     // file and how far the scan read. Both have to be there, or the surface says less than the
-    // launch enforces. Same ungated path as the masks: `scan` only ever closes content of the
-    // project it is declared in, so an untrusted project may set it.
+    // launch enforces. The `scan` shapes take the ungated path the masks take: they only ever close
+    // content of the project they are declared in, so an untrusted project may set them.
+    //
+    // `scan_max_kb` does not, and that split is the point of the first two blocks. It is a ceiling
+    // on how much of a file is *read*, so lowering it closes fewer files: an untrusted project
+    // setting it would widen what its own cage may read past, which is the one direction the
+    // exemption above does not cover. It is stripped and named, and the surface then shows the
+    // built-in ceiling rather than the number that was refused.
     let fx = Project::new("cfg");
     fx.write_project(
         "[network]\nmode = \"deny\"\n\n[fs]\nscan = [\"sk-[A-Za-z0-9]{20,}\"]\nscan_max_kb = 256\n",
@@ -5040,8 +5046,27 @@ fn fs_scan_is_honored_untrusted_and_surfaced_in_config_show() {
         "an untrusted project's content scan must apply and be shown:\n{stdout}"
     );
     assert!(
+        !stdout.contains("256 KiB"),
+        "an untrusted project's ceiling must not become the effective one:\n{stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("scan_max_kb"),
+        "and the refusal has to be visible, not a silent narrowing:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Trusted, the same file sets it, and the surface shows it beside the shapes: the ceiling
+    // decides what a clean verdict rests on. This is the half the assertion above used to cover
+    // from an untrusted project, which is what let the gap stand.
+    let fx = Project::new("cfg");
+    fx.write_project(
+        "[network]\nmode = \"deny\"\n\n[fs]\nscan = [\"sk-[A-Za-z0-9]{20,}\"]\nscan_max_kb = 256\n",
+    );
+    assert!(fx.run(&["trust", ".sbx.toml"]).status.success());
+    let stdout = String::from_utf8_lossy(&fx.run(&["config", "show"]).stdout).into_owned();
+    assert!(
         stdout.contains("256 KiB"),
-        "the ceiling decides what a clean verdict rests on, so it belongs beside the shapes:\n{stdout}"
+        "a trusted project's ceiling belongs beside the shapes:\n{stdout}"
     );
 
     // Unset leaves the built-in ceiling, and says so rather than leaving a reader to guess.

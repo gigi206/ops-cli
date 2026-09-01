@@ -889,6 +889,40 @@ fn an_untrusted_project_apps_security_fields_drop_but_env_packages_and_command_s
 }
 
 #[test]
+fn an_untrusted_project_app_may_not_lower_the_scan_ceiling() {
+    // The same key, the same reason, the other site: an app's `[fs]` is resolved in `apps.rs`, and
+    // its masks are ungated there for the reason the baseline's are. `scan_max_kb` widens, so it is
+    // gated on both — a rule applied to one half only would leave the app route open.
+    let mut app = raw_app(&["id"], &[], &[], &[], None);
+    app.fs = Some(schema::RawFs {
+        rest: Default::default(),
+        scan: vec![r"sk-[A-Za-z0-9]{20,}".to_string()],
+        scan_max_kb: Some(1),
+        ..Default::default()
+    });
+    let project = raw_with_app("probe", app);
+    let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Untrusted)));
+    let resolved = &r.apps["probe"];
+    assert_eq!(
+        resolved.fs.scan,
+        vec![r"sk-[A-Za-z0-9]{20,}".to_string()],
+        "the app's scan patterns still close files"
+    );
+    assert_eq!(
+        resolved.fs.scan_max_kb, None,
+        "an untrusted project's app must not set the ceiling either"
+    );
+    assert!(
+        resolved
+            .warnings
+            .iter()
+            .any(|w| w.contains("scan_max_kb") && is_trust_drop(w)),
+        "the refusal must be visible on the app: {:?}",
+        resolved.warnings
+    );
+}
+
+#[test]
 fn an_untrusted_project_app_cannot_widen_its_default_methods() {
     // The flagship-analog for `default_methods`: the override rides the trusted-only `[network]`
     // block, so an untrusted project app's `["*"]` widen attempt is dropped with the network —
@@ -952,6 +986,67 @@ fn an_untrusted_project_cannot_override_a_trusted_apps_command() {
         r.apps["demo-app"].cmd,
         vec!["demo-app".to_string(), "--resume".to_string()]
     );
+}
+
+/// The gap the sibling test above did not cover: it gives the trusted profile a `cmd`, so the
+/// old field-level flag was set and the guard fired. A profile that publishes a **posture** and no
+/// command left that flag `false`, and an untrusted project then supplied the command that ran
+/// under that posture — network, binds, gui and all. What is gated is the app's provenance, not the
+/// field's.
+#[test]
+fn an_untrusted_project_may_not_supply_the_command_of_a_trusted_app_that_declared_none() {
+    // A global profile with a posture and no `cmd` — `raw_app(&[], ..)` leaves the command unset.
+    let global = raw_with_app("demo-app", raw_app(&[], &[], &[], &[], None));
+    let project = raw_with_app("demo-app", raw_app(&["evil"], &[], &[], &[], None));
+    let r = resolve_no_plugins(global, Some((project, TrustState::Untrusted)));
+    let app = &r.apps["demo-app"];
+    assert!(
+        !app.cmd.contains(&"evil".to_string()),
+        "an untrusted project supplied the command of a trusted app: {:?}",
+        app.cmd
+    );
+    assert!(
+        app.warnings.iter().any(|w| w.contains("`cmd`")),
+        "and the refusal must be visible: {:?}",
+        app.warnings
+    );
+
+    // Same shape for `home_scope`: a trusted profile that named no scope must not take the
+    // untrusted project's word for it either.
+    let mut scoped = raw_app(&[], &[], &[], &[], None);
+    scoped.home_scope = Some("project".to_string());
+    let r = resolve_no_plugins(
+        raw_with_app("demo-app", raw_app(&[], &[], &[], &[], None)),
+        Some((raw_with_app("demo-app", scoped), TrustState::Untrusted)),
+    );
+    assert!(
+        r.apps["demo-app"]
+            .warnings
+            .iter()
+            .any(|w| w.contains("`home_scope`")),
+        "{:?}",
+        r.apps["demo-app"].warnings
+    );
+
+    // Neither regresses the two cases that must keep working. An app no trusted layer names is the
+    // project's own, command and scope included...
+    let own = resolve_no_plugins(
+        RawConfig::default(),
+        Some((
+            raw_with_app("mine", raw_app(&["mine"], &[], &[], &[], None)),
+            TrustState::Untrusted,
+        )),
+    );
+    assert_eq!(own.apps["mine"].cmd, vec!["mine".to_string()]);
+    // ...and a trusted project still supplies whatever it likes.
+    let ok = resolve_no_plugins(
+        raw_with_app("demo-app", raw_app(&[], &[], &[], &[], None)),
+        Some((
+            raw_with_app("demo-app", raw_app(&["fine"], &[], &[], &[], None)),
+            TrustState::Trusted,
+        )),
+    );
+    assert_eq!(ok.apps["demo-app"].cmd, vec!["fine".to_string()]);
 }
 
 #[test]
@@ -4742,6 +4837,20 @@ fn reserved_key_predicate_covers_the_ld_family_and_startup_hooks() {
         "SBX_PACKAGE_ripgrep",
         // and a name sbx has not defined yet, which is the point of reserving the prefix.
         "SBX_SOMETHING_ADDED_LATER",
+        // Interpreter pre-load hooks: each names a file its interpreter runs before the program,
+        // which is `BASH_ENV`'s shape without needing a shell startup at all.
+        "NODE_OPTIONS",
+        "PYTHONSTARTUP",
+        "PERL5OPT",
+        "RUBYOPT",
+        // An exported shell function, which bash runs when it starts. A prefix, because the name
+        // half is the attacker's to spell.
+        "BASH_FUNC_ls%%",
+        "BASH_FUNC_anything",
+        // the indirect form too: the override layer strips `SBX_ENV_` and materializes the
+        // suffix as-is, so the suffix has to be reserved on its own account.
+        "SBX_ENV_BASH_FUNC_ls%%",
+        "SBX_ENV_NODE_OPTIONS",
     ] {
         assert!(is_reserved_env_key(k), "{k} should be reserved");
     }
@@ -6653,6 +6762,55 @@ fn an_untrusted_projects_fs_masks_are_honored() {
             r.warnings
         );
     }
+}
+
+#[test]
+fn an_untrusted_project_may_not_lower_the_scan_ceiling() {
+    // The sibling test above states why `[fs]` is honoured from an untrusted project: its masks
+    // only *close* paths. `scan_max_kb` is the one key in the table that does not — it bounds how
+    // many bytes of a file the content lens reads before letting the open through, so a smaller
+    // value closes *fewer* files. An untrusted `scan_max_kb = 1` would take the window down to one
+    // KiB and let every credential past the first line through, which is the widening the
+    // exemption was never meant to cover.
+    for state in [TrustState::Untrusted, TrustState::Changed] {
+        let r = resolve_no_plugins(
+            RawConfig::default(),
+            Some((raw_fs_scan(&[r"sk-[A-Za-z0-9]{20,}"], Some(1)), state)),
+        );
+        assert_eq!(
+            r.fs.scan,
+            vec![r"sk-[A-Za-z0-9]{20,}".to_string()],
+            "the scan patterns themselves are still honoured — they only close files"
+        );
+        assert_eq!(
+            r.fs.scan_max_kb, None,
+            "an untrusted `scan_max_kb` must not become the effective ceiling"
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("scan_max_kb") && is_trust_drop(w)),
+            "the refusal must be visible and read as a trust drop: {:?}",
+            r.warnings
+        );
+    }
+    // A layer whose only `[fs]` key was the ceiling contributes nothing once it is stripped, so the
+    // provenance must not move to the project on the strength of a value that was refused.
+    let only_ceiling = resolve_no_plugins(
+        RawConfig::default(),
+        Some((raw_fs_scan(&[], Some(1)), TrustState::Untrusted)),
+    );
+    assert_eq!(only_ceiling.fs_origin, Provenance::Default);
+
+    // And a trusted project still sets it: this is a trust gate, not a ban.
+    let trusted = resolve_no_plugins(
+        RawConfig::default(),
+        Some((
+            raw_fs_scan(&[r"sk-[A-Za-z0-9]{20,}"], Some(1)),
+            TrustState::Trusted,
+        )),
+    );
+    assert_eq!(trusted.fs.scan_max_kb, Some(1));
 }
 
 #[test]
@@ -10505,15 +10663,21 @@ const OVERRIDING_PROJECT: &str = "\
 ///
 /// A different gate from [`GATED_REFUSALS`]: those fields are refused because the layer declaring
 /// them is untrusted, and that alone. These are refused because the layer is untrusted **and** a
-/// trusted layer already supplied that facet — an untrusted project may still declare its own app's
-/// command, tools and home scope, so the refusal has to say it is the *override* being dropped.
+/// trusted layer is already in play — an untrusted project may still declare its *own* app, so the
+/// refusal has to say what it was reaching into.
+///
+/// The two halves ask slightly different questions, and the wording follows. A package, a flake or
+/// a tarball resolver is refused when a trusted layer supplied *that facet*, so "override" is
+/// exact. `cmd` and `home_scope` are refused when a trusted layer defined **the app**, whether or
+/// not it named the field: a profile publishing a posture and no command is precisely the case the
+/// guard exists for, and calling that an override would describe something that did not happen.
 const TRUSTED_OVERRIDE_REFUSALS: &[&str] = &[
     "`use` of bundle(s) `demo-bundle`",
     "package `demo-tool` override of a trusted app",
     "inline flake `demo-flake` override of a trusted app",
     "tarball resolver `demo-tar` override of a trusted app",
-    "`cmd` override of a trusted app",
-    "`home_scope` override of a trusted app",
+    "`cmd` for an app a trusted layer defines",
+    "`home_scope` for an app a trusted layer defines",
 ];
 
 /// Every refused override of a trusted app says what it dropped and how to apply it, verbatim.

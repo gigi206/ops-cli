@@ -1085,8 +1085,12 @@ impl Head {
     /// close` token says outright that this is the last request on the connection. `HTTP/1.0`
     /// answers no even when it asks to keep alive: that extension carries framing ambiguities of its
     /// own, and every client this proxy exists for speaks 1.1.
+    ///
+    /// The version token is read by [`request_line_is_http11`], which splits the line the way the
+    /// origin does; reading it with `split_whitespace` let a target carrying a Unicode space put a
+    /// `HTTP/1.1` where the version is not.
     fn keeps_alive(&self) -> bool {
-        self.request_line.split_whitespace().nth(2) == Some("HTTP/1.1")
+        request_line_is_http11(&self.request_line)
             && !self
                 .headers
                 .iter()

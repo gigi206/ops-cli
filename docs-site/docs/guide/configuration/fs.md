@@ -1,6 +1,6 @@
 ---
 sidebar_label: "[fs]"
-description: "Closing a project path off inside the cage: the one field that applies from an untrusted source, because it only takes away."
+description: "Closing a project path off inside the cage: the one table whose masks apply from an untrusted source, because they only take away."
 ---
 
 # `[fs]`: closing project paths off inside the cage
@@ -35,11 +35,18 @@ The name stays visible on purpose. Removing it would change the shape of the pro
 agent is working in, and a tool that expects the file to exist would fail in a way nobody
 can read. Only the *content* is closed.
 
-`[fs]` is the one table honored from **any** source, an untrusted project included. Every
-other security field can grant something, so an untrusted project may not set it; this one
-can only take access away from the cage the project itself declares, and there is no
-syntax for reopening anything. Layers **union**: a project adds to what the global config
-closed, an app adds to what the project closed, and no layer can undo one below it.
+`[fs]` is the one table whose **masks** are honored from any source, an untrusted project
+included. Every other security field can grant something, so an untrusted project may not
+set it; a mask here can only take access away from the cage the project itself declares,
+and there is no syntax for reopening anything. Layers **union**: a project adds to what the
+global config closed, an app adds to what the project closed, and no layer can undo one
+below it.
+
+One key is the exception, and it is gated like any other security field: `scan_max_kb`
+(see [`scan`](#scan-closing-a-file-by-what-it-holds)). It is a ceiling on how much of a file is
+*read*, not a mask, so lowering it closes fewer files. An untrusted project setting it,
+whether on the project itself or on an app it declares, is refused and told so; the scan
+patterns it listed still apply.
 
 See also: [Declared operations](../tasks/) · [`binds`](binds) · [The trust gate](../concepts/trust) · [Enforcement stack](../concepts/enforcement)
 
@@ -99,7 +106,7 @@ The rules, and why each one is there:
   9 to 23 seconds of launch time, against hundredths of a second for an anchored pattern.
   Name the directory instead, which is also the stronger answer (see below).
 - **An absolute path is refused.** What the cage sees of the host outside the project is
-  [`binds`](binds), a trusted field with its own gate. `[fs]` is honored from any source, so
+  [`binds`](binds), a trusted field with its own gate. An `[fs]` mask is honored from any source, so
   letting it name a path outside the project would make it a second way to reach one.
 - **A `..` component is refused**, and so is a path that resolves outside the project through
   a symlink.
@@ -161,8 +168,13 @@ start. The launch says so when it happens, rather than presenting a prefix as a 
 result. Leave it unset for the built-in ceiling; `0` is refused, since a scan that reads nothing
 would pass everything while still looking like a scan, and so is a negative number, which is no
 ceiling at all. Where two layers both set it, the **larger** window is the one that applies: a
-bigger number closes more files, and `[fs]` is honoured from an untrusted project precisely because
-nothing in it can widen what another layer closed.
+bigger number closes more files.
+
+This is the one key in the table that a trust gate holds. The rest of `[fs]` is honoured from an
+untrusted project because nothing in it can widen what another layer closed; a ceiling can, by
+being lowered, so an untrusted layer's `scan_max_kb` is refused rather than merely out-voted, and
+the refusal is named in the launch warnings. The patterns that layer listed are unaffected. A
+trusted project sets the ceiling as before.
 
 **One scanner per layer.** Every pattern a layer lists is compiled into a single scanner, so the
 cost of a scan does not grow with the length of the list; that scanner has a size ceiling, though,
@@ -225,6 +237,12 @@ This is different, and it has three named holes:
 The cage cannot open any of these itself: it cannot create a hard link across a mask, and
 it cannot write a file into a denied directory. They are ways the *host side* can leave a
 path open, which is why they are worth knowing rather than worth panicking about.
+
+Nor can it hide a masked path from the resolver. The cage owns the project tree under your
+own uid, so it can make a directory untraversable; a path that cannot be looked at is then
+indistinguishable from one hidden on purpose, so the launch is **refused** naming the entry
+rather than reported as matching nothing. An entry that is genuinely absent still only
+warns, since that is an ordinary thing for a config to name.
 
 The second one is structural rather than an omission. A mask is a mount, and a cage's mounts
 are fixed when it is built, so a pattern cannot cover a name that did not exist yet. Three

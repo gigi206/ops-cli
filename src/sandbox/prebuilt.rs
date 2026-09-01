@@ -372,18 +372,29 @@ pub(crate) fn prefetch_hash(
     layout: &Layout,
     url: &str,
     quiet: bool,
+    expected_sha256: Option<&str>,
 ) -> io::Result<String> {
     let mut cmd = store::nix_command(nix, layout);
     cmd.args(["--extra-experimental-features", "nix-command flakes"])
         .args(["store", "prefetch-file", "--json"])
-        .args(["--name", &prefetch_name(url)])
-        .arg(url)
-        .stdout(Stdio::piped())
-        .stderr(if quiet {
-            Stdio::piped()
-        } else {
-            Stdio::inherit()
-        });
+        .args(["--name", &prefetch_name(url)]);
+    // A digest an *independent, attested* source published for this artifact, when the caller has
+    // one. It is handed to nix rather than compared afterwards, so a mismatched artifact never
+    // enters the store: nix fails the fetch with `hash mismatch` and there is nothing to clean up.
+    // `sha256:<hex>` is the spelling an apt `Packages` stanza carries, and nix takes it as-is, so
+    // no conversion stands between what the index published and what is enforced.
+    //
+    // `None` means "nothing attests this artifact independently", which is the honest answer for a
+    // plain URL, a GitHub release asset and every backend that pins on first sight: their hash
+    // records what arrived rather than what was promised.
+    if let Some(hex) = expected_sha256 {
+        cmd.args(["--expected-hash", &format!("sha256:{hex}")]);
+    }
+    cmd.arg(url).stdout(Stdio::piped()).stderr(if quiet {
+        Stdio::piped()
+    } else {
+        Stdio::inherit()
+    });
     let out = cmd.spawn()?.wait_with_output()?;
     if !out.status.success() {
         // `quiet` decides this on its own, through what it captured. On the quiet path (an
@@ -980,7 +991,7 @@ pub(crate) fn provision_resolve(
             ctx.allow_insecure_http,
             kind.artefact(),
         )?;
-        let hash = prefetch_hash(ctx.nix, ctx.layout, &url, false)?;
+        let hash = prefetch_hash(ctx.nix, ctx.layout, &url, false, None)?;
         Ok((url, hash))
     })
 }
@@ -1120,7 +1131,7 @@ pub(crate) fn upgrade(
                 ) {
                     Ok(url) => match &previous {
                         Some(pin) if pin.url == url => Ok((url, pin.hash.clone())),
-                        _ => prefetch_hash(nix, layout, &url, true).map(|h| (url, h)),
+                        _ => prefetch_hash(nix, layout, &url, true, None).map(|h| (url, h)),
                     },
                     Err(e) => Err(e),
                 },
@@ -1785,7 +1796,8 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
 
         // An `sbx upgrade` re-resolve captures stderr, so its summary prints the cause in place of
         // the fetch's own multi-line output.
-        let quiet = prefetch_hash(&nix, &layout, url, true).expect_err("the stand-in engine fails");
+        let quiet =
+            prefetch_hash(&nix, &layout, url, true, None).expect_err("the stand-in engine fails");
         assert_eq!(
             quiet.to_string(),
             "unable to download 'https://example.com/demo-app.tar.gz': HTTP error 404"
@@ -1793,7 +1805,8 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
 
         // A first launch has already streamed that output to the terminal, so its error names the
         // step alone rather than repeating what the user just read.
-        let loud = prefetch_hash(&nix, &layout, url, false).expect_err("the stand-in engine fails");
+        let loud =
+            prefetch_hash(&nix, &layout, url, false, None).expect_err("the stand-in engine fails");
         assert_eq!(loud.to_string(), "nix store prefetch-file failed");
     }
 
