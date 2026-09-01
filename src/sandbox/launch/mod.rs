@@ -1009,6 +1009,21 @@ fn collect_roots(
 /// host-provisioned here. A declared, admitted `nix:` tool that fails to resolve or realise
 /// is fatal, like a native `[packages]` tool. Resolution is cached per project, so nixhub is
 /// queried once per `(tool, version)` rather than on every launch.
+///
+/// The early return below skips the reconciliation of that project's `nix-tools/` gcroots, which
+/// [`super::nixhub::provision`] performs and deliberately places ahead of *its* own
+/// empty-declaration return. Both returns answer the same question one level apart, and only the
+/// inner one is covered: dropping the last `nix:` tool still reconciles, while dropping the last
+/// mise *file* (or the `.sbx.toml` mise is anchored on) leaves the project with no config to call
+/// provisioning for at all, so its tool roots hold their closures until the project tree itself is
+/// reaped.
+///
+/// Not simply hoisted, because reconciling needs the answer this return no longer has. Pruning is
+/// for a trusted project — an untrusted one's roots are left alone, and `provision` returns before
+/// its own reconcile for exactly that reason — and the project's mise trust verdict lives on the
+/// [`crate::config::MiseConfig`] that is absent here. Closing it means carrying the project's trust
+/// state on the resolved config in its own right; the trigger is a report of `nix:` closures held
+/// by a project that still exists and declares nothing.
 fn mise_tools(prep: &Prepared) -> Result<super::packages::Provisioned, ExitCode> {
     let Some(mise_cfg) = &prep.cfg.mise else {
         return Ok(super::packages::Provisioned {

@@ -162,6 +162,13 @@ pub(crate) fn prune_project_package_roots(
 /// level down has to be listed: without it every `nix:` tool fell out of the keep-set, and
 /// `sbx gc --prune` dropped its seed root and collected the tools the project declares.
 ///
+/// The *reconciliation* of that directory is not here either, and looking for it here is how it
+/// comes to read as absent: `prune_tool_roots`, in [`crate::sandbox::nixhub`], drops an out-link no
+/// declared `nix:` tool answers to, on the launch path, ahead of the empty-declaration return that
+/// would otherwise skip the one case that matters — the last tool being removed. So a stale root
+/// lives until that project's next launch rather than until the next `sbx gc`, and this function's
+/// only job is to keep the live ones.
+///
 /// Known gap, needing a wider change than this function can make: the base families are keyed on
 /// the project's own `base_rev` alone, while an installed app carries its own
 /// `<data>/apps/<name>/nixpkgs.lock` and has its userland rooted under *that* revision. An app on
