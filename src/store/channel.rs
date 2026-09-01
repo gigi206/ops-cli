@@ -230,6 +230,20 @@ fn engine_lock_path(layout: &Layout) -> PathBuf {
 /// `sbx app rm --purge` removes, so an app's pin goes when the app does rather than outliving it as
 /// an orphan nothing names.
 ///
+/// Keyed by the app name alone, `home_scope` included. A `home_scope = "project"` app keeps a
+/// separate home per project, but it is still one app and one app has one pin — which is what the
+/// rest of the surface says too: a purge of that name takes the per-project trees along with the
+/// global one, and a roll names an app rather than an app in a project. The price is worth
+/// stating plainly: rolling such an app from one project moves it in every project that runs it,
+/// and each rebuilds at the new revision. What buys it back is that they share that revision, so
+/// the second project's launch is a store hit instead of a second base userland.
+///
+/// Re-keying this per project is therefore a change of unit, not a bug fix, and it may not be made
+/// alone: [`live_base_revisions`] walks `<data>/projects/*` and `<data>/apps/*` one level deep, and
+/// a lock it does not find is a revision the collector frees while an app is still running on it.
+/// The guard that fails first is `every_lock_target_writes_where_the_keep_set_reads`, which derives
+/// each path from the constructor that writes it.
+///
 /// Refuses a name that is not a single path component: this is the sink, and a name that traversed
 /// would write a lock outside sbx's data directory.
 fn app_lock_path(layout: &Layout, name: &str) -> io::Result<PathBuf> {
@@ -1181,6 +1195,59 @@ mod tests {
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         }
         assert!(LockTarget::app(&layout, "demo-app", None).is_ok());
+    }
+
+    /// Every lock a `LockTarget` can write is read back by the collector's keep-set.
+    ///
+    /// The neighbouring test writes its three locks at literal paths, so it holds whatever
+    /// `live_base_revisions` walks and whatever the constructors choose, each independently of the
+    /// other: move one without the other and it stays green. This one takes each path from the
+    /// constructor that writes it, so re-keying a lock — an app lock nested under its project, say
+    /// — fails here until the walk is taught the new shape. The failure being guarded is
+    /// destructive: a revision the keep-set misses is collected out from under a home still using
+    /// it.
+    #[test]
+    fn every_lock_target_writes_where_the_keep_set_reads() {
+        let base = TmpDir::new();
+        let layout = Layout::under(&base.join("sbx"));
+        std::fs::create_dir_all(layout.data_dir()).unwrap();
+
+        let cases = [
+            (
+                "the global channel",
+                LockTarget::global(&layout, None),
+                "1111111111111111111111111111111111111111",
+            ),
+            (
+                "a project pin",
+                LockTarget::project(&layout, "abcdef0123456789", "nixos-24.11"),
+                "2222222222222222222222222222222222222222",
+            ),
+            (
+                "an app's own pin",
+                LockTarget::app(&layout, "demo-app", None).expect("a valid app name"),
+                "3333333333333333333333333333333333333333",
+            ),
+        ];
+        for (_, target, rev) in &cases {
+            write_lock(&target.lock_path, target.source(), rev).unwrap();
+        }
+        let live = live_base_revisions(&layout);
+        for (what, _, rev) in &cases {
+            assert!(
+                live.contains(*rev),
+                "{what} writes a lock the keep-set does not read"
+            );
+        }
+
+        // The engine rides its own keep-set, for the same reason and with the same failure.
+        let engine = LockTarget::engine(&layout, None);
+        let engine_rev = "4444444444444444444444444444444444444444";
+        write_lock(&engine.lock_path, engine.source(), engine_rev).unwrap();
+        assert!(
+            live_mise_revisions(&layout).contains(engine_rev),
+            "the engine writes a lock its own keep-set does not read"
+        );
     }
 
     #[test]

@@ -63,6 +63,14 @@ update, only on an explicit [`sbx upgrade`](../housekeeping/upgrade):
   from the global channel's the first time, so an app starts where the base already is.
   See [Rolling one app](../cli/upgrade#an-apps-base-channel).
 
+  The lock is keyed by the app name, `home_scope` included: a `home_scope = "project"`
+  app keeps a separate home per project but is still one app, and one app has one pin.
+  So rolling it from one project moves it in every project that runs it, and each
+  rebuilds at the new revision. Sharing the revision is also what makes the second
+  project's launch a store hit rather than a second base userland. It is the same unit
+  [`sbx app rm --purge`](../cli/app) uses, which removes the per-project trees along
+  with the global one.
+
 Changing the *source* (e.g. `nixos-23.11` → `nixos-24.05`) re-resolves; an unchanged
 source stays fixed. A first launch of a pinned project downloads its own base closure
 (only pinned projects pay this).
