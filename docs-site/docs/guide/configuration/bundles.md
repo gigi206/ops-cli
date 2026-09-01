@@ -316,7 +316,7 @@ The 64 shipped bundles, and what each carries:
 | `hermes` | 2 (`flake:`, `nix:`) | 10 egress entries, 1 env var | `models-catalog`, `npm-audit`, `npm-registry` |
 | `hermes-desktop` | 4 (`flake:`, `mise:`, `nix:`) | 21 egress entries, 1 env var, an install step | `chromium-background`, `google-signin-incage`, `models-catalog`, `npm-audit`, `npm-registry` |
 | `jcode` | 1 (`mise:`) | 1 egress entry, 2 env vars | none |
-| `junie` | 2 (`mise:`, `nix:`) | 7 egress entries, an install step | `npm-audit`, `npm-registry` |
+| `junie` | 2 (`mise:`, `nix:`) | 7 egress entries, 1 env var, an install step | `npm-audit`, `npm-registry` |
 | `kilocode` | 1 (`mise:`) | 4 egress entries | `models-catalog` |
 | `kimi` | 2 (`mise:`, `nix:`) | 7 egress entries | `models-catalog`, `npm-registry` |
 | `kiro` | 2 (`nix:`) | 34 egress entries, an install step | `chromium-background`, `google-signin-incage` |
