@@ -44,7 +44,11 @@ pub(crate) fn stage(data_dir: &Path) -> io::Result<PathBuf> {
     }
 
     std::fs::create_dir_all(&base)?;
-    let tmp = base.join(format!(".tmp-{}-{}", std::process::id(), unique()));
+    let tmp = base.join(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        super::atomicfile::unique()
+    ));
     if let Err(e) = write_tree(&tmp) {
         let _ = std::fs::remove_dir_all(&tmp);
         return Err(e);
@@ -86,12 +90,15 @@ pub(crate) fn register(root: &Path, rel: &str) -> io::Result<()> {
     let plugins_dir = super::cagedir::ensure_under(root, rel, 0o700)?;
     let plugins_dir = plugins_dir.as_path();
     let link = plugins_dir.join(PLUGIN_NAME);
-    // The temp name carries the pid (like `stage`): `unique()` is a process-local counter starting
+    // The temp name carries the pid (like `stage`): `super::atomicfile::unique()` is a process-local counter starting
     // at 0, so without the pid two concurrent same-project launches would share `.nix.0.tmp` and one
     // could `remove_file` the other's temp mid-rename. A crashed launch's pid-tagged temp is then a
     // tiny dangling symlink the next launch does not match — the same self-healing GC class `stage`
     // already accepts.
-    let tmp = plugins_dir.join(register_temp_name(std::process::id(), unique()));
+    let tmp = plugins_dir.join(register_temp_name(
+        std::process::id(),
+        super::atomicfile::unique(),
+    ));
     let _ = std::fs::remove_file(&tmp);
     std::os::unix::fs::symlink(INCAGE_DIR, &tmp)?;
     let placed = std::fs::rename(&tmp, &link).or_else(|_| {
@@ -107,7 +114,7 @@ pub(crate) fn register(root: &Path, rel: &str) -> io::Result<()> {
     placed
 }
 
-/// The temp name `register` stages the plugin symlink at. It carries the pid because `unique()` is a
+/// The temp name `register` stages the plugin symlink at. It carries the pid because `super::atomicfile::unique()` is a
 /// process-local counter starting at 0: without the pid two concurrent same-project launches would
 /// both stage at `.nix.0.tmp` and one could `remove_file` the other's temp mid-rename.
 fn register_temp_name(pid: u32, seq: u64) -> String {
@@ -137,21 +144,7 @@ fn content_hash() -> String {
         h.update((bytes.len() as u64).to_le_bytes());
         h.update(bytes);
     }
-    let digest = h.finalize();
-    let mut s = String::with_capacity(16);
-    for b in &digest[..8] {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
-/// A per-call-unique suffix for the staging temp directory (pid alone is not
-/// enough if a process stages twice). Monotonic process-local counter, so it
-/// needs no clock or RNG (both unavailable to a reproducible build path anyway).
-fn unique() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    SEQ.fetch_add(1, Ordering::Relaxed)
+    crate::plugins::catalogue::to_hex(&h.finalize()[..8])
 }
 
 #[cfg(test)]
@@ -161,7 +154,7 @@ mod tests {
 
     #[test]
     fn register_temp_names_are_unique_per_process() {
-        // Two processes both start `unique()` at 0; the pid keeps their first temp distinct, so a
+        // Two processes both start `super::atomicfile::unique()` at 0; the pid keeps their first temp distinct, so a
         // concurrent same-project register cannot collide on `.nix.0.tmp`.
         assert_ne!(register_temp_name(1000, 0), register_temp_name(2000, 0));
         // within one process the counter keeps them distinct too

@@ -141,7 +141,11 @@ pub(crate) fn stage(data_dir: &Path, contents: &str) -> io::Result<PathBuf> {
         return Ok(file);
     }
 
-    let tmp = base.join(format!(".tmp-{}-{}", std::process::id(), unique()));
+    let tmp = base.join(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        super::atomicfile::unique()
+    ));
     if let Err(e) = std::fs::write(&tmp, contents) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
@@ -166,20 +170,7 @@ pub(crate) fn stage(data_dir: &Path, contents: &str) -> io::Result<PathBuf> {
 fn content_hash(contents: &str) -> String {
     let mut h = Sha256::new();
     h.update(contents.as_bytes());
-    let digest = h.finalize();
-    let mut s = String::with_capacity(16);
-    for b in &digest[..8] {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
-/// A per-call-unique suffix for the staging temp file (pid alone is not enough if a process
-/// stages twice). Monotonic process-local counter, so it needs no clock or RNG.
-fn unique() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    SEQ.fetch_add(1, Ordering::Relaxed)
+    crate::plugins::catalogue::to_hex(&h.finalize()[..8])
 }
 
 #[cfg(test)]

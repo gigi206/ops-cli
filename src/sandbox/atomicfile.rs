@@ -41,6 +41,22 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     })
 }
 
+/// A number no other staging in this process will use, for the temp name a content-keyed
+/// materialization renames from.
+///
+/// The pid alone is not enough: one launch stages several trees (an inline flake, a fontconfig
+/// file, the mise plugin), and two of them entering their staging at once would otherwise pick the
+/// same temp path and have one `rename` pull the ground from under the other. Across processes the
+/// pid separates them; within one, this does.
+///
+/// One definition rather than three byte-identical copies, which is what
+/// [`super::flake_inline`], [`super::fonts`] and [`super::miseplugin`] each carried.
+pub(crate) fn unique() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 /// [`write_atomic`], skipped when the file already holds exactly `bytes` — which is the ordinary
 /// case for content that changes only across sbx releases (the staged audio shim, the desktop
 /// mark). Answers whether the file was written.
