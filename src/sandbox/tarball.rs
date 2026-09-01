@@ -99,11 +99,7 @@ pub(crate) fn resolve_source(
     locator: &str,
     fresh: bool,
 ) -> io::Result<(String, String)> {
-    let url = locator.to_string();
-    // A re-resolve (`fresh`) is an `sbx upgrade` step — capture nix's output and fold the cause
-    // into the error; a first launch streams the download progress live.
-    let hash = prebuilt::prefetch_hash(nix, layout, &url, fresh, None)?;
-    Ok((url, hash))
+    prebuilt::resolve_direct_url(nix, layout, locator, fresh)
 }
 
 /// The generated nix expression building one `tarball:` package: fetch the pinned `.tar.gz`, extract

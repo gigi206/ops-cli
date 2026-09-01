@@ -587,6 +587,27 @@ pub(crate) fn github_release_asset(
     validate_release_asset(kind, &json, owner, repo, system)
 }
 
+/// Resolve a locator that is already the artefact's URL to `(url, SRI content hash)`.
+///
+/// The whole of what `binary:` and `tarball:` do to resolve a source, and they were doing it in two
+/// places: a direct URL resolves to itself, so the only work is the prefetch. The backends whose
+/// locator names a *source* to query — `github:`, `apt:`, a resolve command — have real work of
+/// their own and do not come through here.
+///
+/// A re-resolve (`fresh`) is an `sbx upgrade` step, so nix's output is captured and the cause folded
+/// into the error; a first launch streams the download progress live. Neither backend queries
+/// anything, so there is no metadata cache for `fresh` to bypass — it only decides that.
+pub(super) fn resolve_direct_url(
+    nix: &Path,
+    layout: &Layout,
+    locator: &str,
+    fresh: bool,
+) -> io::Result<(String, String)> {
+    let url = locator.to_string();
+    let hash = prefetch_hash(nix, layout, &url, fresh, None)?;
+    Ok((url, hash))
+}
+
 /// One prebuilt host-side package backend: `deb:`, `appimage:` or `tarball:`. The three share their
 /// whole lifecycle — pin the source on first use, build offline from that pin ever after, one gcroot
 /// per package — and differ only in where the artefact comes from and how the generated derivation

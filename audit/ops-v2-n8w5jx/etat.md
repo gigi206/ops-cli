@@ -116,7 +116,7 @@ vingt lignes de tableau restantes non plus. Plusieurs citent des fichiers que la
 déplacés (`launch.rs`, `store.rs`, `proc_enforce.rs`), et une conclusion de portée ne se transporte
 pas à travers un déplacement : elle se re-mesure.
 
-## Duplication (10 familles) — six fermées, deux partielles, deux ouvertes
+## Duplication (10 familles) — huit fermées, deux partielles, aucune ouverte
 
 Le rapport les classe par *ce qui casse si une copie est corrigée et pas les autres*. La
 décomposition de neuf modules (`6f2a58d`) en a replié quatre au passage, sans les viser.
@@ -124,8 +124,8 @@ décomposition de neuf modules (`6f2a58d`) en a replié quatre au passage, sans 
 | Famille | Statut | Ce qui a été mesuré |
 | --- | --- | --- |
 | `proxy/forward.rs` / `proxy/tunnel.rs` — la queue de réponse du proxy | **fermée** | `relay_response_body` porte le lecteur compté, le tee et **le branchement `masks_reflection`** — la décision de sécurité — en une seule définition. Un garde de source compte `pump_redacting(`/`pump_to_eof(` à zéro dans les deux plans, pour que la scission ne se rouvre pas. 362 tests proxy inchangés : le refactor ne change rien d'observable. |
-| `binary.rs` · `tarball.rs` · `appimage.rs` · `deb.rs` — les accesseurs de verrou | **ouvert** | Les quatre définissent encore `pins`, `pinned_hashes` et `write_pins` ; le trait `prebuilt::Kind` qu'ils implémentent déjà est l'endroit de ces méthodes. |
-| `broker.rs` / `signer.rs` — le lancement d'un plugin en cage | **ouvert** | Deux `CagePlan` + `compose_cage` (`broker.rs:1034`, `signer.rs:476`), avec la même invariante de cycle de vie commentée des deux côtés. |
+| `binary.rs` · `tarball.rs` · `appimage.rs` · `deb.rs` — les accesseurs de verrou | **partielle, et le constat surestime** | **Mesuré** : sur les douze délégations, **huit sont `#[cfg(test)]`** (`pins` et `write_pins` dans les quatre) et quatre seulement sont de production (`pinned_hashes`). Aucune ne porte de décision — chacune passe le même appel partagé avec un type marqueur différent — donc le critère du rapport lui-même (« ce qui casse si une copie est corrigée et pas les autres ») ne mord pas ici, et déplacer des méthodes `#[cfg(test)]` dans un trait de production coûterait plus qu'il ne rend. **En revanche l'addendum du constat était juste et est fait** : `binary::resolve_source` et `tarball::resolve_source` avaient des corps identiques et passent par `prebuilt::resolve_direct_url`. |
+| `broker.rs` / `signer.rs` — le lancement d'un plugin en cage | **fermée** | `resolver::spawn_caged_plugin` porte la paire de sockets, les délais, **l'ordre clone-avant-spawn** et la remise de stdio. L'ordre était l'enjeu : un `?` après le spawn laisse vivre un bwrap que rien ne tue, et l'explication était recopiée mot pour mot des deux côtés — un ordre rétabli correctement d'un seul côté se répare en silence. |
 | `help.rs:2310` et `:2378` — le texte de l'option `<rule>` | **fermée** | Deux constantes, `EGRESS_RULE_ARG` et `EGRESS_SESSION_OPT`. **La divergence soupçonnée n'en était pas une, et il a fallu la mesurer** : les deux variantes « enforcing session(s) » sont les jumelles `proc`, et elles diffèrent l'une de l'autre d'une seule phrase — la mise en garde propre à `proc allow`. Légitime, donc laissées séparées. `net mute` garde aussi son texte court : il renvoie à la grammaire au lieu de la redire. |
 | `launch.rs` — deux séquences `openpty` + `fork` | **fermé** | Un seul site subsiste, `pty.rs:393`. |
 | `layout_or_fail` réécrit à la main | **partiellement fermé** | De treize sites à six, et **aucun dans `src/cli/`** — les onze que le constat nommait là sont partis. Restent `notify_sink.rs:335`, `prebuilt.rs:298`, `flake.rs:103`, `launch/mod.rs:819`, `launch/session.rs:78` et `:340`. |

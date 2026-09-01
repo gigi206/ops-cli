@@ -1024,13 +1024,6 @@ impl PluginProcess {
         allow: &[String],
         marker: Option<&SecretMarker>,
     ) -> io::Result<Self> {
-        use std::os::unix::net::UnixStream;
-        use std::process::{Command, Stdio};
-
-        let (ours, theirs) = UnixStream::pair()?;
-        ours.set_read_timeout(Some(PLUGIN_DEADLINE))?;
-        ours.set_write_timeout(Some(PLUGIN_DEADLINE))?;
-
         let plan = super::resolver::CagePlan {
             kind: crate::plugins::PluginKind::Broker,
             dir: &plugin.dir,
@@ -1045,37 +1038,21 @@ impl PluginProcess {
             // None, and a broker manifest may not ask for any: the fence needs no fence.
             brokers: &[],
         };
-        let (argv, env) = super::resolver::compose_cage(&plan)?;
-
-        // Cloned **before** the spawn. After it, a `?` on this line drops a `Child` that nothing
-        // else holds: `Drop for PluginProcess` is what kills and reaps a plugin, and the child is
-        // not inside one yet — so a failure here left a live bwrap process for the session.
-        let reader_side = ours.try_clone()?;
-        let child = Command::new(bwrap)
-            .args(argv)
-            // The same socket on both: the plugin reads its asks from stdin and writes verdicts to
-            // stdout, and both ends of that are this one connection. Handed over as descriptors,
-            // which is the form `Stdio` takes.
-            .stdin(Stdio::from(std::os::fd::OwnedFd::from(theirs.try_clone()?)))
-            .stdout(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
-            // Discarded rather than piped, and the choice is about liveness: nothing here reads a
-            // plugin's stderr while it runs, and a pipe nobody drains fills and blocks the very
-            // process sbx is waiting on. A plugin's channel for saying what it decided is the
-            // `label` on its verdict, which the session's record carries.
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| {
-                io::Error::other(format!(
-                    "could not start the `{}` broker plugin: {e}",
-                    plugin.name
-                ))
-            })?;
+        // The pair, the deadlines, the clone-before-spawn ordering and the stdio handover are
+        // `spawn_caged_plugin`'s, shared with the signer: they were the same lines twice, including
+        // the comment explaining why the clone comes first.
+        let super::resolver::CagedPlugin {
+            child,
+            writer,
+            reader_side,
+            env,
+        } = super::resolver::spawn_caged_plugin(bwrap, &plan, PLUGIN_DEADLINE)?;
 
         let mut me = Self {
             child,
             max_frame: plugin.broker.max_frame,
             reader: io::BufReader::new(reader_side),
-            writer: ours,
+            writer,
             _env: env,
         };
         me.handshake(plugin, allow, marker)?;

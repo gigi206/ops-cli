@@ -113,6 +113,68 @@ fn state_dir_of(dir: &Path) -> Option<PathBuf> {
     Some(dir.parent()?.parent()?.join("plugin-state").join(name))
 }
 
+/// A plugin's caged process and the socket that is both its stdin and its stdout.
+pub(super) struct CagedPlugin {
+    /// The bwrap child. The caller owns killing and reaping it — that is what its own `Drop` is for.
+    pub(super) child: std::process::Child,
+    /// Our end of the pair, for writing asks.
+    pub(super) writer: std::os::unix::net::UnixStream,
+    /// The same connection, cloned, for the buffered reader that consumes answers.
+    pub(super) reader_side: std::os::unix::net::UnixStream,
+    /// The descriptor files [`compose_cage`] produced, held for as long as bwrap needs to read them.
+    pub(super) env: Vec<std::fs::File>,
+}
+
+/// Spawn a plugin in its cage on a socket pair, with `deadline` on both directions of our end.
+///
+/// One definition rather than one per plugin type, and the reason is the ordering rather than the
+/// line count. The clone of our end is taken **before** the spawn, because after it a `?` would drop
+/// a `Child` nothing else holds — a plugin wrapper's `Drop` is what kills and reaps one, and the
+/// child is not inside a wrapper yet, so the failure left a live bwrap for the session. That
+/// invariant was commented word for word in both copies: an ordering rewritten correctly in one
+/// place and not the other is restored in silence, which is the failure a shared definition removes
+/// rather than documents.
+///
+/// The same socket serves stdin and stdout: a plugin reads its asks from one and writes answers to
+/// the other, and both ends of that are this one connection. `stderr` is discarded rather than
+/// piped, and the choice is about liveness — nothing reads a plugin's stderr while it runs, and a
+/// pipe nobody drains fills and blocks the very process sbx is waiting on. A plugin's channel for
+/// saying why it would not answer is a field on that answer, which the caller's refusal names.
+pub(super) fn spawn_caged_plugin(
+    bwrap: &Path,
+    plan: &CagePlan<'_>,
+    deadline: std::time::Duration,
+) -> io::Result<CagedPlugin> {
+    use std::os::unix::net::UnixStream;
+    use std::process::{Command, Stdio};
+
+    let (ours, theirs) = UnixStream::pair()?;
+    ours.set_read_timeout(Some(deadline))?;
+    ours.set_write_timeout(Some(deadline))?;
+    let (argv, env) = compose_cage(plan)?;
+
+    let reader_side = ours.try_clone()?;
+    let child = Command::new(bwrap)
+        .args(argv)
+        .stdin(Stdio::from(std::os::fd::OwnedFd::from(theirs.try_clone()?)))
+        .stdout(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            io::Error::other(format!(
+                "could not start the `{}` plugin: {e}",
+                plan.configured_as
+            ))
+        })?;
+
+    Ok(CagedPlugin {
+        child,
+        writer: ours,
+        reader_side,
+        env,
+    })
+}
+
 /// Vet the executable, resolve everything the grant asks of this host, and build the argv that
 /// runs the plugin under it. Everything up to the point where a caller decides *how* to run it:
 /// a resolver waits for its output, a broker keeps talking to it.

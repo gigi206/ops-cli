@@ -466,13 +466,6 @@ impl SignerProcess {
         host: &str,
         credential: Credential,
     ) -> io::Result<Self> {
-        use std::os::unix::net::UnixStream;
-        use std::process::{Command, Stdio};
-
-        let (ours, theirs) = UnixStream::pair()?;
-        ours.set_read_timeout(Some(SIGN_DEADLINE))?;
-        ours.set_write_timeout(Some(SIGN_DEADLINE))?;
-
         let plan = super::resolver::CagePlan {
             kind: crate::plugins::PluginKind::Signer,
             dir: &plugin.dir,
@@ -487,33 +480,19 @@ impl SignerProcess {
             // None, and a signer manifest may not ask for any: it reaches no host resource.
             brokers: &[],
         };
-        let (argv, env) = super::resolver::compose_cage(&plan)?;
-
-        // Cloned **before** the spawn. After it, a `?` on this line drops a `Child` that nothing
-        // else holds: `Drop for SignerProcess` is what kills and reaps a plugin, and the child is
-        // not inside one yet — so a failure here left a live bwrap process for the session.
-        let reader_side = ours.try_clone()?;
-        let child = Command::new(bwrap)
-            .args(argv)
-            .stdin(Stdio::from(std::os::fd::OwnedFd::from(theirs.try_clone()?)))
-            .stdout(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
-            // Discarded rather than piped, and the choice is about liveness: nothing reads a
-            // plugin's stderr while it runs, and a pipe nobody drains fills and blocks the very
-            // process sbx is waiting on. A plugin's channel for saying why it would not sign is
-            // the `error` on its answer, which the refusal names.
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| {
-                io::Error::other(format!(
-                    "could not start the `{}` signer plugin: {e}",
-                    plugin.name
-                ))
-            })?;
+        // Shared with the broker (`spawn_caged_plugin`): the pair, the deadlines, the
+        // clone-before-spawn ordering and the stdio handover were written out here as well.
+        let super::resolver::CagedPlugin {
+            child,
+            writer,
+            reader_side,
+            env,
+        } = super::resolver::spawn_caged_plugin(bwrap, &plan, SIGN_DEADLINE)?;
 
         let mut me = Self {
             child,
             reader: io::BufReader::new(reader_side),
-            writer: ours,
+            writer,
             sets: plugin.signer.sets_headers.clone(),
             seq: 0,
             dead: None,
