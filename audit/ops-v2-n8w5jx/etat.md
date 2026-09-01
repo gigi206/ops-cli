@@ -38,9 +38,8 @@ Quatre de ces fermetures sont antérieures au versement et viennent de l'arbre l
 
 ## MEDIUM (33)
 
-Huit constats ont été rouverts à la ligne : sept sont fermés, un est ouvert. Un neuvième est tenu
-pour fermé sans avoir été re-sondé. Les vingt-quatre autres n'ont pas été regardés ici, et la
-colonne le dit plutôt que de le taire.
+Les trente-trois ont été rouverts à la ligne. **Dix-sept sont fermés, seize sont ouverts.** Le
+neuvième, tenu pour fermé sur la foi du rapport, ne l'était pas : la mesure l'a rouvert.
 
 | Constat | Statut | Provenance |
 | --- | --- | --- |
@@ -52,8 +51,44 @@ colonne le dit plutôt que de le taire.
 | `allowlist/mod.rs:587` — la canonicalisation ne retire ni `;params` ni `#fragment` | fermé par `2b6f01a` | **mesuré** — les deux coupes sont après décodage, le compromis est écrit au site. |
 | `overrides.rs:685` — `union_fs_opt` plie `scan_max_kb` avec `min` | fermé par `34a9431` | **mesuré** — le pli est `max`. La note de session portait ce constat comme ouvert jusqu'à ce que le `pull` montre le contraire. |
 | `gc.rs:103` — les out-links des outils mise `nix:` ne sont jamais élagués | **ouvert** | **mesuré** — `gc.rs` nomme `projects/<id>/nix-tools` comme cible à *conserver* (`gc.rs:191`) ; rien ne le réconcilie. Voir ci-dessous. |
-| `proc_enforce.rs:1266` — un `openat2` portant un bit `resolve` récupère la fenêtre d'échange | fermé | **non re-sondé** — le rapport lui-même décrit le remède livré (partage des bits qui ne changent pas quel fichier la marche atteint) ; la ligne n'a pas été rouverte ici. |
-| Les 24 autres | inconnu | **non re-sondé** |
+| `proc_enforce.rs:1266` — un `openat2` portant un bit `resolve` récupère la fenêtre d'échange | **ouvert** | **mesuré, et la cellule précédente était fausse** — `open_serve.rs:63` décline toujours pour tout `resolve` non nul (`Some(0) => {}, _ => return false`) et répond `CONTINUE`. Le remède que la cellule disait livré ne l'est pas. Voir ci-dessous. |
+| `h2mitm.rs:864` — `:method` jamais scanné sur le plan h2 | **ouvert** | **mesuré** — `head_carries_secret` (`h2mitm.rs:999`) bâtit son tampon de `:path` plus les en-têtes ordinaires. En HTTP/2 les pseudo-en-têtes ne sont pas dans `headers()` : ni la méthode, ni `:authority`, ni `:scheme` n'entrent dans le scan. Sa propre doc nomme le tampon qu'elle construit. |
+| `websocket.rs:645` — un rembourrage compressible pousse un secret au-delà du plafond de scan | **ouvert** | **mesuré** — Le code a migré vers `wsframe.rs`. `Inflater::drain` (`wsframe.rs:305`) inflate et **jette** tout ce qui dépasse `SCAN_MESSAGE_CAP`, et `plaintext_cap` (`:689`) plafonne le scan à 256 Kio. Rien ne fait passer le rebut par `LeakScan`. |
+| `openuri.rs:17` — la route OpenURI gelée est re-pointable par un `[env]` non approuvé | **ouvert** | **mesuré** — `is_reserved_env_key` (`config/mod.rs:163`) ne nomme ni `XDG_DATA_HOME` ni `XDG_CONFIG_HOME`. La cage part bien de `--clearenv` et ne laisse passer que `TERM`/`LANG`/`LC_ALL` (`build.rs:2253`) — donc la phrase « unset in the cage » est vraie du **passthrough** et fausse de `[env]`, qui est justement la moitié que le constat vise. |
+| `plugins/mod.rs:1583` — `plugins rm` laisse le répertoire d'état privé du plugin | **ouvert** | **mesuré** — `remove` appelle `origin::forget` et `programs::forget` ; il n'existe pas de troisième. `<data>/plugin-state/<name>` (`resolver.rs:57`) n'est effacé nulle part, et le prochain plugin du même nom le reçoit monté en écriture. |
+| `proxy/mod.rs:761` — `connect(2)` non borné sur les chemins amont synchrones | **ouvert** | **mesuré** — Trois sites sans échéance : `mod.rs:814`, `cleartext.rs:169`, `splice.rs:118`. Le plan h2, lui, enveloppe le sien dans `tokio::time::timeout` (`h2mitm.rs:1124`) — l'asymétrie est mesurable. |
+| `proc_enforce.rs:800` — le `recvmsg` du passage de descripteur bloque sur une socket atteignable depuis la cage | **ouvert** | **mesuré** — le *listener* est non bloquant (`mod.rs:344`) et poll-é par tranches de 250 ms, mais Linux ne propage pas `O_NONBLOCK` au flux accepté, et `recv_fd_raw` (`notify.rs:290`) appelle `recvmsg` sans `MSG_DONTWAIT`. Aucun `set_read_timeout` dans tout `proc_enforce/` : un pair muet fige `accept_handoff`, qui ne relit plus `stop`. |
+| `launch.rs:3489` — les avertissements de configuration sont imprimés sans filtrage | **ouvert** | **mesuré** — `diag::warn` (`diag.rs:13`) ne fait qu'un `eprintln!`. Les deux sites d'impression, `build.rs:299` et `reclaim.rs:376`, passent la chaîne telle quelle, alors que `mise_token_display` filtre la table voisine. |
+| `grammar.rs:548` — un `*` ailleurs qu'en fin de chemin est silencieusement littéral | **ouvert** | **mesuré** — `parse_path_rule` refuse désormais le `?` (correctif de cette session) mais rien d'autre : `grammar.rs:581` ne lit que `path.ends_with("/*")`, et un `*` médian reste un segment littéral sans un mot. |
+| `secrets.rs:70` — `upsert_secret` ne remplace que la première déclaration en collision | **ouvert** | **mesuré** — `find_map` rend la première. `HeaderSecret::headers()` (`types.rs:335`) peut rendre **plusieurs** en-têtes pour un signer, donc deux entrées peuvent se recouvrir partiellement et coexister ; la suivante n'en remplace qu'une. |
+| `tarball.rs:126` — le `fetchurl` généré omet `name` | **ouvert** | **mesuré** — Trois gabarits sur quatre : `tarball.rs:124`, `deb.rs:719`, `appimage.rs:158`. Seul `binary.rs:124` passe `name = "@NAME@-download"`, et il dit pourquoi. |
+| `proc_enforce.rs:1740` — `libc::SYS_open` sans la garde `cfg` | **ouvert, et plus large que le constat** | **mesuré** — Le rapport nommait un site et disait les deux autres gardés. Ici c'est l'inverse : `open_args` (`target.rs:220`) porte `#[cfg(target_arch = "x86_64")]`, et `open_flags` (`:79`), `open_mode` (`:107`) et `open_resolve` (`:142`) ne le portent pas. La décomposition a multiplié les sites. |
+| `h2mitm.rs:558` — rafraîchissement et DNS bloquants sur le runtime partagé du tunnel | **ouvert** | **mesuré** — `resolve_checked` (`h2mitm.rs:351`) et `injection_values` (`:458`, soit `inject::pairs_for`, fonction **synchrone** qui peut lancer un plugin signer) sont appelés sans `await` dans le `serve` asynchrone. |
+| `store.rs:1174` — le verrou de canal d'une app est clé par le seul nom | **ouvert** | **mesuré** — `app_lock_path` (`channel.rs:235`) rend `<data>/apps/<name>/nixpkgs.lock`, sans identifiant de projet. `project_lock_path` existe à côté (`:246`) mais sert le pin de projet, pas le canal d'app. |
+| `store.rs:1724` — un out-link de gcroot repointé sans invalider le témoin `.expr` voisin | **ouvert** | **mesuré** — `provision` (`provisioning.rs:74`), `provision_unfree` (`:113`) et `provision_licensed` (`:181`) écrivent l'out-link et ne touchent jamais `expr_stamp_path`. Seuls `provision_flake` et `provision_expr` en écrivent un, et aucun writer n'en efface. |
+| `allowlist/mod.rs:1516` — un `deny` ne peut pas refuser un WebSocket sur le plan cleartext | fermé | **mesuré** — `explain_clear` interroge `matches_deny` (`allowlist/mod.rs:1562`), et sa doc (`:1545`) énonce la règle. |
+| `h2mitm.rs:153` — un tunnel h2 sans flux épingle un thread pour toujours | fermé | **mesuré** — La borne existe (`h2mitm.rs:186-233`) : `ctx.idle` court en parallèle d'`accept()`. La doc (`:163-176`) nomme le `503 connection-cap` que le constat décrivait. |
+| `gc.rs:881` — `prune_app_tools` rejoint le nom filtré pour l'affichage | fermé | **mesuré** — `installs.join(&tool.dir_name)` (`gc.rs:945`), avec la raison écrite : le filtrage n'est pas réversible. |
+| `gc.rs:518` — un arbre de projet rapporté récupéré alors que la suppression a échoué | fermé | **mesuré** — `ReapReport` porte un champ `failed` et la branche d'échec y verse au lieu de pousser dans `dead`. |
+| `cli/app.rs:198` — `--detach=false` allume `detach` | fermé | **mesuré** — `refuse_flag_value(&raw, APP_LAUNCH_VALUELESS_FLAGS, …)` court avant le `match flag_name`, et `--detach` est dans la liste (`app.rs:156`). |
+| `inspect.rs:129` — `backend_token` suit un lien ou une FIFO | fermé | **mesuré** — `read_cage_metadata` ouvre en `O_NOFOLLOW | O_NONBLOCK`, vérifie le type **sur le descripteur** et plafonne à `CAGE_METADATA_CAP`. |
+| `inspect.rs:347` — `flake_built_in` rend un texte de lien non filtré | fermé | **mesuré** — `sanitize` est appliqué au détail lu par `read_link` (`inspect.rs:413`). |
+| `overrides.rs:648` — `union_allow_opt` perd le `confirm` de `[ssh_agent]` | fermé | **mesuré** — `union_ssh_agent_opt` est dédié, destructure exhaustivement, et sa doc raconte exactement la perte que le constat décrit. |
+| `cli/upgrade.rs:43` — `nix` app-scopable mais classé projet | fermé | **mesuré** — `APP_SCOPED_TARGETS` contient `"nix"` (`upgrade.rs:46`), avec la raison écrite. |
+| `fs_watch.rs:192` — la surveillance inotify suit un lien posé par la cage | fermé | **mesuré** — `WATCH_MASK` porte `IN_DONT_FOLLOW`, le type d'entrée est lu sans suivre, et la doc (`:248-253`) dit que les deux mécanismes tiennent ensemble. |
+
+**`proc_enforce.rs:1266` était porté « fermé » et ne l'est pas.** C'était la seule cellule MEDIUM
+tenue pour fermée sans mesure, sur la foi de la prose du rapport, qui décrivait un remède. La ligne
+rouverte dit l'inverse : `open_serve.rs:63` décline la remise pour **tout** `resolve` non nul et
+répond `CONTINUE`, ce qui est exactement la seconde marche que `fs.md` déclare supprimée. Le
+commentaire du site a bien changé — l'arbitrage est désormais écrit au long, ce que le rapport
+reprochait de ne pas être — mais écrire un arbitrage n'est pas le rendre dans l'autre sens.
+
+Et le voisin immédiat montre que le remède proposé est praticable : la branche `O_NOFOLLOW`, vingt
+lignes plus bas, **décide** au lieu de décliner — elle re-teste le dernier composant et répond
+l'errno que le noyau aurait rendu. Son commentaire renvoie même à la règle du contrôle `resolve`
+au-dessus. Une règle écrite, appliquée à une moitié : c'est la forme de défaut la plus productive de
+cet audit.
 
 **`gc.rs:103` n'est pas fermé par le correctif de `provision`.** `2b6f01a` a corrigé un *autre* site :
 dans `nixhub::provision`, la réconciliation des gcroots contre la déclaration mise était appelée
@@ -139,8 +174,10 @@ décomposition de neuf modules (`6f2a58d`) en a replié quatre au passage, sans 
 - Il ne rejuge aucun constat. Un `fermé` dit que le prédicat du constat ne tient plus dans cet
   arbre, pas que le constat était juste quand il a été écrit. Et un `ouvert` dit que le prédicat
   tient, pas que le remède proposé est le bon.
-- Les constats marqués « non re-sondé » — vingt-quatre MEDIUM, vingt-deux LOW, deux familles de
-  duplication — ne sont **pas** des constats réfutés. Ce sont des constats dont personne n'a mesuré
-  l'état ici.
+- Les constats marqués « non re-sondé » — vingt-deux LOW et deux familles de duplication — ne sont
+  **pas** des constats réfutés. Ce sont des constats dont personne n'a mesuré l'état ici. Le tier
+  MEDIUM n'en porte plus : les trente-trois sont mesurés.
+- Un `ouvert` mesuré ici n'est pas un correctif. Quinze constats MEDIUM tiennent toujours, et aucun
+  n'a encore été corrigé sur cette branche.
 - Les 17 constats que le rapport dit avoir réfutés lui-même, et les pistes qu'il dit avoir écartées,
   sont dans le rapport et n'ont pas été rejugés.
