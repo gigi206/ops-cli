@@ -10469,3 +10469,31 @@ fn each_inspected_plane_keeps_its_own_scheme_proto_and_chunked_rule() {
     assert!(!super::Plane::Cleartext.forwards_chunked());
     assert!(super::Plane::HttpsForward.forwards_chunked());
 }
+
+/// Neither inspected plane chooses between the redacting pump and the plain one itself.
+///
+/// Both wrote that block — the counting reader, the tee, and the `masks_reflection` branch — so a
+/// **security decision** lived in two copies, and a fix landing on one of them is the shape of
+/// defect this proxy's history is full of ("a message past the scan cap must not blind the ones
+/// behind it", "the proxy-hop credential does not go to the origin server"). `relay_response_body`
+/// is the one definition now; this counts the call that would reopen the split rather than trusting
+/// the two planes to stay converted.
+#[test]
+fn neither_inspected_plane_pumps_a_response_body_itself() {
+    for (name, source) in [
+        ("forward.rs", include_str!("forward.rs")),
+        ("tunnel.rs", include_str!("tunnel.rs")),
+    ] {
+        let production = source
+            .rsplit_once("#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        for pump in ["pump_redacting(", "pump_to_eof("] {
+            assert_eq!(
+                production.matches(pump).count(),
+                0,
+                "{name} calls `{pump}` itself — the choice between them belongs to \
+                 `relay_response_body`, where it is made once"
+            );
+        }
+    }
+}

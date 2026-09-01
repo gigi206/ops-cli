@@ -8,6 +8,24 @@
 
 use super::Page;
 
+/// The `<rule>` argument text `net allow` and `net deny` both take.
+///
+/// One definition rather than two identical ~700-character literals. `src/help.rs` is, by
+/// `CLAUDE.md`'s own statement, the single source `--help`, the error synopses and the completion
+/// surface all derive from — so two copies of the grammar are two places to correct it, and
+/// correcting one is a page that describes a language the parser does not speak. `net mute` keeps
+/// its own shorter text on purpose: it cross-references this grammar rather than restating it, and
+/// a mute is not a rule that allows or denies.
+const EGRESS_RULE_ARG: &str = "an egress rule. A bare host (or `https://host`) is inspected over TLS on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `http://host` is an inspected *cleartext* rule (plaintext, default port 80) — the same HTTP policy without TLS; opt-in, so it never carries a credential. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[network.groups]` group (defined in the global config), expanded to its entries at launch";
+
+/// The `--session` option text `net allow` and `net deny` both take.
+///
+/// Its `proc` twins read *enforcing* session(s) and are deliberately not this string: a proc rule
+/// only reaches a session under `[proc]`, and `proc allow` carries a caveat of its own. Those two
+/// differ from each other by exactly that caveat, which was measured rather than assumed before
+/// leaving them apart.
+const EGRESS_SESSION_OPT: &str = "load the rule into the live overlay of the running session(s) instead of a config file (writes nothing, no re-trust); the proxy folds it into its effective policy, so it takes effect immediately on any filtering-posture session (allowlist, denylist, ask). It dies with the session. Scopes to the current project by default";
+
 /// Every command and subcommand. Entries may be declared in any order — the renderer sorts
 /// both the top-level command list and each subcommand listing alphabetically.
 pub(super) const PAGES: &[Page] = &[
@@ -2327,20 +2345,14 @@ pub(super) const PAGES: &[Page] = &[
         synopsis: "sbx net allow <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
         summary: "persist an allow rule to a config file (or load it live with --session)",
         options: &[
-            (
-                "<rule>",
-                "an egress rule. A bare host (or `https://host`) is inspected over TLS on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `http://host` is an inspected *cleartext* rule (plaintext, default port 80) — the same HTTP policy without TLS; opt-in, so it never carries a credential. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[network.groups]` group (defined in the global config), expanded to its entries at launch",
-            ),
+            ("<rule>", EGRESS_RULE_ARG),
             ("-l, --local", "write the project .sbx.toml (the default)"),
             ("-g, --global", "write the global sbx.toml"),
             (
                 "-a, --app <name>",
                 "write the rule under that app's `[app.<name>.network]`; with `--session`, scope the live load to that app's session(s)",
             ),
-            (
-                "--session",
-                "load the rule into the live overlay of the running session(s) instead of a config file (writes nothing, no re-trust); the proxy folds it into its effective policy, so it takes effect immediately on any filtering-posture session (allowlist, denylist, ask). It dies with the session. Scopes to the current project by default",
-            ),
+            ("--session", EGRESS_SESSION_OPT),
             (
                 "--all",
                 "with `--session`, widen the live load to every reachable session (all projects), not just the current one",
@@ -2395,20 +2407,14 @@ pub(super) const PAGES: &[Page] = &[
         synopsis: "sbx net deny <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]",
         summary: "persist a deny rule to a config file (or load it live with --session)",
         options: &[
-            (
-                "<rule>",
-                "an egress rule. A bare host (or `https://host`) is inspected over TLS on port 443; add `:port`/`:*`/`:a,b` to widen. Forms: a host, `*.domain`, `host/path`, IP, or `re:<regex>`, optionally prefixed `{GET,POST}` to scope it to those HTTP verbs. `http://host` is an inspected *cleartext* rule (plaintext, default port 80) — the same HTTP policy without TLS; opt-in, so it never carries a credential. `tcp://host:port` is a raw (uninspected) L4 tunnel — it must name a port; `tcp://host:*` opens every port and protocol. `@<group>` references a reusable `[network.groups]` group (defined in the global config), expanded to its entries at launch",
-            ),
+            ("<rule>", EGRESS_RULE_ARG),
             ("-l, --local", "write the project .sbx.toml (the default)"),
             ("-g, --global", "write the global sbx.toml"),
             (
                 "-a, --app <name>",
                 "write the rule under that app's `[app.<name>.network]`; with `--session`, scope the live load to that app's session(s)",
             ),
-            (
-                "--session",
-                "load the rule into the live overlay of the running session(s) instead of a config file (writes nothing, no re-trust); the proxy folds it into its effective policy, so it takes effect immediately on any filtering-posture session (allowlist, denylist, ask). It dies with the session. Scopes to the current project by default",
-            ),
+            ("--session", EGRESS_SESSION_OPT),
             (
                 "--all",
                 "with `--session`, widen the live load to every reachable session (all projects), not just the current one",

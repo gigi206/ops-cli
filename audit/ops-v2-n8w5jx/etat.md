@@ -116,17 +116,17 @@ vingt lignes de tableau restantes non plus. Plusieurs citent des fichiers que la
 déplacés (`launch.rs`, `store.rs`, `proc_enforce.rs`), et une conclusion de portée ne se transporte
 pas à travers un déplacement : elle se re-mesure.
 
-## Duplication (10 familles) — quatre fermées par la décomposition
+## Duplication (10 familles) — six fermées, deux partielles, deux ouvertes
 
 Le rapport les classe par *ce qui casse si une copie est corrigée et pas les autres*. La
 décomposition de neuf modules (`6f2a58d`) en a replié quatre au passage, sans les viser.
 
 | Famille | Statut | Ce qui a été mesuré |
 | --- | --- | --- |
-| `proxy/forward.rs` / `proxy/tunnel.rs` — la queue de réponse du proxy | **ouvert** | Les deux sites calculent `masks_reflection_for` et composent leur `head_masking` séparément (`forward.rs:523`, `tunnel.rs:783`). C'est la seule famille qui porte une décision de sécurité. |
+| `proxy/forward.rs` / `proxy/tunnel.rs` — la queue de réponse du proxy | **fermée** | `relay_response_body` porte le lecteur compté, le tee et **le branchement `masks_reflection`** — la décision de sécurité — en une seule définition. Un garde de source compte `pump_redacting(`/`pump_to_eof(` à zéro dans les deux plans, pour que la scission ne se rouvre pas. 362 tests proxy inchangés : le refactor ne change rien d'observable. |
 | `binary.rs` · `tarball.rs` · `appimage.rs` · `deb.rs` — les accesseurs de verrou | **ouvert** | Les quatre définissent encore `pins`, `pinned_hashes` et `write_pins` ; le trait `prebuilt::Kind` qu'ils implémentent déjà est l'endroit de ces méthodes. |
 | `broker.rs` / `signer.rs` — le lancement d'un plugin en cage | **ouvert** | Deux `CagePlan` + `compose_cage` (`broker.rs:1034`, `signer.rs:476`), avec la même invariante de cycle de vie commentée des deux côtés. |
-| `help.rs:2310` et `:2378` — le texte de l'option `<rule>` | **ouvert, et pire que dit** | Le texte de ~700 caractères apparaît exactement deux fois dans `help/pages.rs`. Un **second** texte long y est aussi dupliqué, et il a **déjà divergé** : deux quasi-variantes coexistent, l'une disant « running session(s) », l'autre « running enforcing session(s) ». C'est la panne que le constat annonçait, arrivée avant le correctif. |
+| `help.rs:2310` et `:2378` — le texte de l'option `<rule>` | **fermée** | Deux constantes, `EGRESS_RULE_ARG` et `EGRESS_SESSION_OPT`. **La divergence soupçonnée n'en était pas une, et il a fallu la mesurer** : les deux variantes « enforcing session(s) » sont les jumelles `proc`, et elles diffèrent l'une de l'autre d'une seule phrase — la mise en garde propre à `proc allow`. Légitime, donc laissées séparées. `net mute` garde aussi son texte court : il renvoie à la grammaire au lieu de la redire. |
 | `launch.rs` — deux séquences `openpty` + `fork` | **fermé** | Un seul site subsiste, `pty.rs:393`. |
 | `layout_or_fail` réécrit à la main | **partiellement fermé** | De treize sites à six, et **aucun dans `src/cli/`** — les onze que le constat nommait là sont partis. Restent `notify_sink.rs:335`, `prebuilt.rs:298`, `flake.rs:103`, `launch/mod.rs:819`, `launch/session.rs:78` et `:340`. |
 | `cli/net.rs` / `cli/proc.rs` — le préambule de filtres pid | **fermé** | `egress_data_dir` a une définition unique (`main.rs:568`). |

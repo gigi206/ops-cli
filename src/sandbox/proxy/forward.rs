@@ -573,22 +573,21 @@ pub(super) fn handle_https_forward(
     }
     // Count upstream→client (`down`) through the body; the head was counted as it was relayed.
     // Teed ahead of the reflection masking — the capture masks its own buffers at filing time.
-    let mut framed = FramedBody::new(&mut up_br, framing);
-    {
-        let counted = CountingReader::new(&mut framed, flow.down.clone());
-        let mut response = tee_response(counted, capture.as_ref());
-        if masks_reflection {
-            pump_redacting(&mut response, &mut client, &creds.needles)?;
-        } else {
-            pump_to_eof(&mut response, &mut client)?;
-        }
-    }
+    let RelayedBody {
+        ended_as_framed,
+        no_residual,
+    } = relay_response_body(
+        &mut up_br,
+        &mut client,
+        framing,
+        &flow.down,
+        capture.as_ref(),
+        masks_reflection,
+        &creds.needles,
+    )?;
+    drop(up_br);
     // 11. Whether this connection may carry another request — the same three answers as the tunneled
     //     path, and after the relay's `?` for the same reason.
-    let ended_as_framed = framed.ended_as_framed();
-    drop(framed);
-    let no_residual = up_br.buffer().is_empty();
-    drop(up_br);
     if ended_as_framed
         && no_residual
         && response_keeps_alive(&resp_head)

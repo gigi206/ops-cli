@@ -1579,6 +1579,56 @@ fn begin_response_stream(upstream: &TcpStream) {
     let _ = upstream.set_read_timeout(None);
 }
 
+/// What relaying a response body leaves behind, for the two questions reuse asks.
+struct RelayedBody {
+    /// The body ended exactly where its framing said. A truncated one leaves both legs at an
+    /// unknown position in the exchange, so neither may carry another request.
+    ended_as_framed: bool,
+    /// Nothing the head read pulled ahead is still sitting in the reader.
+    no_residual: bool,
+}
+
+/// Relay a response body from `up` to `out`: counted, teed to the capture, and redacted when the
+/// host is one an injection targets.
+///
+/// One definition rather than two, and the reason is the `masks_reflection` branch. Both inspected
+/// planes wrote this block themselves — the counting reader, the tee, and the choice between
+/// `pump_redacting` and `pump_to_eof` — which put a **security decision** in two places. A fix
+/// landing on one of them is exactly the shape of defect this proxy's history is full of, and
+/// nothing about the block is plane-specific: what differs is the writer the bytes go to, which is
+/// a parameter.
+///
+/// The tee is ahead of the redaction on purpose: the capture masks its own buffers at filing time,
+/// over whole buffers, so what is stored is masked either way and what the *cage* receives is
+/// decided by `masks_reflection` alone. The head above it is masked under the same decision, taken
+/// once by the caller because it covers head and body alike.
+fn relay_response_body<R: Read, W: Write>(
+    up: &mut BufReader<R>,
+    out: &mut W,
+    framing: BodyFraming,
+    down: &Arc<AtomicU64>,
+    capture: Option<&CaptureGuard>,
+    masks_reflection: bool,
+    needles: &[SecretNeedle],
+) -> io::Result<RelayedBody> {
+    let mut framed = FramedBody::new(&mut *up, framing);
+    {
+        let counted = CountingReader::new(&mut framed, down.clone());
+        let mut response = tee_response(counted, capture);
+        if masks_reflection {
+            pump_redacting(&mut response, out, needles)?;
+        } else {
+            pump_to_eof(&mut response, out)?;
+        }
+    }
+    let ended_as_framed = framed.ended_as_framed();
+    drop(framed);
+    Ok(RelayedBody {
+        ended_as_framed,
+        no_residual: up.buffer().is_empty(),
+    })
+}
+
 /// Read the upstream's response head and relay it to the client, returning the head **as the
 /// upstream sent it** with whether it was terminated. Bytes the buffered reader pulled past the head
 /// stay in it for the body relay.
