@@ -53,6 +53,21 @@ than the boundary and therefore degrade instead of failing:
   degradation and not a failure: `doctor` reports it, and the namespace, seccomp and
   egress layers are unaffected.
 
+Graphical applications do reach the Windows desktop. WSLg publishes a Wayland socket
+in the distribution, `sbx` binds it into the cage under the `wayland` GUI posture, and
+a window opened by a caged application appears on the desktop with its own taskbar
+entry, like any other window. An X11 application needs an X11 posture rather than the
+Wayland one; asking for Wayland and running an X11 binary fails on the display, which
+says nothing about the platform.
+
+**WSLg belongs to one Windows session, and it is the session that started WSL first.**
+That is the trap worth knowing, because nothing reports it: start the distribution
+from a service, a remote shell or a scheduled task outside the desktop session and its
+window server attaches there, so applications run with no error and their windows are
+drawn where nobody can see them. `wsl --shutdown`, then a launch from the desktop
+session, puts it back. The same holds for notifications, which Windows also delivers
+per session.
+
 Three further differences are worth knowing before they surprise you:
 
 - **Where you launch from decides what is bound in.** A `wsl` shell opened from
@@ -61,8 +76,12 @@ Three further differences are worth knowing before they surprise you:
   Windows home directory, which is the opposite of what the security model is for.
   Keep projects in the distribution's own filesystem, where the bind is the project
   and nothing above it.
-- **No notification daemon.** Nothing on the session bus answers, so refusals that
-  would raise a desktop notification are reported on stderr instead.
+- **No notification daemon is present by default,** so refusals that would raise a
+  desktop notification are reported on stderr, and `doctor` says so. This is a gap in
+  the distribution rather than a limit of `sbx`, which speaks the ordinary freedesktop
+  protocol: give the session a service owning `org.freedesktop.Notifications` and
+  refusals reach the Windows notification centre like any other application's, with no
+  change to `sbx` and no setting to turn on.
 - **No encapsulated storage volume.** A distribution's filesystem is an ordinary
   one, so the store is a plain directory rather than a compressed volume.
   `$SBX_DATA_DIR` can still point `sbx` at a volume that is mounted.
