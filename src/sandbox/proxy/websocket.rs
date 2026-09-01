@@ -14,17 +14,27 @@ use super::wsframe::{Deflate, FrameTee, negotiated_deflate};
 use super::*;
 use crate::sandbox::control::SecretWay;
 
-/// Whether a decrypted request head is a WebSocket upgrade: `Upgrade: websocket` together with a
-/// `Connection` header listing the `upgrade` token (both case-insensitive; `Connection` is a
-/// comma-separated token list). Both are required — an `Upgrade` header without `Connection:
-/// upgrade` is not an upgrade a client will complete, so it stays on the normal request path.
+/// Whether a decrypted request head is a WebSocket upgrade: a `GET` carrying `Upgrade: websocket`
+/// together with a `Connection` header listing the `upgrade` token (the header checks are
+/// case-insensitive; `Connection` is a comma-separated token list). All three are required — an
+/// `Upgrade` header without `Connection: upgrade` is not an upgrade a client will complete, so it
+/// stays on the normal request path.
+///
+/// The method is part of the question, not an assumption made downstream. RFC 6455 requires `GET`,
+/// and the relay below reads the upstream's declining response with the framing rules for a `GET` —
+/// so a `HEAD` carrying these headers was routed here and then had its bodiless response awaited as
+/// though it had a body, hanging until the read timeout. A non-`GET` upgrade attempt is an ordinary
+/// request instead, which is what it is: the normal path strips the hop headers and forces
+/// `Connection: close`, so nothing can upgrade through it, and it is judged by its own method.
 pub(super) fn is_websocket_upgrade(head: &Head) -> bool {
     let names_token = |header: &str, token: &str| {
         head.header(header)
             .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
             .unwrap_or(false)
     };
-    names_token("upgrade", "websocket") && names_token("connection", "upgrade")
+    head.request_line.split_whitespace().next() == Some("GET")
+        && names_token("upgrade", "websocket")
+        && names_token("connection", "upgrade")
 }
 
 /// Reserialize a WebSocket upgrade handshake for forwarding upstream. Like [`reserialize_request`]
@@ -104,8 +114,24 @@ pub(super) fn relay_upgrade(
 
     // Read the upstream's response head. A BufReader may read past it into the server's first frames;
     // those buffered bytes are drained below so none is lost.
+    //
+    // An interim `1xx` is relayed and read past, exactly as [`relay_response_head`] does on the
+    // request path, with the one difference this plane exists for: here a `101` *is* the answer.
+    // Reading a single head treated a `103 Early Hints` as the upstream's verdict and declined an
+    // upgrade the upstream was about to accept. The deadline is taken once, before the loop, so the
+    // whole head phase is bounded by one timeout however many interim heads arrive.
     let mut up_br = BufReader::new(upstream);
-    let resp_head = read_head_buffered(&mut up_br, HEAD_MAX, head_deadline(ctx))?;
+    let deadline = head_deadline(ctx);
+    let resp_head = loop {
+        let head = read_head_buffered(&mut up_br, HEAD_MAX, deadline)?;
+        match parse_status_code(&head) {
+            Some(code) if (100..200).contains(&code) && code != 101 => {
+                write_head_to_client(head, br.get_mut(), &down, redactions)?;
+                br.get_mut().flush()?;
+            }
+            _ => break head,
+        }
+    };
 
     if parse_status_code(&resp_head) != Some(101) {
         // The upstream declined the upgrade — relay its response as a normal one, then close. The
@@ -134,7 +160,9 @@ pub(super) fn relay_upgrade(
             c.push_response(&resp_head);
         }
         // Framed like any ordinary response, so the relay ends at the end of the message. The
-        // handshake was a `GET`, so no bodiless-method rule applies here.
+        // handshake was a `GET` — [`is_websocket_upgrade`] requires it, which is what makes this
+        // literal a fact about the request rather than an assumption about it — so no
+        // bodiless-method rule applies here.
         let framing = response_framing(&resp_head, "GET");
         // Count the declined response body (`down`) as it streams back to the client.
         let counted = CountingReader::new(FramedBody::new(up_br, framing), down.clone());
@@ -629,6 +657,33 @@ pub(super) fn relay_websocket(
 mod tests {
     use super::*;
     use crate::sandbox::proxy::wsframe::{NEEDLE_VALUE, frame, needle};
+
+    /// The method is part of what makes a head a WebSocket handshake, not an assumption about it.
+    ///
+    /// RFC 6455 requires `GET`, and the declined-upgrade path frames the upstream's response with
+    /// the rules for a `GET`. A `HEAD` carrying the upgrade headers was routed here anyway, and its
+    /// bodiless response was then read as though it had the body its `Content-Length` announced —
+    /// waiting for bytes that never come, until the read timeout.
+    #[test]
+    fn only_a_get_carrying_the_upgrade_headers_is_a_websocket_handshake() {
+        let head = |method: &str| {
+            crate::sandbox::proxy::wire::parse_head(
+                format!(
+                    "{method} /socket HTTP/1.1\r\nHost: chat.example\r\nUpgrade: websocket\r\n\
+                     Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("a well-formed head")
+        };
+        assert!(is_websocket_upgrade(&head("GET")));
+        for method in ["HEAD", "POST", "PUT", "DELETE", "OPTIONS"] {
+            assert!(
+                !is_websocket_upgrade(&head(method)),
+                "`{method}` with the upgrade headers is an ordinary request, not a handshake"
+            );
+        }
+    }
 
     /// A tunnel must not scan for a credential the cage learned on the very host the tunnel goes to.
     ///

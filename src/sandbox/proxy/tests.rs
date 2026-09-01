@@ -438,6 +438,15 @@ fn through_proxy_clean_close(
 /// test proves that direction and that the bytes buffered past the `101` are not lost), then reads
 /// the client's frame and echoes it back as `ECHO:<frame>` (client→upstream→client), then closes.
 fn spawn_ws_upstream() -> (SocketAddr, CertificateDer<'static>, thread::JoinHandle<()>) {
+    spawn_ws_upstream_prefixed(b"")
+}
+
+/// The same upstream, writing `interim` before its `101`. A server may send interim `1xx` heads
+/// ahead of its final one, and the relay has to read past them: taking the first head as the answer
+/// reads a `103 Early Hints` as a declined upgrade.
+fn spawn_ws_upstream_prefixed(
+    interim: &'static [u8],
+) -> (SocketAddr, CertificateDer<'static>, thread::JoinHandle<()>) {
     let ca = Arc::new(Ca::ephemeral().unwrap());
     let ca_der = ca.ca_cert_der();
     let server_config = Arc::new(
@@ -467,6 +476,7 @@ fn spawn_ws_upstream() -> (SocketAddr, CertificateDer<'static>, thread::JoinHand
                 }
             }
         }
+        let _ = tls.write_all(interim);
         let _ = tls.write_all(
             b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
                   Connection: Upgrade\r\nSec-WebSocket-Accept: test-accept\r\n\r\nS-FIRST;",
@@ -549,7 +559,19 @@ fn through_proxy_websocket(
     // case, where the transcript is simply the refusal the proxy sent.
     let _ = tls.write_all(upgrade.as_bytes());
     let _ = tls.flush();
-    let head = read_head_until_blank(&mut tls).unwrap_or_default();
+    // A server may send interim `1xx` heads before its final one and the proxy relays them, so the
+    // client reads past them as a real one would. They stay in the transcript; the decision below is
+    // made on the head that answers. Without this the harness took a `103 Early Hints` for the
+    // answer, never sent its frame, and deadlocked against an upstream waiting for one.
+    let mut head = read_head_until_blank(&mut tls).unwrap_or_default();
+    let mut heads = head.clone();
+    while head.starts_with("HTTP/1.1 1") && !head.contains("101 Switching Protocols") {
+        head = read_head_until_blank(&mut tls).unwrap_or_default();
+        if head.is_empty() {
+            break;
+        }
+        heads.push_str(&head);
+    }
     // Only send a client frame on an established WebSocket. On a non-`101` (a refusal, or an
     // upstream that declined the upgrade) the tunnel is closing, so writing would RST the socket
     // and discard the buffered response body before `read_to_string` can relay it.
@@ -559,7 +581,7 @@ fn through_proxy_websocket(
     }
     let mut rest = String::new();
     let _ = tls.read_to_string(&mut rest);
-    Ok(format!("{head}{rest}"))
+    Ok(format!("{heads}{rest}"))
 }
 
 /// Read bytes until the `\r\n\r\n` blank-line terminator (cleartext CONNECT reply).
@@ -1047,6 +1069,51 @@ fn a_websocket_upgrade_is_relayed_bidirectionally() {
     assert!(
         transcript.contains("ECHO:client-frame"),
         "the client frame did not round-trip (client→upstream→client): {transcript:?}"
+    );
+}
+
+/// An interim `1xx` ahead of the `101` is read past, not taken for the upstream's answer.
+///
+/// A server may send `103 Early Hints` (or `100 Continue`) before its final response. The upgrade
+/// relay read exactly one head, so the `103` became "the upstream declined", and an upgrade the
+/// upstream was about to accept was relayed to the cage as an ordinary response with the tunnel
+/// closed behind it. The request plane has read past interim heads all along
+/// (`relay_response_head`); this plane differs only in that a `101` here *is* the answer.
+#[test]
+fn an_interim_head_before_the_101_does_not_decline_the_upgrade() {
+    let (addr, upstream_ca, up) = spawn_ws_upstream_prefixed(
+        b"HTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n",
+    );
+    let mut roots = RootCertStore::empty();
+    roots.add(upstream_ca).unwrap();
+    let upstream_cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+    let proxy_ca_der = proxy_ca.ca_cert_der();
+    let ctx = Arc::new(
+        ProxyCtx::new(proxy_ca, policy(&["{WS} upstream.test:*"]))
+            .unwrap()
+            .with_upstream(upstream_cfg)
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+    );
+
+    let transcript =
+        through_proxy_websocket(ctx, proxy_ca_der, "upstream.test", addr.port()).unwrap();
+    up.join().unwrap();
+    assert!(
+        transcript.contains("103 Early Hints"),
+        "the interim head is relayed to the client, as the request plane relays one: {transcript:?}"
+    );
+    assert!(
+        transcript.contains("101 Switching Protocols"),
+        "and the upgrade still completes behind it: {transcript:?}"
+    );
+    assert!(
+        transcript.contains("ECHO:client-frame"),
+        "so the tunnel carries frames both ways: {transcript:?}"
     );
 }
 
