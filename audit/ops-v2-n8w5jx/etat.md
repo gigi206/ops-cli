@@ -77,6 +77,22 @@ neuvième, tenu pour fermé sur la foi du rapport, ne l'était pas : la mesure l
 | `cli/upgrade.rs:43` — `nix` app-scopable mais classé projet | fermé | **mesuré** — `APP_SCOPED_TARGETS` contient `"nix"` (`upgrade.rs:46`), avec la raison écrite. |
 | `fs_watch.rs:192` — la surveillance inotify suit un lien posé par la cage | fermé | **mesuré** — `WATCH_MASK` porte `IN_DONT_FOLLOW`, le type d'entrée est lu sans suivre, et la doc (`:248-253`) dit que les deux mécanismes tiennent ensemble. |
 
+**Mesuré depuis (2026-09-01) : la moitié DOCUMENTAIRE du constat est confirmée, la moitié
+EXPLOITABLE ne l'est pas.** `fs.md` affirmait deux choses fausses — « **Every** open a cage makes is
+answered this way » et « **One** gap is left, and it is **not one a cage can arrange** ». Le déclin
+sur `resolve` est un second trou, et c'en est un que la cage arrange en choisissant la forme de son
+appel système, sans privilège ni course. La page le nomme désormais, avec le fait qu'il n'est pas
+annoncé là où le repli noyau l'est. Ce correctif ne change aucune sémantique : il rend la page vraie
+sur une décision volontaire.
+
+Ce qui reste **non mesuré** est la course elle-même : que la fenêtre entre le jugement et le
+`CONTINUE` soit gagnable par un thread frère. Le mécanisme, lui, est épinglé par un test qui existe
+et qui l'affirme comme correct — `a_restricted_openat2_is_left_to_the_kernel_to_walk`. La produire
+demanderait une sonde compilée appelant `openat2` en brut depuis la cage, le harnais e2e n'y lançant
+qu'un script shell. Tant qu'elle ne l'est pas, choisir (a) ou (b) serait renverser une décision
+délibérée et testée sur la foi d'une lecture — exactement ce que cette même colonne refuse de faire
+pour `argv.rs:147`.
+
 **`proc_enforce.rs:1266` était porté « fermé » et ne l'est pas.** C'était la seule cellule MEDIUM
 tenue pour fermée sans mesure, sur la foi de la prose du rapport, qui décrivait un remède. La ligne
 rouverte dit l'inverse : `open_serve.rs:63` décline la remise pour **tout** `resolve` non nul et

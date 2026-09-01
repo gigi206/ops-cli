@@ -194,18 +194,32 @@ progress, so the file that arrives would not be the file that was read. Serving 
 removes the second walk, and the descriptor carries no more authority than the cage had: a read-only
 bind refuses a write through it exactly as it refuses the cage.
 
-Every open a cage makes is answered this way, not only the ones under your project and not only the
-ones that hold a file. That breadth is the point rather than thoroughness for its own sake: the cage
-chooses what its path names **first**, so any shape `sbx` could not answer for would be the shape to
-name. A pipe, a device and a socket are each served or replied to on their own terms, and a path
-that is not there is answered with the same error the cage would have received, rather than being
-looked up a second time once something has been moved into place behind it.
+Nearly every open a cage makes is answered this way, not only the ones under your project and not
+only the ones that hold a file. That breadth is the point rather than thoroughness for its own sake:
+the cage chooses what its path names **first**, so any shape `sbx` could not answer for would be the
+shape to name. A pipe, a device and a socket are each served or replied to on their own terms, and a
+path that is not there is answered with the same error the cage would have received, rather than
+being looked up a second time once something has been moved into place behind it.
 
-One gap is left, and it is not one a cage can arrange: a kernel older than 5.9 does not offer the
-operation at all, and there `scan` behaves as it did before, swap included. That fallback is not
-silent. The first allowed open the kernel declines to serve this way prints a warning naming the
-missing operation, once for the session, so a weaker `scan` is something you are told about rather
-than something you have to infer from a kernel version.
+Two gaps are left, and the second one **is** a shape a cage can arrange.
+
+The first is a kernel older than 5.9, which does not offer the operation at all; there `scan`
+behaves as it did before, swap included. That fallback is not silent. The first allowed open the
+kernel declines to serve this way prints a warning naming the missing operation, once for the
+session, so a weaker `scan` is something you are told about rather than something you have to infer
+from a kernel version.
+
+The second is `openat2` carrying a non-zero `resolve` word, and it is worth stating plainly because
+it is chosen rather than suffered. Such a call asks the kernel for a **stricter** path walk than the
+supervisor performed: the scan follows symlinks on purpose, since one that stopped at a link would
+be walked around with a single `ln -s`. Handing that descriptor to a caller that asked for
+`RESOLVE_NO_SYMLINKS` would silently remove the hardening that caller asked for, so `sbx` declines
+to serve the open and lets the real syscall run with the real `resolve` semantics. The verdict is
+unaffected, and a refusal still refuses: what returns is the second walk, and with it the swap
+window this section otherwise closes. A cage reaches it by choosing the form of its own system call,
+which needs no privilege and no race to arrange, and unlike the kernel fallback above it is not
+announced. The scan remains a backstop against a file whose content matches; it is not a guarantee
+about which file arrives when the cage asks in that form.
 
 **What it does not do.** A pattern only finds the shapes you wrote: a password that looks like
 ordinary prose is not one of them, and a scan is a backstop rather than a proof. Rewriting a file
