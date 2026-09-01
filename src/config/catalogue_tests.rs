@@ -643,10 +643,14 @@ fn every_shipped_freshness_exemption_is_named_in_the_bundles_table() {
     //
     // Written as its own guard rather than folded into that one: the two watch different fields,
     // and a single test failing for either would name the wrong fact half the time.
+    //
+    // An equivalence rather than a presence check, like the resolver and service guards below: a
+    // row claiming an exemption the bundle does not declare reports a supply-chain protection
+    // relaxed where it is not, which is the more alarming half of the two.
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let page = std::fs::read_to_string(root.join("docs-site/docs/guide/configuration/bundles.md"))
         .expect("the bundles page exists");
-    let mut missing = Vec::new();
+    let mut wrong = Vec::new();
     let mut carriers = 0;
     for entry in std::fs::read_dir(root.join("examples/bundle"))
         .expect("examples/bundle/ dir exists")
@@ -660,29 +664,37 @@ fn every_shipped_freshness_exemption_is_named_in_the_bundles_table() {
         let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
         // Read with sbx's own parser, like the step above: a name written under a sub-table folds
         // into it and never reaches the launch, and grepping the file would not tell.
-        if raw
+        let declared = raw
             .bundle
             .get(&name)
-            .is_none_or(|bundle| bundle.accepts_fresh_releases.is_empty())
-        {
-            continue;
+            .is_some_and(|bundle| !bundle.accepts_fresh_releases.is_empty());
+        if declared {
+            carriers += 1;
         }
-        carriers += 1;
-        let row = page
+        let named = page
             .lines()
-            .find(|line| line.starts_with(&format!("| `{name}` |")));
-        if !row.is_some_and(|line| line.contains("freshness exemption")) {
-            missing.push(name);
+            .find(|line| line.starts_with(&format!("| `{name}` |")))
+            .is_some_and(|line| line.contains("freshness exemption"));
+        if declared && !named {
+            wrong.push(format!(
+                "`{name}` lifts the freshness delay for one of its packages and its row does not \
+                 say so"
+            ));
+        } else if named && !declared {
+            wrong.push(format!(
+                "`{name}`'s row claims a freshness exemption the bundle does not declare, so it \
+                 reports a supply-chain protection relaxed where it is not"
+            ));
         }
     }
     assert!(
         carriers > 0,
         "no shipped bundle names a freshness exemption, so this guard now asserts nothing"
     );
+    wrong.sort();
     assert!(
-        missing.is_empty(),
-        "these bundles lift the freshness delay for one of their packages and the bundles table \
-         does not say so in their row: {missing:?}"
+        wrong.is_empty(),
+        "the bundles table disagrees with these bundles about the freshness delay: {wrong:#?}"
     );
 }
 
@@ -698,10 +710,14 @@ fn every_shipped_install_step_is_named_in_the_bundles_table() {
     // lists none of them. And the step is read with sbx's parser rather than grepped: one named
     // only in a comment is not one a launch runs, and one written under a sub-table would vanish
     // the way a misplaced `allow` does.
+    //
+    // An equivalence rather than a presence check, for the reason the guards below it give: a row
+    // promising a step the bundle does not carry sends a reader to it for an install that will
+    // never happen, and this column is only worth consulting if it is wrong in neither direction.
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let page = std::fs::read_to_string(root.join("docs-site/docs/guide/configuration/bundles.md"))
         .expect("the bundles page exists");
-    let mut missing = Vec::new();
+    let mut wrong = Vec::new();
     let mut carriers = 0;
     for entry in std::fs::read_dir(root.join("examples/bundle"))
         .expect("examples/bundle/ dir exists")
@@ -713,31 +729,36 @@ fn every_shipped_install_step_is_named_in_the_bundles_table() {
         }
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
         let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
-        if raw
+        let declared = raw
             .bundle
             .get(&name)
-            .and_then(|bundle| bundle.provision.as_ref())
-            .is_none()
-        {
-            continue;
+            .is_some_and(|bundle| bundle.provision.is_some());
+        if declared {
+            carriers += 1;
         }
-        carriers += 1;
-        let row = page
+        let named = page
             .lines()
-            .find(|line| line.starts_with(&format!("| `{name}` |")));
-        if !row.is_some_and(|line| line.contains("install step")) {
-            missing.push(name);
+            .find(|line| line.starts_with(&format!("| `{name}` |")))
+            .is_some_and(|line| line.contains("install step"));
+        if declared && !named {
+            wrong.push(format!(
+                "`{name}` carries an install step its row does not name"
+            ));
+        } else if named && !declared {
+            wrong.push(format!(
+                "`{name}`'s row promises an install step the bundle does not carry, so folding it \
+                 in installs nothing"
+            ));
         }
     }
     assert!(
         carriers > 0,
         "no shipped bundle carries an install step, so this guard now asserts nothing"
     );
-    missing.sort();
+    wrong.sort();
     assert!(
-        missing.is_empty(),
-        "these bundles carry an install step the bundles table does not name in their row: \
-         {missing:?}"
+        wrong.is_empty(),
+        "the bundles table disagrees with these bundles about their install step: {wrong:#?}"
     );
 }
 
