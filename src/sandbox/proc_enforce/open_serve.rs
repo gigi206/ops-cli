@@ -60,6 +60,24 @@ pub(super) fn serve_open(
     // quietly removed by being supervised. So the call is declined here and answered `CONTINUE`,
     // which runs the real `openat2` with the real `resolve` semantics; it joins the other flags
     // that cannot be carried onto a descriptor.
+    //
+    // What that costs, stated because the caller chooses it rather than merely encountering it: any
+    // non-zero `resolve` word takes this branch, so a program in the cage that sets a bit costing it
+    // nothing -- `RESOLVE_NO_MAGICLINKS` on a program that opens no magic link -- routes every one
+    // of its opens back to `CONTINUE`, and with them back to the re-resolution that serving exists
+    // to remove. The verdict still holds: a denied path is denied here, and only a permitted one
+    // reaches this line. What is reachable is the window after an allow, where the path the lens
+    // judged is walked a second time by the kernel and a sibling thread may have moved it.
+    //
+    // Left as it is, with the two alternatives named because neither is free. Refusing instead of
+    // continuing would deny the hardened program the call it was entitled to, punishing the defence
+    // this branch exists to preserve. Serving it properly means re-taking the probe with the
+    // caller's own `resolve` word -- an `openat2` anchored by `RESOLVE_IN_ROOT` on a dirfd for
+    // `/proc/<pid>/root`, which would also subsume what [`vouched_probe`] checks by hand -- and that
+    // is a rewrite of the probe on the enforcement path, verifiable only where a cage can actually
+    // run. The trigger to do it is a launch that needs `openat2` opens served rather than continued,
+    // measured on a host that can run the cage: until then this is a window the supervisor narrows
+    // for `open`/`openat` and does not narrow for a caller that asks the kernel for a stricter walk.
     match open_resolve(
         req.pid,
         req.data.nr,
