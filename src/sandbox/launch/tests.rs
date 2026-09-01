@@ -272,6 +272,60 @@ fn no_config_warning_reaches_the_terminal_unfiltered() {
     }
 }
 
+/// A diagnostic that names an identifier goes through [`crate::diag::error`], which styles it.
+///
+/// Forty raw `eprintln!("sbx…")` lines live in these files, and converting all of them would be a
+/// change with no observable effect: `highlight` paints backticked spans and leaves everything else
+/// byte-identical, so a message with no identifier in it renders the same either way. Four carried
+/// one and lost it: the `[fs] scan` scanner, the `[fs]` mask staging, and the two broker failures,
+/// which name the broker the user configured — the one word a reader needs to find in the message.
+///
+/// So the rule is enforced where it bites rather than by converting thirty-six sites that gain
+/// nothing: a raw diagnostic may not carry a backtick. A `sbx gc:` / `sbx session attach:` line is
+/// held to it too — the prefix says which verb speaks, not whether the message names anything.
+///
+/// The window runs to the call's closing `);` rather than reading one line, and that is what found
+/// the fourth: a grep for a backtick on the `eprintln!` line itself sees three, because the mask
+/// staging spells its format string on the line below.
+#[test]
+fn no_raw_diagnostic_names_an_identifier_it_cannot_style() {
+    for (name, source) in [
+        ("launch/build.rs", include_str!("build.rs")),
+        ("launch/cage.rs", include_str!("cage.rs")),
+        ("launch/mod.rs", include_str!("mod.rs")),
+        ("launch/reclaim.rs", include_str!("reclaim.rs")),
+        ("launch/session.rs", include_str!("session.rs")),
+        ("launch/detach.rs", include_str!("detach.rs")),
+    ] {
+        let production = source
+            .rsplit_once("#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        // A call may spell its format string on the `eprintln!(` line or on the lines under it, so
+        // the window runs to the call's own closing `);` rather than stopping at the first line.
+        let lines: Vec<&str> = production.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.trim_start().starts_with("eprintln!(") {
+                continue;
+            }
+            let mut call = String::new();
+            for l in lines[i..].iter().take(8) {
+                call.push_str(l);
+                call.push(' ');
+                if l.trim_end().ends_with(");") {
+                    break;
+                }
+            }
+            assert!(
+                !(call.contains("\"sbx") && call.contains('`')),
+                "{name}:{} prints an identifier through a raw `eprintln!`, which cannot style it; \
+                 use `diag::error` — {}",
+                i + 1,
+                line.trim()
+            );
+        }
+    }
+}
+
 #[test]
 fn no_pin_targets_the_global_lock_ignoring_any_stale_project_lock() {
     // Without a current pin the decision is the global channel, so the per-project

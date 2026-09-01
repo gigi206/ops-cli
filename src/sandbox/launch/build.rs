@@ -771,7 +771,9 @@ pub(super) fn build(
             Err(e) => {
                 // Refused rather than dropped: a launch that ran with a scan it could not build
                 // would report a protection it does not have.
-                eprintln!("sbx: cannot build the `[fs] scan` content scanner: {e}");
+                crate::diag::error(&format!(
+                    "sbx: cannot build the `[fs] scan` content scanner: {e}"
+                ));
                 return Err(ExitCode::FAILURE);
             }
         }
@@ -1163,7 +1165,9 @@ pub(super) fn build(
                         Some((value, prep.cfg.redact_min_len))
                     }
                     Err(e) => {
-                        eprintln!("sbx: cannot resolve the secret for the `{name}` broker: {e}");
+                        crate::diag::error(&format!(
+                            "sbx: cannot resolve the secret for the `{name}` broker: {e}"
+                        ));
                         return Err(ExitCode::FAILURE);
                     }
                 }
@@ -1208,7 +1212,7 @@ pub(super) fn build(
                     broker_guards.push(guard);
                 }
                 Err(e) => {
-                    eprintln!("sbx: cannot start the `{name}` broker: {e}");
+                    crate::diag::error(&format!("sbx: cannot start the `{name}` broker: {e}"));
                     return Err(ExitCode::FAILURE);
                 }
             }
@@ -1687,9 +1691,9 @@ pub(super) fn build(
             Err(e) => {
                 // Fail closed: without the decoys nothing masks those paths, and a session that
                 // ran anyway would leave open exactly the files the config asked to close.
-                eprintln!(
+                crate::diag::error(&format!(
                     "sbx: cannot stage the `[fs]` masks ({e}) — the paths they name would stay open"
-                );
+                ));
                 return Err(ExitCode::FAILURE);
             }
         }
