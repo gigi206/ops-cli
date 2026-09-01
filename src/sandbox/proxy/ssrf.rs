@@ -255,9 +255,13 @@ impl ConnectRefusal {
     }
 }
 
-/// Resolve `host` host-side, then settle on the one address the proxy may dial for it: the first
-/// resolved address the guard permits for `deciding`. A resolution failure for an allowed host is
-/// an error the client is told about (a clean `502`), not a dropped connection.
+/// Resolve `host` host-side, then hand back every address the proxy may dial for it: the resolved
+/// addresses the guard permits for `deciding`, in resolution order. A resolution failure for an
+/// allowed host is an error the client is told about (a clean `502`), not a dropped connection.
+///
+/// A list rather than one address, because one was a bug: a host whose first record is out of
+/// service was answered `502` where any ordinary client would have tried the next. Dial them with
+/// [`first_reachable`], which is where the order is honoured.
 pub(super) fn resolve_checked(
     ctx: &ProxyCtx,
     proto: Proto,
@@ -266,7 +270,7 @@ pub(super) fn resolve_checked(
     method: Option<&str>,
     path: Option<&str>,
     deciding: Option<&Rule>,
-) -> Result<IpAddr, ConnectRefusal> {
+) -> Result<Vec<IpAddr>, ConnectRefusal> {
     let Ok(ips) = (ctx.resolve)(host) else {
         ctx.push_log(
             proto,
@@ -295,8 +299,17 @@ pub(super) fn checked_address(
     path: Option<&str>,
     deciding: Option<&Rule>,
     ips: Vec<IpAddr>,
-) -> Result<IpAddr, ConnectRefusal> {
-    let Some(ip) = ips.into_iter().find(|ip| ip_permitted(*ip, host, deciding)) else {
+) -> Result<Vec<IpAddr>, ConnectRefusal> {
+    // *Every* permitted address, in resolution order — not the first one. The guard is applied to
+    // each, so nothing here widens what may be dialled; what changes is that a caller can move on
+    // from an address that will not connect. Keeping only the first meant a multi-homed host whose
+    // first A record was out of service answered `502 upstream-unreachable`, where an ordinary
+    // client — which walks the list — would have reached the second.
+    let permitted: Vec<IpAddr> = ips
+        .into_iter()
+        .filter(|ip| ip_permitted(*ip, host, deciding))
+        .collect();
+    if permitted.is_empty() {
         ctx.outcome(
             proto,
             host,
@@ -307,8 +320,31 @@ pub(super) fn checked_address(
             ConnectRefusal::Ssrf.tag(),
         );
         return Err(ConnectRefusal::Ssrf);
-    };
-    Ok(ip)
+    }
+    Ok(permitted)
+}
+
+/// Dial the permitted addresses in order, answering with the first that connects.
+///
+/// The list comes from [`checked_address`], so the SSRF guard has already passed on **each** of
+/// them — walking it cannot reach an address the guard refused, which is the property that makes
+/// the walk safe rather than a second chance at the same question. The last error is the one
+/// reported: a caller that could reach none of them is told about the last thing it tried, and the
+/// refusal it renders is the same one a single-address failure produced.
+pub(super) fn first_reachable<T, E>(
+    ips: &[IpAddr],
+    mut dial: impl FnMut(IpAddr) -> Result<T, E>,
+) -> Result<T, E> {
+    let mut last = None;
+    for ip in ips {
+        match dial(*ip) {
+            Ok(v) => return Ok(v),
+            Err(e) => last = Some(e),
+        }
+    }
+    // `checked_address` never returns an empty list (it refuses instead), and it is the only
+    // producer, so the `expect` is unreachable rather than a case left unhandled.
+    Err(last.expect("the permitted-address list is never empty"))
 }
 
 /// Whether `deciding` is an explicit, exact-host rule for `host` (not a wildcard/regex). With no

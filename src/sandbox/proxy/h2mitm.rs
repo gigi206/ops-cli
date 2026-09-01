@@ -348,7 +348,7 @@ async fn stream(
     // Resolve host-side, then the SSRF guard against the deciding rule (a private/metadata
     // address is refused unless the rule names the exact host) — then connect the checked IP with
     // no re-resolution, exactly like the HTTP/1.1 path.
-    let ip = match resolve_checked(
+    let ips = match resolve_checked(
         ctx,
         Proto::Https,
         connect_host,
@@ -357,7 +357,7 @@ async fn stream(
         Some(&path),
         deciding.as_ref(),
     ) {
-        Ok(ip) => ip,
+        Ok(ips) => ips,
         Err(refusal) => {
             // The refusal is already recorded — the shared guard counts an SSRF block and logs a
             // resolution failure, so this path answers the client and nothing else.
@@ -369,7 +369,7 @@ async fn stream(
     relay(
         req,
         respond,
-        ip,
+        &ips,
         port,
         connect_host,
         method.as_str(),
@@ -415,7 +415,7 @@ fn authority_bound_to(
 async fn relay(
     req: Request<h2::RecvStream>,
     mut respond: h2::server::SendResponse<Bytes>,
-    ip: IpAddr,
+    ips: &[IpAddr],
     port: u16,
     host: &str,
     method: &str,
@@ -508,7 +508,17 @@ async fn relay(
     // Nothing about the decision is reused. The `:authority` re-check, the outbound tripwire, the
     // verdict, the resolution and the address guard all ran above, per stream, and a stream that any
     // of them refuses never reaches this line. What is reused is the handshake.
-    let send_req = match ready_upstream(pool, &injected_ids, ip, port, host, ctx).await {
+    // Walked in order, like the HTTP/1.1 planes: `checked_address` passed the guard on every one
+    // of these, so moving on from an address that will not connect cannot reach one it refused.
+    // Written as a loop rather than through `first_reachable` because each attempt is awaited.
+    let mut attempt = Err("no permitted address for this host");
+    for ip in ips {
+        attempt = ready_upstream(pool, &injected_ids, *ip, port, host, ctx).await;
+        if attempt.is_ok() {
+            break;
+        }
+    }
+    let send_req = match attempt {
         Ok(send) => send,
         Err(reason) => {
             refuse_upstream(respond, ctx, host, port, method, path, reason);

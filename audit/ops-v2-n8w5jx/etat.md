@@ -69,7 +69,7 @@ lui-même lui donne : réconcilier contre cet ensemble supprimerait tous les roo
 Les 28 constats en prose ont été rouverts un par un dans cet arbre. Sur les 23 du tableau qui les
 suit, trois l'ont été ; les vingt autres portent « non re-sondé » et rien d'autre.
 
-### Fermés (24 en prose, 2 au tableau)
+### Fermés (25 en prose, 3 au tableau)
 
 | Constat | Fermé par | Ce qui a été mesuré |
 | --- | --- | --- |
@@ -99,17 +99,14 @@ suit, trois l'ont été ; les vingt autres portent « non re-sondé » et rien d
 | `sandbox/binds.rs:1189` — le routeur d'URL n'est exécutable qu'après le renommage | ce dépôt | Le mode monte sur le fichier temporaire, donc le renommage est la seule chose qui paraisse au chemin final. **Le constat surestime** : la fenêtre montre un routeur NON exécutable, donc c'est une correction de justesse contre un lancement concurrent du même home, pas une élévation. |
 | `sandbox/cgroup.rs:110` — `is_valid_memory_value` accepte ce que systemd refuse | ce dépôt | **Mesuré** : `99E` passait. La borne est 2^64 strict, pas `u64::MAX as f64` — cette conversion arrondit VERS LE HAUT et aurait laissé passer la plus grande valeur qu'un `u64` ne tient pas. |
 | `config/secrets.rs:191` — le nom par défaut d'un secret échappe à `validate_secret_name` | ce dépôt | **Mesuré** : `classify` accepte un octet de contrôle, un saut de ligne, un ESC et un `}` dans le chemin d'une cible ; le nom par défaut était la clé brute, rendue en `${name}`. Il vient désormais de l'hôte classifié, dont les labels sont lettres, chiffres et tirets. |
+| `proxy/ssrf.rs:299` — une seule adresse d'un hôte multi-domicilié est essayée | ce dépôt | **Mesuré** : sans le correctif, `502 upstream-unreachable` pour un hôte dont la seconde adresse répond. `checked_address` rend désormais **toutes** les adresses permises — le garde passe sur chacune, donc parcourir ne peut pas atteindre une adresse qu'il a refusée — et les six chemins de dial les essaient dans l'ordre (`first_reachable`, ou une boucle awaitée sur le plan h2). |
+| `observe_feed.rs:44` — le filtre du flux d'exec s'appuie sur `comm` | ce dépôt | **Prose seule, et c'est le remède que le rapport approuve** : la limite honnête est écrite au site — `prctl(PR_SET_NAME)` laisse un processus se nommer `bwrap`, c'est un trou d'OBSERVATION et non d'application (le chemin `enforce` lit l'exécutable par la vue du superviseur), et le fermer demande une identité que le lancement possède. Le code reste tel quel, pour la raison que le rapport donne. |
 
-### Ouverts et mesurés (2 en prose, 1 au tableau)
-
-Trois constats restent, chacun pour une raison écrite : un refactor à travers cinq chemins d'appel,
-une course que personne n'a reproduite, et une lacune que le rapport lui-même laisse ouverte.
+### Ouvert et mesuré (1 en prose)
 
 | Constat | Ce qui est mesuré |
 | --- | --- |
-| `proxy/ssrf.rs:299` — une seule adresse d'un hôte multi-domicilié est essayée | `ips.into_iter().find(..)` rend **une** adresse. Le chemin est plus long que le constat ne le dit : l'adresse voyage jusqu'au pool amont (`acquire_upstream`, `ready_upstream`, `open_upstream`) et jusqu'à deux `TcpStream::connect` directs. La parcourir demande de rendre une liste et de la faire essayer par cinq chemins d'appel aux transports différents, plus une décision sur ce que le pool indexe. C'est un incrément à part, pas une ligne à changer. |
-| `sandbox/argv.rs:147` — `--die-with-parent` est inconditionnel, y compris détaché | La branche `exec`-replace de `detached_child` survit à la décomposition (`launch/detach.rs:157`), donc le chemin existe toujours. **Verdict PLAUSIBLE conservé, et laissé ouvert délibérément** : la course n'a été reproduite ni par le rapport ni ici, et les trois remèdes proposés changent chacun la durée de vie d'un lancement détaché sans qu'on puisse observer le correctif fonctionner sur cette machine. |
-| `observe_feed.rs:44` — le filtre du flux d'exec s'appuie sur `comm` | `is_plumbing` apparie `comm`, que le processus observé choisit. Le rapport écarte lui-même le correctif de code — le fermer demande une identité que possède le *lancement*, pas le processus observé — mais **la limite honnête qu'il avait écrite au site n'est pas dans cet arbre**. L'écrire ne coûte rien et c'est le remède que le rapport approuve. |
+| `sandbox/argv.rs:147` — `--die-with-parent` est inconditionnel, y compris détaché | La branche `exec`-replace de `detached_child` survit à la décomposition (`launch/detach.rs:157`), donc le chemin existe toujours. **Verdict PLAUSIBLE conservé, et laissé ouvert délibérément** : la course n'a été reproduite ni par le rapport ni ici, et les trois remèdes proposés changent chacun la durée de vie d'un lancement détaché sans qu'on puisse observer le correctif fonctionner sur cette machine. Le fermer sur la foi d'une lecture serait un changement de sémantique sans mesure. |
 
 ### Non re-sondés (2 en prose, 20 au tableau)
 

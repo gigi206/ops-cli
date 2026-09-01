@@ -41,6 +41,19 @@ pub(crate) const OBSERVE_POLL_INTERVAL: Duration = Duration::from_millis(300);
 
 /// The launch plumbing (bubblewrap, and systemd-run on the scoped path) between the supervisor and
 /// the agent's command; not "the agent spawning something", so it is filtered out of the feed.
+///
+/// **Honest limit: `comm` is chosen by the process this filter is deciding about.** A task can set
+/// its own `comm` with `prctl(PR_SET_NAME)` — the kernel takes any 15 bytes — so anything the cage
+/// runs can name itself `bwrap` and drop out of the exec feed. This is a hole in *observation*, not
+/// in enforcement: nothing here decides whether a command runs, and the seccomp
+/// user-notification path that does (`[proc] mode = "enforce"`) reads the executable through the
+/// supervisor's own view of the caller, never a self-chosen string.
+///
+/// Closing it needs an identity the *launch* holds and the observed process cannot write — the pid
+/// of the bwrap this supervisor spawned, or the systemd-run scope it created — rather than a name
+/// read back out of `/proc`. That is a different shape of filter and it belongs to whoever wires
+/// the observer to the launch it observes; it is named here rather than left for a reader to
+/// discover that a filter on a self-chosen value filters nothing against a process that minds.
 fn is_plumbing(comm: &str) -> bool {
     matches!(comm, "bwrap" | "systemd-run" | "socat")
 }

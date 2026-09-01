@@ -101,8 +101,8 @@ pub(super) fn splice_l4(
             Some(deciding),
         ),
     };
-    let ip = match checked {
-        Ok(ip) => ip,
+    let ips = match checked {
+        Ok(ips) => ips,
         Err(refusal) => {
             return write_refusal(
                 &mut client,
@@ -115,7 +115,7 @@ pub(super) fn splice_l4(
 
     // Open the raw upstream to the checked address (no TLS, no certificate validation — a raw splice
     // is uninspected by design; the empty netns + the allowlist are the boundary).
-    let upstream = match TcpStream::connect((ip, port)) {
+    let upstream = match super::ssrf::first_reachable(&ips, |ip| TcpStream::connect((ip, port))) {
         Ok(s) => {
             // Nagle off. A raw splice carries whatever protocol the cage speaks, including
             // interactive ones whose small writes are exactly what Nagle holds back.

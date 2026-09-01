@@ -3228,6 +3228,47 @@ fn a_post_that_loses_its_reused_connection_is_refused_rather_than_sent_again() {
     );
 }
 
+/// A host whose first address does not answer is reached at its second, with the guard on both.
+///
+/// `checked_address` returned the *first* permitted address and every caller composed only that
+/// one, so a multi-homed name whose first A record was out of service answered
+/// `502 upstream-unreachable` — where an ordinary client, which walks the address list, connects.
+/// The walk is not a second chance at the guard: the list it walks is the list the guard passed, so
+/// an address it refused is not in it and cannot be tried.
+#[test]
+fn a_host_whose_first_address_refuses_is_reached_at_its_second() {
+    let (addr, upstream_ca, _upstream) =
+        spawn_keepalive_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, false, vec![]);
+    // 127.0.0.2 is a loopback address with nothing listening on this port, so the first dial is
+    // refused at once; the upstream is on 127.0.0.1. Both pass the guard — the deciding rule names
+    // the exact host, which is what opens a private address to it at all — so the test measures the
+    // walk and not the guard.
+    let ctx = Arc::new(
+        Arc::try_unwrap(ctx)
+            .unwrap_or_else(|_| panic!("the context is not shared yet"))
+            .with_resolver(Box::new(|_| {
+                Ok(vec![
+                    IpAddr::from([127, 0, 0, 2]),
+                    IpAddr::from([127, 0, 0, 1]),
+                ])
+            })),
+    );
+    let got = through_proxy(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        "upstream.test",
+        addr.port(),
+        b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+    )
+    .unwrap();
+    assert!(
+        got.ends_with("hello"),
+        "the second address answers where the first would not: {got:?}"
+    );
+}
+
 /// The whole point of the increment: two requests to the same host, one TLS handshake. Nothing
 /// else in this file could show it — every other upstream helper serves one request and closes,
 /// so reuse would look identical to no reuse.

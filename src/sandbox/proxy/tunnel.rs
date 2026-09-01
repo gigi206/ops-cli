@@ -273,7 +273,7 @@ pub(super) fn serve_tunneled_request(
     //    it goes. A resolution failure for an allowed host is a clean 502 (not a dropped
     //    connection), so the agent sees "the name did not resolve" rather than an ambiguous
     //    transport error.
-    let ip = match resolve_checked(
+    let ips = match resolve_checked(
         ctx,
         crate::sandbox::control::Proto::Https,
         connect_host,
@@ -282,7 +282,7 @@ pub(super) fn serve_tunneled_request(
         Some(&itarget),
         deciding.as_ref(),
     ) {
-        Ok(ip) => ip,
+        Ok(ips) => ips,
         Err(refusal) => {
             return respond_refusal_tls(
                 &mut br,
@@ -487,13 +487,15 @@ pub(super) fn serve_tunneled_request(
     // 7b. Take the upstream connection: a parked one, or a new one to the address just checked (not
     //     a re-resolve, which would reopen the rebinding window) with its certificate validated up
     //     front — a forged or self-signed upstream is refused, never passed through.
-    let (mut upstream, mut from_pool) = match acquire_upstream(
-        ctx,
-        pool_key.as_ref().filter(|_| replayable),
-        ip,
-        port,
-        connect_host,
-    ) {
+    let (mut upstream, mut from_pool) = match super::ssrf::first_reachable(&ips, |ip| {
+        acquire_upstream(
+            ctx,
+            pool_key.as_ref().filter(|_| replayable),
+            ip,
+            port,
+            connect_host,
+        )
+    }) {
         Ok(pair) => pair,
         Err(e) => {
             return Turn::closing(refuse_upstream(
@@ -720,7 +722,9 @@ pub(super) fn serve_tunneled_request(
                     ),
                 );
             }
-            let (fresh, _) = match acquire_upstream(ctx, None, ip, port, connect_host) {
+            let (fresh, _) = match super::ssrf::first_reachable(&ips, |ip| {
+                acquire_upstream(ctx, None, ip, port, connect_host)
+            }) {
                 Ok(pair) => pair,
                 Err(e) => {
                     return Turn::closing(refuse_upstream(

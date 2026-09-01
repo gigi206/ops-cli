@@ -137,7 +137,7 @@ pub(super) fn handle_https_forward(
 
     // 6. Resolve host-side, then the SSRF guard against the deciding rule. A resolution failure for an
     //    allowed host is a clean 502, distinct from a refusal.
-    let ip = match resolve_checked(
+    let ips = match resolve_checked(
         ctx,
         crate::sandbox::control::Proto::Https,
         &host,
@@ -146,7 +146,7 @@ pub(super) fn handle_https_forward(
         Some(&path),
         deciding.as_ref(),
     ) {
-        Ok(ip) => ip,
+        Ok(ips) => ips,
         Err(refusal) => {
             return write_refusal(
                 &mut client,
@@ -323,13 +323,15 @@ pub(super) fn handle_https_forward(
     // 7b. Take the upstream connection: a parked one, or a new validated TLS connection to the
     //     checked address (not a re-resolve, which would reopen the rebinding window). A
     //     forged/self-signed upstream is refused, never downgraded.
-    let (mut upstream, mut from_pool) = match acquire_upstream(
-        ctx,
-        pool_key.as_ref().filter(|_| replayable),
-        ip,
-        port,
-        &host,
-    ) {
+    let (mut upstream, mut from_pool) = match super::ssrf::first_reachable(&ips, |ip| {
+        acquire_upstream(
+            ctx,
+            pool_key.as_ref().filter(|_| replayable),
+            ip,
+            port,
+            &host,
+        )
+    }) {
         Ok(pair) => pair,
         Err(e) => return refuse_upstream(&mut client, ctx, &host, port, verb, &path, e),
     };
@@ -476,7 +478,9 @@ pub(super) fn handle_https_forward(
                     ),
                 );
             }
-            let (fresh, _) = match acquire_upstream(ctx, None, ip, port, &host) {
+            let (fresh, _) = match super::ssrf::first_reachable(&ips, |ip| {
+                acquire_upstream(ctx, None, ip, port, &host)
+            }) {
                 Ok(pair) => pair,
                 Err(e) => return refuse_upstream(&mut client, ctx, &host, port, verb, &path, e),
             };
