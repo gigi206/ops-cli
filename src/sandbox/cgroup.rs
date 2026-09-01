@@ -106,10 +106,32 @@ pub(crate) fn is_valid_memory_value(s: &str) -> bool {
     // A byte quantity: a decimal number with at most one base-1024 suffix. `strip_suffix` only
     // strips when the last char is a suffix letter, so a bare integer (last char a digit) is left
     // whole and validated as a plain decimal.
-    let number = s
-        .strip_suffix(|c| matches!(c, 'K' | 'M' | 'G' | 'T' | 'P' | 'E'))
-        .unwrap_or(s);
-    is_decimal(number)
+    let (number, shift) = match s.as_bytes().last() {
+        Some(b'K') => (&s[..s.len() - 1], 10),
+        Some(b'M') => (&s[..s.len() - 1], 20),
+        Some(b'G') => (&s[..s.len() - 1], 30),
+        Some(b'T') => (&s[..s.len() - 1], 40),
+        Some(b'P') => (&s[..s.len() - 1], 50),
+        Some(b'E') => (&s[..s.len() - 1], 60),
+        _ => (s, 0),
+    };
+    if !is_decimal(number) {
+        return false;
+    }
+    // The shape is not the whole grammar. `99E` is well formed and means 99 exbibytes, which does
+    // not fit the `u64` of bytes systemd counts in: it is accepted here, written into the unit, and
+    // refused when the scope is created — so *every* launch of that project fails, at a point where
+    // the config value that caused it is no longer in view. Checked here instead, where the value
+    // is still named and the refusal can point at it. `f64` is enough for a bound this far from
+    // any precision it would lose.
+    // Compared against 2^64 and strictly, not against `u64::MAX as f64`: that conversion rounds
+    // *up* to 2^64, so the largest value a `u64` cannot hold would have compared equal and passed.
+    // 2^64 is exactly representable in `f64`, and every quantity here is far from the precision a
+    // `f64` would lose.
+    const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
+    number
+        .parse::<f64>()
+        .is_ok_and(|n| n * ((1u64 << shift) as f64) < TWO_POW_64)
 }
 
 /// Whether `s` is a `TasksMax=` value systemd accepts: `infinity` or a positive integer (systemd
@@ -1147,6 +1169,25 @@ mod tests {
                 launches(Some(&format!("TasksMax={v}"))),
                 "systemd-run rejected `TasksMax={v}` the validator accepted"
             );
+        }
+    }
+
+    /// A byte quantity has to fit the `u64` systemd counts in, not merely look like one.
+    ///
+    /// `99E` is well formed and means 99 exbibytes. It was accepted here, written into the unit,
+    /// and refused when the scope was created — so every launch of that project failed, at a point
+    /// where the config value that caused it is no longer in view.
+    #[test]
+    fn a_byte_quantity_too_large_for_systemd_is_refused_where_it_is_still_named() {
+        for over in ["99E", "1024E", "99999P", "18446744073709551616"] {
+            assert!(
+                !is_valid_memory_value(over),
+                "{over} does not fit a u64 of bytes"
+            );
+        }
+        // The ordinary values are untouched, so the bound cannot be satisfied by refusing suffixes.
+        for ok in ["2G", "512M", "1.5G", "8T", "1E", "infinity", "50%"] {
+            assert!(is_valid_memory_value(ok), "{ok} is a value systemd takes");
         }
     }
 }

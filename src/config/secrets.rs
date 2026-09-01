@@ -189,7 +189,24 @@ pub(super) fn validate_host_secret(
     };
     let name = match raw.name.as_deref() {
         Some(n) => validate_secret_name(n)?.to_string(),
-        None => host.to_string(),
+        // The classified rule's **host**, not the raw section key. A key may carry a path, and a
+        // path is held to nothing like `is_valid_hostname`: measured, `classify` accepts a control
+        // byte, a newline, an ESC introducer and a `}` inside one. This name is rendered as
+        // `${name}` wherever a value is withheld and into every diagnostic that mentions the
+        // credential, so a default taken from the key could forge a placeholder or drive the
+        // terminal reading it — the two things `validate_secret_name` refuses for a name an author
+        // wrote, and the default skipped that gate entirely. A host cannot carry either: its
+        // labels are letters, digits and hyphens.
+        //
+        // Two URL-scoped secrets on one host now default to the same name. That is a case this
+        // file already surfaces — [`upsert_secret`] warns when two secrets share a name and names
+        // both targets — and a label two credentials share is the smaller of the two problems.
+        None => match &to.kind {
+            RuleKind::Host(h, _) | RuleKind::Url { host: h, .. } => h.clone(),
+            RuleKind::Ip(ip, _) => ip.to_string(),
+            // `validate_secret_target` admits those three kinds and no other.
+            other => unreachable!("a secret target classified as {other:?}"),
+        },
     };
     Ok(HeaderSecret {
         name,

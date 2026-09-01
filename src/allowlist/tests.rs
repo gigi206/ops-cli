@@ -2509,3 +2509,50 @@ fn speaks_http2_only_for_designated_hosts() {
     // A policy with no http2 entry never selects h2.
     assert!(!EgressPolicy::new(vec![], vec![]).speaks_http2("grpc.example.com", 9001));
 }
+
+/// A query string written into a path rule is refused at parse time.
+///
+/// The request side drops a query before matching and the rule side kept it, so
+/// `allow = ["files.test/exec?cmd=ls"]` — written to open one call — matched `/exec` with any
+/// query at all, while `sbx test net` printed the rule back with the query still attached. A rule
+/// that cannot mean what it says is an error its author should see; `re:` is where a query belongs.
+#[test]
+fn a_query_string_in_a_path_rule_is_refused_rather_than_silently_widening_it() {
+    let err = classify("files.test/exec?cmd=ls").unwrap_err();
+    assert!(
+        err.contains("query string") && err.contains("re:"),
+        "the refusal names the problem and the escape hatch: {err}"
+    );
+    // The same rule without a query is still a rule, so the refusal cannot be satisfied by
+    // rejecting path rules.
+    assert!(classify("files.test/exec").is_ok());
+    // And a query is expressible where it actually works.
+    assert!(classify("re:^https://files\\.test/exec\\?cmd=ls$").is_ok());
+}
+
+/// A `re:` pattern anchored on a scheme other than `https` is refused, because it can never match.
+///
+/// `Request::new` rebuilds the URL a `re:` rule is tested against as `https://<authority><path>`
+/// for every request, the cleartext plane included. So `re:^http://internal\.corp` — the natural
+/// spelling for narrowing a cleartext host one has just opened — matched nothing and said nothing.
+/// A deny that cannot deny is the worst shape a rule can take: it reads as protection.
+#[test]
+fn a_regex_rule_anchored_on_a_non_https_scheme_is_refused() {
+    for pattern in [
+        "re:^http://internal\\.corp",
+        "re:^tcp://internal\\.corp",
+        "re:^ws://internal\\.corp",
+    ] {
+        let err = classify(pattern).unwrap_err();
+        assert!(
+            err.contains("can never match") && err.contains("https"),
+            "{pattern}: {err}"
+        );
+    }
+    // Anchored on the form that is actually built, and unanchored, both still parse — the refusal
+    // is about a scheme that cannot appear, not about anchoring.
+    assert!(classify("re:^https://internal\\.corp").is_ok());
+    assert!(classify("re:internal\\.corp").is_ok());
+    // A pattern merely *containing* a scheme is not anchored on one and is left alone.
+    assert!(classify("re:redirect=http://internal").is_ok());
+}

@@ -69,7 +69,7 @@ lui-même lui donne : réconcilier contre cet ensemble supprimerait tous les roo
 Les 28 constats en prose ont été rouverts un par un dans cet arbre. Sur les 23 du tableau qui les
 suit, trois l'ont été ; les vingt autres portent « non re-sondé » et rien d'autre.
 
-### Fermés (17 en prose, 2 au tableau)
+### Fermés (24 en prose, 2 au tableau)
 
 | Constat | Fermé par | Ce qui a été mesuré |
 | --- | --- | --- |
@@ -92,27 +92,24 @@ suit, trois l'ont été ; les vingt autres portent « non re-sondé » et rien d
 | `proc_enforce/notify.rs:274` — `recv_fd_raw` ignore `cmsg_len` | ce dépôt | **Mesuré** : sans le correctif, un message à deux descripteurs rend `Ok(6)` et fuit le second. Le refus lit désormais TOUS les descripteurs et les ferme AVANT de rendre l'erreur — un refus qui rend la main sans fermer fuit exactement ce qu'il refuse. `MSG_CTRUNC` est refusé, et la limite du nettoyage est écrite : ce que le noyau a jeté n'est nommé par aucun cmsg. |
 | `control/capture.rs:494` — l'élagage de l'historique d'aiguilles part de la tête | ce dépôt | **Mesuré** : sans le correctif, le rafraîchissement 255 dépose la clé statique EN CLAIR dans l'anneau. Le tri sépare retirées et vivantes ; le plafond cède avant qu'une valeur vivante ne tombe, parce que dépasser un plafond de coût est un coût et jeter une aiguille vivante est une divulgation. |
 | `proxy/h2mitm.rs:206` — le refus de plafond de flux n'est enregistré nulle part | ce dépôt | Le journal est poussé avant la réponse, en `Blocked` — la documentation de `LogVerdict` y range le plafond de splice, dont c'est le jumeau h2. **Sans test de comportement** : le garde est un filet contre un client qui viole ses propres SETTINGS, et le client `h2` les respecte, donc l'atteindre demanderait un écrivain de trames brut. La raison est écrite au site. |
+| `allowlist/grammar.rs` — une chaîne de requête dans un chemin de règle élargit la règle | ce dépôt | **Refusée à l'analyse**, comme le refus d'hôte joker une ligne plus haut, plutôt que de se mettre à apparier les requêtes. Sans le correctif la règle garde `path: "/exec?cmd=ls"` et n'apparie que `/exec`. |
+| `allowlist/mod.rs:426` — une règle `re:` ancrée sur `http://` ne peut jamais apparier | ce dépôt | **Refusée à l'analyse** : l'URL testée est toujours rebâtie en `https://`. Un motif qui contient un schéma sans y être ancré est laissé tranquille. |
+| `sandbox/argv.rs:49` — `compose` réécrit tout élément d'argv égal au marqueur | ce dépôt | **Mesuré** : sans le correctif, `sbx run -- printf '%s\n' @sbx-env-args` reçoit `"3"` — le numéro du descripteur. La substitution vise désormais la position que `to_argv` a écrite, après son `--args`. |
+| `sandbox/argv.rs:82` — un NUL dans un *nom* est rapporté comme « the value of » | ce dépôt | **Mesuré** : l'ancien message disait « the value of `PO ISON` » — il se trompait de moitié ET recrachait les octets qu'il refuse. Le nom est décrit, jamais cité ; la valeur est trouvée en nommant sa clé. |
+| `sandbox/binds.rs:1189` — le routeur d'URL n'est exécutable qu'après le renommage | ce dépôt | Le mode monte sur le fichier temporaire, donc le renommage est la seule chose qui paraisse au chemin final. **Le constat surestime** : la fenêtre montre un routeur NON exécutable, donc c'est une correction de justesse contre un lancement concurrent du même home, pas une élévation. |
+| `sandbox/cgroup.rs:110` — `is_valid_memory_value` accepte ce que systemd refuse | ce dépôt | **Mesuré** : `99E` passait. La borne est 2^64 strict, pas `u64::MAX as f64` — cette conversion arrondit VERS LE HAUT et aurait laissé passer la plus grande valeur qu'un `u64` ne tient pas. |
+| `config/secrets.rs:191` — le nom par défaut d'un secret échappe à `validate_secret_name` | ce dépôt | **Mesuré** : `classify` accepte un octet de contrôle, un saut de ligne, un ESC et un `}` dans le chemin d'une cible ; le nom par défaut était la clé brute, rendue en `${name}`. Il vient désormais de l'hôte classifié, dont les labels sont lettres, chiffres et tirets. |
 
-### Ouverts et mesurés (9 en prose, 1 au tableau)
+### Ouverts et mesurés (2 en prose, 1 au tableau)
 
-La ligne est rouverte, le prédicat du constat tient encore. Les deux groupes les moins chers — « un
-frère correct est déjà dans l'arbre » et « sécurité, autonomes » — ont été traités et se lisent
-au-dessus. Ce qui reste change une sémantique visible ou touche plusieurs sites.
-
-**Changent une sémantique visible par l'utilisateur ou touchent plusieurs sites — à arbitrer avant d'écrire.**
+Trois constats restent, chacun pour une raison écrite : un refactor à travers cinq chemins d'appel,
+une course que personne n'a reproduite, et une lacune que le rapport lui-même laisse ouverte.
 
 | Constat | Ce qui est mesuré |
 | --- | --- |
-| `proxy/ssrf.rs:299` — une seule adresse d'un hôte multi-domicilié est essayée | `ips.into_iter().find(..)` rend **une** adresse, et six appelants ne composent que celle-là. |
-| `allowlist/grammar.rs` — une chaîne de requête dans un chemin de règle élargit la règle | La doc (`grammar.rs:412`) dit que le chemin inclut « any query string » ; `canonical_segments` la retire du côté requête. Une règle écrite étroite apparie large et s'affiche sous une forme qui décrit autre chose. |
-| `allowlist/mod.rs:426` — une règle `re:` ancrée sur `http://` ne peut jamais apparier | L'URL comparée est reconstruite en `https://` aux deux formes (`mod.rs:426` et `:430`), y compris pour une requête cleartext. |
-| `sandbox/argv.rs:49` — `compose` réécrit tout élément d'argv égal au marqueur | La substitution est une égalité de valeur sur tout le vecteur, qui porte aussi la commande de la cage et chaque chemin de bind. |
-| `sandbox/argv.rs:82` — un NUL dans un *nom* est rapporté comme « the value of » | Le commentaire deux lignes plus haut dit « The name, never the value » ; le message dit l'inverse et imprime la clé empoisonnée en entier. |
-| `sandbox/argv.rs:147` — `--die-with-parent` est inconditionnel, y compris détaché | La branche `exec`-replace de `detached_child` survit à la décomposition (`launch/detach.rs:157`), donc le chemin existe toujours. **Verdict PLAUSIBLE conservé** : la course n'a été reproduite ni par le rapport ni ici. |
-| `sandbox/binds.rs:1189` — le routeur d'URL n'est exécutable qu'après le renommage | `write_atomic` puis `set_permissions(0o755)` : le fichier est visible en `0644` dans l'intervalle. |
-| `sandbox/cgroup.rs:110` — `is_valid_memory_value` accepte ce que systemd refuse | La vérification est syntaxique : `99E` passe, puis chaque lancement du projet échoue à la création du scope. |
-| `config/secrets.rs:191` — le nom par défaut d'un secret échappe à `validate_secret_name` | `None => host.to_string()`, sans passer la porte que le bras `Some` emprunte. |
-| `observe_feed.rs:44` — le filtre du flux d'exec s'appuie sur `comm` | `is_plumbing` apparie `comm`, que le processus observé choisit. Le rapport écarte le correctif de code, mais **la limite honnête qu'il avait écrite au site n'est pas dans cet arbre**. |
+| `proxy/ssrf.rs:299` — une seule adresse d'un hôte multi-domicilié est essayée | `ips.into_iter().find(..)` rend **une** adresse. Le chemin est plus long que le constat ne le dit : l'adresse voyage jusqu'au pool amont (`acquire_upstream`, `ready_upstream`, `open_upstream`) et jusqu'à deux `TcpStream::connect` directs. La parcourir demande de rendre une liste et de la faire essayer par cinq chemins d'appel aux transports différents, plus une décision sur ce que le pool indexe. C'est un incrément à part, pas une ligne à changer. |
+| `sandbox/argv.rs:147` — `--die-with-parent` est inconditionnel, y compris détaché | La branche `exec`-replace de `detached_child` survit à la décomposition (`launch/detach.rs:157`), donc le chemin existe toujours. **Verdict PLAUSIBLE conservé, et laissé ouvert délibérément** : la course n'a été reproduite ni par le rapport ni ici, et les trois remèdes proposés changent chacun la durée de vie d'un lancement détaché sans qu'on puisse observer le correctif fonctionner sur cette machine. |
+| `observe_feed.rs:44` — le filtre du flux d'exec s'appuie sur `comm` | `is_plumbing` apparie `comm`, que le processus observé choisit. Le rapport écarte lui-même le correctif de code — le fermer demande une identité que possède le *lancement*, pas le processus observé — mais **la limite honnête qu'il avait écrite au site n'est pas dans cet arbre**. L'écrire ne coûte rien et c'est le remède que le rapport approuve. |
 
 ### Non re-sondés (2 en prose, 20 au tableau)
 

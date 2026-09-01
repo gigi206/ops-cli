@@ -1145,7 +1145,7 @@ pub(crate) fn build_spec(
     cmd: Vec<OsString>,
 ) -> io::Result<SandboxSpec> {
     use std::fs::DirBuilder;
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::DirBuilderExt;
 
     let project = canonicalize_project(cwd)?;
     let rt = project_runtime(data_dir, &project, runtime);
@@ -1185,8 +1185,11 @@ pub(crate) fn build_spec(
         .mode(0o700)
         .create(&open_router)?;
     let xdg_open = open_router.join("xdg-open");
-    super::atomicfile::write_atomic(&xdg_open, super::openuri::router(open).as_bytes())?;
-    std::fs::set_permissions(&xdg_open, std::fs::Permissions::from_mode(0o755))?;
+    super::atomicfile::write_atomic_mode(
+        &xdg_open,
+        super::openuri::router(open).as_bytes(),
+        Some(0o755),
+    )?;
 
     // The portal's route to the same router: a desktop-entry directory and the mime defaults naming
     // it, staged here (outside every writable mount, like the router) and bound read-only at the

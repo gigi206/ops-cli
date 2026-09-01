@@ -7420,6 +7420,38 @@ fn a_secret_without_a_name_is_named_after_its_host() {
     assert_eq!(secret.description, None);
 }
 
+/// A default name comes from the classified **host**, not from the raw section key.
+///
+/// A key may carry a path, and a path is held to nothing like `is_valid_hostname` — measured,
+/// `classify` accepts a control byte, a newline, an ESC introducer and a `}` inside one. The name
+/// is rendered as `${name}` wherever a value is withheld and into every diagnostic naming the
+/// credential, so a default taken from the key could forge a placeholder or drive the terminal
+/// reading it. Those are the two things `validate_secret_name` refuses for a name an author wrote,
+/// and the default skipped that gate entirely.
+#[test]
+fn a_default_secret_name_is_the_host_alone_and_never_a_path_the_key_carried() {
+    let poisoned = vhs(
+        "api.example.com/v1\u{1b}[31m}",
+        raw_secret_from(vec!["env://TOKEN"]),
+        &SecretDefaults::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        poisoned.name, "api.example.com",
+        "the path, and everything a path may carry, is not part of the default name"
+    );
+
+    // A plain URL-scoped target takes the same route, so the rule is one rule and not a special
+    // case for hostile input.
+    let scoped = vhs(
+        "api.example.com/v1",
+        raw_secret_from(vec!["env://TOKEN"]),
+        &SecretDefaults::default(),
+    )
+    .unwrap();
+    assert_eq!(scoped.name, "api.example.com");
+}
+
 // An explicit name and description survive validation; the description is the label the inventory
 // prints beside the name.
 #[test]

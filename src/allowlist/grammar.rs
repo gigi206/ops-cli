@@ -55,6 +55,24 @@ pub(crate) fn classify_in(entry: &str, slot: Slot) -> Result<Rule, String> {
     let rest = rest.trim();
     // `re:` patterns may contain `://`, so they are never scheme-split — always inspected over TLS.
     if let Some(pattern) = rest.strip_prefix("re:") {
+        // A pattern anchored on a scheme other than `https` can never fire, so it is refused at
+        // parse time rather than accepted and silently inert. `Request::new` reconstructs the URL
+        // it matches against as `https://<authority><path>` for *every* request, the cleartext
+        // plane included — so `re:^http://internal\.corp`, the natural spelling for narrowing a
+        // cleartext host one has just opened, matched nothing and said nothing. A deny that cannot
+        // deny is the worst shape a rule can take: it reads as protection.
+        for scheme in ["http://", "tcp://", "ws://", "wss://", "ftp://"] {
+            if let Some(anchored) = pattern.strip_prefix('^')
+                && anchored.starts_with(scheme)
+            {
+                return Err(format!(
+                    "entry `{entry}` anchors a `re:` pattern on `{scheme}`, which can never match \
+                     — the URL a `re:` rule is tested against is always rebuilt as `https://…`, \
+                     whatever transport the request used. Drop the scheme from the pattern (the \
+                     layer is chosen by the rule's own scheme, not by its regex)"
+                ));
+            }
+        }
         let re = Regex::new(pattern).map_err(|e| format!("invalid regex `{pattern}`: {e}"))?;
         return Ok(Rule {
             kind: RuleKind::Regex {
@@ -546,6 +564,18 @@ fn parse_path_rule(
         return Err(format!(
             "entry `{s}` has an invalid host `{host}` before the path (a path rule needs a \
              concrete host or IP; use `re:` for a wildcard host)"
+        ));
+    }
+    // A query written into a path rule is silently dropped on the request side and kept on the
+    // rule's, so the rule matches the path alone while displaying a form that describes something
+    // narrower. `allow = ["files.test/exec?cmd=ls"]`, written to open one call, opened every query
+    // on `/exec` — and `sbx test net` printed the rule back with the query still on it. Refused
+    // here, beside the wildcard-host refusal above and for the same reason: a rule that cannot mean
+    // what it says is an error its author should see, not a silent widening.
+    if let Some((before, _)) = path.split_once('?') {
+        return Err(format!(
+            "entry `{s}` writes a query string in a path rule — a rule matches the path only, so \
+             this would open `{before}` with any query at all. Use `re:` to constrain a query"
         ));
     }
     let subtree = path.ends_with("/*");

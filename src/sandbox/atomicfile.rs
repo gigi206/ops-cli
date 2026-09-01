@@ -27,13 +27,34 @@ use std::path::Path;
 /// The owner-only parent is created if it is missing, and **on either failure — the write (ENOSPC)
 /// or the rename — the temp is removed**, so a failed write leaves nothing behind.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic_mode(path, bytes, None)
+}
+
+/// [`write_atomic`], with `mode` applied to the temp file **before** the rename.
+///
+/// The mode belongs on the temp name, not on the published one. A caller that writes atomically and
+/// *then* calls `set_permissions` has already put the file at its final path with whatever mode the
+/// write gave it, and only afterwards makes it what it has to be — so between the two there is a
+/// file that is there and is not right. For the cage's `xdg-open` router that meant a router
+/// visible at the head of the cage's `PATH` without its executable bit: a launch of the same home
+/// racing that window resolves it and cannot run it. Setting the mode before the rename closes the
+/// window by construction, because the rename is the only thing that appears at the final path and
+/// it appears finished.
+pub(crate) fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<()> {
     use std::fs::DirBuilder;
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, bytes).inspect_err(|_| {
+    let staged = || -> io::Result<()> {
+        std::fs::write(&tmp, bytes)?;
+        if let Some(mode) = mode {
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        }
+        Ok(())
+    };
+    staged().inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })?;
     std::fs::rename(&tmp, path).inspect_err(|_| {
@@ -66,4 +87,46 @@ pub(crate) fn write_atomic_if_changed(path: &Path, bytes: &[u8]) -> io::Result<b
     }
     write_atomic(path, bytes)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::TmpDir;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The published file carries its mode, and a caller that needs one no longer has to set it
+    /// after the rename.
+    #[test]
+    fn write_atomic_mode_publishes_the_file_with_the_mode_it_was_given() {
+        let dir = TmpDir::new();
+        let exe = dir.join("router");
+        write_atomic_mode(&exe, b"#!/bin/sh\n", Some(0o755)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&exe).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        // And the plain form still writes without opinion about the mode.
+        let plain = dir.join("plain");
+        write_atomic(&plain, b"x").unwrap();
+        assert_eq!(std::fs::read(&plain).unwrap(), b"x");
+    }
+
+    /// No caller in `binds` publishes a file and *then* makes it what it has to be.
+    ///
+    /// The cage's `xdg-open` router was written atomically and chmod-ed afterwards, so between the
+    /// two there was a router at the head of the cage's `PATH` without its executable bit — a
+    /// launch of the same home racing that window resolves it and cannot run it. The window closes
+    /// by construction when the mode rides the temp file, and this counts the shape that reopened
+    /// it rather than trusting the one call site to stay converted.
+    #[test]
+    fn binds_publishes_no_file_it_has_to_chmod_afterwards() {
+        let source = include_str!("binds.rs");
+        assert_eq!(
+            source.matches("set_permissions").count(),
+            0,
+            "a mode belongs on the temp file `write_atomic_mode` renames, not on the published one"
+        );
+    }
 }

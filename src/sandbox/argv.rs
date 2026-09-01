@@ -45,12 +45,26 @@ pub(crate) fn compose(spec: &SandboxSpec) -> io::Result<(Vec<OsString>, Option<F
     };
     // The placeholder becomes the descriptor's number here, and only here: this is the one step that
     // can create it, which is what keeps [`to_argv`] pure.
-    let fd = OsString::from(file.as_raw_fd().to_string());
-    for arg in argv.iter_mut() {
-        if arg == ENV_ARGS_PLACEHOLDER {
-            arg.clone_from(&fd);
-        }
-    }
+    //
+    // The slot is found by its **position** — the word after the `--args` that [`to_argv`] wrote —
+    // and not by comparing every element to the placeholder text. This vector also carries every
+    // bind path and the cage's own command, so a substitution by value rewrote any of them that
+    // happened to equal the marker: `sbx run -- printf '%s\n' @sbx-env-args` printed a descriptor
+    // number. The literal is special in exactly one slot, the one sbx put it in; everywhere else it
+    // is a word the caller chose and sbx has no business touching.
+    //
+    // The first `--args` pair is that slot: [`to_argv`] writes it before the cage command, which is
+    // pushed last, so nothing a caller supplies can be found ahead of it.
+    let at = argv
+        .windows(2)
+        .position(|w| w[0] == "--args" && w[1] == ENV_ARGS_PLACEHOLDER)
+        .map(|i| i + 1)
+        .ok_or_else(|| {
+            io::Error::other(
+                "the composed argv carries no `--args` placeholder for the environment descriptor",
+            )
+        })?;
+    argv[at] = OsString::from(file.as_raw_fd().to_string());
     Ok((argv, Some(file)))
 }
 
@@ -73,14 +87,25 @@ fn env_fd(spec: &SandboxSpec) -> io::Result<Option<File>> {
     }
     let mut bytes = Vec::new();
     for (key, value) in spec.secret_env.iter().chain(spec.env.iter()) {
-        if key.as_bytes().contains(&0) || value.as_bytes().contains(&0) {
-            // The name, never the value: reporting the value would print a credential, and the name
-            // is what a person needs to find the declaration.
+        // Which half carried it decides what the message may quote, and the two are not the same
+        // case. A NUL in the *value* is reported by naming the key: that is what a person needs to
+        // find the declaration, and printing the value would print a credential. A NUL in the
+        // *name* is reported without quoting anything — the old message said "the value of `{key}`"
+        // and then printed `key`, so it both mislabelled the half and echoed the poisoned bytes it
+        // exists to refuse into the terminal reading it.
+        let carrier = if key.as_bytes().contains(&0) {
+            Some("a variable name".to_string())
+        } else if value.as_bytes().contains(&0) {
+            Some(format!("the value of `{key}`"))
+        } else {
+            None
+        };
+        if let Some(carrier) = carrier {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "refusing to launch: the value of `{key}` contains a NUL byte, which would \
-                     break out of its own argument and add arguments of its own"
+                    "refusing to launch: {carrier} contains a NUL byte, which would break out of \
+                     its own argument and add arguments of its own"
                 ),
             ));
         }
@@ -571,6 +596,82 @@ mod tests {
                 OsString::from("-c"),
                 OsString::from("id")
             ]
+        );
+    }
+
+    /// Only the slot [`to_argv`] wrote becomes a descriptor number — a cage argument that happens
+    /// to equal the marker is left alone.
+    ///
+    /// The substitution used to be a value comparison over the whole vector, which also carries
+    /// every bind path and the cage's own command: `sbx run -- printf '%s\n' @sbx-env-args`
+    /// printed a descriptor number instead of the word the caller wrote.
+    #[test]
+    fn compose_resolves_the_slot_it_wrote_and_not_a_cage_argument_that_looks_like_it() {
+        let mut with_env = spec(
+            Vec::new(),
+            vec![("SHELL".to_string(), "/bin/sh".to_string())],
+            NetPolicy::Shared,
+        );
+        with_env.cmd = vec![
+            OsString::from("printf"),
+            OsString::from("%s\n"),
+            OsString::from(ENV_ARGS_PLACEHOLDER),
+        ];
+        let (argv, file) = compose(&with_env).expect("compose");
+        let file = file.expect("the spec sets variables, so there is a descriptor");
+
+        let args = argv
+            .iter()
+            .position(|a| a == "--args")
+            .expect("`to_argv` writes `--args` when the cage has an environment");
+        assert_eq!(
+            argv[args + 1],
+            OsString::from(file.as_raw_fd().to_string()),
+            "the slot after `--args` is the descriptor's number"
+        );
+        assert_eq!(
+            argv.iter().filter(|a| *a == ENV_ARGS_PLACEHOLDER).count(),
+            1,
+            "the cage's own argument still reads as the word the caller wrote: {argv:?}"
+        );
+        assert_eq!(
+            argv.last().map(|a| a.as_os_str()),
+            Some(OsString::from(ENV_ARGS_PLACEHOLDER).as_os_str()),
+            "and it is still the last argument, where the command was put"
+        );
+    }
+
+    /// A NUL in a variable *name* and a NUL in its *value* are different refusals, and neither
+    /// quotes the bytes it exists to reject.
+    ///
+    /// One message served both: it said "the value of `{key}`" and then printed `key`, so a
+    /// poisoned name was both mislabelled and echoed into the terminal reading the refusal.
+    #[test]
+    fn a_nul_refusal_names_the_half_that_carried_it_and_quotes_no_payload() {
+        let poisoned_value = spec(
+            Vec::new(),
+            vec![("API_KEY".to_string(), "a\0b".to_string())],
+            NetPolicy::Shared,
+        );
+        let err = compose(&poisoned_value).unwrap_err().to_string();
+        assert!(
+            err.contains("the value of `API_KEY`"),
+            "a poisoned value is found by naming its key: {err}"
+        );
+
+        let poisoned_name = spec(
+            Vec::new(),
+            vec![("PO\0ISON".to_string(), "harmless".to_string())],
+            NetPolicy::Shared,
+        );
+        let err = compose(&poisoned_name).unwrap_err().to_string();
+        assert!(
+            err.contains("a variable name contains a NUL byte"),
+            "a poisoned name is described, not quoted: {err}"
+        );
+        assert!(
+            !err.contains("PO"),
+            "the refusal must not echo the bytes it refuses: {err:?}"
         );
     }
 }
