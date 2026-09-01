@@ -45,15 +45,21 @@ pub(super) fn count_host_secrets(hosts: &BTreeMap<String, RawHostSecrets>) -> us
         .sum()
 }
 
-/// Set the secret for its target and headers, overriding an existing one (last-wins) with a
-/// warning while preserving declaration order. Two secrets to the same host that write the same
-/// header would otherwise inject two copies of it upstream.
+/// Set the secret for its target and headers, overriding **every** declaration it collides with
+/// (last-wins) with a warning apiece, while preserving declaration order. Two secrets to the same
+/// host that write the same header would otherwise inject two copies of it upstream.
 ///
 /// The comparison is over **every** header each declaration writes, not the one it is named by. A
 /// signed declaration's `header` is only the first its plugin's manifest lists, so two signers for
 /// one host whose manifests differ in that first header and agree on a later one read as unrelated
 /// and both went on the wire — which is the exact collision this function exists to prevent, on the
 /// declarations most likely to produce it (a signer writes several headers by design).
+///
+/// One declaration can supersede several at once, and that is not an edge case: a signer writes a
+/// whole list of headers, so an entry writing `X` and an unrelated entry writing `Y` — which do
+/// not collide with each other and so both legitimately stand — are both superseded by a later
+/// signer writing `X` and `Y`. Superseding only the first left the second on the wire, which is
+/// the duplicate this function exists to prevent, reached the long way round.
 pub(super) fn upsert_secret(
     out: &mut Vec<HeaderSecret>,
     warnings: &mut Vec<String>,
@@ -67,18 +73,29 @@ pub(super) fn upsert_secret(
             .find(|h| writes.iter().any(|w| w.eq_ignore_ascii_case(h)))
             .map(|h| (*h).to_string())
     };
-    match out.iter_mut().find_map(|s| {
-        (s.to == secret.to)
-            .then(|| shared(s))
-            .flatten()
-            .map(|h| (s, h))
-    }) {
-        Some((slot, header)) => {
-            warnings.push(format!(
-                "{source}: a later secret overrides an earlier one for `{header}` -> {}",
-                secret.to
-            ));
-            *slot = secret;
+    // Every declaration this one collides with, in declaration order, each with the header that
+    // made it collide. Taking only the first would leave a second writer of a shared header in
+    // place, which is the duplicate on the wire this whole function is here to stop.
+    let clashes: Vec<(usize, String)> = out
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.to == secret.to)
+        .filter_map(|(i, s)| shared(s).map(|h| (i, h)))
+        .collect();
+    match clashes.first() {
+        Some(&(slot, _)) => {
+            for (_, header) in &clashes {
+                warnings.push(format!(
+                    "{source}: a later secret overrides an earlier one for `{header}` -> {}",
+                    secret.to
+                ));
+            }
+            // The new declaration takes the first collider's place, so declaration order survives;
+            // the rest are dropped from the back, so the indices ahead of each removal stay valid.
+            for (i, _) in clashes[1..].iter().rev() {
+                out.remove(*i);
+            }
+            out[slot] = secret;
         }
         None => {
             // Two credentials under one name are legal (the name is a label, not a key) but

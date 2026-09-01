@@ -7506,16 +7506,10 @@ fn a_description_is_flattened_to_one_capped_line() {
     assert_eq!(capped.chars().count(), 200, "the description is capped");
 }
 
-/// The dedup asks what a declaration *writes*, not what it is named by.
-///
-/// A signed declaration's `header` is only the first its plugin's manifest lists, so two signers
-/// for one host whose manifests lead with different headers and agree on a later one read as
-/// unrelated — and both went on the wire, putting two copies of the shared header on the request.
-/// That is the exact collision this function exists to prevent, on the declarations most likely to
-/// produce it: a signer writes several headers by design.
-#[test]
-fn two_signers_sharing_any_header_on_one_host_are_deduped() {
-    let signer = |name: &str, sets: &[&str]| crate::plugins::signer::SignerPlugin {
+/// A signer plugin writing exactly `sets`, for the credential-dedup tests. Only the fields the
+/// dedup reads are meaningful; the rest are the empty defaults.
+fn dedup_signer(name: &str, sets: &[&str]) -> crate::plugins::signer::SignerPlugin {
+    crate::plugins::signer::SignerPlugin {
         name: name.to_string(),
         dir: PathBuf::from(format!("/data/plugins/{name}")),
         exec: PathBuf::from(format!("/data/plugins/{name}/sign")),
@@ -7529,15 +7523,29 @@ fn two_signers_sharing_any_header_on_one_host_are_deduped() {
         version: None,
         description: None,
         host: Default::default(),
-    };
-    let declared = |name: &str, sets: &[&str]| {
-        let reg = PluginRegistry::with_signers([signer(name, sets)]);
-        let mut raw = raw_secret_from(vec!["env://K"]);
-        raw.header = None;
-        raw.value_type = None;
-        raw.sign = Some(name.to_string());
-        vhs_with(raw, &reg).expect("a signed declaration")
-    };
+    }
+}
+
+/// A validated signed declaration for one host, signed by a plugin named `name` that writes `sets`.
+fn dedup_declared(name: &str, sets: &[&str]) -> HeaderSecret {
+    let reg = PluginRegistry::with_signers([dedup_signer(name, sets)]);
+    let mut raw = raw_secret_from(vec!["env://K"]);
+    raw.header = None;
+    raw.value_type = None;
+    raw.sign = Some(name.to_string());
+    vhs_with(raw, &reg).expect("a signed declaration")
+}
+
+/// The dedup asks what a declaration *writes*, not what it is named by.
+///
+/// A signed declaration's `header` is only the first its plugin's manifest lists, so two signers
+/// for one host whose manifests lead with different headers and agree on a later one read as
+/// unrelated — and both went on the wire, putting two copies of the shared header on the request.
+/// That is the exact collision this function exists to prevent, on the declarations most likely to
+/// produce it: a signer writes several headers by design.
+#[test]
+fn two_signers_sharing_any_header_on_one_host_are_deduped() {
+    let declared = dedup_declared;
 
     // Different first headers, one shared later one: the shared header would be written twice.
     let mut out = Vec::new();
@@ -7584,6 +7592,55 @@ fn two_signers_sharing_any_header_on_one_host_are_deduped() {
         !warnings.iter().any(|w| w.contains("overrides")),
         "and nothing is reported as overridden: {warnings:?}"
     );
+}
+
+/// A declaration supersedes *every* one it collides with, not just the first.
+///
+/// Two signers to one host that share no header are two credentials, and both legitimately stand.
+/// A third signer writing both their headers collides with both, and superseding only the first
+/// left the second still injecting its header beside the new signer's own copy of it — the
+/// duplicate on the wire reached the long way round.
+#[test]
+fn a_signer_writing_two_headers_supersedes_both_declarations_that_wrote_them() {
+    let mut out = Vec::new();
+    let mut warnings = Vec::new();
+    let add = |out: &mut Vec<HeaderSecret>, warnings: &mut Vec<String>, name, sets: &[&str]| {
+        upsert_secret(out, warnings, "global config", dedup_declared(name, sets));
+    };
+    add(&mut out, &mut warnings, "alpha", &["Authorization"]);
+    add(&mut out, &mut warnings, "beta", &["Signature"]);
+    assert_eq!(
+        out.len(),
+        2,
+        "these two share no header, so nothing collides"
+    );
+
+    add(
+        &mut out,
+        &mut warnings,
+        "gamma",
+        &["Authorization", "Signature"],
+    );
+    assert_eq!(
+        out.len(),
+        1,
+        "the later signer writes both headers, so it supersedes both earlier writers: {:?}",
+        out.iter().map(|s| s.headers()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        out[0].headers(),
+        vec!["Authorization", "Signature"],
+        "and what survives is the later declaration, in the first collider's place"
+    );
+    for header in ["Authorization", "Signature"] {
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("overrides") && w.contains(header)),
+            "each superseded declaration is named by the header that made it collide, \
+             and `{header}` is not: {warnings:?}"
+        );
+    }
 }
 
 // Two credentials may legally share a name (it is a label, not a key), but a redacted value
