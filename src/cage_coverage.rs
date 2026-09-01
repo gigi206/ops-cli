@@ -97,6 +97,115 @@ fn named_suites(relative: &str) -> BTreeSet<String> {
     })
 }
 
+/// Every fully qualified test path a CI file names, as the file that names it and the path.
+///
+/// Read from `.github/` and `mise.toml` together because a filter and the prose describing it have
+/// drifted apart before, and a reader looking for one finds the other.
+fn test_paths_named_by_ci() -> Vec<(String, String)> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "yml" || e == "yaml") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&root().join(".github"), &mut files);
+    files.push(root().join("mise.toml"));
+
+    let mut found = Vec::new();
+    for file in files {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let name = file
+            .strip_prefix(root())
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .into_owned();
+        for token in text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':')) {
+            if token.contains("::tests::") {
+                found.push((name.clone(), token.to_string()));
+            }
+        }
+    }
+    found
+}
+
+/// A CI filter that names a test which does not exist silences nothing, and says so to no one.
+///
+/// `cargo test -- --skip <path>` treats a path matching no test as satisfied, so a filter keeps
+/// reading as though it still excludes something while the run it guards has quietly changed. That
+/// is not hypothetical here: the systemd dollar test was renamed in 358bd4b, five places were
+/// realigned in c0136ad, and the composite build action kept the old name because it had been
+/// written days earlier and nobody was looking at it. The filter had stopped excluding anything,
+/// and the only reason nothing broke is that the test also refuses itself on a host without a user
+/// session, which is a second mechanism doing the first one's job by accident.
+///
+/// **The limit.** This reads fully qualified paths, which is what a live filter is written as. A
+/// bare function name in prose is not matched, because an unqualified identifier cannot be told
+/// from any other snake_case word without guessing, and a guard that guesses reports drift where
+/// there is none.
+#[test]
+fn every_test_a_ci_file_names_exists() {
+    let declared: Vec<String> = walk_sources()
+        .into_iter()
+        .flat_map(|text| {
+            text.match_indices("fn ")
+                .filter_map(|(i, _)| {
+                    let rest = &text[i + 3..];
+                    let end = rest.find(['(', '<', ' ', '\n'])?;
+                    Some(rest[..end].to_string())
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    let mut missing = Vec::new();
+    for (file, path) in test_paths_named_by_ci() {
+        let leaf = path.rsplit("::").next().unwrap_or_default();
+        if !declared.iter().any(|d| d == leaf) {
+            missing.push(format!(
+                "  {file} names `{path}`, and no test is called `{leaf}`"
+            ));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "a CI file filters on a test that does not exist, so the filter excludes nothing:\n{}",
+        missing.join("\n")
+    );
+}
+
+/// Every `.rs` file under `src/` and `tests/`, as its contents.
+fn walk_sources() -> Vec<String> {
+    fn walk(dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                out.push(text);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&root().join("src"), &mut out);
+    walk(&root().join("tests"), &mut out);
+    out
+}
+
 #[test]
 fn both_cage_runs_name_every_suite_that_carries_a_cage_skip() {
     // Both lists are pinned to the same set in both directions, which is also what makes them

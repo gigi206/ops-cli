@@ -28,7 +28,7 @@ inputs:
       `systemd-run`, which differs across systemd versions and fails on a hosted runner while
       passing locally.
     required: false
-    default: sandbox::cgroup::tests::an_escaped_dollar_argument_reaches_the_program_verbatim
+    default: sandbox::cgroup::tests::a_dollar_argument_reaches_the_program_verbatim
 
 runs:
   using: composite
