@@ -973,7 +973,8 @@ fn flag_value_kind(flag: &str, path: &[&str]) -> Option<ValueKind> {
             None => continue,
         };
         // A fused `[=true|false]` list is a literal.
-        if let Some(inner) = tail.strip_prefix('[') {
+        if tail_is_fused(tail) {
+            let inner = tail.trim_start_matches('[');
             let inner = inner.strip_suffix(']').unwrap_or(inner);
             let inner = inner.strip_prefix('=').unwrap_or(inner);
             if inner.contains('|') {
@@ -1024,13 +1025,28 @@ fn alternation_cells(tail: &str) -> Option<Vec<String>> {
         .then_some(cells)
 }
 
-/// Whether a documented flag takes a value at all, completable or not. The question
+/// Whether a documented flag consumes the word that follows it. The question
 /// [`flag_value_kind`] answers is narrower — *which* value — and a flag whose value sbx
 /// cannot complete still consumes the word after it.
+///
+/// A **fused** value does not, and asking the row is how that is known: `--gpu[=true|false]` is
+/// optional-value, and `take_override_flag` gives it a dedicated path precisely so it never eats
+/// the following argument — otherwise `sbx app --gpu <name>` would swallow the app name. Counting
+/// it here made the completion disagree with the parser twice over: it offered `true`/`false` as
+/// the next word, which the parser would then read as the command, and it swallowed a real operand
+/// typed there, shifting every slot after it.
 fn flag_takes_value(flag: &str, path: &[&str]) -> bool {
     help::options_of(path)
         .iter()
-        .any(|(row, _)| flag_tail(row, flag).is_some())
+        .any(|(row, _)| flag_tail(row, flag).is_some_and(|tail| !tail_is_fused(tail)))
+}
+
+/// Whether a [`flag_tail`] is fused to the flag name (`--gpu[=true|false]`) rather than following
+/// it as its own word (`--app <name>`). One definition, because the two readers must agree: the
+/// value kind is a literal cell list only in the fused case, and the following word is consumed
+/// only in the other.
+fn tail_is_fused(tail: &str) -> bool {
+    tail.starts_with('[')
 }
 
 /// The value cell of a flag metavar — the shared vocabulary `--app <name>`,
@@ -1593,9 +1609,17 @@ mod tests {
         // `--verdict <allow|deny|blocked|error>` on `net logs`.
         let verdict = names_at(&["net", "logs", "--verdict"], "");
         assert!(verdict.contains(&"blocked".to_string()));
-        // An inline `[=…]` list: `--gpu[=true|false]`.
-        let gpu = names_at(&["run", "--gpu"], "");
-        assert_eq!(gpu, ["false", "true"]);
+        // An inline `[=…]` list: `--gpu[=true|false]`. The value is fused, so it belongs to the
+        // flag's own word and never to the next one: `take_override_flag` gives these three flags a
+        // path that does not consume the following argument, so a cell offered there would produce
+        // a line the parser reads as `sbx run <command>` with the cell standing in for the command.
+        let gpu = names_at(&["run"], "--gpu=");
+        assert_eq!(gpu, ["false", "true"], "the cells, on the flag's own word");
+        let after_gpu = names_at(&["run", "--gpu"], "");
+        assert!(
+            !after_gpu.iter().any(|c| c == "true" || c == "false"),
+            "the word after a bare `--gpu` is the command's own, not the flag's value: {after_gpu:?}"
+        );
 
         // A flag that takes a file hands the word to the shell — including one whose
         // metavariable carries its own grammar, `--bind <path[:ro|:rw]>`.
