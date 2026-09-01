@@ -564,7 +564,18 @@ fn plan_app_upgrade(cfg: &config::Resolved, app: &config::ResolvedApp) -> AppUpg
     };
     // Both layers: an app's cage equips the project baseline's packages as well as its own, so a
     // baseline `deb:` is as much a part of "how does this app advance" as one the app declares.
+    //
+    // Merged by name before being walked, the way `Resolved::merge_app` merges them for the launch
+    // the plan describes: the app's declaration overrides the baseline's of that name rather than
+    // joining it, so one effective package is one package here. Walking the two lists in sequence
+    // counted a re-declared name twice, and `withheld` is a count -- it reported two untrusted
+    // packages where the cage equips one.
+    let mut effective: std::collections::BTreeMap<&str, &config::Package> =
+        std::collections::BTreeMap::new();
     for pkg in cfg.packages.iter().chain(app.packages.iter()) {
+        effective.insert(pkg.name.as_str(), pkg);
+    }
+    for pkg in effective.into_values() {
         if pkg.state != trust::TrustState::Trusted {
             plan.withheld += 1;
         }
@@ -1958,6 +1969,35 @@ mod tests {
         let plan = plan_app_upgrade(&routing, &routing.apps["reader"]);
         assert!(!plan.mise && !plan.provision);
         assert_eq!(plan.project_wide, vec!["nix", "tarball"]);
+    }
+
+    /// A name both layers declare is one package, and the app's declaration is the one that decides.
+    ///
+    /// `Resolved::merge_app` overrides by name for the launch this plan describes, so the plan has
+    /// to merge the same way. Walking the two lists in sequence counted a re-declared name twice --
+    /// two untrusted packages reported where the cage equips one -- and let the baseline's backend
+    /// name a channel the app's declaration had replaced.
+    #[test]
+    fn a_package_both_layers_declare_is_counted_once_and_the_app_decides() {
+        let mut baseline = pkg("tool", config::Backend::Nix("hello".into()));
+        baseline.state = crate::trust::TrustState::Untrusted;
+        let mut own = pkg("tool", config::Backend::Mise("aqua:owner/tool".into()));
+        own.state = crate::trust::TrustState::Untrusted;
+        let cfg = crate::testutil::resolved(
+            vec![baseline],
+            vec![("demo", crate::testutil::app_with(vec![own]))],
+        );
+        let plan = plan_app_upgrade(&cfg, &cfg.apps["demo"]);
+        assert_eq!(
+            plan.withheld, 1,
+            "one effective package, one withheld count"
+        );
+        assert!(
+            plan.project_wide.is_empty(),
+            "the app's `mise:` replaces the baseline's `nix:`, so no project-wide channel is \
+             named: {:?}",
+            plan.project_wide
+        );
     }
 
     /// A package an untrusted layer declared is counted, not silently dropped.
