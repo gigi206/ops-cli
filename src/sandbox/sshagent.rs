@@ -477,6 +477,10 @@ fn respond<S: Read + Write>(
     conn: &mut Conn<'_>,
 ) -> io::Result<Vec<u8>> {
     let refused = vec![FAILURE];
+    // Defence at the sink, and unreachable from the socket: [`read_message`] refuses a zero-length
+    // frame before one gets here, so the only caller that can produce this is a test. It stays
+    // because this function takes a slice rather than a frame, and a caller that hands it an empty
+    // one must be answered rather than indexed into.
     let Some((&kind, payload)) = request.split_first() else {
         conn.ring.push(AgentKind::Refuse, "an empty request");
         return Ok(refused);
