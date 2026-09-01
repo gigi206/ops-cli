@@ -1031,6 +1031,15 @@ fn cache_reachable() -> bool {
 /// field, rather than from an upstream error message that is part of no contract. Best effort in
 /// one direction only: no `curl`, no answer, or an answer that will not parse all say the quota is
 /// fine, so this can only ever turn a failure into a counted skip, never the reverse.
+///
+/// The margin is the point, and a bare "any budget left" was not one. Resolving a `mise:aqua:`
+/// release is several requests, not one, so a test admitted on the strength of a single remaining
+/// call spends the budget partway through and fails on the half it could not finish — after the
+/// gate has already answered that the quota was fine. That is the shape this whole function exists
+/// to prevent, arriving through the gate itself, and it reads as an unstable test rather than as
+/// the exhausted shared resource it is: a different suite each time, always one of the `aqua:`
+/// family, never reproducible alone. Requiring room for a whole resolution makes the skip land
+/// before the work instead of during it.
 fn github_api_has_quota() -> bool {
     let Ok(out) = std::process::Command::new("curl")
         .args([
@@ -1043,8 +1052,16 @@ fn github_api_has_quota() -> bool {
     else {
         return true;
     };
-    quota_remaining(&String::from_utf8_lossy(&out.stdout)).is_none_or(|remaining| remaining > 0)
+    quota_remaining(&String::from_utf8_lossy(&out.stdout))
+        .is_none_or(|remaining| remaining >= AQUA_RESOLVE_BUDGET)
 }
+
+/// The room one `mise:aqua:` test needs left in the hourly budget before it is worth starting.
+///
+/// Not one: a release resolution is several requests. Not the whole suite's need either, which
+/// would skip a run that could have finished — each test asks this for itself, immediately before
+/// its own work, so what has to fit is one resolution and not five.
+const AQUA_RESOLVE_BUDGET: u32 = 5;
 
 /// The `core` budget left, read out of a `rate_limit` body. `None` when the body says nothing this
 /// can be read from, which the caller treats as "fine" rather than as an accusation.
