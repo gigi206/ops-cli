@@ -19,6 +19,13 @@
 # virtualisation WSL2 needs is not a contract GitHub publishes. This workflow is what measures it:
 # if the distribution cannot boot, the run fails here and names that, which is a finding rather than
 # a silent skip.
+#
+# The GUI path is the other thing left unasserted, and this one cannot be fixed by wanting it. A
+# caged application's window reaches the desktop through WSLg, which attaches to one Windows session
+# and draws nothing anywhere else. A hosted runner has no desktop session at all, so an arm added
+# here would launch an application, watch it exit zero, and prove nothing. That failure is silent by
+# construction: the process runs, reports success, and its window exists where no one can see it,
+# which is exactly why it is called out here rather than left to be inferred from its absence.
 
 name: wsl
 

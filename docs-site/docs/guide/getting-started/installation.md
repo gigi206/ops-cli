@@ -80,8 +80,11 @@ Three further differences are worth knowing before they surprise you:
   desktop notification are reported on stderr, and `doctor` says so. This is a gap in
   the distribution rather than a limit of `sbx`, which speaks the ordinary freedesktop
   protocol: give the session a service owning `org.freedesktop.Notifications` and
-  refusals reach the Windows notification centre like any other application's, with no
-  change to `sbx` and no setting to turn on.
+  refusals reach the Windows notification centre, with no change to `sbx` and no
+  setting to turn on. What that service does on the Windows side is its own problem
+  and not a small one: a relay must raise a modern toast under a registered
+  application id, because the older balloon call returns without error and leaves
+  nothing behind in the centre.
 - **No encapsulated storage volume.** A distribution's filesystem is an ordinary
   one, so the store is a plain directory rather than a compressed volume.
   `$SBX_DATA_DIR` can still point `sbx` at a volume that is mounted.
