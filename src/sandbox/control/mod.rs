@@ -1172,8 +1172,16 @@ fn handle(
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new((&stream).take(CMD_MAX));
     let mut line = String::new();
-    reader.read_line(&mut line)?;
-    let response = dispatch(line.trim(), state, manual, log, flows, capture);
+    let n = reader.read_line(&mut line)?;
+    // A command that filled the bound with no terminating newline was truncated, and dispatching a
+    // truncated command is dispatching a *different* one: `REMEMBER ALLOW <rule>` cut short is
+    // another rule, which the `session` token then loads into the live overlay. Refused rather than
+    // parsed — the rule the reply reader already applies on the other half of this exchange
+    // ([`client`]), where a partial host would be persisted by `--save`.
+    let response = match n as u64 >= CMD_MAX && !line.ends_with('\n') {
+        true => "err bad-request\n".to_string(),
+        false => dispatch(line.trim(), state, manual, log, flows, capture),
+    };
     (&stream).write_all(response.as_bytes())?;
     (&stream).flush()
 }
@@ -1938,6 +1946,53 @@ mod tests {
         assert_eq!(
             dispatch("FLOWS", &state, &manual, &log, &flows, None),
             "ok\n"
+        );
+    }
+
+    /// A command that fills the bound without a terminator was truncated, and a truncated command
+    /// is a different command.
+    ///
+    /// `REMEMBER ALLOW <rule>` cut short is another rule, and this form loads straight into the
+    /// live overlay the proxy folds into its policy. The reply half of the same exchange already
+    /// refuses a line that filled its bound with no newline, for the mirror-image reason: a partial
+    /// host that `--save` would persist. The command half read it as complete and dispatched it.
+    #[test]
+    fn a_command_that_fills_the_bound_without_a_newline_is_refused() {
+        use crate::testutil::TmpDir;
+        use std::io::{Read, Write};
+        let data = TmpDir::new();
+        std::fs::create_dir_all(control_dir(data.path())).unwrap();
+        let pid = 24681u32;
+        let sock = control_socket(data.path(), pid);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let manual = Arc::new(ManualRules::new());
+        let served_manual = manual.clone();
+        thread::spawn(move || {
+            let _ = serve(
+                listener,
+                Arc::new(PendingState::new()),
+                served_manual,
+                Arc::new(LogRing::new(LOG_RING_CAP)),
+                Arc::new(FlowRegistry::new()),
+                None,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+        });
+
+        let mut cmd = b"REMEMBER ALLOW allowed.test/".to_vec();
+        cmd.resize(CMD_MAX as usize, b'a');
+        let stream = UnixStream::connect(&sock).unwrap();
+        (&stream).write_all(&cmd).unwrap();
+        (&stream).flush().unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut reply = String::new();
+        (&stream).read_to_string(&mut reply).unwrap();
+
+        assert_eq!(reply, "err bad-request\n");
+        let (allow, deny) = manual.snapshot();
+        assert!(
+            allow.is_empty() && deny.is_empty(),
+            "and the truncation never reached the overlay: {allow:?} {deny:?}"
         );
     }
 
