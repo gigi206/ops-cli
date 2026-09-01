@@ -1,0 +1,243 @@
+# WSL2 — proves the cage runs on a Windows host's Linux subsystem, and says which branch it ran on.
+#
+# WHAT PROBLEM THIS SOLVES. Every other workflow here runs on Linux. WSL2 is a real Linux kernel,
+# but it is not the shape the suites were written against: a distribution starts processes under
+# `/init.scope` rather than in the launching user's slice, systemd is opt-in per distribution, and
+# the Windows drive is mounted through a filesystem that synthesises permission bits. Each of those
+# has already changed how `sbx` behaves. The delegation root read for resource limits was derived
+# from the caller's own cgroup, which is empty of the user slice here, so the cage ran uncapped on a
+# host whose user manager would have enforced every property asked of it. Nothing in CI could have
+# reported that, because nothing in CI ran on WSL2.
+#
+# WHAT THIS RUN ASSERTS, AND WHY IT IS A MATRIX. `systemd` is the axis that decides whether resource
+# limits are available at all, and both settings are shapes a user really runs: a distribution
+# installed from the store enables it, an imported one does not unless asked. Running both is what
+# makes the difference a standing measurement rather than a property of whichever one was picked.
+# `fail-fast: false` so one arm never hides the other's report.
+#
+# WHAT IS DELIBERATELY NOT ASSERTED. Whether a GitHub-hosted Windows runner offers the nested
+# virtualisation WSL2 needs is not a contract GitHub publishes. This workflow is what measures it:
+# if the distribution cannot boot, the run fails here and names that, which is a finding rather than
+# a silent skip.
+
+name: wsl
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly. The runner image, its WSL package and the distribution image all move underneath this
+    # without a commit here, and a break in any of them is a break for a user on that platform.
+    - cron: "0 4 * * 1"
+  push:
+    paths:
+      - .github/workflows/wsl.yml
+      - .github/actions/build-static-sbx/**
+      - src/**
+      - proc-shim/**
+      - Cargo.toml
+      - Cargo.lock
+      - build.rs
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wsl-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Same revision the publish workflows realise their bundled engines from, so what is exercised
+  # here is the artifact a user would install rather than one built only for this run.
+  NIXPKGS_REV: "89570f24e97e614aa34aa9ab1c927b6578a43775"
+
+jobs:
+  binary:
+    name: build the artifact a user would install
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # The bundled build is what makes the WSL arm cheap: the binary carries its own static `nix`
+      # and `bwrap`, so the distribution needs neither installed and the run measures `sbx` rather
+      # than a package manager.
+      - name: Build the self-contained static musl binary
+        uses: ./.github/actions/build-static-sbx
+        with:
+          nixpkgs-rev: ${{ env.NIXPKGS_REV }}
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbx-linux-x86_64
+          path: sbx-linux-x86_64
+          retention-days: 1
+
+  wsl:
+    name: exercise the cage under WSL2 (systemd=${{ matrix.systemd }})
+    needs: binary
+    runs-on: windows-2025
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        systemd: [true, false]
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sbx-linux-x86_64
+
+      - name: Install WSL2 and a distribution
+        uses: Vampire/setup-wsl@d1da7f2c0322a5ee4f24975344f67fc0f5baf364 # v7.0.0
+        with:
+          distribution: Ubuntu-24.04
+          wsl-version: 2
+          # The matrix axis. Written into the distribution's own `/etc/wsl.conf`, which is where a
+          # user sets it, so the arm differs from the other in exactly the way a host would.
+          wsl-conf: |
+            [boot]
+            systemd=${{ matrix.systemd }}
+          # `ca-certificates` is the one package the bundled engines still need from the
+          # distribution: the store is realised over TLS from the binary cache.
+          additional-packages: ca-certificates
+
+      - name: Report what this distribution can do
+        # Measured before the assertions, and kept whatever they do: when an assertion below fails,
+        # the first question is whether this shape could have satisfied it, and the answer belongs
+        # beside the failure rather than in a reader's inference.
+        shell: wsl-bash {0}
+        run: |
+          set -uo pipefail
+          {
+            echo "### WSL2 capability (systemd=${{ matrix.systemd }})"
+            echo
+            echo '```'
+            echo "kernel:        $(uname -r)"
+            echo "distribution:  $(. /etc/os-release; echo "$PRETTY_NAME")"
+            echo "PID 1:         $(cat /proc/1/comm)"
+            echo "own cgroup:    $(cut -d: -f3 /proc/self/cgroup | head -1)"
+            echo "cgroup fs:     $(findmnt -no FSTYPE /sys/fs/cgroup 2>/dev/null || echo none)"
+            printf 'userns:        '
+            if unshare --user --map-root-user true 2>/dev/null; then echo usable; else echo REFUSED; fi
+            echo "apparmor knob: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"
+            echo "XDG_RUNTIME_DIR: ${XDG_RUNTIME_DIR:-unset}"
+            printf 'session bus:   '
+            if [ -S "${XDG_RUNTIME_DIR:-/nonexistent}/bus" ]; then echo present; else echo ABSENT; fi
+            printf 'delegated:     '
+            cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers" 2>/dev/null \
+              || echo "no delegation root"
+            echo '```'
+          } | tee "$HOME/summary.md"
+
+      - name: Stage the binary off the Windows drive
+        # `/mnt/c` is mounted through drvfs, which synthesises permission bits: the executable bit
+        # does not reliably survive there, and a launch from that path would also bind the Windows
+        # profile into the cage. Both are what the guide tells a user to avoid, so the run does it
+        # the documented way rather than a way only CI could use.
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          # The wrapper starts in the checkout, reached through drvfs; the artifact was
+          # downloaded there. Relative, because the GitHub path variables are not promised to
+          # survive into the distribution and a missing one would read as an empty prefix.
+          test -f ./sbx-linux-x86_64 || { echo "the artifact is not in the working directory"; ls -la; exit 1; }
+          cp ./sbx-linux-x86_64 "$HOME/sbx"
+          chmod +x "$HOME/sbx"
+          mkdir -p "$HOME/project"
+          "$HOME/sbx" --version
+
+      - name: The preflight must pass on this platform
+        shell: wsl-bash {0}
+        run: |
+          set -uo pipefail
+          cd "$HOME/project"
+          "$HOME/sbx" doctor 2>&1 | tee "$HOME/doctor.txt"
+          status=${PIPESTATUS[0]}
+          {
+            echo "### doctor (systemd=${{ matrix.systemd }})"
+            echo
+            echo '```'
+            cat "$HOME/doctor.txt"
+            echo '```'
+          } >> "$HOME/summary.md"
+          [ "$status" -eq 0 ] || { echo "doctor exited $status"; exit 1; }
+          # The boundary itself, which never degrades: a live launch proved the namespace carries
+          # capabilities. A doctor that passed without this line would be passing on something else.
+          grep -q "capability-bearing" "$HOME/doctor.txt" \
+            || { echo "doctor passed without proving capability-bearing namespaces"; exit 1; }
+
+      - name: Resource limits must match what this shape can offer
+        # The regression this arm exists for. With a user manager reachable, the delegation root is
+        # readable even though the caller sits outside the user slice, and the cage is capped; the
+        # earlier behaviour reported the opposite and ran uncapped. Without one there is nothing to
+        # register a scope against, and degrading is correct rather than a failure.
+        shell: wsl-bash {0}
+        run: |
+          set -uo pipefail
+          line=$(grep -E "resource limits" "$HOME/doctor.txt" || true)
+          echo "reported: $line"
+          if [ "${{ matrix.systemd }}" = "true" ]; then
+            case "$line" in
+              *"[ ok ]"*) echo "capped, as this shape allows" ;;
+              *) echo "a user manager is reachable here, so the cage must be capped"; exit 1 ;;
+            esac
+          else
+            case "$line" in
+              *"[warn]"*) echo "degraded, which is the documented behaviour without systemd" ;;
+              *) echo "no user session exists here, so the limits must be reported unavailable"; exit 1 ;;
+            esac
+          fi
+
+      - name: A real cage must launch and be the sandbox user
+        # The preflight is not the product. This runs a command through `sbx`'s own verb and asserts
+        # the same-uid model held: the cage reports the synthetic name on the caller's own uid.
+        shell: wsl-bash {0}
+        run: |
+          set -uo pipefail
+          cd "$HOME/project"
+          "$HOME/sbx" run -- id 2>&1 | tee "$HOME/run.txt"
+          status=${PIPESTATUS[0]}
+          {
+            echo "### a real cage launch (systemd=${{ matrix.systemd }})"
+            echo
+            echo '```'
+            cat "$HOME/run.txt"
+            echo '```'
+          } >> "$HOME/summary.md"
+          [ "$status" -eq 0 ] || { echo "the launch exited $status"; exit 1; }
+          grep -q "uid=$(id -u)(sandbox)" "$HOME/run.txt" \
+            || { echo "the cage did not report the sandbox user on the caller's uid"; exit 1; }
+
+      - name: The host filesystem must be absent from the cage
+        # Confidentiality by absence is the model, and WSL2 is where it is easiest to breach by
+        # accident: the Windows profile is one `cd` away under /mnt/c. Assert the cage cannot see
+        # the distribution's home either, which is what the bind layout is supposed to guarantee.
+        shell: wsl-bash {0}
+        run: |
+          set -uo pipefail
+          cd "$HOME/project"
+          # Asked as a predicate the cage itself answers, so the verdict is an exit status rather
+          # than a phrase: an error message mentioning the path would satisfy a text match while
+          # meaning the opposite.
+          # Three branches, not two: a launch that never ran also exits non-zero, and reading
+          # that as "the path is absent" would turn a broken probe into a passing assertion. The
+          # cage answers in a word, and anything else is the probe failing to speak.
+          probe() {
+            "$HOME/sbx" run -- sh -c "if [ -e '$1' ]; then echo VISIBLE; else echo ABSENT; fi" 2>&1
+          }
+          for path in /mnt/c "$HOME/sbx"; do
+            out=$(probe "$path")
+            case "$out" in
+              *VISIBLE*) echo "$path is reachable inside the cage"; exit 1 ;;
+              *ABSENT*)  echo "$path absent from the cage, as the model requires" ;;
+              *)         echo "the probe for $path did not run: $out"; exit 1 ;;
+            esac
+          done
+
+      - name: Publish the report collected inside the distribution
+        # Written from Windows, where `$GITHUB_STEP_SUMMARY` is certainly defined. `if: always()`
+        # so a failing assertion still lands its evidence beside itself.
+        if: always()
+        shell: pwsh
+        run: |
+          $body = wsl.exe -d Ubuntu-24.04 -- sh -c 'cat "$HOME/summary.md" 2>/dev/null'
+          if ($body) { $body | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8 }
