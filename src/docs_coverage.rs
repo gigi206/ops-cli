@@ -418,6 +418,90 @@ fn the_shipped_counts_the_guide_states_are_the_real_ones() {
     );
 }
 
+/// A bundle's field table names every field a bundle may carry.
+///
+/// The table under "What a bundle may carry" is read as exhaustive, and the prose beneath it says
+/// so in as many words: the line it draws is "the design, not a shortlist". Nothing held it to the
+/// struct, and it drifted three times, always the same way: a field arrives, the launch reads it,
+/// the table does not learn of it. `binary` was the sharpest of the three, sitting beside the row
+/// that already named its three sibling resolvers.
+///
+/// Fields come from the source rather than a list written here, for the reason the table itself
+/// failed: a hand-list goes stale exactly as the prose did, and the guard would then assert only
+/// that someone once agreed with themselves.
+///
+/// `rest` is the one field left out, and the only one that can be: `#[serde(flatten)]` makes it the
+/// holder for keys sbx does not know, reported at launch rather than declared by anyone.
+#[test]
+fn every_bundle_field_is_named_in_the_bundles_field_table() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(root.join("src/config/schema.rs"))
+        .expect("the config schema source is readable");
+    let page = std::fs::read_to_string(root.join("docs-site/docs/guide/configuration/bundles.md"))
+        .expect("the bundles page exists");
+
+    // The first column of that one table, not the page: a field named anywhere in the prose, or in
+    // the second column listing what a bundle deliberately does NOT carry, would answer the wrong
+    // question.
+    let carries: String = page
+        .lines()
+        .skip_while(|line| !line.starts_with("| Carries |"))
+        .skip(2)
+        .take_while(|line| line.starts_with('|'))
+        .filter_map(|line| line.split('|').nth(1))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let fields = struct_fields(&source, "RawBundle");
+    assert!(
+        fields.len() > 10,
+        "the RawBundle parse found only {} field(s), so it has stopped matching the source's shape \
+         and would pass vacuously",
+        fields.len()
+    );
+    let missing: Vec<String> = fields
+        .into_iter()
+        .filter(|field| field != "rest")
+        .filter(|field| !carries.contains(&format!("`{field}`")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "a bundle may carry these fields and the bundles page's field table does not name them, \
+         though it reads as the whole list: {missing:?}"
+    );
+}
+
+/// The TOML spellings of `struct <name>`'s fields, read out of `source`.
+///
+/// Shared by the two checks that hold a page to a struct: one reads the keys an example may use,
+/// the other the fields a table must name. Both would otherwise hand-list them, which is the drift
+/// they exist to catch.
+fn struct_fields(source: &str, name: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let Some(rest) = source.split_once(&format!("struct {name} {{")) else {
+        return out;
+    };
+    let body = rest.1.split("\n}").next().unwrap_or("");
+    let mut renamed: Option<String> = None;
+    for line in body.lines() {
+        let line = line.trim();
+        if line.starts_with("#[") {
+            if let Some(rest) = line.split("rename = \"").nth(1)
+                && let Some(name) = rest.split('"').next()
+            {
+                renamed = Some(name.to_string());
+            }
+            continue;
+        }
+        if let Some((name, _)) = line.strip_prefix("pub(crate) ").and_then(field_decl) {
+            out.insert(renamed.take().unwrap_or(name));
+        } else if !line.is_empty() && !line.starts_with("//") {
+            renamed = None;
+        }
+    }
+    out
+}
+
 /// Every named-table example in the guide uses keys the struct behind it actually has.
 ///
 /// A worked example is the part of a page a reader copies, so an example that cannot work is worse
@@ -435,53 +519,26 @@ fn every_named_table_example_uses_real_keys() {
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config/schema.rs"))
             .expect("the config schema source is readable");
 
-    // `struct Name { … }` → the TOML spellings of its fields.
-    let struct_fields = |name: &str| -> BTreeSet<String> {
-        let mut out = BTreeSet::new();
-        let Some(rest) = source.split_once(&format!("struct {name} {{")) else {
-            return out;
-        };
-        let body = rest.1.split("\n}").next().unwrap_or("");
-        let mut renamed: Option<String> = None;
-        for line in body.lines() {
-            let line = line.trim();
-            if line.starts_with("#[") {
-                if let Some(rest) = line.split("rename = \"").nth(1)
-                    && let Some(name) = rest.split('"').next()
-                {
-                    renamed = Some(name.to_string());
-                }
-                continue;
-            }
-            if let Some((name, _)) = line.strip_prefix("pub(crate) ").and_then(field_decl) {
-                out.insert(renamed.take().unwrap_or(name));
-            } else if !line.is_empty() && !line.starts_with("//") {
-                renamed = None;
-            }
-        }
-        out
-    };
-
     // (the table family, the struct its named entries deserialize into, extra keys it reserves)
     let families: Vec<(&str, BTreeSet<String>)> = vec![
         (
             "secret",
-            struct_fields("RawHostSecret")
+            struct_fields(&source, "RawHostSecret")
                 .into_iter()
-                .chain(struct_fields("RawSecretDefaults"))
+                .chain(struct_fields(&source, "RawSecretDefaults"))
                 .chain(["defaults".to_string()])
                 .collect(),
         ),
         (
             "task",
-            struct_fields("RawTask")
+            struct_fields(&source, "RawTask")
                 .into_iter()
-                .chain(struct_fields("RawTaskDefaults"))
+                .chain(struct_fields(&source, "RawTaskDefaults"))
                 .chain(["defaults".to_string()])
                 .collect(),
         ),
-        ("app", struct_fields("RawApp")),
-        ("bundle", struct_fields("RawBundle")),
+        ("app", struct_fields(&source, "RawApp")),
+        ("bundle", struct_fields(&source, "RawBundle")),
     ];
     for (family, fields) in &families {
         assert!(
