@@ -178,6 +178,13 @@ fn provision_command(
 ///
 /// `allow_unfree` opts the one build into the unfree-permitting invocation described on
 /// [`provision_unfree`].
+///
+/// Writes the out-link and no stamp, deliberately: a `nix:` attribute names the pinned channel
+/// revision, so `nix build` is an eval-cache hit and there is nothing for a short-circuit to save.
+/// It may nevertheless repoint an out-link that a stamping provisioner wrote — `[packages]` roots
+/// every entry at `<gcroots>/<name>` whatever backend declared it — which is why the stamp records
+/// its target and [`reuse_built_expr`] checks it, rather than each non-stamping writer being made
+/// to clear a stamp it does not know about.
 fn provision_licensed(
     nix: &Path,
     layout: &Layout,
@@ -330,6 +337,9 @@ fn source_path_from_metadata(stdout: &str) -> Option<PathBuf> {
 /// target to a locked ref → a rebuild), and makes a pinned flake a warm no-op until a roll changes its
 /// locked ref. The reuse also lets a warm launch — and a fresh project seeding the shared build — skip
 /// nix entirely, so it works offline.
+///
+/// The stamp records the out-link's target beside the digest, and [`reuse_built_expr`] requires both:
+/// this gcroot is shared with the `nix:` path, which writes the out-link and stamps nothing.
 pub(crate) fn provision_flake(
     nix: &Path,
     layout: &Layout,
@@ -378,7 +388,7 @@ pub(crate) fn provision_flake(
     let resolved = select_marked_output(layout, &stdout, label, marker)?;
     // Stamp only after a successful, marked build, so a failed build never leaves a stamp that would
     // short-circuit to a nonexistent output next launch.
-    write_expr_stamp(&stamp, &digest);
+    write_expr_stamp(&stamp, &digest, &resolved);
     Ok(resolved)
 }
 
@@ -393,9 +403,9 @@ pub(crate) fn provision_flake(
 /// Unlike a flake-attr build, an `--expr` build is **not** covered by nix's flake eval-cache, so
 /// `nix build` re-evaluates the whole `getFlake` expression (~1s) on every launch even when the
 /// output is fully built. To avoid that, this short-circuits: a sibling stamp (`<gcroot>.expr`)
-/// records the SHA-256 of the expression that produced the current out-link, and when a launch's
-/// expression hashes the same *and* the out-link still carries `marker`, the built output is
-/// returned without spawning nix. Keying on the expression (not just the gcroot path) is
+/// records the SHA-256 of the expression that produced the current out-link *and the store path it
+/// produced*, and when a launch's expression hashes the same, the out-link still points at that
+/// path, and it still carries `marker`, the built output is returned without spawning nix. Keying on the expression (not just the gcroot path) is
 /// load-bearing: the expression is sbx-controlled and changes across sbx releases — a rev/system
 /// change is in it too — so a changed expression mismatches and falls through to a rebuild, which
 /// re-points the same out-link (no stale-serve, no accumulation). The one residual is that skipping
@@ -451,11 +461,12 @@ pub(crate) fn provision_expr(
     let resolved = select_marked_output(layout, &stdout, label, marker)?;
     // Stamp only after a successful, marked build, so a failed or partial build never leaves a stamp
     // that would short-circuit to a nonexistent output on the next launch.
-    write_expr_stamp(&stamp, &digest);
+    write_expr_stamp(&stamp, &digest, &resolved);
     Ok(resolved)
 }
 
-/// The sibling stamp recording which expression built a gcroot's output: `<gcroot>.expr`. Appended
+/// The sibling stamp recording which expression built a gcroot's output, and which output that
+/// was: `<gcroot>.expr`. Appended
 /// (not `with_extension`, which would eat a `.` in the gcroot name) so it never collides with the
 /// out-link itself. It is a plain file, so it is inert to the gcroot symlink walks.
 fn expr_stamp_path(gcroot: &Path) -> PathBuf {
@@ -475,11 +486,25 @@ fn expr_digest(expr: &str) -> String {
 }
 
 /// The already-built output for an expression, when it can be reused without rebuilding: the stamp
-/// records this exact expression's digest, the out-link still resolves, and its output still carries
-/// `marker`. `None` (⇒ rebuild) on any miss — absent/stale stamp, a dangling or garbage-collected
-/// out-link, or a missing marker — so a changed expression or a vanished output always rebuilds. The
-/// out-link points at the logical `/nix/store/<hash>` path (mapped through [`physical_path`] for the
-/// marker probe, never followed, exactly as [`select_marked_output`] does).
+/// records this exact expression's digest **and the out-link it was written for**, the out-link
+/// still points there, and its output still carries `marker`. `None` (⇒ rebuild) on any miss —
+/// absent/stale stamp, an out-link that has moved, a dangling or garbage-collected out-link, or a
+/// missing marker — so a changed expression or a vanished output always rebuilds. The out-link
+/// points at the logical `/nix/store/<hash>` path (mapped through [`physical_path`] for the marker
+/// probe, never followed, exactly as [`select_marked_output`] does).
+///
+/// Recording the target is what keeps the stamp honest about a gcroot it does not own alone. The
+/// same out-link is written by provisioners that stamp ([`provision_flake`], [`provision_expr`])
+/// and by ones that do not ([`provision_licensed`], the `nix:` path) — `[packages]` roots every
+/// entry at `<gcroots>/<name>` whatever backend it declares — so a package moved from `flake:` to
+/// `nix:` and back would find its own digest still stamped over an out-link the nix build had
+/// repointed, and serve nixpkgs' output under the flake package's name without ever building the
+/// flake. A digest alone cannot see that: it describes the expression, and the expression did not
+/// change. Binding it to the target it described makes the reuse answer for the whole claim, and
+/// it holds against any future writer of a gcroot rather than against the ones known today.
+///
+/// A stamp from before this shape carries the digest alone, mismatches, and rebuilds once. That is
+/// the only direction this can fail in: it forfeits a short-circuit, never serves a wrong output.
 fn reuse_built_expr(
     layout: &Layout,
     gcroot: &Path,
@@ -487,10 +512,15 @@ fn reuse_built_expr(
     stamp: &Path,
     digest: &str,
 ) -> Option<PathBuf> {
-    if std::fs::read_to_string(stamp).ok()?.trim() != digest {
+    let recorded = std::fs::read_to_string(stamp).ok()?;
+    let (recorded_digest, recorded_target) = recorded.split_once('\n')?;
+    if recorded_digest.trim() != digest {
         return None;
     }
     let logical = std::fs::read_link(gcroot).ok()?;
+    if Path::new(recorded_target.trim()) != logical {
+        return None;
+    }
     physical_path(layout, &logical)
         .join(marker)
         .symlink_metadata()
@@ -498,13 +528,19 @@ fn reuse_built_expr(
     Some(logical)
 }
 
-/// Write the expression stamp atomically (temp + rename). Best-effort: a write failure just makes
-/// the next launch rebuild instead of short-circuiting — slower, never incorrect.
-fn write_expr_stamp(stamp: &Path, digest: &str) {
+/// Write the expression stamp atomically (temp + rename): the digest, then the logical out-link
+/// target it describes, one per line. Best-effort: a write failure just makes the next launch
+/// rebuild instead of short-circuiting — slower, never incorrect. A target that is not UTF-8 writes
+/// no stamp at all, for the same reason and with the same consequence; a store path is ASCII, so
+/// this is a shape that does not arise rather than a case being handled.
+fn write_expr_stamp(stamp: &Path, digest: &str, target: &Path) {
+    let Some(target) = target.to_str() else {
+        return;
+    };
     let mut tmp = stamp.as_os_str().to_owned();
     tmp.push(format!(".tmp.{}", std::process::id()));
     let tmp = PathBuf::from(tmp);
-    if std::fs::write(&tmp, digest).is_ok() {
+    if std::fs::write(&tmp, format!("{digest}\n{target}\n")).is_ok() {
         let _ = std::fs::rename(&tmp, stamp);
     } else {
         let _ = std::fs::remove_file(&tmp);
@@ -835,8 +871,9 @@ mod tests {
     #[test]
     fn reuse_built_expr_reuses_only_the_same_expression_and_a_live_marked_output() {
         // The correctness spine of the `provision_expr` short-circuit, without a real nix: it must
-        // reuse a build only when the expression is unchanged AND the marked output is still there,
-        // and must fall through to a rebuild (None) on any change — above all a changed expression.
+        // reuse a build only when the expression is unchanged, the out-link still points where the
+        // stamp says, and the marked output is still there — and must fall through to a rebuild
+        // (None) on any change, above all a changed expression or a repointed out-link.
         let base = TmpDir::new();
         let layout = Layout::under(&base.join("sbx"));
 
@@ -860,7 +897,7 @@ mod tests {
         assert!(reuse_built_expr(&layout, &gcroot, marker, &stamp, &da).is_none());
 
         // Stamp records EXPR-A and the marked out-link is live → reuse, returning the logical path.
-        std::fs::write(&stamp, &da).unwrap();
+        write_expr_stamp(&stamp, &da, &logical);
         assert_eq!(
             reuse_built_expr(&layout, &gcroot, marker, &stamp, &da),
             Some(logical.clone())
@@ -869,6 +906,31 @@ mod tests {
         // THE headline: a changed expression (EXPR-B) over the SAME stamp/out-link must rebuild
         // (None), never serve the stale EXPR-A output. A naive rev-only key would fail here.
         assert!(reuse_built_expr(&layout, &gcroot, marker, &stamp, &db).is_none());
+
+        // The second headline, and the one a digest alone cannot answer: the out-link repointed
+        // under a stamp nobody updated. That is what a `[packages]` entry moved from `flake:` to
+        // `nix:` and back leaves behind — both roots at `<gcroots>/<name>`, only one of them
+        // stamps — and reusing here would serve nixpkgs' output under the flake package's name
+        // without ever building the flake.
+        let other = PathBuf::from("/nix/store/11111111111111111111111111111111-other");
+        let other_physical = physical_path(&layout, &other);
+        std::fs::create_dir_all(other_physical.join("bin")).unwrap();
+        std::fs::write(other_physical.join("bin").join("tool"), b"x").unwrap();
+        std::fs::remove_file(&gcroot).unwrap();
+        std::os::unix::fs::symlink(&other, &gcroot).unwrap();
+        assert!(
+            reuse_built_expr(&layout, &gcroot, marker, &stamp, &da).is_none(),
+            "the expression is unchanged, but the out-link it was stamped for has moved"
+        );
+        std::fs::remove_file(&gcroot).unwrap();
+        std::os::unix::fs::symlink(&logical, &gcroot).unwrap();
+
+        // A stamp written before the target was recorded carries the digest alone: it rebuilds
+        // once rather than short-circuiting on a claim it cannot support.
+        std::fs::write(&stamp, &da).unwrap();
+        assert!(reuse_built_expr(&layout, &gcroot, marker, &stamp, &da).is_none());
+        write_expr_stamp(&stamp, &da, &logical);
+        assert!(reuse_built_expr(&layout, &gcroot, marker, &stamp, &da).is_some());
 
         // A missing marker → rebuild, even though the stamp matches (the output is not the one wanted).
         assert!(reuse_built_expr(&layout, &gcroot, "bin/gone", &stamp, &da).is_none());
