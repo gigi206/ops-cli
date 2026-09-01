@@ -291,8 +291,22 @@ fn the_synthetic_machine_id_is_systemd_shaped_deterministic_and_per_home() {
         "lowercase hex only: {a1:?}"
     );
     // Never the degenerate all-cages id (sha256 of an empty string, truncated) a fingerprinting
-    // app produces when the file is absent — the whole reason this exists.
-    assert_ne!(body, "e3b0c44298fc1c149afbf4c8996fb9242");
+    // app produces when the file is absent — the whole reason this exists. Computed rather than
+    // written out: the literal that stood here was 33 characters against a body asserted to be 32
+    // three lines above, so the comparison could not fail whatever the function did.
+    let degenerate: String = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(b"")[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    };
+    assert_eq!(
+        degenerate.len(),
+        32,
+        "the sentinel is the same width as a body"
+    );
+    assert_ne!(body, degenerate, "the all-cages id: {a1:?}");
     // Deterministic per home (stable across launches) and unique across homes.
     assert_eq!(a1, a2, "same home → same id across launches");
     assert_ne!(a1, b, "a different home → a different id");

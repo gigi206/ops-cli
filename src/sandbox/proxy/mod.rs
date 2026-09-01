@@ -480,7 +480,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     // the raw splice above). The refusal is this plane's, not the proxy's as a whole: the
     // absolute-form plane terminates no TLS toward the client and so decides a literal by the
     // ordinary policy — see the module header.
-    if host.parse::<IpAddr>().is_ok() {
+    if connect_host.parse::<IpAddr>().is_ok() {
         // Log the attempt (host = the IP the agent tried to reach) before refusing. Pre-tunnel, so
         // there is no method/path yet.
         ctx.push_log(

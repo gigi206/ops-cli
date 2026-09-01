@@ -645,13 +645,21 @@ fn strip_fetch_scheme(url: &str, allow_insecure_http: bool) -> Option<&str> {
 /// A `deb:` URL: an `https://` URL to a prebuilt `.deb`. Required to be HTTPS (the fetch is not
 /// authenticated beyond TLS, and a `.deb` is executed after autoPatchelf, so a plaintext source is
 /// refused — unless [`Resolved::allow_insecure_http`] opted in, see [`strip_fetch_scheme`]) and to
-/// end in `.deb` (so a mistyped value is caught, not silently built). The character
-/// set is the unreserved URL set plus the sub-delims a release URL uses, so the value carries no
-/// shell/nix metacharacter — it is interpolated into a generated nix expression and a
-/// `nix store prefetch-file` argument, both of which must stay injection-free.
+/// end in `.deb` (case-insensitively, as [`is_valid_appimage_url`] matches its own suffix, so a
+/// mistyped value is caught and a `.DEB` spelling is not; the character set is the unreserved URL
+/// set plus the sub-delims a release URL uses, so the value carries no shell/nix metacharacter —
+/// it is interpolated into a generated nix expression and a `nix store prefetch-file` argument,
+/// both of which must stay injection-free).
+///
+/// The case rule is not a preference. `sandbox::prebuilt::select_release_asset` lowercases an
+/// asset's name before matching the extension it was asked for, so a release publishing
+/// `app_amd64.DEB` is *selected* by the github and resolve forms and would then be refused here —
+/// a whole release rejected for the spelling of three characters. (Named rather than linked: that
+/// module is private to `sandbox`, so the path does not resolve from this one.)
 pub(crate) fn is_valid_deb_url(url: &str, allow_insecure_http: bool) -> bool {
-    strip_fetch_scheme(url, allow_insecure_http)
-        .is_some_and(|rest| !rest.is_empty() && url.ends_with(".deb") && is_injection_free_url(url))
+    strip_fetch_scheme(url, allow_insecure_http).is_some_and(|rest| {
+        !rest.is_empty() && url.to_ascii_lowercase().ends_with(".deb") && is_injection_free_url(url)
+    })
 }
 
 /// An `appimage:` URL: an `https://` URL to a prebuilt `.AppImage`. The sibling of [`is_valid_deb_url`]

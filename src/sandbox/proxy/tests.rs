@@ -3916,6 +3916,45 @@ fn a_parked_connection_older_than_the_configured_bound_is_not_reused() {
     );
 }
 
+/// An IP-literal CONNECT target is refused on the inspected plane, and "IP literal" is a property
+/// of the **canonical** host — the form every other reader of that target already uses.
+///
+/// `canonical_host` strips a trailing dot, so `127.0.0.1.` and `127.0.0.1` are one address; the
+/// guard parsed the raw authority instead, which fails on the first and succeeds on the second.
+/// The refusal then let the dotted spelling through while the log line beside it named the
+/// canonical form — the value the guard had not asked about. Both spellings are driven here so a
+/// green on one cannot stand in for the other.
+#[test]
+fn a_trailing_dot_does_not_carry_an_ip_literal_past_the_connect_guard() {
+    for authority in ["127.0.0.1.", "127.0.0.1"] {
+        let ctx = Arc::new(
+            ProxyCtx::new(
+                Arc::new(Ca::ephemeral().unwrap()),
+                policy(&["upstream.test:*"]),
+            )
+            .unwrap(),
+        );
+        let dir = TmpDir::new();
+        let path = dir.join("proxy.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        thread::spawn(move || {
+            let _ = serve(
+                listener,
+                ctx,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+        });
+        let mut sock = UnixStream::connect(&path).unwrap();
+        write!(sock, "CONNECT {authority}:443 HTTP/1.1\r\n\r\n").unwrap();
+        sock.flush().unwrap();
+        let reply = read_until_blank(&mut sock).unwrap();
+        assert!(
+            reply.contains("403") && reply.contains("ip-literal"),
+            "`{authority}` is an IP literal once canonicalised: {reply:?}"
+        );
+    }
+}
+
 /// A connection over the cap is refused with a reason, not dropped.
 ///
 /// The raw-splice cap has always answered `503 splice-cap`, and a caller that hits the connection

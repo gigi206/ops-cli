@@ -3584,6 +3584,54 @@ fn validating_a_profile_requires_a_command_and_summarizes_its_posture() {
     );
 }
 
+/// Every name `undescribed_sections` treats as explained is a **serialized** key, so a profile
+/// declaring all of them appends nothing.
+///
+/// The list is filtered against the keys `Value::try_from` yields, which are TOML names, not Rust
+/// field names. `uses` is written `use` (`#[serde(rename)]`), so listing the field name matched
+/// nothing: every profile carrying a `use` was told "also declares: use — read them in the profile
+/// before importing", about a section the summary had rendered in full one line above. Setting all
+/// of them at once is what makes the next rename fail here instead of passing quietly.
+#[test]
+fn a_profile_declaring_every_explained_section_appends_no_catch_all() {
+    let everything = validate_profile(
+        br#"
+            cmd = "demo-app"
+            home_scope = "project"
+            use = ["demo-bundle"]
+            allow_insecure_http = true
+            gpu = true
+            audio = true
+            dbus = true
+            gui = "offscreen"
+            forward = [8080]
+            binds = [{ path = "/etc/hostname", mode = "ro" }]
+            [packages]
+            hello = "nix:hello"
+            [network]
+            allow = ["example.com"]
+            [devices]
+            allow = ["/dev/kvm"]
+            [seccomp]
+            allow = ["userfaultfd"]
+            [ssh_agent]
+            allow = ["deploy@example"]
+            [secret."api.example.com"]
+            from = "env:API_KEY"
+            [task.deploy]
+            cmd = ["deploy"]
+            [service.api]
+            cmd = ["serve"]
+            "#,
+    )
+    .unwrap();
+    let joined = everything.summary.join("\n");
+    assert!(
+        !joined.contains("also declares:"),
+        "every section here has a line of its own: {joined}"
+    );
+}
+
 #[test]
 fn merge_app_overlays_the_baseline_with_app_precedence() {
     let mut base = resolve_no_plugins(raw(&[("A", "base"), ("B", "base")], &[]), None);
@@ -5288,6 +5336,12 @@ fn a_deb_prefixed_package_parses_as_a_deb_backend_and_requires_https_dot_deb() {
         "https://github.com/o/r/releases/latest/download/app-linux-amd64.deb",
         false
     ));
+    // The suffix is matched case-insensitively, the way `is_valid_appimage_url` matches its own.
+    // `select_release_asset` lowercases an asset's name before matching the extension, so a
+    // release publishing `.DEB` is picked by the github and resolve forms; matching with the case
+    // here refused that URL and took the whole release down with it.
+    assert!(is_valid_deb_url("https://example.com/app_amd64.DEB", false));
+    assert!(is_valid_deb_url("https://example.com/app_amd64.Deb", false));
     assert!(!is_valid_deb_url("http://example.com/x.deb", false));
     assert!(!is_valid_deb_url("https://example.com/x.tar.gz", false));
     assert!(!is_valid_deb_url("https://example.com/a b.deb", false));

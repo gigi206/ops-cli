@@ -69,7 +69,7 @@ lui-même lui donne : réconcilier contre cet ensemble supprimerait tous les roo
 Les 28 constats en prose ont été rouverts un par un dans cet arbre. Sur les 23 du tableau qui les
 suit, trois l'ont été ; les vingt autres portent « non re-sondé » et rien d'autre.
 
-### Fermés (8 en prose, 1 au tableau)
+### Fermés (13 en prose, 1 au tableau)
 
 | Constat | Fermé par | Ce qui a été mesuré |
 | --- | --- | --- |
@@ -82,20 +82,16 @@ suit, trois l'ont été ; les vingt autres portent « non re-sondé » et rien d
 | `config/overrides.rs:272` — `env::vars()` panique sur une variable non-UTF-8 | l'arbre | `overrides.rs:280` lit en `vars_os()`. |
 | `store.rs:323` — `LONGEST_SOCKET_SUFFIX` sous-estime le plus large chemin de socket | l'arbre | `BROKER_NAME_MAX` (`store/layout.rs:380`) est dérivé du budget. C'est le remède de l'autre audit ; les deux branches en proposaient un différent, celui-ci a été retenu. |
 | `allowlist/mod.rs:1093` — `capture_max_kb` perdu sans un mot quand une couche redéclare `capture` | — | **Fermé par argument au site, pas par mesure** : `allowlist/mod.rs:1126` soutient que `capture_body_kb` chevauche `capture`, donc nommer l'un nomme l'autre. L'argument n'a pas été vérifié contre le comportement observable. |
+| `config/tools.rs:654` — le suffixe `.deb` est apparié avec la casse | ce dépôt | **Mesuré** : `select_release_asset` minuscule le nom d'un asset avant de l'apparier, donc une release publiant `.DEB` était sélectionnée puis refusée en bloc. Le frère `is_valid_appimage_url` minuscule déjà, en disant pourquoi. |
+| `config/load.rs:969` — `DESCRIBED` liste `"uses"` | ce dépôt | **Mesuré** : la clé sérialisée est `use`. La phrase de doc qui promettait un garde contre ce cas est devenue vraie : un profil déclarant les dix-huit clés est asserté sans ligne fourre-tout. |
+| `proxy/mod.rs:483` — le garde d'IP littérale au CONNECT teste l'hôte brut | ce dépôt | **Mesuré, et plus grave que le constat** : sans le correctif, `CONNECT 127.0.0.1.:443` reçoit `200 Connection established` — le refus ne part pas du tout. Ce qui arrête ensuite la requête est le verdict de politique, rendu sur `connect_host` ; aucun contournement de politique n'est démontré, mais le garde ne tient pas son contrat. |
+| `seccomp.rs:1287` — le commentaire annonce `EFAULT` | ce dépôt | Prose seule : l'assertion trois lignes plus bas lit `EINVAL`, et la raison est désormais écrite — `clone3` refuse une taille sous sa première version avant de déréférencer le pointeur. |
+| `binds/tests.rs:295` — l'assertion « identifiant dégénéré » | ce dépôt | **Mesuré** : le sentinelle est calculé, non écrit. En mutant `machine_id_contents` pour qu'il ne hache plus rien, le test vire au rouge sur une valeur de 32 caractères — un de moins que le littéral qu'il portait. |
 
-### Ouverts et mesurés (17 en prose, 2 au tableau)
+### Ouverts et mesurés (12 en prose, 2 au tableau)
 
-La ligne est rouverte, le prédicat du constat tient encore. Classés par ce que ça coûte de le fermer.
-
-**Un frère correct est déjà dans l'arbre — le motif dominant du rapport.**
-
-| Constat | Ce qui est mesuré |
-| --- | --- |
-| `config/tools.rs:654` — le suffixe `.deb` est apparié avec la casse | `is_valid_deb_url` fait `url.ends_with(".deb")` ; `is_valid_appimage_url`, dix lignes plus bas, fait `to_ascii_lowercase().ends_with(".appimage")` **et dit pourquoi** ; `select_release_asset` (`prebuilt.rs:499`) minuscule le nom. Un asset `…​.DEB` est donc sélectionné puis refusé net. |
-| `config/load.rs:969` — `DESCRIBED` liste `"uses"` | La clé sérialisée est `use` (`config/schema.rs:832`, `#[serde(rename = "use")]`). Le filtre n'apparie jamais, et masquerait une clé réellement non décrite. |
-| `proxy/mod.rs:483` — le garde d'IP littérale au CONNECT teste l'hôte brut | `connect_host = canonical_host(&host)` est calculé à la ligne 465 et sert partout ailleurs ; la ligne 483 teste `host`. `127.0.0.1.` passe le garde. |
-| `seccomp.rs:1287` — le commentaire annonce `EFAULT` | Le test qu'il documente assère `EINVAL` (`seccomp.rs:1318`). |
-| `binds/tests.rs:295` — l'assertion « identifiant dégénéré » | Le littéral compté fait 33 caractères ; la même fonction assère `body.len() == 32` deux lignes plus haut. L'`assert_ne!` ne peut pas échouer. |
+La ligne est rouverte, le prédicat du constat tient encore. Classés par ce que ça coûte de le
+fermer ; le groupe « un frère correct est déjà dans l'arbre » a été traité et se lit au-dessus.
 
 **Sécurité, autonomes, remède court.**
 

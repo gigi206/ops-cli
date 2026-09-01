@@ -956,8 +956,14 @@ fn describe_app_posture(app: &RawApp) -> Vec<String> {
 /// standard was broken each time was a field added to [`RawApp`] and not added here — nothing
 /// failed, the profile simply arrived carrying one more thing than it said. This closes that by
 /// construction: the keys come from serializing the profile, so a field this function has never
-/// heard of still reaches the reader. A key that *is* rendered above is listed by name here, and
-/// the two lists are asserted against the schema in the tests.
+/// heard of still reaches the reader.
+///
+/// The names below are **serialized** keys, not Rust field names, because that is what
+/// `Value::try_from` yields. A field carrying `#[serde(rename)]` is the trap: `uses` is written
+/// `use` in TOML, and listing the field name here meant the entry matched nothing and every
+/// profile declaring `use` was told to go and read a section the summary had just rendered in
+/// full. A profile setting all of them is asserted to carry no catch-all line in the tests, which
+/// is what makes a future rename fail here rather than pass in silence.
 ///
 /// Deliberately terse. These are the sections a reader should go and look at, not ones this
 /// summary tries to explain; the explained ones are explained above.
@@ -966,7 +972,7 @@ fn undescribed_sections(app: &RawApp) -> Vec<String> {
     const DESCRIBED: &[&str] = &[
         "cmd",
         "home_scope",
-        "uses",
+        "use",
         "packages",
         "binds",
         "network",
