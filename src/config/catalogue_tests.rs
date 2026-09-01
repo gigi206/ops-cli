@@ -821,6 +821,87 @@ fn every_shipped_bundle_declares_the_packages_its_row_names() {
     );
 }
 
+#[test]
+fn every_shipped_resolver_table_is_named_in_the_bundles_table() {
+    // The third column's last unwatched item. A `[tarball.<name>]`, `[deb.<name>]`,
+    // `[appimage.<name>]` or `[binary.<name>]` table is what makes a prebuilt package rollable:
+    // `sbx upgrade` re-runs its `resolve` command to find the current download URL, so whether a
+    // bundle carries one decides whether folding it in leaves the reader with a pin they must bump
+    // by hand. That is a property of the same kind as the install step beside it, and it drifted
+    // the same way: the guard that recomputes the packages column found `grok` naming `mise:` for
+    // a `binary:resolve` package, and the row had lost the resolver along with the backend.
+    //
+    // The rule is an equivalence, not a presence check, which is where it goes further than its
+    // two siblings: a row that claims a resolver the bundle does not declare misleads exactly as
+    // much as one that omits the table, and promises a roll that will never happen.
+    //
+    // `[flakes.<name>]` is deliberately not here. It is an inline source a package refers to, not
+    // an auto-upgrade resolver, so the column's own word for these tables does not describe it.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let page = std::fs::read_to_string(root.join("docs-site/docs/guide/configuration/bundles.md"))
+        .expect("the bundles page exists");
+    let mut wrong = Vec::new();
+    let mut carriers = 0;
+    for entry in std::fs::read_dir(root.join("examples/bundle"))
+        .expect("examples/bundle/ dir exists")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+        let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
+        let Some(bundle) = raw.bundle.get(&name) else {
+            continue;
+        };
+        // Read as tables rather than as `<name> = "<backend>:resolve"` package values: the sentinel
+        // and the table are two halves of one declaration, and it is the table that carries the
+        // command a roll runs.
+        let tables = [
+            ("tarball", !bundle.tarball.is_empty()),
+            ("deb", !bundle.deb.is_empty()),
+            ("appimage", !bundle.appimage.is_empty()),
+            ("binary", !bundle.binary.is_empty()),
+        ];
+        let carries = page
+            .lines()
+            .find(|line| line.starts_with(&format!("| `{name}` |")))
+            .and_then(|line| line.split('|').nth(3))
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        for (backend, declared) in tables {
+            if declared {
+                carriers += 1;
+            }
+            // The article in front varies with the backend it introduces (`a `deb:``, `an
+            // `appimage:``), so the phrase is matched from the backend on.
+            let named = carries.contains(&format!("`{backend}:` resolver"));
+            if declared && !named {
+                wrong.push(format!(
+                    "`{name}` declares a `[{backend}.<name>]` resolver its row does not name: \
+                     {carries:?}"
+                ));
+            } else if named && !declared {
+                wrong.push(format!(
+                    "`{name}`'s row promises a `{backend}:` resolver the bundle does not declare, \
+                     so nothing rolls it: {carries:?}"
+                ));
+            }
+        }
+    }
+    assert!(
+        carriers > 0,
+        "no shipped bundle carries a resolver table, so this guard now asserts nothing"
+    );
+    wrong.sort();
+    assert!(
+        wrong.is_empty(),
+        "the bundles table does not say which bundles carry an auto-upgrade resolver: {wrong:#?}"
+    );
+}
+
 /// The shipped `provision` of `<bundle>`, as the script a shell would run.
 fn shipped_install_step(name: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
