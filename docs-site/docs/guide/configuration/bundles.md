@@ -57,8 +57,10 @@ the map-side companion, and it carries the egress along.
 | `secret` | another bundle (`use`) |
 | `task` (declared operations, `[bundle.<name>.task.<task>]`) | |
 | `service` (an auxiliary process run beside the app, `[bundle.<name>.service.<svc>]`) | |
-| `flakes`, `tarball`, `deb`, `appimage` (the resolver tables that pair with a package) | |
+| `flakes`, `tarball`, `deb`, `appimage`, `binary` (the resolver tables that pair with a package) | |
+| `open` (the `<tool>://` callback a sign-in redirects to, `[bundle.<name>.open]`) | |
 | `provision` (the one-time step that finishes an install) | |
+| `accepts_fresh_releases` (the freshness delay lifted for a package it names) | |
 
 The line is the design, not a shortlist. A bundle describes **a tool**; it says
 nothing about **the shape of the cage**. So using one can add a tool, its
