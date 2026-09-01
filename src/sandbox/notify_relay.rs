@@ -29,14 +29,23 @@
 //!   process. A relayed `app_icon` is therefore reduced to a bare theme name and the hints that name
 //!   a file are dropped ([`relayed_app_icon`], [`HOST_PATH_HINTS`]); a caged app has no host path
 //!   worth naming in any case, since everything it can see is inside the cage.
-//! - **Unbounded text.** The cage writes the words; it does not get to decide how many. A summary,
-//!   a body and an action label are each cut to a ceiling, and the action list to a length
-//!   ([`bounded`], [`SUMMARY_MAX`], [`BODY_MAX`], [`ACTIONS_MAX`]). Without one, spoofing a toast
-//!   becomes displacing the desktop's: the strings are relayed into a host process that renders
-//!   them, and a megabyte body costs host memory in the daemon rather than in the cage's cgroup,
-//!   while a summary long enough pushes every other notification's text out of the area the user
-//!   reads. The ceilings are far above any real notification, so what they refuse is only the
-//!   shape that was never one.
+//! - **Unbounded text.** The cage writes the words of a toast; it does not get to decide how many
+//!   are rendered. The summary, the body and each action label are cut to a ceiling, and the action
+//!   list to a length ([`bounded`], [`SUMMARY_MAX`], [`BODY_MAX`], [`ACTIONS_MAX`]). Without one,
+//!   spoofing a toast becomes displacing the desktop's: a summary long enough pushes every other
+//!   notification's text out of the area the user reads, and the cost of rendering it is paid in a
+//!   host process rather than in the cage's cgroup. The ceilings count **characters**, because the
+//!   quantity they are about is rendered length rather than bytes; they are far above any real
+//!   notification, so what they refuse is only the shape that was never one.
+//!
+//!   `hints` is deliberately **not** cut, and that is the residual to state rather than imply: a
+//!   hint value is cage-authored and crosses whole, bounded only by the private bus's own message
+//!   ceiling. A size rule there would be wrong rather than merely absent — `image-data` carries a
+//!   notification's icon as raw pixel data, so "large" is what a legitimate hint looks like, and a
+//!   cap would refuse the real case while an attacker moved the same bytes into the next hint name.
+//!   What *is* ruled on is which hints cross at all ([`HOST_PATH_HINTS`]). The trigger to revisit:
+//!   a hint the cage can make the host daemon persist or execute, where the question stops being
+//!   size.
 //! - **Other applications' notifications.** `Notify`'s `replaces_id` and `CloseNotification` are
 //!   checked against the ids the host daemon actually returned for this cage's own calls
 //!   ([`OwnedIds`]), so the cage can neither overwrite nor dismiss a notification it never raised,
@@ -275,11 +284,12 @@ fn relayed_app_icon(app_icon: &str) -> &str {
 }
 
 /// The most characters a relayed notification's summary may carry. A summary is the one line a
-/// daemon renders large, and no real one approaches this.
+/// daemon renders large, and no real one approaches this. Characters, not bytes: the ceiling is
+/// about what the user is shown, and the worst case in bytes is still bounded by four times this.
 const SUMMARY_MAX: usize = 200;
 
 /// The most characters a relayed notification's body may carry. Generous — a body may legitimately
-/// run to several paragraphs — and still a ceiling.
+/// run to several paragraphs — and still a ceiling. Characters, as for the summary.
 const BODY_MAX: usize = 4096;
 
 /// The most action entries a relayed notification may carry. The list is `(id, label)` pairs, so

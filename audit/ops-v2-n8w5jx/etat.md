@@ -156,15 +156,18 @@ le verdict de confiance mise vit sur la `MiseConfig` absente là.
 
 ## LOW (51) — les cinquante-et-un sont mesurés
 
-Les 28 constats en prose ont été rouverts un par un, puis les 23 du tableau. **Cinquante sont
-fermés ; un seul reste ouvert**, et délibérément : `argv.rs:147`, dont la course n'a été reproduite
-par personne et dont les trois remèdes changent la durée de vie d'un lancement détaché.
+Les 28 constats en prose ont été rouverts un par un, puis les 23 du tableau. Le compte, par seau
+plutôt que par un chiffre unique : **49 fermés + 1 réfuté + 1 ouvert = 51**.
 
-Un des vingt-trois est **réfuté par la mesure** plutôt que fermé par un correctif
-(`plugins/stores.rs:775`), et deux ont mesuré **plus large** que leur énoncé
-(`plugins/catalogue.rs:291`, `sandbox/launch.rs:3944`).
+Le réfuté est `plugins/stores.rs:775` : sa prémisse ne tient pas dans cet arbre, ce qui n'est pas la
+même chose qu'un défaut corrigé. L'ouvert est `argv.rs:147`, et délibérément — sa course n'a été
+reproduite par personne, et ses trois remèdes changent la durée de vie d'un lancement détaché.
 
-### Fermés (25 en prose, 4 au tableau)
+Deux ont mesuré **plus large** que leur énoncé (`plugins/catalogue.rs:291`, `sandbox/launch.rs:3944`)
+et un **plus étroit** (`cli/completion.rs:766` nommait `sbx run --gpu`, le défaut vaut aussi pour
+`--audio` et `--dbus`, et coûtait en plus une position d'opérande).
+
+### Fermés (25 en prose, 3 au tableau)
 
 | Constat | Fermé par | Ce qui a été mesuré |
 | --- | --- | --- |
@@ -209,10 +212,16 @@ Deux des fichiers cités n'existent plus sous ce nom (`launch.rs`, `proc_enforce
 répertoires par la décomposition) ; chaque constat a été re-localisé avant d'être jugé, parce qu'une
 conclusion de portée ne se transporte pas à travers un déplacement.
 
-Les vingt-trois lignes du tableau sont reprises ici en entier, y compris les quatre dont la liste
-« Fermés » ci-dessus porte déjà le verdict **sous les coordonnées de la prose** (`observe_feed.rs:44`
-pour `:179`, `h2mitm.rs:206` pour `:160`, `ssrf.rs:299` pour `:248`, et `store.rs:323`) : un lecteur
-du tableau doit pouvoir le parcourir sans reconstituer un appariement de numéros de ligne.
+Les vingt-trois lignes du tableau sont reprises ici **en entier**, y compris les quatre dont la
+liste « Fermés » ci-dessus porte déjà le verdict sous d'autres coordonnées (`observe_feed.rs:44`
+pour `:179`, `h2mitm.rs:206` pour `:160`, `ssrf.rs:299` pour `:248`, et `store.rs:323` sous son
+propre nom) : un lecteur du tableau doit pouvoir le parcourir sans reconstituer un appariement de
+numéros de ligne.
+
+**L'arithmétique, puisque ces quatre paraissent deux fois.** 28 lignes « Fermés » (25 en prose,
+3 du tableau) + 1 « Ouvert » + 25 ici (2 en prose, les 23 du tableau) = 54 lignes pour **51
+constats** : trois du tableau sont comptés dans les deux listes. Par seau : **49 fermés, 1 réfuté
+(`plugins/stores.rs:775`), 1 ouvert (`argv.rs:147`)**.
 
 | Constat | Statut | Ce qui a été mesuré |
 | --- | --- | --- |
