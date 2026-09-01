@@ -26,6 +26,47 @@ Run [`sbx doctor`](doctor) to check all of these at once. On a restricted
 Ubuntu 24.04+ host, user namespaces may exist but be stripped of capabilities;
 `doctor` checks specifically for the capability-bearing case.
 
+## Running under WSL2
+
+`sbx` runs inside a WSL2 distribution without adaptation. The shipping binary is
+static, so the same artifact that runs on a native host runs here once it is copied
+into the distribution's own filesystem. Copy it out of `/mnt/c` before running it:
+the Windows drive is mounted through `drvfs`, which synthesises permission bits, and
+the executable bit does not reliably survive there.
+
+The WSL2 kernel provides capability-bearing user namespaces, and it does not carry
+the AppArmor restriction that an Ubuntu 24.04 host applies to them, so the boundary
+`sbx` rests on is available with no sysctl to set. `bubblewrap` is not part of a
+fresh distribution image and is installed from the distribution's own packages.
+Install `nix` as the user that will run `sbx` rather than as `root`: run as root,
+its single-user installer writes a configuration naming a build group it does not
+create, and stops before it has a usable profile.
+
+What differs from a native host is **resource limits**, which are hardening rather
+than the boundary and therefore degrade instead of failing:
+
+- A distribution running **systemd** (the default for recent Ubuntu images, set as
+  `systemd=true` under `[boot]` in `/etc/wsl.conf`) has a user manager, and the cage
+  is capped by a transient scope exactly as on a native host.
+- A distribution running **without systemd** has no user session for a scope to be
+  registered against, so the cage launches uncapped. This is the documented
+  degradation and not a failure: `doctor` reports it, and the namespace, seccomp and
+  egress layers are unaffected.
+
+Three further differences are worth knowing before they surprise you:
+
+- **Where you launch from decides what is bound in.** A `wsl` shell opened from
+  Windows starts in the Windows user profile under `/mnt/c`, and `sbx run` binds the
+  project directory into the cage. Launching from there therefore hands the cage the
+  Windows home directory, which is the opposite of what the security model is for.
+  Keep projects in the distribution's own filesystem, where the bind is the project
+  and nothing above it.
+- **No notification daemon.** Nothing on the session bus answers, so refusals that
+  would raise a desktop notification are reported on stderr instead.
+- **No encapsulated storage volume.** A distribution's filesystem is an ordinary
+  one, so the store is a plain directory rather than a compressed volume.
+  `$SBX_DATA_DIR` can still point `sbx` at a volume that is mounted.
+
 ## Development build
 
 For iterating on `sbx` itself:

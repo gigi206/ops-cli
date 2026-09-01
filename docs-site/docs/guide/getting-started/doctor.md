@@ -80,6 +80,13 @@ differently, and the store moves into it:
   host that cannot provide it gets a warning, not a failure: the launch still runs,
   just without the anti-DoS limits. See [Enforcement stack](../concepts/enforcement).
 
+  Availability is decided by the user manager's delegation root, where a transient
+  scope is actually registered, and not by where the calling process itself sits in
+  the cgroup tree. The two differ more often than it looks: a login session is a
+  sibling of that root, and a WSL2 distribution starts everything launched through
+  `wsl.exe` outside the user slice altogether, yet a scope can still be created from
+  either.
+
 - **The store location and channel revision.** Where `sbx`'s user-owned store lives
   and which nixpkgs revision the base userland is pinned to.
 
