@@ -534,13 +534,28 @@ impl PluginRegistry {
         // `sign = "foo"` says they are two plugins. Reaching this takes placing directories by hand
         // — an install refuses a name already installed — but the registry describes it rather than
         // handing each namespace a different plugin under one name.
-        let shared: Vec<String> = brokers
+        //
+        // The sweep reads the conflict map as well as the two indexes, because `claim` *removes* an
+        // ambiguous key from its index: a name already ambiguous within one type is no longer there
+        // to be compared against the other, so the other type's claimant stayed live under a name
+        // every surface reports as ambiguous. Two brokers and one signer named `foo` left
+        // `sign = "foo"` resolving to that signer.
+        let shared: std::collections::BTreeSet<String> = brokers
             .keys()
             .filter(|name| signers.contains_key(*name))
             .cloned()
+            .chain(
+                name_conflicts
+                    .keys()
+                    .filter(|name| brokers.contains_key(*name) || signers.contains_key(*name))
+                    .cloned(),
+            )
             .collect();
         for name in shared {
-            let mut claimants = Vec::new();
+            // The claimants already recorded for this name are kept: a conflict names every plugin
+            // that has to be dealt with, and replacing the entry would drop the two that made the
+            // name ambiguous in the first place.
+            let mut claimants = name_conflicts.remove(&name).unwrap_or_default();
             if let Some(plugin) = brokers.remove(&name) {
                 claimants.push(plugin.dir_name().to_string());
             }
@@ -548,6 +563,7 @@ impl PluginRegistry {
                 claimants.push(plugin.dir_name().to_string());
             }
             claimants.sort();
+            claimants.dedup();
             name_conflicts.insert(name, claimants);
         }
 
@@ -2148,6 +2164,38 @@ mod tests {
             .name_conflict("gpg-agent")
             .expect("the conflict is recorded");
         assert_eq!(claimants, ["as-broker", "as-signer"]);
+    }
+
+    /// The cross-type sweep has to read the conflict map, not just the two indexes.
+    ///
+    /// `claim` removes an ambiguous key from its index, so a name already ambiguous *within* one
+    /// type is no longer there to be compared against the other type. Two brokers and one signer
+    /// named `gpg-agent` therefore left the signer live under a name every surface reports as
+    /// ambiguous — and `sign = "gpg-agent"` resolved to it.
+    #[test]
+    fn a_name_ambiguous_within_one_type_still_disables_the_other_types_claimant() {
+        let root = crate::testutil::TmpDir::new();
+        write_plugin(root.path(), "broker-a", &broker_manifest(""));
+        write_plugin(root.path(), "broker-b", &broker_manifest(""));
+        write_plugin(
+            root.path(),
+            "as-signer",
+            &signer_manifest("").replace("aws-sigv4", "gpg-agent"),
+        );
+        let (reg, _) = load(root.path());
+        assert!(
+            reg.signer("gpg-agent").is_none(),
+            "the signer must not stay reachable under a name reported as ambiguous"
+        );
+        assert!(reg.broker("gpg-agent").is_none());
+        let claimants = reg
+            .name_conflict("gpg-agent")
+            .expect("the conflict is recorded");
+        assert_eq!(
+            claimants,
+            ["as-signer", "broker-a", "broker-b"],
+            "and it names every plugin that has to be dealt with, not the last pair seen"
+        );
     }
 
     /// A signer with no `[signer]` table is not a signer, and the refusal says which table.
