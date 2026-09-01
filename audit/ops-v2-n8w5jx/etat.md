@@ -130,19 +130,30 @@ vingt lignes de tableau restantes non plus. Plusieurs citent des fichiers que la
 déplacés (`launch.rs`, `store.rs`, `proc_enforce.rs`), et une conclusion de portée ne se transporte
 pas à travers un déplacement : elle se re-mesure.
 
-## Duplication (10 familles) — jamais ouvertes
+## Duplication (10 familles) — quatre fermées par la décomposition
 
-Aucune n'a été ouverte. Le rapport les classe par *ce qui casse si une copie est corrigée et pas les
-autres*, et la première de la liste est la seule qui porte une décision de sécurité : la queue de
-réponse du proxy, écrite deux fois entre `proxy/forward.rs` et `proxy/tunnel.rs`, `masks_reflection`
-compris.
+Le rapport les classe par *ce qui casse si une copie est corrigée et pas les autres*. La
+décomposition de neuf modules (`6f2a58d`) en a replié quatre au passage, sans les viser.
+
+| Famille | Statut | Ce qui a été mesuré |
+| --- | --- | --- |
+| `proxy/forward.rs` / `proxy/tunnel.rs` — la queue de réponse du proxy | **ouvert** | Les deux sites calculent `masks_reflection_for` et composent leur `head_masking` séparément (`forward.rs:523`, `tunnel.rs:783`). C'est la seule famille qui porte une décision de sécurité. |
+| `binary.rs` · `tarball.rs` · `appimage.rs` · `deb.rs` — les accesseurs de verrou | **ouvert** | Les quatre définissent encore `pins`, `pinned_hashes` et `write_pins` ; le trait `prebuilt::Kind` qu'ils implémentent déjà est l'endroit de ces méthodes. |
+| `broker.rs` / `signer.rs` — le lancement d'un plugin en cage | **ouvert** | Deux `CagePlan` + `compose_cage` (`broker.rs:1034`, `signer.rs:476`), avec la même invariante de cycle de vie commentée des deux côtés. |
+| `help.rs:2310` et `:2378` — le texte de l'option `<rule>` | **ouvert, et pire que dit** | Le texte de ~700 caractères apparaît exactement deux fois dans `help/pages.rs`. Un **second** texte long y est aussi dupliqué, et il a **déjà divergé** : deux quasi-variantes coexistent, l'une disant « running session(s) », l'autre « running enforcing session(s) ». C'est la panne que le constat annonçait, arrivée avant le correctif. |
+| `launch.rs` — deux séquences `openpty` + `fork` | **fermé** | Un seul site subsiste, `pty.rs:393`. |
+| `layout_or_fail` réécrit à la main | **partiellement fermé** | De treize sites à six, et **aucun dans `src/cli/`** — les onze que le constat nommait là sont partis. Restent `notify_sink.rs:335`, `prebuilt.rs:298`, `flake.rs:103`, `launch/mod.rs:819`, `launch/session.rs:78` et `:340`. |
+| `cli/net.rs` / `cli/proc.rs` — le préambule de filtres pid | **fermé** | `egress_data_dir` a une définition unique (`main.rs:568`). |
+| `cli/config.rs` — six copies d'un littéral `ConfigView` | **fermé** | `blank_config_view` et `sample_config_view` (`cli/config/render.rs:1202`, `:1271`). |
+| `plugins/stores.rs:1218` — deux écrivains « propriétaire seul », plus trois copies d'`unique()` | **partiellement fermé** | `unique()` a une définition unique (`plugins/mod.rs:1746`). Les deux écrivains n'ont pas été re-sondés. |
+| `cli/logs.rs` / `cli/proc.rs` — le préambule de cible de session | **non re-sondé** | — |
 
 ## Ce que ce document ne dit pas
 
 - Il ne rejuge aucun constat. Un `fermé` dit que le prédicat du constat ne tient plus dans cet
   arbre, pas que le constat était juste quand il a été écrit. Et un `ouvert` dit que le prédicat
   tient, pas que le remède proposé est le bon.
-- Les constats marqués « non re-sondé » — vingt-quatre MEDIUM, vingt-deux LOW, les dix familles de
+- Les constats marqués « non re-sondé » — vingt-quatre MEDIUM, vingt-deux LOW, deux familles de
   duplication — ne sont **pas** des constats réfutés. Ce sont des constats dont personne n'a mesuré
   l'état ici.
 - Les 17 constats que le rapport dit avoir réfutés lui-même, et les pistes qu'il dit avoir écartées,
