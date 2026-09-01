@@ -85,13 +85,38 @@ impl Catalogue {
     /// no `..`, and a 64-hex `sha256`. It does **not** verify the signature; that is
     /// [`verify_catalogue`], and the two are composed by [`verified_catalogue`] so
     /// verification always runs on the exact bytes parsed.
+    ///
+    /// Every field is first refused for control characters, uniformly and before the shape checks,
+    /// because a shape refusal quotes the value it refuses — see [`validate_free_text`].
     pub(crate) fn parse(bytes: &[u8]) -> Result<Catalogue, String> {
         let text = std::str::from_utf8(bytes).map_err(|_| "catalogue.toml is not valid UTF-8")?;
         let raw: RawCatalogue =
             toml::from_str(text).map_err(|e| format!("invalid catalogue.toml: {e}"))?;
         let mut plugins = BTreeMap::new();
         for (name, entry) in raw.plugin {
+            // Every field of an entry reaches a terminal verbatim: the free-text pair through
+            // `sbx plugins store list/info`, `path` through an install error naming where the
+            // plugin was listed, and all of them through the shape refusals below, which quote the
+            // value they refuse. A TOML basic string carries a control byte through a `\uXXXX`
+            // escape, so a TOFU-pinned store can put a terminal escape in any of them.
+            //
+            // The serializer refuses a control character in every field uniformly; this is the
+            // consuming half, and it has to be uniform too — guarding only the fields that are
+            // *displayed on success* left the ones that are only displayed on *failure*, where a
+            // refusal quoting the value is itself the injection. It runs first for the same reason.
+            // The entry name is checked before `here` exists, because `here` quotes it into every
+            // message below, including the name's own.
+            validate_free_text("the entry name", &name)?;
             let here = |e: String| format!("catalogue entry `{name}`: {e}");
+            for (field, value) in [
+                ("scheme", entry.scheme.as_deref().unwrap_or("")),
+                ("version", entry.version.as_str()),
+                ("description", entry.description.as_str()),
+                ("path", entry.path.as_str()),
+                ("sha256", entry.sha256.as_str()),
+            ] {
+                validate_free_text(field, value).map_err(here)?;
+            }
             crate::plugins::validate_install_name(&name).map_err(here)?;
             let kind = match entry.plugin_type.as_deref() {
                 Some(raw) => crate::plugins::PluginKind::parse(raw).map_err(here)?,
@@ -116,12 +141,6 @@ impl Catalogue {
             };
             validate_repo_path(&entry.path).map_err(here)?;
             validate_sha256(&entry.sha256).map_err(here)?;
-            // The free-text fields are displayed verbatim (`sbx plugins store list/info`), and a
-            // TOML basic string can carry a control byte via a `\uXXXX` escape; the serializer
-            // refuses control chars, so mirror that on the consuming side (a legitimately-published
-            // store never carries one) to keep a TOFU-pinned store from injecting terminal escapes.
-            validate_free_text("version", &entry.version).map_err(here)?;
-            validate_free_text("description", &entry.description).map_err(here)?;
             plugins.insert(
                 name,
                 CatalogueEntry {
@@ -722,16 +741,18 @@ mod tests {
         let mut version = "0.1.0".to_string();
         let mut path = "plugins/pass".to_string();
         let mut sha256 = "a".repeat(64);
+        let mut description = "a credential resolver".to_string();
         match field {
             "scheme" => scheme = value.to_string(),
             "version" => version = value.to_string(),
             "path" => path = value.to_string(),
             "sha256" => sha256 = value.to_string(),
+            "description" => description = value.to_string(),
             other => panic!("unknown field `{other}`"),
         }
         format!(
             "[plugin.pass]\nscheme = \"{scheme}\"\nversion = \"{version}\"\n\
-             path = \"{path}\"\nsha256 = \"{sha256}\"\n"
+             description = \"{description}\"\npath = \"{path}\"\nsha256 = \"{sha256}\"\n"
         )
     }
 
@@ -837,6 +858,39 @@ mod tests {
         assert!(Catalogue::parse(one_entry("version", "\\u001b]0;x").as_bytes()).is_err());
         // a clean value still parses
         assert!(Catalogue::parse(one_entry("version", "1.2.3").as_bytes()).is_ok());
+    }
+
+    /// The guard covers every field an entry carries, not the pair displayed on success.
+    ///
+    /// `scheme`, `path`, `sha256` and the entry name reach a terminal mainly through a *refusal*,
+    /// and every one of those refusals quotes the value it is refusing — so leaving them unguarded
+    /// made the refusal itself the injection. For the same reason the guard runs before the shape
+    /// checks rather than beside them.
+    #[test]
+    fn a_control_character_is_refused_in_every_catalogue_field() {
+        const ESC: char = '\u{1b}';
+        for field in ["scheme", "version", "description", "path", "sha256"] {
+            let entry = one_entry(field, "a\\u001b]0;x");
+            let err = match Catalogue::parse(entry.as_bytes()) {
+                Err(e) => e,
+                Ok(_) => panic!("`{field}` carrying a terminal escape must be refused"),
+            };
+            assert!(
+                !err.contains(ESC),
+                "the refusal for `{field}` echoes the escape it refuses: {err:?}"
+            );
+        }
+        // The entry name too: `here` quotes it into every other message, its own included.
+        let named = format!(
+            "[plugin.\"a\\u001b]0;x\"]\nscheme = \"pass\"\nversion = \"0\"\n\
+             description = \"d\"\npath = \"p\"\nsha256 = \"{}\"\n",
+            "a".repeat(64)
+        );
+        let err = match Catalogue::parse(named.as_bytes()) {
+            Err(e) => e,
+            Ok(_) => panic!("a terminal escape in the entry name must be refused"),
+        };
+        assert!(!err.contains(ESC), "the refusal echoes the name: {err:?}");
     }
 
     #[test]
