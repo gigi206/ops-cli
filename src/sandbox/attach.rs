@@ -101,9 +101,23 @@ const NAMESPACES: [(&str, libc::c_int); 7] = [
 ];
 
 /// Open a pidfd for the cage process `pid` and compute the namespace mask to join. Same uid, so
-/// `pidfd_open` is permitted; the pidfd pins that exact process, so a pid reused between discovery
-/// and the join can never be entered by mistake.
-pub(super) fn open_cage_handle(pid: u32) -> io::Result<CageHandle> {
+/// `pidfd_open` is permitted; the pidfd pins that exact process, so a pid reused **after** it is
+/// opened can never be entered by mistake.
+///
+/// After it is opened, and that is the whole of what a pidfd promises. [`find_cage_pid`] chose this
+/// pid a moment earlier, and the doc here used to say the pin covered that moment too — it does not:
+/// a pid recycled between the choice and the open is pinned as confidently as the right one. So the
+/// discriminating predicate is asked again on the pinned pid, and it is the one that separates this
+/// session's cage from everything else on the host: does that process's mount namespace carry the
+/// project. A pid recycled into an unrelated process fails it, and a `sbx session attach` that would
+/// otherwise have entered whatever now holds the number is refused instead.
+///
+/// The window it does not close is the one strictly between the choice and this re-check, which
+/// needs the recycled process to satisfy the predicate as well — that is, to be another process in
+/// this same session's cage, which is not a wrong place to attach. Closing it outright would mean
+/// verifying identity *through* the descriptor rather than through `/proc/<pid>`, which the kernel
+/// gives no way to do for the question being asked here.
+pub(super) fn open_cage_handle(pid: u32, project: &Path) -> io::Result<CageHandle> {
     // SAFETY: `pidfd_open` with flags 0 returns a fresh owned descriptor or -1/errno.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
     if fd < 0 {
@@ -111,6 +125,12 @@ pub(super) fn open_cage_handle(pid: u32) -> io::Result<CageHandle> {
     }
     // SAFETY: `fd` is a fresh owned descriptor from `pidfd_open`, wrapped exactly once.
     let pidfd = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
+    if !in_session_cage(pid, project) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the process chosen for this session is no longer in the session's cage",
+        ));
+    }
     let mask = namespaces_to_join(pid);
     Ok(CageHandle { pidfd, mask })
 }

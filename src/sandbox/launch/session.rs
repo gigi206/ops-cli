@@ -119,7 +119,7 @@ pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
         ));
         return ExitCode::FAILURE;
     };
-    let cage = match crate::sandbox::attach::open_cage_handle(cage_pid) {
+    let cage = match crate::sandbox::attach::open_cage_handle(cage_pid, &target.project) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("sbx session attach: cannot open a handle to session '{id}''s cage: {e}");
