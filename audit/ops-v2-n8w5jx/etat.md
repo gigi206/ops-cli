@@ -64,33 +64,75 @@ n'atteint pas ce site-ci. Le constat `gc.rs:103` reste donc ouvert, avec la rais
 lui-même lui donne : réconcilier contre cet ensemble supprimerait tous les roots vivants au premier
 `sbx gc --prune`, et le mode d'échec d'un décalage est la suppression, pas la rétention.
 
-## LOW (51) — quatre fermés, le reste presque intact
+## LOW (51) — le tiers ouvert et mesuré
 
-Le rapport annonce 51 constats LOW : 29 en prose, le reste en tableau. Quatre ont été repris, parce
-qu'ils touchaient un chemin qu'un autre correctif ouvrait déjà :
+Les 28 constats en prose ont été rouverts un par un dans cet arbre. Sur les 23 du tableau qui les
+suit, trois l'ont été ; les vingt autres portent « non re-sondé » et rien d'autre.
 
-| Constat | Statut | Provenance |
+### Fermés (8 en prose, 1 au tableau)
+
+| Constat | Fermé par | Ce qui a été mesuré |
 | --- | --- | --- |
-| `allowlist/mod.rs:475` — `matches_mute` lit son jeu de méthodes par la question du côté *allow* | fermé par `2b6f01a` | **mesuré** — un `mute` d'hôte nu ne silençait pas le refus le plus bruyant. |
-| `proxy/wire.rs:445` — `parse_chunk_size` accepte une taille signée ou entourée de blancs | fermé par `2b6f01a` | **mesuré** — la grammaire exige `1*HEXDIG` ; l'espace insécable était accepté. |
-| `proxy/ssrf.rs:60` — `embedded_v4` ignore la forme `::a.b.c.d` | fermé par `2b6f01a` | **mesuré** — le remède évident (`to_ipv4` au lieu de `to_ipv4_mapped`) ouvrait la boucle locale dans la même édition ; les deux adresses concernées sont écartées et un test échoue sous l'échange. |
-| `proxy/mod.rs:990` — `Head::keeps_alive` lit le jeton de version avec `split_whitespace` | fermé par `2b6f01a` | **mesuré** — trois plans lisaient le jeton ainsi, un seul le lit maintenant. |
+| `proxy/ssrf.rs:60` — `embedded_v4` ignore `::a.b.c.d` | `2b6f01a` | Le remède évident (`to_ipv4`) ouvrait la boucle locale ; les deux adresses concernées sont écartées. |
+| `allowlist/mod.rs:475` — `matches_mute` lit son jeu de méthodes du côté *allow* | `2b6f01a` | `admits_deny`. |
+| `proxy/mod.rs:990` — `keeps_alive` découpe avec `split_whitespace` | `2b6f01a` | Un seul lecteur du jeton de version. |
+| `proxy/wire.rs:445` — `parse_chunk_size` accepte une taille signée ou espacée | `2b6f01a` | `1*HEXDIG` exigé. |
+| `prebuilt.rs:859` — `provision_pinned` réécrit le verrou depuis un instantané d'avant le mint | l'arbre | L'écriture est additive (`prebuilt.rs:939-943`), relue après le mint, et la raison est écrite au site. |
+| `cgroup.rs:372` — `cage_scope_dirs` parcourt la tranche de tous les utilisateurs | l'arbre | `user_slice_root(uid)` rend `/sys/fs/cgroup/user.slice/user-<uid>.slice`. |
+| `config/overrides.rs:272` — `env::vars()` panique sur une variable non-UTF-8 | l'arbre | `overrides.rs:280` lit en `vars_os()`. |
+| `store.rs:323` — `LONGEST_SOCKET_SUFFIX` sous-estime le plus large chemin de socket | l'arbre | `BROKER_NAME_MAX` (`store/layout.rs:380`) est dérivé du budget. C'est le remède de l'autre audit ; les deux branches en proposaient un différent, celui-ci a été retenu. |
+| `allowlist/mod.rs:1093` — `capture_max_kb` perdu sans un mot quand une couche redéclare `capture` | — | **Fermé par argument au site, pas par mesure** : `allowlist/mod.rs:1126` soutient que `capture_body_kb` chevauche `capture`, donc nommer l'un nomme l'autre. L'argument n'a pas été vérifié contre le comportement observable. |
 
-Les autres n'ont pas été regardés. Deux méritent d'être nommés parce que le rapport les laisse
-explicitement sans code, et que la raison vaut d'être relue avant d'y toucher :
+### Ouverts et mesurés (17 en prose, 2 au tableau)
 
-- `observe_feed.rs:179` — le filtre du flux d'exec s'appuie sur `comm`, que le processus observé
-  choisit lui-même. **Mesuré ouvert ici** : `is_plumbing` (`observe_feed.rs:44`) apparie `comm`. Le
-  rapport écarte le correctif parce que le fermer demande une identité que possède le *lancement*,
-  pas le processus observé. La limite honnête que la branche avait écrite au site n'est pas dans cet
-  arbre.
-- `store.rs:323` — `LONGEST_SOCKET_SUFFIX` sous-estime le plus large chemin de socket. Le rapport
-  refuse de rétrécir le plafond (ce serait un verrouillage pour une installation existante) et
-  décrit un autre remède. **Non re-sondé ici.**
+La ligne est rouverte, le prédicat du constat tient encore. Classés par ce que ça coûte de le fermer.
+
+**Un frère correct est déjà dans l'arbre — le motif dominant du rapport.**
+
+| Constat | Ce qui est mesuré |
+| --- | --- |
+| `config/tools.rs:654` — le suffixe `.deb` est apparié avec la casse | `is_valid_deb_url` fait `url.ends_with(".deb")` ; `is_valid_appimage_url`, dix lignes plus bas, fait `to_ascii_lowercase().ends_with(".appimage")` **et dit pourquoi** ; `select_release_asset` (`prebuilt.rs:499`) minuscule le nom. Un asset `…​.DEB` est donc sélectionné puis refusé net. |
+| `config/load.rs:969` — `DESCRIBED` liste `"uses"` | La clé sérialisée est `use` (`config/schema.rs:832`, `#[serde(rename = "use")]`). Le filtre n'apparie jamais, et masquerait une clé réellement non décrite. |
+| `proxy/mod.rs:483` — le garde d'IP littérale au CONNECT teste l'hôte brut | `connect_host = canonical_host(&host)` est calculé à la ligne 465 et sert partout ailleurs ; la ligne 483 teste `host`. `127.0.0.1.` passe le garde. |
+| `seccomp.rs:1287` — le commentaire annonce `EFAULT` | Le test qu'il documente assère `EINVAL` (`seccomp.rs:1318`). |
+| `binds/tests.rs:295` — l'assertion « identifiant dégénéré » | Le littéral compté fait 33 caractères ; la même fonction assère `body.len() == 32` deux lignes plus haut. L'`assert_ne!` ne peut pas échouer. |
+
+**Sécurité, autonomes, remède court.**
+
+| Constat | Ce qui est mesuré |
+| --- | --- |
+| `config/safety.rs:86` — la lecture d'une config n'est pas bornée | `read_safe_bytes` fait un `read_to_end` sans plafond, sur un fichier que le dépôt cloné fournit, et toute invocation de sbx dans ce répertoire y passe. |
+| `proxy/wire.rs:397` — la section de trailers n'est bornée ni en lignes ni par une échéance | Chaque *ligne* est plafonnée par `CHUNK_LINE_MAX` ; leur nombre ne l'est pas. La tête a les deux (`HEAD_MAX` et `head_deadline`), le corps a un plafond, les trailers n'ont rien — et ces octets sont jetés. |
+| `proc_enforce/notify.rs:274` — `recv_fd_raw` ignore `cmsg_len` | Le type et le niveau du cmsg sont vérifiés, sa longueur non, et `MSG_CTRUNC` non plus. Le noyau installe tous les descripteurs d'un `SCM_RIGHTS` ; un seul est lu. |
+| `control/capture.rs:494` — l'élagage de l'historique d'aiguilles part de la tête | `merged.drain(..over)` sans égard pour l'ensemble vivant : une aiguille statique en tête est retirée, et la capture classée par ce même appel est masquée contre un ensemble qui ne la contient plus. |
+| `proxy/h2mitm.rs:206` — le refus de plafond de flux n'est enregistré nulle part | L'appel est `refuse(...)` nu ; `refuse_upstream` (`h2mitm.rs:1195`) est la forme qui pousse un journal, et ce site ne l'emprunte pas. |
+
+**Changent une sémantique visible par l'utilisateur ou touchent plusieurs sites — à arbitrer avant d'écrire.**
+
+| Constat | Ce qui est mesuré |
+| --- | --- |
+| `proxy/ssrf.rs:299` — une seule adresse d'un hôte multi-domicilié est essayée | `ips.into_iter().find(..)` rend **une** adresse, et six appelants ne composent que celle-là. |
+| `allowlist/grammar.rs` — une chaîne de requête dans un chemin de règle élargit la règle | La doc (`grammar.rs:412`) dit que le chemin inclut « any query string » ; `canonical_segments` la retire du côté requête. Une règle écrite étroite apparie large et s'affiche sous une forme qui décrit autre chose. |
+| `allowlist/mod.rs:426` — une règle `re:` ancrée sur `http://` ne peut jamais apparier | L'URL comparée est reconstruite en `https://` aux deux formes (`mod.rs:426` et `:430`), y compris pour une requête cleartext. |
+| `sandbox/argv.rs:49` — `compose` réécrit tout élément d'argv égal au marqueur | La substitution est une égalité de valeur sur tout le vecteur, qui porte aussi la commande de la cage et chaque chemin de bind. |
+| `sandbox/argv.rs:82` — un NUL dans un *nom* est rapporté comme « the value of » | Le commentaire deux lignes plus haut dit « The name, never the value » ; le message dit l'inverse et imprime la clé empoisonnée en entier. |
+| `sandbox/argv.rs:147` — `--die-with-parent` est inconditionnel, y compris détaché | La branche `exec`-replace de `detached_child` survit à la décomposition (`launch/detach.rs:157`), donc le chemin existe toujours. **Verdict PLAUSIBLE conservé** : la course n'a été reproduite ni par le rapport ni ici. |
+| `sandbox/binds.rs:1189` — le routeur d'URL n'est exécutable qu'après le renommage | `write_atomic` puis `set_permissions(0o755)` : le fichier est visible en `0644` dans l'intervalle. |
+| `sandbox/cgroup.rs:110` — `is_valid_memory_value` accepte ce que systemd refuse | La vérification est syntaxique : `99E` passe, puis chaque lancement du projet échoue à la création du scope. |
+| `config/secrets.rs:191` — le nom par défaut d'un secret échappe à `validate_secret_name` | `None => host.to_string()`, sans passer la porte que le bras `Some` emprunte. |
+| `observe_feed.rs:44` — le filtre du flux d'exec s'appuie sur `comm` | `is_plumbing` apparie `comm`, que le processus observé choisit. Le rapport écarte le correctif de code, mais **la limite honnête qu'il avait écrite au site n'est pas dans cet arbre**. |
+
+### Non re-sondés (2 en prose, 20 au tableau)
+
+`attach.rs:95` (pidfd ouvert après la découverte, PLAUSIBLE) et `proc_enforce:1302` (la re-sonde
+`O_NOFOLLOW` répond `ELOOP` pour des errnos qui décrivent le superviseur) n'ont pas été rouverts. Les
+vingt lignes de tableau restantes non plus. Plusieurs citent des fichiers que la décomposition a
+déplacés (`launch.rs`, `store.rs`, `proc_enforce.rs`), et une conclusion de portée ne se transporte
+pas à travers un déplacement : elle se re-mesure.
 
 ## Duplication (10 familles) — jamais ouvertes
 
-Aucune n'a été traitée. Le rapport les classe par *ce qui casse si une copie est corrigée et pas les
+Aucune n'a été ouverte. Le rapport les classe par *ce qui casse si une copie est corrigée et pas les
 autres*, et la première de la liste est la seule qui porte une décision de sécurité : la queue de
 réponse du proxy, écrite deux fois entre `proxy/forward.rs` et `proxy/tunnel.rs`, `masks_reflection`
 compris.
@@ -98,9 +140,10 @@ compris.
 ## Ce que ce document ne dit pas
 
 - Il ne rejuge aucun constat. Un `fermé` dit que le prédicat du constat ne tient plus dans cet
-  arbre, pas que le constat était juste quand il a été écrit.
-- Les constats marqués « non re-sondé » ou « jamais ouvert » — vingt-quatre MEDIUM, la quasi-totalité
-  des LOW, les dix familles de duplication — ne sont **pas** des constats réfutés. Ce sont des
-  constats dont personne n'a mesuré l'état ici.
+  arbre, pas que le constat était juste quand il a été écrit. Et un `ouvert` dit que le prédicat
+  tient, pas que le remède proposé est le bon.
+- Les constats marqués « non re-sondé » — vingt-quatre MEDIUM, vingt-deux LOW, les dix familles de
+  duplication — ne sont **pas** des constats réfutés. Ce sont des constats dont personne n'a mesuré
+  l'état ici.
 - Les 17 constats que le rapport dit avoir réfutés lui-même, et les pistes qu'il dit avoir écartées,
   sont dans le rapport et n'ont pas été rejugés.
