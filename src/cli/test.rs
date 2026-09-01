@@ -266,7 +266,14 @@ fn render_url_verdict(
     // rule allowing the address made this command print ALLOWED for a request the wire
     // refuses — the one answer a tester exists to prevent.
     if refused_as_ip_literal(&host, clear, &effective.l4_decision(&host, port)) {
-        o.push_str(&render_ip_literal_refusal(url, &host, port, pal));
+        // Whether a rule already names the address. If one does, the absolute-form plane reaches it
+        // — inspected, under that rule — and saying so is what keeps an operator from reaching for
+        // a `tcp://` splice they do not need.
+        let named = matches!(
+            effective.explain(&host, port, &path, method),
+            allowlist::Decision::AllowedBy(_) | allowlist::Decision::AllowedDefault
+        );
+        o.push_str(&render_ip_literal_refusal(url, &host, port, named, pal));
         return Ok(o);
     }
     let decision = if clear {
@@ -466,6 +473,11 @@ fn render_l4_decision(target: &str, l4: &allowlist::L4Decision, pal: &style::Pal
 /// says: an operator who read it that way was pushed toward declaring a `tcp://` splice, a strictly
 /// wider rule than the one already in place.
 ///
+/// [`render_ip_literal_refusal`] carries that the rest of the way. When a rule already names the
+/// address, the render says so and names the plane that reaches it under that rule, inspected —
+/// because the harm here is not the headline being the tunnelled answer, it is an operator reading
+/// a bare DENIED and widening their policy to a splice that inspects nothing.
+///
 /// The one way an address is reached without a name is the **raw splice**,
 /// which inspects nothing and so needs none: a `tcp://host:port` allow rule, checked here through
 /// the same [`allowlist::EgressPolicy::l4_decision`] the proxy consults first. A `Suppressed`
@@ -492,7 +504,13 @@ fn refused_as_ip_literal(host: &str, clear: bool, l4: &allowlist::L4Decision) ->
 /// the proxy's (DENIED), and the reason carries the `ip-literal` token it logs and answers with,
 /// names the plane that answers it, and points at the rule that would actually reach the address.
 /// Every span is empty under a non-terminal, so a capture is plain text.
-fn render_ip_literal_refusal(target: &str, host: &str, port: u16, pal: &style::Palette) -> String {
+fn render_ip_literal_refusal(
+    target: &str,
+    host: &str,
+    port: u16,
+    named_by_a_rule: bool,
+    pal: &style::Palette,
+) -> String {
     use std::fmt::Write as _;
     let (n, err, r) = (pal.name, pal.err, pal.reset);
     let mut o = String::new();
@@ -512,6 +530,20 @@ fn render_ip_literal_refusal(target: &str, host: &str, port: u16, pal: &style::P
             pal
         )
     );
+    if named_by_a_rule {
+        let _ = writeln!(
+            o,
+            "  {}",
+            style::dim_prose(
+                &format!(
+                    "a rule already names {host}:{port}, so the absolute-form plane reaches it \
+                     under that rule, inspected. A `tcp://` splice would be a wider rule than the \
+                     one you have, and would inspect nothing"
+                ),
+                pal
+            )
+        );
+    }
     o
 }
 
@@ -784,10 +816,13 @@ mod tests {
         // what keeps the line true: the absolute-form request the same URL can be sent as carries
         // no CONNECT, so it is decided by the policy like any other and this refusal never applies
         // to it.
+        // No rule names this address here, so the second line does not appear and the whole
+        // rendering is still one exact string a reader can be shown.
         let out = render_ip_literal_refusal(
             "https://10.0.0.5/v1",
             "10.0.0.5",
             443,
+            false,
             &style::Palette::plain(),
         );
         assert_eq!(
@@ -942,6 +977,7 @@ mod tests {
             "https://10.0.0.5/token",
             "10.0.0.5",
             443,
+            false,
             &style::Palette::plain(),
         );
         assert!(out.contains("DENIED"), "{out}");
@@ -955,6 +991,29 @@ mod tests {
         );
         // The remedy still names the way an address is legitimately reached.
         assert!(out.contains("tcp://10.0.0.5:443"), "{out}");
+        // With no rule naming the address there is no inspected route to point at, so the note
+        // that would name one must not appear.
+        assert!(!out.contains("inspected"), "{out}");
+
+        // A rule that DOES name it: both answers are shown, so an operator whose policy already
+        // reaches the address is not pushed toward a `tcp://` splice that is wider than what they
+        // have and inspects nothing. That push is the harm this whole render exists to avoid.
+        let named = render_ip_literal_refusal(
+            "https://10.0.0.5/token",
+            "10.0.0.5",
+            443,
+            true,
+            &style::Palette::plain(),
+        );
+        assert!(
+            named.contains("absolute-form") && named.contains("inspected"),
+            "the inspected route a rule already opens must be named: {named}"
+        );
+        assert!(
+            named.contains("DENIED"),
+            "the tunnelled verdict is still the headline, since that is the shape every ordinary \
+             client sends: {named}"
+        );
     }
 
     /// `sbx test net` takes no flag it does not know, and says so about its own verb. A
