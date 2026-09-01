@@ -322,7 +322,7 @@ The 64 shipped bundles, and what each carries:
 | `kiro` | 2 (`nix:`) | 34 egress entries, an install step | `chromium-background`, `google-signin-incage` |
 | `kiro-desktop` | 2 (`nix:`, `tarball:`) | 36 egress entries, 1 env var, a `tarball:` resolver | `chromium-background` |
 | `mimo` | 2 (`mise:`, `nix:`) | 6 egress entries | `models-catalog`, `npm-registry` |
-| `muse` | 1 (`nix:`) | 4 egress entries, 1 env var, an install step | none |
+| `muse` | none | 4 egress entries, 1 env var, an install step | none |
 | `nanobot` | 3 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
 | `nova` | 2 (`mise:`, `nix:`) | 5 egress entries | `npm-audit`, `npm-registry` |
 | `odysseus` | 6 (`nix:`) | 6 egress entries, 3 env vars, an install step | `npm-audit`, `npm-registry`, `pypi` |
@@ -360,10 +360,12 @@ name `opencode`; `hermes-web` and `hermes-webui` name `hermes`. No shipped profi
 one-step import: importing one alone leaves its bundle (and any group that bundle
 REQUIRES) undeclared, and the launch warns.
 
-Eight bundles carry an **install step** (`provision`) beside their packages, because their agent is
-finished by a command rather than by unpacking: `deepseek-harness`, `junie`, `odysseus`, `openfox`
-and `trae` build or extend what a backend delivered, and `cursor-agent`, `muse` and `prime-agent`
-are vendor bootstraps whose installer script is the only way the agent arrives at all. sbx runs the
+Ten bundles carry an **install step** (`provision`), because their agent is finished by a command
+rather than by unpacking: `deepseek-harness`, `junie`, `odysseus`, `openfox` and `trae` build or
+extend what a backend delivered; `cursor-agent`, `muse` and `prime-agent` are vendor bootstraps
+whose installer script is the only way the agent arrives at all, which is why `muse` is the one
+bundle that names no package; and `kiro` and `hermes-desktop` state in the app's home a preference
+the agent reads at startup (telemetry off, the install method it was delivered by). sbx runs the
 step before the consuming app's own command, so naming one of these bundles gets the agent, not
 just the hosts it reaches, and [`sbx upgrade provision`](../cli/upgrade) is what rolls it forward.
 
