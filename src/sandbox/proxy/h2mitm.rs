@@ -68,6 +68,28 @@ pub(super) fn handle(
 /// Accept the tunnel, terminate TLS as h2, then drive stream acceptance and every in-flight
 /// stream concurrently. The per-stream futures borrow `ctx`, so they are driven in a
 /// [`FuturesUnordered`] here (not spawned) — no `'static` bound, no `Arc<ProxyCtx>` threading.
+///
+/// What that costs is a real bound rather than a free choice, so it is written down. Everything
+/// runs on one current-thread runtime, so a synchronous call inside a stream stalls every sibling
+/// stream on this tunnel, and the accept loop with them. Three such calls exist, and measuring them
+/// separates one from the other two:
+///
+/// - The name resolution in [`resolve_checked`] goes through a short-TTL cache, and every stream of
+///   a CONNECT shares one authority, so it blocks once per host per TTL window. It blocks per
+///   stream only where `[network] dns_cache_ttl = 0` turns the cache off.
+/// - The signer plugin in [`super::inject::pairs_for`] is IPC to a child process, held under a
+///   mutex. Per request, and the one worth naming: a stream needing no signer waits behind one that
+///   does. Signing is serialized by that mutex whatever thread it runs on, so moving it off would
+///   recover the unrelated streams rather than any throughput.
+/// - The credential refresh a `401` triggers ([`super::note_final_status`]) runs a resolver, which
+///   is another child process. Rare, and bounded by the refresher's own minimum gap.
+///
+/// None is moved off-thread, because `tokio::task::spawn_blocking` wants `Send + 'static` and that
+/// is precisely the borrow this shape exists to avoid: buying it means carrying an
+/// `Arc<ProxyCtx>` through every stream. Two things would justify paying that. A launch whose
+/// signer latency is the tunnel's limit, visible as sibling streams whose time to first byte tracks
+/// a signer they never invoked; or a default that stops caching resolutions, which would move the
+/// first item into the second's class.
 async fn serve(
     client: std::os::unix::net::UnixStream,
     connect_host: &str,
