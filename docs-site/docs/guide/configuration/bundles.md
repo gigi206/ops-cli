@@ -56,6 +56,7 @@ the map-side companion, and it carries the egress along.
 | `allow`, `deny`, `mute` | `network` mode, `gui`, `gpu`, `audio`, `dbus`, `proc`, `home_scope` |
 | `secret` | another bundle (`use`) |
 | `task` (declared operations, `[bundle.<name>.task.<task>]`) | |
+| `service` (an auxiliary process run beside the app, `[bundle.<name>.service.<svc>]`) | |
 | `flakes`, `tarball`, `deb`, `appimage` (the resolver tables that pair with a package) | |
 | `provision` (the one-time step that finishes an install) | |
 
@@ -325,7 +326,7 @@ The 64 shipped bundles, and what each carries:
 | `muse` | none | 4 egress entries, 1 env var, an install step | none |
 | `nanobot` | 3 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
 | `nova` | 2 (`mise:`, `nix:`) | 5 egress entries | `npm-audit`, `npm-registry` |
-| `odysseus` | 6 (`nix:`) | 6 egress entries, 3 env vars, an install step | `npm-audit`, `npm-registry`, `pypi` |
+| `odysseus` | 6 (`nix:`) | 6 egress entries, 3 env vars, an install step, a background service | `npm-audit`, `npm-registry`, `pypi` |
 | `omp` | 1 (`mise:`) | 1 egress entry | none |
 | `openclaude` | 2 (`mise:`, `nix:`) | 1 egress entry | `npm-registry` |
 | `openclaw` | 2 (`mise:`, `nix:`) | 3 egress entries, 1 env var | `npm-audit`, `npm-registry` |
