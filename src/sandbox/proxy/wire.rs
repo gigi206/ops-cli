@@ -383,6 +383,22 @@ pub(super) fn copy_exact<R: Read, W: Write>(r: &mut R, w: &mut W, mut n: u64) ->
 /// caps.
 pub(super) const CHUNK_LINE_MAX: u64 = 8 * 1024;
 
+/// The most trailer lines a chunked body may carry after its zero chunk.
+///
+/// [`CHUNK_LINE_MAX`] bounds each line and nothing bounded their *number*, so a cage that sent
+/// `0\r\n` and then an endless stream of `x: y\r\n` held a proxy thread in that loop for as long as
+/// it kept writing, holding a `ctx.conns` token with it. No read timeout fires against a peer that
+/// writes continuously, and these bytes are discarded rather than forwarded — so the loop could
+/// run forever over content nothing would ever read.
+///
+/// A count, not a deadline, and the difference is worth naming: neither production caller of
+/// [`read_chunked_body`] hands in a [`Deadlined`] reader (`forward.rs` wraps the client socket in a
+/// plain `BufReader`, and the held-body path takes the caller's), so the whole chunked body — data
+/// and trailers alike — is bounded by size and not by time. Bounding the count ends the unbounded
+/// loop, which is this defect; a slow drip is a property of the body path as a whole and is not
+/// closed here.
+const TRAILER_LINES_MAX: usize = 64;
+
 /// De-chunk a `Transfer-Encoding: chunked` request body into one buffer, fail-closed on malformed
 /// framing (a non-hex chunk size, a short data read, a missing trailing CRLF) or a body over
 /// the caller's ceiling. The caller re-frames the result with a synthesized `Content-Length`
@@ -394,11 +410,17 @@ pub(super) fn read_chunked_body<R: BufRead>(r: &mut R, cap: u64) -> io::Result<V
     loop {
         let size = read_chunk_size_line(r)?;
         if size == 0 {
-            // trailers (if any) end at a blank line; read until it, each trailer line bounded.
+            // trailers (if any) end at a blank line; read until it, each trailer line bounded and
+            // their number bounded too (see `TRAILER_LINES_MAX`).
+            let mut seen = 0usize;
             loop {
                 let t = read_line_bounded(r, CHUNK_LINE_MAX)?;
                 if t.is_empty() || strip_eol(&t).is_empty() {
                     break;
+                }
+                seen += 1;
+                if seen > TRAILER_LINES_MAX {
+                    return Err(invalid("chunked trailer section too long"));
                 }
             }
             return Ok(buf);

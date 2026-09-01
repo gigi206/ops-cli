@@ -5711,6 +5711,40 @@ fn read_chunked_body_concatenates_multiple_chunks_and_strips_trailers() {
     );
 }
 
+/// The trailer section after the zero chunk is bounded in line *count*, not only per line.
+///
+/// `CHUNK_LINE_MAX` caps each line and nothing capped how many there could be, so a cage that sent
+/// `0\r\n` and then kept writing `x: y\r\n` held the reading thread in that loop for as long as it
+/// cared to — a `ctx.conns` token held with it, no read timeout firing against a peer that writes
+/// continuously, and every one of those bytes discarded rather than forwarded. The head has both a
+/// size cap and a deadline; this section had neither.
+///
+/// A short trailer section is still accepted below, so the bound cannot be satisfied by refusing
+/// trailers outright.
+#[test]
+fn a_chunked_body_whose_trailer_section_never_ends_is_refused() {
+    let mut body = b"0\r\n".to_vec();
+    for i in 0..1_000 {
+        body.extend_from_slice(format!("x{i}: y\r\n").as_bytes());
+    }
+    // No blank line: in production the peer simply keeps writing, and the only reason this input
+    // terminates at all is that a test cannot hand the reader an infinite stream.
+    let mut br = std::io::BufReader::new(std::io::Cursor::new(body));
+    let err = read_chunked_body(&mut br, 1024).unwrap_err();
+    assert!(
+        err.to_string().contains("trailer section too long"),
+        "{err}"
+    );
+
+    let mut br = std::io::BufReader::new(std::io::Cursor::new(
+        b"0\r\nX-Trailer: yes\r\n\r\n".to_vec(),
+    ));
+    assert!(
+        read_chunked_body(&mut br, 1024).unwrap().is_empty(),
+        "an ordinary trailer section is still read and discarded"
+    );
+}
+
 #[test]
 fn read_chunked_body_fails_closed_on_malformed_framing() {
     // a non-hex chunk size

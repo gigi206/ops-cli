@@ -489,10 +489,29 @@ impl CaptureRing {
         }
         // Bounded, because every needle here is scanned over every captured part and a session that
         // re-resolves a credential on a schedule would otherwise grow the set for as long as it
-        // runs. The live values are appended last, so dropping from the front retires the least
-        // recently seen first and never the ones in use.
-        let over = merged.len().saturating_sub(NEEDLE_HISTORY_MAX);
-        merged.drain(..over);
+        // runs.
+        //
+        // "The live values are appended last" was not enough to make dropping from the front safe,
+        // and this is what the split repairs. A value already in `history` is not re-appended by
+        // the loop above — it is already there — so a credential declared once and never
+        // re-resolved (a static `API_KEY`) stays at index 0 for the life of the launch while a
+        // refreshing OAuth token pushes the set past the cap. The drain then took the static one,
+        // and the very `insert` that trimmed it filed its capture masked against a set no longer
+        // containing it: `sbx net logs --with-headers` would print that key in cleartext.
+        //
+        // `partition` keeps relative order within each half, which is what the drain depends on:
+        // `retired` stays least-recently-seen-first. And the cap yields before a live value does —
+        // `min(retired.len())` — because exceeding a ceiling that exists to bound scan cost is a
+        // cost, while dropping a live needle is a disclosure.
+        let (mut retired, live): (Vec<SecretNeedle>, Vec<SecretNeedle>) = merged
+            .into_iter()
+            .partition(|h| !current.needles.iter().any(|n| n.as_bytes() == h.as_bytes()));
+        let over = (retired.len() + live.len())
+            .saturating_sub(NEEDLE_HISTORY_MAX)
+            .min(retired.len());
+        retired.drain(..over);
+        retired.extend(live);
+        let merged = retired;
         *history = std::sync::Arc::new(merged);
         history.clone()
     }
@@ -689,6 +708,60 @@ mod tests {
         let body = String::from_utf8(stored.res_body.bytes.clone()).unwrap();
         assert_eq!(body, "retry with *************** please");
         assert!(head.starts_with("GET /v1 HTTP/1.1"), "not this: {head}");
+    }
+
+    /// A credential still in use is never trimmed out of the masking set, however long the launch
+    /// runs.
+    ///
+    /// The set is capped, and the cap dropped from the front on the reasoning that the live values
+    /// are appended last. They are not: the merge does not re-append a value already in the
+    /// history, so a credential declared once and never re-resolved keeps the index it was seeded
+    /// at while a refreshing token pushes the union past the ceiling. The static one was then
+    /// dropped — and the very `insert` that dropped it filed *its* capture against the trimmed
+    /// set, so that one exchange went into the ring with the key in cleartext for
+    /// `sbx net logs --with-headers` to print.
+    ///
+    /// Checked on every round rather than at the end, because the window is one insert wide: the
+    /// round after the drop finds the value missing from the history and re-appends it at the
+    /// tail, which repairs the set and hides the exchange that was already filed.
+    #[test]
+    fn a_static_credential_is_never_trimmed_out_of_the_set_that_masks_its_own_capture() {
+        use crate::sandbox::proxy::{CredentialSet, Credentials};
+
+        let credentials = std::sync::Arc::new(Credentials::new(
+            Vec::new(),
+            vec![needle("static-api-k3y")],
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+        ));
+        let ring = CaptureRing::new(
+            CaptureCaps::new(CaptureLevel::Bodies, 8),
+            credentials.clone(),
+        );
+        // Enough refreshes to carry the union past its ceiling twice over. The static credential
+        // stays declared throughout — that is the point: it is live on every one of these rounds.
+        for i in 0..NEEDLE_HISTORY_MAX * 2 {
+            credentials.replace(CredentialSet {
+                injections: Vec::new(),
+                needles: vec![
+                    needle("static-api-k3y"),
+                    needle(&format!("rotating-t0ken-{i:04}")),
+                ],
+            });
+            let seq = i as u64 + 1;
+            let mut cap = Capture::new(seq);
+            cap.req_head =
+                bytes(b"GET /v1 HTTP/1.1\r\nauthorization: Bearer static-api-k3y\r\n\r\n");
+            ring.insert(cap);
+
+            let (found, _) = ring.get(&[seq]);
+            let head = String::from_utf8(found[0].req_head.bytes.clone()).unwrap();
+            assert!(
+                !head.contains("static-api-k3y"),
+                "refresh {i}: a credential still in use must not be trimmed out of the set that \
+                 masks it: {head}"
+            );
+            assert!(head.starts_with("GET /v1 HTTP/1.1"), "not this: {head}");
+        }
     }
 
     #[test]

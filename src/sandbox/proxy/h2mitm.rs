@@ -203,6 +203,22 @@ async fn accept_streams<T>(
                     if inflight.len() >= MAX_STREAMS as usize {
                         // Backstop the advertised SETTINGS limit: refuse the excess stream
                         // rather than letting an in-cage client open unbounded work per tunnel.
+                        //
+                        // Recorded before it is answered. `refuse` only writes the response; the
+                        // log is `refuse_upstream`'s doing, and this site took the bare form, so
+                        // the one cap an in-cage client can reach on this plane left no trace
+                        // anywhere — no stat, no log line, no notice. `Blocked` rather than
+                        // `Error`: its own documentation files the splice cap there, and this is
+                        // that cap's h2 twin, not a downstream failure.
+                        ctx.push_log(
+                            Proto::Https,
+                            connect_host,
+                            port,
+                            Some(req.method().as_str()),
+                            Some(req.uri().path()),
+                            LogVerdict::Blocked,
+                            "http2-stream-cap",
+                        );
                         let _ = refuse(respond, StatusCode::TOO_MANY_REQUESTS, "http2-stream-cap");
                         continue;
                     }

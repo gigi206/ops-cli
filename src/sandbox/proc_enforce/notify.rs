@@ -285,7 +285,7 @@ pub(super) fn recv_fd_raw(stream: &UnixStream) -> io::Result<libc::c_int> {
     msg.msg_control = cbuf.as_mut_ptr();
     msg.msg_controllen = cbuf.len() as _;
     // SAFETY: msg's buffers are live and the control one is aligned for a `cmsghdr` ([`CmsgBuf`]);
-    // we read exactly one cmsg carrying one fd.
+    // we read every descriptor the cmsg carries, and close all of them on any refusal.
     unsafe {
         let n = libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC);
         if n < 0 {
@@ -298,15 +298,43 @@ pub(super) fn recv_fd_raw(stream: &UnixStream) -> io::Result<libc::c_int> {
         {
             return Err(io::Error::other("no fd in the handoff message"));
         }
-        let mut fd: libc::c_int = -1;
+        // Every descriptor the message carried, not the first one. `SCM_RIGHTS` installs them all
+        // into this process before a single line here runs, so reading one and walking away leaks
+        // the rest for the life of the session — repeat it and the supervisor runs out of
+        // descriptors. `cmsg_len` is the only thing that says how many arrived, and it was not
+        // read at all.
+        let header = libc::CMSG_LEN(0) as usize;
+        let width = std::mem::size_of::<libc::c_int>();
+        let count = ((*cmsg).cmsg_len as usize).saturating_sub(header) / width;
+        let mut fds = vec![-1 as libc::c_int; count];
         std::ptr::copy_nonoverlapping(
             libc::CMSG_DATA(cmsg),
-            &mut fd as *mut libc::c_int as *mut u8,
-            std::mem::size_of::<libc::c_int>(),
+            fds.as_mut_ptr().cast::<u8>(),
+            count * width,
         );
-        if fd < 0 {
-            return Err(io::Error::other("invalid fd in the handoff message"));
+        // Closed before the refusal is returned, or the refusal leaks exactly what it refuses.
+        let refuse = |why: &'static str| {
+            for fd in &fds {
+                if *fd >= 0 {
+                    libc::close(*fd);
+                }
+            }
+            Err(io::Error::other(why))
+        };
+        // `MSG_CTRUNC` is refused rather than trimmed, and the cleanup above is honest about its
+        // limit: the kernel dropped control data that did not fit, so descriptors may have been
+        // closed by it or may not exist at all, and none of them is named by a cmsg this code can
+        // walk. What cannot be seen cannot be closed — but a handoff of this shape is not one this
+        // protocol sends, so the connection has already failed its contract.
+        if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+            return refuse("the handoff message was truncated by the kernel");
         }
-        Ok(fd)
+        if count != 1 || !libc::CMSG_NXTHDR(&msg, cmsg).is_null() {
+            return refuse("the handoff message carried more than one descriptor");
+        }
+        if fds[0] < 0 {
+            return refuse("invalid fd in the handoff message");
+        }
+        Ok(fds[0])
     }
 }

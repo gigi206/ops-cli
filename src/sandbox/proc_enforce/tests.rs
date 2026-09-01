@@ -706,6 +706,122 @@ fn the_handoff_control_buffer_is_aligned_for_the_header_it_is_read_as() {
     );
 }
 
+/// A descriptor handoff carrying more than one `SCM_RIGHTS` descriptor is refused — and the refusal
+/// closes every one of them.
+///
+/// `SCM_RIGHTS` installs *all* of a message's descriptors into this process before a single line of
+/// the receiver runs, and the receiver read `CMSG_DATA` for exactly one `c_int` without ever
+/// looking at `cmsg_len`. The extras stayed open for the life of the session; repeated, that is the
+/// supervisor running out of descriptors.
+///
+/// Measured over many rounds rather than one, and the reason is the harness: `/proc/self/fd` counts
+/// the whole process, and cargo runs these tests as threads of one binary, so a neighbour opening a
+/// file between two counts moves the number. A leak of two per round is *systematic* — two hundred
+/// rounds leak four hundred descriptors — while that interference is incidental and bounded by what
+/// a handful of concurrent tests hold at once. The band below sits an order of magnitude above the
+/// noise and at half the leak, so neither reading can be mistaken for the other.
+#[test]
+fn a_handoff_carrying_two_descriptors_is_refused_and_leaks_neither() {
+    const ROUNDS: usize = 200;
+
+    let before = open_fd_count();
+    for _ in 0..ROUNDS {
+        let (recv, send) = UnixStream::pair().unwrap();
+        let a = std::fs::File::open("/dev/null").unwrap();
+        let b = std::fs::File::open("/dev/null").unwrap();
+        send_scm_rights(&send, &[fd_of(&a), fd_of(&b)]);
+
+        let err = recv_fd_raw(&recv).unwrap_err();
+        assert!(
+            err.to_string().contains("more than one descriptor"),
+            "{err}"
+        );
+    }
+    let after = open_fd_count();
+
+    assert!(
+        after < before + ROUNDS,
+        "a refusal that returns before closing what the kernel installed leaks exactly what it \
+         refuses: {before} descriptors before {ROUNDS} refused handoffs, {after} after"
+    );
+}
+
+/// The ordinary one-descriptor handoff still works, so the check above cannot be satisfied by
+/// refusing every message.
+#[test]
+fn a_handoff_carrying_one_descriptor_is_accepted() {
+    let (recv, send) = UnixStream::pair().unwrap();
+    let f = std::fs::File::open("/dev/null").unwrap();
+    send_scm_rights(&send, &[fd_of(&f)]);
+
+    let fd =
+        recv_fd_raw(&recv).expect("a single-descriptor handoff is the shape this protocol uses");
+    assert!(fd >= 0, "got {fd}");
+    // SAFETY: `fd` is ours from `recv_fd_raw` and is closed exactly once here.
+    unsafe { libc::close(fd) };
+}
+
+/// How many descriptors this process holds. The `read_dir` handle is open during the walk, so it is
+/// counted identically on either side of a comparison.
+fn open_fd_count() -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .expect("/proc/self/fd is readable on Linux")
+        .count()
+}
+
+fn fd_of(f: &std::fs::File) -> libc::c_int {
+    use std::os::unix::io::AsRawFd as _;
+    f.as_raw_fd()
+}
+
+/// Send `fds` over `sock` in one `SCM_RIGHTS` control message.
+///
+/// The control buffer is a union for the same reason [`CmsgBuf`] is one: `CMSG_FIRSTHDR` hands it
+/// back as a `*mut cmsghdr`, and writing through that pointer is only defined if the storage is
+/// aligned for the header.
+fn send_scm_rights(sock: &UnixStream, fds: &[libc::c_int]) {
+    use std::os::unix::io::AsRawFd as _;
+
+    #[repr(C)]
+    union SendBuf {
+        bytes: [u8; 64],
+        _align: libc::cmsghdr,
+    }
+
+    let payload = std::mem::size_of_val(fds);
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast::<libc::c_void>(),
+        iov_len: 1,
+    };
+    let mut cbuf = SendBuf { bytes: [0u8; 64] };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    // SAFETY: `bytes` covers the whole union and every byte of it is initialised.
+    msg.msg_control = unsafe { cbuf.bytes.as_mut_ptr().cast::<libc::c_void>() };
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(payload as u32) } as _;
+    assert!(
+        msg.msg_controllen as usize <= std::mem::size_of::<SendBuf>(),
+        "the test buffer holds the message it is asked to send"
+    );
+
+    // SAFETY: `msg`'s buffers are live, the control one is aligned for a `cmsghdr` and large enough
+    // for the header plus `payload` bytes, and `fds` holds `fds.len()` initialised `c_int`s.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(payload as u32) as _;
+        std::ptr::copy_nonoverlapping(fds.as_ptr().cast::<u8>(), libc::CMSG_DATA(cmsg), payload);
+        assert!(
+            libc::sendmsg(sock.as_raw_fd(), &msg, 0) >= 0,
+            "sendmsg: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 /// An `openat2` may ask the kernel for a stricter path walk than the supervisor performed. The
 /// probe follows symlinks by design, so a descriptor served from it is the result of the looser
 /// walk: a caller that asked for `RESOLVE_NO_SYMLINKS` would be handed exactly what its own

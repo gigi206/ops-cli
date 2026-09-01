@@ -69,7 +69,7 @@ lui-même lui donne : réconcilier contre cet ensemble supprimerait tous les roo
 Les 28 constats en prose ont été rouverts un par un dans cet arbre. Sur les 23 du tableau qui les
 suit, trois l'ont été ; les vingt autres portent « non re-sondé » et rien d'autre.
 
-### Fermés (13 en prose, 1 au tableau)
+### Fermés (17 en prose, 2 au tableau)
 
 | Constat | Fermé par | Ce qui a été mesuré |
 | --- | --- | --- |
@@ -87,21 +87,17 @@ suit, trois l'ont été ; les vingt autres portent « non re-sondé » et rien d
 | `proxy/mod.rs:483` — le garde d'IP littérale au CONNECT teste l'hôte brut | ce dépôt | **Mesuré, et plus grave que le constat** : sans le correctif, `CONNECT 127.0.0.1.:443` reçoit `200 Connection established` — le refus ne part pas du tout. Ce qui arrête ensuite la requête est le verdict de politique, rendu sur `connect_host` ; aucun contournement de politique n'est démontré, mais le garde ne tient pas son contrat. |
 | `seccomp.rs:1287` — le commentaire annonce `EFAULT` | ce dépôt | Prose seule : l'assertion trois lignes plus bas lit `EINVAL`, et la raison est désormais écrite — `clone3` refuse une taille sous sa première version avant de déréférencer le pointeur. |
 | `binds/tests.rs:295` — l'assertion « identifiant dégénéré » | ce dépôt | **Mesuré** : le sentinelle est calculé, non écrit. En mutant `machine_id_contents` pour qu'il ne hache plus rien, le test vire au rouge sur une valeur de 32 caractères — un de moins que le littéral qu'il portait. |
+| `config/safety.rs:86` — la lecture d'une config n'est pas bornée | ce dépôt | **Mesuré** : `read_to_end` sans plafond sur un fichier que le dépôt cloné fournit. Plafond à 1 Mio, trois ordres de grandeur au-dessus du plus gros profil livré (~21 Kio) ; un fichier exactement au plafond est toujours chargé, pour que le refus ne puisse pas être satisfait en refusant tout. |
+| `proxy/wire.rs:397` — la section de trailers n'est bornée ni en lignes ni par une échéance | ce dépôt | **Mesuré, et la moitié restante est écrite** : le nombre de lignes est plafonné, ce qui met fin à la boucle infinie. L'échéance, non : aucun des deux appelants de production ne passe un lecteur `Deadlined`, donc tout le corps chunked — données comprises — est borné en taille et pas en temps. Le goutte-à-goutte lent est une propriété du chemin de corps entier, pas de ce constat. |
+| `proc_enforce/notify.rs:274` — `recv_fd_raw` ignore `cmsg_len` | ce dépôt | **Mesuré** : sans le correctif, un message à deux descripteurs rend `Ok(6)` et fuit le second. Le refus lit désormais TOUS les descripteurs et les ferme AVANT de rendre l'erreur — un refus qui rend la main sans fermer fuit exactement ce qu'il refuse. `MSG_CTRUNC` est refusé, et la limite du nettoyage est écrite : ce que le noyau a jeté n'est nommé par aucun cmsg. |
+| `control/capture.rs:494` — l'élagage de l'historique d'aiguilles part de la tête | ce dépôt | **Mesuré** : sans le correctif, le rafraîchissement 255 dépose la clé statique EN CLAIR dans l'anneau. Le tri sépare retirées et vivantes ; le plafond cède avant qu'une valeur vivante ne tombe, parce que dépasser un plafond de coût est un coût et jeter une aiguille vivante est une divulgation. |
+| `proxy/h2mitm.rs:206` — le refus de plafond de flux n'est enregistré nulle part | ce dépôt | Le journal est poussé avant la réponse, en `Blocked` — la documentation de `LogVerdict` y range le plafond de splice, dont c'est le jumeau h2. **Sans test de comportement** : le garde est un filet contre un client qui viole ses propres SETTINGS, et le client `h2` les respecte, donc l'atteindre demanderait un écrivain de trames brut. La raison est écrite au site. |
 
-### Ouverts et mesurés (12 en prose, 2 au tableau)
+### Ouverts et mesurés (9 en prose, 1 au tableau)
 
-La ligne est rouverte, le prédicat du constat tient encore. Classés par ce que ça coûte de le
-fermer ; le groupe « un frère correct est déjà dans l'arbre » a été traité et se lit au-dessus.
-
-**Sécurité, autonomes, remède court.**
-
-| Constat | Ce qui est mesuré |
-| --- | --- |
-| `config/safety.rs:86` — la lecture d'une config n'est pas bornée | `read_safe_bytes` fait un `read_to_end` sans plafond, sur un fichier que le dépôt cloné fournit, et toute invocation de sbx dans ce répertoire y passe. |
-| `proxy/wire.rs:397` — la section de trailers n'est bornée ni en lignes ni par une échéance | Chaque *ligne* est plafonnée par `CHUNK_LINE_MAX` ; leur nombre ne l'est pas. La tête a les deux (`HEAD_MAX` et `head_deadline`), le corps a un plafond, les trailers n'ont rien — et ces octets sont jetés. |
-| `proc_enforce/notify.rs:274` — `recv_fd_raw` ignore `cmsg_len` | Le type et le niveau du cmsg sont vérifiés, sa longueur non, et `MSG_CTRUNC` non plus. Le noyau installe tous les descripteurs d'un `SCM_RIGHTS` ; un seul est lu. |
-| `control/capture.rs:494` — l'élagage de l'historique d'aiguilles part de la tête | `merged.drain(..over)` sans égard pour l'ensemble vivant : une aiguille statique en tête est retirée, et la capture classée par ce même appel est masquée contre un ensemble qui ne la contient plus. |
-| `proxy/h2mitm.rs:206` — le refus de plafond de flux n'est enregistré nulle part | L'appel est `refuse(...)` nu ; `refuse_upstream` (`h2mitm.rs:1195`) est la forme qui pousse un journal, et ce site ne l'emprunte pas. |
+La ligne est rouverte, le prédicat du constat tient encore. Les deux groupes les moins chers — « un
+frère correct est déjà dans l'arbre » et « sécurité, autonomes » — ont été traités et se lisent
+au-dessus. Ce qui reste change une sémantique visible ou touche plusieurs sites.
 
 **Changent une sémantique visible par l'utilisateur ou touchent plusieurs sites — à arbitrer avant d'écrire.**
 

@@ -36,6 +36,16 @@ fn verdict(file_uid: u32, mode: u32, euid: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// The most a config file may be before it is refused unread.
+///
+/// The gate's own checks are on the inode, not the size, so without this a repository could ship a
+/// multi-gibibyte `.sbx.toml` — one long comment line compresses to little in a pack, so the clone
+/// stays cheap — and every sbx invocation in that directory would read it whole into host memory
+/// before the parser ever saw a key. `sbx run`, `sbx config show`, a shell-prompt integration and
+/// `sbx trust` all take this path. The ceiling is three orders of magnitude above the largest
+/// profile this repository ships (~21 KiB), so it bounds the attack without bounding any use.
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
 /// A refusal carries `PermissionDenied`, the closest kind to "this file is not
 /// trustworthy to load".
 fn refuse(why: &str) -> io::Error {
@@ -82,8 +92,19 @@ pub(crate) fn read_safe_bytes(path: &Path) -> io::Result<Vec<u8>> {
         .open(path)
         .map_err(|e| with_path(e, path))?;
     check_safe_file(&f, path)?;
+    // Read one byte past the ceiling so "exactly at the ceiling" and "over it" are distinguishable,
+    // the way `read_line_bounded` distinguishes them in the proxy's framing reader.
     let mut out = Vec::new();
-    f.read_to_end(&mut out).map_err(|e| with_path(e, path))?;
+    f.by_ref()
+        .take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| with_path(e, path))?;
+    if out.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(with_path(
+            refuse(&format!("larger than {MAX_CONFIG_BYTES} bytes")),
+            path,
+        ));
+    }
     Ok(out)
 }
 
@@ -161,6 +182,39 @@ mod tests {
         assert!(
             err.to_string().contains("absent.toml"),
             "a missing file must name the path; got: {err}"
+        );
+    }
+
+    /// A config larger than the ceiling is refused unread rather than pulled into host memory.
+    ///
+    /// The gate's other checks are on the inode and say nothing about size, so a repository could
+    /// ship a `.sbx.toml` of arbitrary length — cheap to clone, one long comment line — and every
+    /// sbx invocation in that directory read it whole before the parser saw a key. The file at
+    /// exactly the ceiling is loaded, so the refusal cannot be satisfied by refusing everything.
+    #[test]
+    fn read_safe_bytes_refuses_a_config_over_the_ceiling_and_loads_one_at_it() {
+        let dir = TmpDir::new();
+        let at = dir.join("at.toml");
+        std::fs::write(&at, vec![b'#'; MAX_CONFIG_BYTES as usize]).unwrap();
+        assert_eq!(
+            read_safe_bytes(&at).unwrap().len(),
+            MAX_CONFIG_BYTES as usize,
+            "a file exactly at the ceiling is still loaded whole"
+        );
+
+        let over = dir.join("over.toml");
+        std::fs::write(&over, vec![b'#'; MAX_CONFIG_BYTES as usize + 1]).unwrap();
+        // Matched rather than `unwrap_err`, which would print the whole mebibyte on failure.
+        let err = match read_safe_bytes(&over) {
+            Ok(loaded) => panic!(
+                "a config over the ceiling was read whole: {} bytes",
+                loaded.len()
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("larger than") && err.to_string().contains("over.toml"),
+            "the refusal names the ceiling and the file: {err}"
         );
     }
 
