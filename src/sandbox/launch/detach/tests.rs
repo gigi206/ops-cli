@@ -105,6 +105,39 @@ fn the_header_open_detach_log_writes_is_the_one_the_parser_reads() {
 }
 
 #[test]
+fn a_trust_drop_note_cannot_carry_an_escape_run_into_the_log() {
+    // The note names the key it is refusing, and for an untrusted `.sbx.toml` that key is the
+    // project's to spell. `sbx logs` reads this file back into a terminal, so an escape run in it
+    // is a terminal escape run delivered at the moment the user is reading what sbx refused --
+    // which is the one moment worth forging. The filter is `sandbox::sanitize`, the same one the
+    // `[tools]` table already had.
+    let dir = crate::testutil::TmpDir::new();
+    let path = dir.join("logs").join("escape.log");
+    let file = open_detach_log(&path).expect("open the session log");
+    note_trust_drops(
+        &file,
+        &[
+            ".sbx.toml: ignoring `\u{1b}[2J\u{1b}[H` posture (untrusted — run `sbx trust`)"
+                .to_string(),
+        ],
+        None,
+    );
+    drop(file);
+
+    let text = std::fs::read_to_string(&path).expect("read the session log back");
+    assert!(
+        !text.contains('\u{1b}'),
+        "an escape byte reached the log a terminal reads back: {text:?}"
+    );
+    // The note is still there, and still names its key: filtering replaces the control bytes with
+    // spaces rather than dropping the line, so the reader keeps something to act on.
+    assert!(
+        text.contains("sbx trust-drop:") && text.contains("posture"),
+        "the note itself must survive the filter: {text:?}"
+    );
+}
+
+#[test]
 fn a_detached_log_notes_the_trust_drops_and_nothing_else() {
     // The record that outlives the launching terminal a detached session is about to lose.
     // Three properties hold it up, and each fails silently if it breaks: only a trust drop is

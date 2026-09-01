@@ -277,7 +277,7 @@ fn cage_timezone(declared: Option<&str>, zoneinfo_src: &Path) -> String {
     if zoneinfo_src.join(zone).is_file() {
         return zone.to_string();
     }
-    crate::diag::warn(&format!(
+    crate::diag::warn_config(&format!(
         "the zone database carries no `{zone}` — the cage's clock reads {} instead",
         binds::DEFAULT_ZONE
     ));
@@ -444,7 +444,7 @@ pub(super) fn build(
             match crate::sandbox::flake_inline::stage(prep.layout.data_dir(), &content) {
                 Ok(v) => v,
                 Err(e) => {
-                    crate::diag::warn(&format!(
+                    crate::diag::warn_config(&format!(
                         "inline flake `{name}` could not be staged ({e}) — skipping it"
                     ));
                     continue;
@@ -829,7 +829,7 @@ pub(super) fn build(
             // fail). An already-equipped tool still resolves through its persisted shim, so this
             // is a warning, not a hard error.
             let declared = mise_token_display(global_mise.iter().chain(auto_equip.iter()));
-            crate::diag::warn(&format!(
+            crate::diag::warn_config(&format!(
                 "mise tools [{declared}] are declared but `network = \"none\"` — they \
                  cannot be fetched and will be absent unless already equipped"
             ));
@@ -921,7 +921,7 @@ pub(super) fn build(
     // a no-op and an already-built flake runs offline.
     if !flake_pairs.is_empty() {
         if matches!(prep.cfg.network, crate::config::NetworkPolicy::Isolated) {
-            crate::diag::warn(&format!(
+            crate::diag::warn_config(&format!(
                 "inline flakes [{}] are declared but `network = \"none\"` — they \
                  cannot be built and will be absent unless already present",
                 inline_flake_names.join(", ")
@@ -1051,12 +1051,12 @@ pub(super) fn build(
                 // Told apart, because the remedy differs: an ambiguous name is fixed by removing a
                 // plugin, a missing one by installing it.
                 match registry.name_conflict(name) {
-                    Some(claimants) => crate::diag::warn(&format!(
+                    Some(claimants) => crate::diag::warn_config(&format!(
                         "`[broker.{name}]` names a broker claimed by more than one installed \
                          plugin ({}) — they are all disabled, so the cage gets no broker",
                         crate::plugins::quoted_list(claimants)
                     )),
-                    None => crate::diag::warn(&format!(
+                    None => crate::diag::warn_config(&format!(
                         "`[broker.{name}]` names no installed broker plugin — install one with \
                          `sbx plugins install`, or drop the table. The cage gets no broker."
                     )),
@@ -1070,7 +1070,7 @@ pub(super) fn build(
                 // the cage's connections and fail every frame, which reads as the resource
                 // misbehaving rather than as a configuration that does not hold.
                 crate::config::BrokerTarget::Unix(path) if !path.exists() => {
-                    crate::diag::warn(&format!(
+                    crate::diag::warn_config(&format!(
                         "`[broker.{name}] socket` names {}, which does not exist — the cage gets \
                          no broker",
                         path.display()
@@ -1082,7 +1082,7 @@ pub(super) fn build(
                 // the resource is an endpoint: the two declarations are answering different
                 // questions, and standing the broker up anyway would put it where nothing looks.
                 crate::config::BrokerTarget::Tcp { .. } if plugin.broker.at_host_path => {
-                    crate::diag::warn(&format!(
+                    crate::diag::warn_config(&format!(
                         "`[broker.{name}] socket` names a tcp:// endpoint, but the plugin's clients \
                          find the socket at a fixed path (`at_host_path`) — a tcp:// target has \
                          none, so the cage gets no broker"
@@ -1103,7 +1103,7 @@ pub(super) fn build(
                         _ => false,
                     };
                     if !admitted {
-                        crate::diag::warn(&format!(
+                        crate::diag::warn_config(&format!(
                             "`[broker.{name}] socket` names tcp://{host}:{port}, which the \
                              network allowlist does not admit — add `tcp://{host}:{port}` to \
                              `[network] allow`, or the cage gets no broker"
@@ -1121,7 +1121,7 @@ pub(super) fn build(
             } else if !plugin.broker.uses_secret {
                 // The grant is the manifest's to make: a credential is not handed to a plugin that
                 // was not written to place one, whatever the config says.
-                crate::diag::warn(&format!(
+                crate::diag::warn_config(&format!(
                     "`[broker.{name}] secret` names a credential, but the plugin's manifest does \
                      not declare `uses_secret` — the broker runs without it"
                 ));
@@ -1136,7 +1136,7 @@ pub(super) fn build(
                     if let crate::config::SecretSource::Plugin { plugin, .. } = source
                         && !plugin.sandbox.brokers.is_empty()
                     {
-                        crate::diag::warn(&format!(
+                        crate::diag::warn_config(&format!(
                             "`[broker.{name}] secret` resolves through the `{}` plugin, which needs \
                              the {} broker — a broker's own credential is resolved before any \
                              broker is standing, so that grant is not answered here",
@@ -1151,7 +1151,7 @@ pub(super) fn build(
                         // credential under the redaction floor is placed on the wire but not
                         // watched on the way back, and that is a fact about this config.
                         if value.len() < prep.cfg.redact_min_len {
-                            crate::diag::warn(&format!(
+                            crate::diag::warn_config(&format!(
                                 "the credential for the `{name}` broker is {} bytes, under the \
                                  {}-byte `[redact] min_len` floor — it is placed on the wire, but \
                                  a reply carrying it back is not blocked (a scan that short \
@@ -1198,7 +1198,7 @@ pub(super) fn build(
                             .iter()
                             .any(|b: &broker::Reachable| b.env.iter().any(|(k, _)| k == key))
                         {
-                            crate::diag::warn(&format!(
+                            crate::diag::warn_config(&format!(
                                 "broker `{name}` and an earlier broker both set ${key} in the cage \
                                  — the later one wins, so one of them is unreachable"
                             ));
@@ -1239,7 +1239,7 @@ pub(super) fn build(
         // warning, not a note — the rule reads as allowed on every surface that reports a verdict,
         // so an author who is not told concludes the host's loopback is out of reach.
         for rule in egress::unreachable_loopback_rules(policy) {
-            crate::diag::warn(&format!(
+            crate::diag::warn_config(&format!(
                 "`{rule}` allows a host the cage reaches through no client: {exempt} are exempt \
                  from the cage's proxy (`no_proxy`, so the agent's own in-cage services stay \
                  intra-cage), and only a `tcp://` rule gets an in-cage listener — declare \
@@ -1371,7 +1371,7 @@ pub(super) fn build(
     if !prep.cfg.ssh_agent.is_empty() {
         let grant = prep.cfg.ssh_agent.join(", ");
         match sshagent::host_socket() {
-            None => crate::diag::warn(&format!(
+            None => crate::diag::warn_config(&format!(
                 "`[ssh_agent] allow` names {grant} but no agent is running on the host \
                  (`$SSH_AUTH_SOCK` is unset) — the cage gets no agent"
             )),
@@ -1382,7 +1382,7 @@ pub(super) fn build(
                         "cannot reach the host ssh-agent at {} ({e}) — the cage gets no agent",
                         host_sock.display()
                     )),
-                    Ok(a) if a.admitted.is_empty() => crate::diag::warn(&format!(
+                    Ok(a) if a.admitted.is_empty() => crate::diag::warn_config(&format!(
                         "no key the host agent holds matches `[ssh_agent] allow` ({grant}) — the \
                          cage gets no agent. `ssh-add -l` prints the fingerprint and comment an \
                          entry may name."
@@ -2204,7 +2204,7 @@ fn mise_env(prep: &Prepared) -> Result<Vec<(String, String)>, ExitCode> {
         return Ok(Vec::new());
     };
     if mise_cfg.state != crate::trust::TrustState::Trusted {
-        crate::diag::warn(&format!(
+        crate::diag::warn_config(&format!(
             "mise file `{}` withheld ({}): its `[env]` is not applied",
             mise_cfg.name,
             crate::config::untrusted_reason(mise_cfg.state)

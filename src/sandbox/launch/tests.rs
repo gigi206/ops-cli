@@ -243,6 +243,13 @@ fn the_guardless_launch_paths_ask_the_predicate_and_not_the_observe_flag() {
 /// producer with a plain `warn` looks exactly like a correct one, and there are nine of these loops
 /// across four files. The loop variable is the tell — a `warn` whose argument is a bare `warning`
 /// or `w` is printing somebody else's string.
+///
+/// **What this does not cover, stated because the count reads stronger than it is:** the *inline*
+/// form, `warn(&format!("… {key} …"))`, where a config-chosen value arrives through interpolation
+/// and never becomes a loop variable. Seventeen of those in `build.rs` were converted by reading
+/// every one of them, and no mechanical rule separates them from the sites that interpolate only
+/// sbx's own values — the format string has to be read. A new one is therefore not caught here; the
+/// [`crate::diag::warn_config`] doc is where that rule is written for a reader adding a warning.
 #[test]
 fn no_config_warning_reaches_the_terminal_unfiltered() {
     for (name, source) in [
