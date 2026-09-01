@@ -47,7 +47,7 @@ mod broker;
 pub(crate) mod broker_control;
 mod deb;
 mod flake;
-mod flake_inline;
+pub(crate) mod flake_inline;
 mod mise;
 mod miseplugin;
 pub(crate) mod nixhub;

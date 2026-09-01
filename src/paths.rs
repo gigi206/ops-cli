@@ -179,6 +179,12 @@ const DATA_ENTRIES: &[Entry] = &[
         enumerate: Enumerate::None,
     },
     Entry {
+        label: "flake-inline/",
+        rel: "flake-inline",
+        desc: "staged inline `[flakes.*]` sources, one content-keyed directory each",
+        enumerate: Enumerate::None,
+    },
+    Entry {
         label: "logs/",
         rel: "logs",
         desc: "detached sessions' output, read by `sbx session logs`",
@@ -657,11 +663,17 @@ mod tests {
     ///
     /// Each is asked of the module that owns it, so this cannot pass by repeating a string: if a
     /// lens moves its directory, the table has to move with it.
+    ///
+    /// Binding under is not the only way to own a directory, and reading the name as if it were is
+    /// how the next one was missed: the inline-flake staging root is written to and bound from, and
+    /// it was absent from both the table and this list. What belongs here is any directory sbx
+    /// creates under its data root, whatever it then does with it.
     #[test]
     fn every_directory_a_launch_binds_under_is_in_the_table() {
         let data = Path::new("/data/sbx");
         let parent_of = |p: PathBuf| p.parent().expect("a socket has a directory").to_path_buf();
         let owned: Vec<PathBuf> = vec![
+            crate::sandbox::flake_inline::staging_root(data),
             crate::sandbox::fs_control::fs_control_dir(data),
             crate::sandbox::proc_control::proc_control_dir(data),
             crate::sandbox::task_control::task_dir(data, 1),

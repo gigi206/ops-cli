@@ -13,6 +13,15 @@ use sha2::{Digest, Sha256};
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// The data-directory root holding every staged inline flake, one content-keyed directory each.
+///
+/// Named here rather than joined at the use site because two readers depend on agreeing: the
+/// staging below, and the overview in [`crate::paths`], whose claim to list every directory sbx
+/// owns is only true if a directory added here is added there.
+pub(crate) fn staging_root(data_dir: &Path) -> PathBuf {
+    data_dir.join("flake-inline")
+}
+
 /// Stage the `flake.nix` `content` to a content-keyed directory `<data>/flake-inline/<hash>/`
 /// holding a single `flake.nix`, returning `(dir, hash)`. Content-keyed and atomic like the staged
 /// fontconfig/mise plugin: the directory is assembled in a unique temp sibling and `rename`d into
@@ -20,7 +29,7 @@ use std::path::{Path, PathBuf};
 /// rename race just means the other launch wrote the identical bytes first). The `hash` keys the
 /// cage out-link, so an edited flake (a new hash) rebuilds at the next launch.
 pub(crate) fn stage(data_dir: &Path, content: &str) -> io::Result<(PathBuf, String)> {
-    let base = data_dir.join("flake-inline");
+    let base = staging_root(data_dir);
     std::fs::create_dir_all(&base)?;
     let hash = content_hash(content);
     let dir = base.join(&hash);
