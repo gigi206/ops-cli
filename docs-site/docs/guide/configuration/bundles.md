@@ -312,7 +312,7 @@ The 64 shipped bundles, and what each carries:
 | `freebuff-desktop` | 2 (`appimage:`, `nix:`) | 26 egress entries, an `appimage:` resolver | `chromium-background`, `github`, `github-api`, `npm-runtime` |
 | `goose` | 1 (`mise:`) | 1 egress entry, 2 env vars | none |
 | `goose-desktop` | 1 (`deb:`) | 2 env vars | none |
-| `grok` | 1 (`mise:`) | 3 egress entries, 1 env var | none |
+| `grok` | 1 (`binary:`) | 3 egress entries, 1 env var | none |
 | `hermes` | 2 (`flake:`, `nix:`) | 10 egress entries, 1 env var | `models-catalog`, `npm-audit`, `npm-registry` |
 | `hermes-desktop` | 4 (`flake:`, `mise:`, `nix:`) | 21 egress entries, 1 env var, an install step | `chromium-background`, `google-signin-incage`, `models-catalog`, `npm-audit`, `npm-registry` |
 | `jcode` | 1 (`mise:`) | 1 egress entry, 2 env vars | none |

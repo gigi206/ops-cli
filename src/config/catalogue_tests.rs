@@ -741,6 +741,86 @@ fn every_shipped_install_step_is_named_in_the_bundles_table() {
     );
 }
 
+#[test]
+fn every_shipped_bundle_declares_the_packages_its_row_names() {
+    // The bundles table's FIRST column is what a reader consults to know what folding a bundle in
+    // will install, and nothing held it to the files: the two guards above watch the third column
+    // only, so a row could name a backend its bundle does not use and ship that way. Both errors
+    // this closes were of that kind, and neither is visible from the page alone: a row counting one
+    // `nix:` package for the one bundle that declares none, and a row naming `mise:` for a package
+    // whose bundle explains at length that mise cannot serve it at all.
+    //
+    // The cell's form is the table's own, read off the rows that were already right: the number of
+    // packages, then their distinct backend prefixes in sorted order, so two `nix:` packages read
+    // `2 (`nix:`)`. A bundle with no `[packages]` reads `none`, the word the fourth column already
+    // uses for its own empty case, which is what makes it the table's convention rather than one
+    // invented here.
+    //
+    // Packages are read with sbx's parser rather than grepped, for the reason the sibling guards
+    // give: a map written under the wrong sub-table folds into it and never reaches a launch, so
+    // the row has to describe what a launch installs, not what the file appears to say.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let page = std::fs::read_to_string(root.join("docs-site/docs/guide/configuration/bundles.md"))
+        .expect("the bundles page exists");
+    let mut wrong = Vec::new();
+    let mut checked = 0;
+    for entry in std::fs::read_dir(root.join("examples/bundle"))
+        .expect("examples/bundle/ dir exists")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+        let raw = schema::parse(&std::fs::read(&path).expect("read the bundle")).unwrap();
+        let packages = raw
+            .bundle
+            .get(&name)
+            .map(|bundle| bundle.packages.clone())
+            .unwrap_or_default();
+        let want = if packages.is_empty() {
+            "none".to_string()
+        } else {
+            // A value carries its backend as the part before the first colon (`mise:aqua:…`,
+            // `flake:github:…`). One without a colon is not a form sbx accepts, so it is quoted
+            // whole rather than truncated: the mismatch then names the value the row must explain.
+            let backends: std::collections::BTreeSet<String> = packages
+                .values()
+                .map(|value| match value.split_once(':') {
+                    Some((backend, _)) => format!("`{backend}:`"),
+                    None => format!("`{value}`"),
+                })
+                .collect();
+            let backends: Vec<String> = backends.into_iter().collect();
+            format!("{} ({})", packages.len(), backends.join(", "))
+        };
+        checked += 1;
+        let Some(row) = page
+            .lines()
+            .find(|line| line.starts_with(&format!("| `{name}` |")))
+        else {
+            wrong.push(format!("`{name}`: no row in the bundles table at all"));
+            continue;
+        };
+        let got = row.split('|').nth(2).map(str::trim).unwrap_or_default();
+        if got != want {
+            wrong.push(format!(
+                "`{name}`: the row says `{got}`, the bundle declares `{want}`"
+            ));
+        }
+    }
+    assert!(
+        checked >= 36,
+        "expected the shipped bundles to be checked, saw {checked}"
+    );
+    wrong.sort();
+    assert!(
+        wrong.is_empty(),
+        "the bundles table's packages column does not say what these bundles install: {wrong:#?}"
+    );
+}
+
 /// The shipped `provision` of `<bundle>`, as the script a shell would run.
 fn shipped_install_step(name: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
