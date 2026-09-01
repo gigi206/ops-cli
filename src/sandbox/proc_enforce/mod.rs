@@ -525,6 +525,35 @@ fn close_supervision(notif_fd: libc::c_int, pending: &PendingExec) {
     unsafe { libc::close(notif_fd) };
 }
 
+/// How long an accepted handoff may say nothing before it is treated as refused.
+///
+/// Chosen against the shim's own patience rather than against a clock: the shim retries its connect
+/// for a second, so a bound comfortably under that leaves a real handoff room to be served on a
+/// later pass, while a real one never approaches it — the descriptor is written immediately after
+/// `connect` over a unix socket on the same host.
+///
+/// **The limit, stated because it is not the same bound as the one above.** This ends a *single*
+/// silent connection; it does not stop a caller that opens one after another, each costing this
+/// much. That is the backlog flood the paragraph above names, and it needs a concurrent accept
+/// rather than a deadline. What is closed here is the permanent case, where one connection ended
+/// supervision for the whole session.
+const HANDOFF_SILENCE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether an accepted handoff has anything to read within [`HANDOFF_SILENCE`], polled in the same
+/// slices the accept loop uses so `stop` keeps being read.
+fn handoff_speaks(fd: libc::c_int, stop: &AtomicBool) -> bool {
+    let deadline = Instant::now() + HANDOFF_SILENCE;
+    while !stop.load(Ordering::Relaxed) {
+        if poll_readable(fd, 100) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+    }
+    false
+}
+
 /// Poll the listening socket in short slices (honouring `stop`), accept a connection, and receive
 /// the listener fd it sends. Returns `None` if stopped first.
 ///
@@ -535,6 +564,13 @@ fn close_supervision(notif_fd: libc::c_int, pending: &PendingExec) {
 /// which retries its connect for a second — is still served. What this does not defend against is a
 /// caller that floods the backlog for the whole of that second; that is a different bound, and not
 /// one a check on the descriptor can supply.
+///
+/// Nor does a connection that says **nothing** end it. `recv_fd` has no deadline of its own, and an
+/// accepted socket does not inherit the listener's `O_NONBLOCK` on Linux, so a cage process that
+/// connected and then held its peace parked this loop in `recvmsg` for the life of the session:
+/// `stop` was never read again, and the shim's own handoff was never accepted, so exec supervision
+/// ended and every launch failed closed. It is a denial of supervision rather than an escape, but
+/// it costs one connection and no privilege. [`HANDOFF_SILENCE`] bounds it.
 fn accept_handoff(listener: &UnixListener, stop: &AtomicBool) -> Option<libc::c_int> {
     use std::os::unix::io::AsRawFd;
     let mut announced = false;
@@ -543,6 +579,18 @@ fn accept_handoff(listener: &UnixListener, stop: &AtomicBool) -> Option<libc::c_
             continue;
         }
         match listener.accept() {
+            Ok((stream, _)) if !handoff_speaks(stream.as_raw_fd(), stop) => {
+                // Silent past the bound: treated exactly as a refused handoff, which is the answer
+                // this loop already has for a connection that is not the shim's.
+                if !announced {
+                    announced = true;
+                    crate::diag::warn(
+                        "exec supervision: a connection to the handoff socket went silent; \
+                         still waiting for the shim's",
+                    );
+                }
+                continue;
+            }
             Ok((stream, _)) => match recv_fd(&stream) {
                 Ok(fd) => return Some(fd),
                 Err(why) => {

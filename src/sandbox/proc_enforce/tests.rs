@@ -900,6 +900,58 @@ fn each_open_form_states_the_path_walk_it_asked_for() {
     }
 }
 
+/// A connection that says nothing must not park the handoff loop for the session.
+///
+/// The socket is reachable from inside the cage, `recv_fd` has no deadline, and an accepted socket
+/// does not inherit the listener's `O_NONBLOCK` on Linux. So one cage process that connected and
+/// then held its peace left the supervisor blocked in `recvmsg` forever: `stop` was never read
+/// again, the shim's own handoff was never accepted, and exec supervision was over for the session.
+///
+/// The assertion is on the clock, because the duration is the whole finding. The silent peer is
+/// held open for the length of the test so the case under test is a peer that never writes, not one
+/// that hung up.
+#[test]
+fn a_silent_handoff_connection_does_not_park_the_accept_loop() {
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let dir = TmpDir::new();
+    let path = dir.join("handoff.sock");
+    let listener = UnixListener::bind(&path).expect("bind the handoff socket");
+    listener
+        .set_nonblocking(true)
+        .expect("the loop polls rather than blocks");
+
+    // Connect and never write. Kept in scope, so the peer is silent rather than gone.
+    let _mute = UnixStream::connect(&path).expect("connect as a cage process would");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let (tx, done) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(accept_handoff(&listener, &flag));
+    });
+
+    // Well past HANDOFF_SILENCE, and far short of forever.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    stop.store(true, Ordering::Relaxed);
+
+    // Waited for through a channel rather than by joining, so a regression **fails** here instead
+    // of hanging the suite. The defect being pinned is an unbounded block, and `join` would inherit
+    // it: `cargo test` has no per-test deadline, so the whole run would stall with no verdict.
+    match done.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(got) => assert!(
+            got.is_none(),
+            "a silent peer hands over no notification listener"
+        ),
+        Err(_) => panic!(
+            "the accept loop did not return within five seconds of `stop`, so it was parked in \
+             the receive rather than polling"
+        ),
+    }
+}
+
 /// The reader is only half of it: `serve_open` has to act on what it says. A restricted
 /// `openat2` must be declined *before* any answer is formed, so the kernel performs the walk the
 /// caller asked for; an unrestricted one must be served exactly as before.
