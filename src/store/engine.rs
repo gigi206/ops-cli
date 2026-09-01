@@ -32,11 +32,21 @@ const ENGINE_OVERRIDE_ENV: &str = "SBX_NIX_BIN";
 /// owns under the data directory (`<data>/engine/`), then the host `PATH`. The
 /// data-directory tier is where sbx will place an engine it ships itself; consulting
 /// it here puts the seam in place, while the `PATH` fallback keeps sbx working until
-/// then. `layout` is `None` only when the data directory cannot be resolved (no
-/// `$HOME`), in which case that middle tier is skipped.
+/// then. `layout` is `None` whenever [`Layout::from_env`] declined — no `$HOME`/XDG base, or a
+/// base that resolved and was then refused — in which case that middle tier is simply skipped and
+/// resolution falls through to the host `PATH`.
 ///
 /// Pure resolution — it never writes — so a read-only caller (`sbx doctor`) is safe.
+///
+/// The `Option` form, for the many callers that only need the binary or a message of their own; a
+/// caller that *reports the failure to the user* wants [`try_resolve_nix`] instead, which says
+/// whether the engine was missing or refused — two failures with opposite remedies.
 pub(crate) fn resolve_nix(layout: Option<&Layout>) -> Option<PathBuf> {
+    try_resolve_nix(layout).ok()
+}
+
+/// [`resolve_nix`], keeping why it failed — see [`EngineMiss`].
+pub(crate) fn try_resolve_nix(layout: Option<&Layout>) -> Result<PathBuf, EngineMiss> {
     resolve_engine_bin("nix", layout)
 }
 
@@ -46,6 +56,11 @@ pub(crate) fn resolve_nix(layout: Option<&Layout>) -> Option<PathBuf> {
 /// [`resolve_nix`]. Consumed by the per-project store seed the launcher backs the
 /// cage's writable `/nix` with.
 pub(crate) fn resolve_nix_store(layout: Option<&Layout>) -> Option<PathBuf> {
+    try_resolve_nix_store(layout).ok()
+}
+
+/// [`resolve_nix_store`], keeping why it failed — see [`EngineMiss`].
+pub(crate) fn try_resolve_nix_store(layout: Option<&Layout>) -> Result<PathBuf, EngineMiss> {
     resolve_engine_bin("nix-store", layout)
 }
 
@@ -129,7 +144,7 @@ fn absolute_override(env_key: &str) -> Option<PathBuf> {
 /// Shared resolution for an engine command `name` (`nix`/`nix-store`), reading the
 /// real environment, data directory, and `PATH`. The precedence is factored into
 /// [`pick_engine_bin`] so it is unit-testable without touching any of them.
-fn resolve_engine_bin(name: &str, layout: Option<&Layout>) -> Option<PathBuf> {
+fn resolve_engine_bin(name: &str, layout: Option<&Layout>) -> Result<PathBuf, EngineMiss> {
     let override_nix = absolute_override(ENGINE_OVERRIDE_ENV);
     let owned_dir = layout.map(Layout::engine_dir);
     // When sbx ships its own static nix, lay it into the owned engine directory (once;
@@ -213,6 +228,62 @@ enum EngineProbe {
     Trusted,
 }
 
+/// Why an engine did not resolve: nothing usable was found anywhere sbx looks, or sbx found the
+/// binary the invoker named and refused it.
+///
+/// The two must reach the caller apart, because the remedies are opposites. A refused override is
+/// not a missing engine — the binary is installed and sitting at the path the variable names — so a
+/// reporting site that collapses them tells a user whose `nix` is merely world-writable to install
+/// nix, and sends them after a package they already have instead of the permissions that were
+/// actually refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EngineMiss {
+    /// No trusted binary at any tier sbx consults.
+    NotFound,
+    /// The override variable named a binary that is present and fails the trust check. sbx refuses
+    /// it outright rather than substituting another engine, so nothing resolved.
+    Refused {
+        /// The variable that named it — [`ENGINE_OVERRIDE_ENV`] or [`BWRAP_OVERRIDE_ENV`].
+        env: &'static str,
+        /// The path it named.
+        path: PathBuf,
+    },
+}
+
+impl EngineMiss {
+    /// The clause naming what happened to the engine `what`, for a caller composing one line about
+    /// one engine. Callers add their own consequence ("the sandbox cannot run", "cannot upgrade").
+    pub(crate) fn clause(&self, what: &str) -> String {
+        match self {
+            EngineMiss::NotFound => format!("{what} not found"),
+            EngineMiss::Refused { env, path } => format!(
+                "{what} refused: {env} names {}, which sbx will not run",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// Refuse an engine override that is present but untrusted: say so, and return the miss that
+/// carries the disposition to the caller.
+///
+/// Refused rather than skipped, because an override is a deliberate choice and quietly running a
+/// different engine against the same store would be worse than stopping. Both engines refuse in
+/// the same words from here, so the two overrides cannot drift into describing the same decision
+/// differently — and the caller gets [`EngineMiss::Refused`] rather than a bare "nothing found",
+/// which is what keeps the failure from being reported as a missing engine.
+fn refuse_override(env: &'static str, path: &Path) -> EngineMiss {
+    eprintln!(
+        "sbx: refusing {env}={} — sbx will not silently substitute another engine. Fix the \
+         file's ownership or permissions, or unset the variable.",
+        path.display()
+    );
+    EngineMiss::Refused {
+        env,
+        path: path.to_path_buf(),
+    }
+}
+
 /// Pure ownership/permission verdict for a **host binary sbx is about to `execve`**: an engine
 /// (`nix`, `bwrap`) picked off `PATH`, or a program a resolver plugin's manifest declares.
 ///
@@ -280,40 +351,32 @@ fn engine_probe(path: &Path) -> EngineProbe {
 /// injected so the precedence — including the untrusted branches — is testable in isolation.
 ///
 /// A *resolved* override (one whose `nix` is present and trusted) is authoritative: `name` is
-/// taken from beside it and a missing or untrusted sibling yields `None` (fail-closed), never a
-/// fall-back to the host's `PATH` — which would drive one store with two different engines. An
-/// override whose `nix` is **absent** is treated as unset and the next tier applies; one that
-/// is **present but untrusted** is refused outright (`None`), since it is a deliberate choice
-/// and silently substituting another engine would be worse. A lower tier (owned, then `PATH`)
-/// that is untrusted is skipped — with a warning — in favour of the next; on `PATH` that means
-/// scanning past an untrusted match to a later trusted one, so a world-writable early entry does
-/// not shadow the legitimate engine.
+/// taken from beside it and a missing or untrusted sibling fails closed, never a fall-back to the
+/// host's `PATH` — which would drive one store with two different engines. An override whose `nix`
+/// is **absent** is treated as unset and the next tier applies; one that is **present but
+/// untrusted** is refused outright, since it is a deliberate choice and silently substituting
+/// another engine would be worse — and that refusal reaches the caller as
+/// [`EngineMiss::Refused`], not as "nothing found". A lower tier (owned, then `PATH`) that is
+/// untrusted is skipped — with a warning — in favour of the next; on `PATH` that means scanning
+/// past an untrusted match to a later trusted one, so a world-writable early entry does not shadow
+/// the legitimate engine.
 fn pick_engine_bin(
     name: &str,
     override_nix: Option<&Path>,
     owned_dir: Option<&Path>,
     probe: &dyn Fn(&Path) -> EngineProbe,
     on_path: &dyn Fn(&str) -> Vec<PathBuf>,
-) -> Option<PathBuf> {
+) -> Result<PathBuf, EngineMiss> {
     if let Some(nix) = override_nix {
         match probe(nix) {
             EngineProbe::Absent => {}
-            EngineProbe::Untrusted => {
-                // Refused, not skipped: an override is a deliberate choice, and quietly running a
-                // different engine against the same store would be worse than stopping. Said here
-                // because the caller only learns `None`, and reports it as the engine being
-                // missing — which it is not.
-                eprintln!(
-                    "sbx: refusing {ENGINE_OVERRIDE_ENV}={} — sbx will not silently substitute \
-                     another engine. Fix the file's ownership or permissions, or unset the \
-                     variable.",
-                    nix.display()
-                );
-                return None;
-            }
+            EngineProbe::Untrusted => return Err(refuse_override(ENGINE_OVERRIDE_ENV, nix)),
             EngineProbe::Trusted => {
                 let bin = engine_sibling(nix, name);
-                return matches!(probe(bin.as_path()), EngineProbe::Trusted).then_some(bin);
+                return match probe(bin.as_path()) {
+                    EngineProbe::Trusted => Ok(bin),
+                    _ => Err(EngineMiss::NotFound),
+                };
             }
         }
     }
@@ -327,12 +390,16 @@ fn pick_engine_bin(
         let anchor = dir.join("nix");
         if matches!(probe(anchor.as_path()), EngineProbe::Trusted) {
             let bin = dir.join(name);
-            return matches!(probe(bin.as_path()), EngineProbe::Trusted).then_some(bin);
+            return match probe(bin.as_path()) {
+                EngineProbe::Trusted => Ok(bin),
+                _ => Err(EngineMiss::NotFound),
+            };
         }
     }
     on_path(name)
         .into_iter()
         .find(|p| matches!(probe(p.as_path()), EngineProbe::Trusted))
+        .ok_or(EngineMiss::NotFound)
 }
 
 /// Given the path of the `nix` binary, the path of its sibling command `name` in the
@@ -413,13 +480,18 @@ pub(crate) struct BwrapChoice {
 /// back to the host `PATH`. Where the restriction **is** in force, only the path-profiled
 /// `/usr/bin/bwrap` can create a namespace, so the host engine leads and the bundled one is
 /// the fallback; sbx is **non-regressive by construction** there — it uses exactly the host
-/// bwrap it always has. `layout` is `None` only when the data directory cannot be resolved,
-/// in which case the owned tier is skipped.
+/// bwrap it always has. `layout` is `None` whenever [`Layout::from_env`] declined — no `$HOME`/XDG
+/// base, or a base that resolved and was then refused — in which case the owned tier is skipped.
 ///
 /// Under the `bundled-bwrap` feature this materializes the embedded engine into the owned
 /// directory (once; idempotent) before resolving; best-effort, so a failure simply leaves
 /// that tier empty and resolution falls through.
 pub(crate) fn resolve_bwrap(layout: Option<&Layout>) -> Option<BwrapChoice> {
+    try_resolve_bwrap(layout).ok()
+}
+
+/// [`resolve_bwrap`], keeping why it failed — see [`EngineMiss`].
+pub(crate) fn try_resolve_bwrap(layout: Option<&Layout>) -> Result<BwrapChoice, EngineMiss> {
     let override_bin = absolute_override(BWRAP_OVERRIDE_ENV);
     let owned_dir = layout.map(Layout::engine_dir);
     #[cfg(feature = "bundled-bwrap")]
@@ -434,7 +506,7 @@ pub(crate) fn resolve_bwrap(layout: Option<&Layout>) -> Option<BwrapChoice> {
         &|p| engine_probe(p),
         &|n| crate::pathfind::find_all_on_path(n),
     )?;
-    Some(BwrapChoice {
+    Ok(BwrapChoice {
         path,
         source,
         apparmor_restricted,
@@ -492,7 +564,8 @@ fn ensure_owned_bwrap(dir: &Path, bytes: &[u8], sha256: &str) -> io::Result<()> 
 /// branches — is unit-testable in isolation.
 ///
 /// The override, when present and trusted, is authoritative; present-but-untrusted is refused
-/// outright (`None`), absent yields to the host-dependent order. Otherwise: not restricted ⇒
+/// outright — reaching the caller as [`EngineMiss::Refused`], not as "nothing found" — while an
+/// absent one yields to the host-dependent order. Otherwise: not restricted ⇒
 /// the owned engine leads, then `PATH`; restricted ⇒ the host `PATH` engine leads (the same
 /// bwrap sbx uses today — on a standard host the path-profiled `/usr/bin/bwrap`, the only one
 /// able to create a namespace under the restriction), then the owned engine as a last resort.
@@ -504,22 +577,12 @@ fn pick_bwrap(
     owned_dir: Option<&Path>,
     probe: &dyn Fn(&Path) -> EngineProbe,
     on_path: &dyn Fn(&str) -> Vec<PathBuf>,
-) -> Option<(PathBuf, BwrapSource)> {
+) -> Result<(PathBuf, BwrapSource), EngineMiss> {
     if let Some(bin) = override_bin {
         match probe(bin) {
             EngineProbe::Absent => {}
-            // Refused rather than skipped, for the reason `pick_engine_bin`'s override tier gives:
-            // the caller sees only `None` and would otherwise report the engine as missing.
-            EngineProbe::Untrusted => {
-                eprintln!(
-                    "sbx: refusing {BWRAP_OVERRIDE_ENV}={} — sbx will not silently substitute \
-                     another engine. Fix the file's ownership or permissions, or unset the \
-                     variable.",
-                    bin.display()
-                );
-                return None;
-            }
-            EngineProbe::Trusted => return Some((bin.to_path_buf(), BwrapSource::Override)),
+            EngineProbe::Untrusted => return Err(refuse_override(BWRAP_OVERRIDE_ENV, bin)),
+            EngineProbe::Trusted => return Ok((bin.to_path_buf(), BwrapSource::Override)),
         }
     }
     // Probe each tier lazily so only the tier actually consulted is examined — probing eagerly
@@ -538,9 +601,9 @@ fn pick_bwrap(
             .map(|p| (p, BwrapSource::HostPath))
     };
     if restricted {
-        host().or_else(owned)
+        host().or_else(owned).ok_or(EngineMiss::NotFound)
     } else {
-        owned().or_else(host)
+        owned().or_else(host).ok_or(EngineMiss::NotFound)
     }
 }
 
@@ -603,6 +666,26 @@ mod tests {
         );
     }
 
+    /// Every site that reports an unresolved engine composes its line from this clause, so the
+    /// word "found" must never appear for a binary that is present and was refused: that is the
+    /// sentence which sends a user to install an engine they already have.
+    #[test]
+    fn the_miss_clause_never_calls_a_refused_override_missing() {
+        assert_eq!(
+            EngineMiss::NotFound.clause("nix (the store engine)"),
+            "nix (the store engine) not found"
+        );
+        let refused = EngineMiss::Refused {
+            env: ENGINE_OVERRIDE_ENV,
+            path: PathBuf::from("/over/nix"),
+        };
+        assert_eq!(
+            refused.clause("nix (the store engine)"),
+            "nix (the store engine) refused: SBX_NIX_BIN names /over/nix, which sbx will not run"
+        );
+        assert!(!refused.clause("nix").contains("not found"));
+    }
+
     #[test]
     fn pick_engine_bin_follows_override_then_owned_then_path() {
         let over = Path::new("/over/nix");
@@ -613,11 +696,11 @@ mod tests {
         let all = |_: &Path| EngineProbe::Trusted;
         assert_eq!(
             pick_engine_bin("nix", Some(over), Some(owned), &all, &on_path),
-            Some(PathBuf::from("/over/nix"))
+            Ok(PathBuf::from("/over/nix"))
         );
         assert_eq!(
             pick_engine_bin("nix-store", Some(over), Some(owned), &all, &on_path),
-            Some(PathBuf::from("/over/nix-store"))
+            Ok(PathBuf::from("/over/nix-store"))
         );
 
         // A resolved override is authoritative: a missing sibling fails closed rather
@@ -631,7 +714,7 @@ mod tests {
         };
         assert_eq!(
             pick_engine_bin("nix", Some(over), Some(owned), &only_override_nix, &on_path),
-            Some(PathBuf::from("/over/nix"))
+            Ok(PathBuf::from("/over/nix"))
         );
         assert_eq!(
             pick_engine_bin(
@@ -641,7 +724,8 @@ mod tests {
                 &only_override_nix,
                 &on_path
             ),
-            None
+            Err(EngineMiss::NotFound),
+            "an authoritative override with no sibling is a miss, not a refusal"
         );
 
         // An override whose `nix` is absent is treated as unset: the next tier (here
@@ -655,7 +739,7 @@ mod tests {
         };
         assert_eq!(
             pick_engine_bin("nix", Some(over), Some(owned), &only_owned, &on_path),
-            Some(PathBuf::from("/data/engine/nix"))
+            Ok(PathBuf::from("/data/engine/nix"))
         );
 
         // With neither override nor owned engine present, it falls to the (trusted) host `PATH`.
@@ -668,24 +752,27 @@ mod tests {
         };
         assert_eq!(
             pick_engine_bin("nix", Some(over), Some(owned), &host_only, &on_path),
-            Some(PathBuf::from("/usr/bin/nix"))
+            Ok(PathBuf::from("/usr/bin/nix"))
         );
 
         // No layout (no owned dir) simply skips that tier.
         assert_eq!(
             pick_engine_bin("nix-store", None, None, &host_only, &on_path),
-            Some(PathBuf::from("/usr/bin/nix-store"))
+            Ok(PathBuf::from("/usr/bin/nix-store"))
         );
 
-        // Nothing anywhere → None; the caller turns it into a pointed error.
+        // Nothing anywhere → the caller turns it into a pointed error, and this is the one case
+        // where "not found" is the honest word for it.
         let no_path = |_: &str| Vec::<PathBuf>::new();
         assert_eq!(
             pick_engine_bin("nix", None, None, &host_only, &no_path),
-            None
+            Err(EngineMiss::NotFound)
         );
 
         // An override present but UNtrusted is refused outright — never silently replaced by
-        // the (here trusted) owned tier; the deliberate choice fails closed.
+        // the (here trusted) owned tier; the deliberate choice fails closed. The refusal is what
+        // the caller receives, distinct from "not found": the binary is installed, and reporting
+        // it as absent would send its owner to install an engine they already have.
         let over_untrusted = |p: &Path| {
             if p.starts_with("/over") {
                 EngineProbe::Untrusted
@@ -695,7 +782,10 @@ mod tests {
         };
         assert_eq!(
             pick_engine_bin("nix", Some(over), Some(owned), &over_untrusted, &on_path),
-            None
+            Err(EngineMiss::Refused {
+                env: ENGINE_OVERRIDE_ENV,
+                path: over.to_path_buf()
+            })
         );
 
         // An untrusted owned engine is skipped (warned) and resolution falls through to `PATH`.
@@ -708,14 +798,15 @@ mod tests {
         };
         assert_eq!(
             pick_engine_bin("nix", None, Some(owned), &owned_untrusted, &on_path),
-            Some(PathBuf::from("/usr/bin/nix"))
+            Ok(PathBuf::from("/usr/bin/nix"))
         );
 
-        // An untrusted engine resolved from `PATH` (e.g. a poisoned entry) is not used.
+        // An untrusted engine resolved from `PATH` (e.g. a poisoned entry) is not used. No
+        // override was named, so nothing was refused on the invoker's behalf: this is a miss.
         let path_untrusted = |_: &Path| EngineProbe::Untrusted;
         assert_eq!(
             pick_engine_bin("nix", None, None, &path_untrusted, &on_path),
-            None
+            Err(EngineMiss::NotFound)
         );
     }
 
@@ -737,11 +828,11 @@ mod tests {
         };
         assert_eq!(
             pick_engine_bin("nix", None, Some(owned), &owned_nix_only, &on_path),
-            Some(PathBuf::from("/data/engine/nix"))
+            Ok(PathBuf::from("/data/engine/nix"))
         );
         assert_eq!(
             pick_engine_bin("nix-store", None, Some(owned), &owned_nix_only, &on_path),
-            None,
+            Err(EngineMiss::NotFound),
             "owned nix-store missing must fail closed, not borrow the host's"
         );
     }
@@ -770,14 +861,14 @@ mod tests {
         };
         assert_eq!(
             pick_engine_bin("nix", None, None, &early_untrusted, &two),
-            Some(late)
+            Ok(late)
         );
 
         // Every match untrusted → nothing resolves (the skip exhausts the list, fail-closed).
         let all_untrusted = |_: &Path| EngineProbe::Untrusted;
         assert_eq!(
             pick_engine_bin("nix", None, None, &all_untrusted, &two),
-            None
+            Err(EngineMiss::NotFound)
         );
     }
 
@@ -855,24 +946,24 @@ mod tests {
         let all = |_: &Path| EngineProbe::Trusted;
         assert_eq!(
             pick_bwrap(false, None, Some(owned), &all, &host),
-            Some((owned_bwrap.clone(), BwrapSource::Bundled))
+            Ok((owned_bwrap.clone(), BwrapSource::Bundled))
         );
         // Restricted, both present: the path-profiled host engine leads — the only one able
         // to create a namespace under the AppArmor restriction. This is the branch a host
         // without the restriction cannot exercise live, so the unit test is the proof.
         assert_eq!(
             pick_bwrap(true, None, Some(owned), &all, &host),
-            Some((host_bwrap.clone(), BwrapSource::HostPath))
+            Ok((host_bwrap.clone(), BwrapSource::HostPath))
         );
 
         // The override wins regardless of the restriction — the user owns that choice.
         assert_eq!(
             pick_bwrap(false, Some(over), Some(owned), &all, &host),
-            Some((over.to_path_buf(), BwrapSource::Override))
+            Ok((over.to_path_buf(), BwrapSource::Override))
         );
         assert_eq!(
             pick_bwrap(true, Some(over), Some(owned), &all, &host),
-            Some((over.to_path_buf(), BwrapSource::Override))
+            Ok((over.to_path_buf(), BwrapSource::Override))
         );
         // An override whose file is absent is treated as unset: the next tier applies.
         let only_owned = |p: &Path| {
@@ -884,7 +975,7 @@ mod tests {
         };
         assert_eq!(
             pick_bwrap(false, Some(over), Some(owned), &only_owned, &host),
-            Some((owned_bwrap.clone(), BwrapSource::Bundled))
+            Ok((owned_bwrap.clone(), BwrapSource::Bundled))
         );
 
         // Not restricted but no bundled engine present → fall back to the (trusted) host.
@@ -897,7 +988,7 @@ mod tests {
         };
         assert_eq!(
             pick_bwrap(false, None, Some(owned), &host_only, &host),
-            Some((host_bwrap.clone(), BwrapSource::HostPath))
+            Ok((host_bwrap.clone(), BwrapSource::HostPath))
         );
         // Restricted with no host engine → the bundled one is the last resort (it will fail
         // at userns creation, but that is a separate, already-reported failure, not a reason
@@ -905,18 +996,24 @@ mod tests {
         let no_host = |_: &str| Vec::<PathBuf>::new();
         assert_eq!(
             pick_bwrap(true, None, Some(owned), &all, &no_host),
-            Some((owned_bwrap.clone(), BwrapSource::Bundled))
+            Ok((owned_bwrap.clone(), BwrapSource::Bundled))
         );
         // No layout (no owned dir) simply skips that tier.
         assert_eq!(
             pick_bwrap(false, None, None, &host_only, &host),
-            Some((host_bwrap.clone(), BwrapSource::HostPath))
+            Ok((host_bwrap.clone(), BwrapSource::HostPath))
         );
-        // Nothing anywhere → None; the caller turns it into a pointed error.
-        assert_eq!(pick_bwrap(false, None, None, &host_only, &no_host), None);
+        // Nothing anywhere → the caller turns it into a pointed error, and "not found" is the
+        // honest word for it here.
+        assert_eq!(
+            pick_bwrap(false, None, None, &host_only, &no_host),
+            Err(EngineMiss::NotFound)
+        );
 
         // An override present but UNtrusted is refused outright, regardless of the restriction —
-        // never silently replaced by a lower (here trusted) tier.
+        // never silently replaced by a lower (here trusted) tier. The caller receives the refusal
+        // rather than "not found": bubblewrap is installed, and reporting it as absent would send
+        // its owner to install an engine they already have.
         let over_untrusted = |p: &Path| {
             if p.starts_with("/over") {
                 EngineProbe::Untrusted
@@ -926,11 +1023,17 @@ mod tests {
         };
         assert_eq!(
             pick_bwrap(false, Some(over), Some(owned), &over_untrusted, &host),
-            None
+            Err(EngineMiss::Refused {
+                env: BWRAP_OVERRIDE_ENV,
+                path: over.to_path_buf()
+            })
         );
         assert_eq!(
             pick_bwrap(true, Some(over), Some(owned), &over_untrusted, &host),
-            None
+            Err(EngineMiss::Refused {
+                env: BWRAP_OVERRIDE_ENV,
+                path: over.to_path_buf()
+            })
         );
 
         // An untrusted owned engine is skipped (warned) and resolution falls through to the host.
@@ -943,13 +1046,17 @@ mod tests {
         };
         assert_eq!(
             pick_bwrap(false, None, Some(owned), &owned_untrusted, &host),
-            Some((host_bwrap, BwrapSource::HostPath))
+            Ok((host_bwrap, BwrapSource::HostPath))
         );
 
         // An untrusted host engine on `PATH` (a poisoned entry) is not used; with no owned
-        // engine, nothing resolves.
+        // engine, nothing resolves. No override was named, so nothing was refused on the
+        // invoker's behalf: this is a miss.
         let host_untrusted = |_: &Path| EngineProbe::Untrusted;
-        assert_eq!(pick_bwrap(false, None, None, &host_untrusted, &host), None);
+        assert_eq!(
+            pick_bwrap(false, None, None, &host_untrusted, &host),
+            Err(EngineMiss::NotFound)
+        );
 
         // Skip-and-continue on the host `PATH`: an untrusted early `bwrap` does not shadow a
         // later trusted one. This matters most under the AppArmor restriction, where the host
@@ -973,7 +1080,7 @@ mod tests {
         };
         assert_eq!(
             pick_bwrap(true, None, None, &early_host_untrusted, &two_hosts),
-            Some((late, BwrapSource::HostPath))
+            Ok((late, BwrapSource::HostPath))
         );
     }
 

@@ -1799,9 +1799,9 @@ pub(crate) fn start(
                 ring.clone(),
                 secret.clone(),
             );
-            std::thread::spawn(move || {
-                // Held for the connection's life and given back by its `Drop`, so a handler that
-                // panics does not take the slot with it.
+            super::conncap::spawn_conn("broker", move || {
+                // Held for the connection's life and given back by its `Drop`, so neither a handler
+                // that panics nor a thread the host refuses takes the slot with it.
                 let _slot = slot;
                 if let Err(why) = serve_conn(
                     conn,

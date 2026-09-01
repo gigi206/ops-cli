@@ -961,10 +961,10 @@ mod tests {
     /// The failure summary must quote whichever stream actually carried the diagnostic.
     ///
     /// mise wraps backends that write their own failure to stdout (`npm`, `pipx`) while mise's
-    /// stderr carries only progress that trims away to nothing — and the stdout tail was read into a
-    /// buffer and then dropped, so `ensure` and `sbx upgrade` both reported `no output` for a
-    /// failure whose explanation had just been in hand. `InstallRun` now cannot be built without a
-    /// stdout tail, so the buffer cannot be discarded again.
+    /// stderr carries only progress that trims away to nothing, so quoting the stderr tail alone
+    /// answers `no output` for a failure whose explanation is in hand. This covers the choice
+    /// itself; each consumer is covered where it formats its own line — `ensure` above, and the
+    /// roll report's pool line in [`crate::sandbox::launch`].
     #[test]
     fn the_failure_summary_falls_back_to_the_stdout_tail_when_stderr_carried_nothing() {
         let backend_spoke_on_stdout = InstallRun {

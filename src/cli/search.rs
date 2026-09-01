@@ -53,11 +53,17 @@ pub(crate) fn run(args: Vec<OsString>) -> ExitCode {
         Ok(l) => l,
         Err(code) => return code,
     };
-    let Some(nix) = store::resolve_nix(Some(&layout)) else {
-        diag::error(
-            "sbx: nix not found — `sbx search` needs it to query nixhub. See `sbx doctor`.",
-        );
-        return ExitCode::FAILURE;
+    let nix = match store::try_resolve_nix(Some(&layout)) {
+        Ok(nix) => nix,
+        // Not always "not found": an override sbx refused leaves the engine installed at the path
+        // the variable names, and saying it is missing points at the wrong remedy.
+        Err(miss) => {
+            diag::error(&format!(
+                "sbx: {} — `sbx search` needs it to query nixhub. See `sbx doctor`.",
+                miss.clause("nix")
+            ));
+            return ExitCode::FAILURE;
+        }
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     match sandbox::search(&nix, &layout, query, &sandbox::current_system(), &pal) {

@@ -18,9 +18,9 @@ use super::*;
 /// **validated TLS** connection to the real upstream. Differences from [`handle_cleartext`] (the
 /// opt-in `http://` scheme):
 ///   - the verdict uses [`EgressPolicy::explain`](crate::allowlist::EgressPolicy::explain) — a normal `https` allow rule permits it, so this
-///     is NOT a separate opt-in (it is exactly the egress an equivalent `CONNECT` would have gotten,
-///     down to parking an `ask`-undecided host for `sbx net pending`, and down to deciding a
-///     WebSocket handshake under the `WS` pseudo-verb rather than its literal `GET`);
+///     is NOT a separate opt-in (it is the egress an equivalent `CONNECT` would have gotten, down to
+///     parking an `ask`-undecided host for `sbx net pending`, and down to deciding a WebSocket
+///     handshake under the `WS` pseudo-verb rather than its literal `GET`);
 ///   - the upstream leg is TLS with certificate validation (never downgraded — a forged upstream is a
 ///     `502`, as on the MITM path);
 ///   - a host-scoped credential IS injected: it rides the encrypted upstream leg (unlike a cleartext
@@ -40,6 +40,15 @@ use super::*;
 /// response [`relay_response_head`] reads it as, and an upgrade the policy permits does not complete
 /// here the way it does through a CONNECT. What it does share with the tunneled path is every gate
 /// the upgrade passes through first — the `WS` opt-in and the credential-injection refusal below.
+///
+/// Nor is it an equivalence of *pre-policy admission*. A `CONNECT` to an IP literal is refused `403
+/// ip-literal` before the allowlist is read, because a MITM has to mint a leaf and a literal carries
+/// no name to bind one to. This plane mints nothing — it is the TLS client, and validates the
+/// upstream certificate against the literal like any other peer name — so an address reaches the
+/// ordinary verdict here and is admitted only by a rule that names it. That is the narrower of the
+/// two answers, not a way around the tunneled one: through a `CONNECT` the same address is reachable
+/// only by a `tcp://` splice, which inspects nothing. `sbx test net` reports the tunneled verdict
+/// and names the plane it belongs to (see `refused_as_ip_literal`).
 ///
 /// Conscious, bounded property: request and response travel cleartext on the client→proxy leg — but
 /// that leg is a loopback socket inside the cage, unreadable by any cage process (no `CAP_NET_RAW`
@@ -665,6 +674,39 @@ mod tests {
         assert!(
             !transcript.contains("denied-method"),
             "a `{{WS}}` rule is what admits an upgrade: {transcript:?}"
+        );
+    }
+
+    /// An IP-literal target is decided by the policy on this plane, never refused ahead of it.
+    ///
+    /// The tunneled plane answers `403 ip-literal` before any rule is read, because a MITM has to
+    /// mint a leaf and a literal carries no name to bind one to; this plane mints nothing, so the
+    /// two answers legitimately differ and the module header says so. It used to claim the planes
+    /// were identical, which sent an operator whose rule already named the address toward a
+    /// `tcp://` splice — a strictly wider rule than the one already in place. Pinned here so the
+    /// prose and the plane cannot drift apart again in either direction.
+    #[test]
+    fn an_ip_literal_target_is_decided_by_the_policy_not_refused_ahead_of_it() {
+        let request =
+            |host: &str| format!("GET https://{host}:9/token HTTP/1.1\r\nHost: {host}:9\r\n\r\n");
+
+        // Nothing names the address: the ordinary default denial, under the ordinary reason.
+        let transcript = served(&["example.test:*"], vec![], &request("10.1.2.3"));
+        assert!(
+            transcript.contains("denied-default"),
+            "an address no rule names is denied by the policy, like any other host: {transcript:?}"
+        );
+        assert!(
+            !transcript.contains("ip-literal"),
+            "the tunneled plane's pre-policy refusal is not this plane's: {transcript:?}"
+        );
+
+        // And a rule that does name it is honoured: the request gets past the policy to its own
+        // connection (port 9, discard, with nothing listening).
+        let transcript = served(&["10.1.2.3:9"], vec![], &request("10.1.2.3"));
+        assert!(
+            !transcript.contains("403"),
+            "a rule naming the address admits it here: {transcript:?}"
         );
     }
 

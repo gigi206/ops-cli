@@ -851,8 +851,9 @@ fn prepare_config(cwd: PathBuf, ov: &crate::config::Override) -> Result<Prepared
 /// before reaching this point) therefore loses nothing by doing so.
 fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, ExitCode> {
     let PreparedConfig { layout, cwd, cfg } = pc;
-    let Some(bwrap) = crate::store::resolve_bwrap(Some(&layout)).map(|c| c.path) else {
-        return Err(missing("bubblewrap (the sandbox engine)"));
+    let bwrap = match crate::store::try_resolve_bwrap(Some(&layout)) {
+        Ok(choice) => choice.path,
+        Err(miss) => return Err(unresolved_engine("bubblewrap (the sandbox engine)", &miss)),
     };
     if !matches!(crate::probe_userns(), crate::Userns::Ok) {
         crate::diag::error(
@@ -863,11 +864,18 @@ fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, Ex
     // A cage is going to run, so this is where the scopes of the cages that already finished are
     // reclaimed. Every launch path reaches this function, and the sweep runs once per process.
     super::cgroup::sweep_stale_scopes();
-    let Some(nix) = crate::store::resolve_nix(Some(&layout)) else {
-        return Err(missing("nix (the store engine)"));
+    let nix = match crate::store::try_resolve_nix(Some(&layout)) {
+        Ok(nix) => nix,
+        Err(miss) => return Err(unresolved_engine("nix (the store engine)", &miss)),
     };
-    let Some(nix_store) = crate::store::resolve_nix_store(Some(&layout)) else {
-        return Err(missing("nix-store (the store database tool)"));
+    let nix_store = match crate::store::try_resolve_nix_store(Some(&layout)) {
+        Ok(bin) => bin,
+        Err(miss) => {
+            return Err(unresolved_engine(
+                "nix-store (the store database tool)",
+                &miss,
+            ));
+        }
     };
 
     let nixpkgs = match effective_lock_target(&cwd, &layout, &cfg, app)
@@ -1023,9 +1031,21 @@ fn mise_tools(prep: &Prepared) -> Result<super::packages::Provisioned, ExitCode>
     })
 }
 
-fn missing(what: &str) -> ExitCode {
+/// The fatal line for an engine that did not resolve, saying which of the two things happened.
+///
+/// A refused override is not a missing engine: the binary is installed, at the path the variable
+/// names, and pointing its owner at `sbx doctor` — which would report the same engine as "not
+/// found" — sends them after a package they already have instead of the ownership or permissions
+/// that were actually refused. The resolver has already printed that refusal with its remedy, so
+/// this line states the consequence and does not repeat it.
+fn unresolved_engine(what: &str, miss: &crate::store::EngineMiss) -> ExitCode {
+    let tail = match miss {
+        crate::store::EngineMiss::NotFound => " See `sbx doctor`.",
+        crate::store::EngineMiss::Refused { .. } => "",
+    };
     crate::diag::error(&format!(
-        "sbx: {what} not found — the sandbox cannot run. See `sbx doctor`."
+        "sbx: {} — the sandbox cannot run.{tail}",
+        miss.clause(what)
     ));
     ExitCode::FAILURE
 }

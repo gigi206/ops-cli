@@ -808,6 +808,10 @@ impl TaskEngine {
                 self.redact_min_len,
                 &self.brokers,
                 self.egress_log.clone(),
+                // The task's plane. It shares the session's ring for display, but its refusals are
+                // this task's `network` list being enforced, not the agent's allowlist coming up
+                // short, so `--net-learn` must not learn rules from them.
+                super::control::Plane::Task,
                 self.signer_log.clone(),
             )
             .map_err(TaskError::Io)?;

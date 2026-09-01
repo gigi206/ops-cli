@@ -100,6 +100,51 @@ fn doctor_proves_the_boundary_by_a_real_launch_where_supported() {
     );
 }
 
+/// An engine override sbx refuses is not a missing engine, and `doctor` must not report it as one.
+///
+/// `SBX_NIX_BIN` naming a world-writable binary is a deliberate choice sbx declines to honour: it
+/// will not silently substitute another engine against the same store. The binary is installed and
+/// sitting at the named path, so "not found" plus "install nix" sends the user after a package they
+/// already have, instead of the file mode that was actually refused.
+#[test]
+fn doctor_reports_a_refused_engine_override_as_refused_not_missing() {
+    use std::os::unix::fs::PermissionsExt;
+    let data = TmpDir::new("dr");
+    let bin_dir = TmpDir::new("dr");
+    let nix = bin_dir.path().join("nix");
+    std::fs::write(&nix, "#!/bin/sh\nexit 0\n").expect("write the override nix");
+    std::fs::set_permissions(&nix, std::fs::Permissions::from_mode(0o777))
+        .expect("make it world-writable");
+
+    let out = sbx()
+        .arg("doctor")
+        .env("SBX_NIX_BIN", &nix)
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("spawn sbx doctor");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains(&format!(
+            "nix               refused: SBX_NIX_BIN={}",
+            nix.display()
+        )),
+        "the nix line must name the refusal and the path; stdout was:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("nix               not found"),
+        "a refused override is not a missing engine; stdout was:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("install nix"),
+        "the remedy is the file's mode, not an install; stderr was:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("unset SBX_NIX_BIN"),
+        "the remediation must name the way out; stderr was:\n{stderr}"
+    );
+}
+
 #[test]
 fn a_failed_launch_with_a_working_namespace_blames_bubblewrap() {
     // The crux: a capability-bearing namespace plus a failed launch means

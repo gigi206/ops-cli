@@ -522,6 +522,7 @@ mod tests {
             crate::sandbox::control::Proto::Https,
             crate::sandbox::control::HttpVer::H1,
             crate::sandbox::control::RpcKind::None,
+            crate::sandbox::control::Plane::Agent,
         );
         log.expect_capture(seq);
         (CaptureGuard::new(ring.clone(), log.clone(), seq), ring, log)
@@ -666,6 +667,7 @@ mod tests {
             crate::sandbox::control::Proto::Https,
             crate::sandbox::control::HttpVer::H1,
             crate::sandbox::control::RpcKind::None,
+            crate::sandbox::control::Plane::Agent,
         );
         log.expect_capture(seq);
         let g = CaptureGuard::new(ring.clone(), log, seq);

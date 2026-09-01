@@ -191,3 +191,33 @@ fn path_rejects_an_unknown_flag() {
     let s = String::from_utf8_lossy(&out.stderr);
     assert!(s.contains("unknown argument"), "stderr:\n{s}");
 }
+
+/// A data directory sbx *refused* is not a machine with nowhere to put a store, and `sbx path` must
+/// not report it as one.
+///
+/// `Layout::from_env` collapses both into `None`, and the render draws `(no base)` either way — so
+/// the exit code is the only thing separating "nothing is configured here" from "sbx declined the
+/// directory you named, and said so on stderr". The corner that needs its own case is a refused
+/// `$SBX_DATA_DIR` with no default base behind it: nothing resolves, so a check that only asks
+/// whether a default base exists calls the refusal an absence.
+#[test]
+fn path_fails_when_the_data_directory_was_refused_rather_than_absent() {
+    let fx = Project::new("path");
+    let out = fx
+        .cmd(&["path"])
+        .env("SBX_DATA_DIR", "rel/data")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("HOME")
+        .output()
+        .expect("spawn sbx");
+    assert!(
+        !out.status.success(),
+        "a refused data directory must not exit 0:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("SBX_DATA_DIR must be an absolute path"),
+        "the refusal says which directory and why:\n{err}"
+    );
+}

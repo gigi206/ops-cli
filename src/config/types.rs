@@ -735,7 +735,11 @@ pub(crate) struct TaskSpec {
     pub(crate) description: Option<String>,
     /// The command as an argv list, `{param}` placeholders unsubstituted. Never a shell string.
     pub(crate) cmd: Vec<String>,
-    /// The declared parameters, in declaration order.
+    /// The declared parameters, in the declaration section's **key** order — not the order the
+    /// file was written in, which the `BTreeMap` the declarations are parsed into has already
+    /// discarded ([`tasks::validate_params`](super::tasks) builds this vector from it). It is the
+    /// order a caller sees the parameters listed and contracted in; nothing else depends on it,
+    /// since a parameter is addressed by name.
     pub(crate) params: Vec<TaskParam>,
     /// Credentials injected into the command's environment, keyed by variable name.
     pub(crate) secrets: Vec<TaskSecret>,

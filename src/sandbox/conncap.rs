@@ -1,19 +1,30 @@
-//! One definition of how many connections a host-side accept loop will serve at once.
+//! The rules every host-side accept loop follows: how many connections it serves at once, what it
+//! does with a failed `accept(2)`, and what it does when the host will not give it a thread.
 //!
 //! Every socket sbx binds host-side is reachable from the cage, and a connection costs a thread for
 //! as long as it lives. So each accept loop carries a ceiling, and beyond it a connection is
 //! refused rather than allowed to pin another thread.
 //!
-//! It exists as a type because the loops that need it wrote it four times and no copy had both
-//! halves. Two took the slot atomically and released it by hand, so a serving thread that panicked
-//! leaked the slot for the life of the session, and enough of those close the socket for good. Two
-//! released it from a `Drop` guard and *checked* the ceiling before taking it, which lets a burst
-//! of accepts all pass the check and land past the cap. [`ConnCap::take`] does both: the slot is
-//! taken by the same operation that tests the ceiling, and it comes back when the guard goes out of
-//! scope, panic or no panic.
+//! The two failure rules live here for the same reason the ceiling does: each loop is the body of a
+//! detached thread that owns its listener, so a loop that returns — or unwinds — closes its plane
+//! for the rest of the launch with the session otherwise running fine. Neither rule is a judgement
+//! a single plane gets to make differently.
+//!
+//! The ceiling exists as a type because the loops that need it wrote it four times and no copy had
+//! both halves. Two took the slot atomically and released it by hand, so a serving thread that
+//! panicked leaked the slot for the life of the session, and enough of those close the socket for
+//! good. Two released it from a `Drop` guard and *checked* the ceiling before taking it, which lets
+//! a burst of accepts all pass the check and land past the cap. [`ConnCap::take`] does both: the
+//! slot is taken by the same operation that tests the ceiling, and it comes back when the guard
+//! goes out of scope, panic or no panic.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+/// How long a loop pauses after a failure it means to survive. Far too short to matter to a real
+/// connection, and long enough that a condition lasting seconds costs no core.
+const BACKOFF: Duration = Duration::from_millis(20);
 
 /// What an accept loop does with a failed `accept(2)`: say so, pause briefly, and carry on serving.
 ///
@@ -37,7 +48,51 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// same as theirs.
 pub(super) fn accept_backoff(who: &str, e: &std::io::Error) {
     crate::diag::error(&format!("sbx: {who}: accept error: {e}"));
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::thread::sleep(BACKOFF);
+}
+
+/// Hand one accepted connection to its own thread, or say that the host would not give one.
+///
+/// The other half of [`accept_backoff`], and needed for the same reason: `std::thread::spawn`
+/// *panics* when the kernel refuses a thread (`EAGAIN` under `RLIMIT_NPROC` or a slice's
+/// `TasksMax`), and the spawn is the statement right after the accept in a loop that is itself the
+/// body of a detached thread. The unwind drops the listener and closes the plane for the rest of
+/// the launch — exactly the outcome [`accept_backoff`] exists to prevent, reached under the same
+/// host condition, since fd exhaustion and thread exhaustion arrive together on a loaded machine.
+/// `Builder::spawn` reports the refusal instead of panicking, so the connection is let go and the
+/// loop keeps serving.
+///
+/// Whatever the connection holds — its [`ConnSlot`] above all — must travel *inside* `work`, which
+/// is all a refused spawn gives back: a slot taken on the accept loop and released only by a thread
+/// that never ran would leak one slot per refusal, until the count reached the ceiling and every
+/// later connection was refused by a plane serving nothing at all.
+///
+/// Returns whether the thread was created. A refusal has already been reported and paused for, so a
+/// loop with nothing further to say about the connection may ignore the answer and accept the next.
+pub(super) fn spawn_conn<F>(who: &str, work: F) -> bool
+where
+    F: FnOnce() + Send + 'static,
+{
+    spawn_with(std::thread::Builder::new(), who, work)
+}
+
+/// [`spawn_conn`]'s body, with the builder passed in. The refusal path is otherwise reachable only
+/// on a host already out of threads, and it is the path worth pinning, so the seam exists for a
+/// test to ask for a thread the kernel is certain to refuse.
+fn spawn_with<F>(builder: std::thread::Builder, who: &str, work: F) -> bool
+where
+    F: FnOnce() + Send + 'static,
+{
+    match builder.spawn(work) {
+        Ok(_) => true,
+        Err(e) => {
+            crate::diag::error(&format!(
+                "sbx: {who}: could not start a connection thread: {e}"
+            ));
+            std::thread::sleep(BACKOFF);
+            false
+        }
+    }
 }
 
 /// A ceiling on live connections, shared by an accept loop and the threads it spawns.
@@ -124,6 +179,111 @@ mod tests {
         );
         assert_eq!(cap.live(), 0, "the slot was leaked by the panic");
         assert!(cap.take().is_some(), "and the socket is still serving");
+    }
+
+    /// The ordinary hand-over: the work runs on its own thread, and the slot it carried comes back
+    /// when that work ends.
+    #[test]
+    fn a_connection_handed_over_runs_and_gives_its_slot_back() {
+        let cap = ConnCap::new(1);
+        let slot = cap.take().expect("admitted");
+        let (done, ran) = std::sync::mpsc::channel();
+        assert!(spawn_conn("test plane", move || {
+            drop(slot);
+            let _ = done.send(());
+        }));
+        ran.recv_timeout(Duration::from_secs(10))
+            .expect("the connection's thread ran");
+        assert_eq!(cap.live(), 0, "the slot came back with the work");
+    }
+
+    /// A connection whose thread the host refuses gives back everything that connection held, the
+    /// loop is told, and nothing unwinds.
+    ///
+    /// The bare `std::thread::spawn` this replaces panicked instead, and the panic unwound the
+    /// detached accept loop that owns the listener — closing the plane for the rest of the launch
+    /// under precisely the host pressure the accept-error arm above it already anticipates.
+    #[test]
+    fn a_refused_thread_gives_the_connection_back_and_leaves_the_loop_standing() {
+        let cap = ConnCap::new(1);
+        let slot = cap.take().expect("admitted");
+        // A stack larger than any Linux address space, so the thread is refused the way one is
+        // refused under `RLIMIT_NPROC` — a condition a test cannot otherwise reach. Large, but
+        // still small enough that the C library accepts it as a stack size (both glibc and musl
+        // reject an outright absurd one on the attribute, which is a different failure): the
+        // mapping is what has to fail here, not the request to make it.
+        let spawned = spawn_with(
+            std::thread::Builder::new().stack_size(usize::MAX / 8),
+            "test plane",
+            move || drop(slot),
+        );
+        assert!(!spawned, "the host cannot have created this thread");
+        assert_eq!(cap.live(), 0, "the slot travelled inside the refused work");
+        assert!(cap.take().is_some(), "and the plane is still serving");
+    }
+
+    /// Every host-side accept loop hands its connection over through [`spawn_conn`].
+    ///
+    /// The panic it prevents needs a host already out of threads, so nothing else in the suite
+    /// notices a loop that goes back to the bare `std::thread::spawn` — which is the form a hand
+    /// reaches for. Each loop is therefore read from its own file, anchored on the accept-error arm
+    /// above it, and the first spawn after that anchor must be this one.
+    #[test]
+    fn every_accept_loop_hands_its_connection_over_through_the_helper() {
+        for (plane, source, anchor) in [
+            (
+                "broker",
+                include_str!("broker.rs"),
+                r#"accept_backoff("broker""#,
+            ),
+            (
+                "ssh-agent broker",
+                include_str!("sshagent.rs"),
+                r#"accept_backoff("ssh-agent broker""#,
+            ),
+            (
+                "lens control",
+                include_str!("lens.rs"),
+                r#"accept_backoff("lens control""#,
+            ),
+            (
+                "forward",
+                include_str!("forward.rs"),
+                r#"accept_backoff("forward""#,
+            ),
+            (
+                "task control (cage)",
+                include_str!("task_control.rs"),
+                r#"accept_backoff("task control (cage)""#,
+            ),
+            (
+                "task control (logs)",
+                include_str!("task_control.rs"),
+                r#"accept_backoff("task control (logs)""#,
+            ),
+            (
+                "egress control",
+                include_str!("control/mod.rs"),
+                "sbx: egress control: accept error",
+            ),
+            (
+                "egress proxy",
+                include_str!("proxy/mod.rs"),
+                "fn spawn_connection(",
+            ),
+        ] {
+            let at = source
+                .find(anchor)
+                .unwrap_or_else(|| panic!("`{plane}`'s accept loop no longer reads as `{anchor}`"));
+            let rest = &source[at..];
+            let helper = rest.find("spawn_conn(").unwrap_or(usize::MAX);
+            let bare = rest.find("thread::spawn(").unwrap_or(usize::MAX);
+            assert!(
+                helper < bare,
+                "`{plane}` hands its connection to a bare `std::thread::spawn`, which panics when \
+                 the host refuses the thread and unwinds the detached loop that owns the listener"
+            );
+        }
     }
 
     /// Contending takers never hold more slots at once than the ceiling allows.

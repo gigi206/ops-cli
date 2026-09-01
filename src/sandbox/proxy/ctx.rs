@@ -110,6 +110,11 @@ pub(crate) struct ProxyCtx {
     /// [`crate::sandbox::control::LogRing`] via [`Self::with_log`]; a decision's outcome is both counted in
     /// `stats` and pushed here through the single [`Self::outcome`] chokepoint.
     pub(super) log: Option<Arc<crate::sandbox::control::LogRing>>,
+    /// Which plane this proxy is — stamped on every event it pushes, because the ring above may be
+    /// shared with the per-invocation proxies of declared tasks, which enforce policies of their
+    /// own. [`crate::sandbox::control::Plane::Agent`] unless the launch says otherwise via
+    /// [`Self::with_plane`], since the session's own proxy is the common case and every test's.
+    pub(super) plane: crate::sandbox::control::Plane,
     /// The live registry of egress tunnels currently open, read by `sbx net live`, or `None` when
     /// off (tests). The launch ([`crate::sandbox::egress::start`]) attaches the session's
     /// [`crate::sandbox::control::FlowRegistry`] via [`Self::with_flows`]; each permitted tunnel registers a
@@ -245,6 +250,7 @@ impl ProxyCtx {
             notices: false,
             stats: None,
             log: None,
+            plane: crate::sandbox::control::Plane::Agent,
             flows: None,
             splices: AtomicUsize::new(0),
             conns: AtomicUsize::new(0),
@@ -291,6 +297,15 @@ impl ProxyCtx {
     /// Set once by the launch ([`crate::sandbox::egress::start`]) whenever the proxy runs.
     pub(crate) fn with_log(mut self, log: Arc<crate::sandbox::control::LogRing>) -> Self {
         self.log = Some(log);
+        self
+    }
+
+    /// Name the plane this proxy enforces for, so the events it pushes can be told apart from those
+    /// of another proxy sharing the same ring. Set once by the launch
+    /// ([`crate::sandbox::egress::start`]); the session's own proxy leaves the
+    /// [`crate::sandbox::control::Plane::Agent`] default.
+    pub(crate) fn with_plane(mut self, plane: crate::sandbox::control::Plane) -> Self {
+        self.plane = plane;
         self
     }
 
@@ -577,6 +592,7 @@ impl ProxyCtx {
             proto,
             http_ver,
             rpc,
+            self.plane,
         ))
     }
 

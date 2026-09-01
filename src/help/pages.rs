@@ -355,6 +355,10 @@ pub(super) const PAGES: &[Page] = &[
             plain \"not allowed yet\" refusal is learned — a deliberate `deny` rule and a security\n\
             block (SSRF, host-mismatch, an outbound secret) are never turned into a rule. Run it\n\
             again after adding rules to catch a host only reachable once an earlier one is allowed.\n\
+            Only the app's own egress is learned: a declared task runs behind a proxy of its own, so\n\
+            what that task's `network` list turns down is skipped (and counted in the notes) rather\n\
+            than opened in the app's profile, as is a destination an `ask` posture would have put to\n\
+            a person.\n\
             The level sets how wide each rule is: `domain` opens the whole host (`{*} https://host`),\n\
             `path` its first path section (`{*} https://host/v1/*`), `exact` the one endpoint\n\
             (`{POST} https://host/v1/chat`). It is foreground-only (not with `--detach`).\n\n\
@@ -2904,7 +2908,9 @@ pub(super) const PAGES: &[Page] = &[
             This is also where a program the plugin needs gets built, when the host has none and\n\
             `[plugin.<name>] programs` names a `nix:` attribute for it — here rather than at\n\
             launch, since a plugin's program belongs to the plugin and not to any one project.\n\
-            Run it again to pick up a `programs` entry added after installing.",
+            A `programs` entry added after installing is not picked up by running this again: an\n\
+            install over a name already taken is refused. Take the sequence that refusal names —\n\
+            `sbx plugins rm <name>`, then install it once more.",
     },
     Page {
         path: &["plugins", "rm"],

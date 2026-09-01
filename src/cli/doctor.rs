@@ -25,6 +25,19 @@ const BWRAP_LAUNCH_REMEDIATION: &str = "bubblewrap is installed and user namespa
 but launching a sandbox failed — check that bubblewrap is built to use unprivileged user \
 namespaces (not a setuid helper) and review the messages above";
 
+/// Remediation for an engine override sbx refused: the binary is present at the path the variable
+/// names, and sbx will not silently substitute another one against the same store. An install hint
+/// would be wrong here — nothing is missing — so the remedy names the two things that actually
+/// clear it.
+const NIX_OVERRIDE_REMEDIATION: &str = "fix the ownership or permissions of the nix binary \
+SBX_NIX_BIN names (it must be owned by you or root, and not world-writable), or unset SBX_NIX_BIN \
+to let sbx resolve nix itself";
+
+/// [`NIX_OVERRIDE_REMEDIATION`] for the sandbox engine.
+const BWRAP_OVERRIDE_REMEDIATION: &str = "fix the ownership or permissions of the bubblewrap \
+binary SBX_BWRAP_BIN names (it must be owned by you or root, and not world-writable), or unset \
+SBX_BWRAP_BIN to let sbx resolve bubblewrap itself";
+
 /// A colored `[ ok ]` status tag (green when the stream is a terminal, plain otherwise).
 fn tag_ok(p: &style::Palette) -> String {
     format!("{}[ ok ]{}", p.ok, p.reset)
@@ -58,9 +71,9 @@ pub(crate) fn doctor() -> ExitCode {
     // The sandbox engine itself. Hold the choice: a present engine is what lets the
     // boundary be proven by a real launch rather than a stand-in, and its source explains
     // which `bwrap` ran and why — the bundled engine, the host's, or an override.
-    let bwrap = store::resolve_bwrap(layout.as_ref());
+    let bwrap = store::try_resolve_bwrap(layout.as_ref());
     match &bwrap {
-        Some(c) => {
+        Ok(c) => {
             println!("  {} bubblewrap        {}", tag_ok(&pal), c.path.display());
             let note = if c.apparmor_restricted {
                 " — AppArmor userns restriction active (host engine required)"
@@ -73,9 +86,17 @@ pub(crate) fn doctor() -> ExitCode {
                 dim = pal.dim
             );
         }
-        None => {
+        Err(store::EngineMiss::NotFound) => {
             println!("  {} bubblewrap        not found", tag_fail(&pal));
             remediation.push("install bubblewrap (the sandbox engine)");
+        }
+        Err(store::EngineMiss::Refused { env, path }) => {
+            println!(
+                "  {} bubblewrap        refused: {env}={}",
+                tag_fail(&pal),
+                path.display()
+            );
+            remediation.push(BWRAP_OVERRIDE_REMEDIATION);
         }
     }
 
@@ -88,7 +109,7 @@ pub(crate) fn doctor() -> ExitCode {
     // sysctls below are advisory context for the remediation hint.
     report_security_boundary(
         &pal,
-        bwrap.as_ref().map(|c| c.path.as_path()),
+        bwrap.as_ref().ok().map(|c| c.path.as_path()),
         &mut remediation,
     );
     if let Some(v) = read_sysctl("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") {
@@ -110,16 +131,27 @@ pub(crate) fn doctor() -> ExitCode {
     // then an sbx-owned engine, then `PATH`; it makes no store or config change,
     // though a `bundled-nix` build materializes its embedded engine under
     // `<data>/engine/` on first use (idempotent), which a launch would do anyway.
-    match store::resolve_nix(layout.as_ref()) {
-        Some(nix) => {
+    match store::try_resolve_nix(layout.as_ref()) {
+        Ok(nix) => {
             println!("  {} nix               {}", tag_ok(&pal), nix.display());
             if let Some(v) = nix_version(&nix) {
                 println!("         {dim}· {v}{r}", dim = pal.dim);
             }
         }
-        None => {
+        Err(store::EngineMiss::NotFound) => {
             println!("  {} nix               not found", tag_fail(&pal));
             remediation.push("install nix (the store engine sbx drives daemonlessly)");
+        }
+        // Not "not found", and not an install hint: the engine is installed — sbx declined to run
+        // the one the override names. Telling this user to install nix would send them after a
+        // package they already have.
+        Err(store::EngineMiss::Refused { env, path }) => {
+            println!(
+                "  {} nix               refused: {env}={}",
+                tag_fail(&pal),
+                path.display()
+            );
+            remediation.push(NIX_OVERRIDE_REMEDIATION);
         }
     }
 

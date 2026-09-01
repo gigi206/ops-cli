@@ -656,21 +656,28 @@ fn roll_task_pool(
     match outcome? {
         None => Ok(false),
         Some(run) if run.ok => Ok(true),
-        // The tail line is the pool cage's own stderr — mise's, and through it whatever a
-        // registry backend's installer printed. It lands on the roll report's aligned status
-        // column, beside sbx's own lines, so it is sanitised like every other value the cage
-        // chose (see [`crate::sandbox::sanitize`]).
-        Some(run) => Err(format!(
-            "mise upgrade failed: {}",
-            crate::sandbox::sanitize(
-                String::from_utf8_lossy(&run.stderr)
-                    .trim()
-                    .lines()
-                    .last()
-                    .unwrap_or("no output")
-            )
-        )),
+        Some(run) => Err(pool_upgrade_failure(&run)),
     }
+}
+
+/// The roll report's status line for a pool upgrade that failed.
+///
+/// The tail quoted is [`crate::sandbox::taskpool::InstallRun::diagnostics`], not the stderr tail
+/// alone: mise wraps backends that report a resolution failure on stdout while mise's own stderr
+/// carries only progress that trims away to nothing, and this line is the operator's summary of
+/// which it was. It lands on the roll report's aligned status column, beside sbx's own lines, so it
+/// is sanitised like every other value the cage chose (see [`crate::sandbox::sanitize`]).
+fn pool_upgrade_failure(run: &crate::sandbox::taskpool::InstallRun) -> String {
+    format!(
+        "mise upgrade failed: {}",
+        crate::sandbox::sanitize(
+            String::from_utf8_lossy(run.diagnostics())
+                .trim()
+                .lines()
+                .last()
+                .unwrap_or("no output")
+        )
+    )
 }
 
 /// The version-transition lines mise prints for a successful roll — `<token> <from> → <to>`, one per

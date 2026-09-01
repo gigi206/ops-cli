@@ -706,7 +706,8 @@ pub(super) fn build(
     // that resolution happens, and nothing can be refused in between.
     let notify_needles: crate::sandbox::notify_sink::Needles = Arc::new(RwLock::new(Vec::new()));
     // Which sandbox every announcement names. The pid is this launcher's — the one `sbx session ls`
-    // lists and `sbx attach`/`sbx stop` take — so a notification points at something to act on.
+    // lists and `sbx session attach`/`sbx session stop` take — so a notification points at something
+    // to act on.
     let notify_origin = crate::notify::Origin {
         app: match runtime {
             binds::Runtime::GlobalApp(name) | binds::Runtime::ProjectApp(name) => name.to_string(),
@@ -1309,6 +1310,8 @@ pub(super) fn build(
             &brokers,
             // The session's own proxy opens the ring every reader finds; a task's shares it.
             None,
+            // This is the agent's plane: what it is refused is what `--net-learn` may learn.
+            crate::sandbox::control::Plane::Agent,
             signer_ring.clone(),
         )
         .map_err(|e| {

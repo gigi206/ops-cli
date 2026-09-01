@@ -300,8 +300,8 @@ impl Block {
 /// what a person recognises ("that was my coding agent"), but several projects can run the same app.
 /// The **project** disambiguates those, and is the only name a bare `sbx run` has. The **pid** is the
 /// one part that is unique while the session lives — it is what `sbx session ls` lists and what `sbx
-/// attach`/`sbx stop` take — so it turns a toast into something actionable rather than merely
-/// informative.
+/// session attach`/`sbx session stop` take — so it turns a toast into something actionable rather
+/// than merely informative.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Origin {
     /// The `sbx app <name>` this launch runs, or empty for a bare `sbx run`.

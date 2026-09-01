@@ -389,8 +389,10 @@ which share this install phase.
 **single directory** (the platform slug, or the `<name>-<version>/` prefix a vendor commonly wraps
 its tree in) is **hoisted**: its contents become the root the shapes above scan, so a program that
 sits one level down is still found, together with the support files it reads beside itself. The
-condition is "exactly one entry, and it is a directory", which is unambiguous by construction, so it
-needs no declaration of its own; every other root is copied unchanged. `atomic-agent` is the shipped
+condition is "exactly one entry, and it is a real directory", which is unambiguous by construction,
+so it needs no declaration of its own; every other root is copied unchanged. A lone root
+**symlink** is one of those: it is copied as a link and never followed, because hoisting it would
+install the tree it points at instead of the tree the archive ships. `atomic-agent` is the shipped
 example, its release tarball unpacking into `linux-x64/`. `deb:` and `appimage:` do not hoist,
 because a single directory at their root means something else.
 

@@ -198,9 +198,17 @@ pub(crate) fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
         Ok(l) => l,
         Err(code) => return code,
     };
-    let Some(nix) = store::resolve_nix(Some(&layout)) else {
-        diag::error("sbx: nix not found — cannot upgrade. See `sbx doctor`.");
-        return ExitCode::FAILURE;
+    let nix = match store::try_resolve_nix(Some(&layout)) {
+        Ok(nix) => nix,
+        // Not always "not found": an override sbx refused leaves the engine installed at the path
+        // the variable names, and saying it is missing points at the wrong remedy.
+        Err(miss) => {
+            diag::error(&format!(
+                "sbx: {} — cannot upgrade. See `sbx doctor`.",
+                miss.clause("nix")
+            ));
+            return ExitCode::FAILURE;
+        }
     };
     // `--project <path>` retargets the whole upgrade at another project — exactly as `cd <path>
     // && sbx upgrade` would: the path is canonicalized (so the per-project lock derivation matches

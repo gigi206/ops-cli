@@ -337,3 +337,44 @@ fn mise_package_groups_covers_the_baseline_and_each_app_generically() {
         "a name no app carries withholds nothing"
     );
 }
+
+/// The roll report's pool line must quote whichever stream carried the diagnostic.
+///
+/// mise wraps backends (`npm`, `pipx`) that report a resolution failure on stdout while mise's own
+/// stderr carries only progress that trims away to nothing. Reading the stderr tail alone turned
+/// that failure into `no output` on the one line an operator reads to tell a registry outage from a
+/// typo'd token.
+#[test]
+fn the_pool_roll_failure_quotes_the_stream_that_carried_the_diagnostic() {
+    let backend_spoke_on_stdout = crate::sandbox::taskpool::InstallRun {
+        ok: false,
+        stderr: b"  \n \n".to_vec(),
+        stdout: b"npm error 404 Not Found - GET https://registry.example/no-such".to_vec(),
+    };
+    assert_eq!(
+        pool_upgrade_failure(&backend_spoke_on_stdout),
+        "mise upgrade failed: npm error 404 Not Found - GET https://registry.example/no-such"
+    );
+
+    // mise's own stderr wins whenever it has something to say, and only its last line is quoted.
+    let mise_spoke = crate::sandbox::taskpool::InstallRun {
+        ok: false,
+        stderr: b"mise downloading\nmise ERROR failed to resolve tool\n".to_vec(),
+        stdout: b"progress".to_vec(),
+    };
+    assert_eq!(
+        pool_upgrade_failure(&mise_spoke),
+        "mise upgrade failed: mise ERROR failed to resolve tool"
+    );
+
+    // Neither stream said anything, which is the only case the placeholder describes.
+    let silent = crate::sandbox::taskpool::InstallRun {
+        ok: false,
+        stderr: Vec::new(),
+        stdout: Vec::new(),
+    };
+    assert_eq!(
+        pool_upgrade_failure(&silent),
+        "mise upgrade failed: no output"
+    );
+}

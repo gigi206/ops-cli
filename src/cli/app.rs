@@ -1943,18 +1943,17 @@ fn app_prune(args: &[OsString]) -> ExitCode {
         if !live.is_empty() {
             let mut pids: Vec<u32> = live.into_iter().collect();
             pids.sort_unstable();
-            let listed = pids
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
+            let rendered: Vec<String> = pids.iter().map(u32::to_string).collect();
+            let listed = rendered.join(", ");
             diag::error(&format!(
                 "sbx: app prune: {name} has a live session (pid {listed}) whose home these tools \
                  are in — refusing to delete them under a running agent"
             ));
-            diag::hint(
-                "       stop it with `sbx stop`, or re-run without `--yes` to see what would go",
-            );
+            diag::hint(&format!(
+                "       stop it with `sbx session stop {}`, or re-run without `--yes` to see what \
+                 would go",
+                rendered.join(" ")
+            ));
             return ExitCode::FAILURE;
         }
     }

@@ -367,6 +367,31 @@ impl LogVerdict {
     }
 }
 
+/// Which proxy decided a logged request — the *whose policy* axis, distinct from the transport.
+///
+/// A session runs more than one proxy: the launch's own, enforcing the project's allowlist for the
+/// agent, and one per invocation of a declared task ([`crate::sandbox::task`]), enforcing that
+/// task's much narrower `network` list. The per-invocation proxies append to the session's ring
+/// rather than opening one nothing would read (see [`crate::sandbox::egress::Egress::event_log`]),
+/// so the ring is a merge of planes that do not share a policy.
+///
+/// That is harmless for a reader that renders the ring and wrong for one that writes policy from
+/// it: a task's refusal says what the *task* was not granted, and turning it into a rule would
+/// widen the **agent's** allowlist for a destination the operator was never asked about. So every
+/// event names the plane that produced it, and [`crate::sandbox::netlearn`] learns only from
+/// [`Agent`](Self::Agent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Plane {
+    /// The session's own proxy: the agent's plane, under the project/app allowlist.
+    Agent,
+    /// A declared task's per-invocation proxy, under that task's own `network` list.
+    Task,
+    /// The plane is not known. The control wire does not carry it, so an event decoded on the
+    /// client side reads as this — a fail-closed value, since nothing that writes policy may treat
+    /// an unattributed refusal as the agent's.
+    Unknown,
+}
+
 /// The transport the proxy used for a decided request — the *how*, distinct from the port. The three
 /// enforcement paths map one-to-one: an inspected TLS tunnel (a MITM'd `CONNECT`, including a
 /// WebSocket over TLS) is [`Https`](Self::Https); an inspected cleartext `http://` absolute-form is
@@ -565,6 +590,13 @@ pub(crate) struct LogEvent {
     /// arriving status fills the field but does **not** amend: the capture is what completes the
     /// record, so the event is re-emitted exactly once, carrying everything. Server-side only.
     pub(crate) awaiting_capture: bool,
+    /// Which proxy pushed this event ([`Plane`]) — the session's own or a declared task's
+    /// per-invocation one, both of which append here.
+    ///
+    /// Server-side only — never sent over the wire, so a client-decoded event carries
+    /// [`Plane::Unknown`]. The one consumer that needs it, `--net-learn`, snapshots the ring
+    /// in-process while the launch still holds it.
+    pub(crate) plane: Plane,
     /// Configured secrets seen crossing this exchange's WebSocket tunnel, if any. Empty for
     /// everything else: the two HTTP tripwires act on the exchange itself (a `403` outbound, a
     /// masked response inbound), while an open tunnel is relayed byte-exact, so the sighting IS the
@@ -680,6 +712,10 @@ impl LogRing {
     /// is full. Called from the proxy with the path already query-redacted. Returns the assigned
     /// sequence number, so a later [`set_status`](LogRing::set_status) can amend this same event once
     /// its upstream response returns.
+    ///
+    /// `plane` names the proxy making the call, because a ring is shared by proxies enforcing
+    /// different policies — see [`Plane`]. It is a caller's property, not a per-request one: a
+    /// proxy passes the same value for every event it pushes.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn push(
         &self,
@@ -693,6 +729,7 @@ impl LogRing {
         proto: Proto,
         http_ver: HttpVer,
         rpc: RpcKind,
+        plane: Plane,
     ) -> u64 {
         let at_epoch_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -733,6 +770,7 @@ impl LogRing {
             proto,
             http_ver,
             rpc,
+            plane,
             muted,
             status: None,
             amend_seq: None,
@@ -1094,7 +1132,7 @@ pub(crate) fn serve(
         let log = log.clone();
         let flows = flows.clone();
         let capture = capture.clone();
-        std::thread::spawn(move || {
+        super::conncap::spawn_conn("egress control", move || {
             let _ = handle(stream, &state, &manual, &log, &flows, capture.as_deref());
         });
     }
@@ -1789,6 +1827,9 @@ mod tests {
     /// fault in a single proxy connection becomes a session whose log stops recording, whose parked
     /// requests can no longer be answered and whose closed tunnels never leave the live view. See
     /// [`crate::sandbox::locks`] for why these are the recovering class and what makes it sound.
+    ///
+    /// The plane's fifth lock-holder, the traffic capture's ring, is the same class and is covered
+    /// beside its own definition in `control/capture.rs`, whose fields are private to that module.
     #[test]
     fn a_poisoned_control_plane_lock_keeps_serving_rather_than_panicking_again() {
         // Poison a lock the only way it can be poisoned: panic on another thread while a guard on it
@@ -2236,6 +2277,7 @@ mod tests {
             Proto::Https,
             HttpVer::H1,
             RpcKind::None,
+            Plane::Agent,
         );
     }
 
@@ -2275,6 +2317,7 @@ mod tests {
             Proto::Other,
             HttpVer::Unknown,
             RpcKind::None,
+            Plane::Agent,
         );
         let snap = ring.snapshot(None, None, false);
         let e = &snap.events[0];
@@ -2321,6 +2364,7 @@ mod tests {
             Proto::Other,
             HttpVer::Unknown,
             RpcKind::None,
+            Plane::Agent,
         );
         let snap = ring.snapshot(None, None, false);
         let line = format_event_line(&snap.events[0]);
@@ -2427,6 +2471,7 @@ mod tests {
             Proto::Https,
             HttpVer::H1,
             RpcKind::None,
+            Plane::Agent,
         );
         let s2 = ring.push(
             false,
@@ -2439,6 +2484,7 @@ mod tests {
             Proto::Https,
             HttpVer::H1,
             RpcKind::None,
+            Plane::Agent,
         );
         // A status amends the matching still-resident event, and only it.
         ring.set_status(s2, 404);
@@ -2466,6 +2512,7 @@ mod tests {
             Proto::Https,
             HttpVer::H1,
             RpcKind::None,
+            Plane::Agent,
         );
         ring.push(
             false,
@@ -2478,6 +2525,7 @@ mod tests {
             Proto::Https,
             HttpVer::H1,
             RpcKind::None,
+            Plane::Agent,
         );
         ring.set_status(s1, 500);
         let after = ring.snapshot(None, None, false);
@@ -2505,6 +2553,7 @@ mod tests {
             Proto::Https,
             HttpVer::H1,
             RpcKind::None,
+            Plane::Agent,
         );
         // A follow reader catches up: it has seen seq s1, with no amendment yet.
         let seen = ring.snapshot(Some(s1), Some(0), false);
@@ -2587,6 +2636,7 @@ mod tests {
             Proto::Https,
             HttpVer::H1,
             RpcKind::None,
+            Plane::Agent,
         );
         log.push(
             false,
@@ -2599,6 +2649,7 @@ mod tests {
             Proto::Https,
             HttpVer::H1,
             RpcKind::None,
+            Plane::Agent,
         );
 
         let flows = Arc::new(FlowRegistry::new());

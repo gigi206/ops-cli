@@ -59,10 +59,20 @@
 //! [`handle_https_forward`] serves it as the plaintext-client sibling of the MITM path: the
 //! client→proxy leg is cleartext (the cage loopback), but the verdict is the *ordinary* `https` policy
 //! ([`EgressPolicy::explain`](crate::allowlist::EgressPolicy::explain), NOT the opt-in `http://` scheme — so a normal allow rule covers it,
-//! exactly as an equivalent `CONNECT` would, `ask` park included), the upstream leg is a **validated
+//! as an equivalent `CONNECT` would, `ask` park included), the upstream leg is a **validated
 //! TLS** connection (a forged upstream is a `502`, never downgraded), and — unlike the cleartext path
 //! — a host-scoped **credential IS injected** (it rides only the encrypted upstream leg, and a
 //! reflected value is masked out of the response).
+//!
+//! That equivalence is one of *policy*, and it does not extend to the one refusal the tunneled plane
+//! makes before the policy is consulted. An IP-literal target is answered `403 ip-literal` there
+//! because a MITM has to mint a leaf and a literal carries no name to bind one to; this plane mints
+//! nothing — it is the TLS *client*, validating the upstream certificate against the literal like
+//! any other peer name — so an IP literal reaches [`EgressPolicy::explain`](crate::allowlist::EgressPolicy::explain)
+//! here and is admitted only by a rule that names the address. The inspected answer is the narrower
+//! one: through a `CONNECT` the same address is reachable only by a `tcp://` splice, which inspects
+//! nothing. `sbx test net` reports the tunneled verdict and says which plane it belongs to for this
+//! reason.
 //!
 //! The residual is *not* confidentiality on the client leg: that leg is a loopback socket inside the
 //! cage, which no cage process can read (no `CAP_NET_RAW` for a packet socket, and `ptrace` is on the
@@ -282,20 +292,12 @@ pub(crate) fn serve(
             continue;
         }
         // A thread the OS refuses is treated exactly like the accept error above, and for the same
-        // reason: `std::thread::spawn` *panics* when the kernel will not create a thread (`EAGAIN`
-        // under `RLIMIT_NPROC` or a slice's `TasksMax`), and this loop is the body of a detached
-        // thread — the unwind would drop the `UnixListener` and close the cage's only egress for the
-        // rest of the session. That is the very outcome the transient-accept-error arm exists to
-        // prevent, reached under the same host condition (fd and thread exhaustion arrive together
-        // on a loaded machine). `Builder::spawn` reports the refusal instead of panicking, so the
-        // connection is let go and the loop keeps serving.
-        if let Err(e) = spawn_connection(&ctx, stream) {
-            crate::diag::error(&format!(
-                "sbx: egress proxy: could not start a connection thread: {e}"
-            ));
-            std::thread::sleep(Duration::from_millis(20));
-            continue;
-        }
+        // reason — see [`super::conncap::spawn_conn`], which [`spawn_connection`] hands to and
+        // which states it once for every plane: a bare `std::thread::spawn` *panics* when the
+        // kernel will not create a thread, and this loop is the body of a detached thread, so the
+        // unwind would drop the `UnixListener` and close the cage's only egress for the rest of the
+        // session. The refusal is reported and paused for there, and the connection is let go.
+        spawn_connection(&ctx, stream);
     }
     Ok(())
 }
@@ -316,20 +318,19 @@ impl Drop for ConnGuard {
     }
 }
 
-/// Take a connection slot and hand `stream` to its own thread, or report that the host would not
-/// give one. The per-socket timeouts go on inside the thread, before anything is read.
-fn spawn_connection(ctx: &Arc<ProxyCtx>, stream: UnixStream) -> io::Result<()> {
+/// Take a connection slot and hand `stream` to its own thread, reporting through
+/// [`super::conncap::spawn_conn`] if the host would not give one. Returns whether the thread was
+/// created. The per-socket timeouts go on inside the thread, before anything is read.
+fn spawn_connection(ctx: &Arc<ProxyCtx>, stream: UnixStream) -> bool {
     ctx.conns.fetch_add(1, Ordering::Relaxed);
     let guard = ConnGuard(Arc::clone(ctx));
-    std::thread::Builder::new()
-        .spawn(move || {
-            let ctx = &guard.0;
-            let _ = stream.set_read_timeout(Some(ctx.timeout));
-            let _ = stream.set_write_timeout(Some(ctx.timeout));
-            // an error on one connection is that connection's problem, never the proxy's
-            let _ = handle_client(stream, ctx);
-        })
-        .map(|_| ())
+    super::conncap::spawn_conn("egress proxy", move || {
+        let ctx = &guard.0;
+        let _ = stream.set_read_timeout(Some(ctx.timeout));
+        let _ = stream.set_write_timeout(Some(ctx.timeout));
+        // an error on one connection is that connection's problem, never the proxy's
+        let _ = handle_client(stream, ctx);
+    })
 }
 
 /// What a connection refused over [`ProxyCtx::max_conns`] is told.
@@ -475,7 +476,10 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     }
 
     // An IP-literal target carries no SNI to bind the minted leaf to, so the inspected L7 path
-    // refuses it (a hostname target is required to MITM; only the raw splice above accepts an IP).
+    // refuses it (a hostname target is required to MITM; a CONNECT to an address is served only as
+    // the raw splice above). The refusal is this plane's, not the proxy's as a whole: the
+    // absolute-form plane terminates no TLS toward the client and so decides a literal by the
+    // ordinary policy — see the module header.
     if host.parse::<IpAddr>().is_ok() {
         // Log the attempt (host = the IP the agent tried to reach) before refusing. Pre-tunnel, so
         // there is no method/path yet.
@@ -2184,12 +2188,12 @@ mod accept_tests {
     /// `std::thread::spawn` panics when the kernel refuses a thread (`EAGAIN` under `RLIMIT_NPROC`
     /// or a slice's `TasksMax`), and the accept loop is the body of a detached thread — the unwind
     /// dropped the `UnixListener` and closed the cage's only egress for the rest of the session.
-    /// [`spawn_connection`] reports the refusal instead, which puts the second half of the fix on
-    /// the slot: the guard has to travel *inside* the closure the spawner could not run, because
-    /// that closure is all the caller gets back. Taken on the loop and released only by a thread
-    /// that may never start — the shape this replaces — every refusal leaked one slot, until the
-    /// count reached `max_connections` and the loop answered `503 connection-cap` to a proxy that
-    /// was serving nothing at all.
+    /// [`spawn_connection`] reports the refusal through [`super::super::conncap::spawn_conn`]
+    /// instead, which puts the second half of the fix on the slot: the guard has to travel *inside*
+    /// the closure the spawner could not run, because that closure is all the caller gets back.
+    /// Taken on the loop and released only by a thread that may never start — the shape this
+    /// replaces — every refusal leaked one slot, until the count reached `max_connections` and the
+    /// loop answered `503 connection-cap` to a proxy that was serving nothing at all.
     #[test]
     fn a_connection_whose_handler_thread_is_never_created_gives_its_slot_back() {
         let ctx = Arc::new(
@@ -2220,7 +2224,10 @@ mod accept_tests {
         // EOF where it would read a head and returns at once.
         let (client, peer) = UnixStream::pair().unwrap();
         drop(peer);
-        spawn_connection(&ctx, client).expect("a thread for one connection");
+        assert!(
+            spawn_connection(&ctx, client),
+            "the host gave a thread for one connection"
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         while ctx.conns.load(Ordering::Relaxed) != 0 {
             assert!(

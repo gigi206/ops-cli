@@ -264,7 +264,7 @@ where
             }
         };
         let dispatch = dispatch.clone();
-        std::thread::spawn(move || {
+        super::conncap::spawn_conn("lens control", move || {
             let _ = handle(stream, dispatch.as_ref());
         });
     }

@@ -18,9 +18,11 @@
 //! expected, so that is where it happens. A launch only ever *reads* the out-link, which costs one
 //! `readlink`.
 //!
-//! The consequence is that configuring `programs` **after** installing needs one command, not a new
-//! launch: re-running `sbx plugins install` provisions what the config now names. The fail-closed
-//! error a launch raises for a missing program says so.
+//! The consequence is that configuring `programs` **after** installing needs a reinstall, not a new
+//! launch — and not a bare re-run of the install either, which is refused over a name already
+//! taken. The sequence is `sbx plugins rm <name>` and then installing the plugin again, which is
+//! what the fail-closed error a launch raises for a missing program names, and what the
+//! `sbx plugins info` line for a configured-but-unbuilt program names too.
 //!
 //! ## The store the paths come from
 //!

@@ -272,6 +272,45 @@ fn refusal_unspoken() -> bool {
     !SPOKEN.swap(true, Ordering::Relaxed)
 }
 
+/// Whether [`Layout::from_env`] answering `None` means sbx **refused** a data directory rather
+/// than simply finding none.
+///
+/// `from_env` collapses three outcomes into one `None`: no `$HOME`/XDG base at all, a directory
+/// sbx refused (an override that is relative or overlong, or a derived path too long for the
+/// sockets bound under it), and a volume pointer whose volume would not mount. Only the first is
+/// "this machine names nowhere to put a store"; the other two have already printed their own
+/// diagnostic on stderr and mean sbx cannot operate.
+///
+/// The command that merely inventories on-disk locations (`sbx path`) renders the first as an
+/// absent base and must still exit non-zero for the rest, so the distinction is drawn here — from
+/// the same environment and the same guard `from_env` consulted — rather than approximated by the
+/// caller.
+pub(crate) fn data_dir_refused() -> bool {
+    refusal_from(
+        std::env::var_os("SBX_DATA_DIR").as_deref(),
+        std::env::var_os("XDG_DATA_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// Pure core of [`data_dir_refused`], mirroring [`data_dir_from`]'s split so the decision is
+/// testable without touching the environment.
+///
+/// Two ways to be a refusal. A non-empty `$SBX_DATA_DIR` that fails [`check_data_dir_override`] is
+/// one outright — that is the refusal `from_env` speaks before it returns `None`, and it is
+/// invisible to the default base, which never sees the override. Otherwise any environment that
+/// names a default data directory at all is one too: once a base resolves, every remaining way
+/// `from_env` declines — the unmountable volume and the overlong resolved path — is a refusal it
+/// has already reported.
+fn refusal_from(sbx: Option<&OsStr>, xdg: Option<&OsStr>, home: Option<&OsStr>) -> bool {
+    if let Some(sbx) = sbx.filter(|s| !s.is_empty())
+        && check_data_dir_override(sbx).is_err()
+    {
+        return true;
+    }
+    data_dir_from(None, xdg, home).is_some()
+}
+
 /// Whether `$SBX_DATA_DIR` is what selected the data directory. Surfaced by `doctor` so a
 /// shell that carries the override is distinguishable from one that does not — otherwise a
 /// store that looks unexpectedly empty has no visible explanation.
@@ -532,6 +571,32 @@ mod tests {
             Some(PathBuf::from("/home/u/.local/share/sbx"))
         );
         assert_eq!(data_dir_from(None, None, None), None);
+    }
+
+    /// A refusal and an absent base both leave [`Layout::from_env`] holding `None`, and the
+    /// commands that only inventory on-disk locations have to tell them apart: reporting a refused
+    /// data directory as "there is no base here" and exiting 0 tells a script the opposite of what
+    /// happened, after sbx has already printed its refusal on stderr.
+    ///
+    /// The corner the default base cannot answer alone is a refused `$SBX_DATA_DIR` on a machine
+    /// that names no default at all: nothing resolves, yet a refusal was spoken.
+    #[test]
+    fn a_refused_data_directory_is_distinguishable_from_an_absent_base() {
+        // No base named anywhere: nothing was refused, there is simply nowhere to put a store.
+        assert!(!refusal_from(None, None, None));
+        assert!(!refusal_from(Some(OsStr::new("")), None, None));
+
+        // A base resolves, so every way `from_env` can still decline is a refusal it reported.
+        assert!(refusal_from(None, Some(OsStr::new("/xdg")), None));
+        assert!(refusal_from(None, None, Some(OsStr::new("/home/u"))));
+
+        // An override sbx refuses, with no default base behind it to give the answer away.
+        assert!(refusal_from(Some(OsStr::new("rel/data")), None, None));
+        let overlong = "/".to_string() + &"x".repeat(DATA_DIR_MAX);
+        assert!(refusal_from(Some(OsStr::new(&overlong)), None, None));
+
+        // An override sbx accepts is not a refusal: `from_env` returns a layout for it.
+        assert!(!refusal_from(Some(OsStr::new("/vol/data")), None, None));
     }
 
     #[test]

@@ -695,6 +695,13 @@ fn resolve_env_paths(keys: &[String]) -> Vec<(String, String)> {
 /// `sbx plugins install` already built is used instead. Only the out-link is read here — a launch
 /// never builds — so the fallback costs one `readlink` and never stalls a secret on a nix build.
 fn resolve_programs(plugin: &CagePlan<'_>) -> io::Result<Vec<Program>> {
+    // The installed directory's name, which is the key provisioned out-links are filed under and
+    // the token `sbx plugins rm` takes — neither of them the manifest `name` the remedy also cites.
+    let dir_name = plugin
+        .dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
     let mut out = Vec::with_capacity(plugin.grant.programs.len());
     for name in &plugin.grant.programs {
         if let Some(path) = locate_program(name) {
@@ -705,14 +712,9 @@ fn resolve_programs(plugin: &CagePlan<'_>) -> io::Result<Vec<Program>> {
             });
             continue;
         }
-        if let Some(path) = crate::store::Layout::from_env().and_then(|l| {
-            let dir_name = plugin
-                .dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-            crate::plugins::programs::provisioned(&l, dir_name, name)
-        }) {
+        if let Some(path) = crate::store::Layout::from_env()
+            .and_then(|l| crate::plugins::programs::provisioned(&l, dir_name, name))
+        {
             out.push(Program {
                 name: name.clone(),
                 path,
@@ -722,15 +724,16 @@ fn resolve_programs(plugin: &CagePlan<'_>) -> io::Result<Vec<Program>> {
         }
         // Both answers are exhausted, so this is the terminal state: name the two remedies, since
         // which one applies is the user's to know. The configured-but-unbuilt case reads as the
-        // second one, and re-running the install is what turns a `programs` entry added after the
-        // fact into a built program.
+        // second one, and the build that answers it runs at install time only — an install over a
+        // name already taken is refused, so the remedy is the remove-then-install pair that refusal
+        // itself names, not a bare re-run.
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
                 "the `{}` plugin needs the program `{name}`, which is not on sbx's PATH and has \
                  not been provisioned — install it (or add its directory to PATH), or name it in \
-                 `[plugin.{}] programs` as `{name} = \"nix:<attribute>\"` and re-run \
-                 `sbx plugins install`",
+                 `[plugin.{}] programs` as `{name} = \"nix:<attribute>\"` and build it with \
+                 `sbx plugins rm {dir_name}`, then install the plugin again",
                 plugin.called, plugin.configured_as
             ),
         ));
@@ -2119,8 +2122,46 @@ printf 'run-%s' "$n""#,
             "the refusal names the second answer, and the config field that supplies it: {msg}"
         );
         assert!(
-            msg.contains("sbx plugins install"),
-            "the refusal names the command that turns a configured program into a built one: {msg}"
+            msg.contains("sbx plugins rm") && msg.contains("install the plugin again"),
+            "the refusal names the two-step sequence that turns a configured program into a built \
+             one — a bare re-install is refused over a name already taken: {msg}"
+        );
+    }
+
+    /// The refusal a launch raises for a program it cannot find names a sequence that actually
+    /// builds one. That sequence is `sbx plugins rm <dir>` and then a fresh install, because an
+    /// install over a name already taken is refused — so a bare re-run of the install, which the
+    /// refusal used to name, sends the user to a command that cannot succeed.
+    ///
+    /// Driven through [`resolve_programs`] rather than a whole launch, so the wording is held on
+    /// every host and not only on one where a cage can be built.
+    #[test]
+    fn the_missing_program_refusal_names_the_remove_then_install_sequence() {
+        let dir = TmpDir::new();
+        let plugin = plugin_in(
+            dir.path(),
+            SandboxGrant {
+                programs: vec!["sbx-no-such-program".to_string()],
+                ..SandboxGrant::default()
+            },
+        );
+        let Err(err) = resolve_programs(&plan_for(&plugin, "test://x")) else {
+            panic!("a program that is on neither PATH nor the store must fail closed");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let msg = err.to_string();
+        let dir_name = dir.path().file_name().and_then(|n| n.to_str()).unwrap();
+        assert!(
+            msg.contains(&format!("sbx plugins rm {dir_name}")),
+            "the refusal names the installed directory, which is the token `rm` takes: {msg}"
+        );
+        assert!(
+            msg.contains("then install the plugin again"),
+            "the refusal names the second step, without which nothing is built: {msg}"
+        );
+        assert!(
+            !msg.contains("sbx plugins install"),
+            "the install verb alone cannot build it — naming it is the defect: {msg}"
         );
     }
 

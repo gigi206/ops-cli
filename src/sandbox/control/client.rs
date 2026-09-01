@@ -419,6 +419,10 @@ fn parse_event_line(line: &str) -> Option<LogEvent> {
         proto,
         http_ver,
         rpc,
+        // The wire does not name the proxy that pushed the event, so a parsed (client-side) event
+        // cannot claim one. Every client-side consumer renders the event; none writes policy from
+        // it, and the one that does (`--net-learn`) reads the ring in-process.
+        plane: crate::sandbox::control::Plane::Unknown,
         muted,
         status,
         // Amend bookkeeping is server-side; a parsed (client-side) event never carries it.
@@ -773,6 +777,7 @@ mod tests {
             http_ver: HttpVer::H2,
             rpc: RpcKind::Grpc,
             reason: "allowed".into(),
+            plane: Plane::Unknown,
             muted: false,
             // A captured upstream status round-trips on the wire alongside the query path.
             status: Some(200),
@@ -802,6 +807,7 @@ mod tests {
             http_ver: HttpVer::Unknown,
             rpc: RpcKind::None,
             reason: "allowed".into(),
+            plane: Plane::Unknown,
             muted: false,
             status: None,
             amend_seq: None,
@@ -836,6 +842,10 @@ mod tests {
                 // HTTP/1.1 here exercises the `ver=h1` token alongside every verdict.
                 http_ver: HttpVer::H1,
                 rpc: RpcKind::None,
+                // The wire carries no plane, so a decoded event is `Unknown` and the fixture has to
+                // be too for the round-trip below to hold — the same server-side-only status
+                // `amend_seq` has.
+                plane: Plane::Unknown,
                 // A muted deny exercises the `muted=1` token on the wire (mute only ever applies to
                 // a deny), so its round-trip is covered here alongside every verdict token.
                 muted: verdict == LogVerdict::Deny,
@@ -883,6 +893,7 @@ mod tests {
             proto: Proto::Https,
             http_ver: HttpVer::Unknown,
             rpc: RpcKind::None,
+            plane: Plane::Unknown,
             muted: false,
             status: Some(101),
             amend_seq: None,
@@ -924,6 +935,7 @@ mod tests {
             proto: Proto::Https,
             http_ver: HttpVer::Unknown,
             rpc: RpcKind::None,
+            plane: Plane::Unknown,
             muted: false,
             status: None,
             amend_seq: None,

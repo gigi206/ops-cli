@@ -294,7 +294,7 @@ fn accept_loop(listener: TcpListener, sock: PathBuf, shutdown: Arc<AtomicBool>) 
         // another thread.
         let Some(slot) = cap.take() else { continue };
         let sock = sock.clone();
-        std::thread::spawn(move || {
+        super::conncap::spawn_conn("forward", move || {
             let _slot = slot;
             let _ = bridge(stream, &sock);
         });

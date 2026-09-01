@@ -11,11 +11,11 @@
 //! **A lock recovers when what it guards is kept for a reader** — a lens ring, a tally, an
 //! invocation log, a registry the run consults. What such a record is worth is precisely that it
 //! survived whatever went wrong, so propagating the panic destroys the one thing there was to have.
-//! `sbx proc logs`, `sbx task status`, `sbx net stats` and the answer to a parked `execve` all read
-//! through one of these, and one panic in an unrelated handler would turn every one of them into a
-//! second panic. Taking the data is sound: these guards hold a queue, a map or a byte buffer whose
-//! mutations are single calls, so a panic leaves them valid, at worst without the entry that was
-//! being added.
+//! `sbx proc logs`, `sbx task status`, `sbx net stats`, `sbx net logs --with-body` and the answer
+//! to a parked `execve` all read through one of these, and one panic in an unrelated handler would
+//! turn every one of them into a second panic. Taking the data is sound: these guards hold a queue,
+//! a map or a byte buffer whose mutations are single calls, so a panic leaves them valid, at worst
+//! without the entry that was being added.
 //!
 //! **A lock degrades when what it guards is handed back out for reuse** — a pooled upstream
 //! connection, a cached resolution. There, redoing the work beats reusing something a panic touched
@@ -38,7 +38,8 @@
 //! would act on it as if nothing had happened is the case to look at twice: recovery must not turn
 //! an absent record into a confident wrong one. Where a mutation writes a value and its own
 //! qualifier as two steps, the qualifier is what a recovered guard has to settle — see
-//! `proxy/capture.rs`, which states why its own two steps cannot be interrupted.
+//! `proxy/capture.rs` and `control/capture.rs`, the two halves of the traffic capture, each of which
+//! states why its own two steps cannot be interrupted.
 
 use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 

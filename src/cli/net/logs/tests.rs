@@ -20,6 +20,8 @@ fn log_event(
         proto: sandbox::control::Proto::Https,
         http_ver: sandbox::control::HttpVer::Unknown,
         rpc: sandbox::control::RpcKind::None,
+        // These fixtures stand in for events decoded from the control wire, which carries no plane.
+        plane: sandbox::control::Plane::Unknown,
         muted: false,
         status: None,
         amend_seq: None,

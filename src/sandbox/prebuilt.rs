@@ -219,7 +219,10 @@ pub(crate) fn is_sri(s: &str) -> bool {
 /// URL, and the separately resolved asset otherwise (a `github:` release asset, an `apt:` index
 /// selection, a `resolve:` command's output) — and `hash` its SRI content hash. Together they let a
 /// warm launch fetch and build the pinned artefact offline, without re-querying the source.
-#[derive(Clone)]
+///
+/// Compared as a whole where a writer has to tell "the entry I read" from "an entry somebody wrote
+/// since" — see the reconcile at the end of [`upgrade`].
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Pin {
     pub(crate) hash: String,
     pub(crate) url: String,
@@ -1038,7 +1041,16 @@ pub(crate) enum Upgrade {
 /// Re-resolve a project's declared references for one backend and rewrite its per-project lock —
 /// pinning new ones, rolling changed ones forward, and pruning entries no longer declared (so a
 /// removed-then-readded package never reuses a stale pin). Resolution is best-effort per reference:
-/// a failure keeps the prior pin and is reported, and the lock is rewritten once at the end.
+/// a failure keeps the prior pin and is reported, and the lock is reconciled once at the end.
+///
+/// That reconcile applies **only what this roll decided** — the entries it resolved, and the entries
+/// it pruned — to the lock as it stands when the roll finishes, the way `nixhub::provision` persists
+/// a freshly-resolved pin. It is not a write-back of the snapshot read at the top: every resolution
+/// below is a network round-trip (a release query, a resolve command in a cage, an artefact
+/// prefetch), so a cold launch of the same project has a wide window in which to mint a pin of its
+/// own, and a whole-map write of the pre-network snapshot would drop it — the package would then
+/// re-resolve and re-pin on the next launch, a second trust-on-first-use and a network round-trip on
+/// a path documented as offline.
 ///
 /// Every resolution here runs with `fresh` set, which is what makes this an *upgrade* rather than a
 /// re-read: it bypasses nix's metadata cache, so a locator's source query sees a new GitHub release
@@ -1066,24 +1078,26 @@ pub(crate) fn upgrade(
         all: universe,
     } = declared(kind, cfg);
     let system = super::current_system();
-    let mut lock = pins(layout, project_id, &lock_file);
+    // The lock as it stood before any network work: what each reference is compared against, and
+    // what the reconcile at the end treats as this roll's (by then possibly stale) knowledge.
+    let snapshot = pins(layout, project_id, &lock_file);
     let mut outcomes = Vec::new();
+    // This roll's decisions, applied to the on-disk lock once the resolutions are done.
+    let mut resolved_pins: BTreeMap<String, Pin> = BTreeMap::new();
+    let mut pruned: Vec<(String, Pin)> = Vec::new();
 
     // Prune entries whose locator is no longer declared (across ALL layers regardless of trust, so a
     // withheld project's still-declared package keeps its pin rather than being silently unpinned).
-    let stale: Vec<String> = lock
-        .keys()
-        .filter(|k| !universe.contains(k.as_str()))
-        .cloned()
-        .collect();
-    for url in stale {
-        lock.remove(&url);
-        outcomes.push(Upgrade::Pruned { url });
+    for (key, pin) in &snapshot {
+        if !universe.contains(key.as_str()) {
+            pruned.push((key.clone(), pin.clone()));
+            outcomes.push(Upgrade::Pruned { url: key.clone() });
+        }
     }
 
     for reference in &declared {
         let key = reference.key();
-        let previous = lock.get(&key).cloned();
+        let previous = snapshot.get(&key).cloned();
         let resolved = match reference {
             // A locator: always re-resolve, since its source can move (a `latest` alias, a new
             // release, a new apt index entry) and even a fixed URL's content can change.
@@ -1129,7 +1143,7 @@ pub(crate) fn upgrade(
                         hash: hash.clone(),
                     },
                 };
-                lock.insert(key, Pin { hash, url });
+                resolved_pins.insert(key, Pin { hash, url });
                 outcomes.push(outcome);
             }
             Err(e) => outcomes.push(Upgrade::Failed {
@@ -1139,7 +1153,20 @@ pub(crate) fn upgrade(
         }
     }
 
-    write_pins(layout, project_id, &lock_file, &lock)?;
+    let mut disk = pins(layout, project_id, &lock_file);
+    for (key, previous) in pruned {
+        // Compare and swap, key by key. An entry that changed while this roll resolved was written
+        // by a process whose config read is newer than this one's, so its pin outranks this roll's
+        // "no longer declared" — only an entry still exactly as the snapshot found it is pruned.
+        if disk.get(&key) == Some(&previous) {
+            disk.remove(&key);
+        }
+    }
+    // A resolution that just happened is the freshest statement about its key there is, so it lands
+    // over whatever the entry currently holds. Every key this roll decided nothing about — one whose
+    // resolution failed, one another process pinned meanwhile — is left exactly as found.
+    disk.extend(resolved_pins);
+    write_pins(layout, project_id, &lock_file, &disk)?;
     Ok(outcomes)
 }
 
@@ -1280,6 +1307,9 @@ mod tests {
     #[derive(Default)]
     struct Recording {
         fresh: std::cell::Cell<Option<bool>>,
+        /// Run once, inside the first source resolution, standing in for whatever another process
+        /// writes to the lock during the network work a roll does.
+        meanwhile: std::cell::Cell<Option<Box<dyn FnOnce()>>>,
     }
 
     const RECORDED_HASH: &str = "sha256-jBGtMS5lpJWVXe+KzQgRSho8BcaEzGvONzIbAWled0w=";
@@ -1304,6 +1334,9 @@ mod tests {
             _allow_insecure_http: bool,
         ) -> io::Result<(String, String)> {
             self.fresh.set(Some(fresh));
+            if let Some(meanwhile) = self.meanwhile.take() {
+                meanwhile();
+            }
             Ok((locator.to_string(), RECORDED_HASH.to_string()))
         }
         fn derivation_expr(
@@ -1371,6 +1404,109 @@ mod tests {
             lock.get(url).map(|p| p.hash.as_str()),
             Some(RECORDED_HASH),
             "the pin reached the lock the backend's name spells"
+        );
+    }
+
+    /// Every resolution in a roll is a network round-trip — a release query, a resolve command in a
+    /// cage, a whole artefact prefetch — so a cold launch of the same project has a wide window in
+    /// which to mint a pin of its own. Writing the snapshot read before that work back over the lock
+    /// dropped the launch's pin, and the package then re-resolved and re-pinned on the next launch:
+    /// a second trust-on-first-use, and a network round-trip on a path documented as offline. What
+    /// the roll writes is what it decided, applied to the lock as it stands when it finishes.
+    #[test]
+    fn a_roll_keeps_a_pin_recorded_while_it_was_resolving() {
+        let data = TmpDir::new();
+        let project = TmpDir::new();
+        let layout = Layout::under(data.path());
+        let id = super::super::binds::project_runtime_id(project.path()).unwrap();
+        let lock_name = lock_file(&Recording::default());
+        let url = "https://example.com/demo-app.tar.gz";
+        let gone = "https://example.com/gone.tar.gz";
+        let cfg = resolved(
+            vec![
+                pkg(
+                    "demo-app",
+                    crate::config::Backend::Tarball(url.to_string()),
+                    true,
+                ),
+                pkg(
+                    "other-app",
+                    crate::config::Backend::TarballResolve {
+                        command: vec!["print-the-newest-url".to_string()],
+                    },
+                    true,
+                ),
+            ],
+            vec![],
+        );
+
+        // An entry nothing declares any more, and nothing touches while the roll runs.
+        let stale = BTreeMap::from([(
+            gone.to_string(),
+            Pin {
+                hash: RECORDED_HASH.to_string(),
+                url: gone.to_string(),
+            },
+        )]);
+        write_pins(&layout, &id, &lock_name, &stale).unwrap();
+
+        // A cold launch of the same project mints `other-app`'s pin while this roll is off resolving
+        // `demo-app`, and records it the way `provision_pinned` does: additively, against the lock as
+        // it stands at that moment.
+        let kind = Recording::default();
+        let concurrent = {
+            let layout = layout.clone();
+            let id = id.clone();
+            let lock_name = lock_name.clone();
+            move || {
+                let mut disk = pins(&layout, &id, &lock_name);
+                disk.insert(
+                    resolve_key("other-app"),
+                    Pin {
+                        hash: "sha256-OOOO".to_string(),
+                        url: "https://example.com/other-app.tar.gz".to_string(),
+                    },
+                );
+                write_pins(&layout, &id, &lock_name, &disk).unwrap();
+            }
+        };
+        kind.meanwhile.set(Some(Box::new(concurrent)));
+
+        let outcomes = upgrade(
+            &kind,
+            Path::new("/nonexistent/nix"),
+            &layout,
+            project.path(),
+            &cfg,
+            None,
+        )
+        .expect("the roll reconciles its lock");
+
+        // No sandbox on this host, so the resolver could not be re-run: the roll decided nothing
+        // about that key, which is what leaves the launch's pin the only statement about it.
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, Upgrade::Failed { url, .. }
+                                             if url == &resolve_key("other-app"))),
+            "the resolver reference must be reported failed"
+        );
+        let after = pins(&layout, &id, &lock_name);
+        assert_eq!(
+            after.get(url).map(|p| p.hash.as_str()),
+            Some(RECORDED_HASH),
+            "the roll records the pin it resolved"
+        );
+        assert_eq!(
+            after
+                .get(&resolve_key("other-app"))
+                .map(|p| p.hash.as_str()),
+            Some("sha256-OOOO"),
+            "the concurrent launch's pin survives — writing the pre-network snapshot would drop it"
+        );
+        assert!(
+            !after.contains_key(gone),
+            "an entry no longer declared, and unchanged since the snapshot, is still pruned"
         );
     }
 

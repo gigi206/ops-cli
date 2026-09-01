@@ -210,12 +210,22 @@ Everything below applies unchanged (host identity, SSRF guard, upstream validati
 credential injection and redaction), and the connection sbx opens to the real upstream
 is still a **validated TLS** one.
 
-What differs is only the *client* leg: that request, and the response, travel in
+What differs on the wire is the *client* leg: that request, and the response, travel in
 cleartext between the tool and the proxy. That leg is a loopback socket **inside the
 cage**, which no process in the cage can read (there is no `CAP_NET_RAW` for a packet
 socket, and `ptrace` is on the [seccomp denylist](../concepts/enforcement)), and an
 injected credential is added by the proxy for the upstream leg only: it never appears
 on the client leg at all. Nothing leaves the cage unencrypted on this path.
+
+One thing does not carry over, and it happens *before* any rule is read: a `CONNECT` to
+an **IP literal** is refused `ip-literal`, because inspecting it means minting a
+certificate and a bare address carries no name to mint one for. Through a tunnel such an
+address is therefore reachable only as a [`tcp://` splice](rules#raw-l4-splice-tcp),
+which inspects nothing. The absolute form terminates no TLS toward the tool, so there is
+nothing to mint: an IP-literal target is decided by the ordinary policy, and admitted
+only where a rule names that address, inspected like any other request.
+[`sbx test net`](../cli/test) reports the tunnelled verdict and says which path its
+answer belongs to.
 
 Under [`ask`](ask) such a request parks like any other, answerable with `sbx net
 pending`. Worth knowing: a client that reached the proxy this way is usually a library
@@ -462,10 +472,19 @@ policy refusal from a host that does not respond from a name that does not resol
 The categories surface in [`sbx net logs`](observability#sbx-net-logs) as the
 per-event reason: `denied-default`, `denied-by-rule` (categorical: the rule text is
 never disclosed, so a global-config rule the cage cannot read does not leak),
-`denied-method`, `ssrf-blocked`, `host-mismatch`, `ip-literal`, `bad-request` (including
-`bad-request:head`, a head that never arrived whole),
+`denied-method`, `asked-denied` (the [`ask`](ask) posture parked the request and it was
+not allowed, whether by an explicit deny, the timeout, or the pending-queue cap),
+`ws-injection-refused` (a WebSocket upgrade naming a host a
+[`[secret]` is injected into](../secrets/injection), which is refused rather than opened
+because nothing can redact the frames past the `101`), `http2-ask-unsupported` (an
+`ask`-undecided host designated [`http2`](../configuration/network#http2-and-grpc),
+failed closed rather than parked, because parking one stream of a multiplexed connection
+would stall its siblings), `ssrf-blocked`, `host-mismatch`, `ip-literal`,
+`method-not-allowed` (a request naming no destination the proxy can route),
+`bad-request` (including `bad-request:head`, a head that never arrived whole),
 `outbound-secret`, `signer-refused`, `signer-body-too-large`, `body-buffer-cap`,
-`connection-cap`, `injected-header-invalid`, and the transport-side `dns-failure`, `upstream-unreachable`,
+`connection-cap`, `splice-cap` (the concurrent raw `tcp://` tunnel ceiling),
+`injected-header-invalid`, and the transport-side `dns-failure`, `upstream-unreachable`,
 `upstream-cert-rejected`, `upstream-http2-unsupported`, and `upstream-closed`. A genuine
 upstream status (a real `404`) is relayed verbatim with no such header.
 

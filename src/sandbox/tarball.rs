@@ -14,8 +14,10 @@
 //! One shape correction happens between the unpack and the shared install phase: an archive whose
 //! root is a **single directory** — the platform slug or `<name>-<version>/` prefix a vendor
 //! commonly wraps its tree in — is hoisted, so the program lands at the root the install phase
-//! scans. It is the one unambiguous case (exactly one entry, and a directory), which is why it
-//! needs no per-package declaration.
+//! scans. It is the one unambiguous case (exactly one entry, and a *real* directory), which is why
+//! it needs no per-package declaration. A lone root **symlink** is declined rather than hoisted:
+//! hoisting one would copy the tree it points at — a path the archive chooses — in place of the
+//! tree the archive ships.
 //!
 //! Two source forms:
 //! * `tarball:<https url>` — a direct `.tar.gz`/`.tgz` URL. A version-stamped vendor URL does not
@@ -153,12 +155,17 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
     # a platform slug (`linux-x64/`), a `<name>-<version>/` prefix — instead of spilling its tree
     # at the archive root, and the generic install phase below scans `$out` itself: without this
     # the program sits one level too deep and the build refuses it. The condition is "exactly one
-    # entry, and it is a directory", which is unambiguous by construction — there is nothing to
-    # guess, so it needs no per-package knob. Every other root (a bare binary beside its data
-    # files, an FHS tree, an Electron bundle) has more than one entry and is copied unchanged.
+    # entry, and it is a real directory", which is unambiguous by construction — there is nothing
+    # to guess, so it needs no per-package knob. The `! -L` is what makes "real" hold: `-d`
+    # resolves a symlink and the copy's trailing `/.` traverses one, so hoisting a root symlink
+    # would splice the tree it points at — a path the archive picks, outside the unpacked one —
+    # into $out in place of the tree the archive ships. An archive whose single root entry is a
+    # link has nothing of its own to hoist, so declining it loses no vendor layout. Every other
+    # root (a bare binary beside its data files, an FHS tree, an Electron bundle) has more than
+    # one entry and is copied unchanged.
     root=extracted
     only=$(find extracted -mindepth 1 -maxdepth 1)
-    if [ "$(printf '%s\n' "$only" | wc -l)" -eq 1 ] && [ -d "$only" ]; then
+    if [ "$(printf '%s\n' "$only" | wc -l)" -eq 1 ] && [ -d "$only" ] && [ ! -L "$only" ]; then
       root=$only
     fi
     cp -r "$root"/. "$out"
@@ -282,13 +289,23 @@ mod tests {
     /// everything else (the hoist, the `find` passes, the refusals) is the shipped snippet
     /// verbatim, so a layout that breaks here breaks a real build.
     fn install_on(work: &Path, files: &[(&str, bool)]) -> Result<String, String> {
-        use std::os::unix::fs::PermissionsExt;
+        install_on_tree(work, files, &[])
+    }
+
+    /// [`install_on`] for a root that also holds symbolic links: each `(path, target)` is planted
+    /// under `extracted/` as a link, the one entry shape a list of files cannot express.
+    fn install_on_tree(
+        work: &Path,
+        files: &[(&str, bool)],
+        links: &[(&str, &str)],
+    ) -> Result<String, String> {
+        let extracted = work.join("extracted");
+        std::fs::create_dir_all(&extracted).unwrap();
         for (rel, executable) in files {
-            let path = work.join("extracted").join(rel);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, b"#!/bin/sh\n").unwrap();
-            let mode = if *executable { 0o755 } else { 0o644 };
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            plant(&extracted.join(rel), *executable);
+        }
+        for (rel, target) in links {
+            std::os::unix::fs::symlink(target, extracted.join(rel)).unwrap();
         }
         let expr = derivation_expr(
             "github:NixOS/nixpkgs/abc",
@@ -323,6 +340,16 @@ mod tests {
         }
     }
 
+    /// Write `path` as a stub program, executable or not, creating its parent directories. The
+    /// install phase decides on the mode bit alone, so the bytes are the same everywhere.
+    fn plant(path: &Path, executable: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"#!/bin/sh\n").unwrap();
+        let mode = if executable { 0o755 } else { 0o644 };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
     /// Replace every `${…}` (the wrapper's four nixpkgs search paths) with a literal, so the
     /// snippet is runnable shell. Nix does not nest braces inside these, so the first `}` closes.
     fn flatten_nix_interpolations(snippet: &str) -> String {
@@ -342,8 +369,9 @@ mod tests {
     const NAME: &str = "demo-app";
     const URL: &str = "https://example.com/x/1.0/linux-x64/Demo%20App.tar.gz";
 
-    /// The shape this backend refused before the hoist, and the three it must keep resolving the
-    /// way it already did. Every case is a layout a vendor actually ships.
+    /// The shape this backend refused before the hoist, and the ones it must keep resolving the
+    /// way it already did. Every case but the last is a layout a vendor actually ships; the last
+    /// is the root a hostile archive would build to make the hoist reach outside itself.
     #[test]
     fn the_install_phase_hoists_a_lone_top_level_directory_and_leaves_every_other_root_alone() {
         let tmp = TmpDir::new();
@@ -431,6 +459,24 @@ mod tests {
         assert!(
             refusal.contains("2 executables at the archive root"),
             "the refusal must name what it found:\n{refusal}"
+        );
+
+        // (g) A lone top-level symlink is the shape the hoist must NOT take, however
+        // directory-like it looks: `[ -d ]` resolves it and the copy's trailing `/.` traverses
+        // it, so hoisting one would put a tree the archive merely points at into `$out` in place
+        // of the tree it ships. It is declined — the link is copied as a link, nothing is
+        // followed, and the root scan then refuses because it has no executable to wrap.
+        let linked = tmp.join("linked");
+        plant(&linked.join("outside/demo-app"), true);
+        let declined = install_on_tree(&linked, &[], &[("linux-x64", "../outside")])
+            .expect_err("a lone root symlink leaves the root with nothing to wrap");
+        assert!(
+            declined.contains("no executable at the archive root"),
+            "the refusal must report an empty root:\n{declined}"
+        );
+        assert!(
+            !linked.join("out/demo-app").exists(),
+            "nothing from the link's target may be copied into $out"
         );
     }
 

@@ -679,7 +679,8 @@ pub(crate) fn projects_rm(
             super::gc::ReapOneOutcome::Live => {
                 crate::diag::error(&format!(
                     "sbx projects rm: project tree {n}{id}{r} is held by a live session — \
-                     stop it first with {n}sbx stop{r}, then `sbx projects rm {id}`."
+                     stop it first with `sbx session stop` (`sbx session ls` names the pid), \
+                     then `sbx projects rm {id}`."
                 ));
                 had_error = true;
             }

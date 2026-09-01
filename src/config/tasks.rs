@@ -1288,12 +1288,12 @@ mod tests {
     }
 
     /// The validated parameters come out in the section's **key** order, because `RawTask::params`
-    /// is a `BTreeMap` and the authored order does not survive parsing. `validate_params` used to
-    /// promise declaration order, which nothing on this path could deliver. Nothing depends on the
-    /// order — a parameter is addressed by name — but a caller reading a task's contract sees it,
-    /// so the promise and the behaviour are pinned together here: giving the section an
-    /// order-preserving map later is then a deliberate change with a failing test attached, not a
-    /// silent one that leaves the prose wrong again.
+    /// is a `BTreeMap` and the authored order does not survive parsing. `validate_params` and the
+    /// field it fills, [`TaskSpec::params`], both used to promise declaration order, which nothing
+    /// on this path could deliver. Nothing depends on the order — a parameter is addressed by
+    /// name — but a caller reading a task's contract sees it, so the promise and the behaviour are
+    /// pinned together here: giving the section an order-preserving map later is then a deliberate
+    /// change with a failing test attached, not a silent one that leaves the prose wrong again.
     #[test]
     fn the_validated_parameters_come_out_in_key_order_not_in_declaration_order() {
         let mut raw = raw_task();

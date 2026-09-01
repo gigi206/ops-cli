@@ -34,6 +34,7 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use crate::sandbox::locks::locked;
 use crate::sandbox::proxy::SecretNeedle;
 use crate::sandbox::proxy::redact_in_place;
 
@@ -312,6 +313,23 @@ impl Capture {
 /// The bounded store of captured exchanges, shared (via `Arc`) between the proxy threads that
 /// [`insert`](CaptureRing::insert) a finished exchange and the control thread that reads captures
 /// back for `sbx net logs`.
+///
+/// Both locks are taken through [`crate::sandbox::locks::locked`], because this ring is a record
+/// kept for a reader and propagating a poisoning would destroy the one thing it is for. Each side
+/// has its own reason to survive: a filing runs in `CaptureGuard`'s destructor, where an `Err` from
+/// the lock would panic a thread that may already be unwinding and abort the process, and a read
+/// runs on the per-connection control thread, where it would drop the socket `sbx net logs
+/// --with-headers` is waiting on for the rest of the launch.
+///
+/// Recovery is sound because neither critical section writes a value and its own qualifier as two
+/// steps an unwind could separate — the caveat `sandbox::locks` names. A part's `truncated` flag
+/// is settled on the forwarding side before the bytes ever reach this ring, so no recovered guard
+/// can present a cut capture as whole; the byte budget is the only state an unwind mid-insert
+/// could leave out of step with the entries, and it can be out by at most the one capture being
+/// filed, which shifts when the oldest is evicted and nothing else. The needle history is replaced
+/// as a single assignment, so a recovered guard yields a complete set — at worst the one from
+/// before the merge that panicked, which the next filing rebuilds, since
+/// [`needles`](CaptureRing::needles) compares against the live state every time.
 pub(crate) struct CaptureRing {
     inner: Mutex<CaptureInner>,
     caps: CaptureCaps,
@@ -405,7 +423,7 @@ impl CaptureRing {
             redact_in_place(&mut part.bytes, &needles);
         }
         let weight = capture.weight();
-        let mut g = self.inner.lock().unwrap();
+        let mut g = locked(&self.inner);
         // An exchange filed more than once (a WebSocket: its handshake, then its frames) folds into
         // the entry already there rather than appearing twice.
         if let Some(at) = g.entries.iter().position(|e| e.seq == capture.seq) {
@@ -455,7 +473,7 @@ impl CaptureRing {
     /// rendered, and exactly what the live credential state already does with the current ones.
     fn needles(&self) -> std::sync::Arc<Vec<SecretNeedle>> {
         let current = self.credentials.snapshot();
-        let mut history = self.history.lock().unwrap();
+        let mut history = locked(&self.history);
         if current
             .needles
             .iter()
@@ -482,7 +500,7 @@ impl CaptureRing {
     /// The captures for `seqs` (those still retained), plus how many captures have been evicted over
     /// this ring's life. Cloned out under the lock so the caller renders without holding it.
     pub(crate) fn get(&self, seqs: &[u64]) -> (Vec<Capture>, u64) {
-        let g = self.inner.lock().unwrap();
+        let g = locked(&self.inner);
         let found = g
             .entries
             .iter()
@@ -766,6 +784,65 @@ mod tests {
         let (found, _) = ring.get(&[1, 2, 3]);
         let order: Vec<u64> = found.iter().map(|c| c.seq).collect();
         assert_eq!(order, vec![1, 2, 3]);
+    }
+
+    /// A panic in an unrelated holder must not cost the captures already filed, nor the ability to
+    /// file more. Both sides matter and for different reasons: a filing runs in `CaptureGuard`'s
+    /// destructor, where propagating would panic a possibly-unwinding thread and abort the process,
+    /// and a read runs on the control thread answering `sbx net logs --with-headers`, which would
+    /// otherwise drop that socket for the rest of the launch while the captures sat in memory. See
+    /// [`crate::sandbox::locks`].
+    #[test]
+    fn a_poisoned_capture_ring_keeps_filing_and_reading_rather_than_panicking_again() {
+        let ring = std::sync::Arc::new(CaptureRing::with_needles(
+            CaptureCaps::new(CaptureLevel::Bodies, 8),
+            vec![needle("s3cr3t-value")],
+        ));
+        let mut before = Capture::new(1);
+        before.req_head = bytes(b"GET /one HTTP/1.1\r\n\r\n");
+        ring.insert(before);
+
+        // Poison each lock the only way it can be poisoned: panic on another thread while a guard
+        // on it is still held, so the unwind marks it. The assertion is the fixture's own — a body
+        // that released its guard before panicking would poison nothing and prove nothing.
+        fn poisoning(hold_and_panic: impl FnOnce() + Send + 'static) {
+            let panicked = std::thread::spawn(hold_and_panic).join();
+            assert!(
+                panicked.is_err(),
+                "the fixture must actually poison the lock"
+            );
+        }
+        let poisoner = std::sync::Arc::clone(&ring);
+        poisoning(move || {
+            let _held = locked(&poisoner.inner);
+            panic!("an unrelated holder gives up mid-flight");
+        });
+        let poisoner = std::sync::Arc::clone(&ring);
+        poisoning(move || {
+            let _held = locked(&poisoner.history);
+            panic!("an unrelated holder gives up mid-flight");
+        });
+        assert!(
+            ring.inner.lock().is_err() && ring.history.lock().is_err(),
+            "…and the standard take must see both poisoned"
+        );
+
+        let mut after = Capture::new(2);
+        after.req_body = bytes(br#"{"key":"s3cr3t-value"}"#);
+        ring.insert(after);
+
+        let (found, _) = ring.get(&[1, 2]);
+        let seqs: Vec<u64> = found.iter().map(|c| c.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![1, 2],
+            "the capture filed before the poisoning is still readable, and a later one still files"
+        );
+        assert_eq!(
+            String::from_utf8(found[1].req_body.bytes.clone()).unwrap(),
+            r#"{"key":"************"}"#,
+            "and the masking still runs, so recovery does not put a secret in the ring"
+        );
     }
 
     #[test]

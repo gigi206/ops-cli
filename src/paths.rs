@@ -289,8 +289,11 @@ struct ChildView {
 
 /// Build the full layout view, probing existence and enumerating on-disk children.
 ///
-/// `layout` is `None` only when the data directory cannot be resolved (no `$HOME`),
-/// in which case the data base reports no root and its entries are all absent.
+/// `layout` is `None` whenever [`Layout::from_env`] declined — no `$HOME`/XDG base, or a base that
+/// resolved and was then refused (a volume that would not mount, an overlong path). The data base
+/// then reports no root and its entries are all absent, which reads as "nowhere to look"; a refusal
+/// has already printed why on stderr and makes `sbx path` exit non-zero, so the render is not the
+/// only thing the caller sees.
 pub(crate) fn view(layout: Option<&Layout>) -> PathView {
     // The three `<xdg>/sbx` roots sbx owns. The data root comes from the store
     // layout; the config root is the parent of the profiles directory (sibling of

@@ -687,7 +687,7 @@ pub(crate) fn start(
                 let quota = Arc::clone(&quota);
                 // One thread per connection: an invocation runs for as long as its task's timeout,
                 // and a second caller must not queue behind it.
-                std::thread::spawn(move || {
+                super::conncap::spawn_conn("task control (cage)", move || {
                     let _slot = slot;
                     let _ = serve_cage(stream, &engine, &log, &quota, CAGE_FIRST_REQUEST);
                 });
@@ -722,7 +722,7 @@ pub(crate) fn start(
                 // Its own thread for the same reason the crossing socket's connections get one: a
                 // `STOP` waits for the invocation to end, and a `STATUS` behind it must not queue
                 // behind that wait.
-                std::thread::spawn(move || {
+                super::conncap::spawn_conn("task control (logs)", move || {
                     let _slot = slot;
                     let _ = serve_host(stream, &engine, &log, &results, &quota);
                 });

@@ -503,8 +503,14 @@ fn rollup_name(project: &str, app: Option<&str>) -> String {
     format!("{ROLLUP_PREFIX}{hex}")
 }
 
-/// The finished files of one project+app, and the counters they add up to.
-type Group = (Vec<PathBuf>, Tally);
+/// The finished files of one project+app, each paired with the counters it holds.
+///
+/// A file at a time rather than one running sum, because the fold has to be able to name the
+/// counters of an individual source: one that outlives its unlink is still on disk and still counted
+/// by [`aggregate`], so it has to be left out of the rollup — and taking it back out of a sum is not
+/// possible, since [`Tally::merge`] folds a host past [`MAX_HOSTS`] into [`Tally::overflow`] and no
+/// subtraction undoes that.
+type Group = Vec<(PathBuf, Tally)>;
 
 /// The lock file whose `flock` serialises [`compact`] across processes.
 ///
@@ -557,7 +563,23 @@ fn lock_compact(egress_dir: &Path) -> Option<std::fs::File> {
 ///
 /// Best-effort throughout. A file that cannot be read or parsed is left where it is, and a group
 /// whose rollup cannot be written keeps its sources: the counters are worth more than the tidiness.
+/// The rollup is written *before* its sources are unlinked for that same reason — a pass that stops
+/// in between leaves the counters in two places rather than none. What that ordering costs is a
+/// source that survives its own unlink: it still answers for its counters, which the rollup has just
+/// absorbed, so `sbx net stats` would count them twice and every later pass would fold the same file
+/// in again. So the rollup is rewritten from what actually went away, leaving the survivor's
+/// counters where the survivor still holds them.
 pub(crate) fn compact(egress_dir: &Path, prune: bool) -> Vec<PathBuf> {
+    compact_with(egress_dir, prune, &|path| std::fs::remove_file(path))
+}
+
+/// [`compact`] with the unlink injected, so the fold's behaviour around a source it cannot remove is
+/// testable without a filesystem that refuses removals.
+fn compact_with(
+    egress_dir: &Path,
+    prune: bool,
+    remove: &dyn Fn(&Path) -> io::Result<()>,
+) -> Vec<PathBuf> {
     // Held for the whole function: the dry run takes it too, or it would report files a fold running
     // beside it is in the middle of removing.
     let Some(_lock) = lock_compact(egress_dir) else {
@@ -597,33 +619,65 @@ pub(crate) fn compact(egress_dir: &Path, prune: bool) -> Vec<PathBuf> {
         let Some(session) = parse(&contents) else {
             continue;
         };
-        let slot = groups
+        groups
             .entry((session.project, session.app))
-            .or_insert_with(|| (Vec::new(), Tally::default()));
-        slot.0.push(path);
-        slot.1.merge(&session.tally);
+            .or_default()
+            .push((path, session.tally));
     }
 
     let mut folded = Vec::new();
-    for ((project, app), (sources, tally)) in groups {
+    for ((project, app), sources) in groups {
         let target = egress_dir.join(rollup_name(&project, app.as_deref()));
         // A group that is already exactly its own rollup has nothing to fold; re-writing it every
         // pass would be churn for no change.
-        if sources.len() == 1 && sources[0] == target {
+        if sources.len() == 1 && sources[0].0 == target {
             continue;
         }
-        let gone: Vec<PathBuf> = sources.iter().filter(|p| **p != target).cloned().collect();
         if !prune {
-            folded.extend(gone);
+            folded.extend(
+                sources
+                    .into_iter()
+                    .map(|(path, _)| path)
+                    .filter(|path| *path != target),
+            );
             continue;
         }
-        if write_rollup(&target, &project, app.as_deref(), &tally).is_err() {
+        let mut total = Tally::default();
+        for (_, tally) in &sources {
+            total.merge(tally);
+        }
+        if write_rollup(&target, &project, app.as_deref(), &total).is_err() {
             continue; // keep the sources: losing counters is worse than keeping files
         }
-        for path in gone {
-            if std::fs::remove_file(&path).is_ok() {
-                folded.push(path);
+        // The rollup now carries every source, so any source still on disk is counted twice. Build
+        // what the rollup may keep from the removals that actually happened: its own prior counters,
+        // plus those of the files this pass took away.
+        let mut kept = Tally::default();
+        let mut survivors = false;
+        for (path, tally) in sources {
+            if path == target {
+                kept.merge(&tally);
+                continue;
             }
+            // A file another process removed first counts as gone: `sbx net stats --reset` races
+            // this fold, and a source that is no longer on disk answers for nothing, so its counters
+            // belong in the rollup exactly like a source this pass unlinked itself.
+            let gone = match remove(&path) {
+                Ok(()) => true,
+                Err(err) => err.kind() == io::ErrorKind::NotFound,
+            };
+            if gone {
+                kept.merge(&tally);
+                folded.push(path);
+            } else {
+                survivors = true;
+            }
+        }
+        if survivors {
+            // Best-effort like every other write here. Should this one fail, the rollup keeps the
+            // survivor's counters until a later pass rewrites it, and the overcount stays bounded at
+            // that one copy: every pass puts the rollup back to what it actually took away.
+            let _ = write_rollup(&target, &project, app.as_deref(), &kept);
         }
     }
     folded.sort();
@@ -864,6 +918,79 @@ mod tests {
         assert_eq!(
             aggregate(egress, "/p", None).hosts["api.example.com"].allow,
             7
+        );
+    }
+
+    /// A source the fold cannot unlink is still on disk, and every consumer sums the files it finds
+    /// — so a rollup that already absorbed it counts it twice, and each later pass would fold the
+    /// same file in again, growing the rollup without bound. The rollup keeps only what actually
+    /// went away.
+    #[test]
+    fn a_source_that_outlives_its_unlink_is_not_counted_twice() {
+        let dir = TmpDir::new();
+        let egress = dir.path();
+        session_file(egress, 1, 11, "/p", "api.example.com", 3);
+        session_file(egress, 1, 12, "/p", "api.example.com", 4);
+        let before = aggregate(egress, "/p", None);
+        let stuck = egress.join("stats-1-12");
+        // One source refuses to go, as an unlink denied by the directory's permissions does. The
+        // rest of the group folds as always.
+        let refuse = |path: &Path| -> io::Result<()> {
+            if path == stuck {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            std::fs::remove_file(path)
+        };
+
+        let folded = compact_with(egress, true, &refuse);
+
+        assert_eq!(
+            folded,
+            [egress.join("stats-1-11")],
+            "only the source that went away may be reported folded"
+        );
+        assert!(
+            stuck.exists(),
+            "the refused source must be left where it is"
+        );
+        assert_eq!(
+            aggregate(egress, "/p", None),
+            before,
+            "folding must not change a single counter"
+        );
+
+        // And the next pass does not add it a second time: what the rollup holds is still only the
+        // sources that left.
+        assert!(
+            compact_with(egress, true, &refuse).is_empty(),
+            "a source that cannot be removed is never reported folded"
+        );
+        assert_eq!(aggregate(egress, "/p", None), before);
+    }
+
+    /// `sbx net stats --reset` removes session files without taking the fold lock, so a source can
+    /// be gone by the time the fold unlinks it. It is gone either way: it answers for nothing on
+    /// disk, so its counters stay in the rollup rather than being dropped as a survivor's.
+    #[test]
+    fn a_source_removed_underneath_the_fold_keeps_its_counters() {
+        let dir = TmpDir::new();
+        let egress = dir.path();
+        session_file(egress, 1, 11, "/p", "api.example.com", 3);
+        session_file(egress, 1, 12, "/p", "api.example.com", 4);
+        let before = aggregate(egress, "/p", None);
+        // Removed by somebody else first: the unlink reports the file already gone.
+        let raced = |path: &Path| -> io::Result<()> {
+            std::fs::remove_file(path)?;
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        };
+
+        let folded = compact_with(egress, true, &raced);
+
+        assert_eq!(folded.len(), 2, "both sources are gone: {folded:?}");
+        assert_eq!(
+            aggregate(egress, "/p", None),
+            before,
+            "counters of a file that vanished mid-fold must land in the rollup"
         );
     }
 

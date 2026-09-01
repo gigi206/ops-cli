@@ -61,6 +61,13 @@ plain "not allowed yet" refusal is learned: a deliberate `deny` rule and a secur
 block (SSRF, host-mismatch, an outbound secret) are never turned into a rule. Run it
 again after adding rules to catch a host only reachable once an earlier one is allowed.
 
+Only the app's **own** egress is learned. A [declared task](../configuration/task) runs
+behind a proxy of its own enforcing the task's `network` list, and what that list turns
+down is the task's to declare, not the app's to discover, so those refusals are skipped
+and counted in the run's notes rather than opened in the app's profile. A destination the
+posture would have [asked](../networking/modes) a person about is skipped for the same
+reason: the answer is theirs to give.
+
 The level sets how wide each rule is:
 
 | Level | Rule written |
@@ -314,8 +321,8 @@ whole home instead, use [`sbx app rm --purge`](#removing-an-app).
 `--yes` is **refused while a session of that app is running**: the tools are in the home
 that session is using, so deleting them takes an interpreter or a `PATH` entry out from
 under a command in flight, and what the agent then reports looks nothing like what
-happened. Stop it with `sbx stop` and retry. The preview deletes nothing, so it stays
-available either way.
+happened. Stop it with `sbx session stop` and retry. The preview deletes nothing, so
+it stays available either way.
 
 ## Examples
 

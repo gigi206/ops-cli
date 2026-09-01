@@ -121,10 +121,9 @@ impl Egress {
     ///
     /// It is the session's record, not the agent proxy's alone: a declared operation's
     /// per-invocation proxy appends to this same ring ([`Self::event_log`] says why), under a policy
-    /// of its own that is deliberately narrower, and a [`super::control::LogEvent`] carries nothing
-    /// naming the proxy that pushed it. So a consumer that turns refusals into *policy* must not
-    /// read a refusal here as necessarily the agent plane's — [`super::netlearn`] states the gate it
-    /// applies for that reason.
+    /// of its own that is deliberately narrower. Each event names the proxy that pushed it
+    /// ([`super::control::LogEvent::plane`]), so a consumer that turns refusals into *policy* can
+    /// keep to the agent's — [`super::netlearn`] is the one that does.
     pub(crate) fn observed_events(&self) -> Vec<super::control::LogEvent> {
         // The run's full record includes muted refusals (`--all`) — a `mute` rule only suppresses a
         // live log *view*, it never removes a decision from what `--net-learn` observed.
@@ -144,9 +143,10 @@ impl Egress {
     ///
     /// What it costs: the merged ring is the *display* record of a session, and the two planes it
     /// merges do not share a policy. Everything that reads it for display is right to; a reader that
-    /// writes policy from it — `--net-learn`, through [`Self::observed_events`] — cannot separate the
-    /// two, because an event names no proxy. Until it can, that is a property of the ring, and the
-    /// consumer holds the line.
+    /// writes policy from it — `--net-learn`, through [`Self::observed_events`] — must separate the
+    /// two, which is why every event carries the plane that pushed it
+    /// ([`super::control::LogEvent::plane`]) and the per-invocation proxy taking this handle stamps
+    /// [`super::control::Plane::Task`] on everything it appends.
     pub(crate) fn event_log(&self) -> Arc<super::control::LogRing> {
         Arc::clone(&self.log)
     }
@@ -699,6 +699,9 @@ pub(crate) fn start(
     // session's proxy, and every test). A task's per-invocation proxy passes the session's, for the
     // reason [`Egress::event_log`] states: its own control socket is not one `sbx net logs` finds.
     event_log: Option<Arc<super::control::LogRing>>,
+    // Whose policy this proxy enforces, stamped on every event it pushes so a consumer that writes
+    // policy from the shared ring can tell the planes apart — see [`super::control::Plane`].
+    plane: super::control::Plane,
     // Where this proxy records what its signer plugins formed, or `None` when the launch declared
     // none (and in tests). The launch owns it, so a task's per-invocation proxy records into the
     // same session-wide feed the agent's proxy does.
@@ -845,6 +848,7 @@ pub(crate) fn start(
     if let Some(capture) = &capture {
         ctx = ctx.with_capture(capture.clone());
     }
+    ctx = ctx.with_plane(plane);
     if let Some(wiring) = notify {
         ctx = ctx.with_notifier(Arc::clone(&wiring.notifier));
     }
@@ -1459,6 +1463,7 @@ mod tests {
         );
     }
     use super::*;
+    use crate::sandbox::control::Plane;
     use crate::testutil::{EnvVar, TmpDir, env_lock};
     use std::os::unix::fs::PermissionsExt;
 
@@ -1627,6 +1632,7 @@ mod tests {
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             &[],
             None,
+            Plane::Agent,
             None,
         )
         .expect("start the egress proxy");
@@ -1802,6 +1808,7 @@ mod tests {
                 crate::sandbox::redact::MIN_LEN_DEFAULT,
                 &[],
                 None,
+                Plane::Agent,
                 None,
             )
             .expect("start the egress proxy");
@@ -2204,6 +2211,7 @@ mod tests {
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             &[],
             None,
+            Plane::Agent,
             None,
         )
         .expect("start the ask egress proxy");
@@ -2276,6 +2284,7 @@ mod tests {
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             &[],
             None,
+            Plane::Agent,
             None,
         )
         .expect("start with stats off");
@@ -2303,6 +2312,7 @@ mod tests {
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             &[],
             None,
+            Plane::Agent,
             None,
         )
         .expect("start with stats on");
@@ -3101,6 +3111,7 @@ mod tests {
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             &[],
             Some(shared.clone()),
+            Plane::Task,
             None,
         )
         .expect("start with a shared ring");
@@ -3115,6 +3126,7 @@ mod tests {
             Proto::Https,
             HttpVer::H1,
             RpcKind::None,
+            Plane::Agent,
         );
         let seen = guard.observed_events();
         assert_eq!(
@@ -3143,6 +3155,7 @@ mod tests {
             crate::sandbox::redact::MIN_LEN_DEFAULT,
             &[],
             None,
+            Plane::Agent,
             None,
         )
         .expect("start with a ring of its own");

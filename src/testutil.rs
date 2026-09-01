@@ -125,14 +125,11 @@ pub(crate) fn force_remove(path: &Path) {
     }
 }
 
-/// Every `.rs` source under `src/cli`, sorted, subdirectories included.
-///
-/// Two guards read the dispatcher sources — the routed-subcommand check in [`crate::cli`] and the
-/// alias check in [`crate::help`] — and both must see the same corpus. The walk descends because
-/// a verb family that outgrew one file keeps its dispatcher in `<verb>.rs` and everything else in a
-/// `<verb>/` beside it: a flat listing would read the root, skip the children, and report the
-/// silence as a pass.
-pub(crate) fn cli_sources() -> Vec<PathBuf> {
+/// Every `.rs` source under `dir`, sorted, subdirectories included. The walk descends because a
+/// module that outgrew one file keeps its root in `<name>.rs` and everything else in a `<name>/`
+/// beside it: a flat listing would read the root, skip the children, and report the silence as a
+/// pass.
+fn rs_sources_under(dir: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -147,12 +144,26 @@ pub(crate) fn cli_sources() -> Vec<PathBuf> {
         }
     }
     let mut out = Vec::new();
-    walk(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli"),
-        &mut out,
-    );
+    walk(dir, &mut out);
     out.sort();
     out
+}
+
+/// Every `.rs` source under `src/cli`, sorted, subdirectories included.
+///
+/// Two guards read the dispatcher sources — the routed-subcommand check in [`crate::cli`] and the
+/// alias check in [`crate::help`] — and both must see the same corpus.
+pub(crate) fn cli_sources() -> Vec<PathBuf> {
+    rs_sources_under(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli"))
+}
+
+/// Every `.rs` source in the crate, sorted, subdirectories included.
+///
+/// The corpus for guards whose subject is not one module's code but a claim any file may make — a
+/// command named in a diagnostic, a comment, or a doc — where restricting the sweep to the module
+/// that happens to hold today's instance would let tomorrow's land anywhere else unguarded.
+pub(crate) fn crate_sources() -> Vec<PathBuf> {
+    rs_sources_under(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
 }
 
 /// A sorted `(relative path, size)` fingerprint of a tree — sensitive to any

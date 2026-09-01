@@ -90,7 +90,13 @@ launch from that shell, long after you have forgotten it.
 | `SBX_BWRAP_BIN` | use this `bwrap` binary instead of the bundled/host one |
 
 These take precedence over the bundled engine and the host `PATH`. A resolved engine
-must still pass an ownership/permission gate before it is executed. See
+must still pass an ownership/permission gate before it is executed: it has to be a
+regular file, owned by you or by root, and not world-writable. A binary that is present
+and fails that gate is **refused** rather than skipped, because sbx will not silently
+drive the same store with a different engine. The launch stops, and `sbx doctor` reports
+that engine as `refused: SBX_NIX_BIN=<path>` rather than as missing; the remedy is the
+file's ownership or permissions, or unsetting the variable. A path that does not exist at
+all is treated as unset, and the next source applies. See
 [Provisioning](../concepts/provisioning).
 
 Two more are read **at build time**, not at run time, and only when the matching

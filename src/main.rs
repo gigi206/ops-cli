@@ -346,13 +346,14 @@ fn path_cmd(args: &[OsString]) -> ExitCode {
         }
     }
     let layout = store::Layout::from_env();
-    // `from_env` answers `None` for three different reasons, and only one of them is the "this
-    // machine has no XDG base" that the view renders as `(no base)`: the other two are refusals —
-    // a volume that could not be mounted, and a resolved data directory the socket-length check
-    // rejects. Both have already printed their own diagnostic and both mean sbx cannot operate, so
-    // reporting the layout as merely absent and exiting 0 tells a script the opposite of what
-    // happened. A base that resolves while `from_env` still declines is exactly that case.
-    let refused = layout.is_none() && store::Layout::default_data_dir().is_some();
+    // `from_env` answers `None` for several different reasons, and only one of them is the "this
+    // machine has no XDG base" that the view renders as `(no base)`: the rest are refusals — a
+    // relative or overlong `$SBX_DATA_DIR`, a volume that could not be mounted, and a resolved data
+    // directory the socket-length check rejects. Each has already printed its own diagnostic and
+    // each means sbx cannot operate, so reporting the layout as merely absent and exiting 0 tells a
+    // script the opposite of what happened. Which case this is belongs to the store, which owns the
+    // guards, not to the render.
+    let refused = layout.is_none() && store::data_dir_refused();
     let view = paths::view(layout.as_ref());
     if json {
         if let Err(code) = print_json("path", &view) {

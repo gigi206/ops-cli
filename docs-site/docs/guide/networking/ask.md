@@ -51,7 +51,11 @@ blocks inside the cage while it waits for your live decision.
    ```
 
    The id addresses one live session's destination. Answering unblocks the parked
-   request **and every identical retry of the same URL** at once.
+   request **and every identical retry of the same URL** at once. A denial reaches the
+   cage as a `403` whose reason category is `asked-denied`, and that is the token
+   [`sbx net logs`](observability) records for it: the same one stands for an explicit
+   deny, an `ask_timeout` that ran out, and a park refused because the pending queue was
+   full, since all three are the same answer to the caller.
 
 4. **Optionally remember or persist the answer** (see below).
 

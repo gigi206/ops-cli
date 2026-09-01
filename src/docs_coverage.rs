@@ -1,9 +1,10 @@
 //! Tests that the user guide still describes the whole product.
 //!
-//! Three surfaces are meant to be documented exhaustively: every CLI verb has a reference page,
-//! every config field a launch accepts is named somewhere in the guide, and every shipped app
-//! profile appears in the catalogue. Each of those held when written, but only by hand: nothing
-//! failed when a new verb, field or profile arrived without its prose, so the gap surfaced when a
+//! Four surfaces are meant to be documented exhaustively: every CLI verb has a reference page,
+//! every config field a launch accepts is named somewhere in the guide, every shipped app profile
+//! appears in the catalogue, and every refusal category the proxy answers with is named in the
+//! networking guide. Each of those held when written, but only by hand: nothing failed when a new
+//! verb, field, profile or refusal reason arrived without its prose, so the gap surfaced when a
 //! reader looked for it rather than when it was introduced. These tests move that to build time.
 //!
 //! They check *presence*, never accuracy: a page that exists but says the wrong thing still passes,
@@ -703,6 +704,54 @@ fn every_unwatched_tree_is_named_in_the_file_feed_page() {
     );
 }
 
+/// Every refusal category the proxy's own reference table lists is named in the guide's list of
+/// them.
+///
+/// Both lists claim to be complete, and both are written by hand, so a new category lands in the
+/// table beside the code that emits it and the guide keeps a shorter list that still says
+/// "every refusal". That is what happened: five categories, `asked-denied` among them, were
+/// answered by the proxy and shown by `sbx net logs` while appearing nowhere in the guide, so a
+/// reader who met one had no page to look it up on.
+///
+/// The rustdoc table is the source of truth because it sits next to the emitting code; this only
+/// asserts that the guide names each of its tokens. It says nothing about the reverse direction:
+/// the guide legitimately names sub-categories (`bad-request:head`) that are not rows of their own,
+/// and describing a category in more or fewer words than the table is prose, not drift.
+#[test]
+fn every_refusal_category_the_proxy_documents_is_named_in_the_guide() {
+    // A row of the reference table reads `//! | `403` | `denied-default` | meaning …`; the header
+    // and the separator carry no backticked status, which is what tells them apart from a row.
+    let categories: Vec<String> = include_str!("sandbox/proxy/mod.rs")
+        .lines()
+        .filter_map(|line| {
+            let cells: Vec<&str> = line.strip_prefix("//! |")?.split('|').collect();
+            let (status, token) = (cells.first()?.trim(), cells.get(1)?.trim());
+            (status.starts_with('`') && token.starts_with('`'))
+                .then(|| token.trim_matches('`').to_string())
+        })
+        .collect();
+    assert!(
+        categories.len() > 10,
+        "the refusal table in src/sandbox/proxy/mod.rs no longer reads as one: {categories:?}"
+    );
+
+    let page = std::fs::read_to_string(guide().join("networking/architecture.md"))
+        .expect("docs-site/docs/guide/networking/architecture.md must exist");
+    let list = page
+        .split_once("\n## Refusal reasons\n")
+        .expect("the page must keep a `## Refusal reasons` section")
+        .1;
+    let missing: Vec<&String> = categories
+        .iter()
+        .filter(|token| !list.contains(&format!("`{token}`")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these refusal categories are documented beside the proxy but named nowhere in the \
+         refusal-reasons section of docs-site/docs/guide/networking/architecture.md: {missing:?}"
+    );
+}
+
 /// How wide a slice around an em dash must be found under `src/` for the dash to count as a
 /// quotation rather than prose.
 ///
@@ -907,7 +956,6 @@ const UNDOCUMENTED_MODULE_ITEMS: &[(&str, &str)] = &[
     ("sandbox/control/mod.rs", "LogInner"),
     ("sandbox/control/mod.rs", "ManualInner"),
     ("sandbox/gc.rs", "accumulate_usage"),
-    ("sandbox/launch/mod.rs", "missing"),
     ("sandbox/launch/mod.rs", "prepare_config"),
     ("sandbox/lens.rs", "Inner"),
     ("sandbox/netns.rs", "die"),

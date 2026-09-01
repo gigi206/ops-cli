@@ -620,11 +620,13 @@ pub(crate) enum ReapOneOutcome {
 
 /// Whether `id` is safe to use as a project-tree directory name — a single, ordinary path
 /// component with no separator, no `.`/`..`, and no absolute form. This is the anti-traversal
-/// guard for `sbx gc --id`: the id is joined onto `projects/` and fed to a recursive delete, so a
-/// value like `/etc` (which `Path::join` treats as absolute and *replaces* the base with) or
-/// `../x` (which escapes the tree) must never reach the `join`. A real id is a 16-hex hash, but the
-/// check does not hard-code that — any legitimate directory name under `projects/` is one normal
-/// component; anything that is not is refused.
+/// guard every caller that joins a user-supplied name onto a directory shares: `sbx projects show`
+/// and `sbx projects rm` for a project id, and the app-home purge behind `sbx app rm` for an app
+/// name. The value is joined onto the data directory and fed to a recursive delete, so a value like
+/// `/etc` (which `Path::join` treats as absolute and *replaces* the base with) or `../x` (which
+/// escapes the tree) must never reach the `join`. A real id is a 16-hex hash, but the check does
+/// not hard-code that — any legitimate directory name under `projects/` is one normal component;
+/// anything that is not is refused.
 pub(crate) fn is_safe_tree_id(id: &str) -> bool {
     use std::path::Component;
     let mut comps = Path::new(id).components();
@@ -2227,7 +2229,7 @@ mod tests {
     }
 
     /// `is_safe_tree_id` accepts a single ordinary component (a real id) and refuses every path-ish
-    /// form — the anti-traversal guard for `sbx gc --id`.
+    /// form — the anti-traversal guard the project-id verbs share.
     #[test]
     fn is_safe_tree_id_rejects_traversal_and_absolute_ids() {
         // Real ids (16-hex) and any single component are fine.

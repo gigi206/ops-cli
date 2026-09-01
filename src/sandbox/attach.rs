@@ -18,10 +18,22 @@
 //!   ([`super::seccomp`]) before exec, on **both** the pty and inherited-stdio paths. It always
 //!   installs the *baseline* policy, never a project's `[seccomp] allow` relaxation, so the joined
 //!   shell or command is confined **at least** as tightly as the agent.
-//! - **no_new_privs + capabilities** are likewise re-applied: `PR_SET_NO_NEW_PRIVS`, the
-//!   ambient set cleared, the bounding set dropped. With an empty permitted set and
-//!   `no_new_privs`, no bounded capability can ever become effective, so a full bounding
-//!   set (which `setns` leaves in place) is inert and grants nothing the agent lacks.
+//! - **no_new_privs + capabilities** are likewise re-applied, and the capability drops are
+//!   load-bearing rather than decorative. `setns(CLONE_NEWUSER)` does not leave the joining
+//!   process's credentials alone: the kernel grants it a *full* permitted, effective and bounding
+//!   set inside the namespace it has just entered, so for a moment the joining process is the most
+//!   capable process in the cage. `no_new_privs` does not take that back — it bounds a
+//!   file-capability `execve` by intersecting the permitted set the file would grant with the
+//!   caller's own, which is a no-op when the caller's own set is already full. What keeps the
+//!   entered shell no more capable than the agent is therefore the *emptying* of the sets:
+//!   [`confine_and_exec`] drops the whole bounding set (the `X` in the kernel's `pP' = X & fP`,
+//!   and so the only thing standing between a file-capability binary inside the cage and a
+//!   privileged `execve`), clears the ambient set, and then empties permitted, effective and
+//!   inheritable with `capset`. Each of the three is checked, and a failure `_exit`s rather than
+//!   exec'ing a shell more capable than the agent. `no_new_privs` is still set first, because an
+//!   unprivileged seccomp install requires it. The intermediate process that performed the
+//!   `setns` empties its own sets the same way as soon as it has forked, so no process outlives
+//!   the join still holding what the join granted.
 //!
 //! Three residuals, all named and accepted:
 //! - **cgroup resource limits are not shared.** `setns(CLONE_NEWCGROUP)` joins the cgroup
@@ -366,6 +378,16 @@ pub(super) unsafe fn enter_and_exec(
         if child == 0 {
             confine_and_exec(filters, tty, argv, envp);
         }
+        // The shell's parent stays inside the cage's mount/net/ipc/uts namespaces, holding
+        // everything the `setns` granted, for as long as the attach lasts — so empty its
+        // capability sets too. It has to happen *after* the fork: emptying the effective set
+        // before it would take CAP_SETPCAP away from the child, whose own bounding-set drop needs
+        // it. The child is killed rather than left behind if the drop fails, because a supervisor
+        // that exits would orphan a live shell inside the cage.
+        if !drop_all_capabilities() {
+            libc::kill(child, libc::SIGKILL);
+            libc::_exit(125);
+        }
         // Parent of the shell: reap it and mirror its exit status up to the pty supervisor.
         let mut status: libc::c_int = 0;
         loop {
@@ -417,24 +439,40 @@ unsafe fn confine_and_exec(
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
             libc::_exit(125);
         }
-        // Drop the capability bounding + ambient sets. Defense in depth: already inert
-        // under `no_new_privs` with an empty permitted set, but this matches the cage
-        // exactly. Best-effort (a bounding-set drop can lack CAP_SETPCAP after `setns`);
-        // the inert-under-no_new_privs argument holds regardless.
+        // Empty every capability set. The `setns` into the cage's user namespace granted this
+        // process a full permitted, effective and bounding set there, and `no_new_privs` does not
+        // undo that (module header), so these drops — not the `prctl` above — are what makes the
+        // exec'd command no more privileged than the agent. Order is forced: the bounding set is
+        // `X` in the kernel's `pP' = X & fP`, so it must go before the permitted set that carries
+        // the CAP_SETPCAP the drop itself requires.
+        //
+        // Every failure is fatal. A capability number this kernel does not define answers `EINVAL`
+        // and is simply past the end of the set; anything else is a failure to confine, and
+        // confining is the precondition of entering at all.
         let mut cap: libc::c_int = 0;
         while cap <= 63 {
-            libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0);
+            if libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) != 0
+                && *libc::__errno_location() != libc::EINVAL
+            {
+                libc::_exit(125);
+            }
             cap += 1;
         }
-        libc::prctl(
+        if libc::prctl(
             libc::PR_CAP_AMBIENT,
             libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
             0,
             0,
             0,
-        );
-        // The seccomp denylist — the load-bearing re-application: this refuses the
-        // mount/namespace/ptrace family the confined agent cannot call.
+        ) != 0
+        {
+            libc::_exit(125);
+        }
+        if !drop_all_capabilities() {
+            libc::_exit(125);
+        }
+        // The seccomp denylist — the other re-application the confinement rests on: this refuses
+        // the mount/namespace/ptrace family the confined agent cannot call.
         if !super::seccomp::install_filters(filters) {
             libc::_exit(125);
         }
@@ -442,6 +480,37 @@ unsafe fn confine_and_exec(
         // Only reached if execve failed (e.g. the cage's /bin/bash is gone).
         libc::_exit(127);
     }
+}
+
+/// Empty the calling thread's permitted, effective and inheritable capability sets, reporting
+/// whether the kernel accepted the call.
+///
+/// Both processes on the attach path call it, and not for symmetry with the cage: entering a user
+/// namespace makes a process fully capable *in that namespace*, so the join itself is what grants
+/// the privilege being taken away here. Lowering one's own sets never requires a capability, so the
+/// only way this fails is an ABI the kernel does not recognise — which is why each caller treats a
+/// failure as a reason to refuse the attach rather than as a best-effort miss.
+///
+/// # Safety
+///
+/// Async-signal-safe: one `capset` syscall over two stack buffers, no allocation and no locks, so
+/// it may be called between `fork` and `exec`.
+unsafe fn drop_all_capabilities() -> bool {
+    /// `_LINUX_CAPABILITY_VERSION_3`: the 64-capability ABI, which splits each set across two
+    /// 32-bit words. Version 1 covers only the first 32 and the kernel answers `EINVAL` for it on
+    /// a modern header, so the version word is not a formality.
+    const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+    // `struct __user_cap_header_struct { __u32 version; int pid; }` — pid 0 meaning this thread —
+    // followed by two `struct __user_cap_data_struct { __u32 effective, permitted, inheritable; }`,
+    // the low half of each set first. Written as plain words because Rust only ever fills them in:
+    // every field is read by the kernel, none by this crate.
+    let mut header: [u32; 2] = [CAPABILITY_VERSION_3, 0];
+    let data: [u32; 6] = [0; 6];
+    // SAFETY: both buffers are live for the call and sized exactly as the version-3 ABI above
+    // requires. The header is passed mutably because a kernel that rejects the version writes the
+    // one it prefers back into that word before answering `EINVAL`.
+    unsafe { libc::syscall(libc::SYS_capset, header.as_mut_ptr(), data.as_ptr()) == 0 }
 }
 
 #[cfg(test)]
@@ -597,5 +666,58 @@ mod tests {
         let env = build_env(b"HOME=/home/sandbox\x00", None);
         let strings: Vec<&str> = env.iter().map(|c| c.to_str().unwrap()).collect();
         assert!(strings.contains(&"TERM=xterm-256color"));
+    }
+
+    /// The `capset` that empties the entered process is hand-rolled against the kernel ABI, so a
+    /// wrong version word or a mis-sized data buffer would be answered with `EINVAL` — and the
+    /// process would keep every capability the user-namespace join granted it. Proven in a forked
+    /// child that runs only async-signal-safe calls, so the suite's own credentials are untouched
+    /// whatever privilege it happens to run with.
+    #[test]
+    fn the_capset_that_empties_a_joined_process_is_accepted_by_the_kernel() {
+        // SAFETY: the child calls `capset` and `_exit` only — both async-signal-safe — so the
+        // fork is safe from a threaded harness.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe { libc::_exit(i32::from(!drop_all_capabilities())) };
+        }
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(
+            libc::WIFEXITED(status),
+            "the probe child did not exit normally"
+        );
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "the kernel refused the capability drop the attach path depends on"
+        );
+    }
+
+    /// Every capability drop on the attach path is checked, and both processes that hold what the
+    /// join granted perform one. A discarded return here fails nothing else in the suite: the
+    /// drops succeed on every host that runs it, and the exposure — a file-capability binary in
+    /// the cage gaining privilege across the entered shell's `execve` — appears only on a host
+    /// where one of them does not. So the shape is pinned against the source.
+    #[test]
+    fn the_capability_drops_the_join_makes_necessary_are_checked_not_attempted() {
+        // The production half only: this test quotes the shapes it looks for, and would otherwise
+        // find its own assertions.
+        let source = include_str!("attach.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a production half");
+        assert!(
+            source.contains("if libc::prctl(libc::PR_CAPBSET_DROP"),
+            "the bounding-set drop bounds `X` in `pP' = X & fP`: its return decides whether the \
+             entered shell may still gain file capabilities, so it cannot be discarded"
+        );
+        assert_eq!(
+            source.matches("if !drop_all_capabilities()").count(),
+            2,
+            "both the exec'd command and the process supervising it must empty the sets \
+             `setns(CLONE_NEWUSER)` granted them"
+        );
     }
 }

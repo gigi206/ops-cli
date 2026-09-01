@@ -153,9 +153,9 @@ fn is_command_word(tok: &str) -> bool {
 ///
 /// A page is where a refusal's remediation is written, so a command named here is read at the
 /// moment something already failed — and both ways it goes stale are silent. A verb that never
-/// existed (`sbx stop`, where the verb is `sbx session stop`) is one. A namespace named without
-/// the subcommand it requires is the other: `sbx app <name>` is not a launch, because an app
-/// name is never a subcommand — an app may itself be named `run`, and is launched as
+/// existed — a bare `stop`, where the verb is `sbx session stop` — is one. A namespace named
+/// without the subcommand it requires is the other: `sbx app <name>` is not a launch, because
+/// an app name is never a subcommand — an app may itself be named `run`, and is launched as
 /// `sbx app run <name>` either way.
 ///
 /// Both halves are read out of the table rather than from a list kept here. The head of a
@@ -207,6 +207,89 @@ fn no_page_names_a_command_the_binary_does_not_have() {
     assert!(
         broken.is_empty(),
         "these pages quote a command the dispatcher would refuse:\n{}",
+        broken.join("\n")
+    );
+    // A sweep that read no span at all would pass while guarding nothing.
+    assert!(checked > 150, "only {checked} quoted commands swept");
+}
+
+/// One Rust source with the line breaks a quoted span may wrap across closed up: leading
+/// whitespace, a comment's `///`/`//!`/`//` continuation marker, and a string literal's trailing
+/// `\` (with the `\n` a page's prose puts before it) are dropped, and the lines are joined by a
+/// single space.
+///
+/// A quoted command is written the way prose is written, so it wraps like prose: the same span
+/// crosses a line break in a doc comment and in a diagnostic alike. Splitting such a file line by
+/// line would cut the span in two and sweep neither half, which is silence reported as a pass.
+fn unwrapped_source(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, raw) in text.lines().enumerate() {
+        let mut line = raw.trim_start();
+        for marker in ["///", "//!", "//"] {
+            if let Some(rest) = line.strip_prefix(marker) {
+                line = rest.trim_start();
+                break;
+            }
+        }
+        let line = line.trim_end();
+        let line = line.strip_suffix('\\').unwrap_or(line);
+        let line = line.strip_suffix("\\n").unwrap_or(line);
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// No source sends a reader to a command the binary does not have, either.
+///
+/// [`no_page_names_a_command_the_binary_does_not_have`] guards the help table, which is where a
+/// remedy is *documented*. The same remedy is also *printed* — by the refusal itself, and by the
+/// hint under it — and explained in the comments beside the code that prints it, and none of those
+/// are pages. That is how `sbx app prune` came to refuse a live session and send the user to a
+/// top-level `stop` verb long after its own page had been corrected to `sbx session stop`: the page
+/// sweep read the fixed half and had nothing to say about the other one.
+///
+/// The unit is the same inline-code span, taken here from every `.rs` file in the crate, so a
+/// diagnostic, a doc comment and an ordinary comment are all held to it — a comment naming a verb
+/// is what the next reader of that code repeats into a message.
+///
+/// Only the *top-level* verb is checked. The page sweep's second half — a namespace named without
+/// the subcommand it requires — is deliberately not applied to the sources yet: the comments write
+/// `sbx app <name>` throughout as shorthand for a launch, where the verb is `sbx app run <name>`.
+/// That shorthand is wrong in the same way and correcting it is worth doing, but it is a change to
+/// those comments; asserting it here first would leave a permanently red test, which guards
+/// nothing.
+#[test]
+fn no_source_names_a_command_the_binary_does_not_have() {
+    let mut broken: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for path in crate::testutil::crate_sources() {
+        let text = unwrapped_source(&std::fs::read_to_string(&path).expect("a crate source"));
+        let shown = path.display().to_string();
+        for span in text.split('`').skip(1).step_by(2) {
+            let mut words = span.split_whitespace();
+            if words.next() != Some("sbx") {
+                continue;
+            }
+            let Some(head) = words.next().filter(|w| is_command_word(w)) else {
+                continue;
+            };
+            // `help` is a real verb, and the one with no page of its own.
+            if head == "help" {
+                continue;
+            }
+            checked += 1;
+            let head = canonical(&[], head);
+            if find(&[head]).is_none() {
+                broken.push(format!("{shown}: `{span}` names no command `{head}`"));
+            }
+        }
+    }
+    assert!(
+        broken.is_empty(),
+        "these sources quote a command the dispatcher would refuse:\n{}",
         broken.join("\n")
     );
     // A sweep that read no span at all would pass while guarding nothing.
