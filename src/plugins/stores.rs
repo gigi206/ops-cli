@@ -37,9 +37,25 @@ const CHECKOUT: &str = "checkout";
 const STAGE_PREFIX: &str = ".store-stage";
 const PROBE_PREFIX: &str = ".store-probe";
 
-/// The public-key file a store repository carries at its root, read only by a trust-on-first-use
-/// add (`--trust`) to learn the key it then pins. A pinned add (`--key`) ignores it entirely, and
-/// `update` never reads it — the trust anchor is always the key recorded in `store.toml`.
+/// The public-key file a store repository carries at its root.
+///
+/// The trust anchor is never this file: it is the key recorded in `store.toml`. What this file is
+/// depends on who reads it, and there are four readers, which is why they are listed rather than
+/// summarised — an enumeration that is wrong is worse than none, and this one said `update` never
+/// reads it while `update` does:
+///
+/// - a trust-on-first-use add (`--trust`) learns the key it then pins, the one read that *becomes*
+///   an anchor. A pinned add (`--key`) ignores the file entirely;
+/// - `rekey --trust` does the same, for a store that rotated its signing key;
+/// - [`shipped_pubkey`] reads it from a throwaway clone so `sbx plugins store` can show a user the
+///   key a URL ships before they decide to pin it. Nothing is trusted by that read, and it says so;
+/// - `update` reads it **after** a verification failure, and only to name the likeliest cause: the
+///   store now ships a different key than the one pinned. It never becomes the anchor there.
+///
+/// [`publish`] writes it, which is the fifth site and the reason the four are worth naming: a
+/// reader looking for "who consults this" finds a writer too.
+///
+/// `every_repo_pubkey_reader_is_named_in_its_doc` counts the call sites against this list.
 const REPO_PUBKEY: &str = "pubkey";
 
 /// The git attribute file a publish writes at the store root, disabling end-of-line conversion for
@@ -1288,6 +1304,27 @@ mod tests {
         assert_eq!(
             read_store_file(&gone, "catalogue.toml", "the-missing-note").unwrap_err(),
             "the-missing-note"
+        );
+    }
+
+    /// The `pubkey` doc names its readers, so the count has to be kept honest by something.
+    ///
+    /// It listed one and was wrong about a second: `update` was said never to read the file, and it
+    /// does — after a verification failure, to name the likeliest cause. Two more readers had
+    /// appeared since the sentence was written and were not in it. A doc that enumerates is worth
+    /// more than one that summarises only while the enumeration is true, and nothing but a count
+    /// notices when a fifth reader arrives.
+    #[test]
+    fn every_repo_pubkey_reader_is_named_in_its_doc() {
+        let source = include_str!("stores.rs");
+        let production = source
+            .rsplit_once("#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        let calls = production.matches("read_repo_pubkey(").count() - 1; // minus the definition
+        assert_eq!(
+            calls, 4,
+            "the `REPO_PUBKEY` doc names four readers — a reader added or removed has to be added \
+             to or removed from that list, not left for the next audit to find"
         );
     }
 
