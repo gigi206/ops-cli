@@ -224,9 +224,25 @@ impl Inflater {
     /// `None` means the stream did not decode, and the caller stops capturing this direction rather
     /// than storing rubbish.
     ///
-    /// The cap bounds what is **kept**, never what is **decoded**: see [`Inflated::in_step`] for why
-    /// the difference is the whole of this direction's leak scan.
-    fn message(&mut self, compressed: &[u8], cap: usize) -> Option<Inflated> {
+    /// The cap bounds what is **kept**, never what is **decoded** or what is **scanned**: see
+    /// [`Inflated::in_step`] for why the difference is the whole of this direction's leak scan.
+    ///
+    /// `plaintext` is handed every decoded byte **in stream order**, the kept prefix first and then
+    /// the tail past the cap. That order is not cosmetic: the scan carries a partial match across
+    /// pieces, so a value straddling the cap is only found if the two sides arrive the right way
+    /// round. What the caller keeps is [`Inflated::plain`]; what it scans is everything.
+    ///
+    /// `scan_tail` asks for the tail to be inflated even when the window would not need it. Only a
+    /// `no_context_takeover` peer makes that a real choice — its window resets per message, so
+    /// nothing forces the tail out — and a caged client is free to negotiate exactly that, which is
+    /// why "the window does not need it" cannot be allowed to mean "nobody looks at it".
+    fn message(
+        &mut self,
+        compressed: &[u8],
+        cap: usize,
+        scan_tail: bool,
+        mut plaintext: impl FnMut(&[u8]),
+    ) -> Option<Inflated> {
         let mut input: Vec<u8> = Vec::with_capacity(compressed.len() + 4);
         input.extend_from_slice(compressed);
         input.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
@@ -235,6 +251,14 @@ impl Inflater {
         let mut out = vec![0u8; limit.clamp(1, 16 * 1024)];
         let mut written = 0usize;
         let mut read = 0usize;
+        // Whether the loop stopped on the plaintext cap rather than on a finished message. It has
+        // to be recorded rather than inferred from the input position: a back-reference goes on
+        // unrolling long after the few bytes naming it were read, so a wholly compressible payload
+        // is fully *consumed* while most of its plaintext is still to come. `read >= input.len()`
+        // therefore does not mean "the message is out", and reading it that way is what let a
+        // compressible pad carry a secret past the scan. It costs the window nothing — the pending
+        // output simply prepends to the next message — which is why only the scan noticed.
+        let mut capped = false;
         loop {
             let res = inflate(
                 &mut self.state,
@@ -251,6 +275,7 @@ impl Inflater {
                 _ => {}
             }
             if written >= limit {
+                capped = true;
                 break;
             }
             if written == out.len() {
@@ -280,9 +305,20 @@ impl Inflater {
             }
         }
         out.truncate(written);
+        // The kept prefix goes to the scan first, so the tail below continues the same stream.
+        plaintext(&out);
+        // The overflow path is the cap exit, whatever the input position: what is left may be
+        // pending input, pending output, or both.
+        let remainder = capped;
         // A peer that resets its window per message shares nothing across them, so a message the cap
-        // cut short costs the next one nothing: reset, and the decoder is in step by construction.
+        // cut short costs the next one nothing as far as the *window* goes. The scan is the other
+        // reason to inflate it, and the only one left here.
         if self.no_context_takeover {
+            if remainder && scan_tail {
+                // Only the scan wants these bytes; the reset below squares the window either way,
+                // so a decode failure here costs nothing beyond what it already means.
+                self.drain(&input[read..], &mut plaintext);
+            }
             self.state.reset(DataFormat::Raw);
             return Some(Inflated {
                 plain: out,
@@ -290,25 +326,30 @@ impl Inflater {
             });
         }
         // Otherwise the window carries across messages, and the bytes past the cap are part of it.
-        // Inflate the rest and throw it away, so the window this message leaves behind is the one
-        // the peer has. The loop above exits with input pending *only* on the cap — its other exits
-        // both require the input consumed — so this is exactly the overflow path.
-        let in_step = read >= input.len() || self.drain(&input[read..]);
+        // Inflate the rest — feeding the scan on the way — so the window this message leaves behind
+        // is the one the peer has.
+        let in_step = !remainder || self.drain(&input[read..], &mut plaintext);
         Some(Inflated {
             plain: out,
             in_step,
         })
     }
 
-    /// Inflate the rest of a message the plaintext cap cut short, discarding every byte it yields,
-    /// so this direction's window ends the message holding what the peer's does.
+    /// Inflate the rest of a message the plaintext cap cut short, handing every byte it yields to
+    /// `plaintext` and keeping none, so this direction's window ends the message holding what the
+    /// peer's does **and** the leak scan sees the part the cap cut off.
+    ///
+    /// Those are two jobs, and the second is why the discarded bytes are no longer merely
+    /// discarded: a cheap compressible pad ahead of a secret is enough to push the secret past the
+    /// cap, and a scan that only ever saw the kept prefix would report nothing about a message
+    /// whose whole purpose was the tail.
     ///
     /// Bounded like everything else here that inflates hostile input, but on a different axis from
     /// the cap it is recovering from: the discard buffer is one fixed block reused to the end, so the
     /// *memory* cost is constant however far the message inflates, and [`RESYNC_PLAINTEXT_CAP`]
     /// bounds the *work*. Returns whether the input was consumed — `false` leaves the decoder out of
     /// step, and is the caller's signal to stop this direction rather than decode the rest wrongly.
-    fn drain(&mut self, mut rest: &[u8]) -> bool {
+    fn drain(&mut self, mut rest: &[u8], plaintext: &mut impl FnMut(&[u8])) -> bool {
         let mut scratch = vec![0u8; 16 * 1024];
         let mut inflated = 0usize;
         loop {
@@ -319,6 +360,7 @@ impl Inflater {
                 _ => {}
             }
             rest = &rest[res.bytes_consumed..];
+            plaintext(&scratch[..res.bytes_written]);
             inflated = inflated.saturating_add(res.bytes_written);
             if inflated > self.resync_cap {
                 return false;
@@ -504,6 +546,16 @@ impl FrameTee {
         if let Some(scan) = self.scan.as_mut() {
             scan.take(piece);
         }
+        self.capture(piece)
+    }
+
+    /// Push one decoded piece to the capture sink alone, for a path that has already scanned it.
+    ///
+    /// The compressed path is that caller: its scan is fed from inside the inflater so it can see
+    /// the bytes past the plaintext cap, which never reach the sink. Scanning here as well would
+    /// hand the scan the kept prefix twice, out of order with the tail it already saw, and the
+    /// carry that matches a value straddling two pieces is exactly what that would corrupt.
+    fn capture(&mut self, piece: &[u8]) -> bool {
         if self.sink_full {
             return false;
         }
@@ -721,17 +773,29 @@ impl FrameTee {
         }
         let compressed = std::mem::take(&mut self.pending);
         let cap = self.plaintext_cap();
+        // Taken out for the duration so the inflater can borrow `self` while the scan is fed. It
+        // goes back below on every path.
+        let mut scan = self.scan.take();
+        if let Some(scan) = scan.as_mut() {
+            scan.start_message();
+        }
+        let scan_tail = scan.is_some();
         let Some(inflater) = self.inflater.as_mut() else {
+            self.scan = scan;
             return false;
         };
-        match inflater.message(&compressed, cap) {
+        // The scan is fed from inside, in stream order, because it must see the tail the cap cuts
+        // off: a compressible pad ahead of a secret is otherwise enough to hide it. What comes back
+        // is only what the *capture* keeps.
+        let decoded = inflater.message(&compressed, cap, scan_tail, |piece| {
+            if let Some(scan) = scan.as_mut() {
+                scan.take(piece);
+            }
+        });
+        self.scan = scan;
+        match decoded {
             Some(inflated) => {
-                // The message arrives whole here, so the scan needs no carry on this path — it is
-                // handed the one payload it was going to reassemble anyway.
-                if let Some(scan) = self.scan.as_mut() {
-                    scan.start_message();
-                }
-                let filled = self.consume(&inflated.plain);
+                let filled = self.capture(&inflated.plain);
                 if !inflated.in_step {
                     // The window could not be brought back level with the peer's, so every later
                     // message on this direction would decode to rubbish. Stop, rather than scan
@@ -932,6 +996,60 @@ mod tests {
         framed
     }
 
+    /// A secret sitting **past** the plaintext cap, in the very message that overflowed it, must
+    /// still be seen.
+    ///
+    /// The sibling test below covers the message *behind* an overflowing one. This is the other
+    /// half, and it is the cheaper attack: one message whose plaintext is a compressible pad
+    /// followed by the credential. The pad costs a few hundred bytes on the wire, so neither the
+    /// compressed budget nor anything else stops it, and a scan fed only the kept prefix sees a
+    /// quarter of a megabyte of `a` and reports nothing.
+    ///
+    /// Both takeover modes, because the cage negotiates that. With context takeover the tail has to
+    /// be inflated anyway to keep the window level, so a scan could get it for free; with
+    /// `no_context_takeover` nothing forces the tail out at all, and a fix that only fed the scan
+    /// from the window-squaring path would leave the hole open to any client that announces it.
+    #[test]
+    fn a_secret_past_the_scan_cap_in_its_own_message_is_still_seen() {
+        use miniz_oxide::deflate::core::CompressorOxide;
+        const SECRET: &[u8] = b"SUPERSECRETVALUE0000";
+        let needle = SecretNeedle::named("test-secret", SECRET.to_vec());
+
+        for no_takeover in [false, true] {
+            // The control: the same secret alone, on a tee in the same mode. Without it a green
+            // arm could mean the scan is off rather than thorough.
+            let mut c = CompressorOxide::new(raw_deflate_flags());
+            let mut control = scanning_tee(std::slice::from_ref(&needle), Some(no_takeover));
+            control.push(&deflated_message(SECRET, &mut c));
+            assert_eq!(
+                control.sightings(),
+                vec!["test-secret".to_string()],
+                "no_takeover={no_takeover}: the scan must see the secret sent alone"
+            );
+
+            // One message: pad past the cap, then the credential.
+            let mut payload = vec![b'a'; SCAN_MESSAGE_CAP + 1];
+            payload.extend_from_slice(SECRET);
+            let mut c = CompressorOxide::new(raw_deflate_flags());
+            let framed = deflated_message(&payload, &mut c);
+            assert!(
+                framed.len() < 64 * 1024,
+                "no_takeover={no_takeover}: the pad must be cheap on the wire ({} bytes), or the \
+                 compressed budget stops it and this tests the wrong bound",
+                framed.len()
+            );
+
+            let mut t = scanning_tee(std::slice::from_ref(&needle), Some(no_takeover));
+            t.push(&framed);
+            assert_eq!(
+                t.sightings(),
+                vec!["test-secret".to_string()],
+                "no_takeover={no_takeover}: a compressible pad ahead of the secret carried it past \
+                 the scan cap — one cheap message turns the tripwire off for what follows it"
+            );
+        }
+    }
+
     /// A message that inflates past [`SCAN_MESSAGE_CAP`] must not blind the messages behind it.
     ///
     /// With context takeover — the default, since `no_context_takeover` has to be announced — one
@@ -1012,7 +1130,7 @@ mod tests {
         let mut inflater = Inflater::new(false);
         inflater.resync_cap = 1024; // far below the ~64 KiB left after the cap
         let got = inflater
-            .message(body, SCAN_MESSAGE_CAP)
+            .message(body, SCAN_MESSAGE_CAP, true, |_| {})
             .expect("the message decodes as far as the cap");
         assert_eq!(
             got.plain.len(),
