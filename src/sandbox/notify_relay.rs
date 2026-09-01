@@ -29,6 +29,14 @@
 //!   process. A relayed `app_icon` is therefore reduced to a bare theme name and the hints that name
 //!   a file are dropped ([`relayed_app_icon`], [`HOST_PATH_HINTS`]); a caged app has no host path
 //!   worth naming in any case, since everything it can see is inside the cage.
+//! - **Unbounded text.** The cage writes the words; it does not get to decide how many. A summary,
+//!   a body and an action label are each cut to a ceiling, and the action list to a length
+//!   ([`bounded`], [`SUMMARY_MAX`], [`BODY_MAX`], [`ACTIONS_MAX`]). Without one, spoofing a toast
+//!   becomes displacing the desktop's: the strings are relayed into a host process that renders
+//!   them, and a megabyte body costs host memory in the daemon rather than in the cage's cgroup,
+//!   while a summary long enough pushes every other notification's text out of the area the user
+//!   reads. The ceilings are far above any real notification, so what they refuse is only the
+//!   shape that was never one.
 //! - **Other applications' notifications.** `Notify`'s `replaces_id` and `CloseNotification` are
 //!   checked against the ids the host daemon actually returned for this cage's own calls
 //!   ([`OwnedIds`]), so the cage can neither overwrite nor dismiss a notification it never raised,
@@ -266,6 +274,32 @@ fn relayed_app_icon(app_icon: &str) -> &str {
     app_icon
 }
 
+/// The most characters a relayed notification's summary may carry. A summary is the one line a
+/// daemon renders large, and no real one approaches this.
+const SUMMARY_MAX: usize = 200;
+
+/// The most characters a relayed notification's body may carry. Generous — a body may legitimately
+/// run to several paragraphs — and still a ceiling.
+const BODY_MAX: usize = 4096;
+
+/// The most action entries a relayed notification may carry. The list is `(id, label)` pairs, so
+/// this is even on purpose: an odd cut would hand the daemon half a pair, which is a malformed
+/// action rather than one fewer. A list the cage sent odd stays as the cage sent it — that is its
+/// own malformed input and not something a ceiling should quietly repair.
+const ACTIONS_MAX: usize = 32;
+
+/// Cut `s` to at most `max` characters, on a character boundary.
+///
+/// Characters rather than bytes, because the ceiling is about what a daemon renders and a byte cut
+/// through a multi-byte character is not a string at all. A value already within the ceiling is
+/// returned untouched, so the common path allocates nothing.
+fn bounded(s: String, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        None => s,
+        Some((cut, _)) => s[..cut].to_string(),
+    }
+}
+
 /// The interface served on the **private** bus: every method is forwarded to the host proxy. A
 /// forwarding error becomes an `fdo` error reply so the caged app sees a clean failure rather than a
 /// dropped call.
@@ -308,9 +342,13 @@ impl Served {
                 app_name: relayed_app_name(&app_name),
                 replaces_id,
                 app_icon: relayed_app_icon(&app_icon).to_string(),
-                summary,
-                body,
-                actions,
+                summary: bounded(summary, SUMMARY_MAX),
+                body: bounded(body, BODY_MAX),
+                actions: actions
+                    .into_iter()
+                    .take(ACTIONS_MAX)
+                    .map(|a| bounded(a, SUMMARY_MAX))
+                    .collect(),
                 hints: relayed_hints,
                 expire_timeout,
             })
@@ -577,6 +615,56 @@ mod tests {
         zbus::zvariant::Value::from(value)
             .try_into()
             .expect("a string is a hint value")
+    }
+
+    /// The cage writes the words of a toast; it does not decide how many reach the host daemon.
+    ///
+    /// The strings are relayed into a host process that renders them, so an unbounded body costs
+    /// host memory outside the cage's cgroup, and a summary long enough pushes every other
+    /// notification's text out of the area the user reads. Spoofing a toast is the accepted
+    /// residual; displacing the desktop's is not the same thing.
+    #[test]
+    fn a_relayed_notification_is_cut_to_its_ceilings() {
+        let host = FakeHost::default();
+        let served = served(&host);
+        let long = |n: usize| "x".repeat(n);
+        async_io::block_on(
+            served.notify(
+                "caged-app".to_string(),
+                0,
+                String::new(),
+                long(SUMMARY_MAX * 10),
+                long(BODY_MAX * 10),
+                (0..ACTIONS_MAX * 4)
+                    .map(|_| long(SUMMARY_MAX * 2))
+                    .collect(),
+                HashMap::new(),
+                -1,
+            ),
+        )
+        .expect("the recording host accepts every call forwarded to it");
+
+        let calls = locked(&host.calls);
+        let call = calls.first().expect("one call reached the host");
+        assert_eq!(call.summary.chars().count(), SUMMARY_MAX);
+        assert_eq!(call.body.chars().count(), BODY_MAX);
+        assert_eq!(call.actions.len(), ACTIONS_MAX);
+        assert!(
+            call.actions
+                .iter()
+                .all(|a| a.chars().count() == SUMMARY_MAX),
+            "an action label is a line of text like a summary, and is cut like one"
+        );
+    }
+
+    /// A value already inside its ceiling crosses untouched, so the bound cannot be satisfied by
+    /// cutting everything, and a multi-byte character is never cut through.
+    #[test]
+    fn a_value_within_its_ceiling_is_unchanged_and_the_cut_is_on_a_character() {
+        assert_eq!(bounded("short".to_string(), 200), "short");
+        assert_eq!(bounded("héllo wörld".to_string(), 200), "héllo wörld");
+        assert_eq!(bounded("héllo".to_string(), 2), "hé");
+        assert_eq!(bounded(String::new(), 0), "");
     }
 
     #[test]
