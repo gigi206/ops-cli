@@ -7039,8 +7039,25 @@ fn a_trusted_devices_grant_binds_a_host_device_into_the_cage() {
 /// Skips if the host has no GPU render node or cannot sandbox.
 #[test]
 fn a_trusted_gpu_posture_grants_the_render_node_and_sys_to_the_cage() {
-    if !std::path::Path::new("/dev/dri").exists() {
-        skip_incapable!("skipping gpu e2e: no /dev/dri render node on this host");
+    // The gate asks the question the grant answers: `gpu = true` binds the `renderD*` nodes alone,
+    // never the directory holding them. A host can carry `/dev/dri` with no render node in it — a
+    // hosted runner with no GPU does, and so does a machine whose only DRM device is a `card*`
+    // primary node — and there the cage correctly receives nothing while the assertions below
+    // require a render node to have arrived.
+    //
+    // Testing the directory was the right gate while the grant bound the whole of it. It stopped
+    // being right when the grant narrowed to the render nodes, and a skip condition that measures
+    // the old shape does not skip: it hands the test a host that cannot satisfy it and reports the
+    // difference as a regression.
+    let has_render_node = std::fs::read_dir("/dev/dri").is_ok_and(|entries| {
+        entries.flatten().any(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("renderD"))
+        })
+    });
+    if !has_render_node {
+        skip_incapable!("skipping gpu e2e: no `renderD*` node under /dev/dri on this host");
         return;
     }
 
