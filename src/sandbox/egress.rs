@@ -675,7 +675,7 @@ pub(super) fn wrap_background(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start(
     layout: &Layout,
-    policy: EgressPolicy,
+    mut policy: EgressPolicy,
     secrets: &[HeaderSecret],
     project_root: &Path,
     bwrap: &Path,
@@ -706,6 +706,9 @@ pub(crate) fn start(
     // none (and in tests). The launch owns it, so a task's per-invocation proxy records into the
     // same session-wide feed the agent's proxy does.
     signer_log: Option<Arc<super::signer_control::SignerRing>>,
+    // What an unresolvable credential costs: the launch, or only its own destination. See
+    // [`Unresolved`] — every caller but the batch rolls passes `Abort`.
+    unresolved: Unresolved,
 ) -> io::Result<(Egress, Wiring)> {
     use std::fs::DirBuilder;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -722,8 +725,19 @@ pub(crate) fn start(
     // come from the same resolved values, so they cannot disagree with the injections. A
     // relative `sops` file resolves against the project root (the `.sbx.toml`'s directory). A
     // plugin-backed source runs its resolver host-side under `bwrap` (never inside the cage).
-    let (injections, redactions) =
-        resolve_injections(secrets, project_root, bwrap, redact_min_len, brokers, &[])?;
+    let (injections, redactions) = match unresolved {
+        Unresolved::Abort => {
+            resolve_injections(secrets, project_root, bwrap, redact_min_len, brokers, &[])?
+        }
+        Unresolved::DenyDestination => {
+            let (injections, redactions, denied) =
+                resolve_or_deny(secrets, project_root, bwrap, redact_min_len, brokers);
+            // Applied before the proxy is built, so no request is ever served against the policy
+            // as it stood while a credential was still expected to resolve.
+            policy.deny_also(denied);
+            (injections, redactions)
+        }
+    };
 
     // The credential state the proxy will read, built here so the refresher can hold the same one
     // and swap it in place. Re-resolution repeats exactly this call, which is why the inputs are
@@ -1038,6 +1052,68 @@ pub(crate) fn start(
 /// `standing` is the set this one replaces, empty at launch and the live one on a refresh. It is the
 /// only thing here that is *running* rather than resolved: see [`resolve_one`] for what is reused
 /// out of it and on what condition.
+/// What a launch does when a credential it declared cannot be resolved.
+///
+/// The two answers differ in blast radius, never in whether an unauthenticated request may leave:
+/// under both, a destination whose credential did not resolve is one the cage cannot reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unresolved {
+    /// Refuse the launch. What an interactive session wants: the failure is reported once, before
+    /// anything is stood up, rather than surfacing later as a refusal the user has to trace back
+    /// to a resolver.
+    Abort,
+    /// Deny that credential's destination and carry on. What a batch roll wants: it runs one
+    /// captured command per app, and a credential that command never sends must not decide whether
+    /// the app is upgraded at all.
+    DenyDestination,
+}
+
+/// Resolve every declared credential, denying the destination of any that does not resolve instead
+/// of refusing the whole launch.
+///
+/// The fail-closed property of [`resolve_injections`] is kept rather than traded away: the header a
+/// destination was declared to carry is the reason the configuration named it, so a destination
+/// whose credential did not resolve is denied outright and no request reaches it bare. What changes
+/// is only which failures are fatal. Each secret is resolved on its own — the failure of one says
+/// nothing about the next, and a chain that aborted the set would hide every credential behind the
+/// first unreadable one.
+fn resolve_or_deny(
+    secrets: &[HeaderSecret],
+    project_root: &Path,
+    bwrap: &Path,
+    min_len: usize,
+    brokers: &[super::broker::Reachable],
+) -> (
+    Vec<HeaderInjection>,
+    Vec<SecretNeedle>,
+    Vec<crate::allowlist::Rule>,
+) {
+    let mut injections = Vec::with_capacity(secrets.len());
+    let mut redactions = Vec::new();
+    let mut denied = Vec::new();
+    for secret in secrets {
+        // No standing set: this path runs at launch, where there is nothing to reuse. A refresh
+        // keeps the aborting form, which is what a live proxy swapping credentials in place needs.
+        match resolve_one(secret, project_root, bwrap, min_len, brokers, None) {
+            Ok((injection, needles)) => {
+                injections.push(injection);
+                redactions.extend(needles);
+            }
+            Err(e) => {
+                // Named, never silent: the run is about to behave differently from what the
+                // configuration declared, and the destination is what the user has to recognise.
+                crate::diag::warn(&format!(
+                    "the credential for `{}` did not resolve ({e}) — {} is denied for this run                      rather than reached without the header it was declared to carry",
+                    secret.name,
+                    secret.to.concrete_host().unwrap_or(secret.name.as_str())
+                ));
+                denied.push(secret.to.clone());
+            }
+        }
+    }
+    (injections, redactions, denied)
+}
+
 fn resolve_injections(
     secrets: &[HeaderSecret],
     project_root: &Path,
@@ -1634,6 +1710,7 @@ mod tests {
             None,
             Plane::Agent,
             None,
+            Unresolved::Abort,
         )
         .expect("start the egress proxy");
 
@@ -1810,6 +1887,7 @@ mod tests {
                 None,
                 Plane::Agent,
                 None,
+                Unresolved::Abort,
             )
             .expect("start the egress proxy");
 
@@ -2213,6 +2291,7 @@ mod tests {
             None,
             Plane::Agent,
             None,
+            Unresolved::Abort,
         )
         .expect("start the ask egress proxy");
 
@@ -2286,6 +2365,7 @@ mod tests {
             None,
             Plane::Agent,
             None,
+            Unresolved::Abort,
         )
         .expect("start with stats off");
         drop(guard);
@@ -2314,6 +2394,7 @@ mod tests {
             None,
             Plane::Agent,
             None,
+            Unresolved::Abort,
         )
         .expect("start with stats on");
         drop(guard);
@@ -3113,6 +3194,7 @@ mod tests {
             Some(shared.clone()),
             Plane::Task,
             None,
+            Unresolved::Abort,
         )
         .expect("start with a shared ring");
         shared.push(
@@ -3157,6 +3239,7 @@ mod tests {
             None,
             Plane::Agent,
             None,
+            Unresolved::Abort,
         )
         .expect("start with a ring of its own");
         assert!(

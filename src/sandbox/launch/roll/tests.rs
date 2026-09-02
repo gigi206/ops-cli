@@ -46,23 +46,62 @@ fn mise_roll_recap_names_what_rolled_and_tallies_the_rest() {
     // untouched majority, so "what is concerned?" reads at a glance. No noun on the count: the
     // names are usually apps, but the task tool pool rolls under this same recap and is not one.
     assert_eq!(
-        mise_roll_recap(&["demo-app".into(), "other-app".into()], 15, 0, 0),
+        mise_roll_recap(&["demo-app".into(), "other-app".into()], &[], 15, 0, 0),
         "2 rolled: demo-app, other-app (15 up to date)."
     );
     // Nothing advanced, everything current — collapse to one reassuring line, not "0 rolled".
-    assert_eq!(mise_roll_recap(&[], 17, 0, 0), "all 17 up to date.");
+    assert_eq!(mise_roll_recap(&[], &[], 17, 0, 0), "all 17 up to date.");
     // A mixed tally (skips + failures) still surfaces.
     assert_eq!(
-        mise_roll_recap(&["demo-app".into()], 0, 1, 2),
+        mise_roll_recap(&["demo-app".into()], &[], 0, 1, 2),
         "1 rolled: demo-app (1 skipped, 2 failed)."
     );
     // Nothing rolled but not a clean no-op — say what got in the way.
     assert_eq!(
-        mise_roll_recap(&[], 10, 2, 1),
+        mise_roll_recap(&[], &[], 10, 2, 1),
         "nothing rolled (10 up to date, 2 skipped, 1 failed)."
     );
     // Degenerate empty run (no groups reached the loop).
-    assert_eq!(mise_roll_recap(&[], 0, 0, 0), "nothing to roll.");
+    assert_eq!(mise_roll_recap(&[], &[], 0, 0, 0), "nothing to roll.");
+}
+
+#[test]
+fn mise_roll_recap_names_the_groups_that_did_not_move_forward() {
+    // The headline case this distinction exists for: most apps advanced, one walked back. It is
+    // named inside the tally rather than counted with the rolled, so "what do I have to look at?"
+    // is answered without re-reading the lines above.
+    assert_eq!(
+        mise_roll_recap(&["demo-app".into()], &["kilo-app".into()], 15, 0, 0),
+        "1 rolled: demo-app (15 up to date, 1 not forward: kilo-app)."
+    );
+    // Nothing advanced and one walked back: the run is not the clean sweep the all-up-to-date
+    // collapse would claim.
+    assert_eq!(
+        mise_roll_recap(&[], &["kilo-app".into()], 17, 0, 0),
+        "nothing rolled (17 up to date, 1 not forward: kilo-app)."
+    );
+}
+
+#[test]
+fn transition_regression_reads_the_versions_off_the_arrow() {
+    use crate::version::Regression;
+    // The token carries its backend's own syntax, so the old version is the last field before the
+    // arrow — not the second field of the line.
+    assert_eq!(
+        transition_regression("aqua:anthropics/claude-code 2.1.220 → 2.1.251"),
+        None
+    );
+    // A tag that names another release line is what a bare " → " filter cannot see.
+    assert_eq!(
+        transition_regression("kilo 7.4.17 → jetbrains/v7.1.2"),
+        Some(Regression::ChangedLine)
+    );
+    assert_eq!(
+        transition_regression("demo 7.4.17 → 7.1.2"),
+        Some(Regression::Backward)
+    );
+    // A line the arrow does not split is not a transition.
+    assert_eq!(transition_regression("added 3 packages in 617ms"), None);
 }
 
 fn mise_pkg(name: &str, token: &str, trusted: bool) -> crate::config::Package {

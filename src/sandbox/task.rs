@@ -813,6 +813,9 @@ impl TaskEngine {
                 // short, so `--net-learn` must not learn rules from them.
                 super::control::Plane::Task,
                 self.signer_log.clone(),
+                // A task runs a command the configuration named, so a credential it declared but
+                // cannot read is the launch's problem, not something to work around.
+                super::egress::Unresolved::Abort,
             )
             .map_err(TaskError::Io)?;
             proxy_binds = wiring.binds;

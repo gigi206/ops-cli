@@ -101,6 +101,21 @@ Equipped **in-cage** with `mise use -g --pin <token>` at launch, fetched upstrea
 works: `aqua:`, `github:`, `npm:`, `cargo:`, a plain registry token, etc. Advances
 with [`sbx upgrade mise`](../housekeeping/upgrade).
 
+mise's own tool options ride the token in brackets, and a declaration may carry them:
+
+```toml
+[packages]
+kilo = "mise:github:Kilo-Org/kilocode[version_prefix=v]"
+```
+
+This one matters for a repository that publishes **two release lines from one repo** — a CLI
+tagged `v7.5.9` beside an IDE plugin tagged `jetbrains/v7.1.5`. Asked for the newest release,
+the backend ranks every tag it finds and can land on the wrong line, which is not a version
+you would have chosen and may not even carry the executable the profile names.
+`version_prefix` says which line is being asked for; the tags that do not carry the prefix
+stop being candidates.
+
+
 **The equip pins; the roll is what moves the pin.** `--pin` writes the version it actually
 installed into the cage's own mise config, in place of the floating request you wrote. This
 matters because the tool on the cage's `PATH` is a mise *shim*, which re-resolves whatever

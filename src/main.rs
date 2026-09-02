@@ -38,6 +38,7 @@ mod style;
 #[cfg(test)]
 mod testutil;
 mod trust;
+mod version;
 
 use std::ffi::OsString;
 use std::io::IsTerminal;

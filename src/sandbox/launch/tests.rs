@@ -287,6 +287,14 @@ fn no_config_warning_reaches_the_terminal_unfiltered() {
 /// The window runs to the call's closing `);` rather than reading one line, and that is what found
 /// the fourth: a grep for a backtick on the `eprintln!` line itself sees three, because the mask
 /// staging spells its format string on the line below.
+///
+/// What it cannot see: an identifier that arrives by interpolation. A format string with no
+/// backtick still renders one when the value it prints carries it — `{e}` on an error from the
+/// credential chain reaches the terminal naming a resolver plugin in backticks, unstyled, and this
+/// guard passes the call. Reading the source cannot settle that, because it is a property of the
+/// error at run time; the egress proxy's failure in `build.rs` is the site where it was measured,
+/// and it goes through `diag::error` for that reason rather than because of its own text. Any new
+/// raw diagnostic printing an error from another module is subject to the same gap.
 #[test]
 fn no_raw_diagnostic_names_an_identifier_it_cannot_style() {
     for (name, source) in [

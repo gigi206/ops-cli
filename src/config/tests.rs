@@ -6230,6 +6230,10 @@ fn package_name_and_attribute_validators() {
         "pipx:demo-agent",
         "pipx:demo-agent[web]",
         "pipx:demo-agent[web,messaging]",
+        // mise's tool options: a repository publishing two release lines is told which one it
+        // is being asked for, and that assignment needs the `=` the extras never used.
+        "github:example/demo-tool[version_prefix=v]",
+        "github:example/demo-tool[matching=demo,rename_exe=demo]",
     ] {
         assert!(is_valid_mise_token(t), "{t} should be a valid mise token");
     }

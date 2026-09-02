@@ -1317,9 +1317,16 @@ pub(super) fn build(
             // This is the agent's plane: what it is refused is what `--net-learn` may learn.
             crate::sandbox::control::Plane::Agent,
             signer_ring.clone(),
+            prep.unresolved_secret,
         )
         .map_err(|e| {
-            eprintln!("sbx: cannot start the egress filtering proxy: {e}");
+            // Through `diag::error` despite carrying no backtick of its own: the error it
+            // interpolates is the credential chain's, and a resolver plugin's failure names the
+            // plugin in backticks. The guard on raw diagnostics reads format strings, so this is
+            // the one site where that reading is known to come up short.
+            crate::diag::error(&format!(
+                "sbx: cannot start the egress filtering proxy: {e}"
+            ));
             ExitCode::FAILURE
         })?;
         // The wrap owns its copy: `tcp_plan` is read again further down, when the same destinations

@@ -1101,6 +1101,17 @@ impl EgressPolicy {
         self
     }
 
+    /// Add deny rules to a policy already built, keeping every rule and setting it carries.
+    ///
+    /// The one caller is a launch that resolved its declared credentials and found one it could
+    /// not read: the destination that credential was scoped to becomes unreachable for the run,
+    /// so a request never leaves for it without the header the configuration said it must carry.
+    /// A deny is the right instrument for that because it outranks the allow side — the host may
+    /// well be allowed by the app's own bundle, and this has to win over it.
+    pub(crate) fn deny_also(&mut self, rules: impl IntoIterator<Item = Rule>) {
+        self.deny.extend(rules);
+    }
+
     /// The settings `parent` carries that `self` does not, by their `[network]` key — what a config
     /// layer gives up by declaring a table of its own.
     ///

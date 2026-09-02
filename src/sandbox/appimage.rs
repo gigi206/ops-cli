@@ -10,7 +10,7 @@
 //!
 //! **The AppImage is unpacked at BUILD time, never run as an AppImage.** `wrapType2`, `appimage-run`,
 //! and the raw `.AppImage` all self-mount a squashfs via FUSE (a runtime namespace op) — which the
-//! cage's seccomp denylist blocks. Build-time squashfs extraction (`appimageTools.extractType2`,
+//! cage's seccomp denylist blocks. Build-time squashfs extraction (`appimageTools.extract`,
 //! `unsquashfs` under the hood) plus a plain autoPatchelf'd ELF is the only mechanism that runs
 //! inside the cage; see [`super::prebuilt`] for the full rationale shared with `deb:`.
 //!
@@ -137,7 +137,7 @@ pub(crate) fn resolve_source(
 }
 
 /// The generated nix expression building one `appimage:` package: fetch the pinned `.AppImage`,
-/// extract its squashfs with `appimageTools.extractType2`, copy it into `$out`, and autoPatchelf it
+/// extract its squashfs with `appimageTools.extract`, copy it into `$out`, and autoPatchelf it
 /// against [`prebuilt::ELECTRON_LIBS`] from the pinned `nixpkgs`. The launcher-locating install
 /// phase is shared with `deb:` ([`prebuilt::launcher_wrap`], which excludes the AppImage `AppRun`
 /// script so the real binary is wrapped). Every interpolated value is sbx-controlled and
@@ -152,7 +152,7 @@ fn derivation_expr(
     libs: &[String],
 ) -> String {
     const TEMPLATE: &str = r#"let pkgs = (builtins.getFlake "@NIXPKGS@").legacyPackages.@SYSTEM@;
-    extracted = pkgs.appimageTools.extractType2 {
+    extracted = pkgs.appimageTools.extract {
       pname = "@NAME@";
       version = "0";
       src = pkgs.fetchurl { name = "@NAME@-download"; url = "@URL@"; hash = "@HASH@"; };
@@ -340,11 +340,11 @@ mod tests {
             &[],
         );
         // pinned source (url + resolved hash) against the pinned nixpkgs, extracted (not run) via
-        // extractType2 — the build-time squashfs unpack the seccomp cage requires.
+        // extract — the build-time squashfs unpack the seccomp cage requires.
         assert!(expr.contains(
             "(builtins.getFlake \"github:NixOS/nixpkgs/abc\").legacyPackages.x86_64-linux"
         ));
-        assert!(expr.contains("appimageTools.extractType2"));
+        assert!(expr.contains("appimageTools.extract"));
         assert!(expr.contains("url = \"https://example.com/x/demo-app-0.0.28-x86_64.AppImage\";"));
         assert!(expr.contains(&format!("hash = \"{HASH}\";")));
         assert!(expr.contains("cp -r ${extracted}/. \"$out\""));

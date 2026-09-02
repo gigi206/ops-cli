@@ -223,6 +223,11 @@ pub(crate) fn upgrade_mise_packages(
     // In this batch context the per-app "equipping app packages in-cage" line `build` prints repeats
     // for every app and buries the roll result — silence it (the report names each app anyway).
     prep.quiet_equip = true;
+    // A roll fetches packages; the credentials an app declares are for the traffic it makes when it
+    // actually runs. One that cannot be resolved now denies its own destination for this cage
+    // instead of failing the upgrade — the roll never sends it, and an app whose token endpoint is
+    // briefly unavailable is still an app whose tools can move forward.
+    prep.unresolved_secret = crate::sandbox::egress::Unresolved::DenyDestination;
 
     // Every group name is known up front, so the result lines are dot-leader aligned to one column
     // even though each prints live (as its cage finishes) to keep progress visible over a long
@@ -235,6 +240,10 @@ pub(crate) fn upgrade_mise_packages(
 
     let mut ok = true;
     let mut rolled: Vec<String> = Vec::new();
+    // Groups whose roll moved a tool somewhere the versions do not call forward. Kept apart from
+    // `rolled` rather than counted with it: the recap's job is to answer "what changed?", and a
+    // tool walked back to an earlier release line is the one answer a user has to act on.
+    let mut not_forward: Vec<String> = Vec::new();
     let (mut up_to_date, mut skipped, mut failed) = (0usize, 0usize, 0usize);
 
     for group in groups {
@@ -311,28 +320,54 @@ pub(crate) fn upgrade_mise_packages(
                 [only] => {
                     // The token is redundant with the name column, so show just the version delta.
                     let delta = only.split_once(' ').map_or(only.as_str(), |(_, v)| v);
-                    println!(
-                        "{}",
-                        roll_line(&name, width, &format!("{ok_c}{delta}{r}"), pal)
-                    );
-                    rolled.push(name);
+                    match transition_regression(only) {
+                        Some(reg) => {
+                            println!(
+                                "{}",
+                                roll_line(
+                                    &name,
+                                    width,
+                                    &format!("{warn}{delta} — {}{r}", reg.describe()),
+                                    pal
+                                )
+                            );
+                            not_forward.push(name);
+                        }
+                        None => {
+                            println!(
+                                "{}",
+                                roll_line(&name, width, &format!("{ok_c}{delta}{r}"), pal)
+                            );
+                            rolled.push(name);
+                        }
+                    }
                 }
                 many => {
                     // A group that rolled several tokens: a count on the aligned line, then each
-                    // full `<token> <old> → <new>` transition indented below it.
-                    println!(
-                        "{}",
-                        roll_line(
-                            &name,
-                            width,
-                            &format!("{ok_c}{} tools rolled{r}", many.len()),
-                            pal
-                        )
-                    );
+                    // full `<token> <old> → <new>` transition indented below it. One token that did
+                    // not move forward names itself on its own line and decides the group's colour,
+                    // so a single walked-back tool cannot hide inside a count of its siblings.
+                    let back = many
+                        .iter()
+                        .filter(|t| transition_regression(t).is_some())
+                        .count();
+                    let status = if back > 0 {
+                        format!("{warn}{} tools rolled, {back} not forward{r}", many.len())
+                    } else {
+                        format!("{ok_c}{} tools rolled{r}", many.len())
+                    };
+                    println!("{}", roll_line(&name, width, &status, pal));
                     for t in many {
-                        println!("       {ok_c}{t}{r}");
+                        match transition_regression(t) {
+                            Some(reg) => println!("       {warn}{t} — {}{r}", reg.describe()),
+                            None => println!("       {ok_c}{t}{r}"),
+                        }
                     }
-                    rolled.push(name);
+                    if back > 0 {
+                        not_forward.push(name);
+                    } else {
+                        rolled.push(name);
+                    }
                 }
             }
         } else {
@@ -391,8 +426,8 @@ pub(crate) fn upgrade_mise_packages(
     // Close with the one line that answers "what changed?": each rolled app — and the task tool
     // pool, when it rolled — by name, plus a tally of the rest, coloured by outcome (a failure
     // paints it a warning, a clean no-op dims).
-    let recap = mise_roll_recap(&rolled, up_to_date, skipped, failed);
-    let hue = if failed > 0 {
+    let recap = mise_roll_recap(&rolled, &not_forward, up_to_date, skipped, failed);
+    let hue = if failed > 0 || !not_forward.is_empty() {
         warn
     } else if rolled.is_empty() {
         dim
@@ -481,6 +516,11 @@ pub(crate) fn upgrade_provision_steps(
         }
     };
     prep.quiet_equip = true;
+    // A roll fetches packages; the credentials an app declares are for the traffic it makes when it
+    // actually runs. One that cannot be resolved now denies its own destination for this cage
+    // instead of failing the upgrade — the roll never sends it, and an app whose token endpoint is
+    // briefly unavailable is still an app whose tools can move forward.
+    prep.unresolved_secret = crate::sandbox::egress::Unresolved::DenyDestination;
 
     let width = groups
         .iter()
@@ -701,6 +741,20 @@ pub(super) fn mise_transitions(captured: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether one `<token> <old> → <new>` transition moved a tool somewhere the two versions do not
+/// call forward, and which of the shapes in [`crate::version::Regression`] it was.
+///
+/// The versions are read off the arrow rather than off a field count: mise writes the token first,
+/// and a token carries its backend's own syntax (`aqua:anthropics/claude-code`), so the old version
+/// is the last field before the arrow and the new one is everything after it. A line the arrow does
+/// not split is not a transition at all, and a pair that says nothing conclusive is not a
+/// regression — [`crate::version::regression`] decides which pairs qualify.
+fn transition_regression(line: &str) -> Option<crate::version::Regression> {
+    let (before, new) = line.split_once(" → ")?;
+    let old = before.rsplit(' ').next()?;
+    crate::version::regression(old.trim(), new.trim())
+}
+
 /// Whether mise reported nothing to do. mise prints `All tools are up to date` (to stderr) when a
 /// roll finds every tool already current. Pure — unit-tested against real mise output.
 fn mise_up_to_date(captured: &str) -> bool {
@@ -722,10 +776,26 @@ fn roll_line(name: &str, width: usize, status: &str, pal: &crate::style::Palette
 /// groups by name, then a parenthesised tally of the rest. Plain text (the caller colours it by
 /// outcome); pure, so it is unit-tested. With nothing rolled and nothing wrong it collapses to a
 /// single reassuring line rather than "0 apps rolled".
-fn mise_roll_recap(rolled: &[String], up_to_date: usize, skipped: usize, failed: usize) -> String {
+fn mise_roll_recap(
+    rolled: &[String],
+    not_forward: &[String],
+    up_to_date: usize,
+    skipped: usize,
+    failed: usize,
+) -> String {
     let mut tail = Vec::new();
     if up_to_date > 0 {
         tail.push(format!("{up_to_date} up to date"));
+    }
+    // Named, not just counted, and inside the tally rather than beside the rolled list: these are
+    // the groups a user has to look at, and a bare number would send them back to the lines above
+    // to find out which.
+    if !not_forward.is_empty() {
+        tail.push(format!(
+            "{} not forward: {}",
+            not_forward.len(),
+            not_forward.join(", ")
+        ));
     }
     if skipped > 0 {
         tail.push(format!("{skipped} skipped"));
@@ -740,7 +810,7 @@ fn mise_roll_recap(rolled: &[String], up_to_date: usize, skipped: usize, failed:
     };
 
     if rolled.is_empty() {
-        if !tail.is_empty() && skipped == 0 && failed == 0 {
+        if !tail.is_empty() && skipped == 0 && failed == 0 && not_forward.is_empty() {
             format!("all {up_to_date} up to date.")
         } else if tail.is_empty() {
             "nothing to roll.".to_string()

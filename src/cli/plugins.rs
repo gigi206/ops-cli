@@ -103,51 +103,6 @@ struct InstalledIndex {
     name_conflicts: std::collections::BTreeMap<String, Vec<String>>,
 }
 
-/// Order two version strings when — and only when — both are plainly ordered: dot-separated
-/// numbers with an optional pre-release suffix after a `-`. A manifest's `version` is free-form,
-/// and a store's is whatever it published, so anything else (a date, a git describe, a letter, an
-/// overflowing component) yields `None` and the caller says "differs" instead of inventing a
-/// direction. Guessing here would be the one failure mode that matters: telling a user they are
-/// up to date when they are not.
-fn version_order(a: &str, b: &str) -> Option<std::cmp::Ordering> {
-    /// `(numeric components, pre-release)`, or `None` when the core is not plainly numeric.
-    fn split(v: &str) -> Option<(Vec<u64>, Option<&str>)> {
-        let v = v.trim().strip_prefix('v').unwrap_or(v.trim());
-        let (core, pre) = match v.split_once('-') {
-            Some((core, pre)) if !pre.is_empty() => (core, Some(pre)),
-            Some(_) => return None,
-            None => (v, None),
-        };
-        if core.is_empty() {
-            return None;
-        }
-        let nums: Option<Vec<u64>> = core.split('.').map(|c| c.parse::<u64>().ok()).collect();
-        nums.filter(|n| !n.is_empty()).map(|n| (n, pre))
-    }
-    let (a_nums, a_pre) = split(a)?;
-    let (b_nums, b_pre) = split(b)?;
-    // `1.8` against `1.8.2`: a missing component is zero, so the shorter one sorts first.
-    for i in 0..a_nums.len().max(b_nums.len()) {
-        let (x, y) = (
-            a_nums.get(i).copied().unwrap_or(0),
-            b_nums.get(i).copied().unwrap_or(0),
-        );
-        if x != y {
-            return Some(x.cmp(&y));
-        }
-    }
-    match (a_pre, b_pre) {
-        // A release outranks a pre-release of the same core (`1.2.0` over `1.2.0-rc1`).
-        (None, None) => Some(std::cmp::Ordering::Equal),
-        (None, Some(_)) => Some(std::cmp::Ordering::Greater),
-        (Some(_), None) => Some(std::cmp::Ordering::Less),
-        // Two pre-releases: identical is equal, and anything else is not ours to rank
-        // (`rc2` vs `beta` has no numeric answer).
-        (Some(x), Some(y)) if x == y => Some(std::cmp::Ordering::Equal),
-        (Some(_), Some(_)) => None,
-    }
-}
-
 /// How to phrase an installed build the store no longer lists. The *fact* is always the digest
 /// difference; the version strings only name it, and only as far as they can be ordered — an
 /// unorderable pair says the two differ rather than which is newer, and a republish under the same
@@ -159,7 +114,7 @@ fn drift_wording(have: &str, listed: &str) -> String {
     if have == listed {
         return format!("installed v{have}, the store lists a different build of v{listed}");
     }
-    match version_order(have, listed) {
+    match crate::version::version_order(have, listed) {
         Some(std::cmp::Ordering::Less) => format!("update available: v{have} → v{listed}"),
         Some(std::cmp::Ordering::Greater) => {
             format!("ahead of the store: installed v{have}, listed v{listed}")
@@ -184,7 +139,7 @@ fn drift_wording(have: &str, listed: &str) -> String {
 /// Anything the versions cannot settle (either side unnamed, unorderable, equal-but-rebuilt) keeps
 /// the ordinary word: the digest changed, and nothing says it went backwards.
 fn move_verb(have: &str, listed: &str) -> &'static str {
-    match version_order(have, listed) {
+    match crate::version::version_order(have, listed) {
         Some(std::cmp::Ordering::Greater) => "downgraded",
         _ => "upgraded",
     }
@@ -3097,30 +3052,6 @@ mod tests {
             ),
             "  [ahead of the store: installed v1.0.0, listed v0.9.0]"
         );
-    }
-
-    #[test]
-    fn version_order_refuses_to_guess_what_it_cannot_order() {
-        use std::cmp::Ordering;
-        assert_eq!(version_order("1.0.0", "1.1.0"), Some(Ordering::Less));
-        assert_eq!(version_order("2", "1.9.9"), Some(Ordering::Greater));
-        // A missing component is zero, so a shorter version sorts before a longer one.
-        assert_eq!(version_order("1.8", "1.8.2"), Some(Ordering::Less));
-        assert_eq!(version_order("1.8", "1.8.0"), Some(Ordering::Equal));
-        assert_eq!(version_order("v1.2.3", "1.2.3"), Some(Ordering::Equal));
-        // A release outranks its own pre-release; two different pre-releases have no numeric answer.
-        assert_eq!(version_order("1.2.0", "1.2.0-rc1"), Some(Ordering::Greater));
-        assert_eq!(
-            version_order("1.2.0-rc1", "1.2.0-rc1"),
-            Some(Ordering::Equal)
-        );
-        assert_eq!(version_order("1.2.0-rc2", "1.2.0-beta"), None);
-        // Free-form strings: a manifest's `version` is not constrained, so these must not be
-        // ranked. Claiming "up to date" from a bad guess is the failure that matters.
-        assert_eq!(version_order("2026-08-01", "2026-08-02"), None);
-        assert_eq!(version_order("1.0.0a", "1.0.1"), None);
-        assert_eq!(version_order("latest", "1.0.0"), None);
-        assert_eq!(version_order("", "1.0.0"), None);
     }
 
     #[test]

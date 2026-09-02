@@ -123,6 +123,10 @@ struct Prepared {
     /// which app actually rolled; left `false` for an ordinary launch, where it tells the user what
     /// is being equipped.
     quiet_equip: bool,
+    /// What an unresolvable credential costs this launch. `Abort` everywhere but the batch rolls,
+    /// which run one captured command per app and must not let a credential that command never
+    /// sends decide whether the app is upgraded — see [`crate::sandbox::egress::Unresolved`].
+    unresolved_secret: crate::sandbox::egress::Unresolved,
 }
 
 /// `sbx run [--] [<cmd>]`: run a command inside the project sandbox, or — with no command — open
@@ -919,6 +923,7 @@ fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, Ex
         engine_ref,
         userland,
         quiet_equip: false,
+        unresolved_secret: crate::sandbox::egress::Unresolved::Abort,
     })
 }
 

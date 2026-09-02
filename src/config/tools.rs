@@ -845,17 +845,24 @@ pub(crate) fn is_bare_nix_attr(attr: &str) -> bool {
 /// `npm:@example/demo-tool`, or `aqua:example/demo-tool@0.141.0`. It rides the equip
 /// wrapper positionally, so it cannot inject shell whatever it contains; the charset is
 /// still restricted to what a real token uses (no whitespace or control characters) so a
-/// malformed value is refused rather than handed to mise. The `[`, `]`, and `,` are admitted
-/// for PEP 508 extras (`pipx:demo-agent[web]`, `pipx:demo-agent[web,messaging]`) — a
-/// Python install selects optional dependency groups that way. They are not shell or nix
-/// metacharacters in any backend (the token is positional argv to mise, and the equip never
-/// interpolates it into a nix expression or a shell string), so admitting them adds no
-/// injection surface; a backend that does not understand them simply rejects the token.
+/// malformed value is refused rather than handed to mise. The `[`, `]`, `,` and `=` are
+/// admitted for PEP 508 extras (`pipx:demo-agent[web]`, `pipx:demo-agent[web,messaging]`) — a
+/// Python install selects optional dependency groups that way — and for mise's tool options
+/// (`github:owner/repo[version_prefix=v]`), which are how a repository publishing two release
+/// lines is told which one it is being asked for. Without `=` the bracket pair was admitted
+/// while the assignment it delimits was not, so an option could be spelled but never given a
+/// value. None of the four are shell or nix metacharacters in any backend (the token is
+/// positional argv to mise, and the equip never interpolates it into a nix expression or a
+/// shell string), so admitting them adds no injection surface; a backend that does not
+/// understand them simply rejects the token.
 pub(super) fn is_valid_mise_token(token: &str) -> bool {
     !token.is_empty()
         && token.chars().all(|c| {
             c.is_ascii_alphanumeric()
-                || matches!(c, ':' | '/' | '@' | '.' | '_' | '-' | '+' | '[' | ']' | ',')
+                || matches!(
+                    c,
+                    ':' | '/' | '@' | '.' | '_' | '-' | '+' | '[' | ']' | ',' | '='
+                )
         })
 }
 
