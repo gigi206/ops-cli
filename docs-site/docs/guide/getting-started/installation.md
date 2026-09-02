@@ -85,6 +85,15 @@ Three further differences are worth knowing before they surprise you:
   and not a small one: a relay must raise a modern toast under a registered
   application id, because the older balloon call returns without error and leaves
   nothing behind in the centre.
+- **The light/dark preference comes from Windows.** A distribution runs no desktop
+  portal, so the bus name `sbx` reads that preference from owns nothing there. Under a
+  WSL kernel it asks Windows instead, through its own registry, and seeds the cage with
+  what the desktop is wearing. The two scales are opposites and `sbx` reconciles them,
+  so nothing has to be set. What this does **not** do is follow a switch made after the
+  launch: the relay that mirrors a live change subscribes to a bus signal, and Windows
+  offers none to subscribe to across that boundary. A cage opens in the desktop's theme
+  and keeps it for the session. On any other host nothing changes, and nothing is run:
+  the branch is reached only by a WSL kernel.
 - **No encapsulated storage volume.** A distribution's filesystem is an ordinary
   one, so the store is a plain directory rather than a compressed volume.
   `$SBX_DATA_DIR` can still point `sbx` at a volume that is mounted.

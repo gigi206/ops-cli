@@ -64,13 +64,115 @@ const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// signal: the value read once at launch and the values mirrored afterwards must be the same
 /// setting read the same way, or the app would open on one interpretation and switch to another.
 pub(crate) fn read_host_color_scheme() -> Option<String> {
-    async_io::block_on(async {
+    let from_portal = async_io::block_on(async {
         futures_util::select! {
             scheme = current_color_scheme().fuse() => scheme,
             // `Timer` is both a `Future` and a `Stream`, so name the trait rather than let
             // `.fuse()` resolve to the stream one.
             _ = FutureExt::fuse(async_io::Timer::after(READ_TIMEOUT)) => None,
         }
+    });
+    if from_portal.is_some() {
+        return from_portal;
+    }
+    // No portal answered. Under WSL that is the normal case rather than a failure — the desktop
+    // whose preference this is runs on the Windows side, which answers through a registry value
+    // instead of a bus name — so the same question is asked there. Everywhere else this is where
+    // the read gives up, exactly as before: the branch is gated on the kernel being a WSL one, so a
+    // Linux host with no portal reaches no process spawn it did not reach yesterday.
+    windows_fallback(host_is_wsl(), read_windows_color_scheme)
+}
+
+/// The fallback itself, with its gate and its reader passed in so both halves are testable: the
+/// point of the gate is a spawn that does **not** happen off WSL, and an absence is only provable
+/// against a reader that would have recorded being called.
+fn windows_fallback(is_wsl: bool, read: impl FnOnce() -> Option<String>) -> Option<String> {
+    if !is_wsl {
+        return None;
+    }
+    read()
+}
+
+/// Ask Windows for its apps light/dark preference, through the interop `reg.exe`. Best-effort and
+/// bounded: a launch must not hang on it, and the price of giving up is the cage opening in its
+/// default theme.
+///
+/// Bounded the way the install step is, by polling for exit against a deadline and killing what
+/// outlives it, because an interop call crosses into another operating system and there is nothing
+/// on this side that promises it returns. The budget is the portal read's, so a host that answers
+/// through neither channel costs one launch the same wait twice rather than an unbounded one.
+///
+/// This serves the launch seed alone. The relay that mirrors a **later** switch stays on the bus
+/// signal it subscribes to, and WSL offers no such signal: following live here would mean polling
+/// Windows, which is an interop round-trip per poll for a value that changes twice a day. A cage
+/// therefore opens in the desktop's theme and keeps it for the session.
+fn read_windows_color_scheme() -> Option<String> {
+    let mut child = std::process::Command::new("reg.exe")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            "/v",
+            "AppsUseLightTheme",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + READ_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(_) => return None,
+        }
+    }
+    let out = child.wait_with_output().ok()?;
+    windows_scheme_name(&String::from_utf8_lossy(out.stdout.as_slice())).map(str::to_string)
+}
+
+/// Whether this kernel is a WSL one, from what `/proc/sys/kernel/osrelease` holds. Pure.
+///
+/// Microsoft's own marker: a WSL2 kernel names itself `…-microsoft-standard-WSL2`. Read as a
+/// substring rather than a suffix because the release carries a version prefix that changes, and
+/// case-insensitively because the spelling has changed across WSL generations.
+pub(crate) fn is_wsl_release(osrelease: &str) -> bool {
+    osrelease.to_ascii_lowercase().contains("microsoft")
+}
+
+/// Whether the kernel this launch runs on is a WSL one, read from `/proc/sys/kernel/osrelease`.
+/// A file that cannot be read answers `false`, which keeps the fallback shut on a host whose
+/// `/proc` is not the one this expects rather than opening it on a guess.
+fn host_is_wsl() -> bool {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .is_ok_and(|release| is_wsl_release(&release))
+}
+
+/// The keyfile value a Windows `AppsUseLightTheme` word means, from the line `reg.exe` prints for
+/// it. Pure, and the one place the two scales are reconciled.
+///
+/// They are inverted, which is the whole reason this is a named function with a test of its own:
+/// the registry answers *are apps using the light theme*, so `1` is light, while the freedesktop
+/// portal answers *which scheme is preferred*, where `1` is [`super::portal::color_scheme_name`]'s
+/// `prefer-dark`. Mapping one number onto the other would open every cage in the opposite theme.
+/// A missing or unparseable value is `None`: the launch then seeds nothing, which is what it did
+/// before this fallback existed.
+pub(crate) fn windows_scheme_name(reg_output: &str) -> Option<&'static str> {
+    let value = reg_output
+        .lines()
+        .find(|l| l.contains("AppsUseLightTheme"))?
+        .split_whitespace()
+        .next_back()?;
+    let light = u32::from_str_radix(value.strip_prefix("0x")?, 16).ok()?;
+    Some(if light == 0 {
+        "prefer-dark"
+    } else {
+        "prefer-light"
     })
 }
 
@@ -459,5 +561,72 @@ mod tests {
                 "{case}: a refused directory link must be left alone, not replaced"
             );
         }
+    }
+
+    /// The gate is the whole safety property of the WSL fallback: a host that is not WSL must not
+    /// reach the reader at all. Asserted as an absence — the reader records being called, and the
+    /// non-WSL arm proves it was not — because "returns None" is satisfied just as well by a reader
+    /// that ran, spawned a process that does not exist there, and failed.
+    #[test]
+    fn only_a_wsl_host_reaches_the_windows_read() {
+        let called = std::cell::Cell::new(false);
+        let reader = || {
+            called.set(true);
+            Some("prefer-dark".to_string())
+        };
+        assert_eq!(super::windows_fallback(false, reader), None);
+        assert!(!called.get(), "a host that is not WSL must spawn nothing");
+
+        let called = std::cell::Cell::new(false);
+        let reader = || {
+            called.set(true);
+            Some("prefer-dark".to_string())
+        };
+        assert_eq!(
+            super::windows_fallback(true, reader),
+            Some("prefer-dark".to_string())
+        );
+        assert!(called.get(), "a WSL host asks Windows");
+    }
+
+    /// The marker Microsoft writes, and the shapes that are not it.
+    #[test]
+    fn a_wsl_kernel_is_told_from_an_ordinary_one() {
+        assert!(super::is_wsl_release("6.18.33.2-microsoft-standard-WSL2"));
+        assert!(super::is_wsl_release("5.15.0-MICROSOFT-standard"));
+        assert!(!super::is_wsl_release("6.11.0-19-generic"));
+        assert!(!super::is_wsl_release("6.6.87.1-lts"));
+    }
+
+    /// The two scales are inverted, so this asserts the NAME rather than the number: reading the
+    /// registry's `1` as the portal's `1` would open every cage in the opposite theme, and no
+    /// numeric assertion would catch it.
+    #[test]
+    fn the_registry_word_maps_to_the_opposite_numbered_scheme() {
+        let line = |v| format!("\n    AppsUseLightTheme    REG_DWORD    {v}\n");
+        assert_eq!(
+            super::windows_scheme_name(&line("0x1")),
+            Some("prefer-light"),
+            "apps use the light theme, which the portal numbers 2"
+        );
+        assert_eq!(
+            super::windows_scheme_name(&line("0x0")),
+            Some("prefer-dark"),
+            "apps do not use the light theme, which the portal numbers 1"
+        );
+        // And the same value as the portal's own mapping would name it, so the two cannot drift.
+        assert_eq!(
+            super::windows_scheme_name(&line("0x0")),
+            Some(crate::sandbox::portal::color_scheme_name(1))
+        );
+        assert_eq!(
+            super::windows_scheme_name(&line("0x1")),
+            Some(crate::sandbox::portal::color_scheme_name(2))
+        );
+        assert_eq!(super::windows_scheme_name("nothing here"), None);
+        assert_eq!(
+            super::windows_scheme_name("    AppsUseLightTheme    REG_DWORD    zzz"),
+            None
+        );
     }
 }
