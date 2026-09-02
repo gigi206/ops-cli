@@ -10,7 +10,8 @@ fn each_open_form_is_read_from_its_own_registers() {
     assert_eq!(
         open_args(libc::SYS_open as libc::c_int, &args),
         Some((libc::AT_FDCWD, 11)),
-        "`open(path, …)` carries no descriptor: the path is the first argument, and the form is              implicitly relative to the working directory"
+        "`open(path, …)` carries no descriptor: the path is the first argument, and the \
+         form is implicitly relative to the working directory"
     );
     assert_eq!(
         open_args(libc::SYS_openat as libc::c_int, &args),
@@ -30,7 +31,8 @@ fn a_syscall_that_is_not_an_open_is_left_to_the_exec_path() {
     assert_eq!(
         open_args(libc::SYS_execve as libc::c_int, &args),
         None,
-        "the same receive loop carries `execve`, which must fall through to the exec policy              rather than be read as a path to scan"
+        "the same receive loop carries `execve`, which must fall through to the exec \
+         policy rather than be read as a path to scan"
     );
     assert_eq!(open_args(libc::SYS_read as libc::c_int, &args), None);
 }

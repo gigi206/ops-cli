@@ -991,7 +991,8 @@ fn a_restricted_openat2_is_left_to_the_kernel_to_walk() {
     );
     assert!(
         !serve(libc::RESOLVE_NO_SYMLINKS),
-        "a caller that asked the kernel not to follow symlinks must not be handed the result of              a walk that did"
+        "a caller that asked the kernel not to follow symlinks must not be handed the \
+         result of a walk that did"
     );
     assert!(
         !serve(libc::RESOLVE_BENEATH),
@@ -1950,7 +1951,8 @@ fn the_open_lens_flag_rides_before_the_separator() {
             OsString::from("node"),
             OsString::from("agent.js"),
         ],
-        "the flag must sit between the socket and `--`, where the shim parses its flags: after              the separator it would be handed to the payload as an argument instead"
+        "the flag must sit between the socket and `--`, where the shim parses its flags: \
+         after the separator it would be handed to the payload as an argument instead"
     );
 }
 

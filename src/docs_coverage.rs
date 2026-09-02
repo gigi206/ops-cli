@@ -953,6 +953,92 @@ fn the_guide_writes_no_em_dash_outside_the_output_it_quotes() {
     );
 }
 
+/// A message literal does not run its own indentation through the middle of a sentence.
+///
+/// A long literal is wrapped with a trailing `\`, which makes Rust drop the newline **and** the
+/// indentation under it. Lose the backslash and the indentation stays, as a run of spaces sitting
+/// inside the sentence a user reads. Three shipped messages carried one: the unresolved-credential
+/// warning, the `[plugin.*]` refusal and the proxy's body-budget answer. No other guard here looks
+/// at message text, so all three were found by reading a terminal rather than the tree.
+///
+/// The rule has to separate prose from alignment, because a run of spaces is also how a report
+/// lines its columns up and that must go on working. Three conditions, each measured against this
+/// tree before being written down:
+///
+/// * the literal carries no `\n`. One that renders several lines is aligning them, which is what
+///   the help pages and the `sbx task` usage do.
+/// * the gap is four spaces or more between two **lowercase** letters. Two spaces is a deliberate
+///   separator in a benchmark line or a fixture, and a digit or a capital on either side is a
+///   column.
+/// * at least four words precede the gap inside the literal. `doctor`'s status report writes one
+///   word and then pads (`bubblewrap        not found`), where a sentence that lost its backslash
+///   has a whole clause behind it.
+///
+/// What it does not see, named rather than implied: a message assembled from several literals by
+/// concatenation, and a gap whose sentence is shorter than four words.
+#[test]
+fn no_message_literal_runs_its_indentation_through_a_sentence() {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut paths = Vec::new();
+    walk(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut paths,
+    );
+    paths.sort();
+
+    // The crate's regex has no look-around, so the letters bounding the gap are part of the match
+    // and the prefix is taken one byte past its start.
+    let gap = regex::Regex::new(r"[a-z] {4,}[a-z]").expect("the gap pattern compiles");
+    let manifest = format!("{}/", env!("CARGO_MANIFEST_DIR"));
+    let mut offenders = Vec::new();
+    for path in paths {
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        for (n, line) in text.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let (Some(open), Some(close)) = (line.find('"'), line.rfind('"')) else {
+                continue;
+            };
+            if close <= open {
+                continue;
+            }
+            let literal = &line[open + 1..close];
+            if literal.contains("\\n") {
+                continue;
+            }
+            for m in gap.find_iter(literal) {
+                if literal[..m.start() + 1].split_whitespace().count() >= 4 {
+                    let at = path.display().to_string().replace(&manifest, "");
+                    offenders.push(format!("{at}:{}  {}", n + 1, line.trim()));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a run of spaces sits inside a sentence, which is what a wrapped literal leaves behind when \
+         its trailing `\\` is missing: Rust drops the newline and the indentation only when the \
+         backslash is there. Put it back rather than deleting the spaces by hand, so the next wrap \
+         cannot reintroduce them. If the line is aligning columns rather than writing prose, it \
+         reads as prose to this guard: give the padded field a shorter label, or render it with \
+         `{{:width$}}`.\n{}",
+        offenders.join("\n")
+    );
+}
+
 /// The module-level items in `src/` that carry no doc comment today.
 ///
 /// A grandfather list, not a permission: every entry is a gap this guard was switched on around,
