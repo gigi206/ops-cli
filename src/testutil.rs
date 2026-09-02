@@ -224,6 +224,7 @@ pub(crate) fn resolved(
         nixpkgs_global: None,
         nixpkgs_project: None,
         mise: None,
+        mise_ignored: Vec::new(),
         network: crate::config::NetworkPolicy::Shared,
         network_origin: Default::default(),
         egress_stats: true,

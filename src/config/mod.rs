@@ -364,6 +364,16 @@ pub(crate) struct Resolved {
     /// presence and the gating verdict. Discovered in [`load()`] (it is I/O), so the
     /// pure [`resolve`] always leaves it `None`.
     pub(crate) mise: Option<MiseConfig>,
+    /// The project's mise files that sbx declared inert — present, but with no `.sbx.toml` to
+    /// anchor them, so nothing here is folded into the resolved configuration.
+    ///
+    /// Kept because saying a file is ignored does not make it so. The project tree is bound into
+    /// the cage at its real path, and mise walks the working directory on every invocation, so
+    /// the cage's own mise would find these files and act on them — resolving their tools, and
+    /// reaching for the network to do it — while sbx reported them ignored. The launcher names
+    /// them to mise (`MISE_IGNORED_CONFIG_PATHS`) so the verdict holds on both sides of the cage
+    /// wall. Discovered in [`load()`] (it is I/O), so the pure [`resolve`] always leaves it empty.
+    pub(crate) mise_ignored: Vec<std::path::PathBuf>,
     /// The resolved network posture: [`NetworkPolicy`]'s built-in default — the deny-by-default
     /// filtering allowlist, which reaches only the proxy's self-equip set — unless the global
     /// config or a trusted project declared one of its own (`none`, `shared`, or one of the
@@ -2472,6 +2482,7 @@ fn resolve(
         nixpkgs_project,
         // A mise file is discovered by I/O in `load`; the pure layering never sees one.
         mise: None,
+        mise_ignored: Vec::new(),
         network,
         network_origin,
         net_groups,

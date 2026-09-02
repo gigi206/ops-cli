@@ -2361,6 +2361,7 @@ mod tests {
             nixpkgs_global: Some(global.to_string()),
             nixpkgs_project: None,
             mise: None,
+            mise_ignored: Vec::new(),
             network: config::NetworkPolicy::Shared,
             network_origin: Default::default(),
             egress_stats: true,

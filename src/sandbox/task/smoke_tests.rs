@@ -49,6 +49,7 @@ fn engine_for(tasks: Vec<TaskSpec>, project: &Path, slug: &str) -> Option<(TaskE
         bin_paths: &[],
         timezone: super::super::binds::DEFAULT_ZONE,
         fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
     };
     let nix_mount = super::super::binds::NixMount {
         src: crate::store::physical_path(&layout, Path::new("/nix")),

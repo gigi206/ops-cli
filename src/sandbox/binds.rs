@@ -268,6 +268,9 @@ pub(crate) struct Overlay<'a> {
     /// cage's mise accepts a release with no cooling-off period for them. Empty for almost every
     /// cage; when it is empty no variable is set at all, so mise keeps its own default.
     pub(crate) fresh_release_tokens: &'a [String],
+    /// The project mise files sbx declared inert, named to the cage's own mise so it skips them
+    /// too. Empty whenever the project has none, or has one that is honored.
+    pub(crate) ignored_mise_paths: &'a [std::path::PathBuf],
 }
 
 /// Host-side locations of one sandbox's mount sources, passed to [`assemble`].
@@ -842,6 +845,7 @@ fn cage_env(
         paths.mise_project_src.is_some(),
         nix.on_btrfs,
         overlay.fresh_release_tokens,
+        overlay.ignored_mise_paths,
     ));
     for (key, val) in overlay.env {
         upsert_env(&mut env, key, val);
@@ -1024,6 +1028,7 @@ fn mise_env(
     per_project_primary: bool,
     store_on_btrfs: bool,
     fresh_release_tokens: &[String],
+    ignored_mise_paths: &[std::path::PathBuf],
 ) -> Vec<(String, String)> {
     let mut nix_config = "extra-experimental-features = nix-command flakes\n\
                           sandbox = false\n\
@@ -1067,6 +1072,30 @@ fn mise_env(
             "MISE_MINIMUM_RELEASE_AGE_EXCLUDES".to_string(),
             fresh_release_tokens.join(","),
         ));
+    }
+
+    // The project mise files sbx declared inert, named to the cage's own mise so it declines them
+    // too. Without this the verdict holds on one side of the cage wall only: sbx refuses to fold
+    // the file into the resolved configuration and says so, while mise — which walks the working
+    // directory, and the project tree is bound there at its real path — reads it anyway, resolves
+    // the tools it declares and reaches for the network to do it. What the user sees of that is a
+    // refused request against a host their configuration never named.
+    //
+    // This one is read while mise is still discovering config files, before any of them is parsed,
+    // so it is an environment variable or nothing: setting it inside a config file would arrive
+    // after the decision it governs.
+    //
+    // The separator is the platform's path separator. A path that contains one cannot be expressed
+    // in such a list at all, so it is left out rather than joined into an entry that would name
+    // neither it nor its neighbour — an unexpressible path is one file still read, where corrupting
+    // the list would be every file in it.
+    let nameable: Vec<String> = ignored_mise_paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .filter(|p| !p.contains(':'))
+        .collect();
+    if !nameable.is_empty() {
+        env.push(("MISE_IGNORED_CONFIG_PATHS".to_string(), nameable.join(":")));
     }
     env
 }

@@ -2513,6 +2513,7 @@ mod tests {
             nixpkgs_global: None,
             nixpkgs_project: None,
             mise: None,
+            mise_ignored: Vec::new(),
             network: NetworkPolicy::Shared,
             network_origin: Provenance::Default,
             egress_stats: true,

@@ -52,6 +52,7 @@ fn the_generated_argv_launches_a_working_hermetic_shell() {
         bin_paths: &[],
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
     };
     // this smoke exercises the userland against the shared store, read-only — the
     // writable per-project store is the launcher's concern.
@@ -219,6 +220,7 @@ fn the_nix_ld_shim_serves_foreign_binaries_and_unskews_cross_channel_tools() {
         bin_paths: &[],
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
     };
     let foreign_spec = build_spec(
         data.path(),
@@ -267,6 +269,7 @@ fn the_nix_ld_shim_serves_foreign_binaries_and_unskews_cross_channel_tools() {
         bin_paths: &bin_paths,
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
     };
     let cross_spec = build_spec(
         data.path(),
@@ -403,6 +406,7 @@ fn the_cage_runs_from_a_writable_per_project_store_seeded_with_the_base_closure(
         bin_paths: &[],
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
     };
     // the cage reads the base userland AND writes into `/nix` — proving the rw bind
     // through the wired path. The write succeeding is itself proof `/nix` is
@@ -577,6 +581,7 @@ fn the_cage_builds_a_fresh_derivation_offline_from_the_seeded_base() {
         bin_paths: &[],
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
     };
     let cmd = vec![
         userland.shell_bin.clone().into_os_string(),
@@ -746,6 +751,7 @@ fn the_cage_self_equips_a_nix_tool_via_mise() {
         bin_paths: &[],
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
     };
     let cmd = vec![
         userland.shell_bin.clone().into_os_string(),
@@ -876,6 +882,7 @@ fn a_mise_used_tool_is_activated_on_path_in_a_later_launch() {
             bin_paths: &[],
             timezone: DEFAULT_ZONE,
             fresh_release_tokens: &[],
+            ignored_mise_paths: &[],
         };
         let cmd = vec![
             userland.shell_bin.clone().into_os_string(),
@@ -1009,6 +1016,7 @@ fn a_global_app_cage_puts_both_mise_shims_dirs_on_path_and_splits_the_pool() {
         bin_paths: &[],
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
     };
     let nix_mount = NixMount {
         src: crate::store::physical_path(&layout, Path::new("/nix")),

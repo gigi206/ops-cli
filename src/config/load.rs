@@ -114,7 +114,7 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
         .as_ref()
         .map(|(_, _, files)| files.clone())
         .unwrap_or_default();
-    let mise = mise_status(cwd, project_state, mise_files, &mut warnings);
+    let (mise, mise_ignored) = mise_status(cwd, project_state, mise_files, &mut warnings);
 
     let mut resolved = resolve(
         global,
@@ -122,6 +122,7 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
         &plugins,
     );
     resolved.mise = mise;
+    resolved.mise_ignored = mise_ignored;
 
     // Attach each app's bundle notes to that app, so they surface wherever its own notes do.
     for (name, notes) in app_notes {
@@ -594,10 +595,10 @@ fn mise_status(
     project_state: Option<TrustState>,
     validated: trust::MiseInputs,
     warnings: &mut Vec<String>,
-) -> Option<MiseConfig> {
+) -> (Option<MiseConfig>, Vec<std::path::PathBuf>) {
     let files = trust::mise_files_for(&cwd.join(PROJECT_CONFIG));
     if files.is_empty() {
-        return None;
+        return (None, Vec::new());
     }
     // List every discovered file — all of them are folded into trust and would be
     // read together, so showing only the first would understate the gated surface.
@@ -608,11 +609,14 @@ fn mise_status(
         .collect::<Vec<_>>()
         .join(", ");
     match project_state {
-        Some(state) => Some(MiseConfig {
-            name,
-            state,
-            files: validated,
-        }),
+        Some(state) => (
+            Some(MiseConfig {
+                name,
+                state,
+                files: validated,
+            }),
+            Vec::new(),
+        ),
         None => {
             if !cwd.join(PROJECT_CONFIG).exists() {
                 warnings.push(format!(
@@ -620,7 +624,9 @@ fn mise_status(
                      which is missing — add one (it may be empty) to enable it"
                 ));
             }
-            None
+            // Returned rather than dropped: saying the file is ignored is not the same as making
+            // it inert, and the launcher needs the paths to tell the cage's own mise to skip them.
+            (None, files)
         }
     }
 }

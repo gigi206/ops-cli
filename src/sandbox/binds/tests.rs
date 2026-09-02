@@ -100,6 +100,7 @@ fn assembled_from(paths: &SandboxPaths) -> SandboxSpec {
         bin_paths: &[],
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
     };
     assemble(
         paths,
@@ -445,6 +446,7 @@ fn assemble_binds_a_device_after_the_minimal_dev() {
         bin_paths: &[],
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
     };
     let devices = [PathBuf::from("/dev/dri"), PathBuf::from("/dev/kvm")];
     let spec = assemble(
@@ -690,6 +692,7 @@ fn assemble_emits_launcher_extra_binds_after_the_structural_mounts() {
         bin_paths: &[],
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
     };
     let extra = [
         ExtraBind {
@@ -766,6 +769,7 @@ fn assemble_with_zone(
         bin_paths: extra_bin_paths,
         timezone: zone,
         fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
     };
     assemble(
         &paths,
@@ -1079,6 +1083,7 @@ fn build_spec_refuses_an_open_pin_parent_the_cage_pointed_out_of_the_home() {
         bin_paths: &[],
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
     };
     let err = build_spec(
         data.path(),
@@ -1346,6 +1351,7 @@ fn a_writable_nix_mount_is_a_read_write_bind_of_the_per_project_store() {
         bin_paths: &[],
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
     };
     let spec = assemble(
         &paths,
@@ -1553,7 +1559,7 @@ fn a_named_package_lifts_the_freshness_delay_and_an_unnamed_cage_carries_no_sett
     // default in place, which is what almost every cage wants.
     assert_eq!(
         get(
-            &mise_env(false, false, &[]),
+            &mise_env(false, false, &[], &[]),
             "MISE_MINIMUM_RELEASE_AGE_EXCLUDES"
         ),
         None
@@ -1569,7 +1575,7 @@ fn a_named_package_lifts_the_freshness_delay_and_an_unnamed_cage_carries_no_sett
     ];
     assert_eq!(
         get(
-            &mise_env(false, false, &two),
+            &mise_env(false, false, &two, &[]),
             "MISE_MINIMUM_RELEASE_AGE_EXCLUDES"
         ),
         Some("npm:@ampcode/cli,npm:@deepseek-ai/dsh".to_string())
@@ -1577,10 +1583,52 @@ fn a_named_package_lifts_the_freshness_delay_and_an_unnamed_cage_carries_no_sett
     // The setting rides the ambient environment, so it reaches the equip and the roll alike
     // rather than only whichever script it was written beside.
     assert!(
-        mise_env(true, false, &two)
+        mise_env(true, false, &two, &[])
             .iter()
             .any(|(k, _)| k == "MISE_MINIMUM_RELEASE_AGE_EXCLUDES"),
         "the per-project primary cage must carry it too"
+    );
+}
+
+#[test]
+fn an_ignored_project_mise_file_is_named_to_the_cage_s_own_mise() {
+    use std::path::PathBuf;
+    let get = |env: &[(String, String)], k: &str| {
+        env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone())
+    };
+    // Absent, not empty: a project with nothing to skip leaves mise's own discovery alone.
+    assert_eq!(
+        get(
+            &mise_env(false, false, &[], &[]),
+            "MISE_IGNORED_CONFIG_PATHS"
+        ),
+        None
+    );
+    // Named by absolute path, because that is where the cage sees them: the project tree is
+    // bound at its real path, which is the path mise reports when it reads one of these files.
+    let files = [
+        PathBuf::from("/home/u/proj/mise.toml"),
+        PathBuf::from("/home/u/proj/.mise.toml"),
+    ];
+    assert_eq!(
+        get(
+            &mise_env(false, false, &[], &files),
+            "MISE_IGNORED_CONFIG_PATHS"
+        ),
+        Some("/home/u/proj/mise.toml:/home/u/proj/.mise.toml".to_string())
+    );
+    // A path carrying the separator cannot be named in such a list. It is dropped rather than
+    // joined: one file still read is a smaller failure than a list whose every entry is wrong.
+    let colon = [
+        PathBuf::from("/home/u/od:d/mise.toml"),
+        PathBuf::from("/home/u/proj/mise.toml"),
+    ];
+    assert_eq!(
+        get(
+            &mise_env(false, false, &[], &colon),
+            "MISE_IGNORED_CONFIG_PATHS"
+        ),
+        Some("/home/u/proj/mise.toml".to_string())
     );
 }
 
@@ -1594,7 +1642,7 @@ fn mise_env_moves_the_primary_and_adds_a_shared_fallback_for_a_global_app() {
         env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone())
     };
 
-    let single = mise_env(false, false, &[]);
+    let single = mise_env(false, false, &[], &[]);
     assert_eq!(
         get(&single, "MISE_DATA_DIR"),
         Some(format!("{SANDBOX_HOME}/{MISE_DATA_REL}"))
@@ -1604,7 +1652,7 @@ fn mise_env_moves_the_primary_and_adds_a_shared_fallback_for_a_global_app() {
         "a single-pool cage has no shared-install fallback"
     );
 
-    let split = mise_env(true, false, &[]);
+    let split = mise_env(true, false, &[], &[]);
     assert_eq!(
         get(&split, "MISE_DATA_DIR"),
         Some(MISE_PROJECT_INCAGE.to_string()),
@@ -1633,7 +1681,7 @@ fn a_btrfs_backed_store_makes_in_cage_nix_ignore_the_compression_attribute() {
     // The flag adds the ignore line; elsewhere the attribute cannot exist and the
     // line stays out.
     let nix_config = |on_btrfs: bool| {
-        mise_env(false, on_btrfs, &[])
+        mise_env(false, on_btrfs, &[], &[])
             .into_iter()
             .find(|(k, _)| k == "NIX_CONFIG")
             .map(|(_, v)| v)
@@ -1730,6 +1778,7 @@ fn assemble_binds_the_per_project_mise_pool_and_puts_both_shims_on_path() {
         bin_paths: &[],
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
     };
     let spec = assemble(
         &paths,
@@ -1829,6 +1878,7 @@ fn build_spec_registers_the_nix_plugin_under_both_pools_for_a_global_app() {
         bin_paths: &[],
         timezone: DEFAULT_ZONE,
         fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
     };
     let spec = build_spec(
         data.path(),
