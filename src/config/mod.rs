@@ -2065,7 +2065,9 @@ fn resolve(
                 let mut names: Vec<&str> = proj.plugin.keys().map(String::as_str).collect();
                 names.sort_unstable();
                 warnings.push(format!(
-                    "{PROJECT_CONFIG}: ignoring `[plugin.*]` ({}) — it can provision a program                      and set the environment of a host-side resolver, so it is honored only from                      a trusted project (`sbx trust`)",
+                    "{PROJECT_CONFIG}: ignoring `[plugin.*]` ({}) — it can provision a \
+                     program and set the environment of a host-side resolver, so it is \
+                     honored only from a trusted project (`sbx trust`)",
                     names.join(", ")
                 ));
             }
