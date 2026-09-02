@@ -959,7 +959,11 @@ fn upgrade_mise_engine(
     cfg: &config::Resolved,
     pal: &style::Palette,
 ) -> bool {
-    let target = store::LockTarget::engine(layout, cfg.nixpkgs_global.as_deref());
+    let target = store::LockTarget::engine(
+        layout,
+        cfg.mise_engine.as_deref(),
+        cfg.nixpkgs_global.as_deref(),
+    );
     let upgrade = match target.refresh(nix, layout) {
         Ok(u) => u,
         Err(e) => {
@@ -2359,6 +2363,7 @@ mod tests {
             service: Default::default(),
             provisions: Default::default(),
             nixpkgs_global: Some(global.to_string()),
+            mise_engine: None,
             nixpkgs_project: None,
             mise: None,
             mise_ignored: Vec::new(),

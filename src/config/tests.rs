@@ -102,6 +102,7 @@ fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
         appimage: BTreeMap::new(),
         binary: BTreeMap::new(),
         nixpkgs: None,
+        mise: None,
         network: None,
         gui: None,
         gpu: None,
@@ -6239,6 +6240,83 @@ fn package_name_and_attribute_validators() {
     }
     for t in ["", "a b", "a$b", "a\"b", "a;b", "a\0b"] {
         assert!(!is_valid_mise_token(t), "{t} should be rejected");
+    }
+}
+
+#[test]
+fn a_global_mise_engine_reaches_the_resolved_config_and_a_project_never_does() {
+    const REV: &str = "3e0ce8c5d4a1b0c2e5f7a9b1d3c5e7f9a1b3c5d7";
+    let engine = |source: &str| RawConfig {
+        mise: Some(crate::config::schema::RawMise {
+            engine: Some(source.to_string()),
+            ..Default::default()
+        }),
+        ..RawConfig::default()
+    };
+    // The whole point of the field: the global layer sets it and it survives resolution. The
+    // unit tests around it check the pieces; this one checks that they are joined.
+    let pinned = format!("github:jdx/mise/{REV}#default");
+    let r = resolve_no_plugins(engine(&pinned), None);
+    assert_eq!(r.mise_engine.as_deref(), Some(pinned.as_str()));
+    // Unset leaves the engine following the global nixpkgs source, which is what a config
+    // without the table has always done.
+    assert_eq!(
+        resolve_no_plugins(RawConfig::default(), None).mise_engine,
+        None
+    );
+    // Global-only: a project's `[mise]` is not read, trusted or not, because the engine installs
+    // the tools of every app in every project.
+    for state in [TrustState::Trusted, TrustState::Untrusted] {
+        let r = resolve_no_plugins(RawConfig::default(), Some((engine("nixos-23.11"), state)));
+        assert_eq!(
+            r.mise_engine, None,
+            "a {state:?} project must not set the engine"
+        );
+    }
+    // A malformed source is dropped with a warning rather than reaching nix.
+    let r = resolve_no_plugins(engine("github:jdx/mise/main"), None);
+    assert_eq!(r.mise_engine, None);
+    assert!(
+        r.warnings.iter().any(|w| w.contains("[mise] engine")),
+        "the refusal must say which field it dropped: {:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn the_mise_engine_source_accepts_three_spellings_and_refuses_a_movable_name() {
+    const REV: &str = "3e0ce8c5d4a1b0c2e5f7a9b1d3c5e7f9a1b3c5d7";
+    for good in [
+        // A tracked channel, resolved through the engine's lock like the global one.
+        "nixos-unstable",
+        "nixos-23.11",
+        // A frozen nixpkgs pin, bare or spelled out.
+        REV,
+        &format!("github:NixOS/nixpkgs/{REV}"),
+        // Any flake that builds a mise, with the attribute written when it is not nixpkgs'.
+        &format!("github:jdx/mise/{REV}"),
+        &format!("github:jdx/mise/{REV}#default"),
+    ] {
+        assert!(is_valid_mise_engine(good), "{good} should be accepted");
+    }
+    for bad in [
+        // A name in a reference position is refused on purpose: it can be moved under you, and
+        // this field names the program that installs every other program.
+        "github:jdx/mise/v2026.9.1",
+        "github:jdx/mise/main",
+        // A revision that is not one.
+        &format!("github:jdx/mise/{}", &REV[..39]),
+        // Shapes this field does not admit, however valid they may be as flake references.
+        "git+https://example.com/mise",
+        &format!("gitlab:jdx/mise/{REV}"),
+        &format!("github:jdx/{REV}"),
+        &format!("github:jdx/mise/{REV}/extra"),
+        // An attribute that is not a plain identifier, or is empty.
+        &format!("github:jdx/mise/{REV}#"),
+        &format!("github:jdx/mise/{REV}#legacyPackages.x86_64-linux.mise"),
+        "",
+    ] {
+        assert!(!is_valid_mise_engine(bad), "{bad} should be refused");
     }
 }
 

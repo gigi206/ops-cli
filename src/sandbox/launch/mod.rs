@@ -897,14 +897,18 @@ fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, Ex
     // on first use (no network, and a binary update never bumps the engine — see
     // `resolve_engine_ref`). Threaded to both mise consumers: the in-cage engine (the base
     // userland) and the host-side `[env]` driver.
-    let engine_ref =
-        match crate::store::resolve_engine_ref(&nix, &layout, cfg.nixpkgs_global.as_deref()) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("sbx: cannot resolve the mise engine channel: {e}");
-                return Err(ExitCode::FAILURE);
-            }
-        };
+    let engine_ref = match crate::store::resolve_engine_ref(
+        &nix,
+        &layout,
+        cfg.mise_engine.as_deref(),
+        cfg.nixpkgs_global.as_deref(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("sbx: cannot resolve the mise engine channel: {e}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
     let userland = match super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &engine_ref) {
         Ok(u) => u,
         Err(e) => {

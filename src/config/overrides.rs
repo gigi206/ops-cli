@@ -487,6 +487,9 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
         // override never carries them, so there is nothing here for an ambient value to have set.
         app: _,
         bundle: _,
+        // The engine that installs every `mise:` tool: global-only by construction,
+        // so neither a project layer nor a one-shot override redirects it.
+        mise: _,
         flakes: _,
         tarball: _,
         deb: _,
@@ -586,6 +589,9 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
         // resolver command, and a declared operation are all vetted where they are read and listed,
         // not assembled on a command line for one launch. `rest` is the unknown-key bag, reported
         // per blob in `collect_from` before this merge, since nothing downstream would see it.
+        // The engine that installs every `mise:` tool: global-only by construction,
+        // so neither a project layer nor a one-shot override redirects it.
+        mise: _,
         flakes: _,
         tarball: _,
         deb: _,

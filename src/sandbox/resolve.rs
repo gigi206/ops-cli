@@ -82,8 +82,13 @@ impl UpgradeCage {
             .ok()?
             .resolve(nix, layout)
             .ok()?;
-        let engine_ref =
-            crate::store::resolve_engine_ref(nix, layout, cfg.nixpkgs_global.as_deref()).ok()?;
+        let engine_ref = crate::store::resolve_engine_ref(
+            nix,
+            layout,
+            cfg.mise_engine.as_deref(),
+            cfg.nixpkgs_global.as_deref(),
+        )
+        .ok()?;
         let userland = super::fhs::resolve_userland(nix, layout, &nixpkgs, &engine_ref).ok()?;
         let mut bins = userland.bin_paths.clone();
         // The project's baseline `[packages]` bins, so a resolve command using e.g. `jq` finds it

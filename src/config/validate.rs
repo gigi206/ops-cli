@@ -234,6 +234,27 @@ pub(super) fn validate_nixpkgs(
     }
 }
 
+/// Validate a `[mise] engine` source, warning on anything [`super::is_valid_mise_engine`] refuses.
+///
+/// `None` leaves the engine following the global `nixpkgs` source, which is the behaviour a config
+/// without the field gets: a malformed value must not strand the engine, and it must not silently
+/// select something other than what was written either.
+pub(super) fn validate_mise_engine(
+    warnings: &mut Vec<String>,
+    source_label: &str,
+    value: String,
+) -> Option<String> {
+    if super::is_valid_mise_engine(&value) {
+        Some(value)
+    } else {
+        warnings.push(format!(
+            "{source_label}: ignoring malformed `[mise] engine` source `{value}` — expected a \
+             channel, a 40-hex revision, or `github:<owner>/<repo>/<40-hex revision>[#<attr>]`"
+        ));
+        None
+    }
+}
+
 /// Validate a `gui` posture string into [`GuiPolicy`], warning on anything unrecognized. A
 /// typo must never silently leave the GUI in the wrong posture; returning `None` keeps the
 /// prior (default or global) posture rather than guessing. There is intentionally no `x11`

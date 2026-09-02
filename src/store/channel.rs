@@ -109,8 +109,18 @@ impl LockTarget {
     /// free of the one-channel rule that binds the base to its pin), but pins it in a
     /// dedicated lock so `sbx upgrade mise` advances the engine independently of the base
     /// channel that `sbx upgrade nix` rolls.
-    pub(crate) fn engine(layout: &Layout, override_source: Option<&str>) -> Self {
-        let (source, origin) = global_source(override_source);
+    pub(crate) fn engine(
+        layout: &Layout,
+        engine_source: Option<&str>,
+        global_override: Option<&str>,
+    ) -> Self {
+        // `[mise] engine` wins; with none, the engine tracks the global source exactly as it did
+        // before the field existed. The lock has always been its own, so only the *source* is
+        // being separated here — the revisions already rolled forward independently.
+        let (source, origin) = match engine_source {
+            Some(s) => (s.to_string(), Origin::Global),
+            None => global_source(global_override),
+        };
         Self {
             source,
             lock_path: engine_lock_path(layout),
@@ -338,15 +348,42 @@ pub(crate) fn live_mise_revisions(layout: &Layout) -> BTreeSet<String> {
 pub(crate) fn resolve_engine_ref(
     nix: &Path,
     layout: &Layout,
+    engine_source: Option<&str>,
     global_override: Option<&str>,
 ) -> io::Result<String> {
-    LockTarget::engine(layout, global_override).resolve(nix, layout)
+    LockTarget::engine(layout, engine_source, global_override).resolve(nix, layout)
 }
 
 /// Whether a source is itself a fixed 40-hex revision (a frozen pin that an upgrade
 /// can never roll), as opposed to a branch/channel that tracks new revisions.
 pub(crate) fn is_pinned_revision(source: &str) -> bool {
-    valid_revision(source).is_some()
+    valid_revision(source).is_some() || whole_reference(source).is_some()
+}
+
+/// The revision a source carries when the source is a **whole flake reference** rather than a
+/// nixpkgs channel or bare revision — `github:<owner>/<repo>/<rev>`, optionally `#<attr>`.
+///
+/// Only the `[mise] engine` field produces these, and only in its revision-pinned spellings, so
+/// there is nothing to resolve: the reference is already the pin. Returning the revision lets the
+/// rest of this module go on keying its locks and gcroots by one, without teaching any of them a
+/// second shape. `None` for a channel or a bare revision, which take the nixpkgs path.
+fn whole_reference(source: &str) -> Option<&str> {
+    let reference = source.split_once('#').map_or(source, |(r, _)| r);
+    let rev = reference.strip_prefix("github:")?.rsplit('/').next()?;
+    valid_revision(rev).is_some().then_some(rev)
+}
+
+/// The flake reference a `(source, revision)` pair names.
+///
+/// A whole reference is handed back as written: it already carries its owner, its repository, its
+/// revision and — where it differs from the default — its attribute, none of which a
+/// `github:NixOS/nixpkgs/<rev>` rebuild could recover. Everything else is a nixpkgs source, whose
+/// reference is that prefix and the revision the lock resolved.
+fn flake_ref(source: &str, revision: &str) -> String {
+    match whole_reference(source) {
+        Some(_) => source.to_string(),
+        None => format!("{NIXPKGS_FLAKE_PREFIX}{revision}"),
+    }
 }
 
 /// The outcome of forcing a channel to re-resolve: the source asked for, the
@@ -368,7 +405,11 @@ pub(crate) struct Upgrade {
 /// userland), so two launches on the same revision share it and a rolled channel
 /// gets its own.
 pub(crate) fn revision_of(flake_ref: &str) -> &str {
-    flake_ref.rsplit('/').next().unwrap_or(flake_ref)
+    // The attribute, where one is written, is not part of the revision: `#default` and `#mise` on
+    // one revision are two builds of the same source, and a key carrying it would spell a path
+    // segment out of a value the config chose.
+    let reference = flake_ref.split_once('#').map_or(flake_ref, |(r, _)| r);
+    reference.rsplit('/').next().unwrap_or(reference)
 }
 
 /// Resolve `source` (a branch/channel or a 40-hex revision under `NixOS/nixpkgs`) to
@@ -394,18 +435,18 @@ fn resolve_ref(
     if let Some((locked_source, locked_rev)) = read_lock(lock_path)
         && locked_source == source
     {
-        return Ok(format!("{NIXPKGS_FLAKE_PREFIX}{locked_rev}"));
+        return Ok(flake_ref(source, &locked_rev));
     }
     if let Some(seed) = seed_from
         && let Some((seed_source, seed_rev)) = read_lock(seed)
         && seed_source == source
     {
         write_lock(lock_path, source, &seed_rev)?;
-        return Ok(format!("{NIXPKGS_FLAKE_PREFIX}{seed_rev}"));
+        return Ok(flake_ref(source, &seed_rev));
     }
     let rev = resolve_source_rev(nix, layout, source, false)?;
     write_lock(lock_path, source, &rev)?;
-    Ok(format!("{NIXPKGS_FLAKE_PREFIX}{rev}"))
+    Ok(flake_ref(source, &rev))
 }
 
 /// Force a fresh resolution of `source`, ignoring any matching lock, and rewrite
@@ -440,6 +481,11 @@ fn resolve_source_rev(
     source: &str,
     fresh: bool,
 ) -> io::Result<String> {
+    // A whole reference is its own pin: there is no channel behind it to ask, and asking GitHub
+    // what a revision resolves to would only echo it back.
+    if let Some(rev) = whole_reference(source) {
+        return Ok(rev.to_string());
+    }
     if let Some(rev) = valid_revision(source) {
         // Witnessed here and not below: a pinned revision is opaque, and nothing about the name it
         // was written under says it belongs to nixpkgs. The branch form needs no witness, and
@@ -957,14 +1003,14 @@ mod tests {
         // the engine tracks the same source as the global channel (default, or a global
         // override) but pins it in its OWN lock — never the shared nixpkgs.lock — so the
         // two roll forward independently.
-        let engine = LockTarget::engine(&layout, None);
+        let engine = LockTarget::engine(&layout, None, None);
         assert_eq!(engine.source(), DEFAULT_SOURCE);
         assert_eq!(engine.origin(), Origin::Default);
         assert_eq!(
             engine.lock_path,
             PathBuf::from("/data/sbx/mise-engine.lock")
         );
-        let engine_over = LockTarget::engine(&layout, Some("nixos-23.11"));
+        let engine_over = LockTarget::engine(&layout, None, Some("nixos-23.11"));
         assert_eq!(engine_over.source(), "nixos-23.11");
         assert_eq!(engine_over.origin(), Origin::Global);
         assert_eq!(
@@ -1101,7 +1147,7 @@ mod tests {
         // no mise-engine.lock yet
         assert!(!layout.data_dir().join(MISE_ENGINE_LOCK).exists());
 
-        let got = resolve_engine_ref(Path::new(BOGUS_NIX), &layout, None)
+        let got = resolve_engine_ref(Path::new(BOGUS_NIX), &layout, None, None)
             .expect("engine seeds from the global lock with no nix");
         assert_eq!(got, format!("{NIXPKGS_FLAKE_PREFIX}{REV}"));
         // it recorded the seed in the engine's own lock, so later launches reuse it
@@ -1111,7 +1157,7 @@ mod tests {
         );
         // a second resolution now reuses the engine lock directly (still no nix)
         assert_eq!(
-            resolve_engine_ref(Path::new(BOGUS_NIX), &layout, None).unwrap(),
+            resolve_engine_ref(Path::new(BOGUS_NIX), &layout, None, None).unwrap(),
             format!("{NIXPKGS_FLAKE_PREFIX}{REV}")
         );
     }
@@ -1124,7 +1170,7 @@ mod tests {
         let base = TmpDir::new();
         let layout = Layout::under(&base.join("sbx"));
         std::fs::create_dir_all(layout.data_dir()).unwrap();
-        assert!(resolve_engine_ref(Path::new(BOGUS_NIX), &layout, None).is_err());
+        assert!(resolve_engine_ref(Path::new(BOGUS_NIX), &layout, None, None).is_err());
     }
 
     #[test]
@@ -1241,7 +1287,7 @@ mod tests {
         }
 
         // The engine rides its own keep-set, for the same reason and with the same failure.
-        let engine = LockTarget::engine(&layout, None);
+        let engine = LockTarget::engine(&layout, None, None);
         let engine_rev = "4444444444444444444444444444444444444444";
         write_lock(&engine.lock_path, engine.source(), engine_rev).unwrap();
         assert!(
@@ -1293,5 +1339,52 @@ mod tests {
         assert!(is_pinned_revision(REV));
         assert!(!is_pinned_revision("nixos-unstable"));
         assert!(!is_pinned_revision("nixos-23.11"));
+    }
+
+    #[test]
+    fn a_whole_reference_is_its_own_pin_and_keeps_its_attribute() {
+        // A nixpkgs source names no repository, so the reference is rebuilt around the revision
+        // the lock resolved.
+        assert_eq!(whole_reference("nixos-unstable"), None);
+        assert_eq!(whole_reference(REV), None);
+        assert_eq!(
+            flake_ref("nixos-unstable", REV),
+            format!("{NIXPKGS_FLAKE_PREFIX}{REV}")
+        );
+
+        // A whole reference carries owner, repository, revision and attribute, none of which that
+        // rebuild could recover, so it is handed back exactly as written.
+        let upstream = format!("github:jdx/mise/{REV}#default");
+        assert_eq!(whole_reference(&upstream), Some(REV));
+        assert_eq!(flake_ref(&upstream, REV), upstream);
+        assert!(is_pinned_revision(&upstream));
+
+        // The attribute is not part of the revision: two attributes of one revision are two
+        // builds of the same source, and the key must not spell one out of the other.
+        assert_eq!(revision_of(&upstream), REV);
+        assert_eq!(revision_of(&format!("github:jdx/mise/{REV}")), REV);
+        assert_eq!(revision_of(&format!("{NIXPKGS_FLAKE_PREFIX}{REV}")), REV);
+    }
+
+    #[test]
+    fn the_engine_takes_its_own_source_and_falls_back_to_the_global_one() {
+        let base = TmpDir::new();
+        let layout = Layout::under(base.path());
+        // With none of its own it tracks the global source, which is what happened before the
+        // field existed; the lock it writes to is its own either way.
+        assert_eq!(
+            LockTarget::engine(&layout, None, Some("nixos-23.11")).source,
+            "nixos-23.11"
+        );
+        assert_eq!(
+            LockTarget::engine(&layout, None, None).source,
+            DEFAULT_SOURCE
+        );
+        // Its own wins, and does not disturb the global channel's target.
+        let own = format!("github:jdx/mise/{REV}#default");
+        let engine = LockTarget::engine(&layout, Some(&own), Some("nixos-23.11"));
+        assert_eq!(engine.source, own);
+        assert_eq!(engine.lock_path, engine_lock_path(&layout));
+        assert_ne!(engine.lock_path, global_lock_path(&layout));
     }
 }

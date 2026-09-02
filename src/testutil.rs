@@ -222,6 +222,7 @@ pub(crate) fn resolved(
         bind_layer: Default::default(),
         packages,
         nixpkgs_global: None,
+        mise_engine: None,
         nixpkgs_project: None,
         mise: None,
         mise_ignored: Vec::new(),

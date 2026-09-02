@@ -1338,7 +1338,11 @@ fn nixpkgs_channel(cwd: &Path, resolved: &Resolved, app: Option<&str>) -> Channe
 /// Best-effort like [`nixpkgs_channel`].
 fn engine_channel(resolved: &Resolved) -> ChannelView {
     if let Some(layout) = store::Layout::from_env() {
-        let target = store::LockTarget::engine(&layout, resolved.nixpkgs_global.as_deref());
+        let target = store::LockTarget::engine(
+            &layout,
+            resolved.mise_engine.as_deref(),
+            resolved.nixpkgs_global.as_deref(),
+        );
         return ChannelView {
             source: target.source().to_string(),
             origin: target.origin().label().to_string(),
@@ -2511,6 +2515,7 @@ mod tests {
             service: Default::default(),
             provisions: Default::default(),
             nixpkgs_global: None,
+            mise_engine: None,
             nixpkgs_project: None,
             mise: None,
             mise_ignored: Vec::new(),

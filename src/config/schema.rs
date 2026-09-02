@@ -134,6 +134,8 @@ pub(crate) struct RawConfig {
     /// — honored from the global config or a trusted project, ignored from an
     /// untrusted one (the source is a supply-chain-relevant choice).
     pub(crate) nixpkgs: Option<String>,
+    /// The `[mise]` table: which build of the mise engine provisions the cage's tools.
+    pub(crate) mise: Option<RawMise>,
     /// The sandbox's network posture. Either a simple string — `"none"` (a fresh, empty
     /// network namespace), `"shared"` (the host network), `"deny"`
     /// (filtered egress, deny-by-default — only the built-in hosts reach, and the posture a config
@@ -687,6 +689,38 @@ pub(crate) struct RawRedact {
     /// floor; `0` is refused (a zero-length needle matches at every offset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) min_len: Option<u64>,
+    /// Unknown keys in this table, kept so they can be reported.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
+}
+
+/// The `[mise]` table: which build of the mise engine sbx provisions.
+///
+/// The engine already pins its revision in a lock of its own, separate from the global channel's,
+/// so the two roll forward independently. What this table adds is the other half of that
+/// separation: the *source* the engine's lock tracks, which until now was the global one.
+///
+/// Global-only, like `[bundle]`. The engine is what installs every `mise:` tool in every cage, so
+/// choosing its build is infrastructure rather than a project's business, and a project — trusted
+/// or not — does not get to redirect it.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RawMise {
+    /// Where the engine comes from. Unset follows the global `nixpkgs` source, which is the
+    /// behaviour that predates this table. Three spellings are accepted, and
+    /// `config::is_valid_mise_engine` is where each is checked:
+    ///
+    /// * a channel or branch (`nixos-unstable`) — tracked, and rolled by `sbx upgrade mise`;
+    /// * a bare 40-hex revision, or `github:NixOS/nixpkgs/<rev>` — a frozen nixpkgs pin;
+    /// * `github:<owner>/<repo>/<rev>#<attr>` — any flake that builds a mise, upstream's own
+    ///   included. The attribute defaults to `mise` (what nixpkgs calls it) and is written out
+    ///   when it differs (`#default`, in jdx's flake).
+    ///
+    /// The last two forms carry a revision because they *are* the pin: nothing resolves them, so
+    /// `sbx upgrade mise` reports them frozen and the way to move one is to edit it here. A
+    /// mutable tag is refused for the reason the nixpkgs pin refuses one — a name can be moved
+    /// under you, and this names the program that installs every other program.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) engine: Option<String>,
     /// Unknown keys in this table, kept so they can be reported.
     #[serde(flatten)]
     pub(crate) rest: BTreeMap<String, RawIgnored>,
@@ -2663,6 +2697,23 @@ mod tests {
         let cfg = parse(b"nixpkgs = \"nixos-23.11\"\n").unwrap();
         assert_eq!(cfg.nixpkgs.as_deref(), Some("nixos-23.11"));
         assert_eq!(parse(b"").unwrap().nixpkgs, None);
+    }
+
+    #[test]
+    fn parses_the_mise_engine_and_keeps_an_unknown_key_of_its_table() {
+        let cfg = parse(b"[mise]\nengine = \"nixos-23.11\"\n").unwrap();
+        let mise = cfg.mise.expect("the table parses");
+        assert_eq!(mise.engine.as_deref(), Some("nixos-23.11"));
+        assert!(mise.rest.is_empty());
+        // Absent table and absent key are both `None`, so a config without one behaves as it did
+        // before the field existed.
+        assert!(parse(b"").unwrap().mise.is_none());
+        assert!(parse(b"[mise]\n").unwrap().mise.unwrap().engine.is_none());
+        // An unknown key inside the table is kept rather than dropped, so it can be reported.
+        let cfg = parse(b"[mise]\nengin = \"typo\"\n").unwrap();
+        let mise = cfg.mise.expect("the table parses");
+        assert!(mise.engine.is_none());
+        assert_eq!(mise.rest.keys().collect::<Vec<_>>(), vec!["engin"]);
     }
 
     #[test]

@@ -78,13 +78,22 @@ pub(crate) fn provision_engine(
     layout: &Layout,
     engine_ref: &str,
 ) -> io::Result<PathBuf> {
+    // The attribute rides the reference when it is not the one nixpkgs uses: `store::provision`
+    // builds `<reference>#<attr>`, so the two are split back apart here rather than handed over
+    // joined. `MISE_ATTR` is the default because that is what nixpkgs calls the package; a flake
+    // that calls it something else (`#default`, in mise's own) says so in the config.
+    let (reference, attr) = engine_ref
+        .split_once('#')
+        .unwrap_or((engine_ref, MISE_ATTR));
+    // Keyed by attribute as well as revision: two attributes of one revision are two builds, and
+    // sharing a gcroot between them would let either one's collection take the other's.
     let gcroot = layout
         .data_dir()
         .join("gcroots")
         .join("mise")
         .join(store::revision_of(engine_ref))
-        .join(MISE_ATTR);
-    store::provision(nix, layout, &gcroot, engine_ref, MISE_ATTR, MISE_BIN)
+        .join(attr);
+    store::provision(nix, layout, &gcroot, reference, attr, MISE_BIN)
 }
 
 /// The `mise` binary within an engine store root provisioned by [`provision_engine`].

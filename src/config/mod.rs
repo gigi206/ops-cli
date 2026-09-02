@@ -86,8 +86,8 @@ pub(crate) use tasks::check_value;
 use secrets::{validate_header_shape, validate_host_secret, validate_secret_target};
 use validate::{
     validate_device_path, validate_forward, validate_gui, validate_home_scope, validate_limits,
-    validate_network, validate_nixpkgs, validate_notify, validate_open, validate_proc,
-    validate_redact_min_len, validate_service, validate_timezone,
+    validate_mise_engine, validate_network, validate_nixpkgs, validate_notify, validate_open,
+    validate_proc, validate_redact_min_len, validate_service, validate_timezone,
 };
 // Exercised by a cross-cutting config unit test (profile merge + the shared `raw_app` builders).
 #[cfg(test)]
@@ -355,6 +355,14 @@ pub(crate) struct Resolved {
     /// the default channel. Drives the base userland and is the default source for a
     /// project's tools.
     pub(crate) nixpkgs_global: Option<String>,
+    /// The source the **mise engine** tracks, from the global `[mise] engine`. `None` follows
+    /// [`Resolved::nixpkgs_global`], which is what happened before the field existed.
+    ///
+    /// The engine's revision was already pinned in a lock of its own (`store::channel`), so the
+    /// engine and the base userland already rolled forward separately; this is the source half of
+    /// that separation, and it is what lets the engine track something the base userland does not
+    /// — a frozen nixpkgs, or a flake that is not nixpkgs at all.
+    pub(crate) mise_engine: Option<String>,
     /// A trusted project's `nixpkgs` override, or `None`. Pins *this project's* tools
     /// to its own source; an untrusted or changed project's value is dropped (it is a
     /// supply-chain-relevant choice), so this is never set from one.
@@ -806,6 +814,9 @@ impl Resolved {
             // them for the same reason: a declared operation is a program plus a credential, vetted
             // where it is read and listed, not assembled on a command line for one launch.
             nixpkgs: _,
+            // The engine that installs every `mise:` tool: global-only by construction,
+            // so neither a project layer nor a one-shot override redirects it.
+            mise: _,
             task: _,
             app: _,
             bundle: _,
@@ -1692,6 +1703,12 @@ fn resolve(
     let nixpkgs_global = global
         .nixpkgs
         .and_then(|v| validate_nixpkgs(&mut warnings, GLOBAL_CONFIG, v));
+    // Global-only, like `[bundle]`: the engine installs every `mise:` tool in every cage, so a
+    // project does not get to redirect it. The project layer's own `[mise]` is never read here.
+    let mise_engine = global
+        .mise
+        .and_then(|m| m.engine)
+        .and_then(|v| validate_mise_engine(&mut warnings, GLOBAL_CONFIG, v));
     // The network posture is trusted by location at the global layer; an invalid or
     // unset value falls back to the default (the deny-by-default allowlist). The origin is
     // recorded as `Global` only when the layer actually supplied a valid posture, so a `Default`
@@ -2481,6 +2498,7 @@ fn resolve(
         // Filled by `merge_app` when a launch is an app's; a project run carries none.
         provisions: Vec::new(),
         nixpkgs_global,
+        mise_engine,
         nixpkgs_project,
         // A mise file is discovered by I/O in `load`; the pure layering never sees one.
         mise: None,
@@ -3652,6 +3670,46 @@ fn is_valid_nixpkgs_source(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+}
+
+/// Whether `s` names a build of the mise engine: a nixpkgs source, or a **revision-pinned**
+/// GitHub flake reference with an optional `#<attr>`.
+///
+/// Deliberately narrower than the `tools::is_valid_flake_ref` gate, and for a different reason
+/// guards. This value selects the program that installs every other program in every cage, so the
+/// shapes it admits are enumerated rather than filtered: `github:<owner>/<repo>/<40-hex>` and
+/// nothing looser. A branch or tag in this position is refused — not because it could not be
+/// fetched, but because a name can be moved under you, and the whole point of the engine's lock is
+/// that its revision is fixed until someone changes it on purpose. `nixos-unstable` stays legal in
+/// its own right: it is a *tracked channel*, resolved through the lock and rolled only by
+/// `sbx upgrade mise`, which is a different thing from a reference that pretends to be pinned.
+fn is_valid_mise_engine(s: &str) -> bool {
+    if is_valid_nixpkgs_source(s) {
+        return true;
+    }
+    let (reference, attr) = s.split_once('#').map_or((s, None), |(r, a)| (r, Some(a)));
+    // An attribute, when written, is a plain nix identifier — no path, no quoting to interpret.
+    if attr.is_some_and(|a| {
+        a.is_empty()
+            || !a
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    }) {
+        return false;
+    }
+    let Some(rest) = reference.strip_prefix("github:") else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    let [owner, repo, rev] = parts[..] else {
+        return false;
+    };
+    let ident = |p: &str| {
+        !p.is_empty()
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+    };
+    ident(owner) && ident(repo) && rev.len() == 40 && rev.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// An env key usable with `--setenv`: non-empty, and free of `=` and control

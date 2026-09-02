@@ -75,6 +75,67 @@ Changing the *source* (e.g. `nixos-23.11` → `nixos-24.05`) re-resolves; an unc
 source stays fixed. A first launch of a pinned project downloads its own base closure
 (only pinned projects pay this).
 
+## `[mise] engine`: the engine's own source
+
+The **mise engine** is the program that installs every `mise:` tool in every cage. Its
+revision has always been pinned in a lock of its own, `<data>/mise-engine.lock`, separate
+from the channel lock above, so `sbx upgrade mise` and `sbx upgrade nix` move different
+things. What that lock tracked, until this field existed, was still the global `nixpkgs`
+source: the two rolled apart but could not point apart.
+
+`[mise] engine` is the other half of that separation.
+
+```toml
+[mise]
+engine = "nixos-unstable"                        # a channel: tracked, rolled by `sbx upgrade mise`
+# engine = "github:NixOS/nixpkgs/<40-hex rev>"   # a frozen nixpkgs, independent of the global pin
+# engine = "github:jdx/mise/<40-hex rev>#default"  # any flake that builds a mise, upstream's own included
+```
+
+Unset, the engine follows the global `nixpkgs` source, which is what happens without the
+table at all.
+
+`[mise] engine` is a **security field, honored only from the global config**. Unlike
+`nixpkgs`, a trusted project does not get one: the engine installs the tools of every app
+in every project, so which build of it runs is infrastructure rather than a project's
+business.
+
+### What it accepts
+
+- A **channel** (`nixos-unstable`): tracked through the engine's lock, and advanced by
+  `sbx upgrade mise` like the global channel is by `sbx upgrade nix`.
+- A **40-hex revision**, bare or spelled `github:NixOS/nixpkgs/<rev>`: a frozen nixpkgs
+  pin that no upgrade rolls.
+- A **flake reference**, `github:<owner>/<repo>/<rev>`, with an optional `#<attr>`. The
+  attribute defaults to `mise`, which is what nixpkgs calls the package; mise's own flake
+  calls it `default`, so that form writes it out.
+
+The last two forms carry a revision because they *are* the pin. Nothing resolves them, so
+`sbx upgrade mise` reports them frozen and the way to move one is to edit it here. A
+branch or a tag is refused in that position on purpose: a name can be moved under you, and
+this one names the program that installs every other program.
+
+### Reaching past nixpkgs
+
+The reason the flake form exists: nixpkgs packages mise on its own schedule, and that
+schedule can fall behind upstream. Everything a `mise:` package installs is fetched
+upstream-direct precisely so it does not wait on a packager (see
+[`packages`](packages#mise-a-mise-backend)); the engine doing that fetching was the one
+component still waiting. Pointing it at `github:jdx/mise/<rev>#default` builds upstream's
+own derivation, from source, at a revision you chose.
+
+What it costs, and it is not nothing: that flake carries its own inputs, so a second
+nixpkgs enters your store, and mise is compiled rather than substituted from
+`cache.nixos.org`. Staying on the nixpkgs attribute keeps the binary cache and the review
+that comes with a distribution package. Reach for the flake form when nixpkgs is behind
+something you need, not by default.
+
+### Seeing and rolling it
+
+`sbx config show` prints the engine beside the channel, with the origin of each.
+`sbx upgrade mise` reports the engine on its own line: rolled forward for a channel,
+unchanged for a revision, and frozen for a reference that carries its own.
+
 ## Rolling a channel forward
 
 A **channel** pin (`nixos-23.11`) advances *within itself* only via `sbx upgrade` run
