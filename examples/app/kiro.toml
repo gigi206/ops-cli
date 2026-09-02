@@ -15,6 +15,7 @@
 #
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/chromium-background.toml
+#     sbx net groups import examples/net-groups/google-signin-incage.toml
 #
 # Kiro CLI is a **native glibc terminal program** (a Rust TUI: kiro-cli + kiro-cli-chat +
 # kiro-cli-term) — NOT an Electron/Chromium app. It runs like any other CLI in the cage; the

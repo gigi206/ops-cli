@@ -1291,3 +1291,105 @@ fn every_shipped_profile_resolves_the_egress_groups_it_references() {
         "expected the shipped profiles to be checked, saw {checked}"
     );
 }
+
+#[test]
+fn a_profile_header_that_lists_egress_groups_lists_every_one_it_needs() {
+    // A header block that enumerates `sbx net groups import` lines reads as the set of fragments
+    // to import before the app runs: a reader follows it, imports what it names, and is warned at
+    // import time about the group it was not told to import — the lane is then silently narrower
+    // than the profile claims. Most profiles enumerate nothing, make no such claim, and are left
+    // alone here: the bundle header is where the list lives, and every shipped bundle carries a
+    // complete one. The obligation is on the profile that chooses to restate it.
+    //
+    // Only the LEADING comment block counts, and that is the contract asserted rather than an
+    // accident of the current tree. An import instruction written further down sits beside the
+    // rule it enables and speaks for that rule alone — hermes points at `openrouter.toml` next to
+    // a commented-out, optional `@openrouter` — so it promises nothing about the rest. A group
+    // named in a mid-file comment is therefore not read as part of any list.
+    //
+    // One direction only: everything referenced must be named. The reverse (a header naming a
+    // group nothing references) is not asserted, because a header may legitimately name the
+    // fragment an optional, commented-out rule would need.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut enumerating = 0;
+    let mut missing: Vec<String> = Vec::new();
+
+    for entry in std::fs::read_dir(root.join("examples/app"))
+        .expect("examples/app/ dir exists")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+        let text = std::fs::read_to_string(&path).expect("read the profile");
+
+        // The header block: everything up to the first line that is neither blank nor a comment.
+        let declared: std::collections::BTreeSet<String> = text
+            .lines()
+            .take_while(|l| {
+                let t = l.trim_start();
+                t.is_empty() || t.starts_with('#')
+            })
+            .filter_map(|l| l.split_once("examples/net-groups/"))
+            .filter_map(|(_, rest)| rest.split_once(".toml"))
+            .map(|(group, _)| group.to_string())
+            .collect();
+        if declared.is_empty() {
+            continue;
+        }
+        enumerating += 1;
+
+        // What the launch actually resolves: the profile's own group references plus those of
+        // every bundle it names, which is what `sbx app import` warns about when one is undefined.
+        let profile = schema::parse_app(&std::fs::read(&path).expect("read the profile")).unwrap();
+        let mut required: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        if let Some(schema::NetworkField::Table(t)) = &profile.network {
+            for list in [&t.allow, &t.deny, &t.mute] {
+                for rule in list {
+                    if let Some(group) = rule.strip_prefix('@') {
+                        required.insert(group.to_string());
+                    }
+                }
+            }
+        }
+        for used in &profile.uses {
+            let bundle_path = root.join(format!("examples/bundle/{used}.toml"));
+            let raw = schema::parse(&std::fs::read(&bundle_path).unwrap_or_else(|e| {
+                panic!("`examples/app/{name}.toml` names the bundle `{used}`: {e}")
+            }))
+            .unwrap();
+            let bundle = raw
+                .bundle
+                .get(used)
+                .unwrap_or_else(|| panic!("`{used}.toml` must declare `[bundle.{used}]`"));
+            for list in [&bundle.allow, &bundle.deny, &bundle.mute] {
+                for rule in list {
+                    if let Some(group) = rule.strip_prefix('@') {
+                        required.insert(group.to_string());
+                    }
+                }
+            }
+        }
+
+        for group in required.difference(&declared) {
+            missing.push(format!(
+                "`examples/app/{name}.toml` lists egress groups in its header but not @{group}, \
+                 which it reaches through its own rules or its bundle — add `sbx net groups \
+                 import examples/net-groups/{group}.toml` to that block"
+            ));
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "{} header(s) name an incomplete set of egress groups:\n{}",
+        missing.len(),
+        missing.join("\n")
+    );
+    assert!(
+        enumerating >= 15,
+        "expected the enumerating profiles to be checked, saw {enumerating}"
+    );
+}

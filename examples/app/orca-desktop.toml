@@ -9,6 +9,8 @@
 # BUNDLE, so import it too:
 #     sbx bundle import    examples/bundle/opencode.toml
 #     sbx net groups import examples/net-groups/npm-runtime.toml
+#     sbx net groups import examples/net-groups/npm-registry.toml
+#     sbx net groups import examples/net-groups/models-catalog.toml
 #     sbx app import       examples/app/orca-desktop.toml
 # One extra step, and it buys the thing that was actually broken here: a hand-copy of an agent's
 # requirements silently falls behind the agent.

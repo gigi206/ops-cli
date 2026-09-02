@@ -16,6 +16,7 @@
 #     sbx net groups import examples/net-groups/npm-audit.toml
 #     sbx net groups import examples/net-groups/models-catalog.toml
 #     sbx net groups import examples/net-groups/chromium-background.toml
+#     sbx net groups import examples/net-groups/google-signin-incage.toml
 #
 # A third way to run Hermes alongside `sbx app run hermes` (the terminal CLI) and `sbx app run hermes-web`
 # (the browser dashboard). Hermes Desktop is the native Electron app — a real window with chat,

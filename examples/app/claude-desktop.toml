@@ -13,6 +13,7 @@
 #
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/chromium-background.toml
+#     sbx net groups import examples/net-groups/google-signin-incage.toml
 #
 # This is the GRAPHICAL app whose **Code** tab runs the same Claude Code engine as the
 # `claude-code` CLI profile (its terminal sibling), plus the Chat and Cowork tabs, parallel
