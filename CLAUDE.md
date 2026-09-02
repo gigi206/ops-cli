@@ -15,8 +15,9 @@
 
 ## Tests
 
-- ALWAYS prefer targeted tests over the full suite, which is very long. Run only the test binary or filter relevant to the change (e.g. `cargo test --test <file> <filter>`, `cargo test --lib <module>::<test>`, or `cargo test --doc` for doctests). Only run the whole `cargo test` when the change has cross-cutting impact that demands it.
-- Before any push (and at the end of a task), ALWAYS run `mise run ci` — it chains `fmt` + `lint` + `rustdoc` + `test` and is the local reproduction of `.github/workflows/ci.yml`. If `mise run ci` passes locally, CI passes; if it fails here, push nothing and fix it first.
+- ALWAYS prefer targeted tests over the full suite, which is very long. Run only the filter relevant to the change. This crate is a `[[bin]]` with no library target, so `cargo test --lib` fails with `no library targets found` — use `cargo test --bins <filter>` for the unit tests (e.g. `cargo test --bins version::`), `cargo test --test <file> <filter>` for an integration suite, or `cargo test --doc` for doctests.
+- NEVER run `mise run ci`, or a whole `cargo test`, on your own initiative. The full suite is the maintainer's to run, and when. After a change, run the three cheap gates on their own — `mise run fmt`, `mise run lint`, `mise run rustdoc`, together around thirty seconds, and the latter two deny warnings — plus the targeted filter for what the change touched. Then report which filters were exercised and which were not, rather than implying the suite passed.
+- `mise run ci` chains those three gates with `test` and is the local reproduction of `.github/workflows/ci.yml`. It must pass before a push; whether to run it is the maintainer's call, never the assistant's.
 
 ## Authorization
 
