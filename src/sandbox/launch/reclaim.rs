@@ -171,7 +171,9 @@ pub(in crate::sandbox) fn shared_store_gc(
     let _lock = match crate::sandbox::projectstore::lock_exclusive(layout) {
         Ok(guard) => guard,
         Err(e) => {
-            eprintln!("sbx gc: cannot lock the shared store ({e}); skipping the shared-store gc.");
+            crate::diag::error(&format!(
+                "sbx gc: cannot lock the shared store ({e}); skipping the shared-store gc."
+            ));
             return;
         }
     };
@@ -192,7 +194,7 @@ pub(in crate::sandbox) fn shared_store_gc(
     let report = match crate::sandbox::gc::collect(&nix_store, &layout.store_dir(), prune) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("sbx gc: shared-store gc failed: {e}");
+            crate::diag::error(&format!("sbx gc: shared-store gc failed: {e}"));
             return;
         }
     };
@@ -249,7 +251,7 @@ fn report_optimise(
             crate::sandbox::gc::human_bytes(report.bytes_freed),
             report.inodes_freed,
         ),
-        Err(e) => eprintln!("sbx gc: {label} — deduplication failed: {e}"),
+        Err(e) => crate::diag::error(&format!("sbx gc: {label} — deduplication failed: {e}")),
     }
 }
 
@@ -357,7 +359,9 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
     let (id, project) = match binds::project_identity(&prep.cwd) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("sbx gc: cannot resolve the project directory: {e}");
+            crate::diag::error(&format!(
+                "sbx gc: cannot resolve the project directory: {e}"
+            ));
             return Err(ExitCode::FAILURE);
         }
     };
@@ -462,7 +466,7 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
     let report = match crate::sandbox::gc::collect(&prep.nix_store, &store_dir, prune) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("sbx gc: {e}");
+            crate::diag::error(&format!("sbx gc: {e}"));
             return Err(ExitCode::FAILURE);
         }
     };
@@ -590,7 +594,7 @@ fn equip_for_gc(prep: &Prepared) -> Result<crate::sandbox::projectstore::Project
         &prep.cfg.packages,
     )
     .map_err(|e| {
-        eprintln!("sbx gc: {e}");
+        crate::diag::error(&format!("sbx gc: {e}"));
         ExitCode::FAILURE
     })?;
     for warning in &packages.warnings {
@@ -685,7 +689,7 @@ fn equip_for_gc(prep: &Prepared) -> Result<crate::sandbox::projectstore::Project
     }
 
     seed_project_store(prep, &packages.roots, &tools.roots, &gui_roots).map_err(|e| {
-        eprintln!("sbx gc: cannot prepare the project's store: {e}");
+        crate::diag::error(&format!("sbx gc: cannot prepare the project's store: {e}"));
         ExitCode::FAILURE
     })
 }

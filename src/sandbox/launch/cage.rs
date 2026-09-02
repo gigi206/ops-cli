@@ -84,14 +84,14 @@ pub(super) fn run_status(
         Err(e) => {
             // Not only the filter: this step also builds the descriptor carrying the cage's
             // environment, and naming the wrong one would send a reader looking at `[seccomp]`.
-            eprintln!("sbx: cannot prepare the sandbox: {e}");
+            crate::diag::error(&format!("sbx: cannot prepare the sandbox: {e}"));
             return 1;
         }
     };
     match Command::new(prog).args(args).status() {
         Ok(status) => status_code(status),
         Err(e) => {
-            eprintln!("sbx: failed to launch the sandbox: {e}");
+            crate::diag::error(&format!("sbx: failed to launch the sandbox: {e}"));
             1
         }
     }

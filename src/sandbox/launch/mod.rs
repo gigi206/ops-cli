@@ -752,7 +752,7 @@ fn launch_pty_supervised(
     match supervise(&prep.bwrap, &spec, &prep.cfg.limits, gui) {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
-            eprintln!("sbx: sandbox session failed: {e}");
+            crate::diag::error(&format!("sbx: sandbox session failed: {e}"));
             ExitCode::FAILURE
         }
     }
@@ -785,7 +785,7 @@ fn prepare_with(ov: &crate::config::Override, app: Option<&str>) -> Result<Prepa
 /// The project directory a launch invoked without an explicit one is built from.
 fn launch_cwd() -> Result<PathBuf, ExitCode> {
     std::env::current_dir().map_err(|e| {
-        eprintln!("sbx: cannot read the current directory: {e}");
+        crate::diag::error(&format!("sbx: cannot read the current directory: {e}"));
         ExitCode::FAILURE
     })
 }
@@ -830,7 +830,7 @@ fn prepare_config(cwd: PathBuf, ov: &crate::config::Override) -> Result<Prepared
     // The override's nixpkgs channel must land before the lock target is chosen. A set-but-invalid
     // channel is a hard error (no safe baseline fallback for a supply-chain field).
     if let Err(e) = cfg.apply_override_channel(ov) {
-        eprintln!("sbx: {e}");
+        crate::diag::error(&format!("sbx: {e}"));
         return Err(ExitCode::from(2));
     }
     // Reject a mistyped scalar security value (network/gui/limits) now — before the engines are
@@ -839,7 +839,7 @@ fn prepare_config(cwd: PathBuf, ov: &crate::config::Override) -> Result<Prepared
     // launch's final point.
     if let Err(errs) = cfg.validate_override(ov) {
         for e in errs {
-            eprintln!("sbx: {e}");
+            crate::diag::error(&format!("sbx: {e}"));
         }
         return Err(ExitCode::from(2));
     }
@@ -887,7 +887,7 @@ fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, Ex
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("sbx: cannot resolve the nixpkgs channel: {e}");
+            crate::diag::error(&format!("sbx: cannot resolve the nixpkgs channel: {e}"));
             return Err(ExitCode::FAILURE);
         }
     };
@@ -905,14 +905,14 @@ fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, Ex
     ) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("sbx: cannot resolve the mise engine channel: {e}");
+            crate::diag::error(&format!("sbx: cannot resolve the mise engine channel: {e}"));
             return Err(ExitCode::FAILURE);
         }
     };
     let userland = match super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &engine_ref) {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("sbx: cannot resolve the sandbox userland: {e}");
+            crate::diag::error(&format!("sbx: cannot resolve the sandbox userland: {e}"));
             return Err(ExitCode::FAILURE);
         }
     };
@@ -1050,7 +1050,7 @@ fn mise_tools(prep: &Prepared) -> Result<super::packages::Provisioned, ExitCode>
         &super::nixhub::current_system(),
     )
     .map_err(|e| {
-        eprintln!("sbx: {e}");
+        crate::diag::error(&format!("sbx: {e}"));
         ExitCode::FAILURE
     })
 }

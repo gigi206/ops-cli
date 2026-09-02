@@ -84,7 +84,9 @@ pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
     let sessions = match crate::session::Registry::at(layout.data_dir()).list() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("sbx session attach: cannot read the session registry: {e}");
+            crate::diag::error(&format!(
+                "sbx session attach: cannot read the session registry: {e}"
+            ));
             return ExitCode::FAILURE;
         }
     };
@@ -122,7 +124,9 @@ pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
     let cage = match crate::sandbox::attach::open_cage_handle(cage_pid, &target.project) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("sbx session attach: cannot open a handle to session '{id}''s cage: {e}");
+            crate::diag::error(&format!(
+                "sbx session attach: cannot open a handle to session '{id}''s cage: {e}"
+            ));
             return ExitCode::FAILURE;
         }
     };
@@ -133,7 +137,7 @@ pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
     let argv_owned = match attach_argv(&cmd) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("sbx session attach: {e}");
+            crate::diag::error(&format!("sbx session attach: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -156,7 +160,7 @@ pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
     match result {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
-            eprintln!("sbx: attach session failed: {e}");
+            crate::diag::error(&format!("sbx: attach session failed: {e}"));
             ExitCode::FAILURE
         }
     }
@@ -347,7 +351,9 @@ pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
     let sessions = match registry.list() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("sbx session stop: cannot read the session registry: {e}");
+            crate::diag::error(&format!(
+                "sbx session stop: cannot read the session registry: {e}"
+            ));
             return ExitCode::FAILURE;
         }
     };

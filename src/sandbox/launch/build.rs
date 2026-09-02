@@ -326,7 +326,7 @@ pub(super) fn build(
     ) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("sbx: {e}");
+            crate::diag::error(&format!("sbx: {e}"));
             return Err(ExitCode::FAILURE);
         }
     };
@@ -662,7 +662,7 @@ pub(super) fn build(
     let project_store = match seed_project_store(prep, &packages.roots, &tools.roots, &gui_roots) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("sbx: cannot prepare the project's store: {e}");
+            crate::diag::error(&format!("sbx: cannot prepare the project's store: {e}"));
             return Err(ExitCode::FAILURE);
         }
     };
@@ -783,7 +783,7 @@ pub(super) fn build(
         // it cannot be placed is the point: the alternative would be binding some other executable
         // into the cage, which is the exposure the dedicated shim exists to remove.
         let shim_bin = crate::store::ensure_proc_shim(&prep.layout).map_err(|e| {
-            eprintln!("sbx: cannot place the exec-enforcement shim: {e}");
+            crate::diag::error(&format!("sbx: cannot place the exec-enforcement shim: {e}"));
             ExitCode::FAILURE
         })?;
         // With `[proc]` off, the exec side is a denylist with nothing on it: every `execve` is
@@ -802,7 +802,7 @@ pub(super) fn build(
             Arc::clone(&notify_wiring.notifier),
         )
         .map_err(|e| {
-            eprintln!("sbx: cannot start exec enforcement: {e}");
+            crate::diag::error(&format!("sbx: cannot start exec enforcement: {e}"));
             ExitCode::FAILURE
         })?;
         // The flag rides in the closure so the filter the cage installs matches the lens the
@@ -842,10 +842,10 @@ pub(super) fn build(
                     // on purpose: they ride `\"$@\"` positionally and must reach mise exactly as the
                     // project wrote them.
                     let shown = mise_token_display(auto_equip.iter());
-                    eprintln!(
+                    crate::diag::error(&format!(
                         "sbx: equipping non-nix tools in-cage via mise: {shown} (each backend's \
                          host must be in [network].allow under an allowlist)"
-                    );
+                    ));
                 }
                 wraps.push((
                     WrapLayer::MiseEquip,
@@ -929,11 +929,11 @@ pub(super) fn build(
                 inline_flake_names.join(", ")
             ));
         } else {
-            eprintln!(
+            crate::diag::error(&format!(
                 "sbx: building inline flakes in-cage via nix build: {} (each flake's fetch \
                  host must be in [network].allow under an allowlist)",
                 inline_flake_names.join(", ")
-            );
+            ));
             wraps.push((
                 WrapLayer::FlakeEquip,
                 Box::new(|cmd| {
@@ -987,7 +987,7 @@ pub(super) fn build(
         } else {
             let (guard, wiring) =
                 forward::start(&prep.layout, prep.cfg.forward.clone()).map_err(|e| {
-                    eprintln!("sbx: {e}");
+                    crate::diag::error(&format!("sbx: {e}"));
                     ExitCode::FAILURE
                 })?;
             let forwards = wiring.forwards;
@@ -1032,7 +1032,7 @@ pub(super) fn build(
         // call for the same reason; standing brokers up ahead of it moved the first plugin-backed
         // resolution in this process to here.
         if let Err(e) = crate::store::ensure(&prep.layout) {
-            eprintln!("sbx: cannot prepare the data directory: {e}");
+            crate::diag::error(&format!("sbx: cannot prepare the data directory: {e}"));
             return Err(ExitCode::FAILURE);
         }
         let mut plugin_warnings = Vec::new();
@@ -1425,7 +1425,9 @@ pub(super) fn build(
                                 Arc::clone(&notify_wiring.notifier),
                             )
                             .map_err(|e| {
-                                eprintln!("sbx: cannot start the ssh-agent broker: {e}");
+                                crate::diag::error(&format!(
+                                    "sbx: cannot start the ssh-agent broker: {e}"
+                                ));
                                 ExitCode::FAILURE
                             })?;
                             crate::diag::note(&format!(
@@ -1683,7 +1685,7 @@ pub(super) fn build(
         crate::diag::warn_config(warning);
     }
     if let Some(reason) = &fs_masks.refused {
-        eprintln!("sbx: {reason}");
+        crate::diag::error(&format!("sbx: {reason}"));
         return Err(ExitCode::FAILURE);
     }
     let fs_decoys = if fs_masks.is_empty() {
@@ -1737,9 +1739,9 @@ pub(super) fn build(
             // Fail closed: if a pin cannot be established the containing read-write bind would be
             // unprotected, so abort the launch rather than run with a gap. An extreme case — a
             // mkdir failing in sbx's own data/config tree.
-            eprintln!(
+            crate::diag::error(&format!(
                 "sbx: cannot protect sbx's control plane ({e}) — a read-write bind contains it"
-            );
+            ));
             return Err(ExitCode::FAILURE);
         }
     }
@@ -1933,7 +1935,7 @@ pub(super) fn build(
         startup_cmd,
     )
     .map_err(|e| {
-        eprintln!("sbx: cannot prepare the sandbox: {e}");
+        crate::diag::error(&format!("sbx: cannot prepare the sandbox: {e}"));
         ExitCode::FAILURE
     })?;
     // A graphical cage under an isolated network namespace (any filtering posture — the namespace
@@ -1955,9 +1957,9 @@ pub(super) fn build(
                 holder_exe: exe,
             }),
             Err(e) => {
-                eprintln!(
+                crate::diag::error(&format!(
                     "sbx: netns holder unavailable ({e}); the cage runs without an online signal"
-                );
+                ));
                 spec
             }
         }
@@ -2045,7 +2047,7 @@ pub(super) fn build(
             ) {
                 Ok(plane) => Some(plane),
                 Err(e) => {
-                    eprintln!("sbx: cannot start the task control plane: {e}");
+                    crate::diag::error(&format!("sbx: cannot start the task control plane: {e}"));
                     return Err(ExitCode::FAILURE);
                 }
             }
@@ -2228,7 +2230,7 @@ fn mise_env(prep: &Prepared) -> Result<Vec<(String, String)>, ExitCode> {
     let mise_root =
         crate::sandbox::mise::provision_engine(&prep.nix, &prep.layout, &prep.engine_ref).map_err(
             |e| {
-                eprintln!("sbx: cannot provision the mise engine: {e}");
+                crate::diag::error(&format!("sbx: cannot provision the mise engine: {e}"));
                 ExitCode::FAILURE
             },
         )?;
@@ -2236,7 +2238,7 @@ fn mise_env(prep: &Prepared) -> Result<Vec<(String, String)>, ExitCode> {
     // Stage the authorized files in a per-project directory that sits outside every
     // writable mount (a sibling of the writable home, like the synthetic identity).
     let id = binds::project_runtime_id(&prep.cwd).map_err(|e| {
-        eprintln!("sbx: cannot identify the project: {e}");
+        crate::diag::error(&format!("sbx: cannot identify the project: {e}"));
         ExitCode::FAILURE
     })?;
     let stage = prep
@@ -2253,7 +2255,7 @@ fn mise_env(prep: &Prepared) -> Result<Vec<(String, String)>, ExitCode> {
         &stage,
     )
     .map_err(|e| {
-        eprintln!("sbx: mise [env] resolution failed: {e}");
+        crate::diag::error(&format!("sbx: mise [env] resolution failed: {e}"));
         ExitCode::FAILURE
     })
 }

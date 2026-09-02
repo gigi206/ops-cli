@@ -272,29 +272,36 @@ fn no_config_warning_reaches_the_terminal_unfiltered() {
     }
 }
 
-/// A diagnostic that names an identifier goes through [`crate::diag::error`], which styles it.
+/// A diagnostic sbx prints itself carries no interpolation: it goes through
+/// [`crate::diag::error`], which styles the identifiers in it.
 ///
-/// Forty raw `eprintln!("sbx…")` lines live in these files, and converting all of them would be a
-/// change with no observable effect: `highlight` paints backticked spans and leaves everything else
-/// byte-identical, so a message with no identifier in it renders the same either way. Four carried
-/// one and lost it: the `[fs] scan` scanner, the `[fs]` mask staging, and the two broker failures,
-/// which name the broker the user configured — the one word a reader needs to find in the message.
+/// `diag::error` is `eprintln!` plus [`crate::style::paint_spans`] over the backticked spans, and
+/// it adds no prefix, so routing a line through it changes the bytes only where a backtick already
+/// stood. That is what makes this rule cheap to hold: no message is reworded to satisfy it.
 ///
-/// So the rule is enforced where it bites rather than by converting thirty-six sites that gain
-/// nothing: a raw diagnostic may not carry a backtick. A `sbx gc:` / `sbx session attach:` line is
-/// held to it too — the prefix says which verb speaks, not whether the message names anything.
+/// **The rule this replaced could not be checked.** It read the format string and refused a
+/// literal backtick, on the reasoning that a message with no identifier renders the same either
+/// way. Thirty-six sites were left raw on that basis. The reasoning was wrong about one thing, and
+/// it is the thing that matters: an identifier does not have to be in the format string. The egress
+/// proxy's failure prints `{e}`, and the credential chain puts a resolver plugin's name in
+/// backticks inside that error, so the terminal received an unstyled identifier from a call this
+/// guard had passed. No reading of the source can settle what a value will render.
 ///
-/// The window runs to the call's closing `);` rather than reading one line, and that is what found
-/// the fourth: a grep for a backtick on the `eprintln!` line itself sees three, because the mask
-/// staging spells its format string on the line below.
+/// So the rule is now a shape rather than a prediction: **a raw `eprintln!` whose format string
+/// begins with `sbx` may not interpolate.** A line that interpolates nothing renders identically
+/// through either path and stays as it is; a line that interpolates goes through `diag::error`,
+/// where whatever it turns out to carry is styled. That is decidable by reading, which the previous
+/// rule was not.
 ///
-/// What it cannot see: an identifier that arrives by interpolation. A format string with no
-/// backtick still renders one when the value it prints carries it — `{e}` on an error from the
-/// credential chain reaches the terminal naming a resolver plugin in backticks, unstyled, and this
-/// guard passes the call. Reading the source cannot settle that, because it is a property of the
-/// error at run time; the egress proxy's failure in `build.rs` is the site where it was measured,
-/// and it goes through `diag::error` for that reason rather than because of its own text. Any new
-/// raw diagnostic printing an error from another module is subject to the same gap.
+/// The window runs to the call's closing `);` rather than one line, since a format string may be
+/// spelled below the macro name.
+///
+/// Two residuals, named rather than implied. This reads **six files by name**, so the same shape in
+/// another module is not covered; the producers that embed backticks (`resolver`, `egress`,
+/// `broker`) have callers outside `launch/`. And a line assembled by a helper and printed as
+/// `eprintln!("{}", render_…(…, &pal))` does not begin with `sbx`, so it is not examined: those
+/// helpers take a palette and style themselves, which is the arrangement this rule exists to
+/// produce rather than one it needs to police.
 #[test]
 fn no_raw_diagnostic_names_an_identifier_it_cannot_style() {
     for (name, source) in [
@@ -308,8 +315,6 @@ fn no_raw_diagnostic_names_an_identifier_it_cannot_style() {
         let production = source
             .rsplit_once("#[cfg(test)]")
             .map_or(source, |(before, _)| before);
-        // A call may spell its format string on the `eprintln!(` line or on the lines under it, so
-        // the window runs to the call's own closing `);` rather than stopping at the first line.
         let lines: Vec<&str> = production.lines().collect();
         for (i, line) in lines.iter().enumerate() {
             if !line.trim_start().starts_with("eprintln!(") {
@@ -324,9 +329,9 @@ fn no_raw_diagnostic_names_an_identifier_it_cannot_style() {
                 }
             }
             assert!(
-                !(call.contains("\"sbx") && call.contains('`')),
-                "{name}:{} prints an identifier through a raw `eprintln!`, which cannot style it; \
-                 use `diag::error` — {}",
+                !(call.contains("\"sbx") && call.contains('{')),
+                "{name}:{} interpolates into a raw `eprintln!`, so whatever the value turns out to \
+                 name reaches the terminal unstyled; use `diag::error` — {}",
                 i + 1,
                 line.trim()
             );
