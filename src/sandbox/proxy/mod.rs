@@ -1265,7 +1265,9 @@ fn reserve_body_buffer(
 
 /// What a request refused for want of buffer budget is told.
 fn body_budget_message() -> String {
-    "the proxy is already holding as much request-body data as it will hold at one time — this      request was not sent, and the same request will be taken once one in flight completes"
+    "the proxy is already holding as much request-body data as it will hold at one time — \
+     this request was not sent, and the same request will be taken once one in flight \
+     completes"
         .to_string()
 }
 
