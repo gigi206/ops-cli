@@ -2269,6 +2269,7 @@ fn a_parked_request_masks_a_secret_riding_in_its_query() {
         Vec::new(),
         Vec::new(),
         crate::sandbox::redact::MIN_LEN_DEFAULT,
+        Vec::new(),
     ));
     assert!(
         credentials.observe(
@@ -7830,6 +7831,7 @@ fn run_with_refresh(
         injections,
         Vec::new(),
         crate::sandbox::redact::MIN_LEN_DEFAULT,
+        Vec::new(),
     ));
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let seen = calls.clone();

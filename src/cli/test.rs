@@ -169,7 +169,7 @@ fn net_test(args: &[OsString]) -> ExitCode {
             // Build the *effective* policy a launch serves: the user rules plus the built-in
             // allow-set the proxy always unions — the single source of truth, so the verdict here
             // matches the wire (e.g. a cache host reads as allowed, not deny-default).
-            let effective = sandbox::union_with_builtin(policy.clone());
+            let effective = sandbox::union_with_builtin((**policy).clone());
             // A one-line header so an ALLOWED/DENIED verdict on an arbitrary URL is
             // self-explanatory — it names the default the policy applies to an unmatched request.
             let mode = match effective.default_action() {

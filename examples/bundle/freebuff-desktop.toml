@@ -82,6 +82,12 @@ mute = [
     "translate.googleapis.com",
 ]
 
+# The header above says it plainly: the login page, the device-code flow and the model traffic all
+# target codebuff.com. They are not the same HOST, though, and the tripwire's exemption is per host,
+# so the credential the sign-in obtains would be refused on its way to `api.codebuff.com`. One
+# wildcard says what the sentence already said.
+shared_credential = [["*.codebuff.com"]]
+
 [bundle.freebuff-desktop.packages]
 # The Freebuff desktop app, auto-upgraded through the resolver below. The package name is
 # `freebuff`, so it binds to the `[…appimage.freebuff]` table and is wrapped as `bin/freebuff`.

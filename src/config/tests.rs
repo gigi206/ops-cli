@@ -145,6 +145,7 @@ fn declare_groups(raw: &mut RawConfig, defs: &[(&str, &[&str])]) {
 /// it. That guard belongs on the resolver, not on a test spelling out sixteen `None`s to reach one.
 fn net_table_defaults() -> NetworkTable {
     NetworkTable {
+        shared_credential: vec![],
         mode: None,
         allow: vec![],
         deny: vec![],
@@ -171,6 +172,7 @@ fn net_table_defaults() -> NetworkTable {
 /// Build a `[network]` field in table form for the egress-group tests.
 fn net_field(mode: &str, allow: &[&str], deny: &[&str]) -> NetworkField {
     NetworkField::Table(NetworkTable {
+        shared_credential: vec![],
         mode: Some(mode.into()),
         allow: allow.iter().map(|s| s.to_string()).collect(),
         deny: deny.iter().map(|s| s.to_string()).collect(),
@@ -187,6 +189,182 @@ fn make_groups(defs: &[(&str, &[&str])]) -> (NetGroups, Vec<String>) {
         .map(|(n, es)| (n.to_string(), es.iter().map(|s| s.to_string()).collect()))
         .collect();
     (build_net_groups(&mut w, raw), w)
+}
+
+/// A `shared_credential` group reaches the policy the proxy reads, canonicalized, so the credential
+/// store and a request's host are compared in one spelling.
+#[test]
+fn a_shared_credential_group_reaches_the_policy() {
+    let mut w = Vec::new();
+    let field = NetworkField::Table(NetworkTable {
+        shared_credential: vec![vec!["API.Example.Test".into(), "app.example.test.".into()]],
+        ..match net_field("deny", &["api.example.test"], &[]) {
+            NetworkField::Table(t) => t,
+            NetworkField::Posture(_) => unreachable!("net_field builds a table"),
+        }
+    });
+    let policy = super::validate_network(
+        &mut w,
+        GLOBAL_CONFIG,
+        field,
+        &NetGroups::default(),
+        &NetworkPolicy::default(),
+    )
+    .unwrap();
+    let NetworkPolicy::Allowlist(p) = policy else {
+        panic!("expected an allowlist policy");
+    };
+    assert_eq!(
+        p.shared_credential()
+            .iter()
+            .map(|g| g.to_vec())
+            .collect::<Vec<_>>(),
+        vec![vec![
+            "api.example.test".to_string(),
+            "app.example.test".to_string()
+        ]],
+        "the group is carried to the proxy in the canonical spelling"
+    );
+    assert!(
+        w.is_empty(),
+        "a well-formed group warns about nothing: {w:?}"
+    );
+}
+
+/// A lone wildcard is a group: it widens the exemption to a whole domain, which the acquiring host
+/// does not already grant. A lone hostname is not, and that is the difference the rule turns on.
+#[test]
+fn a_lone_wildcard_is_a_group_and_a_lone_host_is_not() {
+    for (entry, kept) in [("*.example.test", 1), ("only.example.test", 0)] {
+        let mut w = Vec::new();
+        let field = NetworkField::Table(NetworkTable {
+            shared_credential: vec![vec![entry.to_string()]],
+            ..match net_field("deny", &["api.example.test"], &[]) {
+                NetworkField::Table(t) => t,
+                NetworkField::Posture(_) => unreachable!("net_field builds a table"),
+            }
+        });
+        let policy = super::validate_network(
+            &mut w,
+            GLOBAL_CONFIG,
+            field,
+            &NetGroups::default(),
+            &NetworkPolicy::default(),
+        )
+        .unwrap();
+        let NetworkPolicy::Allowlist(p) = policy else {
+            panic!("expected an allowlist policy");
+        };
+        assert_eq!(
+            p.shared_credential().len(),
+            kept,
+            "entry {entry:?} should have been {}",
+            if kept == 1 { "kept" } else { "dropped" }
+        );
+    }
+}
+
+/// A `*.domain` entry keeps its wildcard through the config layer and reaches the policy with its
+/// domain canonicalized, so the tripwire's matcher sees the shape the file wrote.
+#[test]
+fn a_wildcard_shared_credential_entry_survives_resolution() {
+    let mut w = Vec::new();
+    let field = NetworkField::Table(NetworkTable {
+        shared_credential: vec![vec!["*.Example.Test.".into(), "other.example.test".into()]],
+        ..match net_field("deny", &["api.example.test"], &[]) {
+            NetworkField::Table(t) => t,
+            NetworkField::Posture(_) => unreachable!("net_field builds a table"),
+        }
+    });
+    let policy = super::validate_network(
+        &mut w,
+        GLOBAL_CONFIG,
+        field,
+        &NetGroups::default(),
+        &NetworkPolicy::default(),
+    )
+    .unwrap();
+    let NetworkPolicy::Allowlist(p) = policy else {
+        panic!("expected an allowlist policy");
+    };
+    assert_eq!(
+        p.shared_credential()
+            .iter()
+            .map(|g| g.to_vec())
+            .collect::<Vec<_>>(),
+        vec![vec![
+            "*.example.test".to_string(),
+            "other.example.test".to_string()
+        ]],
+        "the wildcard keeps its prefix and its domain is canonicalized"
+    );
+    assert!(
+        w.is_empty(),
+        "a well-formed wildcard group warns about nothing: {w:?}"
+    );
+}
+
+/// The two shapes that cannot mean what they say are dropped, each with a warning, and the rest of
+/// the table is unaffected — fail-closed, so the tripwire keeps the per-host exemption.
+#[test]
+fn an_ambiguous_shared_credential_group_is_refused() {
+    for (groups, expected) in [
+        (
+            vec![vec!["only.example.test".to_string()]],
+            "one host and no wildcard",
+        ),
+        (
+            vec![
+                vec!["a.example.test".to_string(), "b.example.test".to_string()],
+                vec!["b.example.test".to_string(), "c.example.test".to_string()],
+            ],
+            "already covered by an earlier group",
+        ),
+        // The collision a wildcard makes: the second group's `*.example.test` swallows the
+        // first group's hosts, however differently the two spell them.
+        (
+            vec![
+                vec!["a.example.test".to_string(), "b.example.test".to_string()],
+                vec!["*.example.test".to_string(), "c.other.test".to_string()],
+            ],
+            "already covered by an earlier group",
+        ),
+    ] {
+        let mut w = Vec::new();
+        let kept = groups.len().saturating_sub(1);
+        let field = NetworkField::Table(NetworkTable {
+            shared_credential: groups,
+            ..match net_field("deny", &["a.example.test"], &[]) {
+                NetworkField::Table(t) => t,
+                NetworkField::Posture(_) => unreachable!("net_field builds a table"),
+            }
+        });
+        let policy = super::validate_network(
+            &mut w,
+            GLOBAL_CONFIG,
+            field,
+            &NetGroups::default(),
+            &NetworkPolicy::default(),
+        )
+        .unwrap();
+        let NetworkPolicy::Allowlist(p) = policy else {
+            panic!("expected an allowlist policy");
+        };
+        assert_eq!(
+            p.shared_credential().len(),
+            kept,
+            "only the offending group is dropped"
+        );
+        assert!(
+            w.iter().any(|m| m.contains(expected)),
+            "the warning says which shape was refused, expected {expected:?}: {w:?}"
+        );
+        assert_eq!(
+            p.allow_rules().len(),
+            1,
+            "the rest of the table is untouched"
+        );
+    }
 }
 
 #[test]
@@ -235,6 +413,7 @@ fn a_mute_list_classifies_and_expands_groups_like_allow_deny() {
     let (g, _) = make_groups(&[("telemetry", &["play.googleapis.com", "*.datadoghq.com"])]);
     let mut w = Vec::new();
     let field = NetworkField::Table(NetworkTable {
+        shared_credential: vec![],
         mode: Some("deny".into()),
         allow: vec![],
         deny: vec![],
@@ -439,6 +618,7 @@ fn an_apps_own_network_table_defines_no_group() {
     let mut global = RawConfig::default();
     declare_groups(&mut global, &[("ci", &["{*} a.example.com:443"])]);
     let mut app_net = NetworkTable {
+        shared_credential: vec![],
         mode: Some("deny".into()),
         allow: vec!["@ci".into()],
         ..net_table_defaults()
@@ -628,6 +808,7 @@ fn raw_network(value: &str) -> RawConfig {
 fn raw_network_table(allow: &[&str], deny: &[&str]) -> RawConfig {
     RawConfig {
         network: Some(NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mute: vec![],
             http2: vec![],
             capture: None,
@@ -930,6 +1111,7 @@ fn an_untrusted_project_app_cannot_widen_its_default_methods() {
     // the app falls to the built-in `{GET,HEAD}`, never all-verbs. (Read-by-default only ever
     // tightens; the only direction an untrusted layer could abuse is widening, which it cannot.)
     let net = NetworkField::Table(NetworkTable {
+        shared_credential: vec![],
         mute: vec![],
         http2: vec![],
         capture: None,
@@ -1142,6 +1324,7 @@ fn network_modes_set_the_egress_default_action() {
     let mut w = Vec::new();
     let tbl = |mode: &str, allow: &[&str], deny: &[&str]| {
         NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mute: vec![],
             http2: vec![],
             capture: None,
@@ -1250,6 +1433,7 @@ fn a_mode_less_table_inherits_a_filtering_parent_and_keeps_its_own_rules() {
     // A `[network]` table that lists a rule but omits `mode`.
     let no_mode = || {
         NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mute: vec![],
             http2: vec![],
             capture: None,
@@ -1272,7 +1456,8 @@ fn a_mode_less_table_inherits_a_filtering_parent_and_keeps_its_own_rules() {
             ca_roots: None,
         })
     };
-    let filtering = |action| NetworkPolicy::Allowlist(EgressPolicy::default().with_default(action));
+    let filtering =
+        |action| NetworkPolicy::Allowlist(Box::new(EgressPolicy::default().with_default(action)));
     // Resolve the mode-less table against a given parent, asserting the effective default action
     // and that the table's own allow rule survives (inheritance is of the mode only).
     let effective = |parent: &NetworkPolicy| {
@@ -1322,6 +1507,7 @@ fn a_table_names_the_settings_of_the_layer_below_it_gives_up() {
     // The table `sbx net allow --local` writes: a mode and one rule, no settings of its own.
     let one_rule = || {
         NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mute: vec![],
             http2: vec![],
             capture: None,
@@ -1358,11 +1544,11 @@ fn a_table_names_the_settings_of_the_layer_below_it_gives_up() {
     };
 
     // Two settings below: both named, in the order the config file declares them, plural.
-    let w = warn(&NetworkPolicy::Allowlist(
+    let w = warn(&NetworkPolicy::Allowlist(Box::new(
         EgressPolicy::default()
             .with_ca_roots(false)
             .with_capture(CaptureLevel::Bodies, None),
-    ));
+    )));
     assert_eq!(w.len(), 1, "one line names them all: {w:?}");
     assert!(
         w[0].contains("replaces the layer below rather than adding to it"),
@@ -1379,9 +1565,9 @@ fn a_table_names_the_settings_of_the_layer_below_it_gives_up() {
     // A setting added to the table has to appear here too, or a layer would give it up without a
     // word. The exhaustive destructure in `settings_dropped_from` is what makes that a compile
     // error rather than an omission; this is what makes it a message.
-    let w = warn(&NetworkPolicy::Allowlist(
+    let w = warn(&NetworkPolicy::Allowlist(Box::new(
         EgressPolicy::default().with_websocket_secret(crate::allowlist::WebsocketSecret::Block),
-    ));
+    )));
     assert_eq!(w.len(), 1, "{w:?}");
     assert!(
         w[0].contains("does not apply here: `websocket_secret`"),
@@ -1391,9 +1577,9 @@ fn a_table_names_the_settings_of_the_layer_below_it_gives_up() {
 
     // One setting: the singular form, because a message that reads as generated invites being
     // skimmed past.
-    let w = warn(&NetworkPolicy::Allowlist(
+    let w = warn(&NetworkPolicy::Allowlist(Box::new(
         EgressPolicy::default().with_ca_roots(false),
-    ));
+    )));
     assert!(
         w[0].contains("setting it carried does not apply here: `ca_roots`"),
         "{}",
@@ -1404,7 +1590,7 @@ fn a_table_names_the_settings_of_the_layer_below_it_gives_up() {
     // The two silent cases, which is what keeps this off every project that adds a rule: a parent
     // carrying nothing, and a non-filtering parent that has no settings to carry.
     assert!(
-        warn(&NetworkPolicy::Allowlist(EgressPolicy::default())).is_empty(),
+        warn(&NetworkPolicy::Allowlist(Box::default())).is_empty(),
         "a neutral parent gives nothing up"
     );
     assert!(
@@ -1420,6 +1606,7 @@ fn a_mode_less_project_network_table_inherits_the_global_mode() {
     let global = raw_network("ask");
     let project = RawConfig {
         network: Some(NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mute: vec![],
             http2: vec![],
             capture: None,
@@ -1466,6 +1653,7 @@ fn a_mode_less_app_network_table_inherits_the_baseline_mode() {
         RawApp {
             cmd: Some(schema::RawCmd::Line("demo".to_string())),
             network: Some(NetworkField::Table(NetworkTable {
+                shared_credential: vec![],
                 mute: vec![],
                 http2: vec![],
                 capture: None,
@@ -1511,6 +1699,7 @@ fn a_mode_less_app_network_table_inherits_the_baseline_mode() {
 fn the_pool_toggle_defaults_on_and_is_gated_trusted_only() {
     let pool_table = |pool: Option<bool>| {
         NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mute: vec![],
             http2: vec![],
             capture: None,
@@ -1581,6 +1770,7 @@ fn the_pool_toggle_defaults_on_and_is_gated_trusted_only() {
 fn ca_roots_defaults_on_and_a_splice_overrides_a_request_to_drop_them() {
     let ca_table = |ca_roots: Option<bool>, entry: &str| {
         NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mute: vec![],
             http2: vec![],
             capture: None,
@@ -1670,6 +1860,7 @@ fn ca_roots_defaults_on_and_a_splice_overrides_a_request_to_drop_them() {
 fn dns_cache_ttl_flows_from_the_table_to_the_policy() {
     let dns_table = |ttl: Option<u64>| {
         NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mute: vec![],
             http2: vec![],
             capture: None,
@@ -1712,6 +1903,7 @@ fn dns_cache_ttl_flows_from_the_table_to_the_policy() {
 fn the_connection_settings_flow_from_the_table_and_fail_closed_on_a_value_that_would_bite() {
     let conn_table = |idle: Option<&str>, max: Option<usize>, body_mb: Option<u64>| {
         NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mute: vec![],
             http2: vec![],
             capture: None,
@@ -1818,6 +2010,7 @@ fn the_websocket_secret_posture_flows_from_the_table_and_keeps_the_default_on_a_
     use crate::allowlist::WebsocketSecret;
     let table = |raw: Option<&str>| {
         NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mute: vec![],
             http2: vec![],
             capture: None,
@@ -1869,6 +2062,7 @@ fn the_capture_level_flows_from_the_table_to_the_policy_and_fails_closed_on_a_ty
     use crate::sandbox::control::CaptureLevel;
     let capture_table = |level: Option<&str>, kb: Option<u64>| {
         NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mute: vec![],
             http2: vec![],
             capture: level.map(str::to_string),
@@ -1932,6 +2126,7 @@ fn an_untrusted_project_cannot_turn_the_capture_on() {
     use crate::sandbox::control::CaptureLevel;
     let project = || RawConfig {
         network: Some(NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mute: vec![],
             http2: vec![],
             capture: Some("bodies".into()),
@@ -1964,6 +2159,7 @@ fn an_untrusted_project_cannot_turn_the_capture_on() {
     // back to a comparable posture rather than to "no network policy at all".
     let global = || RawConfig {
         network: Some(NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mute: vec![],
             http2: vec![],
             capture: None,
@@ -2037,6 +2233,7 @@ fn ask_mode_parses_and_carries_an_optional_timeout() {
     use crate::allowlist::DefaultAction;
     let ask_table = |timeout: Option<&str>| {
         NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mute: vec![],
             http2: vec![],
             capture: None,
@@ -2086,6 +2283,7 @@ fn ask_mode_parses_and_carries_an_optional_timeout() {
 
     // An `ask_timeout` under a non-ask mode is moot — warned and ignored.
     let moot = NetworkField::Table(NetworkTable {
+        shared_credential: vec![],
         mute: vec![],
         http2: vec![],
         capture: None,
@@ -2119,6 +2317,7 @@ fn ask_notice_defaults_on_and_can_be_silenced() {
     use crate::allowlist::DefaultAction;
     let ask = |notice: Option<bool>| {
         NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mute: vec![],
             http2: vec![],
             capture: None,
@@ -2160,6 +2359,7 @@ fn ask_notice_defaults_on_and_can_be_silenced() {
 
     // An `ask_notice` under a non-ask mode is moot — warned and ignored.
     let moot = NetworkField::Table(NetworkTable {
+        shared_credential: vec![],
         mute: vec![],
         http2: vec![],
         capture: None,
@@ -3811,9 +4011,9 @@ fn merge_app_keeps_secrets_under_an_allowlist_the_app_declares() {
         packages: vec![],
         open: Default::default(),
         service: Default::default(),
-        network: Some(NetworkPolicy::Allowlist(
+        network: Some(NetworkPolicy::Allowlist(Box::new(
             crate::allowlist::EgressPolicy::new(vec![], vec![]),
-        )),
+        ))),
         gui: None,
         gpu: None,
         allow_insecure_http: None,
@@ -3901,13 +4101,13 @@ fn merge_app_applies_the_apps_default_methods_to_its_effective_allowlist() {
     // posture; an explicit `{*}` rule keeps all verbs.
     let mut base = resolve_no_plugins(raw_network("shared"), None);
     base.merge_app(app_with(
-        Some(NetworkPolicy::Allowlist(EgressPolicy::new(
+        Some(NetworkPolicy::Allowlist(Box::new(EgressPolicy::new(
             vec![
                 classify("read.test").unwrap(),
                 classify("{*} write.test").unwrap(),
             ],
             vec![],
-        ))),
+        )))),
         read_default.clone(),
     ));
     let NetworkPolicy::Allowlist(p) = &base.network else {
@@ -3928,10 +4128,10 @@ fn merge_app_applies_the_apps_default_methods_to_its_effective_allowlist() {
     // narrows the inherited rules at merge time (the forced read-by-default reaches Mode-B apps
     // regardless of whose allowlist they run under).
     let mut base2 = resolve_no_plugins(raw_network("shared"), None);
-    base2.network = NetworkPolicy::Allowlist(EgressPolicy::new(
+    base2.network = NetworkPolicy::Allowlist(Box::new(EgressPolicy::new(
         vec![classify("inherited.test").unwrap()],
         vec![],
-    ));
+    )));
     base2.merge_app(app_with(None, Methods::Only(vec!["GET".to_string()])));
     let NetworkPolicy::Allowlist(p2) = &base2.network else {
         panic!("expected an allowlist");
@@ -3950,6 +4150,7 @@ fn a_baseline_default_methods_is_ignored_with_a_warning() {
     // ignored (Mode-A `sbx run` stays all-verbs), with a warning so it is not silent.
     let global = RawConfig {
         network: Some(NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mute: vec![],
             http2: vec![],
             capture: None,
@@ -4005,7 +4206,10 @@ fn merge_app_dedups_a_secret_the_app_redeclares_for_the_same_host_and_header() {
     // one (the app shadowing the baseline, like env/packages) — never two identical header
     // lines injected upstream.
     let mut base = resolve_no_plugins(raw_network("shared"), None);
-    base.network = NetworkPolicy::Allowlist(crate::allowlist::EgressPolicy::new(vec![], vec![]));
+    base.network = NetworkPolicy::Allowlist(Box::new(crate::allowlist::EgressPolicy::new(
+        vec![],
+        vec![],
+    )));
     base.declared_secrets = vec![a_header_secret()];
     base.secrets = vec![a_header_secret()];
     let app = ResolvedApp {
@@ -4090,9 +4294,9 @@ fn merge_app_inherits_a_baseline_secret_when_the_app_opens_a_filtering_posture()
         packages: vec![],
         open: Default::default(),
         service: Default::default(),
-        network: Some(NetworkPolicy::Allowlist(
+        network: Some(NetworkPolicy::Allowlist(Box::new(
             crate::allowlist::EgressPolicy::new(vec![], vec![]),
-        )),
+        ))),
         gui: None,
         gpu: None,
         allow_insecure_http: None,
@@ -7176,6 +7380,7 @@ fn network_posture_validator() {
 #[test]
 fn a_non_filtering_mode_names_the_fields_it_leaves_inert() {
     let table = |mode: &str, allow: &[&str], ask_timeout: Option<&str>| NetworkTable {
+        shared_credential: vec![],
         mute: vec![],
         http2: vec![],
         capture: None,
@@ -7333,6 +7538,7 @@ fn an_unknown_network_mode_is_dropped_with_a_warning() {
     let r = resolve_no_plugins(
         RawConfig {
             network: Some(NetworkField::Table(NetworkTable {
+                shared_credential: vec![],
                 mute: vec![],
                 http2: vec![],
                 capture: None,
@@ -7450,6 +7656,7 @@ fn raw_secret_section(secrets: Vec<(String, RawHostSecret)>) -> RawSecretSection
 fn raw_secrets(allow: &[&str], secrets: Vec<(String, RawHostSecret)>) -> RawConfig {
     RawConfig {
         network: Some(NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mute: vec![],
             http2: vec![],
             capture: None,
@@ -8063,6 +8270,7 @@ fn an_override_reference_to_an_undefined_group_is_dropped_with_a_warning() {
 fn a_one_shot_override_says_what_its_network_table_gives_up() {
     let table = |capture: Option<&str>, allow: &[&str]| {
         NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mode: Some("deny".to_string()),
             allow: allow.iter().map(|h| h.to_string()).collect(),
             capture: capture.map(str::to_string),
@@ -8520,6 +8728,7 @@ fn the_egress_stats_toggle_defaults_on_and_is_gated_trusted_only() {
     // A `[network]` table carrying an explicit `stats` value.
     let net = |stats: Option<bool>| RawConfig {
         network: Some(NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mute: vec![],
             http2: vec![],
             capture: None,
@@ -8677,6 +8886,7 @@ fn an_apps_network_stats_toggle_is_warned_and_ignored() {
         &[],
         &[],
         Some(NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mute: vec![],
             http2: vec![],
             capture: None,
@@ -8786,6 +8996,7 @@ fn raw_plugin_defaults(order: &[&str], scheme: &str, locator: Option<&str>) -> R
 /// A trusted-shaped network allowlist for the given hosts.
 fn allowlist_net(allow: &[&str]) -> Option<NetworkField> {
     Some(NetworkField::Table(NetworkTable {
+        shared_credential: vec![],
         mute: vec![],
         http2: vec![],
         capture: None,
@@ -10641,6 +10852,7 @@ fn an_unknown_key_under_network_is_named() {
     // not, and this table carried no report of its own until it held the egress groups.
     let raw = RawConfig {
         network: Some(NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mode: Some("deny".into()),
             rest: [("alow".to_string(), schema::RawIgnored)]
                 .into_iter()
@@ -10671,6 +10883,7 @@ fn an_unknown_key_under_network_is_named_even_under_a_non_filtering_posture() {
     // hardest to notice.
     let raw = RawConfig {
         network: Some(NetworkField::Table(NetworkTable {
+            shared_credential: vec![],
             mode: Some("shared".into()),
             rest: [("alow".to_string(), schema::RawIgnored)]
                 .into_iter()

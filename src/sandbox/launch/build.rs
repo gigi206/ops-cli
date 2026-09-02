@@ -1297,7 +1297,7 @@ pub(super) fn build(
         };
         let (guard, wiring) = egress::start(
             &prep.layout,
-            policy.clone(),
+            (**policy).clone(),
             &prep.cfg.secrets,
             &prep.cwd,
             &prep.bwrap,

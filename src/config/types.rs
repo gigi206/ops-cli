@@ -242,7 +242,11 @@ pub(crate) enum NetworkPolicy {
     Isolated,
     /// Filtered egress: the cage reaches only what the policy permits (an allow list with
     /// deny carve-outs), through a host-side proxy.
-    Allowlist(crate::allowlist::EgressPolicy),
+    ///
+    /// Boxed because this payload is two orders of magnitude larger than the other two variants,
+    /// which carry nothing: inline, every `NetworkPolicy` anywhere — including the two postures
+    /// that need none of it — would be the size of the whole egress policy.
+    Allowlist(Box<crate::allowlist::EgressPolicy>),
 }
 
 impl Default for NetworkPolicy {
@@ -250,7 +254,7 @@ impl Default for NetworkPolicy {
     /// save the built-in self-equip set the proxy unions into every policy. Written by hand
     /// because the default variant carries a payload, which `#[derive(Default)]` cannot express.
     fn default() -> Self {
-        Self::Allowlist(crate::allowlist::EgressPolicy::default())
+        Self::Allowlist(Box::default())
     }
 }
 

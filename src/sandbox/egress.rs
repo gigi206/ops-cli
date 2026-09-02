@@ -748,6 +748,11 @@ pub(crate) fn start(
         injections,
         redactions,
         redact_min_len,
+        policy
+            .shared_credential()
+            .iter()
+            .map(|group| group.to_vec())
+            .collect(),
     ));
     let refresh = (!secrets.is_empty()).then(|| {
         let (secrets, root, bwrap, brokers) = (

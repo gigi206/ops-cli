@@ -86,6 +86,7 @@ host, unfiltered".
 | `capture` | how much of each inspected exchange to keep for [`sbx net logs --with-body`](../networking/observability#seeing-the-traffic-network-capture): `"off"` (default), `"headers"`, `"bodies"` |
 | `capture_max_kb` | bytes kept per captured body, in KiB (default `8`, ceiling `1024`); inert unless `capture = "bodies"` |
 | `websocket_secret` | what a configured secret seen leaving through a WebSocket does: `"warn"` (default, record it) or `"block"` (record it and close the tunnel): see below |
+| `shared_credential` | groups of hosts that are one service, so a credential the cage obtained by its own sign-in may travel among them: see below |
 | `default_methods` | an **app's** read-by-default verbs (see below) |
 
 Every duration field (`ask_timeout`, `idle_timeout`, a task's `timeout`, a service's
@@ -494,6 +495,59 @@ Every other layered table composes instead of replacing: [`[limits]`](limits) me
 field, [`[fs]`](fs), [`forward`](../networking/forward), [`[devices]`](devices), [`[seccomp]`](seccomp)
 and [`[ssh_agent]`](ssh-agent) union their entries, and [`[notify]`](notify) inherits per
 event.
+
+## Hosts that are one service (`shared_credential`)
+
+A credential an app obtains by signing itself in is remembered by `sbx`, and refused on
+its way to any host it was not acquired on. That is what stops a cage carrying one
+service's token to a different service. It also refuses an app whose own service answers
+on more than one name, because the exemption is per host and a service is not: the app
+signs in on one name, calls its API on another, and its own authenticated traffic is read
+as an exfiltration.
+
+`shared_credential` is where that is declared. Each entry is a group of hosts, and a
+credential learned on any host of a group is not refused toward the others:
+
+```toml
+[network]
+mode = "deny"
+allow = ["{*} https://api.example.com", "{*} https://app.example.com"]
+shared_credential = [["app.example.com", "api.example.com"]]
+```
+
+An entry is a hostname or a `*.domain` wildcard, and the wildcard obeys the rule an `allow`
+list's does: it covers the apex and every subdomain, and the separating dot is required, so
+`*.example.com` never covers `example.com.evil.com`. A service spread over regional or
+per-purpose names is written once:
+
+```toml
+shared_credential = [["*.kiro.dev", "*.auth.us-east-1.amazoncognito.com"]]
+```
+
+A bundle carries the same field, unioned onto the app's own groups, and that is usually
+where it belongs: a bundle already enumerates the hosts of the service it packages.
+
+Nothing infers a group. Two names that belong to one service share no property that can be
+read from them. The shipped `claude-desktop` bundle groups `claude.ai` with
+`api.anthropic.com`, whose registrable domains differ, so a group is a declaration or it
+does not exist. It is also a widening: every host named in a group is one more place a
+learned credential may travel, which is why it is trusted-only like the rest of the table
+and why a group written wider than the service it names weakens the tripwire without
+saying so. Name the hosts a refusal actually shows you, rather than every host the app
+reaches.
+
+Two shapes are dropped with a warning, and the tripwire then keeps the per-host exemption
+it had without them: a group naming fewer than two distinct hosts, which says nothing a
+credential's own host does not already say, and a group whose entry an earlier group already
+covers, which leaves "the same service" undecided rather than merely wide. The second is
+asked with the matcher the tripwire itself uses, so a wildcard that swallows another group's
+host counts as the collision it is.
+
+The refusal itself names no fix, deliberately: an `outbound-secret` block is a security
+guard, and a message offering to lift it would be advice to allow a leak. What tells the
+two cases apart is [`sbx net logs`](../networking/observability): a refusal toward a host
+of the app's own service is this one, and a refusal toward anything else is the guard
+doing its work.
 
 ## `default_methods` (apps)
 

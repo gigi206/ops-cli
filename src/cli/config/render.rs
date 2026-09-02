@@ -513,6 +513,7 @@ fn network_section(view: &config::view::ConfigView, pal: &style::Palette, detail
         deny,
         mute,
         http2,
+        shared_credential,
         builtin,
         ..
     } = &view.network
@@ -618,6 +619,19 @@ fn network_section(view: &config::view::ConfigView, pal: &style::Palette, detail
             );
             for host in http2 {
                 let _ = writeln!(o, "      http2 {n}{host}{r}");
+            }
+        }
+        // The host groups a learned credential may travel across. Surfaced because it widens a
+        // security guard and an app usually inherits it from a bundle rather than writing it: a
+        // reader auditing what a launch granted has to be able to see it here.
+        if !shared_credential.is_empty() {
+            let _ = writeln!(
+                o,
+                "    {dim}shared_credential (one service for a credential the cage signs in \
+                 for):{r}"
+            );
+            for group in shared_credential {
+                let _ = writeln!(o, "      {n}{}{r}", group.join(", "));
             }
         }
         // The egress-stats toggle is meaningful only under a filtering posture (the proxy runs
@@ -1307,6 +1321,7 @@ mod tests {
                 allow: vec!["github.com".into()],
                 deny: vec!["evil.com".into()],
                 mute: vec![],
+                shared_credential: vec![],
                 http2: vec![],
                 capture: "off".to_string(),
                 capture_max_kb: None,

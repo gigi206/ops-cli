@@ -386,6 +386,7 @@ impl CaptureRing {
                 Vec::new(),
                 needles,
                 crate::sandbox::redact::MIN_LEN_DEFAULT,
+                Vec::new(),
             )),
         )
     }
@@ -679,6 +680,7 @@ mod tests {
             Vec::new(),
             vec![needle("old-t0ken-value")],
             crate::sandbox::redact::MIN_LEN_DEFAULT,
+            Vec::new(),
         ));
         let ring = CaptureRing::new(
             CaptureCaps::new(CaptureLevel::Bodies, 8),
@@ -732,6 +734,7 @@ mod tests {
             Vec::new(),
             vec![needle("static-api-k3y")],
             crate::sandbox::redact::MIN_LEN_DEFAULT,
+            Vec::new(),
         ));
         let ring = CaptureRing::new(
             CaptureCaps::new(CaptureLevel::Bodies, 8),

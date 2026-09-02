@@ -1543,6 +1543,7 @@ mod tests {
                 Vec::new(),
                 vec![SecretNeedle::named("token", SECRET.as_bytes().to_vec())],
                 crate::sandbox::redact::MIN_LEN_DEFAULT,
+                Vec::new(),
             )));
 
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -2946,6 +2947,7 @@ mod tests {
                 )],
                 Vec::new(),
                 crate::sandbox::redact::MIN_LEN_DEFAULT,
+                Vec::new(),
             ));
             let calls = Arc::new(AtomicUsize::new(0));
             let seen = Arc::clone(&calls);

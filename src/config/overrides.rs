@@ -1085,6 +1085,7 @@ fn net_table(mode: &str, allow: Vec<String>, deny: Vec<String>) -> NetworkField 
     NetworkField::Table(NetworkTable {
         mute: vec![],
         http2: vec![],
+        shared_credential: vec![],
         mode: Some(mode.to_string()),
         allow,
         deny,

@@ -55,6 +55,7 @@ the map-side companion, and it carries the egress along.
 | `env` | `binds`, `forward`, `devices`, `seccomp`, `limits` |
 | `allow`, `deny`, `mute` | `network` mode, `gui`, `gpu`, `audio`, `dbus`, `proc`, `home_scope` |
 | `secret` | another bundle (`use`) |
+| `shared_credential` (the hosts of this tool that are one service) | |
 | `task` (declared operations, `[bundle.<name>.task.<task>]`) | |
 | `service` (an auxiliary process run beside the app, `[bundle.<name>.service.<svc>]`) | |
 | `flakes`, `tarball`, `deb`, `appimage`, `binary` (the resolver tables that pair with a package) | |

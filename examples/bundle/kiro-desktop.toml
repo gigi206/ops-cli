@@ -99,6 +99,17 @@ mute = [
     "translate.googleapis.com",
 ]
 
+# Same service split as the `kiro` bundle, with the IDE's own extra: this build treats
+# `cognito-identity` as an auth dependency rather than telemetry, as the header says, so it belongs
+# to the group that the credential may travel across.
+shared_credential = [[
+    "*.kiro.dev",
+    "kiro-prod-us-east-1.auth.us-east-1.amazoncognito.com",
+    "cognito-identity.us-east-1.amazonaws.com",
+    "q.us-east-1.amazonaws.com",
+    "q.eu-central-1.amazonaws.com",
+]]
+
 [bundle.kiro-desktop.packages]
 # Kiro's prebuilt `.tar.gz`, auto-upgraded through the resolver below.
 kiro = "tarball:resolve"

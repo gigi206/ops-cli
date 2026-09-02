@@ -96,6 +96,13 @@ mute = [
     "ptht05hbb1ssoooe.public.blob.vercel-storage.com",
 ]
 
+# WorkOS is annotated above as Cursor's identity provider, and it is where the token exchange
+# happens; the editor then spends that token on Cursor's own hosts. Declaring the two one service
+# is what keeps the outbound tripwire from reading the second half as a leak. The marketplace host
+# is deliberately absent: nothing here says it carries this credential, and a group is only as
+# narrow as what it names.
+shared_credential = [["*.cursor.com", "*.cursor.sh", "api.workos.com"]]
+
 [bundle.cursor.packages]
 # Cursor's prebuilt `.deb`, auto-upgraded through the resolver below.
 cursor = "deb:resolve"

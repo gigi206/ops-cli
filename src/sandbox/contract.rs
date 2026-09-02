@@ -475,7 +475,7 @@ mod tests {
     #[test]
     fn the_allowlist_contract_lists_declared_and_builtin_hosts_but_no_deny() {
         let policy = policy_from(&["api.demo.test"], &["secret.demo.test"]);
-        let text = egress_contract(&NetworkPolicy::Allowlist(policy));
+        let text = egress_contract(&NetworkPolicy::Allowlist(Box::new(policy)));
 
         // The isolation note and a declared allow host.
         assert!(text.contains("isolated network namespace"));
@@ -497,7 +497,7 @@ mod tests {
     #[test]
     fn an_ask_default_contract_describes_the_approval_prompt() {
         let policy = policy_from(&["api.demo.test"], &[]).with_default(DefaultAction::Ask);
-        let text = egress_contract(&NetworkPolicy::Allowlist(policy));
+        let text = egress_contract(&NetworkPolicy::Allowlist(Box::new(policy)));
         assert!(text.contains("approval prompt"));
         assert!(!text.contains("refused (HTTP 403"));
     }
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn an_allow_default_contract_describes_the_open_denylist_posture() {
         let policy = policy_from(&[], &["secret.demo.test"]).with_default(DefaultAction::Allow);
-        let text = egress_contract(&NetworkPolicy::Allowlist(policy));
+        let text = egress_contract(&NetworkPolicy::Allowlist(Box::new(policy)));
         assert!(text.contains("open by default"));
         assert!(!text.contains("secret.demo.test"));
     }
@@ -525,7 +525,7 @@ mod tests {
             ],
             &[],
         );
-        let text = egress_contract(&NetworkPolicy::Allowlist(policy));
+        let text = egress_contract(&NetworkPolicy::Allowlist(Box::new(policy)));
 
         // The threat is a forged LINE: a heading or a list item only reads as structure at the
         // start of one. The egress posture alone declares no operations at all, so any `## `
@@ -559,7 +559,7 @@ mod tests {
             DefaultAction::Allow,
         ] {
             let policy = policy_from(&["*.demo.test"], &["secret.demo.test"]).with_default(action);
-            let text = egress_contract(&NetworkPolicy::Allowlist(policy));
+            let text = egress_contract(&NetworkPolicy::Allowlist(Box::new(policy)));
             assert!(
                 text.contains("A listed host may still be refused by an explicit deny rule"),
                 "{action:?} must not present its listing as a guarantee: {text}"
@@ -586,7 +586,7 @@ mod tests {
             ],
             &[],
         );
-        let text = egress_contract(&NetworkPolicy::Allowlist(policy));
+        let text = egress_contract(&NetworkPolicy::Allowlist(Box::new(policy)));
 
         let section_of = |needle: &str| {
             let at = text
@@ -612,7 +612,7 @@ mod tests {
         // A plane the policy never opened gets no heading: an empty section advertises a
         // capability the cage does not have.
         let inspected_only = policy_from(&["api.demo.test"], &[]);
-        let https_only = egress_contract(&NetworkPolicy::Allowlist(inspected_only));
+        let https_only = egress_contract(&NetworkPolicy::Allowlist(Box::new(inspected_only)));
         assert!(!https_only.contains("raw TCP stream"), "{https_only}");
         assert!(!https_only.contains("no TLS"), "{https_only}");
     }

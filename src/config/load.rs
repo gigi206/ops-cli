@@ -1212,6 +1212,7 @@ fn absorb_bundle(acc: &mut RawBundle, higher: RawBundle, notes: &mut Vec<String>
     acc.allow.extend(higher.allow);
     acc.deny.extend(higher.deny);
     acc.mute.extend(higher.mute);
+    acc.shared_credential.extend(higher.shared_credential);
     acc.open.extend(higher.open);
     acc.service.extend(higher.service);
     acc.flakes.extend(higher.flakes);
@@ -1324,7 +1325,10 @@ fn fold_bundle_into_app(app: &mut RawApp, acc: RawBundle, notes: &mut Vec<String
         }
     }
 
-    let egress = !acc.allow.is_empty() || !acc.deny.is_empty() || !acc.mute.is_empty();
+    let egress = !acc.allow.is_empty()
+        || !acc.deny.is_empty()
+        || !acc.mute.is_empty()
+        || !acc.shared_credential.is_empty();
     if !egress {
         return;
     }
@@ -1335,21 +1339,23 @@ fn fold_bundle_into_app(app: &mut RawApp, acc: RawBundle, notes: &mut Vec<String
             extend_deduped(&mut table.allow, acc.allow);
             extend_deduped(&mut table.deny, acc.deny);
             extend_deduped(&mut table.mute, acc.mute);
+            extend_deduped(&mut table.shared_credential, acc.shared_credential);
         }
         // A scalar posture is already decided: `shared` is wider than any allow entry could grant
         // and `none` admits nothing, so the bundle's entries are redundant either way.
         Some(NetworkField::Posture(_)) => {}
         None => notes.push(
-            "uses a bundle with egress rules but declares no `[network]` table, so they are \
-             dropped — add one (e.g. `[network] mode = \"deny\"`) to apply them; synthesizing one \
-             here could change the app's posture, which a bundle must never do"
+            "uses a bundle with egress rules or a shared-credential group but declares no \
+             `[network]` table, so they are dropped — add one (e.g. `[network] mode = \"deny\"`) \
+             to apply them; synthesizing one here could change the app's posture, which a bundle \
+             must never do"
                 .to_string(),
         ),
     }
 }
 
 /// Append the entries of `add` that `into` does not already carry, preserving order.
-fn extend_deduped(into: &mut Vec<String>, add: Vec<String>) {
+fn extend_deduped<T: PartialEq>(into: &mut Vec<T>, add: Vec<T>) {
     for entry in add {
         if !into.contains(&entry) {
             into.push(entry);

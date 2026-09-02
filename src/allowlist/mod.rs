@@ -677,13 +677,28 @@ fn hex_val(b: u8) -> Option<u8> {
 /// sweeps its rule lists several times per request, and a `format!` there allocates once per rule
 /// per sweep, only to compare against bytes both sides already hold.
 ///
-/// One definition for the three places that ask it (the verdict, the port-agnostic `mute` match,
-/// and the HTTP/2 host list), so the separator rule cannot be right in one and wrong in another.
+/// One definition for the four places that ask it (the verdict, the port-agnostic `mute` match,
+/// the HTTP/2 host list, and a `shared_credential` group's `*.domain` entry), so the separator rule
+/// cannot be right in one and wrong in another.
 fn apex_or_subdomain(domain: &str, host: &str) -> bool {
     host == domain
         || host
             .strip_suffix(domain)
             .is_some_and(|rest| rest.ends_with('.'))
+}
+
+/// Whether a `shared_credential` entry covers `host`: an exact hostname, or a `*.domain` wildcard
+/// answered by [`apex_or_subdomain`] — the same separator rule an `allow` list's `*.domain` obeys,
+/// so a group cannot be dodged by a spelling the verdict would have refused.
+///
+/// Both sides arrive canonicalized: the entry by `config::parse_shared_credential`, the host by the
+/// credential store. An exemption that fails to match is invisible — the request is refused and the
+/// reason names a leak — so the two must be compared in one spelling.
+pub(crate) fn shared_credential_covers(entry: &str, host: &str) -> bool {
+    match entry.strip_prefix("*.") {
+        Some(domain) => apex_or_subdomain(domain, host),
+        None => entry == host,
+    }
 }
 
 /// Canonicalize a host for matching: lowercase it, drop a trailing DNS root dot, and if it is an
@@ -1048,6 +1063,17 @@ pub(crate) struct EgressPolicy {
     /// direction that matters is up: the sum across connections is a multiple of it. Read via
     /// [`Self::body_max`].
     body_max: Option<u64>,
+    /// The host sets that are one service for a credential the cage obtained by its own sign-in
+    /// (`[network] shared_credential`). A credential learned on any host of a set is not refused on
+    /// its way to the others; a host in no set keeps the per-host exemption, which is the behaviour
+    /// without the field. Empty by default, and never a verdict — it grants no reach, so a host
+    /// named here is unreachable unless an `allow` rule says otherwise. Read via
+    /// [`Self::shared_credential`].
+    ///
+    /// Behind a `Box` because it is almost always absent, and this type is the payload of
+    /// `NetworkPolicy::Allowlist`: an inline `Vec` grows every one of that enum's values by its
+    /// three words, for a field a launch declaring no group never reads.
+    shared_credential: Option<Box<[Box<[String]>]>>,
 }
 
 impl Default for EgressPolicy {
@@ -1084,6 +1110,7 @@ impl EgressPolicy {
             idle_timeout: None,
             max_connections: None,
             body_max: None,
+            shared_credential: None,
         }
     }
 
@@ -1153,6 +1180,7 @@ impl EgressPolicy {
             websocket_secret,
             ask_timeout,
             suppress_ask_notice,
+            shared_credential,
         } = self;
         let mut dropped = Vec::new();
         let mut lost = |key: &'static str, parent_carries: bool, mine_is_neutral: bool| {
@@ -1164,6 +1192,11 @@ impl EgressPolicy {
         // file does. `Rule` carries no `PartialEq`, so `mute` compares by the only thing that can be
         // neutral for it: an empty list.
         lost("mute", !parent.mute.is_empty(), mute.is_empty());
+        lost(
+            "shared_credential",
+            parent.shared_credential.is_some(),
+            shared_credential.is_none(),
+        );
         lost(
             "http2",
             parent.http2 != neutral.http2,
@@ -1323,6 +1356,22 @@ impl EgressPolicy {
     /// The **configured** connection cap, raw: `None` says no layer set one.
     pub(crate) fn max_connections(&self) -> Option<usize> {
         self.max_connections
+    }
+
+    /// The host sets that share one learned credential (builder style). See the field.
+    pub(crate) fn with_shared_credential(mut self, groups: Vec<Vec<String>>) -> Self {
+        self.shared_credential = (!groups.is_empty()).then(|| {
+            groups
+                .into_iter()
+                .map(|group| group.into_boxed_slice())
+                .collect()
+        });
+        self
+    }
+
+    /// The host sets that share one learned credential, as the credential store reads them.
+    pub(crate) fn shared_credential(&self) -> &[Box<[String]>] {
+        self.shared_credential.as_deref().unwrap_or(&[])
     }
 
     /// The most of one request body the proxy holds, in bytes, from `[network] body_max_mb`.

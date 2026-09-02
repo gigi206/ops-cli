@@ -586,6 +586,7 @@ pub(super) fn sample_app_detail_view() -> config::view::AppDetailView {
             allow: vec!["api.example.com".into()],
             deny: vec![],
             mute: vec![],
+            shared_credential: vec![],
             http2: vec![],
             capture: "off".to_string(),
             capture_max_kb: None,

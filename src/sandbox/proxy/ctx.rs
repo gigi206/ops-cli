@@ -243,6 +243,7 @@ impl ProxyCtx {
                 Vec::new(),
                 Vec::new(),
                 crate::sandbox::redact::MIN_LEN_DEFAULT,
+                Vec::new(),
             )),
             refresh: None,
             pending: Arc::new(crate::sandbox::control::PendingState::new()),
@@ -679,7 +680,12 @@ impl ProxyCtx {
     pub(crate) fn with_injections(self, injections: Vec<HeaderInjection>) -> Self {
         let needles = self.credentials.snapshot().needles.clone();
         let min_len = self.credentials.min_len();
-        self.with_shared_credentials(Arc::new(Credentials::new(injections, needles, min_len)))
+        self.with_shared_credentials(Arc::new(Credentials::new(
+            injections,
+            needles,
+            min_len,
+            Vec::new(),
+        )))
     }
 
     /// Set the needles alone, keeping the injections. **Tests only** — see [`Self::with_injections`].
@@ -690,7 +696,12 @@ impl ProxyCtx {
     pub(crate) fn with_redactions(self, needles: Vec<SecretNeedle>) -> Self {
         let injections = self.credentials.snapshot().injections.clone();
         let min_len = self.credentials.min_len();
-        self.with_shared_credentials(Arc::new(Credentials::new(injections, needles, min_len)))
+        self.with_shared_credentials(Arc::new(Credentials::new(
+            injections,
+            needles,
+            min_len,
+            Vec::new(),
+        )))
     }
 
     /// The CA certificate (PEM) a launch injects into the cage trust store so in-cage tools accept

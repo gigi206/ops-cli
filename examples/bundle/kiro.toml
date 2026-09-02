@@ -128,6 +128,21 @@ fi
 ''',
 ]
 
+# The token this agent obtains for itself is issued on one host and spent on another, which the
+# outbound tripwire reads as a leak unless the hosts are declared one service. The split is the one
+# annotated above: the auth / token exchange / refresh hosts (`*.auth.desktop.kiro.dev`, the Cognito
+# pool, the two `oidc` regional endpoints) against the runtime and management API on `kiro.dev` and
+# the two `q` endpoints. Grounded in this bundle's own annotations, not in a run: if a refusal
+# names a host absent from this group, add that host rather than widening the wildcards.
+shared_credential = [[
+    "*.kiro.dev",
+    "kiro-prod-us-east-1.auth.us-east-1.amazoncognito.com",
+    "oidc.us-east-1.amazonaws.com",
+    "oidc.eu-central-1.amazonaws.com",
+    "q.us-east-1.amazonaws.com",
+    "q.eu-central-1.amazonaws.com",
+]]
+
 [bundle.kiro.packages]
 # Kiro CLI from nixpkgs (host-side, durable, offline-reusable after the first build). The
 # derivation fetches the official AWS `.tar.gz`, patchelfs the native binaries, and puts

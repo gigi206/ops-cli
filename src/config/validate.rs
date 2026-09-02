@@ -458,19 +458,17 @@ pub(super) fn validate_network(
             // The filtered-egress modes in bare-string form (no carve-out lists): `deny` =
             // deny-by-default (only the built-in set reaches), `allow` = allow-by-default (a
             // denylist; the proxy stays active). Carve-out lists need the `[network]` table.
-            "deny" => Some(NetworkPolicy::Allowlist(
-                crate::allowlist::EgressPolicy::default(),
-            )),
-            "allow" => Some(NetworkPolicy::Allowlist(
+            "deny" => Some(NetworkPolicy::Allowlist(Box::default())),
+            "allow" => Some(NetworkPolicy::Allowlist(Box::new(
                 crate::allowlist::EgressPolicy::default()
                     .with_default(crate::allowlist::DefaultAction::Allow),
-            )),
+            ))),
             // `ask` in bare-string form parks every unmatched request with no timeout (an
             // indefinite wait); a bound needs the `[network]` table's `ask_timeout`.
-            "ask" => Some(NetworkPolicy::Allowlist(
+            "ask" => Some(NetworkPolicy::Allowlist(Box::new(
                 crate::allowlist::EgressPolicy::default()
                     .with_default(crate::allowlist::DefaultAction::Ask),
-            )),
+            ))),
             other => {
                 warnings.push(format!(
                     "{source_label}: ignoring unknown network policy `{other}` (expected \
@@ -522,6 +520,7 @@ fn warn_inert_under_posture(
     list("ask_notice", table.ask_notice.is_some());
     list("stats", table.stats.is_some());
     list("default_methods", table.default_methods.is_some());
+    list("shared_credential", !table.shared_credential.is_empty());
     if inert.is_empty() {
         return;
     }
@@ -605,10 +604,16 @@ pub(super) fn validate_network_table(
     // rule (no path/method/verdict) — just a host[:port] the proxy MITMs as h2 — so it parses on its
     // own, dropping a malformed entry with a warning (fail-closed: that host keeps HTTP/1.1).
     let http2 = parse_http2_hosts(warnings, source_label, table.http2);
+    // `shared_credential` groups the hosts that are one service, so a credential the cage acquired
+    // on one of them is not refused on its way to another. Not an egress rule either: it grants no
+    // reach, and a host named here is unreachable unless an `allow` rule says otherwise.
+    let shared_credential =
+        parse_shared_credential(warnings, source_label, table.shared_credential);
     let mut policy = crate::allowlist::EgressPolicy::new(allow, deny)
         .with_default(action)
         .with_mute(mute)
-        .with_http2(http2);
+        .with_http2(http2)
+        .with_shared_credential(shared_credential);
     if action == DefaultAction::Ask {
         // A configured `ask_timeout` bounds the parked wait; a malformed value falls back to
         // indefinite (warned), never a hard config failure.
@@ -774,7 +779,7 @@ pub(super) fn validate_network_table(
             ));
         }
     }
-    Some(NetworkPolicy::Allowlist(policy))
+    Some(NetworkPolicy::Allowlist(Box::new(policy)))
 }
 
 /// Validate an `[open]` table into resolved handlers, dropping and warning on each entry it cannot

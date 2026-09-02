@@ -423,6 +423,11 @@ pub(crate) enum NetworkView {
         /// gRPC) instead of HTTP/1.1. A transport choice, orthogonal to the verdict — the host must
         /// still be permitted by an `allow` rule. Empty for a policy that designates no h2 host.
         http2: Vec<String>,
+        /// The host groups a credential the cage obtained by its own sign-in may travel across
+        /// (`shared_credential`). Surfaced because it widens a security guard: a group applied and
+        /// shown nowhere is a grant the reader cannot audit, and an app usually inherits it from a
+        /// bundle rather than writing it itself.
+        shared_credential: Vec<Vec<String>>,
         /// The traffic-capture level (`off`/`headers`/`bodies`) and, when bodies are captured, the
         /// per-body cap in KiB. Surfaced so a launch that retains the plaintext of its exchanges
         /// says so in `sbx config` — a capture is never silent.
@@ -1374,6 +1379,11 @@ fn network_view(network: &NetworkPolicy) -> NetworkView {
             deny: a.deny_rules().iter().map(|r| r.to_string()).collect(),
             mute: a.mute_rules().iter().map(|r| r.to_string()).collect(),
             http2: a.http2_hosts().iter().map(|h| h.display()).collect(),
+            shared_credential: a
+                .shared_credential()
+                .iter()
+                .map(|group| group.to_vec())
+                .collect(),
             websocket_secret: match a.websocket_secret() {
                 crate::allowlist::WebsocketSecret::Warn => "warn".to_string(),
                 crate::allowlist::WebsocketSecret::Block => "block".to_string(),
@@ -2098,6 +2108,7 @@ mod tests {
                 allow: vec!["github.com".into()],
                 deny: vec![],
                 mute: vec![],
+                shared_credential: vec![],
                 http2: vec![],
                 capture: "off".to_string(),
                 capture_max_kb: None,

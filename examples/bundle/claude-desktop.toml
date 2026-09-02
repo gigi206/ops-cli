@@ -97,6 +97,19 @@ mute = [
     "ogs.google.com",
 ]
 
+# The app signs in on one host and calls its account API on another, and both carry the same session
+# credential. sbx remembers a credential an app obtained for itself and refuses it toward any host it
+# was not acquired on — which is what stops a cage carrying one service's token to a different
+# service — so without this declaration the app's own control plane (settings, conversation list,
+# Code sessions, MCP servers, Cowork tasks) is refused while its message traffic keeps working, and
+# the app looks alive while missing its state.
+#
+# Measured, not guessed: the OAuth exchange lands on `api.anthropic.com` and the refusals fall on
+# `claude.ai`. Only that pair is named. The other Anthropic hosts in the allow list stay out until a
+# refusal shows one of them carrying this credential too, because every name added here is a host
+# this token may travel to.
+shared_credential = [["claude.ai", "api.anthropic.com"]]
+
 [bundle.claude-desktop.packages]
 # Anthropic's prebuilt `.deb`, fetched host-side and autoPatchelf'd (Electron, no source build).
 claude-desktop = "deb:apt:https://downloads.claude.ai/claude-desktop/apt/stable/dists/stable/main/binary-amd64/Packages"

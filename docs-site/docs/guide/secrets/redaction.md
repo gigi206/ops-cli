@@ -185,13 +185,22 @@ kept as a needle, along with the host it was going to, and from then on it is tr
 like a declared secret's value: refused if the cage sends it to any **other** host,
 masked if a response reflects it, hidden from the capture.
 
-Its own host is the exception, and it has to be. A session token exists to be sent
+Its own service is the exception, and it has to be. A session token exists to be sent
 back to the service that issued it, on every request after the sign-in; refusing it
 there would turn a successful login into an application that stops working at its
 second authenticated request. What the tripwire stops is the case it exists for, which
 is the cage carrying a credential it holds for one service to a different one. A
 declared secret keeps no such exemption: the cage is never given its value, so that
 value appearing in a request is a leak wherever the request is going.
+
+A service is not always one host, and which names belong together cannot be read from
+them: an app may sign in on one hostname and call its API on another whose registrable
+domain differs. So the exemption covers the host the credential was acquired on plus any
+the launch declared to share it, through
+[`[network] shared_credential`](../configuration/network#hosts-that-are-one-service-shared_credential).
+Undeclared, it is that one host, which is what an app on a single name needs and what an
+app on several will see refused: its own control plane blocked while its traffic to the
+acquiring host keeps working.
 
 This is worth being explicit about, because it means `sbx` retains a value you never
 gave it. It only ever holds it in memory, never writes it and never logs it, and the
@@ -222,7 +231,8 @@ Five bounds keep this narrow:
   the first: a request the policy allowed and the SSRF guard then blocked teaches
   nothing either;
 - the tripwire is scoped to **other** destinations, so an app re-sending its own
-  session token to its own service is not refused for holding it;
+  session token to its own service is not refused for holding it, where that service is
+  the acquiring host and whatever `shared_credential` groups with it;
 - observation happens **after** the outbound scan, so the request that teaches a
   value is never refused by that value;
 - a short value is ignored, on a stricter floor than for a declared secret, since

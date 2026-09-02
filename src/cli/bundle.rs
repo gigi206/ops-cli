@@ -324,6 +324,15 @@ fn grants_of(b: &config::RawBundle) -> Vec<String> {
     if let Some(creds) = b.secret.as_ref().map(|s| s.hosts.len()).filter(|c| *c > 0) {
         parts.push(format!("{creds} credential(s)"));
     }
+    // Named apart from the egress rules it is not: a group grants no reach, it widens where a
+    // credential the cage obtained for itself may travel. The fallback below would have named the
+    // section, which says a key was written rather than what naming this bundle would allow.
+    if !b.shared_credential.is_empty() {
+        parts.push(format!(
+            "{} shared-credential group(s)",
+            b.shared_credential.len()
+        ));
+    }
     if b.provision.is_some() {
         parts.push("an install step".to_string());
     }

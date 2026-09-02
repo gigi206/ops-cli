@@ -514,9 +514,7 @@ fn net_policy_maps_the_config_posture_to_the_cage_posture() {
     // foundation: the cage's only egress is the bound socket to the host filtering proxy,
     // never the shared host network.
     assert_eq!(
-        net_policy(&crate::config::NetworkPolicy::Allowlist(
-            crate::allowlist::EgressPolicy::default()
-        )),
+        net_policy(&crate::config::NetworkPolicy::Allowlist(Box::default())),
         NetPolicy::Isolated
     );
 }

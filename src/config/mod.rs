@@ -3449,6 +3449,89 @@ fn parse_http2_hosts(
     hosts
 }
 
+/// Parse the `[network] shared_credential` groups into the host sets the credential store reads.
+///
+/// Each group names the hosts that are one service, and a credential the cage acquired on any of
+/// them is then not refused on its way to the others. Hosts are canonicalized the way a request's
+/// host is, so a group and the destination it must match are compared in one spelling.
+///
+/// Two shapes are dropped with a warning, both fail-closed — the tripwire keeps the per-host
+/// exemption it had without the declaration. A group of fewer than two distinct hosts states
+/// nothing a credential's own host does not already say. And a host in two groups leaves "the same
+/// service" undecided: the sets would have to be merged to be usable, which is a wider grant than
+/// either group asked for, so the second group is refused instead and named.
+fn parse_shared_credential(
+    warnings: &mut Vec<String>,
+    source_label: &str,
+    groups: Vec<Vec<String>>,
+) -> Vec<Vec<String>> {
+    let mut kept: Vec<Vec<String>> = Vec::new();
+    for group in groups {
+        let mut hosts: Vec<String> = Vec::new();
+        for host in &group {
+            let entry = host.trim();
+            // A `*.domain` entry keeps its prefix and canonicalizes the domain, so the wildcard
+            // survives to the match and the two sides still compare in one spelling.
+            let canonical = match entry.strip_prefix("*.") {
+                Some(domain) => {
+                    let domain = crate::allowlist::canonical_host(domain);
+                    if domain.is_empty() {
+                        String::new()
+                    } else {
+                        format!("*.{domain}")
+                    }
+                }
+                None => crate::allowlist::canonical_host(entry),
+            };
+            if !canonical.is_empty() && !hosts.contains(&canonical) {
+                hosts.push(canonical);
+            }
+        }
+        // One entry says something only when it is a wildcard: `*.example.com` widens the exemption
+        // to a whole domain, while a single hostname repeats what the acquiring host already grants.
+        let says_something = hosts.len() >= 2 || hosts.iter().any(|entry| entry.starts_with("*."));
+        if !says_something {
+            warnings.push(format!(
+                "{source_label}: ignoring a `shared_credential` group naming one host and no \
+                 wildcard ({}) — a credential is already exempt on the host it was acquired on, so \
+                 such a group grants nothing",
+                render_hosts(&group)
+            ));
+            continue;
+        }
+        // Overlap is asked with the same matcher the tripwire will use, so a wildcard that
+        // swallows an earlier group's host counts as the collision it is: `*.example.com` and
+        // `api.example.com` name one host between them however differently they spell it.
+        let overlap = hosts.iter().find(|entry| {
+            kept.iter().flatten().any(|earlier| {
+                crate::allowlist::shared_credential_covers(entry, earlier)
+                    || crate::allowlist::shared_credential_covers(earlier, entry)
+            })
+        });
+        if let Some(shared) = overlap {
+            warnings.push(format!(
+                "{source_label}: ignoring a `shared_credential` group whose entry `{shared}` is \
+                 already covered by an earlier group — a host belongs to one service here, and \
+                 merging the two would widen the tripwire further than either group asks"
+            ));
+            continue;
+        }
+        kept.push(hosts);
+    }
+    kept
+}
+
+/// The hosts of a `shared_credential` group as written, for a warning that has to name which group
+/// it is about. Quoted individually so an empty entry is visible rather than swallowed by the
+/// separator.
+fn render_hosts(group: &[String]) -> String {
+    group
+        .iter()
+        .map(|h| format!("`{h}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Parse an `ask_timeout` duration string: a non-negative integer with an optional unit suffix
 /// (`s` seconds [the default], `m` minutes, `h` hours), e.g. `"90s"`, `"5m"`, `"2h"`, or a bare
 /// `"90"`. A zero-valued form (`"0"`, `"0m"`) means no timeout — an indefinite wait, the same as

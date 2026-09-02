@@ -703,6 +703,7 @@ mod tests {
             Vec::new(),
             vec![SecretNeedle::named("declared", NEEDLE_VALUE.to_vec())],
             crate::sandbox::redact::MIN_LEN_DEFAULT,
+            Vec::new(),
         );
         assert!(
             creds.observe("Authorization", &format!("Bearer {OWN}"), "chat.example"),

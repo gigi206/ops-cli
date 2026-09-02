@@ -555,7 +555,7 @@ pub(crate) fn app(
             };
         // Subsume against the SAME effective policy the proxy enforced — the config allowlist unioned
         // with the always-on built-in allow-set — so a built-in-allowed host is never re-proposed.
-        let effective = super::union_with_builtin(policy);
+        let effective = super::union_with_builtin((*policy).clone());
         let learned = super::netlearn::synthesize(&events, &effective, gran);
         return AppOutcome {
             code,

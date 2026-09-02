@@ -121,6 +121,11 @@ fi
 ''',
 ]
 
+# Privy is annotated above as the auth API and login modal, and Nous runs its own Privy endpoint;
+# the session is then spent on the inference and portal hosts. One service for the credential, two
+# domains on the wire.
+shared_credential = [["*.nousresearch.com", "*.privy.io"]]
+
 [bundle.hermes-desktop.packages]
 # Hermes Desktop via the flake's `#desktop` output, built host-side — so `sbx upgrade flake` rolls
 # it forward.

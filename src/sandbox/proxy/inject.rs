@@ -373,17 +373,24 @@ pub(crate) struct SecretNeedle {
     /// value of the same declaration; an observed one has no declaration behind it, so nothing
     /// replaces it and dropping it is simply losing it — see [`Credentials::replace`].
     observed: bool,
-    /// For a **learned** needle, the host the cage was sending it to when sbx saw it — its rightful
-    /// destination, lowercased and without a port. `None` for a declared one.
+    /// For a **learned** needle, the hosts it may travel to — its own service, lowercased and
+    /// without a port. `None` for a declared one.
     ///
-    /// The outbound tripwire skips a learned needle on a request bound for this host, and only
+    /// The outbound tripwire skips a learned needle on a request bound for one of these, and only
     /// there. What the tripwire exists to stop is the cage taking a credential it acquired for one
     /// service and re-sending it to ANOTHER; scanning it on the way back to its own service refuses
     /// the app's own authenticated traffic instead, so an app that signs itself in cuts its own
-    /// session off at the second request. A declared needle keeps `None` and is therefore scanned
-    /// everywhere, which stays correct: the cage never holds a declared value in the first place,
-    /// so its appearance anywhere — destination included — is a leak.
-    dest: Option<String>,
+    /// session off at the second request.
+    ///
+    /// It is a set rather than the one host sbx saw, because a service is not one host: an app that
+    /// signs in on one name and calls its API on another would otherwise refuse its own traffic on
+    /// the second name for the reason above. Which names belong together is not inferable — the
+    /// registrable domains of a real pair differ — so it comes from the `[network]
+    /// shared_credential` group containing the host it was learned on, and is that host alone when
+    /// no group names it. A declared needle keeps `None` and is therefore scanned everywhere, which
+    /// stays correct: the cage never holds a declared value in the first place, so its appearance
+    /// anywhere — destination included — is a leak.
+    dest: Option<Vec<String>>,
 }
 
 impl SecretNeedle {
@@ -402,12 +409,13 @@ impl SecretNeedle {
     }
 
     /// A needle for a credential sbx **saw** rather than issued: an app's own sign-in, remembered by
-    /// [`Credentials::observe`] so the tripwires cover it too. `dest` is the host it was travelling
-    /// to, which [`Self::scanned_for`] then exempts — see the field's own note.
-    fn learned(name: impl Into<String>, bytes: Vec<u8>, dest: &str) -> Self {
+    /// [`Credentials::observe`] so the tripwires cover it too. `service` is the host it was
+    /// travelling to together with any the launch declared to share its credential, which
+    /// [`Self::scanned_for`] then exempts — see the field's own note.
+    fn learned(name: impl Into<String>, bytes: Vec<u8>, service: Vec<String>) -> Self {
         Self {
             observed: true,
-            dest: Some(host_key(dest)),
+            dest: Some(service),
             ..Self::named(name, bytes)
         }
     }
@@ -450,12 +458,20 @@ impl SecretNeedle {
 
     /// Whether the outbound tripwire scans for this needle on a request bound for `host`.
     ///
-    /// True for every declared needle, and for a learned one everywhere except the host it was
-    /// learned on. The comparison is on the same normalized form both sides record ([`host_key`]),
-    /// because an exemption that fails to match is invisible: the request is refused and the reason
-    /// looks like the credential really did go somewhere it should not.
+    /// True for every declared needle, and for a learned one everywhere except the hosts of the
+    /// service it was learned on. The comparison is on the same normalized form both sides record
+    /// ([`host_key`]), because an exemption that fails to match is invisible: the request is refused
+    /// and the reason looks like the credential really did go somewhere it should not.
     pub(crate) fn scanned_for(&self, host: &str) -> bool {
-        self.dest.as_deref() != Some(host_key(host).as_str())
+        match &self.dest {
+            None => true,
+            Some(service) => {
+                let host = host_key(host);
+                !service
+                    .iter()
+                    .any(|entry| crate::allowlist::shared_credential_covers(entry, &host))
+            }
+        }
     }
 
     /// The needle bytes — used by the scan, and by the egress tests to confirm a needle was
@@ -556,6 +572,14 @@ pub(crate) struct Credentials {
     /// own after the launch resolved its declared ones, and a needle it adds must clear the same
     /// floor as those — see [`OBSERVE_MIN_LEN`].
     min_len: usize,
+    /// The launch's `[network] shared_credential` groups, canonicalized by the config layer (which
+    /// is where a `*.domain` entry keeps its prefix and its domain is normalized). Read once per
+    /// learned
+    /// needle, to give it the whole service rather than the single host sbx happened to see the
+    /// credential going to. Held here rather than consulted per request because
+    /// [`SecretNeedle::scanned_for`] runs against every request head: resolving the group at learn
+    /// time keeps that a membership test with no reachback.
+    shared_credential: Vec<Vec<String>>,
 }
 
 impl Credentials {
@@ -564,6 +588,7 @@ impl Credentials {
         injections: Vec<HeaderInjection>,
         needles: Vec<SecretNeedle>,
         min_len: usize,
+        shared_credential: Vec<Vec<String>>,
     ) -> Self {
         Self {
             current: std::sync::RwLock::new(std::sync::Arc::new(CredentialSet {
@@ -571,6 +596,21 @@ impl Credentials {
                 needles,
             })),
             min_len,
+            shared_credential,
+        }
+    }
+
+    /// The hosts a credential learned on `dest` may travel to: the declared group containing it, or
+    /// `dest` alone when no group names it — which is the behaviour that predates the field.
+    fn service_of(&self, dest: &str) -> Vec<String> {
+        let host = host_key(dest);
+        match self.shared_credential.iter().find(|group| {
+            group
+                .iter()
+                .any(|entry| crate::allowlist::shared_credential_covers(entry, &host))
+        }) {
+            Some(group) => group.clone(),
+            None => vec![host],
         }
     }
 
@@ -675,7 +715,7 @@ impl Credentials {
         needles.push(SecretNeedle::learned(
             format!("observed:{header}"),
             bytes.to_vec(),
-            dest,
+            self.service_of(dest),
         ));
         *current = std::sync::Arc::new(CredentialSet {
             injections: current.injections.clone(),
@@ -929,7 +969,7 @@ mod tests {
     /// A credential state on the built-in redaction floor — what a launch that configures none runs
     /// with. The tests that care about the floor itself call [`Credentials::new`] directly.
     fn default_creds(injections: Vec<HeaderInjection>, needles: Vec<SecretNeedle>) -> Credentials {
-        Credentials::new(injections, needles, MIN_LEN_DEFAULT)
+        Credentials::new(injections, needles, MIN_LEN_DEFAULT, Vec::new())
     }
 
     /// A credential sbx **learned** survives a re-resolution; a declared one is replaced by it.
@@ -1244,11 +1284,141 @@ mod tests {
         assert!(creds.snapshot().needles.is_empty());
     }
 
+    /// A service is not one host. A credential learned on one host of a declared group travels to
+    /// the others without tripping the wire, and still trips it everywhere else — the third host is
+    /// what makes this a test of the scope rather than of the tripwire being off.
+    #[test]
+    fn a_learned_credential_travels_across_its_declared_service_and_no_further() {
+        let creds = Credentials::new(
+            Vec::new(),
+            Vec::new(),
+            MIN_LEN_DEFAULT,
+            vec![vec![
+                "api.example.test".to_string(),
+                "app.example.test".to_string(),
+            ]],
+        );
+        assert!(creds.observe(
+            "authorization",
+            "Bearer tok-0123456789abcdef",
+            "api.example.test"
+        ));
+        let set = creds.snapshot();
+        let needle = set.needles.first().expect("the credential was learned");
+        assert!(
+            !needle.scanned_for("api.example.test"),
+            "the host it was acquired on is exempt, as it was before the field existed"
+        );
+        assert!(
+            !needle.scanned_for("app.example.test"),
+            "the other host of the declared service is exempt too — this is the whole field"
+        );
+        assert!(
+            needle.scanned_for("elsewhere.test"),
+            "a host outside the group is still scanned: the guard is scoped, not disabled"
+        );
+    }
+
+    /// A `*.domain` entry covers the apex and every subdomain, and nothing that merely ends in the
+    /// same letters — the separator rule an `allow` list's wildcard obeys, asked here through the
+    /// same function so it cannot be right in one place and wrong in the other.
+    #[test]
+    fn a_wildcard_group_covers_the_service_and_stops_at_its_boundary() {
+        let creds = Credentials::new(
+            Vec::new(),
+            Vec::new(),
+            MIN_LEN_DEFAULT,
+            vec![vec![
+                "*.example.test".to_string(),
+                "example.test".to_string(),
+            ]],
+        );
+        assert!(creds.observe(
+            "authorization",
+            "Bearer tok-0123456789abcdef",
+            "api.example.test"
+        ));
+        let set = creds.snapshot();
+        let needle = set.needles.first().expect("the credential was learned");
+        assert!(
+            !needle.scanned_for("api.example.test"),
+            "the acquiring host"
+        );
+        assert!(!needle.scanned_for("app.example.test"), "another subdomain");
+        assert!(!needle.scanned_for("example.test"), "the apex");
+        assert!(
+            needle.scanned_for("example.test.evil.test"),
+            "a domain that merely carries the name is outside the group"
+        );
+        assert!(
+            needle.scanned_for("notexample.test"),
+            "the separating dot is required, so a bare suffix does not match"
+        );
+        assert!(needle.scanned_for("elsewhere.test"), "an unrelated host");
+    }
+
+    /// With no group naming its host, a learned credential keeps the exemption it had before the
+    /// field existed — one host, and one only.
+    #[test]
+    fn an_undeclared_host_keeps_the_single_host_exemption() {
+        let creds = Credentials::new(
+            Vec::new(),
+            Vec::new(),
+            MIN_LEN_DEFAULT,
+            vec![vec![
+                "api.other.test".to_string(),
+                "app.other.test".to_string(),
+            ]],
+        );
+        assert!(creds.observe(
+            "authorization",
+            "Bearer tok-0123456789abcdef",
+            "api.example.test"
+        ));
+        let set = creds.snapshot();
+        let needle = set.needles.first().expect("the credential was learned");
+        assert!(!needle.scanned_for("api.example.test"));
+        assert!(
+            needle.scanned_for("app.other.test"),
+            "a group that does not name the acquiring host grants it nothing"
+        );
+    }
+
+    /// The group and the request's host are compared in one spelling, because an exemption that
+    /// fails to match is invisible: the request is refused and the reason names a leak. The two
+    /// sides are normalized in different places — the entries by the config layer, which is where a
+    /// group is read, and the request's host here — so this covers the half this type owns: an
+    /// oddly-spelled destination still meets a canonical group.
+    #[test]
+    fn a_request_host_is_canonicalized_before_it_meets_its_group() {
+        let creds = Credentials::new(
+            Vec::new(),
+            Vec::new(),
+            MIN_LEN_DEFAULT,
+            vec![vec![
+                "api.example.test".to_string(),
+                "app.example.test".to_string(),
+            ]],
+        );
+        assert!(creds.observe(
+            "authorization",
+            "Bearer tok-0123456789abcdef",
+            "API.Example.Test"
+        ));
+        let set = creds.snapshot();
+        let needle = set.needles.first().expect("the credential was learned");
+        assert!(
+            !needle.scanned_for("APP.EXAMPLE.TEST."),
+            "upper case and a trailing root dot still name the group's host"
+        );
+        assert!(needle.scanned_for("elsewhere.test"));
+    }
+
     /// Lowering the declared floor must not lower this one: an observed credential was inferred
     /// rather than named by a human, so it stays on the stricter of the two.
     #[test]
     fn a_lowered_declared_floor_does_not_lower_the_observed_one() {
-        let creds = Credentials::new(Vec::new(), Vec::new(), 4);
+        let creds = Credentials::new(Vec::new(), Vec::new(), 4, Vec::new());
         // 12 bytes: over the launch's floor, under the inferred one.
         assert!(!creds.observe("authorization", "Bearer tok-01234567", "host.test"));
         assert!(creds.snapshot().needles.is_empty());
@@ -1258,7 +1428,7 @@ mod tests {
     /// only worth scanning for above 24 bytes means it for the ones it did not declare too.
     #[test]
     fn a_raised_declared_floor_raises_the_observed_one() {
-        let creds = Credentials::new(Vec::new(), Vec::new(), 24);
+        let creds = Credentials::new(Vec::new(), Vec::new(), 24, Vec::new());
         // 20 bytes: over the inferred floor, under the launch's.
         assert!(!creds.observe("authorization", "Bearer tok-0123456789abcdef", "host.test"));
         assert!(creds.snapshot().needles.is_empty());

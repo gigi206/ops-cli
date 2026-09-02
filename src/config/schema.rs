@@ -409,6 +409,12 @@ pub(crate) struct RawBundle {
     /// Refusals to keep out of the default egress log, unioned onto the app's `mute` list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) mute: Vec<String>,
+    /// Hosts of this tool that are one service for a credential it obtains by its own sign-in —
+    /// same shape and meaning as [`NetworkTable::shared_credential`], unioned onto the app's own
+    /// groups. The bundle is where a service's hosts are already enumerated, so it is where the
+    /// statement that some of them share a credential belongs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) shared_credential: Vec<Vec<String>>,
     /// Credentials the egress proxy injects for this tool, host-side. Same shape and effect as an
     /// app's `[secret]` section — effective only under a network allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1918,6 +1924,33 @@ pub(crate) struct NetworkTable {
     /// (Mode A) stays all-verbs. Absent means the built-in `["GET","HEAD"]` app default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default_methods: Option<Vec<String>>,
+    /// Hosts that are one service, for a credential the cage obtained by its own sign-in. Each
+    /// entry is a group, and a credential learned on any host of a group is not refused on its way
+    /// to the others.
+    ///
+    /// The outbound tripwire exempts a learned credential on the host it was acquired on, and only
+    /// there. A service is not one host: an app that signs in on one name and calls its API on
+    /// another sends its own session token somewhere sbx never saw it acquired, which has the shape
+    /// of an exfiltration and is refused as one. Claude Desktop is the shipped example — the OAuth
+    /// exchange lands on `api.anthropic.com` while the account API is on `claude.ai` — and without
+    /// a group its settings, conversation list and session state are refused while its message
+    /// traffic keeps working.
+    ///
+    /// Nothing infers a group. Two names belonging to one service share no property a resolver can
+    /// read: the registrable domains differ in that very example. Declaring one widens where a
+    /// learned credential may travel, so it is a security field, gated like the rest of the table,
+    /// and one written wider than the service it names widens the tripwire without saying so.
+    ///
+    /// An entry is a hostname or a `*.domain` wildcard, which covers the apex and every subdomain
+    /// under the separator rule an `allow` list's wildcard obeys, so a service spread over regional
+    /// names is written once.
+    ///
+    /// A group needs at least two hosts to mean anything, and no group may cover an entry an
+    /// earlier one already covers — that would leave "the same service" ambiguous rather than
+    /// merely wide. Either shape is dropped with a warning, which is the fail-closed direction: the
+    /// tripwire then keeps the per-host exemption it had before the declaration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) shared_credential: Vec<Vec<String>>,
     /// Named reusable egress groups, `[network.groups]` — each `name = [ "<entry>", … ]`, where an
     /// entry is any egress rule string the `allow`/`deny` lists accept (an IP, host, `*.domain`,
     /// exact URL, `re:` regex, or `tcp://` L4 target, with an optional `{VERB,…}` method prefix).
@@ -2740,6 +2773,7 @@ mod tests {
         assert_eq!(
             cfg.network,
             Some(NetworkField::Table(NetworkTable {
+                shared_credential: vec![],
                 mute: vec![],
                 http2: vec![],
                 capture: None,
@@ -2775,6 +2809,7 @@ mod tests {
         assert_eq!(
             cfg.network,
             Some(NetworkField::Table(NetworkTable {
+                shared_credential: vec![],
                 mute: vec![],
                 http2: vec![],
                 capture: None,
@@ -2807,6 +2842,7 @@ mod tests {
         assert_eq!(
             cfg.network,
             Some(NetworkField::Table(NetworkTable {
+                shared_credential: vec![],
                 mute: vec![],
                 http2: vec![],
                 capture: None,
