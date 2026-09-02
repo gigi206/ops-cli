@@ -1131,7 +1131,8 @@ fn resolve_or_deny(
                 // Named, never silent: the run is about to behave differently from what the
                 // configuration declared, and the destination is what the user has to recognise.
                 crate::diag::warn(&format!(
-                    "the credential for `{}` did not resolve ({e}) — {} is denied for this run                      rather than reached without the header it was declared to carry",
+                    "the credential for `{}` did not resolve ({e}) — {} is denied for this \
+                     run rather than reached without the header it was declared to carry",
                     secret.name,
                     secret.to.concrete_host().unwrap_or(secret.name.as_str())
                 ));
