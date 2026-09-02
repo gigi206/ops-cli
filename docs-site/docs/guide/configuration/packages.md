@@ -108,7 +108,7 @@ mise's own tool options ride the token in brackets, and a declaration may carry 
 kilo = "mise:github:Kilo-Org/kilocode[version_prefix=v]"
 ```
 
-This one matters for a repository that publishes **two release lines from one repo** — a CLI
+This one matters for a repository that publishes **two release lines from one repo**: a CLI
 tagged `v7.5.9` beside an IDE plugin tagged `jetbrains/v7.1.5`. Asked for the newest release,
 the backend ranks every tag it finds and can land on the wrong line, which is not a version
 you would have chosen and may not even carry the executable the profile names.

@@ -1052,6 +1052,34 @@ pub(crate) fn start(
 /// `standing` is the set this one replaces, empty at launch and the live one on a refresh. It is the
 /// only thing here that is *running* rather than resolved: see [`resolve_one`] for what is reused
 /// out of it and on what condition.
+fn resolve_injections(
+    secrets: &[HeaderSecret],
+    project_root: &Path,
+    bwrap: &Path,
+    min_len: usize,
+    brokers: &[super::broker::Reachable],
+    standing: &[HeaderInjection],
+) -> io::Result<(Vec<HeaderInjection>, Vec<SecretNeedle>)> {
+    let mut injections = Vec::with_capacity(secrets.len());
+    let mut redactions = Vec::new();
+    for (i, secret) in secrets.iter().enumerate() {
+        // Positional, because both sets are built from the same `secrets` in the same order by this
+        // very loop — and checked rather than trusted: `resolve_one` reuses nothing whose plugin
+        // name and key do not also match.
+        let (injection, needles) = resolve_one(
+            secret,
+            project_root,
+            bwrap,
+            min_len,
+            brokers,
+            standing.get(i),
+        )?;
+        injections.push(injection);
+        redactions.extend(needles);
+    }
+    Ok((injections, redactions))
+}
+
 /// What a launch does when a credential it declared cannot be resolved.
 ///
 /// The two answers differ in blast radius, never in whether an unauthenticated request may leave:
@@ -1112,34 +1140,6 @@ fn resolve_or_deny(
         }
     }
     (injections, redactions, denied)
-}
-
-fn resolve_injections(
-    secrets: &[HeaderSecret],
-    project_root: &Path,
-    bwrap: &Path,
-    min_len: usize,
-    brokers: &[super::broker::Reachable],
-    standing: &[HeaderInjection],
-) -> io::Result<(Vec<HeaderInjection>, Vec<SecretNeedle>)> {
-    let mut injections = Vec::with_capacity(secrets.len());
-    let mut redactions = Vec::new();
-    for (i, secret) in secrets.iter().enumerate() {
-        // Positional, because both sets are built from the same `secrets` in the same order by this
-        // very loop — and checked rather than trusted: `resolve_one` reuses nothing whose plugin
-        // name and key do not also match.
-        let (injection, needles) = resolve_one(
-            secret,
-            project_root,
-            bwrap,
-            min_len,
-            brokers,
-            standing.get(i),
-        )?;
-        injections.push(injection);
-        redactions.extend(needles);
-    }
-    Ok((injections, redactions))
 }
 
 /// Read one secret's plaintext host-side, validate it, and shape it into a [`HeaderInjection`] plus

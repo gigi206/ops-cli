@@ -113,8 +113,8 @@ profile sets `network = "none"` is skipped.
 A credential the app declares is resolved for the roll's cage like it is for any launch, but an
 unresolvable one costs less here. A launch refuses to start; a roll denies that credential's
 destination for the run and rolls the app anyway, naming what it denied. The header a destination
-was declared to carry is still never omitted from a request — the destination simply becomes
-unreachable — so the roll cannot reach it bare. The reasoning is that a roll fetches packages,
+was declared to carry is still never omitted from a request (the destination simply becomes
+unreachable), so the roll cannot reach it bare. The reasoning is that a roll fetches packages,
 while a credential is for the traffic the app makes when it actually runs: an API token that is
 briefly unavailable should not decide whether the app's tools can move forward.
 
@@ -127,8 +127,8 @@ land on an *earlier* version, or on an artefact from a different line altogether
 sbx does not silently call that an upgrade. Each `<old> → <new>` step is read back, and two shapes
 are reported apart from the rest:
 
-- **downgraded** — the two versions rank, and the new one ranks below the old.
-- **changed release line** — they cannot be ranked *and* they do not share a shape, so the new
+- **downgraded**: the two versions rank, and the new one ranks below the old.
+- **changed release line**: they cannot be ranked *and* they do not share a shape, so the new
   version names a different line rather than a later release of the same one (`7.4.17` against
   `jetbrains/v7.1.2`).
 
@@ -138,7 +138,7 @@ The exit status does not change: the roll did what it was asked, and what to do 
 landed on is a decision about the declaration, not about the command.
 
 A pair that simply cannot be ranked while keeping its shape (`0.preview.70` → `0.preview.91`) is an
-ordinary roll and is reported as one — only the digits moved.
+ordinary roll and is reported as one: only the digits moved.
 
 ### The `resolve` forms
 
