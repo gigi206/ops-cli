@@ -148,7 +148,7 @@ pub(crate) fn is_wsl_release(osrelease: &str) -> bool {
 /// Whether the kernel this launch runs on is a WSL one, read from `/proc/sys/kernel/osrelease`.
 /// A file that cannot be read answers `false`, which keeps the fallback shut on a host whose
 /// `/proc` is not the one this expects rather than opening it on a guess.
-fn host_is_wsl() -> bool {
+pub(crate) fn host_is_wsl() -> bool {
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .is_ok_and(|release| is_wsl_release(&release))
 }

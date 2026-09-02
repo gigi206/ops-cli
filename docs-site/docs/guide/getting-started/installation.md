@@ -76,15 +76,25 @@ Three further differences are worth knowing before they surprise you:
   Windows home directory, which is the opposite of what the security model is for.
   Keep projects in the distribution's own filesystem, where the bind is the project
   and nothing above it.
-- **No notification daemon is present by default,** so refusals that would raise a
-  desktop notification are reported on stderr, and `doctor` says so. This is a gap in
-  the distribution rather than a limit of `sbx`, which speaks the ordinary freedesktop
-  protocol: give the session a service owning `org.freedesktop.Notifications` and
-  refusals reach the Windows notification centre, with no change to `sbx` and no
-  setting to turn on. What that service does on the Windows side is its own problem
-  and not a small one: a relay must raise a modern toast under a registered
-  application id, because the older balloon call returns without error and leaves
-  nothing behind in the centre.
+- **Refusals are raised as Windows toasts.** A distribution owns no
+  `org.freedesktop.Notifications`, and the desktop these announcements are for is the
+  Windows one, so under a WSL kernel `sbx` raises them there instead. It also keeps the
+  stderr line: nothing in the toast call reports whether it was seen, because a session
+  mismatch, Focus Assist, or a per-application notification setting each swallow one and
+  return success. A duplicate line is the price of never announcing a refusal into
+  silence. Should a distribution own that bus name after all, the ordinary desktop sink
+  wins and neither of these applies.
+
+  The toast carries **PowerShell's** name, and that is a choice rather than an oversight.
+  A toast has to be raised under an application id Windows already knows; registering one
+  for `sbx` means writing to the Windows registry from Linux, which is a heavier thing to
+  do as a side effect of a notification than the wrong name on a banner is to read.
+
+  A toast is drawn in the Windows session the distribution's interop belongs to, which is
+  the session that started it. Start the distribution from a service or a remote shell and
+  the toasts are drawn where nobody looks; `sbx` compares that session against the
+  desktop's and says so once, after the first announcement, rather than leaving it to be
+  discovered. `wsl --shutdown` and a launch from the desktop puts them back.
 - **The light/dark preference comes from Windows.** A distribution runs no desktop
   portal, so the bus name `sbx` reads that preference from owns nothing there. Under a
   WSL kernel it asks Windows instead, through its own registry, and seeds the cage with

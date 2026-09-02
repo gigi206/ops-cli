@@ -204,6 +204,119 @@ impl Sink for StderrSink {
     }
 }
 
+/// The PowerShell fragment that raises one Windows toast, with `title` and `body` embedded as
+/// single-quoted literals. Pure, so the quoting is pinned by a test rather than by a terminal.
+///
+/// Both strings are the cage's writing: a refused host, an exec target, a task name. They are
+/// sanitised first, which takes the control characters and newlines out, and then embedded with
+/// PowerShell's own escape for a single-quoted string — a quote doubled. Interpolating them into a
+/// command line instead would hand the cage a shell on the Windows side, which is a boundary this
+/// sandbox exists to keep.
+///
+/// The application id is PowerShell's own. A toast has to be raised under an id Windows already
+/// knows, and registering one for `sbx` would mean writing to the Windows registry from Linux as a
+/// side effect of a notification. The visible cost is the name on the toast, which reads
+/// "Windows PowerShell"; the alternative costs a write to another operating system's configuration.
+fn toast_script(title: &str, body: &str) -> String {
+    let quote = |s: &str| crate::sandbox::sanitize(s).replace('\'', "''");
+    format!(
+        "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, \
+         ContentType=WindowsRuntime] > $null\n\
+         [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, \
+         ContentType=WindowsRuntime] > $null\n\
+         $x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(\
+         [Windows.UI.Notifications.ToastTemplateType]::ToastText02)\n\
+         $t = $x.GetElementsByTagName('text')\n\
+         $t.Item(0).AppendChild($x.CreateTextNode('{title}')) > $null\n\
+         $t.Item(1).AppendChild($x.CreateTextNode('{body}')) > $null\n\
+         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(\
+         '{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\powershell.exe'\
+         ).Show([Windows.UI.Notifications.ToastNotification]::new($x))\n",
+        title = quote(title),
+        body = quote(body),
+    )
+}
+
+/// Whether a toast raised from here would be drawn where somebody can see it: the Windows session
+/// the interop lands in against the one the desktop shell runs in.
+///
+/// They disagree when the distribution was first started from outside the desktop — a service, a
+/// remote shell, a scheduled task — because WSL's interop belongs to whichever session started it.
+/// A toast raised into the services session is delivered with no error and drawn where nobody
+/// looks, so this is read once per launch and reported once, rather than left to be discovered by
+/// a refusal that seemed not to happen.
+fn toast_is_visible() -> Option<bool> {
+    let ask = |script: &str| -> Option<u32> {
+        let out = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", script])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    };
+    let interop = ask("(Get-Process -Id $PID).SessionId")?;
+    let desktop = ask("(Get-Process -Name explorer | Select-Object -First 1).SessionId")?;
+    Some(interop == desktop)
+}
+
+/// The WSL sink: a Windows toast, **and** the stderr line the fallback would have printed.
+///
+/// Both, deliberately. Nothing in the toast call reports whether it was seen: a session mismatch,
+/// Focus Assist, or a per-application notification setting each swallow it and return success. The
+/// stderr line is what sbx already gave a WSL user, so keeping it trades a duplicate line for the
+/// certainty that a refusal is never announced into silence — and the duplicate is only ever seen
+/// by someone who also got the toast.
+struct WslToastSink {
+    context: String,
+    /// Whether the session check below has been made. It costs two interop round-trips, so it is
+    /// made once, and **after** the first announcement has already been delivered: made at
+    /// construction it sat in front of the delivery loop, and a launch short enough to finish
+    /// inside it lost its refusal entirely. Measured — a cage that refused a request and exited
+    /// announced nothing at all.
+    diagnosed: bool,
+}
+
+impl Sink for WslToastSink {
+    fn deliver(
+        &mut self,
+        summary: &str,
+        body: &str,
+        _replaces: Option<u32>,
+    ) -> Result<Option<u32>, ()> {
+        crate::diag::warn(&stderr_line(&self.context, summary, body));
+        // Detached and not waited for: a toast is an announcement, and a launch must not spend an
+        // interop round-trip of its own time on one. A failure to spawn is not a transport that is
+        // gone either — the stderr half above is the delivery that always lands — so this sink
+        // never asks to be replaced.
+        let _ = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", &toast_script(summary, body)])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if !self.diagnosed {
+            self.diagnosed = true;
+            // Last, so neither the line above nor the toast waits on it. What it explains is a
+            // toast that was raised and not seen, which is only worth explaining once the first
+            // one has been raised.
+            match toast_is_visible() {
+                Some(false) => crate::diag::note(
+                    "this distribution was first started outside the Windows desktop session, so \
+                     a toast raised from it is drawn where nobody sees it — the refusals are on \
+                     stderr; `wsl --shutdown` and a launch from the desktop restores them",
+                ),
+                Some(true) => {}
+                None => crate::diag::note(
+                    "could not tell which Windows session a toast is drawn in — the refusals are \
+                     on stderr as well as raised",
+                ),
+            }
+        }
+        Ok(None)
+    }
+}
+
 /// The desktop sink: `org.freedesktop.Notifications.Notify` on the host session bus.
 ///
 /// Holds the connection for the session's lifetime — one connection, one thread, and the async work
@@ -535,6 +648,14 @@ impl Notifier {
                 Some(s) => s,
                 None => match DesktopSink::connect(&context) {
                     Some(d) => Box::new(d),
+                    // No daemon answered. Under WSL that is the normal state rather than a
+                    // failure — the desktop these announcements are for is the Windows one, which
+                    // takes them through its own toast API — so the announcement goes there as
+                    // well as to stderr. Everywhere else this is the stderr fallback it always was.
+                    None if crate::sandbox::theme_relay::host_is_wsl() => Box::new(WslToastSink {
+                        context: context.clone(),
+                        diagnosed: false,
+                    }),
                     None => {
                         crate::diag::note(
                             "no desktop notification daemon reachable — reporting blocked \
@@ -737,6 +858,35 @@ mod tests {
         seen: Arc<Mutex<Vec<Delivery>>>,
         /// Whether this sink hands out ids (a desktop daemon does, stderr does not).
         ids: bool,
+    }
+
+    /// The two strings a toast carries are the cage's writing, so the escape that contains them is
+    /// the boundary. A quote in a host name must close no literal, and a newline must add no
+    /// statement.
+    #[test]
+    fn a_toast_script_contains_what_the_cage_wrote() {
+        let script = super::toast_script(
+            "Blocked: evil'; Start-Process calc.exe; #.test:443",
+            "line one\nline two",
+        );
+        assert!(
+            script.contains("evil''; Start-Process calc.exe; #.test:443"),
+            "a quote is doubled, which is PowerShell's own escape: {script}"
+        );
+        assert!(
+            !script.contains("line one\nline two"),
+            "a newline is taken out before quoting, not carried into the script"
+        );
+        // The statements the script is made of are sbx's, and there are exactly as many lines as it
+        // wrote: a cage string that opened a line of its own would show up here.
+        assert_eq!(
+            script
+                .lines()
+                .filter(|l| l.contains("Start-Process"))
+                .count(),
+            1,
+            "the injected text sits inside one literal, not on a line of its own: {script}"
+        );
     }
 
     impl Sink for Recorder {
