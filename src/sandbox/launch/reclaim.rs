@@ -657,10 +657,19 @@ fn equip_for_gc(prep: &Prepared) -> Result<crate::sandbox::projectstore::Project
 
     // mesa driver roots under `gpu = true`, so gc keeps the built output rather than collecting and
     // re-provisioning it each launch — mirroring the launch path's GPU provisioning and the fonts.
+    // GLVND comes with it where this host has an NVIDIA bridge: it is provisioned on the same
+    // condition, so it has to be retained on the same condition or gc would collect what the next
+    // launch rebuilds.
     if prep.cfg.gpu
-        && let Ok(layer) = crate::sandbox::gpu::provision(&prep.nix, &prep.layout, &prep.nixpkgs)
+        && let Ok(layer) = crate::sandbox::gpu::provision(
+            &prep.nix,
+            &prep.layout,
+            &prep.nixpkgs,
+            crate::sandbox::gpu::nvidia_bridge().as_ref(),
+        )
     {
         gui_roots.push(layer.root);
+        gui_roots.extend(layer.glvnd);
     }
 
     // audio userspace roots under `audio = true`, same reason: gc keeps the client libraries and

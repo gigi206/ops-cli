@@ -49,7 +49,7 @@ fn task_client_programs(userland: &binds::Userland) -> (PathBuf, PathBuf, PathBu
 fn optional_layer<T>(
     prep: &Prepared,
     wanted: bool,
-    provision: fn(&Path, &Layout, &str) -> io::Result<T>,
+    provision: impl FnOnce(&Path, &Layout, &str) -> io::Result<T>,
     explain: impl FnOnce(&io::Error) -> String,
 ) -> Option<T> {
     if !wanted {
@@ -607,12 +607,28 @@ pub(super) fn build(
     // project store and the cage reads the drivers through `/nix`; the env pointing libgbm/libEGL
     // at them is applied in the launch block below. Best-effort, like the fonts: a fetch that fails
     // warns and the app runs (falling back to software rendering) rather than failing the launch.
-    let gpu_layer = optional_layer(prep, prep.cfg.gpu, crate::sandbox::gpu::provision, |e| {
-        format!(
-            "`gpu = true` but the mesa drivers could not be provisioned \
+    // Resolved once for its three readers: the GPU layer's provisioning (which adds GLVND only
+    // where there is a bridge to serve), the binds and env below, and the device grant further
+    // down. It walks the host's driver directories and `/dev`, so asking three times would be
+    // three walks and, worse, three chances to disagree.
+    let nvidia = prep
+        .cfg
+        .gpu
+        .then(crate::sandbox::gpu::nvidia_bridge)
+        .flatten();
+    let gpu_layer = optional_layer(
+        prep,
+        prep.cfg.gpu,
+        |nix, layout, nixpkgs| {
+            crate::sandbox::gpu::provision(nix, layout, nixpkgs, nvidia.as_ref())
+        },
+        |e| {
+            format!(
+                "`gpu = true` but the mesa drivers could not be provisioned \
                  ({e}) — rendering may fall back to software"
-        )
-    });
+            )
+        },
+    );
 
     // Under `audio = true`, provision the PulseAudio client library (`libpulse.so.0`) host-side so
     // the cage can open capture/playback streams. Provisioned here — before the seed — so its store
@@ -1466,15 +1482,6 @@ pub(super) fn build(
     // bind, whose source path is set by sbx — so these keys need no denylist entry.
     let mut gui_binds: Vec<binds::ExtraBind> = Vec::new();
     let mut gui_env: Vec<(String, String)> = Vec::new();
-
-    // Resolved once: the libraries are bound in the GPU block below and the device nodes are
-    // granted with the render nodes further down, and neither should walk the host's directories
-    // a second time.
-    let nvidia = prep
-        .cfg
-        .gpu
-        .then(crate::sandbox::gpu::nvidia_bridge)
-        .flatten();
 
     // Fonts: bind the generated fontconfig configuration read-only and name it to the cage's
     // fontconfig. The font *files* were provisioned and seeded above; this points fontconfig at

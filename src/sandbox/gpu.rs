@@ -105,10 +105,19 @@ pub(crate) struct GpuLayer {
     pub(crate) env: Vec<(String, String)>,
 }
 
-/// Provision mesa into sbx's store against the pinned `nixpkgs` and derive the driver-path env.
+/// Provision mesa into sbx's store against the pinned `nixpkgs` and derive the driver-path env,
+/// plus GLVND when `nvidia` names a bridge to serve (see [`GLVND`]). The bridge is passed in rather
+/// than resolved here because it walks the host's driver directories, and its other two readers —
+/// the binds and the device grant — need the same answer this one does.
+///
 /// The gcroot is keyed by revision (`<data>/gcroots/gpu/<rev>/mesa`), shared across every project
 /// on the same channel — like the fonts and the base userland — rather than copied per project.
-pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Result<GpuLayer> {
+pub(crate) fn provision(
+    nix: &Path,
+    layout: &Layout,
+    nixpkgs: &str,
+    nvidia: Option<&NvidiaBridge>,
+) -> io::Result<GpuLayer> {
     let (attr, marker, name) = MESA;
     let root_dir = layout
         .data_dir()
@@ -119,7 +128,7 @@ pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Resul
     let env = driver_env(&root);
     // Only where there is an NVIDIA driver to bridge: on every other host mesa's own dispatch comes
     // from the app, and provisioning a second one would be a download for no gain.
-    let glvnd = match nvidia_bridge() {
+    let glvnd = match nvidia {
         Some(_) => {
             let (attr, marker, name) = GLVND;
             Some(store::provision(
