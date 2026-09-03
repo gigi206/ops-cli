@@ -138,7 +138,7 @@ navbar entry: they are for looking things up, not reading through.
 - [`[devices]`](configuration/devices): expose host device nodes into the cage (trusted-only).
 - [`[ssh_agent]`](configuration/ssh-agent): sign with a named key the cage never holds (trusted-only).
 - [`gui`](configuration/gui): the Wayland display posture.
-- [`gpu`](configuration/gpu): hardware-accelerated GPU rendering (mesa: Intel/AMD/nouveau).
+- [`gpu`](configuration/gpu): hardware-accelerated GPU rendering (mesa: Intel/AMD/nouveau; NVIDIA through the host's own driver).
 - [`audio`](configuration/audio): microphone and playback via PulseAudio.
 - [`dbus`](configuration/dbus): a private in-cage desktop portal (file chooser + theme + notifications).
 - [`network`](configuration/network): the egress posture (links to [Networking](networking/)).

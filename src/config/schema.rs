@@ -232,8 +232,12 @@ pub(crate) struct RawConfig {
     /// global config or a trusted project, ignored from an untrusted one: a render node and the
     /// `/sys` device tree widen the kernel attack surface (a GPU-driver bug becomes reachable
     /// from the cage), a choice an untrusted project may not make. Covers mesa-supported GPUs
-    /// (Intel/AMD/nouveau); the NVIDIA proprietary stack is a separate, not-yet-built mechanism.
-    /// Most useful together with `gui = "wayland"`.
+    /// (Intel/AMD/nouveau) from sbx's own store, and NVIDIA's proprietary userspace from the
+    /// host, which is where it has to come from: it is version-locked to the host's kernel
+    /// module and so cannot be provisioned hermetically. That bridge serves compute and
+    /// offscreen rendering; on a hybrid host a windowed client still renders on the integrated
+    /// GPU, as it does outside a cage. Most useful together with `gui = "wayland"`, though a
+    /// compute-only launch under `gui = "none"` gets the devices and libraries just the same.
     pub(crate) gpu: Option<bool>,
     /// Whether to open audio (microphone + playback) for the cage (`audio = true`). sbx provisions
     /// the PulseAudio client library into its own store and puts it on the app's loader path, and

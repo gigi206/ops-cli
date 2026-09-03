@@ -1,6 +1,6 @@
 ---
 sidebar_label: "gpu"
-description: "Hardware-accelerated rendering inside the cage, on Intel, AMD and nouveau."
+description: "Hardware-accelerated rendering inside the cage, on Intel, AMD, nouveau, and NVIDIA."
 ---
 
 # `gpu`: hardware-accelerated GPU rendering
@@ -24,7 +24,8 @@ See also: [`gui`](gui) · [`[devices]`](devices) · [Enforcement stack](../conce
 
 ## What `gpu = true` provides
 
-Three pieces, together, all supplied automatically: no paths to write:
+Three pieces, together, all supplied automatically: no paths to write. A fourth set joins
+them on a host with an NVIDIA driver, described under [the NVIDIA bridge](#scope-mesa-gpus-and-the-nvidia-bridge).
 
 1. **mesa's DRI drivers**, provisioned into sbx's own store and pointed at through
    `LIBGL_DRIVERS_PATH`/`GBM_BACKENDS_PATH`/`__EGL_VENDOR_LIBRARY_DIRS`. The driver path
@@ -40,20 +41,60 @@ Each piece is **best-effort**: if mesa cannot be provisioned (no network on a fi
 or a render node is absent, the app still runs and falls back to software rendering rather
 than failing the launch.
 
-## Scope: mesa GPUs
+## Scope: mesa GPUs, and the NVIDIA bridge
 
-This covers **mesa-supported GPUs, Intel, AMD, and nouveau**. The **NVIDIA proprietary**
-stack is a separate mechanism (its userspace is version-locked to the host kernel module, so
-it cannot be provisioned hermetically like mesa) and is not this hole. On an NVIDIA-only
-machine `gpu = true` provisions mesa but finds no mesa-drivable device, and rendering falls
-back to software (it still works, just slower).
+The three pieces above cover **mesa-supported GPUs, Intel, AMD, and nouveau**, whose
+userspace sbx provisions itself from its own pinned nixpkgs.
+
+The **NVIDIA proprietary** stack cannot be provisioned that way: its userspace is
+version-locked to the host's kernel module, so it has to come from the host. Under the same
+`gpu = true`, sbx bridges it when the host has one, adding three more pieces:
+
+4. **The driver's libraries**, bound read-only file by file under `/run/sbx-nvidia/lib` and
+   placed on the loader path. Each real file is bound under the name the loader asks for
+   (its soname), because a host symlink bound onto itself resolves to its versioned target
+   and the soname would disappear from the cage.
+5. **The GLVND vendor declaration** (`10_nvidia.json`) and NVIDIA's **EGL external platform**
+   declarations, named through `__EGL_VENDOR_LIBRARY_FILENAMES` and
+   `__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS`. mesa's own vendor stays alongside, so the cage
+   carries both and each platform gets the one that drives it.
+6. **The driver's character devices** (`/dev/nvidiactl`, `/dev/nvidia<N>`, `/dev/nvidia-uvm`,
+   `/dev/nvidia-uvm-tools`, `/dev/nvidia-modeset`), granted through the same device-bind
+   mechanism as the render nodes and enumerated rather than assumed, so a second card comes
+   along. Never a DRM `card*` primary node, for the reason the render nodes are granted alone.
+
+### Prerequisites
+
+The host must carry the NVIDIA **graphics** userspace, not only the compute one. On
+Debian and Ubuntu that is `libnvidia-gl-<branch>` alongside `libnvidia-compute-<branch>`; a
+compute-only install ships `libcuda.so.1` but no `libEGL_nvidia.so.0`, no GLVND vendor
+declaration and no Vulkan ICD. On such a host nothing renders on the card, in a cage or out
+of one, and sbx builds no bridge: `gpu = true` provisions mesa and behaves exactly as before.
+
+That userspace must match the loaded kernel module. When the two disagree sbx names the
+mismatch, because the natural failure is silent: the vendor never registers, and EGL reports
+an empty extension string with no error at all.
+
+### Limitation: a windowed app on a hybrid machine
+
+The bridge serves **compute** (CUDA) and **offscreen** rendering. On a hybrid machine (an
+integrated GPU plus an NVIDIA card, the usual laptop arrangement) a **windowed** client still
+renders on the integrated GPU, inside the cage exactly as it does outside one: the compositor
+holds that device, and the only known way around it runs GLX under X11 with PRIME offload.
+
+sbx [never offers X11](gui#why-wayland-only-never-x11), by the same isolation decision that
+governs the display posture: an X client can snoop and drive every other window in the
+session. The bridge does not touch that refusal, so that way around stays out of reach, on
+purpose. On a host whose NVIDIA card is the only one, the compositor itself runs on it and
+the question does not arise.
 
 ## Most useful with a display
 
 `gpu = true` is independent of `gui`, but its point is a rendered window, so it is normally
 paired with `gui = "wayland"`. For a Chromium/Electron desktop app that means dropping
-`--disable-gpu` from the app's `cmd` (that flag forces the software path). A GPU-less
-compute use (no display) is possible but not the primary case.
+`--disable-gpu` from the app's `cmd` (that flag forces the software path). A compute use
+with no display at all is equally supported: `gpu = true` with `gui = "none"` still grants the
+devices and the driver libraries, which is what a CUDA workload in a cage needs.
 
 ## Why it is trusted-only
 

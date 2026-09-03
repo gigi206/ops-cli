@@ -1466,6 +1466,15 @@ pub(super) fn build(
     let mut gui_binds: Vec<binds::ExtraBind> = Vec::new();
     let mut gui_env: Vec<(String, String)> = Vec::new();
 
+    // Resolved once: the libraries are bound in the GPU block below and the device nodes are
+    // granted with the render nodes further down, and neither should walk the host's directories
+    // a second time.
+    let nvidia = prep
+        .cfg
+        .gpu
+        .then(crate::sandbox::gpu::nvidia_bridge)
+        .flatten();
+
     // Fonts: bind the generated fontconfig configuration read-only and name it to the cage's
     // fontconfig. The font *files* were provisioned and seeded above; this points fontconfig at
     // them so text renders rather than boxes — and a browser engine renders nothing at all
@@ -1585,6 +1594,113 @@ pub(super) fn build(
                 dest: bridge,
                 writable: false,
             });
+        }
+
+        // The NVIDIA bridge: this host's proprietary userspace, which is version-locked to its
+        // kernel module and so cannot be provisioned hermetically the way mesa is. Same shape as
+        // the WSL bridge above — host libraries plus the loader path — with the one difference
+        // that is the whole trick: each real file is bound *under the name the loader asks for*,
+        // because a soname bound onto itself resolves to its versioned target and disappears.
+        //
+        // Scope is compute (CUDA) and offscreen rendering. On a hybrid host a windowed client
+        // still renders on the integrated GPU, inside the cage exactly as outside it: the
+        // compositor holds that device, and the one workaround is GLX under X11, which sbx never
+        // offers. Nothing here approaches that refusal.
+        if let Some(nv) = &nvidia {
+            for (src, dest) in &nv.libs {
+                gui_binds.push(binds::ExtraBind {
+                    src: src.clone(),
+                    dest: dest.clone(),
+                    writable: false,
+                });
+            }
+            gui_env.push((
+                "LD_LIBRARY_PATH".to_string(),
+                PathBuf::from(crate::sandbox::gpu::CAGE_NVIDIA)
+                    .join("lib")
+                    .display()
+                    .to_string(),
+            ));
+
+            // Both vendors have to stay reachable: mesa's, in the seeded store, drives the
+            // Wayland and GBM platforms, and dropping it would take those platforms away with it.
+            // `__EGL_VENDOR_LIBRARY_DIRS` names a *list*, so the answer is the union — NVIDIA's
+            // directory ahead of mesa's, the order this was measured working in. Composed from
+            // the layer's own value rather than enumerated on the host: what the layer holds is
+            // the path as seen *from the cage*, and the store lives elsewhere on the host.
+            match &nv.vendor_json {
+                Some((src, dest)) => {
+                    gui_binds.push(binds::ExtraBind {
+                        src: src.clone(),
+                        dest: dest.clone(),
+                        writable: false,
+                    });
+                    let nvidia_dir = PathBuf::from(crate::sandbox::gpu::CAGE_NVIDIA)
+                        .join("egl_vendor.d")
+                        .display()
+                        .to_string();
+                    let mesa_dirs = gpu_layer.as_ref().and_then(|layer| {
+                        layer
+                            .env
+                            .iter()
+                            .find(|(k, _)| k == "__EGL_VENDOR_LIBRARY_DIRS")
+                            .map(|(_, v)| v.clone())
+                    });
+                    gui_env.push((
+                        "__EGL_VENDOR_LIBRARY_DIRS".to_string(),
+                        match mesa_dirs {
+                            Some(mesa) => format!("{nvidia_dir}:{mesa}"),
+                            None => nvidia_dir,
+                        },
+                    ));
+                }
+                None => crate::diag::warn(
+                    "`gpu = true`: the NVIDIA driver libraries are here but their GLVND \
+                     declaration (`10_nvidia.json`) is not — the cage renders on mesa",
+                ),
+            }
+
+            // Without these NVIDIA's vendor does not expose `EGL_EXT_platform_wayland`, so a
+            // Wayland client falls back to mesa without ever saying why.
+            if nv.platforms.is_empty() {
+                crate::diag::warn(
+                    "`gpu = true`: no NVIDIA EGL external-platform declaration was found under \
+                     `/usr/share/egl/egl_external_platform.d` — the cage's NVIDIA vendor will not \
+                     offer the Wayland platform",
+                );
+            }
+            for (src, dest) in &nv.platforms {
+                gui_binds.push(binds::ExtraBind {
+                    src: src.clone(),
+                    dest: dest.clone(),
+                    writable: false,
+                });
+            }
+            if !nv.platforms.is_empty() {
+                gui_env.push((
+                    "__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS".to_string(),
+                    PathBuf::from(crate::sandbox::gpu::CAGE_NVIDIA)
+                        .join("egl_external_platform.d")
+                        .display()
+                        .to_string(),
+                ));
+            }
+
+            // A userspace that does not match the loaded kernel module fails the same silent way
+            // a missing soname does: the vendor never registers and EGL reports an empty
+            // extension string. Name it instead of leaving the reader to derive it from a blank.
+            if let (Some(user), Some(kernel)) = (
+                nv.version.as_deref(),
+                std::fs::read_to_string("/proc/driver/nvidia/version")
+                    .ok()
+                    .and_then(|t| crate::sandbox::gpu::kernel_module_version(&t)),
+            ) && user != kernel
+            {
+                crate::diag::warn(&format!(
+                    "`gpu = true`: the NVIDIA userspace on this host is {user} but the loaded \
+                     kernel module is {kernel} — the cage will find no NVIDIA device"
+                ));
+            }
         }
     }
 
@@ -1892,7 +2008,11 @@ pub(super) fn build(
     // Deduped: a trusted `[devices] allow = [...]` alongside `gpu = true` must not emit a bind twice.
     let mut devices = prep.cfg.devices.clone();
     if prep.cfg.gpu {
-        for node in crate::sandbox::gpu::render_nodes() {
+        let nvidia_nodes = nvidia.iter().flat_map(|nv| nv.devices.iter().cloned());
+        for node in crate::sandbox::gpu::render_nodes()
+            .into_iter()
+            .chain(nvidia_nodes)
+        {
             if !devices.contains(&node) {
                 devices.push(node);
             }

@@ -4,7 +4,7 @@
 //! enumerate a DRM device), and no render node — so a graphical app falls back to a
 //! software GL path that, on Wayland, often fails to produce a buffer and the window
 //! never maps. When `gpu = true` a trusted config opens hardware-accelerated rendering
-//! by supplying the three pieces the driver needs:
+//! by supplying the pieces the driver needs:
 //!
 //! 1. mesa's DRI drivers, provisioned into sbx's own store and pointed at through
 //!    `LIBGL_DRIVERS_PATH`/`GBM_BACKENDS_PATH`/`__EGL_VENDOR_LIBRARY_DIRS` — so the
@@ -19,9 +19,15 @@
 //!    ([`wsl_bridge`]) — Windows provides those, not nixpkgs, so a hermetic cage would
 //!    otherwise hold the render node and render in software regardless.
 //!
-//! Scope: mesa-supported GPUs (Intel/AMD/nouveau). The NVIDIA proprietary stack is a
-//! separate mechanism — its userspace is version-locked to the host kernel module, so
-//! it cannot be provisioned hermetically like mesa — and is not this hole.
+//! 5. where the host carries an NVIDIA driver, that driver's own userspace
+//!    ([`nvidia_bridge`]): its libraries, its GLVND vendor declaration, its EGL external
+//!    platforms and its character devices. Version-locked to the host's kernel module, so
+//!    unlike mesa it cannot be provisioned hermetically and has to come from the host.
+//!
+//! Scope of that last piece is compute and offscreen rendering. On a hybrid host a windowed
+//! client still renders on the integrated GPU, inside a cage exactly as outside one, because
+//! the compositor holds that device; the one way around it is GLX under X11, which the
+//! display posture never offers and this module does not reopen.
 
 use crate::store::{self, Layout};
 use std::io;
@@ -154,6 +160,179 @@ pub(crate) fn wsl_bridge_in(root: &Path) -> Option<PathBuf> {
     dir.join(WSL_BRIDGE_LIB).exists().then_some(dir)
 }
 
+/// The fixed cage path the host's NVIDIA driver userspace is bound under (parity with the other
+/// fixed cage paths, `/run/sbx-pulse` and friends). Three children: `lib` for the driver
+/// libraries, `egl_vendor.d` for the GLVND vendor declaration, `egl_external_platform.d` for the
+/// platform declarations NVIDIA's Wayland and GBM support are declared through.
+pub(crate) const CAGE_NVIDIA: &str = "/run/sbx-nvidia";
+
+/// The library the NVIDIA bridge keys on: the GLVND EGL vendor. A host without it has no NVIDIA
+/// graphics userspace at all — a compute-only install (`libnvidia-compute-*` with no
+/// `libnvidia-gl-*`) is exactly that, and nothing on such a host can render on the card, cage or
+/// no cage. The bridge is then `None` and the GPU hole is what it was.
+const NVIDIA_VENDOR_LIB: &str = "libEGL_nvidia.so.0";
+
+/// Where distributions keep the driver's userspace, probed in order. The first directory holding
+/// [`NVIDIA_VENDOR_LIB`] wins; sbx is a static binary and does not shell out to `ldconfig` to ask.
+const NVIDIA_LIB_DIRS: [&str; 4] = [
+    "usr/lib/x86_64-linux-gnu",
+    "usr/lib64",
+    "usr/lib",
+    "run/opengl-driver/lib",
+];
+
+/// The host's NVIDIA userspace, resolved into what a cage needs: files to bind, and nodes to grant.
+///
+/// Every path pair is `(host source, cage destination)`. The destination matters as much as the
+/// source: the loader asks for a *soname* (`libEGL_nvidia.so.0`), which on the host is a symlink
+/// to a versioned file. Binding such a path with source and destination equal resolves it to the
+/// versioned name and the soname disappears from the cage — measured, and its failure mode is
+/// silent: the vendor never registers and EGL reports an empty extension string with no error at
+/// all. So each real file is bound *under the name the loader asks for*.
+pub(crate) struct NvidiaBridge {
+    /// The driver libraries, each real file destined for the name it is known by.
+    pub(crate) libs: Vec<(PathBuf, PathBuf)>,
+    /// The GLVND vendor declaration, named through `__EGL_VENDOR_LIBRARY_FILENAMES`.
+    pub(crate) vendor_json: Option<(PathBuf, PathBuf)>,
+    /// The external EGL platform declarations (Wayland, GBM); without them NVIDIA's vendor does
+    /// not expose `EGL_EXT_platform_wayland`.
+    pub(crate) platforms: Vec<(PathBuf, PathBuf)>,
+    /// The character devices the driver reaches the card through. Never a DRM `card*` node: the
+    /// reason [`render_nodes`] gives holds here too.
+    pub(crate) devices: Vec<PathBuf>,
+    /// The driver version, read off the versioned file the vendor soname resolves to, so a skew
+    /// against the loaded kernel module can be named rather than left to fail silently.
+    pub(crate) version: Option<String>,
+}
+
+/// The NVIDIA bridge for this host, or `None` where there is no NVIDIA graphics userspace.
+pub(crate) fn nvidia_bridge() -> Option<NvidiaBridge> {
+    nvidia_bridge_in(Path::new("/"))
+}
+
+/// [`nvidia_bridge`] under a named root, so the whole resolution is testable against a fixture
+/// tree rather than the host's own `/usr` and `/dev`.
+pub(crate) fn nvidia_bridge_in(root: &Path) -> Option<NvidiaBridge> {
+    let dir = NVIDIA_LIB_DIRS
+        .iter()
+        .map(|d| root.join(d))
+        .find(|d| d.join(NVIDIA_VENDOR_LIB).exists())?;
+    let cage_lib = PathBuf::from(CAGE_NVIDIA).join("lib");
+
+    let mut libs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !is_nvidia_driver_lib(name) {
+                continue;
+            }
+            // The *resolved* file as the source, so a soname entry carries the real library and
+            // not a link that would dangle once the cage no longer holds its target.
+            if let Ok(src) = std::fs::canonicalize(entry.path()) {
+                libs.push((src, cage_lib.join(name)));
+            }
+        }
+    }
+    libs.sort();
+    if libs.is_empty() {
+        return None;
+    }
+
+    let vendor = root.join("usr/share/glvnd/egl_vendor.d/10_nvidia.json");
+    let vendor_json = vendor.exists().then(|| {
+        (
+            vendor,
+            PathBuf::from(CAGE_NVIDIA).join("egl_vendor.d/10_nvidia.json"),
+        )
+    });
+
+    let platform_dir = root.join("usr/share/egl/egl_external_platform.d");
+    let cage_platforms = PathBuf::from(CAGE_NVIDIA).join("egl_external_platform.d");
+    let mut platforms: Vec<(PathBuf, PathBuf)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&platform_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            // Only NVIDIA's own declarations: the directory is shared, and another vendor's
+            // platform has no business entering a cage on the GPU flag's account.
+            if name.contains("nvidia") && name.ends_with(".json") {
+                platforms.push((entry.path(), cage_platforms.join(name)));
+            }
+        }
+    }
+    platforms.sort();
+
+    let version = libs
+        .iter()
+        .find(|(_, dest)| dest.file_name().is_some_and(|n| n == NVIDIA_VENDOR_LIB))
+        .and_then(|(src, _)| src.file_name()?.to_str()?.rsplit_once(".so."))
+        .map(|(_, v)| v.to_string());
+
+    Some(NvidiaBridge {
+        libs,
+        vendor_json,
+        platforms,
+        devices: nvidia_nodes_in(root),
+        version,
+    })
+}
+
+/// The NVIDIA character devices under a named root: the control and memory nodes plus every
+/// numbered card, enumerated rather than assumed — a second card is `nvidia1`, and a host with the
+/// libraries but no card at all yields the control nodes only.
+fn nvidia_nodes_in(root: &Path) -> Vec<PathBuf> {
+    let dev = root.join("dev");
+    let mut nodes: Vec<PathBuf> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&dev) else {
+        return nodes;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let wanted = matches!(
+            name,
+            "nvidiactl" | "nvidia-uvm" | "nvidia-uvm-tools" | "nvidia-modeset"
+        ) || numbered_node(name, "nvidia");
+        if wanted {
+            nodes.push(entry.path());
+        }
+    }
+    nodes.sort();
+    nodes
+}
+
+/// Whether a file in the host's driver directory belongs to the NVIDIA driver's userspace. Pure.
+fn is_nvidia_driver_lib(name: &str) -> bool {
+    // The container toolkit installs `libnvidia-container*` in the same directory. It is not part
+    // of the driver's userspace, versions on its own schedule, and a cage has no use for it.
+    if name.starts_with("libnvidia-container") {
+        return false;
+    }
+    [
+        "libnvidia-",
+        "libEGL_nvidia",
+        "libGLX_nvidia",
+        "libGLESv1_CM_nvidia",
+        "libGLESv2_nvidia",
+        "libcuda",
+        "libnvcuvid",
+        "libnvoptix",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+}
+
+/// The driver version the loaded kernel module reports, from the text of
+/// `/proc/driver/nvidia/version`. That file is prose, not a bare version — its first line reads
+/// `NVRM version: NVIDIA UNIX x86_64 Kernel Module  580.173.02  <date>` — so the version is the
+/// token after `Kernel Module`. Pure, because the format is the fragile part. `None` when the line
+/// does not have that shape, which is the same answer as "cannot tell", never a false mismatch.
+pub(crate) fn kernel_module_version(text: &str) -> Option<String> {
+    let (_, rest) = text.split_once("Kernel Module")?;
+    rest.split_whitespace().next().map(str::to_string)
+}
+
 /// The minimal `/sys` DRM subtree mesa/libdrm read to enumerate a device, discovered from the
 /// host's DRM nodes at launch. `drmGetDevices2()` walks `/sys/dev/char` and each node's sysfs
 /// device directory (the PCI/platform device carrying `vendor`/`device`/`uevent` and the `drm/`
@@ -283,6 +462,112 @@ mod tests {
     /// handing over the directory gives that up for a use case (a Wayland client rendering offscreen
     /// and handing the buffer to the compositor) that never touches a `card*` node. Both the module
     /// header and the shipped guide say "the render node(s)"; this is what makes that true.
+    #[test]
+    fn the_nvidia_bridge_binds_each_real_file_under_the_name_the_loader_asks_for() {
+        let root = crate::testutil::TmpDir::new();
+        let dir = root.join("usr/lib/x86_64-linux-gnu");
+
+        assert!(
+            nvidia_bridge_in(root.path()).is_none(),
+            "a host with no NVIDIA graphics userspace has no bridge — a compute-only install is \
+             exactly that"
+        );
+
+        std::fs::create_dir_all(&dir).expect("stage the driver directory");
+        std::fs::write(dir.join("libEGL_nvidia.so.580.173.02"), b"").expect("stage the vendor");
+        std::os::unix::fs::symlink(
+            "libEGL_nvidia.so.580.173.02",
+            dir.join("libEGL_nvidia.so.0"),
+        )
+        .expect("stage the soname");
+        std::fs::write(dir.join("libnvidia-container.so.1.20.0"), b"").expect("stage the toolkit");
+
+        let bridge = nvidia_bridge_in(root.path()).expect("the vendor library makes it a bridge");
+
+        let soname = bridge
+            .libs
+            .iter()
+            .find(|(_, dest)| dest.ends_with("libEGL_nvidia.so.0"))
+            .expect("the soname is carried into the cage");
+        assert_eq!(
+            soname.0,
+            std::fs::canonicalize(dir.join("libEGL_nvidia.so.0")).expect("resolve the soname"),
+            "the source is the real file, so the cage entry does not dangle"
+        );
+        assert_eq!(
+            soname.1,
+            PathBuf::from("/run/sbx-nvidia/lib/libEGL_nvidia.so.0"),
+            "and its destination keeps the name the loader asks for — a source bound onto itself \
+             would resolve to the versioned name and the soname would vanish"
+        );
+        assert_eq!(
+            bridge.version.as_deref(),
+            Some("580.173.02"),
+            "the version is read off the file the soname resolves to"
+        );
+        assert!(
+            !bridge
+                .libs
+                .iter()
+                .any(|(_, dest)| dest.to_string_lossy().contains("libnvidia-container")),
+            "the container toolkit sits in the same directory and is not the driver's userspace"
+        );
+    }
+
+    #[test]
+    fn the_nvidia_grant_enumerates_its_nodes_and_never_a_drm_primary_node() {
+        let root = crate::testutil::TmpDir::new();
+        let dev = root.join("dev");
+        std::fs::create_dir_all(&dev).expect("stage the device directory");
+        for node in [
+            "nvidiactl",
+            "nvidia0",
+            "nvidia1",
+            "nvidia-uvm",
+            "nvidia-modeset",
+            "nvidia-caps",
+            "card0",
+        ] {
+            std::fs::write(dev.join(node), b"").expect("stage a node");
+        }
+
+        let nodes: Vec<String> = nvidia_nodes_in(root.path())
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str().map(str::to_string))
+            .collect();
+
+        assert_eq!(
+            nodes,
+            [
+                "nvidia-modeset",
+                "nvidia-uvm",
+                "nvidia0",
+                "nvidia1",
+                "nvidiactl"
+            ],
+            "every numbered card is enumerated rather than assumed, the control nodes come along, \
+             and neither a DRM primary node nor the `nvidia-caps` directory does"
+        );
+    }
+
+    #[test]
+    fn the_kernel_module_version_is_read_from_the_prose_line_it_sits_in() {
+        assert_eq!(
+            kernel_module_version(
+                "NVRM version: NVIDIA UNIX x86_64 Kernel Module  580.173.02  Tue Jun 23 08:38:17 \
+                 UTC 2026\nGCC version:\n"
+            )
+            .as_deref(),
+            Some("580.173.02"),
+            "the file is prose, not a bare version: the number is the token after `Kernel Module`"
+        );
+        assert_eq!(
+            kernel_module_version("something else entirely"),
+            None,
+            "a line of another shape answers `cannot tell`, never a false mismatch"
+        );
+    }
+
     #[test]
     fn the_gpu_grant_enumerates_render_nodes_and_never_the_primary_nodes() {
         let dri = crate::testutil::TmpDir::new();
