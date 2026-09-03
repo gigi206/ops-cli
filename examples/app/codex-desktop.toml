@@ -1,0 +1,258 @@
+# Codex Desktop — OpenAI's desktop app (Chat + Work + Codex), sandboxed by sbx.
+#
+#   sbx bundle import examples/bundle/codex-desktop.toml
+#   sbx app import    examples/app/codex-desktop.toml
+#   sbx app run codex-desktop
+#
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The app's `.deb`, the sign-in browser, the extra
+# libraries its build needs and the hosts it reaches come from a shared BUNDLE, so import it too:
+#     sbx bundle import examples/bundle/codex-desktop.toml
+#     sbx app import    examples/app/codex-desktop.toml
+# One extra step, and it buys the thing that was actually broken here: a hand-copy of an app's
+# requirements silently falls behind the app.
+#
+#   EGRESS GROUP — a shared lane, imported once (shared, not per-agent):
+#     sbx net groups import examples/net-groups/chromium-background.toml
+#
+# This is the GRAPHICAL app whose **Codex** surface is the desktop sibling of the `codex` CLI
+# profile, alongside the Chat and Work surfaces, parallel threads, file inspection and a browser
+# panel. OpenAI ships an official Linux build as a `.deb` (Ubuntu 24.04/26.04, Debian 13) and an
+# `.rpm`; the app is packaged under the name `chatgpt` and its documentation lives at
+# developers.openai.com/codex/app. Neither a `.deb` nor an apt repository installs in the hermetic
+# cage, so sbx packages it with the `deb:` backend.
+#
+# THE `deb:` BACKEND. sbx fetches OpenAI's prebuilt `.deb` directly, resolves it to a content hash
+# (pinned in the per-project deb lock), and builds a generated derivation that unpacks it and
+# `autoPatchelfHook`s the Electron binaries against a curated library set — no apt, no maintainer
+# scripts, no from-source build. The build is HOST-SIDE (like `nix:`), safe because a `.deb` runs no
+# build script; the result is seeded into the store and offline-reusable. FIRST LAUNCH resolves and
+# builds it, and this artifact is LARGE — several hundred megabytes of `.deb` unpacking to a
+# multi-gigabyte tree, plus the Electron and Chromium closures, over your host network and NOT the
+# cage allowlist. Later launches reuse the pinned build offline. Versions move on `sbx upgrade deb`,
+# which re-reads the vendor's apt index; see the bundle's header for how that pin is attested.
+#
+# THE BUILD IS PROVEN, and it needed three extra library attributes to get there. Run against the
+# shipped `.deb`, the generated derivation wraps `usr/lib/chatgpt/ChatGPT` (the Electron binary) as
+# the command below, with no unsatisfied dependency left. The three attributes ride the bundle's
+# `[…deb.codex-desktop] libs`, and the reason each is there is written beside it — in particular the
+# two Qt ones, which exist ONLY to satisfy Chromium's optional Qt platform-theme shims and do not
+# make this a Qt application. One difference from the other Electron `.deb` profiles is worth
+# knowing: this package ships no `chrome-sandbox` at all, so the setuid-bit problem those profiles
+# had to work around does not arise here.
+#
+# CA TRUST (why `--use-system-ca`). Under the allowlist sbx runs a TLS-terminating proxy with a
+# per-session CA. Electron/Chromium ignores the CA-file env vars sbx sets and trusts its own NSS
+# database (`~/.pki/nssdb`), so a Chromium app would otherwise fail every HTTPS with
+# `ERR_CERT_AUTHORITY_INVALID`. For a `gui = "wayland"` cage under a filtering posture, sbx seeds
+# its MITM CA into the cage's NSS db automatically (part of the GUI hole, like fonts) — no
+# per-profile shim needed. The app only has to be told to consult that store, hence
+# `--use-system-ca`, which this binary accepts.
+#
+# DISPLAY + GPU + AUDIO + DBUS — `gui = "wayland"` binds the host Wayland socket (read-only) and
+# provisions fonts so the window maps (X11 is never offered; isolation is compositor-dependent —
+# Mutter/GNOME is safe, wlroots exposes screen-capture/input-injection, see
+# docs-site/docs/guide/configuration/gui.md). `gpu = true` opens hardware-accelerated rendering
+# (mesa's drivers into sbx's store + the `/dev/dri` render node + the minimal `/sys` DRM subtree);
+# without it a Chromium/Electron app on Wayland often produces no buffer and no window maps. mesa
+# covers Intel/AMD/nouveau; an NVIDIA-only machine falls back to software (still renders, slower).
+# `audio = true` provisions the PulseAudio client library and binds the host PulseAudio socket into
+# the cage, so voice input and sound work — the package's own `Recommends: pulseaudio` says it wants
+# them. It is trusted-only because the PulseAudio bus exposes the microphone AND every system-audio
+# `.monitor` source (recording all host output), see docs-site/docs/guide/configuration/audio.md.
+# `dbus = true` gives the cage its OWN private desktop portal (a `dbus-daemon` +
+# `xdg-desktop-portal` with the reference GTK backend, all in-cage), so the app's FILE CHOOSER opens
+# IN-CAGE and lists only the cage filesystem, and its `libnotify` notifications reach a host-side
+# relay bridging `org.freedesktop.Notifications`. It also seeds your host light/dark theme at launch
+# and follows it live, while the login keyring (`org.freedesktop.secrets`) stays absent. The
+# Electron flags: `--no-sandbox` is mandatory and acceptable (bubblewrap + seccomp + the empty netns
+# IS the boundary, replacing Chromium's own redundant sandbox); `--ozone-platform=wayland` selects
+# the Wayland backend; `--disable-dev-shm-usage` avoids the small cage `/dev/shm`.
+#
+# `--password-store=basic`: Chromium normally encrypts its session cookie with a key from the OS
+# keyring (Secret Service, over dbus), which the cage's private bus does not expose — so without it
+# the cookie cannot be re-decrypted next launch and you are logged out. The package's own
+# `Suggests: gir1.2-gnomekeyring-1.0` is the vendor saying it looks for exactly that keyring.
+# `basic` forces the file store in the isolated $HOME (a weak fixed key — acceptable: the token
+# already lives only in the per-app isolated cage home, never the project shell).
+#
+# CREDENTIAL POSTURE — account sign-in, with an optional BYOK key. You sign in with your ChatGPT
+# account, ONCE inside the cage; the session then persists in the app's dedicated, persistent,
+# isolated home. The app also reads `OPENAI_API_KEY` from its environment — it exposes that variable
+# to its own UI through an internal handler — so the commented `[env]` + `[secret]` pair at the
+# bottom gives you the same header-injected BYOK path the `codex` CLI profile uses: the real key is
+# read on the HOST and substituted by the egress proxy on the wire to api.openai.com, and the
+# plaintext never enters the cage. Both paths stay bounded by the egress allowlist.
+#
+# THE SIGN-IN, AND WHY THERE IS NO `forward`. The app's browser-based login uses
+# `https://auth.openai.com` as its issuer and takes the result back on a LOOPBACK callback —
+# `http://localhost:1455/auth/callback`, falling back to port 1457 — which it opens with the
+# platform's external-browser handler. The `[open]` table below routes that to a Chromium running
+# INSIDE the cage, and that is what removes the need for a `forward`: an in-cage browser's
+# `localhost` is the cage's own loopback, which is where the app is already listening. `forward`
+# would only be needed to bring a HOST browser's callback in, and it fails the launch closed when
+# the port is already taken on the host — so it is deliberately absent here. (The `codex` CLI
+# profile does forward 1455, because there the browser is genuinely the host's.)
+#
+# `codex` is routed back to the app because the shipped desktop entry registers
+# `x-scheme-handler/codex`: the app's own deep links (a shared thread, a review request, a settings
+# page) must reach the running instance rather than the host desktop. Unlike the callback above,
+# nothing in the sign-in depends on it.
+#
+# WHY THE COMMAND LINKS `ldd`, AND WHAT IT COSTS TO LEAVE IT OUT. Without the preamble below, the
+# app dies a few seconds after its window loads, as soon as a git project is selected: `sbx` reports
+# 132, which is `128 + 4`, so the process took SIGILL. The selection persists in the app's isolated
+# home, so every later launch dies the same way.
+#
+# What the crash is. The faulting instruction is a `ud1` — the trap LLVM emits for a sanitizer
+# check, not an `abort()` — inside the app's own binary, on a worker thread the app names `git`,
+# right after it logs `[git-repo-watcher] Starting git repo watcher`. A syscall trace of the dying
+# thread ends on an unambiguous sequence: it reads its own ELF header through `/proc/self/exe`,
+# opens `/usr/bin/ldd` and gets `ENOENT`, calls `getcwd`, and traps. The JavaScript it had just
+# loaded is `detect-libc`, which decides whether it is on a glibc or a musl system, and which reads
+# that **literal path** rather than searching `PATH`. A hermetic cage has no `/usr/bin/ldd`, so the
+# answer comes back unknown and the code path that follows takes the trap. What that path does is
+# not established: the trace ends at `getcwd`, and the faulting frame is in the main binary rather
+# than in any bundled `.node`.
+#
+# The fix is therefore to put a real `ldd` at the path that is consulted — not to relax the cage.
+# Binding the host's own `/usr/bin/ldd` also works and was how the cause was confirmed, but it would
+# make the profile depend on a host file; the bundle's `nix:glibc.bin` carries one instead.
+#
+# Ruled out along the way, each by its own run, so none of these is worth retrying: the network
+# posture (it died under `deny` and under `--net allow` alike), `gpu`, the size of the tree (a
+# 16-directory repository died the same way, and masking the largest subtree changed nothing), the
+# seccomp denylist (lifted in full, still died), a missing `/sys/devices/system/cpu`, the size of
+# `/dev/shm`, and the absence of `git` (it is present). Two control arms bounded it before the trace
+# named it: `claude-desktop` survives on the same project, and this app's own binary run OUTSIDE the
+# cage survives — the two closures agree byte for byte on the binary and on the native addons'
+# RUNPATHs, so that arm was valid.
+#
+# One app was measured, and the generalization is a hypothesis rather than a finding: any packaged
+# Node application that consults `detect-libc` would meet the same absent path, so if another
+# profile dies this way that is the first thing to check. No other profile was tested.
+#
+# To collect a crash report yourself, re-permit `ptrace` for one run:
+#     sbx app run codex-desktop --config 'seccomp = { allow = ["ptrace"] }'
+# Without it the app's own crash handler cannot attach and writes nothing.
+#
+# CAVEATS (honest, and labelled by what was actually established):
+#   * The `.deb` build is MEASURED — it resolves, unpacks, patches and wraps the right binary.
+#     Whether every surface (Chat, Work, Codex, the browser panel) is fully functional in the cage
+#     is for your live session, and the defect above bounds what a session can reach today.
+#   * The `[open]` routing is REASONED FROM PRECEDENT, not from a live sign-in: the loopback
+#     callback and the issuer are read out of the shipped artifact, but which of the app's sign-in
+#     paths a first run actually takes is not. If a login stalls, watch `sbx net logs -a
+#     codex-desktop` and the launch's stderr — an unrouted scheme is printed rather than opened.
+#   * Quitting — a single Ctrl+C does nothing (a GUI Electron app ignores SIGINT) and closing the
+#     window may not quit. Press **Ctrl+C twice within 2s** to force-quit the session (sbx
+#     terminates the cage), or `sbx session stop <id>` from another terminal.
+#   * Credential persistence — confirm the login survives a relaunch. The app may want the system
+#     keyring, which the hermetic cage does not provide, and should fall back to a file under the
+#     isolated home.
+#   * If the app signs in but comes back EMPTY — no settings, no thread list, no Codex sessions —
+#     while ordinary chat works, that is sbx refusing to carry a credential toward a host it was not
+#     acquired on. It is not declared here because it was not measured; the fix is a
+#     `shared_credential = [["chatgpt.com", "auth.openai.com"]]` in the bundle, added once the
+#     refusals name that pair. Every host named there is a host the token may travel to, which is
+#     why it is not guessed.
+#
+# If a request is refused, the proxy names the host — watch `sbx net logs -a codex-desktop` and add
+# it below (or check ahead with `sbx test net <url>`).
+cmd = [
+    "bash",
+    "-c",
+    '''
+# Put a real `ldd` where the app looks for one. Without this the app dies on SIGILL the moment a
+# git project is opened — the whole measurement is in the header above. `/usr/bin` is a writable
+# cage tmpfs (it is where sbx synthesises `env` and `xdg-open`), and `ldd` is on PATH because the
+# bundle declares `nix:glibc.bin`. Guarded rather than assumed: if either is ever missing the app
+# still starts, and fails the way it did before rather than failing to launch at all.
+if command -v ldd >/dev/null 2>&1 && mkdir -p /usr/bin 2>/dev/null; then
+    ln -sf "$(command -v ldd)" /usr/bin/ldd 2>/dev/null || true
+fi
+
+exec codex-desktop --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
+    --use-system-ca --password-store=basic "$@"
+''',
+    # Bound to `$0` so the first argument of `sbx app run codex-desktop -- <args>` reaches `"$@"`
+    # above instead of being eaten as the shell's own name.
+    "codex-desktop",
+]
+
+gui = "wayland"
+gpu = true
+audio = true
+dbus = true
+
+# Your host Codex config, mounted read-write at its real absolute path (so the caged app shares your
+# host settings and login state). `binds` is a security field, honored only because this profile
+# lives in your trusted config dir. The app reads `$CODEX_HOME`, defaulting to `~/.codex`, and its
+# user config is `~/.codex/config.toml` — read out of the shipped artifact, so the DIRECTORY is
+# confirmed; whether sharing it with the host is what you want is your call, and the app's isolated
+# home (the default) keeps the two apart.
+#binds = [
+#    { path = "~/.codex", mode = "rw" },
+#]
+
+# --- The app's requirements come from its bundle --------------------------------------------------
+# `use` pulls in the `codex-desktop` BUNDLE — the tracked `.deb`, the extra library attributes its
+# build needs, the sign-in Chromium and every host the app reaches — from one declaration shared
+# with the bundle file itself, so this profile cannot fall behind when the app's requirements
+# change. What the bundle may never carry is posture: the `gui`/`gpu`/`audio`/`dbus` grants, the
+# Electron flags in `cmd` and the `[open]` routing stay here.
+#
+# THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
+#     sbx bundle import examples/bundle/codex-desktop.toml
+# Without it the launch warns that the bundle is undeclared and the app is simply absent.
+use = ["codex-desktop"]
+
+# No `[packages]` here: the app's packages come from its bundle — see `use` above.
+
+# Where a link opens, declared rather than scripted. `http`/`https` go to the in-cage Chromium, which
+# is where the sign-in page belongs: what you type there stays behind the same egress allowlist as
+# everything else, and the loopback callback it is redirected to lands on the cage's own loopback
+# where the app is listening. `codex` is the app's deep-link scheme, registered by its own desktop
+# entry, and must reach the running instance. One declaration covers both ways a link is opened — a
+# tool calling `xdg-open` and an Electron app calling the portal under `dbus = true` — and sbx
+# freezes the routing, so nothing running in the cage can answer a sign-in link instead.
+#
+# Chromium gets the cage flags (`--no-sandbox` since bwrap+seccomp is the boundary; Wayland; the
+# file password store) and trusts the egress MITM CA because sbx seeds it into the shared
+# `~/.pki/nssdb`.
+#
+# Must stay below every top-level key: written above one, TOML would fold that key into this table.
+[open]
+http = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+https = ["chromium", "--no-sandbox", "--ozone-platform=wayland", "--password-store=basic", "--no-first-run", "--no-default-browser-check"]
+codex = ["codex-desktop", "--no-sandbox", "--ozone-platform=wayland", "--disable-dev-shm-usage"]
+
+[network]
+mode = "deny"
+allow = [
+    # The ChatGPT backend and its WebSocket hosts, the sign-in issuer, the OpenAI API, the UI's
+    # asset CDNs and the user-content domain all arrive with the `codex-desktop` bundle (`use`
+    # above) and are unioned into this list at resolution — inspect them with `sbx bundle
+    # codex-desktop`, and see the launch's own view with `sbx config show --app codex-desktop`.
+    #
+    # Enterprise routing — if your organization fronts OpenAI with a gateway or a proxy of its own,
+    # model traffic goes THERE instead of the hosts above; add that host.
+]
+# Silence the denied telemetry so `sbx net logs` reads clean. `mute` keeps those refusals out of the
+# default log (still denied, still counted in `sbx net stats`; see them with `--all`). Add any other
+# refused telemetry host you spot in the log — a `mute` never opens egress.
+mute = [
+    # Nothing here: the crash-reporting, feature-flag and analytics endpoints, and
+    # `@chromium-background`, all arrive with the bundle and are unioned in at resolution.
+]
+
+# BYOK path: the real key is read on the HOST and injected by the egress proxy — never in the cage.
+# Provide it on the host as $OPENAI_API_KEY (or point `from` at a resolver: `sops://`, `file://`)
+# and uncomment both blocks. The in-cage placeholder is what lets the app populate the field and
+# issue its request; the proxy strips the placeholder and substitutes the real key on the wire.
+[env]
+#OPENAI_API_KEY = "sk-sbx-placeholder-replaced-by-the-egress-proxy"
+
+#[secret."api.openai.com"]
+#from = "env://OPENAI_API_KEY"
+#header = "Authorization"
+#type = "bearer"

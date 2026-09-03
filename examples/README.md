@@ -43,7 +43,7 @@ the app launches without the tool and egress it named.
 here. It merges into your global config rather than only writing a profile sbx owns, which is why it
 is a flag: an unresolvable reference makes it refuse and write nothing at all.
 
-All 73 shipped profiles name a bundle, so this is the shape everywhere. The seven that name
+All 74 shipped profiles name a bundle, so this is the shape everywhere. The seven that name
 **another** agent's bundle rather than their own are the orchestrators listed below.
 
 ## App profiles (`app/`)
@@ -99,7 +99,7 @@ no such table gets a warning rather than an invented one, because inventing one 
 posture.
 
 **A bundle publishes what another profile can consume**, and that is the rule. Every shipped tool
-now has one — 66 bundles for 73 profiles — with a single exception: a profile that consumes another
+now has one — 67 bundles for 74 profiles — with a single exception: a profile that consumes another
 agent's engine publishes nothing of its own. `t3code` names `claude-code`; `aionui`,
 `opencode-web`, `open-design` and `orca-desktop` name `opencode`; `hermes-web` and `hermes-webui`
 name `hermes`. Nothing would ever compose one of *those*, so a bundle for them would be an artifact

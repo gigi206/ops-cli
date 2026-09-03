@@ -879,11 +879,20 @@ fn every_shipped_resolver_table_is_named_in_the_bundles_table() {
         // Read as tables rather than as `<name> = "<backend>:resolve"` package values: the sentinel
         // and the table are two halves of one declaration, and it is the table that carries the
         // command a roll runs.
+        //
+        // What is read is the `resolve` command, not the table around it. A `[<backend>.<name>]`
+        // table may also carry `libs` alone — extra nixpkgs attributes decorating a package whose
+        // source is already a fixed URL or an index — and such a table rolls nothing, so a row
+        // naming a resolver for it would promise a command that does not exist. The presence of
+        // the table was an exact proxy only while every shipped one happened to carry a command.
+        let carries_resolver = |tables: &std::collections::BTreeMap<String, schema::RawResolve>| {
+            tables.values().any(|table| !table.resolve.is_empty())
+        };
         let tables = [
-            ("tarball", !bundle.tarball.is_empty()),
-            ("deb", !bundle.deb.is_empty()),
-            ("appimage", !bundle.appimage.is_empty()),
-            ("binary", !bundle.binary.is_empty()),
+            ("tarball", carries_resolver(&bundle.tarball)),
+            ("deb", carries_resolver(&bundle.deb)),
+            ("appimage", carries_resolver(&bundle.appimage)),
+            ("binary", carries_resolver(&bundle.binary)),
         ];
         let carries = page
             .lines()

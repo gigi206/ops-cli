@@ -284,7 +284,7 @@ A bundle may itself reference shared egress groups with `@name` (its header then
 `examples/net-groups/`,
 with `sbx net groups import`.
 
-The 66 shipped bundles, and what each carries:
+The 67 shipped bundles, and what each carries:
 
 | Bundle | Packages | Also carries | Requires groups |
 |---|---|---|---|
@@ -301,6 +301,7 @@ The 66 shipped bundles, and what each carries:
 | `cline` | 3 (`mise:`, `nix:`) | 7 egress entries | `models-catalog`, `npm-audit`, `npm-registry` |
 | `codebuddy` | 2 (`mise:`, `nix:`) | 4 egress entries, 2 env vars | `npm-audit`, `npm-registry` |
 | `codex` | 1 (`mise:`) | 6 egress entries | none |
+| `codex-desktop` | 3 (`deb:`, `nix:`) | 17 egress entries, 3 `deb:` library attributes | `chromium-background` |
 | `command-code` | 2 (`mise:`, `nix:`) | 12 egress entries | `github-install`, `npm-registry` |
 | `copilot` | 1 (`mise:`) | 6 egress entries | none |
 | `cortex` | 2 (`mise:`, `nix:`) | 6 egress entries | none |
@@ -359,7 +360,7 @@ None of them carries a `cmd` or a posture (`network` mode, `gui`, `gpu`, …): a
 what a tool *needs*, and the consuming app keeps its own command and its own posture. See
 [What a bundle may carry](#what-a-bundle-may-carry-and-what-it-may-not).
 
-Every shipped profile names a bundle with `use`: 66 of the 73 name their own, and the
+Every shipped profile names a bundle with `use`: 67 of the 74 name their own, and the
 other 7 consume **another** agent's, because nothing would ever compose them in turn:
 `t3code` names `claude-code`; `aionui`, `opencode-web`, `open-design` and `orca-desktop`
 name `opencode`; `hermes-web` and `hermes-webui` name `hermes`. No shipped profile is a

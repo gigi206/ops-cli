@@ -4,7 +4,7 @@ description: "The importable starter profiles in the repository, what each one l
 
 # Profile catalog
 
-The repository's `examples/app/` directory ships **73 importable
+The repository's `examples/app/` directory ships **74 importable
 starter profiles**. `sbx` ships **no built-in apps**: you import each deliberately:
 
 ```sh
@@ -13,7 +13,7 @@ sbx app import    examples/app/claude-code.toml
 sbx app run claude-code
 ```
 
-**Every profile below takes two imports.** All 73 name a bundle in `use`: the bundle holds
+**Every profile below takes two imports.** All 74 name a bundle in `use`: the bundle holds
 the agent's package, environment and egress and follows upstream, the profile holds what
 you configure, and each ships as `examples/bundle/<name>.toml` beside
 `examples/app/<name>.toml`. Either order works, and nothing runs until you launch. Some
@@ -90,7 +90,7 @@ The common case: a CLI or TUI that runs in the terminal you launched it from.
 | `warp` | `tarball:resolve` (the vendor's artifact redirect) | `app.warp.dev` + `sessions`/`rtc.app.warp.dev` WS (Warp account, device-code login; `WARP_API_KEY`) |
 | `vtcode` | `mise:github:vinhnx/VTCode` (+ `nix:ripgrep`, `nix:ast-grep`) | provider-dependent (BYOK, default OpenRouter) |
 
-## Desktop applications (16)
+## Desktop applications (17)
 
 GUI agents: Electron for most, a Wails/WebKit2GTK shell for `reasonix-desktop`. Each needs a [Wayland display](../configuration/gui)
 (`gui = "wayland"`), and most also enable [`gpu`](../configuration/gpu) and the in-cage
@@ -112,6 +112,7 @@ again.
 | `aionui` | `deb:` pinned to `v2.1.47-final` (+ `nix:chromium`) | multi-provider (BYOK) |
 | `antigravity` | `tarball:resolve` (+ `nix:chromium`) | `cloudcode-pa.googleapis.com` (Google account) |
 | `claude-desktop` | `deb:apt:downloads.claude.ai/…` (+ `nix:chromium`) | `api.anthropic.com` / `claude.ai` (Anthropic account) |
+| `codex-desktop` | `deb:apt:persistent.oaistatic.com/…` (+ `nix:chromium`, `nix:glibc.bin`) | `chatgpt.com` / `api.openai.com` (ChatGPT account, or `OPENAI_API_KEY` BYOK) |
 | `cursor` | `deb:resolve` (+ `nix:chromium`) | `*.cursor.com` (Cursor account) |
 | `freebuff-desktop` | `appimage:resolve` (+ `nix:chromium`) | `www.codebuff.com` (account) |
 | `goose-desktop` | `deb:github:aaif-goose/goose` | provider-dependent (BYOK) |
@@ -146,7 +147,7 @@ default (`home_scope = "global"`).
 ## Bundles: the shared pieces
 
 Beyond the app profiles, `examples/bundle/`
-ships **66 reusable tool bundles**: a named set of packages and egress rules that
+ships **67 reusable tool bundles**: a named set of packages and egress rules that
 profiles pull in with `use = [...]` instead of restating it: the namesake profile
 names its own bundle, so the two cannot drift apart. Shared egress lanes (npm and
 GitHub installs, the models catalogue, the identity providers) live separately as

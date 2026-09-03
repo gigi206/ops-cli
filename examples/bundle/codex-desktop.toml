@@ -1,0 +1,130 @@
+# `codex-desktop` — OpenAI's Codex desktop app: what it needs to be installed, to sign in, and to
+# reach its own services.
+#
+#   sbx bundle import examples/bundle/codex-desktop.toml
+#   # then in an app profile:   use = ["codex-desktop"]
+#
+#   REQUIRES an egress group — import it once (it is shared, not per-agent):
+#     sbx net groups import examples/net-groups/chromium-background.toml
+#
+# Derived from `examples/app/codex-desktop.toml`, whose namesake profile names this bundle in `use`
+# (thin profile): the bundle is the single source of truth for the app's packages, env and egress,
+# while the profile keeps its own command, posture and credential choices. A test pins the two
+# artifacts together, so they cannot drift apart.
+#
+# It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
+# `gui`/`gpu`/`audio`/`dbus`, limits and home scope. An Electron app needs `gui = "wayland"` and
+# `gpu = true` to map a window at all, and the sign-in needs the `[open]` routing
+# `examples/app/codex-desktop.toml` declares — a consuming profile without them gets a package it
+# cannot display or log into.
+#
+# THE `.deb` VERSION IS TRACKED, not hand-pinned. OpenAI publishes a real apt repository, and
+# `deb:apt:` points at its `Packages` index: sbx picks the newest version's `.deb`, pins it per
+# project, and `sbx upgrade deb` re-reads the index and rolls forward. The vendor also serves a
+# `.../deb/latest/chatgpt_amd64.deb` alias; it is deliberately NOT used, because a pin is a content
+# hash and a moving URL breaks the next launch with a hash mismatch the moment upstream releases.
+# ARCH: the index below is `binary-amd64` (x86_64); on arm64 point it at `.../binary-arm64/Packages`
+# instead, which that pool also publishes.
+#
+# THE INDEX IS ATTESTED. The pool publishes a signed `InRelease` covering the index, so sbx verifies
+# it and pins the signing key the first time, naming the fingerprint on stderr. The first pin is
+# trust on first use and proves nothing by itself; every later resolve and `sbx upgrade deb` must
+# present a signature by that same key, and a re-keyed pool is refused rather than resolved. The
+# key the signature names is served by keys.openpgp.org, so the first pin resolves rather than
+# falling back to TLS-only trust, and the `.deb`'s own postinst ships the same key inline under the
+# user id `Codex Linux Repository` — the vendor publishes it twice, which is what makes the pin the
+# vendor's key rather than whatever a keyserver felt like answering. To pin again from scratch,
+# delete the repository's file under `apt-keys/` in sbx's data directory.
+#
+# THE `{WS}` GRANTS ARE DELIBERATE. Three hosts carry WebSockets the app depends on (the streaming
+# response channel, its dedicated socket host, and the realtime voice session). sbx gates a
+# WebSocket behind an explicit `WS` opt-in that a plain `{*}` does NOT cover, because a
+# bidirectional channel is one whose frames the proxy can neither inspect nor redact. Narrow them in
+# the consuming app if you do not use those features.
+#
+# WHERE THE EGRESS LIST COMES FROM: the hosts below were read out of the shipped artifact (the app's
+# own `app.asar`), not from a live session. It is the set the app names; a request it makes that is
+# not here is refused with the host named, so watch `sbx net logs -a codex-desktop` on a first run
+# and add what the proxy reports.
+#
+# FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
+# `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
+# silently become `packages.allow` — an unknown key, dropped without a word.
+
+[bundle.codex-desktop]
+allow = [
+    # The backend the whole app is built on — Chat, Work and Codex all talk to it — and the
+    # WebSocket its responses stream over.
+    "{*,WS} https://chatgpt.com",
+    # The dedicated socket host the app opens beside the backend.
+    "{*,WS} https://ws.chatgpt.com",
+    # The realtime session channel (voice). Drop this entry if you never use voice.
+    "{*,WS} https://realtime.chatgpt.com",
+    # Experiment and feature assignment. Left in `allow` rather than `mute` on purpose: a muted
+    # denial is silent, and a feature that never appears with nothing in the default log is the
+    # worst of both.
+    "{*} https://ab.chatgpt.com",
+    # The OpenAI API — where the Codex surface POSTs completions, and the host the optional BYOK
+    # `[secret]` block in the profile injects into.
+    "{*} https://api.openai.com",
+    # The sign-in issuer. The app opens its authorization URL in a browser and takes the result back
+    # on a loopback callback; see the profile's header for the whole flow.
+    "{*} https://auth.openai.com",
+    # The web UI's own bundle (JS/CSS) and the sign-in page's assets. Without them the Electron
+    # window loads no content and stays blank.
+    "{GET} https://cdn.oaistatic.com",
+    "{GET} https://auth-cdn.oaistatic.com",
+    # Static images and marketing assets the UI reads.
+    "{GET} https://persistent.oaistatic.com",
+    "{GET} https://cdn.openai.com",
+    # Generated files and the sandboxed subdomain the app renders web content in. The prefix varies
+    # per artifact, so the apex and its subdomains are opened together (spoof-safe); these are reads.
+    "{GET} https://*.oaiusercontent.com",
+]
+# Deliberately-DENIED telemetry, kept out of the default `sbx net logs`. A `mute` never opens egress
+# and never hides a count (`sbx net stats` still tallies them; see them with `--all`).
+mute = [
+    # Crash and error reporting.
+    "*.sentry.io",
+    # Feature-flag / experiment analytics: the vendor's own Statsig deployment, Statsig's CDN under
+    # an OpenAI name, and the SDK's own exception endpoint.
+    "api.oaistatsig.com",
+    "statsigcdn.openai.com",
+    "statsigapi.net",
+    # Segment's analytics loader.
+    "cdn.segment.com",
+    # The in-cage Chromium's own background services — irrelevant to the sign-in it is there for.
+    "@chromium-background",
+]
+
+[bundle.codex-desktop.packages]
+# OpenAI's prebuilt `.deb`, fetched host-side and autoPatchelf'd (Electron, no source build). The
+# apt pool publishes one package, `chatgpt`, whose payload is the Codex desktop app.
+codex-desktop = "deb:apt:https://persistent.oaistatic.com/codex-app-prod/linux/deb/dists/stable/main/binary-amd64/Packages"
+# An in-cage Chromium for the browser half of the sign-in. HEAVY — a large nixpkgs closure on first
+# launch, shared with every other Chromium profile in your store.
+chromium = "nix:chromium"
+# A real `ldd`, for the one caller that needs it: the app's bundled `detect-libc` decides whether it
+# is on a glibc or a musl system by reading the file at `/usr/bin/ldd`, which a hermetic cage does
+# not have. The consuming profile's command links this one there before the app starts; the header
+# of `examples/app/codex-desktop.toml` carries the whole measurement. The `bin` output is named
+# because that is the one holding `ldd`, and it is small — this does not pull glibc's dev tree.
+glibc = "nix:glibc.bin"
+
+# Three attributes the shared prebuilt library set does not carry, added for THIS package only so no
+# other Electron app pays for their closures. Without them the `.deb` build fails outright, naming
+# nine unsatisfied dependencies:
+#
+#   * `libusb1` — the bundled `node-hid` prebuilds link against `libusb-1.0.so.0`.
+#   * `qt5.qtbase.out`, `qt6.qtbase.out` — `libqt5_shim.so` and `libqt6_shim.so`, Chromium's
+#     OPTIONAL Qt platform-theme shims. This is not a Qt application: a `gui = "wayland"` cage
+#     running the GTK path never loads either shim, but autoPatchelf resolves every ELF it finds and
+#     refuses the build over the two of them. The `.out` output is named rather than the package,
+#     because nixpkgs' Qt setup hooks refuse a derivation that pulls Qt 5 and Qt 6 together
+#     ("detected mismatched Qt dependencies") and those hooks ride the `dev` output.
+[bundle.codex-desktop.deb.codex-desktop]
+libs = [
+    "libusb1",
+    "qt5.qtbase.out",
+    "qt6.qtbase.out",
+]
