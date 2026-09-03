@@ -67,8 +67,8 @@ host identifier.
 The cage's filesystem is assembled from a small, explicit set of binds, layered so a
 project's own binds cannot displace `sbx`'s structural mounts:
 
-- **The hermetic FHS**: a minimal `/bin/sh`, `/usr/bin/env`, `/nix` (the store),
-  and the synthetic `/etc`. No host `/usr`, no ambient system libraries.
+- **The hermetic FHS**: a minimal `/bin/sh`, `/usr/bin/env`, `/usr/bin/ldd`, `/nix` (the
+  store), and the synthetic `/etc`. No host `/usr`, no ambient system libraries.
 - **The project**, the current working directory, bound so the tool can work on the
   code.
 - **Explicitly granted paths**: whatever a *trusted* [`binds`](../configuration/binds)
@@ -86,7 +86,7 @@ flowchart LR
 
     subgraph cage["<b>cage</b>"]
         direction TB
-        FHS["<b>hermetic FHS</b><br/><i>/bin/sh · /usr/bin/env · /nix · synthetic /etc</i>"]
+        FHS["<b>hermetic FHS</b><br/><i>/bin/sh · /usr/bin/env · /usr/bin/ldd · /nix · synthetic /etc</i>"]
         CWD["<b>the project</b><br/><i>read-write, at its own host path</i>"]
         RO["<b>granted paths</b><br/><i>read-only by default</i>"]
     end

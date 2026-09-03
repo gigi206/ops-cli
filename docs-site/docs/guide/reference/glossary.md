@@ -49,7 +49,8 @@ and [`timezone`](../configuration/timezone), the two that read nothing from the 
 of a security field. See [The trust gate](../concepts/trust).
 
 **Hermetic FHS**, the minimal, self-contained filesystem the cage presents (`/bin/sh`,
-`/usr/bin/env`, `/nix`, a synthetic `/etc`), with no host `/usr` or ambient libraries.
+`/usr/bin/env`, `/usr/bin/ldd`, `/nix`, a synthetic `/etc`), with no host `/usr` or ambient
+libraries.
 
 **Lens**, one of the four read-only views on a live session: what it ran, what it wrote,
 where it went, and what it asked your keys to sign. Each is read over a socket the cage

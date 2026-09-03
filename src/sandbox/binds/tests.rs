@@ -43,6 +43,7 @@ fn userland() -> Userland {
         ],
         shell_bin: PathBuf::from("/store/bash/bin/bash"),
         env_bin: PathBuf::from("/store/coreutils/bin/env"),
+        ldd_bin: PathBuf::from("/store/glibc-bin/bin/ldd"),
         socat_bin: PathBuf::from("/store/socat/bin/socat"),
         mise_bin: PathBuf::from("/store/mise/bin/mise"),
         nix_bin: PathBuf::from("/store/nix/bin/nix"),
@@ -1128,6 +1129,29 @@ fn usr_bin_env_is_symlinked_to_coreutils_env() {
         "/usr/bin/env links to coreutils' env"
     );
     assert_eq!(argv[env - 2], "--symlink", "/usr/bin/env is a symlink");
+}
+
+#[test]
+fn usr_bin_ldd_is_symlinked_to_the_base_glibcs_ldd() {
+    // A program asking which C library it runs on reads `/usr/bin/ldd` by its literal path
+    // rather than searching `PATH`, so a cage without the name leaves the question unanswered
+    // instead of failing where the caller could handle it. Measured on a packaged Electron
+    // application whose bundled `detect-libc` opens exactly this path: absent, the application
+    // took `SIGILL` seconds into its run.
+    //
+    // Asserted as a symlink to the base glibc's own `ldd`, and not merely as "some `/usr/bin/ldd`
+    // exists": what makes the answer true is that it is the libc the cage actually runs.
+    let argv = argv_strings(&assembled());
+    let ldd = argv
+        .iter()
+        .position(|s| s == "/usr/bin/ldd")
+        .expect("/usr/bin/ldd is synthesised");
+    assert_eq!(
+        argv[ldd - 1],
+        "/store/glibc-bin/bin/ldd",
+        "/usr/bin/ldd links to the base glibc's ldd"
+    );
+    assert_eq!(argv[ldd - 2], "--symlink", "/usr/bin/ldd is a symlink");
 }
 
 #[test]

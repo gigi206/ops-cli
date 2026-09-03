@@ -497,6 +497,7 @@ fn collect_roots_unions_base_then_packages_then_tools_then_fonts() {
         bin_paths: vec![],
         shell_bin: PathBuf::from("/nix/store/bash/bin/bash"),
         env_bin: PathBuf::from("/nix/store/coreutils/bin/env"),
+        ldd_bin: PathBuf::from("/nix/store/glibc-bin/bin/ldd"),
         socat_bin: PathBuf::from("/nix/store/socat/bin/socat"),
         mise_bin: PathBuf::from("/nix/store/mise/bin/mise"),
         nix_bin: PathBuf::from("/nix/store/nix/bin/nix"),

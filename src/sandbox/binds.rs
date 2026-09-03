@@ -65,6 +65,17 @@ pub(crate) const SANDBOX_BASH: &str = "/bin/bash";
 /// rather than working around it.
 pub(super) const SANDBOX_ENV: &str = "/usr/bin/env";
 
+/// The in-sandbox `/usr/bin/ldd`, synthesised as a symlink to glibc's own `ldd`. A hermetic cage
+/// has no host `/usr`, and the absence is not merely a missing convenience: a program that asks
+/// which C library it is running on reads this **literal path** rather than searching `PATH`, so
+/// it gets neither an answer nor an error it can act on. That was measured, on an Electron
+/// application whose bundled `detect-libc` opens exactly this path: without it the application
+/// took `SIGILL` seconds after start, and with it the same launch runs.
+///
+/// Like the other synthetic FHS names it adds no exposure — the answer it gives is which libc the
+/// cage already runs, and the file it links to is in the base closure the cage already carries.
+pub(super) const SANDBOX_LDD: &str = "/usr/bin/ldd";
+
 /// The in-sandbox `/usr/bin/xdg-open`, synthesised as a tiny shell script. A
 /// hermetic cage has no host display, no browser, and no file manager, so a tool
 /// that calls `xdg-open <file|url>` (an OAuth device-auth flow that auto-opens the
@@ -186,6 +197,13 @@ pub(crate) struct Userland {
     /// standardizes, so synthesising it follows nix convention. An in-sandbox logical
     /// path (it resolves through the store bound at `/nix`).
     pub(crate) env_bin: PathBuf,
+    /// The glibc `ldd` `/usr/bin/ldd` links to. A hermetic cage has no host `/usr`, and a
+    /// packaged application that asks which libc it is running on reads **that literal path**
+    /// rather than searching `PATH` — `detect-libc`, bundled in a great many Node applications,
+    /// is the one this was measured on. An in-sandbox logical path (it resolves through the store
+    /// bound at `/nix`), and glibc's own `bin` output rather than the `out` the loader comes from,
+    /// because `ldd` ships only in `bin`.
+    pub(crate) ldd_bin: PathBuf,
     /// The in-cage egress forwarder (`socat`), as an in-sandbox logical path. Invoked
     /// by absolute path from the allowlist-posture wrapper; off `PATH` and untouched by
     /// other postures.
@@ -433,6 +451,15 @@ fn cage_mounts(
         Mount::Symlink {
             target: userland.env_bin.clone(),
             dest: PathBuf::from(SANDBOX_ENV),
+        },
+        // Zone 1 — the synthetic `/usr/bin/ldd`: what a program consults to learn whether it runs
+        // on glibc or on musl. It reads this exact path instead of searching `PATH`, so a cage
+        // without it leaves the question unanswered rather than failing in a way the caller can
+        // handle — see [`SANDBOX_LDD`] for the failure that was measured. glibc is already in the
+        // base closure; only its `bin` output, which is where `ldd` lives, joins it for this.
+        Mount::Symlink {
+            target: userland.ldd_bin.clone(),
+            dest: PathBuf::from(SANDBOX_LDD),
         },
         // Zone 1 — the second link of the router's mountpoint chain: sbx's own in-cage directory,
         // a mountpoint so it cannot be renamed aside either (pinning only the leaf is useless —
@@ -883,6 +910,7 @@ pub(super) const STRUCTURAL_DESTS: &[&str] = &[
     SANDBOX_SHELL,
     SANDBOX_BASH,
     SANDBOX_ENV,
+    SANDBOX_LDD,
     XDG_OPEN_INCAGE,
     SBX_INCAGE_DIR,
     OPEN_ROUTER_DIR,

@@ -202,6 +202,11 @@ pub(crate) fn resolve_userland(
     // itself: no gcc/g++/headers ship in the cage) is what heavier foreign binaries
     // (Electron/Chromium, Node with C++ native addons) dlopen.
     let glibc = realise("glibc.out", LOADER, "glibc")?;
+    // glibc's `bin` output, for one file: `ldd`. The cage synthesises `/usr/bin/ldd` from it
+    // because a program asking which libc it runs on reads that literal path — see
+    // [`super::binds::SANDBOX_LDD`] for the failure the absence caused. Its own closure is
+    // already the one `glibc.out` above pulls in, so this adds a single store path.
+    let glibc_bin = realise("glibc.bin", "bin/ldd", "glibc-bin")?;
     let stdcpp = realise("stdenv.cc.cc.lib", "lib/libstdc++.so.6", "stdcpp")?;
     // zlib supplies `libz.so.1`, a near-universal dependency a foreign dynamic binary
     // dlopens (Node native addons, some bundled CLIs, many bundled tools) that is absent
@@ -332,6 +337,10 @@ pub(crate) fn resolve_userland(
     // in the store the cage reads.
     let mut base_roots = vec![
         glibc.clone(),
+        // `glibc.bin` is a root of its own: the `/usr/bin/ldd` symlink points into it, and a
+        // symlink is not a closure reference — without this root the store the cage reads would
+        // not carry it and the link would dangle.
+        glibc_bin.clone(),
         stdcpp.clone(),
         zlib.clone(),
         bash.clone(),
@@ -377,6 +386,8 @@ pub(crate) fn resolve_userland(
         // The coreutils `env` `/usr/bin/env` links to, so an interpreted tool's
         // `#!/usr/bin/env <interp>` shebang resolves. Logical, like the shell above.
         env_bin: coreutils.join("bin/env"),
+        // glibc's own `ldd`, which `/usr/bin/ldd` links to. Logical, like the shell above.
+        ldd_bin: glibc_bin.join("bin/ldd"),
         // The forwarder is invoked by absolute store path from the egress wrapper, never via
         // PATH (so it does not need to be a user-visible tool), so socat's bin stays off the
         // base PATH above.
@@ -518,14 +529,16 @@ mod resolve_tests {
         // the base roots are logical store paths, each backed by sbx's store and each a
         // top-level store path (no `bin`/`lib` sub-path), since they are the closure
         // roots the per-project store is seeded from. The expected base set is present:
-        // the twelve core provisions plus one root per curated CLI tool. Three of the twelve
-        // carry data rather than a program (cacert, the locale archive, the zone database) and
-        // are deliberately absent from the loop below: they are off PATH, so a marker on the
-        // base PATH is exactly what they must NOT have.
+        // the thirteen core provisions plus one root per curated CLI tool. Four of the thirteen
+        // carry data rather than a program on the base PATH (cacert, the locale archive, the zone
+        // database, and glibc's `bin` output, whose `ldd` is reached through the synthetic
+        // `/usr/bin/ldd` rather than through PATH) and are deliberately absent from the loop
+        // below: a marker on the base PATH is exactly what they must NOT have.
         assert_eq!(
             u.base_roots.len(),
-            12 + BASE_TOOLS.len(),
-            "glibc, stdcpp, zlib, bash, coreutils, nix-ld, nix, mise, socat, cacert, locales, tzdata + the curated tools"
+            13 + BASE_TOOLS.len(),
+            "glibc, glibc.bin, stdcpp, zlib, bash, coreutils, nix-ld, nix, mise, socat, cacert, \
+             locales, tzdata + the curated tools"
         );
         // every curated tool is reachable by name: its marker binary physically exists in
         // one of the base PATH directories (so it is both realised and on PATH).
