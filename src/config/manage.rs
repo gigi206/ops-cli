@@ -76,7 +76,10 @@ pub(crate) enum ManageError {
     /// A `mute` rule was added but there is no filtering posture to carry it — a mute suppresses a
     /// *denied* request's log line, so with no proxy (a non-filtering posture) there is nothing to
     /// mute; refuse rather than write an inert rule.
-    MuteNeedsPosture,
+    /// A `mute` was asked for where no filtering posture is declared. Carries the app name when
+    /// the write targets one, because the remedy differs: a baseline needs a posture set, while an
+    /// app whose profile already declares one needs the rule written in that profile instead.
+    MuteNeedsPosture(Option<String>),
     /// The target's network is explicitly `shared`/`none` (a non-filtering posture); adding a rule
     /// would silently flip a deliberate choice, so refuse and let the user change it explicitly.
     NonFilteringPosture(String),
@@ -219,11 +222,23 @@ impl std::fmt::Display for ManageError {
                 "no filtering network posture is set, and a `deny` rule must not open one — set a \
                  posture first: `sbx config set network allow` (a denylist) then `sbx trust`"
             ),
-            ManageError::MuteNeedsPosture => write!(
+            ManageError::MuteNeedsPosture(None) => write!(
                 f,
                 "no filtering network posture is set, so a `mute` rule would be inert (there is no \
                  proxy to suppress a refusal from) — set a posture first \
                  (`sbx config set network deny|allow`), then `sbx net mute`"
+            ),
+            // An app usually HAS a posture: an imported profile declares its own, which is why the
+            // launch filters at all. What this layer has is no posture of its own, and writing one
+            // here would not add a rule to that profile — a `[network]` table replaces the one
+            // below it rather than amending it, so the app would trade its whole allow list for one
+            // mute line. The remedy is therefore the profile, not a posture.
+            ManageError::MuteNeedsPosture(Some(app)) => write!(
+                f,
+                "this layer declares no network posture of its own, and a `[network]` table written \
+                 here would REPLACE the one app `{app}` inherits — its allow rules with it. If the \
+                 app's posture comes from an imported profile, add the rule there instead \
+                 (`sbx config edit --app {app}`); the refusal it suppresses stays refused either way"
             ),
             ManageError::NonFilteringPosture(p) => write!(
                 f,
@@ -860,7 +875,9 @@ pub(crate) fn add_egress_rule(
             // inert (nothing to suppress) — each needs the user to set a posture first.
             match list {
                 EgressList::Deny => return Err(ManageError::DenyNeedsPosture),
-                EgressList::Mute => return Err(ManageError::MuteNeedsPosture),
+                EgressList::Mute => {
+                    return Err(ManageError::MuteNeedsPosture(app.map(str::to_string)));
+                }
                 EgressList::Allow => {}
             }
             parent.insert(
@@ -2665,8 +2682,37 @@ mod tests {
         let p = tmp.path().join(".sbx.toml");
         assert!(matches!(
             add_egress_rule(&p, None, EgressList::Mute, "x.test"),
-            Err(ManageError::MuteNeedsPosture)
+            Err(ManageError::MuteNeedsPosture(None))
         ));
+        assert!(!p.exists(), "a refused mute writes nothing");
+    }
+
+    /// The same refusal for an app says something else, because the cause is not the same one.
+    ///
+    /// An app whose profile declares `deny` HAS a posture — the launch filters, which is why there
+    /// is a refusal to suppress in the first place. What this layer has is no posture of its own,
+    /// and a `[network]` table written here replaces the one below rather than amending it. Telling
+    /// that user to "set a posture first" sends them to write the very table that would cost the app
+    /// its allow rules, so the message names the profile instead.
+    #[test]
+    fn the_refusal_for_an_app_names_its_profile_and_not_a_missing_posture() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = tmp.path().join(".sbx.toml");
+        let err = add_egress_rule(&p, Some("demo"), EgressList::Mute, "x.test")
+            .expect_err("a mute on a posture-less app layer is refused");
+        assert!(
+            matches!(&err, ManageError::MuteNeedsPosture(Some(a)) if a == "demo"),
+            "the app is carried so the message can name it: {err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("REPLACE") && text.contains("demo"),
+            "it says what writing here would cost, and to which app: {text}"
+        );
+        assert!(
+            !text.contains("set a posture first"),
+            "and it does not send the reader to write that very table: {text}"
+        );
         assert!(!p.exists(), "a refused mute writes nothing");
     }
 
