@@ -127,15 +127,20 @@ const WSL_BRIDGE_LIB: &str = "libdxcore.so";
 
 /// The WSL GPU bridge directory to bind, when this host has one.
 ///
-/// Under WSL the render node `dxgkrnl` publishes is an ordinary `renderD*` that [`render_nodes`]
-/// already finds — but the driver behind it is mesa's `d3d12`, and that reaches the GPU through
-/// `libdxcore.so`/`libd3d12core.so`, which Windows provides here rather than nixpkgs. A hermetic
-/// cage carries neither, so it falls back to software with the node in hand.
+/// mesa's `d3d12` driver reaches the GPU through `libdxcore.so`/`libd3d12core.so`, which Windows
+/// provides here rather than nixpkgs. A hermetic cage carries neither, so it falls back to
+/// software rendering.
 ///
 /// Measured, because the bind alone is not the grant: with the directory bound and nothing else,
 /// the cage's loader still answers `cannot open shared object file` for all three, since a
 /// subdirectory of `/usr/lib` is not a default search path. The caller therefore puts it on the
 /// loader path as well, and that pair is what makes the libraries resolvable.
+///
+/// It grants libraries and not a device. The WSL this was measured on publishes no DRM node at
+/// all — no `/dev/dri`, only the `dxgkrnl` character device `/dev/dxg` — so [`render_nodes`] finds
+/// nothing there and a `--gpu` cage reaches it without any device node. Binding `/dev/dxg` was
+/// measured too and moved no renderer, because that host answers `swrast` outside any cage as
+/// well; the grant would buy nothing. Whether another WSL publishes a `renderD*` is untested.
 ///
 /// `None` on any host without it, which is every host that is not WSL — the GPU hole is then
 /// exactly what it was.
