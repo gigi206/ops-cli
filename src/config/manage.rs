@@ -232,8 +232,9 @@ impl std::fmt::Display for ManageError {
             ManageError::RuleWouldReplaceInherited(app) => write!(
                 f,
                 "this layer declares no network posture of its own, and a `[network]` table written \
-                 here would REPLACE the one app `{app}` inherits — its allow rules with it. Add the \
-                 rule where that posture lives instead (`sbx config edit --app {app}`)"
+                 here would REPLACE the one app `{app}` inherits — its allow rules with it. Write it \
+                 where that posture lives instead: the same command with `--global` amends the app's \
+                 own profile"
             ),
             ManageError::MuteNeedsPosture(None) => write!(
                 f,
@@ -249,9 +250,9 @@ impl std::fmt::Display for ManageError {
             ManageError::MuteNeedsPosture(Some(app)) => write!(
                 f,
                 "this layer declares no network posture of its own, and a `[network]` table written \
-                 here would REPLACE the one app `{app}` inherits — its allow rules with it. If the \
-                 app's posture comes from an imported profile, add the rule there instead \
-                 (`sbx config edit --app {app}`); the refusal it suppresses stays refused either way"
+                 here would REPLACE the one app `{app}` inherits — its allow rules with it. Write it \
+                 where that posture lives instead: the same command with `--global` amends the app's \
+                 own profile. The refusal it suppresses stays refused either way"
             ),
             ManageError::NonFilteringPosture(p) => write!(
                 f,
@@ -2769,6 +2770,12 @@ mod tests {
         assert!(
             !text.contains("set a posture first"),
             "and it does not send the reader to write that very table: {text}"
+        );
+        // The remedy has to be a command that works. `--global` on this verb amends the app's own
+        // profile, measured; pointing at an editor instead left the reader to find that themselves.
+        assert!(
+            text.contains("--global"),
+            "it names the command that writes where the posture lives: {text}"
         );
         assert!(!p.exists(), "a refused mute writes nothing");
     }
