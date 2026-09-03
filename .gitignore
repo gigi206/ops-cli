@@ -39,3 +39,10 @@ docs-site/.docusaurus/
 # repositories rather than as files — commit one and the history gains a gitlink pointing at a path
 # that will not exist. `.claude/settings.json` beside them is tracked and stays so.
 .claude/worktrees/
+
+# Runtime state a caged app writes into the project root. `freebuff` keys its per-project data by a
+# `project-id` it drops here alongside a SQLite database, so the directory appears the first time
+# `sbx app run freebuff` is used on this tree and is never something to commit. Listed for the same
+# reason as the worktrees above: it is untracked residue at the root, where a `git add -A` sweeps it
+# into a commit that has nothing to do with it.
+.freebuff/
