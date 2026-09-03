@@ -639,6 +639,7 @@ pub(super) fn build(
     }
     if let Some(layer) = &gpu_layer {
         gui_roots.push(layer.root.clone());
+        gui_roots.extend(layer.glvnd.iter().cloned());
     }
     if let Some(layer) = &audio_layer {
         gui_roots.extend(layer.roots.iter().cloned());
@@ -1621,6 +1622,16 @@ pub(super) fn build(
                     .display()
                     .to_string(),
             ));
+            // And the GLVND dispatch the vendor library links, which nothing else puts within its
+            // reach: a library bound under `/run/sbx-nvidia` sees neither the app's `RUNPATH` nor
+            // an `ldconfig` cache, and a cage carrying no graphical package has no `libEGL.so.1`
+            // of its own. Folded into the one loader path by `merge_loader_path`.
+            if let Some(glvnd) = gpu_layer.as_ref().and_then(|l| l.glvnd.as_ref()) {
+                gui_env.push((
+                    "LD_LIBRARY_PATH".to_string(),
+                    glvnd.join("lib").display().to_string(),
+                ));
+            }
 
             // Both vendors have to stay reachable: mesa's, in the seeded store, drives the
             // Wayland and GBM platforms, and dropping it would take those platforms away with it.

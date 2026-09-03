@@ -79,14 +79,20 @@ That userspace must match the loaded kernel module. When the two disagree sbx na
 mismatch, because the natural failure is silent: the vendor never registers, and EGL reports
 an empty extension string with no error at all.
 
-### Limitation: Vulkan is served by mesa
+### Vulkan
 
-`gpu = true` gives a cage a working Vulkan loader with mesa's drivers behind it, which is
-what a Vulkan client finds today: without `VK_DRIVER_FILES` the loader searches host
-directories a hermetic cage does not have and enumerates no device at all. NVIDIA's ICD is
-bridged beside them, and the loader does find it, but on the hybrid host this was built
-against NVIDIA's Vulkan driver does not complete instance creation inside a cage even though
-it does outside one. OpenGL on the card is unaffected: that path works.
+`gpu = true` gives a cage a working Vulkan loader with mesa's drivers behind it and, where the
+host has an NVIDIA driver, that driver's ICD beside them. Both halves are needed for a cage to
+see any device at all: the loader searches host directories a hermetic cage does not have, so
+without `VK_DRIVER_FILES` it enumerates nothing, not even a software device.
+
+The NVIDIA half carries one more piece, and it is the reason a bare cage could not use it:
+NVIDIA's vendor library links **GLVND's** `libEGL.so.1`, which it resolves through the ordinary
+loader search. A library bound under `/run/sbx-nvidia` inherits neither the app's `RUNPATH` nor
+an `ldconfig` cache, and a cage carrying no graphical package has no `libEGL.so.1` of its own,
+so the driver used to answer `NULL` for `vkCreateInstance` without ever touching the card or
+naming a reason. sbx therefore provisions GLVND beside mesa, from the same pinned nixpkgs, and
+puts it on the cage's loader path.
 
 ### Limitation: a windowed app on a hybrid machine
 

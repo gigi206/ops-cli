@@ -42,6 +42,17 @@ use std::path::{Path, PathBuf};
 /// the error path complains about) and the GLVND EGL vendor JSON. Keyed on `lib/dri`.
 const MESA: (&str, &str, &str) = ("mesa", "lib/dri", "mesa");
 
+/// The GLVND dispatch, provisioned beside mesa when this host has an NVIDIA driver to bridge.
+///
+/// NVIDIA's vendor library links `libEGL.so.1` — GLVND's dispatch, not mesa's `libEGL_mesa.so.0` —
+/// and resolves it through the ordinary loader search. A hermetic cage has no `ldconfig` cache and
+/// a library bound at [`CAGE_NVIDIA`] does not inherit the app's `RUNPATH`, so unless the app's own
+/// closure happens to carry GLVND there is nothing to find: measured, a cage with no graphical
+/// package has no `libEGL.so.1` at all, and NVIDIA's Vulkan driver then answers `NULL` for
+/// `vkCreateInstance` without touching the card or naming a reason. Provisioned from the same
+/// pinned nixpkgs as mesa, for the same reason mesa is: no ABI skew with the app's own dispatch.
+const GLVND: (&str, &str, &str) = ("libglvnd", "lib/libEGL.so.1", "libglvnd");
+
 /// The device directory the DRM nodes live under. Not itself the grant: [`render_nodes`] enumerates
 /// the `renderD*` entries in it, and those are what `gpu = true` binds.
 pub(crate) const DRI_DIR: &str = "/dev/dri";
@@ -88,6 +99,8 @@ fn render_nodes_in(dri_dir: &Path) -> Vec<PathBuf> {
 pub(crate) struct GpuLayer {
     /// The mesa store root, to seed into the project store like the fonts and base userland.
     pub(crate) root: PathBuf,
+    /// The GLVND store root, present only where the NVIDIA bridge needs it (see [`GLVND`]).
+    pub(crate) glvnd: Option<PathBuf>,
     /// Env pairs pointing the cage's libgbm/libEGL at mesa's own drivers (hermetic, no host path).
     pub(crate) env: Vec<(String, String)>,
 }
@@ -104,7 +117,23 @@ pub(crate) fn provision(nix: &Path, layout: &Layout, nixpkgs: &str) -> io::Resul
         .join(store::revision_of(nixpkgs));
     let root = store::provision(nix, layout, &root_dir.join(name), nixpkgs, attr, marker)?;
     let env = driver_env(&root);
-    Ok(GpuLayer { root, env })
+    // Only where there is an NVIDIA driver to bridge: on every other host mesa's own dispatch comes
+    // from the app, and provisioning a second one would be a download for no gain.
+    let glvnd = match nvidia_bridge() {
+        Some(_) => {
+            let (attr, marker, name) = GLVND;
+            Some(store::provision(
+                nix,
+                layout,
+                &root_dir.join(name),
+                nixpkgs,
+                attr,
+                marker,
+            )?)
+        }
+        None => None,
+    };
+    Ok(GpuLayer { root, glvnd, env })
 }
 
 /// The env that points the cage's libgbm/libEGL at mesa's own drivers in the seeded store, so
