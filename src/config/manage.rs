@@ -76,9 +76,10 @@ pub(crate) enum ManageError {
     /// A `mute` rule was added but there is no filtering posture to carry it — a mute suppresses a
     /// *denied* request's log line, so with no proxy (a non-filtering posture) there is nothing to
     /// mute; refuse rather than write an inert rule.
-    /// A `mute` was asked for where no filtering posture is declared. Carries the app name when
-    /// the write targets one, because the remedy differs: a baseline needs a posture set, while an
-    /// app whose profile already declares one needs the rule written in that profile instead.
+    ///
+    /// Carries the app name when the write targets one, because the remedy differs there: a
+    /// baseline genuinely has no posture and needs one set, while an app usually has one from its
+    /// profile and needs the rule written where that posture lives.
     MuteNeedsPosture(Option<String>),
     /// The target's network is explicitly `shared`/`none` (a non-filtering posture); adding a rule
     /// would silently flip a deliberate choice, so refuse and let the user change it explicitly.
