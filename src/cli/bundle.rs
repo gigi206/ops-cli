@@ -9,6 +9,7 @@
 //! This module is the read and move surface only: `list`/`show` read the global config,
 //! `export`/`import` move bundles between configs. It never resolves or launches anything.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -91,11 +92,21 @@ fn bundle_list(args: &[OsString]) -> ExitCode {
                     "services": b.service.keys().collect::<Vec<_>>(),
                     "open": b.open.keys().collect::<Vec<_>>(),
                     "flakes": b.flakes.keys().collect::<Vec<_>>(),
+                    // Keyed on the `resolve` command rather than on the table holding it: the same
+                    // table may carry `libs` alone, which rolls nothing, so listing every table
+                    // here would report an upgrade path a `--json` audit cannot act on. The
+                    // library attributes such a table does grant are reported beside it.
                     "resolvers": {
-                        "tarball": b.tarball.keys().collect::<Vec<_>>(),
-                        "deb": b.deb.keys().collect::<Vec<_>>(),
-                        "appimage": b.appimage.keys().collect::<Vec<_>>(),
-                        "binary": b.binary.keys().collect::<Vec<_>>(),
+                        "tarball": resolver_names(&b.tarball),
+                        "deb": resolver_names(&b.deb),
+                        "appimage": resolver_names(&b.appimage),
+                        "binary": resolver_names(&b.binary),
+                    },
+                    "libs": {
+                        "tarball": lib_names(&b.tarball),
+                        "deb": lib_names(&b.deb),
+                        "appimage": lib_names(&b.appimage),
+                        "binary": lib_names(&b.binary),
                     },
                     "accepts_fresh_releases": b.accepts_fresh_releases,
                     "undescribed": undescribed_sections(b),
@@ -229,10 +240,22 @@ fn render_bundles(
             ("appimage", &b.appimage),
             ("binary", &b.binary),
         ] {
-            for name in entries.keys() {
-                out.push_str(&format!(
-                    "  resolve  {name} ({table}: where an upgrade looks for a new release)\n"
-                ));
+            for (name, entry) in entries {
+                // The two halves of such a table are reported separately, because only one of them
+                // is an upgrade path: a table carrying `libs` alone rolls nothing, and calling it a
+                // resolver would promise a release lookup that does not exist.
+                if !entry.resolve.is_empty() {
+                    out.push_str(&format!(
+                        "  resolve  {name} ({table}: where an upgrade looks for a new release)\n"
+                    ));
+                }
+                if !entry.libs.is_empty() {
+                    out.push_str(&format!(
+                        "  libs     {name} ({table}: {} extra nixpkgs attribute(s) the build \
+                         patches against)\n",
+                        entry.libs.len()
+                    ));
+                }
             }
         }
         for scheme in b.open.keys() {
@@ -287,6 +310,30 @@ const DESCRIBED_BUNDLE_SECTIONS: &[&str] = &[
     "appimage",
     "binary",
 ];
+
+/// The packages in one `[<backend>.<name>]` map whose table carries a `resolve` command — the ones
+/// `sbx upgrade` re-queries for a new release.
+///
+/// Split from [`lib_names`] because the two halves of such a table are independent: a table may
+/// carry either, or both. Reporting the map's keys instead would name an upgrade path for a table
+/// that declares only library attributes, and so has none.
+fn resolver_names(tables: &BTreeMap<String, config::RawResolve>) -> Vec<&String> {
+    tables
+        .iter()
+        .filter(|(_, table)| !table.resolve.is_empty())
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// The packages in one `[<backend>.<name>]` map whose table carries extra nixpkgs library
+/// attributes — what widens the set the package's ELFs are autoPatchelf'd against.
+fn lib_names(tables: &BTreeMap<String, config::RawResolve>) -> Vec<&String> {
+    tables
+        .iter()
+        .filter(|(_, table)| !table.libs.is_empty())
+        .map(|(name, _)| name)
+        .collect()
+}
 
 /// Every top-level key a bundle declares that neither [`render_bundles`] nor [`grants_of`] renders
 /// a line of its own for — including a key sbx does not know, which `RawBundle` keeps rather than
@@ -348,9 +395,27 @@ fn grants_of(b: &config::RawBundle) -> Vec<String> {
     if !b.flakes.is_empty() {
         parts.push(format!("{} inline flake(s)", b.flakes.len()));
     }
-    let resolvers = b.tarball.len() + b.deb.len() + b.appimage.len() + b.binary.len();
+    // A `[<backend>.<name>]` table declares two separable things, and only one of them is an
+    // upgrade path: the `resolve` command is what `sbx upgrade` re-runs, while a `libs` list widens
+    // the nixpkgs attributes the package's ELFs are patched against. A table carrying `libs` alone
+    // rolls nothing, so counting the tables would name a resolver that does not exist — and would
+    // leave unnamed the one thing such a table does grant, which is a wider build input set.
+    let prebuilt = [&b.tarball, &b.deb, &b.appimage, &b.binary];
+    let resolvers = prebuilt
+        .iter()
+        .flat_map(|tables| tables.values())
+        .filter(|table| !table.resolve.is_empty())
+        .count();
     if resolvers > 0 {
         parts.push(format!("{resolvers} upgrade resolver(s)"));
+    }
+    let libs: usize = prebuilt
+        .iter()
+        .flat_map(|tables| tables.values())
+        .map(|table| table.libs.len())
+        .sum();
+    if libs > 0 {
+        parts.push(format!("{libs} extra library attribute(s)"));
     }
     if !b.accepts_fresh_releases.is_empty() {
         parts.push(format!(
@@ -735,6 +800,67 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("package  demo = mise:demo"), "{shown}");
+    }
+
+    /// A `[<backend>.<name>]` table is read for what it declares, not for existing: a `resolve`
+    /// command is an upgrade path, a `libs` list is a wider build input set, and a table may carry
+    /// either alone.
+    ///
+    /// Both halves are asserted in one test because the defect is the confusion between them: a
+    /// reader told a libs-only table is "1 upgrade resolver" will look for a roll that never
+    /// happens, and one told nothing about the attributes never learns the build reaches further
+    /// than the shared set. The control is the resolver arm — it must keep reading exactly as it
+    /// did, or this would be a rename rather than a distinction.
+    #[test]
+    fn a_prebuilt_table_is_reported_by_what_it_declares_not_by_existing() {
+        let pal = style::Palette::plain();
+
+        let mut libs_only = bundle_of(&[("demo", "deb:https://example.com/demo.deb")], &[]);
+        libs_only.deb.insert(
+            "demo".to_string(),
+            config::RawResolve {
+                resolve: Vec::new(),
+                libs: vec!["libusb1".to_string(), "qt6.qtbase.out".to_string()],
+            },
+        );
+        let name = "libs-only".to_string();
+
+        let summary = render_bundles(&[(&name, &libs_only)], true, &pal);
+        assert!(
+            summary.contains("1 package(s), 2 extra library attribute(s)"),
+            "a libs-only table is counted as what it is: {summary}"
+        );
+        assert!(
+            !summary.contains("resolver"),
+            "and never as an upgrade path it does not carry: {summary}"
+        );
+
+        let shown = render_bundles(&[(&name, &libs_only)], false, &pal);
+        assert!(
+            shown.contains("libs     demo (deb: 2 extra nixpkgs attribute(s)"),
+            "the full listing names the table and how many attributes it adds: {shown}"
+        );
+        assert!(!shown.contains("resolve  demo"), "{shown}");
+
+        // The control: a table that does carry a command still reads as a resolver, and a table
+        // carrying both is reported twice rather than one masking the other.
+        let mut both = bundle_of(&[("demo", "deb:resolve")], &[]);
+        both.deb.insert(
+            "demo".to_string(),
+            config::RawResolve {
+                resolve: vec!["sh".to_string(), "-c".to_string(), "echo url".to_string()],
+                libs: vec!["webkitgtk_4_1".to_string()],
+            },
+        );
+        let name = "both".to_string();
+        let summary = render_bundles(&[(&name, &both)], true, &pal);
+        assert!(
+            summary.contains("1 upgrade resolver(s), 1 extra library attribute(s)"),
+            "{summary}"
+        );
+        let shown = render_bundles(&[(&name, &both)], false, &pal);
+        assert!(shown.contains("resolve  demo (deb:"), "{shown}");
+        assert!(shown.contains("libs     demo (deb:"), "{shown}");
     }
 
     #[test]

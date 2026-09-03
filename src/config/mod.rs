@@ -44,6 +44,10 @@ pub(crate) use schema::RawBundle;
 /// constructs one; the renderer reaches it through [`schema::RawCmd::into_argv`].
 #[cfg(test)]
 pub(crate) use schema::RawCmd;
+/// One `[<backend>.<name>]` table: the `resolve` command a roll re-runs, the extra library
+/// attributes a build patches against, or both. Reached by name from the `bundle` renderer, which
+/// reports the two halves apart because a table may carry either.
+pub(crate) use schema::RawResolve;
 // The locator grammar, reached from the fetching backends and the store as `crate::config::…`:
 // every URL a backend derives is re-validated through the same predicate the declaration passed.
 pub(crate) use tools::{
@@ -100,8 +104,8 @@ use crate::trust::{self, TrustState};
 use fspolicy::FsPolicy;
 use schema::{
     NetworkField, NetworkTable, RawApp, RawBind, RawConfig, RawHostSecret, RawHostSecrets,
-    RawInlineFlake, RawResolve, RawSecretDefaults, RawTask, RawTaskDefaults, RawTaskParam,
-    RawTaskSecret, RawTaskSection, SecretFrom,
+    RawInlineFlake, RawSecretDefaults, RawTask, RawTaskDefaults, RawTaskParam, RawTaskSecret,
+    RawTaskSection, SecretFrom,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
