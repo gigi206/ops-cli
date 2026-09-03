@@ -881,6 +881,23 @@ struct RuleWrite<'a> {
 ///   then the sole delta from the trusted bytes.
 ///
 /// `base` is the directory a `--local` scope resolves against: the cwd for `sbx net allow|deny`, or
+/// Whether the app's imported profile declares a `[network]` table, which is the layer a rule
+/// written on a project's `[app.<name>.network]` would stand in for.
+///
+/// Read from the profile file rather than from a full resolution because that is the question:
+/// not what the app's effective posture is, but whether a lower layer wrote the table this write
+/// would replace. An app declared inline in a project has no profile and no such layer, so it
+/// bootstraps a posture as it always did — that is the arm this must not break.
+fn app_profile_declares_network(name: &str) -> bool {
+    let Some(dir) = config::profiles_dir() else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(dir.join(format!("{name}.toml"))) else {
+        return false;
+    };
+    config::schema::parse_app(&bytes).is_ok_and(|app| app.network.is_some())
+}
+
 /// the *answered session's* project for `sbx net pending --save`, so the rule lands in the project
 /// the agent runs in rather than wherever the user happens to stand. Global ignores it.
 fn open_rule_write<'a>(
@@ -1012,8 +1029,12 @@ fn persist_egress_rule(
     } = open_rule_write("net", verb, NO_TRUST_STORE_ON_ADD, scope, app, base)?;
     let gated = store.is_some();
 
-    let written =
-        manage::add_egress_rule(&path, app_key, list, rule).map_err(|e| (2, e.to_string()))?;
+    // Whether a layer BELOW this one already declares a `[network]` table for the app, which only
+    // the caller can know: `add_egress_rule` sees one file. For a global app that layer is its
+    // imported profile, and a table written here would replace it rather than amend it.
+    let inherits = app_key.is_some_and(app_profile_declares_network);
+    let written = manage::add_egress_rule(&path, app_key, list, rule, inherits)
+        .map_err(|e| (2, e.to_string()))?;
 
     // Re-trust the project config after the write, attesting to the bytes just written rather than
     // to whatever is on disk now. Ordering is fail-safe against a crash — one between the write and
