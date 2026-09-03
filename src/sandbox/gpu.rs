@@ -117,6 +117,12 @@ pub(crate) fn driver_env(mesa_root: &Path) -> Vec<(String, String)> {
             "__EGL_VENDOR_LIBRARY_DIRS",
             mesa_root.join("share/glvnd/egl_vendor.d"),
         ),
+        // The Vulkan loader searches `/usr/share/vulkan/icd.d`, `/etc/vulkan/icd.d` and
+        // `$XDG_DATA_DIRS/vulkan/icd.d`. A hermetic cage has none of those carrying a driver
+        // manifest, so without this the loader enumerates zero devices and Vulkan is not merely
+        // unaccelerated, it is absent. Points at mesa's own manifests in the seeded store, the
+        // same way the three above point at its DRI drivers.
+        ("VK_DRIVER_FILES", mesa_root.join("share/vulkan/icd.d")),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.display().to_string()))
@@ -197,6 +203,8 @@ pub(crate) struct NvidiaBridge {
     /// The external EGL platform declarations (Wayland, GBM); without them NVIDIA's vendor does
     /// not expose `EGL_EXT_platform_wayland`.
     pub(crate) platforms: Vec<(PathBuf, PathBuf)>,
+    /// The Vulkan driver manifest, so a Vulkan client sees the card and not only mesa's devices.
+    pub(crate) icd: Option<(PathBuf, PathBuf)>,
     /// The character devices the driver reaches the card through. Never a DRM `card*` node: the
     /// reason [`render_nodes`] gives holds here too.
     pub(crate) devices: Vec<PathBuf>,
@@ -269,10 +277,19 @@ pub(crate) fn nvidia_bridge_in(root: &Path) -> Option<NvidiaBridge> {
         .and_then(|(src, _)| src.file_name()?.to_str()?.rsplit_once(".so."))
         .map(|(_, v)| v.to_string());
 
+    let icd_src = root.join("usr/share/vulkan/icd.d/nvidia_icd.json");
+    let icd = icd_src.exists().then(|| {
+        (
+            icd_src,
+            PathBuf::from(CAGE_NVIDIA).join("vulkan/icd.d/nvidia_icd.json"),
+        )
+    });
+
     Some(NvidiaBridge {
         libs,
         vendor_json,
         platforms,
+        icd,
         devices: nvidia_nodes_in(root),
         version,
     })
@@ -412,6 +429,12 @@ mod tests {
             Some("/nix/store/abc-mesa-26.1.4/lib/dri")
         );
         assert_eq!(
+            get("VK_DRIVER_FILES").as_deref(),
+            Some("/nix/store/abc-mesa-26.1.4/share/vulkan/icd.d"),
+            "the Vulkan loader searches host directories a hermetic cage does not have, so \
+             without this it enumerates no device at all"
+        );
+        assert_eq!(
             get("GBM_BACKENDS_PATH").as_deref(),
             Some("/nix/store/abc-mesa-26.1.4/lib/gbm")
         );
@@ -511,6 +534,25 @@ mod tests {
                 .iter()
                 .any(|(_, dest)| dest.to_string_lossy().contains("libnvidia-container")),
             "the container toolkit sits in the same directory and is not the driver's userspace"
+        );
+        assert!(
+            bridge.icd.is_none() && bridge.vendor_json.is_none(),
+            "the libraries alone declare nothing: a host without the manifests offers no vendor \
+             and no Vulkan driver, and the bridge says so rather than inventing them"
+        );
+
+        let icd = root.join("usr/share/vulkan/icd.d");
+        std::fs::create_dir_all(&icd).expect("stage the Vulkan manifest directory");
+        std::fs::write(icd.join("nvidia_icd.json"), b"{}").expect("stage the manifest");
+        assert_eq!(
+            nvidia_bridge_in(root.path())
+                .expect("still a bridge")
+                .icd
+                .map(|(_, dest)| dest),
+            Some(PathBuf::from(
+                "/run/sbx-nvidia/vulkan/icd.d/nvidia_icd.json"
+            )),
+            "and it is carried once it is there, so a Vulkan client sees the card beside mesa"
         );
     }
 

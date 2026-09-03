@@ -1686,6 +1686,34 @@ pub(super) fn build(
                 ));
             }
 
+            // Vulkan chooses its driver through a manifest too, so the card needs its own beside
+            // mesa's. `VK_DRIVER_FILES` names a list of manifests *and* directories, so this is
+            // again a union rather than a replacement: NVIDIA's one file ahead of the directory
+            // holding mesa's, composed from what the layer already set for the same reason the
+            // EGL vendor directories are.
+            if let Some((src, dest)) = &nv.icd {
+                gui_binds.push(binds::ExtraBind {
+                    src: src.clone(),
+                    dest: dest.clone(),
+                    writable: false,
+                });
+                let mesa_icd = gpu_layer.as_ref().and_then(|layer| {
+                    layer
+                        .env
+                        .iter()
+                        .find(|(k, _)| k == "VK_DRIVER_FILES")
+                        .map(|(_, v)| v.clone())
+                });
+                let nvidia_icd = dest.display().to_string();
+                gui_env.push((
+                    "VK_DRIVER_FILES".to_string(),
+                    match mesa_icd {
+                        Some(mesa) => format!("{nvidia_icd}:{mesa}"),
+                        None => nvidia_icd,
+                    },
+                ));
+            }
+
             // A userspace that does not match the loaded kernel module fails the same silent way
             // a missing soname does: the vendor never registers and EGL reports an empty
             // extension string. Name it instead of leaving the reader to derive it from a blank.

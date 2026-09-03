@@ -199,6 +199,17 @@ pub(crate) fn is_reserved_env_key(key: &str) -> bool {
                 | "LIBGL_DRIVERS_PATH"
                 | "GBM_BACKENDS_PATH"
                 | "__EGL_VENDOR_LIBRARY_DIRS"
+                // The same shape, one indirection further out: each of these names a *manifest*
+                // (a small JSON) whose whole content is the path of a library to `dlopen`. Aiming
+                // one at a project-shipped manifest is aiming the loader at a project-shipped
+                // `.so`, so they belong in this group and not among the data paths. sbx sets them
+                // for `gpu = true` where the host has an NVIDIA driver.
+                | "__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS"
+                | "VK_DRIVER_FILES"
+                | "VK_ADD_DRIVER_FILES"
+                | "VK_ICD_FILENAMES"
+                | "VK_LAYER_PATH"
+                | "VK_ADD_LAYER_PATH"
                 // Interpreter pre-load hooks, the same shape as `BASH_ENV`/`ENV` above: each names
                 // a file the interpreter runs before the program, so an untrusted `[env]` setting
                 // one runs code in the user's later `sbx run` without needing a prompt or a shell

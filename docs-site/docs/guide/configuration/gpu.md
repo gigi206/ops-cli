@@ -28,9 +28,12 @@ Three pieces, together, all supplied automatically: no paths to write. A fourth 
 them on a host with an NVIDIA driver, described under [the NVIDIA bridge](#scope-mesa-gpus-and-the-nvidia-bridge).
 
 1. **mesa's DRI drivers**, provisioned into sbx's own store and pointed at through
-   `LIBGL_DRIVERS_PATH`/`GBM_BACKENDS_PATH`/`__EGL_VENDOR_LIBRARY_DIRS`. The driver path
-   never depends on the host and does not drift across `sbx upgrade` (the same pinned
-   nixpkgs as the app → the same mesa, no ABI skew with the app's own libgbm/libEGL).
+   `LIBGL_DRIVERS_PATH`/`GBM_BACKENDS_PATH`/`__EGL_VENDOR_LIBRARY_DIRS`, and its Vulkan
+   driver manifests through `VK_DRIVER_FILES`. The driver path never depends on the host and
+   does not drift across `sbx upgrade` (the same pinned nixpkgs as the app → the same mesa,
+   no ABI skew with the app's own libgbm/libEGL). The Vulkan entry is not optional polish:
+   the loader looks in host directories a hermetic cage does not have, so without it a
+   Vulkan client finds no device at all, not even a software one.
 2. **The render node(s)** under `/dev/dri`, granted through the same device-bind mechanism
    as [`[devices]`](devices).
 3. **The minimal `/sys` DRM subtree** the driver reads to enumerate the device
@@ -54,10 +57,11 @@ version-locked to the host's kernel module, so it has to come from the host. Und
    placed on the loader path. Each real file is bound under the name the loader asks for
    (its soname), because a host symlink bound onto itself resolves to its versioned target
    and the soname would disappear from the cage.
-5. **The GLVND vendor declaration** (`10_nvidia.json`) and NVIDIA's **EGL external platform**
-   declarations, named through `__EGL_VENDOR_LIBRARY_FILENAMES` and
-   `__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS`. mesa's own vendor stays alongside, so the cage
-   carries both and each platform gets the one that drives it.
+5. **Its driver manifests**: the GLVND vendor declaration (`10_nvidia.json`), NVIDIA's EGL
+   external platform declarations, and its Vulkan ICD (`nvidia_icd.json`), named through
+   `__EGL_VENDOR_LIBRARY_DIRS`, `__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS` and `VK_DRIVER_FILES`.
+   Each of those is a union with mesa's, never a replacement: the cage carries both vendors
+   and each platform gets the one that drives it.
 6. **The driver's character devices** (`/dev/nvidiactl`, `/dev/nvidia<N>`, `/dev/nvidia-uvm`,
    `/dev/nvidia-uvm-tools`, `/dev/nvidia-modeset`), granted through the same device-bind
    mechanism as the render nodes and enumerated rather than assumed, so a second card comes
@@ -74,6 +78,15 @@ of one, and sbx builds no bridge: `gpu = true` provisions mesa and behaves exact
 That userspace must match the loaded kernel module. When the two disagree sbx names the
 mismatch, because the natural failure is silent: the vendor never registers, and EGL reports
 an empty extension string with no error at all.
+
+### Limitation: Vulkan is served by mesa
+
+`gpu = true` gives a cage a working Vulkan loader with mesa's drivers behind it, which is
+what a Vulkan client finds today: without `VK_DRIVER_FILES` the loader searches host
+directories a hermetic cage does not have and enumerates no device at all. NVIDIA's ICD is
+bridged beside them, and the loader does find it, but on the hybrid host this was built
+against NVIDIA's Vulkan driver does not complete instance creation inside a cage even though
+it does outside one. OpenGL on the card is unaffected: that path works.
 
 ### Limitation: a windowed app on a hybrid machine
 
