@@ -112,7 +112,7 @@ again.
 | `aionui` | `deb:` pinned to `v2.1.47-final` (+ `nix:chromium`) | multi-provider (BYOK) |
 | `antigravity` | `tarball:resolve` (+ `nix:chromium`) | `cloudcode-pa.googleapis.com` (Google account) |
 | `claude-desktop` | `deb:apt:downloads.claude.ai/…` (+ `nix:chromium`) | `api.anthropic.com` / `claude.ai` (Anthropic account) |
-| `codex-desktop` | `deb:apt:persistent.oaistatic.com/…` (+ `nix:chromium`, `nix:glibc.bin`) | `chatgpt.com` / `api.openai.com` (ChatGPT account, or `OPENAI_API_KEY` BYOK) |
+| `codex-desktop` | `deb:apt:persistent.oaistatic.com/…` (+ `nix:chromium`) | `chatgpt.com` / `api.openai.com` (ChatGPT account, or `OPENAI_API_KEY` BYOK) |
 | `cursor` | `deb:resolve` (+ `nix:chromium`) | `*.cursor.com` (Cursor account) |
 | `freebuff-desktop` | `appimage:resolve` (+ `nix:chromium`) | `www.codebuff.com` (account) |
 | `goose-desktop` | `deb:github:aaif-goose/goose` | provider-dependent (BYOK) |

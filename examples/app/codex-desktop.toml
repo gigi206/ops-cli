@@ -98,40 +98,29 @@
 # page) must reach the running instance rather than the host desktop. Unlike the callback above,
 # nothing in the sign-in depends on it.
 #
-# WHY THE COMMAND LINKS `ldd`, AND WHAT IT COSTS TO LEAVE IT OUT. Without the preamble below, the
-# app dies a few seconds after its window loads, as soon as a git project is selected: `sbx` reports
-# 132, which is `128 + 4`, so the process took SIGILL. The selection persists in the app's isolated
-# home, so every later launch dies the same way.
+# WHY THIS APP NEEDED `/usr/bin/ldd`, AND WHY THE PROFILE NO LONGER SAYS SO. This app is what
+# uncovered a gap in the cage itself, and the fix went there rather than here. Without a
+# `/usr/bin/ldd`, the app took SIGILL a few seconds after its window loaded, as soon as a git
+# project was opened — `sbx` reported 132, which is `128 + 4`. A syscall trace of the dying thread
+# ended on an unambiguous sequence: it read its own ELF header through `/proc/self/exe`, opened
+# `/usr/bin/ldd`, got `ENOENT`, called `getcwd`, and trapped on a `ud1` (the instruction LLVM emits
+# for a sanitizer check, not an `abort()`). The JavaScript loaded just before is `detect-libc`,
+# which decides glibc-or-musl by reading that **literal path** rather than searching `PATH`.
 #
-# What the crash is. The faulting instruction is a `ud1` — the trap LLVM emits for a sanitizer
-# check, not an `abort()` — inside the app's own binary, on a worker thread the app names `git`,
-# right after it logs `[git-repo-watcher] Starting git repo watcher`. A syscall trace of the dying
-# thread ends on an unambiguous sequence: it reads its own ELF header through `/proc/self/exe`,
-# opens `/usr/bin/ldd` and gets `ENOENT`, calls `getcwd`, and traps. The JavaScript it had just
-# loaded is `detect-libc`, which decides whether it is on a glibc or a musl system, and which reads
-# that **literal path** rather than searching `PATH`. A hermetic cage has no `/usr/bin/ldd`, so the
-# answer comes back unknown and the code path that follows takes the trap. What that path does is
-# not established: the trace ends at `getcwd`, and the faulting frame is in the main binary rather
-# than in any bundled `.node`.
+# A hermetic cage had none, so sbx now synthesises `/usr/bin/ldd` as a symlink to the base glibc's
+# own `ldd`, beside the `/bin/sh` and `/usr/bin/env` it already provided. Nothing here works around
+# it any more: the command below is a plain argv again. What was measured and what was not: the
+# trap was measured on this app, and the code path between the missing file and the trap was not —
+# the trace ends at `getcwd`, and the faulting frame is in the app's own binary rather than in any
+# bundled `.node`.
 #
-# The fix is therefore to put a real `ldd` at the path that is consulted — not to relax the cage.
-# Binding the host's own `/usr/bin/ldd` also works and was how the cause was confirmed, but it would
-# make the profile depend on a host file; the bundle's `nix:glibc.bin` carries one instead.
+# Ruled out along the way, each by its own run, so none is worth retrying: the network posture (it
+# died under `deny` and under `--net allow` alike), `gpu`, the size of the tree (a 16-directory
+# repository died the same way, and masking the largest subtree changed nothing), the seccomp
+# denylist (lifted in full, still died), a missing `/sys/devices/system/cpu`, the size of
+# `/dev/shm`, and the absence of `git` (it is present).
 #
-# Ruled out along the way, each by its own run, so none of these is worth retrying: the network
-# posture (it died under `deny` and under `--net allow` alike), `gpu`, the size of the tree (a
-# 16-directory repository died the same way, and masking the largest subtree changed nothing), the
-# seccomp denylist (lifted in full, still died), a missing `/sys/devices/system/cpu`, the size of
-# `/dev/shm`, and the absence of `git` (it is present). Two control arms bounded it before the trace
-# named it: `claude-desktop` survives on the same project, and this app's own binary run OUTSIDE the
-# cage survives — the two closures agree byte for byte on the binary and on the native addons'
-# RUNPATHs, so that arm was valid.
-#
-# One app was measured, and the generalization is a hypothesis rather than a finding: any packaged
-# Node application that consults `detect-libc` would meet the same absent path, so if another
-# profile dies this way that is the first thing to check. No other profile was tested.
-#
-# To collect a crash report yourself, re-permit `ptrace` for one run:
+# To collect a crash report from this app yourself, re-permit `ptrace` for one run:
 #     sbx app run codex-desktop --config 'seccomp = { allow = ["ptrace"] }'
 # Without it the app's own crash handler cannot attach and writes nothing.
 #
@@ -159,24 +148,12 @@
 # If a request is refused, the proxy names the host — watch `sbx net logs -a codex-desktop` and add
 # it below (or check ahead with `sbx test net <url>`).
 cmd = [
-    "bash",
-    "-c",
-    '''
-# Put a real `ldd` where the app looks for one. Without this the app dies on SIGILL the moment a
-# git project is opened — the whole measurement is in the header above. `/usr/bin` is a writable
-# cage tmpfs (it is where sbx synthesises `env` and `xdg-open`), and `ldd` is on PATH because the
-# bundle declares `nix:glibc.bin`. Guarded rather than assumed: if either is ever missing the app
-# still starts, and fails the way it did before rather than failing to launch at all.
-if command -v ldd >/dev/null 2>&1 && mkdir -p /usr/bin 2>/dev/null; then
-    ln -sf "$(command -v ldd)" /usr/bin/ldd 2>/dev/null || true
-fi
-
-exec codex-desktop --no-sandbox --ozone-platform=wayland --disable-dev-shm-usage \
-    --use-system-ca --password-store=basic "$@"
-''',
-    # Bound to `$0` so the first argument of `sbx app run codex-desktop -- <args>` reaches `"$@"`
-    # above instead of being eaten as the shell's own name.
     "codex-desktop",
+    "--no-sandbox",
+    "--ozone-platform=wayland",
+    "--disable-dev-shm-usage",
+    "--use-system-ca",
+    "--password-store=basic",
 ]
 
 gui = "wayland"

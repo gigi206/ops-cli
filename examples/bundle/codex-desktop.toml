@@ -104,12 +104,6 @@ codex-desktop = "deb:apt:https://persistent.oaistatic.com/codex-app-prod/linux/d
 # An in-cage Chromium for the browser half of the sign-in. HEAVY — a large nixpkgs closure on first
 # launch, shared with every other Chromium profile in your store.
 chromium = "nix:chromium"
-# A real `ldd`, for the one caller that needs it: the app's bundled `detect-libc` decides whether it
-# is on a glibc or a musl system by reading the file at `/usr/bin/ldd`, which a hermetic cage does
-# not have. The consuming profile's command links this one there before the app starts; the header
-# of `examples/app/codex-desktop.toml` carries the whole measurement. The `bin` output is named
-# because that is the one holding `ldd`, and it is small — this does not pull glibc's dev tree.
-glibc = "nix:glibc.bin"
 
 # Three attributes the shared prebuilt library set does not carry, added for THIS package only so no
 # other Electron app pays for their closures. Without them the `.deb` build fails outright, naming

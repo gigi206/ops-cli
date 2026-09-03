@@ -301,7 +301,7 @@ The 67 shipped bundles, and what each carries:
 | `cline` | 3 (`mise:`, `nix:`) | 7 egress entries | `models-catalog`, `npm-audit`, `npm-registry` |
 | `codebuddy` | 2 (`mise:`, `nix:`) | 4 egress entries, 2 env vars | `npm-audit`, `npm-registry` |
 | `codex` | 1 (`mise:`) | 6 egress entries | none |
-| `codex-desktop` | 3 (`deb:`, `nix:`) | 17 egress entries, 3 `deb:` library attributes | `chromium-background` |
+| `codex-desktop` | 2 (`deb:`, `nix:`) | 17 egress entries, 3 `deb:` library attributes | `chromium-background` |
 | `command-code` | 2 (`mise:`, `nix:`) | 12 egress entries | `github-install`, `npm-registry` |
 | `copilot` | 1 (`mise:`) | 6 egress entries | none |
 | `cortex` | 2 (`mise:`, `nix:`) | 6 egress entries | none |
