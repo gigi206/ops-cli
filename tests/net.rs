@@ -1084,9 +1084,9 @@ fn net_allow_app_writes_the_apps_network_table_and_retrusts() {
             && body.contains("telemetry.example.com"),
         "both rules must land in the app's own network table:\n{body}"
     );
-    // NOTE: this still wholesale-replaces the app's effective network until the Inc 2 deep-merge
-    // lands — a project `[app.<name>.network]` with a mode replaces the profile's posture. Inc 2
-    // makes a mode-less overlay amend it instead.
+    // The table written here is mode-less, so it AMENDS the app's profile rather than replacing it:
+    // see `net_allow_app_local_amends_the_profile_rather_than_replacing_it`. A project
+    // `[app.<name>.network]` that names a `mode` still replaces, which is the intended shape.
 }
 
 #[test]
@@ -1241,8 +1241,9 @@ fn net_allow_app_save_local_still_writes_project_sbx_toml() {
         "cmd = \"claude\"\n[network]\nmode = \"ask\"\nallow = [\"api.anthropic.com\"]\n",
     );
     // `--save -l -a <app>` targets the project `.sbx.toml [app.<app>.network]` (a project overlay is
-    // still allowed). Inc 1 leaves this path wholesale-replacing the profile's network at resolve
-    // time — the Inc 2 deep-merge fixes that. Here we only pin that the write lands in the project.
+    // still allowed). Here we only pin that the write lands in the project; that it *amends* the
+    // profile rather than replacing it is pinned by
+    // `net_allow_app_local_amends_the_profile_rather_than_replacing_it`.
     let out = fx.run(&["net", "allow", "h.com", "--app", "claude", "-l"]);
     assert!(
         out.status.success(),
@@ -1253,6 +1254,63 @@ fn net_allow_app_save_local_still_writes_project_sbx_toml() {
     assert!(
         body.contains("[app.claude.network]") && body.contains("h.com"),
         "the project overlay must land in .sbx.toml:\n{body}"
+    );
+}
+
+#[test]
+fn net_allow_app_local_amends_the_profile_rather_than_replacing_it() {
+    let fx = Project::new("net");
+    fx.write_global("[network]\nmode = \"shared\"\n");
+    // A profile that carries a posture, a scalar setting, and three rules — the shape a shipped app
+    // profile has, and the shape a single `sbx net allow --app` used to reduce to one rule.
+    fx.write_profile(
+        "demo",
+        "cmd = \"true\"\n[network]\nmode = \"ask\"\nask_timeout = \"45s\"\n         allow = [\"a.test\", \"b.test\", \"c.test\"]\n",
+    );
+    // Each verb is legitimate here: the app inherits a filtering posture from its profile, so a
+    // `deny` has something to tighten and a `mute` has denials to suppress. Before, only `allow`
+    // was accepted — and it was the one that did the damage.
+    for (verb, rule) in [
+        ("allow", "x.test"),
+        ("deny", "evil.test"),
+        ("mute", "noisy.test"),
+    ] {
+        let out = fx.run(&["net", verb, rule, "--app", "demo", "-l"]);
+        assert!(
+            out.status.success(),
+            "`net {verb}` on an app inheriting a posture must be accepted: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let said = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            !said.contains("set network mode"),
+            "no mode may be invented: naming one turns the overlay into a replacing table\n{said}"
+        );
+    }
+
+    let body = std::fs::read_to_string(fx.proj.path().join(".sbx.toml")).unwrap();
+    assert!(
+        body.contains("[app.demo.network]") && !body.contains("mode ="),
+        "the overlay must stay mode-less, which is what makes it amend:\n{body}"
+    );
+
+    let shown = fx.run(&["config", "show", "--app", "demo"]);
+    let text = String::from_utf8_lossy(&shown.stdout).to_string();
+    for kept in ["a.test", "b.test", "c.test", "45s"] {
+        assert!(
+            text.contains(kept),
+            "the profile's `{kept}` must survive the overlay:\n{text}"
+        );
+    }
+    for added in ["x.test", "evil.test"] {
+        assert!(
+            text.contains(added),
+            "the overlay's `{added}` must be added to them:\n{text}"
+        );
+    }
+    assert!(
+        text.contains("ask"),
+        "and the profile's posture must not be replaced by an invented one:\n{text}"
     );
 }
 

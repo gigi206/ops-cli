@@ -824,6 +824,25 @@ pub(crate) fn unset(path: &Path, key: &str) -> Result<bool, ManageError> {
     Ok(existed)
 }
 
+/// What the layer being written into inherits from the layer below, when it declares no `network`
+/// of its own.
+///
+/// The writer sees one file. For an app that is not the whole story: `[app.<name>.network]` may be
+/// absent from the project `.sbx.toml` and yet the app's *profile* declare a posture and a set of
+/// rules one layer down. Told nothing, the writer read that as "no posture anywhere" and bootstrapped
+/// a `mode` of its own — which turned the overlay into a replacing table and took the profile's
+/// rules with it: three allow rules became one, and the command reported success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Inherited {
+    /// Nothing a rule can attach to. `allow` bootstraps the deny-by-default posture, `deny` and
+    /// `mute` refuse: with no posture there is nothing to tighten and nothing to suppress.
+    Nothing,
+    /// A filtering posture from the layer below. The rule amends it, so the table written here must
+    /// **not** name a `mode`: naming one is declaring a policy of one's own, which replaces exactly
+    /// what the rule meant to add to.
+    FilteringPosture,
+}
+
 /// Add an egress `rule` to the `list` (allow/deny) of the target file's network policy — the
 /// baseline `[network]` when `app` is `None`, or `[app.<name>.network]` when `Some(name)`.
 ///
@@ -840,6 +859,7 @@ pub(crate) fn add_egress_rule(
     app: Option<&str>,
     list: EgressList,
     rule: &str,
+    inherited: Inherited,
 ) -> Result<Written, ManageError> {
     // Inspect the current `network` field into an owned decision first, so the read borrow is
     // released before the document is mutated below.
@@ -870,6 +890,13 @@ pub(crate) fn add_egress_rule(
     };
 
     let outcome = match case {
+        NetCase::Absent if inherited == Inherited::FilteringPosture => {
+            // Absent *here*, declared one layer down. The rule joins that layer, so this table is
+            // written mode-less: it amends rather than replaces, and every list is legitimate —
+            // a `deny` tightens the inherited posture and a `mute` has denials to suppress.
+            parent.insert("network", Item::Table(new_network_table(None, list, rule)));
+            AddOutcome::Added { created_mode: None }
+        }
         NetCase::Absent => {
             // Only `allow` bootstraps a posture (the most restrictive, deny-by-default allowlist). A
             // `deny` must not silently open a denylist, and a `mute` with no filtering posture is
@@ -883,7 +910,7 @@ pub(crate) fn add_egress_rule(
             }
             parent.insert(
                 "network",
-                Item::Table(new_network_table("deny", list, rule)),
+                Item::Table(new_network_table(Some("deny"), list, rule)),
             );
             AddOutcome::Added {
                 created_mode: Some("deny".into()),
@@ -891,7 +918,10 @@ pub(crate) fn add_egress_rule(
         }
         NetCase::BareFiltering(mode) => {
             // Promote the bare-string posture to the table form, keeping its mode, with the rule.
-            parent.insert("network", Item::Table(new_network_table(&mode, list, rule)));
+            parent.insert(
+                "network",
+                Item::Table(new_network_table(Some(&mode), list, rule)),
+            );
             AddOutcome::Added {
                 created_mode: Some(mode),
             }
@@ -1312,9 +1342,11 @@ fn implicit_table() -> Table {
 }
 
 /// A fresh `[network]` table carrying `mode` and one `rule` in `list`.
-fn new_network_table(mode: &str, list: EgressList, rule: &str) -> Table {
+fn new_network_table(mode: Option<&str>, list: EgressList, rule: &str) -> Table {
     let mut t = Table::new();
-    t.insert("mode", value(mode));
+    if let Some(mode) = mode {
+        t.insert("mode", value(mode));
+    }
     let mut arr = Array::new();
     arr.push(rule);
     t.insert(list.key(), value(arr));
@@ -2542,7 +2574,13 @@ mod tests {
         let tmp = crate::testutil::TmpDir::new();
         let p = doc_at(tmp.path(), "[network]\nmode = \"bogus\"\n");
         assert!(matches!(
-            add_egress_rule(&p, None, EgressList::Allow, "example.com"),
+            add_egress_rule(
+                &p,
+                None,
+                EgressList::Allow,
+                "example.com",
+                Inherited::Nothing
+            ),
             Err(ManageError::MalformedNetwork(_))
         ));
     }
@@ -2602,9 +2640,15 @@ mod tests {
     fn add_egress_rule_bootstraps_an_allowlist_for_allow_on_a_fresh_config() {
         let tmp = crate::testutil::TmpDir::new();
         let p = tmp.path().join(".sbx.toml");
-        let out = add_egress_rule(&p, None, EgressList::Allow, "github.com")
-            .unwrap()
-            .outcome;
+        let out = add_egress_rule(
+            &p,
+            None,
+            EgressList::Allow,
+            "github.com",
+            Inherited::Nothing,
+        )
+        .unwrap()
+        .outcome;
         assert_eq!(
             out,
             AddOutcome::Added {
@@ -2628,9 +2672,15 @@ mod tests {
         );
 
         // Add a mute rule → it lands in a `mute` array beside `allow`, the verdict lists untouched.
-        let added = add_egress_rule(&p, None, EgressList::Mute, "play.googleapis.com")
-            .unwrap()
-            .outcome;
+        let added = add_egress_rule(
+            &p,
+            None,
+            EgressList::Mute,
+            "play.googleapis.com",
+            Inherited::Nothing,
+        )
+        .unwrap()
+        .outcome;
         assert_eq!(added, AddOutcome::Added { created_mode: None });
         let body = std::fs::read_to_string(&p).unwrap();
         assert!(body.contains("mute = [\"play.googleapis.com\"]"), "{body}");
@@ -2641,9 +2691,15 @@ mod tests {
 
         // Adding the same rule again is idempotent.
         assert_eq!(
-            add_egress_rule(&p, None, EgressList::Mute, "play.googleapis.com")
-                .unwrap()
-                .outcome,
+            add_egress_rule(
+                &p,
+                None,
+                EgressList::Mute,
+                "play.googleapis.com",
+                Inherited::Nothing
+            )
+            .unwrap()
+            .outcome,
             AddOutcome::AlreadyPresent
         );
 
@@ -2676,13 +2732,84 @@ mod tests {
     }
 
     #[test]
+    fn a_layer_inheriting_a_posture_is_written_mode_less_and_takes_every_verb() {
+        let dir = crate::testutil::TmpDir::new();
+        let p = dir.join("sbx.toml");
+        std::fs::write(&p, "packages = {}\n").expect("stage an empty project config");
+
+        // `Absent` here does not mean absent everywhere: the app's profile declares the posture one
+        // layer down. Each verb is then legitimate, and none may invent a `mode` — inventing one
+        // turns the overlay into a table that replaces the very rules it was meant to join.
+        for (list, rule) in [
+            (EgressList::Allow, "x.test"),
+            (EgressList::Deny, "evil.test"),
+            (EgressList::Mute, "noisy.test"),
+        ] {
+            let out = add_egress_rule(&p, Some("demo"), list, rule, Inherited::FilteringPosture)
+                .expect("an inherited posture accepts every list");
+            assert_eq!(
+                out.outcome,
+                AddOutcome::Added { created_mode: None },
+                "no mode is created for a layer that inherits one"
+            );
+        }
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            !body.contains("mode ="),
+            "the written table stays mode-less, which is what makes it amend:\n{body}"
+        );
+        for rule in ["x.test", "evil.test", "noisy.test"] {
+            assert!(body.contains(rule), "`{rule}` was written:\n{body}");
+        }
+
+        // The same three verbs with nothing inherited keep the old answers: `allow` bootstraps the
+        // deny-by-default posture, and the other two refuse rather than write something inert.
+        let q = dir.join("other.toml");
+        std::fs::write(&q, "packages = {}\n").expect("stage a second project config");
+        assert!(matches!(
+            add_egress_rule(
+                &q,
+                Some("demo"),
+                EgressList::Deny,
+                "evil.test",
+                Inherited::Nothing
+            ),
+            Err(ManageError::DenyNeedsPosture)
+        ));
+        assert!(matches!(
+            add_egress_rule(
+                &q,
+                Some("demo"),
+                EgressList::Mute,
+                "noisy.test",
+                Inherited::Nothing
+            ),
+            Err(ManageError::MuteNeedsPosture(_))
+        ));
+        assert_eq!(
+            add_egress_rule(
+                &q,
+                Some("demo"),
+                EgressList::Allow,
+                "x.test",
+                Inherited::Nothing
+            )
+            .expect("allow bootstraps a posture")
+            .outcome,
+            AddOutcome::Added {
+                created_mode: Some("deny".into())
+            }
+        );
+    }
+
+    #[test]
     fn a_mute_rule_needs_a_filtering_posture() {
         let tmp = crate::testutil::TmpDir::new();
         // No `[network]` at all → a mute would be inert, so it is refused (like a posture-less deny),
         // and nothing is written.
         let p = tmp.path().join(".sbx.toml");
         assert!(matches!(
-            add_egress_rule(&p, None, EgressList::Mute, "x.test"),
+            add_egress_rule(&p, None, EgressList::Mute, "x.test", Inherited::Nothing),
             Err(ManageError::MuteNeedsPosture(None))
         ));
         assert!(!p.exists(), "a refused mute writes nothing");
@@ -2699,8 +2826,14 @@ mod tests {
     fn the_refusal_for_an_app_names_its_profile_and_not_a_missing_posture() {
         let tmp = crate::testutil::TmpDir::new();
         let p = tmp.path().join(".sbx.toml");
-        let err = add_egress_rule(&p, Some("demo"), EgressList::Mute, "x.test")
-            .expect_err("a mute on a posture-less app layer is refused");
+        let err = add_egress_rule(
+            &p,
+            Some("demo"),
+            EgressList::Mute,
+            "x.test",
+            Inherited::Nothing,
+        )
+        .expect_err("a mute on a posture-less app layer is refused");
         assert!(
             matches!(&err, ManageError::MuteNeedsPosture(Some(a)) if a == "demo"),
             "the app is carried so the message can name it: {err:?}"
@@ -2730,7 +2863,7 @@ mod tests {
         // the inheritance the author chose.
         let tmp = crate::testutil::TmpDir::new();
         let p = doc_at(tmp.path(), "[network]\nallow = [\"a.test\"]\n");
-        add_egress_rule(&p, None, EgressList::Allow, "b.test").unwrap();
+        add_egress_rule(&p, None, EgressList::Allow, "b.test", Inherited::Nothing).unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
         assert!(
             body.contains("\"a.test\"") && body.contains("\"b.test\""),
@@ -2747,7 +2880,7 @@ mod tests {
         let tmp = crate::testutil::TmpDir::new();
         let p = tmp.path().join(".sbx.toml");
         assert!(matches!(
-            add_egress_rule(&p, None, EgressList::Deny, "evil.com"),
+            add_egress_rule(&p, None, EgressList::Deny, "evil.com", Inherited::Nothing),
             Err(ManageError::DenyNeedsPosture)
         ));
         assert!(!p.exists(), "a refused deny must not create the file");
@@ -2757,7 +2890,7 @@ mod tests {
     fn add_egress_rule_promotes_a_bare_string_posture_keeping_its_mode() {
         let tmp = crate::testutil::TmpDir::new();
         let p = doc_at(tmp.path(), "network = \"allow\"\n");
-        let out = add_egress_rule(&p, None, EgressList::Deny, "evil.com")
+        let out = add_egress_rule(&p, None, EgressList::Deny, "evil.com", Inherited::Nothing)
             .unwrap()
             .outcome;
         assert_eq!(
@@ -2783,7 +2916,7 @@ mod tests {
         let tmp = crate::testutil::TmpDir::new();
         let p = doc_at(tmp.path(), "network = \"shared\"\n");
         assert!(matches!(
-            add_egress_rule(&p, None, EgressList::Allow, "x.com"),
+            add_egress_rule(&p, None, EgressList::Allow, "x.com", Inherited::Nothing),
             Err(ManageError::NonFilteringPosture(s)) if s == "shared"
         ));
     }
@@ -2801,7 +2934,7 @@ mod tests {
             let p = doc_at(tmp.path(), body);
             assert!(
                 matches!(
-                    add_egress_rule(&p, None, EgressList::Deny, "evil.com"),
+                    add_egress_rule(&p, None, EgressList::Deny, "evil.com", Inherited::Nothing),
                     Err(ManageError::NonFilteringPosture(_))
                 ),
                 "expected a non-filtering refusal for {body:?}"
@@ -2817,20 +2950,20 @@ mod tests {
             "[network]\nmode = \"deny\"\nallow = [\"a.com\"]\n",
         );
         assert_eq!(
-            add_egress_rule(&p, None, EgressList::Allow, "b.com")
+            add_egress_rule(&p, None, EgressList::Allow, "b.com", Inherited::Nothing)
                 .unwrap()
                 .outcome,
             AddOutcome::Added { created_mode: None }
         );
         assert_eq!(
-            add_egress_rule(&p, None, EgressList::Deny, "evil.com")
+            add_egress_rule(&p, None, EgressList::Deny, "evil.com", Inherited::Nothing)
                 .unwrap()
                 .outcome,
             AddOutcome::Added { created_mode: None }
         );
         // An exact-string match already present is a no-op.
         assert_eq!(
-            add_egress_rule(&p, None, EgressList::Allow, "b.com")
+            add_egress_rule(&p, None, EgressList::Allow, "b.com", Inherited::Nothing)
                 .unwrap()
                 .outcome,
             AddOutcome::AlreadyPresent
@@ -2848,7 +2981,14 @@ mod tests {
     fn add_egress_rule_writes_the_apps_own_network_table_with_implicit_parents() {
         let tmp = crate::testutil::TmpDir::new();
         let p = tmp.path().join(".sbx.toml");
-        add_egress_rule(&p, Some("demo-app"), EgressList::Allow, "api.example.com").unwrap();
+        add_egress_rule(
+            &p,
+            Some("demo-app"),
+            EgressList::Allow,
+            "api.example.com",
+            Inherited::Nothing,
+        )
+        .unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
         assert!(
             body.contains("[app.demo-app.network]") && body.contains("api.example.com"),
@@ -2887,7 +3027,7 @@ mod tests {
         // fresh profile the Absent bootstrap creates a deny-by-default allowlist with the host.
         let tmp = crate::testutil::TmpDir::new();
         let p = tmp.path().join("apps").join("demo.toml");
-        add_egress_rule(&p, None, EgressList::Allow, "api.x.com").unwrap();
+        add_egress_rule(&p, None, EgressList::Allow, "api.x.com", Inherited::Nothing).unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
         assert!(
             body.contains("[network]")
@@ -2915,7 +3055,7 @@ mod tests {
             "network = { mode = \"deny\", allow = [\"a.com\"] }\n",
         );
         assert_eq!(
-            add_egress_rule(&p, None, EgressList::Allow, "b.com")
+            add_egress_rule(&p, None, EgressList::Allow, "b.com", Inherited::Nothing)
                 .unwrap()
                 .outcome,
             AddOutcome::Added { created_mode: None }
@@ -2924,7 +3064,7 @@ mod tests {
         assert!(body.contains("a.com") && body.contains("b.com"), "{body}");
         // Idempotent within the inline form too.
         assert_eq!(
-            add_egress_rule(&p, None, EgressList::Allow, "b.com")
+            add_egress_rule(&p, None, EgressList::Allow, "b.com", Inherited::Nothing)
                 .unwrap()
                 .outcome,
             AddOutcome::AlreadyPresent
@@ -2936,7 +3076,7 @@ mod tests {
         let tmp = crate::testutil::TmpDir::new();
         let p = doc_at(tmp.path(), "network = 42\n");
         assert!(matches!(
-            add_egress_rule(&p, None, EgressList::Allow, "x.com"),
+            add_egress_rule(&p, None, EgressList::Allow, "x.com", Inherited::Nothing),
             Err(ManageError::MalformedNetwork(_))
         ));
     }
@@ -3376,7 +3516,14 @@ mod tests {
         let before = std::fs::read_to_string(&p).unwrap();
         let ino = std::fs::metadata(&p).unwrap().ino();
 
-        let written = add_egress_rule(&p, None, EgressList::Allow, "github.com").unwrap();
+        let written = add_egress_rule(
+            &p,
+            None,
+            EgressList::Allow,
+            "github.com",
+            Inherited::Nothing,
+        )
+        .unwrap();
         assert_eq!(written.outcome, AddOutcome::AlreadyPresent);
         assert_eq!(
             written.text, before,
@@ -3394,7 +3541,7 @@ mod tests {
 
         // The negative control: a rule that is genuinely new still writes.
         assert!(matches!(
-            add_egress_rule(&p, None, EgressList::Allow, "crates.io")
+            add_egress_rule(&p, None, EgressList::Allow, "crates.io", Inherited::Nothing)
                 .unwrap()
                 .outcome,
             AddOutcome::Added { .. }

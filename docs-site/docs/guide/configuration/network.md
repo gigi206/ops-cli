@@ -487,9 +487,39 @@ the global config stops applying there from that moment. sbx names what stopped 
 sbx: warning: .sbx.toml: this `[network]` table replaces the layer below rather than adding to it, so the settings it carried do not apply here: `ca_roots`, `capture` — re-declare them in this table to keep them
 ```
 
-Re-declare the ones you want in the table that replaced them. Two things stand outside this:
-the mode, inherited when omitted (above), and `stats`, which is read outside the table and
-applies to every launch.
+Re-declare the ones you want in the table that replaced them. Three things stand outside this:
+the mode, inherited when omitted (above); `stats`, which is read outside the table and applies
+to every launch; and one table that amends instead, below.
+
+### The one table that amends: a mode-less app overlay
+
+A project `[app.<name>.network]` that declares **no `mode`** is the exception. With no posture
+of its own it is not a policy but an addition to one, so it **amends** the app's profile: its
+`allow`/`deny`/`mute` entries are appended to the profile's, and a setting it does not
+re-declare keeps the profile's value.
+
+```toml
+# ~/.config/sbx/apps/demo.toml   (the app's profile)
+[network]
+mode = "ask"
+ask_timeout = "45s"
+allow = ["a.test", "b.test", "c.test"]
+```
+
+```toml
+# ./.sbx.toml   (a project overlay, written by `sbx net allow x.test --app demo -l`)
+[app.demo.network]
+allow = ["x.test"]
+```
+
+The app then runs under `ask`, still with `ask_timeout = "45s"`, and with **four** allow rules.
+Name a `mode` in that overlay and it replaces the profile's table like any other, which is what
+declaring a posture means.
+
+This is why `sbx net allow|deny|mute --app <name> --local` writes a mode-less table: the rule
+you add joins the app's own rules instead of standing in for them. It is also why `deny` and
+`mute` are accepted there even though they are refused where no posture exists at all: an app
+that inherits a filtering posture has something to tighten and something to suppress.
 
 Every other layered table composes instead of replacing: [`[limits]`](limits) merges field by
 field, [`[fs]`](fs), [`forward`](../networking/forward), [`[devices]`](devices), [`[seccomp]`](seccomp)

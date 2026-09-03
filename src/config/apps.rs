@@ -703,9 +703,15 @@ fn resolve_app(
                     warn_if_app_sets_stats(w, &source, &field);
                     let raw_dm = network_default_methods_of(&field).cloned();
                     // A mode-less table inherits from whatever posture is in effect so far — the
-                    // app's own global layer if it set one, else the baseline.
+                    // app's own global layer if it set one, else the baseline — and, here alone,
+                    // *amends* it rather than replacing it. This is the project overlay over an
+                    // app's own profile: with no posture of its own it is an addition, and
+                    // rebuilding from its keys dropped the profile's rules, so a single
+                    // `sbx net allow --app` left an app that declared three allow rules with one.
+                    // A table that does name a `mode` still replaces, which is the shape the
+                    // repository intends: declaring a posture is declaring a policy of one's own.
                     let parent = current.as_ref().unwrap_or(baseline_network);
-                    let policy = validate_network(w, &source, field, net_groups, parent)?;
+                    let policy = validate_network_amending(w, &source, field, net_groups, parent)?;
                     // Only once the policy stands: the verb posture belongs to a policy that exists.
                     if let Some(m) = resolve_app_default_methods(w, &source, raw_dm) {
                         default_methods = m;

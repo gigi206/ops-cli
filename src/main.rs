@@ -985,6 +985,33 @@ fn report_rule_write(result: Result<String, (u8, String)>) -> ExitCode {
 const NO_TRUST_STORE_ON_ADD: &str = "cannot determine the trust store (set XDG_STATE_HOME or HOME); the rule would be written but \
      could not be trusted, so it would not take effect — use --global, or set the trust store";
 
+/// What the layer a rule is about to be written into inherits from below.
+///
+/// Only an app can inherit one: its profile (or the baseline under it) may declare a filtering
+/// posture that the file being written says nothing about. Answering `Nothing` where a posture is
+/// in fact inherited is the defect this exists to close — the writer then invents a `mode`, the
+/// overlay stops amending and starts replacing, and the rules the user meant to add to are gone.
+///
+/// Resolving the config costs a load per rule write. That is the price of the writer knowing what
+/// the launch will know; the alternative is guessing from one file, which is what it did before.
+fn inherited_posture(app: Option<&str>, base: &Path) -> config::manage::Inherited {
+    use config::manage::Inherited;
+    let Some(name) = app else {
+        return Inherited::Nothing;
+    };
+    let resolved = config::load(base);
+    let Some(entry) = resolved.apps.get(name) else {
+        return Inherited::Nothing;
+    };
+    // The app's own posture when a layer set one, else the baseline it runs under. A filtering
+    // posture is the one that reads rules at all: `none`/`shared` carry none.
+    let effective = entry.network.as_ref().unwrap_or(&resolved.network);
+    match effective {
+        config::NetworkPolicy::Allowlist(_) => Inherited::FilteringPosture,
+        _ => Inherited::Nothing,
+    }
+}
+
 /// Persist an egress `rule` to the scoped config file, trust-gating a project write and re-trusting
 /// it after — the shared writer behind `sbx net allow|deny <rule>` and the `--save` of
 /// `sbx net pending allow|deny`. Returns the success line to print, or `(exit-code, message)`: a
@@ -1012,8 +1039,8 @@ fn persist_egress_rule(
     } = open_rule_write("net", verb, NO_TRUST_STORE_ON_ADD, scope, app, base)?;
     let gated = store.is_some();
 
-    let written =
-        manage::add_egress_rule(&path, app_key, list, rule).map_err(|e| (2, e.to_string()))?;
+    let written = manage::add_egress_rule(&path, app_key, list, rule, inherited_posture(app, base))
+        .map_err(|e| (2, e.to_string()))?;
 
     // Re-trust the project config after the write, attesting to the bytes just written rather than
     // to whatever is on disk now. Ordering is fail-safe against a crash — one between the write and

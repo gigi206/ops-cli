@@ -438,6 +438,23 @@ pub(super) fn validate_notify(
     Some(policy.with_repeat_after(period))
 }
 
+/// How a `[network]` table stands to the layer below it.
+///
+/// [`Layering::Replace`] is the rule everywhere: the table is rebuilt from its own keys, only an
+/// omitted `mode` is inherited, and a setting the layer below carried is named in a warning rather
+/// than kept. [`Layering::Amend`] is the one exception the repository intends, for a *mode-less*
+/// `[app.<name>.network]` project overlay: with no posture of its own such a table is not a policy
+/// but an addition to one, and replacing would silently drop the profile's rules — measured as
+/// three rules becoming one on a single `sbx net allow --app`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Layering {
+    /// Rebuild from this table alone; warn about what the layer below carried and it does not.
+    Replace,
+    /// Start from the layer below when this table declares no `mode`: its lists are appended to
+    /// the lower layer's and a scalar it omits keeps the lower layer's value.
+    Amend,
+}
+
 /// Validate a `network` field — either a posture string or a `[network]` table — mapping it to a
 /// policy and warning on anything unrecognized. A typo must never silently leave the network in the
 /// wrong posture; returning `None` keeps the prior (default or global) posture rather than guessing.
@@ -450,6 +467,46 @@ pub(super) fn validate_network(
     field: NetworkField,
     groups: &NetGroups,
     parent: &NetworkPolicy,
+) -> Option<NetworkPolicy> {
+    validate_network_layered(
+        warnings,
+        source_label,
+        field,
+        groups,
+        parent,
+        Layering::Replace,
+    )
+}
+
+/// [`validate_network`] for the one layer that amends rather than replaces: a project
+/// `[app.<name>.network]` over the app's own profile. See [`Layering`].
+pub(super) fn validate_network_amending(
+    warnings: &mut Vec<String>,
+    source_label: &str,
+    field: NetworkField,
+    groups: &NetGroups,
+    parent: &NetworkPolicy,
+) -> Option<NetworkPolicy> {
+    validate_network_layered(
+        warnings,
+        source_label,
+        field,
+        groups,
+        parent,
+        Layering::Amend,
+    )
+}
+
+/// The shared body of [`validate_network`] and [`validate_network_amending`], parameterised by
+/// how this table stands to the layer below. Written once because the two differ in that single
+/// decision and a second copy could drift from it.
+fn validate_network_layered(
+    warnings: &mut Vec<String>,
+    source_label: &str,
+    field: NetworkField,
+    groups: &NetGroups,
+    parent: &NetworkPolicy,
+    layering: Layering,
 ) -> Option<NetworkPolicy> {
     match field {
         NetworkField::Posture(value) => match value.as_str() {
@@ -478,7 +535,7 @@ pub(super) fn validate_network(
             }
         },
         NetworkField::Table(table) => {
-            validate_network_table(warnings, source_label, table, groups, parent)
+            validate_network_table(warnings, source_label, table, groups, parent, layering)
         }
     }
 }
@@ -550,6 +607,7 @@ pub(super) fn validate_network_table(
     table: NetworkTable,
     groups: &NetGroups,
     parent: &NetworkPolicy,
+    layering: Layering,
 ) -> Option<NetworkPolicy> {
     use crate::allowlist::DefaultAction;
     // Report what this table carries and sbx will not apply, before any posture is decided: the
@@ -609,11 +667,35 @@ pub(super) fn validate_network_table(
     // reach, and a host named here is unreachable unless an `allow` rule says otherwise.
     let shared_credential =
         parse_shared_credential(warnings, source_label, table.shared_credential);
-    let mut policy = crate::allowlist::EgressPolicy::new(allow, deny)
-        .with_default(action)
-        .with_mute(mute)
-        .with_http2(http2)
-        .with_shared_credential(shared_credential);
+    // An amending table with no `mode` of its own is an addition to the layer below, not a policy:
+    // start from that layer so its rules survive and so a setting this table does not redeclare
+    // keeps its value. Every other table is built from its own keys, as the warning at the end of
+    // this function says out loud.
+    let amends_below = layering == Layering::Amend && table.mode.is_none();
+    let mut policy = match parent {
+        NetworkPolicy::Allowlist(below) if amends_below => {
+            let mut p = below
+                .as_ref()
+                .clone()
+                .with_default(action)
+                .amended_with(allow, deny, mute);
+            // The two remaining list-shaped settings: appended when this table names any, and left
+            // to the layer below when it names none. Written as guards rather than folded into
+            // `amended_with` because both are `Option`/empty-shaped rather than plain lists.
+            if !http2.is_empty() {
+                p = p.with_http2(http2);
+            }
+            if !shared_credential.is_empty() {
+                p = p.with_shared_credential(shared_credential);
+            }
+            p
+        }
+        _ => crate::allowlist::EgressPolicy::new(allow, deny)
+            .with_default(action)
+            .with_mute(mute)
+            .with_http2(http2)
+            .with_shared_credential(shared_credential),
+    };
     if action == DefaultAction::Ask {
         // A configured `ask_timeout` bounds the parked wait; a malformed value falls back to
         // indefinite (warned), never a hard config failure.
@@ -627,9 +709,14 @@ pub(super) fn validate_network_table(
                 None
             }),
         };
-        policy = policy
-            .with_ask_timeout(timeout)
-            .with_ask_notice(table.ask_notice.unwrap_or(true));
+        // Declared-only when amending: an overlay that says nothing about the parked wait keeps
+        // the wait the layer below chose, rather than resetting it to the built-in.
+        if !amends_below || table.ask_timeout.is_some() {
+            policy = policy.with_ask_timeout(timeout);
+        }
+        if !amends_below || table.ask_notice.is_some() {
+            policy = policy.with_ask_notice(table.ask_notice.unwrap_or(true));
+        }
     } else {
         // `ask_timeout`/`ask_notice` are moot outside the effective `ask` mode — flag them rather
         // than silently drop (the effective mode may be inherited, so key off `action`, not the raw
@@ -759,7 +846,9 @@ pub(super) fn validate_network_table(
     // It is warned rather than merged because the rules a table declares are its own by design, and
     // because the layer that loses a setting is usually not the one that wrote it: `sbx net allow
     // --local` writes this table for a user whose settings live in the global config.
-    if let NetworkPolicy::Allowlist(below) = parent {
+    if let NetworkPolicy::Allowlist(below) = parent
+        && !amends_below
+    {
         let dropped = policy.settings_dropped_from(below);
         if !dropped.is_empty() {
             let list = dropped

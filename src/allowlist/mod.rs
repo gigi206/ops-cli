@@ -1455,6 +1455,28 @@ impl EgressPolicy {
         self.http2.iter().any(|h| h.matches(host, port))
     }
 
+    /// This policy with a higher layer's rule lists appended to its own.
+    ///
+    /// For a table that *amends* the layer below rather than replacing it: a mode-less
+    /// `[app.<name>.network]` overlay, which declares rules to add and not a posture of its own.
+    /// Only the list-shaped settings append here; a scalar the higher table declares is applied by
+    /// the caller through the ordinary `with_*` setters afterwards, and one it omits keeps this
+    /// policy's value — which is the reason the caller starts from this policy at all.
+    ///
+    /// Order is the layers' own: the lower layer's rules first, then the amending layer's, so a
+    /// later rule wins a tie exactly as it does inside one table.
+    pub(crate) fn amended_with(
+        mut self,
+        allow: Vec<Rule>,
+        deny: Vec<Rule>,
+        mute: Vec<Rule>,
+    ) -> Self {
+        self.allow.extend(allow);
+        self.deny.extend(deny);
+        self.mute.extend(mute);
+        self
+    }
+
     pub(crate) fn allow_rules(&self) -> &[Rule] {
         &self.allow
     }
