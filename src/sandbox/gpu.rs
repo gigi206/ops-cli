@@ -14,7 +14,10 @@
 //! 2. the render node(s) under `/dev/dri` — the `renderD*` nodes alone, never the `card*`
 //!    primary nodes beside them — granted through the device-bind mechanism;
 //! 3. the minimal `/sys` DRM subtree the driver reads to enumerate the device,
-//!    read-only and scoped to the GPU device directories (not all of `/sys`).
+//!    read-only and scoped to the GPU device directories (not all of `/sys`);
+//! 4. under WSL only, the bridge libraries the `d3d12` driver reaches the GPU through
+//!    ([`wsl_bridge`]) — Windows provides those, not nixpkgs, so a hermetic cage would
+//!    otherwise hold the render node and render in software regardless.
 //!
 //! Scope: mesa-supported GPUs (Intel/AMD/nouveau). The NVIDIA proprietary stack is a
 //! separate mechanism — its userspace is version-locked to the host kernel module, so
@@ -114,6 +117,38 @@ pub(crate) fn driver_env(mesa_root: &Path) -> Vec<(String, String)> {
     .collect()
 }
 
+/// The directory a WSL distribution keeps the GPU bridge libraries in. Not itself the grant:
+/// [`wsl_bridge_in`] answers whether it holds them.
+pub(crate) const WSL_LIB_DIR: &str = "/usr/lib/wsl/lib";
+
+/// The library the check keys on. mesa's d3d12 path reaches the GPU through DXCore, and this is the
+/// loader stub it goes through, so a directory without it is not the bridge whatever else it holds.
+const WSL_BRIDGE_LIB: &str = "libdxcore.so";
+
+/// The WSL GPU bridge directory to bind, when this host has one.
+///
+/// Under WSL the render node `dxgkrnl` publishes is an ordinary `renderD*` that [`render_nodes`]
+/// already finds — but the driver behind it is mesa's `d3d12`, and that reaches the GPU through
+/// `libdxcore.so`/`libd3d12core.so`, which Windows provides here rather than nixpkgs. A hermetic
+/// cage carries neither, so it falls back to software with the node in hand.
+///
+/// Measured, because the bind alone is not the grant: with the directory bound and nothing else,
+/// the cage's loader still answers `cannot open shared object file` for all three, since a
+/// subdirectory of `/usr/lib` is not a default search path. The caller therefore puts it on the
+/// loader path as well, and that pair is what makes the libraries resolvable.
+///
+/// `None` on any host without it, which is every host that is not WSL — the GPU hole is then
+/// exactly what it was.
+pub(crate) fn wsl_bridge() -> Option<PathBuf> {
+    wsl_bridge_in(Path::new("/"))
+}
+
+/// [`wsl_bridge`] under a named root, so both answers are testable without the host's own `/usr`.
+pub(crate) fn wsl_bridge_in(root: &Path) -> Option<PathBuf> {
+    let dir = root.join(WSL_LIB_DIR.trim_start_matches('/'));
+    dir.join(WSL_BRIDGE_LIB).exists().then_some(dir)
+}
+
 /// The minimal `/sys` DRM subtree mesa/libdrm read to enumerate a device, discovered from the
 /// host's DRM nodes at launch. `drmGetDevices2()` walks `/sys/dev/char` and each node's sysfs
 /// device directory (the PCI/platform device carrying `vendor`/`device`/`uevent` and the `drm/`
@@ -199,6 +234,38 @@ mod tests {
         assert_eq!(
             get("__EGL_VENDOR_LIBRARY_DIRS").as_deref(),
             Some("/nix/store/abc-mesa-26.1.4/share/glvnd/egl_vendor.d")
+        );
+    }
+
+    /// The WSL bridge is discovered by what it holds, and its absence leaves the hole untouched.
+    ///
+    /// The second and third arms are the ones that matter: every host that is not WSL takes them,
+    /// and a GPU hole that started binding a directory there would be granting on a guess. The
+    /// empty-directory arm is not hypothetical either — a distribution can carry `/usr/lib/wsl`
+    /// without the bridge, and a directory is not a driver.
+    #[test]
+    fn the_wsl_bridge_is_found_by_its_library_and_not_by_its_path() {
+        let root = crate::testutil::TmpDir::new();
+        let dir = root.join("usr/lib/wsl/lib");
+
+        assert_eq!(
+            wsl_bridge_in(root.path()),
+            None,
+            "no such directory: an ordinary Linux host grants nothing here"
+        );
+
+        std::fs::create_dir_all(&dir).expect("stage the bridge directory");
+        assert_eq!(
+            wsl_bridge_in(root.path()),
+            None,
+            "the directory alone is not the bridge"
+        );
+
+        std::fs::write(dir.join("libdxcore.so"), b"").expect("stage the loader stub");
+        assert_eq!(
+            wsl_bridge_in(root.path()),
+            Some(dir),
+            "the library is what makes it the bridge"
         );
     }
 

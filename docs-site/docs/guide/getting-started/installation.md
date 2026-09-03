@@ -95,6 +95,16 @@ Three further differences are worth knowing before they surprise you:
   the toasts are drawn where nobody looks; `sbx` compares that session against the
   desktop's and says so once, after the first announcement, rather than leaving it to be
   discovered. `wsl --shutdown` and a launch from the desktop puts them back.
+- **GPU acceleration needs the bridge libraries, and `sbx` binds them.** Where the
+  Windows host has a GPU that WSL can share, the distribution gets an ordinary
+  `renderD*` node and `gpu = true` grants it as it would on any Linux host. The driver
+  behind that node is mesa's `d3d12`, which reaches the GPU through `libdxcore.so` and
+  `libd3d12core.so`. Windows provides those under `/usr/lib/wsl/lib` rather than nixpkgs
+  building them, so a hermetic cage holds the node and renders in software anyway. Under `gpu = true` that directory is bound read-only and put on the cage's
+  loader path. Both halves are needed: bound and not on the path, the cage still
+  answers `cannot open shared object file`, because a subdirectory of `/usr/lib` is not
+  a default search path. A host without that directory is untouched.
+
 - **The light/dark preference comes from Windows.** A distribution runs no desktop
   portal, so the bus name `sbx` reads that preference from owns nothing there. Under a
   WSL kernel it asks Windows instead, through its own registry, and seeds the cage with

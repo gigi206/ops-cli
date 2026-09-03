@@ -548,3 +548,46 @@ fn resolve_wayland_hole_binds_the_socket_file_never_the_runtime_dir() {
     assert!(resolve_wayland_hole(Some(""), Some("/run/user/1000")).is_err());
     assert!(resolve_wayland_hole(Some("wayland-0"), None).is_err());
 }
+
+/// Two grants contribute to the loader path, and a cage with both must keep the directories of
+/// each. The union is what a path list means; the last-writer rule that governs every other shared
+/// key would drop one grant's libraries with no message, which is how a caged app loses its audio
+/// or its GPU while both are declared.
+#[test]
+fn the_loader_path_is_the_union_of_what_each_grant_contributed() {
+    let mut env = vec![
+        ("WAYLAND_DISPLAY".to_string(), "wayland-0".to_string()),
+        (
+            "LD_LIBRARY_PATH".to_string(),
+            "/usr/lib/wsl/lib".to_string(),
+        ),
+        ("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string()),
+        (
+            "LD_LIBRARY_PATH".to_string(),
+            "/store/pulse/lib".to_string(),
+        ),
+    ];
+    super::merge_loader_path(&mut env);
+    let loader: Vec<&(String, String)> =
+        env.iter().filter(|(k, _)| k == "LD_LIBRARY_PATH").collect();
+    assert_eq!(loader.len(), 1, "one entry, not two: {env:?}");
+    assert_eq!(
+        loader[0].1, "/usr/lib/wsl/lib:/store/pulse/lib",
+        "in the order the grants added them"
+    );
+    assert_eq!(env.len(), 3, "the other keys are untouched: {env:?}");
+    assert_eq!(env[0].0, "WAYLAND_DISPLAY", "and keep their order");
+
+    // The ordinary cases: one grant, and none at all.
+    let mut one = vec![("LD_LIBRARY_PATH".to_string(), "/only".to_string())];
+    super::merge_loader_path(&mut one);
+    assert_eq!(
+        one,
+        vec![("LD_LIBRARY_PATH".to_string(), "/only".to_string())]
+    );
+
+    let mut none = vec![("HOME".to_string(), "/home/a".to_string())];
+    let before = none.clone();
+    super::merge_loader_path(&mut none);
+    assert_eq!(none, before, "a cage with neither grant is untouched");
+}

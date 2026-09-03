@@ -1571,6 +1571,21 @@ pub(super) fn build(
                 writable: false,
             });
         }
+        // Under WSL the render node above is real and its driver is mesa's `d3d12`, which reaches
+        // the GPU through libraries Windows provides in this directory rather than nixpkgs. Both
+        // halves are needed and neither works alone: bound and not on the loader path, the cage
+        // still answers `cannot open shared object file`; on the path and not bound, there is
+        // nothing to open. `LD_LIBRARY_PATH` is in the same reserved class as the driver-path
+        // variables above, for the same reason — it loads code, so it is sbx's to set and an
+        // untrusted `[env]` may not.
+        if let Some(bridge) = crate::sandbox::gpu::wsl_bridge() {
+            gui_env.push(("LD_LIBRARY_PATH".to_string(), bridge.display().to_string()));
+            gui_binds.push(binds::ExtraBind {
+                src: bridge.clone(),
+                dest: bridge,
+                writable: false,
+            });
+        }
     }
 
     // Audio: when `audio = true`, bind the host PulseAudio socket read-only at the fixed cage path
@@ -1810,6 +1825,12 @@ pub(super) fn build(
         }
         path
     });
+
+    // Two holes contribute directories to the cage's loader path — the audio client libraries and,
+    // under WSL, the GPU bridge — and each pushed its own entry. A shared key is won by one source,
+    // so a cage with both grants kept whichever came last and silently lost the other's
+    // directories, which for `claude-desktop` is both of them.
+    merge_loader_path(&mut gui_env);
 
     // Environment. Each source is tagged with where it belongs, and `EnvLayer` — not this list's
     // order — decides which one wins a shared key. The structural HOME/PATH/... are added by the
@@ -2382,6 +2403,29 @@ enum EnvLayer {
 
 /// Layer the cage's extra environment by [`EnvLayer`] precedence, lowest first.
 ///
+/// Fold repeated `LD_LIBRARY_PATH` entries into one, joined in the order they were added.
+///
+/// Only that key. It names a *list* of directories, so two producers of it both have something to
+/// say and the answer is their union; every other shared key names one value, where the last
+/// writer winning is the intended rule and merging would produce something neither meant.
+fn merge_loader_path(env: &mut Vec<(String, String)>) {
+    const KEY: &str = "LD_LIBRARY_PATH";
+    let joined = env
+        .iter()
+        .filter(|(k, _)| k == KEY)
+        .map(|(_, v)| v.as_str())
+        .collect::<Vec<_>>()
+        .join(":");
+    if joined.is_empty() {
+        return;
+    }
+    let mut first = true;
+    env.retain(|(k, _)| k != KEY || std::mem::replace(&mut first, false));
+    if let Some(slot) = env.iter_mut().find(|(k, _)| k == KEY) {
+        slot.1 = joined;
+    }
+}
+
 /// The caller may list its layers in any order — they are sorted here. Two entries carrying the
 /// same layer keep the order they were given, since the sort is stable.
 fn extra_cage_env(mut layers: Vec<(EnvLayer, Vec<(String, String)>)>) -> Vec<(String, String)> {
