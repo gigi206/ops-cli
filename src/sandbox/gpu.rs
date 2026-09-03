@@ -388,6 +388,117 @@ pub(crate) fn kernel_module_version(text: &str) -> Option<String> {
     rest.split_whitespace().next().map(str::to_string)
 }
 
+/// What a cage needs wired for the NVIDIA bridge: the files to bind, and the environment that makes
+/// them findable.
+pub(crate) struct NvidiaWiring {
+    /// `(host source, cage destination)` pairs. All are bound read-only by the caller.
+    pub(crate) binds: Vec<(PathBuf, PathBuf)>,
+    /// Environment pairs to add. `LD_LIBRARY_PATH` appears more than once on purpose: it names a
+    /// list, and the caller folds repeats into their union rather than letting the last writer win.
+    pub(crate) env: Vec<(String, String)>,
+}
+
+/// Compose the NVIDIA bridge's binds and environment. Pure over its inputs, so the composition is
+/// unit-tested — which is where it needed to be, because the two defects this wiring has had were
+/// both here and neither was in a resolver: a vendor list built so that mesa's own declaration
+/// dropped out (taking the Wayland and GBM platforms with it), and a missing GLVND dispatch that
+/// left the driver refusing an instance without a word.
+///
+/// `mesa_env` is the layer's own env, read for the settings this one *joins* rather than replaces:
+/// both `__EGL_VENDOR_LIBRARY_DIRS` and `VK_DRIVER_FILES` name lists, and the answer is the union
+/// with NVIDIA's entry first. Read from there rather than recomputed because those values are the
+/// paths *as the cage sees them*, and the store sits elsewhere on the host.
+///
+/// `kernel_version` is what the loaded module reports (see [`kernel_module_version`]), passed in so
+/// the skew check is testable; `None` means "cannot tell", which never warns.
+pub(crate) fn nvidia_wiring(
+    bridge: &NvidiaBridge,
+    mesa_env: &[(String, String)],
+    glvnd: Option<&Path>,
+    kernel_version: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> NvidiaWiring {
+    let cage = PathBuf::from(CAGE_NVIDIA);
+    let mut binds: Vec<(PathBuf, PathBuf)> = bridge.libs.clone();
+    let mut env: Vec<(String, String)> = vec![(
+        "LD_LIBRARY_PATH".to_string(),
+        cage.join("lib").display().to_string(),
+    )];
+
+    // The GLVND dispatch the vendor library links, which nothing else puts within its reach.
+    if let Some(glvnd) = glvnd {
+        env.push((
+            "LD_LIBRARY_PATH".to_string(),
+            glvnd.join("lib").display().to_string(),
+        ));
+    }
+
+    let mesa_value = |key: &str| {
+        mesa_env
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    };
+    let joined = |first: String, mesa: Option<String>| match mesa {
+        Some(mesa) => format!("{first}:{mesa}"),
+        None => first,
+    };
+
+    match &bridge.vendor_json {
+        Some((src, dest)) => {
+            binds.push((src.clone(), dest.clone()));
+            env.push((
+                "__EGL_VENDOR_LIBRARY_DIRS".to_string(),
+                joined(
+                    cage.join("egl_vendor.d").display().to_string(),
+                    mesa_value("__EGL_VENDOR_LIBRARY_DIRS"),
+                ),
+            ));
+        }
+        None => warnings.push(
+            "`gpu = true`: the NVIDIA driver libraries are here but their GLVND declaration \
+             (`10_nvidia.json`) is not — the cage renders on mesa"
+                .to_string(),
+        ),
+    }
+
+    if bridge.platforms.is_empty() {
+        warnings.push(
+            "`gpu = true`: no NVIDIA EGL external-platform declaration was found under \
+             `/usr/share/egl/egl_external_platform.d` — the cage's NVIDIA vendor will not offer \
+             the Wayland platform"
+                .to_string(),
+        );
+    } else {
+        binds.extend(bridge.platforms.iter().cloned());
+        env.push((
+            "__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS".to_string(),
+            cage.join("egl_external_platform.d").display().to_string(),
+        ));
+    }
+
+    if let Some((src, dest)) = &bridge.icd {
+        binds.push((src.clone(), dest.clone()));
+        env.push((
+            "VK_DRIVER_FILES".to_string(),
+            joined(dest.display().to_string(), mesa_value("VK_DRIVER_FILES")),
+        ));
+    }
+
+    // A userspace that does not match the loaded kernel module fails the same silent way a missing
+    // soname does. Name it rather than leaving the reader to derive it from a blank.
+    if let (Some(user), Some(kernel)) = (bridge.version.as_deref(), kernel_version)
+        && user != kernel
+    {
+        warnings.push(format!(
+            "`gpu = true`: the NVIDIA userspace on this host is {user} but the loaded kernel \
+             module is {kernel} — the cage will find no NVIDIA device"
+        ));
+    }
+
+    NvidiaWiring { binds, env }
+}
+
 /// The minimal `/sys` DRM subtree mesa/libdrm read to enumerate a device, discovered from the
 /// host's DRM nodes at launch. `drmGetDevices2()` walks `/sys/dev/char` and each node's sysfs
 /// device directory (the PCI/platform device carrying `vendor`/`device`/`uevent` and the `drm/`
@@ -627,6 +738,141 @@ mod tests {
             ],
             "every numbered card is enumerated rather than assumed, the control nodes come along, \
              and neither a DRM primary node nor the `nvidia-caps` directory does"
+        );
+    }
+
+    /// A bridge with one library and every declaration present, for the composition tests below.
+    fn a_bridge() -> NvidiaBridge {
+        let cage = PathBuf::from(CAGE_NVIDIA);
+        NvidiaBridge {
+            libs: vec![(
+                PathBuf::from("/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.580.173.02"),
+                cage.join("lib/libEGL_nvidia.so.0"),
+            )],
+            vendor_json: Some((
+                PathBuf::from("/usr/share/glvnd/egl_vendor.d/10_nvidia.json"),
+                cage.join("egl_vendor.d/10_nvidia.json"),
+            )),
+            platforms: vec![(
+                PathBuf::from("/usr/share/egl/egl_external_platform.d/10_nvidia_wayland.json"),
+                cage.join("egl_external_platform.d/10_nvidia_wayland.json"),
+            )],
+            icd: Some((
+                PathBuf::from("/usr/share/vulkan/icd.d/nvidia_icd.json"),
+                cage.join("vulkan/icd.d/nvidia_icd.json"),
+            )),
+            devices: vec![PathBuf::from("/dev/nvidiactl")],
+            version: Some("580.173.02".into()),
+        }
+    }
+
+    #[test]
+    fn the_nvidia_wiring_joins_mesas_lists_and_never_stands_in_for_them() {
+        let mesa = driver_env(Path::new("/nix/store/abc-mesa"));
+        let mut warnings = Vec::new();
+        let wiring = nvidia_wiring(
+            &a_bridge(),
+            &mesa,
+            Some(Path::new("/nix/store/abc-libglvnd")),
+            Some("580.173.02"),
+            &mut warnings,
+        );
+        let all = |key: &str| -> Vec<String> {
+            wiring
+                .env
+                .iter()
+                .filter(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .collect()
+        };
+
+        // The defect this pins: a first cut named vendor *files* built from a host path that did
+        // not exist in the cage, so mesa's declaration dropped out and the Wayland and GBM
+        // platforms went with it. Both directories, NVIDIA first, is the measured answer.
+        assert_eq!(
+            all("__EGL_VENDOR_LIBRARY_DIRS"),
+            ["/run/sbx-nvidia/egl_vendor.d:/nix/store/abc-mesa/share/glvnd/egl_vendor.d"],
+            "the vendor directories are a union with mesa's, not a replacement of it"
+        );
+        assert_eq!(
+            all("VK_DRIVER_FILES"),
+            ["/run/sbx-nvidia/vulkan/icd.d/nvidia_icd.json:/nix/store/abc-mesa/share/vulkan/icd.d"],
+            "and so are the Vulkan manifests: NVIDIA's file ahead of the directory holding mesa's"
+        );
+
+        // The second defect: without GLVND on the loader path the vendor library cannot resolve
+        // `libEGL.so.1`, and the driver refuses an instance without a word. Both directories are
+        // emitted; the caller folds repeats of this key into their union.
+        assert_eq!(
+            all("LD_LIBRARY_PATH"),
+            ["/run/sbx-nvidia/lib", "/nix/store/abc-libglvnd/lib"],
+            "the bridge's own directory and the GLVND dispatch both reach the loader path"
+        );
+        assert_eq!(
+            all("__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS"),
+            ["/run/sbx-nvidia/egl_external_platform.d"],
+            "without which NVIDIA's vendor offers no Wayland platform"
+        );
+        assert!(warnings.is_empty(), "a complete bridge warns about nothing");
+
+        let dests: Vec<String> = wiring
+            .binds
+            .iter()
+            .map(|(_, dest)| dest.display().to_string())
+            .collect();
+        assert_eq!(
+            dests,
+            [
+                "/run/sbx-nvidia/lib/libEGL_nvidia.so.0",
+                "/run/sbx-nvidia/egl_vendor.d/10_nvidia.json",
+                "/run/sbx-nvidia/egl_external_platform.d/10_nvidia_wayland.json",
+                "/run/sbx-nvidia/vulkan/icd.d/nvidia_icd.json",
+            ],
+            "every declaration is carried, each under the name its reader asks for"
+        );
+    }
+
+    #[test]
+    fn a_missing_piece_is_named_and_leaves_the_layer_below_alone() {
+        let mesa = driver_env(Path::new("/nix/store/abc-mesa"));
+        let mut bridge = a_bridge();
+        bridge.vendor_json = None;
+        bridge.platforms.clear();
+        let mut warnings = Vec::new();
+        let wiring = nvidia_wiring(&bridge, &mesa, None, Some("580.173.02"), &mut warnings);
+
+        assert!(
+            !wiring
+                .env
+                .iter()
+                .any(|(k, _)| k == "__EGL_VENDOR_LIBRARY_DIRS"
+                    || k == "__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS"),
+            "a declaration that is not there is not announced: mesa's own value stands"
+        );
+        assert_eq!(warnings.len(), 2, "and each absence is named: {warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("10_nvidia.json"))
+                && warnings.iter().any(|w| w.contains("Wayland platform")),
+            "by what is missing and what it costs: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_userspace_that_disagrees_with_the_kernel_module_is_named() {
+        let mut warnings = Vec::new();
+        nvidia_wiring(&a_bridge(), &[], None, Some("575.64.03"), &mut warnings);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("580.173.02") && w.contains("575.64.03")),
+            "the skew names both sides, because its natural failure is silent: {warnings:?}"
+        );
+
+        let mut quiet = Vec::new();
+        nvidia_wiring(&a_bridge(), &[], None, None, &mut quiet);
+        assert!(
+            quiet.is_empty(),
+            "and `cannot tell` is not a mismatch: {quiet:?}"
         );
     }
 

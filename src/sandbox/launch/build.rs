@@ -1615,138 +1615,34 @@ pub(super) fn build(
         // compositor holds that device, and the one workaround is GLX under X11, which sbx never
         // offers. Nothing here approaches that refusal.
         if let Some(nv) = &nvidia {
-            for (src, dest) in &nv.libs {
-                gui_binds.push(binds::ExtraBind {
-                    src: src.clone(),
-                    dest: dest.clone(),
-                    writable: false,
-                });
+            // Composed by `gpu::nvidia_wiring`, which is pure over its inputs so the composition
+            // itself is unit-tested: both of this wiring's defects lived in the joining of lists,
+            // not in resolving them, and neither had a test to fail.
+            let kernel = std::fs::read_to_string("/proc/driver/nvidia/version")
+                .ok()
+                .and_then(|text| crate::sandbox::gpu::kernel_module_version(&text));
+            let mut notes = Vec::new();
+            let wiring = crate::sandbox::gpu::nvidia_wiring(
+                nv,
+                gpu_layer.as_ref().map_or(&[][..], |layer| &layer.env),
+                gpu_layer.as_ref().and_then(|layer| layer.glvnd.as_deref()),
+                kernel.as_deref(),
+                &mut notes,
+            );
+            for note in &notes {
+                crate::diag::warn(note);
             }
-            gui_env.push((
-                "LD_LIBRARY_PATH".to_string(),
-                PathBuf::from(crate::sandbox::gpu::CAGE_NVIDIA)
-                    .join("lib")
-                    .display()
-                    .to_string(),
-            ));
-            // And the GLVND dispatch the vendor library links, which nothing else puts within its
-            // reach: a library bound under `/run/sbx-nvidia` sees neither the app's `RUNPATH` nor
-            // an `ldconfig` cache, and a cage carrying no graphical package has no `libEGL.so.1`
-            // of its own. Folded into the one loader path by `merge_loader_path`.
-            if let Some(glvnd) = gpu_layer.as_ref().and_then(|l| l.glvnd.as_ref()) {
-                gui_env.push((
-                    "LD_LIBRARY_PATH".to_string(),
-                    glvnd.join("lib").display().to_string(),
-                ));
-            }
-
-            // Both vendors have to stay reachable: mesa's, in the seeded store, drives the
-            // Wayland and GBM platforms, and dropping it would take those platforms away with it.
-            // `__EGL_VENDOR_LIBRARY_DIRS` names a *list*, so the answer is the union — NVIDIA's
-            // directory ahead of mesa's, the order this was measured working in. Composed from
-            // the layer's own value rather than enumerated on the host: what the layer holds is
-            // the path as seen *from the cage*, and the store lives elsewhere on the host.
-            match &nv.vendor_json {
-                Some((src, dest)) => {
-                    gui_binds.push(binds::ExtraBind {
-                        src: src.clone(),
-                        dest: dest.clone(),
+            gui_binds.extend(
+                wiring
+                    .binds
+                    .into_iter()
+                    .map(|(src, dest)| binds::ExtraBind {
+                        src,
+                        dest,
                         writable: false,
-                    });
-                    let nvidia_dir = PathBuf::from(crate::sandbox::gpu::CAGE_NVIDIA)
-                        .join("egl_vendor.d")
-                        .display()
-                        .to_string();
-                    let mesa_dirs = gpu_layer.as_ref().and_then(|layer| {
-                        layer
-                            .env
-                            .iter()
-                            .find(|(k, _)| k == "__EGL_VENDOR_LIBRARY_DIRS")
-                            .map(|(_, v)| v.clone())
-                    });
-                    gui_env.push((
-                        "__EGL_VENDOR_LIBRARY_DIRS".to_string(),
-                        match mesa_dirs {
-                            Some(mesa) => format!("{nvidia_dir}:{mesa}"),
-                            None => nvidia_dir,
-                        },
-                    ));
-                }
-                None => crate::diag::warn(
-                    "`gpu = true`: the NVIDIA driver libraries are here but their GLVND \
-                     declaration (`10_nvidia.json`) is not — the cage renders on mesa",
-                ),
-            }
-
-            // Without these NVIDIA's vendor does not expose `EGL_EXT_platform_wayland`, so a
-            // Wayland client falls back to mesa without ever saying why.
-            if nv.platforms.is_empty() {
-                crate::diag::warn(
-                    "`gpu = true`: no NVIDIA EGL external-platform declaration was found under \
-                     `/usr/share/egl/egl_external_platform.d` — the cage's NVIDIA vendor will not \
-                     offer the Wayland platform",
-                );
-            }
-            for (src, dest) in &nv.platforms {
-                gui_binds.push(binds::ExtraBind {
-                    src: src.clone(),
-                    dest: dest.clone(),
-                    writable: false,
-                });
-            }
-            if !nv.platforms.is_empty() {
-                gui_env.push((
-                    "__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS".to_string(),
-                    PathBuf::from(crate::sandbox::gpu::CAGE_NVIDIA)
-                        .join("egl_external_platform.d")
-                        .display()
-                        .to_string(),
-                ));
-            }
-
-            // Vulkan chooses its driver through a manifest too, so the card needs its own beside
-            // mesa's. `VK_DRIVER_FILES` names a list of manifests *and* directories, so this is
-            // again a union rather than a replacement: NVIDIA's one file ahead of the directory
-            // holding mesa's, composed from what the layer already set for the same reason the
-            // EGL vendor directories are.
-            if let Some((src, dest)) = &nv.icd {
-                gui_binds.push(binds::ExtraBind {
-                    src: src.clone(),
-                    dest: dest.clone(),
-                    writable: false,
-                });
-                let mesa_icd = gpu_layer.as_ref().and_then(|layer| {
-                    layer
-                        .env
-                        .iter()
-                        .find(|(k, _)| k == "VK_DRIVER_FILES")
-                        .map(|(_, v)| v.clone())
-                });
-                let nvidia_icd = dest.display().to_string();
-                gui_env.push((
-                    "VK_DRIVER_FILES".to_string(),
-                    match mesa_icd {
-                        Some(mesa) => format!("{nvidia_icd}:{mesa}"),
-                        None => nvidia_icd,
-                    },
-                ));
-            }
-
-            // A userspace that does not match the loaded kernel module fails the same silent way
-            // a missing soname does: the vendor never registers and EGL reports an empty
-            // extension string. Name it instead of leaving the reader to derive it from a blank.
-            if let (Some(user), Some(kernel)) = (
-                nv.version.as_deref(),
-                std::fs::read_to_string("/proc/driver/nvidia/version")
-                    .ok()
-                    .and_then(|t| crate::sandbox::gpu::kernel_module_version(&t)),
-            ) && user != kernel
-            {
-                crate::diag::warn(&format!(
-                    "`gpu = true`: the NVIDIA userspace on this host is {user} but the loaded \
-                     kernel module is {kernel} — the cage will find no NVIDIA device"
-                ));
-            }
+                    }),
+            );
+            gui_env.extend(wiring.env);
         }
     }
 
