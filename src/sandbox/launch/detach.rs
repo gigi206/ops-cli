@@ -158,6 +158,12 @@ fn detached_child(
     match guard {
         None if may_exec_replace(&prep.cfg.proc, observe) => {
             // exec-replace: bwrap (pid 1 of the cage's namespace) inherits the redirected stdio.
+            //
+            // This is the one launch that must not carry `--die-with-parent`. Replacing the daemon
+            // leaves bwrap parented to the launcher, which exits as soon as it has printed the
+            // session id — the exact process `--detach` exists to outlive. See
+            // [`crate::sandbox::spec::SandboxSpec::dies_with_launcher`] for the measurement.
+            let spec = spec.outliving_its_launcher();
             let err = exec(&prep.bwrap, &spec, &prep.cfg.limits);
             crate::diag::error(&format!("sbx: failed to launch the sandbox: {err}"));
             std::process::exit(1);

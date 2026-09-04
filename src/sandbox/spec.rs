@@ -8,6 +8,10 @@
 //! environment, all namespaces incl. pid, dropped capabilities, fresh session)
 //! is deliberately *not* expressed here as toggleable state — it is emitted
 //! unconditionally by `to_argv`, so an unhardened sandbox is unrepresentable.
+//! [`SandboxSpec::dies_with_launcher`] is the one hardening flag that is a field, and it is
+//! here precisely because it is not a removal: `--die-with-parent` names a *relationship*
+//! to a supervising process, so the one launch that has no such process cannot be described
+//! without it.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -156,6 +160,20 @@ pub(crate) struct SandboxSpec {
     /// `to_argv` maps the cage back to these host credentials (the holder runs root-in-userns);
     /// None is the ordinary path (bwrap emits `--unshare-net`). See [`NetnsDummy`].
     pub(super) netns_dummy: Option<NetnsDummy>,
+    /// Whether bwrap is given `--die-with-parent`, which arms `PR_SET_PDEATHSIG` so the cage cannot
+    /// outlive the process supervising it. True for every launch but one, and
+    /// [`SandboxSpec::outliving_its_launcher`] is the only thing that clears it.
+    ///
+    /// The exception is a detached launch with no guard, where the daemon `exec`s bwrap in place
+    /// rather than supervising it. bwrap then inherits the daemon's parent — the short-lived
+    /// launcher that reports the session id and exits — so the flag names a process whose whole
+    /// purpose is to go away, and `--detach` promises the cage outlives exactly that. Whether the
+    /// signal fires is a race between the launcher's exit and bwrap's `prctl`: measured on this
+    /// host, a launcher still alive at that instant kills the session the moment it exits, four
+    /// times out of four, while the ordinary ordering (launcher gone first, cage reparented to the
+    /// user's subreaper) leaves it running. The supervised branch keeps the flag, and must: there
+    /// the daemon is a real long-lived parent whose death should cascade.
+    pub(super) dies_with_launcher: bool,
 }
 
 /// The netns-holder wiring for a cage that needs a `dummy0` interface (see
@@ -204,7 +222,17 @@ impl SandboxSpec {
             cage_slug: "cage".to_string(),
             seccomp: super::seccomp::SeccompPolicy::default(),
             netns_dummy: None,
+            dies_with_launcher: true,
         })
+    }
+
+    /// Drop `--die-with-parent` for a cage that has no supervising parent to die with — the
+    /// detached, guardless branch that replaces its own daemon with bwrap. See
+    /// [`SandboxSpec::dies_with_launcher`] for what the flag would otherwise be armed against, and
+    /// why keeping it there can only ever kill a session `--detach` promised to keep.
+    pub(super) fn outliving_its_launcher(mut self) -> Self {
+        self.dies_with_launcher = false;
+        self
     }
 
     /// Route this launch through the netns holder so the cage's network namespace carries a

@@ -6,6 +6,11 @@
 //! flags, and those only ever *remove* privilege. The returned vector is the
 //! argument list for `bwrap` — the `bwrap` program itself is not included.
 //!
+//! Two hardening flags are read off the Spec rather than added unconditionally, and both
+//! describe a relationship rather than a removal: `--new-session` (omitted for the private-pty
+//! terminal, which establishes its own) and `--die-with-parent` (omitted for the one launch with
+//! no supervising process to die with — see [`SandboxSpec::dies_with_launcher`]).
+//!
 //! The cage's **environment** is the one thing that does not travel in that list. A process's
 //! arguments are world-readable (`/proc/<pid>/cmdline` is mode `444`) while its environment is not
 //! (`400`), so `--setenv VAR <value>` publishes every value to every uid on the machine for as long
@@ -166,12 +171,18 @@ pub(crate) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
     )));
 
     // Free hardening — pure removals, always emitted: start from a clean
-    // environment (before anything is set into it), drop every capability, and
-    // die with the launcher so no sandbox outlives sbx.
+    // environment (before anything is set into it) and drop every capability.
     a.push(lit("--clearenv"));
-    a.push(lit("--die-with-parent"));
     a.push(lit("--cap-drop"));
     a.push(lit("ALL"));
+
+    // Die with the launcher, so no sandbox outlives the process that supervises it. Conditional
+    // for one shape only, and [`SandboxSpec::dies_with_launcher`] states which: a detached launch
+    // that replaces its own daemon with bwrap has no supervisor to outlive, and the flag would
+    // arm `PR_SET_PDEATHSIG` against the short-lived launcher instead.
+    if spec.dies_with_launcher {
+        a.push(lit("--die-with-parent"));
+    }
 
     // Terminal session: a new session blocks terminal injection for a
     // non-interactive launch. The private-pty path establishes its own session
@@ -313,7 +324,6 @@ mod tests {
             "--unshare-cgroup",
             "--clearenv",
             "--new-session",
-            "--die-with-parent",
         ] {
             assert!(index_of(&argv, flag).is_some(), "missing {flag}: {argv:?}");
         }
@@ -324,6 +334,34 @@ mod tests {
         // `sbx-cage`), so the fresh UTS namespace never inherits — nor reveals — the host's
         let h = index_of(&argv, "--hostname").expect("--hostname present");
         assert_eq!(argv[h + 1], OsString::from("sbx-cage"));
+    }
+
+    #[test]
+    fn die_with_parent_rides_every_launch_but_the_one_with_no_parent_to_die_with() {
+        // The flag is armed against the process supervising the cage, so it belongs on every
+        // launch that has one — which is every launch but the detached, guardless branch, where
+        // the daemon `exec`s bwrap and leaves it parented to a launcher whose job is to exit.
+        let supervised = spec(vec![], vec![], NetPolicy::Shared);
+        assert!(
+            index_of(&to_argv(&supervised), "--die-with-parent").is_some(),
+            "a supervised launch keeps the flag"
+        );
+
+        let detached = spec(vec![], vec![], NetPolicy::Shared).outliving_its_launcher();
+        let argv = to_argv(&detached);
+        assert!(
+            index_of(&argv, "--die-with-parent").is_none(),
+            "the detached exec-replace drops it: {argv:?}"
+        );
+
+        // Nothing else moves. Written as the whole-argv difference rather than as a second list of
+        // flags to re-assert, so a hardening flag added later is covered here without being named
+        // twice — and so this cannot pass by dropping something it never thought to check.
+        let expected: Vec<_> = to_argv(&supervised)
+            .into_iter()
+            .filter(|a| a != "--die-with-parent")
+            .collect();
+        assert_eq!(argv, expected, "only the one flag differs");
     }
 
     #[test]

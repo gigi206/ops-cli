@@ -157,11 +157,17 @@ le verdict de confiance mise vit sur la `MiseConfig` absente là.
 ## LOW (51) — les cinquante-et-un sont mesurés
 
 Les 28 constats en prose ont été rouverts un par un, puis les 23 du tableau. Le compte, par seau
-plutôt que par un chiffre unique : **49 fermés + 1 réfuté + 1 ouvert = 51**.
+plutôt que par un chiffre unique : **50 fermés + 1 réfuté + 0 ouvert = 51**.
 
 Le réfuté est `plugins/stores.rs:775` : sa prémisse ne tient pas dans cet arbre, ce qui n'est pas la
-même chose qu'un défaut corrigé. L'ouvert est `argv.rs:147`, et délibérément — sa course n'a été
-reproduite par personne, et ses trois remèdes changent la durée de vie d'un lancement détaché.
+même chose qu'un défaut corrigé.
+
+*Ce compteur a longtemps annoncé « 49 fermés + 1 ouvert », l'ouvert étant `argv.rs:147`. Il est
+recompté au 2026-09-04 : cette ligne est reproduite, corrigée et épinglée, et sa cellule le dit.
+La raison qui la tenait ouverte — « on ne peut pas observer le correctif fonctionner sur cette
+machine » — était une conjecture sur l'observabilité, pas une mesure ; c'est elle qu'il fallait
+sonder, et elle n'a pas tenu. Une raison de ne pas mesurer se vérifie comme le constat qu'elle
+protège.*
 
 Deux ont mesuré **plus large** que leur énoncé (`plugins/catalogue.rs:291`, `sandbox/launch.rs:3944`)
 et un **plus étroit** (`cli/completion.rs:766` nommait `sbx run --gpu`, le défaut vaut aussi pour
@@ -200,11 +206,11 @@ et un **plus étroit** (`cli/completion.rs:766` nommait `sbx run --gpu`, le déf
 | `proxy/ssrf.rs:299` — une seule adresse d'un hôte multi-domicilié est essayée | ce dépôt | **Mesuré** : sans le correctif, `502 upstream-unreachable` pour un hôte dont la seconde adresse répond. `checked_address` rend désormais **toutes** les adresses permises — le garde passe sur chacune, donc parcourir ne peut pas atteindre une adresse qu'il a refusée — et les six chemins de dial les essaient dans l'ordre (`first_reachable`, ou une boucle awaitée sur le plan h2). |
 | `observe_feed.rs:44` — le filtre du flux d'exec s'appuie sur `comm` | ce dépôt | **Prose seule, et c'est le remède que le rapport approuve** : la limite honnête est écrite au site — `prctl(PR_SET_NAME)` laisse un processus se nommer `bwrap`, c'est un trou d'OBSERVATION et non d'application (le chemin `enforce` lit l'exécutable par la vue du superviseur), et le fermer demande une identité que le lancement possède. Le code reste tel quel, pour la raison que le rapport donne. |
 
-### Ouvert et mesuré (1 en prose)
+### Reproduit et fermé le 2026-09-04 (1 en prose)
 
 | Constat | Ce qui est mesuré |
 | --- | --- |
-| `sandbox/argv.rs:147` — `--die-with-parent` est inconditionnel, y compris détaché | La branche `exec`-replace de `detached_child` survit à la décomposition (`launch/detach.rs:157`), donc le chemin existe toujours. **Verdict PLAUSIBLE conservé, et laissé ouvert délibérément** : la course n'a été reproduite ni par le rapport ni ici, et les trois remèdes proposés changent chacun la durée de vie d'un lancement détaché sans qu'on puisse observer le correctif fonctionner sur cette machine. Le fermer sur la foi d'une lecture serait un changement de sémantique sans mesure. |
+| `sandbox/argv.rs:147` — `--die-with-parent` est inconditionnel, y compris détaché | **Verdict PLAUSIBLE levé : VÉRIFIÉ, puis corrigé.** Le blocage inscrit ici était « on ne peut pas observer le correctif fonctionner sur cette machine ». C'est une affirmation sur l'observabilité, et elle était fausse : une course dont on ne contrôle pas l'ordre est une course, dont on le contrôle c'est un test déterministe. Le démon se distingue de tout sous-processus de provisionnement par son `setsid()` (son *session id* vaut son propre pid) ; geler le lanceur par `SIGSTOP` juste après le `fork`, le temps que bwrap arme son `prctl` contre un parent vivant, puis le relâcher, force le bras nuisible sans toucher au code. Mesuré ainsi, sur un lancement `--detach` avec `network = "none"` et aucune garde : `/proc/<sid>/exe` vaut bien `/usr/bin/bwrap` (la branche `exec`-replace est prise), et la cage meurt **4 fois sur 4** quand le lanceur était vivant à l'instant du `prctl`, contre **4 survies sur 4** dans l'ordre naturel (lanceur déjà sorti, cage réattachée à `systemd --user`). Remède retenu des trois proposés : `--die-with-parent` devient une propriété de la spec (`dies_with_launcher`), fausse sur cette seule branche. Le double-fork était écarté parce qu'il change le pid, qui **est** l'identifiant de session affiché et le nom du fichier de log ; et sur ce chemin le drapeau ne peut jamais rien protéger, puisqu'il est soit inerte soit fatal à ce que `--detach` promet. Remède re-mesuré sur le même harnais : **4 survies sur 4** au bras forcé, témoin inchangé. Épinglé par `die_with_parent_rides_every_launch_but_the_one_with_no_parent_to_die_with`, qui compare les deux argv en entier plutôt que de ré-énumérer les drapeaux, afin qu'un durcissement ajouté plus tard soit couvert sans être nommé deux fois. |
 
 ### Mesurés le 2026-09-02 (2 en prose, les 23 du tableau)
 

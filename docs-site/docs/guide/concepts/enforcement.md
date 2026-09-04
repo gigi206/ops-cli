@@ -65,7 +65,8 @@ there is no setuid binary to attack. The hardening flags below are emitted
   precondition for loading an unprivileged seccomp filter.
 - **Drop all capabilities** (`--cap-drop ALL`): no ambient capabilities inside
   the namespace.
-- **`--die-with-parent`**: the cage cannot outlive its supervisor.
+- **`--die-with-parent`**: the cage cannot outlive its supervisor (see the note
+  below for the one launch that has no supervisor to outlive).
 - **`--clearenv`**: the environment is rebuilt from empty, not inherited.
 - **`--new-session`**: a fresh session, which blocks terminal-input injection
   (`TIOCSTI`) at the source.
@@ -75,6 +76,14 @@ there is no setuid binary to attack. The hardening flags below are emitted
 > command) omits it because it needs a controlling terminal for job control: the pty
 > supervisor establishes the session itself and keeps the pty master, so the launching
 > terminal stays unreachable either way.
+
+> **The `--die-with-parent` nuance.** The flag arms a signal that kills the cage when the
+> process supervising it dies, so it belongs on every launch that has such a process. One
+> shape does not: a `--detach`ed session that needs no proxy, broker, ssh-agent, forward,
+> portal, task plane or process observation has nothing to supervise it, so the daemon
+> replaces itself with bwrap. The cage's parent is then the launcher that prints the session
+> id and exits, which is precisely the process `--detach` exists to outlive, and the flag is
+> omitted there. Every other launch, detached ones included, keeps it.
 
 The cage's `/dev` is also **minimal and hostless**: `null`/`zero`/`urandom`/`tty` and the
 standard descriptor symlinks, never a real host device. A tool that genuinely needs the GPU,
