@@ -144,39 +144,52 @@ fn split_scope(args: &[OsString]) -> Result<ScopeArgs, String> {
     let mut app = None;
     let mut only_positional = false;
     let mut it = args.iter();
+    // Every flag and positional is read through `to_str`, whose `None` **is** the refusal. The
+    // alternative — `to_string_lossy` — replaces the offending bytes with `U+FFFD` and hands the
+    // result on as though it had been typed that way, so an egress rule arrives mutated, is
+    // validated as a rule the caller never wrote, and is reported back under that spelling. A path
+    // is the exception and stays an `OsStr`: a filename is not required to be UTF-8 on Linux, and
+    // `-c` is the one argument that names one.
+    let not_utf8 = |what: &str, arg: &OsString| format!("{what} {arg:?} is not valid UTF-8");
     while let Some(arg) = it.next() {
+        let Some(text) = arg.to_str() else {
+            return Err(not_utf8("the argument", arg));
+        };
         if only_positional {
-            positionals.push(arg.to_string_lossy().into_owned());
+            positionals.push(text.to_string());
             continue;
         }
-        match arg.to_str() {
-            Some("--") => only_positional = true,
-            Some("--local") | Some("-l") => {
+        match text {
+            "--" => only_positional = true,
+            "--local" | "-l" => {
                 scope = Scope::Local;
                 scope_explicit = true;
             }
-            Some("--global") | Some("-g") => {
+            "--global" | "-g" => {
                 scope = Scope::Global;
                 scope_explicit = true;
             }
-            Some("-c") | Some("--config") => {
+            "-c" | "--config" => {
                 let file = it
                     .next()
                     .ok_or_else(|| "`-c` needs a file path".to_string())?;
                 scope = Scope::File(PathBuf::from(file));
                 scope_explicit = true;
             }
-            Some("--app") | Some("-a") => {
+            "--app" | "-a" => {
                 let name = it
                     .next()
                     .ok_or_else(|| "`--app` needs an app name".to_string())?;
-                app = Some(name.to_string_lossy().into_owned());
+                let Some(name) = name.to_str() else {
+                    return Err(not_utf8("the app name", name));
+                };
+                app = Some(name.to_string());
             }
-            Some("--trust") => trust = true,
-            Some(flag) if flag.starts_with('-') && flag != "-" => {
+            "--trust" => trust = true,
+            flag if flag.starts_with('-') && flag != "-" => {
                 return Err(format!("unknown flag `{flag}`"));
             }
-            _ => positionals.push(arg.to_string_lossy().into_owned()),
+            _ => positionals.push(text.to_string()),
         }
     }
     Ok(ScopeArgs {
@@ -781,8 +794,13 @@ fn precheck_local_save(cwd: &Path) -> Result<(), (u8, String)> {
             .to_string(),
     ))?;
     let path = manage::scope_path(&Scope::Local, cwd).map_err(|e| (1, e.to_string()))?;
+    // Read once and handed to both. The gate decides on whether the file is there and the refusal
+    // names why, so two reads straddling a file being created or removed would print a reason for a
+    // state other than the one that was judged — "there is no config yet" against a path that now
+    // has one, or the reverse.
+    let exists = path.exists();
     if !local_save_permitted(
-        path.exists(),
+        exists,
         trust::state(&store, &path),
         !trust::mise_files_for(&path).is_empty(),
     ) {
@@ -790,7 +808,7 @@ fn precheck_local_save(cwd: &Path) -> Result<(), (u8, String)> {
             2,
             format!(
                 "{} (a `--local` save will not silently bless what you have not approved)",
-                local_save_refusal(&path, path.exists())
+                local_save_refusal(&path, exists)
             ),
         ));
     }
@@ -914,12 +932,14 @@ fn open_rule_write<'a>(
     // under `apps/` are trusted by location.
     let store = if matches!(scope, Scope::Local) {
         let store = trust::default_store_dir().ok_or((1, no_store.to_string()))?;
+        // One read for the gate and the refusal both, for the reason `precheck_local_save` states.
+        let exists = path.exists();
         if !local_save_permitted(
-            path.exists(),
+            exists,
             trust::state(&store, &path),
             !trust::mise_files_for(&path).is_empty(),
         ) {
-            return Err((2, local_save_refusal(&path, path.exists())));
+            return Err((2, local_save_refusal(&path, exists)));
         }
         Some(store)
     } else {
@@ -1604,6 +1624,59 @@ mod tests {
             session_pids_for_project(data.path(), &elsewhere).is_empty(),
             "a different project must select no session"
         );
+    }
+
+    /// An argument that is not UTF-8 is refused, never repaired into one that is.
+    ///
+    /// `to_string_lossy` would replace the offending bytes with `U+FFFD` and hand the result on as
+    /// though it had been typed that way: an egress rule arrives mutated, is validated as a rule
+    /// nobody wrote, and is reported back under that spelling — so the caller reads a refusal for a
+    /// rule they cannot find in what they typed. A path is the exception and stays an `OsStr`,
+    /// because a filename on Linux is not required to be UTF-8 and `-c` is the argument that names
+    /// one.
+    #[test]
+    fn split_scope_refuses_an_argument_that_is_not_utf8() {
+        use config::manage::Scope;
+        use std::os::unix::ffi::OsStringExt;
+
+        // A lone continuation byte: valid as a path, never valid as text.
+        let raw = || OsString::from_vec(vec![b'r', b'u', b'l', b'e', 0x80]);
+
+        // `ScopeArgs` carries no `Debug`, so the refusal is taken by hand rather than through
+        // `expect_err`, which would need one.
+        let refusal = |args: Vec<OsString>, must: &str| -> String {
+            match split_scope(&args) {
+                Err(e) => e,
+                Ok(_) => panic!("{must}"),
+            }
+        };
+
+        let err = refusal(vec![raw()], "a positional must be refused, not repaired");
+        assert!(err.contains("not valid UTF-8"), "{err}");
+
+        // Past `--`, where the parser stops reading flags, the same rule holds.
+        let err = refusal(
+            vec![OsString::from("--"), raw()],
+            "a trailing positional must be refused too",
+        );
+        assert!(err.contains("not valid UTF-8"), "{err}");
+
+        let err = refusal(
+            vec![OsString::from("-a"), raw()],
+            "an app name must be refused, not repaired",
+        );
+        assert!(
+            err.contains("not valid UTF-8") && err.contains("app name"),
+            "the refusal must name which argument it is about: {err}"
+        );
+
+        // The one argument that may legitimately hold non-UTF-8 bytes still does.
+        let parsed = split_scope(&[OsString::from("-c"), raw()])
+            .expect("a file path is not required to be UTF-8");
+        let Scope::File(p) = parsed.scope else {
+            panic!("`-c` must still select a file scope");
+        };
+        assert_eq!(p.into_os_string(), raw());
     }
 
     #[test]

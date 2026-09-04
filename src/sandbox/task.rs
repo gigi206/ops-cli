@@ -1240,27 +1240,25 @@ impl TaskEngine {
 
     /// Whether invocation `id` has been asked to stop.
     fn stop_requested(&self, id: u64) -> bool {
-        self.running
-            .lock()
-            .map(|r| r.get(&id).is_some_and(|e| e.stop))
-            .unwrap_or(false)
+        // A `false` from a poisoned lock would read as "no stop was asked for", which both callers
+        // act on: one starts the command, the other keeps waiting on it. A stopped invocation would
+        // run, and go on running.
+        locked(&self.running).get(&id).is_some_and(|e| e.stop)
     }
 
     /// Record the cage's pid against the live invocation, so a reader can see which process a
     /// long-running operation is.
     fn note_pid(&self, id: u64, pid: u32) {
-        if let Ok(mut running) = self.running.lock()
-            && let Some(entry) = running.get_mut(&id)
-        {
+        let mut running = locked(&self.running);
+        if let Some(entry) = running.get_mut(&id) {
             entry.pid = Some(pid);
         }
     }
 
     /// Record what this invocation actually runs, once its parameters are substituted in.
     fn note_argv(&self, id: u64, argv: &[OsString]) {
-        if let Ok(mut running) = self.running.lock()
-            && let Some(entry) = running.get_mut(&id)
-        {
+        let mut running = locked(&self.running);
+        if let Some(entry) = running.get_mut(&id) {
             entry.argv = argv
                 .iter()
                 .map(|a| a.to_string_lossy().into_owned())
@@ -1276,7 +1274,7 @@ impl TaskEngine {
     /// declaration and the command, which is the pair that answers "what is this doing".
     pub(crate) fn describe(&self, id: u64) -> Option<Vec<(String, String)>> {
         let (task, elapsed, argv, pid, stopping, detached) = {
-            let running = self.running.lock().ok()?;
+            let running = locked(&self.running);
             let entry = running.get(&id)?;
             (
                 entry.task.clone(),
@@ -1445,9 +1443,7 @@ impl TaskEngine {
 
     /// What is running right now, oldest first.
     pub(crate) fn running(&self) -> Vec<RunningView> {
-        let Ok(running) = self.running.lock() else {
-            return Vec::new();
-        };
+        let running = locked(&self.running);
         running
             .iter()
             .map(|(id, r)| RunningView {
@@ -1471,9 +1467,13 @@ impl TaskEngine {
     /// process that this one cannot make.
     pub(crate) fn stop(&self, id: u64) -> StopOutcome {
         {
-            let Ok(mut running) = self.running.lock() else {
-                return StopOutcome::NotRunning;
-            };
+            // Recovers, where [`Self::enter`] refuses, and the two are not in tension. `enter` holds
+            // a **cap**: one a caller could get around by arranging for the lock to be poisoned
+            // would not be a cap, so doubt has to refuse. This holds no cap — it carries an order,
+            // and the safe direction for an order to stop is that it arrives. Giving up here set no
+            // flag at all and reported `NotRunning`, so the invocation the user stopped kept
+            // running under an answer saying it was never there.
+            let mut running = locked(&self.running);
             match running.get_mut(&id) {
                 Some(entry) => entry.stop = true,
                 None => return StopOutcome::NotRunning,
@@ -1492,10 +1492,9 @@ impl TaskEngine {
     /// Whether invocation `id` is still in the registry — the one fact that tells a stop that
     /// *happened* from a stop that was merely requested.
     fn is_running(&self, id: u64) -> bool {
-        self.running
-            .lock()
-            .map(|r| r.contains_key(&id))
-            .unwrap_or(false)
+        // The fact a stop reports on. A `false` taken from a poisoned lock rather than from the
+        // registry would report an invocation as stopped while it is still running.
+        locked(&self.running).contains_key(&id)
     }
 
     /// Where an in-cage path lives on the host, read off the mounts this cage is built from. A path
@@ -1888,9 +1887,10 @@ impl OutputClaim {
 
 impl Drop for OutputClaim {
     fn drop(&mut self) {
-        if let Ok(mut held) = self.held.lock() {
-            held.remove(&self.task);
-        }
+        // The same lock `claim_output` takes through `locked`, released the same way: taking it
+        // with recovery and releasing it without would strand the claim, and every later invocation
+        // of this task would be refused for a conflict with an invocation that has already ended.
+        locked(&self.held).remove(&self.task);
     }
 }
 
@@ -2101,9 +2101,10 @@ pub(crate) struct RunGuard {
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        if let Ok(mut running) = self.registry.lock() {
-            running.remove(&self.id);
-        }
+        // Recovering here is what keeps the registry finite. A release that gave up on a poisoned
+        // lock would leave this invocation in the map for the life of the session — read as running
+        // long after it ended, and counted against [`MAX_LIVE`] by every admission after it.
+        locked(&self.registry).remove(&self.id);
     }
 }
 

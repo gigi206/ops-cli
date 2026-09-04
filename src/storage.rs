@@ -469,7 +469,11 @@ pub(crate) fn state(image: &Path) -> io::Result<State> {
     let Some(loop_dev) = loop_for(image, Path::new("/sys/block"))? else {
         return Ok(State::Detached);
     };
-    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    // Propagated, not defaulted. An empty table makes `mount_of` answer `None`, which is this
+    // function's word for "attached but not mounted" — so a read that failed would be reported as a
+    // *state*, and the `noexec` guard keyed on `State::Mounted`'s options would never run. A table
+    // that cannot be read is not a volume that is unmounted.
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")?;
     match mount_of(&loop_dev, &mountinfo) {
         Some((mount_point, options)) => Ok(State::Mounted {
             loop_dev,
@@ -1221,7 +1225,11 @@ pub(crate) fn up(image: &Path) -> Result<PathBuf, String> {
     // and the two `State::Mounted` arms then handed that same mount point back to every later
     // call — so the guard fired once and was never reachable again. `down` is best-effort: if it
     // cannot undo the mount the refusal still stands, and the arms above now refuse it too.
-    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    // Read errors are fatal here for the reason [`state`] states: an empty table answers `None`,
+    // which is indistinguishable from "this mount is not noexec" and would wave the volume through
+    // on the one call that performs the transition.
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|e| format!("cannot read /proc/self/mountinfo: {e}"))?;
     if let Some((_, options)) = mount_of(&loop_dev, &mountinfo)
         && mount_is_noexec(&options)
     {

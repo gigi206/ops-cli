@@ -606,7 +606,20 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
     // needs the header and the streaming arm below needs the offset, and they are the same look.
     let fallback = match in_window {
         Some(_) => None,
-        None => last_header_at(&path).ok(),
+        None => match last_header_at(&path) {
+            Ok(found) => Some(found),
+            // Propagated rather than dropped. This pass yields the offset the streaming arm below
+            // starts from, and a swallowed error left that offset at 0 — which streams the whole
+            // file, every earlier session of a reused pid included, for a reading that asked for
+            // one. A log that cannot be scanned is a failure to report, not a wider answer to give.
+            Err(e) => {
+                diag::error(&format!(
+                    "sbx: cannot scan the session log {} for its header: {e}",
+                    path.display()
+                ));
+                return ExitCode::FAILURE;
+            }
+        },
     };
     let header = in_window
         .as_ref()
@@ -639,6 +652,10 @@ fn logs_cmd(args: &[OsString]) -> ExitCode {
         // One session, unlimited, and longer than the window: stream it from its own header. The
         // forward pass that finds the header holds nothing either.
         (None, false, false) => {
+            // A `None` here can no longer mean "the scan failed" — that is fatal above. It would
+            // mean the window carried the header, which `tail_window` does not report as an
+            // incomplete answer, so this arm does not meet it. What a 0 offset does mean is a log
+            // holding no header at all, whose whole content is the one session there is to show.
             let at = fallback.as_ref().map(|(_, at)| *at).unwrap_or(0);
             stream_range(at, end)
         }

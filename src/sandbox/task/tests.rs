@@ -196,6 +196,69 @@ fn a_taken_registration_keeps_the_invocation_visible_until_it_is_dropped() {
     );
 }
 
+/// A panic in an unrelated thread does not make a live invocation vanish from the registry.
+///
+/// [`crate::sandbox::locks`] settles this once for the whole program and names this very reader: a
+/// registry the run consults recovers from a poisoned lock, because what such a record is worth is
+/// precisely that it survived whatever went wrong. These two readers took `.ok()` instead, so one
+/// panic anywhere turned a running invocation into no invocation at all — not an error the caller
+/// could see, but a confident wrong answer they would act on. `output_held`, three fields away, has
+/// recovered all along.
+#[test]
+fn a_poisoned_registry_still_reports_the_invocation_it_holds() {
+    let engine = TaskEngine::inventory_only(vec![task()]);
+    let admitted = engine
+        .admit(
+            "db-query",
+            &values(&[("sql", "SELECT one")]),
+            &values(&[]),
+            7,
+            true,
+        )
+        .expect("the admission");
+
+    // Poisoned after the admission, so the entry is already in the registry: `enter` refuses on a
+    // poisoned lock by its own argument, which is about a cap and not about a reader.
+    let registry = engine.running.clone();
+    let _ = std::thread::spawn(move || {
+        let _held = registry.lock().expect("the registry");
+        panic!("the holder gives up mid-flight");
+    })
+    .join();
+    assert!(
+        engine.running.lock().is_err(),
+        "the fixture must actually poison the lock, or this test asserts nothing"
+    );
+
+    assert!(
+        engine.running().iter().any(|row| row.id == 7),
+        "a poisoned registry must still list what it holds"
+    );
+    assert!(
+        engine.describe(7).is_some(),
+        "and must still describe it — the pair `sbx task status` asks for"
+    );
+
+    // An order to stop reaches it as well. Refusing to set the flag reported `NotRunning` for an
+    // invocation that was right there, and left it running — the one answer that is wrong in both
+    // halves at once. It reads as `Stopping` here because nothing is polling the flag in this test,
+    // which is the honest outcome: asked for, not yet observed to have happened.
+    assert_eq!(
+        engine.stop(7),
+        StopOutcome::Stopping,
+        "a stop must set the flag on a poisoned registry, not report the invocation missing"
+    );
+
+    // And the release recovers too, which is what keeps the registry finite: an entry that could
+    // not be removed would read as running for the rest of the session and count against the
+    // admission cap for every invocation after it.
+    drop(admitted);
+    assert!(
+        !engine.running().iter().any(|row| row.id == 7),
+        "a poisoned registry must still let go of what has ended"
+    );
+}
+
 fn task() -> TaskSpec {
     TaskSpec {
         unmask: Vec::new(),
