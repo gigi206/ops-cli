@@ -116,7 +116,7 @@ fn derivation_expr(
     name: &str,
     url: &str,
     hash: &str,
-    libs: &[String],
+    decor: &prebuilt::Decor<'_>,
 ) -> String {
     const TEMPLATE: &str = r#"let pkgs = (builtins.getFlake "@NIXPKGS@").legacyPackages.@SYSTEM@;
 in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
@@ -150,7 +150,7 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
     TEMPLATE
         .replace("@NIXPKGS@", nixpkgs)
         .replace("@SYSTEM@", system)
-        .replace("@LIBS@", &prebuilt::lib_set(libs))
+        .replace("@LIBS@", &prebuilt::lib_set(decor.libs))
         .replace("@URL@", url)
         .replace("@HASH@", hash)
         .replace("@NAME@", name)
@@ -195,9 +195,9 @@ impl prebuilt::Kind for Binary {
         name: &str,
         url: &str,
         hash: &str,
-        libs: &[String],
+        decor: &prebuilt::Decor<'_>,
     ) -> String {
-        derivation_expr(nixpkgs, system, name, url, hash, libs)
+        derivation_expr(nixpkgs, system, name, url, hash, decor)
     }
 
     fn form(&self, package: &crate::config::Package) -> Option<prebuilt::Form> {
@@ -258,7 +258,10 @@ mod tests {
             "demo-app",
             "https://example.com/cli/demo-1.2.3-linux-x86_64",
             HASH,
-            &[],
+            &prebuilt::Decor {
+                libs: &[],
+                main: "",
+            },
         );
 
         // The pin is what binds this build to one artefact — the URL alone never did.
@@ -307,6 +310,7 @@ mod tests {
             backend,
             state: crate::trust::TrustState::Trusted,
             libs: Vec::new(),
+            main: String::new(),
         };
 
         assert!(matches!(

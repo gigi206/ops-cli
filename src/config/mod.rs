@@ -622,7 +622,12 @@ impl Resolved {
                 pkg.name,
                 pkg.backend,
                 pkg.state,
-                pkg.libs,
+                // The app's packages are already resolved, decoration included, so it travels with
+                // the declaration instead of being re-read from a table this merge does not have.
+                tools::Decoration {
+                    libs: pkg.libs,
+                    main: pkg.main,
+                },
             );
         }
         // Merge by *path*: an app bind whose path the baseline already exposes overrides it in

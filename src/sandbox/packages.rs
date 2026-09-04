@@ -322,6 +322,7 @@ mod tests {
             backend: Backend::Nix(attr.to_string()),
             state,
             libs: Vec::new(),
+            main: String::new(),
         }
     }
 
@@ -331,6 +332,7 @@ mod tests {
             backend: Backend::Mise(token.to_string()),
             state,
             libs: Vec::new(),
+            main: String::new(),
         }
     }
 
@@ -340,6 +342,7 @@ mod tests {
             backend: Backend::Flake(reference.to_string()),
             state,
             libs: Vec::new(),
+            main: String::new(),
         }
     }
 
@@ -352,6 +355,7 @@ mod tests {
             },
             state,
             libs: Vec::new(),
+            main: String::new(),
         }
     }
 

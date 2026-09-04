@@ -1299,6 +1299,19 @@ pub(crate) struct RawResolve {
     /// attribute, since it is interpolated into the generated derivation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) libs: Vec<String>,
+    /// The program inside the artefact, relative to its root, for an archive whose layout the
+    /// install phase cannot name on its own: `main = "cursor-agent"` for a tarball whose root
+    /// carries a Node runtime, an updater and eight native addons beside the CLI. Optional, and
+    /// meaningless for `binary:`, whose download *is* the program.
+    ///
+    /// The install phase recognises three vendor layouts and refuses anything else rather than
+    /// choosing among several root executables — the refusal is right, and this is the answer to
+    /// it. Written into the generated derivation's shell, so it passes a path barrier of its own:
+    /// relative, no `..` segment, and no character that would end the shell word it is spliced
+    /// into. Per package, like `libs`, because which file is the program is a fact about one
+    /// vendor's archive.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) main: String,
 }
 
 /// The `[secret]` section: a reserved `defaults` table plus one entry per destination host.

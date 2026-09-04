@@ -1782,6 +1782,7 @@ mod tests {
             backend: config::Backend::Mise("aqua:attacker/x".into()),
             state: crate::trust::TrustState::Untrusted,
             libs: Vec::new(),
+            main: String::new(),
         }];
         cfg.apps.insert("shady".into(), untrusted);
         let withheld = app_selector_refusal(&cfg, "shady", "mise").expect("withheld-only refused");
@@ -1818,6 +1819,7 @@ mod tests {
             backend,
             state: crate::trust::TrustState::Trusted,
             libs: Vec::new(),
+            main: String::new(),
         }
     }
 

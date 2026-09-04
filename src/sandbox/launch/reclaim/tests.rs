@@ -64,6 +64,7 @@ fn a_lapse_in_trust_does_not_look_like_a_removed_inline_flake() {
         },
         state,
         libs: Vec::new(),
+        main: String::new(),
     };
 
     let declared = vec![
@@ -77,6 +78,7 @@ fn a_lapse_in_trust_does_not_look_like_a_removed_inline_flake() {
             backend: Backend::Nix("ripgrep".to_string()),
             state: TrustState::Trusted,
             libs: Vec::new(),
+            main: String::new(),
         },
     ];
 

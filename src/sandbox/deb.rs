@@ -711,7 +711,7 @@ fn derivation_expr(
     name: &str,
     url: &str,
     hash: &str,
-    libs: &[String],
+    decor: &prebuilt::Decor<'_>,
 ) -> String {
     const TEMPLATE: &str = r#"let pkgs = (builtins.getFlake "@NIXPKGS@").legacyPackages.@SYSTEM@;
 in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
@@ -744,12 +744,16 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
     // The `.deb` binary lives under its own prefix and finds its sibling `.so`s via RUNPATH, so the
     // wrapper's `LD_LIBRARY_PATH` is just the buildInputs closure — no bundle-root prefix (unlike an
     // AppImage, whose Chromium `.so`s sit loose beside the launcher).
-    let wrap = prebuilt::launcher_wrap(name, "${pkgs.lib.makeLibraryPath finalAttrs.buildInputs}");
+    let wrap = prebuilt::launcher_wrap(
+        name,
+        "${pkgs.lib.makeLibraryPath finalAttrs.buildInputs}",
+        decor.main,
+    );
     TEMPLATE
         .replace("@WRAP@", &wrap)
         .replace("@NIXPKGS@", nixpkgs)
         .replace("@SYSTEM@", system)
-        .replace("@LIBS@", &prebuilt::lib_set(libs))
+        .replace("@LIBS@", &prebuilt::lib_set(decor.libs))
         .replace("@URL@", url)
         .replace("@HASH@", hash)
         .replace("@NAME@", name)
@@ -791,9 +795,9 @@ impl prebuilt::Kind for Deb {
         name: &str,
         url: &str,
         hash: &str,
-        libs: &[String],
+        decor: &prebuilt::Decor<'_>,
     ) -> String {
-        derivation_expr(nixpkgs, system, name, url, hash, libs)
+        derivation_expr(nixpkgs, system, name, url, hash, decor)
     }
 
     fn form(&self, package: &crate::config::Package) -> Option<prebuilt::Form> {
@@ -851,7 +855,10 @@ mod tests {
             "demo-app",
             "https://example.com/x/demo-app-linux-amd64.deb",
             HASH,
-            &[],
+            &prebuilt::Decor {
+                libs: &[],
+                main: "",
+            },
         );
         // pinned source (url + resolved hash), against the pinned nixpkgs for this system
         assert!(expr.contains(
@@ -884,7 +891,10 @@ mod tests {
             "demo-app",
             "https://example.com/x/demo-app-linux-amd64.deb",
             HASH,
-            &[],
+            &prebuilt::Decor {
+                libs: &[],
+                main: "",
+            },
         );
         assert!(!plain.contains("webkitgtk_4_1"));
 
@@ -894,7 +904,10 @@ mod tests {
             "demo-app",
             "https://example.com/x/demo-app-linux-amd64.deb",
             HASH,
-            &["webkitgtk_4_1".to_string(), "libsoup_3".to_string()],
+            &prebuilt::Decor {
+                libs: &["webkitgtk_4_1".to_string(), "libsoup_3".to_string()],
+                main: "",
+            },
         );
         assert!(with_libs.contains("webkitgtk_4_1") && with_libs.contains("libsoup_3"));
         // The built-in set is unioned, never replaced — an app declaring one attribute must not
@@ -1112,6 +1125,7 @@ mod tests {
                 crate::trust::TrustState::Untrusted
             },
             libs: Vec::new(),
+            main: String::new(),
         }
     }
 

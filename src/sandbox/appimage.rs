@@ -149,7 +149,7 @@ fn derivation_expr(
     name: &str,
     url: &str,
     hash: &str,
-    libs: &[String],
+    decor: &prebuilt::Decor<'_>,
 ) -> String {
     const TEMPLATE: &str = r#"let pkgs = (builtins.getFlake "@NIXPKGS@").legacyPackages.@SYSTEM@;
     extracted = pkgs.appimageTools.extract {
@@ -180,6 +180,7 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
     let wrap = prebuilt::launcher_wrap(
         name,
         "$out:${pkgs.lib.makeLibraryPath finalAttrs.buildInputs}",
+        decor.main,
     );
     let ignore = APPIMAGE_IGNORE_MISSING
         .iter()
@@ -190,7 +191,7 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
         .replace("@WRAP@", &wrap)
         .replace("@NIXPKGS@", nixpkgs)
         .replace("@SYSTEM@", system)
-        .replace("@LIBS@", &prebuilt::lib_set(libs))
+        .replace("@LIBS@", &prebuilt::lib_set(decor.libs))
         .replace("@IGNORE@", &ignore)
         .replace("@URL@", url)
         .replace("@HASH@", hash)
@@ -236,9 +237,9 @@ impl prebuilt::Kind for AppImage {
         name: &str,
         url: &str,
         hash: &str,
-        libs: &[String],
+        decor: &prebuilt::Decor<'_>,
     ) -> String {
-        derivation_expr(nixpkgs, system, name, url, hash, libs)
+        derivation_expr(nixpkgs, system, name, url, hash, decor)
     }
 
     fn form(&self, package: &crate::config::Package) -> Option<prebuilt::Form> {
@@ -337,7 +338,10 @@ mod tests {
             "demo-app",
             "https://example.com/x/demo-app-0.0.28-x86_64.AppImage",
             HASH,
-            &[],
+            &prebuilt::Decor {
+                libs: &[],
+                main: "",
+            },
         );
         // pinned source (url + resolved hash) against the pinned nixpkgs, extracted (not run) via
         // extract — the build-time squashfs unpack the seccomp cage requires.
@@ -525,6 +529,7 @@ mod tests {
                 crate::trust::TrustState::Untrusted
             },
             libs: Vec::new(),
+            main: String::new(),
         }
     }
 

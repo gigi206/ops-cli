@@ -108,6 +108,14 @@ fn bundle_list(args: &[OsString]) -> ExitCode {
                         "appimage": lib_names(&b.appimage),
                         "binary": lib_names(&b.binary),
                     },
+                    // Beside `libs` for the same reason: it is the other half of what such a table
+                    // grants, and it decides which file in the artefact the launch actually runs.
+                    "main": {
+                        "tarball": main_names(&b.tarball),
+                        "deb": main_names(&b.deb),
+                        "appimage": main_names(&b.appimage),
+                        "binary": main_names(&b.binary),
+                    },
                     "accepts_fresh_releases": b.accepts_fresh_releases,
                     "undescribed": undescribed_sections(b),
                 })
@@ -256,6 +264,15 @@ fn render_bundles(
                         entry.libs.len()
                     ));
                 }
+                // Named on its own line, because it decides which file in the artefact the launch
+                // runs: a reader deciding whether to fold this bundle in is owed that, not just the
+                // fact that a table exists.
+                if !entry.main.is_empty() {
+                    out.push_str(&format!(
+                        "  main     {name} ({table}: `{}` is the program inside the artefact)\n",
+                        entry.main
+                    ));
+                }
             }
         }
         for scheme in b.open.keys() {
@@ -331,6 +348,16 @@ fn lib_names(tables: &BTreeMap<String, config::RawResolve>) -> Vec<&String> {
     tables
         .iter()
         .filter(|(_, table)| !table.libs.is_empty())
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// The packages in one `[<backend>.<name>]` map whose table names the program inside the artefact —
+/// the third independent half of such a table, beside its resolver and its library attributes.
+fn main_names(tables: &BTreeMap<String, config::RawResolve>) -> Vec<&String> {
+    tables
+        .iter()
+        .filter(|(_, table)| !table.main.is_empty())
         .map(|(name, _)| name)
         .collect()
 }
@@ -416,6 +443,14 @@ fn grants_of(b: &config::RawBundle) -> Vec<String> {
         .sum();
     if libs > 0 {
         parts.push(format!("{libs} extra library attribute(s)"));
+    }
+    let mains = prebuilt
+        .iter()
+        .flat_map(|tables| tables.values())
+        .filter(|table| !table.main.is_empty())
+        .count();
+    if mains > 0 {
+        parts.push(format!("{mains} declared program name(s)"));
     }
     if !b.accepts_fresh_releases.is_empty() {
         parts.push(format!(
@@ -821,6 +856,7 @@ mod tests {
             config::RawResolve {
                 resolve: Vec::new(),
                 libs: vec!["libusb1".to_string(), "qt6.qtbase.out".to_string()],
+                main: String::new(),
             },
         );
         let name = "libs-only".to_string();
@@ -850,6 +886,7 @@ mod tests {
             config::RawResolve {
                 resolve: vec!["sh".to_string(), "-c".to_string(), "echo url".to_string()],
                 libs: vec!["webkitgtk_4_1".to_string()],
+                main: String::new(),
             },
         );
         let name = "both".to_string();

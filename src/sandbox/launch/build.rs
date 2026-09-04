@@ -355,8 +355,8 @@ pub(super) fn build(
     let ctx = prebuilt_ctx(prep);
     for kind in crate::sandbox::prebuilt::DIRECT_ORDER {
         for (name, url) in kind.packages(&prep.cfg.packages) {
-            let libs = crate::sandbox::prebuilt::libs_of(&prep.cfg.packages, &name);
-            match crate::sandbox::prebuilt::provision(kind, &ctx, &name, &url, &libs) {
+            let decor = crate::sandbox::prebuilt::decor_of(&prep.cfg.packages, &name);
+            match crate::sandbox::prebuilt::provision(kind, &ctx, &name, &url, &decor) {
                 Ok((bin, root)) => {
                     bin_paths.push(bin);
                     packages.roots.push(root);
@@ -392,14 +392,14 @@ pub(super) fn build(
     };
     for kind in crate::sandbox::prebuilt::RESOLVE_ORDER {
         for (name, command) in kind.resolve_packages(&prep.cfg.packages) {
-            let libs = crate::sandbox::prebuilt::libs_of(&prep.cfg.packages, &name);
+            let decor = crate::sandbox::prebuilt::decor_of(&prep.cfg.packages, &name);
             match crate::sandbox::prebuilt::provision_resolve(
                 kind,
                 &ctx,
                 &name,
                 &command,
                 &resolve_cage,
-                &libs,
+                &decor,
             ) {
                 Ok((bin, root)) => {
                     bin_paths.push(bin);

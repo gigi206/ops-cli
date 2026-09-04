@@ -68,6 +68,19 @@ pub(crate) const ELECTRON_LIBS: &[&str] = &[
 /// three passes, and the order matters: the **bundle** shape first, then the **named binary**, and
 /// the **lone bare binary** only when neither matched.
 ///
+/// Ahead of all three sits the **declared** program, `main` in the package's own table, and it is
+/// the only pass that is not a search. The three shapes cover what vendors ship, but they answer by
+/// recognising a layout, so an archive they do not recognise is *refused* — the last pass counts the
+/// root's executables and stops at anything but one, because picking among them is how a build
+/// silently wraps the wrong program. That refusal is correct and leaves the user with nothing to
+/// do, which is what `main` is for: an archive that carries a runtime, an updater and a handful of
+/// native addons beside its CLI is unambiguous to whoever wrote the profile and unrecognisable
+/// here. Naming the program answers the question instead of widening a heuristic that would then
+/// guess for everyone. The path is relative to the archive root — after the `tarball:` hoist, so it
+/// is what a user reads out of `tar -tzf`, not a store path — and it must exist and be executable,
+/// or the build fails naming which of the two it was: a wrong `main` must not fall through to a
+/// search whose answer would then depend on the archive rather than on the declaration.
+///
 /// A bundle is located by its `resources/` signature — either a packed `resources/app.asar` file or,
 /// for an asar-less build (some modern VS Code forks ship the app as a loose `resources/app/`
 /// directory), the `resources/app` directory itself; both resolve to the same bundle root. The
@@ -108,11 +121,18 @@ pub(crate) const ELECTRON_LIBS: &[&str] = &[
 /// no such package is among the inputs — the directories simply do not exist, and each consumer
 /// skips a missing one.
 ///
-/// Two placeholders: `@NAME@` (the wrapped launcher name — the `[packages]` key, which is also the
-/// derivation's `meta.mainProgram`, so the command a profile writes is that key) and `@LDPREFIX@`
+/// Three placeholders: `@NAME@` (the wrapped launcher name — the `[packages]` key, which is also the
+/// derivation's `meta.mainProgram`, so the command a profile writes is that key), `@LDPREFIX@`
 /// (the `LD_LIBRARY_PATH` prefix value — a backend chooses whether to prepend the bundle root for
-/// sibling `.so`s).
-pub(crate) const LAUNCHER_WRAP: &str = r#"    app=$(find $out -type f -path '*/resources/app.asar' | sort | head -1)
+/// sibling `.so`s), and `@MAIN@` (the declared program, empty when the package named none, which is
+/// the case that runs the three passes).
+pub(crate) const LAUNCHER_WRAP: &str = r#"    declared="@MAIN@"
+    if [ -n "$declared" ]; then
+      main=$out/$declared
+      [ -f "$main" ] || { echo "@NAME@: \`main = \"$declared\"\` names nothing in the archive" >&2; exit 1; }
+      [ -x "$main" ] || { echo "@NAME@: \`main = \"$declared\"\` is not executable" >&2; exit 1; }
+    else
+    app=$(find $out -type f -path '*/resources/app.asar' | sort | head -1)
     [ -n "$app" ] || app=$(find $out -type d -path '*/resources/app' | sort | head -1)
     if [ -n "$app" ]; then
       appdir=$(dirname "$(dirname "$app")")
@@ -138,9 +158,10 @@ pub(crate) const LAUNCHER_WRAP: &str = r#"    app=$(find $out -type f -path '*/r
           ! -name '*.so' ! -name '*.so.*' | sort)
         [ -n "$cands" ] || { echo "@NAME@: no Electron resources/app(.asar), no */bin/@NAME@, and no executable at the archive root" >&2; exit 1; }
         count=$(printf '%s\n' "$cands" | wc -l)
-        [ "$count" -eq 1 ] || { echo "@NAME@: no Electron resources/app(.asar), no single */bin/@NAME@, and $count executables at the archive root (need exactly 1):" >&2; printf '%s\n' "$cands" >&2; exit 1; }
+        [ "$count" -eq 1 ] || { echo "@NAME@: no Electron resources/app(.asar), no single */bin/@NAME@, and $count executables at the archive root (need exactly 1) — name the program with \`main\` in the package's table:" >&2; printf '%s\n' "$cands" >&2; exit 1; }
         main=$cands
       fi
+    fi
     fi
     mkdir -p $out/bin
     makeWrapper "$main" "$out/bin/@NAME@" \
@@ -167,28 +188,52 @@ const GIO_SEARCH_PATH: &str =
 const XDG_DATA_SEARCH_PATH: &str =
     r#"${pkgs.lib.makeSearchPathOutput "out" "share" finalAttrs.buildInputs}"#;
 
-/// Fill [`LAUNCHER_WRAP`]'s two placeholders. `ld_prefix` is the `LD_LIBRARY_PATH` prefix value: a
+/// Fill [`LAUNCHER_WRAP`]'s placeholders. `ld_prefix` is the `LD_LIBRARY_PATH` prefix value: a
 /// `.deb` passes just the `makeLibraryPath` of its `buildInputs`; an AppImage prepends `$out` (its
-/// bundle root holds the Chromium sibling `.so`s — `libEGL.so`, `libffmpeg.so`, …).
-pub(crate) fn launcher_wrap(name: &str, ld_prefix: &str) -> String {
+/// bundle root holds the Chromium sibling `.so`s — `libEGL.so`, `libffmpeg.so`, …). `main` is the
+/// package's declared program, empty when it declared none.
+pub(crate) fn launcher_wrap(name: &str, ld_prefix: &str, main: &str) -> String {
     LAUNCHER_WRAP
         .replace("@NAME@", name)
+        .replace("@MAIN@", main)
         .replace("@LDPREFIX@", ld_prefix)
         .replace("@GSTPREFIX@", GST_SEARCH_PATH)
         .replace("@GIOPREFIX@", GIO_SEARCH_PATH)
         .replace("@DATAPREFIX@", XDG_DATA_SEARCH_PATH)
 }
 
-/// The extra library attributes the package called `name` declared, or none when it declared any.
+/// What a package's `[deb.<name>]` / `[appimage.<name>]` / `[tarball.<name>]` table adds to it.
+///
+/// Both fields **decorate** a package rather than declare one — the declaration is its `[packages]`
+/// entry — and both are read out of that same table, so they travel as one value through the
+/// provisioning chain instead of as two parallel parameters threaded through the same six
+/// functions. A third decoration joins here rather than by widening those signatures again.
+pub(crate) struct Decor<'a> {
+    /// Extra nixpkgs attributes this package's ELFs are autoPatchelf'd against, unioned with the
+    /// built-in Electron/Chromium set by [`lib_set`]: that set is shared by all three backends, so a
+    /// GTK/WebKit app names what it needs here rather than growing every other app's closure.
+    pub(crate) libs: &'a [String],
+    /// The program inside the archive, relative to its root, when none of [`LAUNCHER_WRAP`]'s three
+    /// shapes can name it. Empty for a package that declared none, which is the ordinary case.
+    pub(crate) main: &'a str,
+}
+
+/// What the package called `name` declared in its table, or nothing when it declared neither field.
 /// The collectors on [`Kind`] answer `(name, locator)` — deliberately, since the prune and count
-/// paths want exactly that — so the provisioning sites read the package's `libs` back through here
+/// paths want exactly that — so the provisioning sites read the decoration back through here
 /// rather than widening every tuple in the crate.
-pub(crate) fn libs_of(packages: &[crate::config::Package], name: &str) -> Vec<String> {
+pub(crate) fn decor_of<'a>(packages: &'a [crate::config::Package], name: &str) -> Decor<'a> {
     packages
         .iter()
         .find(|p| p.name == name)
-        .map(|p| p.libs.clone())
-        .unwrap_or_default()
+        .map(|p| Decor {
+            libs: &p.libs,
+            main: &p.main,
+        })
+        .unwrap_or(Decor {
+            libs: &[],
+            main: "",
+        })
 }
 
 /// The nixpkgs attributes one prebuilt package is autoPatchelf'd against: the built-in
@@ -655,9 +700,9 @@ pub(crate) trait Kind {
     /// way (a `dpkg-deb` data tarball, an AppImage squashfs, a plain `.tar.gz`) and autoPatchelfs the
     /// result — the one step that is genuinely a backend's own.
     ///
-    /// `libs` are the package's own extra nixpkgs attributes (its table's `libs`), unioned with the
-    /// built-in Electron/Chromium set by [`lib_set`]: that set is shared by all three backends, so a
-    /// GTK/WebKit app names what it needs here rather than growing every other app's closure.
+    /// `decor` is what the package's own table added to it — the extra library attributes every
+    /// backend unions into its `buildInputs`, and the program name the three that wrap a launcher
+    /// pass to [`launcher_wrap`]. See [`Decor`] for why the two travel together.
     fn derivation_expr(
         &self,
         nixpkgs: &str,
@@ -665,7 +710,7 @@ pub(crate) trait Kind {
         name: &str,
         url: &str,
         hash: &str,
-        libs: &[String],
+        decor: &Decor<'_>,
     ) -> String;
 
     /// Which of this backend's two declaration forms `package` uses, or `None` when it belongs to
@@ -884,10 +929,10 @@ fn build_pinned(
     name: &str,
     url: &str,
     hash: &str,
-    libs: &[String],
+    decor: &Decor<'_>,
 ) -> io::Result<(PathBuf, PathBuf)> {
     let system = super::current_system();
-    let expr = kind.derivation_expr(ctx.nixpkgs, &system, name, url, hash, libs);
+    let expr = kind.derivation_expr(ctx.nixpkgs, &system, name, url, hash, decor);
     let gcroot = ctx
         .layout
         .data_dir()
@@ -939,7 +984,7 @@ fn provision_pinned<F>(
     ctx: &Ctx,
     name: &str,
     key: &str,
-    libs: &[String],
+    decor: &Decor<'_>,
     mint: F,
 ) -> io::Result<(PathBuf, PathBuf)>
 where
@@ -963,7 +1008,7 @@ where
         }
         write_pins(ctx.layout, project_id.as_str(), &lock_file, &disk)?;
     }
-    build_pinned(kind, ctx, project_id.as_str(), name, &url, &hash, libs)
+    build_pinned(kind, ctx, project_id.as_str(), name, &url, &hash, decor)
 }
 
 /// Provision one declared package host-side: resolve its locator to a hash (pinning it on first use),
@@ -975,9 +1020,9 @@ pub(crate) fn provision(
     ctx: &Ctx,
     name: &str,
     locator: &str,
-    libs: &[String],
+    decor: &Decor<'_>,
 ) -> io::Result<(PathBuf, PathBuf)> {
-    provision_pinned(kind, ctx, name, locator, libs, || {
+    provision_pinned(kind, ctx, name, locator, decor, || {
         let system = super::current_system();
         kind.resolve_source(
             ctx.nix,
@@ -1001,9 +1046,9 @@ pub(crate) fn provision_resolve(
     name: &str,
     command: &[String],
     cage: &super::resolve::ResolveCage,
-    libs: &[String],
+    decor: &Decor<'_>,
 ) -> io::Result<(PathBuf, PathBuf)> {
-    provision_pinned(kind, ctx, name, &resolve_key(name), libs, || {
+    provision_pinned(kind, ctx, name, &resolve_key(name), decor, || {
         let url = super::resolve::resolve_url(
             cage,
             name,
@@ -1024,7 +1069,7 @@ pub(crate) fn provision_resolve_pinned(
     kind: &dyn Kind,
     ctx: &Ctx,
     name: &str,
-    libs: &[String],
+    decor: &Decor<'_>,
 ) -> io::Result<Option<(PathBuf, PathBuf)>> {
     let project_id = super::binds::project_runtime_id(ctx.project)?;
     let Some(pin) =
@@ -1039,7 +1084,7 @@ pub(crate) fn provision_resolve_pinned(
         name,
         &pin.url,
         &pin.hash,
-        libs,
+        decor,
     )
     .map(Some)
 }
@@ -1424,7 +1469,7 @@ mod tests {
             _name: &str,
             _url: &str,
             _hash: &str,
-            _libs: &[String],
+            _decor: &Decor<'_>,
         ) -> String {
             unreachable!("upgrade never builds a derivation")
         }
@@ -1448,6 +1493,7 @@ mod tests {
                 backend: crate::config::Backend::Tarball(url.to_string()),
                 state: crate::trust::TrustState::Trusted,
                 libs: Vec::new(),
+                main: String::new(),
             }],
             vec![],
         );
@@ -1602,6 +1648,7 @@ mod tests {
                 },
                 state: crate::trust::TrustState::Trusted,
                 libs: Vec::new(),
+                main: String::new(),
             }],
             vec![],
         );
@@ -1666,6 +1713,7 @@ mod tests {
                 crate::trust::TrustState::Untrusted
             },
             libs: Vec::new(),
+            main: String::new(),
         }
     }
 
@@ -1879,7 +1927,7 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
 
     #[test]
     fn launcher_wrap_fills_both_placeholders_and_excludes_apprun() {
-        let wrap = launcher_wrap("demo-app", "$out:/lib");
+        let wrap = launcher_wrap("demo-app", "$out:/lib", "");
         assert!(wrap.contains("$out/bin/demo-app"));
         assert!(wrap.contains("--prefix LD_LIBRARY_PATH : \"$out:/lib\""));
         // AppRun exclusion is what makes one snippet serve both backends.
@@ -1893,7 +1941,7 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
 
     #[test]
     fn launcher_wrap_falls_back_to_a_lone_top_level_binary_only_when_there_is_no_bundle() {
-        let wrap = launcher_wrap("demo-cli", "/lib");
+        let wrap = launcher_wrap("demo-cli", "/lib", "");
         // The bundle probe still runs FIRST and unchanged: a backend that works today must take the
         // identical path. The fallback lives in the `else` arm, so it is unreachable for a bundle.
         let bundle_probe = wrap.find("resources/app.asar").expect("bundle probe");
@@ -1935,7 +1983,7 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
         // `usr/bin/<name>` beside a CLI and an updater. Nothing sits at the archive root, and three
         // executables sit below it, so the root scan would refuse on both counts — the declared name
         // is what makes the choice unambiguous.
-        let wrap = launcher_wrap("demo-app", "/lib");
+        let wrap = launcher_wrap("demo-app", "/lib", "");
         let bundle = wrap.find("resources/app.asar").expect("bundle probe");
         let named = wrap.find("named=").expect("named-bin probe");
         let root_scan = wrap.find("cands=").expect("root scan");
@@ -1959,7 +2007,7 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
         // TLS backend — no HTTPS without it) and the XDG data dirs holding GSettings schemas. All
         // are looked up by path at runtime, so a package present in `buildInputs` is still invisible
         // unless the wrapper says where it is.
-        let wrap = launcher_wrap("demo-app", "/lib");
+        let wrap = launcher_wrap("demo-app", "/lib", "");
         for (var, expr) in [
             ("GST_PLUGIN_SYSTEM_PATH_1_0", GST_SEARCH_PATH),
             ("GIO_EXTRA_MODULES", GIO_SEARCH_PATH),
@@ -1997,7 +2045,16 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
     /// plain paths — everything else (the `find` passes, the counting, the refusals) is the shipped
     /// snippet verbatim, so a layout that breaks here breaks a real build.
     fn wrap_on(tree: &std::path::Path, files: &[(&str, bool)]) -> Result<String, String> {
-        wrap_tree(tree, files, None)
+        wrap_tree(tree, files, None, "")
+    }
+
+    /// [`wrap_on`] for a package that declared `main` — the pass ahead of the three searches.
+    fn wrap_on_with_main(
+        tree: &std::path::Path,
+        files: &[(&str, bool)],
+        main: &str,
+    ) -> Result<String, String> {
+        wrap_tree(tree, files, None, main)
     }
 
     /// [`wrap_on`] plus one symlink, for the layout whose `bin/<name>` points into the tree.
@@ -2007,13 +2064,14 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
         link: &str,
         target: &str,
     ) -> Result<String, String> {
-        wrap_tree(tree, files, Some((link, target)))
+        wrap_tree(tree, files, Some((link, target)), "")
     }
 
     fn wrap_tree(
         tree: &std::path::Path,
         files: &[(&str, bool)],
         link: Option<(&str, &str)>,
+        main: &str,
     ) -> Result<String, String> {
         use std::os::unix::fs::PermissionsExt;
         for (rel, executable) in files {
@@ -2028,7 +2086,7 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::os::unix::fs::symlink(target, &path).unwrap();
         }
-        let snippet = launcher_wrap("demo-app", "/lib")
+        let snippet = launcher_wrap("demo-app", "/lib", main)
             .replace(GST_SEARCH_PATH, "/gst")
             .replace(GIO_SEARCH_PATH, "/gio")
             .replace(XDG_DATA_SEARCH_PATH, "/share");
@@ -2132,6 +2190,73 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
         );
     }
 
+    /// The pass a package opts into when the three searches cannot answer.
+    ///
+    /// The layout is the one that motivated the field, reduced to its shape: a vendor CLI shipped
+    /// beside its own Node runtime, an updater and a native addon, all executable and all at the
+    /// archive root. The counting pass refuses it — correctly, since nothing in the tree says which
+    /// is the program — and the same tree resolves once the package names one. The two failure
+    /// arms matter as much: a `main` that names nothing, or names a file that is not executable,
+    /// must fail the build rather than fall through to a search, or the wrapped program would
+    /// depend on the archive at the moment the declaration was already wrong.
+    #[test]
+    fn a_declared_main_answers_the_layout_no_search_can() {
+        let tmp = crate::testutil::TmpDir::new();
+        let files = &[
+            ("demo-app", true),
+            ("node", true),
+            ("updater", true),
+            ("addon.node", true),
+            ("README", false),
+        ];
+
+        // Without it: refused, and the message says what to do about it.
+        let bare = tmp.join("bare");
+        let refused = wrap_on(&bare, files).expect_err("several root executables are ambiguous");
+        assert!(
+            refused.contains("4 executables at the archive root")
+                && refused.contains("name the program with `main`"),
+            "the refusal must point at the remedy: {refused}"
+        );
+
+        // With it: the declared file is wrapped, and the four siblings are left alone.
+        let named = tmp.join("named");
+        assert_eq!(
+            wrap_on_with_main(&named, files, "demo-app"),
+            Ok(format!("WRAPPED {}/demo-app", named.display()))
+        );
+
+        // A nested path is what a vendor's `<slug>/bin/<tool>` layout needs once the hoist has run.
+        let nested = tmp.join("nested");
+        assert_eq!(
+            wrap_on_with_main(
+                &nested,
+                &[("inner/demo-app", true), ("inner/node", true)],
+                "inner/demo-app",
+            ),
+            Ok(format!("WRAPPED {}/inner/demo-app", nested.display()))
+        );
+
+        // Names nothing: a typo, or a vendor that moved the file. Refused by name.
+        let absent = tmp.join("absent");
+        let missing = wrap_on_with_main(&absent, files, "demo-agent")
+            .expect_err("a `main` naming nothing fails the build");
+        assert!(
+            missing.contains("names nothing in the archive"),
+            "the refusal must name the cause: {missing}"
+        );
+
+        // Present but not executable: the same declaration, a different mistake, said differently —
+        // the two call for different fixes.
+        let plain = tmp.join("plain");
+        let unexec = wrap_on_with_main(&plain, files, "README")
+            .expect_err("a `main` naming a non-executable fails the build");
+        assert!(
+            unexec.contains("is not executable"),
+            "the refusal must name the cause: {unexec}"
+        );
+    }
+
     #[test]
     fn the_derived_lock_and_gcroot_names_are_the_ones_already_on_disk() {
         // `Kind::name` is on-disk state: it spells the per-project lock a project's existing pins
@@ -2160,6 +2285,7 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
             backend,
             state: crate::trust::TrustState::Trusted,
             libs: Vec::new(),
+            main: String::new(),
         };
         let url = "https://example.com/app".to_string();
         for (kind, backend) in [
@@ -2214,7 +2340,10 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
                     "demo-app",
                     URL,
                     HASH,
-                    &libs,
+                    &Decor {
+                        libs: &libs,
+                        main: "",
+                    },
                 );
                 crate::testutil::assert_nix_parses(
                     &instantiate,

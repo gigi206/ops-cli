@@ -607,8 +607,8 @@ fn equip_for_gc(prep: &Prepared) -> Result<crate::sandbox::projectstore::Project
     let ctx = prebuilt_ctx(prep);
     for kind in crate::sandbox::prebuilt::DIRECT_ORDER {
         for (name, url) in kind.packages(&prep.cfg.packages) {
-            let libs = crate::sandbox::prebuilt::libs_of(&prep.cfg.packages, &name);
-            match crate::sandbox::prebuilt::provision(kind, &ctx, &name, &url, &libs) {
+            let decor = crate::sandbox::prebuilt::decor_of(&prep.cfg.packages, &name);
+            match crate::sandbox::prebuilt::provision(kind, &ctx, &name, &url, &decor) {
                 Ok((_, root)) => packages.roots.push(root),
                 Err(e) => {
                     crate::diag::error(&format!(
@@ -626,8 +626,8 @@ fn equip_for_gc(prep: &Prepared) -> Result<crate::sandbox::projectstore::Project
     // so it is skipped rather than resolved.
     for kind in crate::sandbox::prebuilt::RESOLVE_ORDER {
         for (name, _command) in kind.resolve_packages(&prep.cfg.packages) {
-            let libs = crate::sandbox::prebuilt::libs_of(&prep.cfg.packages, &name);
-            match crate::sandbox::prebuilt::provision_resolve_pinned(kind, &ctx, &name, &libs) {
+            let decor = crate::sandbox::prebuilt::decor_of(&prep.cfg.packages, &name);
+            match crate::sandbox::prebuilt::provision_resolve_pinned(kind, &ctx, &name, &decor) {
                 Ok(Some((_, root))) => packages.roots.push(root),
                 Ok(None) => {}
                 Err(e) => {

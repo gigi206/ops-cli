@@ -114,6 +114,7 @@ fn mise_pkg(name: &str, token: &str, trusted: bool) -> crate::config::Package {
             crate::trust::TrustState::Untrusted
         },
         libs: Vec::new(),
+        main: String::new(),
     }
 }
 
@@ -123,6 +124,7 @@ fn nix_pkg(name: &str, attr: &str) -> crate::config::Package {
         backend: crate::config::Backend::Nix(attr.into()),
         state: crate::trust::TrustState::Trusted,
         libs: Vec::new(),
+        main: String::new(),
     }
 }
 

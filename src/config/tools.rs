@@ -92,7 +92,7 @@ pub(super) fn apply_packages(
                 continue;
             }
         };
-        upsert_package(out, name, backend, state, Vec::new());
+        upsert_package(out, name, backend, state, Decoration::default());
     }
 }
 
@@ -234,25 +234,28 @@ pub(super) fn apply_tools(
             *make_backend,
         );
     }
-    // A second pass, after the packages exist, since `libs` decorates a package rather than
-    // declaring one: the table it comes from may pair with either declaration form, so both must
-    // already be in `out`.
+    // A second pass, after the packages exist, since the table's fields decorate a package rather
+    // than declaring one: the table they come from may pair with either declaration form, so both
+    // must already be in `out`.
     for (tables, _, label, _) in &backends {
-        apply_prebuilt_libs(out, warnings, source, tables, label, protect_trusted, state);
+        apply_prebuilt_decor(out, warnings, source, tables, label, protect_trusted, state);
     }
 }
 
-/// Attach a `[<label>.<name>]` table's `libs` to the package it names — the extra nixpkgs attributes
-/// that package's ELFs are autoPatchelf'd against, on top of the built-in Electron/Chromium set.
+/// Attach a `[<label>.<name>]` table's decoration to the package it names: `libs`, the extra nixpkgs
+/// attributes that package's ELFs are autoPatchelf'd against on top of the built-in
+/// Electron/Chromium set, and `main`, which file inside the artefact is the program.
 ///
-/// Separate from [`apply_resolvers`] because `libs` decorates a package instead of declaring one: it
-/// applies to both declaration forms (a fixed URL, a `github:` locator, or the `resolve` sentinel),
-/// so it runs once every package of this layer is in `out`. Each name is interpolated into the
-/// generated derivation, so it passes the same charset barrier as a `nix:` attribute; an invalid one
-/// is dropped on its own rather than voiding the list. A table naming a package this layer never
-/// declared, or one whose backend is not this prebuilt backend, is warned about — both are config
-/// mistakes whose silent form would be a package built against the wrong library set.
-fn apply_prebuilt_libs(
+/// Separate from [`apply_resolvers`] because both fields decorate a package instead of declaring
+/// one: they apply to both declaration forms (a fixed URL, a `github:` locator, or the `resolve`
+/// sentinel), so this runs once every package of this layer is in `out`. Both are interpolated into
+/// the generated derivation, so each passes a barrier of its own — a library name the same charset
+/// barrier as a `nix:` attribute, `main` a path barrier — and an invalid value is dropped on its own
+/// rather than voiding the rest. A table naming a package this layer never declared, or one whose
+/// backend is not this prebuilt backend, is warned about — both are config mistakes whose silent
+/// form would be a package built against the wrong library set, or wrapped around the wrong
+/// program.
+fn apply_prebuilt_decor(
     out: &mut [Package],
     warnings: &mut Vec<String>,
     source: &str,
@@ -262,19 +265,26 @@ fn apply_prebuilt_libs(
     state: TrustState,
 ) {
     for (name, raw) in tables {
-        if raw.libs.is_empty() {
+        if raw.libs.is_empty() && raw.main.is_empty() {
             continue;
         }
+        // One word for both fields in every message below, so a table carrying the two is not
+        // reported twice under two names for the same mistake.
+        let what = match (raw.libs.is_empty(), raw.main.is_empty()) {
+            (false, true) => "`libs`",
+            (true, false) => "`main`",
+            _ => "`libs`/`main`",
+        };
         let Some(slot) = out.iter_mut().find(|p| &p.name == name) else {
             warnings.push(format!(
-                "{source}: ignoring `libs` in [{label}.{name}] — no `{name}` in [packages]"
+                "{source}: ignoring {what} in [{label}.{name}] — no `{name}` in [packages]"
             ));
             continue;
         };
         if slot.backend.label() != label {
             warnings.push(format!(
-                "{source}: ignoring `libs` in [{label}.{name}] — `{name}` is a `{}` package, and \
-                 `libs` only applies to a prebuilt one",
+                "{source}: ignoring {what} in [{label}.{name}] — `{name}` is a `{}` package, and \
+                 they only apply to a prebuilt one",
                 slot.backend.label()
             ));
             continue;
@@ -283,7 +293,7 @@ fn apply_prebuilt_libs(
         // choosing, exactly as it may not replace the tool itself.
         if protect_trusted && slot.state == TrustState::Trusted {
             warnings.push(format!(
-                "{source}: ignoring `libs` in [{label}.{name}] — it would override a trusted app's \
+                "{source}: ignoring {what} in [{label}.{name}] — it would override a trusted app's \
                  package"
             ));
             continue;
@@ -303,7 +313,7 @@ fn apply_prebuilt_libs(
             refuse_untrusted(
                 warnings,
                 source,
-                &format!("`libs` in [{label}.{name}] — it decorates a trusted package"),
+                &format!("{what} in [{label}.{name}] — it decorates a trusted package"),
                 state,
             );
             continue;
@@ -328,7 +338,56 @@ fn apply_prebuilt_libs(
             }
         }
         slot.libs = valid;
+
+        if raw.main.is_empty() {
+            continue;
+        }
+        // `binary:` downloads the program itself and installs it under the `[packages]` key, so it
+        // runs no launcher search and has nothing for `main` to answer. Named rather than accepted
+        // and ignored: a field that silently does nothing reads as a setting that did not work.
+        if label == "binary" {
+            warnings.push(format!(
+                "{source}: ignoring `main` in [{label}.{name}] — a `binary:` download is the \
+                 program, so there is no archive to name a file in"
+            ));
+            continue;
+        }
+        if !is_safe_archive_path(&raw.main) {
+            warnings.push(format!(
+                "{source}: ignoring `main` in [{label}.{name}] — `{}` is not a plain relative path \
+                 inside the archive (no leading `/`, no `..`, and only letters, digits and \
+                 `. _ - + /`), and it is written into the generated derivation's shell",
+                raw.main
+            ));
+            continue;
+        }
+        slot.main = raw.main.clone();
     }
+}
+
+/// Whether `path` may be spliced into the install phase's shell as a location inside the unpacked
+/// archive: a plain relative path, and nothing that could leave it or end the word it sits in.
+///
+/// Three separate refusals, and each is load-bearing for a different reason. An **absolute** path
+/// would name a location outside the archive, which is not a thing the archive's own author gets to
+/// pick. A `..` segment is the same escape spelled relatively, and an empty segment (`a//b`, or a
+/// trailing slash) is how one hides. The **charset** is the third: this value lands inside a
+/// double-quoted word in a shell snippet that itself sits inside a nix string, so a quote, a `$`, a
+/// backtick or a newline would not merely name the wrong file, it would end the word and run
+/// something. Admitting a named set rather than refusing a blacklist is what keeps that true when
+/// either language grows a new metacharacter.
+fn is_safe_archive_path(path: &str) -> bool {
+    if path.is_empty() || path.starts_with('/') {
+        return false;
+    }
+    if path
+        .split('/')
+        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return false;
+    }
+    path.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '/'))
 }
 
 /// Bind each `<name> = "<label>:resolve"` sentinel to its `[<label>.<name>]` table, folding it into
@@ -359,10 +418,10 @@ pub(super) fn apply_resolvers(
     let table_names: BTreeSet<String> = tables.keys().cloned().collect();
     for (name, raw) in tables {
         if !resolve_names.contains(&name) {
-            // A table carrying only `libs` is not a resolver declaration at all: it decorates a
-            // package declared with a fixed URL or a `github:` locator, and `apply_prebuilt_libs`
+            // A table carrying only a decoration is not a resolver declaration at all: it decorates
+            // a package declared with a fixed URL or a `github:` locator, and `apply_prebuilt_decor`
             // is what reads it. Only a table that meant to resolve is a mistake here.
-            if !raw.resolve.is_empty() || raw.libs.is_empty() {
+            if !raw.resolve.is_empty() || (raw.libs.is_empty() && raw.main.is_empty()) {
                 warnings.push(format!(
                     "{source}: ignoring [{label}.{name}] — no matching `{name} = \
                      \"{sentinel}\"` in [packages]"
@@ -395,7 +454,13 @@ pub(super) fn apply_resolvers(
             ));
             continue;
         }
-        upsert_package(out, name, make_backend(raw.resolve), state, Vec::new());
+        upsert_package(
+            out,
+            name,
+            make_backend(raw.resolve),
+            state,
+            Decoration::default(),
+        );
     }
     // A sentinel with no `[<label>.<name>]` table at all can never resolve — warn rather than
     // silently drop the package (a sentinel whose table was present but invalid was already warned).
@@ -461,7 +526,7 @@ pub(super) fn apply_flakes(
             name,
             Backend::FlakeInline { content, attr },
             state,
-            Vec::new(),
+            Decoration::default(),
         );
     }
 }
@@ -768,24 +833,44 @@ pub(super) fn upsert_package(
     name: String,
     backend: Backend,
     state: TrustState,
-    libs: Vec<String>,
+    decor: Decoration,
 ) {
     match out.iter_mut().find(|p| p.name == name) {
         Some(slot) => {
             slot.backend = backend;
             slot.state = state;
-            // A layer that re-declares a package re-declares what it is patched against too: the
-            // decoration belongs to the declaration, so it never outlives it. `apply_prebuilt_libs`
-            // fills the new one in from this layer's own table, right after.
-            slot.libs = libs;
+            // A layer that re-declares a package re-declares its decoration too — what it is
+            // patched against, and which file inside it is the program: both belong to the
+            // declaration, so neither outlives it. The layering paths therefore hand over an empty
+            // one and `apply_prebuilt_decor` fills it from this layer's own table right after;
+            // merging a resolved app package hands over that package's own, which is already
+            // resolved and must survive the merge.
+            slot.libs = decor.libs;
+            slot.main = decor.main;
         }
         None => out.push(Package {
             name,
             backend,
             state,
-            libs,
+            libs: decor.libs,
+            main: decor.main,
         }),
     }
+}
+
+/// What [`upsert_package`] installs on the package beside its declaration: the two fields a
+/// `[deb.<name>]` / `[appimage.<name>]` / `[tarball.<name>]` table decorates it with.
+///
+/// One value rather than two parameters, so the rule that a re-declaration replaces the whole
+/// decoration cannot be half-applied by a caller that remembers one field and forgets the other —
+/// which is the shape a second decoration would otherwise invite. [`Default`] is the layering
+/// paths' answer, and it reads as what it means there: this declaration carries none yet.
+#[derive(Default)]
+pub(super) struct Decoration {
+    /// Extra nixpkgs attributes to autoPatchelf against — the table's `libs`.
+    pub(super) libs: Vec<String>,
+    /// The program inside the artefact — the table's `main`.
+    pub(super) main: String,
 }
 
 /// A package label usable as a single path component (it names a garbage-collection

@@ -400,6 +400,34 @@ Anything else fails the build with a message naming what it found: two executabl
 ambiguity, not a pick-the-first situation. The same three shapes apply to `deb:` and `appimage:`,
 which share this install phase.
 
+**When none of the three fits, name the program yourself** with `main` in the package's own table:
+
+```toml
+[packages]
+cursor-agent = "tarball:resolve"
+
+[tarball.cursor-agent]
+resolve = ["sh", "-c", "…"]
+# Which file in the archive is the program, relative to its root (after the hoist below).
+main = "cursor-agent"
+```
+
+The three shapes recognise the layouts vendors actually ship, and the refusal above is the right
+answer when none matches: nothing in such an archive says which file is the program, so a build that
+picked one would be guessing. But some archives are only ambiguous to the *installer*. A CLI shipped
+beside its own Node runtime, an updater, a `rg` and a handful of `.node` addons is obvious to whoever
+wrote the profile and unrecognisable to a search. `main` is where you say so, once, for that package.
+
+The path is relative to the archive root, and to what that root *becomes* after the `tarball:` hoist
+described below, so it is what you read out of `tar -tzf` minus any single top-level directory. It
+must exist and be executable, or the build fails saying which of the two it was: a wrong `main` never
+falls back to a search, because the wrapped program would then depend on the archive rather than on
+your declaration. It is refused for `binary:`, whose download *is* the program. It takes a plain
+relative path only (no leading `/`, no `..`, and letters, digits and `. _ - + /`), because that value
+is written into the generated derivation's shell. Like `libs` it decorates a package rather than
+declaring one, so it sits in the same table and works with either declaration form: a fixed URL, a
+`github:` locator, or the `resolve` sentinel.
+
 `tarball:` alone corrects one thing before those shapes are tried. An archive whose root is a
 **single directory** (the platform slug, or the `<name>-<version>/` prefix a vendor commonly wraps
 its tree in) is **hoisted**: its contents become the root the shapes above scan, so a program that

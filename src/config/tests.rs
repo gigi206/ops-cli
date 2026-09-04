@@ -18,24 +18,28 @@ fn a_mise_nix_package_warns_to_use_the_plain_nix_backend() {
             backend: Backend::Mise("nix:jq".into()),
             state: TrustState::Trusted,
             libs: Vec::new(),
+            main: String::new(),
         },
         Package {
             name: "rg".into(),
             backend: Backend::Mise("aqua:BurntSushi/ripgrep".into()),
             state: TrustState::Trusted,
             libs: Vec::new(),
+            main: String::new(),
         },
         Package {
             name: "hello".into(),
             backend: Backend::Nix("hello".into()),
             state: TrustState::Trusted,
             libs: Vec::new(),
+            main: String::new(),
         },
         Package {
             name: "fd".into(),
             backend: Backend::Mise("nix:fd".into()),
             state: TrustState::Untrusted,
             libs: Vec::new(),
+            main: String::new(),
         },
     ];
     let mut warnings = Vec::new();
@@ -5481,6 +5485,7 @@ fn apply_flakes_refuses_an_untrusted_override_of_a_trusted_tool() {
         backend: Backend::Nix("jq".into()),
         state: TrustState::Trusted,
         libs: Vec::new(),
+        main: String::new(),
     }];
     let mut warnings = Vec::new();
     let flakes: BTreeMap<String, RawInlineFlake> = [("guarded", FLAKE_SRC), ("fresh", FLAKE_SRC)]
@@ -5780,6 +5785,7 @@ fn raw_tarball_resolve(name: &str, command: &[&str]) -> RawConfig {
         RawResolve {
             resolve: command.iter().map(|s| s.to_string()).collect(),
             libs: Vec::new(),
+            main: String::new(),
         },
     );
     raw
@@ -5815,6 +5821,7 @@ fn an_orphan_tarball_table_is_ignored_with_a_warning() {
         RawResolve {
             resolve: CMD.iter().map(|s| s.to_string()).collect(),
             libs: Vec::new(),
+            main: String::new(),
         },
     );
     let r = resolve_no_plugins(raw, None);
@@ -5871,6 +5878,7 @@ fn apply_tarball_resolvers_refuses_an_untrusted_override_of_a_trusted_tool() {
         backend: Backend::Nix("jq".into()),
         state: TrustState::Trusted,
         libs: Vec::new(),
+        main: String::new(),
     }];
     let mut warnings = Vec::new();
     let tarball: BTreeMap<String, RawResolve> = ["guarded", "fresh"]
@@ -5881,6 +5889,7 @@ fn apply_tarball_resolvers_refuses_an_untrusted_override_of_a_trusted_tool() {
                 RawResolve {
                     resolve: CMD.iter().map(|s| s.to_string()).collect(),
                     libs: Vec::new(),
+                    main: String::new(),
                 },
             )
         })
@@ -5920,6 +5929,7 @@ fn raw_deb_resolve(name: &str, command: &[&str]) -> RawConfig {
         RawResolve {
             resolve: command.iter().map(|s| s.to_string()).collect(),
             libs: Vec::new(),
+            main: String::new(),
         },
     );
     raw
@@ -5950,6 +5960,7 @@ fn an_orphan_deb_table_is_ignored_with_a_warning() {
         RawResolve {
             resolve: CMD.iter().map(|s| s.to_string()).collect(),
             libs: Vec::new(),
+            main: String::new(),
         },
     );
     let r = resolve_no_plugins(raw, None);
@@ -5970,6 +5981,7 @@ fn raw_deb_libs(name: &str, locator: &str, libs: &[&str]) -> RawConfig {
         RawResolve {
             resolve: Vec::new(),
             libs: libs.iter().map(|s| s.to_string()).collect(),
+            main: String::new(),
         },
     );
     raw
@@ -5997,6 +6009,7 @@ fn an_untrusted_project_cannot_repatch_a_trusted_baseline_package() {
         RawResolve {
             resolve: Vec::new(),
             libs: vec!["attacker_lib".to_string()],
+            main: String::new(),
         },
     );
 
@@ -6036,6 +6049,7 @@ fn a_trusted_project_may_still_decorate_a_baseline_package() {
         RawResolve {
             resolve: Vec::new(),
             libs: vec!["webkitgtk_4_1".to_string()],
+            main: String::new(),
         },
     );
 
@@ -6074,12 +6088,104 @@ fn a_deb_table_carrying_only_libs_decorates_the_package_without_a_sentinel() {
     );
 }
 
+/// `main` travels the same path `libs` does, and is refused where it would mean nothing or do harm.
+///
+/// Three cases here, and each fails differently if the field is wired carelessly: it must LAND on
+/// the package (or the install phase never sees the declaration), it must be REFUSED for `binary:`
+/// (whose download is the program, so the field would silently do nothing), and it must be refused
+/// when it is not a plain relative path — that value is spliced into the generated derivation's
+/// shell, where a quote or a `$` ends the word it sits in rather than naming a file. The fourth,
+/// surviving the merge the launch reads an app through, is pinned beside `libs` in
+/// `an_apps_decoration_survives_the_merge_onto_the_baseline`, which is the merge's own test.
 #[test]
-fn an_apps_libs_survive_the_merge_onto_the_baseline() {
-    // The launch reads the app through `merge_app`, not through `apps[…]`: a `libs` list that
-    // resolves correctly but is dropped by the merge reaches the builder empty, and the package is
-    // patched against the built-in set alone — the build then fails on the very NEEDED entries the
-    // list was there to satisfy.
+fn main_lands_on_the_package_and_is_refused_where_it_cannot_apply() {
+    let table = |label: &str, name: &str, locator: &str, main: &str| {
+        let mut raw = raw_packages(&[(name, locator)]);
+        let entry = RawResolve {
+            resolve: Vec::new(),
+            libs: Vec::new(),
+            main: main.to_string(),
+        };
+        match label {
+            "binary" => raw.binary.insert(name.to_string(), entry),
+            _ => raw.tarball.insert(name.to_string(), entry),
+        };
+        raw
+    };
+
+    // It lands, and a decoration-only table is not an orphan.
+    let r = resolve_no_plugins(
+        table(
+            "tarball",
+            "app",
+            "tarball:https://example.com/app.tar.gz",
+            "dist/app",
+        ),
+        None,
+    );
+    assert_eq!(pkg(&r.packages, "app").unwrap().main, "dist/app");
+    assert!(
+        !r.warnings.iter().any(|w| w.contains("no matching")),
+        "a main-only table is not an orphan: {:?}",
+        r.warnings
+    );
+
+    // `binary:` has no archive to name a file in.
+    let r = resolve_no_plugins(
+        table("binary", "tool", "binary:https://example.com/tool", "tool"),
+        None,
+    );
+    assert_eq!(pkg(&r.packages, "tool").unwrap().main, "");
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("`main`") && w.contains("is the program")),
+        "the refusal must say why: {:?}",
+        r.warnings
+    );
+
+    // Anything that is not a plain relative path inside the archive.
+    for bad in [
+        "/etc/passwd",
+        "../outside",
+        "a//b",
+        "dist/app\"; rm -rf /",
+        "dist/$(id)",
+        "dist/`id`",
+    ] {
+        let r = resolve_no_plugins(
+            table(
+                "tarball",
+                "app",
+                "tarball:https://example.com/app.tar.gz",
+                bad,
+            ),
+            None,
+        );
+        assert_eq!(
+            pkg(&r.packages, "app").unwrap().main,
+            "",
+            "`{bad}` must not reach the derivation"
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("not a plain relative")),
+            "`{bad}` must be refused by name: {:?}",
+            r.warnings
+        );
+    }
+}
+
+#[test]
+fn an_apps_decoration_survives_the_merge_onto_the_baseline() {
+    // The launch reads the app through `merge_app`, not through `apps[…]`: a decoration that
+    // resolves correctly but is dropped by the merge reaches the builder empty. For `libs` the
+    // package is then patched against the built-in set alone and the build fails on the very NEEDED
+    // entries the list was there to satisfy; for `main` the install phase falls back to the
+    // searches the declaration existed to replace, and refuses the archive. Both fields are
+    // asserted here because the merge carries them through one call, so a fix that carries one and
+    // forgets the other is exactly the mistake this catches.
     let mut app = raw_app(
         &["demo-desktop"],
         &[],
@@ -6092,16 +6198,16 @@ fn an_apps_libs_survive_the_merge_onto_the_baseline() {
         RawResolve {
             resolve: Vec::new(),
             libs: vec!["webkitgtk_4_1".to_string()],
+            main: "opt/demo/demo-desktop".to_string(),
         },
     ))
     .collect();
     let r = resolve_no_plugins(raw_with_app("demo-app", app), None);
     let mut merged = r.clone();
     merged.merge_app(r.apps["demo-app"].clone());
-    assert_eq!(
-        pkg(&merged.packages, "demo-desktop").unwrap().libs,
-        vec!["webkitgtk_4_1"]
-    );
+    let p = pkg(&merged.packages, "demo-desktop").unwrap();
+    assert_eq!(p.libs, vec!["webkitgtk_4_1"]);
+    assert_eq!(p.main, "opt/demo/demo-desktop");
 }
 
 #[test]
@@ -6192,6 +6298,7 @@ fn an_untrusted_project_cannot_repatch_a_trusted_apps_package() {
             RawResolve {
                 resolve: Vec::new(),
                 libs: libs.iter().map(|s| s.to_string()).collect(),
+                main: String::new(),
             },
         ))
         .collect::<BTreeMap<_, _>>()
@@ -6239,6 +6346,7 @@ fn libs_naming_no_package_at_all_are_ignored_with_a_warning() {
         RawResolve {
             resolve: Vec::new(),
             libs: vec!["webkitgtk_4_1".to_string()],
+            main: String::new(),
         },
     );
     let r = resolve_no_plugins(raw, None);
@@ -6294,6 +6402,7 @@ fn raw_appimage_resolve(name: &str, command: &[&str]) -> RawConfig {
         RawResolve {
             resolve: command.iter().map(|s| s.to_string()).collect(),
             libs: Vec::new(),
+            main: String::new(),
         },
     );
     raw
@@ -6323,6 +6432,7 @@ fn an_orphan_appimage_table_is_ignored_with_a_warning() {
         RawResolve {
             resolve: CMD.iter().map(|s| s.to_string()).collect(),
             libs: Vec::new(),
+            main: String::new(),
         },
     );
     let r = resolve_no_plugins(raw, None);
@@ -6374,6 +6484,7 @@ fn the_three_resolve_forms_coexist_as_distinct_backends() {
     let cmd = || RawResolve {
         resolve: CMD.iter().map(|s| s.to_string()).collect(),
         libs: Vec::new(),
+        main: String::new(),
     };
     raw.tarball.insert("web".to_string(), cmd());
     raw.deb.insert("app".to_string(), cmd());

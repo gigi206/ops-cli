@@ -205,6 +205,18 @@ pub(crate) struct Package {
     /// the package that declared it. Each name is interpolated into the generated derivation, so it
     /// passes the same charset barrier a `nix:` attribute does.
     pub(crate) libs: Vec<String>,
+    /// The program inside the archive, declared as `main` in the same `[deb.<name>]` /
+    /// `[appimage.<name>]` / `[tarball.<name>]` table, and empty for every other backend and for a
+    /// package whose layout the install phase already recognises.
+    ///
+    /// The install phase finds the program to wrap by recognising one of three vendor layouts, and
+    /// refuses an archive that matches none — the last of them counts the executables at the root
+    /// and stops at anything but one, because choosing among them is how a build silently wraps the
+    /// wrong program. That leaves an archive carrying a runtime, an updater and native addons
+    /// beside its CLI with no way in, though which file is the program is obvious to whoever wrote
+    /// the profile. This is where they say so, per package, instead of a heuristic widened for
+    /// everyone.
+    pub(crate) main: String,
 }
 
 /// A project's mise file as the resolved configuration sees it: the discovered
