@@ -47,7 +47,28 @@ provision = [
     "-c",
     '''
 set -eo pipefail
-if [ ! -x "$HOME/.local/bin/muse" ] || [ -n "${SBX_UPGRADE:-}${MUSE_SBX_UPDATE:-}" ]; then
+# Guard on the VERSION, not merely on the launcher's existence. The vendor installs a small launcher
+# script beside a versioned payload (`muse-bin-<version>`), and its own `.muse-version` records which
+# payload is active — so a guard keyed on the launcher stops firing after the first install while the
+# payload stays where it was. Measured: a launcher dated 2026-08-06 was still running a 0.1.0-R708.1
+# payload on 2026-09-04, when the channel had long served 1.0.2-R2040.1.
+#
+# The channel is read through the SAME variable the vendor launcher reads, so what this compares
+# against is what an install would fetch. `grep`+`cut` rather than a JSON parser, because the cage
+# carries no jq and the field is unambiguous: `min_version` cannot match a pattern that requires a
+# quote immediately before `version`.
+served="$(curl -fsSL --max-time 10 "${MUSE_CHANNEL_URL:-https://api.meta.ai/muse-code/channels/muse-stable}" 2>/dev/null | grep -oE '"version":"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
+installed="$(cat "$HOME/.local/bin/.muse-version" 2>/dev/null | tr -d '[:space:]' || true)"
+# One definition of "it moved", read by the condition below and by the line that explains it. An
+# unreachable channel or an unreadable version file leaves it EMPTY on purpose: a failed fetch is not
+# evidence that anything moved, and treating it as one would re-download 263 MiB on every offline
+# launch.
+moved=""
+if [ -n "$served" ] && [ -n "$installed" ] && [ "$served" != "$installed" ]; then
+  moved="$installed -> $served"
+fi
+if [ ! -x "$HOME/.local/bin/muse" ] || [ -n "$moved" ] || [ -n "${SBX_UPGRADE:-}${MUSE_SBX_UPDATE:-}" ]; then
+  [ -z "$moved" ] || echo "muse: the release channel moved ($moved) — re-installing …" >&2
   curl -fsSL https://dev.meta.ai/install.sh \
     | MUSE_INSTALL_DIR="$HOME/.local/bin" MUSE_NO_MODIFY_PATH=1 bash
 fi

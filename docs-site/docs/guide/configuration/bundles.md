@@ -307,7 +307,7 @@ The 67 shipped bundles, and what each carries:
 | `cortex` | 2 (`mise:`, `nix:`) | 6 egress entries | none |
 | `crush` | 1 (`mise:`) | 4 egress entries, 2 env vars | `github-install` |
 | `cursor` | 2 (`deb:`, `nix:`) | 31 egress entries, 1 env var, a `deb:` resolver | `chromium-background` |
-| `cursor-agent` | 2 (`nix:`) | 5 egress entries, 1 env var, an install step | none |
+| `cursor-agent` | 1 (`tarball:`) | 4 egress entries, 1 env var, a `tarball:` resolver | none |
 | `deepagents-code` | 3 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
 | `deepseek-harness` | 5 (`mise:`, `nix:`) | 3 egress entries, 1 env var, an install step, a freshness exemption | `npm-audit`, `npm-registry` |
 | `devin` | 1 (`tarball:`) | 4 egress entries, a `tarball:` resolver | none |
@@ -367,9 +367,9 @@ name `opencode`; `hermes-web` and `hermes-webui` name `hermes`. No shipped profi
 one-step import: importing one alone leaves its bundle (and any group that bundle
 REQUIRES) undeclared, and the launch warns.
 
-Ten bundles carry an **install step** (`provision`), because their agent is finished by a command
+Nine bundles carry an **install step** (`provision`), because their agent is finished by a command
 rather than by unpacking: `deepseek-harness`, `junie`, `odysseus`, `openfox` and `trae` build or
-extend what a backend delivered; `cursor-agent`, `muse` and `prime-agent` are vendor bootstraps
+extend what a backend delivered; `muse` and `prime-agent` are vendor bootstraps
 whose installer script is the only way the agent arrives at all, which is why `muse` is the one
 bundle that names no package; and `kiro` and `hermes-desktop` state in the app's home a preference
 the agent reads at startup (telemetry off, the install method it was delivered by). sbx runs the

@@ -11,47 +11,33 @@
 # It carries no `cmd` and no posture: the consuming app keeps its own command, network mode,
 # `gui`/`gpu`/`audio`/`dbus`, limits and home scope.
 #
-# THE AGENT IS A VENDOR BOOTSTRAP, and the bundle carries it. Cursor publishes no package sbx could
-# ride, only an installer script, which is why `[packages]` names an archiver rather than the CLI:
-# the download itself is the `provision` below, the one-time step sbx runs before the consuming
-# app's `cmd`. Naming this bundle gets the agent. What the app still owes is its own `cmd`: the
-# installer writes into the app's home, and a step is a separate process, so the launch is what puts
-# that directory on PATH.
+# THE AGENT IS THE BUNDLE'S `[packages]` ENTRY. Cursor publishes no `.deb`, no nixpkgs attribute and
+# no flake, but it does publish a plain `.tar.gz` — so this rides `tarball:`, and the consuming app
+# owes nothing but `cmd = "cursor-agent"`, the `[packages]` key the generated wrapper is installed
+# as. It was a `curl https://cursor.com/install | bash` bootstrap before, which is why the vendor's
+# `$HOME/.local/bin` and an in-cage archiver appear in nothing here any more: the fetch and the
+# unpack are host-side now, and the artifact is pinned by content hash.
 #
-# UPGRADE. A bootstrap install rides no `[packages]` backend, so there is no lock to roll. The
-# installer carries no update logic of its own either — it always downloads and overwrites with the
-# version `cursor.com/install` currently serves — so re-running it IS the upgrade:
-#     sbx app upgrade cursor-agent
-# re-runs this step in the app's cage with SBX_UPGRADE set, and the guard below yields to it. For
-# one launch only: `sbx app run cursor-agent --env CURSOR_AGENT_SBX_UPDATE=1`. The login lives
-# elsewhere in the app home and is untouched either way.
+# WHICH FILE IS THE PROGRAM. The archive root carries sixteen executables — the CLI's launcher
+# script, the `node` it runs itself with, `rg`, `cursorsandbox`, `crepectl` and the native addons —
+# so none of the install phase's three layout searches can name one, and it refuses rather than
+# guess. `main` below is the answer. The launcher finds its siblings relative to itself, so the
+# whole tree lands together, which is exactly what `tarball:` installs.
+#
+# UPGRADE. `sbx upgrade tarball` re-runs the resolver below, and re-fetches only when the URL it
+# prints actually changed. The login lives in the app home and is untouched by a roll.
 #
 # FIELD ORDER MATTERS. The arrays come BEFORE the sub-tables: TOML reads a key after a
 # `[table]` header as belonging to that table, so an `allow` written below `[…packages]` would
 # silently become `packages.allow` — an unknown key, dropped without a word.
 
 [bundle.cursor-agent]
-# Cursor's official installer, run once inside the cage — contained by bubblewrap + seccomp + the
-# empty netns + the allowlist below — into the app's isolated home. `pipefail` makes a failed
-# `curl … | bash` surface as a clean install error rather than later as `cursor-agent: not found`.
-#
-# The guard is the step's own, and it must be: sbx runs a `provision` on every launch and does not
-# remember that one succeeded. Keying it on the installed binary also self-heals — remove it and the
-# next launch installs again.
-provision = [
-    "bash",
-    "-c",
-    '''
-set -eo pipefail
-if [ ! -x "$HOME/.local/bin/cursor-agent" ] || [ -n "${SBX_UPGRADE:-}${CURSOR_AGENT_SBX_UPDATE:-}" ]; then
-  curl https://cursor.com/install -fsS | bash
-fi
-''',
-]
 allow = [
-    # The vendor site and its download host (the bootstrap fetch), then the agent's own backends.
+    # The vendor site the CLI itself carries as its `websiteUrl`, then the agent's own backends
+    # (`api2`/`api3`/`repo42` all sit under `*.cursor.sh`). The DOWNLOAD host is deliberately not
+    # here: the artifact is fetched host-side by the `tarball:` backend, outside any cage, so no
+    # launch ever reaches it.
     "{GET} https://cursor.com",
-    "{GET} https://downloads.cursor.com",
     "{*} https://*.cursor.sh",
     # A git fetch of the Notion plugin over smart HTTP: github.com is already readable through sbx's
     # built-in set, so only the upload-pack POST is authorized, as the EXACT URL.
@@ -61,12 +47,31 @@ allow = [
 ]
 
 [bundle.cursor-agent.packages]
-# What the bootstrap install unpacks with; the CLI itself arrives through the profile's `cmd`.
-gnutar = "nix:gnutar"
-gzip = "nix:gzip"
+# The agent itself, pinned on first use and rolled by `sbx upgrade tarball`.
+cursor-agent = "tarball:resolve"
 
 [bundle.cursor-agent.env]
 # The CLI's Node runtime reaches its endpoints through Node's built-in fetch (undici), which
 # ignores http_proxy/https_proxy unless this is set — and in the empty netns a bypassed fetch
 # dies with `EAI_AGAIN` before the proxy is ever consulted.
 NODE_USE_ENV_PROXY = "1"
+
+# The `tarball:resolve` command. sbx runs it in a hermetic sandbox (its own base tools; the HOST
+# network, because provisioning is host-side and an allowlist governs runtime egress), captures the
+# URL it prints, validates it is an https `.tar.gz`, and pins it with its content hash. A warm
+# launch reuses the pin offline and never re-runs this.
+#
+# The vendor publishes no release index: the version lives in the install script served at
+# `cursor.com/install`, spelled once in the download URL that script composes. Reading it back names
+# an immutable artifact, which is what a content-hash pin needs — a constant alias would break the
+# next launch with a hash mismatch the moment upstream ships a new build.
+[bundle.cursor-agent.tarball.cursor-agent]
+resolve = [
+    "sh",
+    "-c",
+    'v=$(curl -fsSL https://cursor.com/install | grep -oE "downloads\.cursor\.com/lab/[^/]+" | head -1 | cut -d/ -f3); [ -n "$v" ] || { echo "cursor-agent: the vendor installer named no version" >&2; exit 1; }; echo "https://downloads.cursor.com/lab/$v/linux/x64/agent-cli-package.tar.gz"',
+]
+# Sixteen executables at the archive root, so no layout search can pick one. This names it. The path
+# is relative to the root the `tarball:` hoist produces (the archive wraps its tree in
+# `dist-package/`), so it is what `tar -tzf` shows minus that directory.
+main = "cursor-agent"

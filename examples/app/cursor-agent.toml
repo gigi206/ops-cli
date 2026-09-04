@@ -4,7 +4,7 @@
 #   sbx app import    examples/app/cursor-agent.toml
 #   sbx app run cursor-agent -- -p "your task here"        # headless: prompt in, result out
 #
-# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The tooling its bootstrap install needs and the hosts it reaches come from a
+# THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent itself and the hosts it reaches come from a
 # shared BUNDLE, so import it too:
 #     sbx bundle import examples/bundle/cursor-agent.toml
 #     sbx app import    examples/app/cursor-agent.toml
@@ -17,23 +17,21 @@
 # Cursor agent from a terminal: `cursor-agent -p "…"` takes a prompt and returns a result, the
 # form used in CI, git hooks, and scripts — the ideal fit for sbx's Mode-B sandbox.
 #
-# PACKAGING — a bootstrap download, NOT a clean sbx backend (and NOT the npm "cursor-agent").
-# Cursor distributes the CLI ONLY as a versioned tarball from `downloads.cursor.com` (its own
-# `curl https://cursor.com/install | bash` installer) — there is no nixpkgs attribute, no GitHub
-# release, and no genuine npm/mise package (the npm package literally named `cursor-agent` is an
-# UNRELATED third-party package by another author — using it would install the wrong thing). So
-# none of sbx's `nix:`/`mise:`/`flake:`/`deb:`/`appimage:` backends fit. Nor does `tarball:`, and
-# the reason is the archive rather than the URL (which is versioned and resolvable): it unpacks to
-# a `dist-package/` tree of JavaScript plus native `.node` addons, with no executable for the
-# install phase to wrap — measured against `agent-cli-package.tar.gz`. Instead the `cmd` below
-# runs Cursor's OWN installer INSIDE the cage on the first launch, into the app's isolated home —
-# contained by bubblewrap + seccomp + the empty netns + the egress allowlist. The installer needs
-# `tar` + `gzip` (absent from the base toolset), so `[packages]` provisions them via nix (host-side,
-# seeded, offline-reusable). The downloaded `cursor-agent` binary is not autoPatchelf'd, so it runs
-# against the cage's `nix-ld` loader shim (the standard mechanism for a foreign dynamic binary; the
-# base userland supplies glibc + libstdc++ + zlib, the runtime a Node CLI dlopens — without `libz.so.1`
-# it dies `node-loader: libz.so.1: cannot open shared object file`). The download needs the network AND `cursor.com` /
-# `downloads.cursor.com` in `allow` on the first launch of each project; later launches skip it.
+# PACKAGING — `tarball:`, and NOT the npm "cursor-agent". Cursor distributes the CLI only as a
+# versioned tarball from `downloads.cursor.com`, fetched by its own `curl https://cursor.com/install
+# | bash` installer: there is no nixpkgs attribute, no GitHub release, and no genuine npm/mise
+# package (the npm package literally named `cursor-agent` is an UNRELATED third-party package by
+# another author — using it would install the wrong thing). What there IS is a resolvable versioned
+# URL, so the bundle rides `tarball:resolve`: the version is read out of the install script, the
+# artifact is pinned by content hash, and `sbx upgrade tarball` rolls it.
+#
+# That archive needs one thing the three layout searches cannot supply. It unpacks to a
+# `dist-package/` tree whose root holds sixteen executables — the launcher, its own `node`, `rg`,
+# `cursorsandbox`, `crepectl`, the native `.node` addons — so the install phase refuses to guess
+# which is the program, and the bundle's `main = "cursor-agent"` names it. Everything is then
+# host-side: the fetch, the unpack, and the autoPatchelf against the curated library set. Nothing
+# downloads inside the cage any more, so no launch needs `downloads.cursor.com`, and the app's
+# `cmd` is just the package key.
 #
 # CREDENTIAL POSTURE — a Cursor ACCOUNT key, NOT a header-injectable provider key. `cursor-agent`
 # authenticates to YOUR Cursor account (which pays for the models) and routes model traffic through
@@ -78,41 +76,31 @@
 # (a Chromium client) — do not copy one transport set to the other.
 #
 # STATUS — honest scope. This profile IMPORTS and RESOLVES cleanly (covered by the shipped-profiles
-# test). PROVEN LIVE: the bootstrap download + the un-patchelf'd binary under nix-ld runs (after
-# sbx's base userland supplies `libz.so.1`), the CLI routes through sbx's proxy, and the api5 agent
-# hosts + repo42 reach their transport. Still to be proven with a real Cursor account: the AUTH
+# test). PROVEN LIVE: the `tarball:` resolve, pin and build, and `cursor-agent --version` answering
+# from the built store path; before the move to that backend, the bootstrap download and the CLI
+# routing through sbx's proxy, with the api5 agent hosts + repo42 reaching their transport. Still to
+# be proven with a real Cursor account: the AUTH
 # (`CURSOR_API_KEY` via `--env`, or `cursor-agent login`) and a full prompt round-trip. Treat it as
 # a grounded starting point to validate, not a turnkey profile. If a request is blocked, the proxy
 # names the host it refused — add it to `allow` (or check ahead with `sbx test net <url>`).
-cmd = [
-    "bash",
-    "-c",
-    '''
-set -e
-# The install is the `cursor-agent` bundle's `provision`, and sbx has already run it by the time
-# this starts. A `provision` is a separate process, so the PATH it exported does not reach this
-# shell: the installer writes the binary under the app's home, and the launch puts it back on PATH.
-export PATH="$HOME/.local/bin:$PATH"
-exec cursor-agent "$@"
-''',
-    # `$0` placeholder: `sbx app run cursor-agent -- <args>` appends <args> to this cmd array, so they
-    # arrive as `$1 $2 …` (this element fills `$0`) and reach the agent verbatim via `exec … "$@"`.
-    "cursor-agent",
-]
+# The bundle's `[packages]` key, which is what the generated wrapper is installed as and what the
+# launch puts on PATH. `sbx app run cursor-agent -- <args>` appends its arguments to this command,
+# and they reach the agent verbatim — no shell wrapper, since nothing has to be put on PATH by hand
+# any more.
+cmd = "cursor-agent"
 
 # --- The agent's requirements come from its bundle ------------------------------------------------
-# `use` pulls in the `cursor-agent` BUNDLE — the archiver its bootstrap unpacks with, the hosts the CLI reaches and the proxy variable its
-# Node runtime needs —
-# from one declaration shared with the bundle file itself, so this profile cannot fall behind when
-# the agent's requirements change. What the bundle CANNOT carry is the install step itself: that is
-# the `cmd` above, and a consuming app has to reproduce it to get the agent at all.
+# `use` pulls in the `cursor-agent` BUNDLE — the agent itself, the hosts the CLI reaches and the
+# proxy variable its Node runtime needs — from one declaration shared with the bundle file itself,
+# so this profile cannot fall behind when the agent's requirements change. The bundle is COMPLETE:
+# an app that names it gets the agent, and owes only the `cmd` above naming the package key.
 #
 # THE BUNDLE IS NOT IN THIS FILE — import it too, in either order:
 #     sbx bundle import examples/bundle/cursor-agent.toml
 # Without it the launch warns that the bundle is undeclared and the tooling is simply absent.
 use = ["cursor-agent"]
 
-# No `[packages]` here: what the bundle provisions comes from it — see `use` above.
+# No `[packages]` here: the agent and everything it needs come from the bundle — see `use` above.
 
 # An app is read-by-default ({GET,HEAD}); a host the agent WRITES to (POSTing prompts/context) is
 # opened to all verbs with a `{*}` prefix. See the EGRESS note in the header for the HTTP/2 caveat.

@@ -57,7 +57,26 @@ set -eo pipefail
 # same prefix on PATH for the launch.
 export NPM_CONFIG_PREFIX="$HOME/.npm-global"
 export PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
-if [ ! -x "$NPM_CONFIG_PREFIX/bin/prime-agent" ] || [ -n "${SBX_UPGRADE:-}${PRIME_AGENT_SBX_UPDATE:-}" ]; then
+# Guard on the VERSION, not merely on the binary's existence. The vendor publishes this agent as an
+# npm package that is NOT on the public registry, so no sbx backend can pin it and this step is the
+# only thing that advances it — and a guard that just asks "is it installed?" never fires again,
+# leaving the agent at whatever the first launch fetched until someone runs a re-install by hand.
+# Both halves of the comparison already exist: the release channel is a few bytes of text, and the
+# installed version is in the package's own manifest.
+#
+# The channel is read through the SAME variable the vendor installer reads, so what this compares
+# against is what an install would actually fetch.
+served="$(curl -fsSL --max-time 10 "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/${PRIME_AGENT_RELEASE_CHANNEL:-stable}" 2>/dev/null | tr -d '[:space:]' | sed 's/^v//' || true)"
+installed="$(node -p "require('$NPM_CONFIG_PREFIX/lib/node_modules/prime-agent/package.json').version" 2>/dev/null || true)"
+# One definition of "it moved", read by the condition below and by the line that explains it. An
+# unreachable channel or an unreadable manifest leaves it EMPTY on purpose: a failed fetch is not
+# evidence that anything moved, and treating it as one would re-download on every offline launch.
+moved=""
+if [ -n "$served" ] && [ -n "$installed" ] && [ "$served" != "$installed" ]; then
+  moved="$installed -> $served"
+fi
+if [ ! -x "$NPM_CONFIG_PREFIX/bin/prime-agent" ] || [ -n "$moved" ] || [ -n "${SBX_UPGRADE:-}${PRIME_AGENT_SBX_UPDATE:-}" ]; then
+  [ -z "$moved" ] || echo "prime-agent: the release channel moved ($moved) — re-installing …" >&2
   export PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=1
   curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | bash
 fi
