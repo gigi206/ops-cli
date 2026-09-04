@@ -274,6 +274,12 @@ pub(crate) fn upgrade_mise_packages(
         let runtime = home.runtime();
         let mut cfg = cfg;
         cfg.warnings.clear();
+        // The command below IS the install chain, and `build` composes `cfg.provisions` ahead of
+        // whatever command it is given — so leaving them declared here ran every step twice in one
+        // cage. Invisible while the output was dropped on success, and paid for on every roll: a
+        // well-guarded step no-ops its second run, an unguarded one does its whole work again.
+        // `steps` was taken out of this config before the loop, so clearing it loses nothing.
+        cfg.provisions.clear();
         prep.cfg = cfg;
 
         let cmd = mise_upgrade_cmd(
