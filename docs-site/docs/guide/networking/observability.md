@@ -220,6 +220,18 @@ mute  = ["play.googleapis.com", "*.datadoghq.com", "antigravity-unleash.goog"]
   [`sbx net stats`](#sbx-net-stats), so you always know *how many* happened.
 - **It only suppresses refusals** (`deny`): a security-guard `blocked`, an `error`,
   and every `allow` are always shown.
+- **It also silences that refusal's desktop notification**, not just its log line. The
+  two travel together for a denied request, so muting a chatty denied host quiets it on
+  both surfaces at once.
+- **It cannot quiet a security-guard `blocked`, on either surface.** A refused credential
+  leak (`outbound-secret`), an SSRF target, a `host-mismatch`: these are not `deny`
+  verdicts and no mute rule reaches them, deliberately, since a rule in the config must
+  not be able to hide the guards from you. If such a notification is repeating and you
+  have decided you do not need to see it again, the lever is
+  [`[notify]`](../configuration/notify), not `mute`. `[notify.events] network = "once"`
+  announces each distinct problem once and then stays quiet about it, and
+  `sbx run --notify off` silences a single launch. The refusal still happens and still
+  reaches `sbx net logs` either way.
 - **`--all` brings them back**, each tagged `muted`. Muted refusals live in a
   **separate** ring, so a chatty muted host can never push a real event off the log.
 - **It reads its verbs the way a `deny` does.** A mute naming no verb silences that

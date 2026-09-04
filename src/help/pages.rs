@@ -2501,7 +2501,15 @@ pub(super) const PAGES: &[Page] = &[
             which the proxy folds into its effective policy — so it quiets the log immediately, on\n\
             any filtering-posture session. It writes no file (no re-trust) and dies with the session;\n\
             scope it with `-a <app>`/`--all`. A live mute is not un-loaded by `unmute` (it is a\n\
-            log filter with no counter-verdict) — it simply ends with the session.",
+            log filter with no counter-verdict) — it simply ends with the session.\n\
+            \n\
+            A mute quiets both surfaces a denied request reaches — its log line and its desktop\n\
+            notification — but only for a `deny`. A security-guard `blocked` (a refused credential\n\
+            leak, an SSRF target, a `host-mismatch`) is not a deny, and no mute reaches it: a rule\n\
+            in the config must not be able to hide the guards. If it is that notification you want\n\
+            to stop seeing, the lever is `[notify]` — `[notify.events] network = \"once\"` announces\n\
+            each distinct problem once, `sbx run --notify off` silences one launch — and the\n\
+            refusal still reaches `sbx net logs` either way.",
     },
     Page {
         path: &["net", "unmute"],

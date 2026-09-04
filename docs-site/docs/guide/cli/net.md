@@ -167,6 +167,13 @@ effect immediately and dies with the session, exactly like `sbx net allow|deny -
 (scope with `-a <app>`/`--all`). A live mute is not un-loaded by `unmute` (a log filter has no
 counter-verdict); it ends with the session.
 
+A mute quiets both surfaces a denied request reaches, its log line and its desktop
+notification, but only for a `deny`. A security-guard `blocked` (a refused credential
+leak, an SSRF target, a `host-mismatch`) is not a deny and no mute reaches it, which is
+deliberate: a rule in the config must not be able to hide the guards. When it is such a
+notification you want to stop seeing, the lever is [`[notify]`](../configuration/notify),
+typically `[notify.events] network = "once"` or `sbx run --notify off` for one launch.
+
 ```sh
 sbx net mute play.googleapis.com -a agy             # persist to the profile
 sbx net mute play.googleapis.com --session -a agy   # quiet a running agy session now

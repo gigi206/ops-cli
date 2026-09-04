@@ -1490,9 +1490,20 @@ impl EgressPolicy {
     }
 
     /// Whether a **denied** request to `host:port` for `path`/`method` matches a mute rule — a
-    /// LOG-ONLY filter (SELinux `dontaudit`): it never affects the verdict (only [`Self::explain`]
-    /// does), only whether the refusal enters the default `sbx net log` view. The proxy consults it
-    /// at logging time, after the verdict, and still counts a muted refusal in `sbx net stats`.
+    /// REPORTING filter (SELinux `dontaudit`): it never affects the verdict (only
+    /// [`Self::explain`] does). The proxy consults it at logging time, after the verdict, and still
+    /// counts a muted refusal in `sbx net stats`.
+    ///
+    /// It decides **two** surfaces, not one: whether the refusal enters the default `sbx net log`
+    /// view, and whether it is announced as a desktop notification. Both are gated on the same
+    /// answer, at the same chokepoint, so a host quieted in the log is quieted on the desktop too.
+    ///
+    /// And it is asked only of a `deny`. A security-guard `blocked` — an outbound secret, an SSRF
+    /// target, a host mismatch — never reaches this question, so no mute can quiet one on either
+    /// surface. That is deliberate: a rule in the config must not be able to hide the guards. The
+    /// lever for such a notification is the `[notify]` policy, which is where a reader whose
+    /// problem is a repeating toast has to be sent.
+    ///
     /// Matching is deliberately **port- and transport-agnostic** ([`Rule::matches_mute`]): a mute
     /// names a *host* to silence, so a bare-host mute suppresses that host's refusals on every port
     /// and scheme — its cleartext `http://…:80` noise (a component updater, an NTP-over-HTTP probe)
