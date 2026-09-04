@@ -88,6 +88,25 @@ pub(super) fn top_level(pal: &Palette) -> String {
     out
 }
 
+/// The folded option rows under their heading, indented one level below the ungrouped list.
+fn emit_group(
+    out: &mut String,
+    folded: Option<(&'static str, &'static [&'static str])>,
+    names: &[&str],
+    pal: &Palette,
+) {
+    let Some((heading, _)) = folded else { return };
+    if names.is_empty() {
+        return;
+    }
+    out.push_str(&format!(
+        "\n  {}{heading}:{}\n    {}\n\n",
+        pal.head,
+        pal.reset,
+        names.join(", ")
+    ));
+}
+
 /// Render one page: header, usage, options, subcommands (alphabetical), then prose.
 pub(super) fn render(page: &Page, pal: &Palette) -> String {
     let joined = page.path.join(" ");
@@ -106,9 +125,37 @@ pub(super) fn render(page: &Page, pal: &Palette) -> String {
     ));
 
     if !page.options.is_empty() {
+        // A page may fold part of its list under a heading — see `super::OPTION_GROUPS` for why.
+        // The folded rows keep their place in `page.options` (completion reads that table), so this
+        // only decides where each one is PRINTED: everything else in order, then the group.
+        let folded = super::option_group(page.path);
+        let is_folded = |flag: &str| folded.is_some_and(|(_, members)| members.contains(&flag));
         out.push_str(&format!("\n{}Options:{}\n", pal.head, pal.reset));
-        let width = page.options.iter().map(|(f, _)| f.len()).max().unwrap_or(0);
-        for (flag, desc) in page.options {
+        let width = page
+            .options
+            .iter()
+            .filter(|(f, _)| !is_folded(f))
+            .map(|(f, _)| f.len())
+            .max()
+            .unwrap_or(0);
+        // Printed from `page.options` rather than from the group's own list, so the rendered set is
+        // the page's set: a member the page dropped disappears here too, instead of being announced
+        // as a target that no longer exists.
+        let folded_names: Vec<&str> = page
+            .options
+            .iter()
+            .map(|(f, _)| *f)
+            .filter(|f| is_folded(f))
+            .collect();
+        let mut group_emitted = folded_names.is_empty();
+        for (flag, desc) in page.options.iter().filter(|(f, _)| !is_folded(f)) {
+            // The group sits between the operands and the flags, because that is what it is made
+            // of: every folded row on such a page is an operand, and printing it after `--project`
+            // would put a way to name the target below the flags that modify one.
+            if !group_emitted && flag.starts_with('-') {
+                emit_group(&mut out, folded, &folded_names, pal);
+                group_emitted = true;
+            }
             item(
                 &mut out,
                 pal.flag,
@@ -117,6 +164,9 @@ pub(super) fn render(page: &Page, pal: &Palette) -> String {
                 width,
                 &paint_inline_code(desc, pal),
             );
+        }
+        if !group_emitted {
+            emit_group(&mut out, folded, &folded_names, pal);
         }
     }
 

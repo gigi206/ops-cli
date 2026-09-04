@@ -53,6 +53,35 @@ struct Page {
     details: &'static str,
 }
 
+/// Option rows a page renders **folded under a heading** instead of one per line, keyed by command
+/// path.
+///
+/// It exists for a page whose option list is mostly one repeated shape. `sbx upgrade` is the case:
+/// seven of its ten rows are a channel name, each a way to narrow the roll to one backend, and
+/// listing them at the same level as the default made the command read as a choice to make when the
+/// answer is almost always `sbx upgrade` with no argument at all. Folding them says which rows are
+/// the decision and which are the narrowing, without taking a capability away.
+///
+/// It governs the RENDERING only. The rows stay in [`Page::options`], which is what
+/// [`options_of`] answers and what completion walks — so a folded target still completes, and the
+/// help/completion parity guards still see one page with ten rows. A member named here that the
+/// page does not carry is simply not folded; the table cannot invent a row.
+const OPTION_GROUPS: &[(&[&str], &str, &[&str])] = &[(
+    &["upgrade"],
+    "narrow to one channel",
+    &[
+        "nix", "mise", "flake", "deb", "appimage", "tarball", "binary",
+    ],
+)];
+
+/// The heading and members folded on this page, or `None` when it folds nothing.
+fn option_group(path: &[&str]) -> Option<(&'static str, &'static [&'static str])> {
+    OPTION_GROUPS
+        .iter()
+        .find(|(p, _, _)| *p == path)
+        .map(|(_, heading, members)| (*heading, *members))
+}
+
 /// Every alternate spelling a dispatcher accepts: the command path it is read under, the
 /// spelling itself, and the canonical name it stands for. Aliases stay out of [`PAGES`] —
 /// a page per spelling would double every subcommand listing, every completion candidate

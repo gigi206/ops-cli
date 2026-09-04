@@ -29,6 +29,50 @@ fn colored_render_balances_every_span() {
     assert_balanced(&top_level(&Palette::colored()));
 }
 
+/// A folded option group changes where a row is PRINTED and nothing else.
+///
+/// The two halves are what make the fold safe. The rendered page must show the heading and must not
+/// give a folded target a line of its own, or the fold did not happen; and `options_of` must still
+/// answer every one of them, because that table is what completion walks — a target that stops
+/// completing is a capability quietly removed, which is the opposite of what folding is for.
+#[test]
+fn a_folded_option_group_moves_the_row_without_removing_it() {
+    let page = find(&["upgrade"]).expect("upgrade page");
+    let rendered = render(page, &Palette::plain());
+    let folded = [
+        "nix", "mise", "flake", "deb", "appimage", "tarball", "binary",
+    ];
+
+    assert!(
+        rendered.contains("narrow to one channel:"),
+        "the heading must be rendered:\n{rendered}"
+    );
+    for name in folded {
+        assert!(
+            !rendered
+                .lines()
+                .any(|l| l.trim_start().starts_with(&format!("{name} "))),
+            "`{name}` must not keep an option line of its own:\n{rendered}"
+        );
+    }
+    // The group sits between the operands and the flags, which is where every folded row belongs:
+    // they are operands themselves.
+    let heading = rendered.find("narrow to one channel:").expect("heading");
+    let flag = rendered.find("-a, --app").expect("a flag row");
+    assert!(heading < flag, "the group precedes the flags:\n{rendered}");
+
+    let offered: Vec<&str> = crate::help::options_of(&["upgrade"])
+        .iter()
+        .map(|(f, _)| *f)
+        .collect();
+    for name in folded {
+        assert!(
+            offered.contains(&name),
+            "`{name}` must still be offered to completion: {offered:?}"
+        );
+    }
+}
+
 #[test]
 fn plain_render_emits_no_escapes() {
     let page = find(&["app"]).expect("app page");
