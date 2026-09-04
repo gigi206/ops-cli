@@ -661,6 +661,12 @@ pub(super) fn wrap_background(
     out
 }
 
+/// Distinguishes the proxies one process stands up, for the one name of theirs that is persisted.
+///
+/// A launch stands up a single proxy, so this stays 0 there. A batch roll stands up one per app,
+/// and their stat files must not be the same file — see where it is read for what that cost.
+static PROXY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Start the host proxy for `policy` on a fresh per-launch Unix socket, write its CA, and
 /// return the cage wiring plus a guard owning the on-disk artifacts. The proxy is serving
 /// before this returns (the listener is bound and a thread is accepting), so the cage's
@@ -672,12 +678,6 @@ pub(super) fn wrap_background(
 /// a [`HeaderInjection`]. The plaintext never crosses into the cage — only the per-host
 /// injection does, applied by the proxy to matching allowed requests. A missing or malformed
 /// source aborts the launch (fail-closed), so the proxy never injects an empty credential.
-/// Distinguishes the proxies one process stands up, for the one name of theirs that is persisted.
-///
-/// A launch stands up a single proxy, so this stays 0 there. A batch roll stands up one per app,
-/// and their stat files must not be the same file — see where it is read for what that cost.
-static PROXY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start(
     layout: &Layout,
