@@ -92,8 +92,9 @@ pub(crate) struct Expanded {
     /// What the expansion found worth saying: an entry that matched nothing, a file reachable by a
     /// second name, a path git tracks. Surfaced by the launch, never fatal on its own.
     pub(crate) warnings: Vec<String>,
-    /// Set when the policy asks for more masks than [`MASK_MAX`]. The launch fails closed on it:
-    /// dropping the excess would leave paths open while the config says they are shut.
+    /// Set when the expansion cannot deliver what the policy asks for: the project root does not
+    /// resolve, or the policy asks for more masks than [`MASK_MAX`]. The launch fails closed on it,
+    /// because the alternative is a run whose paths are open while the config says they are shut.
     pub(crate) refused: Option<String>,
 }
 
@@ -160,9 +161,14 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
         return out;
     }
     let Ok(root) = project.canonicalize() else {
-        out.warnings.push(format!(
-            "cannot resolve the project directory {} — no `[fs]` mask is applied, so every path it \
-             names stays open to the cage",
+        // Refused, not warned. Everything below resolves against this root, so without it the
+        // expansion yields nothing and the launch would run with **no** mask at all — the answer a
+        // policy that names none produces, which is the opposite of what this one says. A warning
+        // left that difference for a reader to notice in passing; `resolve_list` already refuses an
+        // entry whose parent it cannot read, and this is the same failure one level up.
+        out.refused = Some(format!(
+            "cannot resolve the project directory {} — the `[fs]` masks it names cannot be placed, \
+             and a run without them leaves open exactly the paths the policy closes",
             project.display()
         ));
         return out;
@@ -716,6 +722,39 @@ mod tests {
             readonly: readonly.iter().map(|s| s.to_string()).collect(),
             ..FsPolicy::default()
         }
+    }
+
+    /// A project root that does not resolve refuses the launch instead of dropping every mask.
+    ///
+    /// Everything the expansion does resolves against that root, so failing to read it yields the
+    /// same empty answer a policy naming nothing produces — while the config says the opposite. The
+    /// launch reads `refused` as fatal and `warnings` as prose, so this is the difference between a
+    /// run that stops and a run whose secrets are readable under a line nobody had to act on.
+    #[test]
+    fn a_project_root_that_does_not_resolve_refuses_rather_than_dropping_every_mask() {
+        let tmp = TmpDir::new();
+        let absent = tmp.path().join("gone");
+
+        let e = expand(&absent, &policy(&["prod.key"], &[]));
+        let refusal = e
+            .refused
+            .expect("an unresolvable root must refuse the launch");
+        assert!(
+            refusal.contains("gone"),
+            "the refusal must name the directory it could not resolve: {refusal}"
+        );
+        assert!(
+            e.denied.is_empty() && e.readonly.is_empty(),
+            "and it must place nothing, which is why it cannot be a warning"
+        );
+
+        // The control arm: a policy that asks for nothing is not a policy that failed, and the same
+        // unresolvable path must stay silent for it — the early return above it sees to that.
+        let empty = expand(&absent, &policy(&[], &[]));
+        assert!(
+            empty.refused.is_none(),
+            "a launch declaring no `[fs]` masks has nothing to place and nothing to refuse"
+        );
     }
 
     #[test]
