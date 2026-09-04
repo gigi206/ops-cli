@@ -41,8 +41,10 @@ pub(crate) const ENV_ARGS_PLACEHOLDER: &str = "@sbx-env-args";
 /// The bubblewrap argument list for `spec`, ready to exec, plus the descriptor it must inherit to
 /// read the cage's environment (`None` when the cage sets no variables at all).
 ///
-/// **Hold the returned file** until bwrap has read it: the descriptor is deliberately not
-/// close-on-exec, and dropping the `File` closes the number the argv points at.
+/// **Hold the returned file** until bwrap has read it — dropping the `File` closes the number the
+/// argv points at — and prepare the command with [`super::memfd::inherit_across_exec`]: the
+/// descriptor is close-on-exec in this process, so an exec that was not prepared reaches bwrap with
+/// that number already closed.
 pub(crate) fn compose(spec: &SandboxSpec) -> io::Result<(Vec<OsString>, Option<File>)> {
     let mut argv = to_argv(spec);
     let Some(file) = env_fd(spec)? else {
@@ -267,8 +269,16 @@ pub(crate) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
 /// bwrap then reports `Invalid fd` instead of a result.
 #[cfg(test)]
 pub(super) fn run_bwrap(bwrap: &Path, spec: &SandboxSpec) -> io::Result<std::process::Output> {
-    let (argv, _env) = compose(spec)?;
-    std::process::Command::new(bwrap).args(argv).output()
+    let (argv, env) = compose(spec)?;
+    let mut command = std::process::Command::new(bwrap);
+    command.args(argv);
+    // Prepared exactly as the launch paths prepare theirs: the descriptor is close-on-exec in this
+    // process, so without this bwrap is handed a number that closed at the exec.
+    let held: Vec<File> = env.into_iter().collect();
+    super::memfd::inherit_across_exec(&mut command, &held);
+    let out = command.output();
+    drop(held);
+    out
 }
 
 /// The arguments the descriptor carries, read back as bwrap will parse them — the cage's

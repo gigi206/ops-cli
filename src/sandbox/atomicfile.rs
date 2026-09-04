@@ -48,18 +48,39 @@ pub(crate) fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) ->
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
     let staged = || -> io::Result<()> {
-        std::fs::write(&tmp, bytes)?;
+        // Written and flushed to the device before the rename, rather than through `fs::write`.
+        // The rename orders itself against the data only if the data is already durable: without
+        // this, a machine that loses power just after the rename can come back with the new name
+        // pointing at an inode whose blocks were never written — a file that is present, is the
+        // right size, and holds zeros. `write_atomic` publishes the pointer to a storage volume and
+        // the pin locks a launch resolves against, so an empty-but-present one is the shape that
+        // costs most.
+        let file = std::fs::File::create(&tmp)?;
+        {
+            use io::Write as _;
+            let mut file = &file;
+            file.write_all(bytes)?;
+            file.flush()?;
+        }
         if let Some(mode) = mode {
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
         }
-        Ok(())
+        file.sync_all()
     };
     staged().inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })?;
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
-    })
+    })?;
+    // And the directory entry itself, which is a second piece of metadata: the rename is atomic
+    // against a concurrent reader either way, but only this makes it survive a crash. Best-effort —
+    // a filesystem that will not open its own directory has already published the file, and failing
+    // the write here would report a failure that did not happen.
+    if let Ok(dir) = std::fs::File::open(dir) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 /// A number no other staging in this process will use, for the temp name a content-keyed

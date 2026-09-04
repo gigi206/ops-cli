@@ -54,7 +54,7 @@ pub(crate) fn proc_cmd(args: Vec<OsString>) -> ExitCode {
     }
 }
 
-/// `sbx proc allow|deny <rule> [--local|--global|-c <file>] [-a <app>]`: add a process/exec rule to a
+/// `sbx proc allow|deny <rule> [--local|--global] [-a <app>]`: add a process/exec rule to a
 /// config file's `[proc]` allow/deny list. On a fresh project a `deny` bootstraps `mode = "enforce"`
 /// (the denylist posture) so it takes effect at once; an `allow` requires `mode = "ask"` (it is inert
 /// otherwise). A project `.sbx.toml` write is trust-gated and re-trusted, exactly like
@@ -117,7 +117,7 @@ fn removal_words(list: config::manage::ProcList) -> (&'static str, &'static str)
     }
 }
 
-/// `sbx proc unallow|undeny <rule> [--local|--global|-c <file>] [-a <app>]`: remove one exec rule
+/// `sbx proc unallow|undeny <rule> [--local|--global] [-a <app>]`: remove one exec rule
 /// from a config file — the inverse of `sbx proc allow|deny`, so a rule is undone with the
 /// vocabulary it was written in. Idempotent (removing a rule that is not there is a reported no-op,
 /// not an error); a project `.sbx.toml` write is trust-gated and re-trusted exactly like the add

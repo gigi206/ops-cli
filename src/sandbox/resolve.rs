@@ -213,17 +213,23 @@ pub(crate) fn resolve_url(
             "cannot build the resolve sandbox for `{name}`: {e:?}"
         ))
     })?;
-    // `_env` keeps the descriptor carrying the cage's environment open until bwrap has read it.
-    let (argv, _env) = super::argv::compose(&spec)?;
-    let out = Command::new(cage.bwrap)
+    // `env` keeps the descriptor carrying the cage's environment open until bwrap has read it, and
+    // is read below to prepare the exec that inherits it.
+    let (argv, env) = super::argv::compose(&spec)?;
+    let mut command = Command::new(cage.bwrap);
+    command
         .args(argv)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| {
-            io::Error::other(format!("could not run the `{name}` resolve command: {e}"))
-        })?;
+        .stderr(Stdio::piped());
+    // The descriptor is close-on-exec here; this is what carries it across the one exec that needs
+    // it. See [`super::memfd::write`].
+    if let Some(env) = env.as_ref() {
+        super::memfd::inherit_across_exec(&mut command, std::slice::from_ref(env));
+    }
+    let out = command.output().map_err(|e| {
+        io::Error::other(format!("could not run the `{name}` resolve command: {e}"))
+    })?;
     if !out.status.success() {
         let detail = String::from_utf8_lossy(&out.stderr);
         let detail = detail.trim();

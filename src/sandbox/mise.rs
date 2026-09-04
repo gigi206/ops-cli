@@ -132,8 +132,11 @@ fn command(
         args,
     ));
     cmd.args(argv);
-    // Returned alongside, never dropped here: the descriptors are not close-on-exec and bwrap reads
-    // them at the exec, so closing one before the caller runs the command turns into `Invalid fd`.
+    // Prepared before the command leaves this function: the descriptors are close-on-exec, and the
+    // exec bwrap performs inherits them only because of this.
+    super::memfd::inherit_across_exec(&mut cmd, &seccomp);
+    // Returned alongside, never dropped here: bwrap reads them at the exec, so closing one before
+    // the caller runs the command turns into `Invalid fd`.
     Ok((cmd, seccomp))
 }
 

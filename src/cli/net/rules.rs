@@ -376,7 +376,7 @@ fn render_net_rules(
     o
 }
 
-/// `sbx net allow|deny <rule> [--local|--global|-c <file>] [--app <name>]`: persist an egress rule
+/// `sbx net allow|deny <rule> [--local|--global] [--app <name>]`: persist an egress rule
 /// to a config file. The rule is validated up front (fail-closed), then `manage::add_egress_rule`
 /// places it per the posture matrix. A write to the project `.sbx.toml` is trust-gated: it must be
 /// absent or already trusted (else refuse — never bless an unreviewed file by appending), and is
@@ -463,7 +463,7 @@ pub(super) fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) 
     ))
 }
 
-/// `sbx net unallow|undeny|unmute <rule> [--local|--global|-c <file>] [-a <app>]`: remove one egress
+/// `sbx net unallow|undeny|unmute <rule> [--local|--global] [-a <app>]`: remove one egress
 /// rule from a config file — the inverse of `sbx net allow|deny|mute`, so a rule is undone with the
 /// vocabulary it was written in. Idempotent (removing a rule that is not there is a reported no-op,
 /// not an error); a project `.sbx.toml` write is trust-gated and re-trusted exactly like the add

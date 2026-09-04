@@ -153,18 +153,21 @@ pub(super) fn spawn_caged_plugin(
     let (argv, env) = compose_cage(plan)?;
 
     let reader_side = ours.try_clone()?;
-    let child = Command::new(bwrap)
+    let mut command = Command::new(bwrap);
+    command
         .args(argv)
         .stdin(Stdio::from(std::os::fd::OwnedFd::from(theirs.try_clone()?)))
         .stdout(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| {
-            io::Error::other(format!(
-                "could not start the `{}` plugin: {e}",
-                plan.configured_as
-            ))
-        })?;
+        .stderr(Stdio::null());
+    // The descriptors `compose_cage` staged are close-on-exec; this is what carries them into the
+    // one exec that reads them. See [`super::memfd::write`].
+    super::memfd::inherit_across_exec(&mut command, &env);
+    let child = command.spawn().map_err(|e| {
+        io::Error::other(format!(
+            "could not start the `{}` plugin: {e}",
+            plan.configured_as
+        ))
+    })?;
 
     Ok(CagedPlugin {
         child,
@@ -514,10 +517,12 @@ fn run_within(
         args: vec![OsString::from(reff)],
         brokers,
     };
-    // `_env` holds the environment descriptor open until bwrap has run.
-    let (argv, _env) = compose_cage(&plan)?;
+    // `env` holds the descriptors open until bwrap has run, and prepares the exec that inherits
+    // them — they are close-on-exec until then.
+    let (argv, env) = compose_cage(&plan)?;
     let mut cmd = Command::new(bwrap);
     cmd.args(argv);
+    super::memfd::inherit_across_exec(&mut cmd, &env);
     let out = match output_within(
         &mut cmd,
         deadline,

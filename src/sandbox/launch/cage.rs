@@ -79,7 +79,7 @@ pub(super) fn run_status(
     spec: &SandboxSpec,
     limits: &crate::sandbox::cgroup::Limits,
 ) -> i32 {
-    let (prog, args, _keep_open) = match cage_command(bwrap, spec, limits) {
+    let (prog, args, keep_open) = match cage_command(bwrap, spec, limits) {
         Ok(cmd) => cmd,
         Err(e) => {
             // Not only the filter: this step also builds the descriptor carrying the cage's
@@ -88,7 +88,10 @@ pub(super) fn run_status(
             return 1;
         }
     };
-    match Command::new(prog).args(args).status() {
+    let mut command = Command::new(prog);
+    command.args(args);
+    crate::sandbox::memfd::inherit_across_exec(&mut command, &keep_open);
+    match command.status() {
         Ok(status) => status_code(status),
         Err(e) => {
             crate::diag::error(&format!("sbx: failed to launch the sandbox: {e}"));
@@ -137,19 +140,20 @@ pub(super) fn run_captured(
     spec: &SandboxSpec,
     limits: &crate::sandbox::cgroup::Limits,
 ) -> (i32, String) {
-    let (prog, args, _keep_open) = match cage_command(bwrap, spec, limits) {
+    let (prog, args, keep_open) = match cage_command(bwrap, spec, limits) {
         Ok(cmd) => cmd,
         Err(e) => return (1, format!("cannot prepare the sandbox: {e}")),
     };
-    let mut child = match Command::new(prog)
+    let mut command = Command::new(prog);
+    command
         .args(args)
         // No stdin, as `output()` gave it: this path is non-interactive, and the terminal it
         // reports to is the operator's.
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
+        .stderr(std::process::Stdio::piped());
+    crate::sandbox::memfd::inherit_across_exec(&mut command, &keep_open);
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => return (1, format!("failed to launch the sandbox: {e}")),
     };
@@ -320,13 +324,18 @@ pub(super) fn exec(
             "internal error: a private-tty sandbox must be launched through the pty supervisor",
         );
     }
-    // `_keep_open` stays alive until the exec replaces this process (or, on failure, until this
+    // `keep_open` stays alive until the exec replaces this process (or, on failure, until this
     // returns), so bwrap can read the inherited filter descriptors.
-    let (prog, args, _keep_open) = match cage_command(bwrap, spec, limits) {
+    let (prog, args, keep_open) = match cage_command(bwrap, spec, limits) {
         Ok(cmd) => cmd,
         Err(e) => return e,
     };
-    Command::new(prog).args(args).exec()
+    let mut command = Command::new(prog);
+    command.args(args);
+    // `exec` runs the registered `pre_exec` closures too — it reaches the same `do_exec` a spawn
+    // does — so the descriptors are cleared here exactly as they are on the forking paths.
+    crate::sandbox::memfd::inherit_across_exec(&mut command, &keep_open);
+    command.exec()
 }
 
 /// Run `spec` under a pty supervisor and return its exit status code. sbx opens
@@ -344,6 +353,13 @@ pub(super) fn supervise(
     // here so the child inherits their descriptors. `_keep_open` holds them through `pump`, so bwrap
     // can still read them after the exec.
     let (program, full_argv, _keep_open) = cage_command(bwrap, spec, limits)?;
+    // Recorded before the fork, for the child to clear between `fork` and `execv`. The parent keeps
+    // its copies close-on-exec, so nothing else this process launches inherits them — see
+    // [`crate::sandbox::memfd::write`] for what that window cost.
+    let inherit: Vec<libc::c_int> = {
+        use std::os::unix::io::AsRawFd;
+        _keep_open.iter().map(|f| f.as_raw_fd()).collect()
+    };
     let program_c = cstring(program.as_os_str().as_bytes())?;
     let mut argv_owned = vec![program_c.clone()];
     for arg in &full_argv {
@@ -355,6 +371,13 @@ pub(super) fn supervise(
     // The child of the fork below: it calls only async-signal-safe functions (`login_tty`, `execv`,
     // `_exit`) on the prebuilt argv, and never returns.
     let in_child = move |slave: libc::c_int| -> std::convert::Infallible {
+        // First, and through the same helper the `Command` paths use: bwrap reads these descriptors
+        // by number off its own argument list, so an exec that dropped them would have it open
+        // nothing. `clear_cloexec` calls only `fcntl`, which this child may.
+        if !crate::sandbox::memfd::clear_cloexec(&inherit) {
+            // SAFETY: `_exit` in a fork child, the only safe way out of here.
+            unsafe { libc::_exit(127) };
+        }
         unsafe {
             // login_tty: setsid + make the slave our controlling terminal + dup it onto
             // stdin/out/err. This is what gives the sandbox a controlling terminal (and thus job

@@ -2144,6 +2144,7 @@ pub(super) fn spawn_launcher(
     command: &mut Command,
     memfds: Vec<std::fs::File>,
 ) -> io::Result<std::process::Child> {
+    super::memfd::inherit_across_exec(command, &memfds);
     let child = command.spawn()?;
     drop(memfds);
     Ok(child)

@@ -1093,6 +1093,9 @@ fn mkfs_command(
             c.arg("--ro-bind").arg(seed).arg(seed);
             c.arg("--").arg(bin);
             args(&mut c);
+            // Prepared here, where the descriptors and the command are both in hand: they are
+            // close-on-exec, and this is what carries them across the exec bwrap performs.
+            crate::sandbox::memfd::inherit_across_exec(&mut c, &seccomp);
             // Handed back rather than dropped here: the filters' descriptors are not
             // close-on-exec, and bwrap reads them at the exec.
             (c, seccomp)

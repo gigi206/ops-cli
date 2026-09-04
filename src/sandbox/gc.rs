@@ -169,16 +169,17 @@ pub(crate) fn prune_project_package_roots(
 /// lives until that project's next launch rather than until the next `sbx gc`, and this function's
 /// only job is to keep the live ones.
 ///
-/// Known gap, needing a wider change than this function can make: the base families are keyed on
-/// the project's own `base_rev` alone, while an installed app carries its own
-/// `<data>/apps/<name>/nixpkgs.lock` and has its userland rooted under *that* revision. An app on
-/// another channel therefore has its base collected. The fix is for the callers to pass the live
-/// revision set ([`crate::store::live_base_revisions`]) instead of one revision — this has no
-/// [`crate::store::Layout`] to derive it from.
+/// The base families are keyed on **every live revision**, not on the caller's own. An installed app
+/// carries its own `<data>/apps/<name>/nixpkgs.lock` and has its userland rooted under *that*
+/// revision, so keying on one project's `base_rev` alone had an app on another channel lose its base
+/// to the sweep — and with it the store paths that app's home still points at, which is the failure a
+/// per-app lock exists to make less frequent rather than to cause. [`crate::store::live_base_revisions`]
+/// reads the whole set, and the callers pass it because they hold the [`crate::store::Layout`] it
+/// derives from and this does not.
 pub(crate) fn project_keep_roots(
     data_gcroots: &Path,
     id: &str,
-    base_rev: &str,
+    base_revs: &BTreeSet<String>,
     mise_revs: &BTreeSet<String>,
 ) -> BTreeSet<OsString> {
     let mut keep = BTreeSet::new();
@@ -197,7 +198,9 @@ pub(crate) fn project_keep_roots(
     add_targets(data_gcroots.join("projects").join(id));
     add_targets(data_gcroots.join("projects").join(id).join("nix-tools"));
     for family in ["base", "gui", "gpu", "audio"] {
-        add_targets(data_gcroots.join(family).join(base_rev));
+        for rev in base_revs {
+            add_targets(data_gcroots.join(family).join(rev));
+        }
     }
     for rev in mise_revs {
         add_targets(data_gcroots.join("mise").join(rev));
@@ -2038,7 +2041,8 @@ mod tests {
         );
 
         let mise_revs = BTreeSet::from([mise_rev.to_string()]);
-        let keep = project_keep_roots(&gcroots, id, base_rev, &mise_revs);
+        let base_revs = BTreeSet::from([base_rev.to_string()]);
+        let keep = project_keep_roots(&gcroots, id, &base_revs, &mise_revs);
 
         for base in [
             "h1-app-desktop",
@@ -2054,6 +2058,48 @@ mod tests {
         // The stale-rev build is excluded, so a later prune can reclaim it.
         assert!(!keep.contains(&OsString::from("old-glibc-2.41")));
         assert_eq!(keep.len(), 7);
+    }
+
+    /// An app on a revision of its own keeps its base, instead of losing it to the project's sweep.
+    ///
+    /// An installed app carries `<data>/apps/<name>/nixpkgs.lock` and has its userland rooted under
+    /// that revision, which no project lock records. Keyed on the project's revision alone, the
+    /// keep-set omitted every root under the app's — so `sbx gc --prune` reclaimed the store paths
+    /// that app's home still points at, and its next launch found them gone. The whole live set is
+    /// what the callers pass now.
+    #[test]
+    fn a_base_revision_only_an_app_is_on_is_kept() {
+        let dir = TmpDir::new();
+        let gcroots = dir.path().join("gcroots");
+        let (id, project_rev, app_rev) = ("proj-1", "revA", "revB");
+        let link = |dir: PathBuf, name: &str, target: &str| {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::os::unix::fs::symlink(Path::new("/nix/store").join(target), dir.join(name))
+                .unwrap();
+        };
+        link(gcroots.join("base").join(project_rev), "glibc", "a-glibc");
+        link(gcroots.join("base").join(app_rev), "glibc", "b-glibc");
+
+        // The project's revision alone: the app's base is not in the keep-set, so a prune takes it.
+        let only_project = project_keep_roots(
+            &gcroots,
+            id,
+            &BTreeSet::from([project_rev.to_string()]),
+            &BTreeSet::new(),
+        );
+        assert!(!only_project.contains(&OsString::from("b-glibc")));
+
+        // The live set, which is what a caller holding a `Layout` now passes.
+        let live = project_keep_roots(
+            &gcroots,
+            id,
+            &BTreeSet::from([project_rev.to_string(), app_rev.to_string()]),
+            &BTreeSet::new(),
+        );
+        assert!(
+            live.contains(&OsString::from("a-glibc")) && live.contains(&OsString::from("b-glibc")),
+            "both revisions' bases are live and must be kept: {live:?}"
+        );
     }
 
     #[test]

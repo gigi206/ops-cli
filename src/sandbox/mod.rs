@@ -21,7 +21,7 @@ pub(crate) mod deadline;
 mod fhs;
 mod launch;
 pub(crate) mod locks;
-mod memfd;
+pub(crate) mod memfd;
 mod naming;
 mod openuri;
 mod pty;

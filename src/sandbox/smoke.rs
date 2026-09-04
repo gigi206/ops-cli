@@ -88,7 +88,14 @@ pub(crate) fn run(bwrap: &Path) -> io::Result<SmokeReport> {
     let mut argv = super::seccomp::argv_prefix(&seccomp);
     let (spec_argv, env) = super::argv::compose(&spec)?;
     argv.extend(spec_argv);
-    let out = Command::new(bwrap).args(argv).output()?;
+    let mut command = Command::new(bwrap);
+    command.args(argv);
+    // Both sets of descriptors, which the preparations accumulate over.
+    super::memfd::inherit_across_exec(&mut command, &seccomp);
+    if let Some(env) = env.as_ref() {
+        super::memfd::inherit_across_exec(&mut command, std::slice::from_ref(env));
+    }
+    let out = command.output()?;
     drop((seccomp, env));
     let stdout = String::from_utf8_lossy(&out.stdout);
 

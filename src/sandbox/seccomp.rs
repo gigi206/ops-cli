@@ -392,10 +392,10 @@ fn programs(policy: &SeccompPolicy) -> Vec<Vec<u8>> {
 }
 
 /// Write each compiled filter into an anonymous in-memory file, ready to hand to
-/// `bwrap --add-seccomp-fd`. The descriptors are deliberately **not**
-/// close-on-exec so bwrap inherits them across the launch; the caller must keep
-/// the returned files alive until bwrap has read them. (No `memfd` seal is applied
-/// or needed — the file is written, rewound, and read once by bwrap.)
+/// `bwrap --add-seccomp-fd`. The descriptors are close-on-exec and reach bwrap through
+/// [`super::memfd::inherit_across_exec`], which the caller must apply to the command it spawns;
+/// the caller must also keep the returned files alive until bwrap has read them. (No `memfd` seal
+/// is applied or needed — the file is written, rewound, and read once by bwrap.)
 pub(crate) fn memfds(policy: &SeccompPolicy) -> io::Result<Vec<File>> {
     programs(policy).into_iter().map(write_to_memfd).collect()
 }
@@ -1153,10 +1153,16 @@ mod tests {
         let mut argv = argv_prefix(&memfds);
         let (spec_argv, env) = super::super::argv::compose(&spec).expect("compose");
         argv.extend(spec_argv);
-        let out = Command::new(&bwrap)
-            .args(argv)
-            .output()
-            .expect("launch bwrap");
+        let mut command = Command::new(&bwrap);
+        command.args(argv);
+        // Both sets: the filters this test compiled and the cage environment `compose` staged. The
+        // preparations accumulate, so two calls cover both — a probe that skipped either would fail
+        // as `Bad file descriptor` rather than as a verdict about the policy.
+        super::super::memfd::inherit_across_exec(&mut command, &memfds);
+        if let Some(env) = env.as_ref() {
+            super::super::memfd::inherit_across_exec(&mut command, std::slice::from_ref(env));
+        }
+        let out = command.output().expect("launch bwrap");
         // Both kinds of anonymous file stay alive until bwrap has read the inherited descriptors:
         // the compiled filters, and the cage's environment.
         drop((memfds, env));

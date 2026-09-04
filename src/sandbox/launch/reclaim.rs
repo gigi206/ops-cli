@@ -456,7 +456,12 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
         // `id` is `project_identity(cwd).0` — the very value `project_runtime_id` returns and the
         // provisioning path keys `<data>/gcroots/projects/<id>/` on — so the projects family of the
         // keep-set cannot drift from where a project's app builds are actually rooted.
-        let keep = crate::sandbox::gc::project_keep_roots(&data_gcroots, &id, base_rev, &mise_revs);
+        // Every live base revision, not this project's alone: an app installed here may sit on a
+        // revision of its own, and a keep-set built from one would let the sweep take that app's
+        // base out from under it.
+        let base_revs = crate::store::live_base_revisions(&prep.layout);
+        let keep =
+            crate::sandbox::gc::project_keep_roots(&data_gcroots, &id, &base_revs, &mise_revs);
         crate::sandbox::gc::prune_superseded_roots(&store_dir, &keep, prune).len()
     } else {
         0
@@ -559,7 +564,9 @@ pub(crate) fn superseded_reclaimable_hint(
         return;
     }
     let store_dir = crate::sandbox::projectstore::store_dir_for(layout, &id);
-    let keep = crate::sandbox::gc::project_keep_roots(&data_gcroots, &id, &rev, &mise_revs);
+    // The whole live set, for the reason the pruning path above states.
+    let base_revs = crate::store::live_base_revisions(layout);
+    let keep = crate::sandbox::gc::project_keep_roots(&data_gcroots, &id, &base_revs, &mise_revs);
     let n = crate::sandbox::gc::prune_superseded_roots(&store_dir, &keep, false).len();
     if n > 0 {
         println!(
