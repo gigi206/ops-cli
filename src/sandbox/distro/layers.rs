@@ -87,13 +87,33 @@ fn unpack<R: io::Read>(archive: &mut tar::Archive<R>, root: &Path) -> io::Result
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            // A member whose final component is not UTF-8 cannot be compared against the whiteout
-            // markers, and a name that cannot be read is a name that cannot be checked.
-            return Err(io::Error::other(format!(
-                "layer member has an unreadable name: {}",
-                path.display()
-            )));
+        let name = match path.file_name() {
+            Some(raw) => match raw.to_str() {
+                Some(name) => name,
+                // A final component that is not UTF-8 cannot be compared against the whiteout
+                // markers, and a name that cannot be read is a name that cannot be checked.
+                None => {
+                    return Err(io::Error::other(format!(
+                        "layer member has an unreadable name: {}",
+                        path.display()
+                    )));
+                }
+            },
+            // The archive's own root, `.` or `./`, which a good many images ship as their first
+            // member: it names the directory the unpack is already writing into. There is nothing
+            // to create and no marker to read, so skipping it is the whole of the handling. Refusing
+            // it instead cost a `debian:12-slim` unpack its whole image, on a member every other
+            // reader treats as a no-op.
+            None if path.components().all(|c| matches!(c, Component::CurDir)) => continue,
+            // Anything else with no final component is absolute or climbs out. `safe_path` is the
+            // one definition of which, so it answers rather than a second rule here.
+            None => {
+                safe_path(root, &path)?;
+                return Err(io::Error::other(format!(
+                    "layer member `{}` names no file",
+                    path.display()
+                )));
+            }
         };
 
         if name == OPAQUE {

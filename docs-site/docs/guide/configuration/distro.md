@@ -162,6 +162,8 @@ distribution's own tools fetch and unpack into the project, which is writable, w
 privilege and no `sbx` feature involved:
 
 ```sh
+mkdir -p /tmp/apt/lists/partial /tmp/apt/cache
+apt-get -o Dir::State::Lists=/tmp/apt/lists -o Dir::Cache=/tmp/apt/cache update
 apt-get -o Dir::State::Lists=/tmp/apt/lists -o Dir::Cache=/tmp/apt/cache \
         download libjq-dev libjq1 libonig5
 for deb in *.deb; do dpkg -x "$deb" ./prefix; done
@@ -169,14 +171,31 @@ export CPATH=$PWD/prefix/usr/include
 export LD_LIBRARY_PATH=$PWD/prefix/usr/lib/x86_64-linux-gnu
 ```
 
-Two of apt's directories are redirected because its defaults live under the read-only root.
+Two of apt's directories are redirected because its defaults live under the read-only root,
+and the `partial` subdirectory is created because apt does not create it itself.
+
 What you get is an unpacked tree, not an installed package: no maintainer scripts run and
 no package database records it, so this suits a library, its headers and a self-contained
 program, and does not suit anything that needs post-install configuration. You also name the
 dependencies yourself, since `download` fetches what you ask for and nothing else.
 
-The archive host has to be reachable: egress is deny-by-default, so add it to the
-[allowlist](../networking/rules) for the fetch to succeed.
+The archive host has to be reachable, and **naming the host is not enough**. Debian's
+`sources.list` fetches over plain `http://`, which the egress proxy refuses unless the
+allowlist entry says so: apt reports `403 Forbidden [IP: 127.0.0.1]`, which is `sbx`
+answering, not the archive. Name the scheme:
+
+```toml
+[network]
+mode  = "allow"
+allow = ["http://deb.debian.org", "http://security.debian.org"]
+```
+
+Apt is not less safe for it: it verifies the archive by GPG signature rather than by
+transport, which is why Debian publishes over `http` in the first place.
+
+A release that has left security support is on a different host. `debian:10` is archived, so
+its entries are `http://archive.debian.org` and its `sources.list` needs rewriting to match;
+a supported release needs neither.
 
 Because it lands in the project, it survives across sessions and stays out of the shared
 image, which is where a dependency belonging to one project should be.

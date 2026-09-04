@@ -310,3 +310,62 @@ fn a_member_spelled_with_a_current_directory_component_lands_where_it_names() {
     .expect("a final component spelled with `./` is still a final component");
     assert_eq!(fs::read_to_string(root.join("bin")).unwrap(), "replaced");
 }
+
+#[test]
+fn the_archives_own_root_member_is_a_no_op_not_a_refusal() {
+    // `./` as the first member is what a good many images ship, `debian:12-slim` among them. It
+    // names the directory the unpack is already writing into, and refusing it cost that image its
+    // whole unpack on an entry every other reader treats as nothing.
+    let tmp = crate::testutil::TmpDir::new();
+    let root = tmp.join("root");
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Directory);
+    header.set_mode(0o755);
+    header.set_size(0);
+    header.set_cksum();
+    builder.append_data(&mut header, "./", &[][..]).unwrap();
+    // One archive, not two concatenated: `into_inner` writes the end-of-archive blocks, and a
+    // reader stops there rather than continuing into whatever follows.
+    let body = b"ID=debian\n";
+    let mut file = tar::Header::new_gnu();
+    file.set_entry_type(tar::EntryType::Regular);
+    file.set_mode(0o644);
+    file.set_size(body.len() as u64);
+    file.set_cksum();
+    builder
+        .append_data(&mut file, "etc/os-release", &body[..])
+        .unwrap();
+    let blob = builder.into_inner().unwrap();
+
+    apply_tar(tmp.path(), &root, &blob).expect("the root member is skipped and the rest lands");
+    assert_eq!(
+        fs::read_to_string(root.join("etc/os-release")).unwrap(),
+        "ID=debian\n"
+    );
+}
+
+#[test]
+fn a_member_with_no_final_component_that_climbs_is_still_refused() {
+    // The skip above is for `.` and `./` alone. A member that has no final component *and* leaves
+    // the tree keeps the refusal, and `safe_path` is what names which.
+    let tmp = crate::testutil::TmpDir::new();
+    let root = tmp.join("root");
+    for name in ["/", "../"] {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_mode(0o755);
+        header.set_size(0);
+        header.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name.as_bytes());
+        header.set_cksum();
+        builder.append(&header, &[][..]).unwrap();
+        let blob = builder.into_inner().unwrap();
+        let err = apply_tar(tmp.path(), &root, &blob)
+            .expect_err(&format!("`{name}` must not be treated as the archive root"));
+        assert!(
+            err.to_string().contains("leaves the image root"),
+            "`{name}`: {err}"
+        );
+    }
+}
