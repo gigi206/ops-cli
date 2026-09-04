@@ -1135,6 +1135,15 @@ impl EgressPolicy {
     /// so a request never leaves for it without the header the configuration said it must carry.
     /// A deny is the right instrument for that because it outranks the allow side — the host may
     /// well be allowed by the app's own bundle, and this has to win over it.
+    ///
+    /// The rules are the credentials' own `to` targets, and that is what makes the cover exact
+    /// rather than approximate. An injection is selected by [`rule_matches`] on that very rule; a
+    /// deny is read by [`Rule::matches_deny`], which asks the same kind matcher through a method
+    /// set a secret target cannot narrow (`validate_secret_target` admits only
+    /// [`Methods::Unspecified`], which [`Methods::admits_deny`] answers for every verb). So the
+    /// deny reaches every request the header would have been put on, and reaches it on the port
+    /// and path the declaration named — the ones a wider reach would cover are the ones the
+    /// credential never travelled to either.
     pub(crate) fn deny_also(&mut self, rules: impl IntoIterator<Item = Rule>) {
         self.deny.extend(rules);
     }

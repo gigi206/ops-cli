@@ -450,6 +450,12 @@ pub(crate) fn upgrade(
 /// The roll command: `mise upgrade <tokens>`, the same verb the agent's own `mise:` packages roll
 /// with. Each token is stripped of its `@version` — mise upgrades a *tool* within the spec its
 /// config records, and passing `jq@1.8.2` would ask it to move to the version it is already on.
+///
+/// Stripping is also what the dedup runs on, and that is wider than dropping repeats of one spec:
+/// [`super::task::TaskEngine::declared_packages`] dedups by the whole token, so two tasks naming
+/// the same tool at different versions both reach here and the pool holds both, while the roll
+/// leaves as a single argument naming the tool. The argv is therefore not a picture of the pool,
+/// which is worth saying where the two stop matching.
 fn upgrade_argv(mise_bin: &Path, tokens: &[String]) -> Vec<OsString> {
     let mut argv = vec![
         mise_bin.as_os_str().to_os_string(),

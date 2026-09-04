@@ -731,17 +731,18 @@ pub(crate) fn start(
     // come from the same resolved values, so they cannot disagree with the injections. A
     // relative `sops` file resolves against the project root (the `.sbx.toml`'s directory). A
     // plugin-backed source runs its resolver host-side under `bwrap` (never inside the cage).
-    let (injections, redactions) = match unresolved {
+    let (injections, redactions, resolved) = match unresolved {
         Unresolved::Abort => {
-            resolve_injections(secrets, project_root, bwrap, redact_min_len, brokers, &[])?
+            let (injections, redactions) =
+                resolve_injections(secrets, project_root, bwrap, redact_min_len, brokers, &[])?;
+            (injections, redactions, secrets.to_vec())
         }
         Unresolved::DenyDestination => {
-            let (injections, redactions, denied) =
-                resolve_or_deny(secrets, project_root, bwrap, redact_min_len, brokers);
+            let kept = resolve_or_deny(secrets, project_root, bwrap, redact_min_len, brokers);
             // Applied before the proxy is built, so no request is ever served against the policy
             // as it stood while a credential was still expected to resolve.
-            policy.deny_also(denied);
-            (injections, redactions)
+            policy.deny_also(kept.denied);
+            (kept.injections, kept.redactions, kept.declarations)
         }
     };
 
@@ -760,9 +761,17 @@ pub(crate) fn start(
             .map(|group| group.to_vec())
             .collect(),
     ));
-    let refresh = (!secrets.is_empty()).then(|| {
+    // Armed over the declarations the set above was actually built from, which under
+    // [`Unresolved::DenyDestination`] is a subset of what the launch declared. Handing it every
+    // declaration instead would break both halves of the refresh contract: [`resolve_injections`]
+    // pairs a declaration with the standing injection at the same index, so a set shorter than the
+    // declarations mis-pairs every entry past the first denial; and its `?` would abort the whole
+    // re-resolution on the credential that already failed once, taking the ones that resolved with
+    // it. A denied destination stays denied for the life of the run, so the credential scoped to it
+    // is not one a refresh has anything to do with.
+    let refresh = (!resolved.is_empty()).then(|| {
         let (secrets, root, bwrap, brokers) = (
-            secrets.to_vec(),
+            resolved,
             project_root.to_path_buf(),
             bwrap.to_path_buf(),
             // The brokers as they stand now, kept for every later refresh. A refresh that ran after
@@ -1073,6 +1082,13 @@ pub(crate) fn start(
 /// `standing` is the set this one replaces, empty at launch and the live one on a refresh. It is the
 /// only thing here that is *running* rather than resolved: see [`resolve_one`] for what is reused
 /// out of it and on what condition.
+///
+/// The caller must pass the declarations that set was built from rather than every declaration the
+/// launch made, because the two are read positionally. A launch that denied an unresolvable
+/// destination ([`Unresolved::DenyDestination`]) holds a set shorter than its own list, and passes
+/// the declarations behind it ([`Kept::declarations`]); handing it the full list would pair every
+/// entry past the first denial with another declaration's credential, and would re-resolve the one
+/// that already failed, whose error aborts the rest.
 fn resolve_injections(
     secrets: &[HeaderSecret],
     project_root: &Path,
@@ -1084,9 +1100,9 @@ fn resolve_injections(
     let mut injections = Vec::with_capacity(secrets.len());
     let mut redactions = Vec::new();
     for (i, secret) in secrets.iter().enumerate() {
-        // Positional, because both sets are built from the same `secrets` in the same order by this
-        // very loop — and checked rather than trusted: `resolve_one` reuses nothing whose plugin
-        // name and key do not also match.
+        // Positional, on the alignment this function's contract asks its caller for — and checked
+        // rather than trusted: `resolve_one` reuses nothing whose plugin name and key do not also
+        // match, so a mis-paired entry costs a fresh signer process rather than the wrong one.
         let (injection, needles) = resolve_one(
             secret,
             project_root,
@@ -1132,21 +1148,20 @@ fn resolve_or_deny(
     bwrap: &Path,
     min_len: usize,
     brokers: &[super::broker::Reachable],
-) -> (
-    Vec<HeaderInjection>,
-    Vec<SecretNeedle>,
-    Vec<crate::allowlist::Rule>,
-) {
+) -> Kept {
     let mut injections = Vec::with_capacity(secrets.len());
     let mut redactions = Vec::new();
+    let mut declarations = Vec::with_capacity(secrets.len());
     let mut denied = Vec::new();
     for secret in secrets {
         // No standing set: this path runs at launch, where there is nothing to reuse. A refresh
-        // keeps the aborting form, which is what a live proxy swapping credentials in place needs.
+        // keeps the aborting form, which is what a live proxy swapping credentials in place needs —
+        // over the declarations collected here, which are the ones it can still answer for.
         match resolve_one(secret, project_root, bwrap, min_len, brokers, None) {
             Ok((injection, needles)) => {
                 injections.push(injection);
                 redactions.extend(needles);
+                declarations.push(secret.clone());
             }
             Err(e) => {
                 // Named, never silent: the run is about to behave differently from what the
@@ -1161,7 +1176,31 @@ fn resolve_or_deny(
             }
         }
     }
-    (injections, redactions, denied)
+    Kept {
+        injections,
+        redactions,
+        declarations,
+        denied,
+    }
+}
+
+/// What survived a [`resolve_or_deny`] pass, and what the failures cost.
+///
+/// `injections` and `declarations` are one set described twice — the resolved credential and the
+/// declaration it came from — and they are returned together because their **alignment** is what
+/// the refresh path depends on. [`resolve_injections`] reads the standing injection at a
+/// declaration's own index, so re-resolving against the launch's full declaration list would pair
+/// each one past the first denial with another's credential. Pairing them here, where the denials
+/// are known, is what keeps that index meaningful without a second identity to key on.
+struct Kept {
+    /// The credentials that resolved, in declaration order.
+    injections: Vec<HeaderInjection>,
+    /// The outbound-redaction needles those credentials produced.
+    redactions: Vec<SecretNeedle>,
+    /// The declarations behind `injections`, same length and same order.
+    declarations: Vec<HeaderSecret>,
+    /// The destinations of the credentials that did not resolve, to deny for the run.
+    denied: Vec<crate::allowlist::Rule>,
 }
 
 /// Read one secret's plaintext host-side, validate it, and shape it into a [`HeaderInjection`] plus
@@ -2472,8 +2511,14 @@ mod tests {
 
     /// A signed injection standing for `plugin` with `key` behind it, as a launch left it.
     fn standing_signer(plugin: &str, key: &str) -> HeaderInjection {
+        standing_signer_for("api.example.com", plugin, key)
+    }
+
+    /// [`standing_signer`] scoped to a named destination, for the case where *which* declaration a
+    /// running signer belongs to is the question being asked.
+    fn standing_signer_for(host: &str, plugin: &str, key: &str) -> HeaderInjection {
         HeaderInjection {
-            rule: crate::allowlist::classify("api.example.com").unwrap(),
+            rule: crate::allowlist::classify(host).unwrap(),
             form: crate::sandbox::proxy::Form::Signed(crate::sandbox::proxy::Signed {
                 name: plugin.to_string(),
                 sets: vec!["Authorization".to_string()],
@@ -2543,6 +2588,37 @@ mod tests {
             "Bearer t",
         );
         assert!(reusable_signer(Some(&fixed), "demo-sigv4", "the-key").is_none());
+    }
+
+    /// A running signer is kept on its plugin and its key alone — never on its destination, which
+    /// is what makes the index its caller reads it at load-bearing rather than tidy.
+    ///
+    /// Two declarations may name one signer for one credential and still be scoped to different
+    /// hosts: nothing folds them together, since `upsert_secret` collides declarations only where
+    /// their `to` agrees. [`reusable_signer`] is not shown a destination and so cannot tell such a
+    /// pair apart, while the process it hands back was told its own at a handshake it cannot be
+    /// given twice. So a caller reading the standing set at the wrong index gets a live signer
+    /// bound to the other declaration's host, and gets it without a refusal. The alignment
+    /// [`resolve_injections`] asks its caller for is the only thing standing between the two.
+    #[test]
+    fn a_running_signer_is_kept_on_its_plugin_and_key_alone_not_on_its_destination() {
+        let first = standing_signer_for("first.test", "demo-sigv4", "the-key");
+        let last = standing_signer_for("last.test", "demo-sigv4", "the-key");
+        assert_ne!(first.rule, last.rule, "two declarations, two destinations");
+        assert!(
+            !std::sync::Arc::ptr_eq(&process_of(&first), &process_of(&last)),
+            "each declaration started its own plugin process"
+        );
+        // Both answer the same question the same way: whichever entry the caller reads is the
+        // process it gets, so the destinations being different costs the guard nothing.
+        for standing in [&first, &last] {
+            let (_marker, kept) =
+                reusable_signer(Some(standing), "demo-sigv4", "the-key").expect("kept");
+            assert!(
+                std::sync::Arc::ptr_eq(&kept, &process_of(standing)),
+                "the entry handed in is the one whose process comes back, whatever it is scoped to"
+            );
+        }
     }
 
     /// Resolve with a throwaway project root — the env/file tests never read it (only a relative
@@ -2812,6 +2888,159 @@ mod tests {
         assert!(
             err.contains("SBX_TEST_EGRESS_DEFINITELY_UNSET"),
             "the error must name the missing source: {err}"
+        );
+    }
+
+    /// [`resolve_or_deny`] at the same throwaway root [`resolve_injections_at_root`] resolves at.
+    fn resolve_or_deny_at_root(secrets: &[HeaderSecret]) -> Kept {
+        resolve_or_deny(
+            secrets,
+            Path::new("/"),
+            Path::new(UNUSED_BWRAP),
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            &[],
+        )
+    }
+
+    /// The declaration set the denying tests share: one credential that resolves, one whose source
+    /// is absent, one more that resolves — so the failure sits *between* two that have to survive
+    /// it, which a set failing at either end would not show. The guards travel with it because a
+    /// variable dropped early would unset itself halfway through the test.
+    fn a_set_with_one_unreadable_credential() -> (Vec<EnvVar>, Vec<HeaderSecret>) {
+        let guards = vec![
+            EnvVar::set("SBX_TEST_EGRESS_DENY_FIRST", "first-credential-value"),
+            EnvVar::unset("SBX_TEST_EGRESS_DENY_ABSENT"),
+            EnvVar::set("SBX_TEST_EGRESS_DENY_LAST", "last-credential-value"),
+        ];
+        let bearer = || crate::config::HeaderShape::new("Bearer ", false);
+        let secrets = vec![
+            secret(
+                SecretSource::Env("SBX_TEST_EGRESS_DENY_FIRST".into()),
+                "first.test",
+                "Authorization",
+                bearer(),
+            ),
+            secret(
+                SecretSource::Env("SBX_TEST_EGRESS_DENY_ABSENT".into()),
+                "absent.test",
+                "Authorization",
+                bearer(),
+            ),
+            secret(
+                SecretSource::Env("SBX_TEST_EGRESS_DENY_LAST".into()),
+                "last.test",
+                "Authorization",
+                bearer(),
+            ),
+        ];
+        (guards, secrets)
+    }
+
+    /// A credential that cannot be read costs its own destination and nothing else.
+    ///
+    /// That is the whole difference between the two [`Unresolved`] answers. The aborting form lets
+    /// the first unreadable source decide whether anything is stood up at all, which for a batch
+    /// roll means one stale source stops every app from being upgraded. Here the failure becomes a
+    /// deny for that destination alone, and the run carries on without the cage ever reaching it
+    /// without the header the configuration said it must carry.
+    #[test]
+    fn an_unresolvable_credential_denies_its_own_destination_and_leaves_the_rest() {
+        let _lock = env_lock();
+        let (_guards, secrets) = a_set_with_one_unreadable_credential();
+        let kept = resolve_or_deny_at_root(&secrets);
+        assert_eq!(
+            kept.denied,
+            vec![crate::allowlist::classify("absent.test").unwrap()],
+            "only the destination whose credential did not resolve is denied"
+        );
+        let reached: Vec<crate::allowlist::Rule> =
+            kept.injections.iter().map(|i| i.rule.clone()).collect();
+        assert_eq!(
+            reached,
+            vec![
+                crate::allowlist::classify("first.test").unwrap(),
+                crate::allowlist::classify("last.test").unwrap(),
+            ],
+            "a failure in the middle stops neither the declaration before it nor the one after"
+        );
+    }
+
+    /// The declarations a denying pass keeps are the ones its injections were built from.
+    ///
+    /// [`resolve_injections`] reads the standing injection at a declaration's own index, so this
+    /// alignment is what every later refresh rests on. Were the refresh armed over the launch's
+    /// full list instead, each declaration past the denial would meet another destination's
+    /// credential — and since [`reusable_signer`] keeps a running plugin on its name and key rather
+    /// than on the destination, two declarations naming one signer for one value would hand the
+    /// process started for one host to the other.
+    #[test]
+    fn the_declarations_kept_line_up_with_the_injections_built_from_them() {
+        let _lock = env_lock();
+        let (_guards, secrets) = a_set_with_one_unreadable_credential();
+        let kept = resolve_or_deny_at_root(&secrets);
+        assert_eq!(
+            kept.declarations.len(),
+            kept.injections.len(),
+            "the two are one set described twice"
+        );
+        assert!(
+            kept.declarations.len() < secrets.len(),
+            "the set has to be shorter than the launch's own list for the alignment to be at stake"
+        );
+        for (declared, injected) in kept.declarations.iter().zip(&kept.injections) {
+            assert_eq!(
+                declared.to, injected.rule,
+                "the declaration at an index and the credential at it name one destination"
+            );
+        }
+    }
+
+    /// A refresh under a denying launch answers for what resolved, and is not held back by what did
+    /// not.
+    ///
+    /// The refresh closure is [`resolve_injections`], which is `?`-propagating. Armed over the
+    /// launch's full declaration list it would re-resolve the credential that already failed once
+    /// and fail on it again, and a refresher that errors stops for good — so every credential that
+    /// resolved would keep its launch value and never be re-resolved again, on a source that has
+    /// nothing to do with it. Arming it over the kept declarations is what carries the launch's
+    /// per-destination isolation into the life of the run.
+    #[test]
+    fn a_refresh_under_a_denying_launch_is_not_held_back_by_the_credential_that_failed() {
+        let _lock = env_lock();
+        let (_guards, secrets) = a_set_with_one_unreadable_credential();
+        let kept = resolve_or_deny_at_root(&secrets);
+
+        // The refresh exactly as the launch arms it: the kept declarations, against the live set.
+        let (again, _needles) = resolve_injections(
+            &kept.declarations,
+            Path::new("/"),
+            Path::new(UNUSED_BWRAP),
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            &[],
+            &kept.injections,
+        )
+        .expect("a refresh must answer for the credentials that resolved");
+        assert_eq!(
+            again.len(),
+            kept.injections.len(),
+            "a refresh replaces the live set entry for entry"
+        );
+
+        // The same call over the launch's full list is the one that cannot work, and the reason the
+        // two are not interchangeable.
+        let err = resolve_injections(
+            &secrets,
+            Path::new("/"),
+            Path::new(UNUSED_BWRAP),
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            &[],
+            &kept.injections,
+        )
+        .expect_err("the unreadable credential is still unreadable")
+        .to_string();
+        assert!(
+            err.contains("SBX_TEST_EGRESS_DENY_ABSENT"),
+            "the refusal must name the source that failed: {err}"
         );
     }
 
