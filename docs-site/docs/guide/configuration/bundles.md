@@ -145,9 +145,16 @@ the variable simply reports as up to date, which is honest, nothing moved. `SBX_
 is set by sbx, so it is a reserved environment key: an untrusted project cannot raise it
 and turn every launch into a re-download.
 
-The channel is deliberately **not** part of `sbx upgrade all`. Every other channel rewrites
-a lock; this one launches a cage per app and re-runs a clone, a build or a vendor script,
-so it is asked for by name. `all` names the apps it left behind instead.
+`sbx upgrade all` runs these steps too, and the difference is `SBX_UPGRADE`. Under `all`
+it is **not** set, so each step's own guard decides: one that compares the upstream release
+to what is installed re-installs exactly when something moved, and costs a channel read of
+a few bytes when nothing did. The `provision` verb sets it, so the install runs regardless.
+
+That is the split worth understanding when you write a guard. A guard that can only ask
+whether the agent is installed at all will never advance under `all`, because it has
+nothing to compare: a checkout of a branch is the honest example, and it moves only when
+someone asks for `sbx upgrade provision`. A guard that reads a version, on either side,
+turns `sbx upgrade` into the command that keeps that agent current.
 
 Guard on what has to **work**, not on what has to exist. A step's own guard is the only thing
 standing between a launch and a re-install, so it decides what counts as installed, and a path

@@ -1637,7 +1637,10 @@ pub(super) const PAGES: &[Page] = &[
         synopsis: "sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|binary|provision] [-a <name>] [--project <path>]",
         summary: "roll managed channels forward (versions move only here)",
         options: &[
-            ("all", "roll every lock-rewriting channel (the default)"),
+            (
+                "all",
+                "roll every channel and run the bundles' install steps (the default)",
+            ),
             (
                 "nix",
                 "the nixpkgs channel (base userland + native nix: packages)",
@@ -1653,7 +1656,7 @@ pub(super) const PAGES: &[Page] = &[
             ("binary", "the project's and apps' binary: packages"),
             (
                 "provision",
-                "re-run the apps' bundle install steps in-cage (not part of `all`)",
+                "re-run the apps' bundle install steps in-cage, regardless of their guards",
             ),
             (
                 "-a, --app <name>",
@@ -1670,11 +1673,16 @@ pub(super) const PAGES: &[Page] = &[
             `provision` is the channel for an agent that rides no `[packages]` backend: its\n\
             bundle INSTALLS it (a clone and a build, a vendor script), so there is no lock to\n\
             rewrite and what advances it is running that install again. Each such app's install\n\
-            step re-runs in the app's own cage — its home, packages, egress and environment —\n\
-            with `SBX_UPGRADE=1` set, which is what a step's own \"already installed\" guard\n\
-            yields to. The app's command never runs: the install is the point. It is NOT part of\n\
-            `all`, because unlike a lock rewrite it launches a cage per app and re-downloads;\n\
-            `all` names the apps it left instead.\n\
+            step re-runs in the app's own cage — its home, packages, egress and environment.\n\
+            The app's command never runs: the install is the point.\n\
+            \n\
+            `all` runs those steps too, with each step's OWN guard in charge: a guard that\n\
+            compares the upstream release to what is installed re-installs exactly when something\n\
+            moved, and costs a few bytes of channel read when nothing did. What `provision` adds\n\
+            is `SBX_UPGRADE=1` in the cage, which every guard is written to yield to, so the\n\
+            install runs REGARDLESS. That is what an agent whose guard cannot detect a new\n\
+            release needs — a checkout of a branch has no version to compare — and it is how to\n\
+            re-install over a guard that is simply wrong.\n\
             \n\
             `-a, --app <name>` narrows a roll to one app. It applies to the two in-cage rolls,\n\
             `provision` and `mise`, whose unit of work is already one app's own cage — and to\n\

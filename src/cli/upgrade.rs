@@ -5,9 +5,12 @@
 //! would. The lock-rewriting parts need nix to resolve but not the sandbox boundary; the in-cage
 //! `mise:` roll needs the cage and degrades to a warning where it is unavailable.
 //!
-//! `provision` is the odd one out and the reason `all` is not "everything": an agent its bundle
-//! INSTALLS has no lock to rewrite, so its roll re-runs that install in the app's own cage. That
-//! costs a cage and a download per app, so it is asked for by name.
+//! `provision` is the odd one out: an agent its bundle INSTALLS has no lock to rewrite, so what
+//! advances it is running that install again, in the app's own cage. `all` runs those steps too —
+//! anything else would make "bring everything up to date" walk past a whole class of agent — but
+//! with each step's own guard in charge, so a step installs when something moved and stands down
+//! when nothing did. The `provision` verb is the one that installs REGARDLESS, which is what an
+//! agent whose guard cannot detect a new release needs, and what a wrong guard needs.
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -177,8 +180,8 @@ fn parse_upgrade_args(args: &[OsString]) -> ParsedArgs {
 /// binary update. `nix` rolls the nixpkgs channel the target directory tracks (a trusted
 /// project pin, else the global channel) — base and native `nix:` `[packages]`. `mise` rolls
 /// the mise engine (its own dedicated lock), the project's `nix:` tools, and the project's and
-/// apps' `mise:` `[packages]` (the last in-cage). `all` rolls every lock-rewriting one, and names
-/// the install steps it left to `provision`. `--project <path>`
+/// apps' `mise:` `[packages]` (the last in-cage). `all` rolls every one of them and runs the
+/// bundles' install steps under their own guards. `--project <path>`
 /// runs the whole thing against another project instead of the current directory. The
 /// lock-rewriting parts need nix (to resolve) but not the sandbox boundary; the in-cage `mise:`
 /// roll needs the sandbox and degrades to a warning where it is unavailable.
@@ -327,15 +330,22 @@ pub(crate) fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
         ok &= upgrade_tarball_packages(&nix, &layout, &cwd, &cfg, &pal);
     }
     // The bundles' install steps: an agent with no `[packages]` backend has no lock to rewrite, so
-    // what advances it is running its install again. Deliberately NOT part of `all`: unlike a lock
-    // rewrite, this launches one cage per app and re-runs a clone, a build or a vendor script — the
-    // cost belongs to a command the user asked for by name. `all` names it instead (below), so the
-    // channel is discoverable from the command that does not run it.
-    if what == "provision" {
-        ok &= sandbox::upgrade_provision_steps(&cwd, &cfg, &pal, only);
+    // what advances it is running its install again. Part of `all`, because "bring everything up to
+    // date" that walks past a whole class of agent is not what the word means — and because the
+    // objection this channel was once excluded for does not survive reading: `all` already builds a
+    // cage per app for the `mise` roll, so these add cages to a command that has them, not a new
+    // kind of cost.
+    //
+    // What differs is WHO decides to install. Under `all` the steps run with their own guards in
+    // charge (`force = false`): one that compares an upstream release to what is installed
+    // re-installs exactly when something moved, and one that can only ask whether the agent exists
+    // reports nothing to do. The `provision` verb keeps `SBX_UPGRADE` raised, which is the only
+    // thing that advances an agent whose guard cannot tell — a checkout of a branch has no version
+    // to compare — and the way to re-install over a guard that is wrong.
+    if matches!(what, "provision" | "all") {
+        ok &= sandbox::upgrade_provision_steps(&cwd, &cfg, &pal, only, what == "provision");
     }
     match closing_note(what, moved_store_paths) {
-        ClosingNote::ProvisionSkipped => provision_channel_hint(&cfg, &pal),
         ClosingNote::StoreMoved => store_moved_hint(&cfg, only, &pal),
         ClosingNote::None => {}
     }
@@ -354,8 +364,6 @@ pub(crate) fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
 /// The closing note a run owes the reader, if any.
 #[derive(Debug, PartialEq, Eq)]
 enum ClosingNote {
-    /// `all` rolled every lock-rewriting channel and owes the reader the one it left out.
-    ProvisionSkipped,
     /// A channel that resolves through nix replaced a locked revision, so store paths moved and
     /// the homes built against them may hold a reference to a path that is gone.
     StoreMoved,
@@ -370,15 +378,11 @@ enum ClosingNote {
 ///
 /// The scope is bounded by which channels can report a move at all: [`upgrade_nix_channel`],
 /// [`upgrade_mise_tools`] and [`upgrade_flake_packages`] are the three that return a [`Roll`], and
-/// they are exactly the three the `StoreMoved` arm below names. The `all` arm takes precedence over
-/// that arm here, so a run cannot print two notes about the same apps.
+/// they are exactly the three the `StoreMoved` arm below names — plus `all`, which runs them.
 fn closing_note(what: &str, moved_store_paths: bool) -> ClosingNote {
     match what {
         // The channel that runs the install steps has nothing to point at: it just ran them.
         "provision" => ClosingNote::None,
-        // `all` already names the apps and the command; adding the store note would say the same
-        // set twice and read as two separate problems.
-        "all" => ClosingNote::ProvisionSkipped,
         // Named, not defaulted. These three resolve to nix store paths, so rolling one repoints a
         // path and a home that holds it is left dangling: `nix` rolls the channel, `flake` builds
         // through `nix build`, and `mise` rolls the project's `nix:` tools (its engine moves
@@ -386,23 +390,14 @@ fn closing_note(what: &str, moved_store_paths: bool) -> ClosingNote {
         // what qualifies it). The rest are excluded on their mechanism: `deb`, `appimage`,
         // `tarball` and `binary` place their own content-hashed artifacts, so none of them moves a
         // path a home points into, and claiming otherwise would be an unmeasured warning.
-        "nix" | "flake" | "mise" if moved_store_paths => ClosingNote::StoreMoved,
+        //
+        // `all` is here because it runs all three, and because it is the case the note is now most
+        // worth printing for: `all` has just run the install steps with their own guards in charge,
+        // and a guard that compares an upstream version cannot see that a store path moved under
+        // the home it built. That is precisely what `sbx upgrade provision` is for.
+        "nix" | "flake" | "mise" | "all" if moved_store_paths => ClosingNote::StoreMoved,
         _ => ClosingNote::None,
     }
-}
-
-/// Name the one channel `all` does not roll, when this project actually has apps in it.
-///
-/// `all` rolls every channel that rewrites a lock; the install steps are left out because they run
-/// cages and re-download. Silence would read as "everything is rolled", so the apps whose agents
-/// ride an install step rather than a backend are named here, with the command that rolls them. It
-/// prints nothing when no app declares one, so the common project keeps a clean close.
-fn provision_channel_hint(cfg: &config::Resolved, pal: &style::Palette) {
-    let Some(note) = provision_channel_note(cfg) else {
-        return;
-    };
-    let (dim, r) = (pal.dim, pal.reset);
-    println!("{}", style::prose(&format!("  {dim}{note}{r}"), pal));
 }
 
 /// Resolve `<name>` to an app that can actually be rolled, or the refusal that says why it cannot.
@@ -734,7 +729,9 @@ pub(crate) fn app_upgrade_cmd(args: &[OsString]) -> ExitCode {
         // Announced before the cage is built, not reported after it: the step is the one part of
         // this verb that costs a download, and it runs without a flag to gate it.
         println!("{}", install_step_notice(name, &plan, &pal));
-        ok &= sandbox::upgrade_provision_steps(&cwd, &cfg, &pal, Some(name));
+        // `sbx app upgrade` is the per-app form of the `provision` verb, so it forces: a user
+        // naming one agent is asking for that agent to be re-installed, not polled.
+        ok &= sandbox::upgrade_provision_steps(&cwd, &cfg, &pal, Some(name), true);
     }
     for note in app_upgrade_notes(name, &plan, &pal) {
         println!("{note}");
@@ -758,25 +755,11 @@ pub(crate) fn app_upgrade_cmd(args: &[OsString]) -> ExitCode {
     }
 }
 
-/// The text of that note, or `None` when no app in this project declares an install step. Pure, so
-/// the rule it encodes — `all` leaves the install steps, and says which — is unit-tested.
-fn provision_channel_note(cfg: &config::Resolved) -> Option<String> {
-    let apps = apps_with_install_steps(cfg);
-    if apps.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "not rolled by `all`: the bundle install steps of {} — they re-run an install in a cage, \
-         so ask for them by name with `sbx upgrade provision`.",
-        apps.join(", ")
-    ))
-}
-
 /// The launchable apps whose bundles carry an install step, named once and in a stable order.
 ///
-/// Shared by the two notes that name them, which answer two *different* questions — "what did
-/// `all` leave out?" and "what did this roll just invalidate?" — over the same set. One selector,
-/// so the two can never disagree about which apps ride an install step.
+/// One selector, so nothing that reasons about this set can disagree with anything else about which
+/// apps ride an install step. It served two notes until `all` began running the steps itself, which
+/// left the question "what did `all` leave out?" with no answer to give.
 fn apps_with_install_steps(cfg: &config::Resolved) -> Vec<&str> {
     let mut apps: Vec<&str> = cfg
         .apps
@@ -799,9 +782,9 @@ fn apps_with_install_steps(cfg: &config::Resolved) -> Vec<&str> {
 /// — `deb`/`appimage`/`tarball`/`binary` place their own content-hashed artifacts, so none of them
 /// moves the paths a home points into, and claiming otherwise would be noise.
 ///
-/// This is a *different* statement from [`provision_channel_note`], which answers "what did `all`
-/// leave out?". Here the roll already happened and the question is what it invalidated — so the two
-/// never share a sentence, even though they name the same apps.
+/// The question is what the roll invalidated, and it is one no guard inside a step can answer: a
+/// guard comparing an upstream release sees nothing wrong with a home whose `bin/python` symlinks
+/// into a store path that moved. So this note stands even after `all` has run the steps.
 ///
 /// `only` is the roll's `--app` selector, and it narrows this the same way it narrowed the roll: a
 /// roll that moved one app's store paths must not name the apps it left alone. Without it the note
@@ -1458,55 +1441,11 @@ mod tests {
         }
     }
 
-    /// `all` deliberately leaves the install steps — they launch a cage each and re-download — so
-    /// the one thing it owes the reader is naming what it did not roll, and only when there is
-    /// something to name.
-    #[test]
-    fn all_leaves_the_install_steps_and_names_the_apps_that_have_them() {
-        let mut cfg = crate::testutil::resolved(vec![], vec![]);
-        assert!(
-            provision_channel_note(&cfg).is_none(),
-            "a project with no app says nothing"
-        );
-
-        // An app whose bundle installs, and one that rides a backend like every other.
-        let mut installs = crate::testutil::app_with(vec![]);
-        installs.provisions = vec![config::BundleProvision {
-            bundle: "trae".into(),
-            argv: vec!["true".into()],
-        }];
-        cfg.apps.insert("trae".into(), installs);
-        cfg.apps
-            .insert("plain".into(), crate::testutil::app_with(vec![]));
-
-        let note = provision_channel_note(&cfg).expect("an app with a step must be named");
-        assert!(note.contains("trae"), "{note}");
-        assert!(
-            !note.contains("plain"),
-            "an app with no step is not named: {note}"
-        );
-        assert!(
-            note.contains("sbx upgrade provision"),
-            "the note must name the command that rolls them: {note}"
-        );
-
-        // An app that cannot launch installs nothing, so it is not named either.
-        let mut unlaunchable = crate::testutil::app_with(vec![]);
-        unlaunchable.cmd.clear();
-        unlaunchable.provisions = vec![config::BundleProvision {
-            bundle: "ghost".into(),
-            argv: vec!["true".into()],
-        }];
-        let mut only_unlaunchable = crate::testutil::resolved(vec![], vec![]);
-        only_unlaunchable.apps.insert("ghost".into(), unlaunchable);
-        assert!(provision_channel_note(&only_unlaunchable).is_none());
-    }
-
     /// A roll that repoints store paths can leave an app home holding a reference to a path that
     /// is gone — measured once for real: rolling the channel moved the store, a virtualenv's
     /// interpreter symlink died, and the run said nothing. The close must name the apps that build
-    /// against those paths, and it must be its OWN sentence: "what did `all` leave out?" and "what
-    /// did this roll just invalidate?" are two different events over the same set of apps.
+    /// against those paths — and it stands even now that `all` runs the steps itself, because no
+    /// guard inside a step can see that the store moved under the home it built.
     #[test]
     fn a_roll_that_moved_store_paths_names_the_homes_built_against_them() {
         let mut cfg = crate::testutil::resolved(vec![], vec![]);
@@ -1538,13 +1477,9 @@ mod tests {
             note.contains("next launch"),
             "the note must say the home also repairs itself, or it reads as breakage: {note}"
         );
-        // One name, two events. `all`'s note is about what it did NOT roll; this one is about what
-        // a roll DID invalidate. Sharing a sentence would be the category error this refuses.
-        let skipped = provision_channel_note(&cfg).expect("same set, other question");
-        assert_ne!(note, skipped, "the two notes must not share a sentence");
         assert!(
-            !note.contains("not rolled by `all`"),
-            "the store note must not claim the user ran `all`: {note}"
+            !note.contains("not rolled"),
+            "the store note is about what a roll invalidated, never about what it skipped: {note}"
         );
 
         // A roll narrowed to one app moved only that app's store paths, so the note is narrowed the
@@ -1596,10 +1531,18 @@ mod tests {
                 "{what} does not move the paths a home holds"
             );
         }
+        // `all` runs the three channels that move store paths, so it owes the same note they do.
+        // It used to be excluded because it printed a note of its own about the steps it skipped;
+        // it no longer skips them, so the exclusion went with the reason for it.
         assert_eq!(
             closing_note("all", true),
-            ClosingNote::ProvisionSkipped,
-            "`all` owes the reader what it skipped, and must not also print the store note"
+            ClosingNote::StoreMoved,
+            "`all` runs nix/flake/mise, so a moved store path is its note too"
+        );
+        assert_eq!(
+            closing_note("all", false),
+            ClosingNote::None,
+            "and it says nothing when no revision was replaced"
         );
         assert_eq!(
             closing_note("provision", true),

@@ -277,13 +277,25 @@ fn an_install_roll_runs_the_steps_alone_and_never_the_app() {
 
 #[test]
 fn the_install_roll_recap_names_what_ran_and_tallies_the_rest() {
+    let apps = ["trae".to_string(), "odysseus".to_string()];
     assert_eq!(
-        provision_roll_recap(&["trae".to_string(), "odysseus".to_string()], 0, 0),
+        provision_roll_recap(&apps, 0, 0, true),
         "re-installed: trae, odysseus"
     );
     assert_eq!(
-        provision_roll_recap(&[], 2, 1),
+        provision_roll_recap(&[], 2, 1, true),
         "nothing re-installed · 2 skipped · 1 failed"
+    );
+    // Without `force` the same run claims less, because it knows less: the guards decided, and an
+    // exit status does not say which way. Saying "re-installed" here would be the report asserting
+    // what only the step can see.
+    assert_eq!(
+        provision_roll_recap(&apps, 0, 0, false),
+        "install steps ran: trae, odysseus"
+    );
+    assert_eq!(
+        provision_roll_recap(&[], 2, 1, false),
+        "no install step ran · 2 skipped · 1 failed"
     );
 }
 

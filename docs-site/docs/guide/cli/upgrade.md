@@ -13,7 +13,7 @@ advance **only here**, never on an `sbx` binary update.
 
 | Target | Rolls |
 |---|---|
-| `all` | every lock-rewriting channel (the default); `provision` is not part of it |
+| `all` | every channel, and the bundles' install steps under their own guards (the default) |
 | `nix` | the nixpkgs channel (base userland + native `nix:` packages) |
 | `mise` | the mise engine, the project's `nix:` tools, `mise:` packages, and the [task tool pool](../tasks/execution#the-task-tool-pool) |
 | `flake` | the project's and apps' `flake:` packages |
@@ -21,7 +21,7 @@ advance **only here**, never on an `sbx` binary update.
 | `appimage` | the project's and apps' `appimage:` packages |
 | `tarball` | the project's and apps' `tarball:` packages |
 | `binary` | the project's and apps' `binary:` packages |
-| `provision` | re-run the apps' [bundle install steps](../configuration/bundles#the-install-step) in-cage |
+| `provision` | re-run the apps' [bundle install steps](../configuration/bundles#the-install-step) in-cage, regardless of their guards |
 
 | Flag | Effect |
 |---|---|
@@ -48,7 +48,10 @@ itself. Lock writes are atomic (a reader sees old-or-new, never torn).
   packages (an in-cage `mise upgrade` per home) + the declared operations' tool pool
   (host-side, under a `task pool` line), leaving `nixpkgs.lock` intact.
 - `sbx upgrade flake` re-pins the project's and apps' `flake:` packages.
-- `sbx upgrade provision` re-runs the bundle install steps, one cage per app.
+- `sbx upgrade provision` re-runs the bundle install steps, one cage per app, with
+  `SBX_UPGRADE=1` so each step installs whatever its guard would have said. `all` runs
+  the same steps without it, leaving each guard to decide, so an agent whose guard
+  compares the upstream release advances there and one whose guard cannot tell does not.
 
 ### After a roll that moved the store
 

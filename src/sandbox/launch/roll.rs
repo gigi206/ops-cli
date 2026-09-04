@@ -478,15 +478,24 @@ fn provision_groups(cfg: &crate::config::Resolved, only: Option<&str>) -> Vec<Pr
     groups
 }
 
-/// Re-run each app's bundle install steps with `SBX_UPGRADE` raised — the roll for an agent that
-/// rides no `[packages]` backend.
+/// Run each app's bundle install steps — the roll for an agent that rides no `[packages]` backend.
 ///
 /// A `nix:`/`mise:`/`deb:` package advances by re-resolving a lock; an agent its bundle *installs*
 /// (a clone and a build, a vendor script) has no lock to rewrite, so what advances it is running
-/// that install again. The step already carries its own "already installed" guard — that is what
-/// keeps a launch from re-installing every time — so the roll raises `SBX_UPGRADE=1` in the cage
-/// and the step's guard is written to yield to it. A step that ignores the variable simply reports
-/// as up to date, which is honest: nothing moved.
+/// that install again. Which leaves one question, and `force` is it: who decides whether this run
+/// installs anything.
+///
+/// **`force = false`** hands that decision to each step's own guard, and is what `sbx upgrade all`
+/// asks for. A guard that compares the upstream release to what is installed then re-installs
+/// exactly when something moved, and costs a few bytes of channel read when nothing did — so the
+/// command that means "bring everything up to date" brings these up to date too, instead of naming
+/// them and walking past. A guard that can only ask whether the agent is installed at all reports
+/// nothing to do, which is all it can honestly say.
+///
+/// **`force = true`** raises `SBX_UPGRADE=1` in the cage, which every shipped guard is written to
+/// yield to, and is what the `provision` verb and `sbx app upgrade` ask for. That is the only thing
+/// that advances an agent whose guard *cannot* tell — a checkout of a branch, with no version to
+/// compare — and the way to re-install over a guard that is simply wrong.
 ///
 /// The cage is the app's own (its home, packages, egress, environment), so what the roll installs
 /// is exactly what the next launch finds. The app's command never runs: the install is the point,
@@ -497,6 +506,7 @@ pub(crate) fn upgrade_provision_steps(
     cfg: &crate::config::Resolved,
     pal: &crate::style::Palette,
     only: Option<&str>,
+    force: bool,
 ) -> bool {
     let (h, warn, dim, r, ok_c) = (pal.head, pal.warn, pal.dim, pal.reset, pal.ok);
     println!("{h}sbx upgrade — bundle install steps{r}");
@@ -553,9 +563,13 @@ pub(crate) fn upgrade_provision_steps(
         let runtime = home.runtime();
         let mut cfg = cfg;
         cfg.warnings.clear();
-        // The signal the steps' guards read. It rides the app's `[env]` layer, so it reaches the
-        // cage the way every other declared variable does — never on the bwrap argv.
-        cfg.env.push(("SBX_UPGRADE".to_string(), "1".to_string()));
+        // The signal the steps' guards read, and only under `force`: without it each guard answers
+        // for itself, which is the whole difference between "bring what moved up to date" and
+        // "re-install regardless". It rides the app's `[env]` layer, so it reaches the cage the way
+        // every other declared variable does — never on the bwrap argv.
+        if force {
+            cfg.env.push(("SBX_UPGRADE".to_string(), "1".to_string()));
+        }
         prep.cfg = cfg;
 
         let (spec, guard) = match build(&prep, runtime, provision_only_cmd(&steps)) {
@@ -571,21 +585,32 @@ pub(crate) fn upgrade_provision_steps(
             }
         };
         // Fork-and-wait so the next group runs; the guard holds the proxy/forwarder across the
-        // fetch. The output is captured and shown only on failure — an install is verbose, and on
-        // a clean run the line above already says what happened.
+        // fetch. The output is always shown on failure. On a clean run it is shown only when the
+        // guards decided (`!force`), because there it is the only thing that says which way they
+        // decided; under `force` the line above already says what happened, and an install is
+        // verbose enough that repeating it would bury a fifty-app report.
         let (code, out) = run_captured(&prep.bwrap, &spec, &prep.cfg.limits);
         drop(guard);
         if code == 0 {
             let bundles = step_bundles(&steps);
-            println!(
-                "{}",
-                roll_line(
-                    &name,
-                    width,
-                    &format!("{ok_c}re-installed ({bundles}){r}"),
-                    pal
-                )
-            );
+            // What is KNOWN is the exit status, and the line says no more than that. Under `force`
+            // the re-install was asked for, so naming it is fair; without it the guard decided, and
+            // sbx cannot see which way — the version a guard compares lives in the vendor's channel
+            // and in the vendor's own manifest, which is exactly why the guard is in the step.
+            //
+            // So the step's own output is what tells the user, and here it is SHOWN rather than
+            // dropped: a step that acted says so (`… the release channel moved (a -> b)`), and one
+            // that stood down says nothing. That is the step's account, not sbx's inference, which
+            // is the only honest form this line can take.
+            let verdict = if force {
+                format!("{ok_c}re-installed ({bundles}){r}")
+            } else {
+                format!("{ok_c}install step ran ({bundles}){r}")
+            };
+            println!("{}", roll_line(&name, width, &verdict, pal));
+            if !force {
+                echo_cage_output(&out);
+            }
             ran.push(name);
         } else {
             println!(
@@ -604,7 +629,7 @@ pub(crate) fn upgrade_provision_steps(
         }
     }
 
-    let recap = provision_roll_recap(&ran, skipped, failed);
+    let recap = provision_roll_recap(&ran, skipped, failed, force);
     let hue = if failed > 0 {
         warn
     } else if ran.is_empty() {
@@ -629,12 +654,17 @@ fn step_bundles(steps: &[crate::config::BundleProvision]) -> String {
 }
 
 /// The closing line of a provision roll: which apps re-installed, and a tally of the rest.
-fn provision_roll_recap(ran: &[String], skipped: usize, failed: usize) -> String {
+fn provision_roll_recap(ran: &[String], skipped: usize, failed: usize, force: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if ran.is_empty() {
-        parts.push("nothing re-installed".to_string());
+    let (none, some) = if force {
+        ("nothing re-installed", "re-installed")
     } else {
-        parts.push(format!("re-installed: {}", ran.join(", ")));
+        ("no install step ran", "install steps ran")
+    };
+    if ran.is_empty() {
+        parts.push(none.to_string());
+    } else {
+        parts.push(format!("{some}: {}", ran.join(", ")));
     }
     if skipped > 0 {
         parts.push(format!("{skipped} skipped"));
