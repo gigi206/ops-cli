@@ -21,7 +21,8 @@
 //!   Destinations past the cap are folded into one counter rather than dropped ([`Tally::overflow`]),
 //!   so the totals stay true.
 //! - **One file per session, aggregated at read.** Files are keyed by this process *incarnation*
-//!   (`stats-<pid>-<start-ticks>`), so two sessions of the same project never contend on a write and
+//!   (`stats-<pid>-<start-ticks>-<seq>`, the sequence separating the proxies one process stands
+//!   up), so two sessions of the same project never contend on a write and
 //!   a later process reusing the pid cannot clobber a prior session's still-wanted file; `sbx net
 //!   stats` sums every session file whose embedded `project=` header matches the project the user
 //!   stands in. The project key
@@ -188,7 +189,7 @@ impl Tally {
 /// Shared (via `Arc`) across the proxy's per-connection threads; each [`record`](EgressStats::record)
 /// updates the in-memory map and rewrites the session file atomically.
 pub(crate) struct EgressStats {
-    /// The session file this flushes to (`<data>/egress/stats-<pid>-<start-ticks>`).
+    /// The session file this flushes to (`<data>/egress/stats-<pid>-<start-ticks>-<seq>`).
     path: PathBuf,
     /// The canonical project path (the `project=` header), for read-side attribution.
     project: String,
@@ -481,7 +482,13 @@ fn is_finished(name: &str) -> bool {
     let Some(rest) = name.strip_prefix("stats-") else {
         return false;
     };
-    let Some((pid, ticks)) = rest.split_once('-') else {
+    // The name is `<pid>-<ticks>` plus, since one process may stand up several proxies, a `-<seq>`
+    // that is none of this check's business: the incarnation is the pair, and a file written by a
+    // live process must be kept whichever of its proxies wrote it. Split rather than `split_once`,
+    // so the sequence lands in a third field that is dropped instead of being parsed as part of the
+    // ticks — which would fail, report the file as live, and keep it forever.
+    let mut fields = rest.split('-');
+    let (Some(pid), Some(ticks)) = (fields.next(), fields.next()) else {
         return false;
     };
     match (pid.parse::<u32>(), ticks.parse::<u64>()) {
@@ -802,6 +809,29 @@ pub(crate) fn reset(egress_dir: &Path, project: &str, app: Option<&str>) -> usiz
 
 #[cfg(test)]
 mod tests {
+
+    /// A stats file carries a per-proxy sequence, and the liveness check must read past it.
+    ///
+    /// That check decides whether a file may be folded into the rollup, and it keeps anything it
+    /// does not recognise. So a sequence parsed as part of the ticks does not fail loudly: every
+    /// file reads as live, nothing is ever folded, and the directory grows without bound. The pair
+    /// that identifies the incarnation is the first two fields; whatever follows is another
+    /// proxy's business.
+    #[test]
+    fn the_liveness_check_reads_past_a_proxys_sequence() {
+        let me = std::process::id();
+        let ticks = crate::session::current_start_ticks().expect("own start ticks");
+        // This process is alive, so its own files are unfinished — sequence or not.
+        assert!(!is_finished(&format!("stats-{me}-{ticks}")));
+        assert!(!is_finished(&format!("stats-{me}-{ticks}-0")));
+        assert!(!is_finished(&format!("stats-{me}-{ticks}-7")));
+        // An incarnation that cannot be this one is finished, with or without a sequence.
+        assert!(is_finished("stats-1-11"));
+        assert!(is_finished("stats-1-11-3"));
+        // And a name carrying no incarnation is still kept rather than guessed at.
+        assert!(!is_finished("stats-nonsense"));
+    }
+
     use super::*;
     use crate::testutil::TmpDir;
 

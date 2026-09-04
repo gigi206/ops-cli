@@ -672,6 +672,12 @@ pub(super) fn wrap_background(
 /// a [`HeaderInjection`]. The plaintext never crosses into the cage — only the per-host
 /// injection does, applied by the proxy to matching allowed requests. A missing or malformed
 /// source aborts the launch (fail-closed), so the proxy never injects an empty credential.
+/// Distinguishes the proxies one process stands up, for the one name of theirs that is persisted.
+///
+/// A launch stands up a single proxy, so this stays 0 there. A batch roll stands up one per app,
+/// and their stat files must not be the same file — see where it is read for what that cost.
+static PROXY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start(
     layout: &Layout,
@@ -791,9 +797,19 @@ pub(crate) fn start(
     // The persisted stats file outlives its session (it is aggregated later), so it must be keyed
     // by this *incarnation* — pid plus start-time ticks — not the pid alone: a later process that
     // reuses the pid would otherwise overwrite a prior session's still-wanted counters.
+    //
+    // And by a per-proxy sequence on top of it, because the incarnation is not unique either: a
+    // batch roll (`sbx upgrade`) stands up one cage per app in a single process, each with its own
+    // proxy. The transient names above survive that on their own — a cage's socket is unlinked when
+    // its guard drops, before the next cage opens one — but this file is written to be kept, so
+    // every cage after the first was overwriting the counters of the cage before it, and a
+    // fifty-app roll persisted the last app's alone. Measured: an `sbx upgrade all` left one file,
+    // tagged with the last app in the loop and holding no host at all, while the run's earlier
+    // cages had recorded real traffic.
     let session_tag = crate::session::current_start_ticks()
         .map(|ticks| format!("{pid}-{ticks}"))
         .unwrap_or_else(|| pid.to_string());
+    let seq = PROXY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Per-host decision counters for this session, keyed by the project's canonical path (the same
     // identity `sbx net stats` derives from a cwd, so a launch's record and a later read agree).
@@ -805,7 +821,7 @@ pub(crate) fn start(
             .ok()
             .map(|(_, canon)| {
                 Arc::new(super::egress_stats::EgressStats::new(
-                    dir.join(format!("stats-{session_tag}")),
+                    dir.join(format!("stats-{session_tag}-{seq}")),
                     canon.display().to_string(),
                     app.map(str::to_string),
                 ))
