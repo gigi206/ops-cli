@@ -206,6 +206,8 @@ pub(crate) fn resolved(
         accepts_fresh_releases: Default::default(),
         timezone: None,
         timezone_origin: crate::config::Provenance::Default,
+        distro: None,
+        distro_origin: crate::config::Provenance::Default,
         open: Default::default(),
         service: Default::default(),
         provisions: Default::default(),

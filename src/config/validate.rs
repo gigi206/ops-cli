@@ -234,6 +234,26 @@ pub(super) fn validate_nixpkgs(
     }
 }
 
+/// Validate a `distro` locator, warning on anything [`super::is_valid_distro_source`] refuses.
+///
+/// `None` leaves the cage on the nix-provisioned userland, which is what a config without the
+/// field gets: a malformed locator must not strand the launch, and it must not quietly select a
+/// substrate other than the one that was written either.
+pub(super) fn validate_distro(
+    warnings: &mut Vec<String>,
+    source_label: &str,
+    value: String,
+) -> Option<String> {
+    if super::is_valid_distro_source(&value) {
+        Some(value)
+    } else {
+        warnings.push(format!(
+            "{source_label}: ignoring malformed distro locator `{value}`"
+        ));
+        None
+    }
+}
+
 /// Validate a `[mise] engine` source, warning on anything [`super::is_valid_mise_engine`] refuses.
 ///
 /// `None` leaves the engine following the global `nixpkgs` source, which is the behaviour a config

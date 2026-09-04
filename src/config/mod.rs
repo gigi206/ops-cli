@@ -89,10 +89,10 @@ pub(crate) use tasks::check_value;
 #[cfg(test)]
 use secrets::{validate_header_shape, validate_host_secret, validate_secret_target};
 use validate::{
-    validate_device_path, validate_forward, validate_gui, validate_home_scope, validate_limits,
-    validate_mise_engine, validate_network, validate_network_amending, validate_nixpkgs,
-    validate_notify, validate_open, validate_proc, validate_redact_min_len, validate_service,
-    validate_timezone,
+    validate_device_path, validate_distro, validate_forward, validate_gui, validate_home_scope,
+    validate_limits, validate_mise_engine, validate_network, validate_network_amending,
+    validate_nixpkgs, validate_notify, validate_open, validate_proc, validate_redact_min_len,
+    validate_service, validate_timezone,
 };
 // Exercised by a cross-cutting config unit test (profile merge + the shared `raw_app` builders).
 #[cfg(test)]
@@ -439,6 +439,13 @@ pub(crate) struct Resolved {
     pub(crate) gui: GuiPolicy,
     /// Which layer supplied the winning `gui` posture (`Default` when neither config set it).
     pub(crate) gui_origin: Provenance,
+    /// The distribution userland the cage runs on, when a layer named one. `None` — the ordinary
+    /// case — leaves the cage on the hermetic nix userland the sandbox resolves from sbx's own
+    /// store. A security field: an untrusted project's value is dropped with a warning, since the
+    /// root filesystem supplies every program the cage runs.
+    pub(crate) distro: Option<String>,
+    /// Which layer supplied the winning `distro` locator (`Default` when neither config set it).
+    pub(crate) distro_origin: Provenance,
     /// The IANA zone the cage's clock reads in, when a layer named one. `None` leaves the cage on
     /// the built-in default (`sandbox::binds::DEFAULT_ZONE`), which is a real zone and not
     /// an absence — the cage always carries the database and the `/etc/localtime` link. **Not a
@@ -835,6 +842,11 @@ impl Resolved {
             // them for the same reason: a declared operation is a program plus a credential, vetted
             // where it is read and listed, not assembled on a command line for one launch.
             nixpkgs: _,
+            // The distribution userland joins them, for the sharpest version of the same reason:
+            // it names the root filesystem every program in the cage is executed from. That is
+            // declared in a config that is reviewed and trusted, not assembled on a command line
+            // for one launch.
+            distro: _,
             // The engine that installs every `mise:` tool: global-only by construction,
             // so neither a project layer nor a one-shot override redirects it.
             mise: _,
@@ -1724,6 +1736,13 @@ fn resolve(
     let nixpkgs_global = global
         .nixpkgs
         .and_then(|v| validate_nixpkgs(&mut warnings, GLOBAL_CONFIG, v));
+    let mut distro_origin = Provenance::Default;
+    let mut distro = global
+        .distro
+        .and_then(|v| validate_distro(&mut warnings, GLOBAL_CONFIG, v));
+    if distro.is_some() {
+        distro_origin = Provenance::Global;
+    }
     // Global-only, like `[bundle]`: the engine installs every `mise:` tool in every cage, so a
     // project does not get to redirect it. The project layer's own `[mise]` is never read here.
     let mise_engine = global
@@ -2140,6 +2159,21 @@ fn resolve(
                 gate.refuse("`nixpkgs` override", &mut warnings);
             }
         }
+        // `distro` is a security field — a trusted project may put the cage on its own
+        // distribution userland; an untrusted or changed one may not choose the root filesystem
+        // every program in the cage is executed from.
+        if let Some(value) = proj.distro {
+            // A userland is whole or absent, so the locator inherits nothing from the layer
+            // below: a malformed value leaves the global one standing rather than stranding the
+            // cage between two substrates.
+            gate.take_validated(
+                &mut distro,
+                &mut distro_origin,
+                "`distro` userland",
+                &mut warnings,
+                |w, _| validate_distro(w, PROJECT_CONFIG, value).map(Some),
+            );
+        }
         // `network` is a security field — a trusted project may change the posture;
         // an untrusted or changed one may not narrow or widen the network.
         if let Some(value) = proj.network {
@@ -2504,6 +2538,18 @@ fn resolve(
         &mut warnings,
     );
 
+    // A declared distribution supplies its own `/etc/localtime`, and sbx stops emitting the link
+    // that a `timezone` writes: the setting has no effect in such a cage. Named rather than left to
+    // be discovered, on the rule the `[network]` layering follows — a setting sbx abandons is one it
+    // says it abandoned, because the alternative is a user reading a config that describes a cage
+    // they are not running.
+    if distro.is_some() && timezone_origin != Provenance::Default {
+        warnings.push(
+            "`timezone` has no effect under a declared `distro`: the image supplies its own              `/etc/localtime`"
+                .to_string(),
+        );
+    }
+
     Resolved {
         allow_insecure_http,
         allow_insecure_http_origin,
@@ -2521,6 +2567,8 @@ fn resolve(
         nixpkgs_global,
         mise_engine,
         nixpkgs_project,
+        distro,
+        distro_origin,
         // A mise file is discovered by I/O in `load`; the pure layering never sees one.
         mise: None,
         mise_ignored: Vec::new(),
@@ -3774,6 +3822,16 @@ fn is_valid_nixpkgs_source(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+}
+
+/// Whether `s` is a distribution userland locator.
+///
+/// The grammar itself lives in [`crate::sandbox::distro::reference`], which is also what takes the
+/// locator apart when the image is fetched. One definition: a validator that read the string a
+/// second time would drift from the parser, and the two disagreeing is how a value that passed
+/// review reaches a registry as something else.
+fn is_valid_distro_source(s: &str) -> bool {
+    crate::sandbox::distro::reference::parse(s).is_some()
 }
 
 /// Whether `s` names a build of the mise engine: a nixpkgs source, or a **revision-pinned**

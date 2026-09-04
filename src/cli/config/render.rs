@@ -197,12 +197,23 @@ fn tools_section(tools: &config::view::ToolsView, pal: &style::Palette) -> Optio
 /// The nixpkgs source the tools resolve against and its locked revision, then the mise engine's own
 /// channel — shown so the engine's decoupling from the base channel is visible. Routed through the
 /// launch's own channel decision; an unlocked source omits the revision.
+///
+/// A declared distribution userland joins them, since it is the same question one layer down:
+/// where the programs in the cage come from. It is printed only when a layer named one, so the
+/// section stays two lines for a cage on the hermetic nix userland.
 fn channels_section(view: &config::view::ConfigView, pal: &style::Palette) -> String {
     use std::fmt::Write as _;
     let (h, r) = (pal.head, pal.reset);
     let mut o = String::new();
     let _ = writeln!(o, "  {h}nixpkgs:{r} {}", channel_text(&view.nixpkgs, pal));
     let _ = writeln!(o, "  {h}engine:{r} {}", channel_text(&view.engine, pal));
+    if let Some(distro) = &view.distro {
+        let _ = writeln!(
+            o,
+            "  {h}distro:{r} {distro}{}",
+            provenance_tag(view.distro_origin, pal)
+        );
+    }
     o
 }
 
@@ -1255,6 +1266,8 @@ mod tests {
             proc_origin: Default::default(),
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
+            distro: None,
+            distro_origin: ProvenanceView::Default,
             gpu: false,
             allow_insecure_http: false,
             audio: false,

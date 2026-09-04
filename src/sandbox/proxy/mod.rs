@@ -192,7 +192,7 @@ use super::egress_stats::StatKind;
 
 #[cfg(test)]
 mod bench;
-mod ca;
+pub(super) mod ca;
 mod capture;
 mod cleartext;
 mod ctx;
@@ -205,7 +205,7 @@ mod splice;
 mod ssrf;
 mod tunnel;
 mod websocket;
-mod wire;
+pub(super) mod wire;
 mod wsframe;
 pub(crate) use ca::Ca;
 use ca::upstream_server_name;

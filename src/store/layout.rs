@@ -187,6 +187,17 @@ impl Layout {
         self.data_dir.join("stores")
     }
 
+    /// One directory per image digest, each holding a provisioned distribution root filesystem.
+    /// Trusted by location like the plugins and apt-key trees, so a project cannot write here and
+    /// the tree a cage is executed from is the one sbx itself unpacked from the digest it verified.
+    ///
+    /// Keyed by digest rather than by project, because that is what the content is addressed by: two
+    /// projects on the same image share one copy, and a project that moves to another image leaves
+    /// the first behind for whoever else still names it.
+    pub(crate) fn distro_dir(&self) -> PathBuf {
+        self.data_dir.join("distro")
+    }
+
     /// Where the signing key of an apt repository is pinned once sbx has verified an `InRelease`
     /// against it, one armored key per repository. Trusted by location like the plugins and stores
     /// trees: a project cannot write here, so what is pinned is what sbx itself verified. The pin is

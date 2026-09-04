@@ -462,6 +462,10 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
         binds,
         packages,
         nixpkgs,
+        // The distribution userland names the root filesystem every program in the cage runs
+        // from, so it is declared in a config that is reviewed and trusted, never carried by an
+        // ambient variable or a one-shot override.
+        distro: _,
         network,
         proc,
         notify,
@@ -564,6 +568,8 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
         binds,
         packages,
         nixpkgs,
+        // Same reason as the ambient fold above: the substrate is not a one-launch decision.
+        distro: _,
         network,
         proc,
         notify,

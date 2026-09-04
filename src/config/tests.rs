@@ -84,6 +84,7 @@ fn raw(env: &[(&str, &str)], binds: &[&str]) -> RawConfig {
     RawConfig {
         accepts_fresh_releases: Default::default(),
         timezone: None,
+        distro: None,
         plugin: Default::default(),
         broker: Default::default(),
         fs: None,
@@ -796,6 +797,14 @@ fn raw_packages(packages: &[(&str, &str)]) -> RawConfig {
 fn raw_nixpkgs(source: &str) -> RawConfig {
     RawConfig {
         nixpkgs: Some(source.to_string()),
+        ..RawConfig::default()
+    }
+}
+
+/// A `RawConfig` declaring only a `distro` userland.
+fn raw_distro(locator: &str) -> RawConfig {
+    RawConfig {
+        distro: Some(locator.to_string()),
         ..RawConfig::default()
     }
 }
@@ -6678,6 +6687,101 @@ fn a_malformed_nixpkgs_source_is_dropped() {
 }
 
 #[test]
+fn a_global_distro_is_honored_a_trusted_project_overrides_it() {
+    // Nothing declared leaves the cage on the nix userland, which is what every cage carried
+    // before the field existed.
+    let r = resolve_no_plugins(RawConfig::default(), None);
+    assert!(r.distro.is_none());
+    assert_eq!(r.distro_origin, Provenance::Default);
+
+    // global is trusted by location
+    let r = resolve_no_plugins(raw_distro("oci:docker.io/library/debian:10"), None);
+    assert_eq!(r.distro.as_deref(), Some("oci:docker.io/library/debian:10"));
+    assert_eq!(r.distro_origin, Provenance::Global);
+    assert!(r.warnings.is_empty());
+
+    // a trusted project puts itself on its own userland
+    let r = resolve_no_plugins(
+        raw_distro("oci:docker.io/library/debian:10"),
+        Some((
+            raw_distro("oci:docker.io/library/debian:12"),
+            TrustState::Trusted,
+        )),
+    );
+    assert_eq!(r.distro.as_deref(), Some("oci:docker.io/library/debian:12"));
+    assert_eq!(r.distro_origin, Provenance::Project);
+}
+
+#[test]
+fn a_timezone_declared_beside_a_distro_is_named_as_having_no_effect() {
+    // An image supplies its own `/etc/localtime`, and sbx stops emitting the link a `timezone`
+    // writes. The setting is then inert, and a setting sbx abandons is one it says it abandoned.
+    let r = resolve_no_plugins(
+        RawConfig {
+            timezone: Some("Europe/Paris".to_string()),
+            ..raw_distro("oci:docker.io/library/debian:10")
+        },
+        None,
+    );
+    assert_eq!(r.timezone.as_deref(), Some("Europe/Paris"));
+    assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains("`timezone` has no effect"),
+        "{:?}",
+        r.warnings
+    );
+
+    // Each on its own is silent: the warning is about the pair, not about either field.
+    let r = resolve_no_plugins(raw_distro("oci:docker.io/library/debian:10"), None);
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    let r = resolve_no_plugins(
+        RawConfig {
+            timezone: Some("Europe/Paris".to_string()),
+            ..RawConfig::default()
+        },
+        None,
+    );
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+}
+
+#[test]
+fn an_untrusted_project_distro_is_dropped_with_a_warning() {
+    for state in [TrustState::Untrusted, TrustState::Changed] {
+        let r = resolve_no_plugins(
+            RawConfig::default(),
+            Some((raw_distro("oci:docker.io/library/debian:10"), state)),
+        );
+        assert!(
+            r.distro.is_none(),
+            "an untrusted project may not choose the root filesystem the cage runs from"
+        );
+        assert_eq!(r.distro_origin, Provenance::Default);
+        assert_eq!(r.warnings.len(), 1);
+        assert!(r.warnings[0].contains("distro"));
+    }
+}
+
+#[test]
+fn a_malformed_distro_locator_is_dropped() {
+    // An unprefixed image reference must not reach a registry.
+    let r = resolve_no_plugins(raw_distro("docker.io/library/debian:10"), None);
+    assert!(r.distro.is_none());
+    assert_eq!(r.warnings.len(), 1);
+    assert!(r.warnings[0].contains("malformed distro locator"));
+
+    // A project's malformed value leaves the global one standing rather than stranding the
+    // launch between two substrates — and the provenance stays where the value came from.
+    let r = resolve_no_plugins(
+        raw_distro("oci:docker.io/library/debian:10"),
+        Some((raw_distro("oci:debian:10"), TrustState::Trusted)),
+    );
+    assert_eq!(r.distro.as_deref(), Some("oci:docker.io/library/debian:10"));
+    assert_eq!(r.distro_origin, Provenance::Global);
+    assert_eq!(r.warnings.len(), 1);
+    assert!(r.warnings[0].contains("malformed distro locator"));
+}
+
+#[test]
 fn a_global_network_posture_is_honored_a_trusted_project_overrides_it() {
     // global is trusted by location
     let r = resolve_no_plugins(raw_network("none"), None);
@@ -7701,6 +7805,47 @@ fn nixpkgs_source_validator() {
         "a;b",
     ] {
         assert!(!is_valid_nixpkgs_source(s), "{s} should be rejected");
+    }
+}
+
+#[test]
+fn distro_locator_validator() {
+    let digest = "a".repeat(64);
+    let valid = [
+        "oci:docker.io/library/debian:10".to_string(),
+        "oci:ghcr.io/owner/repo:v1.2.3".to_string(),
+        "oci:registry.example.com:8443/a/b/c:tag".to_string(),
+        "oci:localhost:5000/img:tag".to_string(),
+        "oci:localhost/img:tag".to_string(),
+        format!("oci:quay.io/org/img@sha256:{digest}"),
+    ];
+    for s in &valid {
+        assert!(is_valid_distro_source(s), "{s} should be valid");
+    }
+    let invalid = [
+        String::new(),
+        // no prefix: the scheme is what keeps a second image source additive
+        "docker.io/library/debian:10".to_string(),
+        // no registry: a bare name would resolve against whatever default a client carries
+        "oci:debian:10".to_string(),
+        // no reference: an unpinned name floats
+        "oci:docker.io/library/debian".to_string(),
+        "oci:docker.io/library/debian:".to_string(),
+        // a path that climbs out of the repository it appears to name
+        "oci:docker.io/library/../etc:10".to_string(),
+        // a digest that is not one
+        "oci:docker.io/library/debian@sha256:short".to_string(),
+        format!("oci:docker.io/library/debian@md5:{digest}"),
+        // a tag and a digest at once: the digest alone pins, so the doubled form is refused
+        format!("oci:docker.io/library/debian:10@sha256:{digest}"),
+        // an empty host, an uppercase repository, and characters a fetch must never see
+        "oci:/library/debian:10".to_string(),
+        "oci:docker.io/Library/debian:10".to_string(),
+        "oci:docker.io/lib rary/debian:10".to_string(),
+        "oci:docker.io/library/debian:10;rm".to_string(),
+    ];
+    for s in &invalid {
+        assert!(!is_valid_distro_source(s), "{s} should be rejected");
     }
 }
 

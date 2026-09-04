@@ -134,6 +134,18 @@ pub(crate) struct RawConfig {
     /// — honored from the global config or a trusted project, ignored from an
     /// untrusted one (the source is a supply-chain-relevant choice).
     pub(crate) nixpkgs: Option<String>,
+    /// The distribution userland the cage runs on, in place of the hermetic nix one: a prefixed
+    /// locator naming a prebuilt root filesystem (`oci:<registry>/<repository>:<tag>`, or
+    /// `@sha256:<digest>` for an image the registry cannot move). Unset — the ordinary case —
+    /// leaves the cage on sbx's own hermetic nix userland.
+    ///
+    /// A security field, honored from the global config or a trusted project and ignored from an
+    /// untrusted one: the root filesystem supplies every program the cage runs, which is the
+    /// broadest supply-chain choice a config can express.
+    ///
+    /// The prefix is mandatory, as it is for every `[packages]` backend, so a second image source
+    /// is additive and leaves a value written for the first one meaning exactly what it did.
+    pub(crate) distro: Option<String>,
     /// The `[mise]` table: which build of the mise engine provisions the cage's tools.
     pub(crate) mise: Option<RawMise>,
     /// The sandbox's network posture. Either a simple string — `"none"` (a fresh, empty

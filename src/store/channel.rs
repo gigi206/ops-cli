@@ -502,14 +502,27 @@ fn resolve_source_rev(
 /// when the file is absent or its revision is malformed, so resolution re-runs rather
 /// than trusting a corrupt revision.
 fn read_lock(lock_path: &Path) -> Option<(String, String)> {
+    match read_lock_lines(lock_path)? {
+        (source, Some(rev)) => valid_revision(&rev).map(|rev| (source, rev)),
+        // a legacy single-line lock is a bare revision on the default channel
+        (only, None) => valid_revision(&only).map(|rev| (DEFAULT_SOURCE.to_string(), rev)),
+    }
+}
+
+/// The lines a lock file carries, trimmed and **unvalidated**: the first is the source, the second
+/// is what that source resolved to, and a file with only one line yields `None` for the second.
+///
+/// Split out from [`read_lock`] because the format is shared and the validation is not. Every lock
+/// sbx writes has this shape, but what a second line means differs — a 40-hex nixpkgs revision here,
+/// a `sha256:` image digest for a distribution root filesystem — so the shape is defined once and
+/// each caller holds its own second line to its own grammar. Reading a digest through
+/// [`read_lock`] would reject every valid one.
+pub(crate) fn read_lock_lines(lock_path: &Path) -> Option<(String, Option<String>)> {
     let contents = std::fs::read_to_string(lock_path).ok()?;
     let mut lines = contents.lines();
-    let first = lines.next()?.trim();
-    match lines.next() {
-        Some(second) => valid_revision(second.trim()).map(|rev| (first.to_string(), rev)),
-        // a legacy single-line lock is a bare revision on the default channel
-        None => valid_revision(first).map(|rev| (DEFAULT_SOURCE.to_string(), rev)),
-    }
+    let first = lines.next()?.trim().to_string();
+    let second = lines.next().map(|l| l.trim().to_string());
+    (!first.is_empty()).then_some((first, second))
 }
 
 /// Write a source-aware lock as `<source>\n<rev>`, creating the parent directory
@@ -520,7 +533,7 @@ fn read_lock(lock_path: &Path) -> Option<(String, String)> {
 /// another launch resolving, or a second `sbx upgrade` — sees either the old lock
 /// or the new one, never a half-written file. Two upgrades racing settle on a
 /// last-writer-wins of two valid revisions, which the next upgrade reconciles.
-fn write_lock(lock_path: &Path, source: &str, rev: &str) -> io::Result<()> {
+pub(crate) fn write_lock(lock_path: &Path, source: &str, rev: &str) -> io::Result<()> {
     if let Some(parent) = lock_path.parent() {
         use std::fs::DirBuilder;
         use std::os::unix::fs::DirBuilderExt;

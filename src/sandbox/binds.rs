@@ -189,6 +189,17 @@ pub(crate) struct Userland {
     pub(crate) foreign_lib_paths: Vec<PathBuf>,
     /// Directories joined into `PATH`.
     pub(crate) bin_paths: Vec<PathBuf>,
+    /// Host path of the provisioned distribution root filesystem the cage runs on, when a config
+    /// declared one. `None` is the hermetic userland every other field on this type describes, and
+    /// the two are exclusive: a declared distribution supplies the shell, the loader and the FHS
+    /// paths listed in [`DISTRO_SUPPLIED`], which are then not emitted.
+    ///
+    /// Bound **read-only** at the cage root. Read-only is the shape, not a precaution: with a
+    /// read-write bind bubblewrap creates a missing mountpoint *inside the artefact itself*, so one
+    /// cage would alter the tree every other cage on the same image reads. It is also what makes
+    /// the substrate's rule hold in the filesystem rather than by convention, since nothing in the
+    /// cage can then change the userland it runs on.
+    pub(crate) distro: Option<PathBuf>,
     /// The shell binary `/bin/sh` links to and the default command runs.
     pub(crate) shell_bin: PathBuf,
     /// The coreutils `env` binary `/usr/bin/env` links to, so an interpreted tool's
@@ -225,6 +236,203 @@ pub(crate) struct Userland {
     /// backs a mount), like `ca_bundle_src` and unlike the locale archive, which is named by
     /// store path rather than bound. Ships only data, so it is off `PATH`.
     pub(crate) zoneinfo_src: PathBuf,
+}
+/// What a mountpoint has to be for the mount that lands on it: bubblewrap binds a file over a file
+/// and a directory over a directory, and refuses the mismatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Mountpoint {
+    Dir,
+    File,
+}
+
+/// The mountpoints a provisioned root filesystem has to carry, and what each has to be.
+///
+/// A distribution image carries the paths *it* needs, which is not the same set: a Debian image has
+/// no `/nix`, an Alpine one no `/usr/share/zoneinfo`, and neither has `/etc/machine-id`. Under a
+/// read-only root bubblewrap cannot create a missing one — it refuses with `Read-only file system`
+/// and the launch stops — so they are created in the tree when it is unpacked, once, for every
+/// project that will ever run on that image.
+///
+/// Empty directories and empty files: a mountpoint is a name to mount over, and nothing here is
+/// ever read. What the cage sees at each of these paths is the mount sbx puts there.
+///
+/// Two of them are also tmpfs destinations ([`DISTRO_TMPFS`]), which is what covers everything
+/// *under* them without naming it: `/opt/sbx/…` and `/home/sandbox` need no entry of their own.
+/// `distro_mountpoints_cover_every_structural_destination` fails when a structural mount is added
+/// that this list, [`DISTRO_SUPPLIED`] and those two tmpfs between them do not account for.
+pub(super) const DISTRO_MOUNTPOINTS: &[(&str, Mountpoint)] = &[
+    ("/nix", Mountpoint::Dir),
+    ("/proc", Mountpoint::Dir),
+    ("/dev", Mountpoint::Dir),
+    ("/tmp", Mountpoint::Dir),
+    ("/home", Mountpoint::Dir),
+    (OPT_DIR, Mountpoint::Dir),
+    ("/etc/passwd", Mountpoint::File),
+    ("/etc/group", Mountpoint::File),
+    ("/etc/hosts", Mountpoint::File),
+    ("/etc/machine-id", Mountpoint::File),
+    ("/var/lib/dbus/machine-id", Mountpoint::File),
+    (CAGE_ZONEINFO, Mountpoint::Dir),
+    ("/etc/resolv.conf", Mountpoint::File),
+    ("/etc/ssl/certs/ca-certificates.crt", Mountpoint::File),
+    (CAGE_CA_BUNDLE, Mountpoint::File),
+    (XDG_OPEN_INCAGE, Mountpoint::File),
+    (SSH_CONFIG_INCAGE, Mountpoint::File),
+];
+
+/// The binary directories a distribution userland contributes to `PATH`, in the order a
+/// distribution's own default `PATH` lists them.
+///
+/// A fixed FHS list rather than the image's declared `PATH`: an image carries one in its config
+/// blob, but that is a hint for whoever runs the image and every mainstream distribution's is this
+/// list. Naming it here keeps the cage's `PATH` a property a reader can see rather than one that
+/// changes with the image, and a project that needs something else sets `PATH` through `[env]`,
+/// which is upserted over this and wins.
+pub(super) const DISTRO_BIN_DIRS: &[&str] = &[
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+];
+
+/// The two cage directories a distribution root filesystem is always given a tmpfs over.
+///
+/// `/opt` is sbx's own tree and is a tmpfs in every cage anyway. `/home` is the one an image leaves
+/// empty and sbx fills: the sandbox home, and — for most installations — the project at its real
+/// path. Covering the directory rather than each path under it is what keeps a shared tree free of
+/// project-specific names: no other project's cage can enumerate what this one mounted.
+pub(super) const DISTRO_TMPFS: &[&str] = &["/home", OPT_DIR];
+
+/// The synthetic-FHS mounts a distribution userland supplies itself, and which are therefore not
+/// emitted over one.
+///
+/// Each is a path every distribution already occupies, so emitting sbx's own would not shadow the
+/// image's: bubblewrap refuses outright (`destination exists and is not a symlink`, or
+/// `Can't create file …`) and the launch never starts. The loader is the sharpest of them: routing
+/// a distribution's binaries through the nix-ld shim would hand them the base glibc under their own
+/// interpreter, which is the ABI skew [`Userland`] exists to avoid.
+///
+/// Every entry is also in [`STRUCTURAL_DESTS`], whose own guard fails when a structural mount is
+/// added without being listed, so this list cannot silently fall behind the mount plan.
+pub(super) const DISTRO_SUPPLIED: &[&str] = &[
+    LOADER_DEST,
+    SANDBOX_SHELL,
+    SANDBOX_BASH,
+    SANDBOX_ENV,
+    SANDBOX_LDD,
+    CAGE_LOCALTIME,
+];
+
+/// Create in `rootfs` every mountpoint of [`DISTRO_MOUNTPOINTS`] the image does not already carry.
+///
+/// Called once, when the tree is unpacked, because that is the only moment it can be: a launch
+/// binds the tree read-only, and a read-only root is precisely what cannot be given a mountpoint.
+/// Idempotent, so re-running it over a tree an earlier version of sbx unpacked adds what that
+/// version did not know to need.
+///
+/// A path the image already carries is left exactly as it is — including a symlink, which is what a
+/// distribution often makes of `/etc/resolv.conf`. Replacing one would be sbx editing the image
+/// rather than adding to it, and the mount that lands there follows the link the way every other
+/// reader of that image does.
+pub(super) fn create_distro_mountpoints(rootfs: &Path) -> io::Result<()> {
+    for (path, kind) in DISTRO_MOUNTPOINTS {
+        let dest = rootfs.join(path.trim_start_matches('/'));
+        if dest.symlink_metadata().is_ok() {
+            continue;
+        }
+        match kind {
+            Mountpoint::Dir => std::fs::create_dir_all(&dest)?,
+            Mountpoint::File => {
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::File::create(&dest)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The cage directories to cover with a tmpfs, so that every mount this launch makes has somewhere
+/// to land on a read-only root.
+///
+/// [`DISTRO_TMPFS`] covers what sbx's own mount plan needs. What is left are the destinations this
+/// launch alone knows: the project at its real path, and whatever `[[binds]]` declared. Each is
+/// resolved by one rule, and the rule is what the three outcomes below have in common — a mount
+/// needs a writable ancestor, and only the image can say where one may be put:
+///
+/// * the image **carries the destination**: nothing to do, bubblewrap mounts over it;
+/// * the deepest ancestor the image carries is an **empty directory**: a tmpfs there, which hides
+///   nothing and writes nothing into a tree other projects share;
+/// * the image carries **nothing above it but the root**: the one missing top-level directory is
+///   created in the tree, then covered. That is one directory name in a shared artefact, which is
+///   the price of running a project from a path the image's distribution never imagined.
+///
+/// The remaining case is refused by name: an ancestor that is a **populated** directory. Covering
+/// `/etc` to reach `/etc/myapp.conf` would empty the distribution's `/etc`, so the launch stops and
+/// says which directory it will not hide.
+pub(super) fn distro_writable(
+    rootfs: &Path,
+    project: &Path,
+    extra_binds: &[ExtraBind],
+) -> io::Result<Vec<PathBuf>> {
+    let mut out: Vec<PathBuf> = DISTRO_TMPFS.iter().map(PathBuf::from).collect();
+    for dest in std::iter::once(project).chain(extra_binds.iter().map(|b| b.dest.as_path())) {
+        if out.iter().any(|t| dest.starts_with(t)) || in_image(rootfs, dest) {
+            continue;
+        }
+        let anchor = writable_anchor(rootfs, dest)?;
+        if !out.contains(&anchor) {
+            out.push(anchor);
+        }
+    }
+    Ok(out)
+}
+
+/// Whether `dest` is a path the image itself carries. `symlink_metadata`, so a symlink counts as
+/// carried: it is what an image put there, and the mount lands on it rather than through it.
+fn in_image(rootfs: &Path, dest: &Path) -> bool {
+    rootfs
+        .join(dest.strip_prefix("/").unwrap_or(dest))
+        .symlink_metadata()
+        .is_ok()
+}
+
+/// The directory to cover with a tmpfs so `dest` can be created under it. See [`distro_writable`]
+/// for the rule; this is where it is applied to one destination.
+fn writable_anchor(rootfs: &Path, dest: &Path) -> io::Result<PathBuf> {
+    // Deepest first: the shallowest tmpfs that works hides the most, so the deepest one that works
+    // is the one to take.
+    for ancestor in dest.ancestors().skip(1) {
+        if ancestor == Path::new("/") {
+            break;
+        }
+        let on_image = rootfs.join(ancestor.strip_prefix("/").unwrap_or(ancestor));
+        let Ok(meta) = on_image.symlink_metadata() else {
+            continue;
+        };
+        if meta.is_dir() && std::fs::read_dir(&on_image)?.next().is_none() {
+            return Ok(ancestor.to_path_buf());
+        }
+        return Err(io::Error::other(format!(
+            "the image carries no `{}`, and sbx will not cover `{}` to make room \
+             for it: that directory is the distribution's own",
+            dest.display(),
+            ancestor.display()
+        )));
+    }
+    // Nothing above it exists at all. Create the single top-level directory, and cover that.
+    let Some(first) = dest.components().nth(1) else {
+        return Err(io::Error::other(format!(
+            "`{}` is not a path a mount can be given inside the cage",
+            dest.display()
+        )));
+    };
+    let top = Path::new("/").join(first);
+    std::fs::create_dir_all(rootfs.join(top.strip_prefix("/").unwrap_or(&top)))?;
+    Ok(top)
 }
 
 /// One explicit bind injected by the launcher after the structural mounts (so it is
@@ -295,6 +503,12 @@ pub(crate) struct Overlay<'a> {
 struct SandboxPaths<'a> {
     /// Canonical project root; bound read-write at the same absolute path.
     project: &'a Path,
+    /// Cage directories to cover with a tmpfs before anything else, under a declared distribution
+    /// only: a mount whose destination the image lacks needs a writable ancestor to be created in.
+    /// Computed by [`distro_writable`] from this launch's own paths, which is why it lives here and
+    /// not on [`Userland`] — the set depends on where the project is, not on which image it is.
+    /// Empty for a hermetic cage, whose root is writable already.
+    distro_writable: &'a [PathBuf],
     /// Host sandbox home; bound read-write at [`SANDBOX_HOME`].
     home_src: &'a Path,
     /// For a global app only: the host per-project mise data pool, bound writable at
@@ -390,9 +604,34 @@ fn cage_mounts(
     // structural block because it must shadow nothing: a `[[binds]]` under `/opt` still lands inside
     // this tmpfs, and one *at* `/opt` replaces it with a mount of its own, which keeps the property
     // the pin is here for.
-    let mut mounts: Vec<Mount> = vec![Mount::Tmpfs {
-        dest: PathBuf::from(OPT_DIR),
-    }];
+    let mut mounts: Vec<Mount> = Vec::new();
+
+    // Layer 0, and only under a declared distribution: the provisioned root filesystem, read-only,
+    // before every other mount. bubblewrap applies its argv in sequence and a mount lands *inside*
+    // the root current at that point, so the userland has to be the first thing there is. This is
+    // also why it cannot be expressed as a config bind, which is emitted after this point and
+    // shadowed by every structural mount below.
+    //
+    // The tmpfs that follow give the mounts sbx owns a writable ancestor to be created in; see
+    // [`distro_writable`] for why a read-only root makes that necessary.
+    if let Some(root) = &userland.distro {
+        mounts.push(Mount::RoBind {
+            src: root.clone(),
+            dest: PathBuf::from("/"),
+        });
+        mounts.extend(
+            paths
+                .distro_writable
+                .iter()
+                .map(|dest| Mount::Tmpfs { dest: dest.clone() }),
+        );
+    }
+
+    if userland.distro.is_none() {
+        mounts.push(Mount::Tmpfs {
+            dest: PathBuf::from(OPT_DIR),
+        });
+    }
 
     // Config-declared binds come next, so any structural mount below shadows a colliding one —
     // a config bind can never displace `/nix`, the synthetic `/etc/passwd`/`group`, the loader,
@@ -720,6 +959,14 @@ fn cage_mounts(
             }
         }
     }));
+
+    // Under a declared distribution, drop the synthetic FHS the image supplies itself. Emitting one
+    // over the image's own would not shadow it: bubblewrap refuses the mount and the launch never
+    // starts. Filtering by destination rather than skipping at each emission site keeps the mount
+    // plan one list read in one order, which is the property every comment above depends on.
+    if userland.distro.is_some() {
+        mounts.retain(|m| !DISTRO_SUPPLIED.iter().any(|d| m.dest() == Path::new(d)));
+    }
     mounts
 }
 
@@ -795,13 +1042,23 @@ fn cage_env(
         path_dirs.push(PathBuf::from(format!("{MISE_PROJECT_INCAGE}/shims")));
     }
     path_dirs.push(PathBuf::from(format!("{SANDBOX_HOME}/{MISE_SHIMS_REL}")));
+    // A declared distribution's own binary directories come *before* the base userland's, which is
+    // what declaring one means: the distribution owns the userland and sbx adds what is missing
+    // rather than replacing what is there. It is also what a build expects, since a release's own
+    // tools are part of what the release was named for. Declared tools and mise shims still lead,
+    // so a project's own pin is never displaced by the image.
+    if userland.distro.is_some() {
+        path_dirs.extend(DISTRO_BIN_DIRS.iter().map(PathBuf::from));
+    }
     path_dirs.extend(userland.bin_paths.iter().cloned());
     // The synthetic `/usr/bin` (only `env` and `xdg-open`, both sbx-owned — no host
     // leak) is on PATH last, so declared tools, mise shims, and the base userland all win on a
     // name collision; `/usr/bin/env` is the same coreutils `env` already on PATH. It is no longer
     // how a bare `xdg-open` resolves — the router directory at the head is — so this entry now
     // serves only a caller that names `/usr/bin` explicitly.
-    path_dirs.push(PathBuf::from("/usr/bin"));
+    if userland.distro.is_none() {
+        path_dirs.push(PathBuf::from("/usr/bin"));
+    }
 
     // Where the declared-operations client is bound, when the session offers any. On PATH because
     // the contract the cage reads tells an agent to run `sbx task run <name>` — an instruction that
@@ -868,6 +1125,13 @@ fn cage_env(
         ("TZDIR".to_string(), CAGE_ZONEINFO.to_string()),
         ("TZ".to_string(), overlay.timezone.to_string()),
     ];
+    // Under a declared distribution the nix-ld shim is not mounted: the image's own loader is at
+    // the interpreter path, and it is what a foreign binary gets — which is the whole point of
+    // declaring one. Nothing then reads either variable, so carrying them would leave the cage
+    // describing a substitution that is not happening.
+    if userland.distro.is_some() {
+        env.retain(|(key, _)| key != "NIX_LD" && key != "NIX_LD_LIBRARY_PATH");
+    }
     env.extend(mise_env(
         paths.mise_project_src.is_some(),
         nix.on_btrfs,
@@ -1377,8 +1641,18 @@ pub(crate) fn build_spec(
     let machine_id = rt.etc_dir.join("machine-id");
     super::atomicfile::write_atomic(&machine_id, machine_id_contents(&rt.home_src).as_bytes())?;
 
+    // Under a declared distribution the cage root is read-only, so every mount this launch makes
+    // needs a writable ancestor already there. Computed before the plan rather than from it: the
+    // destinations that are not sbx's own are exactly the two known here, the project and the
+    // config's binds, so one pass answers it and [`assemble`] stays pure.
+    let distro_writable = match &userland.distro {
+        Some(root) => distro_writable(root, &project, extra_binds)?,
+        None => Vec::new(),
+    };
+
     let paths = SandboxPaths {
         project: &project,
+        distro_writable: &distro_writable,
         home_src: &rt.home_src,
         mise_project_src: rt.mise_project_src.as_deref(),
         passwd_src: &passwd,

@@ -70,7 +70,7 @@ const OPTION_GROUPS: &[(&[&str], &str, &[&str])] = &[(
     &["upgrade"],
     "narrow to one channel",
     &[
-        "nix", "mise", "flake", "deb", "appimage", "tarball", "binary",
+        "nix", "mise", "flake", "deb", "appimage", "tarball", "binary", "distro",
     ],
 )];
 

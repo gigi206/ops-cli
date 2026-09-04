@@ -86,6 +86,11 @@ pub(crate) struct ConfigView {
     pub(crate) gui: GuiView,
     /// Which layer supplied the GUI posture (`Default` when neither config set it).
     pub(crate) gui_origin: ProvenanceView,
+    /// The distribution userland the cage runs on, when a layer named one. `None` — the ordinary
+    /// case — means the cage runs on sbx's own hermetic nix userland.
+    pub(crate) distro: Option<String>,
+    /// Which layer named the distribution userland (`Default` when none did).
+    pub(crate) distro_origin: ProvenanceView,
     /// The IANA zone the cage's clock reads in. Always a zone, never absent: the built-in
     /// `sandbox::binds::DEFAULT_ZONE` when no layer named one.
     pub(crate) timezone: String,
@@ -1153,6 +1158,8 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         notify_origin: resolved.notify_origin.into(),
         gui,
         gui_origin: resolved.gui_origin.into(),
+        distro: resolved.distro.clone(),
+        distro_origin: resolved.distro_origin.into(),
         // The view reports the zone the cage will actually run in, so an unset field reads as the
         // built-in default rather than as a blank — the cage always has one.
         timezone: resolved
@@ -2129,6 +2136,8 @@ mod tests {
             proc_origin: Default::default(),
             gui: GuiView::Wayland,
             gui_origin: ProvenanceView::Global,
+            distro: None,
+            distro_origin: ProvenanceView::Default,
             gpu: true,
             allow_insecure_http: false,
             audio: true,
@@ -2501,6 +2510,8 @@ mod tests {
             accepts_fresh_releases: Default::default(),
             timezone: None,
             timezone_origin: Provenance::Default,
+            distro: None,
+            distro_origin: Provenance::Default,
             plugin: Default::default(),
             net_groups: Default::default(),
             brokers: Vec::new(),

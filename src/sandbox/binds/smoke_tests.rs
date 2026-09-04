@@ -1067,3 +1067,153 @@ fn a_global_app_cage_puts_both_mise_shims_dirs_on_path_and_splits_the_pool() {
         "MISE_SHARED_INSTALL_DIRS is not the app-global installs:\n{stdout}"
     );
 }
+
+/// A declared distribution really is the cage's root filesystem: the image's own userland answers,
+/// its loader and its shell are the ones in use, and everything sbx mounts still lands on top.
+///
+/// Only a launch can show this. The unit tests pin the plan, but the plan is an argv, and what
+/// bubblewrap makes of it — layer 0 first, a read-only root that still accepts every later mount,
+/// a tmpfs where the image had nothing — is a property of the kernel, not of the vector.
+#[test]
+fn a_declared_distribution_is_the_cage_root_and_every_mount_still_lands() {
+    let Some((bwrap, nix)) = prerequisites() else {
+        skip_incapable!("skipping distribution smoke: need bwrap, userns, and nix");
+        return;
+    };
+
+    let data = TmpDir::new();
+    let layout = crate::store::Layout::under(data.path());
+    let nixpkgs = crate::store::LockTarget::global(&layout, None)
+        .resolve(&nix, &layout)
+        .expect("resolve nixpkgs");
+    let Ok(mut userland) = super::super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs)
+    else {
+        skip_unreachable!("skipping: base userland provisioning failed (cache or channel drift)");
+        return;
+    };
+
+    let locator = "oci:docker.io/library/debian:10-slim";
+    let lock = data.path().join("distro.lock");
+    match crate::sandbox::distro::store::provision(&layout, locator, &lock) {
+        Ok(root) => userland.distro = Some(root),
+        Err(e) => {
+            skip_unreachable!("skipping distribution smoke: {e}");
+            return;
+        }
+    }
+
+    let project = TmpDir::new();
+    std::fs::write(project.path().join("README"), b"hi").unwrap();
+
+    let cmd = vec![
+        std::ffi::OsString::from("/bin/sh"),
+        OsString::from("-c"),
+        OsString::from(
+            "echo ID=$(. /etc/os-release; echo $ID$VERSION_ID); \
+             echo ENV=$(readlink -f /usr/bin/env); \
+             echo LD=$(readlink -f /lib64/ld-linux-x86-64.so.2); \
+             echo NIX=$(ls /nix | tr '\\n' ','); \
+             echo HOME_OK=$(touch $HOME/w && echo yes); \
+             echo PROJ=$(ls); \
+             echo GREP=$(command -v grep); \
+             echo APT=$(command -v apt-get); \
+             echo ROOT_RO=$(touch /etc/intruder >/dev/null 2>&1 && echo writable || echo readonly)",
+        ),
+    ];
+    let env = [("TERM".to_string(), "dumb".to_string())];
+    let overlay = Overlay {
+        env: &env,
+        binds: &[],
+        bin_paths: &[],
+        timezone: DEFAULT_ZONE,
+        fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
+    };
+    let nix_mount = NixMount {
+        src: crate::store::physical_path(&layout, Path::new("/nix")),
+        writable: false,
+        on_btrfs: false,
+    };
+    let spec = build_spec(
+        data.path(),
+        project.path(),
+        Runtime::ProjectDefault,
+        &userland,
+        &nix_mount,
+        &overlay,
+        &[],
+        NetPolicy::Shared,
+        "",
+        &Default::default(),
+        crate::sandbox::seccomp::SeccompPolicy::default(),
+        &[],
+        &Default::default(),
+        cmd,
+    )
+    .expect("build spec");
+
+    let out = super::super::argv::run_bwrap(&bwrap, &spec).expect("spawn bwrap");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "bwrap failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Layer 0 landed, and it is what `/` is: the image's own release file answered, which no
+    // hermetic cage carries at all.
+    assert!(
+        stdout.contains("ID=debian10"),
+        "not the image's root:\n{stdout}"
+    );
+    // The paths a distribution supplies are the distribution's. `env` resolving into `/nix` would
+    // mean sbx's symlink had shadowed the image's, and the loader is the sharper of the two: a
+    // foreign binary going through the nix-ld shim is exactly the ABI skew a declared image avoids.
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.starts_with("ENV=") && !l.contains("/nix/store")),
+        "/usr/bin/env is not the image's:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.starts_with("LD=") && !l.contains("/nix/store")),
+        "the loader is not the image's:\n{stdout}"
+    );
+    // And everything sbx mounts still landed on top: the store at a mountpoint the image had no
+    // idea about, the writable home inside a tmpfs where the image had an empty directory, and the
+    // project at its own absolute path.
+    assert!(
+        stdout.contains("NIX=store,"),
+        "the store did not mount:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("HOME_OK=yes"),
+        "the home is not writable:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("README"),
+        "the project is not visible:\n{stdout}"
+    );
+    // The distribution's own tools are the ones a build finds: its `grep` ahead of the base
+    // userland's, and its package manager reachable at all, which a hermetic PATH never was.
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.starts_with("GREP=") && !l.contains("/nix/store")),
+        "the base userland's grep shadows the distribution's:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.starts_with("APT=/usr/bin/apt-get")),
+        "the distribution's own tools are not on PATH:\n{stdout}"
+    );
+    // The root itself is not: one cage must not be able to alter the tree every other cage on the
+    // same image reads.
+    assert!(
+        stdout.contains("ROOT_RO=readonly"),
+        "the root is writable:\n{stdout}"
+    );
+}

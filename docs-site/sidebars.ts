@@ -168,6 +168,7 @@ const sidebars: SidebarsConfig = {
             'configuration/service',
             'configuration/tools',
             'configuration/nixpkgs',
+            'configuration/distro',
           ],
         },
         {

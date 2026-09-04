@@ -46,6 +46,7 @@ mod catalogue_freshness;
 mod broker;
 pub(crate) mod broker_control;
 mod deb;
+pub(crate) mod distro;
 mod flake;
 pub(crate) mod flake_inline;
 mod mise;
@@ -141,8 +142,8 @@ pub(crate) use gc::{
     purge_app_homes, tree_size, tree_usage, tree_usage_parts,
 };
 pub(crate) use launch::{
-    SessionHeader, app, attach, detach_log_path, effective_lock_target, gc, parse_session_header,
-    run, run_mise, stop, superseded_reclaimable_hint, upgrade_mise_packages,
+    SessionHeader, app, attach, detach_log_path, distro_lock_path, effective_lock_target, gc,
+    parse_session_header, run, run_mise, stop, superseded_reclaimable_hint, upgrade_mise_packages,
     upgrade_provision_steps,
 };
 pub(crate) use naming::cage_name;

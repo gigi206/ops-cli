@@ -361,7 +361,7 @@ pub(super) use crate::sandbox::deadline::Deadlined;
 pub(super) const RELAY_CHUNK: usize = 64 * 1024;
 
 /// Copy exactly `n` bytes from `r` to `w`; a short read is an error (a truncated body).
-pub(super) fn copy_exact<R: Read, W: Write>(r: &mut R, w: &mut W, mut n: u64) -> io::Result<()> {
+pub(crate) fn copy_exact<R: Read, W: Write>(r: &mut R, w: &mut W, mut n: u64) -> io::Result<()> {
     let mut buf = vec![0u8; RELAY_CHUNK];
     while n > 0 {
         let want = n.min(buf.len() as u64) as usize;
@@ -405,7 +405,7 @@ const TRAILER_LINES_MAX: usize = 64;
 /// (stripping `Transfer-Encoding`), so the upstream receives one unambiguous Content-Length and no
 /// TE — no CL/TE request-smuggling ambiguity can reach it. Trailers after the zero chunk are read
 /// and discarded (the proxy does not forward them; they are not part of any secret-tripwire path).
-pub(super) fn read_chunked_body<R: BufRead>(r: &mut R, cap: u64) -> io::Result<Vec<u8>> {
+pub(crate) fn read_chunked_body<R: BufRead>(r: &mut R, cap: u64) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     loop {
         let size = read_chunk_size_line(r)?;
@@ -513,7 +513,7 @@ pub(super) fn parse_chunk_size(line: &[u8]) -> io::Result<u64> {
 /// upstream managed to send and lets the relay end on the EOF that follows, so a truncated head must
 /// stay a truncated relay here and not become a hard error the client never sees the reason for.
 /// Bytes past the head stay in the reader.
-pub(super) fn read_response_head<R: BufRead>(r: &mut R, max: usize) -> (Vec<u8>, bool) {
+pub(crate) fn read_response_head<R: BufRead>(r: &mut R, max: usize) -> (Vec<u8>, bool) {
     let mut buf = Vec::new();
     loop {
         let start = buf.len();
@@ -536,7 +536,7 @@ pub(super) fn read_response_head<R: BufRead>(r: &mut R, max: usize) -> (Vec<u8>,
 }
 
 /// Where an HTTP/1.1 response body ends, decided from the response head (RFC 9112 §6.3).
-pub(super) enum BodyFraming {
+pub(crate) enum BodyFraming {
     /// The message has no body at all, whatever its head declares: a `1xx`, a `204` or a `304`, or
     /// any response to a `HEAD`. Such a head routinely carries a `Content-Length` describing the
     /// entity that *would* have been sent — reading that many bytes would block forever on a body
@@ -562,7 +562,7 @@ pub(super) enum BodyFraming {
 /// `Transfer-Encoding`, then `Content-Length`, then close-delimited. Anything unparsable or
 /// ambiguous yields [`BodyFraming::ToEof`] — this decides how long to *read*, never what to
 /// forward, so an undecidable head costs a close-delimited relay and not a refusal.
-pub(super) fn response_framing(head: &[u8], request_method: &str) -> BodyFraming {
+pub(crate) fn response_framing(head: &[u8], request_method: &str) -> BodyFraming {
     let status = parse_status_code(head);
     if request_method.eq_ignore_ascii_case("head")
         || matches!(status, Some(204) | Some(304))

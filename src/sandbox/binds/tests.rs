@@ -41,6 +41,7 @@ fn userland() -> Userland {
             PathBuf::from("/store/bash/bin"),
             PathBuf::from("/store/coreutils/bin"),
         ],
+        distro: None,
         shell_bin: PathBuf::from("/store/bash/bin/bash"),
         env_bin: PathBuf::from("/store/coreutils/bin/env"),
         ldd_bin: PathBuf::from("/store/glibc-bin/bin/ldd"),
@@ -70,6 +71,7 @@ fn nix_mount() -> NixMount {
 fn base_paths() -> SandboxPaths<'static> {
     SandboxPaths {
         project: Path::new("/home/u/proj"),
+        distro_writable: &[],
         home_src: Path::new("/data/sbx/projects/abc/home"),
         mise_project_src: None,
         passwd_src: Path::new("/data/sbx/projects/abc/etc/passwd"),
@@ -135,6 +137,116 @@ fn assembled_with_every_conditional_mount() -> SandboxSpec {
         open_mimeapps_src: Some(Path::new("/data/sbx/projects/abc/etc/mimeapps.list")),
         ..base_paths()
     })
+}
+
+/// The spec the base paths assemble to when a distribution userland is declared, with the writable
+/// ancestor the cage's home and the project's real path both need.
+fn assembled_on_distro() -> SandboxSpec {
+    let env = [("TERM".to_string(), "xterm".to_string())];
+    let overlay = Overlay {
+        env: &env,
+        binds: &[],
+        bin_paths: &[],
+        timezone: DEFAULT_ZONE,
+        fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
+    };
+    let mut userland = userland();
+    userland.distro = Some(PathBuf::from("/store/distro/rootfs"));
+    // `/home` and `/opt` are what [`DISTRO_TMPFS`] always yields; the project here lives under the
+    // first of them, so this launch needs nothing else.
+    let writable = [PathBuf::from("/home"), PathBuf::from("/opt")];
+    assemble(
+        &SandboxPaths {
+            distro_writable: &writable,
+            ..base_paths()
+        },
+        &userland,
+        &nix_mount(),
+        &overlay,
+        &[],
+        &[],
+        NetPolicy::Shared,
+        vec![OsString::from("/bin/sh")],
+    )
+    .expect("valid spec")
+}
+
+#[test]
+fn a_declared_distribution_is_the_first_mount_and_is_read_only() {
+    let spec = assembled_on_distro();
+    // Order is the whole point: bubblewrap applies its argv in sequence and every later mount
+    // lands inside the root current at that moment, so the userland has to precede all of them.
+    assert_eq!(
+        spec.mounts.first(),
+        Some(&Mount::RoBind {
+            src: PathBuf::from("/store/distro/rootfs"),
+            dest: PathBuf::from("/"),
+        }),
+        "the distribution root filesystem is layer 0, read-only"
+    );
+    // The writable ancestors come next, before the `/opt` pin and therefore before every mount
+    // whose destination the image does not carry.
+    assert_eq!(
+        spec.mounts.get(1),
+        Some(&Mount::Tmpfs {
+            dest: PathBuf::from("/home"),
+        }),
+        "a writable ancestor precedes the mounts that need it"
+    );
+    assert_eq!(
+        spec.mounts.get(2),
+        Some(&Mount::Tmpfs {
+            dest: PathBuf::from(OPT_DIR),
+        }),
+        "and the `/opt` pin still leads the config binds"
+    );
+}
+
+#[test]
+fn a_declared_distribution_supplies_its_own_fhs_so_sbx_emits_none_of_it() {
+    let plain = assembled();
+    let distro = assembled_on_distro();
+    for dest in DISTRO_SUPPLIED {
+        let dest = Path::new(dest);
+        assert!(
+            plain.mounts.iter().any(|m| m.dest() == dest),
+            "{} is a structural mount of the hermetic userland",
+            dest.display()
+        );
+        assert!(
+            !distro.mounts.iter().any(|m| m.dest() == dest),
+            "{} belongs to the image: emitting sbx's own would make bubblewrap refuse the launch",
+            dest.display()
+        );
+    }
+    // What is *kept* matters as much: these destinations exist in a distribution image, so the
+    // structural mount lands on them and the cage keeps its identity, its resolver and its store.
+    for dest in ["/etc/passwd", "/etc/resolv.conf", "/nix", CAGE_ZONEINFO] {
+        assert!(
+            distro.mounts.iter().any(|m| m.dest() == Path::new(dest)),
+            "{dest} is still emitted over a distribution userland"
+        );
+    }
+}
+
+#[test]
+fn no_distribution_leaves_the_mount_plan_exactly_as_it_was() {
+    let spec = assembled();
+    assert!(
+        !spec
+            .mounts
+            .iter()
+            .any(|m| m.dest() == Path::new("/") || m.dest() == Path::new("/home")),
+        "an undeclared userland adds neither a root bind nor a writable ancestor"
+    );
+    assert_eq!(
+        spec.mounts.first(),
+        Some(&Mount::Tmpfs {
+            dest: PathBuf::from(OPT_DIR),
+        }),
+        "the `/opt` pin is still the one mount preceding the config binds"
+    );
 }
 
 #[test]
@@ -1780,6 +1892,7 @@ fn assemble_binds_the_per_project_mise_pool_and_puts_both_shims_on_path() {
     let pool = Path::new("/data/sbx/projects/abc/apps/demo-app/mise");
     let paths = SandboxPaths {
         project: Path::new("/home/u/proj"),
+        distro_writable: &[],
         home_src: Path::new("/data/sbx/apps/demo-app/home"),
         mise_project_src: Some(pool),
         passwd_src: Path::new("/data/sbx/apps/demo-app/etc/passwd"),
@@ -1957,5 +2070,200 @@ fn build_spec_registers_the_nix_plugin_under_both_pools_for_a_global_app() {
         std::fs::read_link(&home_link).unwrap(),
         Path::new(crate::sandbox::miseplugin::INCAGE_DIR),
         "the nix: plugin is also registered under the app-global home for a global app"
+    );
+}
+
+#[test]
+fn distro_mountpoints_cover_every_structural_destination() {
+    // The list of mountpoints a provisioned tree carries is written by hand, and a structural mount
+    // added later would otherwise land on a destination no image has and no launch can create. Each
+    // destination has to be accounted for by exactly one of the three: the image supplies it, the
+    // tree carries a mountpoint for it, or a tmpfs covers the directory it is under.
+    for dest in crate::sandbox::binds::STRUCTURAL_DESTS {
+        let supplied = crate::sandbox::binds::DISTRO_SUPPLIED.contains(dest);
+        let carried = crate::sandbox::binds::DISTRO_MOUNTPOINTS
+            .iter()
+            .any(|(p, _)| p == dest);
+        let covered = crate::sandbox::binds::DISTRO_TMPFS
+            .iter()
+            .any(|t| Path::new(dest).starts_with(t) && *dest != *t);
+        assert!(
+            supplied || carried || covered,
+            "`{dest}` is a structural mount destination that a distribution root filesystem has no \
+             mountpoint for: add it to DISTRO_MOUNTPOINTS, or to DISTRO_SUPPLIED if the image has \
+             to provide it"
+        );
+    }
+}
+
+/// A tree shaped like a distribution image: `/etc` and `/usr/bin` populated, `/home` and `/srv`
+/// empty, and no `/nix` at all.
+fn image_like(dir: &Path) -> PathBuf {
+    let rootfs = dir.join("rootfs");
+    for d in ["etc", "usr/bin", "usr/local/bin", "home", "srv", "opt"] {
+        std::fs::create_dir_all(rootfs.join(d)).unwrap();
+    }
+    std::fs::write(rootfs.join("etc/passwd"), b"root:x:0:0::/root:/bin/sh\n").unwrap();
+    std::fs::write(rootfs.join("usr/bin/awk"), b"").unwrap();
+    std::fs::write(rootfs.join("usr/local/bin/tool"), b"").unwrap();
+    rootfs
+}
+
+#[test]
+fn the_writable_set_covers_the_project_without_naming_it() {
+    let tmp = crate::testutil::TmpDir::new();
+    let rootfs = image_like(tmp.path());
+    let writable =
+        crate::sandbox::binds::distro_writable(&rootfs, Path::new("/home/u/proj"), &[]).unwrap();
+
+    // The two sbx always takes, and nothing more: the project is under one of them, so no other
+    // directory is covered and no project-specific name is written into a tree others share.
+    assert_eq!(
+        writable,
+        vec![PathBuf::from("/home"), PathBuf::from("/opt")]
+    );
+    assert!(
+        !rootfs.join("home/u").exists(),
+        "the shared tree learned nothing about this project"
+    );
+}
+
+#[test]
+fn a_project_outside_the_image_gets_one_directory_and_one_only() {
+    let tmp = crate::testutil::TmpDir::new();
+    let rootfs = image_like(tmp.path());
+
+    // An empty directory the image does carry is covered as it is.
+    let writable =
+        crate::sandbox::binds::distro_writable(&rootfs, Path::new("/srv/work/proj"), &[]).unwrap();
+    assert!(writable.contains(&PathBuf::from("/srv")), "{writable:?}");
+    assert!(!rootfs.join("srv/work").exists());
+
+    // A top-level directory it does not carry is created, and nothing below it is.
+    let writable =
+        crate::sandbox::binds::distro_writable(&rootfs, Path::new("/data/team/proj"), &[]).unwrap();
+    assert!(writable.contains(&PathBuf::from("/data")), "{writable:?}");
+    assert!(rootfs.join("data").is_dir());
+    assert!(
+        !rootfs.join("data/team").exists(),
+        "one directory, not the path"
+    );
+}
+
+#[test]
+fn a_mount_that_would_hide_the_distributions_own_directory_is_refused() {
+    let tmp = crate::testutil::TmpDir::new();
+    let rootfs = image_like(tmp.path());
+    let bind = ExtraBind {
+        src: PathBuf::from("/host/conf"),
+        dest: PathBuf::from("/etc/myapp.conf"),
+        writable: false,
+    };
+    let err = crate::sandbox::binds::distro_writable(&rootfs, Path::new("/home/u/proj"), &[bind])
+        .expect_err("covering /etc would empty the distribution's own");
+    let message = err.to_string();
+    assert!(message.contains("/etc/myapp.conf"), "{message}");
+    assert!(message.contains("`/etc`"), "{message}");
+
+    // A destination the image *does* carry needs no cover at all, so it is not refused.
+    let bind = ExtraBind {
+        src: PathBuf::from("/host/passwd"),
+        dest: PathBuf::from("/etc/passwd"),
+        writable: false,
+    };
+    let writable =
+        crate::sandbox::binds::distro_writable(&rootfs, Path::new("/home/u/proj"), &[bind])
+            .unwrap();
+    assert_eq!(
+        writable,
+        vec![PathBuf::from("/home"), PathBuf::from("/opt")]
+    );
+}
+
+#[test]
+fn the_mountpoints_a_tree_is_given_are_empty_and_of_the_right_kind() {
+    let tmp = crate::testutil::TmpDir::new();
+    let rootfs = image_like(tmp.path());
+    // A path the image already carries, as a symlink, must survive untouched: replacing it would be
+    // sbx editing the image rather than adding to it.
+    std::os::unix::fs::symlink("/run/resolv.conf", rootfs.join("etc/resolv.conf")).unwrap();
+
+    crate::sandbox::binds::create_distro_mountpoints(&rootfs).unwrap();
+
+    assert!(rootfs.join("nix").is_dir());
+    assert!(rootfs.join("etc/machine-id").is_file());
+    assert!(rootfs.join("var/lib/dbus/machine-id").is_file());
+    assert_eq!(
+        std::fs::read_link(rootfs.join("etc/resolv.conf")).unwrap(),
+        Path::new("/run/resolv.conf"),
+        "a path the image carries is left exactly as the image left it"
+    );
+    assert_eq!(
+        std::fs::read(rootfs.join("etc/passwd")).unwrap(),
+        b"root:x:0:0::/root:/bin/sh\n",
+        "and so is its content"
+    );
+    // Idempotent: a tree an earlier version unpacked gains what that version did not know to need.
+    crate::sandbox::binds::create_distro_mountpoints(&rootfs).unwrap();
+}
+
+#[test]
+fn a_distribution_cage_carries_no_nix_ld_substitution() {
+    // The shim is not mounted over an image's own loader, so the two variables that steer it name a
+    // substitution that cannot happen. A hermetic cage still gets both.
+    let spec = assembled_on_distro();
+    for key in ["NIX_LD", "NIX_LD_LIBRARY_PATH"] {
+        assert!(
+            !spec.env.iter().any(|(k, _)| k == key),
+            "`{key}` is set in a cage whose loader is the image's"
+        );
+    }
+    let hermetic = assembled();
+    for key in ["NIX_LD", "NIX_LD_LIBRARY_PATH"] {
+        assert!(
+            hermetic.env.iter().any(|(k, _)| k == key),
+            "`{key}` must still serve a hermetic cage's foreign binaries"
+        );
+    }
+}
+
+#[test]
+fn a_distribution_leads_the_base_userland_on_path_but_not_the_declared_tools() {
+    let spec = assembled_on_distro();
+    let path = spec
+        .env
+        .iter()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| v.clone())
+        .expect("a cage has a PATH");
+    let dirs: Vec<&str> = path.split(':').collect();
+    let at = |needle: &str| {
+        dirs.iter()
+            .position(|d| *d == needle)
+            .unwrap_or_else(|| panic!("`{needle}` is not on PATH: {path}"))
+    };
+
+    // Every FHS directory the distribution owns, and each before the base userland's store paths:
+    // the distribution owns the userland, so its `grep` and its compiler are the ones a build gets.
+    let first_store = dirs
+        .iter()
+        .position(|d| d.starts_with("/store/"))
+        .expect("the base userland is still on PATH");
+    for dir in crate::sandbox::binds::DISTRO_BIN_DIRS {
+        assert!(
+            at(dir) < first_store,
+            "`{dir}` must precede the base: {path}"
+        );
+    }
+    // …and behind the mise shims, so a project's own pin is never displaced by the image.
+    assert!(
+        at("/usr/bin") > at("/home/sandbox/.local/share/mise/shims"),
+        "{path}"
+    );
+    // No duplicate: the trailing synthetic entry is the hermetic cage's, not this one's.
+    assert_eq!(
+        dirs.iter().filter(|d| **d == "/usr/bin").count(),
+        1,
+        "{path}"
     );
 }

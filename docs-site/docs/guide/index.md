@@ -133,6 +133,7 @@ navbar entry: they are for looking things up, not reading through.
   four prebuilt ones.
 - [`[tools]` (mise)](configuration/tools): a project's mise toolchain, auto-equipped in-cage.
 - [`nixpkgs`](configuration/nixpkgs): pin the channel or revision.
+- [`distro`](configuration/distro): run the cage on a distribution userland instead of the hermetic nix one (trusted-only).
 - [`[limits]`](configuration/limits): cgroup resource limits.
 - [`[seccomp]`](configuration/seccomp): relax the mandatory syscall denylist (trusted-only).
 - [`[devices]`](configuration/devices): expose host device nodes into the cage (trusted-only).

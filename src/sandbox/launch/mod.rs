@@ -916,13 +916,35 @@ fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, Ex
             return Err(ExitCode::FAILURE);
         }
     };
-    let userland = match super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &engine_ref) {
+    let mut userland = match super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &engine_ref) {
         Ok(u) => u,
         Err(e) => {
             crate::diag::error(&format!("sbx: cannot resolve the sandbox userland: {e}"));
             return Err(ExitCode::FAILURE);
         }
     };
+    // A declared distribution replaces the userland resolved just above at the cage root; the
+    // hermetic one still resolves, because `/nix` is mounted either way and the tools a project
+    // provisions come from it. Provisioned after it rather than inside `resolve_userland`, which
+    // reads no config and is shared with every caller that needs the base alone.
+    if let Some(locator) = cfg.distro.clone() {
+        let lock = match distro_lock_path(&cwd, &layout, &cfg) {
+            Ok(p) => p,
+            Err(e) => {
+                crate::diag::error(&format!("sbx: cannot identify the project directory: {e}"));
+                return Err(ExitCode::FAILURE);
+            }
+        };
+        match super::distro::store::provision(&layout, &locator, &lock) {
+            Ok(root) => userland.distro = Some(root),
+            Err(e) => {
+                crate::diag::error(&format!(
+                    "sbx: cannot provision the `{locator}` root filesystem: {e}"
+                ));
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    }
     Ok(Prepared {
         bwrap,
         nix,
@@ -936,6 +958,32 @@ fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, Ex
         in_batch: false,
         unresolved_secret: crate::sandbox::egress::Unresolved::Abort,
     })
+}
+
+/// Where this launch's distribution pin is recorded.
+///
+/// The same rule the channel lock follows, for the same reason: a value a project declared is
+/// pinned under that project, and a value the global config declared is pinned once for the host.
+/// So a project that names its own image resolves it independently of every other, and a host-wide
+/// declaration is rolled once rather than per project.
+///
+/// An app has no branch here because an app profile cannot declare `distro` — it is not in the app
+/// schema, so an app launch runs on whatever the baseline declared, under the baseline's lock.
+pub(crate) fn distro_lock_path(
+    cwd: &Path,
+    layout: &Layout,
+    cfg: &crate::config::Resolved,
+) -> io::Result<std::path::PathBuf> {
+    use crate::sandbox::distro::store::DISTRO_LOCK;
+    if cfg.distro_origin != crate::config::Provenance::Project {
+        return Ok(layout.data_dir().join(DISTRO_LOCK));
+    }
+    let id = binds::project_runtime_id(cwd)?;
+    Ok(layout
+        .data_dir()
+        .join("projects")
+        .join(id)
+        .join(DISTRO_LOCK))
 }
 
 /// The single channel decision for a launch — the one place that picks "which source, which lock",

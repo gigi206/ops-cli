@@ -1634,7 +1634,7 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["upgrade"],
-        synopsis: "sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|binary|provision] [-a <name>] [--project <path>]",
+        synopsis: "sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|binary|distro|provision] [-a <name>] [--project <path>]",
         summary: "roll managed channels forward (versions move only here)",
         options: &[
             (
@@ -1654,6 +1654,10 @@ pub(super) const PAGES: &[Page] = &[
             ("appimage", "the project's and apps' appimage: packages"),
             ("tarball", "the project's and apps' tarball: packages"),
             ("binary", "the project's and apps' binary: packages"),
+            (
+                "distro",
+                "the declared distribution image (re-resolves its tag to the digest served now)",
+            ),
             (
                 "provision",
                 "re-run the apps' bundle install steps in-cage, regardless of their guards",
@@ -1683,6 +1687,13 @@ pub(super) const PAGES: &[Page] = &[
             install runs REGARDLESS. That is what an agent whose guard cannot detect a new\n\
             release needs — a checkout of a branch has no version to compare — and it is how to\n\
             re-install over a guard that is simply wrong.\n\
+            \n\
+            `distro` re-resolves the image a `distro` locator names and rewrites its lock: a\n\
+            moving tag like `latest` advances to the digest the registry serves now, and a locator\n\
+            that already carries a digest resolves to itself and reports no change. The new root\n\
+            filesystem is unpacked at the next launch, not here. The lock is the project's when a\n\
+            project declared the image and the shared one otherwise, which is the rule the nixpkgs\n\
+            channel follows.\n\
             \n\
             `-a, --app <name>` narrows a roll to one app. It applies to the two in-cage rolls,\n\
             `provision` and `mise`, whose unit of work is already one app's own cage — and to\n\

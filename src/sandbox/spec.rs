@@ -46,10 +46,12 @@ pub(crate) enum Mount {
     Tmpfs { dest: PathBuf },
 }
 
-#[cfg(test)]
 impl Mount {
-    /// The in-cage destination this mount occupies; every variant has exactly one. Used by the
-    /// test that pins the structural-mount destination list against what `assemble` emits.
+    /// The in-cage destination this mount occupies; every variant has exactly one.
+    ///
+    /// Read by the distribution-userland filter, which drops the synthetic FHS an image supplies
+    /// itself, and by the test that pins the structural-mount destination list against what
+    /// `assemble` emits.
     pub(crate) fn dest(&self) -> &std::path::Path {
         match self {
             Mount::RoBind { dest, .. }

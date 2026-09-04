@@ -5,7 +5,7 @@ description: "Roll managed toolchains forward by re-resolving and rewriting thei
 # `sbx upgrade`
 
 ```
-sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|binary|provision] [-a <name>] [--project <path>]
+sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|binary|distro|provision] [-a <name>] [--project <path>]
 ```
 
 Roll managed channels forward by re-resolving and rewriting their locks, so versions
@@ -21,6 +21,7 @@ advance **only here**, never on an `sbx` binary update.
 | `appimage` | the project's and apps' `appimage:` packages |
 | `tarball` | the project's and apps' `tarball:` packages |
 | `binary` | the project's and apps' `binary:` packages |
+| `distro` | the declared [`distro`](../configuration/distro) image, re-resolved to the digest the registry serves now |
 | `provision` | re-run the apps' [bundle install steps](../configuration/bundles#the-install-step) in-cage, regardless of their guards |
 
 | Flag | Effect |
@@ -79,8 +80,8 @@ provision` only brings that repair forward, which is worth doing when you would 
 find a broken build now than at the next launch.
 
 The other targets stay silent here, and on their mechanism rather than by omission:
-`deb`, `appimage`, `tarball` and `binary` place their own content-hashed artifacts, so
-none of them moves a path a home points into. Under `mise` it is the project's `nix:`
+`deb`, `appimage`, `tarball`, `binary` and `distro` place their own content-hashed
+artifacts, so none of them moves a path a home points into. Under `mise` it is the project's `nix:`
 tools that qualify the target, and only those: the engine runs host-side out of its own
 private home, and `mise:` packages are downloads inside each app's home, so neither can
 leave a home pointing into the store. `all` says the same thing in its own words, naming
@@ -90,6 +91,22 @@ A roll that fails with `403 rate limit exceeded` and `github auth: no` is not a
 misconfiguration: mise's `aqua:` backend reads the GitHub API, whose anonymous ceiling is
 60 requests an hour per IP, and a cage inherits no token from your shell by design. See
 [authenticating the GitHub API](../configuration/secret#worked-example-authenticating-the-github-api).
+
+### The distribution image
+
+`distro` asks the registry what the locator resolves to now and rewrites the lock. A
+moving tag advances to the digest served today; a locator that already carries a digest
+resolves to itself and reports no change, which is what a pin means. Nothing is fetched
+here: the new root filesystem is unpacked at the next launch, so a roll costs one request
+and the download happens when you actually run something.
+
+Which lock is rewritten follows the layer that named the image: a project that declares
+its own gets a lock under that project, and a global declaration is pinned once for the
+host. That is the rule the [nixpkgs channel](../configuration/nixpkgs) follows, so a
+project's image and its revision move together or not at all.
+
+A cage on the hermetic nix userland has no image, so this target reports nothing: there is
+no channel to roll.
 
 ### Rolling one app
 
@@ -157,6 +174,7 @@ sbx upgrade nix                    # just the nixpkgs channel
 sbx upgrade mise                   # the mise engine + tools/packages
 sbx upgrade --project ~/work/api   # roll everything for another project
 sbx upgrade deb --project ~/work/api   # just its deb: packages
+sbx upgrade distro                 # re-resolve the declared image's tag
 ```
 
 See [Upgrading toolchains](../housekeeping/upgrade) for the lock model and the

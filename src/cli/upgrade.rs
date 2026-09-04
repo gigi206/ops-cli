@@ -31,6 +31,7 @@ pub(crate) const TARGETS: &[&str] = &[
     "appimage",
     "tarball",
     "binary",
+    "distro",
     "provision",
 ];
 
@@ -323,6 +324,12 @@ pub(crate) fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
         // The project's and apps' `binary:` `[packages]` re-resolve to a new content hash and the
         // per-project binary lock is rewritten — the same shape as the three archive backends.
         ok &= upgrade_binary_packages(&nix, &layout, &cwd, &cfg, &pal);
+    }
+    if matches!(what, "distro" | "all") {
+        // The declared distribution image: its tag is re-resolved to whatever digest the registry
+        // serves now and the lock is rewritten — a host-side lock rewrite like the channels above,
+        // and the new root filesystem is unpacked at the next launch.
+        ok &= upgrade_distro(&layout, &cwd, &cfg, &pal);
     }
     if matches!(what, "tarball" | "all") {
         // The project's and apps' `tarball:` `[packages]` re-resolve their `.tar.gz` URL to a new
@@ -930,6 +937,41 @@ fn upgrade_nix_channel(
     Roll { ok: true, moved }
 }
 
+/// Roll the declared distribution image: re-resolve its locator against the registry and rewrite
+/// the lock, so the cage root advances only here.
+///
+/// Silent when no layer declared one, which is every cage on the hermetic nix userland: a channel
+/// nothing selected has nothing to report, and `sbx upgrade` with no argument runs this alongside
+/// the rest.
+fn upgrade_distro(
+    layout: &store::Layout,
+    cwd: &Path,
+    cfg: &config::Resolved,
+    pal: &style::Palette,
+) -> bool {
+    let Some(locator) = cfg.distro.as_deref() else {
+        return true;
+    };
+    let lock = match sandbox::distro_lock_path(cwd, layout, cfg) {
+        Ok(p) => p,
+        Err(e) => {
+            diag::error(&format!("sbx: cannot identify the project directory: {e}"));
+            return false;
+        }
+    };
+    let rolled = match sandbox::distro::store::refresh(locator, &lock) {
+        Ok(r) => r,
+        Err(e) => {
+            diag::error(&format!("sbx: cannot upgrade the `{locator}` image: {e}"));
+            return false;
+        }
+    };
+    for line in distro_upgrade_summary(cfg.distro_origin, &rolled, pal) {
+        println!("{line}");
+    }
+    true
+}
+
 /// Roll the mise engine: force a fresh resolution of its dedicated lock (the global
 /// channel source, in `mise-engine.lock`) and rewrite it, so the engine advances
 /// independently of the base channel that `sbx upgrade nix` rolls. Host-global and
@@ -1406,6 +1448,56 @@ fn channel_upgrade_summary(
     lines
 }
 
+/// The four outcomes a distribution roll can have, in the wording the channel rolls use.
+///
+/// Written out rather than routed through [`channel_upgrade_summary`], which reads a
+/// [`store::Upgrade`] and decides "pinned, nothing to roll" by asking whether the *source* is a
+/// 40-hex nixpkgs revision. A digest locator is pinned by a different grammar, so sharing that
+/// function would mean teaching it a second one — and the branch that matters here (a digest
+/// resolving to itself) would silently take the wrong arm.
+fn distro_upgrade_summary(
+    origin: config::Provenance,
+    rolled: &sandbox::distro::store::Rolled,
+    pal: &style::Palette,
+) -> Vec<String> {
+    let (h, n, ok, dim, r) = (pal.head, pal.name, pal.ok, pal.dim, pal.reset);
+    let origin = match origin {
+        config::Provenance::Project => "project",
+        config::Provenance::Global => "global",
+        config::Provenance::Override => "override",
+        config::Provenance::Default => "default",
+    };
+    let pinned = crate::sandbox::distro::reference::parse(&rolled.locator).is_some_and(|i| {
+        matches!(
+            i.reference,
+            crate::sandbox::distro::reference::Reference::Digest(_)
+        )
+    });
+    let short = short_rev(rolled.digest.trim_start_matches("sha256:"));
+    let outcome = match &rolled.previous {
+        None => format!(
+            "  resolved to {n}{short}{r} {ok}(first pin){r} — the root filesystem is unpacked on \
+             the next launch."
+        ),
+        Some(prev) if prev == &rolled.digest && pinned => {
+            format!("  pinned to a fixed digest {n}{short}{r} — {dim}nothing to roll.{r}")
+        }
+        Some(prev) if prev == &rolled.digest => {
+            format!("  already at the latest digest {n}{short}{r} — {dim}nothing to do.{r}")
+        }
+        Some(prev) => format!(
+            "  {ok}rolled forward{r} {n}{}{r} → {n}{short}{r} — the root filesystem is unpacked on \
+             the next launch.",
+            short_rev(prev.trim_start_matches("sha256:"))
+        ),
+    };
+    vec![
+        format!("{h}sbx upgrade — distribution image{r}"),
+        format!("  image: {n}{}{r}  ({dim}{origin}{r})", rolled.locator),
+        outcome,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1425,6 +1517,62 @@ mod tests {
                 app: None,
             }
         );
+    }
+
+    /// The digest a lock records, in the shape `refresh` hands back.
+    fn rolled(
+        locator: &str,
+        digest: &str,
+        previous: Option<&str>,
+    ) -> sandbox::distro::store::Rolled {
+        sandbox::distro::store::Rolled {
+            locator: locator.to_string(),
+            digest: format!("sha256:{}", digest.repeat(64 / digest.len())),
+            previous: previous.map(|p| format!("sha256:{}", p.repeat(64 / p.len()))),
+        }
+    }
+
+    #[test]
+    fn a_distribution_roll_reports_its_four_outcomes_apart() {
+        let pal = style::Palette::plain();
+        let tag = "oci:docker.io/library/debian:10";
+        let pin = "oci:docker.io/library/debian@sha256:".to_string() + &"a".repeat(64);
+
+        let first =
+            distro_upgrade_summary(config::Provenance::Global, &rolled(tag, "a", None), &pal);
+        assert!(first[2].contains("(first pin)"), "{first:?}");
+        assert!(first[1].contains("(global)"), "{first:?}");
+
+        let moved = distro_upgrade_summary(
+            config::Provenance::Project,
+            &rolled(tag, "b", Some("a")),
+            &pal,
+        );
+        assert!(moved[2].contains("rolled forward"), "{moved:?}");
+        assert!(
+            moved[2].contains("aaaaaaa") && moved[2].contains("bbbbbbb"),
+            "{moved:?}"
+        );
+        assert!(moved[1].contains("(project)"), "{moved:?}");
+
+        let still = distro_upgrade_summary(
+            config::Provenance::Global,
+            &rolled(tag, "a", Some("a")),
+            &pal,
+        );
+        assert!(
+            still[2].contains("already at the latest digest"),
+            "{still:?}"
+        );
+
+        // A locator that names a digest resolves to itself, and says so in the word a pin earns
+        // rather than in the word a tag that did not move earns.
+        let pinned = distro_upgrade_summary(
+            config::Provenance::Global,
+            &rolled(&pin, "a", Some("a")),
+            &pal,
+        );
+        assert!(pinned[2].contains("pinned to a fixed digest"), "{pinned:?}");
     }
 
     #[test]
@@ -2292,6 +2440,8 @@ mod tests {
             accepts_fresh_releases: Default::default(),
             timezone: None,
             timezone_origin: config::Provenance::Default,
+            distro: None,
+            distro_origin: config::Provenance::Default,
             plugin: Default::default(),
             net_groups: Default::default(),
             fs: Default::default(),

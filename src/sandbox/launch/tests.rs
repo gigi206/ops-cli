@@ -495,6 +495,7 @@ fn collect_roots_unions_base_then_packages_then_tools_then_fonts() {
         base_loader: PathBuf::from("/nix/store/glibc/lib/ld"),
         foreign_lib_paths: vec![],
         bin_paths: vec![],
+        distro: None,
         shell_bin: PathBuf::from("/nix/store/bash/bin/bash"),
         env_bin: PathBuf::from("/nix/store/coreutils/bin/env"),
         ldd_bin: PathBuf::from("/nix/store/glibc-bin/bin/ldd"),

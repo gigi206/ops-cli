@@ -382,6 +382,9 @@ pub(crate) fn resolve_userland(
         base_loader: glibc.join(LOADER),
         foreign_lib_paths: vec![glibc.join("lib"), stdcpp.join("lib"), zlib.join("lib")],
         bin_paths,
+        // The hermetic userland this function resolves. A declared distribution replaces it,
+        // and is provisioned elsewhere: nothing here reads a config.
+        distro: None,
         shell_bin: bash.join("bin/bash"),
         // The coreutils `env` `/usr/bin/env` links to, so an interpreted tool's
         // `#!/usr/bin/env <interp>` shebang resolves. Logical, like the shell above.
