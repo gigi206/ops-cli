@@ -274,12 +274,6 @@ pub(crate) fn upgrade_mise_packages(
         let runtime = home.runtime();
         let mut cfg = cfg;
         cfg.warnings.clear();
-        // The command below IS the install chain, and `build` composes `cfg.provisions` ahead of
-        // whatever command it is given — so leaving them declared here ran every step twice in one
-        // cage. Invisible while the output was dropped on success, and paid for on every roll: a
-        // well-guarded step no-ops its second run, an unguarded one does its whole work again.
-        // `steps` was taken out of this config before the loop, so clearing it loses nothing.
-        cfg.provisions.clear();
         prep.cfg = cfg;
 
         let cmd = mise_upgrade_cmd(
@@ -569,6 +563,13 @@ pub(crate) fn upgrade_provision_steps(
         let runtime = home.runtime();
         let mut cfg = cfg;
         cfg.warnings.clear();
+        // The command below IS the install chain, and `build` composes `cfg.provisions` ahead of
+        // whatever command it is handed — so leaving them declared here ran every step twice in
+        // one cage. `steps` came out of this config before the loop, so clearing it loses nothing,
+        // and the composition then finds nothing to compose and passes the command through. The
+        // `mise` roll above deliberately keeps its provisions: there the command is `mise upgrade`,
+        // so composing the steps ahead of it is the ordinary launch behaviour, not a second copy.
+        cfg.provisions.clear();
         // The signal the steps' guards read, and only under `force`: without it each guard answers
         // for itself, which is the whole difference between "bring what moved up to date" and
         // "re-install regardless". It rides the app's `[env]` layer, so it reaches the cage the way
