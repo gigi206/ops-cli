@@ -207,6 +207,7 @@ pub(crate) fn resolved(
         timezone: None,
         timezone_origin: crate::config::Provenance::Default,
         distro: None,
+        distro_auth: None,
         distro_origin: crate::config::Provenance::Default,
         open: Default::default(),
         service: Default::default(),

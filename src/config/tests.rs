@@ -804,7 +804,9 @@ fn raw_nixpkgs(source: &str) -> RawConfig {
 /// A `RawConfig` declaring only a `distro` userland.
 fn raw_distro(locator: &str) -> RawConfig {
     RawConfig {
-        distro: Some(locator.to_string()),
+        distro: Some(crate::config::schema::DistroField::Locator(
+            locator.to_string(),
+        )),
         ..RawConfig::default()
     }
 }
@@ -6724,11 +6726,14 @@ fn a_timezone_declared_beside_a_distro_is_named_as_having_no_effect() {
         None,
     );
     assert_eq!(r.timezone.as_deref(), Some("Europe/Paris"));
-    assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
-    assert!(
-        r.warnings[0].contains("`timezone` has no effect"),
-        "{:?}",
-        r.warnings
+    // The whole message, not a prefix of it: a wrapped literal whose continuation backslash is lost
+    // still contains the words a `contains` looks for, and ships a run of spaces in the middle.
+    assert_eq!(
+        r.warnings,
+        vec![
+            "`timezone` has no effect under `distro`: the image supplies its own `/etc/localtime`"
+                .to_string()
+        ]
     );
 
     // Each on its own is silent: the warning is about the pair, not about either field.
@@ -12181,4 +12186,96 @@ fn a_plaintext_refusal_names_the_switch_and_a_shape_refusal_does_not() {
             "`{value}` is not admitted by the switch, yet the refusal offered it: {err}"
         );
     }
+}
+
+/// A `RawConfig` declaring the table form of `distro`.
+fn raw_distro_table(image: Option<&str>, auth: Option<&str>) -> RawConfig {
+    RawConfig {
+        distro: Some(crate::config::schema::DistroField::Table(
+            crate::config::schema::DistroTable {
+                image: image.map(str::to_string),
+                auth: auth.map(str::to_string),
+            },
+        )),
+        ..RawConfig::default()
+    }
+}
+
+#[test]
+fn the_table_form_of_distro_carries_a_credential_reference() {
+    let r = resolve_no_plugins(
+        raw_distro_table(
+            Some("oci:registry.example.com/team/base:2024a"),
+            Some("env://REGISTRY_TOKEN"),
+        ),
+        None,
+    );
+    assert_eq!(
+        r.distro.as_deref(),
+        Some("oci:registry.example.com/team/base:2024a")
+    );
+    assert_eq!(r.distro_origin, Provenance::Global);
+    // The reference, never a value, and described by its source so nothing prints the secret.
+    assert_eq!(
+        r.distro_auth.as_ref().map(|s| s.describe()),
+        Some("env REGISTRY_TOKEN".to_string())
+    );
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+
+    // The string form is unchanged, and carries no credential.
+    let r = resolve_no_plugins(raw_distro("oci:docker.io/library/debian:10"), None);
+    assert!(r.distro_auth.is_none());
+}
+
+#[test]
+fn a_distro_table_that_names_no_image_is_dropped_with_a_warning() {
+    // A table with only a credential names no userland. Dropping it silently would leave the cage
+    // on the nix one while the config appears to have chosen otherwise.
+    let r = resolve_no_plugins(raw_distro_table(None, Some("env://TOKEN")), None);
+    assert!(r.distro.is_none());
+    assert!(r.distro_auth.is_none());
+    assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains("names no `image`"),
+        "{:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn a_malformed_credential_reference_drops_the_credential_and_keeps_the_image() {
+    // The image is the larger decision of the two: a locator that resolves anonymously still runs,
+    // and one that does not fails at the registry naming the image. Dropping the image here would
+    // put the cage on a different userland than the config names.
+    let r = resolve_no_plugins(
+        raw_distro_table(Some("oci:docker.io/library/debian:10"), Some("TOKEN")),
+        None,
+    );
+    assert_eq!(r.distro.as_deref(), Some("oci:docker.io/library/debian:10"));
+    assert!(r.distro_auth.is_none());
+    assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains("ignoring the `distro` credential"),
+        "{:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn an_untrusted_project_may_not_bring_its_own_registry_credential() {
+    // The credential travels with the image, so the security gate that refuses the one refuses the
+    // other: an untrusted project must not be able to make sbx resolve a secret it chose.
+    let r = resolve_no_plugins(
+        raw_distro("oci:docker.io/library/debian:10"),
+        Some((
+            raw_distro_table(Some("oci:evil.example.com/x/y:1"), Some("env://SECRET")),
+            TrustState::Untrusted,
+        )),
+    );
+    assert_eq!(r.distro.as_deref(), Some("oci:docker.io/library/debian:10"));
+    assert!(
+        r.distro_auth.is_none(),
+        "no credential from an untrusted layer"
+    );
+    assert_eq!(r.distro_origin, Provenance::Global);
 }

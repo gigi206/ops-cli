@@ -208,9 +208,16 @@ fn channels_section(view: &config::view::ConfigView, pal: &style::Palette) -> St
     let _ = writeln!(o, "  {h}nixpkgs:{r} {}", channel_text(&view.nixpkgs, pal));
     let _ = writeln!(o, "  {h}engine:{r} {}", channel_text(&view.engine, pal));
     if let Some(distro) = &view.distro {
+        // The credential's *source*, never its value: this is printed to a terminal and serialised
+        // to JSON, and a config view that could leak a password would make `sbx config show` a
+        // thing you cannot paste into a bug report.
+        let auth = match &view.distro_auth {
+            Some(source) => format!("  ({} auth)", source),
+            None => String::new(),
+        };
         let _ = writeln!(
             o,
-            "  {h}distro:{r} {distro}{}",
+            "  {h}distro:{r} {distro}{}{auth}",
             provenance_tag(view.distro_origin, pal)
         );
     }
@@ -1267,6 +1274,7 @@ mod tests {
             gui: GuiView::None,
             gui_origin: ProvenanceView::Default,
             distro: None,
+            distro_auth: None,
             distro_origin: ProvenanceView::Default,
             gpu: false,
             allow_insecure_http: false,

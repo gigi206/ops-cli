@@ -145,7 +145,9 @@ pub(crate) struct RawConfig {
     ///
     /// The prefix is mandatory, as it is for every `[packages]` backend, so a second image source
     /// is additive and leaves a value written for the first one meaning exactly what it did.
-    pub(crate) distro: Option<String>,
+    ///
+    /// The table form adds `auth`, for a registry that will not serve the image anonymously.
+    pub(crate) distro: Option<DistroField>,
     /// The `[mise]` table: which build of the mise engine provisions the cage's tools.
     pub(crate) mise: Option<RawMise>,
     /// The sandbox's network posture. Either a simple string — `"none"` (a fresh, empty
@@ -1043,6 +1045,43 @@ pub(crate) struct RawApp {
     /// is exactly the observation this turns into a sentence.
     #[serde(flatten)]
     pub(crate) rest: BTreeMap<String, RawIgnored>,
+}
+
+/// The `distro` field: a bare locator, or a table that adds a credential.
+///
+/// An untagged enum, on the precedent [`NetworkField`] sets: the string form is what almost every
+/// configuration writes and it keeps meaning exactly what it did, while the table is where anything
+/// the locator cannot carry goes. A second setting later is then a key in the table rather than a
+/// third spelling of the field.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum DistroField {
+    /// `distro = "oci:<registry>/<repository>:<tag>"`.
+    Locator(String),
+    /// `[distro] image = "…"` with an optional `auth`.
+    Table(DistroTable),
+}
+
+/// The table form of `distro`: the image, and how to authenticate to the registry that serves it.
+///
+/// No `deny_unknown_fields`, like every other table here: a config is additive and never a hard
+/// error for a key sbx does not know.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct DistroTable {
+    /// The image locator, in the same grammar the string form uses. A table with no `image` names
+    /// nothing and is dropped with a warning, rather than leaving a cage on a userland the config
+    /// appears to have chosen.
+    pub(crate) image: Option<String>,
+    /// A secret reference (`env://VAR`, `file:///abs/path`, `sops://…`, a resolver plugin's scheme)
+    /// resolving to `<username>:<password>` for the registry. Read **host-side**, sent only on the
+    /// request that obtains the registry's token, and never carried into the cage or through a
+    /// redirect: a blob hand-off goes to a different origin, and a credential that followed one
+    /// would be handed to whoever the registry named.
+    ///
+    /// A reference, never a value: a password written in a config is a password in the shell
+    /// history, the backup and the diff. That is the same rule `[secret]` follows, and the same
+    /// resolver runs it.
+    pub(crate) auth: Option<String>,
 }
 
 /// The command form of an app's `cmd`: a full argv (`["demo-app", "--flag"]`) or a bare

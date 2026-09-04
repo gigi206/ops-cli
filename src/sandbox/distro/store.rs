@@ -71,7 +71,9 @@ pub(crate) fn provision(
     locator: &str,
     lock_path: &Path,
     holder: &str,
+    credential: Option<&str>,
 ) -> io::Result<PathBuf> {
+    let credential = credential.map(registry::Credential::basic);
     let image = reference::parse(locator).ok_or_else(|| {
         io::Error::other(format!(
             "`{locator}` is not a usable image locator (expected `oci:<registry>/<repository>:<tag>` or `…@sha256:<digest>`)"
@@ -84,14 +86,14 @@ pub(crate) fn provision(
         Reference::Digest(digest) => digest.clone(),
         Reference::Tag(_) => match locked_digest(lock_path, locator) {
             Some(digest) => digest,
-            None => registry::resolve(&image)?.digest,
+            None => registry::resolve(&image, credential.as_ref())?.digest,
         },
     };
 
     let dir = image_dir(layout, &digest);
     let rootfs = dir.join("rootfs");
     if !rootfs.is_dir() {
-        unpack_into(&image.pinned(&digest), &digest, &dir)?;
+        unpack_into(&image.pinned(&digest), &digest, &dir, credential.as_ref())?;
     }
     // Checked on every launch rather than once at unpack: the list of paths a distribution has to
     // supply is sbx's, so a tree unpacked by an earlier version is held to the current one.
@@ -127,7 +129,12 @@ pub(crate) struct Rolled {
 /// Nothing is fetched or unpacked. The new digest names a tree the next launch provisions, on the
 /// rule every channel here follows: a roll rewrites a lock, and the build happens when something is
 /// actually run.
-pub(crate) fn refresh(locator: &str, lock_path: &Path) -> io::Result<Rolled> {
+pub(crate) fn refresh(
+    locator: &str,
+    lock_path: &Path,
+    credential: Option<&str>,
+) -> io::Result<Rolled> {
+    let credential = credential.map(registry::Credential::basic);
     let image = reference::parse(locator)
         .ok_or_else(|| io::Error::other(format!("`{locator}` is not a usable image locator")))?;
     let previous = crate::store::read_lock_lines(lock_path)
@@ -135,7 +142,7 @@ pub(crate) fn refresh(locator: &str, lock_path: &Path) -> io::Result<Rolled> {
         .and_then(|d| reference::valid_digest(&d).map(str::to_string));
     let digest = match &image.reference {
         Reference::Digest(digest) => digest.clone(),
-        Reference::Tag(_) => registry::resolve(&image)?.digest,
+        Reference::Tag(_) => registry::resolve(&image, credential.as_ref())?.digest,
     };
     crate::store::write_lock(lock_path, locator, &digest)?;
     Ok(Rolled {
@@ -166,7 +173,12 @@ fn locked_digest(lock_path: &Path, locator: &str) -> Option<String> {
 /// directory that no launch will ever name, rather than a root filesystem missing half its files.
 /// The name carries this process's pid so two launches provisioning the same image at once each
 /// assemble their own, and the loser of the rename finds the winner's tree already there.
-fn unpack_into(image: &ImageRef, digest: &str, dir: &Path) -> io::Result<()> {
+fn unpack_into(
+    image: &ImageRef,
+    digest: &str,
+    dir: &Path,
+    credential: Option<&registry::Credential>,
+) -> io::Result<()> {
     let parent = dir
         .parent()
         .ok_or_else(|| io::Error::other(format!("`{}` has no parent directory", dir.display())))?;
@@ -181,10 +193,10 @@ fn unpack_into(image: &ImageRef, digest: &str, dir: &Path) -> io::Result<()> {
     let outcome = (|| -> io::Result<()> {
         let blobs = partial.join("blobs");
         std::fs::create_dir_all(&blobs)?;
-        let manifest = registry::resolve(image)?;
+        let manifest = registry::resolve(image, credential)?;
         let rootfs = partial.join("rootfs");
         for layer in &manifest.layers {
-            let blob = registry::fetch_layer(image, layer, &blobs)?;
+            let blob = registry::fetch_layer(image, layer, &blobs, credential)?;
             layers::apply(&blob, &layer.media_type, &rootfs)?;
             // Freed as soon as it is applied: the layers of one image can outweigh the tree they
             // produce, and keeping them all would double the cost of every provision for a set of

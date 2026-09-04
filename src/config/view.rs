@@ -91,6 +91,10 @@ pub(crate) struct ConfigView {
     pub(crate) distro: Option<String>,
     /// Which layer named the distribution userland (`Default` when none did).
     pub(crate) distro_origin: ProvenanceView,
+    /// How the registry serving that image is authenticated to, as the source's own label
+    /// (`env VAR`, `file /abs/path`): never the credential, which this view is read out loud and
+    /// serialised to JSON. `None` when the image is fetched anonymously, which is the usual case.
+    pub(crate) distro_auth: Option<String>,
     /// The IANA zone the cage's clock reads in. Always a zone, never absent: the built-in
     /// `sandbox::binds::DEFAULT_ZONE` when no layer named one.
     pub(crate) timezone: String,
@@ -1160,6 +1164,7 @@ pub(crate) fn build_scoped(cwd: &Path, source: super::Source) -> ConfigView {
         gui_origin: resolved.gui_origin.into(),
         distro: resolved.distro.clone(),
         distro_origin: resolved.distro_origin.into(),
+        distro_auth: resolved.distro_auth.as_ref().map(|s| s.describe()),
         // The view reports the zone the cage will actually run in, so an unset field reads as the
         // built-in default rather than as a blank — the cage always has one.
         timezone: resolved
@@ -2138,6 +2143,7 @@ mod tests {
             gui_origin: ProvenanceView::Global,
             distro: None,
             distro_origin: ProvenanceView::Default,
+            distro_auth: None,
             gpu: true,
             allow_insecure_http: false,
             audio: true,
@@ -2511,6 +2517,7 @@ mod tests {
             timezone: None,
             timezone_origin: Provenance::Default,
             distro: None,
+            distro_auth: None,
             distro_origin: Provenance::Default,
             plugin: Default::default(),
             net_groups: Default::default(),

@@ -444,6 +444,10 @@ pub(crate) struct Resolved {
     /// store. A security field: an untrusted project's value is dropped with a warning, since the
     /// root filesystem supplies every program the cage runs.
     pub(crate) distro: Option<String>,
+    /// How to authenticate to the registry serving [`Self::distro`], when the declaration named a
+    /// credential. A reference to a secret, resolved host-side at the moment a registry asks for
+    /// one, so no value is held here and none reaches the cage.
+    pub(crate) distro_auth: Option<SecretSource>,
     /// Which layer supplied the winning `distro` locator (`Default` when neither config set it).
     pub(crate) distro_origin: Provenance,
     /// The IANA zone the cage's clock reads in, when a layer named one. `None` leaves the cage on
@@ -1736,11 +1740,14 @@ fn resolve(
     let nixpkgs_global = global
         .nixpkgs
         .and_then(|v| validate_nixpkgs(&mut warnings, GLOBAL_CONFIG, v));
+    // The locator and the credential reference travel as one value through both layers: a
+    // credential belongs to the image it was written for, so a project that replaces the image
+    // replaces the credential with it rather than inheriting one meant for another registry.
     let mut distro_origin = Provenance::Default;
-    let mut distro = global
+    let mut distro_decl = global
         .distro
         .and_then(|v| validate_distro(&mut warnings, GLOBAL_CONFIG, v));
-    if distro.is_some() {
+    if distro_decl.is_some() {
         distro_origin = Provenance::Global;
     }
     // Global-only, like `[bundle]`: the engine installs every `mise:` tool in every cage, so a
@@ -2167,7 +2174,7 @@ fn resolve(
             // below: a malformed value leaves the global one standing rather than stranding the
             // cage between two substrates.
             gate.take_validated(
-                &mut distro,
+                &mut distro_decl,
                 &mut distro_origin,
                 "`distro` userland",
                 &mut warnings,
@@ -2538,6 +2545,26 @@ fn resolve(
         &mut warnings,
     );
 
+    // Split the declaration now that both layers have had their say: the locator the launch binds,
+    // and the credential reference resolved beside it. Parsed here rather than at validation because
+    // a resolver plugin's scheme is only known once the registry has been read, which is the same
+    // reason `[secret]` parses its own refs at this point.
+    let (distro, distro_auth) = match distro_decl {
+        Some((locator, Some(reff))) => match secrets::parse_secret_ref(&reff, plugins) {
+            Ok(source) => (Some(locator), Some(source)),
+            Err(why) => {
+                // The image stands and the credential does not: a locator that resolves anonymously
+                // still runs, and one that does not fails at the registry naming the image. Dropping
+                // the image here would put the cage on a different userland than the config names,
+                // which is the larger surprise of the two.
+                warnings.push(format!("ignoring the `distro` credential: {why}"));
+                (Some(locator), None)
+            }
+        },
+        Some((locator, None)) => (Some(locator), None),
+        None => (None, None),
+    };
+
     // A declared distribution supplies its own `/etc/localtime`, and sbx stops emitting the link
     // that a `timezone` writes: the setting has no effect in such a cage. Named rather than left to
     // be discovered, on the rule the `[network]` layering follows — a setting sbx abandons is one it
@@ -2545,7 +2572,7 @@ fn resolve(
     // they are not running.
     if distro.is_some() && timezone_origin != Provenance::Default {
         warnings.push(
-            "`timezone` has no effect under a declared `distro`: the image supplies its own              `/etc/localtime`"
+            "`timezone` has no effect under `distro`: the image supplies its own `/etc/localtime`"
                 .to_string(),
         );
     }
@@ -2568,6 +2595,7 @@ fn resolve(
         mise_engine,
         nixpkgs_project,
         distro,
+        distro_auth,
         distro_origin,
         // A mise file is discovered by I/O in `load`; the pure layering never sees one.
         mise: None,

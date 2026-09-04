@@ -41,6 +41,9 @@ distro = "oci:ghcr.io/owner/image@sha256:0123…"            # an exact image
 distro = "oci:registry.example.com:8443/team/base:2024a"   # a private registry, with a port
 ```
 
+A registry that will not serve the image anonymously needs the table form, which adds
+`image` and `auth`. See [a private registry](#a-private-registry) below.
+
 The registry is written out. A bare `debian:10` is refused, because a reference with no
 registry resolves against whatever default the client that reads it happens to carry, and
 which host served your userland is not a detail to leave implicit. A reference is required
@@ -49,6 +52,48 @@ process in the cage stands on.
 
 The prefix is what keeps a second image source additive. A locator written today keeps
 meaning exactly what it means now when another one is added beside it.
+
+## A private registry
+
+The table form adds a credential:
+
+```toml
+[distro]
+image = "oci:registry.example.com/team/base:2024a"
+auth  = "env://REGISTRY_TOKEN"
+```
+
+`image` is the same locator the string form takes; the two spellings mean the same thing, so
+a configuration that never needs a credential keeps writing `distro = "..."`.
+
+`auth` is a **reference to a secret**, never a secret: the same schemes
+[`secret`](secret) accepts (`env://VAR`, `file:///abs/path`, `sops://file#key`, a resolver
+plugin's own scheme), resolved by the same resolver. A password written in a config is a
+password in the shell history, the backup and the diff.
+
+It resolves to `<username>:<password>`, which is what a registry's token service exchanges
+for a token. Three properties are worth stating, because they are what the code is shaped
+around:
+
+- **Host-side.** It is resolved before the cage exists and never bound into it. A credential
+  the cage could read is a credential every program in the cage has.
+- **On the token request only.** Once the registry has issued a token, that token is what
+  every later request carries. The credential itself never reaches the registry's blob
+  storage or its CDN.
+- **Never through a redirect.** A blob hand-off names a URL nobody here reviewed, and a
+  credential that followed one would be handed to whoever the registry named.
+
+A registry that answers with a `Basic` challenge instead of pointing at a token service, as
+a self-hosted one often does, gets the credential on the request itself. That is the only
+other place it goes.
+
+`sbx config show` names the *source* (`env REGISTRY_TOKEN`), never the value, so the output
+stays something you can paste into a bug report.
+
+One limit worth knowing: a resolver plugin that itself reaches a **broker** cannot serve
+this. A launch starts its brokers well after the userland it is about to run on has to
+exist, so there is nothing for such a plugin to reach, and it fails with its own message
+rather than resolving to something unexpected.
 
 ## What the image has to supply
 

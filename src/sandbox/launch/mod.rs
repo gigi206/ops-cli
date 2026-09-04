@@ -942,7 +942,22 @@ fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, Ex
                 return Err(ExitCode::FAILURE);
             }
         };
-        match super::distro::store::provision(&layout, &locator, &lock, &holder) {
+        let credential = match super::distro::credential(&cfg, &cwd, &bwrap) {
+            Ok(c) => c,
+            Err(e) => {
+                crate::diag::error(&format!(
+                    "sbx: cannot resolve the `distro` registry credential: {e}"
+                ));
+                return Err(ExitCode::FAILURE);
+            }
+        };
+        match super::distro::store::provision(
+            &layout,
+            &locator,
+            &lock,
+            &holder,
+            credential.as_deref(),
+        ) {
             Ok(root) => userland.distro = Some(root),
             Err(e) => {
                 crate::diag::error(&format!(

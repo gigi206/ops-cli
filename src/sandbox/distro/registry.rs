@@ -66,11 +66,66 @@ fn v2_url(image: &ImageRef, kind: &str, reference: &str) -> String {
     )
 }
 
+/// A registry credential, already in the form a header carries it.
+///
+/// Built once from the `<username>:<password>` a `[distro] auth` reference resolved to, so the
+/// encoding happens at the boundary rather than at each of the three requests that may need it, and
+/// the plaintext pair is not carried around beside the encoded one.
+#[derive(Clone)]
+pub(super) struct Credential(String);
+
+impl Credential {
+    /// Encode `<username>:<password>` as the value of a `Basic` `Authorization` header.
+    pub(super) fn basic(user_password: &str) -> Credential {
+        Credential(format!("Basic {}", base64(user_password.as_bytes())))
+    }
+
+    fn header(&self) -> &str {
+        &self.0
+    }
+}
+
+// A credential must not reach a log, a panic message or a `{:?}` of the struct that holds it.
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Credential(<redacted>)")
+    }
+}
+
+/// Standard base64, written here for the reason the gzip reader was: what it needs is one table and
+/// a three-bytes-to-four-characters loop, and a dependency for that would cost more than it saves.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i)) as usize & 0x3f] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 /// A bearer token for `image`, or `None` when the registry answered without asking for one.
 ///
 /// `challenge` is the `WWW-Authenticate` value the registry sent with its `401`. Only the `Bearer`
-/// scheme is followed: `Basic` would mean sending a credential sbx does not have and was not given.
-fn token(challenge: &str) -> io::Result<Option<String>> {
+/// scheme is followed here; a `Basic` challenge is answered by the caller, which has the credential
+/// and the original request to repeat.
+///
+/// `credential` goes on **this** request and nowhere else. It is what the registry's token service
+/// exchanges for a token scoped to one repository, and once that token exists it is what every
+/// later request carries — so the credential itself never reaches the registry's blob storage, its
+/// CDN, or whatever host a redirect names.
+fn token(challenge: &str, credential: Option<&Credential>) -> io::Result<Option<String>> {
     let Some(params) = challenge.trim().strip_prefix("Bearer ") else {
         return Ok(None);
     };
@@ -101,11 +156,19 @@ fn token(challenge: &str) -> io::Result<Option<String>> {
     } else {
         format!("{realm}?{}", query.join("&"))
     };
-    let response = http::get(&url, &[])?;
+    let headers: Vec<(&str, &str)> = credential
+        .map(|c| vec![("Authorization", c.header())])
+        .unwrap_or_default();
+    let response = http::get(&url, &headers)?;
     if response.status != 200 {
         return Err(io::Error::other(format!(
-            "token endpoint answered {}",
-            response.status
+            "token endpoint answered {}{}",
+            response.status,
+            if credential.is_some() {
+                " (the `distro` credential was presented)"
+            } else {
+                " (no `distro` credential is configured)"
+            }
         )));
     }
     let doc: serde_json::Value = serde_json::from_slice(&response.body)
@@ -138,7 +201,11 @@ fn percent_encode(value: &str) -> String {
 ///
 /// The challenge is followed exactly once: a second `401` after presenting a token means the token
 /// does not authorise this repository, and retrying would loop.
-fn get_authenticated(url: &str, accept: Option<&str>) -> io::Result<http::Response> {
+fn get_authenticated(
+    url: &str,
+    accept: Option<&str>,
+    credential: Option<&Credential>,
+) -> io::Result<http::Response> {
     let base: Vec<(&str, &str)> = accept.map(|a| vec![("Accept", a)]).unwrap_or_default();
     let first = http::get(url, &base)?;
     if first.status != 401 {
@@ -147,25 +214,51 @@ fn get_authenticated(url: &str, accept: Option<&str>) -> io::Result<http::Respon
     let Some(challenge) = first.header("www-authenticate") else {
         return Ok(first);
     };
-    let Some(token) = token(challenge)? else {
-        return Ok(first);
+    // A registry that asks for `Basic` has no token service to go through, so the credential
+    // answers the original request. Common on a self-hosted registry, and the reason the challenge
+    // is read rather than assumed to be `Bearer`.
+    let authorization = match basic_answer(challenge, credential) {
+        Some(header) => header.to_string(),
+        None => match token(challenge, credential)? {
+            Some(token) => format!("Bearer {token}"),
+            None => return Ok(first),
+        },
     };
-    let authorization = format!("Bearer {token}");
     let mut headers = base;
     headers.push(("Authorization", &authorization));
     http::get(url, &headers)
 }
 
+/// The credential to answer a `Basic` challenge with, or `None` when the challenge is not `Basic`
+/// or no credential was configured. A `Basic` challenge with nothing to answer it falls through to
+/// the token path, which returns the registry's own `401` rather than inventing an error.
+fn basic_answer<'a>(challenge: &str, credential: Option<&'a Credential>) -> Option<&'a str> {
+    challenge
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("basic")
+        .then(|| credential.map(Credential::header))
+        .flatten()
+}
+
 /// The same, for a blob streamed to `sink`. The token is obtained against the blob URL itself, so
 /// the scope the registry names is the one this request needs.
-fn get_authenticated_to_writer<W: io::Write>(url: &str, sink: &mut W) -> io::Result<u64> {
+fn get_authenticated_to_writer<W: io::Write>(
+    url: &str,
+    credential: Option<&Credential>,
+    sink: &mut W,
+) -> io::Result<u64> {
     let probe = http::get(url, &[])?;
     if probe.status == 401
         && let Some(challenge) = probe.header("www-authenticate")
-        && let Some(token) = token(challenge)?
     {
-        let authorization = format!("Bearer {token}");
-        return http::get_to_writer(url, &[("Authorization", &authorization)], sink);
+        let authorization = match basic_answer(challenge, credential) {
+            Some(header) => Some(header.to_string()),
+            None => token(challenge, credential)?.map(|t| format!("Bearer {t}")),
+        };
+        if let Some(authorization) = authorization {
+            return http::get_to_writer(url, &[("Authorization", &authorization)], sink);
+        }
     }
     http::get_to_writer(url, &[], sink)
 }
@@ -176,13 +269,13 @@ fn get_authenticated_to_writer<W: io::Write>(url: &str, sink: &mut W) -> io::Res
 /// locator that already carries a digest is not re-resolved into something else: the manifest is
 /// fetched by that digest and checked against it, so this path proves the pin rather than trusting
 /// it.
-pub(super) fn resolve(image: &ImageRef) -> io::Result<Image> {
+pub(super) fn resolve(image: &ImageRef, credential: Option<&Credential>) -> io::Result<Image> {
     let selector = match &image.reference {
         Reference::Tag(tag) => tag.clone(),
         Reference::Digest(digest) => digest.clone(),
     };
     let url = v2_url(image, "manifests", &selector);
-    let response = get_authenticated(&url, Some(MANIFEST_ACCEPT))?;
+    let response = get_authenticated(&url, Some(MANIFEST_ACCEPT), credential)?;
     if response.status != 200 {
         return Err(io::Error::other(format!(
             "{} answered {} for {}",
@@ -228,7 +321,7 @@ pub(super) fn resolve(image: &ImageRef) -> io::Result<Image> {
         // The layers come from the platform manifest, but the pin stays the digest the reference
         // resolved to: a lock that named the per-platform manifest would not match what a tag
         // resolves to anywhere else.
-        let platform = resolve(&image.pinned(picked))?;
+        let platform = resolve(&image.pinned(picked), credential)?;
         return Ok(Image {
             digest,
             layers: platform.layers,
@@ -265,7 +358,12 @@ pub(super) fn resolve(image: &ImageRef) -> io::Result<Image> {
 /// The digest is verified over the bytes as they are written, so a blob that is not what was asked
 /// for never becomes a file the applier reads: the partial download is removed and the fetch fails
 /// naming both digests.
-pub(super) fn fetch_layer(image: &ImageRef, layer: &Layer, dir: &Path) -> io::Result<PathBuf> {
+pub(super) fn fetch_layer(
+    image: &ImageRef,
+    layer: &Layer,
+    dir: &Path,
+    credential: Option<&Credential>,
+) -> io::Result<PathBuf> {
     let name = layer.digest.replace(':', "-");
     let path = dir.join(&name);
     if path.exists() {
@@ -280,7 +378,7 @@ pub(super) fn fetch_layer(image: &ImageRef, layer: &Layer, dir: &Path) -> io::Re
     // Any failure removes the partial file, not only a digest mismatch: a fetch that stopped
     // halfway leaves bytes that are not a layer, and a later run must not find them and take them
     // for one.
-    let written = match get_authenticated_to_writer(&url, &mut sink) {
+    let written = match get_authenticated_to_writer(&url, credential, &mut sink) {
         Ok(written) => written,
         Err(e) => {
             let _ = std::fs::remove_file(&partial);

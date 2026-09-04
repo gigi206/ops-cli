@@ -227,14 +227,15 @@ fn a_real_image_unpacks_into_a_usable_root_filesystem() {
     // types agree with what a registry actually serves.
     use crate::sandbox::distro::reference;
     let image = reference::parse("oci:docker.io/library/alpine:3.22").unwrap();
-    let Ok(resolved) = crate::sandbox::distro::registry::resolve(&image) else {
+    let Ok(resolved) = crate::sandbox::distro::registry::resolve(&image, None) else {
         skip_unreachable!("skipping the image unpack: the registry did not answer");
         return;
     };
     let tmp = crate::testutil::TmpDir::new();
     let root = tmp.join("rootfs");
     for layer in &resolved.layers {
-        let Ok(blob) = crate::sandbox::distro::registry::fetch_layer(&image, layer, tmp.path())
+        let Ok(blob) =
+            crate::sandbox::distro::registry::fetch_layer(&image, layer, tmp.path(), None)
         else {
             skip_unreachable!("skipping the image unpack: a layer did not arrive");
             return;

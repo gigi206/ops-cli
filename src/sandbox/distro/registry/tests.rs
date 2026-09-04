@@ -27,11 +27,11 @@ fn a_scope_is_percent_encoded_so_the_query_cannot_be_read_two_ways() {
 #[test]
 fn only_a_bearer_challenge_is_followed() {
     // `Basic` would mean presenting a credential sbx neither has nor was given.
-    assert!(token("Basic realm=\"private\"").unwrap().is_none());
-    assert!(token("").unwrap().is_none());
+    assert!(token("Basic realm=\"private\"", None).unwrap().is_none());
+    assert!(token("", None).unwrap().is_none());
     // A Bearer challenge with no realm names nowhere to go, which is an error rather than a
     // silent unauthenticated retry.
-    let err = token("Bearer service=\"registry.docker.io\"").expect_err("no realm");
+    let err = token("Bearer service=\"registry.docker.io\"", None).expect_err("no realm");
     assert!(err.to_string().contains("names no realm"), "{err}");
 }
 
@@ -54,7 +54,7 @@ const ALPINE_3_22: &str = "sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68af
 #[test]
 fn a_tag_resolves_to_the_digest_a_second_implementation_reports() {
     let image = reference::parse("oci:docker.io/library/alpine:3.22").unwrap();
-    let Ok(resolved) = resolve(&image) else {
+    let Ok(resolved) = resolve(&image, None) else {
         skip_unreachable!("skipping the registry resolve: the registry did not answer");
         return;
     };
@@ -71,7 +71,7 @@ fn a_digest_locator_is_checked_against_the_bytes_the_registry_serves() {
     // Resolving by digest proves the pin rather than trusting it: the manifest that comes back is
     // hashed and compared, so a registry serving something else fails here.
     let image = reference::parse(&format!("oci:docker.io/library/alpine@{ALPINE_3_22}")).unwrap();
-    let Ok(resolved) = resolve(&image) else {
+    let Ok(resolved) = resolve(&image, None) else {
         skip_unreachable!("skipping the resolve by digest: the registry did not answer");
         return;
     };
@@ -81,13 +81,13 @@ fn a_digest_locator_is_checked_against_the_bytes_the_registry_serves() {
 #[test]
 fn a_layer_is_verified_against_its_digest_as_it_lands() {
     let image = reference::parse("oci:docker.io/library/alpine:3.22").unwrap();
-    let Ok(resolved) = resolve(&image) else {
+    let Ok(resolved) = resolve(&image, None) else {
         skip_unreachable!("skipping the layer fetch: the registry did not answer");
         return;
     };
     let dir = crate::testutil::TmpDir::new();
     let layer = &resolved.layers[0];
-    let Ok(path) = fetch_layer(&image, layer, dir.path()) else {
+    let Ok(path) = fetch_layer(&image, layer, dir.path(), None) else {
         skip_unreachable!("skipping the layer fetch: the blob did not arrive");
         return;
     };
@@ -100,7 +100,8 @@ fn a_layer_is_verified_against_its_digest_as_it_lands() {
         digest: format!("sha256:{}", "b".repeat(64)),
         ..layer.clone()
     };
-    let err = fetch_layer(&image, &wrong, dir.path()).expect_err("a mismatched digest is refused");
+    let err =
+        fetch_layer(&image, &wrong, dir.path(), None).expect_err("a mismatched digest is refused");
     assert!(
         err.to_string().contains("came back as") || err.to_string().contains("answered"),
         "{err}"
@@ -111,4 +112,54 @@ fn a_layer_is_verified_against_its_digest_as_it_lands() {
             .exists(),
         "a refused blob leaves no partial file"
     );
+}
+
+#[test]
+fn base64_matches_the_standard_alphabet_and_padding() {
+    // The RFC 4648 vectors, which is what a registry's token service decodes with.
+    for (plain, encoded) in [
+        ("", ""),
+        ("f", "Zg=="),
+        ("fo", "Zm8="),
+        ("foo", "Zm9v"),
+        ("foob", "Zm9vYg=="),
+        ("fooba", "Zm9vYmE="),
+        ("foobar", "Zm9vYmFy"),
+    ] {
+        assert_eq!(base64(plain.as_bytes()), encoded, "`{plain}`");
+    }
+    // The two characters that separate this from the URL-safe alphabet: a token endpoint reads
+    // standard base64, and `-`/`_` here would be rejected as a malformed credential.
+    assert_eq!(base64(&[0xfb, 0xff, 0xbe]), "+/++");
+}
+
+#[test]
+fn a_credential_carries_its_header_and_never_prints_itself() {
+    let c = Credential::basic("robot$ci:hunter2");
+    assert_eq!(c.header(), "Basic cm9ib3QkY2k6aHVudGVyMg==");
+    // A `{:?}` of anything holding one must not put the secret in a log or a panic message.
+    let printed = format!("{c:?}");
+    assert!(!printed.contains("hunter2"), "{printed}");
+    assert!(!printed.contains("cm9ib3Qk"), "{printed}");
+}
+
+#[test]
+fn only_a_basic_challenge_is_answered_with_the_credential_itself() {
+    let c = Credential::basic("u:p");
+    // A registry with no token service: the credential answers the original request.
+    assert_eq!(
+        basic_answer("Basic realm=\"private\"", Some(&c)),
+        Some(c.header())
+    );
+    assert_eq!(
+        basic_answer("basic realm=\"x\"", Some(&c)),
+        Some(c.header())
+    );
+    // A bearer challenge goes to the token endpoint instead, whatever credential exists.
+    assert_eq!(
+        basic_answer("Bearer realm=\"https://auth\"", Some(&c)),
+        None
+    );
+    // And a Basic challenge with nothing configured falls through rather than inventing an error.
+    assert_eq!(basic_answer("Basic realm=\"private\"", None), None);
 }

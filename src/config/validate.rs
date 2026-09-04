@@ -234,7 +234,12 @@ pub(super) fn validate_nixpkgs(
     }
 }
 
-/// Validate a `distro` locator, warning on anything [`super::is_valid_distro_source`] refuses.
+/// Validate a `distro` declaration in either spelling, warning on anything
+/// [`super::is_valid_distro_source`] refuses.
+///
+/// Returns the locator and the credential reference beside it, because the two are one decision:
+/// dropping a malformed locator has to drop the credential written for it, and keeping a credential
+/// whose image was refused would leave a secret resolved for a registry nothing asks any more.
 ///
 /// `None` leaves the cage on the nix-provisioned userland, which is what a config without the
 /// field gets: a malformed locator must not strand the launch, and it must not quietly select a
@@ -242,13 +247,25 @@ pub(super) fn validate_nixpkgs(
 pub(super) fn validate_distro(
     warnings: &mut Vec<String>,
     source_label: &str,
-    value: String,
-) -> Option<String> {
-    if super::is_valid_distro_source(&value) {
-        Some(value)
+    value: super::schema::DistroField,
+) -> Option<(String, Option<String>)> {
+    let (locator, auth) = match value {
+        super::schema::DistroField::Locator(locator) => (locator, None),
+        super::schema::DistroField::Table(table) => match table.image {
+            Some(image) => (image, table.auth),
+            None => {
+                warnings.push(format!(
+                    "{source_label}: ignoring a `distro` table that names no `image`"
+                ));
+                return None;
+            }
+        },
+    };
+    if super::is_valid_distro_source(&locator) {
+        Some((locator, auth))
     } else {
         warnings.push(format!(
-            "{source_label}: ignoring malformed distro locator `{value}`"
+            "{source_label}: ignoring malformed distro locator `{locator}`"
         ));
         None
     }

@@ -949,6 +949,9 @@ fn upgrade_distro(
     cfg: &config::Resolved,
     pal: &style::Palette,
 ) -> bool {
+    // Only a private registry needs one, so bubblewrap is resolved only when a credential was
+    // declared: a roll of a public image must not fail on a host that cannot sandbox, and the
+    // resolver needs bwrap solely to run a resolver plugin under least privilege.
     let Some(locator) = cfg.distro.as_deref() else {
         return true;
     };
@@ -959,7 +962,26 @@ fn upgrade_distro(
             return false;
         }
     };
-    let rolled = match sandbox::distro::store::refresh(locator, &lock) {
+    let credential = if cfg.distro_auth.is_some() {
+        let Some(bwrap) = store::resolve_bwrap(Some(layout)) else {
+            diag::error(
+                "sbx: the `distro` credential is resolved under bubblewrap, which is not usable here.",
+            );
+            return false;
+        };
+        match sandbox::distro::credential(cfg, cwd, &bwrap.path) {
+            Ok(c) => c,
+            Err(e) => {
+                diag::error(&format!(
+                    "sbx: cannot resolve the `distro` registry credential: {e}"
+                ));
+                return false;
+            }
+        }
+    } else {
+        None
+    };
+    let rolled = match sandbox::distro::store::refresh(locator, &lock, credential.as_deref()) {
         Ok(r) => r,
         Err(e) => {
             diag::error(&format!("sbx: cannot upgrade the `{locator}` image: {e}"));
@@ -2441,6 +2463,7 @@ mod tests {
             timezone: None,
             timezone_origin: config::Provenance::Default,
             distro: None,
+            distro_auth: None,
             distro_origin: config::Provenance::Default,
             plugin: Default::default(),
             net_groups: Default::default(),
