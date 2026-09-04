@@ -218,6 +218,7 @@ pub(crate) fn doctor() -> ExitCode {
                     )
                 }
             }
+            report_distro(&pal, layout);
         }
         None => {
             println!(
@@ -273,6 +274,39 @@ fn report_resource_limits(pal: &style::Palette, limits: &sandbox::cgroup::Limits
     } else if let Some(note) = report.note {
         println!("  {} resource limits   {note}", tag_warn(pal));
     }
+}
+
+/// The host-level distribution image, when one is pinned: which image, which digest, and whether
+/// its tree is unpacked.
+///
+/// Read straight from the shared lock, like the channel line above, because doctor has no project
+/// context. A project that declares its own image pins it in its own lock, which this cannot see;
+/// what it answers is the host-level question.
+///
+/// Silent when no image is pinned. Every other line here is a prerequisite, and a cage on the
+/// hermetic nix userland has no distribution to check: a line reporting its absence would read as
+/// something missing rather than as the ordinary case.
+fn report_distro(pal: &style::Palette, layout: &store::Layout) {
+    use crate::sandbox::distro::store::DISTRO_LOCK;
+    let Some((locator, Some(digest))) =
+        store::read_lock_lines(&layout.data_dir().join(DISTRO_LOCK))
+    else {
+        return;
+    };
+    let dir = layout
+        .distro_dir()
+        .join(digest.replacen(':', "-", 1))
+        .join("rootfs");
+    let state = if dir.is_dir() {
+        "unpacked"
+    } else {
+        "not unpacked — fetched on the next launch"
+    };
+    println!(
+        "  {} distro            {locator} @ {} ({state})",
+        tag_ok(pal),
+        short_rev(digest.trim_start_matches("sha256:"))
+    );
 }
 
 /// Report the storage posture: whether the data directory lives in an encapsulated volume, and

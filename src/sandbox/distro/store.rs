@@ -46,12 +46,32 @@ fn image_dir(layout: &Layout, digest: &str) -> PathBuf {
     layout.distro_dir().join(digest.replacen(':', "-", 1))
 }
 
+/// The directory of holder markers beside a tree: one empty file per project that has launched on
+/// it. See [`provision`] for why they exist and [`crate::sandbox::gc::sweep_distro_trees`] for what reads them.
+pub(crate) const ROOTS_DIR: &str = "roots";
+
 /// Provision the root filesystem `locator` names, and return the directory to bind at `/`.
 ///
 /// `lock_path` is where this launch's pin is recorded — the project's own lock under a project
 /// declaration, the shared one otherwise. It is written on every call, not only when it changes, so
 /// that a tree provisioned before the lock existed still ends up pinned.
-pub(crate) fn provision(layout: &Layout, locator: &str, lock_path: &Path) -> io::Result<PathBuf> {
+///
+/// `holder` is the runtime id of the project this launch is for, recorded as an empty file under
+/// [`ROOTS_DIR`]. It is a garbage-collection root, in the sense nix uses the word: a lock says which
+/// tree the *next* launch wants, and that is not the same question as which tree a *running* cage is
+/// executing from. The two diverge for as long as a session outlives a roll, and removing a tree
+/// under a live cage is not a degraded launch but a broken one, measured: the cage keeps its mount
+/// and loses every file through it, so its own shell disappears mid-command.
+///
+/// Written on every launch and removed by nothing, which is what makes it self-healing: a marker is
+/// read against the set of live sessions, so one left by a cage that crashed holds nothing, and
+/// [`crate::sandbox::gc::sweep_distro_trees`] removes it when it sweeps.
+pub(crate) fn provision(
+    layout: &Layout,
+    locator: &str,
+    lock_path: &Path,
+    holder: &str,
+) -> io::Result<PathBuf> {
     let image = reference::parse(locator).ok_or_else(|| {
         io::Error::other(format!(
             "`{locator}` is not a usable image locator (expected `oci:<registry>/<repository>:<tag>` or `…@sha256:<digest>`)"
@@ -76,6 +96,9 @@ pub(crate) fn provision(layout: &Layout, locator: &str, lock_path: &Path) -> io:
     // Checked on every launch rather than once at unpack: the list of paths a distribution has to
     // supply is sbx's, so a tree unpacked by an earlier version is held to the current one.
     check_supplied(&rootfs, locator)?;
+    let roots = dir.join(ROOTS_DIR);
+    std::fs::create_dir_all(&roots)?;
+    std::fs::File::create(roots.join(holder))?;
     crate::store::write_lock(lock_path, locator, &digest)?;
     Ok(rootfs)
 }

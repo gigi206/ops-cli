@@ -90,6 +90,11 @@ differently, and the store moves into it:
 - **The store location and channel revision.** Where `sbx`'s user-owned store lives
   and which nixpkgs revision the base userland is pinned to.
 
+- **The distribution image**, when the host-level lock pins one: the locator, its digest,
+  and whether the tree is unpacked yet. The line is absent on a host that runs the hermetic
+  nix userland, which is the ordinary case and not something missing. A project that
+  declares its own image pins it in the project's own lock, which `doctor` does not read.
+
 ## Why it hard-fails
 
 `sbx`'s entire security model depends on the unprivileged user namespace being

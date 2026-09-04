@@ -935,7 +935,14 @@ fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, Ex
                 return Err(ExitCode::FAILURE);
             }
         };
-        match super::distro::store::provision(&layout, &locator, &lock) {
+        let holder = match binds::project_runtime_id(&cwd) {
+            Ok(id) => id,
+            Err(e) => {
+                crate::diag::error(&format!("sbx: cannot identify the project directory: {e}"));
+                return Err(ExitCode::FAILURE);
+            }
+        };
+        match super::distro::store::provision(&layout, &locator, &lock, &holder) {
             Ok(root) => userland.distro = Some(root),
             Err(e) => {
                 crate::diag::error(&format!(

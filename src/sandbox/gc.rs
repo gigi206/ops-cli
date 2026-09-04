@@ -1408,6 +1408,149 @@ fn runtime_entry_pid(name: &str, prefixes: &[&str]) -> Option<u32> {
     })
 }
 
+/// Sweep — or, in a dry run, list — the unpacked distribution root filesystems nothing names any
+/// more. Returns `(digest directory name, bytes)` for each, largest first.
+///
+/// A tree is kept when either of two things still points at it, and the two answer different
+/// questions:
+///
+/// * **a lock names its digest** — the global `distro.lock`, or any project's. That is the tree the
+///   *next* launch of that scope wants, and freeing it would make the next launch re-fetch an image
+///   it already has.
+/// * **a live session holds it** — a marker under `<tree>/roots/<project id>` whose project has a
+///   session running. That is the tree a *running* cage is executing from, which is not the same
+///   thing: the two diverge for as long as a session outlives an `sbx upgrade distro`, and freeing
+///   one under a live cage leaves it mounted on nothing, its own shell gone mid-command.
+///
+/// A marker whose project has no live session holds nothing and is removed on a prune, whether or
+/// not its tree survives. That is what keeps the markers from accumulating without a teardown hook:
+/// they are read against liveness rather than maintained.
+///
+/// A `<digest>.partial.<pid>` left by an interrupted unpack is swept on the same rule the runtime
+/// directories use, by the pid its name carries — no lock or marker will ever name one, and nothing
+/// else reaps them.
+///
+/// Best-effort throughout: an unreadable directory is skipped and a failed removal is not an error,
+/// because this is housekeeping and never a reason to fail the caller.
+pub(crate) fn sweep_distro_trees(
+    data_dir: &Path,
+    live_projects: &std::collections::BTreeSet<String>,
+    prune: bool,
+) -> Vec<(String, u64)> {
+    let dir = data_dir.join("distro");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let locked = locked_distro_digests(data_dir);
+    let mut freed: Vec<(String, u64)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        if let Some(pid) = partial_unpack_pid(&name) {
+            // An interrupted unpack. Its own process would have removed it; that it is here means
+            // that process is gone, so the only thing to check is that the pid has not come back.
+            if !crate::session::pid_is_live(pid) {
+                let usage = crate::sandbox::tree_usage(&path);
+                if prune {
+                    let _ = make_writable(&path);
+                    let _ = std::fs::remove_dir_all(&path);
+                }
+                freed.push((name, usage.bytes));
+            }
+            continue;
+        }
+        if !name.starts_with("sha256-") {
+            continue;
+        }
+        let held = sweep_distro_roots(
+            &path.join(crate::sandbox::distro::store::ROOTS_DIR),
+            live_projects,
+            prune,
+        );
+        if held || locked.contains(&name) {
+            continue;
+        }
+        let usage = crate::sandbox::tree_usage(&path);
+        if prune {
+            // The tree is unpacked read-only where the image said so, and a directory with no write
+            // bit cannot have its entries removed. The owner bits added at unpack are what make this
+            // a plain removal rather than a recursive `chmod` first, but a tree from an older sbx
+            // may not carry them, so the walk is done here rather than assumed away.
+            let _ = make_writable(&path);
+            let _ = std::fs::remove_dir_all(&path);
+        }
+        freed.push((name, usage.bytes));
+    }
+    freed.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    freed
+}
+
+/// Every digest a distribution lock records: the shared one, and each project's. Read across
+/// sources rather than scoped to a locator, because the question is which trees are still spoken
+/// for, not which one a given configuration would choose today.
+fn locked_distro_digests(data_dir: &Path) -> std::collections::BTreeSet<String> {
+    use crate::sandbox::distro::store::DISTRO_LOCK;
+    let mut out = std::collections::BTreeSet::new();
+    let mut take = |path: PathBuf| {
+        if let Some((_, Some(digest))) = crate::store::read_lock_lines(&path) {
+            out.insert(digest.replacen(':', "-", 1));
+        }
+    };
+    take(data_dir.join(DISTRO_LOCK));
+    if let Ok(projects) = std::fs::read_dir(data_dir.join("projects")) {
+        for project in projects.flatten() {
+            take(project.path().join(DISTRO_LOCK));
+        }
+    }
+    out
+}
+
+/// Whether any marker in `roots` belongs to a project with a live session, removing the ones that
+/// do not when `prune` is set.
+fn sweep_distro_roots(
+    roots: &Path,
+    live_projects: &std::collections::BTreeSet<String>,
+    prune: bool,
+) -> bool {
+    let Ok(entries) = std::fs::read_dir(roots) else {
+        return false;
+    };
+    let mut held = false;
+    for entry in entries.flatten() {
+        let holder = entry.file_name().to_string_lossy().into_owned();
+        if live_projects.contains(&holder) {
+            held = true;
+        } else if prune {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    held
+}
+
+/// The pid in a `<digest>.partial.<pid>` name, or `None` for anything else.
+fn partial_unpack_pid(name: &str) -> Option<u32> {
+    let (head, pid) = name.rsplit_once(".partial.")?;
+    head.starts_with("sha256-").then(|| pid.parse().ok())?
+}
+
+/// Add the owner's write and search bits to every directory under `path`, so a tree unpacked from
+/// an image that made one read-only can be removed without a separate `chmod` pass by the user.
+fn make_writable(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = path.symlink_metadata()?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Ok(());
+    }
+    let mode = meta.permissions().mode();
+    if mode & 0o700 != 0o700 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o700))?;
+    }
+    for entry in std::fs::read_dir(path)?.flatten() {
+        let _ = make_writable(&entry.path());
+    }
+    Ok(())
+}
+
 /// Sweep — or, in a dry run, list — the entries of the per-launch runtime directories
 /// ([`RUNTIME_DIRS`]) whose launcher pid is gone. Returns what was (or would be) removed.
 ///
@@ -2798,5 +2941,151 @@ mod tests {
     fn installed_app_homes_is_empty_without_a_data_tree() {
         let data = TmpDir::new();
         assert!(installed_app_homes(data.path()).is_empty());
+    }
+    /// A tree keyed by a digest, with a marker for each holder.
+    fn distro_tree(data: &Path, digest: &str, holders: &[&str]) -> PathBuf {
+        let dir = data
+            .join("distro")
+            .join(format!("sha256-{}", digest.repeat(64 / digest.len())));
+        std::fs::create_dir_all(dir.join("rootfs/bin")).unwrap();
+        std::fs::write(dir.join("rootfs/bin/sh"), b"#!/bin/sh\n").unwrap();
+        for holder in holders {
+            std::fs::create_dir_all(dir.join("roots")).unwrap();
+            std::fs::write(dir.join("roots").join(holder), b"").unwrap();
+        }
+        dir
+    }
+
+    fn distro_lock_at(path: &Path, locator: &str, digest: &str) {
+        crate::store::write_lock(
+            path,
+            locator,
+            &format!("sha256:{}", digest.repeat(64 / digest.len())),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_distribution_tree_a_lock_names_is_never_freed() {
+        let data = TmpDir::new();
+        let kept = distro_tree(data.path(), "a", &[]);
+        let by_project = distro_tree(data.path(), "b", &[]);
+        let orphan = distro_tree(data.path(), "c", &[]);
+        distro_lock_at(&data.path().join("distro.lock"), "oci:x.io/a/b:1", "a");
+        distro_lock_at(
+            &data.path().join("projects/deadbeef/distro.lock"),
+            "oci:x.io/a/b:2",
+            "b",
+        );
+
+        let freed = sweep_distro_trees(data.path(), &BTreeSet::new(), true);
+        assert_eq!(freed.len(), 1, "{freed:?}");
+        assert!(freed[0].0.contains(&"c".repeat(64)), "{freed:?}");
+        assert!(kept.is_dir() && by_project.is_dir(), "a locked tree stays");
+        assert!(!orphan.exists(), "an unlocked, unheld tree goes");
+    }
+
+    #[test]
+    fn a_tree_a_live_session_holds_survives_a_roll_that_moved_the_lock() {
+        // The case a lock-only keep set gets wrong, and the one that breaks a running cage: the
+        // session started on one digest, `sbx upgrade distro` moved the lock to another, and the
+        // first tree is now named by nothing but the marker its launch wrote.
+        let data = TmpDir::new();
+        let running = distro_tree(data.path(), "a", &["proj0001"]);
+        distro_lock_at(&data.path().join("distro.lock"), "oci:x.io/a/b:latest", "d");
+
+        let live: BTreeSet<String> = ["proj0001".to_string()].into_iter().collect();
+        let freed = sweep_distro_trees(data.path(), &live, true);
+        assert!(freed.is_empty(), "{freed:?}");
+        assert!(running.join("rootfs/bin/sh").is_file());
+
+        // Once that session is gone the marker holds nothing, and the tree goes with it.
+        let freed = sweep_distro_trees(data.path(), &BTreeSet::new(), true);
+        assert_eq!(freed.len(), 1, "{freed:?}");
+        assert!(!running.exists());
+    }
+
+    #[test]
+    fn a_marker_left_by_a_session_that_is_gone_is_swept_even_from_a_kept_tree() {
+        // Nothing removes a marker at teardown, so a tree that keeps being launched would otherwise
+        // accumulate one per project that ever ran on it.
+        let data = TmpDir::new();
+        let kept = distro_tree(data.path(), "a", &["dead0001", "live0001"]);
+        distro_lock_at(&data.path().join("distro.lock"), "oci:x.io/a/b:1", "a");
+        let live: BTreeSet<String> = ["live0001".to_string()].into_iter().collect();
+
+        // A dry run removes nothing, marker included.
+        sweep_distro_trees(data.path(), &live, false);
+        assert!(kept.join("roots/dead0001").exists());
+
+        sweep_distro_trees(data.path(), &live, true);
+        assert!(
+            !kept.join("roots/dead0001").exists(),
+            "the stale marker is gone"
+        );
+        assert!(kept.join("roots/live0001").exists(), "the live one is not");
+        assert!(kept.is_dir(), "and the tree its lock names stays");
+    }
+
+    #[test]
+    fn an_interrupted_unpack_is_swept_by_the_pid_its_name_carries() {
+        let data = TmpDir::new();
+        let dir = data.path().join("distro");
+        let mine = dir.join(format!(
+            "sha256-{}.partial.{}",
+            "a".repeat(64),
+            std::process::id()
+        ));
+        let dead = dir.join(format!("sha256-{}.partial.999999999", "b".repeat(64)));
+        for d in [&mine, &dead] {
+            std::fs::create_dir_all(d.join("rootfs")).unwrap();
+        }
+
+        let freed = sweep_distro_trees(data.path(), &BTreeSet::new(), true);
+        let names: Vec<&str> = freed.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            mine.is_dir(),
+            "an unpack whose process is still running is left alone: {names:?}"
+        );
+        assert!(
+            !dead.exists(),
+            "one whose process is gone is swept: {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_read_only_tree_is_removed_without_a_chmod_pass_by_the_user() {
+        // The unpacker adds the owner's write bit for exactly this reason. A tree from an image that
+        // shipped a read-only directory — or from an sbx that did not add the bit — still has to be
+        // reclaimable, so the sweep restores what it needs rather than assuming it.
+        use std::os::unix::fs::PermissionsExt;
+        let data = TmpDir::new();
+        let tree = distro_tree(data.path(), "a", &[]);
+        let locked_down = tree.join("rootfs/opt");
+        std::fs::create_dir_all(locked_down.join("inner")).unwrap();
+        std::fs::write(locked_down.join("inner/file"), b"x").unwrap();
+        std::fs::set_permissions(&locked_down, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let freed = sweep_distro_trees(data.path(), &BTreeSet::new(), true);
+        assert_eq!(freed.len(), 1, "{freed:?}");
+        assert!(
+            !tree.exists(),
+            "a read-only directory did not block the reclaim"
+        );
+    }
+
+    #[test]
+    fn the_holder_a_launch_writes_is_the_id_the_sweep_looks_up() {
+        // The join that keeps a live cage's tree: a launch records `project_runtime_id(cwd)`, and
+        // the sweep is handed the ids `session_housekeeping` derived with `project_id` from the
+        // path each session recorded. Both hash the canonical project root, and this fails if
+        // either side ever stops canonicalising.
+        let project = TmpDir::new();
+        let canonical = project.path().canonicalize().unwrap();
+        assert_eq!(
+            crate::sandbox::binds::project_runtime_id(project.path()).unwrap(),
+            crate::sandbox::binds::project_id(&canonical),
+            "the id a launch writes and the id the sweep looks up must be the same string"
+        );
     }
 }

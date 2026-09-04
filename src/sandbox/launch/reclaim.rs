@@ -41,8 +41,8 @@ pub(crate) fn gc(prune: bool, all: bool, optimise: bool, pal: &crate::style::Pal
                 // Prune stale session records, then collect the shared store. Reaping whole
                 // per-project runtime *trees* is `sbx projects rm`; `--all` here is purely the
                 // nix-store side — the shared store's orphaned closures across every project.
-                let _ = session_housekeeping(&layout);
-                runtime_housekeeping(&layout, prune, pal);
+                let live = session_housekeeping(&layout);
+                runtime_housekeeping(&layout, &live, prune, pal);
                 shared_store_gc(&layout, prune, optimise, pal);
             }
             None => crate::diag::error(
@@ -106,7 +106,12 @@ pub(in crate::sandbox) fn session_housekeeping(
 /// runtime directories, the process-observation sockets. Every launch already sweeps these, so this
 /// is for the data directory of someone who has stopped launching; it is pure host-side filesystem
 /// work (no sandbox, no nix), and stays silent when there is nothing to reclaim.
-fn runtime_housekeeping(layout: &crate::store::Layout, prune: bool, pal: &crate::style::Palette) {
+fn runtime_housekeeping(
+    layout: &crate::store::Layout,
+    live_projects: &std::collections::BTreeSet<String>,
+    prune: bool,
+    pal: &crate::style::Palette,
+) {
     let (h, n, r) = (pal.head, pal.name, pal.reset);
     // Reported apart from the sweep below because it is a different event: these counters are added
     // into the file that replaces them, not discarded. `sbx net stats` answers the same afterwards.
@@ -119,6 +124,20 @@ fn runtime_housekeeping(layout: &crate::store::Layout, prune: bool, pal: &crate:
             folded.len()
         );
     }
+    // The unpacked distribution root filesystems, reported before the runtime files because they
+    // are the larger number by orders of magnitude: an image tree is a distribution, and a run that
+    // freed one has freed more than every other pass here put together.
+    let trees = crate::sandbox::gc::sweep_distro_trees(layout.data_dir(), live_projects, prune);
+    if !trees.is_empty() {
+        let bytes: u64 = trees.iter().map(|(_, b)| b).sum();
+        let verb = if prune { "removed" } else { "would be removed" };
+        println!(
+            "{h}sbx gc:{r} distribution images — {n}{}{r} unpacked tree(s) {verb}, {n}{}{r} freed.",
+            trees.len(),
+            crate::sandbox::human_bytes(bytes)
+        );
+    }
+
     let stale = crate::sandbox::gc::sweep_runtime_dirs(layout.data_dir(), prune);
     if stale.is_empty() {
         return;

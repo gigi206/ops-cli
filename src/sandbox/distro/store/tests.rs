@@ -118,7 +118,7 @@ fn a_provisioned_image_lands_with_its_lock_and_its_mountpoints() {
     let lock = tmp.join("distro.lock");
     let locator = "oci:docker.io/library/debian:10-slim";
 
-    let rootfs = match provision(&layout, locator, &lock) {
+    let rootfs = match provision(&layout, locator, &lock, "proj0001") {
         Ok(r) => r,
         Err(e) => {
             skip_unreachable!("skipping the provision: {e}");
@@ -156,6 +156,14 @@ fn a_provisioned_image_lands_with_its_lock_and_its_mountpoints() {
     assert!(leftovers.is_empty(), "{leftovers:?}");
 
     // A second call is a lock read and a `stat`: same tree, and nothing fetched again.
-    let again = provision(&layout, locator, &lock).expect("the second call reuses the tree");
+    let again =
+        provision(&layout, locator, &lock, "proj0002").expect("the second call reuses the tree");
     assert_eq!(again, rootfs);
+
+    // Each launch records its own holder, and a tree already unpacked records it too: the marker is
+    // what a reclaim reads to tell a running cage from a lock's next choice.
+    let roots = rootfs.parent().unwrap().join(ROOTS_DIR);
+    for holder in ["proj0001", "proj0002"] {
+        assert!(roots.join(holder).is_file(), "`{holder}` holds the tree");
+    }
 }

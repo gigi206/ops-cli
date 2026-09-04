@@ -59,6 +59,31 @@ originals go. The totals are identical before and after; what changes is how man
 hold them. A running session's file is left alone, since it is still being written.
 `sbx net stats --reset` remains the way to actually discard counters.
 
+## Distribution image trees
+
+A [`distro`](../configuration/distro) declaration unpacks a whole root filesystem under the
+data directory, keyed by the image's digest. It is not a nix path, so the store collection
+above never sees it, and it is the largest single thing a reclaim can free.
+
+`sbx gc --all` reports the trees nothing names any more, and `--prune` removes them. A tree
+is kept when either of two things still points at it:
+
+- **a lock names its digest**, whether the shared one or a project's. That is the tree the
+  next launch of that scope wants, and freeing it would make that launch fetch an image it
+  already had.
+- **a live session holds it**, whatever the locks now say. A running cage executes out of
+  that tree; freeing it leaves the cage mounted on nothing, and its own shell disappears
+  mid-command. A launch records a marker under the tree it uses, and a marker is read
+  against the set of live sessions, so one left by a cage that crashed holds nothing and is
+  swept on the same pass.
+
+The consequence worth stating: rolling an image with [`sbx upgrade distro`](upgrade) during
+a long session never puts that session at risk. The tree it moved past is freed by the
+first reclaim after the session ends.
+
+A directory left by an interrupted unpack is swept by the pid its name carries, on the same
+rule the runtime files use.
+
 ## Examples
 
 ```sh

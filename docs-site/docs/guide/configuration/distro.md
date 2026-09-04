@@ -201,11 +201,22 @@ Which lock is rewritten follows the layer that named the image: a project that d
 own gets a lock beside its other project state, and a global declaration is pinned once for
 the host.
 
-## What it costs
+## What it costs, and how to get it back
 
-The unpacked tree lives in `sbx`'s store, keyed by the image's digest, so two projects on the
-same image share one copy and the second pays nothing. A distribution image is larger than
-the tools a hermetic cage carries, and that is the price of the userland.
+The unpacked tree lives under `sbx`'s data directory, beside the nix store rather than in
+it: it holds no nix paths and nix knows nothing about it. It is keyed by the image's
+digest, so two projects on the same image share one copy and the second pays nothing. A
+distribution image is larger than the tools a hermetic cage carries, and that is the price
+of the userland.
+
+[`sbx store`](../cli/store) counts it with everything else, and
+[`sbx gc --all --prune`](../cli/gc) frees the trees nothing names any more: an image you
+tried once, or the one a roll moved past. Two things keep a tree, and they answer different
+questions. A lock naming its digest keeps it, because that is what the next launch of that
+project wants. A **running** session keeps it too, whatever the locks now say, because a
+cage executes out of that tree: freeing it under one leaves it mounted on nothing, and its
+own shell disappears mid-command. So a roll during a long session does not put that session
+at risk, and the tree it left behind is freed by the first reclaim after it ends.
 
 ## Viewing the effective value
 

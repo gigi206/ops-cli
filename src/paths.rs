@@ -71,6 +71,12 @@ const DATA_ENTRIES: &[Entry] = &[
         enumerate: Enumerate::None,
     },
     Entry {
+        label: "distro/",
+        rel: "distro",
+        desc: "unpacked distribution root filesystems (one per image digest)",
+        enumerate: Enumerate::None,
+    },
+    Entry {
         label: "apt-keys/",
         rel: "apt-keys",
         desc: "pinned apt repository signing keys (one per repository)",
