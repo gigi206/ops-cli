@@ -118,11 +118,18 @@ struct Prepared {
     /// host-side `[env]` driver.
     engine_ref: String,
     userland: Userland,
-    /// Suppress the per-launch "equipping app packages in-cage" informational line. Set on the batch
-    /// `sbx upgrade` path, where it repeats for every app and buries the one thing that matters —
-    /// which app actually rolled; left `false` for an ordinary launch, where it tells the user what
-    /// is being equipped.
-    quiet_equip: bool,
+    /// Whether this launch is one cage of a batch — set on the `sbx upgrade` rolls, which build one
+    /// cage per app, and left `false` for an ordinary launch.
+    ///
+    /// It gates the narration a launch prints about how its own cage was assembled: the "equipping
+    /// app packages in-cage" line and the standing broker's note. Each tells an ordinary launch
+    /// something it wants (what is being equipped, which host resource is fenced); repeated once per
+    /// app across a fifty-app roll, both bury the one thing that matters — which app actually
+    /// rolled — and they land on stderr while the roll's own report is on stdout, so they interleave
+    /// with it rather than group. The flag names the situation rather than a policy, so a third such
+    /// line joins by reading it. It suppresses narration only: no warning, no refusal, and nothing
+    /// the cage does is conditioned on it.
+    in_batch: bool,
     /// What an unresolvable credential costs this launch. `Abort` everywhere but the batch rolls,
     /// which run one captured command per app and must not let a credential that command never
     /// sends decide whether the app is upgraded — see [`crate::sandbox::egress::Unresolved`].
@@ -926,7 +933,7 @@ fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, Ex
         nixpkgs,
         engine_ref,
         userland,
-        quiet_equip: false,
+        in_batch: false,
         unresolved_secret: crate::sandbox::egress::Unresolved::Abort,
     })
 }

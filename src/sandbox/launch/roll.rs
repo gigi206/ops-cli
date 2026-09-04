@@ -220,9 +220,10 @@ pub(crate) fn upgrade_mise_packages(
         }
     };
 
-    // In this batch context the per-app "equipping app packages in-cage" line `build` prints repeats
-    // for every app and buries the roll result — silence it (the report names each app anyway).
-    prep.quiet_equip = true;
+    // One cage per app: the lines `build` prints about how it assembled each one — the equipping
+    // line, the standing broker's note — repeat for every app and bury the roll result. Silenced
+    // here, where the report names each app anyway.
+    prep.in_batch = true;
     // A roll fetches packages; the credentials an app declares are for the traffic it makes when it
     // actually runs. One that cannot be resolved now denies its own destination for this cage
     // instead of failing the upgrade — the roll never sends it, and an app whose token endpoint is
@@ -515,7 +516,7 @@ pub(crate) fn upgrade_provision_steps(
             return true;
         }
     };
-    prep.quiet_equip = true;
+    prep.in_batch = true;
     // A roll fetches packages; the credentials an app declares are for the traffic it makes when it
     // actually runs. One that cannot be resolved now denies its own destination for this cage
     // instead of failing the upgrade — the roll never sends it, and an app whose token endpoint is

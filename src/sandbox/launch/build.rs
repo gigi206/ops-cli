@@ -854,7 +854,7 @@ pub(super) fn build(
             ));
         } else {
             if !auto_equip.is_empty() {
-                if !prep.quiet_equip {
+                if !prep.in_batch {
                     // The display copy only. The tokens handed to `wrap_mise_equip` below stay raw
                     // on purpose: they ride `\"$@\"` positionally and must reach mise exactly as the
                     // project wrote them.
@@ -897,7 +897,7 @@ pub(super) fn build(
                 ));
             }
             if !global_mise.is_empty() {
-                if !prep.quiet_equip {
+                if !prep.in_batch {
                     eprintln!("{}", equip_announcement(&global_mise));
                 }
                 wraps.push((
@@ -1203,14 +1203,21 @@ pub(super) fn build(
                 ring.clone(),
             ) {
                 Ok((guard, reachable)) => {
-                    crate::diag::note(&format!(
-                        "broker: `{name}` stands in front of {}{}",
-                        binding.socket.describe(),
-                        match binding.allow.len() {
-                            0 => String::new(),
-                            n => format!(" ({n} allow entr{})", if n == 1 { "y" } else { "ies" }),
-                        }
-                    ));
+                    // Narration, so it yields to `in_batch` like the equipping line above: a
+                    // launch is told which host resource is fenced, a fifty-app roll is not told
+                    // it fifty times. What the note reports is unchanged either way — the broker
+                    // is standing before this line is reached, not because of it.
+                    if !prep.in_batch {
+                        crate::diag::note(&format!(
+                            "broker: `{name}` stands in front of {}{}",
+                            binding.socket.describe(),
+                            match binding.allow.len() {
+                                0 => String::new(),
+                                n =>
+                                    format!(" ({n} allow entr{})", if n == 1 { "y" } else { "ies" }),
+                            }
+                        ));
+                    }
                     // Two brokers claiming one variable would silently last-wins, leaving a client
                     // pointed at whichever was stood up second and a broker serving nobody. Named
                     // instead, like the secrets layer names a duplicated destination header.
