@@ -37,13 +37,51 @@ use std::path::{Path, PathBuf};
 /// project's pinned state is one directory rather than two mechanisms.
 pub(crate) const DISTRO_LOCK: &str = "distro.lock";
 
-/// The directory holding one image's unpacked tree, keyed by its digest.
+/// The prefix a derived userland's key carries, ahead of the `sha256:` its content hashes to.
 ///
-/// `sha256:<hex>` becomes `sha256-<hex>`: a colon is a legal path byte on Linux, but this directory
-/// is named in messages, in `PATH`-like lists and on command lines, and a component that needs
-/// quoting in half of them is a component that will eventually be split in one of them.
-fn image_dir(layout: &Layout, digest: &str) -> PathBuf {
-    layout.distro_dir().join(digest.replacen(':', "-", 1))
+/// A **distinct** form rather than a widened digest: `sha256:<hex>` is the grammar of a *registry*
+/// digest and the registry client rests on it, so teaching that grammar a second meaning would put
+/// a key nothing published where a digest is expected. Kept apart, a lock written by one form and
+/// read by the other yields `None` and the launch re-resolves, which is the safe failure.
+pub(crate) const DERIVED_PREFIX: &str = "derived:sha256:";
+
+/// The key a derived userland is addressed by: the base digest and the commands, hashed together.
+///
+/// Both go in because both decide what the tree contains. Editing a command therefore builds a
+/// different userland rather than mutating this one, and a base that moved does the same — which is
+/// the answer to "if I change `run`, does it rebuild?" and to the same question about the base.
+///
+/// The commands are separated by a byte none of them can carry, so two lists cannot hash alike by
+/// running into each other: `["a", "bc"]` and `["ab", "c"]` are different userlands.
+fn derived_key(base_digest: &str, run: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(base_digest.as_bytes());
+    for command in run {
+        hasher.update([0u8]);
+        hasher.update(command.as_bytes());
+    }
+    format!(
+        "{DERIVED_PREFIX}{}",
+        crate::plugins::catalogue::to_hex(&hasher.finalize())
+    )
+}
+
+/// The file inside a derived tree recording the base digest it was built from.
+///
+/// The lock cannot answer this: its second line is the derived key, which is a hash *of* the base
+/// digest and does not contain it. Without this file a roll would have nothing to compare the
+/// registry's current answer against, and could only ever report "rebuilt" or nothing at all.
+pub(crate) const BASE_FILE: &str = "base";
+
+/// The directory holding one unpacked tree, keyed by its digest or its derived key.
+///
+/// Every `:` becomes `-`: a colon is a legal path byte on Linux, but this directory is named in
+/// messages, in `PATH`-like lists and on command lines, and a component that needs quoting in half
+/// of them is a component that will eventually be split in one of them. Both forms stay one path
+/// component, and stay distinguishable: `sha256-<hex>` and `derived-sha256-<hex>`.
+fn image_dir(layout: &Layout, key: &str) -> PathBuf {
+    layout.distro_dir().join(key.replace(':', "-"))
 }
 
 /// The directory of holder markers beside a tree: one empty file per project that has launched on
@@ -72,8 +110,10 @@ pub(crate) fn provision(
     lock_path: &Path,
     holder: &str,
     credential: Option<&str>,
+    build: Option<&super::build::Context<'_>>,
 ) -> io::Result<PathBuf> {
     let credential = credential.map(registry::Credential::basic);
+    let run: &[String] = build.map(|b| b.commands).unwrap_or_default();
     let image = reference::parse(locator).ok_or_else(|| {
         io::Error::other(format!(
             "`{locator}` is not a usable image locator (expected `oci:<registry>/<repository>:<tag>` or `…@sha256:<digest>`)"
@@ -84,16 +124,29 @@ pub(crate) fn provision(
         // A digest names the image itself, so there is nothing to resolve and nothing a registry
         // could answer differently.
         Reference::Digest(digest) => digest.clone(),
-        Reference::Tag(_) => match locked_digest(lock_path, locator) {
+        Reference::Tag(_) => match locked_base(layout, lock_path, locator) {
             Some(digest) => digest,
             None => registry::resolve(&image, credential.as_ref())?.digest,
         },
     };
 
-    let dir = image_dir(layout, &digest);
+    // What names the tree: the digest alone when the image is taken as published, the digest and
+    // the commands together when it is derived.
+    let key = if run.is_empty() {
+        digest.clone()
+    } else {
+        derived_key(&digest, run)
+    };
+    let dir = image_dir(layout, &key);
     let rootfs = dir.join("rootfs");
     if !rootfs.is_dir() {
-        unpack_into(&image.pinned(&digest), &digest, &dir, credential.as_ref())?;
+        unpack_into(
+            &image.pinned(&digest),
+            &digest,
+            &dir,
+            credential.as_ref(),
+            build,
+        )?;
     }
     // Checked on every launch rather than once at unpack: the list of paths a distribution has to
     // supply is sbx's, so a tree unpacked by an earlier version is held to the current one.
@@ -101,7 +154,7 @@ pub(crate) fn provision(
     let roots = dir.join(ROOTS_DIR);
     std::fs::create_dir_all(&roots)?;
     std::fs::File::create(roots.join(holder))?;
-    crate::store::write_lock(lock_path, locator, &digest)?;
+    crate::store::write_lock(lock_path, locator, &key)?;
     Ok(rootfs)
 }
 
@@ -115,8 +168,19 @@ pub(crate) fn provision(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Rolled {
     pub(crate) locator: String,
-    pub(crate) digest: String,
+    /// What the lock now records: the digest for an image taken as published, the derived key for
+    /// one a `run` list builds.
+    pub(crate) key: String,
+    /// What it recorded before, whatever image wrote it.
     pub(crate) previous: Option<String>,
+    /// The base digest behind [`Self::key`], and the one behind [`Self::previous`]. Equal to the
+    /// key itself when nothing is derived.
+    ///
+    /// Carried apart from the keys because a derived key is a hash of its base and its commands:
+    /// without them a roll could say that something changed but never which, and "the base moved"
+    /// and "you edited a command" are different answers to the only question a roll is asked.
+    pub(crate) base: String,
+    pub(crate) previous_base: Option<String>,
 }
 
 /// Re-resolve `locator` and rewrite its lock, whatever the lock already said.
@@ -130,25 +194,43 @@ pub(crate) struct Rolled {
 /// rule every channel here follows: a roll rewrites a lock, and the build happens when something is
 /// actually run.
 pub(crate) fn refresh(
+    layout: &Layout,
     locator: &str,
+    run: &[String],
     lock_path: &Path,
     credential: Option<&str>,
 ) -> io::Result<Rolled> {
     let credential = credential.map(registry::Credential::basic);
     let image = reference::parse(locator)
         .ok_or_else(|| io::Error::other(format!("`{locator}` is not a usable image locator")))?;
-    let previous = crate::store::read_lock_lines(lock_path)
-        .and_then(|(_, digest)| digest)
-        .and_then(|d| reference::valid_digest(&d).map(str::to_string));
-    let digest = match &image.reference {
+    // Read across sources rather than scoped to this locator: the question is what this roll
+    // supersedes, and a lock recording another image answers it.
+    let previous = crate::store::read_lock_lines(lock_path).and_then(|(_, key)| key);
+    let previous_base = previous.as_deref().and_then(|key| {
+        if key.starts_with(DERIVED_PREFIX) {
+            std::fs::read_to_string(image_dir(layout, key).join(BASE_FILE))
+                .ok()
+                .and_then(|b| reference::valid_digest(b.trim()).map(str::to_string))
+        } else {
+            reference::valid_digest(key).map(str::to_string)
+        }
+    });
+    let base = match &image.reference {
         Reference::Digest(digest) => digest.clone(),
         Reference::Tag(_) => registry::resolve(&image, credential.as_ref())?.digest,
     };
-    crate::store::write_lock(lock_path, locator, &digest)?;
+    let key = if run.is_empty() {
+        base.clone()
+    } else {
+        derived_key(&base, run)
+    };
+    crate::store::write_lock(lock_path, locator, &key)?;
     Ok(Rolled {
         locator: locator.to_string(),
-        digest,
+        key,
         previous,
+        base,
+        previous_base,
     })
 }
 
@@ -158,12 +240,29 @@ pub(crate) fn refresh(
 /// the same rule [`crate::store::LockTarget::locked_revision`] applies to a channel. Held to the
 /// digest grammar here rather than trusted, because a lock is a file on disk and this value goes on
 /// to name a directory.
-fn locked_digest(lock_path: &Path, locator: &str) -> Option<String> {
-    let (source, digest) = crate::store::read_lock_lines(lock_path)?;
-    (source == locator)
-        .then_some(digest)
-        .flatten()
-        .and_then(|d| reference::valid_digest(&d).map(str::to_string))
+fn locked_key(lock_path: &Path, locator: &str) -> Option<String> {
+    let (source, key) = crate::store::read_lock_lines(lock_path)?;
+    (source == locator).then_some(key).flatten().filter(|k| {
+        reference::valid_digest(k).is_some()
+            || k.strip_prefix(DERIVED_PREFIX)
+                .is_some_and(|hex| reference::valid_digest(&format!("sha256:{hex}")).is_some())
+    })
+}
+
+/// The **base** digest this lock stands for: the key itself when the image is taken as published,
+/// and the `base` file of the tree the key names when it is derived.
+///
+/// The indirection is what a derived key costs: it is a hash of the base digest, so the lock alone
+/// cannot say which base it stands for. A tree that is gone, or one from before this file existed,
+/// yields `None` and the launch re-resolves — the same safe failure a lock recording another image
+/// gets.
+fn locked_base(layout: &Layout, lock_path: &Path, locator: &str) -> Option<String> {
+    let key = locked_key(lock_path, locator)?;
+    if !key.starts_with(DERIVED_PREFIX) {
+        return Some(key);
+    }
+    let recorded = std::fs::read_to_string(image_dir(layout, &key).join(BASE_FILE)).ok()?;
+    reference::valid_digest(recorded.trim()).map(str::to_string)
 }
 
 /// Fetch every layer of `image` and apply it, then move the result into place.
@@ -178,6 +277,7 @@ fn unpack_into(
     digest: &str,
     dir: &Path,
     credential: Option<&registry::Credential>,
+    build: Option<&super::build::Context<'_>>,
 ) -> io::Result<()> {
     let parent = dir
         .parent()
@@ -204,6 +304,15 @@ fn unpack_into(
             let _ = std::fs::remove_file(&blob);
         }
         std::fs::remove_dir_all(&blobs)?;
+        // The commands run on the base, before the mountpoints and before the check: they see the
+        // image as the image published it, and a command that removes something a userland has to
+        // supply is caught by the check afterwards rather than hidden by a mountpoint created over
+        // it. Then the base digest is recorded, because the key that names this tree is a hash of
+        // it and cannot be read backwards.
+        if let Some(build) = build {
+            super::build::run(&rootfs, build)?;
+            std::fs::write(partial.join(BASE_FILE), digest.as_bytes())?;
+        }
         crate::sandbox::binds::create_distro_mountpoints(&rootfs)
     })();
 

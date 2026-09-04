@@ -29,16 +29,13 @@ fn a_lock_answers_for_the_image_that_wrote_it_and_no_other() {
     crate::store::write_lock(&lock, "oci:docker.io/library/debian:10", digest).unwrap();
 
     assert_eq!(
-        locked_digest(&lock, "oci:docker.io/library/debian:10").as_deref(),
+        locked_key(&lock, "oci:docker.io/library/debian:10").as_deref(),
         Some(digest)
     );
     // A lock left by another image is not this one's pin, however recent it is.
-    assert_eq!(
-        locked_digest(&lock, "oci:docker.io/library/debian:11"),
-        None
-    );
+    assert_eq!(locked_key(&lock, "oci:docker.io/library/debian:11"), None);
     // And no lock at all is not a pin either.
-    assert_eq!(locked_digest(&tmp.join("absent.lock"), "oci:x/y:z"), None);
+    assert_eq!(locked_key(&tmp.join("absent.lock"), "oci:x/y:z"), None);
 }
 
 #[test]
@@ -56,7 +53,7 @@ fn a_lock_holding_something_that_is_not_a_digest_is_not_read_as_one() {
         let lock = tmp.join("distro.lock");
         crate::store::write_lock(&lock, locator, bad).unwrap();
         assert_eq!(
-            locked_digest(&lock, locator),
+            locked_key(&lock, locator),
             None,
             "`{bad}` must not be read as a digest"
         );
@@ -118,7 +115,7 @@ fn a_provisioned_image_lands_with_its_lock_and_its_mountpoints() {
     let lock = tmp.join("distro.lock");
     let locator = "oci:docker.io/library/debian:10-slim";
 
-    let rootfs = match provision(&layout, locator, &lock, "proj0001", None) {
+    let rootfs = match provision(&layout, locator, &lock, "proj0001", None, None) {
         Ok(r) => r,
         Err(e) => {
             skip_unreachable!("skipping the provision: {e}");
@@ -156,7 +153,7 @@ fn a_provisioned_image_lands_with_its_lock_and_its_mountpoints() {
     assert!(leftovers.is_empty(), "{leftovers:?}");
 
     // A second call is a lock read and a `stat`: same tree, and nothing fetched again.
-    let again = provision(&layout, locator, &lock, "proj0002", None)
+    let again = provision(&layout, locator, &lock, "proj0002", None, None)
         .expect("the second call reuses the tree");
     assert_eq!(again, rootfs);
 

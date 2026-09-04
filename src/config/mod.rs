@@ -115,6 +115,23 @@ use std::path::{Path, PathBuf};
 const GLOBAL_CONFIG: &str = "sbx.toml";
 /// The project config file name, in the project root.
 pub(crate) const PROJECT_CONFIG: &str = ".sbx.toml";
+/// A `distro` declaration as the validator accepted it: which image, how to reach its registry, and
+/// what to run on it.
+///
+/// The three travel together through both config layers because they are one decision. A project
+/// that replaces the image replaces the credential written for another registry and the commands
+/// written for another base along with it, rather than inheriting either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DistroDecl {
+    /// The image locator, from `image` or from `from`.
+    pub(crate) locator: String,
+    /// The credential reference, unparsed: a resolver plugin's scheme is only known once the
+    /// plugin registry has been read, which happens after both layers have had their say.
+    pub(crate) auth: Option<String>,
+    /// The commands to derive a userland from that image, empty when it is taken as published.
+    pub(crate) run: Vec<String>,
+}
+
 /// The source label a one-shot override's warnings carry, so a dropped/malformed override field
 /// reads as `override: …` rather than as coming from a config file.
 const OVERRIDE_SOURCE: &str = "override";
@@ -444,6 +461,13 @@ pub(crate) struct Resolved {
     /// store. A security field: an untrusted project's value is dropped with a warning, since the
     /// root filesystem supplies every program the cage runs.
     pub(crate) distro: Option<String>,
+    /// The commands that derive this project's userland from [`Self::distro`], in order. Empty —
+    /// the ordinary case — means the image is used exactly as published.
+    ///
+    /// sbx understands none of them: each is a line for the image's own `/bin/sh`. They identify
+    /// the result together with the base digest, so editing one builds a different userland rather
+    /// than mutating this one.
+    pub(crate) distro_run: Vec<String>,
     /// How to authenticate to the registry serving [`Self::distro`], when the declaration named a
     /// credential. A reference to a secret, resolved host-side at the moment a registry asks for
     /// one, so no value is held here and none reaches the cage.
@@ -2549,7 +2573,11 @@ fn resolve(
     // and the credential reference resolved beside it. Parsed here rather than at validation because
     // a resolver plugin's scheme is only known once the registry has been read, which is the same
     // reason `[secret]` parses its own refs at this point.
-    let (distro, distro_auth) = match distro_decl {
+    let distro_run = distro_decl
+        .as_ref()
+        .map(|d| d.run.clone())
+        .unwrap_or_default();
+    let (distro, distro_auth) = match distro_decl.map(|d| (d.locator, d.auth)) {
         Some((locator, Some(reff))) => match secrets::parse_secret_ref(&reff, plugins) {
             Ok(source) => (Some(locator), Some(source)),
             Err(why) => {
@@ -2595,6 +2623,7 @@ fn resolve(
         mise_engine,
         nixpkgs_project,
         distro,
+        distro_run,
         distro_auth,
         distro_origin,
         // A mise file is discovered by I/O in `load`; the pure layering never sees one.

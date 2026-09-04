@@ -1459,7 +1459,10 @@ pub(crate) fn sweep_distro_trees(
             }
             continue;
         }
-        if !name.starts_with("sha256-") {
+        // Both spellings of a tree: one taken as published, and one derived by a `[distro] run`.
+        // A derived key hashes its base and its commands together, so the two never collide and
+        // both are swept on the same rule.
+        if !name.starts_with("sha256-") && !name.starts_with("derived-sha256-") {
             continue;
         }
         let held = sweep_distro_roots(
@@ -1492,8 +1495,10 @@ fn locked_distro_digests(data_dir: &Path) -> std::collections::BTreeSet<String> 
     use crate::sandbox::distro::store::DISTRO_LOCK;
     let mut out = std::collections::BTreeSet::new();
     let mut take = |path: PathBuf| {
-        if let Some((_, Some(digest))) = crate::store::read_lock_lines(&path) {
-            out.insert(digest.replacen(':', "-", 1));
+        if let Some((_, Some(key))) = crate::store::read_lock_lines(&path) {
+            // The same mapping the store uses to name the directory, so a lock and a tree agree
+            // whichever spelling the key carries.
+            out.insert(key.replace(':', "-"));
         }
     };
     take(data_dir.join(DISTRO_LOCK));
@@ -1530,7 +1535,8 @@ fn sweep_distro_roots(
 /// The pid in a `<digest>.partial.<pid>` name, or `None` for anything else.
 fn partial_unpack_pid(name: &str) -> Option<u32> {
     let (head, pid) = name.rsplit_once(".partial.")?;
-    head.starts_with("sha256-").then(|| pid.parse().ok())?
+    (head.starts_with("sha256-") || head.starts_with("derived-sha256-"))
+        .then(|| pid.parse().ok())?
 }
 
 /// Add the owner's write and search bits to every directory under `path`, so a tree unpacked from

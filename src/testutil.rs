@@ -203,6 +203,7 @@ pub(crate) fn resolved(
     apps: Vec<(&str, crate::config::ResolvedApp)>,
 ) -> crate::config::Resolved {
     crate::config::Resolved {
+        distro_run: Vec::new(),
         accepts_fresh_releases: Default::default(),
         timezone: None,
         timezone_origin: crate::config::Provenance::Default,

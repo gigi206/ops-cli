@@ -386,6 +386,11 @@ pub(crate) enum Plane {
     Agent,
     /// A declared task's per-invocation proxy, under that task's own `network` list.
     Task,
+    /// A `[distro] run` build's proxy, under the launch's own allowlist. Distinct from
+    /// [`Agent`](Self::Agent) for the reason this enum exists: a build runs commands the project
+    /// wrote, and letting its refusals widen the agent's allowlist would answer a question about
+    /// the agent that nobody asked about the agent.
+    Build,
     /// The plane is not known. The control wire does not carry it, so an event decoded on the
     /// client side reads as this — a fail-closed value, since nothing that writes policy may treat
     /// an unattributed refusal as the agent's.

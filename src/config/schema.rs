@@ -1068,10 +1068,26 @@ pub(crate) enum DistroField {
 /// error for a key sbx does not know.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct DistroTable {
-    /// The image locator, in the same grammar the string form uses. A table with no `image` names
-    /// nothing and is dropped with a warning, rather than leaving a cage on a userland the config
-    /// appears to have chosen.
+    /// The image locator, in the same grammar the string form uses: the userland is taken exactly
+    /// as published. A table naming neither `image` nor `from` names nothing and is dropped with a
+    /// warning, rather than leaving a cage on a userland the config appears to have chosen.
     pub(crate) image: Option<String>,
+    /// The image to derive one from, in the same grammar as [`Self::image`], together with
+    /// [`Self::run`]. Mutually exclusive with `image`, and the exclusion is by name rather than by
+    /// precedence: the two say different things about the same field, and picking one silently
+    /// would run a cage on a userland the reader did not choose.
+    pub(crate) from: Option<String>,
+    /// The commands that turn [`Self::from`] into this project's userland, run in order in a cage
+    /// on that image, with the tree writable.
+    ///
+    /// sbx understands **none** of them. Each is a line handed to the image's own `/bin/sh`, so
+    /// what a command means is what that distribution means by it: there is no package-manager
+    /// knowledge here, no name translation, and nothing that has to be taught a new distribution.
+    /// That is the same reason the consuming path works everywhere.
+    ///
+    /// They are part of what identifies the result, so editing one builds a different userland
+    /// rather than mutating this one. A tree is keyed by its base digest and this list together.
+    pub(crate) run: Option<Vec<String>>,
     /// A secret reference (`env://VAR`, `file:///abs/path`, `sops://…`, a resolver plugin's scheme)
     /// resolving to `<username>:<password>` for the registry. Read **host-side**, sent only on the
     /// request that obtains the registry's token, and never carried into the cage or through a

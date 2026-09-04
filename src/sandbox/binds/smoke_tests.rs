@@ -1094,7 +1094,8 @@ fn a_declared_distribution_is_the_cage_root_and_every_mount_still_lands() {
 
     let locator = "oci:docker.io/library/debian:10-slim";
     let lock = data.path().join("distro.lock");
-    match crate::sandbox::distro::store::provision(&layout, locator, &lock, "smoke000", None) {
+    match crate::sandbox::distro::store::provision(&layout, locator, &lock, "smoke000", None, None)
+    {
         Ok(root) => userland.distro = Some(root),
         Err(e) => {
             skip_unreachable!("skipping distribution smoke: {e}");

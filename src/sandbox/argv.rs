@@ -150,6 +150,15 @@ pub(crate) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
             if spec.net == NetPolicy::Isolated {
                 a.push(lit("--unshare-net"));
             }
+            // A build maps itself to uid 0 *inside* this namespace, which is what a distribution's
+            // package tools check for. Only on this branch: the holder path already sets the pair
+            // below, and for the opposite reason.
+            if spec.as_root {
+                a.push(lit("--uid"));
+                a.push(lit("0"));
+                a.push(lit("--gid"));
+                a.push(lit("0"));
+            }
         }
         // Holder path: the network namespace is pre-created by the netns holder (with a `dummy0`
         // interface up) and inherited across the holder's exec, so bwrap must *not* unshare its
@@ -269,16 +278,30 @@ pub(crate) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
 /// bwrap then reports `Invalid fd` instead of a result.
 #[cfg(test)]
 pub(super) fn run_bwrap(bwrap: &Path, spec: &SandboxSpec) -> io::Result<std::process::Output> {
-    let (argv, env) = compose(spec)?;
-    let mut command = std::process::Command::new(bwrap);
-    command.args(argv);
-    // Prepared exactly as the launch paths prepare theirs: the descriptor is close-on-exec in this
-    // process, so without this bwrap is handed a number that closed at the exec.
-    let held: Vec<File> = env.into_iter().collect();
-    super::memfd::inherit_across_exec(&mut command, &held);
+    let (mut command, held) = command_for(bwrap, spec)?;
     let out = command.output();
     drop(held);
     out
+}
+
+/// The `Command` that launches `spec`, together with the descriptors it must be spawned holding.
+///
+/// Split out of the test-only launcher above for a caller that has to watch the child rather than
+/// wait on it: a build step enforcing a deadline, say. The environment travels through a memfd
+/// rather than the argv, so a caller that builds its own `Command` from [`compose`] and forgets
+/// [`super::memfd::inherit_across_exec`] gets `bwrap: Invalid fd` at the exec: the descriptor is
+/// close-on-exec in this process and closes before bwrap can read it. Handing back both together is
+/// what keeps that from having to be remembered.
+pub(super) fn command_for(
+    bwrap: &Path,
+    spec: &SandboxSpec,
+) -> io::Result<(std::process::Command, Vec<File>)> {
+    let (argv, env) = compose(spec)?;
+    let mut command = std::process::Command::new(bwrap);
+    command.args(argv);
+    let held: Vec<File> = env.into_iter().collect();
+    super::memfd::inherit_across_exec(&mut command, &held);
+    Ok((command, held))
 }
 
 /// The arguments the descriptor carries, read back as bwrap will parse them — the cage's

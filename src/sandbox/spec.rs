@@ -176,6 +176,20 @@ pub(crate) struct SandboxSpec {
     /// user's subreaper) leaves it running. The supervised branch keeps the flag, and must: there
     /// the daemon is a real long-lived parent whose death should cascade.
     pub(super) dies_with_launcher: bool,
+    /// Whether the cage is mapped to uid 0 **inside its own user namespace** (`--uid 0 --gid 0`).
+    ///
+    /// False for every launch, which keeps the same-uid model the rest of this type is built
+    /// around: a process in the cage runs as the invoking user, so what it may touch on a bind is
+    /// what that user may touch.
+    ///
+    /// True only for a `[distro] run` build, and there because a distribution's own package tools
+    /// refuse to run otherwise: `dpkg` exits with "requested operation requires superuser
+    /// privilege" on a `geteuid()` check, before touching anything. It buys no privilege on the
+    /// host — the mapping is inside an unprivileged user namespace, so uid 0 there is the invoking
+    /// user outside, and a file the build writes is owned by that user. Exactly one uid can be
+    /// mapped without a setuid helper, so it is 0 and nothing else: a package that insists on
+    /// giving a file to some *other* uid still fails, and fails saying so.
+    pub(super) as_root: bool,
 }
 
 /// The netns-holder wiring for a cage that needs a `dummy0` interface (see
@@ -222,10 +236,18 @@ impl SandboxSpec {
             terminal: TerminalPolicy::NewSession,
             cmd,
             cage_slug: "cage".to_string(),
+            as_root: false,
             seccomp: super::seccomp::SeccompPolicy::default(),
             netns_dummy: None,
             dies_with_launcher: true,
         })
+    }
+
+    /// Map this cage to uid 0 inside its own user namespace. See [`Self::as_root`] for what that
+    /// does and does not buy; only a `[distro] run` build calls it.
+    pub(crate) fn rooted_in_its_namespace(mut self) -> Self {
+        self.as_root = true;
+        self
     }
 
     /// Drop `--die-with-parent` for a cage that has no supervising parent to die with — the

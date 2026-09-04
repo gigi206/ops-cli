@@ -951,12 +951,29 @@ fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, Ex
                 return Err(ExitCode::FAILURE);
             }
         };
+        // The shared store, physically, for the forwarder the build cage runs under an allowlist.
+        let nix_store_src = crate::store::physical_path(&layout, std::path::Path::new("/nix"));
+        // A `run` list turns the base into this project's own userland. The context is assembled
+        // here because every field in it is something only a launch knows, and it is `None` when
+        // nothing was declared so the consuming path costs nothing.
+        let build = (!cfg.distro_run.is_empty()).then(|| super::distro::build::Context {
+            commands: &cfg.distro_run,
+            bwrap: &bwrap,
+            ca_bundle: userland.ca_bundle_src.as_path(),
+            network: &cfg.network,
+            layout: &layout,
+            project_root: &cwd,
+            nix_store: nix_store_src.as_path(),
+            socat: userland.socat_bin.as_path(),
+            shell: userland.shell_bin.as_path(),
+        });
         match super::distro::store::provision(
             &layout,
             &locator,
             &lock,
             &holder,
             credential.as_deref(),
+            build.as_ref(),
         ) {
             Ok(root) => userland.distro = Some(root),
             Err(e) => {

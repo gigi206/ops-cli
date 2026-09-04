@@ -12190,15 +12190,117 @@ fn a_plaintext_refusal_names_the_switch_and_a_shape_refusal_does_not() {
 
 /// A `RawConfig` declaring the table form of `distro`.
 fn raw_distro_table(image: Option<&str>, auth: Option<&str>) -> RawConfig {
+    raw_distro_full(image, None, None, auth)
+}
+
+/// The same, with every key of the table spelled out.
+fn raw_distro_full(
+    image: Option<&str>,
+    from: Option<&str>,
+    run: Option<&[&str]>,
+    auth: Option<&str>,
+) -> RawConfig {
     RawConfig {
         distro: Some(crate::config::schema::DistroField::Table(
             crate::config::schema::DistroTable {
                 image: image.map(str::to_string),
+                from: from.map(str::to_string),
+                run: run.map(|r| r.iter().map(|c| (*c).to_string()).collect()),
                 auth: auth.map(str::to_string),
             },
         )),
         ..RawConfig::default()
     }
+}
+
+#[test]
+fn from_and_run_derive_a_userland_and_travel_with_the_image() {
+    let r = resolve_no_plugins(
+        raw_distro_full(
+            None,
+            Some("oci:docker.io/library/debian:12-slim"),
+            Some(&["apt-get update", "  ", "apt-get install -y gcc"]),
+            None,
+        ),
+        None,
+    );
+    assert_eq!(
+        r.distro.as_deref(),
+        Some("oci:docker.io/library/debian:12-slim")
+    );
+    // Blank entries are dropped rather than handed to a shell, which would run an empty command
+    // and count its success as a step.
+    assert_eq!(r.distro_run, ["apt-get update", "apt-get install -y gcc"]);
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+
+    // An untrusted project brings neither the image nor the commands: they are one decision, and
+    // arbitrary commands are the sharper half of it.
+    let r = resolve_no_plugins(
+        raw_distro("oci:docker.io/library/debian:10"),
+        Some((
+            raw_distro_full(
+                None,
+                Some("oci:evil.example.com/x/y:1"),
+                Some(&["rm -rf /"]),
+                None,
+            ),
+            TrustState::Untrusted,
+        )),
+    );
+    assert_eq!(r.distro.as_deref(), Some("oci:docker.io/library/debian:10"));
+    assert!(
+        r.distro_run.is_empty(),
+        "no commands from an untrusted layer"
+    );
+}
+
+#[test]
+fn image_and_from_say_different_things_so_declaring_both_is_refused() {
+    // Not resolved by precedence: the two say different things about the same field, and picking
+    // one silently would run the cage on a userland the reader did not choose between.
+    let r = resolve_no_plugins(
+        raw_distro_full(
+            Some("oci:docker.io/library/debian:10"),
+            Some("oci:docker.io/library/debian:12-slim"),
+            None,
+            None,
+        ),
+        None,
+    );
+    assert!(r.distro.is_none());
+    assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains("both `image` and `from`"),
+        "{:?}",
+        r.warnings
+    );
+
+    // `run` beside `image` would read as "and also run this every launch", which is neither what
+    // it does nor something sbx offers.
+    let r = resolve_no_plugins(
+        raw_distro_full(
+            Some("oci:docker.io/library/debian:10"),
+            None,
+            Some(&["apt-get update"]),
+            None,
+        ),
+        None,
+    );
+    assert!(r.distro.is_none());
+    assert!(
+        r.warnings[0].contains("`run` beside `image`"),
+        "{:?}",
+        r.warnings
+    );
+
+    // `from` with nothing to run derives nothing, so it is taken as an image rather than refused.
+    let r = resolve_no_plugins(
+        raw_distro_full(None, Some("oci:docker.io/library/debian:10"), None, None),
+        None,
+    );
+    assert_eq!(r.distro.as_deref(), Some("oci:docker.io/library/debian:10"));
+    assert!(r.distro_run.is_empty());
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
 }
 
 #[test]

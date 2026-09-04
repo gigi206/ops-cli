@@ -41,8 +41,8 @@ distro = "oci:ghcr.io/owner/image@sha256:0123…"            # an exact image
 distro = "oci:registry.example.com:8443/team/base:2024a"   # a private registry, with a port
 ```
 
-A registry that will not serve the image anonymously needs the table form, which adds
-`image` and `auth`. See [a private registry](#a-private-registry) below.
+The table form adds three keys: `auth` for [a private registry](#a-private-registry), and
+`from` plus `run` for [building your own userland](#building-your-own-userland).
 
 The registry is written out. A bare `debian:10` is refused, because a reference with no
 registry resolves against whatever default the client that reads it happens to carry, and
@@ -52,6 +52,89 @@ process in the cage stands on.
 
 The prefix is what keeps a second image source additive. A locator written today keeps
 meaning exactly what it means now when another one is added beside it.
+
+## Building your own userland
+
+`image` takes a published image as it is. `from` plus `run` derives one from it:
+
+```toml
+[distro]
+from = "oci:docker.io/library/debian:12-slim"
+run  = [
+  "printf 'APT::Sandbox::User \"root\";\\n' > /etc/apt/apt.conf.d/00-sbx-rootless",
+  "apt-get update",
+  "apt-get install -y --no-install-recommends build-essential",
+]
+
+[network]
+mode  = "allow"
+allow = ["http://deb.debian.org", "http://security.debian.org"]
+```
+
+The first line is Debian's, not `sbx`'s, and it is here because it is the one thing that is
+not obvious. A build runs as uid 0 **inside its own user namespace**, which is what `dpkg`
+checks for; exactly one uid can be mapped that way without a privileged helper, so it is 0
+and nothing else. Debian's `apt` drops to the `_apt` user before fetching, that uid is not
+mapped, and the fetch fails with `seteuid 42 failed`. Telling apt not to drop is the fix, and
+it is a line you write because you know your distribution: `sbx` neither knows it nor
+supplies it.
+
+The allowlist entries name the **scheme** for the reason [the recipe
+below](#adding-a-package-anyway) explains: Debian fetches over plain `http`, which the egress
+proxy refuses unless the entry says so.
+
+`sbx` understands **none** of those commands. Each is a line handed to the image's own
+`/bin/sh`, so what a command means is what that distribution means by it: there is no
+package-manager knowledge here and no name translation. That is the same property the
+consuming path has, and it is why both work on a distribution nobody here has heard of.
+
+`image` and `from` say different things about the same field, so declaring both is refused
+by name rather than resolved by precedence. `run` beside `image` is refused too: it would
+read as "and also run this every launch", which is neither what it does nor something `sbx`
+offers. `from` with no `run` derives nothing, so it is simply taken as the image.
+
+### It is built once, and rebuilt when it should be
+
+The result is named by the base digest and the commands **together**. Editing a command
+therefore builds a different userland rather than mutating this one, and so does a base that
+moved. Two projects writing the same base and the same commands share one tree.
+
+The build runs at the first launch that needs it, like every other provisioning here, and
+each command is bounded: one that waits on a prompt nobody can answer is killed after ten
+minutes rather than hanging the launch for ever.
+
+[`sbx upgrade distro`](../cli/upgrade) re-resolves the base and says which of the two moved:
+
+```
+sbx upgrade — distribution image
+  image: oci:docker.io/library/debian:12-slim  (project)
+  rebuilt 4a1c9e2 → 88f0b31 (the base moved bb3dc79 → e5b6442) — built on the next launch.
+```
+
+### What the build sees
+
+The tree, writable, and the minimum around it: a `/proc`, a `/dev`, a `/tmp`, the resolver
+configuration and the certificate roots. Not `/nix`, not a home, and above all **not the
+project**: a build is not a launch, and a command that could read the project could carry it
+into an image other projects then share. No `[secret]` injection reaches it either.
+
+The egress is the one the project declared, applied unchanged, on the rule the
+[bundles' install step](bundles#the-install-step) already follows: a command that downloads
+needs its host in the project's own [allowlist](../networking/rules), visible rather than
+implied. Under an allowlist the build gets a proxy of its own, because the userland has to
+exist before the launch's proxy does, and it runs on its own control plane so a build's
+refusal can never widen the agent's allowlist through `--net-learn`. One consequence worth
+knowing: a `tcp://` rule does not apply to a build, since those are served by an in-cage
+forwarder this cage does not carry.
+
+A failed command fails the launch and names itself. What it had already written is left in a
+directory no launch will ever look up, so a build that stopped half way leaves nothing behind
+that could be mistaken for a userland.
+
+One more place a build can happen: [`sbx gc`](../cli/gc) prepares the project in order to
+re-root what it is about to collect, and preparing is what provisions the userland. On a
+project whose derived tree is not built yet, a reclaim therefore builds it first. That is the
+same thing `gc` has always done for the base toolchain, and it costs what the build costs.
 
 ## A private registry
 

@@ -10,9 +10,10 @@
 //! what makes every distribution work without a line of code that knows one: nothing here parses a
 //! package name, runs a package manager, or maps a name from one distribution to another.
 
+pub(crate) mod build;
 mod gzip;
 mod http;
-mod layers;
+pub(crate) mod layers;
 pub(crate) mod reference;
 pub(crate) mod registry;
 pub(crate) mod store;

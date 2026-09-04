@@ -248,27 +248,58 @@ pub(super) fn validate_distro(
     warnings: &mut Vec<String>,
     source_label: &str,
     value: super::schema::DistroField,
-) -> Option<(String, Option<String>)> {
-    let (locator, auth) = match value {
-        super::schema::DistroField::Locator(locator) => (locator, None),
-        super::schema::DistroField::Table(table) => match table.image {
-            Some(image) => (image, table.auth),
-            None => {
-                warnings.push(format!(
-                    "{source_label}: ignoring a `distro` table that names no `image`"
-                ));
-                return None;
+) -> Option<super::DistroDecl> {
+    let (locator, auth, run) = match value {
+        super::schema::DistroField::Locator(locator) => (locator, None, Vec::new()),
+        super::schema::DistroField::Table(table) => {
+            let run: Vec<String> = table
+                .run
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect();
+            match (table.image, table.from) {
+                // Both name the base, and they say different things about what happens to it.
+                // Refused by name rather than resolved by precedence: picking one silently would
+                // run the cage on a userland the reader did not choose between.
+                (Some(_), Some(_)) => {
+                    warnings.push(format!(
+                        "{source_label}: ignoring a `distro` table that sets both `image` and \
+                         `from` (`image` takes an image as published, `from` derives one)"
+                    ));
+                    return None;
+                }
+                // `run` turns an image into another one, so it needs the key that says so. Under
+                // `image` it would read as "and also run this every launch", which is not what it
+                // does and not something sbx offers.
+                (Some(_), None) if !run.is_empty() => {
+                    warnings.push(format!(
+                        "{source_label}: ignoring a `distro` table that sets `run` beside `image`; \
+                         `run` derives a new userland, so its base is written as `from`"
+                    ));
+                    return None;
+                }
+                (Some(image), None) => (image, table.auth, Vec::new()),
+                // `from` with nothing to run derives nothing, so it is the same as `image` and is
+                // taken as one: refusing it would be pedantry about a value that is unambiguous.
+                (None, Some(from)) => (from, table.auth, run),
+                (None, None) => {
+                    warnings.push(format!(
+                        "{source_label}: ignoring a `distro` table that names no `image` or `from`"
+                    ));
+                    return None;
+                }
             }
-        },
+        }
     };
-    if super::is_valid_distro_source(&locator) {
-        Some((locator, auth))
-    } else {
+    if !super::is_valid_distro_source(&locator) {
         warnings.push(format!(
             "{source_label}: ignoring malformed distro locator `{locator}`"
         ));
-        None
+        return None;
     }
+    Some(super::DistroDecl { locator, auth, run })
 }
 
 /// Validate a `[mise] engine` source, warning on anything [`super::is_valid_mise_engine`] refuses.

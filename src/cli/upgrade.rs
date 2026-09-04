@@ -981,7 +981,13 @@ fn upgrade_distro(
     } else {
         None
     };
-    let rolled = match sandbox::distro::store::refresh(locator, &lock, credential.as_deref()) {
+    let rolled = match sandbox::distro::store::refresh(
+        layout,
+        locator,
+        &cfg.distro_run,
+        &lock,
+        credential.as_deref(),
+    ) {
         Ok(r) => r,
         Err(e) => {
             diag::error(&format!("sbx: cannot upgrade the `{locator}` image: {e}"));
@@ -1495,22 +1501,47 @@ fn distro_upgrade_summary(
             crate::sandbox::distro::reference::Reference::Digest(_)
         )
     });
-    let short = short_rev(rolled.digest.trim_start_matches("sha256:"));
+    let short = |key: &str| {
+        short_rev(
+            key.trim_start_matches(crate::sandbox::distro::store::DERIVED_PREFIX)
+                .trim_start_matches("sha256:"),
+        )
+        .to_string()
+    };
+    let now = short(&rolled.key);
+    let derived = rolled.key != rolled.base;
+    let noun = if derived { "userland" } else { "image" };
     let outcome = match &rolled.previous {
         None => format!(
-            "  resolved to {n}{short}{r} {ok}(first pin){r} — the root filesystem is unpacked on \
-             the next launch."
+            "  resolved to {n}{now}{r} {ok}(first pin){r} — the {noun} is built on the next launch."
         ),
-        Some(prev) if prev == &rolled.digest && pinned => {
-            format!("  pinned to a fixed digest {n}{short}{r} — {dim}nothing to roll.{r}")
+        Some(prev) if prev == &rolled.key && pinned && !derived => {
+            format!("  pinned to a fixed digest {n}{now}{r} — {dim}nothing to roll.{r}")
         }
-        Some(prev) if prev == &rolled.digest => {
-            format!("  already at the latest digest {n}{short}{r} — {dim}nothing to do.{r}")
+        Some(prev) if prev == &rolled.key => {
+            format!("  already at {n}{now}{r} — {dim}nothing to do.{r}")
+        }
+        // A derived userland changed for one of two reasons, and saying which is the whole value of
+        // the line: the base moved under the same commands, or the commands were edited.
+        Some(prev) if derived => {
+            let why = match &rolled.previous_base {
+                Some(before) if before != &rolled.base => format!(
+                    "the base moved {n}{}{r} → {n}{}{r}",
+                    short(before),
+                    short(&rolled.base)
+                ),
+                Some(_) => format!("{n}run{r} changed"),
+                None => "the base it was built from is no longer recorded".to_string(),
+            };
+            format!(
+                "  {ok}rebuilt{r} {n}{}{r} → {n}{now}{r} ({why}) — built on the next launch.",
+                short(prev)
+            )
         }
         Some(prev) => format!(
-            "  {ok}rolled forward{r} {n}{}{r} → {n}{short}{r} — the root filesystem is unpacked on \
-             the next launch.",
-            short_rev(prev.trim_start_matches("sha256:"))
+            "  {ok}rolled forward{r} {n}{}{r} → {n}{now}{r} — the {noun} is unpacked on the next \
+             launch.",
+            short(prev)
         ),
     };
     vec![
@@ -1547,10 +1578,13 @@ mod tests {
         digest: &str,
         previous: Option<&str>,
     ) -> sandbox::distro::store::Rolled {
+        let full = |c: &str| format!("sha256:{}", c.repeat(64 / c.len()));
         sandbox::distro::store::Rolled {
             locator: locator.to_string(),
-            digest: format!("sha256:{}", digest.repeat(64 / digest.len())),
-            previous: previous.map(|p| format!("sha256:{}", p.repeat(64 / p.len()))),
+            key: full(digest),
+            previous: previous.map(&full),
+            base: full(digest),
+            previous_base: previous.map(&full),
         }
     }
 
@@ -1582,10 +1616,7 @@ mod tests {
             &rolled(tag, "a", Some("a")),
             &pal,
         );
-        assert!(
-            still[2].contains("already at the latest digest"),
-            "{still:?}"
-        );
+        assert!(still[2].contains("already at"), "{still:?}");
 
         // A locator that names a digest resolves to itself, and says so in the word a pin earns
         // rather than in the word a tag that did not move earns.
@@ -1595,6 +1626,56 @@ mod tests {
             &pal,
         );
         assert!(pinned[2].contains("pinned to a fixed digest"), "{pinned:?}");
+    }
+
+    #[test]
+    fn a_derived_userland_says_whether_the_base_moved_or_the_commands_did() {
+        // The only question a roll is asked, and the two answers are different work for the reader:
+        // a base that moved is upstream's doing, an edited `run` is theirs.
+        let pal = style::Palette::plain();
+        let tag = "oci:docker.io/library/debian:10";
+        let full = |c: &str| format!("sha256:{}", c.repeat(64 / c.len()));
+        let derived = |c: &str| format!("derived:sha256:{}", c.repeat(64 / c.len()));
+
+        let base_moved = sandbox::distro::store::Rolled {
+            locator: tag.to_string(),
+            key: derived("d"),
+            previous: Some(derived("c")),
+            base: full("b"),
+            previous_base: Some(full("a")),
+        };
+        let out = distro_upgrade_summary(config::Provenance::Global, &base_moved, &pal);
+        assert!(out[2].contains("rebuilt"), "{out:?}");
+        assert!(out[2].contains("the base moved"), "{out:?}");
+        assert!(
+            out[2].contains("aaaaaaa") && out[2].contains("bbbbbbb"),
+            "{out:?}"
+        );
+
+        let run_changed = sandbox::distro::store::Rolled {
+            locator: tag.to_string(),
+            key: derived("d"),
+            previous: Some(derived("c")),
+            base: full("a"),
+            previous_base: Some(full("a")),
+        };
+        let out = distro_upgrade_summary(config::Provenance::Project, &run_changed, &pal);
+        assert!(out[2].contains("rebuilt"), "{out:?}");
+        assert!(out[2].contains("run"), "{out:?}");
+        assert!(!out[2].contains("the base moved"), "{out:?}");
+
+        // A derived userland that has not changed says so without claiming a pin: the locator is a
+        // tag, and what pins the result is the commands as much as the digest.
+        let same = sandbox::distro::store::Rolled {
+            locator: tag.to_string(),
+            key: derived("c"),
+            previous: Some(derived("c")),
+            base: full("a"),
+            previous_base: Some(full("a")),
+        };
+        let out = distro_upgrade_summary(config::Provenance::Global, &same, &pal);
+        assert!(out[2].contains("already at"), "{out:?}");
+        assert!(!out[2].contains("rebuilt"), "{out:?}");
     }
 
     #[test]
@@ -2459,6 +2540,7 @@ mod tests {
         let rev_a = "a".repeat(40);
         let rev_b = "b".repeat(40);
         let cfg = |global: &str| config::Resolved {
+            distro_run: Vec::new(),
             accepts_fresh_releases: Default::default(),
             timezone: None,
             timezone_origin: config::Provenance::Default,
