@@ -61,8 +61,14 @@ use std::time::Duration;
 /// per-port socket the in-cage forwarder creates, so one `ExtraBind` covers all ports.
 const CAGE_FORWARD_DIR: &str = "/tmp/sbx-forward";
 
-/// A cap on live host→cage pump threads per listener, matching [`super::proxy::serve`]'s shape: a
+/// A cap on live host→cage connections per listener, matching [`super::proxy::serve`]'s shape: a
 /// connection beyond the cap is refused (fail-closed) rather than allowed to pin a thread.
+///
+/// What it counts is connections, and a connection is two threads: the one
+/// [`super::conncap::spawn_conn`] starts, and the inner copy [`bridge`] spawns beside it so a peer
+/// that only ever reads cannot wedge the other direction. Each listener carries its own count,
+/// since [`accept_loop`] builds a [`super::conncap::ConnCap`] of its own, so a forward that binds
+/// both `127.0.0.1` and `[::1]` admits this many on each.
 const MAX_CONCURRENT_CONNS: usize = 512;
 
 /// How long an accept loop waits between non-blocking `accept()` polls. Small enough that dropping

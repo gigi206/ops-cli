@@ -39,9 +39,13 @@ allow = ["chatgpt.com"]
   over IPv6 is caught too, loopback only, never an external interface, and bridged to the cage's
   own loopback at the *same* port. The in-cage bridge connects the service on
   `127.0.0.1:<port>`, so a cage service that binds only IPv6 loopback (`::1`) is not reached: bind `127.0.0.1` or all interfaces inside the cage.
-- **Loopback only.** sbx never binds an external interface; the port is reachable only from
-  the host itself. (Exposing it to the LAN/internet is a deliberately separate, unbuilt
-  option.)
+- **Loopback only, which means the machine and not the account.** sbx never binds an external
+  interface, so nothing off the host reaches the port. Every local process does, whatever user it
+  runs as: a loopback TCP port carries no owner, unlike the `0700` directory the rest of the
+  control plane lives under. Another account on the same host can therefore connect to a forwarded
+  port and speak to the service in the cage, which is worth weighing for the OAuth callback this
+  field exists to catch. (Exposing it to the LAN or the internet is a deliberately separate,
+  unbuilt option.)
 - **Trusted-only.** `forward` is a security field, gated exactly like `network`/`gui`:
   honored from the global `sbx.toml` (trusted by location), a trusted project, or a named
   app profile; dropped with a warning from an untrusted project. An untrusted project may
