@@ -40,6 +40,20 @@ lives under the owner-only `<data>/stores/<name>/`. An accepted catalogue
 revision is recorded, and a re-fetch **refuses a rollback**: a store cannot be
 downgraded to an older, superseded catalogue (anti-rollback).
 
+Two limits of that floor are worth stating, because both are about what it does
+not claim:
+
+- It governs the **revision**, not the tree at one revision. A store that
+  republishes different bytes under the same `rev` is fetched and installed like
+  any other update; `store update` says the cache was refetched and the revision
+  did not move. What pins a *plugin*'s bytes is the per-entry `sha256`, checked
+  at every install and upgrade.
+- It protects the **catalogue**, not the plugins already in place. Dropping an
+  entry stops it being installed again and leaves `plugins upgrade` unable to
+  compare it, but the copy under `<data>/plugins/` keeps resolving. A store has
+  no way to revoke what it has distributed: remove it with `sbx plugins rm
+  <name>`.
+
 ## Managing stores
 
 ```

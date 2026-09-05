@@ -388,8 +388,14 @@ pub(crate) fn render_published(
 }
 
 /// The update report for one store: `updated store` in green with the revision bump when it
-/// advanced, or a dimmed already-current line when nothing moved (a no-op takes the dim hue). A
-/// pure presenter.
+/// advanced, or a `refetched store` line when the revision stayed where it was, dimmed because
+/// nothing the rollback floor governs moved. A pure presenter.
+///
+/// The second line says *refetched* rather than "already at revision N" because that is what
+/// happened: `update` clones the store afresh and exchanges the cache for the result, so a store
+/// that republishes a different tree under the same `rev` has its new bytes installed here. The
+/// floor is what it is documented to be, a revision that may not go backwards; it never made the
+/// tree at one revision fixed, and a line reading as a no-op would say it did.
 pub(crate) fn render_store_updated(
     name: &str,
     old_rev: u64,
@@ -406,7 +412,9 @@ pub(crate) fn render_store_updated(
         )
     } else {
         format!(
-            "store '{n}{name}{r}' is {dim}already at revision {new_rev} ({count} plugin{plural}){r}"
+            "{dim}refetched store{r} '{n}{name}{r}' \
+             {dim}(still revision {new_rev}, {count} plugin{plural}; the cache holds what the \
+             store serves now){r}"
         )
     }
 }
@@ -415,6 +423,26 @@ pub(crate) fn render_store_updated(
 mod tests {
     use super::*;
     use crate::plugins::PluginKind as Kind;
+
+    /// An update that does not advance the revision is not an update that did nothing.
+    ///
+    /// `update` always clones the store afresh and exchanges the cache for it, so a store that
+    /// republishes a different tree under the same `rev` is fetched and installed while the line
+    /// reads as a no-op. The rollback floor is what it is documented to be — a revision may not go
+    /// backwards — and it never claimed the tree at one revision is fixed. So the line has to say
+    /// what happened: the cache was refetched, and the revision did not move.
+    #[test]
+    fn an_update_that_does_not_advance_still_says_the_cache_was_refetched() {
+        let p = style::Palette::plain();
+        let line = render_store_updated("hub", 5, 5, 1, &p);
+        assert!(
+            !line.contains("already at revision"),
+            "the cache was replaced, so nothing may read as a no-op: {line}"
+        );
+        assert!(line.contains("refetched"), "{line}");
+        assert!(line.contains("revision 5"), "{line}");
+        assert!(line.contains("1 plugin"), "{line}");
+    }
 
     #[test]
     fn transactional_confirmations_are_plain_text_when_uncolored() {
@@ -513,7 +541,8 @@ mod tests {
         );
         assert_eq!(
             render_store_updated("hub", 5, 5, 1, &p),
-            "store 'hub' is already at revision 5 (1 plugin)"
+            "refetched store 'hub' (still revision 5, 1 plugin; the cache holds what the store \
+             serves now)"
         );
         assert_eq!(
             render_app_imported(

@@ -948,6 +948,13 @@ pub(crate) struct Updated {
 /// catalogue's revision must not regress below the highest already accepted, so a validly-signed
 /// but withdrawn or downgraded listing cannot be replayed. Fail-closed and all-or-nothing: any
 /// failure leaves the existing cache exactly as it was.
+///
+/// Two things the floor does not claim, both of them about the tree rather than the listing. A
+/// store may republish *different bytes* under the same `rev`, and they are installed like any
+/// other update — what pins a plugin's content is the per-entry `sha256`, checked at each install.
+/// And a catalogue that drops an entry stops it being installed again without touching the copy
+/// already under `<data>/plugins/`: a store cannot revoke what it has distributed, and
+/// `sbx plugins rm` is what removes it.
 pub(crate) fn update(
     layout: &crate::store::Layout,
     name: &str,
