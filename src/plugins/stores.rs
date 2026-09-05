@@ -735,6 +735,46 @@ pub(crate) fn upgrade_plugin(
     place_plugin(layout, store_name, plugin_name, true)
 }
 
+/// Where a catalogue entry's `path` lands under a store's cached checkout.
+enum Located {
+    /// Every component is a real directory inside the checkout; this is that directory.
+    Dir(PathBuf),
+    /// The named component is a symlink, so following the path would leave the verified tree.
+    Symlink(String),
+    /// A component is missing, or is not a directory at all.
+    Absent,
+}
+
+/// Walk `rel` under `checkout` one component at a time, refusing a symlink at **any** of them.
+///
+/// The content gate that follows pins the bytes, not their provenance: a digest is computed over a
+/// tree whose content the catalogue's own author picked, so any directory whose content he can
+/// predict reproduces it — a plugin published by any store, his own included. A link therefore
+/// buys a tree read from outside the checkout while the listing still attributes it to this store,
+/// and, because the install succeeds only on a match, a confirmation oracle over an arbitrary host
+/// directory. Both are closed by never following a link, at the leaf or above it.
+///
+/// `symlink_metadata` rather than an `openat` walk: the checkout lives under the owner-only data
+/// directory, which nothing sbx runs is given writable, so the walk and the read that follows are
+/// not separated by an adversary's write. `rel`'s components are all `Component::Normal` —
+/// `validate_repo_path` refuses anything else when the catalogue is parsed.
+fn locate_in_checkout(checkout: &Path, rel: &Path) -> Located {
+    let mut at = checkout.to_path_buf();
+    for component in rel.components() {
+        at.push(component);
+        let Ok(meta) = std::fs::symlink_metadata(&at) else {
+            return Located::Absent;
+        };
+        if meta.file_type().is_symlink() {
+            return Located::Symlink(component.as_os_str().to_string_lossy().into_owned());
+        }
+        if !meta.is_dir() {
+            return Located::Absent;
+        }
+    }
+    Located::Dir(at)
+}
+
 /// The shared body: verify a store's listed plugin and place it, replacing an existing one or not.
 fn place_plugin(
     layout: &crate::store::Layout,
@@ -759,27 +799,27 @@ fn place_plugin(
     })?;
 
     // The catalogue's `path` is validated repo-relative (no `..`, no absolute part) when the
-    // catalogue is parsed, so this join stays inside the store's checkout.
-    let plugin_dir = layout
-        .store_path(store_name)
-        .join(CHECKOUT)
-        .join(&entry.path);
-    // A real directory — `symlink_metadata` does not follow, so a symlinked checkout entry reads as
-    // "not a directory" and is refused here (and `verify_entry`/`dir_digest` refuse a symlink root
-    // too, as the load-bearing backstop). An *intermediate* symlink within `entry.path` (e.g. a
-    // symlinked `plugins/`) is not checked component-by-component, but it stays fail-closed via the
-    // content gate: git cannot commit files *under* a symlinked directory, so a clone resolves such a
-    // path to an attacker-uncontrolled location whose digest cannot match the pinned `sha256`.
-    let is_real_dir = std::fs::symlink_metadata(&plugin_dir)
-        .map(|m| m.is_dir())
-        .unwrap_or(false);
-    if !is_real_dir {
-        return Err(format!(
-            "store `{store_name}` lists plugin `{plugin_name}` at `{}`, but that directory is not \
-             in the cached checkout — try `sbx plugins store update {store_name}`",
-            entry.path
-        ));
-    }
+    // catalogue is parsed, so the walk below stays inside the store's checkout — every component
+    // of it, not only the last.
+    let checkout = layout.store_path(store_name).join(CHECKOUT);
+    let plugin_dir = match locate_in_checkout(&checkout, Path::new(&entry.path)) {
+        Located::Dir(dir) => dir,
+        Located::Symlink(component) => {
+            return Err(format!(
+                "store `{store_name}` lists plugin `{plugin_name}` at `{}`, but the component \
+                 `{component}` of that path is a symlink — a plugin is installed from the verified \
+                 checkout itself, never from wherever a link in it points",
+                entry.path
+            ));
+        }
+        Located::Absent => {
+            return Err(format!(
+                "store `{store_name}` lists plugin `{plugin_name}` at `{}`, but that directory is \
+                 not in the cached checkout — try `sbx plugins store update {store_name}`",
+                entry.path
+            ));
+        }
+    };
 
     // The content gate: the directory must reproduce the digest the signed catalogue pinned, so the
     // bytes about to be installed are exactly what was listed and signed.
@@ -2366,8 +2406,8 @@ mod tests {
         add(&layout, "default", &url, pubkey, &git).expect("add the store");
 
         // Swap the cached plugin directory for a symlink pointing at an attacker-chosen directory.
-        // The guard reads it as "not a directory" (symlink_metadata does not follow) and refuses, so
-        // a tampered checkout can never redirect an install outside the verified tree.
+        // The walk of the catalogue's `path` refuses it at that last component, so a tampered
+        // checkout can never redirect an install outside the verified tree.
         let plugin_dir = layout.store_path("default").join("checkout/plugins/pass");
         let elsewhere = crate::testutil::TmpDir::new();
         std::fs::write(elsewhere.path().join("plugin.toml"), "name = \"x\"\n").unwrap();
@@ -2375,7 +2415,42 @@ mod tests {
         std::os::unix::fs::symlink(elsewhere.path(), &plugin_dir).unwrap();
 
         let err = install_plugin(&layout, "default", "pass").unwrap_err();
-        assert!(err.contains("not in the cached checkout"), "{err}");
+        assert!(err.contains("`pass` of that path is a symlink"), "{err}");
+        assert!(!layout.plugins_dir().join("pass").exists());
+    }
+
+    /// A symlink at an *intermediate* component of the catalogue's `path` redirects the read just
+    /// as a symlinked leaf does, and the content gate does not catch it: the digest is pinned over
+    /// bytes whose value the catalogue's own author chose, so any tree whose content he can predict
+    /// — a plugin any store publishes, his own included — reproduces it. What the redirect buys is
+    /// an origin the listing then attributes to this store, and a confirmation oracle on an
+    /// arbitrary host directory.
+    #[test]
+    fn install_plugin_refuses_a_symlinked_component_above_the_plugin_dir() {
+        let Some(git) = git_or_skip() else { return };
+        let repo = crate::testutil::TmpDir::new();
+        let data = crate::testutil::TmpDir::new();
+        let pubkey = build_signed_store(repo.path(), 1);
+        let url = commit_repo(&git, repo.path());
+        let layout = crate::store::Layout::under(data.path());
+        add(&layout, "default", &url, pubkey, &git).expect("add the store");
+
+        // Move the whole `plugins/` directory out of the checkout, to an absolute path with nothing
+        // to do with the data directory, and leave a symlink in its place. The bytes are the ones
+        // the catalogue pinned, so the content gate passes; only the walk of `entry.path` can tell
+        // that the tree about to be installed is no longer the verified checkout's.
+        let checkout = layout.store_path("default").join(CHECKOUT);
+        let outside = crate::testutil::TmpDir::new();
+        let moved = outside.path().join("plugins");
+        std::fs::rename(checkout.join("plugins"), &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, checkout.join("plugins")).unwrap();
+
+        let err = install_plugin(&layout, "default", "pass").unwrap_err();
+        assert!(err.contains("plugins"), "{err}");
+        assert!(
+            err.contains("symlink"),
+            "the refusal has to name the component that leaves the checkout: {err}"
+        );
         assert!(!layout.plugins_dir().join("pass").exists());
     }
 
