@@ -149,10 +149,23 @@ The host-side MITM CONNECT proxy is where the policy is enforced. On each connec
 ### Host-side DNS (no DNS exfil)
 
 The cage cannot resolve names: it has no resolver. A `CONNECT host:port` carries the
-**hostname**, and the *proxy* resolves it, host-side. So the cage never sees a name to
-smuggle data through a DNS query, and the policy matches on the name the tool asked
-for, not on a resolved IP the cage could rebind. This closes DNS-based exfiltration by
-construction.
+**hostname**, and the *proxy* resolves it, host-side. Two things follow. The policy
+matches on the name the tool asked for and not on a resolved IP, so a server that
+answers with one address and connects to another decides nothing: DNS rebinding is
+closed. And the cage cannot send a query of its own to a resolver of its choosing, so
+there is no channel to a nameserver it picked.
+
+What it does not close is the name itself. The cage chooses the host of every
+`CONNECT`, and under a rule that admits more than one name, a wildcard `*.example.com`
+or a `re:` rule, it chooses the left-hand label too. The proxy resolves what the
+policy allowed, so those bytes reach the domain's authoritative nameserver and every
+recursive resolver in between, before any path, method or body rule is consulted and
+whether or not the connection that follows succeeds. Two wildcard entries,
+`*.nixos.org` and `*.githubusercontent.com`, are part of the built-in allowlist that
+every policy carries, so this holds even under `mode = "deny"` with an empty `allow`.
+The recipients are those two domains' operators and the resolver the host uses, never
+a third party of the cage's choosing. Pin exact hosts instead of wildcards where that
+residue matters.
 
 ### The TLS-terminating MITM (path/URL granularity)
 
