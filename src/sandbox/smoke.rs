@@ -80,23 +80,16 @@ pub(crate) fn run(bwrap: &Path) -> io::Result<SmokeReport> {
     );
 
     let spec = probe_spec(work.path(), script)?;
-    // Load the mandatory seccomp filters too, so `doctor` proves the real launch
-    // path — hardening *and* filter — works on this host, not just the namespaces.
-    // The anonymous files (the filters, and the cage's environment) stay alive
-    // until `output` returns, because bwrap reads them at startup.
-    let seccomp = super::seccomp::memfds(&spec.seccomp)?;
-    let mut argv = super::seccomp::argv_prefix(&seccomp);
-    let (spec_argv, env) = super::argv::compose(&spec)?;
-    argv.extend(spec_argv);
+    // The composed list carries the mandatory seccomp filters, so `doctor` proves the real launch
+    // path — hardening *and* filter — works on this host, not just the namespaces. The anonymous
+    // files behind it (the filters, and the cage's environment) stay alive until `output` returns,
+    // because bwrap reads them at startup.
+    let (argv, held) = super::argv::compose(&spec)?;
     let mut command = Command::new(bwrap);
     command.args(argv);
-    // Both sets of descriptors, which the preparations accumulate over.
-    super::memfd::inherit_across_exec(&mut command, &seccomp);
-    if let Some(env) = env.as_ref() {
-        super::memfd::inherit_across_exec(&mut command, std::slice::from_ref(env));
-    }
+    super::memfd::inherit_across_exec(&mut command, &held);
     let out = command.output()?;
-    drop((seccomp, env));
+    drop(held);
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     Ok(SmokeReport {

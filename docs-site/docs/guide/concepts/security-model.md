@@ -68,7 +68,10 @@ The cage's filesystem is assembled from a small, explicit set of binds, layered 
 project's own binds cannot displace `sbx`'s structural mounts:
 
 - **The hermetic FHS**: a minimal `/bin/sh`, `/usr/bin/env`, `/usr/bin/ldd`, `/nix` (the
-  store), and the synthetic `/etc`. No host `/usr`, no ambient system libraries.
+  store), and the synthetic `/etc`. No host `/usr`, no ambient system libraries. Where a
+  trusted layer names a [`distro`](../configuration/distro), that place is taken instead by a
+  distribution's own root filesystem, read-only at mount zero, with the same synthetic `/etc`
+  mounted over it: the userland changes, and none of the host exposure does.
 - **The project**, the current working directory, bound so the tool can work on the
   code.
 - **Explicitly granted paths**: whatever a *trusted* [`binds`](../configuration/binds)

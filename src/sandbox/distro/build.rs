@@ -32,6 +32,11 @@
 //! Two things the cage deliberately lacks, and both are consequences rather than omissions: no
 //! `[secret]` injection reaches it (a build is not the agent, and an image is shared), and no
 //! `tcp://` rule applies (those are served by an in-cage forwarder this cage does not carry).
+//!
+//! Everything a launch does carry, it carries: the mandatory seccomp filters come with the
+//! argument list, and the cage runs inside the launch's own resource scope. Both matter more here
+//! than on the consuming path rather than less, because what runs is a distribution's package
+//! tooling, mapped to uid 0 in its namespace, on a root it may write.
 
 use std::ffi::OsString;
 use std::io;
@@ -80,7 +85,23 @@ pub(crate) struct Context<'a> {
     pub(crate) nix_store: &'a Path,
     pub(crate) socat: &'a Path,
     pub(crate) shell: &'a Path,
+    /// The resource ceilings the launch resolved, applied to each build cage. A command here is a
+    /// distribution's own package tooling, running as root in its namespace on a writable root:
+    /// exactly the process a launch would never leave unbounded, and the launch it is standing up
+    /// for has not started yet, so nothing else is holding the line.
+    pub(crate) limits: &'a crate::sandbox::cgroup::Limits,
+    /// The launch's own name slug, which each build cage extends with a counter of its own. It
+    /// names the cage everywhere a cage is named, so a build shows up under the project it is for.
+    pub(crate) slug: &'a str,
 }
+
+/// How many build cages this process has stood up, which is what separates their scope names.
+///
+/// A transient scope's unit name must be unique among live units. The launcher's process id already
+/// separates two concurrent launches; within one process the cages of a `run` list follow each other
+/// closely enough that a name is not always free again by the time the next one asks for it, so the
+/// counter is what keeps each request answerable.
+static BUILD_CAGE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Run every command of `ctx` on the tree at `rootfs`, in order, stopping at the first failure.
 ///
@@ -227,14 +248,20 @@ fn one(
         // command — the same wrapper a launch uses, so there is one definition of that bridge.
         argv = crate::sandbox::egress::wrap_command(ctx.socat, ctx.shell, argv, &[]);
     }
+    let seq = BUILD_CAGE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let spec = SandboxSpec::new(PathBuf::from("/"), mounts, env, net, argv)
         .map(SandboxSpec::rooted_in_its_namespace)
+        .map(|s| s.with_cage_slug(format!("{}-build{seq}", ctx.slug)))
         .map_err(|e| io::Error::other(format!("building the cage for `{command}`: {e:?}")))?;
 
-    // Through the launcher rather than by composing an argv here: the cage's environment travels in
-    // a memfd, and a `Command` built without the descriptors that carry it fails at the exec with
+    // Through the shared launch command rather than by composing an argv here: that is what carries
+    // the mandatory seccomp filters and the resource scope, and what stages the descriptors the
+    // cage's environment travels on — a `Command` built without them fails at the exec with
     // `bwrap: Invalid fd`.
-    let (mut cage, held) = crate::sandbox::argv::command_for(ctx.bwrap, &spec)?;
+    let (prog, args, held) = crate::sandbox::launch::cage_command(ctx.bwrap, &spec, ctx.limits)?;
+    let mut cage = std::process::Command::new(prog);
+    cage.args(args);
+    crate::sandbox::memfd::inherit_across_exec(&mut cage, &held);
     let mut child = cage
         .stdin(std::process::Stdio::null())
         .spawn()

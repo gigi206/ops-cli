@@ -195,6 +195,14 @@ filter cannot load, and the launch **fails closed**: seccomp is a mandatory cont
 here, not best-effort. It is loaded on every launch path, including the `sbx doctor`
 smoke, so `doctor` proves the real launch path *with* the filter active.
 
+"Every launch path" is a property of the code rather than a rule its authors follow.
+There is one function that turns a sandbox description into a bubblewrap argument
+list, and compiling the filters is part of what it does, so an unfiltered cage is not
+something a new call site can produce by leaving a step out. The argument lists `sbx`
+assembles by hand, for the helpers whose arguments are fixed rather than resolved from
+a project, load the filters themselves, and a test enumerates them: one it does not
+know about fails the build until it says which kind it is.
+
 ## The environment is loaded off the argument list
 
 A process's **environment** is private (`/proc/<pid>/environ` is mode `400`, readable
@@ -211,7 +219,9 @@ So `sbx` does **not** pass the cage's environment as bwrap arguments. The flow i
 2. **The impure stage** opens a [`memfd_create`](https://man7.org/linux/man-pages/man2/memfd_create.2.html)-backed
    in-memory file, writes the cage's environment to it in bwrap's `--args` encoding
    (NUL-separated triples for `--setenv KEY VALUE`), and replaces the placeholder
-   with that file's descriptor number.
+   with that file's descriptor number. The seccomp filters are compiled here too, onto
+   memory files of their own, because they are descriptors as well: only a step allowed
+   to create one can name it on the argument list.
 3. bwrap reads the descriptor exactly once, at exec, and inherits it: a precise
    mechanism, `O_CLOEXEC` is deliberately **not** set so the descriptor survives
    bwrap's own exec.
@@ -229,8 +239,9 @@ environment is rebuilt from nothing on the descriptor, and the credentials, when
 present, are written first so a credential that took the name of the cage's own
 plumbing (`PATH`, `HOME`) loses to the plumbing. The skeleton bwrap argv is **pure**
 (same `SandboxSpec` in, same argv out, no I/O), and the impure step is exactly the
-memfd write. A test rejects any name or value carrying a NUL, and asserts that
-credentials are spliced in declaration order ahead of plain environment entries.
+memory files: the environment, and the compiled filters. A test rejects any name or
+value carrying a NUL, and asserts that credentials are spliced in declaration order
+ahead of plain environment entries.
 
 ## cgroup v2 resource limits (anti-DoS)
 

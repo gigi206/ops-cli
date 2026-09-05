@@ -24,8 +24,14 @@ hosts you name, and the built-in self-equip set, are reachable at all.
 
 ## What it is not
 
-`sbx` is **not** a container manager. There is no OCI runtime wrapping, no
-image to build, no registry.
+`sbx` is **not** a container manager. There is no OCI runtime wrapping the cage, and the
+default cage carries no image at all: its userland is provisioned from `sbx`'s own store.
+
+A project may name one. With [`distro`](../configuration/distro) the cage runs on a published
+image, fetched from a registry and unpacked host-side, and a `run` list can derive a userland
+of the project's own from it. What `sbx` never does is **produce** an image: a derived
+userland is a directory under `sbx`'s data directory, named by what it was built from, and
+nothing another tool consumes. The base of one is always an image somebody else published.
 
 The reference class is **sandboxes**: tools whose job is isolation under
 capability-bearing namespaces, **not** environment managers that assemble a
@@ -35,7 +41,8 @@ toolchain *and* confines it.
 | | `sbx` | container manager | env manager |
 |---|---|---|---|
 | Isolates the host | yes (bind layout + namespaces) | yes (image + namespaces) | no |
-| Builds an image | no | yes | no |
+| Consumes an image | only when [`distro`](../configuration/distro) names one | yes | no |
+| Produces an image | no | yes | no |
 | Runs as your uid | yes (same-uid) | usually root-in-container | n/a |
 | Provisions a toolchain | yes (nix + mise) | at build time | yes |
 | Root/daemon required | no | usually | no |

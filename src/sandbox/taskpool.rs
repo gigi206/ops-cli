@@ -633,7 +633,7 @@ fn run(
     limits: &super::cgroup::Limits,
     slug: &str,
 ) -> io::Result<InstallRun> {
-    let (argv, memfds) = super::launch::seccomp_argv(spec)?;
+    let (argv, memfds) = super::argv::compose(spec)?;
     let (prog, args) = super::cgroup::wrap(bwrap, argv, limits, slug);
     // Through [`super::task::spawn_launcher`], which states why: an install runs for minutes, and
     // these descriptors are not close-on-exec, so every cage this process spawns while one is open

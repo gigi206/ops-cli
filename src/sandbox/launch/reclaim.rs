@@ -352,13 +352,14 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
 
     // A project that was never launched has no store to reclaim — and finding that out must not
-    // cost anything, so the check runs **before** `prepare()`. Preparing provisions the base
+    // cost anything, so the check runs **before** the preparation. Preparing provisions the base
     // userland, so on a cold data directory it downloads an entire toolchain only to then report
-    // that there is nothing to reclaim. Its two inputs are exactly the ones `prepare` derives (the
-    // process's directory and the data-directory layout), so the identity is the same either way;
-    // where either is unavailable the check is skipped and `prepare` below reports that failure in
-    // its own words rather than this path second-guessing it. This is also what makes `sbx gc
-    // --all` safe to run from any directory: a non-project cwd is skipped, never provisioned.
+    // that there is nothing to reclaim. Its two inputs are exactly the ones the preparation derives
+    // (the process's directory and the data-directory layout), so the identity is the same either
+    // way; where either is unavailable the check is skipped and the preparation below reports that
+    // failure in its own words rather than this path second-guessing it. This is also what makes
+    // `sbx gc --all` safe to run from any directory: a non-project cwd is skipped, never
+    // provisioned.
     let early = std::env::current_dir()
         .ok()
         .zip(Layout::from_env())
@@ -373,7 +374,7 @@ fn sweep_current(prune: bool, optimise: bool, pal: &crate::style::Palette) -> Re
         return Ok(());
     }
 
-    let prep = prepare()?;
+    let prep = prepare_to_reclaim()?;
 
     let (id, project) = match binds::project_identity(&prep.cwd) {
         Ok(v) => v,

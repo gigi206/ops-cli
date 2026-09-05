@@ -119,31 +119,10 @@ mod tests {
                 "compose_cage(",
             ]
             .iter()
-            .flat_map(|needle| text.match_indices(needle))
-            .any(|(i, _)| {
-                i == 0
-                    || !matches!(text.as_bytes()[i - 1],
-                            b'_' | b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9')
-            })
-        }
-        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    walk(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    out.push(path);
-                }
-            }
+            .any(|needle| crate::testutil::calls_function(text, needle))
         }
 
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        walk(&root, &mut files);
-        files.sort();
+        let files = crate::testutil::crate_sources();
 
         let mut callers = 0usize;
         let mut offenders = Vec::new();

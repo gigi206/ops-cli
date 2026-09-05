@@ -1148,24 +1148,19 @@ mod tests {
             skip_incapable!("skipping seccomp cage test: no /usr/bin/python3 for the probe");
             return None;
         }
-        let spec = probe_spec(probe);
-        let memfds = memfds(policy).expect("memfds");
-        let mut argv = argv_prefix(&memfds);
-        let (spec_argv, env) = super::super::argv::compose(&spec).expect("compose");
-        argv.extend(spec_argv);
+        // The policy under test travels on the spec, which is what compiles it: a filter this
+        // test also prefixed by hand would be loaded twice, and the mandatory denylist stacked
+        // under a relaxation refuses what the relaxation was asked about.
+        let spec = probe_spec(probe).with_seccomp(policy.clone());
+        let (argv, held) = super::super::argv::compose(&spec).expect("compose");
         let mut command = Command::new(&bwrap);
         command.args(argv);
-        // Both sets: the filters this test compiled and the cage environment `compose` staged. The
-        // preparations accumulate, so two calls cover both — a probe that skipped either would fail
-        // as `Bad file descriptor` rather than as a verdict about the policy.
-        super::super::memfd::inherit_across_exec(&mut command, &memfds);
-        if let Some(env) = env.as_ref() {
-            super::super::memfd::inherit_across_exec(&mut command, std::slice::from_ref(env));
-        }
+        // The filters and the cage's environment alike: a probe that skipped this would fail as
+        // `Bad file descriptor` rather than as a verdict about the policy.
+        super::super::memfd::inherit_across_exec(&mut command, &held);
         let out = command.output().expect("launch bwrap");
-        // Both kinds of anonymous file stay alive until bwrap has read the inherited descriptors:
-        // the compiled filters, and the cage's environment.
-        drop((memfds, env));
+        // The anonymous files stay alive until bwrap has read the inherited descriptors.
+        drop(held);
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(
             out.status.success(),

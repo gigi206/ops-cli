@@ -10,6 +10,12 @@ declares, and the tools an agent installs for itself) is provisioned by
 **daemonless [nix](https://nixos.org/)** into a store `sbx` owns, and bound into the
 cage. This page explains that store model and how it stays reproducible.
 
+A trusted layer can replace the base userland with a published distribution image, which
+[`distro`](../configuration/distro) covers. The store model below is unchanged by that: the
+image supplies `/usr` and the loader, `/nix` is still `sbx`'s own and still bound in, and a
+project's declared tools are still provisioned the way this page describes. What is never
+the host's is the same either way.
+
 See also: [Directory layout](../concepts/directory-layout) · [`packages`](../configuration/packages) · [Upgrading](../housekeeping/upgrade).
 
 ## nix as a rolling OS on a channel

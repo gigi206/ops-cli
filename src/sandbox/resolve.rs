@@ -213,20 +213,19 @@ pub(crate) fn resolve_url(
             "cannot build the resolve sandbox for `{name}`: {e:?}"
         ))
     })?;
-    // `env` keeps the descriptor carrying the cage's environment open until bwrap has read it, and
-    // is read below to prepare the exec that inherits it.
-    let (argv, env) = super::argv::compose(&spec)?;
+    // `held` keeps the descriptors the composed list names — the seccomp filters and the cage's
+    // environment — open until bwrap has read them, and is read below to prepare the exec that
+    // inherits them.
+    let (argv, held) = super::argv::compose(&spec)?;
     let mut command = Command::new(cage.bwrap);
     command
         .args(argv)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // The descriptor is close-on-exec here; this is what carries it across the one exec that needs
-    // it. See [`super::memfd::write`].
-    if let Some(env) = env.as_ref() {
-        super::memfd::inherit_across_exec(&mut command, std::slice::from_ref(env));
-    }
+    // The descriptors are close-on-exec here; this is what carries them across the one exec that
+    // needs them. See [`super::memfd::write`].
+    super::memfd::inherit_across_exec(&mut command, &held);
     let out = command.output().map_err(|e| {
         io::Error::other(format!("could not run the `{name}` resolve command: {e}"))
     })?;
@@ -405,6 +404,45 @@ mod tests {
         assert!(
             validate_download_url("app", b"http://e/app.zip".to_vec(), is_targz, true, "x")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn a_resolve_cage_carries_the_mandatory_seccomp_filters() {
+        // The command a backend's `resolve` step runs is arbitrary and comes from a trusted layer,
+        // which makes the filters no less mandatory here than on a session. The argument list
+        // bubblewrap is handed is what decides it, so it is read back from a stand-in that records
+        // it and answers with a URL the caller accepts.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = crate::testutil::TmpDir::new();
+        let dump = tmp.join("argv.txt");
+        let fake = tmp.join("fake-bwrap");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho https://example.com/x.tar.gz\n",
+                dump.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cage = ResolveCage {
+            bwrap: fake.as_path(),
+            store_src: PathBuf::from("/data/store/nix"),
+            shell_bin: Path::new("/nix/store/abc-bash/bin/bash"),
+            ca_bundle: Path::new("/data/store/ca-bundle.crt"),
+            bins: Vec::new(),
+        };
+        let command = vec!["sh".to_string(), "-c".to_string(), "true".to_string()];
+        let url = resolve_url(&cage, "probe", &command, |_, _| true, false, "`.tar.gz`")
+            .expect("the recorded cage answers");
+        assert_eq!(url, "https://example.com/x.tar.gz");
+
+        let argv = std::fs::read_to_string(&dump).unwrap();
+        assert!(
+            argv.lines().any(|l| l == "--add-seccomp-fd"),
+            "a resolve cage is handed no seccomp filter: {argv}"
         );
     }
 }

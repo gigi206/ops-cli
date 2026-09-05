@@ -150,8 +150,9 @@ pub(crate) struct SandboxSpec {
     ///
     /// [`SandboxSpec::new`] defaults it to empty — the full mandatory denylist, identical to a
     /// cage with no `[seccomp]` config; the launch path sets a non-empty one via
-    /// [`SandboxSpec::with_seccomp`]. Consumed when the seccomp filters are compiled, not by
-    /// [`super::argv::to_argv`] (the filters are prepended as `--add-seccomp-fd` descriptors).
+    /// [`SandboxSpec::with_seccomp`]. Read by [`super::argv::compose`], which compiles the filters
+    /// and prepends them as `--add-seccomp-fd` descriptors, and not by [`super::argv::to_argv`],
+    /// which stays a pure function of the rest of this type.
     pub(super) seccomp: super::seccomp::SeccompPolicy,
     /// When set, the cage's network namespace is provided by the netns holder (which pre-creates
     /// it with a dummy interface up) instead of by bwrap's own `--unshare-net`. A graphical app
@@ -270,7 +271,7 @@ impl SandboxSpec {
     }
 
     /// Set the variables whose values must stay out of the argument list — see
-    /// [`SandboxSpec::secret_env`]. Only [`super::launch::seccomp_argv`] can turn such a spec into a
+    /// [`SandboxSpec::secret_env`]. Only [`super::argv::compose`] can turn such a spec into a
     /// runnable argv, because only it can create the descriptor they travel on.
     pub(crate) fn with_secret_env(mut self, env: Vec<(String, String)>) -> Self {
         self.secret_env = env;

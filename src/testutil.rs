@@ -149,6 +149,21 @@ fn rs_sources_under(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Whether `text` contains a **call** to `needle` — a function name with its opening parenthesis —
+/// rather than a mention of it inside a longer identifier.
+///
+/// The distinction is what separates a call to `write` from one to `memfd_write`, and it is what a
+/// source-scanning guard needs: a needle matched anywhere inside a longer identifier would put
+/// files in a population that never call the thing at all, and a guard whose population is wrong
+/// reports on the wrong files.
+pub(crate) fn calls_function(text: &str, needle: &str) -> bool {
+    text.match_indices(needle).any(|(i, _)| {
+        i == 0
+            || !matches!(text.as_bytes()[i - 1],
+                    b'_' | b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9')
+    })
+}
+
 /// Every `.rs` source under `src/cli`, sorted, subdirectories included.
 ///
 /// Two guards read the dispatcher sources — the routed-subcommand check in [`crate::cli`] and the

@@ -118,6 +118,12 @@ configuration and the certificate roots. Not `/nix`, not a home, and above all *
 project**: a build is not a launch, and a command that could read the project could carry it
 into an image other projects then share. No `[secret]` injection reaches it either.
 
+What it does get is everything that confines a launch. The mandatory
+[seccomp filter](../concepts/enforcement) is loaded here as it is everywhere, and the cage
+runs inside the same [resource scope](limits) a session does. Both matter more here than on
+the consuming path rather than less: what runs is the distribution's own package tooling,
+mapped to uid 0 inside its namespace, on a root it may write.
+
 The egress is the one the project declared, applied unchanged, on the rule the
 [bundles' install step](bundles#the-install-step) already follows: a command that downloads
 needs its host in the project's own [allowlist](../networking/rules), visible rather than
@@ -131,10 +137,12 @@ A failed command fails the launch and names itself. What it had already written 
 directory no launch will ever look up, so a build that stopped half way leaves nothing behind
 that could be mistaken for a userland.
 
-One more place a build can happen: [`sbx gc`](../cli/gc) prepares the project in order to
-re-root what it is about to collect, and preparing is what provisions the userland. On a
-project whose derived tree is not built yet, a reclaim therefore builds it first. That is the
-same thing `gc` has always done for the base toolchain, and it costs what the build costs.
+A reclaim never builds one. [`sbx gc`](../cli/gc) prepares the project in order to
+re-root the tools it is about to collect, and that preparation stops short of the userland:
+it fetches no image, unpacks no tree and runs no command. It has nothing to gain by doing so,
+because what it keeps is decided by the locks on disk and the sessions that are live, and a
+tree it created on the way would be one more thing to reason about rather than one less. A
+project whose derived userland is not built yet still has none after a reclaim.
 
 ## A private registry
 
@@ -285,9 +293,12 @@ image, which is where a dependency belonging to one project should be.
 
 ## What `sbx` does not do
 
-- **It does not build images.** It fetches a published one, verifies it against its digest,
-  unpacks it, and mounts it. The reference class is the prebuilt `[packages]` backends
-  (`deb:`, `tarball:`, `appimage:`), which consume artefacts rather than produce them.
+- **It does not produce images.** It fetches a published one, verifies it against its
+  digest, unpacks it, and mounts it. A [derived userland](#building-your-own-userland) is a
+  tree under `sbx`'s own data directory, named by what it was built from, that nothing but
+  `sbx` reads and no other tool can consume; the base under it is always an image somebody
+  else published. The reference class is the prebuilt `[packages]` backends (`deb:`,
+  `tarball:`, `appimage:`), which consume artefacts rather than produce them.
 - **It knows no package manager.** No name translation, no per-distribution catalogue. A
   package name in this world is the distribution's own name, the way a `nix:` name is a
   nixpkgs attribute.

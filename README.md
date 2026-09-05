@@ -7,10 +7,11 @@ including **encapsulated AI agents**, inside a [bubblewrap](https://github.com/c
 sandbox where they can install a project's full dependency set via single-user,
 daemonless [Nix](https://nixos.org/) **without mutating the host OS**.
 
-It is **not** a container manager: no OCI runtime wrapping, no image to build, no
-registry. The reference class is bubblewrap-based sandboxes, tools whose job is
-isolation under namespace boundaries, not environment managers that only set
-variables and isolate nothing.
+It is **not** a container manager: there is no OCI runtime wrapping the cage, and the
+default cage carries no image at all. A project may name one, and then `sbx` consumes a
+published image from a registry; what it never does is produce one. The reference class is
+bubblewrap-based sandboxes, tools whose job is isolation under namespace boundaries, not
+environment managers that only set variables and isolate nothing.
 
 ## Why
 

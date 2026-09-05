@@ -285,7 +285,7 @@ fn cage_timezone(declared: Option<&str>, zoneinfo_src: &Path) -> String {
 }
 
 /// Build the spec for `cmd`, reporting a clean error as an `ExitCode`. The
-/// configuration resolved in [`prepare`] drives this: a trust-gated `.sbx.toml` adds
+/// configuration resolved in [`super::prepare_with`] drives this: a trust-gated `.sbx.toml` adds
 /// environment and host binds — read-only, or read-write with `mode = "rw"` (its security
 /// fields honored only once trusted)
 /// and provisions its declared tools onto `PATH`. Whatever the gate dropped or

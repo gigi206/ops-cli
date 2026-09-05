@@ -498,6 +498,97 @@ fn the_task_cage_keeps_the_skeleton_and_drops_every_channel() {
     );
 }
 
+/// A task cage runs on the substrate its session was declared on.
+///
+/// Under `[distro]` the agent's plan starts with the image root, read-only at `/`, and the tmpfs
+/// covers a read-only root needs for the mountpoints sbx owns. A sibling cage that dropped them
+/// would have no userland at all: a task naming a program of that distribution finds nothing to
+/// run, and one naming a program of the hermetic base runs on a substrate the session never
+/// declared.
+#[test]
+fn a_task_cage_keeps_the_substrate_the_launch_declared() {
+    let agent = vec![
+        Mount::RoBind {
+            src: PathBuf::from("/data/distro/sha256-abc/rootfs"),
+            dest: PathBuf::from("/"),
+        },
+        Mount::Tmpfs {
+            dest: PathBuf::from("/home"),
+        },
+        Mount::Tmpfs {
+            dest: PathBuf::from("/opt"),
+        },
+        Mount::Tmpfs {
+            dest: PathBuf::from("/srv"),
+        },
+        Mount::Bind {
+            src: PathBuf::from("/data/projects/abc/nix"),
+            dest: PathBuf::from("/nix"),
+        },
+        Mount::RoBind {
+            src: PathBuf::from("/data/projects/abc/etc/passwd"),
+            dest: PathBuf::from("/etc/passwd"),
+        },
+    ];
+    let out = task_mounts(&agent, Path::new("/data/shared/store/nix"));
+
+    assert_eq!(
+        out.first(),
+        Some(&Mount::RoBind {
+            src: PathBuf::from("/data/distro/sha256-abc/rootfs"),
+            dest: PathBuf::from("/"),
+        }),
+        "the declared root is the cage's mount zero, or every mount after it lands elsewhere: \
+         {out:?}"
+    );
+    for cover in ["/home", "/opt", "/srv"] {
+        assert!(
+            out.contains(&Mount::Tmpfs {
+                dest: PathBuf::from(cover)
+            }),
+            "`{cover}` is a writable ancestor a mountpoint needs on a read-only root: {out:?}"
+        );
+    }
+    // The skeleton still comes through, and `/nix` is still repointed at the store no cage writes.
+    assert!(
+        out.contains(&Mount::RoBind {
+            src: PathBuf::from("/data/shared/store/nix"),
+            dest: PathBuf::from("/nix"),
+        }),
+        "{out:?}"
+    );
+    assert!(
+        out.iter()
+            .any(|m| mount_dest(m) == Path::new("/etc/passwd")),
+        "{out:?}"
+    );
+}
+
+/// With the hermetic userland there is no substrate to carry: bubblewrap's own writable root is
+/// the ground, and every mount creates the mountpoint it needs. A rule that kept tmpfs mounts
+/// unconditionally would hand a task cage the session's own scratch surfaces.
+#[test]
+fn a_hermetic_task_cage_gains_no_substrate() {
+    let agent = vec![
+        Mount::Tmpfs {
+            dest: PathBuf::from("/opt/sbx"),
+        },
+        Mount::RoBind {
+            src: PathBuf::from("/data/projects/abc/etc/passwd"),
+            dest: PathBuf::from("/etc/passwd"),
+        },
+    ];
+    let out = task_mounts(&agent, Path::new("/data/shared/store/nix"));
+    assert_eq!(
+        out,
+        vec![Mount::RoBind {
+            src: PathBuf::from("/data/projects/abc/etc/passwd"),
+            dest: PathBuf::from("/etc/passwd"),
+        }],
+        "nothing but the skeleton is kept where the cage root is bubblewrap's own"
+    );
+}
+
 /// The allowlist is matched on *exact* destinations, so an entry that names no real mount keeps
 /// nothing while reading as though it did — `/bin` does not keep `/bin/sh`, `/etc/ssl` does not
 /// keep the CA bundle. Pin every entry against the set the cage assembler actually emits.

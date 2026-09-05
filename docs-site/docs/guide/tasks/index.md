@@ -84,8 +84,10 @@ parameter bounds, and the absence of a shell.
 store mounted read-write and a `mise` tool lives under a writable `$HOME`, so a same-uid agent could
 overwrite the very binary a task is about to run. A task cage instead gets:
 
-- the same hermetic FHS, `/etc` identity files and locales: so a task behaves like the project's own
-  tooling;
+- the same userland the session runs on, `/etc` identity files and locales: so a task behaves like
+  the project's own tooling. Where the session was declared on a
+  [`distro`](../configuration/distro), that userland is the image, mounted the same way and at the
+  same place, so a task naming one of its programs finds the one the session would;
 - `/nix` **read-only from the shared store** (immutable, built host-side);
 - the project **read-only**, a fresh tmpfs `$HOME`, its own pid namespace (so the agent cannot read
   the task's `/proc/<pid>/environ`), an empty network namespace, no stdin, no tty;

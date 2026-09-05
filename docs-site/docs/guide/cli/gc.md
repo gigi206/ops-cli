@@ -65,6 +65,11 @@ A [`distro`](../configuration/distro) declaration unpacks a whole root filesyste
 data directory, keyed by the image's digest. It is not a nix path, so the store collection
 above never sees it, and it is the largest single thing a reclaim can free.
 
+A reclaim reads those trees and never makes one. It prepares the project to re-root the
+tools it is about to collect, and that preparation stops short of the userland: no image is
+fetched, nothing is unpacked, and no `run` list is executed, because what follows is decided
+by the locks on disk and the sessions that are live rather than by a tree.
+
 `sbx gc --all` reports the trees nothing names any more, and `--prune` removes them. A tree
 is kept when either of two things still points at it:
 

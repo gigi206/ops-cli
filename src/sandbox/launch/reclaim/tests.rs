@@ -100,3 +100,34 @@ fn a_lapse_in_trust_does_not_look_like_a_removed_inline_flake() {
         "a flake no longer declared is a removal, and its root is dropped"
     );
 }
+
+/// A reclaim prepares for a reclaim.
+///
+/// The two preparations are interchangeable at the call site: both take the same inputs, both
+/// return a `Prepared`, and both work. What separates them is that the launch preparation
+/// provisions the declared distribution, so a sweep taken through it fetches an image and runs the
+/// project's build commands in order to decide what to free, and on a project whose derived tree
+/// does not exist yet it creates one on the way. The sweep reads neither: it keys what to keep on
+/// the locks on disk and the sessions that are live.
+///
+/// Guarded by reading this module rather than by running one, because the failure is a
+/// substitution and not an absence. The wrong preparation compiles, reports the same numbers, and
+/// differs only in what it did first. Driving it instead would need a project store, which only a
+/// real launch creates.
+#[test]
+fn the_sweep_prepares_without_provisioning_a_distribution() {
+    let text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sandbox/launch/reclaim.rs"),
+    )
+    .expect("this module's own source");
+    assert!(
+        crate::testutil::calls_function(&text, "prepare_to_reclaim("),
+        "the sweep must prepare for a reclaim"
+    );
+    for launch in ["prepare_with(", "prepare_in(", "prepare_engines("] {
+        assert!(
+            !crate::testutil::calls_function(&text, launch),
+            "`{launch}` provisions the declared distribution, which a sweep must never ask for"
+        );
+    }
+}

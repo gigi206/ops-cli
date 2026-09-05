@@ -84,7 +84,7 @@ pub(crate) use roll::{upgrade_mise_packages, upgrade_provision_steps};
 pub(crate) use session::{attach, stop};
 // Re-exported at the width they had as one file: `pub(super)` on a child would now mean "visible in
 // `launch`", and these four are read from `sandbox` itself.
-pub(in crate::sandbox) use cage::{cage_command, seccomp_argv, status_code};
+pub(in crate::sandbox) use cage::{cage_command, status_code};
 pub(in crate::sandbox) use reclaim::{session_housekeeping, shared_store_gc};
 
 /// The hard prerequisites and per-launch resolution shared by `run` and `shell`:
@@ -519,7 +519,7 @@ pub(crate) fn app(
     };
     // The host's half, now that every answer that belongs to the project has been given: the
     // engines, the user namespace, and the channel this app's own lock resolves against.
-    let mut prep = match prepare_engines(pc, Some(name)) {
+    let mut prep = match prepare_engines(pc, Some(name), Purpose::Launch) {
         Ok(p) => p,
         Err(code) => return AppOutcome::plain(code),
     };
@@ -765,17 +765,44 @@ fn launch_pty_supervised(
     }
 }
 
-/// Hard prerequisites + per-launch resolution shared by `run` and `shell`. Returns
-/// a [`Prepared`] or an `ExitCode` to return after a clean, pointed error.
+/// What a preparation is being done for, which decides whether the declared distribution is
+/// provisioned.
 ///
-/// The configuration is loaded here (once, infallibly) because its `nixpkgs` field
-/// chooses the channel the **whole** launch resolves against — base userland and
-/// tools alike (see [`Prepared`] for why they must be one).
-fn prepare() -> Result<Prepared, ExitCode> {
-    prepare_with(&crate::config::Override::none(), None)
+/// A launch runs **on** that userland, so it has to exist: the image is fetched, unpacked, and,
+/// where a `run` list derives one, built. A reclaim never reads a tree at all. It decides what to
+/// keep from the locks on disk and the sessions that are live, so provisioning would fetch an image
+/// and run a project's build commands in order to free space, and on a project whose derived tree
+/// does not exist yet it would create one before deciding it is worth keeping.
+///
+/// The same line the store's own reclaim already draws for a `<backend>:resolve` package, which is
+/// built from its existing pin and never re-resolved: a reclaim works from what past launches
+/// recorded, and produces nothing of its own.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    /// A cage is going to run, so every userland it stands on is provisioned.
+    Launch,
+    /// Nothing will run; only what is already on disk is being decided about.
+    Reclaim,
 }
 
-/// [`prepare`] with a one-shot override applied. The override's **nixpkgs channel** is applied to
+/// The preparation a reclaim needs: the same engines, channel and configuration
+/// [`prepare_with`] resolves, and no declared distribution provisioned. See [`Purpose`] for why
+/// the sweep needs none of it.
+fn prepare_to_reclaim() -> Result<Prepared, ExitCode> {
+    prepare_engines(
+        prepare_config(launch_cwd()?, &crate::config::Override::none())?,
+        None,
+        Purpose::Reclaim,
+    )
+}
+
+/// Hard prerequisites and per-launch resolution shared by `run` and `shell`, with a one-shot
+/// override applied. Returns a [`Prepared`] or an `ExitCode` to return after a clean, pointed
+/// error.
+///
+/// The configuration is loaded here (once, infallibly) because its `nixpkgs` field chooses the
+/// channel the **whole** launch resolves against, base userland and tools alike (see [`Prepared`]
+/// for why they must be one). The override's **nixpkgs channel** is applied to
 /// the loaded config *before* the lock target is chosen (the channel decides which lock the whole
 /// launch resolves against), so a `-o nixpkgs=…` / `SBX_CONFIG` channel takes effect. The rest of
 /// the override (env, binds, network, gui, limits, secret) is applied by the caller with
@@ -806,7 +833,7 @@ fn prepare_in(
     ov: &crate::config::Override,
     app: Option<&str>,
 ) -> Result<Prepared, ExitCode> {
-    prepare_engines(prepare_config(cwd, ov)?, app)
+    prepare_engines(prepare_config(cwd, ov)?, app, Purpose::Launch)
 }
 
 /// The half of a launch's preparation that needs no engine: where sbx keeps its data, and the
@@ -860,7 +887,11 @@ fn prepare_config(cwd: PathBuf, ov: &crate::config::Override) -> Result<Prepared
 /// ([`effective_lock_target`]), and nothing of the app's configuration is read here. A caller that
 /// has already taken the app out of the configuration (as [`app`] does, to refuse an undeclared one
 /// before reaching this point) therefore loses nothing by doing so.
-fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, ExitCode> {
+fn prepare_engines(
+    pc: PreparedConfig,
+    app: Option<&str>,
+    purpose: Purpose,
+) -> Result<Prepared, ExitCode> {
     let PreparedConfig { layout, cwd, cfg } = pc;
     let bwrap = match crate::store::try_resolve_bwrap(Some(&layout)) {
         Ok(choice) => choice.path,
@@ -927,7 +958,8 @@ fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, Ex
     // hermetic one still resolves, because `/nix` is mounted either way and the tools a project
     // provisions come from it. Provisioned after it rather than inside `resolve_userland`, which
     // reads no config and is shared with every caller that needs the base alone.
-    if let Some(locator) = cfg.distro.clone() {
+    // Only where a cage is going to run: see [`Purpose`] for why a reclaim asks for none of this.
+    if let Some(locator) = cfg.distro.clone().filter(|_| purpose == Purpose::Launch) {
         let lock = match distro_lock_path(&cwd, &layout, &cfg) {
             Ok(p) => p,
             Err(e) => {
@@ -956,6 +988,10 @@ fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, Ex
         // A `run` list turns the base into this project's own userland. The context is assembled
         // here because every field in it is something only a launch knows, and it is `None` when
         // nothing was declared so the consuming path costs nothing.
+        //
+        // The same name the session's own cage will carry, so a build shows up under the project or
+        // app it is for wherever a cage is named; the runner extends it per command.
+        let build_slug = super::naming::cage_slug(app, &cwd);
         let build = (!cfg.distro_run.is_empty()).then(|| super::distro::build::Context {
             commands: &cfg.distro_run,
             bwrap: &bwrap,
@@ -966,6 +1002,8 @@ fn prepare_engines(pc: PreparedConfig, app: Option<&str>) -> Result<Prepared, Ex
             nix_store: nix_store_src.as_path(),
             socat: userland.socat_bin.as_path(),
             shell: userland.shell_bin.as_path(),
+            limits: &cfg.limits,
+            slug: &build_slug,
         });
         match super::distro::store::provision(
             &layout,

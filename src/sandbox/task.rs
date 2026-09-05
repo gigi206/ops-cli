@@ -139,10 +139,12 @@ const STOPPED_EXIT: i32 = 128 + libc::SIGKILL;
 /// "still finishing" means something is genuinely holding it rather than that the wait was stingy.
 const STOP_GRACE: Duration = Duration::from_secs(3);
 
-/// The in-cage destinations a task cage keeps from the agent cage's mount set.
+/// The in-cage destinations a task cage keeps from the agent cage's mount set, on top of the
+/// substrate that cage runs on ([`super::binds::substrate`], kept by rule rather than by entry:
+/// a userland is not a destination an allowlist can name).
 ///
-/// An **allowlist**, deliberately: a task needs the hermetic userland and the synthesized identity
-/// files, and nothing else. Anything the agent's cage exposes that is not named here — a `[binds]`
+/// An **allowlist**, deliberately: a task needs the userland and the synthesized identity files,
+/// and nothing else. Anything the agent's cage exposes that is not named here — a `[binds]`
 /// path, a Wayland or PulseAudio socket, the D-Bus portal directory, a granted device, the egress
 /// proxy socket — is dropped. A hole added to the agent cage later therefore does **not** silently
 /// appear in task cages; it has to be named here on purpose.
@@ -207,7 +209,8 @@ const KEPT_ENV: &[&str] = &[
 pub(crate) struct TaskEngine {
     /// The bubblewrap binary the launch resolved.
     bwrap: PathBuf,
-    /// The structural mounts a task cage starts from — the agent cage's set, filtered through
+    /// The structural mounts a task cage starts from — the substrate the launch declared (see
+    /// [`super::binds::substrate`]) followed by the agent cage's set, filtered through
     /// [`KEPT_DESTS`] and with `/nix` repointed at the shared store, read-only.
     base_mounts: Vec<Mount>,
     /// The environment a task cage starts from — the agent cage's, filtered through [`KEPT_ENV`].
@@ -2121,7 +2124,7 @@ struct RawOutput {
 /// Spawn a cage launcher, then close this process's copies of the descriptors bwrap was told to
 /// read.
 ///
-/// [`super::launch::seccomp_argv`] returns the compiled seccomp filters and the `--args` file as
+/// [`super::argv::compose`] returns the compiled seccomp filters and the `--args` file as
 /// anonymous in-memory files that are deliberately **not** close-on-exec ([`super::memfd`]), because
 /// bwrap has to still be able to read them after the exec. A descriptor that survives one exec
 /// survives every exec this process makes while it is open, and `Command::spawn` closes nothing in
@@ -2185,11 +2188,19 @@ fn read_capped(pipe: &mut impl Read, cap: usize, margin: usize) -> io::Result<(V
     Ok((kept, total > cap))
 }
 
-/// Derive a task cage's mounts from the agent cage's: keep the structural skeleton (see
-/// [`KEPT_DESTS`]), repoint `/nix` at the shared store read-only, and demote every kept read-write
-/// bind to read-only.
+/// Derive a task cage's mounts from the agent cage's: keep the substrate the launch declared, then
+/// the structural skeleton (see [`KEPT_DESTS`]), repoint `/nix` at the shared store read-only, and
+/// demote every kept read-write bind to read-only.
+///
+/// The substrate comes first and whole, because it is what everything else lands inside: see
+/// [`super::binds::substrate`] for what it is and why an allowlist of destinations cannot express
+/// it. `/tmp` is the one cover left behind, since [`TaskEngine::build_spec`] mounts a fresh one of
+/// the invocation's own and two would be a mount a reader has to explain.
 fn task_mounts(cage: &[Mount], shared_store_nix: &Path) -> Vec<Mount> {
-    let mut out = Vec::new();
+    let mut out: Vec<Mount> = super::binds::substrate(cage)
+        .into_iter()
+        .filter(|m| mount_dest(m) != Path::new("/tmp"))
+        .collect();
     for mount in cage {
         let dest = mount_dest(mount);
         if !KEPT_DESTS.contains(&dest.to_string_lossy().as_ref()) {

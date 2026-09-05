@@ -282,7 +282,7 @@ pub(super) fn compose_cage(plan: &CagePlan<'_>) -> io::Result<(Vec<OsString>, Ve
     // The returned descriptor is where the cage's environment is read from, and the reason it is a
     // descriptor is this cage in particular: a plugin's `allow_env` is how it is handed its *own*
     // credential (a vault token, an age key), and an argument list is world-readable.
-    super::launch::seccomp_argv(&spec)
+    super::argv::compose(&spec)
 }
 
 /// How long sbx waits on one host-side resolution that reaches nothing but itself.

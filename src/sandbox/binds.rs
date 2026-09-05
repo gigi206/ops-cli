@@ -435,6 +435,36 @@ fn writable_anchor(rootfs: &Path, dest: &Path) -> io::Result<PathBuf> {
     Ok(top)
 }
 
+/// The mounts a cage's **userland** is made of, read off a plan [`cage_mounts`] produced.
+///
+/// Under a declared distribution: the image root, read-only at `/`, and every tmpfs the plan
+/// mounts. On a read-only root those tmpfs are what the rest of the plan lands inside, since a
+/// mountpoint can only be made where something is writable. With the hermetic userland: nothing at
+/// all, because there the cage root is bubblewrap's own writable tmpfs and every mount makes its
+/// own mountpoint, which is why the root is what this keys on.
+///
+/// This is the one definition of which mounts are the substrate, and it exists because a cage
+/// derived from another one has to stand on the same ground. A sibling built from an allowlist of
+/// destinations keeps the skeleton and loses the floor under it: with no root there is no userland,
+/// so a command naming a program of the declared distribution finds nothing to run, and one naming
+/// a program of the hermetic base runs on a substrate the session never declared.
+///
+/// Stated as a rule over the plan's contents rather than as a count of its leading entries: the
+/// number of covers depends on where the project sits, and a claim about how the list is written is
+/// not a claim about what it contains.
+pub(super) fn substrate(mounts: &[Mount]) -> Vec<Mount> {
+    let root = mounts
+        .iter()
+        .find(|m| matches!(m, Mount::RoBind { dest, .. } if dest == Path::new("/")));
+    let Some(root) = root else {
+        return Vec::new();
+    };
+    std::iter::once(root)
+        .chain(mounts.iter().filter(|m| matches!(m, Mount::Tmpfs { .. })))
+        .cloned()
+        .collect()
+}
+
 /// One explicit bind injected by the launcher after the structural mounts (so it is
 /// neither shadowed by, nor shadows, them): a host source exposed at a distinct cage
 /// destination. Used for the network-allowlist machinery — the bound egress socket and

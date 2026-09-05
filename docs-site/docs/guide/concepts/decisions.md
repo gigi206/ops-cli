@@ -158,6 +158,15 @@ serving every package including those that never touch the store.
 Every capability nix lacked so far produced another backend **inside** the binary rather
 than an extension outside it, which is the pattern the next section is about.
 
+**What `distro` did to that trigger.** It grew inside the binary too, and it is not a
+backend: a registry client, an HTTPS client, a gzip reader, tar unpacking with the path
+checks an archive from a stranger needs, and a runner for the commands that derive a
+userland. None of it is a way to name a tool; all of it replaces the substrate a cage runs
+on. So the trigger as written does not fire, because nothing was added to the package
+vocabulary, while the thing the trigger exists to notice happened anyway. What it costs is
+a second provisioning road, with its own locks, its own reclaim rules and its own failure
+modes, maintained beside the first for as long as both exist.
+
 ### Decrypting as the egress default
 
 A filtering posture terminates TLS at a host-side proxy with a per-session CA. The
@@ -198,9 +207,19 @@ signed manifest and a verified store, and it has never been used outside secrets
 the four prebuilt package backends do the same three things as each other and already share
 a common trait.
 
-**What would reopen it**: writing the simplest of those backends as a plugin. If the
-existing manifest suffices, the core can shrink and the question becomes which backends move
-out; if it needs a new plugin type invented, the answer is no, with a reason.
+**Where the examination landed**, because the trigger has since been pulled: the simplest
+prebuilt backend was examined as a plugin, and the backend split in half. Its delegable half
+was already delegated: a `<backend>:resolve` package runs an arbitrary command in a cage,
+honoured only from a trusted layer, and the URL that command prints is re-validated against
+the same rule a declared locator meets. Nothing about that half needs a plugin type it does
+not already have. The other half is a nix template the backend keeps, and it cannot leave the
+host process: evaluation is pure and happens in-process, and a fetch driven from an
+expression would run outside the proxy the launch is enforcing. So the answer is no, and the
+core does not shrink here.
+
+**What would reopen it**: a backend whose resolution step needs something a caged command
+cannot do. That is a different trigger from the one above, and pulling it would be an
+argument about the cage rather than about the plugin manifest.
 
 ### Declarative TOML, and what a field cannot say
 
@@ -213,10 +232,17 @@ host carrying both a layer-4 and a layer-7 rule has the second one ignored, an u
 group reference is dropped. Each is reported as a warning to someone who has already written
 the file.
 
-**What would reopen it**: sorting those rules into the ones a stricter schema could make
-unrepresentable (exclusive variants instead of orthogonal fields) and the ones that are
-genuinely semantic. If most fall in the first group, the schema is under-typed rather than
-the format wrong.
+**Where the sort landed**, because this one was open too: the inter-field rules were divided
+into the ones a stricter type could make unrepresentable and the ones that are genuinely
+semantic. A minority fall in the first group, where an exclusive variant would say what two
+orthogonal fields say today. The majority decide a field from another field that a
+*different layer* supplied, global under project under app under a one-shot override, and the
+type of one document cannot express a rule about a value that document does not contain. So
+the schema is not under-typed, and the warnings at launch are where those rules belong: they
+are the first moment every layer is present.
+
+**What would reopen it**: a rule of the first kind that bites often enough to be worth a
+variant of its own. The sort says which those are; nothing says one is expensive yet.
 
 ## See also
 

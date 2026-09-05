@@ -29,6 +29,18 @@ fn engine_with(
 /// and only the slug can tell their scopes apart. Sharing it makes `systemd-run` refuse the
 /// second launch outright on the live unit name, whichever test happens to reach it first.
 fn engine_for(tasks: Vec<TaskSpec>, project: &Path, slug: &str) -> Option<(TaskEngine, TmpDir)> {
+    engine_on(tasks, project, slug, None)
+}
+
+/// [`engine_for`] against a declared distribution, so what the engine derives from is an agent cage
+/// whose root is an image rather than bubblewrap's own tmpfs. `distro` is the image locator; `None`
+/// is the hermetic userland.
+fn engine_on(
+    tasks: Vec<TaskSpec>,
+    project: &Path,
+    slug: &str,
+    distro: Option<&str>,
+) -> Option<(TaskEngine, TmpDir)> {
     let bwrap = crate::pathfind::find_on_path("bwrap")?;
     if !matches!(crate::probe_userns(), crate::Userns::Ok) {
         return None;
@@ -39,7 +51,17 @@ fn engine_for(tasks: Vec<TaskSpec>, project: &Path, slug: &str) -> Option<(TaskE
     let nixpkgs = crate::store::LockTarget::global(&layout, None)
         .resolve(&nix, &layout)
         .ok()?;
-    let userland = super::super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs).ok()?;
+    let mut userland =
+        super::super::fhs::resolve_userland(&nix, &layout, &nixpkgs, &nixpkgs).ok()?;
+    if let Some(locator) = distro {
+        let lock = data.path().join("distro.lock");
+        userland.distro = Some(
+            crate::sandbox::distro::store::provision(
+                &layout, locator, &lock, "smoke000", None, None,
+            )
+            .ok()?,
+        );
+    }
 
     // Assemble an agent cage exactly as the launcher would, then derive the engine from it — the
     // same path production takes, so what this exercises is the real derivation.
@@ -558,5 +580,71 @@ fn the_timeout_kills_a_hanging_task_and_the_cap_truncates_a_loud_one() {
     assert!(
         cut.stdout.as_deref().map(str::len).unwrap_or(0) <= 256,
         "no more than the declared ceiling is kept"
+    );
+}
+
+/// A declared operation runs on the substrate its session was declared on.
+///
+/// Under `[distro]` the sibling cage takes the same structural skeleton, and the skeleton is
+/// nothing without the ground it stands on: the image root at mount zero. The command here exists
+/// only in the image, so a cage that kept the destinations and lost the root cannot run it at all,
+/// while one that quietly fell back to the hermetic base would answer with a different program.
+///
+/// Skipped rather than failed where the registry does not answer: what the arm proves needs a real
+/// image, and an unreachable registry is not a verdict about the derivation.
+#[test]
+fn a_declared_task_runs_on_the_distribution_the_session_declared() {
+    let project = TmpDir::new();
+    std::fs::write(project.path().join("README"), b"hi").unwrap();
+
+    // `dpkg` is the image's own, and no hermetic cage carries it: what answers says which
+    // substrate ran. Read through the image's `/bin/sh`, which is likewise the image's.
+    let mut task = echo_task("/bin/sh");
+    task.name = "on-the-image".into();
+    task.cmd = vec![
+        "/bin/sh".to_string(),
+        "-c".into(),
+        "dpkg --version | head -1; . /etc/os-release; echo ID=$ID".into(),
+    ];
+    task.params = Vec::new();
+    task.secrets = Vec::new();
+
+    // The two reasons this cannot run are not the same reason. A host with no cage is one this
+    // test was meant to run on and could not, which the capable-host run turns into a failure; a
+    // registry that did not answer is not a verdict about the derivation either way.
+    if crate::pathfind::find_on_path("bwrap").is_none()
+        || !matches!(crate::probe_userns(), crate::Userns::Ok)
+        || crate::store::resolve_nix(None).is_none()
+    {
+        skip_incapable!("skipping the distribution task smoke: need bwrap, userns, and nix");
+        return;
+    }
+    let Some((engine, _data)) = engine_on(
+        vec![task],
+        project.path(),
+        "smoke-distro",
+        Some("oci:docker.io/library/debian:10-slim"),
+    ) else {
+        skip_unreachable!("skipping the distribution task smoke: the registry did not answer");
+        return;
+    };
+
+    let outcome = engine
+        .run("on-the-image", &BTreeMap::new(), &BTreeMap::new(), 1)
+        .expect("the task runs");
+    let stdout = outcome.stdout.clone().unwrap_or_default();
+    assert_eq!(
+        outcome.exit, 0,
+        "a task naming a program of the declared distribution must run; stdout: {stdout}, \
+         stderr: {:?}",
+        outcome.stderr
+    );
+    assert!(
+        stdout.contains("ID=debian"),
+        "the cage's root must be the declared image: {stdout}"
+    );
+    assert!(
+        stdout.contains("Debian"),
+        "the image's own package tool must be the one that answered: {stdout}"
     );
 }

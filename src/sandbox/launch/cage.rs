@@ -2,9 +2,11 @@
 //!
 //! One command is assembled here and four things are done with it: replace this process with it,
 //! fork and wait for its status, fork and capture what it printed, or supervise it through a
-//! private terminal. The assembly is stated once — the seccomp filters, the netns holder and the
-//! cgroup wrap, in that order — because a path that composed them differently would be a launch
-//! that ran under weaker confinement than the others, and nothing would say so.
+//! private terminal. The assembly is stated once — the argument list with its seccomp filters, the
+//! netns holder and the cgroup wrap, in that order — because a path that composed them differently
+//! would be a launch that ran under weaker confinement than the others, and nothing would say so.
+//! The filters are not a step here: they belong to [`crate::sandbox::argv::compose`], so a path
+//! that never reaches this module still cannot produce an unfiltered cage.
 //!
 //! The memfds backing the seccomp filters are handed back rather than dropped: they are not
 //! close-on-exec, and closing one early would close the descriptor bubblewrap was told to read.
@@ -257,27 +259,14 @@ fn cage_output_line(line: &str) -> String {
     format!("       {}", crate::sandbox::sanitize(line))
 }
 
-/// The bwrap argv with the mandatory seccomp filters prepended. Returns the
-/// backing memfds the caller must keep alive until bwrap has read them — they are
-/// not close-on-exec, and dropping a `File` early would close the descriptor
-/// bwrap is told to read. Seccomp is loaded on every launch path the same way the
-/// namespace hardening is emitted unconditionally by `to_argv`.
-pub(in crate::sandbox) fn seccomp_argv(
-    spec: &SandboxSpec,
-) -> io::Result<(Vec<OsString>, Vec<File>)> {
-    let mut memfds = crate::sandbox::seccomp::memfds(&spec.seccomp)?;
-    let mut argv = crate::sandbox::seccomp::argv_prefix(&memfds);
-    let (spec_argv, env) = crate::sandbox::argv::compose(spec)?;
-    argv.extend(spec_argv);
-    // The environment's descriptor joins the filters' in the same vector, because they have the same
-    // lifetime requirement: bwrap must still be able to read all of them at the exec.
-    memfds.extend(env);
-    Ok((argv, memfds))
-}
-
 /// The runnable command for `spec`: the bwrap argv with its seccomp prefix, routed through the netns
 /// holder, then wrapped in the resource-limit scope — the three steps every launch path takes
 /// between a `SandboxSpec` and a process, in the one order that is correct.
+///
+/// The first is [`crate::sandbox::argv::compose`]'s own, which is where it belongs: a cage with no
+/// filter is not something a caller can produce, whether or not it came through here. What is left
+/// for this function is the pair of steps that need what a spec alone does not carry — the host's
+/// netns holder and the launch's resource limits.
 ///
 /// The middle step is the one a new launch path would forget it needs: for a graphical isolated cage
 /// it routes the launch through the netns holder so the namespace carries a `dummy0` interface (see
@@ -292,7 +281,7 @@ pub(in crate::sandbox) fn cage_command(
     spec: &SandboxSpec,
     limits: &crate::sandbox::cgroup::Limits,
 ) -> io::Result<(PathBuf, Vec<OsString>, Vec<File>)> {
-    let (argv, keep_open) = seccomp_argv(spec)?;
+    let (argv, keep_open) = crate::sandbox::argv::compose(spec)?;
     let (holder_prog, holder_argv) =
         crate::sandbox::netns::holder_wrap(bwrap, argv, spec.netns_dummy.as_ref());
     let (prog, args) =

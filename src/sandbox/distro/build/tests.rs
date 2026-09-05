@@ -28,8 +28,17 @@ fn inert<'a>(
         nix_store: Path::new("/nonexistent/nix"),
         socat: Path::new("/nonexistent/socat"),
         shell: Path::new("/nonexistent/bash"),
+        limits: &INERT_LIMITS,
+        slug: "demo-app",
     }
 }
+
+/// The default ceilings, which is what a launch that declares no `[limits]` runs under.
+static INERT_LIMITS: crate::sandbox::cgroup::Limits = crate::sandbox::cgroup::Limits {
+    memory_high: None,
+    memory_max: None,
+    tasks_max: None,
+};
 
 #[test]
 fn an_image_with_no_shell_is_refused_before_a_cage_is_stood_up() {
@@ -188,5 +197,97 @@ fn a_build_cage_cannot_see_the_project() {
     assert!(
         !seen.contains("SECRET"),
         "the project is visible to a build cage: {seen}"
+    );
+}
+
+#[test]
+fn a_build_cage_carries_the_mandatory_seccomp_filters() {
+    // The filters are mandatory on every launch path, and this one runs a distribution's own
+    // package scripts. What decides it is the argument list bubblewrap is handed, so the list is
+    // read back from a stand-in that records it. Two commands, because the cages of one list are
+    // stood up in sequence and each must be admissible on its own.
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = crate::testutil::TmpDir::new();
+    let rootfs = tmp.join("rootfs");
+    std::fs::create_dir_all(rootfs.join("bin")).unwrap();
+    std::fs::write(rootfs.join("bin/sh"), b"").unwrap();
+    let dump = tmp.join("argv.txt");
+    let fake = tmp.join("fake-bwrap");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nprintf 'CAGE\\n' >> '{0}'\nprintf '%s\\n' \"$@\" >> '{0}'\n",
+            dump.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let ca = tmp.join("ca.crt");
+    std::fs::write(&ca, b"").unwrap();
+    let layout = crate::store::Layout::under(tmp.path());
+    let network = crate::config::NetworkPolicy::Isolated;
+    let commands = vec!["true".to_string(), "true".to_string()];
+    run(
+        &rootfs,
+        &inert(&commands, &fake, &ca, &layout, tmp.path(), &network),
+    )
+    .expect("both recorded cages run");
+
+    let dumped = std::fs::read_to_string(&dump).unwrap();
+    let cages: Vec<&str> = dumped.split("CAGE\n").skip(1).collect();
+    assert_eq!(cages.len(), 2, "both commands stand a cage up: {dumped}");
+    for argv in cages {
+        assert!(
+            argv.lines().any(|l| l == "--add-seccomp-fd"),
+            "a build cage is handed no seccomp filter: {argv}"
+        );
+    }
+}
+
+#[test]
+fn a_build_cage_runs_inside_the_resource_limit_scope() {
+    // A build is bounded like every other cage. Read from inside the cage rather than off the
+    // command line, so what is asserted is the control group the process actually landed in.
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = crate::testutil::TmpDir::new();
+    let rootfs = tmp.join("rootfs");
+    std::fs::create_dir_all(rootfs.join("bin")).unwrap();
+    std::fs::write(rootfs.join("bin/sh"), b"").unwrap();
+    let seen = tmp.join("cgroup.txt");
+    let fake = tmp.join("fake-bwrap");
+    std::fs::write(
+        &fake,
+        format!("#!/bin/sh\ncat /proc/self/cgroup > '{}'\n", seen.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let ca = tmp.join("ca.crt");
+    std::fs::write(&ca, b"").unwrap();
+    let layout = crate::store::Layout::under(tmp.path());
+    let network = crate::config::NetworkPolicy::Isolated;
+    // Whether this host can carry a scope at all is the launch path's own decision, taken here
+    // against the same limits the build will run under: where it applies none there is nothing to
+    // assert, and saying so is not the same as passing.
+    let limits = crate::sandbox::cgroup::Limits::default();
+    let (wrapper, _) = crate::sandbox::cgroup::wrap(&fake, Vec::new(), &limits, "probe");
+    if wrapper == fake {
+        skip_incapable!("skipping the build scope check: this host applies no resource limits");
+        return;
+    }
+
+    let commands = vec!["true".to_string()];
+    run(
+        &rootfs,
+        &inert(&commands, &fake, &ca, &layout, tmp.path(), &network),
+    )
+    .expect("the recorded cage runs");
+
+    let cgroup = std::fs::read_to_string(&seen).unwrap();
+    let unit = format!("-{}.scope", std::process::id());
+    assert!(
+        cgroup.contains("sbx-") && cgroup.contains(&unit),
+        "a build cage runs outside sbx's own resource scope: {cgroup}"
     );
 }

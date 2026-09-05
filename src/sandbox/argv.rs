@@ -17,6 +17,12 @@
 //! as the cage runs. The variables go on a descriptor instead ([`compose`]), which is where the two
 //! halves meet: [`to_argv`] stays pure and marks the place, and `compose` — the one impure step —
 //! creates the descriptor and fills its number in.
+//!
+//! The mandatory seccomp filters are compiled in that same impure step, and for the same reason
+//! they are here rather than at each call site: they are descriptors too, so only a step that may
+//! create one can name them, and every path from a spec to a process goes through this one. What
+//! that buys is that an unfiltered cage is not something a caller can assemble by forgetting a
+//! line.
 
 use super::spec::{Mount, NetPolicy, SandboxSpec, TerminalPolicy};
 use std::ffi::OsString;
@@ -38,41 +44,58 @@ fn path(p: &Path) -> OsString {
 /// process happens to hold — bwrap refuses it loudly instead.
 pub(crate) const ENV_ARGS_PLACEHOLDER: &str = "@sbx-env-args";
 
-/// The bubblewrap argument list for `spec`, ready to exec, plus the descriptor it must inherit to
-/// read the cage's environment (`None` when the cage sets no variables at all).
+/// The bubblewrap argument list for `spec`, ready to exec, plus the descriptors it must inherit to
+/// read what that list points at: the compiled seccomp filters, then the cage's environment.
 ///
-/// **Hold the returned file** until bwrap has read it — dropping the `File` closes the number the
-/// argv points at — and prepare the command with [`super::memfd::inherit_across_exec`]: the
-/// descriptor is close-on-exec in this process, so an exec that was not prepared reaches bwrap with
-/// that number already closed.
-pub(crate) fn compose(spec: &SandboxSpec) -> io::Result<(Vec<OsString>, Option<File>)> {
+/// This is the **one** place a spec becomes a runnable argument list, and that is why the filters
+/// are compiled here rather than by each caller. They are mandatory on every launch path, and a
+/// step a caller has to remember is a step some caller will not take: a cage assembled without it
+/// is indistinguishable from a hardened one until something inside it makes a syscall the denylist
+/// exists to refuse. Folding them in leaves nothing to remember and nothing to get wrong. The
+/// relaxation a trusted `[seccomp] allow` grants travels on the spec ([`SandboxSpec::seccomp`]), so
+/// a cage that declared none gets the full mandatory denylist.
+///
+/// **Hold the returned files** until bwrap has read them — dropping one closes a number the argv
+/// points at — and prepare the command with [`super::memfd::inherit_across_exec`]: the descriptors
+/// are close-on-exec in this process, so an exec that was not prepared reaches bwrap with those
+/// numbers already closed. Both kinds have that same lifetime, which is why they come back in one
+/// vector.
+pub(crate) fn compose(spec: &SandboxSpec) -> io::Result<(Vec<OsString>, Vec<File>)> {
     let mut argv = to_argv(spec);
-    let Some(file) = env_fd(spec)? else {
-        return Ok((argv, None));
-    };
-    // The placeholder becomes the descriptor's number here, and only here: this is the one step that
-    // can create it, which is what keeps [`to_argv`] pure.
-    //
-    // The slot is found by its **position** — the word after the `--args` that [`to_argv`] wrote —
-    // and not by comparing every element to the placeholder text. This vector also carries every
-    // bind path and the cage's own command, so a substitution by value rewrote any of them that
-    // happened to equal the marker: `sbx run -- printf '%s\n' @sbx-env-args` printed a descriptor
-    // number. The literal is special in exactly one slot, the one sbx put it in; everywhere else it
-    // is a word the caller chose and sbx has no business touching.
-    //
-    // The first `--args` pair is that slot: [`to_argv`] writes it before the cage command, which is
-    // pushed last, so nothing a caller supplies can be found ahead of it.
-    let at = argv
-        .windows(2)
+    let filters = crate::sandbox::seccomp::memfds(&spec.seccomp)?;
+    // The prefix names the filter descriptors and only those, so it is built before the
+    // environment's descriptor joins them: the two kinds share a lifetime, not a meaning.
+    let mut full = crate::sandbox::seccomp::argv_prefix(&filters);
+    let mut held = filters;
+    if let Some(file) = env_fd(spec)? {
+        let at = env_args_slot(&argv)?;
+        argv[at] = OsString::from(file.as_raw_fd().to_string());
+        held.push(file);
+    }
+    full.extend(argv);
+    Ok((full, held))
+}
+
+/// Where in `argv` the descriptor carrying the cage's environment has its number written: the word
+/// after the `--args` [`to_argv`] wrote.
+///
+/// The slot is found by its **position** and not by comparing every element to the placeholder
+/// text. That vector also carries every bind path and the cage's own command, so a substitution by
+/// value rewrote any of them that happened to equal the marker: `sbx run -- printf` with the marker
+/// as an argument printed a descriptor number. The literal is special in exactly one slot, the one
+/// sbx put it in; everywhere else it is a word the caller chose and sbx has no business touching.
+///
+/// The first `--args` pair is that slot: [`to_argv`] writes it before the cage command, which is
+/// pushed last, so nothing a caller supplies can be found ahead of it.
+fn env_args_slot(argv: &[OsString]) -> io::Result<usize> {
+    argv.windows(2)
         .position(|w| w[0] == "--args" && w[1] == ENV_ARGS_PLACEHOLDER)
         .map(|i| i + 1)
         .ok_or_else(|| {
             io::Error::other(
                 "the composed argv carries no `--args` placeholder for the environment descriptor",
             )
-        })?;
-    argv[at] = OsString::from(file.as_raw_fd().to_string());
-    Ok((argv, Some(file)))
+        })
 }
 
 /// The descriptor carrying the cage's environment, in bwrap's own `--args` encoding (NUL-separated
@@ -274,34 +297,24 @@ pub(crate) fn to_argv(spec: &SandboxSpec) -> Vec<OsString> {
 }
 
 /// Launch `spec` through the real bwrap and wait for it. The one correct way to do that from a
-/// test: the descriptor stays open across the run, which a hand-assembled `Command` would drop —
+/// test: the descriptors stay open across the run, which a hand-assembled `Command` would drop —
 /// bwrap then reports `Invalid fd` instead of a result.
+///
+/// Deliberately not the launch path: nothing here wraps the cage in a resource scope, because a
+/// scope's unit name has to be unique among live units and a test binary stands many cages up under
+/// one process id. What it does exercise is the argument list itself, filters included, which is
+/// what the callers of this helper are asking about.
 #[cfg(test)]
 pub(super) fn run_bwrap(bwrap: &Path, spec: &SandboxSpec) -> io::Result<std::process::Output> {
-    let (mut command, held) = command_for(bwrap, spec)?;
+    let (argv, held) = compose(spec)?;
+    let mut command = std::process::Command::new(bwrap);
+    command.args(argv);
+    // The descriptors are close-on-exec in this process, so this is what carries them across the one
+    // exec that has to read them.
+    super::memfd::inherit_across_exec(&mut command, &held);
     let out = command.output();
     drop(held);
     out
-}
-
-/// The `Command` that launches `spec`, together with the descriptors it must be spawned holding.
-///
-/// Split out of the test-only launcher above for a caller that has to watch the child rather than
-/// wait on it: a build step enforcing a deadline, say. The environment travels through a memfd
-/// rather than the argv, so a caller that builds its own `Command` from [`compose`] and forgets
-/// [`super::memfd::inherit_across_exec`] gets `bwrap: Invalid fd` at the exec: the descriptor is
-/// close-on-exec in this process and closes before bwrap can read it. Handing back both together is
-/// what keeps that from having to be remembered.
-pub(super) fn command_for(
-    bwrap: &Path,
-    spec: &SandboxSpec,
-) -> io::Result<(std::process::Command, Vec<File>)> {
-    let (argv, env) = compose(spec)?;
-    let mut command = std::process::Command::new(bwrap);
-    command.args(argv);
-    let held: Vec<File> = env.into_iter().collect();
-    super::memfd::inherit_across_exec(&mut command, &held);
-    Ok((command, held))
 }
 
 /// The arguments the descriptor carries, read back as bwrap will parse them — the cage's
@@ -688,17 +701,19 @@ mod tests {
             OsString::from("%s\n"),
             OsString::from(ENV_ARGS_PLACEHOLDER),
         ];
-        let (argv, file) = compose(&with_env).expect("compose");
-        let file = file.expect("the spec sets variables, so there is a descriptor");
+        let (argv, held) = compose(&with_env).expect("compose");
 
         let args = argv
             .iter()
             .position(|a| a == "--args")
             .expect("`to_argv` writes `--args` when the cage has an environment");
-        assert_eq!(
-            argv[args + 1],
-            OsString::from(file.as_raw_fd().to_string()),
-            "the slot after `--args` is the descriptor's number"
+        let fd: i32 = argv[args + 1]
+            .to_string_lossy()
+            .parse()
+            .expect("a descriptor number, not the placeholder");
+        assert!(
+            held.iter().any(|f| f.as_raw_fd() == fd),
+            "the slot after `--args` names one of the descriptors kept alive: {argv:?}"
         );
         assert_eq!(
             argv.iter().filter(|a| *a == ENV_ARGS_PLACEHOLDER).count(),
@@ -743,6 +758,231 @@ mod tests {
         assert!(
             !err.contains("PO"),
             "the refusal must not echo the bytes it refuses: {err:?}"
+        );
+    }
+
+    /// Nothing a cage's environment carries may reach bubblewrap's **argument list**:
+    /// `/proc/<pid>/cmdline` is mode `444`, so every uid on the machine could read it for as long as
+    /// the cage runs, while `/proc/<pid>/environ` is `400`. The sentinel used to sit there next to
+    /// `--setenv`.
+    ///
+    /// This asserts on the production function, so the property holds for whatever a spec is built
+    /// from rather than for one hand-written argv.
+    #[test]
+    fn no_variable_reaches_the_world_readable_argument_list() {
+        use std::io::Read;
+        const SENTINEL: &str = "s3nt1nel-v4lue-xyz";
+        const WRITTEN: &str = "hardcoded-in-a-config";
+
+        let spec = SandboxSpec::new(
+            PathBuf::from("/w"),
+            Vec::new(),
+            vec![
+                ("PATH".to_string(), "/bin".to_string()),
+                ("API_TOKEN".to_string(), WRITTEN.to_string()),
+            ],
+            NetPolicy::Isolated,
+            vec![OsString::from("/bin/true")],
+        )
+        .expect("spec")
+        .with_secret_env(vec![("PGPASSWORD".to_string(), SENTINEL.to_string())]);
+
+        let (argv, files) = compose(&spec).expect("argv");
+        let flat: Vec<String> = argv
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for hidden in [SENTINEL, WRITTEN] {
+            assert!(
+                !flat.iter().any(|a| a.contains(hidden)),
+                "no value may be in the argument list: {flat:?}"
+            );
+        }
+        for name in ["PGPASSWORD", "API_TOKEN"] {
+            assert!(
+                !flat.iter().any(|a| a == name),
+                "nor a name, which would say which variable to go and read: {flat:?}"
+            );
+        }
+        assert!(
+            !flat.iter().any(|a| a == "--setenv"),
+            "the whole environment travels on the descriptor: {flat:?}"
+        );
+
+        // It reaches bwrap on a descriptor instead, spliced where the placeholder was — after
+        // `--clearenv`, which would otherwise wipe everything it sets.
+        let at = flat.iter().position(|a| a == "--args").expect("--args");
+        let fd: i32 = flat[at + 1]
+            .parse()
+            .expect("a descriptor number, not the placeholder");
+        assert!(
+            flat.iter()
+                .position(|a| a == "--clearenv")
+                .expect("--clearenv")
+                < at,
+            "spliced before the clear, its variables would be wiped: {flat:?}"
+        );
+
+        let mut carried = String::new();
+        files
+            .iter()
+            .find(|f| f.as_raw_fd() == fd)
+            .expect("the descriptor the argv names is one of the files kept alive")
+            .try_clone()
+            .expect("clone")
+            .read_to_string(&mut carried)
+            .expect("read");
+        // Credentials first, so a variable named after the cage's own plumbing wins over one that
+        // took its name. bwrap reads NUL-separated arguments.
+        assert_eq!(
+            carried,
+            format!(
+                "--setenv\0PGPASSWORD\0{SENTINEL}\0--setenv\0PATH\0/bin\0--setenv\0API_TOKEN\0{WRITTEN}\0"
+            )
+        );
+    }
+
+    /// A cage that sets no variables at all is given no `--args` slot — an unused mechanism leaves
+    /// no trace to explain. The filter descriptors are unconditional and stand apart from it.
+    #[test]
+    fn a_spec_with_no_environment_is_given_no_args_slot() {
+        let spec = SandboxSpec::new(
+            PathBuf::from("/w"),
+            Vec::new(),
+            Vec::new(),
+            NetPolicy::Isolated,
+            vec![OsString::from("/bin/true")],
+        )
+        .expect("spec");
+        let (argv, _files) = compose(&spec).expect("argv");
+        assert!(
+            !argv.iter().any(|a| a == "--args"),
+            "an unused mechanism must leave no trace in the argv"
+        );
+    }
+
+    /// Every composed list carries the mandatory filters, whatever the caller went on to do with
+    /// it. The prefix names descriptors, so what it names has to be among the files handed back:
+    /// a prefix pointing at a number this process does not hold is a cage bubblewrap refuses.
+    #[test]
+    fn every_composed_argument_list_loads_the_mandatory_seccomp_filters() {
+        let (argv, held) = compose(&spec(vec![], vec![], NetPolicy::Shared)).expect("compose");
+        let named: Vec<i32> = argv
+            .windows(2)
+            .filter(|w| w[0] == "--add-seccomp-fd")
+            .map(|w| {
+                w[1].to_string_lossy()
+                    .parse()
+                    .expect("a descriptor number follows the flag")
+            })
+            .collect();
+        assert!(
+            !named.is_empty(),
+            "a cage with no filter is not a cage this crate can produce: {argv:?}"
+        );
+        for fd in named {
+            assert!(
+                held.iter().any(|f| f.as_raw_fd() == fd),
+                "the argv names a filter descriptor nothing keeps alive: {argv:?}"
+            );
+        }
+    }
+
+    /// Every bubblewrap argument list this crate assembles either comes from [`compose`], which
+    /// loads the mandatory filters, or is one of the hand-built lists named below, and each of
+    /// those loads them itself.
+    ///
+    /// The population is every file that spawns bubblewrap by name, plus every file calling
+    /// [`to_argv`] or `argv_prefix` outside the two that define them. The first criterion is the
+    /// one that matters: a list written by hand names neither function, and the process it starts
+    /// is the only trace it leaves. Sorting the population into three kinds is the whole point of
+    /// the guard: it asks a new file's author which kind it is, and each kind carries an obligation
+    /// the guard then checks. Nothing in the type system asks that question, and the failure it
+    /// prevents is an absence: an argument list assembled beside the one definition, running a cage
+    /// that behaves exactly like a hardened one until something inside it makes a syscall the
+    /// denylist exists to refuse.
+    ///
+    /// The three lists are this guard's upkeep. A file that starts spawning bubblewrap, or
+    /// assembling a list of its own, belongs in one of them the day it is written.
+    #[test]
+    fn every_bubblewrap_argument_list_outside_compose_is_accounted_for() {
+        // Both build their list by hand because what they run is not a `SandboxSpec`: the argument
+        // set is fixed and known at the call site rather than resolved from a project's
+        // configuration. Each therefore prepends the filters itself.
+        const ASSEMBLES_BY_HAND: &[&str] = &["src/sandbox/mise.rs", "src/storage.rs"];
+        // These spawn bubblewrap themselves rather than through the launch command, and the list
+        // they hand it is the composed one.
+        const SPAWNS_THE_COMPOSED_LIST: &[&str] = &[
+            "src/sandbox/resolve.rs",
+            "src/sandbox/resolver.rs",
+            "src/sandbox/smoke.rs",
+        ];
+        // These read the pure list to assert something about what it contains, and run nothing.
+        const READS_THE_LIST: &[&str] = &["src/sandbox/binds/tests.rs"];
+        // The two definitions themselves: this module, and the one that compiles a filter into a
+        // descriptor and names it.
+        const DEFINES_THEM: &[&str] = &["src/sandbox/argv.rs", "src/sandbox/seccomp.rs"];
+
+        /// Whether `text` starts a process whose program is named `bwrap`, however it holds it:
+        /// `Command::new(bwrap)`, `Command::new(&bwrap)`, `Command::new(cage.bwrap)`.
+        fn spawns_bwrap_by_name(text: &str) -> bool {
+            text.match_indices("Command::new(").any(|(i, needle)| {
+                let rest = &text[i + needle.len()..];
+                rest.split(')')
+                    .next()
+                    .is_some_and(|arg| arg.contains("bwrap"))
+            })
+        }
+
+        let root = format!("{}/", env!("CARGO_MANIFEST_DIR"));
+        let mut population: Vec<String> = Vec::new();
+        let mut owes: Vec<String> = Vec::new();
+        for file in crate::testutil::crate_sources() {
+            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            let names_the_list = ["to_argv(", "argv_prefix("]
+                .iter()
+                .any(|needle| crate::testutil::calls_function(&text, needle));
+            let spawns = spawns_bwrap_by_name(&text);
+            if !names_the_list && !spawns {
+                continue;
+            }
+            let relative = file.display().to_string().replacen(&root, "", 1);
+            if DEFINES_THEM.contains(&relative.as_str()) {
+                continue;
+            }
+            // What each kind owes. A hand-built list owes the filters' descriptors; a composed one
+            // owes the call that compiles them; a file that only reads the list owes nothing, and
+            // spawning bubblewrap is what would make it something else.
+            let honoured = if ASSEMBLES_BY_HAND.contains(&relative.as_str()) {
+                crate::testutil::calls_function(&text, "argv_prefix(")
+            } else if SPAWNS_THE_COMPOSED_LIST.contains(&relative.as_str()) {
+                crate::testutil::calls_function(&text, "argv::compose(")
+            } else {
+                !spawns
+            };
+            if !honoured {
+                owes.push(relative.clone());
+            }
+            population.push(relative);
+        }
+        population.sort();
+
+        let mut declared: Vec<String> = ASSEMBLES_BY_HAND
+            .iter()
+            .chain(SPAWNS_THE_COMPOSED_LIST)
+            .chain(READS_THE_LIST)
+            .map(|s| (*s).to_string())
+            .collect();
+        declared.sort();
+        assert_eq!(
+            population, declared,
+            "a file spawns bubblewrap or assembles its argument list outside `compose` without \
+             saying which kind it is; add it to the list that describes it"
+        );
+        assert!(
+            owes.is_empty(),
+            "these start a cage without the mandatory seccomp filters, or read the list and spawn \
+             from it: {owes:?}"
         );
     }
 }

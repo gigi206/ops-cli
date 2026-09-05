@@ -110,6 +110,7 @@ absent. What a launch assembles on that empty base:
 | Zone | What it is | Writable |
 |---|---|---|
 | the hermetic FHS | shell, coreutils, loader, resolved from sbx's own store | no |
+| or a declared userland | with [`distro`](../configuration/distro): a distribution's root filesystem at mount zero, with the synthetic identity mounted over it | no |
 | `/nix` | this project's own store, seeded from the shared one | yes |
 | the project | bound at its real host path, so paths in output still mean something | yes |
 | `$HOME` | the project's runtime home, or an [app's isolated home](../apps/home) | yes |
@@ -186,6 +187,7 @@ flowchart LR
         PRE["<b>tarball: · deb: · appimage: · binary:</b><br/><i>a prebuilt upstream artefact</i>"]
         M["<b>mise:</b><br/><i>a mise backend token</i>"]
         IN["<b>an inline flake</b><br/><i>written in the config itself</i>"]
+        OCI["<b>oci:</b><br/><i>a published image, under distro</i>"]
     end
 
     N --> HOST["<b>built host-side</b><br/><i>into the shared store</i>"]
@@ -195,11 +197,13 @@ flowchart LR
     SEED --> CAGE["<b>read-write as /nix in the cage</b><br/><i>the agent self-equips here</i>"]
     M --> CAGE
     IN --> CAGE
+    OCI --> UNPACK["<b>fetched and unpacked host-side</b><br/><i>under the data directory, keyed by content</i>"]
+    UNPACK --> ROOT["<b>read-only as / in the cage</b><br/><i>the userland everything else lands inside</i>"]
 
     classDef hs fill:#F4E4DA,stroke:#B4552F,stroke-width:1.5px,color:#7E3B1F
     classDef cs fill:#EDF1E0,stroke:#8FA557,stroke-width:1.5px,color:#4A5A24
-    class N,FL,PRE,M,IN,HOST,SEED hs
-    class CAGE cs
+    class N,FL,PRE,M,IN,OCI,HOST,SEED,UNPACK hs
+    class CAGE,ROOT cs
 ```
 
 The shared store is written only while sbx itself provisions into it, and is never bound
@@ -208,6 +212,15 @@ being able to corrupt what other projects consume. Versions move only when
 [`sbx upgrade`](../housekeeping/upgrade) rewrites a lock, never because the binary was updated. See
 [Provisioning](provisioning) for the store model, and
 [`packages`](../configuration/packages) for the backend syntax.
+
+A declared userland travels the same host-side road and ends somewhere else. The image is
+resolved to a digest, fetched, checked against it, and unpacked into a tree under the data
+directory named by its content; nothing about it is built by nix, and no layer is ever
+applied from inside a cage. A `run` list derives a userland of the project's own by running
+each command on a copy of that tree, in a cage of its own, before the launch it is for
+exists. Its egress is the project's allowlist and its proxy is its own, on a plane the
+[network learning](../networking/rules) never reads: a build runs commands the project wrote,
+and a refusal there is not a question anyone asked about the agent.
 
 ## Egress
 
@@ -403,6 +416,13 @@ there could have its binary swapped or its environment read. The sibling cage ta
 same structural skeleton with three differences: an immutable store, a read-only project,
 and a fresh home, with every non-structural exposure dropped.
 
+The skeleton includes the ground it stands on. A session running on a declared
+[`distro`](../configuration/distro) gives its sibling cages the same root filesystem, so a
+command naming one of that distribution's programs finds it and one naming a program of the
+hermetic base is not quietly answered by a different substrate. That is a rule about the
+userland rather than an entry on the list of things kept: a userland is not a destination an
+allowlist can name.
+
 The client the agent gets is a small generated script with a handful of verbs, not sbx
 itself, so the vocabulary reachable from inside is exactly the vocabulary intended.
 
@@ -437,6 +457,7 @@ decision. A private in-cage desktop portal is different in kind: it stands up it
 | Decision | Made by | Enforced at |
 |---|---|---|
 | may this config's security fields apply | the trust gate, on file contents | configuration resolution |
+| which userland the cage runs on | [`distro`](../configuration/distro), from a trusted layer, or sbx's own store | mount zero, read-only |
 | what the cage can see of the host | the mount list in the spec | the sandbox argument list |
 | what syscalls are reachable | the mandatory denylist, relaxable only when trusted | the kernel, every launch |
 | what the agent may execute | the [`[proc]`](../configuration/proc) posture | a parked syscall, host-side verdict |
