@@ -574,11 +574,17 @@ pub(super) fn serve_tunneled_request(
     //         aside, and masks its own buffers, without touching what is relayed. The two handshake
     //         *heads* are not frames and are not covered by that: they are relayed under the same
     //         reflection mask any other head gets.
+    // Asked once for the exchange. It decides two things that must agree: whether the response is
+    // scanned for a reflected credential, and whether the request asks for a response the scan can
+    // read at all (`Accept-Encoding: identity`). Asking twice would let the two drift apart, which
+    // is a scan running over bytes it cannot match.
+    let masks_reflection = creds.masks_reflection_for(connect_host);
+
     if ws_upgrade {
         // The heads of this exchange are masked by the same rule an ordinary response's head is —
         // the upgrade is the one exchange whose bytes cannot be masked once it is open, so the
         // handshake is where the question has to be asked rather than after it.
-        let head_masking: &[SecretNeedle] = if creds.masks_reflection_for(connect_host) {
+        let head_masking: &[SecretNeedle] = if masks_reflection {
             &creds.needles
         } else {
             &[]
@@ -624,7 +630,13 @@ pub(super) fn serve_tunneled_request(
         if let Some(c) = &capture {
             c.set_request_body(&body);
         }
-        let mut req = reserialize_request(&inner, &injected, Some(body.len() as u64), keep_alive);
+        let mut req = reserialize_request(
+            &inner,
+            &injected,
+            Some(body.len() as u64),
+            keep_alive,
+            masks_reflection,
+        );
         req.extend_from_slice(&body);
         Some(req)
     } else if chunked {
@@ -665,12 +677,24 @@ pub(super) fn serve_tunneled_request(
         if let Some(c) = &capture {
             c.set_request_body(&body);
         }
-        let mut req = reserialize_request(&inner, &injected, Some(body.len() as u64), keep_alive);
+        let mut req = reserialize_request(
+            &inner,
+            &injected,
+            Some(body.len() as u64),
+            keep_alive,
+            masks_reflection,
+        );
         req.extend_from_slice(&body);
         Some(req)
     } else {
         // Replayable, neither held nor chunked: a request with no body at all.
-        Some(reserialize_request(&inner, &injected, None, keep_alive))
+        Some(reserialize_request(
+            &inner,
+            &injected,
+            None,
+            keep_alive,
+            masks_reflection,
+        ))
     };
 
     if let Some(req) = &forwarded {
@@ -745,7 +769,8 @@ pub(super) fn serve_tunneled_request(
         flow.up.fetch_add(req.len() as u64, Ordering::Relaxed);
     } else {
         // A body the proxy does not hold: forwarded straight from the client, on its own connection.
-        let reserialized = reserialize_request(&inner, &injected, None, keep_alive);
+        let reserialized =
+            reserialize_request(&inner, &injected, None, keep_alive, masks_reflection);
         upstream.write_all(&reserialized)?;
         flow.up
             .fetch_add(reserialized.len() as u64, Ordering::Relaxed);
@@ -784,7 +809,6 @@ pub(super) fn serve_tunneled_request(
     //     answers and why the scoping is what it is belong to `CredentialSet::masks_reflection_for`,
     //     which every inspected plane asks. What is this plane's is the placement: decided here
     //     because the mask covers the head as much as the body, and the head is relayed first.
-    let masks_reflection = creds.masks_reflection_for(connect_host);
     let head_masking: &[SecretNeedle] = if masks_reflection {
         &creds.needles
     } else {

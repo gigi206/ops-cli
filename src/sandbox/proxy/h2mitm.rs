@@ -448,6 +448,10 @@ async fn relay(
     // One credential state for the whole stream's relay: the injection applied below and the reflection
     // masking decided further down must come from the same resolution.
     let creds = ctx.credentials.snapshot();
+    // Asked once for the stream, as on the HTTP/1.1 planes. It decides two things that must agree:
+    // whether the response is scanned for a reflected credential, and whether the request asks for a
+    // response the scan can read at all (`Accept-Encoding: identity`).
+    let masks_reflection = creds.masks_reflection_for(host);
     // Any host-scoped credential to inject — keyed on the already-verified host and the decrypted
     // path, so it reaches exactly its scoped destination. Runs after the verdict (a denied request
     // never got here). Each is **strip-and-replace**: the client's own copy of that header is
@@ -611,7 +615,17 @@ async fn relay(
         if forbidden_request_header(n) || injected.iter().any(|(h, _)| header_name_eq(h, n)) {
             continue;
         }
+        // The client's own content codings go with them when this response will be scanned, so
+        // sbx's `identity` below is the only offer the upstream sees. Same rule, same reason and
+        // same one question (`masks_reflection`) as the HTTP/1.1 serializer's; a plane that skipped
+        // it would relay a compressed body the mask cannot read a value out of.
+        if masks_reflection && n.eq_ignore_ascii_case("accept-encoding") {
+            continue;
+        }
         builder = builder.header(name, value);
+    }
+    if masks_reflection {
+        builder = builder.header("accept-encoding", "identity");
     }
     for (h, v) in &injected {
         builder = builder.header(h.as_str(), v.as_str());
@@ -708,8 +722,8 @@ async fn relay(
 
     // Response-side leak backstop, scoped to a host an injection targets. It is the HTTP/1.1
     // planes' question asked of the same function (`CredentialSet::masks_reflection_for`), so
-    // parity here is structural rather than maintained by hand.
-    let masks_reflection = creds.masks_reflection_for(host);
+    // parity here is structural rather than maintained by hand; the answer was taken once at the
+    // head of this stream, because the request head it also decides went out long before this.
     if masks_reflection {
         redact_header_map(&mut rparts.headers, &creds.needles);
     }
@@ -2905,6 +2919,70 @@ mod tests {
             Some("application/grpc"),
             "the client's other headers are carried through untouched"
         );
+    }
+
+    /// The `Accept-Encoding` rule, on this plane, from the upstream's own account of what arrived.
+    /// The mask that scans a response for a reflected credential reads bytes, so the exchange it
+    /// will scan is asked for `identity` and the client's own offer does not travel beside it. The
+    /// HTTP/1.1 planes strip and replace it in `reserialize_request`; this plane rebuilds its head
+    /// instead, and a rule applied on one of the two is a plane relaying compressed bytes nothing
+    /// can read.
+    #[test]
+    fn a_scanned_h2_response_is_asked_for_uncompressed() {
+        use crate::allowlist::classify;
+        use crate::sandbox::proxy::HeaderInjection;
+
+        for target in ["grpc.test:*", "other.test:*"] {
+            let scanned = target == "grpc.test:*";
+            let trace = Arc::new(H2Trace::default());
+            let (addr, upstream_ca) = spawn_h2_upstream(
+                1,
+                vec![b"h2".to_vec()],
+                UpstreamReply::grpc("PONG"),
+                Arc::clone(&trace),
+            );
+            let (ctx, _stats, _log, _dir) = relaying_ctx(upstream_ca);
+            let ctx = ctx
+                .with_injections(vec![HeaderInjection::fixed(
+                    classify(target).unwrap(),
+                    "authorization".to_string(),
+                    "Bearer topsecret".to_string(),
+                )])
+                .with_redactions(vec![SecretNeedle::named(
+                    "test-secret",
+                    b"topsecret".to_vec(),
+                )]);
+
+            let answer = through_h2_proxy(
+                &ctx,
+                "grpc.test",
+                addr.port(),
+                grpc_request(&[("accept-encoding", "gzip, br")]),
+                None,
+                &trace,
+            );
+            assert_eq!(answer.status, StatusCode::OK, "the stream was relayed");
+
+            let seen = trace.seen_one();
+            let encodings: Vec<&String> = seen
+                .headers
+                .iter()
+                .filter(|(n, _)| n == "accept-encoding")
+                .map(|(_, v)| v)
+                .collect();
+            match scanned {
+                true => assert_eq!(
+                    encodings,
+                    vec!["identity"],
+                    "a response that will be scanned is asked for uncompressed, once: {seen:?}"
+                ),
+                false => assert_eq!(
+                    encodings,
+                    vec!["gzip, br"],
+                    "a response nothing scans keeps the client's own offer: {seen:?}"
+                ),
+            }
+        }
     }
 
     /// A `401` from an injection target re-resolves the credential on this plane too.

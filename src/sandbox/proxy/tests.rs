@@ -7342,6 +7342,7 @@ fn reserialize_strips_all_spellings_of_an_injected_header() {
         ],
         None,
         false,
+        false,
     );
     let s = String::from_utf8(out).unwrap();
     assert_eq!(
@@ -8501,6 +8502,75 @@ fn a_response_from_a_non_injection_host_is_not_masked() {
         resp.contains("sbx-secret-value"),
         "a non-injection host's response is streamed unmasked: {resp:?}"
     );
+}
+
+/// The inbound mask can only strike out bytes it can read, and a compressed body holds no verbatim
+/// occurrence of anything. So the one exchange whose response will be scanned is the one that gives
+/// up compression: a host an injection targets is asked for `identity`, and the client's own offer
+/// does not travel beside it. Every other host keeps what the client asked for, since nothing reads
+/// those bodies looking for a value.
+#[test]
+fn a_response_that_will_be_scanned_is_asked_for_uncompressed() {
+    for target in ["host.test:*", "other.test:*"] {
+        let scanned = target == "host.test:*";
+        let (addr, upstream_ca, rx) = spawn_upstream_capturing(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["host.test:*"]).with_pool(false))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])])))
+                .with_injections(vec![injection(
+                    target,
+                    "Authorization",
+                    "Bearer sbx-secret-value",
+                )])
+                .with_redactions(vec![SecretNeedle::named(
+                    "test-secret",
+                    b"sbx-secret-value".to_vec(),
+                )]),
+        );
+        let resp = through_proxy(
+            ctx,
+            proxy_ca_der,
+            "host.test",
+            "host.test",
+            addr.port(),
+            b"GET /p HTTP/1.1\r\nHost: host.test\r\nAccept-Encoding: gzip, br\r\n\r\n",
+        )
+        .unwrap();
+        assert!(resp.contains("200"), "the exchange must complete: {resp:?}");
+        let head = rx
+            .recv_timeout(UPSTREAM_WAIT)
+            .expect("the upstream received a request")
+            .to_ascii_lowercase();
+        match scanned {
+            true => {
+                assert!(
+                    head.contains("accept-encoding: identity"),
+                    "a response that will be scanned must be asked for uncompressed: {head:?}"
+                );
+                assert!(
+                    !head.contains("gzip"),
+                    "and the client's own offer must not travel beside it: {head:?}"
+                );
+            }
+            false => assert!(
+                head.contains("accept-encoding: gzip, br"),
+                "a response nothing scans keeps the client's own offer: {head:?}"
+            ),
+        }
+    }
 }
 
 /// The backstop covers the response **head**, not just its body. A debug or echo endpoint that

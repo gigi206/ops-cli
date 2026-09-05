@@ -235,7 +235,10 @@ pub(super) fn handle_cleartext(
         headers: head.headers.clone(),
     };
     // Never reused: reuse exists to amortize a TLS handshake, and a cleartext leg has none to save.
-    let reserialized = reserialize_request(&origin, &[], None, false);
+    // Nothing scans this plane's responses — `masks_reflection` is asked of the same function on
+    // every plane and a cleartext host is never an injection target — so the client's own
+    // `Accept-Encoding` is forwarded as it was written.
+    let reserialized = reserialize_request(&origin, &[], None, false, false);
     upstream.write_all(&reserialized)?;
     flow.up
         .fetch_add(reserialized.len() as u64, Ordering::Relaxed);
