@@ -31,6 +31,8 @@ than the newest one.
 If what you need is a tool rather than a substrate, reach for [`packages`](packages)
 instead: it costs nothing, it works on either userland, and it keeps the cage hermetic.
 
+Security framing: the image supplies every program the cage runs, which makes `distro` the broadest supply-chain choice a config can express (hence trusted-only). The tag is resolved once to a digest, checked against the bytes the registry serves, reused without re-querying the registry, and mounted read-only: choosing the userland happens where the image is named, never from inside the cage.
+
 ## What it accepts
 
 An image locator carrying an **explicit prefix**, as every `[packages]` backend does:

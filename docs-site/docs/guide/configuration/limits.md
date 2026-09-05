@@ -6,7 +6,10 @@ description: "Overriding the cage's cgroup v2 resource limits, the anti-DoS cont
 # `[limits]`: cgroup resource limits
 
 Override the cage's cgroup v2 resource limits (the anti-DoS control), which otherwise
-use `sbx`'s built-in defaults.
+use `sbx`'s built-in defaults. The threat is mundane: untrusted code that fork-bombs
+(`tasks_max`), eats memory (`memory_high`/`memory_max`), or grinds the host, by malice
+or by a runaway build. These limits do not isolate (that is the bind layout and the
+namespaces); they cap the blast radius, best-effort, where the host supports cgroup v2.
 
 ```toml
 [limits]

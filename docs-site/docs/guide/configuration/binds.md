@@ -28,6 +28,14 @@ whole layer.
 
 See also: [Security model](../concepts/security-model) · [The trust gate](../concepts/trust) · [`sbx config edit`](../cli/config).
 
+## When you want one
+
+A cage starts from almost nothing: the hermetic base, `/nix`, and the project bound at its real path. Sometimes the tool inside needs one more host path: a shared dataset under `/opt/data`, a host certificate bundle, a scratch directory it may write through. That is what `binds` is for: one extra host path, visible at the same path inside, read-only unless the table form says `rw`.
+
+If what you need is to hide a project file from the agent instead (a `.env`, a key, a `secrets/` tree), that is [`[fs]`](fs), which subtracts from the project tree rather than adding a host path.
+
+Security framing: under the same-uid model a read-only bind protects integrity only (the cage reads whatever is bound), so confidentiality is by absence and what must stay secret is simply not bound. That is why `binds` is trusted-only: each entry widens the boundary itself.
+
 ## Read-only vs read-write, and same-uid
 
 - A **read-only** bind exposes the path's *contents* to the cage.

@@ -50,6 +50,7 @@ Task-oriented walkthroughs, commands in order, from nothing to a working setup: 
 - [Architecture](concepts/architecture): the map: the boundary, the launch pipeline, the control planes, the plugin chain.
 - [Security model](concepts/security-model): same-uid, confidentiality by absence, the bind layout.
 - [Decisions and limits](concepts/decisions): what sbx does not do, and what would reopen each structural choice.
+- [Threat model](concepts/threat-model): each threat beside the control that answers it and what remains.
 - [The trust gate](concepts/trust): the direnv content-hash model, free vs security fields.
 - [Enforcement stack](concepts/enforcement): bubblewrap, seccomp, cgroups, and the egress firewall.
 - [Observability](concepts/observability): the process and filesystem lenses on a running cage.
@@ -221,8 +222,10 @@ The first three questions have a recipe that walks the whole path in commands
 
 ## The why
 
-The guide is mostly the *what* and *how*, and each page argues its own subject. Two pages
+The guide is mostly the *what* and *how*, and each page argues its own subject. Three pages
 carry the *why* across subjects: [Decisions and limits](concepts/decisions), which states
-what `sbx` does not do and what would reopen each structural choice, and [Security
+what `sbx` does not do and what would reopen each structural choice, [Threat
+model](concepts/threat-model), which puts each threat beside the control that answers it
+and what remains, and [Security
 model](concepts/security-model), which holds the threat analysis and names where the
 protection stops.

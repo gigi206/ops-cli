@@ -23,6 +23,10 @@ A table without a `mode` keeps its `allow`/`deny` lists and inherits the posture
 parent layer; an unrecognized `mode` drops the table with a warning, keeping the parent
 posture rather than guessing.
 
+## Why observe or enforce exec
+
+Egress controls where an agent may connect; `[proc]` controls what it may run. An agent that may execute anything can pipe a secret into `curl`, open an `ssh` session, or run a compiler as a download proxy, all without touching a blocked host. `observe` answers the audit question (`sbx proc logs`: what did it spawn), `enforce` blocks the named programs before the syscall runs, and `ask` parks anything undecided for a live decision. Reach for it when the risk is the program, not the destination.
+
 ## Modes
 
 | Mode | What it does |

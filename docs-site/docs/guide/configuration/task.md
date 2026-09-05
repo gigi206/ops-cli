@@ -6,7 +6,11 @@ description: "The field reference for a declared operation: every key of a `[tas
 # `[task]`: declared operations
 
 A **declared operation** is a fixed command sbx runs *on a caller's behalf*, in an ephemeral sibling
-cage, with a credential the caller never holds. This page is the field reference; the
+cage, with a credential the caller never holds. It runs in a sibling cage rather than the
+agent's own because the agent's store is writable and its processes are readable to itself
+there, so a task running there could have its binary swapped or its environment read. The
+sibling takes the same skeleton with an immutable store, a read-only project, and a fresh
+home. This page is the field reference; the
 [Declared operations](../tasks/) section is where the model, the bounds and the trade-offs are
 explained.
 

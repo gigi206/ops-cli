@@ -18,6 +18,12 @@ supply-chain-relevant choice.
 
 See also: [Provisioning](../concepts/provisioning) · [`sbx upgrade`](../housekeeping/upgrade) · [`packages`](packages).
 
+## When you pin it
+
+Unset, the base userland and the `nix:` tools track `nixos-unstable`: current, rolling, and occasionally breaking. A project sometimes needs something else: an older branch that matches the glibc a production host still runs, a stable channel that moves less often, or an exact revision so two machines build the same base byte for byte. That is what `nixpkgs` is for: one channel (or revision) that pins the base and the `nix:` tools together, keeping their glibc aligned.
+
+If what you need is one tool on its own revision while the base stays put, that is a per-tool pin in [`[tools]`](tools), which runs through the `nix-ld` shim instead of the channel-wide base.
+
 ## What it accepts
 
 - A **branch/channel** name: e.g. `nixos-23.11`, `nixos-unstable` (the default when

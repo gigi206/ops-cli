@@ -11,6 +11,8 @@ and nobody else.
 
 It is two halves, and they are read by different people. [What sbx does not
 do](#what-sbx-does-not-do) is for someone deciding whether this tool covers their risk.
+The one-page map for that same reader is [Threat model](threat-model): each threat beside
+the control that answers it and what remains.
 [Why it is shaped this way](#why-it-is-shaped-this-way) is for someone wondering why it
 looks like this rather than like a daemon, a container runtime, or a plugin host. Neither
 half repeats the pages it points at.

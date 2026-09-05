@@ -88,6 +88,8 @@ them is gathered in [Decisions and limits](decisions).
   the bind layout, and where the protection stops.
 - [Decisions and limits](decisions): what sbx does not do, and what would reopen each
   structural choice.
+- [Threat model](threat-model): each threat, the control that answers it, and what
+  remains after the control.
 - [The trust gate](trust): the content-hash model, and free fields versus security
   fields.
 - [Enforcement stack](enforcement): bubblewrap, seccomp, cgroups and the egress

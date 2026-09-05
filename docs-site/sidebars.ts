@@ -54,6 +54,7 @@ const sidebars: SidebarsConfig = {
         'concepts/architecture',
         'concepts/security-model',
         'concepts/decisions',
+        'concepts/threat-model',
         'concepts/trust',
         'concepts/enforcement',
         'concepts/observability',

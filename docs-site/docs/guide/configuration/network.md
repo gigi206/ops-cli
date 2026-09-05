@@ -15,6 +15,12 @@ confidentiality choice an untrusted project may not make.
 
 See also: [Network modes](../networking/modes) · [Rule grammar](../networking/rules) · [`[network.groups]`](../networking/groups) · [`[secret]`](secret).
 
+## Why choose a posture
+
+An agent needs the network for legitimate work (its provider API, the nix cache) and nothing else is safe to assume. The posture says which side of that line the cage stands on: this page documents the config shape, and the five postures with their uses live in [Network modes](../networking/modes).
+
+Security framing: narrowing or widening egress is a confidentiality choice, so the posture and its rules apply only from the global config or a trusted project. An untrusted project's `network` is dropped in both directions: it can neither reopen what a trusted layer closed (exfiltration) nor cut the network to hide what it does.
+
 ## The two forms
 
 `network` accepts either a **bare string** or a **table**.

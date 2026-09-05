@@ -20,6 +20,10 @@ affect the process inside its own cage, so it is not gated. The other free field
 
 See also: [The trust gate](../concepts/trust) · [Configuration overview](../configuration/) · [One-shot overrides](overrides).
 
+## A credential does not belong here
+
+`env` is visible inside the cage by design, so a value the agent must use but must never hold (a token, a password, a key) does not belong here. That is [`[secret]`](secret), which the proxy injects on the wire without ever placing the plaintext in the cage.
+
 ## Precedence
 
 Inside the cage, environment values are layered:

@@ -15,6 +15,10 @@ only from a trusted source.
 
 See also: [The app framework](../apps/) · [Per-app home](../apps/home) · [Portable profiles](../apps/profiles) · [`sbx app`](../cli/app).
 
+## Why name an app
+
+The same agent command tends to be relaunched across projects with the same packages, network allowlist, credential injection, and an isolated `$HOME` that keeps one agent's state away from another's and from your shell. Copying that overlay into every project's `.sbx.toml` drifts: one copy misses a host the others added and the failure looks like a sandbox bug. An `[app.<name>]` table declares it once, and `sbx app run <name>` launches the command under it, on any project.
+
 ## Two ways to declare an app
 
 - **Inline** in a project `.sbx.toml` (or the global `sbx.toml`) as `[app.<name>]`.

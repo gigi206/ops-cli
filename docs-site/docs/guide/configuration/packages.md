@@ -20,6 +20,14 @@ honored only from a trusted source (all three backends).
 
 See also: [Provisioning](../concepts/provisioning) · [`[tools]` (mise)](tools) · [`sbx search`](../cli/search) · [`sbx upgrade`](../housekeeping/upgrade).
 
+## Why declare tools here
+
+A cage starts with no host `/usr` and no host `/nix`: only the base userland `sbx` provisions. A tool the project needs (a compiler, a linter, an agent CLI) therefore has to be provisioned on every launch, pinned so two machines get the same bytes, and present on `PATH` without manual steps. That is what `[packages]` is for: each entry names what to provision and which backend provisions it, the launch provisions it before the cage exists, and [`sbx upgrade`](../housekeeping/upgrade) is what moves the pin afterwards.
+
+If what you need is not a tool, reach for the field that names it instead: [`distro`](distro) for the substrate the cage runs on (an old glibc, a vendor SDK), [`[tools]`](tools) for the project's own mise toolchain, and [bundles](bundles) plus `use` when several apps need the same tool with the same egress and credential.
+
+Security framing: each entry is a supply-chain choice (who built the bytes the cage runs), so `[packages]` is trusted-only and an untrusted project's entries are dropped before anything is built. Provisioning runs host-side into a shared store the cage never sees, and an agent's self-equips land in its own project's copy, so one project can never poison another project's tools.
+
 ## The mandatory backend prefix
 
 There is **no bare form**. A value with no recognized prefix is **dropped with a
