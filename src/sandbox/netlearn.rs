@@ -177,15 +177,20 @@ pub(crate) fn synthesize(
         ));
     }
 
-    // Final gate: never hand the write path a rule its own classifier would reject. A drop here is
-    // rare (the host already passed a sanity gate) but is surfaced, not swallowed.
+    // Final gate: never hand the write path a rule its own classifier would reject. The host
+    // already passed a sanity gate, but the path did not: it comes from `canonical_segments`, which
+    // percent-decodes, so a request the cage chose reaches the rule text as the bytes it decodes to
+    // rather than as the characters that were sent. A drop is surfaced, not swallowed -- and the
+    // note goes through the crate's sanitiser, because a note that quoted such a rule verbatim
+    // would put on the operator's terminal exactly what dropping the rule kept off it.
     let mut out: Vec<String> = Vec::new();
     for r in rules {
         if classify(&r).is_ok() {
             out.push(r);
         } else {
             notes.push(format!(
-                "skipped a synthesized rule the classifier rejected: `{r}`"
+                "skipped a synthesized rule the classifier rejected: `{}`",
+                crate::sandbox::sanitize(&r)
             ));
         }
     }
@@ -1132,6 +1137,69 @@ mod tests {
             .rules,
             vec!["{*} https://evil.test".to_string()]
         );
+    }
+
+    /// A rule this synthesizer proposes is one the write path would take, whatever the cage wrote
+    /// in the request that produced it.
+    ///
+    /// The path a learned rule carries comes from [`canonical_segments`], which percent-decodes:
+    /// a request for `/a%1B%5B31mRED` reduces to a segment holding a raw escape sequence, and the
+    /// three printable characters the cage sent are not what ends up in the rule. That rule is then
+    /// echoed by the `--dry-run` preview and by `sbx net rules`, so a cage that chooses its own
+    /// request paths chooses text on the operator's terminal.
+    ///
+    /// Both granularities that read a path are covered, and the witness is the same refusal with a
+    /// plain path: it still learns, so this cannot be satisfied by a synthesizer that proposes
+    /// nothing.
+    #[test]
+    fn a_rule_the_write_path_would_refuse_is_never_proposed() {
+        for gran in [Granularity::Path, Granularity::Exact] {
+            let painted = ev(
+                "esc.test",
+                443,
+                Some("GET"),
+                Some("/a%1B%5B31mRED/b"),
+                "denied-default",
+            );
+            let out = synthesize(&[painted], &empty_policy(), gran);
+            assert!(
+                out.rules.iter().all(|r| classify(r).is_ok()),
+                "{gran:?}: a proposed rule must be one the write path takes: {:?}",
+                out.rules
+            );
+            assert!(
+                out.rules
+                    .iter()
+                    .all(|r| !r.chars().any(char::is_control)),
+                "{gran:?}: and it must carry no control byte: {:?}",
+                out.rules
+            );
+            assert!(
+                !out.notes.is_empty(),
+                "{gran:?}: a learnable refusal dropped without a note is a silent drop"
+            );
+            assert!(
+                out.notes
+                    .iter()
+                    .all(|n| !n.chars().any(char::is_control)),
+                "{gran:?}: and the note that says so must not itself carry the bytes it is \
+                 reporting: {:?}",
+                out.notes
+            );
+
+            // The witness: the same refusal with an ordinary path still becomes a rule.
+            let plain = ev(
+                "plain.test",
+                443,
+                Some("GET"),
+                Some("/a/b"),
+                "denied-default",
+            );
+            assert!(
+                !synthesize(&[plain], &empty_policy(), gran).rules.is_empty(),
+                "{gran:?}: an ordinary refusal must still be learned"
+            );
+        }
     }
 
     /// Every plane the ring can carry that is not the agent's is named here, so the gate stays a
