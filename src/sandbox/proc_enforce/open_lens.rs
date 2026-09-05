@@ -635,12 +635,17 @@ pub(super) fn open_is_refused(
         }
     };
     use std::os::unix::io::AsRawFd;
-    // What the kernel actually resolved, which is what the project bound is applied to.
-    let Ok(resolved) = std::fs::read_link(format!("/proc/self/fd/{}", probe.as_raw_fd())) else {
-        return OpenOutcome::ALLOWED;
-    };
-    let Ok(meta) = probe.metadata() else {
-        return OpenOutcome::ALLOWED;
+    // What the kernel actually resolved, which is what the project bound is applied to, and what
+    // the file is. Both are taken from the probe the supervisor already holds, and a failure of
+    // either leaves the open allowed with nothing examined — which is the lens's posture, but was
+    // the one shape of it that said nothing.
+    let (resolved, meta) = match probe_facts(
+        path,
+        std::fs::read_link(format!("/proc/self/fd/{}", probe.as_raw_fd())),
+        probe.metadata(),
+    ) {
+        Ok(facts) => facts,
+        Err(outcome) => return outcome,
     };
     // A FIFO, a socket or a device carries no content this policy is written about, so none of them
     // is scanned. The descriptor still rides out: what serves such an open is decided in
@@ -680,16 +685,7 @@ pub(super) fn open_is_refused(
     // root, so this is not the ordinary "no content to examine" path; something went wrong with
     // reading a file the lens meant to scan.
     let Ok(mut file) = std::fs::File::open(format!("/proc/self/fd/{}", probe.as_raw_fd())) else {
-        return OpenOutcome {
-            refused: false,
-            report: Some(OpenReport {
-                path: crate::sandbox::sanitize(path),
-                shapes: Vec::new(),
-                uncovered: Some(Uncovered::Unread),
-            }),
-            probe: None,
-            errno: None,
-        };
+        return OpenOutcome::unread(path);
     };
     // Bounded in *size*, not in time. `S_ISREG` is true of a file on a FUSE mount, an NFS path or
     // any other backing store that can stall, and this read is on the one thread every other open in
@@ -703,16 +699,7 @@ pub(super) fn open_is_refused(
         .is_err()
     {
         // Reported for the reason the re-open above is: the scan was meant to happen and did not.
-        return OpenOutcome {
-            refused: false,
-            report: Some(OpenReport {
-                path: crate::sandbox::sanitize(path),
-                shapes: Vec::new(),
-                uncovered: Some(Uncovered::Unread),
-            }),
-            probe: None,
-            errno: None,
-        };
+        return OpenOutcome::unread(path);
     }
     let verdict = policy.verdict(&buf);
     cache.put(id, verdict.matched);
@@ -748,6 +735,26 @@ pub(super) fn open_is_refused(
         }),
         probe: None,
         errno: None,
+    }
+}
+
+/// What an already-resolved probe says about the file: the path the kernel walked to, and the
+/// file's own metadata. `Err` carries the outcome owed when either read did not answer.
+///
+/// Both reads act on an `O_PATH` descriptor this process already holds, so neither fails in the
+/// ordinary course -- which is exactly why they were answered with a bare allow and no report. A
+/// bare allow is indistinguishable from an open the lens examined and cleared, and the lens has one
+/// rule about that: a file it meant to scan and did not is *reported*, because presenting nothing at
+/// all as a whole-file result is the same error as presenting a prefix. Written as a function taking
+/// the two results rather than performing them, so the failing arm is reachable from a test.
+pub(super) fn probe_facts(
+    path: &str,
+    resolved: io::Result<PathBuf>,
+    meta: io::Result<std::fs::Metadata>,
+) -> Result<(PathBuf, std::fs::Metadata), OpenOutcome> {
+    match (resolved, meta) {
+        (Ok(resolved), Ok(meta)) => Ok((resolved, meta)),
+        _ => Err(OpenOutcome::unread(path)),
     }
 }
 
@@ -800,6 +807,27 @@ impl OpenOutcome {
             } else {
                 libc::EACCES
             }),
+        }
+    }
+
+    /// Allowed, and **reported**: the lens meant to examine this file and could not.
+    ///
+    /// Every step between resolving a path and scanning its bytes can fail on a file the lens had
+    /// every intention of reading, and each one allows -- the lens takes away what it can prove,
+    /// and a cage whose undecidable opens all failed would not run. What none of them may do is
+    /// pass in silence: an allow with no report reads exactly like a file that was scanned and came
+    /// back clean. The scan is bounded in size and says so ([`Uncovered::Truncated`]); a scan that
+    /// did not happen at all is strictly less than that, and gets its own word.
+    fn unread(path: &str) -> OpenOutcome {
+        OpenOutcome {
+            refused: false,
+            report: Some(OpenReport {
+                path: crate::sandbox::sanitize(path),
+                shapes: Vec::new(),
+                uncovered: Some(Uncovered::Unread),
+            }),
+            probe: None,
+            errno: None,
         }
     }
 

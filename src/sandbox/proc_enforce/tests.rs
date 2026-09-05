@@ -2804,6 +2804,56 @@ fn an_execve_whose_target_cannot_be_read_takes_the_modes_default_and_every_one_i
     }
 }
 
+/// A file the lens meant to examine and did not is reported, at every step that can fail.
+///
+/// Between resolving a path and reading its bytes the supervisor takes four reads, and each one
+/// allows the open when it does not answer -- which is the lens's posture and stays. What must not
+/// stay is a *silent* allow: nothing downstream records an open the lens decided nothing about, so
+/// a bare allow is indistinguishable from a file that was scanned and came back clean.
+///
+/// The two reads here act on an `O_PATH` descriptor this process already holds, which is why they
+/// are driven through the seam that decides on their results rather than by making `readlink` and
+/// `fstat` fail: the failing arm exists and has to be reachable.
+#[test]
+fn a_probe_whose_own_reads_did_not_answer_is_allowed_but_never_in_silence() {
+    let dir = TmpDir::new();
+    let file = dir.join("resolved.txt");
+    std::fs::write(&file, b"x").expect("write the fixture");
+    let meta = || std::fs::metadata(&file).expect("stat the fixture");
+    let boom = || std::io::Error::from_raw_os_error(libc::EBADF);
+
+    // The witness: two answers are the ordinary path, and it reports nothing at all.
+    match probe_facts("resolved.txt", Ok(file.clone()), Ok(meta())) {
+        Ok((resolved, _)) => assert_eq!(resolved, file, "the walk's own answer is carried through"),
+        Err(_) => panic!("two answers are not a failure"),
+    }
+
+    for (which, resolved, m) in [
+        ("the resolved path", Err(boom()), Ok(meta())),
+        ("the metadata", Ok(file.clone()), Err(boom())),
+        ("both", Err(boom()), Err(boom())),
+    ] {
+        match probe_facts("resolved.txt", resolved, m) {
+            Ok(_) => panic!("{which} did not answer, so there is nothing to decide on"),
+            Err(outcome) => {
+                assert!(
+                    !outcome.refused,
+                    "{which}: an open the lens could not examine is still allowed"
+                );
+                let report = outcome.report.unwrap_or_else(|| {
+                    panic!("{which}: allowed with nothing examined, and nothing said")
+                });
+                assert_eq!(
+                    report.uncovered,
+                    Some(super::open_lens::Uncovered::Unread),
+                    "{which}: nothing was examined, which is not a truncated scan"
+                );
+                assert_eq!(report.path, "resolved.txt");
+            }
+        }
+    }
+}
+
 #[test]
 fn an_open_the_lens_cannot_name_is_counted_because_it_leaves_nothing_else_behind() {
     // Unlike an exec, an open the lens could not name leaves no trace at all: this lens records
