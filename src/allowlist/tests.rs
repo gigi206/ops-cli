@@ -1579,6 +1579,44 @@ fn parse_url_target_extracts_host_port_and_path() {
     assert!(parse_url_target("not a url").is_err());
 }
 
+/// The absolute-FQDN spelling is decided by the proxy, so the verb that exists to answer "what
+/// would the proxy decide?" has to accept it.
+///
+/// A trailing dot is what DNS calls the root, and `canonical_host` strips every one of them on both
+/// sides of a match -- which is what keeps `evil.com.` from walking past a `deny evil.com`. Rules
+/// themselves can never carry one (`is_valid_hostname` refuses it), and that asymmetry is the
+/// point: the *rule* side stays strict while the *request* side normalizes. A target is a request,
+/// not a declaration, so refusing it there left the one form a reader most needs to check
+/// uncheckable by the tester.
+#[test]
+fn a_target_carries_the_absolute_fqdn_form_the_proxy_normalizes() {
+    assert_eq!(
+        parse_url_target("https://api.github.com./x").unwrap(),
+        ("api.github.com".to_string(), 443, "/x".to_string()),
+        "a trailing root dot is stripped, exactly as the proxy strips it"
+    );
+    assert_eq!(
+        parse_url_target("https://API.GITHUB.COM.:8443").unwrap(),
+        ("api.github.com".to_string(), 8443, "/".to_string()),
+        "and it composes with the lowercasing the same canonicalization does"
+    );
+    assert_eq!(
+        parse_tcp_target("tcp://ssh.example.com.:22").unwrap(),
+        ("ssh.example.com".to_string(), 22),
+        "the L4 target parser answers about the same wire and normalizes the same way"
+    );
+    // The witness: what the canonicalization does not create is a way to name nothing. A host that
+    // is only dots reduces to the empty string, which is not a host in any list.
+    assert!(
+        parse_url_target("https://./x").is_err(),
+        "a host with nothing left after the dots is still refused"
+    );
+    assert!(
+        parse_url_target("https://api..github.com/x").is_err(),
+        "and an interior empty label is still refused"
+    );
+}
+
 #[test]
 fn a_url_rule_matches_an_ipv6_host() {
     let a = allow(&["[::1]:8080/secret"]);

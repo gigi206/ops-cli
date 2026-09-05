@@ -477,10 +477,27 @@ pub(crate) fn parse_url_target(url: &str) -> Result<(String, u16, String), Strin
         };
         (h, port)
     };
-    if !(is_valid_hostname(host) || host.parse::<IpAddr>().is_ok()) {
-        return Err(format!("URL `{url}` has an invalid host `{host}`"));
-    }
-    Ok((canonical_host(host), port, path))
+    let canonical = canonical_target_host(host)
+        .ok_or_else(|| format!("URL `{url}` has an invalid host `{host}`"))?;
+    Ok((canonical, port, path))
+}
+
+/// A **request** host, folded to the one spelling a verdict is taken against, or `None` when what
+/// is left is not a host at all.
+///
+/// Canonicalize first, then validate — which is the opposite order from a rule, and deliberately
+/// so. A rule is a declaration and is held to the strict spelling [`is_valid_hostname`] describes:
+/// it may not carry the absolute-FQDN trailing dot, because a list that spelled one host two ways
+/// would match neither reliably. A target is a *request*, and the proxy answers requests through
+/// [`canonical_host`] — lowercased, every trailing root dot dropped, an IP literal reduced to its
+/// canonical text — before any rule is consulted. Validating the raw spelling would leave the
+/// tester refusing forms the wire decides, which is the one divergence a tester exists to prevent.
+///
+/// What the folding does not do is invent a host: a spelling that reduces to nothing, or to labels
+/// no name can carry, is still refused here.
+fn canonical_target_host(host: &str) -> Option<String> {
+    let canonical = canonical_host(host);
+    (is_valid_hostname(&canonical) || canonical.parse::<IpAddr>().is_ok()).then_some(canonical)
 }
 
 /// Parse a `tcp://host:port` target naming one **L4 request** (for `sbx test net tcp://…`) into
@@ -533,12 +550,9 @@ pub(crate) fn parse_tcp_target(target: &str) -> Result<(String, u16), String> {
             "tcp:// target `{target}` has port 0, which is not valid"
         ));
     }
-    if !(is_valid_hostname(host) || host.parse::<IpAddr>().is_ok()) {
-        return Err(format!(
-            "tcp:// target `{target}` has an invalid host `{host}`"
-        ));
-    }
-    Ok((canonical_host(host), port))
+    let canonical = canonical_target_host(host)
+        .ok_or_else(|| format!("tcp:// target `{target}` has an invalid host `{host}`"))?;
+    Ok((canonical, port))
 }
 
 /// Parse a `host[:ports]/path` entry into a `Url` rule. The part before the first `/` is the
