@@ -1355,39 +1355,6 @@ mod tests {
     use super::*;
     use crate::testutil::TmpDir;
 
-    /// A verb that writes a project config and then re-trusts it must attest to the text it
-    /// composed, never to a second read of the path. The project tree is bind-mounted read-write
-    /// into the cage, so a payload writing between sbx's write and that read would have its own
-    /// config attested and applied at the next launch — the write succeeds either way, which is
-    /// what makes the defect invisible at the call site.
-    ///
-    /// All three writing paths here now hold their own text (the two `Written` add paths and
-    /// `RemoveOutcome::Removed`), so this file has no remaining reason to name the re-reading form.
-    /// Pinned as a count rather than an absence alone: a fourth verb added later either carries its
-    /// text or fails here.
-    ///
-    /// `sbx trust` and `sbx config edit` legitimately hash the path and live in `cli/`, not here —
-    /// there the bytes on disk are exactly what the user is approving.
-    #[test]
-    fn every_re_trust_in_this_file_attests_to_the_text_it_wrote() {
-        // The production half only, cut at the LAST `#[cfg(test)]` rather than the first: the four
-        // test-module declarations sit at the top of this file, so splitting on the first would
-        // leave twelve lines to search and the assertions below would pass having read nothing.
-        let (source, _) = include_str!("main.rs")
-            .rsplit_once("#[cfg(test)]")
-            .expect("the file has a test module");
-        assert_eq!(
-            source.matches("trust::trust(").count(),
-            0,
-            "a re-trust after sbx's own write must hash the composed text, not read the file back"
-        );
-        assert_eq!(
-            source.matches("trust::trust_written(").count(),
-            3,
-            "the two add paths and the removal path each attest to what they wrote"
-        );
-    }
-
     #[test]
     fn read_sysctl_trims_value_and_handles_absence() {
         let dir = TmpDir::new();

@@ -157,20 +157,26 @@ pub(crate) enum AddOutcome {
     AlreadyPresent,
 }
 
-/// What an add left on disk: its [`AddOutcome`], and the exact document text the file now holds.
+/// What a write left on disk: what it did (`T` — an [`AddOutcome`], a [`SetOutcome`], a plain
+/// `bool` for the list and key removals), and the exact document text the file now holds.
 ///
-/// The text is carried out because the caller has to attest to it. `sbx net allow --local` writes a
-/// project config and then re-trusts it, and `trust` hashing the *path* would read the file a second
-/// time — so a payload writing the project between the two (the tree is bound read-write into the
-/// cage) got its own config blessed. Hashing what was composed closes that: a file changed underneath
-/// no longer matches its marker, and the next launch drops it, which is the fail-safe answer.
+/// The text is carried out because the caller has to attest to it. `sbx net allow --local` and
+/// `sbx config set --local --trust` write a project config and then re-trust it, and `trust` hashing
+/// the *path* would read the file a second time — so a payload writing the project between the two
+/// (the tree is bound read-write into the cage) gets its own config blessed. Hashing what was
+/// composed closes that: a file changed underneath no longer matches its marker, and the next launch
+/// drops it, which is the fail-safe answer.
 ///
-/// `AlreadyPresent` carries text too, and the same text the decision was made on: nothing was
-/// written, so what is attested to is the document as read — consistent with the answer given, and
-/// still not a second read.
+/// One shape for every writer in this module, because the obligation is the writer's and not any one
+/// verb's: a write that hands back only its outcome leaves its caller nothing to attest to but the
+/// path, which is the defect above spelled as an API.
+///
+/// A no-op outcome (`AlreadyPresent`, [`SetOutcome::Unchanged`], `false`) carries text too, and the
+/// same text the decision was made on: nothing was written, so what is attested to is the document
+/// as read — consistent with the answer given, and still not a second read.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Written {
-    pub(crate) outcome: AddOutcome,
+pub(crate) struct Written<T> {
+    pub(crate) outcome: T,
     pub(crate) text: String,
 }
 
@@ -390,7 +396,8 @@ pub(crate) enum SetOutcome {
 }
 
 /// Set a value at a dotted key, preserving the rest of the file. Creates the file and any
-/// intermediate tables as needed. Reports what it did as a [`SetOutcome`]; a value the file
+/// intermediate tables as needed. Reports what it did as a [`SetOutcome`], and hands back the
+/// document text so a caller that re-trusts attests to it ([`Written`]); a value the file
 /// already holds is left alone rather than rewritten, so a repeated command cannot re-arm the
 /// trust gate on a file it did not change.
 ///
@@ -400,7 +407,7 @@ pub(crate) enum SetOutcome {
 /// the layer invalid in BOTH forms is **refused without writing**: a committed unparseable layer is
 /// silently dropped whole at the next load (e.g. a filtering `network` posture reverting to open
 /// egress), so this fails closed and loud rather than reporting success over a broken file.
-pub(crate) fn set(path: &Path, key: &str, val: &str) -> Result<SetOutcome, ManageError> {
+pub(crate) fn set(path: &Path, key: &str, val: &str) -> Result<Written<SetOutcome>, ManageError> {
     let mut doc = read_or_empty(path)?;
     // Rendered rather than read off disk, so the comparison below asks the question that matters —
     // "would writing this change the file?" — and not the one about how `toml_edit` happens to
@@ -436,27 +443,34 @@ fn commit(
     doc: &DocumentMut,
     before: &str,
     created: bool,
-) -> Result<SetOutcome, ManageError> {
+) -> Result<Written<SetOutcome>, ManageError> {
     if doc.to_string() == before {
-        return Ok(SetOutcome::Unchanged);
+        return Ok(Written {
+            outcome: SetOutcome::Unchanged,
+            text: before.to_string(),
+        });
     }
-    write_doc(path, doc)?;
-    Ok(if created {
-        SetOutcome::Created
-    } else {
-        SetOutcome::Updated
+    let text = write_doc(path, doc)?;
+    Ok(Written {
+        outcome: if created {
+            SetOutcome::Created
+        } else {
+            SetOutcome::Updated
+        },
+        text,
     })
 }
 
 /// `sbx config add <key> <entry>`: append one entry to the list at `key`, creating the list if it is
-/// absent. Returns whether the file changed — an entry already present is a no-op, which matters
-/// beyond tidiness: an unchanged file keeps its trust marker valid, so re-running the command cannot
-/// silently disarm a trusted config's security fields.
+/// absent. Returns whether the file changed, with the document text a caller re-trusts against
+/// ([`Written`]) — an entry already present is a no-op, which matters beyond tidiness: an unchanged
+/// file keeps its trust marker valid, so re-running the command cannot silently disarm a trusted
+/// config's security fields.
 ///
 /// The entry is always written as a **string**. Every list the schema carries is a list of strings
 /// (paths, hosts, syscall tokens, key names) except `forward` (ports) and `binds` (which also takes
 /// tables) — the layer validation catches the mismatch and refuses, rather than this guessing.
-pub(crate) fn add(path: &Path, key: &str, entry: &str) -> Result<bool, ManageError> {
+pub(crate) fn add(path: &Path, key: &str, entry: &str) -> Result<Written<bool>, ManageError> {
     if let Some(verb) = rule_list_verb(key) {
         return Err(ManageError::UseRuleVerb(key.to_string(), verb));
     }
@@ -466,7 +480,10 @@ pub(crate) fn add(path: &Path, key: &str, entry: &str) -> Result<bool, ManageErr
         .iter()
         .any(|v| v.as_str().is_some_and(|s| s == entry) || render_value(v) == entry)
     {
-        return Ok(false);
+        return Ok(Written {
+            outcome: false,
+            text: doc.to_string(),
+        });
     }
     // The entry takes its natural type, the same guess `set` makes for a single value: `forward` is
     // a list of *ports*, so a string entry there would fail validation and leave the field with no
@@ -484,28 +501,38 @@ pub(crate) fn add(path: &Path, key: &str, entry: &str) -> Result<bool, ManageErr
             return Err(ManageError::InvalidValue(key.to_string(), detail));
         }
     }
-    write_doc(path, &doc)?;
-    Ok(true)
+    let text = write_doc(path, &doc)?;
+    Ok(Written {
+        outcome: true,
+        text,
+    })
 }
 
 /// `sbx config rm <key> <entry>`: remove one entry from the list at `key`. Returns whether the file
-/// changed; an entry that is not there is a no-op, like [`unset`] on an absent key. The now-empty
-/// list is left in place rather than deleted: `deny = []` states "nothing is closed here" and is a
-/// different claim from the key being absent, which a parent layer may still fill.
-pub(crate) fn remove(path: &Path, key: &str, entry: &str) -> Result<bool, ManageError> {
+/// changed, with the document text a caller re-trusts against ([`Written`]); an entry that is not
+/// there is a no-op, like [`unset`] on an absent key. The now-empty list is left in place rather
+/// than deleted: `deny = []` states "nothing is closed here" and is a different claim from the key
+/// being absent, which a parent layer may still fill.
+pub(crate) fn remove(path: &Path, key: &str, entry: &str) -> Result<Written<bool>, ManageError> {
     let mut doc = read_or_empty(path)?;
     let list = list_at(&mut doc, key)?;
     let Some(idx) = list
         .iter()
         .position(|v| v.as_str().is_some_and(|s| s == entry) || render_value(v) == entry)
     else {
-        return Ok(false);
+        return Ok(Written {
+            outcome: false,
+            text: doc.to_string(),
+        });
     };
     remove_entry(list, idx);
     match validate_layer(&doc) {
         Ok(()) => {
-            write_doc(path, &doc)?;
-            Ok(true)
+            let text = write_doc(path, &doc)?;
+            Ok(Written {
+                outcome: true,
+                text,
+            })
         }
         Err(detail) => Err(ManageError::InvalidValue(key.to_string(), detail)),
     }
@@ -791,8 +818,9 @@ fn validate_layer(doc: &DocumentMut) -> Result<(), String> {
     Ok(())
 }
 
-/// Remove a dotted key. Returns whether it existed. An absent file or parent is simply "not
-/// present" (returns `false`), never an error.
+/// Remove a dotted key. Returns whether it existed, with the document text a caller re-trusts
+/// against ([`Written`]). An absent file or parent is simply "not present" (a `false` outcome),
+/// never an error.
 ///
 /// Validated before it commits, like [`set`], [`add`] and [`remove`] — [`validate_layer`]'s own doc
 /// names "a `set`/`unset` that leaves the layer unparseable" as the thing it exists to prevent, and
@@ -806,22 +834,32 @@ fn validate_layer(doc: &DocumentMut) -> Result<(), String> {
 ///
 /// The check is the layer's own parser rather than a list of field names, so it stays right as the
 /// schema's required set changes.
-pub(crate) fn unset(path: &Path, key: &str) -> Result<bool, ManageError> {
+pub(crate) fn unset(path: &Path, key: &str) -> Result<Written<bool>, ManageError> {
     let mut doc = read_or_empty(path)?;
     let segments = split_key(key)?;
     let (parents, leaf) = segments.split_at(segments.len() - 1);
 
     let Some(table) = existing_parent_mut(&mut doc, parents) else {
-        return Ok(false);
+        return Ok(Written {
+            outcome: false,
+            text: doc.to_string(),
+        });
     };
     let existed = table.remove(leaf[0].as_str()).is_some();
-    if existed {
-        if let Err(detail) = validate_layer(&doc) {
-            return Err(ManageError::InvalidValue(key.to_string(), detail));
-        }
-        write_doc(path, &doc)?;
+    if !existed {
+        return Ok(Written {
+            outcome: false,
+            text: doc.to_string(),
+        });
     }
-    Ok(existed)
+    if let Err(detail) = validate_layer(&doc) {
+        return Err(ManageError::InvalidValue(key.to_string(), detail));
+    }
+    let text = write_doc(path, &doc)?;
+    Ok(Written {
+        outcome: true,
+        text,
+    })
 }
 
 /// What the layer being written into inherits from the layer below, when it declares no `network`
@@ -860,7 +898,7 @@ pub(crate) fn add_egress_rule(
     list: EgressList,
     rule: &str,
     inherited: Inherited,
-) -> Result<Written, ManageError> {
+) -> Result<Written<AddOutcome>, ManageError> {
     // Inspect the current `network` field into an owned decision first, so the read borrow is
     // released before the document is mutated below.
     enum NetCase {
@@ -980,7 +1018,7 @@ pub(crate) fn add_proc_rule(
     app: Option<&str>,
     list: ProcList,
     rule: &str,
-) -> Result<Written, ManageError> {
+) -> Result<Written<AddOutcome>, ManageError> {
     enum ProcCase {
         Absent,
         BareMode(String),
@@ -2055,11 +2093,11 @@ mod tests {
             "# keep me\nnixpkgs = \"old\"\n\n[env]\nFOO = \"bar\" # inline\n",
         );
         assert!(
-            set(&p, "nixpkgs", "new").unwrap() == SetOutcome::Updated,
+            set(&p, "nixpkgs", "new").unwrap().outcome == SetOutcome::Updated,
             "nixpkgs already existed"
         );
         assert_eq!(
-            set(&p, "env.BAZ", "qux").unwrap(),
+            set(&p, "env.BAZ", "qux").unwrap().outcome,
             SetOutcome::Created,
             "env.BAZ is new"
         );
@@ -2082,7 +2120,7 @@ mod tests {
         let tmp = crate::testutil::TmpDir::new();
         let p = tmp.path().join(".sbx.toml");
         assert_eq!(
-            set(&p, "env.A", "1").unwrap(),
+            set(&p, "env.A", "1").unwrap().outcome,
             SetOutcome::Created,
             "created in a new file"
         );
@@ -2096,7 +2134,7 @@ mod tests {
         let tmp = crate::testutil::TmpDir::new();
         let p = tmp.path().join("nested").join("dir").join("sbx.toml");
         assert_eq!(
-            set(&p, "env.A", "1").unwrap(),
+            set(&p, "env.A", "1").unwrap().outcome,
             SetOutcome::Created,
             "created under a new dir"
         );
@@ -2127,7 +2165,7 @@ mod tests {
         let tmp = crate::testutil::TmpDir::new();
         let p = doc_at(tmp.path(), "[network]\nmode = \"deny\"\n");
         assert_eq!(
-            set(&p, "network.stats", "false").unwrap(),
+            set(&p, "network.stats", "false").unwrap().outcome,
             SetOutcome::Created,
             "stats is new"
         );
@@ -2187,11 +2225,14 @@ mod tests {
         let tmp = crate::testutil::TmpDir::new();
         let fresh = doc_at(tmp.path(), "[fs]\n");
         assert!(
-            set(&fresh, "fs.deny", r#"[".env"]"#).unwrap() == SetOutcome::Created,
+            set(&fresh, "fs.deny", r#"[".env"]"#).unwrap().outcome == SetOutcome::Created,
             "an absent key is created"
         );
         assert!(
-            set(&fresh, "fs.deny", r#"[".env", "secrets/"]"#).unwrap() == SetOutcome::Updated,
+            set(&fresh, "fs.deny", r#"[".env", "secrets/"]"#)
+                .unwrap()
+                .outcome
+                == SetOutcome::Updated,
             "replacing the list it just wrote is an update, not a creation"
         );
     }
@@ -2221,8 +2262,11 @@ mod tests {
     fn add_creates_the_list_appends_to_it_and_is_idempotent() {
         let tmp = crate::testutil::TmpDir::new();
         let p = tmp.path().join(".sbx.toml");
-        assert!(add(&p, "fs.deny", ".env").unwrap(), "created the list");
-        assert!(add(&p, "fs.deny", "secrets/").unwrap(), "appended");
+        assert!(
+            add(&p, "fs.deny", ".env").unwrap().outcome,
+            "created the list"
+        );
+        assert!(add(&p, "fs.deny", "secrets/").unwrap().outcome, "appended");
         let after = std::fs::read_to_string(&p).unwrap();
         assert!(
             after.contains(r#"deny = [".env", "secrets/"]"#),
@@ -2231,7 +2275,10 @@ mod tests {
         // The idempotence is a trust property, not tidiness: an unchanged file keeps its marker, so
         // re-running a command cannot disarm a trusted config's security fields.
         let before = std::fs::read_to_string(&p).unwrap();
-        assert!(!add(&p, "fs.deny", ".env").unwrap(), "already present");
+        assert!(
+            !add(&p, "fs.deny", ".env").unwrap().outcome,
+            "already present"
+        );
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
             before,
@@ -2243,14 +2290,14 @@ mod tests {
     fn rm_takes_one_entry_out_and_leaves_the_empty_list_in_place() {
         let tmp = crate::testutil::TmpDir::new();
         let p = doc_at(tmp.path(), "[fs]\ndeny = [\"a.key\", \"b.key\"]\n");
-        assert!(remove(&p, "fs.deny", "a.key").unwrap());
+        assert!(remove(&p, "fs.deny", "a.key").unwrap().outcome);
         assert!(
             std::fs::read_to_string(&p)
                 .unwrap()
                 .contains(r#"deny = ["b.key"]"#),
             "the other entry survives"
         );
-        assert!(remove(&p, "fs.deny", "b.key").unwrap());
+        assert!(remove(&p, "fs.deny", "b.key").unwrap().outcome);
         // `deny = []` says "nothing is closed here", which is a different claim from the key being
         // absent — an absent key lets a parent layer's masks stand alone.
         assert!(
@@ -2259,7 +2306,7 @@ mod tests {
         );
         let before = std::fs::read_to_string(&p).unwrap();
         assert!(
-            !remove(&p, "fs.deny", "never.there").unwrap(),
+            !remove(&p, "fs.deny", "never.there").unwrap().outcome,
             "absent entry"
         );
         assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "no-op");
@@ -2322,7 +2369,11 @@ mod tests {
         assert!(proc_err.to_string().contains("sbx proc deny"), "{proc_err}");
         // A group has no posture of its own, so it is not redirected.
         assert!(add(&p, "network.groups.infra", "a.example.com").is_ok());
-        assert!(remove(&p, "network.allow", "a.example.com").unwrap());
+        assert!(
+            remove(&p, "network.allow", "a.example.com")
+                .unwrap()
+                .outcome
+        );
         assert!(
             std::fs::read_to_string(&p)
                 .unwrap()
@@ -2357,7 +2408,7 @@ mod tests {
         // have looked like it worked while changing nothing.
         let tmp = crate::testutil::TmpDir::new();
         let p = doc_at(tmp.path(), "forward = [1455]\n");
-        assert!(add(&p, "forward", "9200:9119").unwrap());
+        assert!(add(&p, "forward", "9200:9119").unwrap().outcome);
         assert!(
             std::fs::read_to_string(&p)
                 .unwrap()
@@ -2429,10 +2480,10 @@ mod tests {
 
         // And the gate still lets through everything the resolver accepts, or it would be refusing
         // the field rather than validating it.
-        assert!(add(&p, "fs.deny", "config/prod.key").unwrap());
-        assert!(add(&p, "fs.readonly", "Cargo.lock").unwrap());
-        assert!(add(&p, "fs.deny", "secrets/*.pem").unwrap());
-        assert!(add(&p, "fs.scan", "AKIA[0-9A-Z]{16}").unwrap());
+        assert!(add(&p, "fs.deny", "config/prod.key").unwrap().outcome);
+        assert!(add(&p, "fs.readonly", "Cargo.lock").unwrap().outcome);
+        assert!(add(&p, "fs.deny", "secrets/*.pem").unwrap().outcome);
+        assert!(add(&p, "fs.scan", "AKIA[0-9A-Z]{16}").unwrap().outcome);
         assert!(set(&p, "fs.scan_max_kb", "64").is_ok());
         let after = std::fs::read_to_string(&p).unwrap();
         assert!(
@@ -2451,7 +2502,7 @@ mod tests {
             add(&p, "app.demo.fs.deny", "/etc/shadow"),
             Err(ManageError::InvalidValue(_, _))
         ));
-        assert!(add(&p, "app.demo.fs.deny", ".env").unwrap());
+        assert!(add(&p, "app.demo.fs.deny", ".env").unwrap().outcome);
     }
 
     #[test]
@@ -2485,7 +2536,11 @@ mod tests {
                 .as_deref(),
             Some("env://K")
         );
-        assert!(unset(&p, r#"secret."api.example.com".header"#).unwrap());
+        assert!(
+            unset(&p, r#"secret."api.example.com".header"#)
+                .unwrap()
+                .outcome
+        );
         // An unbalanced quote is refused rather than swallowing the rest of the key.
         assert!(matches!(
             set(&p, r#"secret."api.example.com.from"#, "x"),
@@ -2500,15 +2555,15 @@ mod tests {
         // single value, and falls back to a string when that does not validate.
         let tmp = crate::testutil::TmpDir::new();
         let p = tmp.path().join(".sbx.toml");
-        assert!(add(&p, "forward", "1455").unwrap());
-        assert!(add(&p, "forward", "8080").unwrap());
+        assert!(add(&p, "forward", "1455").unwrap().outcome);
+        assert!(add(&p, "forward", "8080").unwrap().outcome);
         let after = std::fs::read_to_string(&p).unwrap();
         assert!(
             after.contains("forward = [1455, 8080]"),
             "ports are integers, not strings:\n{after}"
         );
         // A list of strings is unaffected: the guess is validated, not trusted.
-        assert!(add(&p, "seccomp.allow", "ptrace").unwrap());
+        assert!(add(&p, "seccomp.allow", "ptrace").unwrap().outcome);
         assert!(
             std::fs::read_to_string(&p)
                 .unwrap()
@@ -2524,7 +2579,11 @@ mod tests {
         let tmp = crate::testutil::TmpDir::new();
         let p = tmp.path().join(".sbx.toml");
         assert!(set(&p, "task.build.description", "Build").is_ok());
-        assert!(add(&p, "network.groups.infra", "api.example.com").unwrap());
+        assert!(
+            add(&p, "network.groups.infra", "api.example.com")
+                .unwrap()
+                .outcome
+        );
         let after = std::fs::read_to_string(&p).unwrap();
         assert!(
             !after.contains("[task]\n") && !after.contains("[network]\n"),
@@ -2545,12 +2604,12 @@ mod tests {
         assert_eq!(get(&p, "network.mode").unwrap().as_deref(), Some("deny"));
         // set a new inline key and flip an existing one
         assert_eq!(
-            set(&p, "network.stats", "false").unwrap(),
+            set(&p, "network.stats", "false").unwrap().outcome,
             SetOutcome::Updated,
             "stats existed"
         );
         assert_eq!(get(&p, "network.stats").unwrap().as_deref(), Some("false"));
-        assert!(unset(&p, "network.stats").unwrap(), "stats removed");
+        assert!(unset(&p, "network.stats").unwrap().outcome, "stats removed");
         assert_eq!(get(&p, "network.stats").unwrap(), None);
         // the field stays inline and valid after editing
         let after = std::fs::read_to_string(&p).unwrap();
@@ -2589,9 +2648,9 @@ mod tests {
     fn unset_removes_a_key_and_reports_existence() {
         let tmp = crate::testutil::TmpDir::new();
         let p = doc_at(tmp.path(), "[env]\nFOO = \"bar\"\nBAZ = \"qux\"\n");
-        assert!(unset(&p, "env.FOO").unwrap(), "FOO existed");
-        assert!(!unset(&p, "env.FOO").unwrap(), "already gone");
-        assert!(!unset(&p, "absent.key").unwrap(), "absent parent");
+        assert!(unset(&p, "env.FOO").unwrap().outcome, "FOO existed");
+        assert!(!unset(&p, "env.FOO").unwrap().outcome, "already gone");
+        assert!(!unset(&p, "absent.key").unwrap().outcome, "absent parent");
         assert_eq!(get(&p, "env.BAZ").unwrap().as_deref(), Some("qux"));
     }
 
@@ -2624,7 +2683,10 @@ mod tests {
         );
 
         // The ordinary removal still goes through, so the guard is not simply refusing everything.
-        assert!(unset(&p, "flakes.hello.attr").unwrap(), "attr is optional");
+        assert!(
+            unset(&p, "flakes.hello.attr").unwrap().outcome,
+            "attr is optional"
+        );
         assert_eq!(get(&p, "network").unwrap().as_deref(), Some("deny"));
     }
 
@@ -3122,7 +3184,11 @@ mod tests {
             "the posture survives and the group lands:\n{body}"
         );
         // `add` agrees with it on the same shape.
-        assert!(add(&inline, "network.groups.ci", "b.example.com").unwrap());
+        assert!(
+            add(&inline, "network.groups.ci", "b.example.com")
+                .unwrap()
+                .outcome
+        );
 
         // The bare-string posture is the one shape with no room for a sub-table. Refused by name,
         // and the file is left exactly as it was.
@@ -3358,7 +3424,7 @@ mod tests {
             "[fs]\ndeny = [\n    \".env\", # local secrets\n    \"config/prod.key\", # never \
              readable in the cage\n]\n",
         );
-        assert!(add(&p, "fs.deny", "id_rsa").unwrap());
+        assert!(add(&p, "fs.deny", "id_rsa").unwrap().outcome);
         let after = std::fs::read_to_string(&p).unwrap();
         assert!(
             after.contains("\n    \".env\", # local secrets\n"),
@@ -3386,7 +3452,7 @@ mod tests {
              readable in the cage\n]\n",
         )
         .unwrap();
-        assert!(remove(&q, "fs.deny", ".env").unwrap());
+        assert!(remove(&q, "fs.deny", ".env").unwrap().outcome);
         let after = std::fs::read_to_string(&q).unwrap();
         assert!(
             after.contains("\n    \"config/prod.key\", # never readable in the cage\n"),
@@ -3405,7 +3471,7 @@ mod tests {
     fn a_single_line_list_keeps_its_shape_when_an_entry_is_appended_or_taken_out() {
         let tmp = crate::testutil::TmpDir::new();
         let p = doc_at(tmp.path(), "[fs]\ndeny = [\"a.key\", \"b.key\"]\n");
-        assert!(add(&p, "fs.deny", "c.key").unwrap());
+        assert!(add(&p, "fs.deny", "c.key").unwrap().outcome);
         assert!(
             std::fs::read_to_string(&p)
                 .unwrap()
@@ -3416,7 +3482,7 @@ mod tests {
         // The retry path: `2024` is guessed as an integer, which `[fs] deny` (a list of strings)
         // rejects, so the entry is rewritten in the slot the first attempt already placed and
         // decorated — not appended a second time.
-        assert!(add(&p, "fs.deny", "2024").unwrap());
+        assert!(add(&p, "fs.deny", "2024").unwrap().outcome);
         assert!(
             std::fs::read_to_string(&p)
                 .unwrap()
@@ -3426,7 +3492,7 @@ mod tests {
         );
         // Taking the *first* entry out must not leave the next one carrying a separator's leading
         // space (`[ "b.key", …]`), which is what the position-keyed decor is for.
-        assert!(remove(&p, "fs.deny", "a.key").unwrap());
+        assert!(remove(&p, "fs.deny", "a.key").unwrap().outcome);
         assert!(
             std::fs::read_to_string(&p)
                 .unwrap()

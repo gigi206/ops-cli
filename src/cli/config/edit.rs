@@ -316,22 +316,30 @@ pub(super) fn config_set(args: &[OsString]) -> ExitCode {
     };
 
     match config::manage::set(&path, &key, val) {
-        Ok(config::manage::SetOutcome::Unchanged) => {
+        Ok(written) if written.outcome == config::manage::SetOutcome::Unchanged => {
             // Nothing was written, so the trust marker still matches and the gate is not re-armed —
             // the same reasoning (and the same silence about trust) as `add`/`rm` on a no-op.
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!("{}", render_config_same_value(&key, &path, &pal));
             ExitCode::SUCCESS
         }
-        Ok(outcome) => {
-            let verb = if outcome == config::manage::SetOutcome::Created {
+        Ok(written) => {
+            let verb = if written.outcome == config::manage::SetOutcome::Created {
                 "set"
             } else {
                 "updated"
             };
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!("{}", render_config_write(verb, &key, &path, &pal));
-            report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref(), gated)
+            report_write_trust(
+                &path,
+                &key,
+                was_trusted,
+                trust,
+                store_dir.as_deref(),
+                gated,
+                &written.text,
+            )
         }
         Err(e) => {
             diag::error(&format!("sbx: config: {e}"));
@@ -399,7 +407,7 @@ pub(super) fn config_list_edit(args: &[OsString], op: ListEdit) -> ExitCode {
         ListEdit::Remove => config::manage::remove(&path, &key, entry),
     };
     match outcome {
-        Ok(true) => {
+        Ok(written) if written.outcome => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             let (done, preposition) = match op {
                 ListEdit::Add => ("added", "to"),
@@ -409,9 +417,17 @@ pub(super) fn config_list_edit(args: &[OsString], op: ListEdit) -> ExitCode {
                 "{}",
                 render_list_edit(done, preposition, entry, &key, &path, &pal)
             );
-            report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref(), gated)
+            report_write_trust(
+                &path,
+                &key,
+                was_trusted,
+                trust,
+                store_dir.as_deref(),
+                gated,
+                &written.text,
+            )
         }
-        Ok(false) => {
+        Ok(_) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             let why = match op {
                 ListEdit::Add => "is already in",
@@ -463,12 +479,20 @@ pub(super) fn config_unset(args: &[OsString]) -> ExitCode {
     };
 
     match config::manage::unset(&path, &key) {
-        Ok(true) => {
+        Ok(written) if written.outcome => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!("{}", render_config_write("unset", &key, &path, &pal));
-            report_write_trust(&path, &key, was_trusted, trust, store_dir.as_deref(), gated)
+            report_write_trust(
+                &path,
+                &key,
+                was_trusted,
+                trust,
+                store_dir.as_deref(),
+                gated,
+                &written.text,
+            )
         }
-        Ok(false) => {
+        Ok(_) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!("{}", render_config_unchanged(&key, &path, &pal));
             ExitCode::SUCCESS
@@ -699,7 +723,13 @@ pub(super) fn config_edit(args: &[OsString]) -> ExitCode {
         // Reporting success would tell `sbx config edit --trust && sbx run …` that the gate was
         // armed when it was not, and the launch that follows would run against a config whose
         // `[network]`, `[binds]`, `[fs]` and `[secret]` are dropped.
-        if let Err(code) = record_trust(&path, store_dir.as_deref(), "the file was saved") {
+        // The one path that hashes the file rather than composed text, and the only admitted
+        // caller of [`crate::trust::trust`] outside `sbx trust`: sbx wrote none of these bytes —
+        // the editor showed the user the file and left what they saved, which is what they are
+        // approving. There is nothing else here to attest to.
+        if let Err(code) = record_trust(&path, store_dir.as_deref(), "the file was saved", |dir| {
+            trust::trust(dir, &path)
+        }) {
             return code;
         }
     } else if was_trusted {
@@ -731,6 +761,7 @@ fn report_write_trust(
     trust_flag: bool,
     store_dir: Option<&Path>,
     gated: bool,
+    text: &str,
 ) -> ExitCode {
     // The global config and the app profiles under `apps/` are trusted **by location** — they carry
     // no per-file trust marker, so a write never re-arms a gate and needs no `sbx trust`. Reporting
@@ -746,7 +777,11 @@ fn report_write_trust(
         return ExitCode::SUCCESS;
     }
     if trust_flag {
-        return match record_trust(path, store_dir, "the field was written") {
+        // Attested from the text the verb composed, never from a second read of the path: the
+        // reasoning is [`record_trust`]'s and [`crate::trust::trust_written`]'s.
+        return match record_trust(path, store_dir, "the field was written", |dir| {
+            trust::trust_written(dir, path, text.as_bytes())
+        }) {
             Ok(()) => ExitCode::SUCCESS,
             Err(code) => code,
         };
@@ -781,9 +816,23 @@ fn report_write_trust(
 ///
 /// `saved` names what the caller already put on disk — "the field was written", "the file was
 /// saved" — so the remediation hint describes the state the user is actually in.
-fn record_trust(path: &Path, store_dir: Option<&Path>, saved: &str) -> Result<(), ExitCode> {
+///
+/// **What is attested to is the caller's, and it is passed in rather than chosen here.** `attest`
+/// is handed the trust store directory and records the marker: the key-writing verbs pass
+/// [`crate::trust::trust_written`] over the text they composed, `edit` passes
+/// [`crate::trust::trust`] because there the bytes on disk are exactly what the user approved. The
+/// distinction is a security property, not a preference — a re-read blesses whatever a concurrent
+/// writer left, and the project tree is bound read-write into the cage — so this tail is unable to
+/// make the choice on a caller's behalf. A verb that wants the re-reading form has to write the
+/// call itself, where a reader (and the guard in [`crate::trust`]) can see it.
+fn record_trust(
+    path: &Path,
+    store_dir: Option<&Path>,
+    saved: &str,
+    attest: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), ExitCode> {
     match store_dir {
-        Some(dir) => match trust::trust(dir, path) {
+        Some(dir) => match attest(dir) {
             Ok(()) => {
                 let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
                 println!("{}", render_trusted_whole_file(path, &pal));
@@ -847,6 +896,55 @@ fn strip_app_prefix(key: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sbx config set|add|rm|unset --trust` blesses the text it composed, never a second read of
+    /// the path.
+    ///
+    /// The tail these four verbs share writes the file and then records trust for it. A marker taken
+    /// from a re-read attests to whatever is on disk at that moment, and the project tree is bound
+    /// read-write into the cage — so a payload writing between the two has its own `.sbx.toml`
+    /// blessed, and its `[network]` and `[binds]` apply from the next launch. The write succeeds
+    /// either way, which is what makes the difference invisible at the call site.
+    ///
+    /// The racing write is simulated by writing something else after the composed bytes, the same
+    /// shape `crate::trust`'s own test uses: the marker must not cover it. Both halves are asserted,
+    /// because a marker that matches nothing would satisfy the first on its own.
+    #[test]
+    fn a_key_write_with_trust_attests_to_the_text_it_composed() {
+        let dir = crate::testutil::TmpDir::new();
+        let store = dir.path().join("store");
+        let path = dir.path().join(config::PROJECT_CONFIG);
+        std::fs::write(&path, "# project config\n").expect("the starting config");
+        trust::trust(&store, &path).expect("trust the starting config");
+
+        let written = config::manage::set(&path, "network.stats", "false").expect("the write");
+
+        let hostile = "[network]\nmode = \"shared\"\nbinds = [\"/:rw\"]\n";
+        std::fs::write(&path, hostile).expect("the racing write");
+
+        let _ = report_write_trust(
+            &path,
+            "network.stats",
+            true,
+            true,
+            Some(&store),
+            true,
+            &written.text,
+        );
+
+        assert_eq!(
+            trust::state(&store, &path),
+            trust::TrustState::Changed,
+            "the racing write was blessed — the marker covered the file on disk, not what sbx wrote"
+        );
+
+        std::fs::write(&path, &written.text).expect("restore the composed config");
+        assert_eq!(
+            trust::state(&store, &path),
+            trust::TrustState::Trusted,
+            "the bytes that were attested to must be the ones that verify"
+        );
+    }
 
     #[test]
     fn is_security_key_treats_only_the_env_table_as_free() {

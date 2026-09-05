@@ -447,6 +447,93 @@ pub(crate) fn untrust(store_dir: &Path, config_path: &Path) -> io::Result<bool> 
 #[cfg(test)]
 mod tests {
 
+    /// Every re-trust that follows a write sbx composed hashes that text; the two verbs that hash
+    /// the *path* are named here, and nothing else in the crate may.
+    ///
+    /// A verb that writes a config and then blesses it has one obligation: attest to the delta it
+    /// authored. `trust` reads the path back, so it attests to whatever is there at that moment —
+    /// and the project tree is bind-mounted read-write into the cage, so a payload writing between
+    /// the verb's write and that read has its own `.sbx.toml` blessed, with its `[network]` and
+    /// `[binds]` honored from the next launch. The write succeeds in both cases, which is what makes
+    /// the difference invisible at the call site and worth a guard rather than a convention.
+    ///
+    /// **The population is the whole crate, and that is the point.** A guard whose population is one
+    /// file reports on one file: a verb written elsewhere — or moved elsewhere by a refactor —
+    /// satisfies it by absence. So every `.rs` under `src/` is read, and each is asked the same
+    /// question.
+    ///
+    /// Two callers legitimately hash the path, and both are named with the count they carry:
+    ///
+    /// - `src/cli/trust.rs`, the `sbx trust <path>` verb — the user is pointing at a file on disk
+    ///   and approving exactly what it holds;
+    /// - `src/cli/config/edit.rs`, the `sbx config edit --trust` path — the editor showed the user
+    ///   the file and left what they saved, and sbx composed none of it.
+    ///
+    /// The counts are pinned rather than the file merely admitted, so a second re-reading call added
+    /// inside one of those two files fails here as loudly as one added anywhere else.
+    ///
+    /// The second table is the other half of the same rule: the writers that do attest to their own
+    /// text, with how many such calls each holds. It is what catches a verb that drops its re-trust
+    /// altogether — an absence no other test sees, because the write still succeeds and the file is
+    /// simply left untrusted until the user notices.
+    #[test]
+    fn every_re_trust_after_a_write_sbx_composed_attests_to_that_text() {
+        /// The files admitted to hash the path, and how many such calls each holds.
+        const HASHES_THE_PATH: &[(&str, usize)] =
+            &[("src/cli/trust.rs", 1), ("src/cli/config/edit.rs", 1)];
+        /// The files that re-trust what they composed, and how many such calls each holds: the
+        /// egress and proc add paths, the shared removal path, and the tail of the four
+        /// key-writing `sbx config` verbs.
+        const HASHES_ITS_OWN_TEXT: &[(&str, usize)] =
+            &[("src/main.rs", 3), ("src/cli/config/edit.rs", 1)];
+
+        let root = format!("{}/", env!("CARGO_MANIFEST_DIR"));
+        let mut reread: Vec<(String, usize)> = Vec::new();
+        let mut attested: Vec<(String, usize)> = Vec::new();
+        for file in crate::testutil::crate_sources() {
+            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            // The production half only, cut at the LAST `#[cfg(test)]`: a file may declare several
+            // test modules, and splitting on the first would leave the guard reading almost nothing
+            // and passing on the silence.
+            let production = text
+                .rsplit_once("#[cfg(test)]")
+                .map_or(text.as_str(), |(before, _)| before);
+            let relative = file.display().to_string().replacen(&root, "", 1);
+            // `trust::trust_written(` does not contain `trust::trust(` — the character after the
+            // second `trust` is `_`, not `(` — so the two counts never overlap.
+            let rereads = production.matches("trust::trust(").count();
+            if rereads > 0 {
+                reread.push((relative.clone(), rereads));
+            }
+            let writes = production.matches("trust::trust_written(").count();
+            if writes > 0 {
+                attested.push((relative, writes));
+            }
+        }
+        reread.sort();
+        attested.sort();
+
+        let expect = |table: &[(&str, usize)]| {
+            let mut v: Vec<(String, usize)> =
+                table.iter().map(|(f, n)| ((*f).to_string(), *n)).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            reread,
+            expect(HASHES_THE_PATH),
+            "a re-trust after a write sbx composed must hash that text (`trust_written`), never \
+             read the file back; only `sbx trust` and `sbx config edit` bless bytes sbx did not \
+             author"
+        );
+        assert_eq!(
+            attested,
+            expect(HASHES_ITS_OWN_TEXT),
+            "a verb that writes a project config and blesses it in one step must re-trust the \
+             text it wrote"
+        );
+    }
+
     /// Trust attests to the bytes the caller wrote, not to whatever is on disk afterwards.
     ///
     /// `sbx net allow --local` writes a project config and then blesses it. The project tree is
