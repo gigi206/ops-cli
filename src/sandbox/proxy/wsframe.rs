@@ -314,15 +314,21 @@ impl Inflater {
         // cut short costs the next one nothing as far as the *window* goes. The scan is the other
         // reason to inflate it, and the only one left here.
         if self.no_context_takeover {
-            if remainder && scan_tail {
-                // Only the scan wants these bytes; the reset below squares the window either way,
-                // so a decode failure here costs nothing beyond what it already means.
-                self.drain(&input[read..], &mut plaintext);
-            }
+            // The reset below squares the window either way, so the drain here is the scan's
+            // errand alone. Its answer is still this direction's: it is `false` when the tail could
+            // not be decoded AND when the work budget ran out, and in both cases the bytes past the
+            // cap were never scanned. Reporting `true` regardless said the tail had been seen, so a
+            // secret behind a compressible pad crossed with the direction still counted reliable.
+            let drained = match remainder && scan_tail {
+                true => self.drain(&input[read..], &mut plaintext),
+                // Nothing was left behind: either the message fitted under the cap, or no consumer
+                // wanted the tail, and this direction is level on both counts.
+                false => true,
+            };
             self.state.reset(DataFormat::Raw);
             return Some(Inflated {
                 plain: out,
-                in_step: true,
+                in_step: drained,
             });
         }
         // Otherwise the window carries across messages, and the bytes past the cap are part of it.
@@ -385,7 +391,13 @@ impl Inflater {
 struct Inflated {
     /// The plaintext, capped at one byte past what this direction's consumers could use.
     plain: Vec<u8>,
-    /// Whether this direction's decoder is still level with the peer's compressor.
+    /// Whether this direction can still be trusted for the rest of the tunnel.
+    ///
+    /// Two facts, one flag, because the consumer acts on either alone: the decoder is level with
+    /// the peer's compressor, **and** the leak scan was handed every byte of this message. The
+    /// drain answers both at once, which is why its refusal is reported whichever of the two it
+    /// was about; a peer that resets its window per message needs no squaring and still has a tail
+    /// the scan never saw.
     ///
     /// Under `permessage-deflate` with context takeover — the default, since `no_context_takeover`
     /// has to be announced — one window carries across a direction's messages. A message stopped at
@@ -394,7 +406,8 @@ struct Inflated {
     /// noise and the leak scan sees none of the values it exists to catch. That is a security control
     /// the cage switches off at will — one large compressible message, then exfiltrate freely down
     /// the same tunnel — so the overflow path inflates the remainder rather than abandoning it, and
-    /// this reports the case where even that could not square the window.
+    /// this reports the case where that inflate did not finish, for either of the two reasons the
+    /// drain gives up: the stream would not decode, or the work budget ran out.
     in_step: bool,
 }
 
@@ -1141,6 +1154,38 @@ mod tests {
             !got.in_step,
             "a window the drain gave up on must be reported out of step, or the direction carries \
              on scanning rubbish and reporting nothing"
+        );
+    }
+
+    /// The same question on the branch beside it. A peer that announced `no_context_takeover`
+    /// resets its window between messages, so nothing there needs squaring; the drain is called
+    /// anyway because it is also what hands the scan the bytes past the plaintext cap, and it
+    /// gives up on the same budget. Reporting the direction in step then says the tail was
+    /// scanned when it was not: under `[network] websocket_secret = "block"` a secret sitting
+    /// behind a compressible pad crosses unseen, and no direction is declared blind, so the
+    /// tunnel is not closed behind it either.
+    #[test]
+    fn a_reset_window_still_reports_a_tail_the_scan_never_saw() {
+        use miniz_oxide::deflate::core::CompressorOxide;
+        let mut c = CompressorOxide::new(raw_deflate_flags());
+        let framed = deflated_message(&vec![b'a'; SCAN_MESSAGE_CAP + 64 * 1024], &mut c);
+        assert_eq!(framed[1], 126, "expected the two-byte length form");
+        let body = &framed[4..];
+
+        let mut inflater = Inflater::new(true);
+        inflater.resync_cap = 1024; // far below the ~64 KiB left after the cap
+        let got = inflater
+            .message(body, SCAN_MESSAGE_CAP, true, |_| {})
+            .expect("the message decodes as far as the cap");
+        assert_eq!(
+            got.plain.len(),
+            SCAN_MESSAGE_CAP + 1,
+            "the overflow path is the one under test, so the cap must be what stopped it"
+        );
+        assert!(
+            !got.in_step,
+            "a tail the drain gave up on must be reported out of step whether or not the window \
+             needed squaring, or a secret past the cap crosses unseen and unannounced"
         );
     }
 
