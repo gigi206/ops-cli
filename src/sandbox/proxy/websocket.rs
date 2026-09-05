@@ -455,20 +455,23 @@ pub(super) fn relay_websocket(
         ),
         false => (None, None),
     };
-    let creds = ctx.credentials.snapshot();
-    let needles = tunnel_needles(&creds.needles, dest);
-    let mut tee_up = FrameTee::new(to_upstream, &needles, up_deflate);
-    let mut tee_down = FrameTee::new(to_client, &needles, down_deflate);
-    // The transcript is filed whenever a direction reaches its cap, and once more when the tunnel
-    // ends (in the capture guard's teardown). Each direction has its own trigger, and each fires at
-    // most once: one side of a live stream can fill in seconds while the other trickles for hours,
-    // so a single shared trigger would strand whichever filled second. The guard drops a filing that
-    // would show what it already showed, which is what keeps the count bounded.
     // Whether a secret leaving through this tunnel closes it, from `[network] websocket_secret`.
     // Read from the config policy rather than the effective one: a `--session` overlay amends the
     // rules and carries every setting through untouched, so the two answer the same and this one
     // costs no clone.
     let blocking = obs.ctx.policy.websocket_secret() == crate::allowlist::WebsocketSecret::Block;
+    let mut creds = ctx.credentials.snapshot();
+    let needles = tunnel_needles(&creds.needles, dest);
+    // Under `block` the framing is followed even with nothing to look for yet, because a decoder
+    // cannot join a stream it did not start with and the set this tunnel scans against grows while
+    // it is open ([`FrameTee::new`]).
+    let mut tee_up = FrameTee::new(to_upstream, &needles, up_deflate, blocking);
+    let mut tee_down = FrameTee::new(to_client, &needles, down_deflate, blocking);
+    // The transcript is filed whenever a direction reaches its cap, and once more when the tunnel
+    // ends (in the capture guard's teardown). Each direction has its own trigger, and each fires at
+    // most once: one side of a live stream can fill in seconds while the other trickles for hours,
+    // so a single shared trigger would strand whichever filled second. The guard drops a filing that
+    // would show what it already showed, which is what keeps the count bounded.
     // Said on the supervisor's stderr, once per direction: the tunnel's own log event carries secret
     // *sightings*, and "the decoder stopped" is not one — filing it as a sighting would name a
     // credential that was never seen. What the reader needs to know is that from here the transcript
@@ -529,6 +532,23 @@ pub(super) fn relay_websocket(
         // Drain pending TLS output on both sides.
         flush_tls(&mut client.conn, &mut client.sock)?;
         flush_tls(&mut upstream.conn, &mut upstream.sock)?;
+
+        // Re-read the shared credential set. The request planes do this once per request; a tunnel
+        // has one request and may outlive it by hours, so reading it only at the `101` left this
+        // transport watching for the values that existed then and for nothing the cage acquired
+        // afterwards, which is exactly the credential an agent signs in for and then exfiltrates.
+        // The comparison is on the `Arc`, so an unchanged set costs a pointer test per pass.
+        let latest = ctx.credentials.snapshot();
+        if !Arc::ptr_eq(&latest, &creds) {
+            creds = latest;
+            let fresh = tunnel_needles(&creds.needles, dest);
+            if let Some(tee) = tee_up.as_mut() {
+                tee.refresh_needles(&fresh);
+            }
+            if let Some(tee) = tee_down.as_mut() {
+                tee.refresh_needles(&fresh);
+            }
+        }
 
         // `progressed` tracks whether a read delivered plaintext this pass. One `read_tls` can decrypt
         // several TLS records into rustls's plaintext buffer at once, but a single `reader().read`
@@ -806,7 +826,7 @@ mod tests {
         let carrying = frame(0x1, NEEDLE_VALUE, Some([0x37, 0xfa, 0x21, 0x3d]));
         let ordinary = frame(0x1, br#"{"hello":"world"}"#, Some([1, 2, 3, 4]));
 
-        let mut tee = FrameTee::new(None, &[needle()], None);
+        let mut tee = FrameTee::new(None, &[needle()], None, false);
         let mut upstream = Vec::new();
         let seeded = seed_outbound_pending(&mut upstream, &carrying, &mut tee, &obs, true).unwrap();
         assert!(
@@ -821,7 +841,7 @@ mod tests {
 
         // Under `warn` the tunnel stays byte-exact, sighting or not — so this cannot be satisfied by
         // a gate that never writes.
-        let mut tee = FrameTee::new(None, &[needle()], None);
+        let mut tee = FrameTee::new(None, &[needle()], None, false);
         let mut upstream = Vec::new();
         let seeded =
             seed_outbound_pending(&mut upstream, &carrying, &mut tee, &obs, false).unwrap();
@@ -830,7 +850,7 @@ mod tests {
 
         // And ordinary pipelined frames cross under `block` too: what closes the tunnel is the
         // sighting, never the pipelining.
-        let mut tee = FrameTee::new(None, &[needle()], None);
+        let mut tee = FrameTee::new(None, &[needle()], None, false);
         let mut upstream = Vec::new();
         let seeded = seed_outbound_pending(&mut upstream, &ordinary, &mut tee, &obs, true).unwrap();
         assert!(!seeded.followed.seen && seeded.crossed);

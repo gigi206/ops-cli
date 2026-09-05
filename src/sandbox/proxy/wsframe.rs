@@ -150,6 +150,33 @@ impl LeakScan {
         })
     }
 
+    /// Take on needles the launch learned after this scanner was built.
+    ///
+    /// Additive, and that is the property rather than a simplification. A tunnel outlives the
+    /// request that opened it, so the shared set both grows (the cage signs in somewhere and the
+    /// value is remembered) and turns over (the learned population evicts its oldest). Dropping a
+    /// needle here on the second would take back a value this direction was already watching for,
+    /// on a stream where the watching is the whole control; keeping it costs one finder over
+    /// bytes that are being scanned anyway.
+    ///
+    /// What it cannot do is see backwards. A value that had already begun crossing when this ran
+    /// is matched only from the piece the scan is handed next, which is the same limit any needle
+    /// has: the scan is per message and starts where it starts.
+    fn extend(&mut self, needles: &[SecretNeedle]) {
+        for needle in needles {
+            if self
+                .needles
+                .iter()
+                .any(|held| held.as_bytes() == needle.as_bytes())
+            {
+                continue;
+            }
+            self.keep = self.keep.max(needle.as_bytes().len().saturating_sub(1));
+            self.needles.push(needle.clone());
+            self.reported.push(false);
+        }
+    }
+
     /// A new application message begins: nothing carries across it.
     fn start_message(&mut self) {
         self.carry.clear();
@@ -522,13 +549,23 @@ impl FrameTee {
     ///
     /// Returns `None` when neither consumer is present, so a tunnel that neither captures nor scans
     /// is relayed without the framing being followed at all.
+    ///
+    /// `follow_anyway` overrides that, and it exists because a decoder cannot join a stream it did
+    /// not start with: a chunk boundary is not a frame boundary, so a direction relayed as a plain
+    /// pipe stays one for the life of the tunnel however the launch's needle set later grows. On a
+    /// tunnel that will never have a needle that costs nothing and buys nothing; under
+    /// [`crate::allowlist::WebsocketSecret::Block`], where the scan is what the posture promises,
+    /// it is the difference between the promise holding for a credential the cage acquires after
+    /// the `101` and not holding at all. The caller passes the posture, so the default one keeps
+    /// its plain pipe.
     pub(super) fn new(
         sink: Option<Arc<CapBuf>>,
         needles: &[SecretNeedle],
         deflate: Option<bool>,
+        follow_anyway: bool,
     ) -> Option<Self> {
         let scan = LeakScan::new(needles);
-        if sink.is_none() && scan.is_none() {
+        if sink.is_none() && scan.is_none() && !follow_anyway {
             return None;
         }
         Some(FrameTee {
@@ -549,6 +586,26 @@ impl FrameTee {
             compressed: false,
             fin: false,
         })
+    }
+
+    /// Take on the needle set as it stands now, for a direction that is already running.
+    ///
+    /// The request planes read the shared set once per request, so each request is watched with
+    /// what the launch knows by then. A tunnel has one read for its whole life, which on the one
+    /// transport built to stay open for hours means it watches for the values that existed at the
+    /// `101` and for nothing learned since: exactly the credential an agent acquires and then
+    /// exfiltrates. This is that read, repeated.
+    ///
+    /// A direction that had nothing to look for gains a scan here. One whose decoder has already
+    /// stopped ([`Self::done`]) gains nothing, because there is no longer a stream to scan.
+    pub(super) fn refresh_needles(&mut self, needles: &[SecretNeedle]) {
+        if self.done {
+            return;
+        }
+        match self.scan.as_mut() {
+            Some(scan) => scan.extend(needles),
+            None => self.scan = LeakScan::new(needles),
+        }
     }
 
     /// Hand one decoded piece to whichever consumers are present, and report whether the capture
@@ -951,7 +1008,7 @@ mod tests {
     fn tee(cap: usize) -> (FrameTee, Arc<CapBuf>) {
         let sink = Arc::new(CapBuf::new(cap));
         (
-            FrameTee::new(Some(sink.clone()), &[], None).expect("a sink is a consumer"),
+            FrameTee::new(Some(sink.clone()), &[], None, false).expect("a sink is a consumer"),
             sink,
         )
     }
@@ -960,7 +1017,7 @@ mod tests {
     fn deflating_tee(cap: usize, no_takeover: bool) -> (FrameTee, Arc<CapBuf>) {
         let sink = Arc::new(CapBuf::new(cap));
         (
-            FrameTee::new(Some(sink.clone()), &[], Some(no_takeover))
+            FrameTee::new(Some(sink.clone()), &[], Some(no_takeover), false)
                 .expect("a sink is a consumer"),
             sink,
         )
@@ -970,7 +1027,7 @@ mod tests {
     /// configures a secret and does not capture. Nothing about the leak scan may depend on the
     /// capture being on — that would make a security check follow a debugging setting.
     fn scanning_tee(needles: &[SecretNeedle], deflate: Option<bool>) -> FrameTee {
-        FrameTee::new(None, needles, deflate).expect("needles are a consumer")
+        FrameTee::new(None, needles, deflate, false).expect("needles are a consumer")
     }
 
     /// One `permessage-deflate` message, compressed against `c`'s running window and framed with
@@ -1715,7 +1772,7 @@ mod tests {
     /// exactly zero for a launch that uses neither.
     #[test]
     fn a_tunnel_with_nothing_to_do_builds_no_decoder() {
-        assert!(FrameTee::new(None, &[], None).is_none());
+        assert!(FrameTee::new(None, &[], None, false).is_none());
     }
 
     /// A control frame that declares more than RFC 6455 §5.5 allows is refused, not followed.
@@ -1821,7 +1878,8 @@ mod tests {
     #[test]
     fn a_full_capture_does_not_blind_the_scan() {
         let sink = Arc::new(CapBuf::new(4));
-        let mut t = FrameTee::new(Some(sink.clone()), &[needle()], None).expect("two consumers");
+        let mut t =
+            FrameTee::new(Some(sink.clone()), &[needle()], None, false).expect("two consumers");
         t.push(&frame(0x1, b"aaaaaaaaaaaa", None));
         assert!(captured(&sink).truncated, "the capture is full by now");
         t.push(&frame(0x1, b"late SECRET-VALUE-0123456789", None));

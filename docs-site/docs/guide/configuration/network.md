@@ -163,6 +163,17 @@ The way back is recorded and never closed, whichever setting you choose: a secre
 redaction, which a byte-for-byte relay cannot do without rewriting a stream two peers agreed
 on.
 
+The two settings also differ in what a tunnel watches for. sbx remembers a credential an app
+obtained by its own sign-in, so the set of values it scans for grows while a session runs, and
+a tunnel re-reads that set as it relays: a value learned an hour after the `101` is watched for
+on a tunnel that is still open. What a tunnel cannot do is start following the frames of a
+stream it has been relaying as a plain pipe, because a read boundary is not a frame boundary.
+So under `"block"` the framing is followed from the `101` whether or not there is anything to
+look for yet, while under `"warn"` a tunnel opened on a session with no secret at all and no
+[`capture`](../networking/observability#seeing-the-traffic-network-capture) stays a plain pipe
+for its whole life. If a session's agent signs in and you want that credential watched for on
+tunnels it opened first, `"block"` is the setting that does it.
+
 ## DNS resolution (`dns_cache_ttl`)
 
 Because the cage runs in an empty network namespace, the host-side proxy resolves each allowed

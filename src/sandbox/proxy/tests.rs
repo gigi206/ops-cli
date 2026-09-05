@@ -9916,6 +9916,194 @@ fn spawn_listening_ws_upstream() -> (
     (addr, ca_der, rx)
 }
 
+/// Like [`spawn_listening_ws_upstream`] but reports every read as it arrives rather than the whole
+/// stream at the close, so a test can order what it does next against what the tunnel has already
+/// carried.
+#[cfg(test)]
+fn spawn_reporting_ws_upstream() -> (
+    SocketAddr,
+    CertificateDer<'static>,
+    std::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    let ca = Arc::new(Ca::ephemeral().unwrap());
+    let ca_der = ca.ca_cert_der();
+    let server_config = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(CertResolver::new(ca))),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let Ok((sock, _)) = listener.accept() else {
+            return;
+        };
+        let Ok(conn) = ServerConnection::new(server_config) else {
+            return;
+        };
+        let mut tls = StreamOwned::new(conn, sock);
+        {
+            let mut br = BufReader::new(&mut tls);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match br.read_line(&mut line) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) if line == "\r\n" || line == "\n" => break,
+                    Ok(_) => {}
+                }
+            }
+        }
+        let _ = tls.write_all(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+              Connection: Upgrade\r\nSec-WebSocket-Accept: test-accept\r\n\r\n",
+        );
+        let _ = tls.flush();
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = tls.read(&mut buf) {
+            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+    (addr, ca_der, rx)
+}
+
+/// A WebSocket tunnel outlives the request that opened it, and the scan set grows while it is open:
+/// a credential the cage acquires by its own sign-in on another plane joins the shared set at any
+/// moment. A tunnel that read that set once at the `101` therefore watched, for hours, for values
+/// chosen before the interesting one existed, and the one a `block` posture exists to stop crossed
+/// with nothing looking for it.
+///
+/// Both arms of it. With a declared needle at the `101` the tunnel already follows its framing and
+/// the set has to grow; with none, under a `block` posture, there is nothing to follow it with, and
+/// a decoder cannot join a stream it did not start with because a chunk boundary is not a frame
+/// boundary. So the posture that promises the scan is the one that pays for the framing from the
+/// start. A launch that declares no secret at all is the ordinary shape of the second arm, since a
+/// learned credential is by definition one nobody declared.
+///
+/// The ordering is what makes this a measurement rather than a race: the first frame is waited for
+/// at the upstream, which proves the relay loop is running and has taken its snapshot, and only
+/// then is the credential learned and the second frame sent.
+#[test]
+fn a_credential_learned_after_a_tunnel_opens_is_scanned_on_it() {
+    for declared_at_open in [true, false] {
+        a_credential_learned_after_a_tunnel_opens_is_scanned(declared_at_open);
+    }
+}
+
+fn a_credential_learned_after_a_tunnel_opens_is_scanned(declared_at_open: bool) {
+    use crate::allowlist::WebsocketSecret;
+    use crate::sandbox::control::{LOG_RING_CAP, LogRing};
+    const LATE: &str = "LATE-LEARNED-VALUE-01234";
+
+    let (addr, upstream_ca, got) = spawn_reporting_ws_upstream();
+    let mut roots = RootCertStore::empty();
+    roots.add(upstream_ca).unwrap();
+    let upstream_cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+    let proxy_ca_der = proxy_ca.ca_cert_der();
+    let declared = match declared_at_open {
+        // Never sent: it is here only so the tunnel has a scan from the `101`, which makes this arm
+        // about a set that GROWS rather than one that starts empty.
+        true => vec![SecretNeedle::named(
+            "declared",
+            b"DECLARED-VALUE-0123456789".to_vec(),
+        )],
+        false => Vec::new(),
+    };
+    let ctx = Arc::new(
+        ProxyCtx::new(
+            proxy_ca,
+            policy(&["{WS} upstream.test:*"]).with_websocket_secret(WebsocketSecret::Block),
+        )
+        .unwrap()
+        .with_upstream(upstream_cfg)
+        .with_log(Arc::new(LogRing::new(LOG_RING_CAP)))
+        .with_redactions(declared)
+        .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+    );
+
+    let dir = TmpDir::new();
+    let path = dir.join("proxy.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    {
+        let ctx = Arc::clone(&ctx);
+        thread::spawn(move || {
+            let _ = serve(
+                listener,
+                ctx,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+        });
+    }
+    let mut sock = UnixStream::connect(&path).unwrap();
+    write!(
+        sock,
+        "CONNECT upstream.test:{} HTTP/1.1\r\n\r\n",
+        addr.port()
+    )
+    .unwrap();
+    sock.flush().unwrap();
+    let _ = read_until_blank(&mut sock).unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(proxy_ca_der).unwrap();
+    let client_config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = ServerName::try_from("upstream.test".to_string()).unwrap();
+    let conn = ClientConnection::new(Arc::new(client_config), name).unwrap();
+    let mut tls = StreamOwned::new(conn, sock);
+    tls.write_all(
+        b"GET /chat HTTP/1.1\r\nHost: upstream.test\r\nUpgrade: websocket\r\n\
+          Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+          Sec-WebSocket-Version: 13\r\n\r\n",
+    )
+    .unwrap();
+    tls.flush().unwrap();
+    let head = read_head_until_blank(&mut tls).unwrap();
+    assert!(head.contains("101 Switching Protocols"), "{head:?}");
+
+    // The tunnel is carrying frames: the relay loop is past its own setup.
+    tls.write_all(&ws_frame(0x1, b"hello", Some(CAGE_MASK)))
+        .unwrap();
+    tls.flush().unwrap();
+    let first = got
+        .recv_timeout(UPSTREAM_WAIT)
+        .expect("the upstream must receive the opening frame");
+    assert!(!first.is_empty(), "the tunnel carries frames");
+
+    // The cage signs in somewhere else, and the proxy learns the credential.
+    assert!(
+        ctx.credentials
+            .observe("authorization", &format!("Bearer {LATE}"), "api.test"),
+        "the learned needle is the premise of this test"
+    );
+
+    let leak = format!(r#"{{"send":"{LATE}"}}"#);
+    let frame = ws_frame(0x1, leak.as_bytes(), Some(CAGE_MASK));
+    tls.write_all(&frame).unwrap();
+    tls.flush().unwrap();
+    tls.conn.send_close_notify();
+    let _ = tls.flush();
+    drop(tls);
+
+    let mut rest = Vec::new();
+    while let Ok(chunk) = got.recv_timeout(UPSTREAM_WAIT) {
+        rest.extend_from_slice(&chunk);
+    }
+    assert!(
+        !rest.windows(frame.len()).any(|w| w == frame),
+        "a value learned after the tunnel opened must be watched for on it: the frame carrying \
+         it reached the upstream under a `block` posture (declared at open: {declared_at_open})"
+    );
+}
+
 /// Drive one tunnel in which the cage sends `payload` as a frame, and hand back what the upstream
 /// received.
 #[cfg(test)]
