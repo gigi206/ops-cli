@@ -122,7 +122,7 @@ pub(crate) fn synthesize(
     let mut usable: Vec<&LogEvent> = Vec::new();
     // Refusals another plane's proxy pushed into this session's ring, collapsed into one note: they
     // are counted rather than listed, because a task loop can produce thousands of them and the
-    // operator's question is "did any of my rules come from a task?", not "which".
+    // operator's question is "did any of my rules come from somewhere else?", not "which".
     let mut foreign = 0usize;
     for e in events {
         if !LEARNABLE.contains(&e.reason.as_str()) {
@@ -154,9 +154,10 @@ pub(crate) fn synthesize(
     }
     if foreign > 0 {
         notes.push(format!(
-            "skipped {foreign} egress refusal(s) a declared task's own proxy logged — a \
-             task's `network` list is declared with the task, so opening those here would \
-             widen this profile for something the task, not the app, asked for"
+            "skipped {foreign} egress refusal(s) another plane logged into this session's ring — \
+             a declared task's proxy, a distro build's, or one whose origin was not recorded. \
+             What such a refusal asked for is declared with the task or the build, so opening it \
+             here would widen this profile for something the app never asked for"
         ));
     }
 
@@ -1093,7 +1094,7 @@ mod tests {
             out.rules
         );
         assert!(
-            out.notes.iter().any(|n| n.contains("declared task")),
+            out.notes.iter().any(|n| n.contains("another plane")),
             "and the skip must be surfaced, not silent: {:?}",
             out.notes
         );
@@ -1116,6 +1117,58 @@ mod tests {
         );
 
         // The agent's own refusal for the same destination is learned exactly as before.
+        assert_eq!(
+            synthesize(
+                &[ev(
+                    "evil.test",
+                    443,
+                    Some("GET"),
+                    Some("/x"),
+                    "denied-default"
+                )],
+                &empty_policy(),
+                Granularity::Domain,
+            )
+            .rules,
+            vec!["{*} https://evil.test".to_string()]
+        );
+    }
+
+    /// Every plane the ring can carry that is not the agent's is named here, so the gate stays a
+    /// positive list.
+    ///
+    /// [`from_agent`] admits [`Plane::Agent`] and nothing else, which is the shape that holds: a
+    /// plane added later is excluded until someone says otherwise. Rewritten as a negative list —
+    /// "everything except a task's" — it would admit each new plane silently, and a distro build's
+    /// refusals are exactly the ones that would then widen the agent's allowlist for commands the
+    /// project's own build wrote. Naming each plane is what makes that rewrite fail here.
+    #[test]
+    fn no_plane_but_the_agents_is_learned_from() {
+        for plane in [Plane::Task, Plane::Build, Plane::Unknown] {
+            let refusal = ev_from(
+                "evil.test",
+                443,
+                Some("GET"),
+                Some("/x"),
+                "denied-default",
+                Proto::Https,
+                plane,
+            );
+            let out = synthesize(&[refusal], &empty_policy(), Granularity::Domain);
+            assert!(
+                out.rules.is_empty(),
+                "a refusal on {plane:?} must not become an app rule: {:?}",
+                out.rules
+            );
+            assert!(
+                out.notes.iter().any(|n| n.contains("another plane")),
+                "and the skip must be surfaced, not silent, on {plane:?}: {:?}",
+                out.notes
+            );
+        }
+
+        // The witness: the identical refusal on the agent's own plane is still learned, so the
+        // assertions above cannot be satisfied by a synthesizer that learns nothing at all.
         assert_eq!(
             synthesize(
                 &[ev(
