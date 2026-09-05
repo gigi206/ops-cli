@@ -398,6 +398,14 @@ static OPENAT2_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
 /// whole difference between reaching the cage's `/etc/hostname` and reaching ours, and it also means
 /// the walk from here cannot leave the cage whatever it meets.
 ///
+/// `RESOLVE_IN_ROOT` also settles the *other* way a walk leaves a root: a **magic link**, the jump the
+/// kernel performs for `/proc/self`, `/proc/<pid>/root` and `/proc/<pid>/fd/N`. Those are not
+/// symlinks a filesystem holds, so confining symlink targets says nothing about them — but the
+/// kernel refuses one outright in a scoped lookup (`EXDEV`, in `nd_jump_link`), which is why
+/// `RESOLVE_NO_MAGICLINKS` beside it would change no answer this walk gives. Measured: a cage that
+/// spells `/proc/self/root/<path>` is answered about nothing rather than about the supervisor's own
+/// root, which is where `self` would otherwise land.
+///
 /// `absolute` is the path the supervisor's own walk ended on, which for the case that brings a
 /// caller here — a symlink target beginning with `/` — is the path the cage's kernel resolves too.
 /// The limit that leaves: an object the cage reaches under a *different* path than this process does
@@ -463,9 +471,10 @@ pub(super) fn probe_in_cage_root(pid: u32, absolute: &Path) -> Result<libc::c_in
         // This is not covered by a test: reproducing it needs a kernel that lacks the operation.
         crate::diag::warn(
             "this kernel does not offer `openat2` (it landed in 5.6), which is what lets the \
-             supervisor resolve a path the way the cage would; under `[fs] scan` an open whose walk \
-             leaves the cage's own mounts is refused rather than answered from a resolution this \
-             process's root steered",
+             supervisor resolve a path the way the cage would; without it an open whose walk leaves \
+             the cage's own mounts is refused rather than answered from a resolution this process's \
+             root steered, and a refused `execve` is answered with the stricter errno rather than \
+             one that says whether the name is there",
         );
     }
     Err(err)

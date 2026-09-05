@@ -146,7 +146,7 @@ use notify::{
     notif_id_valid, notif_of, notif_recv_code, poll_events, poll_readable, recv_fd,
     respond_continue, respond_errno,
 };
-use open_lens::{OpenLens, handle_open};
+use open_lens::{OpenLens, handle_open, probe_in_cage_root};
 use pending::SWEEP_EVERY;
 use report::{Undecidable, unmatched_word};
 use target::{exec_args, open_args, read_exec_path};
@@ -835,14 +835,37 @@ fn caller_chain(cx: &Deciding<'_>, pid: u32) -> Vec<String> {
 /// The target's path is read in **its** mount namespace, so existence is tested through
 /// `/proc/<pid>/root`. Anything that cannot be resolved that way (a relative path, a dead target)
 /// keeps `EPERM`, the stricter answer.
+///
+/// Resolved through [`probe_in_cage_root`] rather than by a plain `exists()` on the joined path,
+/// and that is a security choice even though the errno is not. Prefixing `/proc/<pid>/root` puts
+/// the walk on the cage's mounts only until it meets a symlink whose target begins with `/`: such a
+/// target restarts resolution at the *resolving* process's root, which is this one's. A cage that
+/// plants `ln -s / /tmp/x` and then asks about `/tmp/x/<anything>` reads the answer off the host's
+/// filesystem, one name per refused `execve` -- and under [`crate::proc_policy::ProcMode::Confine`], where every
+/// unmatched target is refused, it can ask about any absolute path at all. The same rule is written
+/// out at [`open_lens::vouched_probe`], for the same walk; this is the second caller of it.
+///
+/// That walk closes the second route out of a root as well, and this is the caller that needs it:
+/// `/proc/self` names the process doing the resolving, so a cage that spells
+/// `/proc/self/root/<path>` would otherwise be answered about the supervisor's filesystem. A scoped
+/// lookup refuses a magic link outright, so nothing further is asked for here — see
+/// [`probe_in_cage_root`].
 fn refusal_errno(pid: u32, path: &str) -> libc::c_int {
     if !path.starts_with('/') {
         return libc::EPERM;
     }
-    if Path::new(&format!("/proc/{pid}/root{path}")).exists() {
-        libc::EPERM
-    } else {
-        libc::ENOENT
+    match probe_in_cage_root(pid, Path::new(path)) {
+        Ok(fd) => {
+            // SAFETY: fd is this call's own descriptor, returned by the probe and closed once.
+            // Nothing is read through it -- the question was whether it could be opened at all.
+            unsafe { libc::close(fd) };
+            libc::EPERM
+        }
+        // The only errno that keeps a name lookup walking, and the only one this asks about.
+        // Anything else (a directory it may not traverse, a kernel without `openat2`) is a path
+        // this supervisor could not establish, which takes the stricter answer.
+        Err(libc::ENOENT) => libc::ENOENT,
+        Err(_) => libc::EPERM,
     }
 }
 

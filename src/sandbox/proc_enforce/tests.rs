@@ -2854,6 +2854,147 @@ fn a_probe_whose_own_reads_did_not_answer_is_allowed_but_never_in_silence() {
     }
 }
 
+/// Locate `bwrap` on `PATH`, for the one test below that needs a second mount namespace.
+///
+/// The cage is the fixture: what is under test is a walk through `/proc/<pid>/root`, and this
+/// process is its own root, so with no second namespace the two answers coincide and nothing is
+/// measured. `None` where the host has no `bwrap`; on a host that has one the test runs, which is
+/// the only state its assertions mean anything in.
+fn bwrap_on_path() -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join("bwrap"))
+            .find(|c| c.is_file())
+    })
+}
+
+/// A refusal's errno answers about the **cage's** filesystem, whatever the cage points a name at.
+///
+/// The errno a denied `execve` carries is chosen by asking whether the target is there, because a
+/// name lookup only keeps walking `PATH` on `ENOENT`. Asked with a plain `Path::exists()` on
+/// `/proc/<pid>/root<path>`, that walk leaves the cage the moment it meets a symlink whose target
+/// begins with `/`: such a target restarts resolution at the *resolving* process's root, which is
+/// the supervisor's. A cage that plants `ln -s / /tmp/x` then reads the host's filesystem one
+/// answer at a time, and under `confine` -- where every unmatched target is refused -- it can ask
+/// about any absolute path at all.
+///
+/// The cage here holds `/usr` and nothing else, so `/etc/hostname` is absent from it and present on
+/// the host: the two arms of the oracle. What the fix owes is that they become the same answer,
+/// while the errno still tells a name the cage really has from one it does not.
+#[test]
+fn a_refusal_asks_about_the_cage_and_not_about_the_host_behind_an_absolute_link() {
+    let Some(bwrap) = bwrap_on_path() else {
+        return;
+    };
+    let dir = TmpDir::new();
+    let mut cage = match std::process::Command::new(bwrap)
+        .args(["--unshare-user", "--unshare-net", "--unshare-ipc", "--unshare-uts"])
+        .args(["--ro-bind", "/usr", "/usr"])
+        .args(["--symlink", "usr/bin", "/bin"])
+        .args(["--symlink", "usr/lib", "/lib"])
+        // The loader lives under one of the two on every host that has either; a link to a
+        // directory that is not there is inert.
+        .args(["--symlink", "usr/lib64", "/lib64"])
+        .args(["--tmpfs", "/tmp"])
+        // A fresh procfs, because it carries the second route out of a root: the kernel's own
+        // magic links, which `RESOLVE_IN_ROOT` does not confine.
+        .args(["--proc", "/proc"])
+        .arg("--bind")
+        .arg(dir.path())
+        .arg("/out")
+        .args([
+            "/usr/bin/sh",
+            "-c",
+            // The link is the whole fixture: an absolute target is what restarts a walk at the
+            // resolver's root. The pid is the cage's own, written where this process can read it,
+            // because a pid guessed from the process tree is a race.
+            "ln -s / /tmp/x; echo $$ > /out/pid; exec sleep 30",
+        ])
+        .spawn()
+    {
+        Ok(child) => child,
+        // A host that cannot stand up a user namespace cannot host a cage at all.
+        Err(_) => return,
+    };
+    let pid_file = dir.join("pid");
+    let mut pid = None;
+    for _ in 0..200 {
+        if let Ok(text) = std::fs::read_to_string(&pid_file)
+            && let Ok(n) = text.trim().parse::<u32>()
+        {
+            pid = Some(n);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // Every answer is taken before the cage is torn down, so a failing assertion cannot leave a
+    // `sleep` behind.
+    let answers = pid.map(|pid| {
+        [
+            ("/usr", refusal_errno(pid, "/usr")),
+            ("/no-such-name-in-either", refusal_errno(pid, "/no-such-name-in-either")),
+            ("/etc/hostname", refusal_errno(pid, "/etc/hostname")),
+            ("/tmp/x/etc/hostname", refusal_errno(pid, "/tmp/x/etc/hostname")),
+            ("/tmp/x/no-such-name-in-either", refusal_errno(pid, "/tmp/x/no-such-name-in-either")),
+            (
+                "/proc/self/root/etc/hostname",
+                refusal_errno(pid, "/proc/self/root/etc/hostname"),
+            ),
+            (
+                "/proc/self/root/no-such-name-in-either",
+                refusal_errno(pid, "/proc/self/root/no-such-name-in-either"),
+            ),
+        ]
+    });
+    let _ = cage.kill();
+    let _ = cage.wait();
+
+    let answers = answers.expect("the cage never reported its pid");
+    let at = |name: &str| {
+        answers
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, e)| *e)
+            .expect("asked for")
+    };
+
+    // The witness: the probe still tells a name the cage has from one it does not, or the equality
+    // below would be satisfied by a probe that answers `ENOENT` to everything.
+    assert_eq!(at("/usr"), libc::EPERM, "a name the cage has is not absent");
+    assert_eq!(
+        at("/no-such-name-in-either"),
+        libc::ENOENT,
+        "a name nothing has is absent, which is what keeps a `PATH` walk walking"
+    );
+    assert_eq!(
+        at("/etc/hostname"),
+        libc::ENOENT,
+        "the cage does not hold `/etc`, so naming it directly is absent"
+    );
+
+    // The finding: the same file named through an absolute link the cage planted must answer the
+    // same way, rather than reporting what the host holds.
+    assert_eq!(
+        at("/tmp/x/etc/hostname"),
+        at("/tmp/x/no-such-name-in-either"),
+        "a path the cage does not hold answers the same whether or not the host holds it"
+    );
+    assert_eq!(
+        at("/tmp/x/etc/hostname"),
+        libc::ENOENT,
+        "and the answer is the one the cage's own walk would have met"
+    );
+
+    // The second route out of a root, and the reason the walk refuses magic links: `/proc/self`
+    // names the process doing the resolving, so a cage that spells it reads the supervisor's root
+    // through a walk `RESOLVE_IN_ROOT` alone would not have confined.
+    assert_eq!(
+        at("/proc/self/root/etc/hostname"),
+        at("/proc/self/root/no-such-name-in-either"),
+        "a magic link answers about the supervisor, so it answers about nothing at all"
+    );
+}
+
 #[test]
 fn an_open_the_lens_cannot_name_is_counted_because_it_leaves_nothing_else_behind() {
     // Unlike an exec, an open the lens could not name leaves no trace at all: this lens records
