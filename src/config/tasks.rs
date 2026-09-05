@@ -969,6 +969,14 @@ fn validate_task_network(raw: &[String]) -> Result<Vec<Rule>, String> {
 /// whoever set the variable. This is an allowlist-shaped check on purpose — the `[env]`
 /// reserved-key denylist is untrusted-*config*-only (a trusted config harms only itself), while a
 /// caller reaching in over the control socket is a different actor entirely.
+///
+/// The list here and [`crate::config::is_reserved_env_key`]'s are not meant to match: they answer
+/// different questions about different populations. They do disagree on one *fact*, and this is the
+/// side that is behind — an interpreter's import path runs code before the program's first line,
+/// which is why `PYTHONPATH` is refused here while `NODE_PATH`, `CLASSPATH` and `PERL5LIB` are not.
+/// That costs nothing as it stands: a task declaration is trusted by location, and `env_allow` is
+/// validated by this same function, so no untrusted layer reaches either. It starts costing
+/// something the day `env_allow` can be widened by less than a trusted config.
 pub(super) fn validate_env_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("an environment variable name is empty".to_string());
