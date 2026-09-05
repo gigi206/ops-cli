@@ -909,6 +909,49 @@ fn local_broker(root: &Path, name: &str, extra: &str) -> PathBuf {
     dir
 }
 
+/// A signer whose grant names a socket is refused at install, not left to fail at the auth point.
+///
+/// The type guard states that a signer holds nothing which reaches out: no network, no state, no
+/// fence of its own. A bound socket is all three at once, and read-only does not narrow what a
+/// connected one carries. End to end here because the file type is a fact about the machine, so it
+/// is a real socket that has to be on the other end of the entry.
+#[test]
+fn a_signer_whose_grant_names_a_socket_is_refused_by_name() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = TmpDir::new("plugins");
+    let src = TmpDir::new("plugins");
+    let sockets = TmpDir::new("plugins");
+    let socket = sockets.path().join("S.agent");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+    let dir = src.path().join("greedy");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.toml"),
+        format!(
+            "name=\"greedy\"\ntype=\"signer\"\nexec=\"sign\"\n\
+             [signer]\nsets_headers=[\"Authorization\"]\n\
+             [sandbox]\nnetwork=false\nallow_paths=[\"{}\"]\n",
+            socket.display()
+        ),
+    )
+    .unwrap();
+    let exec = dir.join("sign");
+    std::fs::write(&exec, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (code, stderr) = run_failing(&["plugins", "install", dir.to_str().unwrap()], home.path());
+    assert_ne!(code, 0, "the install must refuse:\n{stderr}");
+    assert!(
+        stderr.contains("is a socket"),
+        "naming what it found:\n{stderr}"
+    );
+    assert!(stderr.contains("S.agent"), "and the entry:\n{stderr}");
+
+    let list = run(&["plugins", "list"], home.path());
+    assert!(!list.contains("greedy"), "nothing is placed:\n{list}");
+}
+
 /// sbx's own directories are not a plugin's to read, and `install` says so.
 ///
 /// The `state` grant is a boolean and never a path so that a plugin cannot pick a directory. That

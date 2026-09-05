@@ -91,12 +91,14 @@ pub(crate) fn check_kind_sandbox(kind: PluginKind, grant: &SandboxGrant) -> Resu
     }
 }
 
-/// The rule a plugin's **type** imposes on what its grant paths may *be*, checked where they are
-/// about to become mounts.
+/// The rule a plugin's **type** imposes on what its grant paths may *be*.
 ///
 /// The companion of [`check_kind_sandbox`], and it exists because that one cannot answer this
 /// question: `network`, `state` and `brokers` are fields of the manifest, while a path's file type
-/// is a fact about the machine at the moment the cage is built.
+/// is a fact about the machine. Applied twice for the reason its companion is: once when the
+/// manifest is loaded, so a bad declaration is refused with a reason its author can act on, and
+/// once at the spawn, where the grant is honoured and where the variable-valued paths have
+/// resolved.
 ///
 /// A broker and a signer stand in front of a credential, and the three grants they are refused all
 /// rest on the same premise — the plugin holds nothing that reaches out. A bound **socket** defeats
@@ -209,7 +211,7 @@ pub(crate) fn check_grant_control_plane_for<'a>(
         let canon = crate::trust::canonicalize_existing_prefix(path);
         if let Some(root) = roots.iter().find(|r| canon.starts_with(r)) {
             return Err(format!(
-                "a `{field}` entry names `{}`, which is inside sbx's own control plane `{}` — \
+                "an `{field}` entry names `{}`, which is inside sbx's own control plane `{}` — \
                  a plugin's grant does not reach the directory holding the other plugins' \
                  credentials, the store caches, or the trust markers",
                 path.display(),
@@ -1058,6 +1060,16 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<Plugin>, String> {
     // list can be answered here: what `allow_env_paths` resolves to is a fact about the host at
     // launch, and it is held to the same rule there.
     check_grant_control_plane(
+        sandbox
+            .allow_paths
+            .iter()
+            .map(|p| ("allow_paths", p.as_path())),
+    )?;
+    // The type's rule on what a path may be, for the same reason and with the same reach: only the
+    // literal list can be answered here, and an entry that is not there yet is not a refusal, so
+    // the spawn asks again once every path has resolved.
+    check_kind_grant_paths(
+        kind,
         sandbox
             .allow_paths
             .iter()
