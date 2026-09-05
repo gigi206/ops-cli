@@ -4688,6 +4688,44 @@ fn an_upstream_that_closes_without_answering_is_refused_rather_than_relayed_empt
     );
 }
 
+/// The same ceiling on the cleartext plane, which reaches it by a second route.
+///
+/// Stopping the head relay is not enough on its own here. Past the ceiling there is no final head,
+/// so the framing is "read to the close", and a plane that did not ask why would hand what remains
+/// of the upstream's stream to the client as a body: the flood crosses anyway, on a leg whose read
+/// bound the response stream has already lifted. So this plane answers the refusal like the other
+/// two rather than falling through to the body relay.
+#[test]
+fn a_cleartext_upstream_flooding_interim_heads_is_refused_too() {
+    let mut wire = Vec::new();
+    for _ in 0..64 {
+        wire.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+    }
+    let response: &'static [u8] = Box::leak(wire.into_boxed_slice());
+    let (addr, _up_head) = spawn_plain_upstream(response);
+    let port = addr.port();
+    let rule = format!("http://upstream.test:{port}");
+    let ctx = Arc::new(
+        ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), policy(&[rule.as_str()]))
+            .unwrap()
+            .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+    );
+    let request = format!(
+        "GET http://upstream.test:{port}/path HTTP/1.1\r\nHost: upstream.test:{port}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let resp = through_cleartext(ctx, request.as_bytes()).unwrap();
+    let crossed = resp.matches("100 Continue").count();
+    assert!(
+        crossed < 64,
+        "the flood must stop at the ceiling on this plane too, {crossed} crossed: {resp:?}"
+    );
+    assert!(
+        resp.contains("502") && resp.contains("interim-head-cap"),
+        "and the client must be told which ceiling ended its request: {resp:?}"
+    );
+}
+
 /// The ceiling on interim heads, on the plane that answers it. The upstream never sends a final
 /// head at all, so the exchange ends in a refusal either way: what this pins is *which* one, since
 /// an upstream cut off for flooding the client is not one that closed, and a reader chasing a

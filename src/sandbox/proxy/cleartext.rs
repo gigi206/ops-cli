@@ -271,6 +271,7 @@ pub(super) fn handle_cleartext(
     let RelayedHead {
         head: resp_head,
         framing,
+        no_final,
         ..
     } = relay_response_head(
         &mut up_br,
@@ -283,6 +284,29 @@ pub(super) fn handle_cleartext(
         // words rather than in whatever the upstream chose to answer.
         ClientLeg::Close,
     )?;
+    // An upstream that produced no final head is answered rather than fallen through, and on this
+    // plane that is load-bearing rather than symmetry with the other two. With no final head the
+    // framing is "read to the close", so the body relay below would hand whatever the upstream is
+    // still sending to the client as a body: an upstream cut off for flooding interim heads would
+    // have its flood carried anyway, past the ceiling that stopped the head relay, on a leg whose
+    // read bound `begin_response_stream` has already lifted.
+    if let Some(why) = no_final {
+        ctx.push_log(
+            crate::sandbox::control::Proto::Http,
+            &host,
+            port,
+            Some(method),
+            Some(&path),
+            crate::sandbox::control::LogVerdict::Error,
+            why.tag(),
+        );
+        return write_refusal(
+            &mut client,
+            "502 Bad Gateway",
+            why.tag(),
+            &why.sentence(&host),
+        );
+    }
     if let Some(code) = parse_status_code(&resp_head)
         && code >= 200
     {
