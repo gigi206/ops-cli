@@ -627,13 +627,25 @@ async fn relay(
         // sbx's `identity` below is the only offer the upstream sees. Same rule, same reason and
         // same one question (`masks_reflection`) as the HTTP/1.1 serializer's; a plane that skipped
         // it would relay a compressed body the mask cannot read a value out of.
-        if masks_reflection && n.eq_ignore_ascii_case("accept-encoding") {
+        //
+        // Two headers rather than one, because this is the plane that carries gRPC and gRPC does
+        // not use the HTTP content coding: it compresses each MESSAGE under its own negotiation,
+        // `grpc-accept-encoding`, inside a body the HTTP layer calls uncompressed. Asking only for
+        // `identity` on the HTTP header would leave the mask reading gzip members and finding
+        // nothing, on the transport where an injected credential most often travels.
+        if masks_reflection
+            && super::IDENTITY_ENCODINGS
+                .iter()
+                .any(|(name, _)| n.eq_ignore_ascii_case(name))
+        {
             continue;
         }
         builder = builder.header(name, value);
     }
     if masks_reflection {
-        builder = builder.header("accept-encoding", "identity");
+        for (name, value) in super::IDENTITY_ENCODINGS {
+            builder = builder.header(name, value);
+        }
     }
     for (h, v) in &injected {
         builder = builder.header(h.as_str(), v.as_str());
@@ -3149,30 +3161,52 @@ mod tests {
                 &ctx,
                 "grpc.test",
                 addr.port(),
-                grpc_request(&[("accept-encoding", "gzip, br")]),
+                grpc_request(&[
+                    ("accept-encoding", "gzip, br"),
+                    ("grpc-accept-encoding", "gzip"),
+                ]),
                 None,
                 &trace,
             );
             assert_eq!(answer.status, StatusCode::OK, "the stream was relayed");
 
             let seen = trace.seen_one();
-            let encodings: Vec<&String> = seen
-                .headers
-                .iter()
-                .filter(|(n, _)| n == "accept-encoding")
-                .map(|(_, v)| v)
-                .collect();
+            let seen_values = |name: &str| -> Vec<String> {
+                seen.headers
+                    .iter()
+                    .filter(|(n, _)| n == name)
+                    .map(|(_, v)| v.clone())
+                    .collect()
+            };
             match scanned {
-                true => assert_eq!(
-                    encodings,
-                    vec!["identity"],
-                    "a response that will be scanned is asked for uncompressed, once: {seen:?}"
-                ),
-                false => assert_eq!(
-                    encodings,
-                    vec!["gzip, br"],
-                    "a response nothing scans keeps the client's own offer: {seen:?}"
-                ),
+                true => {
+                    assert_eq!(
+                        seen_values("accept-encoding"),
+                        vec!["identity"],
+                        "a response that will be scanned is asked for uncompressed, once: {seen:?}"
+                    );
+                    // gRPC compresses per message under its own negotiation, which the HTTP
+                    // content coding says nothing about: a `gzip` here would hand the mask
+                    // compressed messages inside an uncompressed body.
+                    assert_eq!(
+                        seen_values("grpc-accept-encoding"),
+                        vec!["identity"],
+                        "and its gRPC twin is asked for the same, or the mask reads nothing on \
+                         the plane that carries gRPC: {seen:?}"
+                    );
+                }
+                false => {
+                    assert_eq!(
+                        seen_values("accept-encoding"),
+                        vec!["gzip, br"],
+                        "a response nothing scans keeps the client's own offer: {seen:?}"
+                    );
+                    assert_eq!(
+                        seen_values("grpc-accept-encoding"),
+                        vec!["gzip"],
+                        "on both headers: {seen:?}"
+                    );
+                }
             }
         }
     }

@@ -8621,7 +8621,8 @@ fn a_response_that_will_be_scanned_is_asked_for_uncompressed() {
             "host.test",
             "host.test",
             addr.port(),
-            b"GET /p HTTP/1.1\r\nHost: host.test\r\nAccept-Encoding: gzip, br\r\n\r\n",
+            b"GET /p HTTP/1.1\r\nHost: host.test\r\nAccept-Encoding: gzip, br\r\n\
+              Grpc-Accept-Encoding: gzip\r\n\r\n",
         )
         .unwrap();
         assert!(resp.contains("200"), "the exchange must complete: {resp:?}");
@@ -8629,11 +8630,17 @@ fn a_response_that_will_be_scanned_is_asked_for_uncompressed() {
             .recv_timeout(UPSTREAM_WAIT)
             .expect("the upstream received a request")
             .to_ascii_lowercase();
+        // Matched per line, because `grpc-accept-encoding: identity` contains the other header's
+        // spelling as a substring and a `contains` over the whole head would accept either one
+        // alone.
+        let lines: Vec<&str> = head.lines().map(str::trim_end).collect();
         match scanned {
             true => {
                 assert!(
-                    head.contains("accept-encoding: identity"),
-                    "a response that will be scanned must be asked for uncompressed: {head:?}"
+                    lines.contains(&"accept-encoding: identity")
+                        && lines.contains(&"grpc-accept-encoding: identity"),
+                    "a response that will be scanned must be asked for uncompressed on both the \
+                     HTTP coding and gRPC's own: {lines:?}"
                 );
                 assert!(
                     !head.contains("gzip"),
@@ -8641,8 +8648,8 @@ fn a_response_that_will_be_scanned_is_asked_for_uncompressed() {
                 );
             }
             false => assert!(
-                head.contains("accept-encoding: gzip, br"),
-                "a response nothing scans keeps the client's own offer: {head:?}"
+                lines.contains(&"accept-encoding: gzip, br"),
+                "a response nothing scans keeps the client's own offer: {lines:?}"
             ),
         }
     }

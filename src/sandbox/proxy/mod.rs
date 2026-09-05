@@ -173,8 +173,9 @@
 //! carries content the agent legitimately needs, so refusing it would deny a real result; both are
 //! the *same backstop class* with the same evasions — a re-encoded value, or one split across a
 //! framing boundary — and neither is the boundary. Compression is not among them: a request whose
-//! response this masks is forwarded asking for [`ACCEPT_ENCODING_IDENTITY`], so what comes back is
-//! bytes the scan can read rather than the same value spelled as DEFLATE symbols. Its residual is *corruption-on-collision*: unlike
+//! response this masks is forwarded asking for [`IDENTITY_ENCODINGS`], both the HTTP content coding
+//! and gRPC's own, so what comes back is bytes the scan can read rather than the same value spelled
+//! as DEFLATE symbols. Its residual is *corruption-on-collision*: unlike
 //! the outbound refusal, masking mutates the stream, so a secret value that coincided with bytes of
 //! a legitimate injection-host response would be struck out of it — again entropy- and
 //! minimum-length-mitigated, and confined to the one injection-target host.
@@ -1487,21 +1488,31 @@ fn carries_secret(head_bytes: &[u8], redactions: &[SecretNeedle], dest: &str) ->
         .any(|n| n.find_in(head_bytes, 0).is_some())
 }
 
-/// The `Accept-Encoding` a request carries upstream when its response will be scanned for a
-/// reflected credential.
+/// The content codings a request carries upstream when its response will be scanned for a
+/// reflected credential, replacing whatever the client asked for.
 ///
 /// The inbound mask ([`pump_redacting`], and its HTTP/2 twin) strikes out **verbatim** occurrences,
 /// and a compressed body contains none: the value is there, spelled as DEFLATE symbols, and the
 /// scan reads past it. Since most clients offer `gzip` and an injection target is by definition an
-/// API, the mask was inert on the ordinary exchange it exists for.
+/// API, the mask is inert on the ordinary exchange it exists for unless the request says otherwise.
 ///
-/// Asked for explicitly rather than by dropping the header, because RFC 9110 §12.5.3 leaves a
+/// Two headers, because they negotiate two different layers and a body can be compressed under
+/// either. `accept-encoding` is the HTTP content coding. `grpc-accept-encoding` is gRPC's own, which
+/// compresses each **message** inside a body the HTTP layer calls uncompressed, and it travels on
+/// the HTTP/2 plane that carries gRPC as well as on the HTTP/1.1 planes that can carry gRPC-Web. A
+/// request that asked for only one of the two would hand the mask compressed bytes by the other
+/// route.
+///
+/// Asked for explicitly rather than by dropping the headers, because RFC 9110 §12.5.3 leaves a
 /// request that names no coding open to whatever the server prefers; `identity` says what sbx
 /// needs. The cost is paid only where the mask applies: an exchange with a host an injection
 /// targets gives up compression, and every other response is relayed with the client's own offer
 /// intact — which is the same scoping [`CredentialSet::masks_reflection_for`] already draws, and
 /// the reason it is that function and not a second rule.
-const ACCEPT_ENCODING_IDENTITY: &str = "accept-encoding: identity";
+const IDENTITY_ENCODINGS: [(&str, &str); 2] = [
+    ("accept-encoding", "identity"),
+    ("grpc-accept-encoding", "identity"),
+];
 
 /// Reserialize a request head for forwarding upstream: keep the request line and headers, but drop
 /// any client `Connection`/`Proxy-Connection` — the proxy owns hop-by-hop semantics on both legs and
@@ -1559,7 +1570,11 @@ fn reserialize_request(
         // The client's own content codings, dropped so sbx's `identity` below is the only offer the
         // upstream sees. Leaving the client's beside it is the same dodge the injected headers
         // close: the upstream would be free to honour `gzip` and the mask would read nothing.
-        if force_identity_encoding && k.eq_ignore_ascii_case("accept-encoding") {
+        if force_identity_encoding
+            && IDENTITY_ENCODINGS
+                .iter()
+                .any(|(name, _)| k.eq_ignore_ascii_case(name))
+        {
             continue;
         }
         out.push_str(k);
@@ -1568,8 +1583,12 @@ fn reserialize_request(
         out.push_str("\r\n");
     }
     if force_identity_encoding {
-        out.push_str(ACCEPT_ENCODING_IDENTITY);
-        out.push_str("\r\n");
+        for (name, value) in IDENTITY_ENCODINGS {
+            out.push_str(name);
+            out.push_str(": ");
+            out.push_str(value);
+            out.push_str("\r\n");
+        }
     }
     for (name, value) in injections {
         out.push_str(name);
