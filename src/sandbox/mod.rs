@@ -22,7 +22,9 @@ mod fhs;
 mod launch;
 pub(crate) mod locks;
 pub(crate) mod memfd;
-mod naming;
+// Reaches outside `sandbox`: the storage helper's cage names itself with `cage_hostname`, so the
+// `sbx-` prefix has one definition rather than a literal per cage.
+pub(crate) mod naming;
 mod openuri;
 mod pty;
 mod smoke;

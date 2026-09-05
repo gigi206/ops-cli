@@ -81,6 +81,12 @@ there is no setuid binary to attack. The hardening flags below are emitted
 > supervisor establishes the session itself and keeps the pty master, so the launching
 > terminal stays unreachable either way.
 
+> **The helpers sbx runs for itself.** Two argument lists are assembled by hand rather than
+> through the cage builder, because what they run is fixed and no configuration has been
+> resolved yet: the one driving `mise` over a project's own files, and the one formatting a
+> storage image. Both carry the same baseline as the cage above, the syscall denylist included,
+> and a test compares the three lists flag by flag so the two copies cannot fall behind.
+
 > **The `--die-with-parent` nuance.** The flag arms a signal that kills the cage when the
 > process supervising it dies, so it belongs on every launch that has such a process. One
 > shape does not: a `--detach`ed session that needs no proxy, broker, ssh-agent, forward,

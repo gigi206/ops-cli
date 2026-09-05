@@ -57,7 +57,7 @@ const MISE_PROJECT: &str = "/project";
 /// One project mise file as exposed to mise: a host source (the materialized,
 /// already-hashed bytes) bound read-only at an in-sandbox destination under
 /// [`MISE_PROJECT`].
-struct ProjectBind {
+pub(super) struct ProjectBind {
     /// Host path of the staged file to bind read-only.
     src: PathBuf,
     /// In-sandbox path it appears at (`/project/<filename>`), also what mise
@@ -290,7 +290,11 @@ fn ensure_home(layout: &Layout) -> io::Result<PathBuf> {
 /// set; their in-sandbox paths are also named in `MISE_TRUSTED_CONFIG_PATHS` so mise
 /// loads them without a trust prompt. Empty for a config-free invocation, which is
 /// run from the private home instead and trusts nothing.
-fn bwrap_argv(
+///
+/// The hardening below is the keystone's, reproduced here rather than inherited. What holds the
+/// two in step is a test, not this sentence:
+/// [`crate::sandbox::argv`]'s `the_hand_built_argument_lists_carry_the_keystones_hardening`.
+pub(super) fn bwrap_argv(
     store_nix: &Path,
     home_src: &Path,
     project_binds: &[ProjectBind],
@@ -321,9 +325,18 @@ fn bwrap_argv(
     a.push(lit("--die-with-parent"));
     // The same unconditional capability drop the main cage's `to_argv` applies (bwrap then also
     // sets no_new_privs itself). This argv is hand-built — mise runs before a `SandboxSpec` exists —
-    // so it is set explicitly here rather than inherited; keep it in step with `to_argv`'s baseline.
+    // so it is set explicitly here rather than inherited.
     a.push(lit("--cap-drop"));
     a.push(lit("ALL"));
+    // A session of its own, so this cage cannot reach the terminal sbx was launched from. The
+    // syscall filters do not cover this: they refuse `ioctl(TIOCSTI)`, while a controlling
+    // terminal kept across the launch is reachable by opening `/dev/tty` and reading it. What
+    // runs here is a downloaded engine over a project's own files.
+    a.push(lit("--new-session"));
+    // The UTS namespace unshared above inherits the hostname it was created from, so leaving it
+    // unset is what *reveals* the host's — name the cage instead, as `to_argv` does.
+    a.push(lit("--hostname"));
+    a.push(lit(&super::naming::cage_hostname("mise")));
 
     // The store backs the relocated binary; the private home is the sole writable
     // surface. `/proc`, `/dev`, and a `/tmp` tmpfs round out a minimal usable root.
@@ -548,6 +561,15 @@ mod tests {
         ] {
             assert!(index_of(&argv, ns).is_some(), "missing {ns}: {argv:?}");
         }
+        // a session of its own, so the cage cannot reach the launching terminal, and a hostname
+        // of its own, so the fresh UTS namespace does not hand it the host's
+        assert!(
+            index_of(&argv, "--new-session").is_some(),
+            "the mise cage keeps the launching terminal: {argv:?}"
+        );
+        let host = index_of(&argv, "--hostname").expect("--hostname present");
+        assert_eq!(argv[host + 1], OsString::from("sbx-mise"));
+
         // the environment is cleared before anything is set into it
         let clear = index_of(&argv, "--clearenv").expect("--clearenv present");
         let first_set = index_of(&argv, "--setenv").expect("--setenv present");

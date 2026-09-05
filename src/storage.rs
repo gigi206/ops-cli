@@ -1025,7 +1025,7 @@ pub(crate) fn resolve_mkfs() -> Result<Mkfs, String> {
 }
 
 /// Build the command that formats `image`, taking its root's ownership from `seed`.
-fn mkfs_command(
+pub(crate) fn mkfs_command(
     mkfs: &Mkfs,
     image: &Path,
     seed: &Path,
@@ -1055,6 +1055,8 @@ fn mkfs_command(
             // The mandatory syscall denylist, which "as everywhere else" below has to include or
             // the claim is not true: this argv is assembled by hand rather than through the
             // `SandboxSpec` keystone, and had the namespaces and the capabilities without it.
+            // What holds this list in step with the keystone's hardening is a test,
+            // `crate::sandbox::argv`'s `the_hand_built_argument_lists_carry_the_keystones_hardening`.
             let seccomp = crate::sandbox::seccomp::memfds(&Default::default())
                 .expect("the statically-defined filters compile");
             c.args(crate::sandbox::seccomp::argv_prefix(&seccomp));
@@ -1072,6 +1074,14 @@ fn mkfs_command(
             }
             c.arg("--clearenv").arg("--die-with-parent");
             c.arg("--cap-drop").arg("ALL");
+            // A session of its own, so the cage cannot reach the terminal sbx was launched from.
+            // The filters above do not cover it: they refuse `ioctl(TIOCSTI)`, while a controlling
+            // terminal kept across the launch is reachable by opening `/dev/tty` and reading it.
+            c.arg("--new-session");
+            // The UTS namespace unshared above inherits the hostname it was created from, so
+            // leaving it unset is what *reveals* the host's — name the cage instead.
+            c.arg("--hostname")
+                .arg(crate::sandbox::naming::cage_hostname("mkfs"));
             // The store backs the relocated binary; `/proc`, `/dev` and a `/tmp` tmpfs make a
             // minimal usable root.
             c.arg("--ro-bind").arg(store_nix).arg("/nix");
@@ -2302,12 +2312,18 @@ this line has no separator at all
             "--clearenv",
             "--die-with-parent",
             "--cap-drop",
+            // A session of its own: the filters refuse `ioctl(TIOCSTI)`, not an open of
+            // `/dev/tty`, so without this the cage reaches the launching terminal.
+            "--new-session",
         ] {
             assert!(
                 a.contains(&expected.to_string()),
                 "{expected} missing: {a:?}"
             );
         }
+        // And a hostname of its own, so the fresh UTS namespace does not hand it the host's.
+        let host_at = a.iter().position(|x| x == "--hostname").expect("named");
+        assert_eq!(a[host_at + 1], "sbx-mkfs");
         // The store is read-only — it backs the binary's interpreter, nothing more.
         let nix_at = a.iter().position(|x| x == "/d/store/nix").expect("bound");
         assert_eq!(a[nix_at - 1], "--ro-bind");

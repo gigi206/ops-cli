@@ -382,6 +382,94 @@ mod tests {
         assert_eq!(argv[h + 1], OsString::from("sbx-cage"));
     }
 
+    /// The hardening every bubblewrap argument list sbx builds carries, whatever built it.
+    ///
+    /// Written as literals rather than read back from [`to_argv`], because an expectation
+    /// computed from one of the three subjects shares whatever that subject is missing: a flag
+    /// dropped from the keystone would quietly stop being owed by the two hand-built lists
+    /// instead of failing here.
+    ///
+    /// `--cap-drop` and `--hostname` are absent from this list and checked below as pairs,
+    /// since a flag whose value carries the meaning is not held by its presence alone.
+    const HARDENING_BASELINE: &[&str] = &[
+        "--unshare-user",
+        "--unshare-ipc",
+        "--unshare-pid",
+        "--unshare-net",
+        "--unshare-uts",
+        "--unshare-cgroup",
+        "--clearenv",
+        "--die-with-parent",
+        "--new-session",
+    ];
+
+    /// Two argument lists in this crate are assembled by hand rather than through
+    /// [`SandboxSpec`], because what they run is fixed at the call site and no spec exists yet:
+    /// the one driving mise over a project's files, and the one formatting a storage image.
+    /// Both stated in prose that they were kept in step with the keystone's baseline, and a
+    /// promise held by hand is the shape this test replaces.
+    ///
+    /// It is what the exhaustiveness guard below cannot ask. That guard checks that a file
+    /// building a list *declares itself*, and that it prepends the syscall filters; it never
+    /// reads a flag. Between the two, a hand-built list is accounted for and hardened.
+    #[test]
+    fn the_hand_built_argument_lists_carry_the_keystones_hardening() {
+        fn holds(argv: &[OsString], who: &str) {
+            for flag in HARDENING_BASELINE {
+                assert!(
+                    index_of(argv, flag).is_some(),
+                    "{who} is missing {flag}: {argv:?}"
+                );
+            }
+            let caps = index_of(argv, "--cap-drop").unwrap_or_else(|| {
+                panic!("{who} drops no capability: {argv:?}");
+            });
+            assert_eq!(argv[caps + 1], OsString::from("ALL"), "{who}: {argv:?}");
+            // A fresh UTS namespace inherits the hostname it was created from, so unsharing it
+            // without naming the cage is what *reveals* the host's hostname rather than hiding
+            // it. The value differs per cage; the `sbx-` prefix is what says one was set.
+            let host = index_of(argv, "--hostname").unwrap_or_else(|| {
+                panic!("{who} keeps the host's hostname: {argv:?}");
+            });
+            assert!(
+                argv[host + 1].to_string_lossy().starts_with("sbx-"),
+                "{who}: {argv:?}"
+            );
+        }
+
+        // The keystone, first, so the literals above are pinned to what it actually emits and
+        // cannot drift away from it unnoticed. Isolated, since that is the posture the two
+        // hand-built cages take (neither reaches the network).
+        holds(
+            &to_argv(&spec(vec![], vec![], NetPolicy::Isolated)),
+            "the keystone",
+        );
+
+        holds(
+            &super::super::mise::bwrap_argv(
+                Path::new("/data/store/nix"),
+                Path::new("/data/mise"),
+                &[],
+                Path::new("/nix/store/abc-mise/bin/mise"),
+                &[OsString::from("--version")],
+            ),
+            "the mise cage",
+        );
+
+        let (mkfs, _fds) = crate::storage::mkfs_command(
+            &crate::storage::Mkfs::Owned {
+                bwrap: PathBuf::from("/e/bwrap"),
+                store_nix: PathBuf::from("/d/store/nix"),
+                bin: PathBuf::from("/nix/store/x-btrfs-progs/bin/mkfs.btrfs"),
+            },
+            Path::new("/vol/sbx-storage.btrfs"),
+            Path::new("/vol/sbx-storage.seed"),
+            "l",
+        );
+        let argv: Vec<OsString> = mkfs.get_args().map(|a| a.to_os_string()).collect();
+        holds(&argv, "the mkfs cage");
+    }
+
     #[test]
     fn die_with_parent_rides_every_launch_but_the_one_with_no_parent_to_die_with() {
         // The flag is armed against the process supervising the cage, so it belongs on every
