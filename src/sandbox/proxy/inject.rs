@@ -278,7 +278,12 @@ pub(crate) fn pairs_for(
                 // What sbx observed of this request, which leads every line on the feed. The values
                 // are never in it — the header *names* are what a reader needs, and they are the
                 // manifest's own.
-                let asked = format!("{} {}{}", req.method, req.host, req.target);
+                //
+                // Built on demand rather than up front: both readers are inside an `if let
+                // Some(log)`, so with no feed attached this allocated a string per request the
+                // signer saw — refused ones included — and dropped each unread. A signer runs on
+                // the request path, which is where that is worth not doing.
+                let asked = || format!("{} {}{}", req.method, req.host, req.target);
                 match signed_headers {
                     // The marker is substituted here and nowhere else: on the plugin's own bytes,
                     // on their way out, after they were bounded to the headers its manifest
@@ -291,7 +296,7 @@ pub(crate) fn pairs_for(
                             log.push(
                                 SignerKind::Sign,
                                 &signed.name,
-                                &format!("{asked} set {}", names.join(", ")),
+                                &format!("{} set {}", asked(), names.join(", ")),
                                 sig.label.as_deref(),
                                 &creds.needles,
                             );
@@ -308,7 +313,7 @@ pub(crate) fn pairs_for(
                             log.push(
                                 SignerKind::Refuse,
                                 &signed.name,
-                                &asked,
+                                &asked(),
                                 Some(&why),
                                 &creds.needles,
                             );

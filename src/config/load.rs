@@ -104,23 +104,20 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
         None => PluginRegistry::default(),
     };
 
-    // Capture the mise file, its verdict, and its validated bytes before `resolve`
-    // consumes the project layer. A mise file is anchored on the `.sbx.toml`: with no
+    // Split the project layer once into the parts each consumer needs: the raw config and its
+    // verdict for `resolve`, the verdict and the validated bytes for the mise status. Taken
+    // apart in one move rather than borrowed twice and then consumed, so the bytes travel
+    // instead of being copied. A mise file is anchored on the `.sbx.toml`: with no
     // usable project config there is nothing to gate it, so it is only flagged, not
     // honored. The bytes travel into `MiseConfig` so the launcher maps exactly the
     // content the verdict covered, without a second read.
-    let project_state = project.as_ref().map(|(_, state, _)| *state);
-    let mise_files = project
-        .as_ref()
-        .map(|(_, _, files)| files.clone())
-        .unwrap_or_default();
+    let (project_layer, project_state, mise_files) = match project {
+        Some((raw, state, files)) => (Some((raw, state)), Some(state), files),
+        None => (None, None, Default::default()),
+    };
     let (mise, mise_ignored) = mise_status(cwd, project_state, mise_files, &mut warnings);
 
-    let mut resolved = resolve(
-        global,
-        project.map(|(raw, state, _)| (raw, state)),
-        &plugins,
-    );
+    let mut resolved = resolve(global, project_layer, &plugins);
     resolved.mise = mise;
     resolved.mise_ignored = mise_ignored;
 

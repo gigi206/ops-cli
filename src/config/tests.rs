@@ -3330,6 +3330,71 @@ fn an_untrusted_project_cannot_widen_a_trusted_apps_home_scope_to_global() {
     assert_eq!(r.apps["mine"].home_scope, AppHomeScope::Global);
 }
 
+/// A `[proc]` rule written as a path is warned about, because its shape promises more than the
+/// lens delivers, and the two limits differ by direction.
+///
+/// A path `deny` matches one spelling and resolves no symlink, so the same program reached by
+/// another name still runs. A path `allow` is worse than incomplete: the kernel re-resolves the
+/// target after the supervisor has answered, so allowing a named path is a guard-rail and not a
+/// guarantee. Both are stated in the module header and in the guide, neither of which is in front
+/// of the person writing the rule.
+#[test]
+fn a_path_shaped_proc_rule_is_warned_about_in_the_direction_that_matters() {
+    use crate::config::schema::{ProcField, ProcTable};
+    let table = |mode: &str, allow: &[&str], deny: &[&str]| {
+        Some(ProcField::Table(ProcTable {
+            mode: Some(mode.into()),
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            deny: deny.iter().map(|s| s.to_string()).collect(),
+            rest: BTreeMap::new(),
+        }))
+    };
+    let warnings_for = |field| {
+        resolve_no_plugins(
+            RawConfig {
+                proc: field,
+                ..RawConfig::default()
+            },
+            None,
+        )
+        .warnings
+    };
+
+    // A path `deny` under an enforcing mode: named, with the basename form to use instead.
+    let w = warnings_for(table("enforce", &[], &["/usr/bin/*"]));
+    let hit = w
+        .iter()
+        .find(|w| w.contains("proc.deny"))
+        .expect("a path-shaped deny is named");
+    assert!(hit.contains("`/usr/bin/*`"), "{hit}");
+    assert!(hit.contains("basename"), "the remedy is named: {hit}");
+
+    // A basename `deny` is the recommended form and says nothing.
+    let w = warnings_for(table("enforce", &[], &["curl"]));
+    assert!(
+        !w.iter().any(|w| w.contains("proc.deny")),
+        "a basename rule is the form to use and must not be warned about: {w:?}"
+    );
+
+    // A path `allow` bites under `ask`, where an unmatched target is parked: warned, and about the
+    // race rather than about the spelling.
+    let w = warnings_for(table("ask", &["/usr/bin/git"], &[]));
+    let hit = w
+        .iter()
+        .find(|w| w.contains("proc.allow"))
+        .expect("a path-shaped allow is named under a mode where it decides");
+    assert!(hit.contains("re-resolves"), "{hit}");
+
+    // Under `observe` nothing is enforced, so neither rule decides anything and neither is warned
+    // about: a warning there would be about a hypothetical.
+    let w = warnings_for(table("observe", &["/usr/bin/git"], &["/usr/bin/curl"]));
+    assert!(
+        !w.iter()
+            .any(|w| w.contains("proc.deny") || w.contains("proc.allow")),
+        "nothing is enforced under observe: {w:?}"
+    );
+}
+
 #[test]
 fn proc_is_trusted_gated_and_the_app_overlay_replaces_the_baseline() {
     use crate::config::schema::{ProcField, ProcTable};
@@ -5020,6 +5085,87 @@ fn an_untrusted_project_cannot_set_reserved_env_keys() {
     assert_eq!(get(&r.env, "SAFE"), Some("ok"));
     assert_eq!(r.warnings.len(), 3, "one warning per refused key");
     assert!(r.warnings.iter().all(|w| w.contains("reserved env key")));
+}
+
+/// The three routes to running code that do not name a startup file: a command the tool runs, a
+/// search path an interpreter imports from, and a runtime that loads an agent from its options.
+///
+/// Each is the same hole `BASH_ENV` is, reached by a different mechanism, and each is refused for a
+/// *task* by `config/tasks.rs` on reasoning this gate's own comment says holds here too. The list
+/// stayed shorter than that one, so an untrusted `[env]` could still set `GIT_SSH_COMMAND` — run at
+/// the first `git fetch`, which is the ordinary shape of the work a cage is stood up for.
+#[test]
+fn an_untrusted_project_cannot_set_a_key_that_runs_code_without_naming_a_startup_file() {
+    let keys = [
+        // A command the tool runs.
+        "GIT_SSH_COMMAND",
+        "GIT_SSH",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_PAGER",
+        "GIT_EDITOR",
+        "LESSOPEN",
+        "LESSCLOSE",
+        "SSH_ASKPASS",
+        "SUDO_ASKPASS",
+        // A search path an interpreter imports from.
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "NODE_PATH",
+        "PERL5LIB",
+        "RUBYLIB",
+        "CLASSPATH",
+        "LUA_PATH",
+        "LUA_CPATH",
+        "GEM_PATH",
+        "R_LIBS",
+        "JULIA_LOAD_PATH",
+        "PSModulePath",
+        // A runtime that loads a hook from its options.
+        "JAVA_TOOL_OPTIONS",
+        "_JAVA_OPTIONS",
+        "DOTNET_STARTUP_HOOKS",
+        // A shell startup file by another name, and the shell itself.
+        "ZDOTDIR",
+        "KSH_ENV",
+        "SHELL",
+        // The directory half of OpenSSL's trust anchors, which `CA_FILE_ENV_KEYS` cannot carry:
+        // that list is file-valued by construction.
+        "SSL_CERT_DIR",
+    ];
+    for key in keys {
+        let r = resolve_no_plugins(
+            RawConfig::default(),
+            Some((
+                raw(&[(key, "/tmp/attacker"), ("SAFE", "ok")], &[]),
+                TrustState::Untrusted,
+            )),
+        );
+        assert_eq!(
+            get(&r.env, key),
+            None,
+            "`{key}` reaches the cage from an untrusted project"
+        );
+        assert_eq!(get(&r.env, "SAFE"), Some("ok"), "for {key}");
+    }
+}
+
+/// The same keys stay settable by a **trusted** project: the gate is about an untrusted layer, and
+/// a project that has been vouched for harms only its own cage. A `PYTHONPATH=src` in a Python
+/// project is the ordinary case this must not break.
+#[test]
+fn a_trusted_project_may_still_set_the_code_running_keys() {
+    let r = resolve_no_plugins(
+        RawConfig::default(),
+        Some((
+            raw(
+                &[("PYTHONPATH", "src"), ("GIT_SSH_COMMAND", "ssh -i k")],
+                &[],
+            ),
+            TrustState::Trusted,
+        )),
+    );
+    assert_eq!(get(&r.env, "PYTHONPATH"), Some("src"));
+    assert_eq!(get(&r.env, "GIT_SSH_COMMAND"), Some("ssh -i k"));
 }
 
 #[test]

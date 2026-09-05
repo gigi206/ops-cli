@@ -322,9 +322,16 @@ pub(crate) fn env(layer: Option<&AudioLayer>, base_lib_dirs: &[PathBuf]) -> Vec<
         }
         // The `find_library` shim only when PortAudio provisioned: put its bound cage directory on
         // `PYTHONPATH` so the staged `sitecustomize.py` runs and `find_library('portaudio')` resolves
-        // the provisioned `libportaudio.so.2` from `LD_LIBRARY_PATH`. `PYTHONPATH` is a data path (an
-        // untrusted `[env]` re-pointing it only self-DoSes the cage's own Python audio), so it needs
-        // no denylist entry.
+        // the provisioned `libportaudio.so.2` from `LD_LIBRARY_PATH`.
+        //
+        // `PYTHONPATH` *is* a reserved key against an untrusted `[env]`
+        // ([`crate::config::is_reserved_env_key`]), which this line is unaffected by: what is pushed
+        // here is sbx's own environment for the cage, not a config layer's, and the denylist governs
+        // only what an untrusted layer may set. The reasoning that once left it off that list —
+        // that re-pointing it self-DoSes the cage's own Python audio — held for this shim and not
+        // for the mechanism: a `sitecustomize.py` on `PYTHONPATH` runs before the first line of
+        // *any* Python the cage starts, which is the same hole `PYTHONSTARTUP` beside it is
+        // reserved for. `config/tasks.rs` had refused it on those terms all along.
         if l.pyshim.is_some() {
             env.push(("PYTHONPATH".to_string(), PYSHIM_INCAGE.to_string()));
         }

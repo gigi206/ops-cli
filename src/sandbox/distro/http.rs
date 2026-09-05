@@ -38,6 +38,18 @@ const MAX_REDIRECTS: usize = 5;
 /// answer decide how much memory sbx spends.
 pub(super) const MAX_DOCUMENT: u64 = 4 * 1024 * 1024;
 
+/// The cap on a **streamed** body when the caller has no size of its own to hold it to.
+///
+/// The same argument as [`MAX_DOCUMENT`] one layer down: that one keeps a registry answer from
+/// deciding how much *memory* sbx spends, this one keeps it from deciding how much *disk*. A blob
+/// is written before its digest can be checked, because the digest is computed from the bytes as
+/// they land, so a mismatch is found only once the whole body has arrived. The digest therefore
+/// bounds what is *kept*, never what is *written*, and something else has to bound the writing.
+///
+/// Generous on purpose, like the block-group ceiling in [`crate::storage`]: no real layer
+/// approaches it, and what it is for is refusing an implausible length rather than serving one.
+pub(super) const MAX_STREAMED_BODY: u64 = 8 * 1024 * 1024 * 1024;
+
 /// How long to wait for the connection and for each read. A provisioning step that hangs is worse
 /// than one that fails: the failure names the host, and the caller can try again.
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -193,11 +205,15 @@ pub(super) fn get(url: &str, headers: &[(&str, &str)]) -> io::Result<Response> {
 /// Fetch `url` and stream the body into `sink`, returning how many bytes were written.
 ///
 /// For blobs, which are megabytes and must not be buffered. The caller verifies the digest as the
-/// bytes pass, so nothing here decides whether the content was the right content.
+/// bytes pass, so nothing here decides whether the content was the right *content* — but the digest
+/// is only known once the whole body has been written, so `cap` is what decides how much may be
+/// written before that answer exists. Pass the length the caller expects when it knows one, and
+/// [`MAX_STREAMED_BODY`] when it does not.
 pub(super) fn get_to_writer<W: Write>(
     url: &str,
     headers: &[(&str, &str)],
     sink: &mut W,
+    cap: u64,
 ) -> io::Result<u64> {
     let mut current = url.to_string();
     let mut carry = headers;
@@ -213,7 +229,7 @@ pub(super) fn get_to_writer<W: Write>(
         if status != 200 {
             return Err(io::Error::other(format!("{current} answered {status}")));
         }
-        return stream_body(&mut reader, &head, sink);
+        return stream_body(&mut reader, &head, sink, cap);
     }
     Err(io::Error::other(format!(
         "more than {MAX_REDIRECTS} redirects starting at {url}"
@@ -292,21 +308,40 @@ fn read_body<R: Read + std::io::BufRead>(
 }
 
 /// Copy a framed body to `sink` without buffering it, returning the byte count.
+///
+/// `cap` bounds every framing, including the one that announces its own length: a `Content-Length`
+/// is the registry's claim, not a fact, so a body that overruns what the caller will accept is
+/// refused here rather than after it has been written. The server chooses the framing, so leaving
+/// either of the other two unbounded would leave the bound to the server as well.
 fn stream_body<R: Read + std::io::BufRead, W: Write>(
     reader: &mut R,
     head: &[u8],
     sink: &mut W,
+    cap: u64,
 ) -> io::Result<u64> {
+    let too_large = || {
+        io::Error::other(format!(
+            "the response body is larger than the {cap} bytes this fetch accepts"
+        ))
+    };
     match wire::response_framing(head, "GET") {
         wire::BodyFraming::Empty => Ok(0),
         wire::BodyFraming::Length(n) => {
+            if n > cap {
+                return Err(too_large());
+            }
             wire::copy_exact(reader, sink, n)?;
             Ok(n)
         }
         wire::BodyFraming::Chunked | wire::BodyFraming::ToEof => {
-            // A registry serves a blob with a length; the other two framings are accepted rather
-            // than refused, and bounded by the digest check the caller runs over the same bytes.
-            let n = io::copy(reader, sink)?;
+            // Neither announces a length, so the bound is the caller's. Read one byte past the cap
+            // to tell "exactly at the cap" from "over it": a body that reaches `cap + 1` is refused
+            // whole rather than silently truncated into something whose digest would then be
+            // reported as a mismatch.
+            let n = io::copy(&mut reader.take(cap.saturating_add(1)), sink)?;
+            if n > cap {
+                return Err(too_large());
+            }
             Ok(n)
         }
     }

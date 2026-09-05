@@ -339,6 +339,11 @@ pub(crate) fn prebuilt_pin_in(tree_dir: &Path, lockfile: &str, locator: &str) ->
 pub(crate) fn prebuilt_lockfile(backend: &crate::config::Backend) -> Option<String> {
     use super::prebuilt::lock_file;
     use crate::config::Backend;
+    // Exhaustive, with no catch-all arm: every backend that implements
+    // [`super::prebuilt::Kind`] writes a lock this view has to be able to name, and a `_` arm
+    // answers `None` for a new one without anything failing to compile. `binary:` was that case —
+    // it has had a `Kind` and a `binary-packages.lock` all along, and reached the caller's
+    // per-project fallback instead of its own pin.
     match backend {
         Backend::Deb(_) | Backend::DebResolve { .. } => Some(lock_file(&super::deb::Deb)),
         Backend::AppImage(_) | Backend::AppImageResolve { .. } => {
@@ -347,22 +352,43 @@ pub(crate) fn prebuilt_lockfile(backend: &crate::config::Backend) -> Option<Stri
         Backend::Tarball(_) | Backend::TarballResolve { .. } => {
             Some(lock_file(&super::tarball::Tarball))
         }
-        _ => None,
+        Backend::Binary(_) | Backend::BinaryResolve { .. } => {
+            Some(lock_file(&super::binary::Binary))
+        }
+        // Not per-tree prebuilts: their build output lands in the per-project store, `flake:`
+        // inline builds into the cage home, mise is per-home, and nix has no lock of this shape.
+        Backend::Nix(_) | Backend::Mise(_) | Backend::Flake(_) | Backend::FlakeInline { .. } => {
+            None
+        }
     }
 }
 
 /// The key a prebuilt package's pin is stored under in its per-tree lock: the declared locator for a
 /// direct form (its URL / `github:` / `apt:` locator), or `resolve:<name>` for a `*:resolve` package
 /// — whose pin is keyed by name, not by the one-line `resolve` sentinel [`Backend::locator`](crate::config::Backend::locator) returns.
-/// So a built `deb:resolve` / `appimage:resolve` / `tarball:resolve` package is found in its lock,
-/// not reported as un-built.
+/// So a built `deb:resolve` / `appimage:resolve` / `tarball:resolve` / `binary:resolve` package is
+/// found in its lock, not reported as un-built.
+///
+/// Through [`super::prebuilt::resolve_key`], which is what the write side spells the key with, so
+/// the two cannot drift. Exhaustive for the same reason
+/// [`prebuilt_lockfile`] is: a `*:resolve` variant left out of the list does not fail to compile, it
+/// silently looks its pin up under the `resolve` sentinel and finds nothing — which is what
+/// `binary:resolve` did.
 pub(crate) fn prebuilt_pin_key(backend: &crate::config::Backend, name: &str) -> String {
     use crate::config::Backend;
     match backend {
         Backend::TarballResolve { .. }
         | Backend::DebResolve { .. }
-        | Backend::AppImageResolve { .. } => format!("resolve:{name}"),
-        other => other.locator().to_string(),
+        | Backend::AppImageResolve { .. }
+        | Backend::BinaryResolve { .. } => super::prebuilt::resolve_key(name),
+        direct @ (Backend::Nix(_)
+        | Backend::Mise(_)
+        | Backend::Flake(_)
+        | Backend::FlakeInline { .. }
+        | Backend::Deb(_)
+        | Backend::AppImage(_)
+        | Backend::Tarball(_)
+        | Backend::Binary(_)) => direct.locator().to_string(),
     }
 }
 
@@ -804,8 +830,63 @@ mod tests {
             Backend::DebResolve { command: vec![] },
             Backend::AppImageResolve { command: vec![] },
             Backend::TarballResolve { command: vec![] },
+            Backend::BinaryResolve { command: vec![] },
         ] {
             assert_eq!(prebuilt_pin_key(&backend, "cursor"), "resolve:cursor");
+        }
+    }
+
+    /// Every backend that writes a per-tree lock can be named by the read side.
+    ///
+    /// The write side derives the filename from [`super::super::prebuilt::Kind`]; this view has to
+    /// answer with the same name for each one, or a package that is pinned reads as un-built. The
+    /// list carries `binary:` because it has a `Kind` of its own, and it was the one the catch-all
+    /// arm answered `None` for.
+    #[test]
+    fn every_per_tree_prebuilt_backend_is_named_by_the_read_side() {
+        use crate::config::Backend;
+        for (backend, expected) in [
+            (Backend::Deb("https://e/a.deb".into()), "deb-packages.lock"),
+            (
+                Backend::AppImage("github:o/r".into()),
+                "appimage-packages.lock",
+            ),
+            (
+                Backend::Tarball("https://e/a.tar.gz".into()),
+                "tarball-packages.lock",
+            ),
+            (
+                Backend::Binary("https://e/tool".into()),
+                "binary-packages.lock",
+            ),
+            (
+                Backend::BinaryResolve { command: vec![] },
+                "binary-packages.lock",
+            ),
+        ] {
+            assert_eq!(
+                prebuilt_lockfile(&backend).as_deref(),
+                Some(expected),
+                "{backend:?} writes {expected} but the read side does not name it"
+            );
+        }
+    }
+
+    /// A backend that is not a per-tree prebuilt still answers `None` — the realized signal for
+    /// these lives in the per-project store or the cage home, not in a lock.
+    #[test]
+    fn a_backend_with_no_per_tree_lock_is_still_none() {
+        use crate::config::Backend;
+        for backend in [
+            Backend::Nix("hello".into()),
+            Backend::Mise("node".into()),
+            Backend::Flake("github:o/r#a".into()),
+            Backend::FlakeInline {
+                content: String::new(),
+                attr: String::new(),
+            },
+        ] {
+            assert_eq!(prebuilt_lockfile(&backend), None, "{backend:?}");
         }
     }
 

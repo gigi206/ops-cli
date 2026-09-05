@@ -300,12 +300,22 @@ pub(crate) fn control_socket(dir: &Path, pid: u32) -> PathBuf {
 /// Callers differ on what a failure means and each decides for itself — a lens stood up beside a
 /// running broker degrades to no reader, while one that owns its whole directory has nowhere to put
 /// anything and says so.
+///
+/// The mode is applied twice on purpose, which is what makes the `0700` a guarantee rather than an
+/// intention. `DirBuilder::create` carries its mode only to a directory it actually creates: under
+/// `recursive` it succeeds and changes nothing when one is already there, so a directory left
+/// looser by an earlier version, a restored backup or a hand-created path would keep that mode and
+/// every socket below it would be reachable by another user on the machine. The second call
+/// tightens what the first found. Same bootstrap, and same reason, as
+/// [`crate::plugins::ensure_owner_only`] — that one states it for the trusted-by-location trees,
+/// this one for the lens sockets.
 pub(crate) fn ensure_control_dir(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(dir)
+        .create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
 /// Bind one lens's per-session control socket and serve it on a detached thread.
@@ -626,5 +636,43 @@ mod tests {
             ["before", "after"],
             "and it goes on recording, rather than losing every event from here on"
         );
+    }
+
+    /// A control directory that already exists with a looser mode is **tightened**, not left as it
+    /// was found.
+    ///
+    /// The mode the builder carries applies only to a directory it creates, so before the second
+    /// call this passed over anything already on disk — and what sits in these directories is the
+    /// socket a session's record is read through, the ssh-agent channel among them. The looser mode
+    /// here is one a directory could plausibly carry from an earlier version or a restored backup.
+    #[test]
+    fn an_existing_control_dir_with_a_looser_mode_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = crate::testutil::TmpDir::new();
+        let dir = tmp.path().join("lens");
+        std::fs::create_dir(&dir).expect("plant the directory");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("loosen it the way an earlier version would have left it");
+
+        ensure_control_dir(&dir).expect("the directory is already there, so this only tightens");
+
+        let mode = std::fs::metadata(&dir).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "a pre-existing control directory keeps its looser mode unless the call tightens it"
+        );
+    }
+
+    /// The ordinary path still holds: a directory this call creates is owner-only from the start.
+    #[test]
+    fn a_created_control_dir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = crate::testutil::TmpDir::new();
+        let dir = tmp.path().join("nested").join("lens");
+
+        ensure_control_dir(&dir).expect("create it");
+
+        let mode = std::fs::metadata(&dir).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 }

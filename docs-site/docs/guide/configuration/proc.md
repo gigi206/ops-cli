@@ -49,6 +49,23 @@ Each `allow`/`deny` entry is a shell-style glob (`*` = any run, `?` = one charac
 Matching is otherwise exact (`curl` never matches `curlish`), and **`deny` always wins** over
 `allow` (an entry in both is denied).
 
+### Prefer a basename, and what a path rule costs
+
+Both shapes are accepted, and a launch **warns** when a rule that decides something is written as
+a path, because the shape promises more than the lens delivers. The two limits differ by direction:
+
+- A path `deny` matches that spelling and no other. No symlink is resolved, so `deny = ["/usr/bin/*"]`
+  says nothing about the same program reached as `/tmp/mycurl` or through a bind mount. A basename
+  rule (`curl`) holds wherever the program is spelled from, which is why the shipped denylists use
+  that form.
+- A path `allow` is a guard-rail rather than a guarantee. The supervisor reads the target, decides,
+  and then the kernel **re-resolves** it to run it, so a second thread in the cage can point the name
+  elsewhere in between. Refusing a path is not exposed to this (the syscall never runs); allowing one
+  is. Write an `allow` to keep a program working, not to prove that only that program ran.
+
+Neither warning stops the launch: a path rule is sometimes exactly what you mean, and the warning is
+there so the choice is made knowingly.
+
 ## Posture: a denylist, by design
 
 `enforce` is a **denylist**: everything runs except an explicit `deny`. A coding agent spawns

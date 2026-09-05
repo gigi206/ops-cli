@@ -85,7 +85,9 @@ allow = ["api.anthropic.com"]
 Under `deny`, the [built-in self-equip set](#the-built-in-self-equip-set) is
 unioned in so the project can still provision from the nix cache and GitHub: you
 do not have to list those yourself. A `deny` entry can carve a hole back out of any
-allow (including a built-in one): `deny` always wins.
+allow (including a built-in one): `deny` always wins. It wins over a `tcp://` allow too,
+with one detail worth knowing when you mix the two: see
+[what a `deny` reaches on a spliced host](#what-a-deny-reaches-on-a-spliced-host).
 
 ### `deny` is the default
 
@@ -213,7 +215,9 @@ proxy's structural guards are untouched, so three refusals survive both:
 - **Raw TCP is opt-in.** A `tcp://` splice happens only when an explicit
   `tcp://host:port` allow rule matches. Everything else takes the inspected HTTPS
   path, which a non-HTTP protocol cannot satisfy, so ssh and a database client stay
-  blocked. See [rules](rules).
+  blocked. See [rules](rules), and
+  [what a `deny` reaches on a spliced host](#what-a-deny-reaches-on-a-spliced-host)
+  for how a `deny` interacts with one.
 - **Private addresses stay out of reach.** The [SSRF guard](architecture#the-ssrf-guard)
   admits a private or loopback address only when the *deciding rule names that exact
   host*: a regex never does, and an allow-by-default verdict has no deciding rule at
@@ -226,6 +230,23 @@ proxy's structural guards are untouched, so three refusals survive both:
 To reach one internal host on purpose, name it exactly (`allow = ["db.internal"]`,
 `allow = ["tcp://db.internal:5432"]`), which is the deliberate act the guard is
 waiting for.
+
+### What a `deny` reaches on a spliced host
+
+`deny` wins over a `tcp://` allow: a matching `deny` suppresses the splice and sends the
+connection to the inspected path instead, where it is refused. A splice carries no HTTP
+request, though, so the rule is matched against the connection alone (`host:port`), and
+two shapes of `deny` therefore do not reach one:
+
+- **A host `deny` covers only its own port set.** `deny = ["evil.com"]` names the default
+  port, so it does not suppress a `tcp://evil.com:22` splice. Write `deny = ["evil.com:*"]`
+  to cover every port, which is what you want whenever a `tcp://` rule for that host exists.
+- **A path `deny` does not apply.** `deny = ["evil.com/secret"]` and a regex written against
+  a path have nothing to match on a raw byte stream. To block a host outright, deny the
+  host, not a path under it.
+
+Neither is a gap in a plain filtering posture: both need a `tcp://` allow rule for the same
+host to be reachable at all, and that rule is opt-in.
 
 ### Which of the two filtering forms to prefer
 

@@ -907,7 +907,7 @@ fn nix_closures(programs: &[Program]) -> io::Result<Vec<(PathBuf, PathBuf)>> {
                 )
             })?),
         };
-        for logical in nix_closure(&program.path, layout.as_ref())? {
+        for logical in nix_closure_once(&program.path, layout.as_ref())? {
             let src = match &layout {
                 None => logical.clone(),
                 Some(l) => crate::store::physical_path(l, &logical),
@@ -921,6 +921,63 @@ fn nix_closures(programs: &[Program]) -> io::Result<Vec<(PathBuf, PathBuf)>> {
 /// The nix store prefix. A program resolving under it is not a self-contained file: its
 /// interpreter line, its libraries and the helpers it shells out to are all other store paths.
 const NIX_STORE: &str = "/nix/store/";
+
+/// What [`nix_closure_once`] keys an answer by: the store the query names (`None` for the host's
+/// own database), and the program's path in it.
+type ClosureKey = (Option<PathBuf>, PathBuf);
+
+/// The answers [`nix_closure_once`] has already paid for, for the life of the process.
+type ClosureMemo = std::sync::Mutex<std::collections::BTreeMap<ClosureKey, Vec<PathBuf>>>;
+
+/// [`nix_closure`], answered once per process for a given program and store.
+///
+/// Every secret resolves in its own cage, and each cage composes its own grant, so a task naming
+/// several secrets of one scheme reaches this path once per secret asking the identical question.
+/// Measured on one host, `nix-store --query --requisites` on a nix `pass` costs 55 ms and returns
+/// 157 paths, against 5 ms for the whole bubblewrap cage around it: the query, not the sandbox, is
+/// what a second secret of the same scheme was paying for.
+///
+/// What is kept is a list of store paths, and the distinction matters here in particular. The task
+/// plane holds no credential beyond one command on purpose, and that rule is not weakened by this:
+/// a closure is public, it is derived from content-addressed paths, and it never carries what a
+/// resolver answered. Nor can an entry go stale — a store path's requisites are a function of its
+/// content, so a rebuilt or re-provisioned program is a *different* path and misses. A collected
+/// store cannot strand an entry either: a valid store path keeps its requisites valid, and a
+/// program collected outright stops resolving at all — [`locate_program`] stats through the profile
+/// symlink and drops a candidate it cannot follow, so the cage fails before any closure is asked
+/// for. That an entry cannot go stale is what makes this safe to keep, because the closure is
+/// bound with [`Mount::RoBindTry`]: a path that were missing would be skipped in silence, and the
+/// program would die at `execve` with the bare exit 127 this file exists to avoid.
+///
+/// Keyed by the store as well as the program, because the same logical path means different content
+/// in sbx's store and the host's, and the two are queried with different arguments.
+///
+/// The lock is released before the query runs. Two threads racing on one cold key both query and
+/// both write the same answer, which costs a duplicate subprocess in a case that does not arise
+/// today; holding the lock across a 55 ms subprocess to prevent it would block every other program's
+/// lookup on it.
+fn nix_closure_once(
+    program: &Path,
+    layout: Option<&crate::store::Layout>,
+) -> io::Result<Vec<PathBuf>> {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
+    static ANSWERED: OnceLock<ClosureMemo> = OnceLock::new();
+    let answered = ANSWERED.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let key = (
+        layout.map(|l| l.store_dir().to_path_buf()),
+        program.to_path_buf(),
+    );
+    // A poisoned lock is not a reason to re-run the query: the map is a memo whose only mutation is
+    // the insert below, so an unwind cannot leave it half-written. That is the "recovers" half of
+    // `sandbox::locks`'s rule, decided there rather than re-argued here.
+    if let Some(hit) = crate::sandbox::locks::locked(answered).get(&key) {
+        return Ok(hit.clone());
+    }
+    let closure = nix_closure(program, layout)?;
+    crate::sandbox::locks::locked(answered).insert(key, closure.clone());
+    Ok(closure)
+}
 
 /// Every store path a nix-installed program needs, itself included, or an error naming why the
 /// question could not be answered.
@@ -1764,6 +1821,60 @@ mod tests {
         );
         let out = run(&bwrap, &p, "test://x", &[]).expect("the resolver should run");
         assert_eq!(out.trim_end(), "started=0");
+    }
+
+    /// A program already looked up is not queried again, measured rather than reasoned about.
+    ///
+    /// Every secret in a task resolves in its own cage, and each cage composes its own grant, so a
+    /// task naming several secrets of one scheme walks this path once per secret with the same
+    /// program every time. The store engine is driven through a stand-in that records one line per
+    /// invocation, so the file's length is the number of processes actually spawned, not an
+    /// estimate of it: two calls, one subprocess. Without the memo it reads two, which is what this
+    /// measured before it existed.
+    ///
+    /// The program path is unique to this test. The memo lives for the process, so a path shared
+    /// with another test would be answered from its entry and this stand-in would never run.
+    #[test]
+    fn a_program_already_looked_up_is_not_queried_a_second_time() {
+        let _lock = env_lock();
+        let dir = TmpDir::new();
+        let calls = dir.path().join("calls");
+        // The override probes `nix` and takes `nix-store` from beside it, so both have to exist and
+        // be owner-only-writable for the tier to resolve at all.
+        for (name, body) in [
+            ("nix", "#!/bin/sh\nexit 0\n".to_string()),
+            (
+                "nix-store",
+                format!(
+                    "#!/bin/sh\necho . >> {}\necho /nix/store/dep\n",
+                    calls.display()
+                ),
+            ),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _over = EnvVar::set("SBX_NIX_BIN", dir.path().join("nix"));
+
+        let programs = [Program {
+            name: "p".to_string(),
+            path: PathBuf::from(format!(
+                "/nix/store/{}-not-queried-twice/bin/p",
+                std::process::id()
+            )),
+            origin: Origin::Host,
+        }];
+        let first = nix_closures(&programs).expect("the stand-in engine answers");
+        let second = nix_closures(&programs).expect("the stand-in engine answers");
+        assert_eq!(first, second, "the same program yields the same closure");
+        assert!(!first.is_empty(), "the stand-in engine named a path");
+
+        let spawned = std::fs::read_to_string(&calls).unwrap().lines().count();
+        assert_eq!(
+            spawned, 1,
+            "the second call is answered from the memo, not from a second subprocess"
+        );
     }
 
     #[test]

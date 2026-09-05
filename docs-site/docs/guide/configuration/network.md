@@ -55,8 +55,12 @@ misspelled field is not left to read as a rule in force.
 | `allow` | **allow-by-default**: every host reaches except `deny`-listed ones (a denylist) |
 | `ask` | park-and-confirm: an undecided host blocks until you answer |
 
-`deny` always wins over `allow` within a table. See [Network modes](../networking/modes)
-for the full semantics.
+`deny` always wins over `allow` within a table, including over a `tcp://` allow. A raw
+splice carries no HTTP request, so a `deny` is matched on `host:port` alone there: a host
+`deny` covers its own port set and a path `deny` does not apply. See
+[Network modes](../networking/modes) for the full semantics and
+[what a `deny` reaches on a spliced host](../networking/modes#what-a-deny-reaches-on-a-spliced-host)
+for that detail.
 
 `none` and `shared` stand up no egress proxy, so every other field of the table is
 addressed to something that is not there. A table that pairs one of them with `allow`,

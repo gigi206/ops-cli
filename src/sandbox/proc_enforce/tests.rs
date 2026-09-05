@@ -2960,3 +2960,56 @@ fn a_parked_target_this_supervisor_cannot_read_reads_as_no_path_at_all() {
     assert!(read_exec_path(pid, addr, None).is_none());
     assert!(read_u64(pid, addr, None).is_none());
 }
+
+/// A file the scan cannot read at all is allowed — and **says so**.
+///
+/// The lens is not an allowlist, so an undecidable open goes through; that is the written contract.
+/// What was missing is the other half of the rule the truncation case states: a file that came back
+/// clean only because the scan stopped is a false negative, and one that came back clean because
+/// nothing was read is the same error with less read. Only the first of the two was reported.
+///
+/// The fixture is a regular file, inside the scanned root, that this process cannot open for
+/// reading: the `O_PATH` probe still resolves it, and the re-open for the scan is what fails.
+#[test]
+fn a_file_the_scan_cannot_read_is_allowed_and_reported() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        skip_incapable!("running as root, which reads a 0000 file and never reaches the failure");
+        return;
+    }
+    let dir = TmpDir::new();
+    let unreadable = dir.path().join("unreadable.env");
+    std::fs::write(&unreadable, b"API key: sk-ABC123DEF456GHI789\n").expect("write the fixture");
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
+        .expect("make it unopenable for reading");
+
+    let lens = OpenLens::new(
+        crate::open_policy::OpenPolicy::compile(
+            &[r"sk-[A-Za-z0-9]{12,}".to_string()],
+            crate::open_policy::MAX_SCAN_DEFAULT,
+        )
+        .expect("the test pattern compiles")
+        .expect("a non-empty list yields a policy"),
+        std::fs::canonicalize(dir.path()).expect("canonical fixture root"),
+    );
+    let outcome = open_is_refused(
+        &lens,
+        std::process::id(),
+        libc::AT_FDCWD,
+        unreadable.to_str().expect("utf-8 fixture path"),
+    );
+
+    assert!(
+        !outcome.refused,
+        "an undecidable open is allowed: the lens closes what it can prove, not what it cannot read"
+    );
+    let report = outcome
+        .report
+        .expect("an open the scan could not read at all is reported, not passed in silence");
+    assert_eq!(
+        report.uncovered,
+        Some(super::open_lens::Uncovered::Unread),
+        "reported as unread rather than as a truncated scan, which would name a ceiling that had \
+         nothing to do with it"
+    );
+}

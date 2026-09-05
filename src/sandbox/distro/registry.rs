@@ -247,6 +247,7 @@ fn get_authenticated_to_writer<W: io::Write>(
     url: &str,
     credential: Option<&Credential>,
     sink: &mut W,
+    cap: u64,
 ) -> io::Result<u64> {
     let probe = http::get(url, &[])?;
     if probe.status == 401
@@ -257,10 +258,10 @@ fn get_authenticated_to_writer<W: io::Write>(
             None => token(challenge, credential)?.map(|t| format!("Bearer {t}")),
         };
         if let Some(authorization) = authorization {
-            return http::get_to_writer(url, &[("Authorization", &authorization)], sink);
+            return http::get_to_writer(url, &[("Authorization", &authorization)], sink, cap);
         }
     }
-    http::get_to_writer(url, &[], sink)
+    http::get_to_writer(url, &[], sink, cap)
 }
 
 /// Resolve `image` to the digest and layer list of a `linux/amd64` image.
@@ -375,10 +376,20 @@ pub(super) fn fetch_layer(
         inner: std::fs::File::create(&partial)?,
         hasher: Sha256::new(),
     };
+    // What may be written before the digest can answer. The digest is computed from the bytes as
+    // they land, so it is known only once the body is fully written: it bounds what is *kept*, not
+    // what is *written*, and a body that never ends fills the disk before it is ever declared
+    // wrong. A manifest that states a size holds the fetch to it; one that does not falls back to
+    // the absolute ceiling rather than to no ceiling at all.
+    let cap = if layer.size > 0 {
+        layer.size
+    } else {
+        http::MAX_STREAMED_BODY
+    };
     // Any failure removes the partial file, not only a digest mismatch: a fetch that stopped
     // halfway leaves bytes that are not a layer, and a later run must not find them and take them
     // for one.
-    let written = match get_authenticated_to_writer(&url, credential, &mut sink) {
+    let written = match get_authenticated_to_writer(&url, credential, &mut sink, cap) {
         Ok(written) => written,
         Err(e) => {
             let _ = std::fs::remove_file(&partial);
@@ -396,7 +407,9 @@ pub(super) fn fetch_layer(
             layer.digest
         )));
     }
-    if layer.size != 0 && written != layer.size {
+    // A stated size is also checked exactly: the cap above refuses a body that overruns it, this
+    // refuses one that stops short of it.
+    if layer.size > 0 && written != layer.size {
         let _ = std::fs::remove_file(&partial);
         return Err(io::Error::other(format!(
             "layer {} is {written} bytes, the manifest says {}",

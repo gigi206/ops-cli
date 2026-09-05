@@ -377,7 +377,75 @@ pub(super) fn validate_proc(
         // A table with no mode inherits the parent layer's mode, keeping this table's own rules.
         None => parent.mode,
     };
+    warn_on_path_shaped_proc_rules(warnings, source_label, mode, &allow, &deny);
     Some(ProcPolicy::new(mode, &allow, &deny))
+}
+
+/// Warn about `[proc]` rules written as a **path** rather than as a basename, where the shape
+/// promises more than the lens delivers.
+///
+/// Both limits are stated in [`crate::proc_policy`] and in the guide, which is the wrong place for
+/// them to be stated *only*: they are properties of a rule someone is writing, and a reader of the
+/// module header is not that person. The rule grammar accepts both shapes and always will, so this
+/// warns rather than refuses.
+///
+/// Only under a mode where the rules decide something. Under `off` and `observe` nothing is
+/// enforced, so a warning would be about a hypothetical.
+fn warn_on_path_shaped_proc_rules(
+    warnings: &mut Vec<String>,
+    source_label: &str,
+    mode: crate::proc_policy::ProcMode,
+    allow: &[String],
+    deny: &[String],
+) {
+    use crate::proc_policy::ProcMode;
+    let path_shaped = |rules: &[String]| -> Vec<String> {
+        rules
+            .iter()
+            .filter(|r| r.contains('/'))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    // A `deny` decides under every enforcing mode.
+    if matches!(mode, ProcMode::Enforce | ProcMode::Ask | ProcMode::Confine) {
+        let named = path_shaped(deny);
+        if !named.is_empty() {
+            warnings.push(format!(
+                "{source_label}: `proc.deny` {} written as a path, which matches that spelling \
+                 and no other: no symlink is resolved, so the same program reached by another \
+                 name still runs. A basename rule (`curl`) holds wherever the program is spelled \
+                 from, which is the form the shipped denylists use.",
+                quoted_rules(&named)
+            ));
+        }
+    }
+    // An `allow` decides where an unmatched target is parked or refused.
+    if matches!(mode, ProcMode::Ask | ProcMode::Confine) {
+        let named = path_shaped(allow);
+        if !named.is_empty() {
+            warnings.push(format!(
+                "{source_label}: `proc.allow` {} written as a path. Allowing a named path is a \
+                 guard-rail, not a guarantee: the kernel re-resolves the target after the \
+                 supervisor has answered, so a sibling thread in the cage can point it elsewhere \
+                 in between. Refusing a path is not exposed to this; allowing one is.",
+                quoted_rules(&named)
+            ));
+        }
+    }
+}
+
+/// `` `a` `` for one rule and `` `a`, `b` `` for several, with the verb that agrees with the count —
+/// so the warning reads as a sentence whichever it is.
+fn quoted_rules(rules: &[String]) -> String {
+    let list = rules
+        .iter()
+        .map(|r| format!("`{r}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match rules.len() {
+        1 => format!("has {list}"),
+        _ => format!("has {list}, each"),
+    }
 }
 
 /// Validate a `notify` field — either a bare mode string or a `[notify]` table — into a resolved

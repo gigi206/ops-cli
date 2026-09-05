@@ -60,6 +60,22 @@ few structural keys:
 - Interpreter pre-load hooks: `NODE_OPTIONS`, `PYTHONSTARTUP`, `PERL5OPT`, `RUBYOPT`.
   Each names a file its interpreter runs before the program, so setting one runs code
   in your later `sbx run` without needing a shell startup at all.
+- A command a tool runs on your behalf: `GIT_SSH_COMMAND`, `GIT_SSH`,
+  `GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_EDITOR`, `LESSOPEN`, `LESSCLOSE`,
+  `SSH_ASKPASS`, `SUDO_ASKPASS`. These carry an argv rather than a file to source, so
+  the first `git fetch` or the first paged file runs whatever the value names.
+- A search path an interpreter imports from: `PYTHONPATH`, `PYTHONHOME`, `NODE_PATH`,
+  `PERL5LIB`, `RUBYLIB`, `CLASSPATH`, `LUA_PATH`, `LUA_CPATH`, `GEM_PATH`, `R_LIBS`,
+  `JULIA_LOAD_PATH`, `PSModulePath`. Nothing is named and nothing is executed directly;
+  a module the interpreter was going to import anyway is simply answered from a
+  directory the value chose (a `sitecustomize.py` on `PYTHONPATH` runs before the
+  program's first line).
+- A runtime that loads a hook from its options: `JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS`,
+  `DOTNET_STARTUP_HOOKS`, each honored before `main`.
+- A shell startup file by another name, and the shell itself: `ZDOTDIR` (the directory
+  zsh reads its startup files from), `KSH_ENV` (ksh's `ENV`), and `SHELL`.
+- The directory half of OpenSSL's trust anchors: `SSL_CERT_DIR`. The file-valued names
+  are covered by the CA-bundle set below.
 - The two XDG base directories the in-cage portal resolves a URI scheme through:
   `XDG_DATA_HOME` and `XDG_CONFIG_HOME`. When `[open]` declares handlers, sbx freezes
   the route by binding the generated desktop entry and `mimeapps.list` read-only at the

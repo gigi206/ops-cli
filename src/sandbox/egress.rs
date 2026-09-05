@@ -716,8 +716,7 @@ pub(crate) fn start(
     // [`Unresolved`] — every caller but the batch rolls passes `Abort`.
     unresolved: Unresolved,
 ) -> io::Result<(Egress, Wiring)> {
-    use std::fs::DirBuilder;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
 
     // Tighten the data directory to owner-only before anything reads from it. A resolver plugin
     // is trusted by location — it is run only because it sits under `<data>/plugins`, a tree a
@@ -788,8 +787,12 @@ pub(crate) fn start(
         ))
     });
 
+    // Through the lens helper rather than a second spelling of the same three calls: what lives
+    // here is the proxy's control socket and the session CA, so the `0700` has to hold over a
+    // directory that already existed as much as over one this line creates — which is the half a
+    // bare `DirBuilder::create` does not do.
     let dir = layout.data_dir().join("egress");
-    DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    super::lens::ensure_control_dir(&dir)?;
 
     // Per-**proxy** names. The pid separates concurrent launches, but one launch can stand up more
     // than one proxy at a time — a session serving two task invocations at once does exactly that —

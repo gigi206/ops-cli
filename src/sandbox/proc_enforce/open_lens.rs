@@ -131,13 +131,21 @@ pub(super) fn handle_open(
             _ => OpenOutcome::ALLOWED,
         };
         if let Some(report) = &outcome.report {
-            if report.partial {
-                crate::diag::warn(&format!(
-                    "`{}` is longer than the {} bytes the content scan reads, so it is open to the \
-                 cage on the strength of its start alone — anything past that was not examined",
-                    report.path,
-                    policy_scan_ceiling(lens)
-                ));
+            if let Some(uncovered) = report.uncovered {
+                match uncovered {
+                    Uncovered::Truncated => crate::diag::warn(&format!(
+                        "`{}` is longer than the {} bytes the content scan reads, so it is open to \
+                         the cage on the strength of its start alone — anything past that was not \
+                         examined",
+                        report.path,
+                        policy_scan_ceiling(lens)
+                    )),
+                    Uncovered::Unread => crate::diag::warn(&format!(
+                        "`{}` could not be read for the content scan, so it is open to the cage \
+                         with nothing examined at all",
+                        report.path
+                    )),
+                }
             } else {
                 // Named rather than merely counted: a refusal a person cannot attribute to a pattern
                 // is one they will turn the lens off to escape.
@@ -664,8 +672,24 @@ pub(super) fn open_is_refused(
     }
     // Re-opened for reading through the descriptor already resolved, so the bytes scanned belong to
     // the file just inspected rather than to whatever the path names a moment later.
+    //
+    // A failure here allows, like every other undecidable open — but it is *reported*, which it was
+    // not. The rule the truncation case states applies with more force to this one: presenting a
+    // prefix as a whole-file result is a false negative, and presenting nothing at all as one is
+    // the same error with less read. The file is regular, already resolved and inside the scanned
+    // root, so this is not the ordinary "no content to examine" path; something went wrong with
+    // reading a file the lens meant to scan.
     let Ok(mut file) = std::fs::File::open(format!("/proc/self/fd/{}", probe.as_raw_fd())) else {
-        return OpenOutcome::ALLOWED;
+        return OpenOutcome {
+            refused: false,
+            report: Some(OpenReport {
+                path: crate::sandbox::sanitize(path),
+                shapes: Vec::new(),
+                uncovered: Some(Uncovered::Unread),
+            }),
+            probe: None,
+            errno: None,
+        };
     };
     // Bounded in *size*, not in time. `S_ISREG` is true of a file on a FUSE mount, an NFS path or
     // any other backing store that can stall, and this read is on the one thread every other open in
@@ -678,7 +702,17 @@ pub(super) fn open_is_refused(
         .read_to_end(&mut buf)
         .is_err()
     {
-        return OpenOutcome::ALLOWED;
+        // Reported for the reason the re-open above is: the scan was meant to happen and did not.
+        return OpenOutcome {
+            refused: false,
+            report: Some(OpenReport {
+                path: crate::sandbox::sanitize(path),
+                shapes: Vec::new(),
+                uncovered: Some(Uncovered::Unread),
+            }),
+            probe: None,
+            errno: None,
+        };
     }
     let verdict = policy.verdict(&buf);
     cache.put(id, verdict.matched);
@@ -691,7 +725,7 @@ pub(super) fn open_is_refused(
             report: verdict.scanned.is_partial().then(|| OpenReport {
                 path: crate::sandbox::sanitize(path),
                 shapes: Vec::new(),
-                partial: true,
+                uncovered: Some(Uncovered::Truncated),
             }),
             probe: Some(probe),
             errno: None,
@@ -710,7 +744,7 @@ pub(super) fn open_is_refused(
         report: Some(OpenReport {
             path: crate::sandbox::sanitize(path),
             shapes,
-            partial: false,
+            uncovered: None,
         }),
         probe: None,
         errno: None,
@@ -794,8 +828,24 @@ pub(super) struct OpenReport {
     pub(super) path: String,
     /// The patterns that matched. Empty when the report is about coverage rather than a refusal.
     shapes: Vec<String>,
-    /// Whether the scan stopped before the end of the file, leaving the rest unexamined.
-    partial: bool,
+    /// Why this report is about **coverage** rather than a refusal, or `None` when it is a refusal.
+    pub(super) uncovered: Option<Uncovered>,
+}
+
+/// What kept a scan from covering the whole file, for a report that carries no refusal.
+///
+/// Both mean the same thing to a reader: the file is open to the cage and its content did not
+/// decide that. They are told apart because the remedy differs, and because presenting the second
+/// as the first would name a ceiling that had nothing to do with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Uncovered {
+    /// The scan reached [`super::super::super::open_policy::OpenPolicy::max_scan`] before the end
+    /// of the file, so the rest was never examined.
+    Truncated,
+    /// The content could not be read at all: the re-open through the resolved descriptor failed, or
+    /// the read did. Nothing was examined, which is strictly less than a truncated scan, and it was
+    /// the only one of the two that said nothing.
+    Unread,
 }
 
 /// Whether an `errno` from an open describes the **file** or this **process**.

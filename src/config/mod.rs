@@ -241,6 +241,69 @@ pub(crate) fn is_reserved_env_key(key: &str) -> bool {
                 | "PYTHONSTARTUP"
                 | "PERL5OPT"
                 | "RUBYOPT"
+                // A **command** the tool runs on the caller's behalf, which is the same hole as a
+                // pre-load hook with one less step: the value is not a file to source, it is an
+                // argv. `GIT_SSH_COMMAND` runs at the first `git fetch` — the ordinary shape of the
+                // work a cage is stood up for — and `LESSOPEN` at the first paged file. The four
+                // `GIT_*` display hooks are here for the same reason `GIT_PAGER` is not a display
+                // preference to sbx: whatever they name is executed.
+                | "GIT_SSH_COMMAND"
+                | "GIT_SSH"
+                | "GIT_EXTERNAL_DIFF"
+                | "GIT_PAGER"
+                | "GIT_EDITOR"
+                | "LESSOPEN"
+                | "LESSCLOSE"
+                | "SSH_ASKPASS"
+                | "SUDO_ASKPASS"
+                // A **search path an interpreter imports from**, which reaches the same place by a
+                // third route: no file is named and no command is given, but a module the
+                // interpreter was going to import anyway is answered from a directory the value
+                // chooses. `PYTHONPATH` is the clearest — a `sitecustomize.py` there runs before
+                // the program's first line — and each of the others is that language's spelling of
+                // it. `config/tasks.rs` refuses `PYTHONPATH` for a task on this reasoning; it holds
+                // here for the same reason the hooks above do.
+                | "PYTHONPATH"
+                | "PYTHONHOME"
+                | "NODE_PATH"
+                | "PERL5LIB"
+                | "RUBYLIB"
+                | "CLASSPATH"
+                | "LUA_PATH"
+                | "LUA_CPATH"
+                | "GEM_PATH"
+                | "R_LIBS"
+                | "JULIA_LOAD_PATH"
+                | "PSModulePath"
+                // A runtime that reads its **options** from the environment, where those options
+                // include loading an agent or a startup hook — the JVM and .NET each ship one, and
+                // both are honored before `main`.
+                | "JAVA_TOOL_OPTIONS"
+                | "_JAVA_OPTIONS"
+                | "DOTNET_STARTUP_HOOKS"
+                // A shell's startup file by another name. `BASH_ENV` and `ENV` are above; `ZDOTDIR`
+                // moves the whole directory zsh reads its startup files from, and `KSH_ENV` is
+                // ksh's `ENV`. Reserving one shell's spelling and not another's would leave the
+                // hole open to whichever shell the cage happens to run.
+                | "ZDOTDIR"
+                | "KSH_ENV"
+                // The interpreter a tool reaches for when it wants "the user's shell": `git
+                // rebase -i`, an editor's `:sh`, a build step shelling out. Each of those runs what
+                // the value names, which puts it in the group above rather than beside `PAGER` and
+                // `EDITOR` (left free: naming a program to *display* something is an ordinary
+                // preference, and a project that wants `less` should be able to say so).
+                //
+                // It is also a key **sbx itself sets** for the cage (`SHELL=/bin/sh`, see
+                // `sandbox::argv`), which is the rule the `SBX_` prefix below states in its own
+                // terms: the keys sbx sets are the keys it protects, or a layer beneath it decides
+                // what sbx already decided.
+                | "SHELL"
+                // The directory half of OpenSSL's trust anchors. `CA_FILE_ENV_KEYS` above covers
+                // the *file*-valued names, and covers them by construction: `egress` sets each of
+                // those to the session CA. This one is directory-valued, so it is not among them
+                // and never was set — but it steers the same lookup, and `config/tasks.rs` already
+                // refuses it beside `SSL_CERT_FILE`.
+                | "SSL_CERT_DIR"
                 // The two XDG base directories the in-cage portal resolves a URI scheme through.
                 // `sandbox::openuri` freezes the OpenURI route by binding the generated desktop
                 // entry and `mimeapps.list` read-only at the locations the XDG lookup prefers, and
