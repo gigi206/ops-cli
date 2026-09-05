@@ -52,7 +52,7 @@ fn bundle_list(args: &[OsString]) -> ExitCode {
     }
     let (bundles, warnings) = config::bundles();
     for w in &warnings {
-        diag::warn(w);
+        diag::warn_config(w);
     }
 
     // A named bundle that does not exist is an explicit error, never a blank success — the same
@@ -500,7 +500,7 @@ fn bundle_export(args: &[OsString]) -> ExitCode {
 
     let (bundles, warnings) = config::bundles();
     for w in &warnings {
-        diag::warn(w);
+        diag::warn_config(w);
     }
     if let Some(code) = report_missing(&names, &bundles) {
         return code;

@@ -190,7 +190,7 @@ fn config_show(args: &[OsString]) -> ExitCode {
     // Warnings go to stderr, out of band from the resolved view, so the body stays a clean
     // capturable document and a warning never pollutes a piped human render.
     for w in &view.warnings {
-        diag::warn(w);
+        diag::warn_config(w);
     }
     ExitCode::SUCCESS
 }

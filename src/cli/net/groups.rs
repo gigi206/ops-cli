@@ -40,7 +40,7 @@ pub(super) fn net_groups_list(args: &[OsString]) -> ExitCode {
     }
     let (groups, warnings) = config::net_groups();
     for w in &warnings {
-        diag::warn(w);
+        diag::warn_config(w);
     }
 
     // A named group that does not exist is an explicit error (never a blank success). Report every
@@ -133,7 +133,7 @@ pub(super) fn net_groups_export(args: &[OsString]) -> ExitCode {
 
     let (groups, warnings) = config::net_groups();
     for w in &warnings {
-        diag::warn(w);
+        diag::warn_config(w);
     }
 
     // Select all groups (sorted) or the named subset. An unknown name is an explicit error.

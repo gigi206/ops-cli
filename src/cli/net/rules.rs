@@ -93,7 +93,7 @@ pub(super) fn net_rules(args: &[OsString]) -> ExitCode {
 
     let mut resolved = config::load(&cwd);
     for w in &resolved.warnings {
-        diag::warn(w);
+        diag::warn_config(w);
     }
     // Fold a named app's overlay so the rules listed are the *effective* set `sbx app <name>` would
     // launch with (its own posture, allow/deny, credentials), not the bare baseline — the same path

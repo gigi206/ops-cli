@@ -164,6 +164,32 @@ pub(crate) fn calls_function(text: &str, needle: &str) -> bool {
     })
 }
 
+/// Whether `path` holds nothing but tests.
+///
+/// A module that outgrew one file keeps its test half in a `tests.rs` — or a `<topic>_tests.rs` —
+/// beside it, declared `#[cfg(test)] mod tests;` from the parent. Unlike an in-file `mod tests`,
+/// such a file carries no `#[cfg(test)]` of its own to cut at, so a guard reading production code
+/// would take the whole thing; and what a guard looks for is exactly what a test quotes, asserts
+/// about, or names in a failure message. The naming is the crate's convention, and it is the only
+/// signal available from the path alone.
+pub(crate) fn is_test_only_source(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|stem| stem == "tests" || stem.ends_with("_tests"))
+}
+
+/// The production half of a source file: everything before its **last** `#[cfg(test)]`, or the
+/// whole text when it declares no test module.
+///
+/// Cut at the last rather than the first, because a file may declare several test modules — and
+/// several declare theirs near the top, where splitting on the first leaves a handful of lines and
+/// a guard that passes having read nothing. It also keeps a guard's own needles, spelled in its own
+/// test module, out of the population it measures.
+pub(crate) fn production_half(text: &str) -> &str {
+    text.rsplit_once("#[cfg(test)]")
+        .map_or(text, |(before, _)| before)
+}
+
 /// Every `.rs` source under `src/cli`, sorted, subdirectories included.
 ///
 /// Two guards read the dispatcher sources — the routed-subcommand check in [`crate::cli`] and the

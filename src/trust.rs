@@ -491,13 +491,11 @@ mod tests {
         let mut reread: Vec<(String, usize)> = Vec::new();
         let mut attested: Vec<(String, usize)> = Vec::new();
         for file in crate::testutil::crate_sources() {
+            if crate::testutil::is_test_only_source(&file) {
+                continue;
+            }
             let text = std::fs::read_to_string(&file).unwrap_or_default();
-            // The production half only, cut at the LAST `#[cfg(test)]`: a file may declare several
-            // test modules, and splitting on the first would leave the guard reading almost nothing
-            // and passing on the silence.
-            let production = text
-                .rsplit_once("#[cfg(test)]")
-                .map_or(text.as_str(), |(before, _)| before);
+            let production = crate::testutil::production_half(&text);
             let relative = file.display().to_string().replacen(&root, "", 1);
             // `trust::trust_written(` does not contain `trust::trust(` — the character after the
             // second `trust` is `_`, not `(` — so the two counts never overlap.

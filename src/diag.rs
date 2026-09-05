@@ -100,6 +100,58 @@ fn highlight(msg: &str, pal: &Palette) -> String {
 mod tests {
     use super::*;
 
+    /// Every warning a config produced reaches the terminal through [`warn_config`], which filters
+    /// it, and never through the unfiltered [`warn`].
+    ///
+    /// The text of such a warning names the key or value it is complaining about, and that name is
+    /// the config's to spell. The global config and an imported app profile are trusted **by
+    /// location**, so nothing gates what they may put in one; a project `.sbx.toml` reaches the same
+    /// tables once it is trusted. Control bytes in the name reach the launching terminal at the
+    /// exact moment sbx is reporting what it refused, so an escape run can erase the trust warnings
+    /// printed just above it.
+    ///
+    /// Counted rather than trusted to stay converted, because the failure is silent: a new warning
+    /// producer with a plain `warn` looks exactly like a correct one. The loop variable is the tell
+    /// — a `warn` whose argument is a bare `warning` or `w` is printing somebody else's string.
+    ///
+    /// **The population is the whole crate.** The rule belongs to the function it is about rather
+    /// than to any one module that happens to hold today's instances: the launch tree and the CLI
+    /// verbs print the same `resolved.warnings` from the same loader, and a guard scoped to one of
+    /// them passes on the other's silence.
+    ///
+    /// **What this does not cover, stated because the count reads stronger than it is:** the
+    /// *inline* form, `warn(&format!("… {key} …"))`, where a config-chosen value arrives through
+    /// interpolation and never becomes a loop variable. No mechanical rule separates those from the
+    /// sites that interpolate only sbx's own values — the format string has to be read. A new one is
+    /// therefore not caught here; [`warn_config`]'s own doc is where that rule is written for a
+    /// reader adding a warning.
+    #[test]
+    fn no_config_warning_reaches_the_terminal_unfiltered() {
+        let root = format!("{}/", env!("CARGO_MANIFEST_DIR"));
+        let mut offenders: Vec<String> = Vec::new();
+        for file in crate::testutil::crate_sources() {
+            if crate::testutil::is_test_only_source(&file) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            let production = crate::testutil::production_half(&text);
+            for needle in ["warn(warning)", "warn(w)"] {
+                let n = production.matches(needle).count();
+                if n > 0 {
+                    let relative = file.display().to_string().replacen(&root, "", 1);
+                    offenders.push(format!("{relative}: {n}× `{needle}`"));
+                }
+            }
+        }
+        offenders.sort();
+        assert!(
+            offenders.is_empty(),
+            "a config-chosen warning is printed through the unfiltered `warn`; use \
+             `diag::warn_config`, the rule `mise_token_display` already applies to `[tools]`: \
+             {offenders:?}"
+        );
+    }
+
     #[test]
     fn plain_lines_are_verbatim_including_backticks() {
         // The plain path must be byte-identical to the bare prefix + message, backticks intact —

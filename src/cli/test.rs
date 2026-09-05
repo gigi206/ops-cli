@@ -128,7 +128,7 @@ fn net_test(args: &[OsString]) -> ExitCode {
     };
     let mut resolved = config::load(&cwd);
     for w in &resolved.warnings {
-        diag::warn(w);
+        diag::warn_config(w);
     }
     // Fold a named app's overlay onto the baseline so the URL is tested against the *effective*
     // policy `sbx app <name>` would launch with (its own posture, allow/deny rules, credentials),

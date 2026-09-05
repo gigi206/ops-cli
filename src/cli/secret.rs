@@ -77,7 +77,7 @@ fn secret_list(args: &[OsString]) -> ExitCode {
     };
     let mut resolved = config::load(&cwd);
     for w in &resolved.warnings {
-        diag::warn(w);
+        diag::warn_config(w);
     }
     // Fold an app's overlay so the inventory is the effective set that app would launch with, the
     // same way `sbx net rules --app` reads the effective policy.

@@ -473,7 +473,7 @@ fn plugins_list() -> ExitCode {
     print_conflicts(&layout, &registry, None, &pal);
     println!("{dim}(browse the configured stores with: sbx plugins store list){r}");
     for w in &warnings {
-        diag::warn(w);
+        diag::warn_config(w);
     }
     ExitCode::SUCCESS
 }
@@ -689,7 +689,7 @@ fn provision_configured_programs(layout: &store::Layout, plugin_name: &str) -> E
     let wanted =
         crate::config::validated_programs(plugin_name, programs, &raw.programs, &mut warnings);
     for w in &warnings {
-        diag::warn(w);
+        diag::warn_config(w);
     }
     if wanted.is_empty() {
         return ExitCode::SUCCESS;
@@ -2173,7 +2173,7 @@ fn plugins_info(key: Option<&str>) -> ExitCode {
             return ExitCode::FAILURE;
         }
         for w in &warnings {
-            diag::warn(w);
+            diag::warn_config(w);
         }
         diag::error(&nothing_answers(key));
         diag::hint("       `sbx plugins list` shows every installed plugin.");

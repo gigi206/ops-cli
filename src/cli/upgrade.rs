@@ -247,7 +247,7 @@ pub(crate) fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
     // take (so an untrusted pin silently rolling the global channel is never a mystery).
     let cfg = config::load(&cwd);
     for warning in &cfg.warnings {
-        diag::warn(warning);
+        diag::warn_config(warning);
     }
 
     // `--app <name>` is checked against the resolved config before any roll starts: a name that
@@ -714,7 +714,7 @@ pub(crate) fn app_upgrade_cmd(args: &[OsString]) -> ExitCode {
     };
     let cfg = config::load(&cwd);
     for warning in &cfg.warnings {
-        diag::warn(warning);
+        diag::warn_config(warning);
     }
     let app = match launchable_app(&cfg, name, "app upgrade") {
         Ok(app) => app,
