@@ -233,6 +233,10 @@ pub(super) struct CaptureGuard {
     ring: Arc<CaptureRing>,
     log: Arc<LogRing>,
     seq: u64,
+    /// The host this exchange is with. The ring's masking needs it: a needle the cage taught the
+    /// proxy on one service is masked out of the record of that service and nowhere else, so the
+    /// door has to know where the exchange went ([`CaptureRing::insert`]).
+    host: String,
     req_head: Mutex<CaptureBytes>,
     injected: Mutex<CaptureBytes>,
     req_body: Arc<CapBuf>,
@@ -259,13 +263,14 @@ pub(super) struct CaptureGuard {
 type FramesShape = ((usize, bool), (usize, bool));
 
 impl CaptureGuard {
-    /// Start capturing the exchange logged as `seq`.
-    pub(super) fn new(ring: Arc<CaptureRing>, log: Arc<LogRing>, seq: u64) -> Self {
+    /// Start capturing the exchange logged as `seq`, with `host`.
+    pub(super) fn new(ring: Arc<CaptureRing>, log: Arc<LogRing>, seq: u64, host: &str) -> Self {
         let caps = ring.caps();
         CaptureGuard {
             ring,
             log,
             seq,
+            host: host.to_string(),
             req_head: Mutex::new(CaptureBytes::default()),
             injected: Mutex::new(CaptureBytes::default()),
             req_body: Arc::new(CapBuf::new(caps.body)),
@@ -329,7 +334,7 @@ impl CaptureGuard {
         let mut capture = Capture::new(self.seq);
         capture.ws_up = up;
         capture.ws_down = down;
-        self.ring.insert(capture);
+        self.ring.insert(capture, &self.host);
         self.log.capture_grew(self.seq);
     }
 
@@ -416,7 +421,7 @@ impl CaptureGuard {
         // until now, and would otherwise never be shown.
         let filed = !capture.is_empty();
         if filed {
-            self.ring.insert(capture);
+            self.ring.insert(capture, &self.host);
         }
         self.log.capture_settled(self.seq, filed);
     }
@@ -525,7 +530,11 @@ mod tests {
             crate::sandbox::control::Plane::Agent,
         );
         log.expect_capture(seq);
-        (CaptureGuard::new(ring.clone(), log.clone(), seq), ring, log)
+        (
+            CaptureGuard::new(ring.clone(), log.clone(), seq, "api.example.com"),
+            ring,
+            log,
+        )
     }
 
     #[test]
@@ -670,7 +679,7 @@ mod tests {
             crate::sandbox::control::Plane::Agent,
         );
         log.expect_capture(seq);
-        let g = CaptureGuard::new(ring.clone(), log, seq);
+        let g = CaptureGuard::new(ring.clone(), log, seq, "api.example.com");
         // Two pushes that split the needle down the middle — as two socket reads would.
         g.set_request_body(b"xx abc");
         g.set_request_body(b"def yy");

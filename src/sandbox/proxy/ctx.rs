@@ -22,7 +22,7 @@ use super::dns::{Resolver, caching_resolver};
 use super::inject::{CredentialRefresh, Credentials};
 #[cfg(test)]
 use super::inject::{HeaderInjection, SecretNeedle};
-use super::redact_in_place;
+use super::redact_record_in_place;
 
 /// The hosts of the built-in self-equip allow-set, in allowlist-entry syntax. Sourced once so
 /// the policy (`builtin_allow_rules`) and the `sbx config` display can never drift.
@@ -353,7 +353,11 @@ impl ProxyCtx {
     ///
     /// Call only for a *permitted* request: a refusal forwards nothing, so there is no traffic to
     /// show, and the decision itself is already the log event.
-    pub(super) fn begin_capture(&self, seq: Option<u64>) -> Option<super::capture::CaptureGuard> {
+    pub(super) fn begin_capture(
+        &self,
+        seq: Option<u64>,
+        host: &str,
+    ) -> Option<super::capture::CaptureGuard> {
         let (capture, log, seq) = (self.capture.as_ref()?, self.log.as_ref()?, seq?);
         // Tell the event ring a capture is coming, so an arriving status waits for it and the event
         // is re-emitted exactly once with everything.
@@ -362,6 +366,7 @@ impl ProxyCtx {
             capture.clone(),
             log.clone(),
             seq,
+            host,
         ))
     }
 
@@ -581,7 +586,7 @@ impl ProxyCtx {
         reason: &str,
     ) -> Option<u64> {
         let log = self.log.as_ref()?;
-        let redacted = path.map(|p| self.redact_query(p));
+        let redacted = path.map(|p| self.redact_query(host, p));
         Some(log.push(
             muted,
             host,
@@ -615,13 +620,13 @@ impl ProxyCtx {
     /// printed by `sbx net pending` and by the park notice, so a path that is masked on its way into
     /// the ring and unmasked on its way into the pending queue is the same token in the same
     /// terminal by another route.
-    pub(super) fn redact_query(&self, path: &str) -> String {
+    pub(super) fn redact_query(&self, host: &str, path: &str) -> String {
         let creds = self.credentials.snapshot();
         if creds.needles.is_empty() {
             return path.to_string();
         }
         let mut bytes = path.as_bytes().to_vec();
-        redact_in_place(&mut bytes, &creds.needles);
+        redact_record_in_place(&mut bytes, &creds.needles, host);
         String::from_utf8_lossy(&bytes).into_owned()
     }
 

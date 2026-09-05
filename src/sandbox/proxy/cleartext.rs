@@ -216,7 +216,7 @@ pub(super) fn handle_cleartext(
     // byte: `reserialize_request` writes out what sbx parsed, which drops the hop-by-hop headers
     // (`Connection`, `Proxy-Connection`, `Proxy-Authorization`, `Expect`) and states its own
     // `Connection: close`. What the capture answers is what the client sent.
-    let capture = ctx.begin_capture(allow_seq);
+    let capture = ctx.begin_capture(allow_seq, &host);
     if let Some(c) = &capture {
         c.set_request(head_bytes, &[]);
     }

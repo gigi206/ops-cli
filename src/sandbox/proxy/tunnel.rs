@@ -542,7 +542,7 @@ pub(super) fn serve_tunneled_request(
     //     any injected credential — so a secret cannot reach the capture even in principle; only the
     //     injected header *names* are noted. The guard files on drop, so however this relay ends,
     //     what it saw is filed exactly once.
-    let capture = ctx.begin_capture(allow_seq);
+    let capture = ctx.begin_capture(allow_seq, connect_host);
     if let Some(c) = &capture {
         c.set_request(&inner_bytes, &injected);
     }

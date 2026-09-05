@@ -2252,6 +2252,43 @@ fn an_ask_undecided_host_on_the_https_forward_path_is_refused_when_denied() {
     );
 }
 
+/// The same rule the capture ring holds, on the other operator surface a needle reaches: the path
+/// that enters the event ring and the pending queue.
+///
+/// Masking a learned needle on the service it was learned on is load-bearing and is what
+/// `a_parked_request_masks_a_secret_riding_in_its_query` depends on. On any other host those same
+/// bytes are the leak, and a reader who greps `sbx net log` for a token that walked off to another
+/// destination must find it rather than a run of stars a cage put there.
+#[test]
+fn a_learned_needle_masks_a_logged_path_for_its_own_service_only() {
+    const TOKEN: &str = "topsecretvalue-abcdef";
+    let credentials = Arc::new(Credentials::new(
+        Vec::new(),
+        Vec::new(),
+        crate::sandbox::redact::MIN_LEN_DEFAULT,
+        Vec::new(),
+    ));
+    assert!(
+        credentials.observe("Authorization", &format!("Bearer {TOKEN}"), "api.test"),
+        "the learned needle is the premise of this test"
+    );
+    let ctx = ProxyCtx::new(Arc::new(Ca::ephemeral().unwrap()), EgressPolicy::default())
+        .unwrap()
+        .with_shared_credentials(credentials);
+    let path = format!("/v1/x?token={TOKEN}&page=2");
+    assert_eq!(
+        ctx.redact_query("api.test", &path),
+        format!("/v1/x?token={}&page=2", "*".repeat(TOKEN.len())),
+        "the app's own credential is masked on the way to its own service"
+    );
+    assert_eq!(
+        ctx.redact_query("elsewhere.test", &path),
+        path,
+        "and the same value bound for another host stays readable, which is what makes the line \
+         worth reading"
+    );
+}
+
 /// A parked request reaches a person's terminal — `sbx net pending`, its `--json` form, and the
 /// park notice all print the path — so it gets the same masking the event ring gets. The needle
 /// here is one the cage's own sign-in taught the proxy for this very host, which is exactly the

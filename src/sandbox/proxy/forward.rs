@@ -359,7 +359,7 @@ pub(super) fn handle_https_forward(
 
     // 8a. Open the traffic capture, recording the client's own head (before the reserialization
     //     below adds any injected credential) plus the injected header names, never their values.
-    let capture = ctx.begin_capture(allow_seq);
+    let capture = ctx.begin_capture(allow_seq, &host);
     if let Some(c) = &capture {
         c.set_request(head_bytes, &injected);
     }

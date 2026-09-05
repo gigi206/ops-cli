@@ -479,6 +479,30 @@ impl SecretNeedle {
         }
     }
 
+    /// Whether the **operator's own record** of an exchange with `host` masks this needle: the
+    /// traffic capture `sbx net logs` prints, and the request path that enters the event ring and
+    /// the pending queue.
+    ///
+    /// A declared needle is masked everywhere. Its value was issued host-side and the cage never
+    /// holds it, so wherever it appears it is a value the operator asked sbx to keep out of sight.
+    ///
+    /// A learned one is masked on the service it was learned on and nowhere else, which is
+    /// [`Self::scanned_for`] read the other way round. The two questions have the same answer for
+    /// the same reason: on its own service the value is the app's credential doing its job, so it
+    /// is neither scanned as a leak nor printed in the record; anywhere else it is a leak, so it
+    /// **is** scanned and it must stay legible in the record, which is where a reader goes to see
+    /// where it went.
+    ///
+    /// The asymmetry matters because a learned needle's bytes are the cage's to choose. It sends a
+    /// value in an auth header and the proxy remembers it, so masking learned needles across the
+    /// whole record would hand a cage a small budget of arbitrary strings it could make disappear
+    /// from what the operator reads, with the seeding request looking exactly like an
+    /// authenticated one. Bounded to its own service, that budget buys the cage nothing it did not
+    /// already have: bytes it sent to the host it sent them to.
+    pub(crate) fn masks_record_for(&self, host: &str) -> bool {
+        !self.observed || !self.scanned_for(host)
+    }
+
     /// The needle bytes — used by the scan, and by the egress tests to confirm a needle was
     /// derived. Deliberately a named method, never `Debug`, so it is only ever read explicitly.
     pub(crate) fn as_bytes(&self) -> &[u8] {
@@ -674,10 +698,21 @@ impl Credentials {
     /// whether it was newly kept.
     ///
     /// A credential an app obtained by its own sign-in is invisible to everything here: it belongs
-    /// to no declaration, so nothing refuses it on the way out, masks it on the way back, or hides
-    /// it from `sbx net logs`. sbx already *sees* it — it terminates the TLS — so the only question
-    /// is whether it retains it. Retaining it costs a value held in host memory, never written and
-    /// never logged; not retaining it leaves the credential with no protection at all.
+    /// to no declaration, so nothing refuses it on the way out and nothing masks it on the way
+    /// back. sbx already *sees* it — it terminates the TLS — so the only question is whether it
+    /// retains it. Retaining it costs a value held in host memory, never written; not retaining it
+    /// leaves the credential with no protection at all.
+    ///
+    /// What it does **not** buy is a value hidden from the operator. A learned needle is masked out
+    /// of the traffic capture and the logged path for the service it was learned on and nowhere
+    /// else ([`SecretNeedle::masks_record_for`]), because the bytes here are the cage's to choose:
+    /// a learned needle that masked the whole record would let a cage decide what
+    /// `sbx net logs --with-headers` can still show.
+    ///
+    /// This is a net over the cage's traffic, not a boundary, and it is a net the cage feeds. It
+    /// cannot tell a credential an app signed in for from a value sent to occupy a slot, since both
+    /// are just header values on allowed requests. What the cap and its eviction settle is which
+    /// eight are held; nothing here can settle whether they are the eight that matter.
     ///
     /// Only the injections are authoritative for what gets *sent*: this never adds an injection, so
     /// observing can change what is scanned but never what the cage authenticates as.
@@ -691,18 +726,16 @@ impl Credentials {
             return false;
         }
         let bytes = credential.as_bytes();
-        // The cap counts the **learned** needles only, which is what [`OBSERVE_MAX`] is about: it
-        // bounds what a cage rotating through values can add, and a declared needle is not that.
-        // Counting the whole set turned the ceiling into a switch — `HeaderShape::needles` emits
-        // *two* needles for a `basic`-shaped secret, so four declared credentials filled it and this
-        // function then learned nothing for the rest of the launch, silently leaving every
-        // cage-acquired token outside the redaction and the outbound tripwire.
-        let observed = |set: &CredentialSet| set.needles.iter().filter(|n| n.is_observed()).count();
+        // Only the duplicate check refuses. The cap is enforced by eviction below, over the
+        // **learned** needles alone, which is what [`OBSERVE_MAX`] bounds: what a cage rotating
+        // through values can add, never a declared needle. Counting the whole set turned the
+        // ceiling into a switch — `HeaderShape::needles` emits *two* needles for a `basic`-shaped
+        // secret, so four declared credentials filled it and this function then learned nothing for
+        // the rest of the launch, silently leaving every cage-acquired token outside the redaction
+        // and the outbound tripwire.
         {
             let current = self.snapshot();
-            if observed(&current) >= OBSERVE_MAX
-                || current.needles.iter().any(|n| n.as_bytes() == bytes)
-            {
+            if current.needles.iter().any(|n| n.as_bytes() == bytes) {
                 return false;
             }
         }
@@ -711,12 +744,19 @@ impl Credentials {
         };
         // Re-checked under the write lock: two threads can reach the check above with the same new
         // credential, and a duplicate needle would scan the same bytes twice for the same result.
-        if observed(&current) >= OBSERVE_MAX
-            || current.needles.iter().any(|n| n.as_bytes() == bytes)
-        {
+        if current.needles.iter().any(|n| n.as_bytes() == bytes) {
             return false;
         }
         let mut needles = current.needles.clone();
+        // Room is made rather than the new value refused, and the two are not the same policy on an
+        // adversary that fills this set for free. What goes out is the least recently learned, and
+        // only ever a learned one: a declared needle is not what `OBSERVE_MAX` bounds.
+        while needles.iter().filter(|n| n.is_observed()).count() >= OBSERVE_MAX {
+            let Some(oldest) = needles.iter().position(|n| n.is_observed()) else {
+                break;
+            };
+            needles.remove(oldest);
+        }
         needles.push(SecretNeedle::learned(
             format!("observed:{header}"),
             bytes.to_vec(),
@@ -816,6 +856,15 @@ const OBSERVE_MIN_LEN: usize = 16;
 /// The most observed credentials kept. A cage rotating through many values must not grow the scan
 /// set without bound, since every needle is scanned against every request head and every response
 /// chunk from an injection target.
+///
+/// Reaching it evicts the least recently learned rather than refusing the new value, and the
+/// difference is the whole of what this ceiling is worth against a cage that fills it deliberately.
+/// Refusing meant eight requests to an allowed host settled the set for the rest of the launch, and
+/// every credential the app obtained afterwards stayed outside the outbound tripwire and the
+/// response mask. Under recency the same manoeuvre costs eight further values for every value it
+/// wants uncovered, and covers nothing in the window between a credential being seen and those
+/// eight arriving. It also fits the ordinary case it was written for, an app whose token rotates:
+/// the current values are the ones held.
 const OBSERVE_MAX: usize = 8;
 
 /// The credential inside an auth header value: the token, with a `Bearer`/`Basic`/`Token` scheme
@@ -1466,6 +1515,53 @@ mod tests {
             creds.snapshot().needles.len(),
             OBSERVE_MAX,
             "the scan set is bounded whatever the cage rotates through"
+        );
+    }
+
+    /// Which eight the cap keeps is the cage's choice either way, so it must be the eight most
+    /// recent rather than the eight that arrived first.
+    ///
+    /// The values that fill this set are chosen by the cage: it sends an auth header and the proxy
+    /// remembers it. First-come admission therefore let eight requests to an allowed host settle
+    /// the set for the whole launch, and a credential the app really signed in for afterwards was
+    /// refused entry, so nothing tripwired it on the way out and nothing masked it on the way back.
+    /// Recency cannot be gamed the same way: covering a value that has been seen costs the cage
+    /// eight further values, every time, and the value is covered from the moment it is seen.
+    #[test]
+    fn a_credential_seen_after_the_cap_is_full_still_joins_the_scan_set() {
+        let creds = default_creds(Vec::new(), Vec::new());
+        for i in 0..OBSERVE_MAX {
+            assert!(
+                creds.observe(
+                    "authorization",
+                    &format!("Bearer seed-{i:0>20}"),
+                    "host.test"
+                ),
+                "the seeding values are the premise of this test"
+            );
+        }
+        assert_eq!(creds.snapshot().needles.len(), OBSERVE_MAX);
+
+        const LATE: &str = "app-signed-in-0123456789";
+        assert!(
+            creds.observe("authorization", &format!("Bearer {LATE}"), "host.test"),
+            "a credential the app obtains after the cap is full must still be kept"
+        );
+        let set = creds.snapshot();
+        assert_eq!(
+            set.needles.len(),
+            OBSERVE_MAX,
+            "and the set stays bounded: the oldest went out to make room"
+        );
+        assert!(
+            set.needles.iter().any(|n| n.as_bytes() == LATE.as_bytes()),
+            "the value the tripwires must cover is the one in the set"
+        );
+        assert!(
+            !set.needles
+                .iter()
+                .any(|n| n.as_bytes() == b"seed-00000000000000000000"),
+            "and the one that made room is the first the cage seeded"
         );
     }
 

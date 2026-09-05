@@ -765,7 +765,7 @@ fn decide_https(
             // tripwire is not a backstop here: `carries_secret` skips a needle whose destination is
             // the host it was learned on, which is exactly the request that parks instead of being
             // refused.
-            let path = &ctx.redact_query(path);
+            let path = &ctx.redact_query(host, path);
             let verdict = ctx.pending.park(
                 host,
                 port,
@@ -2004,6 +2004,22 @@ fn needle_prefix_suffix(window: &[u8], needles: &[SecretNeedle]) -> usize {
 /// Equal length is the invariant the streaming framing relies on; an empty or over-long needle is
 /// skipped (the empty needle is screened out at resolution, but guard here too).
 pub(crate) fn redact_in_place(buf: &mut [u8], needles: &[SecretNeedle]) {
+    mask_each(buf, needles.iter());
+}
+
+/// Replace every occurrence of every needle that masks the **operator's record** of an exchange
+/// with `host` ([`SecretNeedle::masks_record_for`]), in place and at equal length.
+///
+/// The door into the traffic capture and the logged path go through here rather than through
+/// [`redact_in_place`], because those two are records *about* the cage's traffic rather than bytes
+/// travelling to or from the cage: what a value learned from the cage may hide is not the same
+/// question there.
+pub(crate) fn redact_record_in_place(buf: &mut [u8], needles: &[SecretNeedle], host: &str) {
+    mask_each(buf, needles.iter().filter(|n| n.masks_record_for(host)));
+}
+
+/// The masking itself, over whichever needles the caller selected.
+fn mask_each<'a>(buf: &mut [u8], needles: impl Iterator<Item = &'a SecretNeedle>) {
     for needle in needles {
         let len = needle.as_bytes().len();
         if len == 0 || len > buf.len() {

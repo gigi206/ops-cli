@@ -600,7 +600,7 @@ async fn relay(
     // client's own, rendered from the decoded request *before* the rebuild below adds any injected
     // credential, so a secret cannot reach the capture even in principle. The guard files on drop,
     // so every early return below files what it saw exactly once.
-    let capture = ctx.begin_capture(seq);
+    let capture = ctx.begin_capture(seq, host);
     if let Some(c) = &capture {
         c.set_request(&capture_request_head(&req), &injected);
     }

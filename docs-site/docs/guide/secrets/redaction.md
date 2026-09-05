@@ -203,8 +203,8 @@ app on several will see refused: its own control plane blocked while its traffic
 acquiring host keeps working.
 
 This is worth being explicit about, because it means `sbx` retains a value you never
-gave it. It only ever holds it in memory, never writes it and never logs it, and the
-proxy already *saw* it in any case, being the thing that terminates the cage's TLS.
+gave it. It only ever holds it in memory, never writes it to disk, and the proxy
+already *saw* it in any case, being the thing that terminates the cage's TLS.
 The choice is only whether it remembers what it has seen, and remembering is what
 lets it protect the credential at all.
 
@@ -238,7 +238,15 @@ Five bounds keep this narrow:
 - a short value is ignored, on a stricter floor than for a declared secret, since
   one that occurs by chance would refuse ordinary requests;
 - the number kept is capped, because every needle is scanned against every request
-  head and every response chunk.
+  head and every response chunk. Reaching the cap drops the least recently learned
+  value rather than turning learning off, so a credential the app obtains late in a
+  session is covered from the moment it is seen;
+- what a learned value hides from *you* is bounded to the service it was learned on.
+  In your own record of the session, the traffic capture and the logged request path,
+  it is masked for that service and left readable everywhere else. The value there is
+  one the cage chose, so masking it across the whole record would let a cage decide
+  what `sbx net logs` can still show you; and the one place those bytes are worth
+  reading is a request that carried them somewhere else, which is the leak itself.
 
 Once remembered, a value stays remembered for the life of the session. That matters
 because a declared credential can be **re-resolved** mid-session, when the destination

@@ -36,7 +36,7 @@ use std::sync::Mutex;
 
 use crate::sandbox::locks::locked;
 use crate::sandbox::proxy::SecretNeedle;
-use crate::sandbox::proxy::redact_in_place;
+use crate::sandbox::proxy::redact_record_in_place;
 
 /// How much of each exchange a launch captures. `Off` is the default and costs nothing — no buffer
 /// is ever allocated on the forwarding path.
@@ -397,7 +397,7 @@ impl CaptureRing {
         self.caps
     }
 
-    /// Store one finished exchange, masking every configured secret out of every part first.
+    /// Store one finished exchange with `host`, masking every secret out of every part first.
     ///
     /// This is the **only** door into the ring, which is what makes the masking unmissable. It runs
     /// on whole parts rather than on streamed chunks, so a secret that arrived split across two
@@ -407,7 +407,7 @@ impl CaptureRing {
     /// silently forgotten) until the newest fits; a capture larger than the whole budget on its own
     /// is stored anyway — it is already bounded by the per-part caps, and refusing it would silently
     /// lose the one exchange the user is most likely watching.
-    pub(crate) fn insert(&self, mut capture: Capture) {
+    pub(crate) fn insert(&self, mut capture: Capture, host: &str) {
         if capture.is_empty() {
             return;
         }
@@ -421,7 +421,7 @@ impl CaptureRing {
             &mut capture.ws_up,
             &mut capture.ws_down,
         ] {
-            redact_in_place(&mut part.bytes, &needles);
+            redact_record_in_place(&mut part.bytes, &needles, host);
         }
         let weight = capture.weight();
         let mut g = locked(&self.inner);
@@ -649,7 +649,7 @@ mod tests {
         cap.req_head = bytes(b"POST /v1 HTTP/1.1\r\nhost: api.example.com\r\n\r\n");
         cap.req_body = bytes(br#"{"key":"s3cr3t-value"}"#);
         cap.res_body = bytes(b"echoed s3cr3t-value back");
-        ring.insert(cap);
+        ring.insert(cap, "api.example.com");
 
         let (found, _) = ring.get(&[1]);
         let stored = &found[0];
@@ -665,6 +665,59 @@ mod tests {
                 .windows(12)
                 .any(|w| w == b"s3cr3t-value"),
             "a reflected secret is masked on the response side too"
+        );
+    }
+
+    /// A **learned** needle is a value the cage chose. The proxy remembers whatever the cage sent in
+    /// an auth header so the outbound tripwire and the response mask cover it, which is a net over
+    /// the cage's own traffic. It must not also be a lever on the operator's record of that traffic:
+    /// a cage that seeds values of its own choosing would otherwise decide what
+    /// `sbx net logs --with-headers` can no longer show, and the seeding request looks like any
+    /// other authenticated one.
+    ///
+    /// The service the needle was learned on is the discriminant, and it is the one `scanned_for`
+    /// already draws. There, the value is the app's own credential where it lives and masking it is
+    /// the whole reason it is remembered. Anywhere else, the same bytes crossing are the leak the
+    /// record exists to show, and a mask over them hides exactly what the reader is looking for.
+    #[test]
+    fn a_learned_needle_masks_the_record_of_its_own_service_only() {
+        use crate::sandbox::proxy::Credentials;
+
+        const VALUE: &str = "cage-chosen-value-0";
+        let credentials = std::sync::Arc::new(Credentials::new(
+            Vec::new(),
+            Vec::new(),
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            Vec::new(),
+        ));
+        assert!(
+            credentials.observe("authorization", &format!("Bearer {VALUE}"), "api.test"),
+            "a learned needle is the premise of this test"
+        );
+        let ring = CaptureRing::new(CaptureCaps::new(CaptureLevel::Bodies, 8), credentials);
+
+        // The service it was learned on: the app's own credential, where it belongs.
+        let mut own = Capture::new(1);
+        own.req_head =
+            bytes(format!("GET /v1 HTTP/1.1\r\nauthorization: Bearer {VALUE}\r\n\r\n").as_bytes());
+        ring.insert(own, "api.test");
+
+        // Anywhere else: the same bytes leaving for another host is the event the record is for.
+        let mut elsewhere = Capture::new(2);
+        elsewhere.req_body = bytes(format!("payload={VALUE}").as_bytes());
+        ring.insert(elsewhere, "elsewhere.test");
+
+        let (found, _) = ring.get(&[1, 2]);
+        let own = String::from_utf8(found[0].req_head.bytes.clone()).unwrap();
+        assert!(
+            own.contains(&"*".repeat(VALUE.len())) && !own.contains(VALUE),
+            "the app's own credential is masked in the record of its own service: {own}"
+        );
+        let elsewhere = String::from_utf8(found[1].req_body.bytes.clone()).unwrap();
+        assert_eq!(
+            elsewhere,
+            format!("payload={VALUE}"),
+            "and a cage-chosen value cannot blank itself out of the record of where it went"
         );
     }
 
@@ -696,7 +749,7 @@ mod tests {
         let mut cap = Capture::new(1);
         cap.req_head = bytes(b"GET /v1 HTTP/1.1\r\nauthorization: Bearer old-t0ken-value\r\n\r\n");
         cap.res_body = bytes(b"retry with new-t0ken-value please");
-        ring.insert(cap);
+        ring.insert(cap, "api.example.com");
 
         let (found, _) = ring.get(&[1]);
         let stored = &found[0];
@@ -754,7 +807,7 @@ mod tests {
             let mut cap = Capture::new(seq);
             cap.req_head =
                 bytes(b"GET /v1 HTTP/1.1\r\nauthorization: Bearer static-api-k3y\r\n\r\n");
-            ring.insert(cap);
+            ring.insert(cap, "api.example.com");
 
             let (found, _) = ring.get(&[seq]);
             let head = String::from_utf8(found[0].req_head.bytes.clone()).unwrap();
@@ -775,7 +828,7 @@ mod tests {
         for seq in 1..=5u64 {
             let mut cap = Capture::new(seq);
             cap.res_body = bytes(&chunk);
-            ring.insert(cap);
+            ring.insert(cap, "api.example.com");
         }
         let (found, evicted) = ring.get(&[1, 2, 3, 4, 5]);
         let kept: Vec<u64> = found.iter().map(|c| c.seq).collect();
@@ -796,12 +849,12 @@ mod tests {
         let mut handshake = Capture::new(4);
         handshake.req_head = bytes(b"GET /chat HTTP/1.1\r\n\r\n");
         handshake.res_head = bytes(b"HTTP/1.1 101 Switching Protocols\r\n\r\n");
-        ring.insert(handshake);
+        ring.insert(handshake, "api.example.com");
 
         let mut frames = Capture::new(4);
         frames.ws_up = bytes(br#"{"from":"cage"}"#);
         frames.ws_down = bytes(br#"{"from":"server"}"#);
-        ring.insert(frames);
+        ring.insert(frames, "api.example.com");
 
         let (found, _) = ring.get(&[4]);
         assert_eq!(found.len(), 1, "one entry per exchange");
@@ -830,11 +883,11 @@ mod tests {
             bytes: b"partial".to_vec(),
             truncated: true,
         };
-        ring.insert(first);
+        ring.insert(first, "api.example.com");
 
         let mut second = Capture::new(1);
         second.ws_down = bytes(b"partial-and-the-rest");
-        ring.insert(second);
+        ring.insert(second, "api.example.com");
 
         let (found, _) = ring.get(&[1]);
         assert_eq!(found[0].ws_down.bytes, b"partial-and-the-rest");
@@ -855,7 +908,7 @@ mod tests {
         for seq in [3u64, 2, 1] {
             let mut cap = Capture::new(seq);
             cap.req_head = bytes(b"GET / HTTP/1.1\r\n\r\n");
-            ring.insert(cap);
+            ring.insert(cap, "api.example.com");
         }
         let (found, _) = ring.get(&[1, 2, 3]);
         let order: Vec<u64> = found.iter().map(|c| c.seq).collect();
@@ -876,7 +929,7 @@ mod tests {
         ));
         let mut before = Capture::new(1);
         before.req_head = bytes(b"GET /one HTTP/1.1\r\n\r\n");
-        ring.insert(before);
+        ring.insert(before, "api.example.com");
 
         // Poison each lock the only way it can be poisoned: panic on another thread while a guard
         // on it is still held, so the unwind marks it. The assertion is the fixture's own — a body
@@ -905,7 +958,7 @@ mod tests {
 
         let mut after = Capture::new(2);
         after.req_body = bytes(br#"{"key":"s3cr3t-value"}"#);
-        ring.insert(after);
+        ring.insert(after, "api.example.com");
 
         let (found, _) = ring.get(&[1, 2]);
         let seqs: Vec<u64> = found.iter().map(|c| c.seq).collect();
@@ -924,7 +977,7 @@ mod tests {
     #[test]
     fn an_empty_capture_is_not_stored_at_all() {
         let ring = CaptureRing::with_needles(CaptureCaps::new(CaptureLevel::Bodies, 8), vec![]);
-        ring.insert(Capture::new(7));
+        ring.insert(Capture::new(7), "api.example.com");
         assert!(ring.get(&[7]).0.is_empty());
     }
 
