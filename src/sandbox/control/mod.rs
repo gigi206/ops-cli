@@ -52,6 +52,10 @@ pub(crate) enum Verdict {
 
 /// One request parked awaiting a decision: what it is, when it started waiting, and the channel the
 /// control side sends the verdict on to wake the blocked proxy thread.
+///
+/// `host` and `path` are held in their sanitised form — see [`PendingState::park`], which is where
+/// they are filtered. Everything that reads this queue reports it to an operator, so the stored form
+/// is the reportable one and no reader has to remember to filter.
 struct Entry {
     host: String,
     port: u16,
@@ -97,6 +101,10 @@ impl PendingState {
     /// is called with the assigned sequence id immediately after the request is registered and
     /// *before* the thread blocks, so the caller can emit its notice with the live id.
     ///
+    /// `host` and `path` are chosen by the cage and stored filtered ([`super::sanitize`]), the one
+    /// door into a queue every reader of which reports it to an operator. The verdict is unaffected:
+    /// it is reached on the values the caller holds.
+    ///
     /// Flood guard: once `cap` requests are already parked, a new one is denied immediately without
     /// enqueuing, so an in-cage agent cannot pin unbounded host threads by opening connections that
     /// all park (the default `ask` timeout being indefinite, parked threads would otherwise live
@@ -124,12 +132,26 @@ impl PendingState {
             inner.next_seq += 1;
             let seq = inner.next_seq;
             let (tx, rx) = mpsc::channel();
+            // The two free-form values are sanitised **here**, on the way in, for the reason
+            // [`LogRing::push`] states at length for the log ring: this is the one door every ask
+            // enters by, and the alternative is a duty spread over every reader of the queue. Both
+            // are chosen by the cage — a `Host` header, an SNI or a CONNECT authority, and the
+            // target of the request being asked about — so they may carry any byte, including an
+            // ESC, which paints over the operator's terminal when `sbx net pending` prints the row
+            // while they are deciding whether to open egress.
+            //
+            // This is not the verdict's view of either: the decision is reached on the raw values
+            // the caller still holds, and only what is *reported* passes through here. What the
+            // answer reply names, and what `--session` then remembers, is the stored form — so the
+            // rule the operator approves is the one they read. A host that needed filtering
+            // therefore yields a session rule matching nothing, and the next identical request is
+            // asked again rather than granted against a name the operator never saw.
             inner.entries.insert(
                 seq,
                 Entry {
-                    host: host.to_string(),
+                    host: super::sanitize(host),
                     port,
-                    path: path.to_string(),
+                    path: super::sanitize(path),
                     since: Instant::now(),
                     answer: tx,
                 },
@@ -1218,9 +1240,20 @@ fn dispatch(
         Some("LIST") => {
             let mut out = String::new();
             for row in state.list() {
+                // The two cage-chosen fields get the same treatment as the event line's, and for
+                // the same two reasons: [`PendingState::park`] has already stripped the control
+                // characters that would end the line, and [`head_field`]/[`trailing_field`] stop
+                // whitespace from splitting off a token that either restates a field of this row or
+                // — carrying no `=` — makes the reader drop the request altogether, leaving the cage
+                // parked with no id to answer it by. `path` is last, so its value is everything past
+                // the first `=` and a query string's own `=` round-trips.
                 out.push_str(&format!(
                     "pending seq={} port={} waiting={} host={} path={}\n",
-                    row.seq, row.port, row.waiting_secs, row.host, row.path
+                    row.seq,
+                    row.port,
+                    row.waiting_secs,
+                    head_field(&row.host),
+                    trailing_field(&row.path)
                 ));
             }
             out.push_str("ok\n");
@@ -1246,7 +1279,7 @@ fn dispatch(
                     if remember {
                         manual.remember(verdict, &host, port);
                     }
-                    out.push_str(&format!("answered host={host}\n"));
+                    out.push_str(&format!("answered host={}\n", head_field(&host)));
                 }
                 out.push_str("ok\n");
                 return out;
@@ -1259,7 +1292,9 @@ fn dispatch(
                     if remember {
                         manual.remember(verdict, &host, port);
                     }
-                    format!("ok host={host} count={count}\n")
+                    // `host` is not the last token here — `count` follows it — so whitespace in it
+                    // would shift what the reader reads as the count.
+                    format!("ok host={} count={count}\n", head_field(&host))
                 }
                 None => "err not-found\n".to_string(),
             }
@@ -2170,6 +2205,108 @@ mod tests {
         let handle = thread::spawn(move || s.park(host, port, "/", None, 256, |_| {}));
         wait_for_n(state, already + 1);
         handle
+    }
+
+    /// A parked request holds no byte the cage could paint the operator's terminal with.
+    ///
+    /// `host` and `path` are the cage's to choose — a `Host` header, an SNI, a CONNECT authority,
+    /// and the target of the request being asked about — and `sbx net pending` prints both while the
+    /// operator is deciding whether to open egress. An ESC run there erases the lines above it, so a
+    /// listing can be made to show a destination other than the one the id answers. This is the same
+    /// door, and the same treatment, as `LogRing::push`.
+    #[test]
+    fn a_parked_request_carries_no_byte_the_cage_could_paint_with() {
+        let state = Arc::new(PendingState::new());
+        let s = state.clone();
+        let parked = thread::spawn(move || {
+            s.park(
+                "api.example.com\x1b[2Kgithub.com",
+                443,
+                "/v1/x\x1b[31mRED\x1b[0m",
+                None,
+                256,
+                |_| {},
+            )
+        });
+        wait_for_one(&state);
+        let rows = state.list();
+        let row = rows.first().expect("the parked row");
+        for (field, value) in [("host", &row.host), ("path", &row.path)] {
+            assert!(
+                !value.chars().any(char::is_control),
+                "{field} kept a control byte: {value:?}"
+            );
+        }
+        // Replaced rather than dropped, so what the cage asked for stays legible in the listing.
+        assert_eq!(row.host, "api.example.com [2Kgithub.com");
+        assert_eq!(row.path, "/v1/x [31mRED [0m");
+        // The answer reply names the stored host, so what the operator approves is what they read.
+        let (host, _, _) = state
+            .answer_like(row.seq, Verdict::Allow)
+            .expect("answered");
+        assert_eq!(host, "api.example.com [2Kgithub.com");
+        assert_eq!(parked.join().unwrap(), Verdict::Allow);
+    }
+
+    /// Sanitising the queue closes the *line*; this closes the line's own **tokens**.
+    ///
+    /// `parse_pending_line` takes a row as `split_whitespace()` then `split_once('=')` per token,
+    /// and a token carrying no `=` makes the whole parse fail — which drops the request from
+    /// `sbx net pending` entirely, leaving no id to answer it with while the cage stays parked.
+    /// `sanitize` maps a control byte to exactly that separator, and Unicode whitespace such as
+    /// U+00A0 is not a control character and reaches the line untouched, so the two treatments are
+    /// both needed here for the reason `format_event_line` states for the log plane.
+    #[test]
+    fn a_cage_chosen_field_cannot_split_or_rewrite_a_token_of_its_own_pending_line() {
+        let state = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        let log = LogRing::new(LOG_RING_CAP);
+        let flows = FlowRegistry::new();
+        let s = state.clone();
+        let parked = thread::spawn(move || {
+            s.park(
+                // U+00A0: whitespace to the reader, not a control character, so `sanitize` keeps it.
+                "h.test\u{a0}port=1",
+                443,
+                // A query string's `=` must survive; the whitespace around it must not.
+                "/x?a=1\u{a0}waiting=9",
+                None,
+                256,
+                |_| {},
+            )
+        });
+        wait_for_one(&state);
+        let response = dispatch("LIST", &state, &manual, &log, &flows, None);
+        let line = response.lines().next().expect("the pending line");
+
+        // The reader's own contract, applied here so the assertion is the parse and not a guess at
+        // it: every token past the marker splits on an `=`, and the last write of a key wins.
+        let mut tokens = line.split_whitespace();
+        assert_eq!(
+            tokens.next(),
+            Some("pending"),
+            "the line opens with its marker"
+        );
+        let mut fields: BTreeMap<&str, &str> = BTreeMap::new();
+        for token in tokens {
+            let (key, value) = token.split_once('=').unwrap_or_else(|| {
+                panic!("`{token}` carries no `=`, which erases the request: {line}")
+            });
+            fields.insert(key, value);
+        }
+        assert_eq!(fields.get("port"), Some(&"443"), "{line}");
+        assert_eq!(
+            fields.get("waiting"),
+            Some(&"0"),
+            "a cage-chosen value must not restate a field of the row carrying it: {line}"
+        );
+        assert_eq!(fields.get("host"), Some(&"h.test_port_1"), "{line}");
+        // The path is the line's last token, so its value is everything past the first `=` — the one
+        // place a query string's `=` survives, and it has to, or the row would misreport the target.
+        assert_eq!(fields.get("path"), Some(&"/x?a=1_waiting=9"), "{line}");
+
+        let _ = state.answer_all(Verdict::Deny);
+        let _ = parked.join();
     }
 
     #[test]
