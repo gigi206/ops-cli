@@ -324,12 +324,6 @@ pub(super) fn checked_address(
     Ok(permitted)
 }
 
-/// Dial the permitted addresses in order, answering with the first that connects.
-///
-/// The list comes from [`checked_address`], so the SSRF guard has already passed on **each** of
-/// them — walking it cannot reach an address the guard refused, which is the property that makes
-/// the walk safe rather than a second chance at the same question. The last error is the one
-/// reported: a caller that could reach none of them is told about the last thing it tried, and the
 /// Open one TCP connection to `ip:port`, bounded by `timeout`.
 ///
 /// The bound is the whole point, and it is what every caller here was missing. `TcpStream::connect`
@@ -352,6 +346,12 @@ pub(super) fn dial_bounded(
     std::net::TcpStream::connect_timeout(&std::net::SocketAddr::new(ip, port), timeout)
 }
 
+/// Dial the permitted addresses in order, answering with the first that connects.
+///
+/// The list comes from [`checked_address`], so the SSRF guard has already passed on **each** of
+/// them — walking it cannot reach an address the guard refused, which is the property that makes
+/// the walk safe rather than a second chance at the same question. The last error is the one
+/// reported: a caller that could reach none of them is told about the last thing it tried, and the
 /// refusal it renders is the same one a single-address failure produced.
 pub(super) fn first_reachable<T, E>(
     ips: &[IpAddr],
