@@ -99,9 +99,10 @@ pub(crate) fn add(
 
 /// Configure a new remote plugin store on **trust on first use**: clone it, read the public key it
 /// ships, pin that key, and verify the catalogue against it. The pinned key is what every later
-/// `update` enforces, so a subsequent re-key by the remote is refused — re-keying is the deliberate
-/// `rm` + `add`. Weaker first-fetch trust than a pinned `add`; the caller is expected to surface the
-/// pinned key for out-of-band verification.
+/// `update` enforces, so a subsequent re-key by the remote is refused — rotating a pinned key is
+/// [`rekey`], which alerts, confirms and carries the rollback floor over. Weaker first-fetch trust
+/// than a pinned `add`; the caller is expected to surface the pinned key for out-of-band
+/// verification.
 pub(crate) fn add_tofu(
     layout: &crate::store::Layout,
     name: &str,
@@ -903,9 +904,9 @@ pub(crate) struct Updated {
 /// Re-fetch a configured store and atomically replace its cache, enforcing two invariants the
 /// transport cannot. The catalogue must still verify against the **pinned** public key — read
 /// from the cache, never supplied anew — so a compromised remote cannot rotate the key out from
-/// under the user; re-keying a store is the deliberate `rm` + `add`. And the catalogue's
-/// revision must not regress below the highest already accepted, so a validly-signed but
-/// withdrawn or downgraded listing cannot be replayed. Fail-closed and all-or-nothing: any
+/// under the user; rotating a store's key is [`rekey`], the verb this refusal names. And the
+/// catalogue's revision must not regress below the highest already accepted, so a validly-signed
+/// but withdrawn or downgraded listing cannot be replayed. Fail-closed and all-or-nothing: any
 /// failure leaves the existing cache exactly as it was.
 pub(crate) fn update(
     layout: &crate::store::Layout,
@@ -1325,6 +1326,33 @@ mod tests {
             calls, 4,
             "the `REPO_PUBKEY` doc names four readers — a reader added or removed has to be added \
              to or removed from that list, not left for the next audit to find"
+        );
+    }
+
+    /// The verb that rotates a store's pinned signing key is `rekey`, and every doc comment that
+    /// names a rotation has to send its reader there.
+    ///
+    /// `store rm` + `store add` also ends with a new key pinned, but it pins whatever the store
+    /// ships, with no alert, no confirmation and no rollback floor carried over. A comment naming
+    /// that pair as "the deliberate" rotation points a reader at the path the design exists to
+    /// avoid, which is why nothing but a scan keeps the two comments and the user guide agreeing.
+    #[test]
+    fn no_doc_comment_sends_a_key_rotation_to_rm_and_add() {
+        let source = include_str!("stores.rs");
+        // Split at the *first* module boundary, and spell the marker in two pieces so this test's
+        // own source is not a second one: the phrase it forbids is quoted in its doc above.
+        let production = source
+            .split_once(concat!("#[cfg", "(test)]"))
+            .map_or(source, |(before, _)| before);
+        let offenders = production
+            .lines()
+            .filter(|l| l.trim_start().starts_with("///"))
+            .filter(|l| l.contains("`rm` + `add`") || l.contains("`store rm` + `store add`"))
+            .count();
+        assert_eq!(
+            offenders, 0,
+            "a doc comment names `rm` + `add` as the way to rotate a pinned key; `rekey` is the \
+             verb, and it is the one the refusal message and the user guide both point at"
         );
     }
 
