@@ -110,9 +110,12 @@
 //! So a `deny` is a hard stop on the `execve` it names. What exec enforcement is *not* is a full
 //! containment boundary: an agent can do harm **in-process** (in its own interpreter) without
 //! `execve`ing at all, and an `allow`/`CONTINUE` re-runs the real syscall so *approving a specific
-//! path* is TOCTOU-racy
-//! (refusing is not — the syscall never runs). It is a guardrail with real teeth on the exec channel,
-//! layered on the cage's actual boundaries (confinement by absence, the read-only store, the netns).
+//! path* is TOCTOU-racy (refusing is not — the syscall never runs). It is a guardrail with real
+//! teeth on the exec channel, layered on the cage's actual boundaries: confinement by absence and
+//! the netns. The store at `/nix` is not one of them. Every launch binds a per-project copy of it
+//! read-write ([`crate::sandbox::binds::NixMount`]), and the cage runs under the uid that owns
+//! those files, so the programs a rule may name sit in a tree the cage may also rewrite. What the
+//! per-project copy protects is the *shared* store behind it, which no cage ever writes into.
 
 use std::ffi::OsString;
 use std::io;

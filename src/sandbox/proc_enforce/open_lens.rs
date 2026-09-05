@@ -529,7 +529,7 @@ pub(super) struct OpenLens {
     /// The project root, on the host, outside which nothing is scanned.
     ///
     /// The lens exists for the credentials that sit in the tree an agent works in. Everything else a
-    /// cage opens — the read-only store, `/usr/lib`, `/proc` — is content the user did not write and
+    /// cage opens — the store at `/nix`, `/usr/lib`, `/proc` — is content the user did not write and
     /// cannot leave a secret in, and it is also where the volume is: a build's opens are mostly
     /// there. Bounding the scan by the project is what keeps the cost proportional to the risk.
     ///

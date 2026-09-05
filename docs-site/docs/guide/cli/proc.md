@@ -300,4 +300,6 @@ sbx proc rules
 Honest limit: exec-blocking is a **guardrail, not a containment boundary**: it catches every
 `execve`, but an agent can still do harmful work *in-process* (in its own interpreter) without
 spawning. It adds visibility and a veto, on top of the cage's real boundaries (confinement by
-absence, the read-only store, the network allowlist).
+absence, the network allowlist). The store at `/nix` is not one of them: a launch binds a
+per-project copy of it read-write, so the programs a rule may name sit in a tree the cage may also
+rewrite.
