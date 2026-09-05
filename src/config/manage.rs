@@ -179,9 +179,11 @@ pub(crate) enum AddOutcome {
 /// composed closes that: a file changed underneath no longer matches its marker, and the next launch
 /// drops it, which is the fail-safe answer.
 ///
-/// One shape for every writer in this module, because the obligation is the writer's and not any one
-/// verb's: a write that hands back only its outcome leaves its caller nothing to attest to but the
-/// path, which is the defect above spelled as an API.
+/// One shape for every writer whose outcome and text are two separate facts, because the obligation
+/// is the writer's and not any one verb's: a write that hands back only its outcome leaves its caller
+/// nothing to attest to but the path, which is the defect above spelled as an API. The removal path
+/// answers the same obligation through [`RemoveOutcome::Removed`], which carries its text inside the
+/// one variant that has any — nothing was written on the other, so there is nothing to hand back.
 ///
 /// A no-op outcome (`AlreadyPresent`, [`SetOutcome::Unchanged`], `false`) carries text too, and the
 /// same text the decision was made on: nothing was written, so what is attested to is the document

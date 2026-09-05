@@ -146,6 +146,15 @@ impl PendingState {
             // rule the operator approves is the one they read. A host that needed filtering
             // therefore yields a session rule matching nothing, and the next identical request is
             // asked again rather than granted against a name the operator never saw.
+            //
+            // The stored form is also what [`PendingState::answer_like`] groups a destination by,
+            // and that is a real widening to state: two requests whose raw host or path differ only
+            // in control characters — or past this filter's 512-character cap — collapse into one
+            // `×2` row that a single answer frees. They are one row precisely because they are one
+            // row *to the operator*: nothing on screen could tell them apart, so grouping on the raw
+            // values would show one line and mean two. Keeping both forms is the alternative, and it
+            // puts the unfiltered values back in a struct every reader of this queue reports from,
+            // which is the arrangement this door exists to remove.
             inner.entries.insert(
                 seq,
                 Entry {
@@ -2295,9 +2304,11 @@ mod tests {
             fields.insert(key, value);
         }
         assert_eq!(fields.get("port"), Some(&"443"), "{line}");
-        assert_eq!(
+        // `waiting` is read from the clock, so its value is not the assertion — that the cage's own
+        // `waiting=9` did not become the one the reader keeps is.
+        assert_ne!(
             fields.get("waiting"),
-            Some(&"0"),
+            Some(&"9"),
             "a cage-chosen value must not restate a field of the row carrying it: {line}"
         );
         assert_eq!(fields.get("host"), Some(&"h.test_port_1"), "{line}");
