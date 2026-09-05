@@ -107,7 +107,9 @@ async fn serve(
     // connection's thread + runtime (the per-socket read/write timeouts the sync path relies on
     // do not apply once the stream is in nonblocking/tokio mode). Established streams are then
     // driven with no overall deadline — a gRPC stream may legitimately be long-lived — while the
-    // *connection* carrying none is let go on `ctx.idle`, as [`accept_streams`] explains.
+    // *connection* carrying none is let go on `ctx.idle`, as [`accept_streams`] explains. What a
+    // stream does get is [`CapacityBound`]: no deadline on how long it may run, and a bound on how
+    // long either half waits for a peer that grants no flow-control window at all.
     let tls = match tokio::time::timeout(ctx.timeout, acceptor.accept(client)).await {
         Ok(Ok(t)) => t,
         _ => {
@@ -452,6 +454,12 @@ async fn relay(
     // whether the response is scanned for a reflected credential, and whether the request asks for a
     // response the scan can read at all (`Accept-Encoding: identity`).
     let masks_reflection = creds.masks_reflection_for(host);
+    // The wait either half of this stream gives a peer that grants no window, and what is named if
+    // it runs out. Built once so both directions hold the same bound.
+    let capacity_bound = CapacityBound {
+        within: ctx.timeout,
+        dest: Arc::from(format!("{host}:{port}").as_str()),
+    };
     // Any host-scoped credential to inject — keyed on the already-verified host and the decrypted
     // path, so it reaches exactly its scoped destination. Runs after the verdict (a denied request
     // never got here). Each is **strip-and-replace**: the client's own copy of that header is
@@ -684,6 +692,7 @@ async fn relay(
     // this function on a request half that never ends; a counter the registry has already dropped is
     // simply an atomic nobody reads any more.
     let up_bytes = Arc::clone(&flow.up);
+    let up_bound = capacity_bound.clone();
     tokio::spawn(async move {
         let _ = relay_body(
             client_body,
@@ -691,10 +700,20 @@ async fn relay(
             req_sink,
             Some(trailer_strip),
             up_bytes,
+            &up_bound,
+            "cage to upstream",
         )
         .await;
     });
 
+    // Waited for without a deadline, and that is a limit rather than an oversight. An upstream that
+    // takes the request and never answers holds this stream and its connection, and there is no
+    // bound here to stop it: the two HTTP/1.1 planes lift their own upstream read timeout at exactly
+    // this point ([`super::begin_response_stream`]) because a completion API that thinks before its
+    // first token is the ordinary case, and putting a deadline here alone would make this plane
+    // refuse what the others wait for. What bounds it is that the upstream is one the policy allowed
+    // and one this proxy connected to itself, where the peer [`CapacityBound`] answers is a cage
+    // process. The connection cap is the ceiling on how many such streams can be held at once.
     let resp = match resp_fut.await {
         Ok(r) => r,
         Err(_) => {
@@ -761,6 +780,8 @@ async fn relay(
             &creds.needles,
             res_sink,
             Arc::clone(&flow.down),
+            &capacity_bound,
+            "upstream to cage",
         )
         .await;
     } else {
@@ -770,6 +791,8 @@ async fn relay(
             res_sink,
             None,
             Arc::clone(&flow.down),
+            &capacity_bound,
+            "upstream to cage",
         )
         .await;
     }
@@ -820,6 +843,81 @@ fn append_headers(out: &mut String, headers: &http::HeaderMap) {
     out.push_str("\r\n");
 }
 
+/// Why a body relay stopped early.
+///
+/// Two causes and not one, because they are not the same event: an `h2::Error` is what a peer did
+/// to the stream, while [`Self::CapacityStalled`] is what sbx did to a peer that would not read.
+/// They are told apart here rather than folded into one, since `h2::Error` cannot be built from
+/// outside the crate and a relay that reported this as a peer failure would blame the wrong side.
+#[derive(Debug)]
+enum RelayEnd {
+    /// The h2 stack ended the stream: a reset, a protocol error, or the connection going away.
+    ///
+    /// The error itself is not carried, because no caller renders it: every relay here answers a
+    /// peer-side end by stopping, and the peer that caused it is the one side that already knows
+    /// what it did. What the callers need from this type is the other variant.
+    H2,
+    /// The peer granted no flow-control capacity within its [`CapacityBound`], and sbx ended the
+    /// stream. Told apart from the variant above because it is sbx's own act, reported where it
+    /// happens rather than left to read as something the peer did.
+    CapacityStalled,
+}
+
+impl From<h2::Error> for RelayEnd {
+    fn from(_: h2::Error) -> Self {
+        Self::H2
+    }
+}
+
+/// How long a relay waits for its peer to grant flow-control capacity, and the destination named
+/// if that wait runs out.
+///
+/// The two synchronous planes hold a peer to `[network] timeout` for every read and every write,
+/// through `SO_RCVTIMEO`/`SO_SNDTIMEO` on the client socket. This plane puts the same socket in
+/// nonblocking mode and hands it to tokio, which drops those bounds, and the tunnel's idle timer is
+/// armed only while no stream is open. So an established stream had no bound of any kind, and a
+/// cage that advertises `SETTINGS_INITIAL_WINDOW_SIZE = 0` and never reads holds a host thread and
+/// an upstream connection for the life of the launch.
+///
+/// This is that socket bound restored on the one plane that lost it, and it is deliberately not a
+/// deadline on the *stream*: a gRPC call may legitimately run for hours, and the module header
+/// rules a stream deadline out for exactly that reason. What is bounded is a peer that grants
+/// nothing at all, which is a peer that is not reading. A stream that moves never reaches it.
+#[derive(Clone)]
+struct CapacityBound {
+    /// The wait a peer gets, from `[network] timeout` ([`ProxyCtx::timeout`]).
+    within: std::time::Duration,
+    /// `host:port`, for the report the expiry writes.
+    dest: Arc<str>,
+}
+
+impl CapacityBound {
+    /// Wait for `f` within this bound, reporting an expiry as the [`RelayEnd`] every relay here
+    /// propagates. Dropping the send stream on that error resets the stream, which is the answer a
+    /// peer that is not reading has earned.
+    ///
+    /// Said on the supervisor's stderr as it happens: the stream's own log event was written when
+    /// the request was allowed and is not amended by a relay, and an sbx-initiated reset that says
+    /// nothing anywhere is indistinguishable from the peer having reset the stream itself.
+    async fn hold<T>(
+        &self,
+        way: &'static str,
+        f: impl std::future::Future<Output = T>,
+    ) -> Result<T, RelayEnd> {
+        match tokio::time::timeout(self.within, f).await {
+            Ok(v) => Ok(v),
+            Err(_) => {
+                crate::diag::warn(&format!(
+                    "an HTTP/2 stream to `{}` granted no flow-control window on the {way} \
+                     direction within the {:?} egress timeout: the stream was reset",
+                    self.dest, self.within
+                ));
+                Err(RelayEnd::CapacityStalled)
+            }
+        }
+    }
+}
+
 /// Send `chunk` downstream under HTTP/2 flow control, in as many DATA frames as the peer's window
 /// grants, and report how many bytes actually left.
 ///
@@ -838,15 +936,22 @@ fn append_headers(out: &mut String, headers: &http::HeaderMap) {
 async fn send_granted(
     dst: &mut h2::SendStream<Bytes>,
     mut chunk: Bytes,
-) -> Result<usize, h2::Error> {
+    bound: &CapacityBound,
+    way: &'static str,
+) -> Result<usize, RelayEnd> {
     let mut sent = 0;
     while !chunk.is_empty() {
         dst.reserve_capacity(chunk.len());
         let granted = match dst.capacity() {
-            0 => match std::future::poll_fn(|cx| dst.poll_capacity(cx)).await {
+            // Bounded, because this is the wait a peer that never reads never ends — see
+            // [`CapacityBound`]. Each grant restarts it, so a slow but moving stream is not cut.
+            0 => match bound
+                .hold(way, std::future::poll_fn(|cx| dst.poll_capacity(cx)))
+                .await?
+            {
                 Some(Ok(n)) if n > 0 => n,
                 Some(Ok(_)) => continue,
-                Some(Err(e)) => return Err(e),
+                Some(Err(e)) => return Err(e.into()),
                 // The downstream reset/closed: stop relaying (dropping `dst` sends a reset).
                 None => return Ok(sent),
             },
@@ -880,7 +985,9 @@ async fn relay_body(
     cap: Option<Arc<CapBuf>>,
     strip: Option<Vec<String>>,
     bytes: Arc<std::sync::atomic::AtomicU64>,
-) -> Result<(), h2::Error> {
+    bound: &CapacityBound,
+    way: &'static str,
+) -> Result<(), RelayEnd> {
     while let Some(chunk) = src.data().await {
         let chunk = chunk?;
         let len = chunk.len();
@@ -888,7 +995,7 @@ async fn relay_body(
         if let Some(cap) = &cap {
             cap.push(&chunk);
         }
-        if len > 0 && send_granted(&mut dst, chunk).await? < len {
+        if len > 0 && send_granted(&mut dst, chunk, bound, way).await? < len {
             // The downstream reset/closed part-way: stop relaying.
             return Ok(());
         }
@@ -975,7 +1082,9 @@ async fn relay_body_redacting(
     needles: &[SecretNeedle],
     cap: Option<Arc<CapBuf>>,
     bytes: Arc<std::sync::atomic::AtomicU64>,
-) -> Result<(), h2::Error> {
+    bound: &CapacityBound,
+    way: &'static str,
+) -> Result<(), RelayEnd> {
     while let Some(chunk) = src.data().await {
         let chunk = chunk?;
         let len = chunk.len();
@@ -995,9 +1104,9 @@ async fn relay_body_redacting(
         let sent = if needles.iter().any(|n| n.find_in(&chunk, 0).is_some()) {
             let mut buf = chunk.to_vec();
             redact_in_place(&mut buf, needles);
-            send_masked(&mut dst, buf).await?
+            send_masked(&mut dst, buf, bound, way).await?
         } else {
-            send_granted(&mut dst, chunk).await? == len
+            send_granted(&mut dst, chunk, bound, way).await? == len
         };
         // Return the consumed receive-window for the original chunk so the sender keeps sending.
         let _ = src.flow_control().release_capacity(len);
@@ -1020,12 +1129,17 @@ async fn relay_body_redacting(
 
 /// Send one masked DATA frame under flow control (never end-of-stream). Returns `Ok(false)` when
 /// the downstream reset/closed (stop relaying), `Ok(true)` when sent (or the frame was empty).
-async fn send_masked(dst: &mut h2::SendStream<Bytes>, data: Vec<u8>) -> Result<bool, h2::Error> {
+async fn send_masked(
+    dst: &mut h2::SendStream<Bytes>,
+    data: Vec<u8>,
+    bound: &CapacityBound,
+    way: &'static str,
+) -> Result<bool, RelayEnd> {
     if data.is_empty() {
         return Ok(true);
     }
     let len = data.len();
-    Ok(send_granted(dst, Bytes::from(data)).await? == len)
+    Ok(send_granted(dst, Bytes::from(data), bound, way).await? == len)
 }
 
 /// Whether the client's decoded request head carries any configured secret value verbatim — the
@@ -1449,6 +1563,12 @@ mod tests {
         // A window well under the payload, and under h2's 16 KiB default frame size.
         const WINDOW: u32 = 1024;
         const PAYLOAD: usize = 8 * 1024;
+        // Far above anything this exchange waits for: the peer here reads, so the capacity bound is
+        // never what answers, and a test that let it answer would pass for the wrong reason.
+        let bound = CapacityBound {
+            within: std::time::Duration::from_secs(30),
+            dest: Arc::from("peer.test:443"),
+        };
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1496,7 +1616,7 @@ mod tests {
                     let driver = async { while conn.accept().await.is_some() {} };
                     tokio::pin!(driver);
                     tokio::select! {
-                        r = send_granted(&mut stream, Bytes::from(vec![b'x'; PAYLOAD])) => r.unwrap(),
+                        r = send_granted(&mut stream, Bytes::from(vec![b'x'; PAYLOAD]), &bound, "test") => r.unwrap(),
                         () = &mut driver => panic!("the connection ended before the body was sent"),
                     }
                 };
@@ -1516,6 +1636,78 @@ mod tests {
         assert_eq!(
             received, PAYLOAD,
             "and arrive, in as many frames as the window takes"
+        );
+    }
+
+    /// The companion to the test above, on the peer that never grants anything at all. A client
+    /// advertising `SETTINGS_INITIAL_WINDOW_SIZE = 0` and reading nothing leaves `poll_capacity`
+    /// with nothing to answer, for as long as it likes: the socket bounds the synchronous planes
+    /// hold no longer apply once the stream is in tokio's hands, and the tunnel's idle timer is
+    /// armed only while no stream is open. So this send is the last bound there is, and without one
+    /// a single stream pins a host thread and its upstream connection for the life of the launch.
+    ///
+    /// The client is driven but never reads, so the stall is the peer's and not the harness's, and
+    /// the assertion is the deadline: the send must answer on its own bound, well inside it.
+    #[test]
+    fn a_peer_that_grants_no_capacity_does_not_park_the_send_for_ever() {
+        use std::time::Duration;
+        const PAYLOAD: usize = 8 * 1024;
+        let bound = CapacityBound {
+            within: Duration::from_millis(200),
+            dest: Arc::from("peer.test:443"),
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let answered = rt.block_on(async {
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+            // The cage's leg: a client whose window is shut and which never reads a byte, so no
+            // WINDOW_UPDATE is ever sent. Its connection is still driven, or the response head
+            // itself would never arrive and the stall would be the harness's.
+            let client = tokio::spawn(async move {
+                let (mut send, conn) = h2::client::Builder::new()
+                    .initial_window_size(0)
+                    .handshake::<_, Bytes>(client_io)
+                    .await
+                    .unwrap();
+                let driver = tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                let (response, _) = send
+                    .send_request(Request::builder().body(()).unwrap(), true)
+                    .unwrap();
+                let _held = response.await.unwrap();
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                driver.abort();
+            });
+
+            let proxy = async {
+                let mut conn = h2::server::handshake(server_io).await.unwrap();
+                let (_req, mut respond) = conn.accept().await.unwrap().unwrap();
+                let mut stream = respond
+                    .send_response(http::Response::new(()), false)
+                    .unwrap();
+                let driver = async { while conn.accept().await.is_some() {} };
+                tokio::pin!(driver);
+                tokio::select! {
+                    r = send_granted(&mut stream, Bytes::from(vec![b'x'; PAYLOAD]), &bound, "test") => r,
+                    () = &mut driver => panic!("the connection ended before the send answered"),
+                }
+            };
+            let answered = tokio::time::timeout(Duration::from_secs(5), proxy).await;
+            client.abort();
+            answered
+        });
+
+        let answered = answered
+            .expect("the send parked on a window the peer never grants: this stream holds its host thread until the launch ends");
+        assert!(
+            answered.is_err(),
+            "a send that gave up on its bound reports it, so the stream is reset rather than \
+             quietly relaying nothing: {answered:?}"
         );
     }
 
