@@ -1032,6 +1032,42 @@ fn inherited_posture(app: Option<&str>, base: &Path) -> config::manage::Inherite
     }
 }
 
+/// Admit one egress rule text into `slot`'s list, or say why it is refused — the single definition
+/// every path that writes a rule into a config goes through.
+///
+/// A rule reaching a config file has three shapes. A `@<name>` group reference is an alias for a
+/// `[network.groups]` group, expanded at load time and not itself classifiable, so it is validated
+/// as a group name; an undefined reference is not a write-time error (the group may be defined
+/// later) and warns loudly on the next load. Anything else is classified exactly as the config
+/// resolver classifies it — a `*` catch-all, a scheme, an uncompilable regex is refused. And a rule
+/// that fits neither is refused rather than written and silently dropped at the next load.
+///
+/// **This belongs to the writer, not to any one of its callers.** `sbx net allow|deny|mute` checked
+/// it at its own call site, and `sbx net pending allow|deny --save` — whose rule is composed from a
+/// destination the cage named, not from anything a user typed — did not: it wrote `allow = ["*"]`
+/// into a project config, re-trusted the file, and reported success for a rule the loader then threw
+/// away. The refusal a user gets for typing the same string is the refusal every path gets.
+///
+/// The refusal is composed here, once, so its two halves cannot disagree about how the rule is
+/// rendered. `{rule:?}` escapes a control byte as `\u{1b}`; the classifier's own message quotes the
+/// entry too, and it is filtered ([`sandbox::sanitize`]) because that text may be a destination the
+/// cage named rather than anything a user typed. The caller prints what comes back through
+/// [`diag::error`] and adds nothing to it.
+fn admit_egress_rule(rule: &str, slot: allowlist::Slot) -> Result<(), String> {
+    let trimmed = rule.trim();
+    if let Some(group) = trimmed.strip_prefix('@') {
+        if !config::is_valid_group_name(group) {
+            return Err(format!(
+                "invalid group reference {rule:?}: a group name must be 1–64 of [A-Za-z0-9._-]"
+            ));
+        }
+        return Ok(());
+    }
+    allowlist::classify_in(rule, slot)
+        .map(|_| ())
+        .map_err(|e| format!("invalid rule {rule:?}: {}", sandbox::sanitize(&e)))
+}
+
 /// Persist an egress `rule` to the scoped config file, trust-gating a project write and re-trusting
 /// it after — the shared writer behind `sbx net allow|deny <rule>` and the `--save` of
 /// `sbx net pending allow|deny`. Returns the success line to print, or `(exit-code, message)`: a
@@ -1051,6 +1087,11 @@ fn persist_egress_rule(
         manage::EgressList::Deny => "deny",
         manage::EgressList::Mute => "mute",
     };
+    // Admitted before anything is opened, so a refused rule touches no file, no trust marker and no
+    // session — the property `open_rule_write` states for the refusals it owns, extended to the one
+    // refusal that is about the rule itself.
+    admit_egress_rule(rule, list.slot()).map_err(|e| (2, e))?;
+
     let RuleWrite {
         path,
         app_key,

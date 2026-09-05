@@ -10,12 +10,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::{
-    ALL_NEEDS_SESSION, SESSION_IGNORES_FILE_SCOPE, config_cwd, egress_dir_or_fail,
-    fold_app_overlay, in_scope, net_mode_word, pending_session_context, persist_egress_rule,
-    removal_takes_no_session_flags, report_rule_write, session_pids_for_app, session_scope_pids,
-    split_one_rule, split_session_flags,
+    ALL_NEEDS_SESSION, SESSION_IGNORES_FILE_SCOPE, admit_egress_rule, config_cwd,
+    egress_dir_or_fail, fold_app_overlay, in_scope, net_mode_word, pending_session_context,
+    persist_egress_rule, removal_takes_no_session_flags, report_rule_write, session_pids_for_app,
+    session_scope_pids, split_one_rule, split_session_flags,
 };
-use crate::{allowlist, config, diag, help, sandbox, style};
+use crate::{config, diag, help, sandbox, style};
 
 use super::write_session_header;
 
@@ -383,15 +383,10 @@ fn render_net_rules(
 /// re-trusted after the write so the rule takes effect. The global config is trusted by location
 /// (no gate). `--app <name>` targets the app's own `[app.<name>.network]`.
 pub(super) fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) -> ExitCode {
-    use config::manage;
     // The list is also the rule's classification slot: a refused `*` catch-all then names the escape
     // hatch this verb's author was reaching for, rather than one shared pointer that fits only
     // `allow` (and tells a `deny` author to open the network — the exact opposite of the intent).
-    let slot = match list {
-        manage::EgressList::Allow => allowlist::Slot::Allow,
-        manage::EgressList::Deny => allowlist::Slot::Deny,
-        manage::EgressList::Mute => allowlist::Slot::Mute,
-    };
+    let slot = list.slot();
     let verb = slot.label();
 
     let (session, all, rest) = split_session_flags(args);
@@ -399,23 +394,12 @@ pub(super) fn net_add_rule(list: config::manage::EgressList, args: &[OsString]) 
         Ok(v) => v,
         Err(code) => return code,
     };
-    // Validate the rule before touching any file or session (fail-closed). A `@<name>` group reference
-    // is an alias for a `[network.groups]` group, expanded at load time — not itself a classifiable rule —
-    // so it is validated as a group name rather than through `classify` (which would reject the `@`).
-    // An undefined reference is not a write-time error (the group may be defined later); it warns
-    // loudly on the next load. Any other entry is classified: a `*` catch-all, a scheme, or an
-    // uncompilable regex is refused, the same classification the config resolver applies.
+    // Admitted before touching any file or session (fail-closed), through the same definition the
+    // shared writer applies — this call is what covers the `--session` path, which writes no config
+    // and so never reaches that writer.
     let is_group = rule.trim().starts_with('@');
-    if is_group {
-        let group = rule.trim().strip_prefix('@').unwrap_or_default();
-        if !config::is_valid_group_name(group) {
-            diag::error(&format!(
-                "sbx: invalid group reference {rule:?}: a group name must be 1–64 of [A-Za-z0-9._-]"
-            ));
-            return ExitCode::from(2);
-        }
-    } else if let Err(e) = allowlist::classify_in(&rule, slot) {
-        diag::error(&format!("sbx: invalid rule {rule:?}: {e}"));
+    if let Err(e) = admit_egress_rule(&rule, slot) {
+        diag::error(&format!("sbx: {e}"));
         return ExitCode::from(2);
     }
 

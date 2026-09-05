@@ -128,6 +128,18 @@ impl EgressList {
             EgressList::Mute => "mute",
         }
     }
+
+    /// The classification slot this list is, so a rule is admitted against the list it is being
+    /// written to. Written once because a write path that derived it itself would be free to derive
+    /// it differently, and the one refusal that offers a way out — the bare `*` catch-all — offers
+    /// the way out that *that* list's author was reaching for.
+    pub(crate) fn slot(self) -> crate::allowlist::Slot {
+        match self {
+            EgressList::Allow => crate::allowlist::Slot::Allow,
+            EgressList::Deny => crate::allowlist::Slot::Deny,
+            EgressList::Mute => crate::allowlist::Slot::Mute,
+        }
+    }
 }
 
 /// Which process/exec list a rule is added to (`[proc].allow` / `[proc].deny`).

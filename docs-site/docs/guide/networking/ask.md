@@ -106,6 +106,11 @@ config **re-trusts** it (a save must find the file absent or already trusted fir
 the global config is trusted by location. A saved rule is scoped to a host; the id
 addresses one live session's destination.
 
+A saved rule goes through the same grammar as one you type at
+[`sbx net allow`](rules): a destination no rule can be written for is refused, with
+exit code 2 and nothing written, rather than saved as an entry the next launch would
+drop. The request stays answered either way.
+
 The persisted rules a session remembered from `--session` answers are visible with
 [`sbx net rules --source session`](observability).
 

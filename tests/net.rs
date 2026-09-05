@@ -1663,6 +1663,70 @@ fn net_pending_all_save_global_drains_and_persists_each_host() {
     );
 }
 
+/// `sbx net pending --save` refuses exactly what `sbx net allow` refuses, and writes nothing.
+///
+/// The rule this path saves is composed from a destination the cage named, not from anything a user
+/// typed, and it went into a config file without meeting the grammar every other writer applies. A
+/// bare `*` was written as an `allow` entry, the file was re-trusted, and the command reported
+/// success — for an entry the loader then dropped with a warning, so the next session parked the
+/// same request again. Both arms of the comparison are run here, because the claim is that they
+/// agree: the same string through `sbx net allow` and through `--save` must reach the same verdict,
+/// the same exit code, and leave the same file.
+#[test]
+fn net_pending_save_refuses_the_rule_sbx_net_allow_refuses() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    let fx = Project::new("net");
+    let egress = fx.data_home.path().join("sbx").join("egress");
+    std::fs::create_dir_all(&egress).unwrap();
+    let pid = 55556u32;
+    let socket = egress.join(format!("control-{pid}.sock"));
+    let listener = UnixListener::bind(&socket).unwrap();
+
+    // The fake session answers the drain with the one destination a rule cannot be made from.
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut cmd = String::new();
+        BufReader::new(&stream).read_line(&mut cmd).unwrap();
+        (&stream).write_all(b"answered host=*\nok\n").unwrap();
+    });
+
+    let saved = fx.run(&["net", "pending", "allow", "--all", "--save", "--global"]);
+    server.join().unwrap();
+    let save_err = String::from_utf8_lossy(&saved.stderr).into_owned();
+
+    // The control arm: the same string typed at the verb whose grammar this must match.
+    let typed = fx.run(&["net", "allow", "--global", "*"]);
+    let typed_err = String::from_utf8_lossy(&typed.stderr).into_owned();
+
+    assert_eq!(
+        saved.status.code(),
+        Some(2),
+        "a refused rule is a refusal, not a success:\n{save_err}"
+    );
+    assert_eq!(
+        typed.status.code(),
+        Some(2),
+        "the control arm must refuse:\n{typed_err}"
+    );
+    for (arm, text) in [("--save", &save_err), ("net allow", &typed_err)] {
+        assert!(
+            text.contains("matches every host"),
+            "{arm} must name why the catch-all is refused:\n{text}"
+        );
+    }
+
+    // Nothing was written. The global config is either absent or carries no allow entry: a refusal
+    // that leaves a re-trusted file holding the entry is the half of the defect the exit code hides.
+    let global = std::fs::read_to_string(fx.config_home.path().join("sbx").join("sbx.toml"))
+        .unwrap_or_default();
+    assert!(
+        !global.contains('*'),
+        "a refused rule must reach no file:\n{global}"
+    );
+}
+
 #[test]
 fn net_pending_all_save_global_app_writes_the_profile_and_names_it_not_the_global_config() {
     // The user's exact command: `net pending allow --all --save -g --app <name>`. The drained host

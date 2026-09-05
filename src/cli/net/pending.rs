@@ -572,9 +572,15 @@ pub(super) fn net_pending_answer(
                     &style::Palette::for_stream(std::io::stdout().is_terminal())
                 )
             ),
-            Err((_, message)) => {
+            Err((code, message)) => {
+                // The persister's own code, not a flat failure: a refusal (an unwritable scope, an
+                // untrusted project config, a rule the grammar does not admit) is a `2` and an
+                // operational problem is a `1`, exactly as `sbx net allow` reports them. A script
+                // that answers and saves can tell "this rule was refused" from "the write broke".
+                // Still a warning rather than an error line: the live answer stuck, and saying
+                // otherwise would read as if it had been undone.
                 diag::warn(&format!("answered, but could not save the rule: {message}"));
-                return ExitCode::FAILURE;
+                return ExitCode::from(code);
             }
         }
     }
@@ -866,8 +872,8 @@ fn net_pending_drain_and_save(
     for host in &unique {
         match persist_egress_rule(list, host, scope, app, &cwd) {
             Ok(_) => saved += 1,
-            Err((_, msg)) => {
-                save_error = Some(msg);
+            Err(refusal) => {
+                save_error = Some(refusal);
                 break;
             }
         }
@@ -911,12 +917,13 @@ fn net_pending_drain_and_save(
             }
             ExitCode::SUCCESS
         }
-        Some(msg) => {
+        Some((code, msg)) => {
+            // The persister's own code, for the reason the by-id save states.
             diag::warn(&format!(
                 "answered {total} request(s) and saved {saved} of {} rule(s), then stopped: {msg}",
                 unique.len()
             ));
-            ExitCode::FAILURE
+            ExitCode::from(code)
         }
     }
 }

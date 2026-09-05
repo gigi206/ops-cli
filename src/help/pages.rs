@@ -2621,8 +2621,9 @@ pub(super) const PAGES: &[Page] = &[
         details: "Unblocks the parked request — and every identical retry of the same URL — letting it\n\
             proceed. `--session` remembers the exact host:port for the running session (it is not\n\
             re-asked); `--save` persists an allow rule so the host is pre-decided next launch. The\n\
-            unblock sticks even if a save fails. The two combine; the id addresses one live session's\n\
-            destination.\n\
+            unblock sticks even if a save fails. A saved rule meets the same grammar `sbx net allow`\n\
+            applies, so a destination no rule can be written for is refused (exit 2) and nothing is\n\
+            written. The two combine; the id addresses one live session's destination.\n\
             \n\
             `--all` instead drains every request parked across every reachable session at once — or,\n\
             with `-a <app>`, only that app's session(s). A point-in-time bulk allow (one parked after\n\
@@ -2667,7 +2668,9 @@ pub(super) const PAGES: &[Page] = &[
         details: "Refuses the parked request — and every identical retry of the same URL — (the proxy\n\
             returns a 403 to the cage). `--session` remembers the host:port as denied for the running\n\
             session (it is not re-asked); `--save` persists a deny rule so the host is auto-denied\n\
-            next launch. The answer sticks even if a save fails.\n\
+            next launch. The answer sticks even if a save fails. A saved rule meets the same grammar\n\
+            `sbx net deny` applies, so a destination no rule can be written for is refused (exit 2)\n\
+            and nothing is written.\n\
             \n\
             `--all` instead drains every request parked across every reachable session at once — or,\n\
             with `-a <app>`, only that app's session(s). A point-in-time bulk deny (one parked after\n\
