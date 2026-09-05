@@ -20,7 +20,10 @@ nothing:
   namespace. It sees frames and answers verdicts.
 - **A broker plugin can therefore never grant more than binding the host socket
   into the cage would have granted.** That bound is the whole reason the type
-  exists in this shape rather than as a plugin that owns the socket.
+  exists in this shape rather than as a plugin that owns the socket. It holds
+  because the bound is enforced on both sides: sbx keeps the resource, and the
+  plugin's own `[sandbox]` grant may name only regular files, so a manifest
+  cannot reach a *second* host socket past the one it is fenced in front of.
 
 ```toml
 name = "gpg-agent"
@@ -87,10 +90,27 @@ bounds. It also cannot be handed a credential unless its manifest says `uses_sec
 and what it is handed then is a marker, never the value.
 :::
 
-The rest of `[sandbox]` applies exactly as it does to a resolver, because one function
+The rest of `[sandbox]` is declared exactly as it is on a resolver, because one function
 builds all three cages from it: `programs`, `allow_paths`, `mask_paths`, `allow_env` and
-`allow_env_paths` bind the same way, and `sbx plugins info <name>` shows them on a
+`allow_env_paths` reach the same places, and `sbx plugins info <name>` shows them on a
 broker's page with each declared program resolved against this host's `PATH`.
+
+One rule is narrower here than on a resolver, and it is the one that keeps the bound
+above true. A path a broker grants, whether written in `allow_paths` or reached through
+`allow_env_paths`, must be a **regular file**. A socket, a FIFO and a directory are each
+refused, naming the entry, before the cage is built:
+
+```
+sbx: refusing to run the `gpg-agent` plugin: a broker plugin's `allow_paths` entry
+`/run/user/1000/gnupg` is a directory, and only a regular file may be bound into this
+cage — a socket carries in both directions whatever the mount is read-only, and a
+directory grants every socket inside it
+```
+
+Read-only is a rule about writing to a filesystem: it does not narrow what a connected
+socket carries, which is the premise the `brokers` grant itself rests on. A directory is
+that same grant one level up, since an agent socket is one entry inside one. What is left
+is what the field is for on this type: a configuration or data file the plugin reads.
 
 ## See also
 

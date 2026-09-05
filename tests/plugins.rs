@@ -911,9 +911,10 @@ fn local_broker(root: &Path, name: &str, extra: &str) -> PathBuf {
 
 /// The grant block is not a resolver's privilege.
 ///
-/// `programs`, `allow_paths`, `mask_paths`, `allow_env` and `allow_env_paths` are refused to no
-/// kind, and one `compose_cage` builds all three cages from them, so a broker's and a signer's
-/// declaration bind exactly what a resolver's does. A page that showed the grant for one kind only
+/// `programs`, `allow_paths`, `mask_paths`, `allow_env` and `allow_env_paths` are declarable on
+/// every kind, and one `compose_cage` builds all three cages from them, so a broker's and a
+/// signer's declaration reach the same places a resolver's do, under the narrower rule on what
+/// those paths may be. A page that showed the grant for one kind only
 /// would read as a kind that cannot ask — and it would withhold the `programs` probe, which is the
 /// answer to "it works on yours and fails on mine": a signer that cannot find its interpreter fails
 /// where a resolver that cannot find its CLI does.
@@ -953,6 +954,13 @@ fn every_kind_of_plugin_shows_the_grant_it_declared() {
         assert!(
             info.contains("    allow_paths:  (none)") && info.contains("    mask_paths:   (none)"),
             "and keeps the same shape when a field is empty:\n{info}"
+        );
+        // What the type refuses to bind is stated beside them, for the same reason: read-only
+        // governs writes to a filesystem, so a socket in the grant would carry in both directions.
+        assert!(
+            info.contains("    grant paths: regular files only")
+                && info.contains(&format!("a {kind} plugin's `allow_paths`")),
+            "and states what its paths may be:\n{info}"
         );
         // The three the loader refuses to this kind are stated as a rule of the type. `brokers:`
         // has no line at all: an empty one would report as a choice what the manifest may not make.

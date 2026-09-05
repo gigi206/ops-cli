@@ -2354,11 +2354,12 @@ fn print_grant_programs(
 
 /// The `sbx plugins info` grant lines every kind of plugin shares.
 ///
-/// `programs`, `allow_paths`, `mask_paths`, `allow_env` and `allow_env_paths` are refused to no
-/// type: one cage description is built from the grant for all three, so a broker's or a signer's
-/// declaration binds exactly what a resolver's does. Printing them from one place is what keeps the
-/// three pages saying so — a page that shows the grant for one kind and not the others reads as a
-/// kind that cannot ask, which is the opposite of what the loader does.
+/// `programs`, `allow_paths`, `mask_paths`, `allow_env` and `allow_env_paths` are declarable on
+/// every type: one cage description is built from the grant for all three, so printing them from
+/// one place is what keeps the three pages saying so — a page that shows the grant for one kind and
+/// not the others reads as a kind that cannot ask, which is the opposite of what the loader does.
+/// What a broker's and a signer's paths may *be* is narrower, and
+/// [`print_kind_path_rule`] states that above this block.
 ///
 /// `brokers` is the exception, and it is passed rather than read off the grant: a broker and a
 /// signer are refused the field at load, so an empty line here would report as a choice what is a
@@ -2386,6 +2387,19 @@ fn print_shared_grant(
     if let Some(n) = crate::sandbox::resolver::nix_closure_paths(&grant.programs) {
         println!("    nix closure: {n} store paths, so a store-installed program can run");
     }
+}
+
+/// The `sbx plugins info` line stating what a broker's or a signer's grant paths may be.
+///
+/// Printed beside the three grants the type refuses, and for the same reason: it is a rule of the
+/// type rather than a choice this manifest made, and the reader deciding whether to install the
+/// process that will stand in front of their credential is owed the whole rule. A resolver has no
+/// such line, having no such rule.
+fn print_kind_path_rule(kind: &str) {
+    println!(
+        "    grant paths: regular files only — a {kind} plugin's `allow_paths` and \
+         `allow_env_paths` may not name a socket, a FIFO or a directory"
+    );
 }
 
 /// One `sbx plugins info` grant line listing read-only path binds, or `(none)`.
@@ -2520,6 +2534,7 @@ fn info_broker(
         "    network:     no, and neither state nor a broker fence — a broker plugin may declare \
          none of the three"
     );
+    print_kind_path_rule("broker");
     print_shared_grant(layout, p.dir_name(), &p.name, &p.sandbox, None, err, r);
     print_plugin_host_config(&p.name, &p.sandbox, err, r);
     ExitCode::SUCCESS
@@ -2579,6 +2594,7 @@ fn info_signer(
         "    network:     no, and neither state nor a broker fence — a signer plugin may declare \
          none of the three"
     );
+    print_kind_path_rule("signer");
     print_shared_grant(layout, p.dir_name(), &p.name, &p.sandbox, None, err, r);
     print_plugin_host_config(&p.name, &p.sandbox, err, r);
     ExitCode::SUCCESS

@@ -91,6 +91,94 @@ pub(crate) fn check_kind_sandbox(kind: PluginKind, grant: &SandboxGrant) -> Resu
     }
 }
 
+/// The rule a plugin's **type** imposes on what its grant paths may *be*, checked where they are
+/// about to become mounts.
+///
+/// The companion of [`check_kind_sandbox`], and it exists because that one cannot answer this
+/// question: `network`, `state` and `brokers` are fields of the manifest, while a path's file type
+/// is a fact about the machine at the moment the cage is built.
+///
+/// A broker and a signer stand in front of a credential, and the three grants they are refused all
+/// rest on the same premise — the plugin holds nothing that reaches out. A bound **socket** defeats
+/// that whatever the manifest declared: read-only governs writes to a filesystem and says nothing
+/// about what a connected socket carries, which is the very premise of the `brokers` grant, and
+/// `AF_UNIX` crosses an empty network namespace. So does a **FIFO**, and so does the **directory**
+/// that holds either: the session bus and the GnuPG agent are each one entry inside one, and a
+/// directory grant is that socket grant spelled one level up. What is left is what the field is
+/// documented for on these two types: a data file. A resolver is unrestricted, as it is in
+/// [`check_kind_sandbox`] and for the same reason — reaching a vault, over a socket or otherwise,
+/// is what most of them are for.
+///
+/// An **absent** path is not a refusal: every grant path is a `--ro-bind-try`, so a path that is
+/// not there binds nothing, and refusing here would disagree with the mount over a manifest that is
+/// merely portable. Any *other* stat error is a refusal, because it leaves the question unanswered.
+///
+/// `field` travels with each path so the refusal names the list its author has to edit: two of them
+/// arrive here, the manifest's own `allow_paths` and the values `allow_env_paths` resolved to. The
+/// second is included because the manifest picks the variable: naming `SSH_AUTH_SOCK` there is the
+/// grant `allow_paths` on that socket would have been. The paths sbx itself resolves — a program's
+/// binary and the store closure behind it — are not the manifest's to choose and are not held to
+/// this rule.
+///
+/// The check and the bind that follows are not one operation, so a same-uid process could in
+/// principle exchange the file in between. Closing that would take binding by descriptor, which the
+/// argument list this composes to has no form for; the window is inside the same-uid class sbx
+/// already accepts, and the store's own trees are owner-only.
+pub(crate) fn check_kind_grant_paths<'a>(
+    kind: PluginKind,
+    paths: impl IntoIterator<Item = (&'a str, &'a Path)>,
+) -> Result<(), String> {
+    if matches!(kind, PluginKind::Resolver) {
+        return Ok(());
+    }
+    for (field, path) in paths {
+        // Follows, deliberately: bwrap binds what the path resolves to, so a symlink to a socket
+        // has to read as the socket it reaches.
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(format!(
+                    "a {} plugin's `{field}` entry `{}` cannot be examined: {e} — what it is has \
+                     to be known before it is bound",
+                    kind.token(),
+                    path.display()
+                ));
+            }
+        };
+        if !meta.is_file() {
+            return Err(format!(
+                "a {} plugin's `{field}` entry `{}` is {}, and only a regular file may be bound \
+                 into this cage — a socket carries in both directions whatever the mount is \
+                 read-only, and a directory grants every socket inside it",
+                kind.token(),
+                path.display(),
+                describe_file_type(&meta.file_type())
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Name a file type in the voice a refusal uses, so the message says what was found rather than
+/// leaving the reader to stat the path themselves.
+fn describe_file_type(ft: &std::fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt as _;
+    if ft.is_dir() {
+        "a directory"
+    } else if ft.is_socket() {
+        "a socket"
+    } else if ft.is_fifo() {
+        "a FIFO"
+    } else if ft.is_block_device() {
+        "a block device"
+    } else if ft.is_char_device() {
+        "a character device"
+    } else {
+        "not a regular file"
+    }
+}
+
 impl PluginKind {
     /// The token a manifest and a catalogue both write.
     pub(crate) fn token(self) -> &'static str {
@@ -1865,6 +1953,61 @@ mod tests {
         let mut warnings = Vec::new();
         let reg = PluginRegistry::load_with(root, &exp, &mut warnings);
         (reg, warnings)
+    }
+
+    /// A broker and a signer are refused a socket in their grant, and refused the directory that
+    /// holds one, whatever their manifest asked for.
+    ///
+    /// The type guard's three refusals rest on the plugin holding nothing that reaches out: no
+    /// network, no state, no second fence. A bound socket is none of those and defeats all of them
+    /// at once, because read-only is a rule about writing to a filesystem and says nothing about
+    /// what a connected socket carries. A directory is the same grant spelled one level up: the
+    /// session bus and the GnuPG agent are each one entry inside one.
+    #[test]
+    fn a_broker_or_signer_grant_path_may_only_be_a_regular_file() {
+        let dir = crate::testutil::TmpDir::new();
+        let socket = dir.path().join("S.agent");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let file = dir.path().join("broker.conf");
+        fs::write(&file, b"k = 1\n").unwrap();
+        let absent = dir.path().join("not-there");
+
+        for kind in [PluginKind::Broker, PluginKind::Signer] {
+            let why = check_kind_grant_paths(kind, [("allow_paths", socket.as_path())])
+                .expect_err("a socket in the grant is refused");
+            assert!(why.contains("allow_paths"), "{why}");
+            assert!(why.contains("S.agent"), "the entry is named: {why}");
+
+            let why = check_kind_grant_paths(kind, [("allow_paths", dir.path())])
+                .expect_err("the directory holding it is refused too");
+            assert!(why.contains("allow_paths"), "{why}");
+
+            // A regular file is what the grant is for, and an absent path is skipped by the mount
+            // itself, so neither is a refusal.
+            check_kind_grant_paths(kind, [("allow_paths", file.as_path())]).expect("a data file");
+            check_kind_grant_paths(kind, [("allow_paths", absent.as_path())])
+                .expect("an absent path binds nothing");
+        }
+
+        // A resolver is unrestricted here: reaching a socket is what several of them are for, and
+        // it is the plugin sbx does not stand in front of a credential with.
+        check_kind_grant_paths(PluginKind::Resolver, [("allow_paths", socket.as_path())])
+            .expect("a resolver may name a socket");
+        check_kind_grant_paths(PluginKind::Resolver, [("allow_paths", dir.path())])
+            .expect("a resolver may name a directory");
+    }
+
+    /// The rule reaches `allow_env_paths` too: the manifest picks the variable, so naming
+    /// `SSH_AUTH_SOCK` there is the same grant `allow_paths` on the socket would have been.
+    #[test]
+    fn a_broker_grant_refuses_a_socket_reached_through_a_variable() {
+        let dir = crate::testutil::TmpDir::new();
+        let socket = dir.path().join("S.agent");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let why =
+            check_kind_grant_paths(PluginKind::Broker, [("allow_env_paths", socket.as_path())])
+                .expect_err("the value a variable resolved to is held to the same rule");
+        assert!(why.contains("allow_env_paths"), "{why}");
     }
 
     /// The broker manifest a `[broker]` table is read from, for the tests that vary one field.

@@ -200,7 +200,8 @@ pub(super) fn cage_spec_for(plan: &CagePlan<'_>) -> io::Result<SandboxSpec> {
     // holding a credential in plaintext the same, with nothing left to refuse it.
     //
     // First, before the executable is even looked at: this needs nothing from the filesystem, and a
-    // grant the type forbids is refused whatever the file turns out to be.
+    // grant the type forbids is refused whatever the file turns out to be. Its companion, the rule
+    // on what the grant paths may *be*, runs below, once they have resolved.
     crate::plugins::check_kind_sandbox(plan.kind, plan.grant).map_err(|why| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -259,6 +260,28 @@ pub(super) fn cage_spec_for(plan: &CagePlan<'_>) -> io::Result<SandboxSpec> {
         &mut allow_env,
         &mut env_paths,
     );
+    // The second half of the type's rule, and the half that can only be asked here: what the grant
+    // paths *are*. Applied once the variable-valued ones have resolved, so both doors into the
+    // mount list are held to it, and before anything is bound.
+    crate::plugins::check_kind_grant_paths(
+        plan.kind,
+        plugin
+            .grant
+            .allow_paths
+            .iter()
+            .map(|p| ("allow_paths", p.as_path()))
+            .chain(
+                env_paths
+                    .iter()
+                    .map(|(_, v)| ("allow_env_paths", Path::new(v))),
+            ),
+    )
+    .map_err(|why| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("refusing to run the `{}` plugin: {why}", plan.called),
+        )
+    })?;
     let brokers = resolve_brokers(plugin);
     let programs = resolve_programs(plugin)?;
     // A nix-installed program is not a self-contained file, so the paths it needs come with it.
@@ -1591,6 +1614,40 @@ mod tests {
                 .any(|(k, v)| k == "GPG_AGENT_SOCK" && v == "/run/user/1000/gnupg/S.gpg-agent"),
             "the declared variable must name it: {:?}",
             spec.env()
+        );
+    }
+
+    /// The type's grant-path rule is applied where the grant becomes mounts, not only where a
+    /// manifest is parsed: a socket named by a broker or a signer never reaches the argument list.
+    #[test]
+    fn a_broker_cage_is_refused_a_grant_path_naming_a_socket() {
+        let dir = TmpDir::new();
+        let exec = dir.path().join("resolve");
+        std::fs::write(&exec, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.path().join("S.agent");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let grant = SandboxGrant {
+            allow_paths: vec![socket.clone()],
+            ..Default::default()
+        };
+        let p = plugin_in(dir.path(), grant);
+        let plan = CagePlan {
+            kind: crate::plugins::PluginKind::Broker,
+            ..plan_for(&p, "test://x")
+        };
+        let why = cage_spec_for(&plan).expect_err("a broker may not be handed a socket");
+        assert_eq!(why.kind(), io::ErrorKind::PermissionDenied);
+        assert!(why.to_string().contains("S.agent"), "{why}");
+
+        // The same grant on a resolver builds its spec, so what is refused is the type's rule and
+        // not the path.
+        let resolver = cage_spec_for(&plan_for(&p, "test://x")).expect("a resolver may name one");
+        let argv = super::super::argv::to_argv(&resolver);
+        assert!(
+            argv.iter().any(|a| *a == *socket.to_string_lossy()),
+            "{argv:?}"
         );
     }
 

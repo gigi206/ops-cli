@@ -85,6 +85,12 @@ brokers     = []                   # broker plugins whose fenced socket replaces
   socket. `HOME` in the cage is a private tmpfs, so a tool that derives a
   location from it (a password store, a GnuPG keyring, a token file) looks where
   nothing exists: bind the host path and point the tool at it. Naming `PATH` in `allow_env` has no effect; the structural value wins.
+  - On a **broker** or a **signer** the entry must be a regular file. A socket, a
+    FIFO and a directory are refused by name before the cage is built, on both
+    this list and the values `allow_env_paths` resolves to: those two types stand
+    in front of a credential, and a bound socket carries in both directions
+    however read-only the mount is. See [the broker type](broker) and
+    [the signer type](signer).
 - `mask_paths` takes something back out of a path `allow_paths` granted, by
   covering it with an empty filesystem. It exists because a grant is sometimes
   wide for a reason unrelated to what the plugin needs: the `pass` plugin binds

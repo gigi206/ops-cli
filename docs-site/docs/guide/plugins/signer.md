@@ -77,11 +77,18 @@ it may not declare `brokers` of its own: a broker fences a cage's access to a ho
 resource, and a signer has no cage and reaches no resource.
 :::
 
-The rest of `[sandbox]` applies exactly as it does to a resolver: `programs`,
-`allow_paths`, `mask_paths`, `allow_env` and `allow_env_paths` bind the same way, and
+The rest of `[sandbox]` is declared exactly as it is on a resolver: `programs`,
+`allow_paths`, `mask_paths`, `allow_env` and `allow_env_paths` reach the same places, and
 `sbx plugins info <name>` shows them on a signer's page with each declared program
 resolved against this host's `PATH`. `aws-sigv4` declares `programs = ["python3"]`, so
 that line is where a missing interpreter is visible before a request is ever signed.
+
+One rule is narrower, and it is the same one a broker is held to. A path a signer grants,
+in `allow_paths` or through `allow_env_paths`, must be a **regular file**: a socket, a
+FIFO and a directory are refused by name before the cage is built. A signer is shown a
+credential's requests and, where it declares `reads_secret`, the credential itself, so the
+three grants it may not declare exist to leave it nothing that reaches out. A bound socket
+would be all three at once, and a directory is a socket grant spelled one level up.
 
 A declaration reaches it with [`sign`](../configuration/secret#sign-a-credential-computed-from-the-request):
 
