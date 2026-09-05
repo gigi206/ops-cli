@@ -8379,6 +8379,39 @@ fn resolve_no_plugins(global: RawConfig, project: Option<(RawConfig, TrustState)
     super::resolve(global, project, &PluginRegistry::default())
 }
 
+/// A project's `[mise]` is dropped, like `[bundle.*]` and `[network.groups]` — and, like them, it
+/// has to be named. The engine installs every `mise:` tool in every cage, so it is honored from the
+/// global config alone; an author who writes it in `.sbx.toml` has picked nothing, and the only
+/// signal that says so is the warning. Nothing else can: `mise` is a *known* field of `RawConfig`,
+/// so it deserializes normally and never reaches the unknown-key net.
+#[test]
+fn a_project_mise_table_is_dropped_and_named() {
+    let project = RawConfig {
+        mise: Some(super::schema::RawMise {
+            engine: Some("nixos-24.05".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let r = resolve_no_plugins(RawConfig::default(), Some((project, TrustState::Trusted)));
+
+    assert_eq!(
+        r.mise_engine, None,
+        "the project layer never picks the engine: {:?}",
+        r.mise_engine
+    );
+    let named = r
+        .warnings
+        .iter()
+        .find(|w| w.contains("`[mise]`"))
+        .unwrap_or_else(|| panic!("the dropped table is named: {:?}", r.warnings));
+    assert!(named.contains(PROJECT_CONFIG), "{named}");
+    assert!(
+        named.contains("global config"),
+        "the warning says where the table is honored: {named}"
+    );
+}
+
 /// A config carrying nothing but a zone, for the layering test below.
 fn zoned(zone: &str) -> RawConfig {
     RawConfig {

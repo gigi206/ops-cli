@@ -98,7 +98,12 @@ table at all.
 `[mise] engine` is a **security field, honored only from the global config**. Unlike
 `nixpkgs`, a trusted project does not get one: the engine installs the tools of every app
 in every project, so which build of it runs is infrastructure rather than a project's
-business.
+business. A `[mise]` table in a project's `.sbx.toml` is dropped, and `sbx` says so:
+
+```
+sbx: .sbx.toml: ignoring `[mise]` — the engine that installs every `mise:` tool is set in
+the global config only, and it governs every cage
+```
 
 ### What it accepts
 

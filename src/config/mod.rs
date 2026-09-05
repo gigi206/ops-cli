@@ -1838,11 +1838,24 @@ fn resolve(
         distro_origin = Provenance::Global;
     }
     // Global-only, like `[bundle]`: the engine installs every `mise:` tool in every cage, so a
-    // project does not get to redirect it. The project layer's own `[mise]` is never read here.
+    // project does not get to redirect it. *Taken* out of the project layer rather than left
+    // unread, so the table cannot reach a later reader, and named on the way out: a key sbx passes
+    // over is said, because an engine believed to be chosen and governing nothing is exactly the
+    // failure the warning beside `[bundle.*]` and `[network.groups]` exists to avoid. Nothing else
+    // would say it — `mise` is a known field of `RawConfig`, so it deserializes normally and never
+    // lands in the unknown-key net.
     let mise_engine = global
         .mise
         .and_then(|m| m.engine)
         .and_then(|v| validate_mise_engine(&mut warnings, GLOBAL_CONFIG, v));
+    if let Some((proj, _)) = &mut project
+        && proj.mise.take().is_some()
+    {
+        warnings.push(format!(
+            "{PROJECT_CONFIG}: ignoring `[mise]` — the engine that installs every `mise:` tool is \
+             set in the global config only, and it governs every cage"
+        ));
+    }
     // The network posture is trusted by location at the global layer; an invalid or
     // unset value falls back to the default (the deny-by-default allowlist). The origin is
     // recorded as `Global` only when the layer actually supplied a valid posture, so a `Default`

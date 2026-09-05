@@ -315,6 +315,9 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
     // Whether any blob declared egress groups, recorded per blob for the same reason: `network` is
     // a scalar field, so the blob that loses the merge takes its `groups` table out of sight with it.
     let mut blob_groups = false;
+    // Whether any blob declared `[mise]`, recorded per blob for the sharper version of that reason:
+    // `overlay_into` does not carry the table at all, so a later fold would leave nothing to notice.
+    let mut blob_mise = false;
 
     // Tier 0 — the environment blob.
     let t0 = match &ambient.config {
@@ -322,6 +325,7 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
             let parsed = parse_blob(s).map_err(|e| format!("{SBX_CONFIG}: {e}"))?;
             super::warn_unknown_keys(&mut unknown, SBX_CONFIG, &parsed);
             blob_groups |= declares_net_groups(&parsed);
+            blob_mise |= parsed.mise.is_some();
             parsed
         }
         None => RawConfig::default(),
@@ -351,6 +355,7 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
         let parsed = parse_blob(c).map_err(|e| format!("--config (#{}): {e}", i + 1))?;
         super::warn_unknown_keys(&mut unknown, &format!("--config (#{})", i + 1), &parsed);
         blob_groups |= declares_net_groups(&parsed);
+        blob_mise |= parsed.mise.is_some();
         t2 = overlay_into(t2, parsed);
     }
     // Tier 3 — the CLI's typed fragments.
@@ -382,7 +387,7 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
     let cli_side = overlay_into(t2, t3);
 
     let mut notices = unknown;
-    push_ignored_field_notices(&env_side, &cli_side, blob_groups, &mut notices);
+    push_ignored_field_notices(&env_side, &cli_side, blob_groups, blob_mise, &mut notices);
     push_env_source_notices(&env_side, &cli_side, &mut notices);
 
     let mut merged = overlay_into(env_side, cli_side);
@@ -396,18 +401,24 @@ fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Overrid
     })
 }
 
-/// Note the fields an override carries that are not one-shot launch concepts: egress groups are a
-/// global-config affordance, and an override shapes *the* launch rather than defining apps. They are
-/// dropped (ignored downstream), so the notice is the only signal.
+/// Note the fields an override carries that are not one-shot launch concepts: egress groups and the
+/// mise engine are global-config affordances, and an override shapes *the* launch rather than
+/// defining apps. They are dropped (ignored downstream), so the notice is the only signal.
 ///
-/// `blob_groups` is decided per blob by the caller rather than read off the merged sides, for the
-/// reason an unknown key is: `network` is a **scalar** field, so a later blob's posture replaces an
-/// earlier one's table outright, and a `groups` declaration in the blob that lost would reach here
-/// as an absence indistinguishable from never having been written.
+/// The fields dropped for the *other* reason — `nixpkgs`, `distro`, `[task.*]`, `[plugin.*]`,
+/// `[broker.*]` and the auto-upgrade resolver tables, each declared in a config someone reads
+/// rather than assembled on a command line — are passed over here without a notice.
+///
+/// `blob_groups` and `blob_mise` are decided per blob by the caller rather than read off the merged
+/// sides, for the reason an unknown key is: `network` is a **scalar** field, so a later blob's
+/// posture replaces an earlier one's table outright, and a `groups` declaration in the blob that
+/// lost would reach here as an absence indistinguishable from never having been written. `[mise]`
+/// is stronger still: [`overlay_into`] does not carry it at all, so no merged side ever holds one.
 fn push_ignored_field_notices(
     env_side: &RawConfig,
     cli_side: &RawConfig,
     blob_groups: bool,
+    blob_mise: bool,
     notices: &mut Vec<String>,
 ) {
     if blob_groups {
@@ -425,6 +436,13 @@ fn push_ignored_field_notices(
         notices.push(
             "ignoring `[bundle.*]` in the override — it is not a one-shot launch field (a bundle \
              is reached through an app's `use`, and an override declares no app)"
+                .to_string(),
+        );
+    }
+    if blob_mise {
+        notices.push(
+            "ignoring `[mise]` in the override — the engine that installs every `mise:` tool is \
+             set in the global config only, and it governs every cage"
                 .to_string(),
         );
     }
@@ -1563,6 +1581,39 @@ mod tests {
             .find(|n| n.contains("`netowrk`"))
             .unwrap_or_else(|| panic!("{:?}", ov.notices()));
         assert!(n.contains("--config"), "named against its blob: {n}");
+    }
+
+    #[test]
+    fn a_mise_table_in_a_blob_is_named_like_the_other_global_only_ones() {
+        // `[mise]` is global-only by construction, the same class as `[bundle.*]` and
+        // `[network.groups]`, and it is dropped here for the same reason. It is a *known* field of
+        // `RawConfig`, so it parses cleanly and the unknown-key net never sees it: the notice is
+        // the only thing between an author who wrote an engine on a command line and an engine
+        // that governs nothing.
+        let ov = collect_cli(Cli {
+            config: &["[mise]\nengine = \"nixos-24.05\""],
+            ..Default::default()
+        })
+        .unwrap();
+        let n = ov
+            .notices()
+            .iter()
+            .find(|n| n.contains("`[mise]`"))
+            .unwrap_or_else(|| panic!("the table must be named: {:?}", ov.notices()));
+        assert!(n.contains("global config"), "{n}");
+
+        // The ambient blob reaches the notice by the same route, and it is the one nobody is
+        // looking at while they type the command.
+        let amb = ambient(AmbientOverrides {
+            config: Some("[mise]\nengine = \"nixos-24.05\"".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            amb.notices().iter().any(|n| n.contains("`[mise]`")),
+            "{:?}",
+            amb.notices()
+        );
     }
 
     #[test]
