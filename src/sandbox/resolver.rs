@@ -263,8 +263,7 @@ pub(super) fn cage_spec_for(plan: &CagePlan<'_>) -> io::Result<SandboxSpec> {
     // The second half of the type's rule, and the half that can only be asked here: what the grant
     // paths *are*. Applied once the variable-valued ones have resolved, so both doors into the
     // mount list are held to it, and before anything is bound.
-    crate::plugins::check_kind_grant_paths(
-        plan.kind,
+    let grant_paths = || {
         plugin
             .grant
             .allow_paths
@@ -274,14 +273,19 @@ pub(super) fn cage_spec_for(plan: &CagePlan<'_>) -> io::Result<SandboxSpec> {
                 env_paths
                     .iter()
                     .map(|(_, v)| ("allow_env_paths", Path::new(v))),
-            ),
-    )
-    .map_err(|why| {
+            )
+    };
+    let refuse = |why: String| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("refusing to run the `{}` plugin: {why}", plan.called),
         )
-    })?;
+    };
+    crate::plugins::check_kind_grant_paths(plan.kind, grant_paths()).map_err(refuse)?;
+    // sbx's own control plane is off every grant, of every kind. The manifest loader answered this
+    // for the literal `allow_paths`; here the variable-valued ones have resolved, and this is the
+    // point a second way to build a plugin would otherwise reach the mounts unchecked.
+    crate::plugins::check_grant_control_plane(grant_paths()).map_err(refuse)?;
     let brokers = resolve_brokers(plugin);
     let programs = resolve_programs(plugin)?;
     // A nix-installed program is not a self-contained file, so the paths it needs come with it.

@@ -179,6 +179,54 @@ fn describe_file_type(ft: &std::fs::FileType) -> &'static str {
     }
 }
 
+/// Refuse a grant path that names sbx's own control plane, whatever kind of plugin declared it.
+///
+/// The `state` grant is a boolean and never a path precisely so that a plugin cannot pick a
+/// directory: sbx chooses the location, one per plugin, and no plugin reaches another's. That
+/// closure is only as good as the *other* list of paths a manifest may write, and `allow_paths` had
+/// no denylist while the sibling surface — a project config's `binds` — has one and is held to it.
+/// This traverses that same list, [`crate::config::sbx_control_plane_roots`], so the two answer one
+/// question once: the data directory (plugin trees and store caches, and every plugin's state
+/// beneath it), the trust-marker store, and the global-config directory, whose `[plugin.<name>]
+/// env` carries other plugins' credentials in the clear because that is what the table is for.
+///
+/// **Refused, not degraded.** A `binds` entry is forced read-only because a project config is a
+/// file the user may not have written; a manifest is a fixed file its author can correct, so the
+/// entry is named and the plugin does not run. The mount would be read-only either way, which is
+/// why the write side of this was never open — what the refusal closes is the read.
+///
+/// Each entry is canonicalized the way the roots are ([`crate::trust::canonicalize_existing_prefix`],
+/// which resolves as far as the path exists), because a root reached through a symlinked `$HOME`
+/// would otherwise pass a plain prefix test.
+///
+/// `roots` is taken explicitly so the rule is testable without an environment;
+/// [`check_grant_control_plane`] is the caller that resolves them.
+pub(crate) fn check_grant_control_plane_for<'a>(
+    paths: impl IntoIterator<Item = (&'a str, &'a Path)>,
+    roots: &[PathBuf],
+) -> Result<(), String> {
+    for (field, path) in paths {
+        let canon = crate::trust::canonicalize_existing_prefix(path);
+        if let Some(root) = roots.iter().find(|r| canon.starts_with(r)) {
+            return Err(format!(
+                "a `{field}` entry names `{}`, which is inside sbx's own control plane `{}` — \
+                 a plugin's grant does not reach the directory holding the other plugins' \
+                 credentials, the store caches, or the trust markers",
+                path.display(),
+                root.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// [`check_grant_control_plane_for`] against the roots this host resolves to.
+pub(crate) fn check_grant_control_plane<'a>(
+    paths: impl IntoIterator<Item = (&'a str, &'a Path)>,
+) -> Result<(), String> {
+    check_grant_control_plane_for(paths, &crate::config::sbx_control_plane_roots())
+}
+
 impl PluginKind {
     /// The token a manifest and a catalogue both write.
     pub(crate) fn token(self) -> &'static str {
@@ -444,7 +492,9 @@ pub(crate) struct SandboxGrant {
     /// So the grant exists, and is narrow: a boolean, never a path. sbx picks the location
     /// (`<data>/plugin-state/<name>`, owner-only), one per plugin, and tells the plugin where it
     /// landed through `SBX_PLUGIN_STATE`. A plugin cannot name the directory, cannot reach
-    /// another plugin's, and nothing in the agent's cage ever sees any of them.
+    /// another plugin's, and nothing in the agent's cage ever sees any of them. The half of that
+    /// closure this field cannot state itself is [`check_grant_control_plane`]: a boolean is only
+    /// unnameable while the *other* path list a manifest writes cannot reach the same directory.
     pub(crate) state: bool,
     /// Broker plugins, by name, whose fenced socket this plugin is given instead of the host
     /// resource behind it.
@@ -1003,6 +1053,16 @@ fn load_one(dir: &Path, exp: &Expansion) -> Result<Option<Plugin>, String> {
         state: raw.sandbox.state,
         brokers: raw.sandbox.brokers,
     };
+    // Applied here so a manifest naming sbx's own directories is refused with a reason its author
+    // can act on, and applied again at the spawn, where the grant becomes mounts. Only the literal
+    // list can be answered here: what `allow_env_paths` resolves to is a fact about the host at
+    // launch, and it is held to the same rule there.
+    check_grant_control_plane(
+        sandbox
+            .allow_paths
+            .iter()
+            .map(|p| ("allow_paths", p.as_path())),
+    )?;
 
     // A table belonging to another type declares something nothing reads, which is the same trap
     // `deny_unknown_fields` closes one level down: an author who wrote `[signer]` under
@@ -1953,6 +2013,42 @@ mod tests {
         let mut warnings = Vec::new();
         let reg = PluginRegistry::load_with(root, &exp, &mut warnings);
         (reg, warnings)
+    }
+
+    /// No grant path may name sbx's own control plane, whatever kind declares it.
+    ///
+    /// The `state` grant is a boolean and never a path so that a plugin cannot pick a directory —
+    /// its own, or another plugin's. `allow_paths` is a path, and it had no denylist at all, while
+    /// the sibling surface, a project config's `binds`, has one and is held to it. The sharpest
+    /// target is the global config directory: `[plugin.<name>] env` carries other plugins'
+    /// credentials there in the clear, which is what the table is for.
+    #[test]
+    fn no_grant_path_may_name_sbxs_own_control_plane() {
+        let roots = vec![
+            PathBuf::from("/h/.local/share/sbx"),
+            PathBuf::from("/h/.local/state/sbx/trusted"),
+            PathBuf::from("/h/.config/sbx"),
+        ];
+
+        // At a root, under one, and the credential-bearing global config among them.
+        for entry in [
+            "/h/.config/sbx",
+            "/h/.config/sbx/sbx.toml",
+            "/h/.local/share/sbx/stores",
+            "/h/.local/state/sbx/trusted",
+        ] {
+            let why = check_grant_control_plane_for([("allow_paths", Path::new(entry))], &roots)
+                .expect_err("sbx's own control plane is not a plugin's to read");
+            assert!(why.contains(entry), "the entry is named: {why}");
+            assert!(why.contains("allow_paths"), "and the list it is in: {why}");
+        }
+
+        // A neighbour that merely shares a prefix is not inside anything, and an ordinary grant is
+        // untouched.
+        for entry in ["/h/.config/sbx-other/x", "/h/.password-store"] {
+            check_grant_control_plane_for([("allow_paths", Path::new(entry))], &roots)
+                .unwrap_or_else(|why| panic!("`{entry}` is not the control plane: {why}"));
+        }
     }
 
     /// A broker and a signer are refused a socket in their grant, and refused the directory that

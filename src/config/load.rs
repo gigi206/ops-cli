@@ -280,7 +280,7 @@ pub(super) fn canonicalize_binds(
 /// host-side too), the trust-marker store (a forged marker would approve another project's config),
 /// and the global-config directory (trusted by location). Resolved from the environment like every
 /// other sbx path; a component whose base does not resolve is simply omitted.
-pub(super) fn sbx_control_plane_roots() -> Vec<PathBuf> {
+pub(crate) fn sbx_control_plane_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(layout) = crate::store::Layout::from_env() {
         roots.push(layout.data_dir().to_path_buf());

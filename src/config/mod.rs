@@ -36,7 +36,7 @@ pub(crate) use gate::{is_trust_drop, untrusted_reason};
 pub(crate) use load::{
     Source, bundles, control_plane_pins, export_profile, is_valid_bundle_name, load, load_scoped,
     net_groups, profile_path, profiles_dir, read_bundle_fragment, read_net_groups_fragment,
-    validate_profile,
+    sbx_control_plane_roots, validate_profile,
 };
 pub(crate) use overrides::{CliOverrides, Override};
 pub(crate) use schema::RawBundle;
@@ -75,7 +75,7 @@ use tools::{
     is_valid_package_name, parse_backend,
 };
 // Consumed by the resolution engine that stays in this file (and `global_path` by `manage`).
-use load::{canonicalize_binds, global_path, read_global, sbx_control_plane_roots};
+use load::{canonicalize_binds, global_path, read_global};
 // The secret source/validation machinery the resolution engine folds into the resolved set.
 use secrets::{
     SecretDefaults, apply_secret_section, count_host_secrets, upsert_secret, warn_resolver_bindings,

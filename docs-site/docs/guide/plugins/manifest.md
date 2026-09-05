@@ -52,6 +52,15 @@ brokers     = []                   # broker plugins whose fenced socket replaces
   **`SBX_PLUGIN_STATE`**. A plugin cannot name the directory, cannot reach
   another plugin's, and nothing in the agent's cage ever sees any of them.
 
+  `allow_paths` is held to the other half of that: no entry may name sbx's own
+  control plane, which is the data directory (the store caches, the installed
+  plugin trees and every plugin's state), the trust-marker store, and the global
+  config directory, where `[plugin.<name>] env` carries other plugins'
+  credentials in the clear. An entry inside one of them is refused by name, both
+  when the manifest is loaded and again when the cage is built. It is the same
+  list a project config's `binds` is measured against, which is forced read-only
+  rather than refused: a manifest is a fixed file its author can correct.
+
   One consequence to plan for: a resolver that refreshes must be the **only**
   refresher. If the application also holds a working refresh token, both will
   eventually exchange, the provider will see a reused token, and the session

@@ -909,6 +909,51 @@ fn local_broker(root: &Path, name: &str, extra: &str) -> PathBuf {
     dir
 }
 
+/// sbx's own directories are not a plugin's to read, and `install` says so.
+///
+/// The `state` grant is a boolean and never a path so that a plugin cannot pick a directory. That
+/// only closes if the *other* path list is closed too: the global config directory carries every
+/// other plugin's credentials in `[plugin.<name>] env`, in the clear, and the data directory
+/// carries the store caches and every plugin's own state. End to end here because the roots are
+/// resolved from the environment, and this harness is what redirects it.
+#[test]
+fn a_manifest_naming_sbxs_own_directories_is_refused_by_name() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = TmpDir::new("plugins");
+    let src = TmpDir::new("plugins");
+
+    // `~/sbx` is the global config directory under this harness's redirected `XDG_CONFIG_HOME`,
+    // and `~` is one of the two prefixes a manifest may expand.
+    let dir = src.path().join("nosy");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name=\"nosy\"\ntype=\"resolver\"\nscheme=\"nosy\"\nexec=\"resolve\"\n\
+         [sandbox]\nallow_paths=[\"~/sbx\"]\n",
+    )
+    .unwrap();
+    let exec = dir.join("resolve");
+    std::fs::write(&exec, "#!/bin/sh\necho secret\n").unwrap();
+    std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (code, stderr) = run_failing(&["plugins", "install", dir.to_str().unwrap()], home.path());
+    assert_ne!(code, 0, "the install must refuse:\n{stderr}");
+    assert!(
+        stderr.contains("control plane"),
+        "and name what it is refusing:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("allow_paths"),
+        "and the list to edit:\n{stderr}"
+    );
+
+    let list = run(&["plugins", "list"], home.path());
+    assert!(
+        !list.contains("nosy"),
+        "nothing is placed by a refused install:\n{list}"
+    );
+}
+
 /// The grant block is not a resolver's privilege.
 ///
 /// `programs`, `allow_paths`, `mask_paths`, `allow_env` and `allow_env_paths` are declarable on
