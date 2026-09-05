@@ -609,6 +609,24 @@ fn render_resolution_layers(layers: &[config::manage::Layer], pal: &style::Palet
 /// A `--trust` on a gated target that could not be recorded fails the verb, exactly as it does for
 /// the key-writing verbs and through the same tail ([`record_trust`]): the editor's changes are on
 /// disk, and their security fields are inert until a marker exists.
+///
+/// # Two limits of running an editor, stated rather than implied
+///
+/// **The editor inherits the invoking environment whole.** It is a program of the user's choosing,
+/// named by `$VISUAL`/`$EDITOR`, and it is run on the host with the user's own privileges — sbx
+/// neither sandboxes it nor trims what it is handed. That is what makes an editor with a
+/// configuration, plugins and credentials work at all, and it is the same trust the shell that
+/// invoked `sbx` already extends to it. It also means this verb is not a confinement boundary: an
+/// editor is a program, and running one is running it.
+///
+/// **The file is edited in place.** sbx stages no temporary copy and performs no atomic replace,
+/// because the write is the editor's and the editor owns how it makes it — most replace through a
+/// temporary of their own, some truncate and rewrite. So an editor killed mid-write can leave a
+/// truncated or unparseable config, which the loader then drops whole with a warning; a gated file
+/// in that state also no longer matches its marker, so its security fields are inert until it is
+/// reviewed and re-trusted, which is the fail-safe direction. What sbx does own is what follows: a
+/// non-zero exit stops before anything is trusted, and the trust verdict is read from the file as
+/// the editor left it.
 pub(super) fn config_edit(args: &[OsString]) -> ExitCode {
     let ScopeArgs {
         positionals,

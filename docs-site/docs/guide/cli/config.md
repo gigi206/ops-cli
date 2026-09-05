@@ -335,6 +335,13 @@ This is also the one verb whose `--trust` blesses a file that was never trusted,
 file in front of you, so what is blessed is what you read. It is the way through the
 other four verbs point at.
 
+Two limits worth knowing. Your editor runs on the host with your own privileges and the
+environment you invoked `sbx` with: it is not sandboxed, and this verb is not a
+confinement boundary. And the file is edited in place, so sbx neither stages a copy nor
+replaces it atomically; an editor killed mid-write can leave a truncated file, which the
+loader drops whole with a warning and which no longer matches its trust marker, so its
+security fields stay inert until you review and trust it again.
+
 ## Examples
 
 ```sh
