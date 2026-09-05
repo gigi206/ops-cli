@@ -501,18 +501,28 @@ impl CaptureRing {
         // containing it: `sbx net logs --with-headers` would print that key in cleartext.
         //
         // `partition` keeps relative order within each half, which is what the drain depends on:
-        // `retired` stays least-recently-seen-first. And the cap yields before a live value does —
-        // `min(retired.len())` — because exceeding a ceiling that exists to bound scan cost is a
-        // cost, while dropping a live needle is a disclosure.
-        let (mut retired, live): (Vec<SecretNeedle>, Vec<SecretNeedle>) = merged
+        // each half stays least-recently-seen-first. And the cap yields before a live value does —
+        // the drain never reaches into `live` — because exceeding a ceiling that exists to bound
+        // scan cost is a cost, while dropping a live needle is a disclosure.
+        let (retired, live): (Vec<SecretNeedle>, Vec<SecretNeedle>) = merged
             .into_iter()
             .partition(|h| !current.needles.iter().any(|n| n.as_bytes() == h.as_bytes()));
-        let over = (retired.len() + live.len())
-            .saturating_sub(NEEDLE_HISTORY_MAX)
-            .min(retired.len());
-        retired.drain(..over);
-        retired.extend(live);
-        let merged = retired;
+        // The retired half holds two unlike things, and the cage decides how much of one there is.
+        // A retired *declared* value is one sbx issued and the cage never held: a capture filed
+        // after the re-resolution that retired it still contains it, which is the disclosure this
+        // history exists to prevent. A retired *learned* value is one the cage taught the proxy and
+        // has since rotated past, produced one per request for as long as it likes. Draining the
+        // cage's leftovers first is what keeps a few hundred requests from emptying the history of
+        // every superseded credential the launch declared.
+        let (mut spent, mut superseded): (Vec<SecretNeedle>, Vec<SecretNeedle>) =
+            retired.into_iter().partition(|h| h.is_observed());
+        let over = (spent.len() + superseded.len() + live.len()).saturating_sub(NEEDLE_HISTORY_MAX);
+        let from_spent = over.min(spent.len());
+        spent.drain(..from_spent);
+        superseded.drain(..(over - from_spent).min(superseded.len()));
+        let mut merged = superseded;
+        merged.extend(spent);
+        merged.extend(live);
         *history = std::sync::Arc::new(merged);
         history.clone()
     }
@@ -665,6 +675,69 @@ mod tests {
                 .windows(12)
                 .any(|w| w == b"s3cr3t-value"),
             "a reflected secret is masked on the response side too"
+        );
+    }
+
+    /// The history is bounded, so something has to go when it fills, and what goes must never be a
+    /// value sbx itself issued.
+    ///
+    /// The retired half of the history is what the drain takes from, and it holds two very
+    /// different things: a declared credential the launch has since re-resolved, which the cage has
+    /// never held and which a capture filed after that refresh still contains; and a value the cage
+    /// taught the proxy and has since rotated past. The second is produced on demand, one per
+    /// request, so a cage that rotates through a few hundred values would otherwise drain the
+    /// history of every superseded declared token and put the next such capture into
+    /// `sbx net logs --with-headers` in the clear. The cage's own leftovers go first.
+    #[test]
+    fn cage_churn_cannot_drain_a_superseded_declared_value_out_of_the_history() {
+        use crate::sandbox::proxy::{CredentialSet, Credentials};
+        const OLD: &str = "old-t0ken-value-0123";
+
+        let credentials = std::sync::Arc::new(Credentials::new(
+            Vec::new(),
+            vec![needle(OLD)],
+            crate::sandbox::redact::MIN_LEN_DEFAULT,
+            Vec::new(),
+        ));
+        let ring = CaptureRing::new(
+            CaptureCaps::new(CaptureLevel::Bodies, 8),
+            credentials.clone(),
+        );
+        // One filing, so the declared value is in the history before anything else is.
+        let mut seed = Capture::new(1);
+        seed.req_head = bytes(b"GET /seed HTTP/1.1\r\n\r\n");
+        ring.insert(seed, "api.test");
+
+        // The upstream rejected it and the launch re-resolved: the old value is now retired.
+        credentials.replace(CredentialSet {
+            injections: Vec::new(),
+            needles: vec![needle("new-t0ken-value-0123")],
+        });
+
+        // The cage rotates through values of its own, each learned and then evicted by the next.
+        for i in 0..(NEEDLE_HISTORY_MAX + 64) {
+            credentials.observe(
+                "authorization",
+                &format!("Bearer cage-value-{i:0>20}"),
+                "api.test",
+            );
+            let mut churn = Capture::new(10 + i as u64);
+            churn.req_head = bytes(b"GET /x HTTP/1.1\r\n\r\n");
+            ring.insert(churn, "api.test");
+        }
+
+        // The exchange that was in flight across the refresh is filed last, still carrying the
+        // value it was sent with.
+        let mut late = Capture::new(99_999);
+        late.req_head =
+            bytes(format!("GET /v1 HTTP/1.1\r\nauthorization: Bearer {OLD}\r\n\r\n").as_bytes());
+        ring.insert(late, "api.test");
+
+        let (found, _) = ring.get(&[99_999]);
+        let head = String::from_utf8(found[0].req_head.bytes.clone()).unwrap();
+        assert!(
+            !head.contains(OLD) && head.contains(&"*".repeat(OLD.len())),
+            "a superseded declared credential must stay masked however much the cage churns: {head}"
         );
     }
 

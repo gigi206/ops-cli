@@ -457,7 +457,7 @@ impl SecretNeedle {
     }
 
     /// Whether this needle was learned from traffic rather than declared.
-    fn is_observed(&self) -> bool {
+    pub(crate) fn is_observed(&self) -> bool {
         self.observed
     }
 
