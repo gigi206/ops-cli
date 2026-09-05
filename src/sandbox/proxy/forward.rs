@@ -534,6 +534,7 @@ pub(super) fn handle_https_forward(
     let RelayedHead {
         head: resp_head,
         framing,
+        no_final,
         ..
     } = relay_response_head(
         &mut up_br,
@@ -547,9 +548,10 @@ pub(super) fn handle_https_forward(
         // upstream leg does or says it does.
         ClientLeg::Close,
     )?;
-    // An upstream that closed without answering leaves nothing to relay, and an empty success would
-    // be indistinguishable from a genuine zero-byte response — see the tunneled path.
-    if resp_head.is_empty() {
+    // An upstream that produced no final head leaves nothing to relay, and an empty success would
+    // be indistinguishable from a genuine zero-byte response — see the tunneled path. Which cause
+    // it was, and the words for it, come from the relay ([`NoFinalHead`]).
+    if let Some(why) = no_final {
         ctx.push_log(
             crate::sandbox::control::Proto::Https,
             &host,
@@ -557,13 +559,13 @@ pub(super) fn handle_https_forward(
             Some(verb),
             Some(&path),
             crate::sandbox::control::LogVerdict::Error,
-            "upstream-closed",
+            why.tag(),
         );
         return write_refusal(
             &mut client,
             "502 Bad Gateway",
-            "upstream-closed",
-            &format!("`{host}` closed the connection without sending a response"),
+            why.tag(),
+            &why.sentence(&host),
         );
     }
     if let Some(code) = parse_status_code(&resp_head)

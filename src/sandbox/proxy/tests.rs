@@ -2609,6 +2609,51 @@ fn every_relayed_head_is_counted_including_an_interim_one() {
     }
 }
 
+/// An upstream may put interim `1xx` heads in front of its response, and each one is relayed and
+/// read past. Without a ceiling on how many, an allowed but hostile upstream answers `100 Continue`
+/// for as long as it likes: the relay thread never leaves this loop, and the bytes cross into the
+/// cage the whole time. The read bound is already lifted by then, so nothing else stops it.
+///
+/// The count is what is bounded here. How long the upstream may take *between* heads is the same
+/// wait a slowly streamed body gets, which this proxy deliberately does not cut short.
+#[test]
+fn an_upstream_that_only_sends_interim_heads_is_cut_off() {
+    let mut wire = Vec::new();
+    for _ in 0..64 {
+        wire.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+    }
+    wire.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let mut up = io::BufReader::new(io::Cursor::new(wire));
+    let mut client = Vec::new();
+    let down = Arc::new(AtomicU64::new(0));
+    let relayed = relay_response_head(
+        &mut up,
+        &mut client,
+        &down,
+        None,
+        &[],
+        "GET",
+        ClientLeg::Close,
+    )
+    .unwrap();
+    let crossed = String::from_utf8_lossy(&client)
+        .matches("100 Continue")
+        .count();
+    assert!(
+        crossed < 64,
+        "the relay must stop short of an unbounded run of interim heads, {crossed} crossed"
+    );
+    assert!(
+        relayed.head.is_empty(),
+        "past the ceiling there is no head to hand back: {:?}",
+        String::from_utf8_lossy(&relayed.head)
+    );
+    assert!(
+        matches!(relayed.no_final, Some(NoFinalHead::InterimCap)),
+        "and the caller is told which refusal to answer with"
+    );
+}
+
 /// The live log captures the **upstream** HTTP status for a completed L7 request (the
 /// `--with-status` data). Teeth: two requests sbx permits identically (both `allow`) reach two
 /// upstreams that differ ONLY in their response status — so a recorded 200 vs 404 can come only
@@ -4603,6 +4648,41 @@ fn an_upstream_that_closes_without_answering_is_refused_rather_than_relayed_empt
     assert!(
         got.contains("upstream-closed"),
         "and the reason must name what happened: {got:?}"
+    );
+}
+
+/// The ceiling on interim heads, on the plane that answers it. The upstream never sends a final
+/// head at all, so the exchange ends in a refusal either way: what this pins is *which* one, since
+/// an upstream cut off for flooding the client is not one that closed, and a reader chasing a
+/// stalled request needs the two told apart.
+#[test]
+fn an_upstream_flooding_interim_heads_is_refused_under_its_own_reason() {
+    let mut wire = Vec::new();
+    for _ in 0..64 {
+        wire.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+    }
+    let response: &'static [u8] = Box::leak(wire.into_boxed_slice());
+    let (addr, upstream_ca, up) = spawn_upstream("upstream.test", response);
+    let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, false, vec![]);
+    let got = through_proxy(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        "upstream.test",
+        addr.port(),
+        b"GET /p HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+    )
+    .unwrap();
+    up.join().unwrap();
+    assert!(got.contains("502 Bad Gateway"), "expected a 502: {got:?}");
+    assert!(
+        got.contains("interim-head-cap"),
+        "the refusal must name the ceiling that was reached, not the close that followed: {got:?}"
+    );
+    let crossed = got.matches("100 Continue").count();
+    assert!(
+        crossed < 64,
+        "and the relay must have stopped short of the flood, {crossed} crossed"
     );
 }
 

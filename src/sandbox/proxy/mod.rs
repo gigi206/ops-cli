@@ -119,6 +119,7 @@
 //! | `502` | `upstream-unreachable`   | the host is allowed but the TCP connection failed |
 //! | `502` | `upstream-cert-rejected` | the upstream TLS certificate failed validation (never downgraded) |
 //! | `502` | `upstream-http2-unsupported` | a `[network] http2` host will not speak HTTP/2. gRPC is HTTP/2 end to end and this plane does not translate, so it fails closed. Reported whether the upstream refuses the ALPN offer or ignores ALPN and negotiates nothing: both are the same fact about the server, and neither is a certificate problem |
+//! | `502` | `interim-head-cap`       | the upstream answered with more interim `1xx` heads than one exchange carries ([`INTERIM_HEAD_MAX`]). Each is relayed and read past on a leg whose read bound the response stream has already lifted, so an unbounded run holds a proxy thread and pours bytes into the cage; the count is what is bounded, and the wait between heads is the one a slowly streamed body also gets |
 //! | `502` | `upstream-closed`        | the upstream was reached and then closed (or reset the stream) before answering. Distinct from `upstream-unreachable`, which means the connection was never made: this one falls *after* the allow is recorded, so the exchange reads as an allow whose status never arrived, with this error beside it |
 //! | `502` | `injected-header-invalid` | a header sbx was adding could not be one (HTTP/2 plane). A backstop, not a live path: a signer's value is refused at the plugin boundary if it carries a newline or a NUL. Named for its cause rather than folded into `bad-request`, which would blame the caller for a header the caller never sent |
 //!
@@ -1677,6 +1678,7 @@ fn relay_response_head<R: BufRead, W: Write>(
     request_method: &str,
     client_leg: ClientLeg,
 ) -> io::Result<RelayedHead> {
+    let mut interim_seen = 0usize;
     loop {
         let (head, complete) = read_response_head(up, HEAD_MAX);
         if head.is_empty() {
@@ -1684,10 +1686,26 @@ fn relay_response_head<R: BufRead, W: Write>(
                 head,
                 framing: BodyFraming::ToEof,
                 persistent: false,
+                no_final: Some(NoFinalHead::UpstreamClosed),
             });
         }
         let interim =
             complete && matches!(parse_status_code(&head), Some(c) if (100..200).contains(&c));
+        // Counted before it is written on, so the head that breaks the ceiling does not cross
+        // either. Past it the exchange is over: the caller answers the refusal rather than reading
+        // on, since an upstream that has spent this many heads without a response has already shown
+        // it is not going to send one.
+        if interim {
+            interim_seen += 1;
+            if interim_seen > INTERIM_HEAD_MAX {
+                return Ok(RelayedHead {
+                    head: Vec::new(),
+                    framing: BodyFraming::ToEof,
+                    persistent: false,
+                    no_final: Some(NoFinalHead::InterimCap),
+                });
+            }
+        }
         // An interim `1xx` is not the response, so its framing is not the connection's to state —
         // the head that follows it is the one every question below is about.
         let final_head = complete && !interim;
@@ -1724,6 +1742,7 @@ fn relay_response_head<R: BufRead, W: Write>(
             head,
             framing,
             persistent,
+            no_final: None,
         });
     }
 }
@@ -1764,7 +1783,59 @@ struct RelayedHead {
     /// Whether the head **as written to the client** announces a connection a further request may
     /// ride on. False unless the caller asked for [`ClientLeg::MayReuse`] and the head answered yes.
     persistent: bool,
+    /// Why no final head is being handed back, when none is. `None` with a non-empty
+    /// [`Self::head`] is the ordinary case; `Some` always comes with an empty head and names the
+    /// refusal the caller answers with, so the planes that relay a head state one answer per cause
+    /// rather than each choosing its own.
+    no_final: Option<NoFinalHead>,
 }
+
+/// Why an upstream produced no final response head for [`relay_response_head`] to hand back.
+///
+/// It names the refusal rather than being one, because the answer is written on the client's leg by
+/// whichever plane is relaying, each over its own transport: the tunneled plane writes it back
+/// inside the TLS session it terminated, the forwarding plane straight onto its cleartext socket.
+/// What must not differ between them is the reason token and the sentence, which is what this
+/// carries.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NoFinalHead {
+    /// The upstream was reached and then closed, or reset, before answering.
+    UpstreamClosed,
+    /// The upstream answered with more interim `1xx` heads than one exchange may carry.
+    InterimCap,
+}
+
+impl NoFinalHead {
+    /// The refusal reason token this is logged and answered under, from the module's table.
+    fn tag(self) -> &'static str {
+        match self {
+            Self::UpstreamClosed => "upstream-closed",
+            Self::InterimCap => "interim-head-cap",
+        }
+    }
+
+    /// The sentence the client is answered with, naming the upstream `host` it is about.
+    fn sentence(self, host: &str) -> String {
+        match self {
+            Self::UpstreamClosed => {
+                format!("`{host}` closed the connection without sending a response")
+            }
+            Self::InterimCap => format!(
+                "`{host}` sent more than {INTERIM_HEAD_MAX} interim `1xx` responses without a \
+                 final one"
+            ),
+        }
+    }
+}
+
+/// The most interim `1xx` heads one exchange relays before the upstream is cut off.
+///
+/// Each is relayed to the client and read past, and the loop that does so runs after
+/// [`begin_response_stream`] has lifted the upstream read bound, so an allowed upstream answering
+/// `100 Continue` forever holds one of the proxy's synchronous threads and pours bytes into the cage
+/// for as long as it cares to. No legitimate server strings more than a few `103 Early Hints` ahead
+/// of its response, so the ceiling can sit far below anything real and still never be met.
+const INTERIM_HEAD_MAX: usize = 8;
 
 /// What a relayed head should tell the client about the **client's own** connection.
 ///

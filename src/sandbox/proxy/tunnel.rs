@@ -802,7 +802,7 @@ pub(super) fn serve_tunneled_request(
         head: resp_head,
         framing,
         persistent,
-        ..
+        no_final,
     } = relay_response_head(
         &mut up_br,
         br.get_mut(),
@@ -820,11 +820,12 @@ pub(super) fn serve_tunneled_request(
             ClientLeg::Close
         },
     )?;
-    // An upstream that closed without answering leaves nothing to relay, and saying so is the honest
+    // An upstream that produced no final head leaves nothing to relay, and saying so is the honest
     // reply: an empty success is indistinguishable from a genuine zero-byte response, and it would
     // hide the one failure reuse can produce — a connection the far side closed in the window
-    // between the pool's probe and the write.
-    if resp_head.is_empty() {
+    // between the pool's probe and the write. Which cause it was, and the words for it, come from
+    // the relay ([`NoFinalHead`]).
+    if let Some(why) = no_final {
         ctx.push_log(
             crate::sandbox::control::Proto::Https,
             connect_host,
@@ -832,13 +833,13 @@ pub(super) fn serve_tunneled_request(
             Some(&imethod),
             Some(&itarget),
             crate::sandbox::control::LogVerdict::Error,
-            "upstream-closed",
+            why.tag(),
         );
         return respond_refusal_tls(
             &mut br,
             "502 Bad Gateway",
-            "upstream-closed",
-            &format!("`{connect_host}` closed the connection without sending a response"),
+            why.tag(),
+            &why.sentence(connect_host),
         );
     }
     // Record only a FINAL status (>= 200). Any interim 1xx was relayed and read past above, so what

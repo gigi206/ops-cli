@@ -503,8 +503,9 @@ would stall its siblings), `ssrf-blocked`, `host-mismatch`, `ip-literal`,
 `outbound-secret`, `signer-refused`, `signer-body-too-large`, `body-buffer-cap`,
 `connection-cap`, `splice-cap` (the concurrent raw `tcp://` tunnel ceiling),
 `injected-header-invalid`, and the transport-side `dns-failure`, `upstream-unreachable`,
-`upstream-cert-rejected`, `upstream-http2-unsupported`, and `upstream-closed`. A genuine
-upstream status (a real `404`) is relayed verbatim with no such header.
+`upstream-cert-rejected`, `upstream-http2-unsupported`, `upstream-closed`, and
+`interim-head-cap`. A genuine upstream status (a real `404`) is relayed verbatim with no
+such header.
 
 `upstream-http2-unsupported` belongs to a host designated
 [`http2`](../configuration/network#http2-and-grpc) alone: gRPC is HTTP/2 end to end and the
@@ -520,6 +521,15 @@ and no allow at all, since nothing was allowed to leave. A host that was reached
 then closed before answering leaves the allow standing, its status blank, with an
 `upstream-closed` beside it. The two reasons are the difference between a host that is
 down and a call that was lost mid-flight, so they are never used for each other.
+
+`interim-head-cap` is the other one an upstream earns rather than a request. A server may
+put interim `1xx` responses in front of its answer, `100 Continue` or `103 Early Hints`,
+and sbx relays each one and reads past it. By then the read bound on the upstream leg has
+been lifted so a slow answer is waited for, which leaves a server that only ever sends
+interim heads holding a proxy thread and sending bytes into the cage for as long as it
+likes. A handful is all any real server sends, so past a small ceiling the exchange is
+refused under this reason instead of `upstream-closed`: the two say different things
+about the server and are never used for each other.
 
 `signer-refused` is the one that is not a policy verdict: the policy allowed the host,
 and the request was refused because its credential could not be formed. See
