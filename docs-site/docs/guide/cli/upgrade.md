@@ -26,8 +26,8 @@ advance **only here**, never on an `sbx` binary update.
 
 | Flag | Effect |
 |---|---|
-| `-a, --app <name>` | narrow `nix`, `mise` or `provision` to one app |
-| `--project <path>` | roll another project instead of the current directory |
+| `-a, --app <name>` | narrow `nix`, `mise` or `provision` to one app (`--app=<name>` also accepted) |
+| `--project <path>` | roll another project instead of the current directory (`--project=<path>` also accepted) |
 
 This page is organised by **channel**, which is the right shape when you know which one
 you want. To advance a single app without working that out first, use

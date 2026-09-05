@@ -58,9 +58,9 @@ The **sources**:
 - `config`: the rules your `.sbx.toml`/global config declared.
 - `builtin`, the [always-allowed self-equip hosts](modes#the-built-in-self-equip-set),
   unioned into every filtering policy regardless of trust.
-- `manual`, this project's live `ask`-mode sessions' remembered rules (from
-  [`--session` answers](ask#remembering-vs-persisting-an-answer)). Does not
-  combine with `-a`.
+- `session`, this project's live `ask`-mode sessions' remembered rules (from
+  [`--session` answers](ask#remembering-vs-persisting-an-answer); `manual` is accepted
+  as an alias). Combines with `-a <name>` to scope the query to one app's sessions.
 
 Under `shared`/`none` there are no rules (no proxy). `-a <name>` shows an app's
 effective policy, the same policy [`sbx test net --app`](#sbx-test-net) tests a URL
@@ -239,6 +239,8 @@ mute  = ["play.googleapis.com", "*.datadoghq.com", "antigravity-unleash.goog"]
   loudest of them since a refused WebSocket is retried in a loop. One that names verbs
   still means exactly those. Only an `allow` requires `WS` to be spelled out, because
   an allow is the only list that hands that capability out.
+- **It ignores port and scheme.** A bare-host mute covers the host's cleartext `:80`
+  noise as well as `:443` and `tcp://`: muting is about the host, not the transport.
 
 `mute` uses the **same grammar** as `allow`/`deny`: a host, `*.domain`, an exact
 `host/path`, a `{VERB}` method prefix, a `re:` regex, ports, and `@group` references, and is **trusted/global-only** like the rest of the `[network]` table (an untrusted
@@ -423,12 +425,14 @@ configured secret seen crossing an exchange's WebSocket tunnel:
       ! secret `openai-key` crossed this websocket (upstream → cage); it was NOT blocked or masked
 ```
 
-Read the second half of that line literally. Unlike the two HTTP tripwires in
+Read the second half of that line literally, under the default `websocket_secret = "warn"`.
+Unlike the two HTTP tripwires in
 [Redaction](../secrets/redaction), which refuse an outbound request with a `403` and mask a
 reflected value out of a response, **nothing was stopped here**. An open tunnel is a
 byte-exact pipe between two peers that agreed their own framing, masking and compression, so
 the frame reached its destination exactly as it was sent. What sbx does is tell you that it
-did, while the tunnel is still open.
+did, while the tunnel is still open. (With `websocket_secret = "block"` the same sighting
+closes the tunnel instead: see below.)
 
 - **Both directions.** `cage → upstream` is the agent sending a credential out;
   `upstream → cage` is the far side sending one back.
@@ -442,7 +446,15 @@ did, while the tunnel is still open.
   `permessage-deflate` message are both scanned as the text they carry.
 - **Byte-exact, per message.** Like the other tripwires it matches a verbatim value; a
   re-encoded one, or one split across two separate messages, is out of scope by design.
-  Within one message a value spanning several frames is still seen.
+  Within one message a value spanning several frames is still seen. Decompressed scanning
+  is capped at 256 KiB per message (scanned up to the cap, never claimed whole past it);
+  control frames past 125 bytes or fragmented leave that direction unscanned; a
+  `permessage-deflate` resync that would discard past 64 MiB of plaintext stops the
+  direction instead.
+- **`websocket_secret` decides what happens next.** The default `"warn"` only records,
+  as above. With `websocket_secret = "block"` the tunnel is recorded **and closed**;
+  the match is bounded to one message chunk, so a secret already partly relayed cannot
+  be un-sent. See [`websocket_secret`](../configuration/network#table-fields).
 
 Under `--json` the same fact rides on every event as `secrets_seen`, a possibly-empty list of
 `{"name": …, "way": "out"|"back"}`.
@@ -470,8 +482,10 @@ A capture is bounded three ways, and never trims in silence:
   is also marked when the exchange was filed while more was still arriving, which an
   HTTP/2 request body can be (its pump runs concurrently with the response, and a
   server may answer without draining it). A prefix is never shown as if it were whole.
-- **Per exchange count** and **by a total byte budget**: past it, the *oldest*
+- **Per exchange count** (200 exchanges) and **by a total byte budget** (16 MiB): past it, the *oldest*
   captures are dropped and the count is reported (`N earlier capture(s) evicted`).
+- **Per head** (32 KiB per direction), bounded independently of the body cap so a
+  header flood cannot eat the body budget.
 
 Like the log itself, a capture lives **only in the running session's memory**: never
 written to disk, never bound into the cage, gone when the session exits. The relay is

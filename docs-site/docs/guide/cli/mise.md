@@ -20,7 +20,8 @@ See also: [`[tools]` (mise)](../configuration/tools) · [`packages`](../configur
 - **Open by design**: `sbx mise` works whether or not the project is trusted (the
   documented Mode-B self-equip inversion), unlike `sbx run`'s host-side `nix:`
   provisioning which is trusted-only.
-- For mise's own help, run `sbx mise help`.
+- For mise's own help, run `sbx mise help`. Only a **leading** `sbx mise --help` / `-h`
+  shows sbx's own page; a `--help` further along is passed through to the in-cage mise.
 
 ## Install vs activate
 

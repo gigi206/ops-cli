@@ -54,6 +54,9 @@ frees nothing.
 
 The sweep therefore reconciles those seed roots against what the project's **current**
 out-links reference: it keeps the current version of each and collects the superseded ones.
+A live package's `<name>-man` / `<name>-dev` sibling outputs are kept with it, and a pruned
+prebuilt root takes its `.expr` stamp with it. The keep-set also covers
+`projects/<id>/nix-tools/*` (the `nix:`-via-mise tools).
 It is conservative: if the base or mise out-links for the current revision are missing it
 skips rather than risk dropping a live build, so an over-eager prune only ever costs a
 re-provision on the next launch.

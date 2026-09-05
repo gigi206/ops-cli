@@ -25,7 +25,8 @@ See also: [Provisioning](../concepts/provisioning) · [`sbx upgrade`](../houseke
 - A **40-hex revision** under `NixOS/nixpkgs`: an exact, immutable pin.
 
 The value is charset-validated before it reaches a flake reference. Forks and
-arbitrary flake refs are not accepted.
+arbitrary flake refs are not accepted. A malformed source is warned about and ignored,
+keeping the default.
 
 ## One channel pins the whole sandbox
 

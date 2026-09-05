@@ -57,13 +57,19 @@ launch:
   it fences: the one the config named, still never one the manifest chose.
 - **`cage_env` passes the reserved-key barrier** an untrusted project's `[env]`
   meets. A broker points a client at its socket; names like `LD_PRELOAD` or `PATH`
-  load code in the cage instead.
+  load code in the cage instead. `SSH_AUTH_SOCK` is refused too (sbx sets it for its
+  own ssh-agent fence), every name must be valid, and each named once.
+  `socket_name` defaults to `<plugin>.sock`: a file name only, never a path
+  (empty, `/`, `.`, `..` and NUL refused).
+- **`framing` is a closed set** implemented in `sbx`: `length-u32-be` (a four-byte
+  big-endian length, then the body, which carries the protocol's own type byte),
 - **`framing` is a closed set** implemented in `sbx`: `length-u32-be` (a four-byte
   big-endian length, then the body, which carries the protocol's own type byte),
   `line` (one message per line, the newline being the boundary rather than part of the
   message), and `pgwire` (PostgreSQL's: a type byte, then a length that **counts itself**,
   except for the startup packet which has no type byte at all, so the reader is stateful). A plugin handed an uncut stream would be the broker rather than rule on its
-  messages. An over-long frame is an error, never a truncation.
+  messages. An over-long frame is an error, never a truncation. Both `framing` and
+  `max_frame` are required: `max_frame` is positive and at most 256 KiB.
 - **`uses_secret` is what lets a broker place a credential it never sees.** The plugin is
   handed a random marker and `sbx` substitutes the value on the way to the host resource;
   see [`[broker]`](../configuration/broker#placing-a-credential-the-cage-does-not-have).
@@ -74,7 +80,8 @@ launch:
   process and two connections while it waits. Thirty seconds suits a resource answering at
   machine speed and is wrong for one that stops to **ask a person**: a gpg-agent opening a
   pinentry answers when the human does. A manifest raises it up to ten minutes; past that,
-  whatever is on the other side is wedged rather than thinking.
+  whatever is on the other side is wedged rather than thinking. The default is 30 seconds;
+  zero, negative and above-600 values are refused at load.
 - **`host_greets` and multi-message answers both need `inspect_replies`.** A protocol
   whose reply is a run of messages needs the plugin to say where the run ends, and a
   greeting is a frame from the host that must not reach the cage unseen.
@@ -82,6 +89,8 @@ launch:
 `deny_frame` is optional because it does not generalise: it fits a protocol whose
 refusal is the same whatever was refused, and a protocol whose refusal must echo a
 request id has none. The refusal that always works is closing the connection.
+When present it must be non-empty, fit within `max_frame`, and hold bytes (`0-255`)
+only.
 
 :::note What a broker plugin does not reach
 A broker plugin is given no `scheme`, so nothing a secret's `from` names routes to it,

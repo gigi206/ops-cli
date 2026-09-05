@@ -70,7 +70,10 @@ global `[broker.x] socket` is reported and nothing is started.
 
 `allow` is handed to the plugin verbatim at the start of every connection. `sbx` does not
 interpret it: what an entry means belongs to the protocol the plugin speaks, exactly as
-`[ssh_agent] allow` names keys rather than describing them. An **untrusted** project's
+`[ssh_agent] allow` names keys rather than describing them. Only a project that actually
+writes `allow` replaces the global policy: a project table written for its `socket` alone
+leaves the global `allow` in place, while an explicit `allow = []` is a project choice
+that empties it. An **untrusted** project's
 whole `[broker.*]` section is dropped with a warning naming it, so "not configured" and
 "not trusted" never look alike.
 
@@ -212,9 +215,11 @@ variable is pointing at nothing.
 
 A manifest says so with `at_host_path = true`, and the fenced socket is then bound **at the
 address of the resource it stands in front of**: the path `[broker.<name>] socket` names.
-A client that would have found the raw socket finds the fence, and needs no telling:
+A client that would have found the raw socket finds the fence, and needs no telling.
+The keys below live in the **plugin's manifest**, not in `sbx.toml`:
 
 ```toml
+# plugin manifest, not sbx.toml
 [broker]
 framing         = "line"
 max_frame       = 2048

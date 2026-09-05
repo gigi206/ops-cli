@@ -289,10 +289,11 @@ the session would be:
 | the `mise` environment resolution | `mise`, over the files a project declared |
 | a [plugin](../plugins/) (resolver, broker or signer) | third-party code, which may be holding a plaintext credential |
 
-Two cages stay outside, and both run one of `sbx`'s own fixed probes rather than anything a
+One cage stays outside, running one of `sbx`'s own fixed probes rather than anything a
 configuration chose: the [`sbx doctor`](../getting-started/doctor) smoke, which reports what the
-kernel granted a minimal cage, and the format of `sbx`'s own [storage volume](../cli/storage)
-image. Neither takes an instruction from a project, so a limit would have nothing to bound, and
+kernel granted a minimal cage. (Formatting `sbx`'s own [storage volume](../cli/storage)
+image runs `mkfs` on the host, outside any cage, so no scope applies to it either.)
+Neither takes an instruction from a project, so a limit would have nothing to bound, and
 putting a probe of the host behind a mechanism the host may not have is the wrong way round.
 
 Which ceilings a cage gets follows the same reading. A cage standing up a launch takes the

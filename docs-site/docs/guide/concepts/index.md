@@ -60,7 +60,8 @@ one:
   keyboard. Network egress rules stay all-verbs; the human is the trust anchor.
 - **Mode B, autonomous agent** (`sbx app run <name>`): actions are untrusted. **This is
   the default posture.** An app's egress allowlist defaults to read-only verbs
-  (`GET`/`HEAD`) unless a rule opts a host out, credentials are injected host-side
+  (`GET`/`HEAD`, overridable per app with [`default_methods`](../networking/modes#default_methods-apps-only))
+  unless a rule opts a host out, credentials are injected host-side
   and never enter the cage, and the app gets its own isolated home.
 
 The whole design is oriented around Mode B: safely running an agent *on* untrusted

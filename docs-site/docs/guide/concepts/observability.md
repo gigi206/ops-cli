@@ -67,7 +67,7 @@ Both are enabled for the lifetime of a single supervised launch:
 - **the filesystem lens**: inotify-watches the project tree and pushes every write
   into a per-session **fs ring**.
 
-Both rings are private memmap'd ring buffers: the supervisor writes, the host-side
+Both rings are private in-memory ring buffers: the supervisor writes, the host-side
 [`sbx proc logs`](../cli/proc) and [`sbx fs logs`](../cli/fs) readers attach
 out-of-band, no rewriting of the cage. Each lens is best-effort and degrades
 independently: a failure to stand up the filesystem lens warns and leaves the exec
@@ -118,7 +118,7 @@ on the project root; subdirectories are watched recursively by default.
 Only **writes** (and directory creations / moves / chmod / … that change the tree)
 are recorded; pure reads do not fire inotify. A noisy editor (a `git pull`, a build
 that rebuilds a 10 000-file `target/`) emits a lot, and the read interfaces (`sbx fs
-logs --tail`, `--follow`, `--path` filters) are designed to filter that down.
+logs --follow`, `--json` for a pipe) are designed to filter that down.
 
 The filesystem feed is **never inlined** to the run's stderr: it is far too chatty
 for that. It is only readable out-of-band (`sbx fs logs`).
@@ -126,7 +126,7 @@ for that. It is only readable out-of-band (`sbx fs logs`).
 ### The control sockets
 
 Each supervised launch binds two per-session sockets under
-`<data>/sessions/<pid>/proc.sock` and `<data>/sessions/<pid>/fs.sock`. The reader
+`<data>/proc/control-<pid>.sock` and `<data>/fs/control-<pid>.sock`. The reader
 commands (`sbx proc logs`, `sbx fs logs`) connect to those sockets and pull from the
 rings on demand; the supervisor unlinks them on exit.
 
@@ -140,9 +140,7 @@ Live the way `tail -f` lives:
 ```sh
 sbx proc logs <pid> --follow        # every new cage process, since launch
 sbx fs   logs <pid> --follow        # every new write to the project tree
-sbx proc logs <pid> --tail 200      # the last 200 events
 sbx proc logs <pid> --json          # one event per line, machine-readable
-sbx proc logs <pid> --path src/     # fs lens only: filter by path prefix
 ```
 
 `sbx proc ls <pid>` shows the **process tree** of the cage at one instant:

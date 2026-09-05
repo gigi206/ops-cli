@@ -34,9 +34,10 @@ into the distribution's own filesystem. Copy it out of `/mnt/c` before running i
 the Windows drive is mounted through `drvfs`, which synthesises permission bits, and
 the executable bit does not reliably survive there.
 
-The WSL2 kernel provides capability-bearing user namespaces, and it does not carry
+The WSL2 kernel has been observed to provide capability-bearing user namespaces, and it does not carry
 the AppArmor restriction that an Ubuntu 24.04 host applies to them, so the boundary
-`sbx` rests on is available with no sysctl to set. `bubblewrap` is not part of a
+`sbx` rests on is available with no sysctl to set (if that changes, [`sbx doctor`](doctor)
+reports it before anything else runs). `bubblewrap` is not part of a
 fresh distribution image and is installed from the distribution's own packages.
 Install `nix` as the user that will run `sbx` rather than as `root`: run as root,
 its single-user installer writes a configuration naming a build group it does not

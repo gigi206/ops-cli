@@ -327,8 +327,8 @@ Inheritance is deliberately **fail-safe**: only a *filtering* mode is inherited.
 the parent posture is `allow` (a denylist), `shared`, `none`, or absent, a
 mode-less table falls back to the safe **`deny`** rather than inheriting an open
 posture. So a mode-less table can never silently widen the network: a `mode`
-typo lands here too (the table parses mode-less and resolves to `deny`/`ask`, never
-`shared`). Inheritance follows the layer chain: an app takes the baseline's mode, a
+typo is warned about and the layer is ignored, so the parent posture stands
+(the global layer, having no parent, falls back to `deny`). Inheritance follows the layer chain: an app takes the baseline's mode, a
 project takes the global's.
 
 The `ask_notice` and `stats` fields inherit the same way: a layer that does not

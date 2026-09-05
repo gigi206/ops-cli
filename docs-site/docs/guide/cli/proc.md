@@ -9,10 +9,10 @@ sbx proc ls      [<id>] [--json]
 sbx proc live    [<id>] [-i|--interval <secs>] [--json]
 sbx proc logs    [<id>] [-f|--follow] [--json]
 sbx proc pending [allow|deny <id>]
-sbx proc allow   <rule> [-l|-g] [-a <app>] [--session [--all]]
-sbx proc deny    <rule> [-l|-g] [-a <app>] [--session [--all]]
-sbx proc unallow <rule> [-l|-g] [-a <app>]
-sbx proc undeny  <rule> [-l|-g] [-a <app>]
+sbx proc allow   <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>] [--session [--all]]
+sbx proc deny    <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>] [--session [--all]]
+sbx proc unallow <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>]
+sbx proc undeny  <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>]
 sbx proc rules   [-a <app>] [--all]
 ```
 
@@ -129,9 +129,14 @@ sbx proc logs 12345 --json | jq .command   # machine-readable
 
 This is the way to watch an observed session **from another terminal**, and the **only** way to
 watch a [detached](run) (`--detach`) one, which has no terminal for the inline `[sbx:exec]`
-feed. The events are held in the supervisor's memory for the session's lifetime, read over a
+feed. The events are held in the supervisor's memory for the session's lifetime (the last
+1000; a follower that falls behind is told how many it missed), read over a
 per-session control socket that is never exposed inside the cage; nothing is written to disk or
-kept after the session exits.
+kept after the session exits. Commands are sanitized (control characters to spaces,
+capped at 512 characters) before they travel, and the issuing program rides along with
+spaces and `=` flattened to `_`, so a cage path cannot forge the line's own fields.
+A read waits up to 10 seconds on a slow session (150 ms for a completion glance, which
+then reports nothing rather than stalling the prompt).
 
 Under a non-enforcing `--observe` run the feed is populated by a short-interval `/proc` poll, so a
 process that starts and exits within one tick can be missed, and each line's verdict reads
@@ -214,7 +219,8 @@ sbx proc allow git                 # only valid once mode = "ask"
 
 Writing the project `.sbx.toml` **re-trusts** it (it must be absent or already trusted first), so the
 rule takes effect on the next launch; the global config and app profiles are trusted by location.
-Removing a rule is done by editing the config ([`sbx config edit`](config)).
+Removing a rule is done with [`unallow` / `undeny`](#unallow--undeny) (or, generically,
+[`sbx config rm` / `edit`](config)).
 
 ### `--session`: load a rule into a running session
 

@@ -68,7 +68,7 @@ A **remote signed store** is a git repository whose catalogue is verified agains
 pinned Ed25519 public key, with anti-rollback on the revision.
 
 ```
-sbx plugins store list [<name>]
+sbx plugins store list [<name>] [--installed]
 sbx plugins store add --name <n> --url <git-url> (--key <hex|@file> | --trust)
 sbx plugins store update [name]
 sbx plugins store install <store> <plugin>
@@ -90,6 +90,7 @@ sbx plugins store publish <dir> --key <key-file> [--rev <n>]
 | `info <name>` | detail a configured store, how its key was trusted, and the plugins it lists |
 | `rm <name>` | remove a configured store |
 | `publish <dir> --key <key-file>` | **operator tool**: sign a directory of plugins into a store |
+| `publish --rev <n>` | pin this publish at revision `n`: a non-negative integer, refused otherwise |
 
 A store whose key was accepted rather than supplied is flagged
 `[key not confirmed elsewhere]`, with the `verify` command to close it on the next line. The catalogue's

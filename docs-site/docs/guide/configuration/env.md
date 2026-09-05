@@ -94,7 +94,9 @@ few structural keys:
   `PIP_CERT`, `npm_config_cafile` (a nonstandard tool reading a lowercase variant must
   not slip a swapped CA past the gate).
 - GPU driver-load paths: `LIBGL_DRIVERS_PATH`, `GBM_BACKENDS_PATH`,
-  `__EGL_VENDOR_LIBRARY_DIRS` (mesa's libgbm/libEGL `dlopen` a `<driver>_dri.so` /
+  `__EGL_VENDOR_LIBRARY_DIRS`, `__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS`, `VK_DRIVER_FILES`,
+  `VK_ADD_DRIVER_FILES`, `VK_ICD_FILENAMES`, `VK_LAYER_PATH`, `VK_ADD_LAYER_PATH`
+  (mesa's libgbm/libEGL `dlopen` a `<driver>_dri.so` /
   gbm backend from these).
 - Anything starting with `SBX_`. That prefix is sbx's own control namespace: it is what
   the [one-shot overrides](overrides) read from the environment (`SBX_NET`, `SBX_BIND`,

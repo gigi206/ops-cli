@@ -118,7 +118,10 @@ Durations are `"90s"`, `"5m"`, `"2h"` (a bare number is seconds). The clock rest
 announcement, and it is **per problem**: one host being held back never delays another's first
 notification. `once` ignores it (that mode never repeats at all) and says so with a warning, and a
 malformed duration keeps whatever period was already in effect rather than falling back to
-announcing everything.
+announcing everything. A `repeat_after` with no event on `always` (a bare mode or a per-event
+table that never says `always`) is likewise warned about and without effect: a period is
+meaningless where nothing ever repeats. A table without a `mode` inherits per event from the
+parent layer instead of resetting everything to the default.
 
 ### What `once` counts as "the same problem"
 

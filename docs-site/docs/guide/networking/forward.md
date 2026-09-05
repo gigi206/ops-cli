@@ -26,7 +26,7 @@ forwarder, same `socat`-over-a-bound-socket plumbing, opposite direction.
 
 ```toml
 # `forward` is a top-level key, declared before any table header. Written under
-# `[network]` it is an unknown key and silently ignored.
+# `[network]` it is an unknown key: ignored with a warning.
 forward = [1455]
 
 [network]
@@ -34,10 +34,12 @@ mode = "deny"
 allow = ["chatgpt.com"]
 ```
 
-- **`forward = [port, …]`**: a list of entries, each a TCP port number. Each is bound on the
+- **`forward = [port, …]`**: a list of entries, each a TCP port number in `1-65535`
+  (`0` and out-of-range values are warned about and skipped, per entry). Each is bound on the
   host's `127.0.0.1`, and, best-effort, on `[::1]` so a `localhost` callback the browser sends
   over IPv6 is caught too, loopback only, never an external interface, and bridged to the cage's
-  own loopback at the *same* port. The in-cage bridge connects the service on
+  own loopback at the *same* port. Entries are ordered canonically by `(cage, host)` port, so
+  two equivalent layers produce one identical set. The in-cage bridge connects the service on
   `127.0.0.1:<port>`, so a cage service that binds only IPv6 loopback (`::1`) is not reached: bind `127.0.0.1` or all interfaces inside the cage.
 - **Loopback only, which means the machine and not the account.** sbx never binds an external
   interface, so nothing off the host reaches the port. Every local process does, whatever user it
@@ -82,7 +84,8 @@ forward = ["9200:9119"]
   remap form is for the other case, a dev server or dashboard whose address only you decide.
 - **One host port, one cage port.** Two forwards claiming the same host port fail the launch
   closed before anything is bound, naming both cage ports. Two entries naming the same *cage*
-  port cannot both apply, so the last one wins, with a warning naming the host port it dropped.
+  port cannot both apply, so the last one wins, with a warning naming the cage port, the
+  dropped host port and the kept one.
 
 ## Behaviour
 

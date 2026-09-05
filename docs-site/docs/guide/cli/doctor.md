@@ -8,12 +8,15 @@ description: "Verify the runtime prerequisites, and report the store location an
 sbx doctor
 ```
 
-Verify the runtime prerequisites before anything can run.
+Verify the runtime prerequisites before anything can run. Takes no argument: anything
+extra is refused (usage, exit 2).
 
 Checks the load-bearing requirements: capability-bearing unprivileged user namespaces
 (the security boundary everything rests on), the bubblewrap engine, and the nix binary
 that drives the user-owned store. A missing requirement is a **hard failure with a
-remediation hint**: never a silent fallback to a weaker engine. Also reports
+remediation hint**: never a silent fallback to a weaker engine. `SBX_NIX_BIN` and
+`SBX_BWRAP_BIN` pin the two binaries explicitly (owned by you or root, not
+world-writable); unset them to let sbx resolve both itself. Also reports
 best-effort resource limiting, the store location and channel revision, and the
 **storage posture**: whether the data directory lives in an encapsulated
 [volume](storage), or, when it does not, whether one is worth adopting on this host

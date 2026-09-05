@@ -141,7 +141,7 @@ does fail, and that is worth knowing before you read it as a bug.
 Three bounds keep a hopeless credential from spinning, since a resolver run can
 mean launching a sandboxed plugin:
 
-- a refusal within a short window of the last attempt is ignored;
+- a refusal within 30 seconds of the last attempt is ignored;
 - a resolver that **errors** stops the mechanism for the session, since a broken
   source is not a stale one and retrying only repeats the failure;
 - a resolver that returns **the same value** stops it too: the upstream just

@@ -63,8 +63,8 @@ scope flag). See [Egress groups](../networking/groups).
 ## sbx net allow and deny
 
 ```
-sbx net allow <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]
-sbx net deny  <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]
+sbx net allow <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>] [--session [--all]]
+sbx net deny  <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>] [--session [--all]]
 ```
 
 Validates the rule, then persists it to a config file. `allow` on a fresh config
@@ -97,9 +97,9 @@ sbx net deny  ads.example.com --session --all    # every reachable session, this
 ## sbx net unallow, undeny and unmute
 
 ```
-sbx net unallow <rule> [-l|--local|-g|--global] [-a|--app <name>]
-sbx net undeny  <rule> [-l|--local|-g|--global] [-a|--app <name>]
-sbx net unmute  <rule> [-l|--local|-g|--global] [-a|--app <name>]
+sbx net unallow <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>]
+sbx net undeny  <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>]
+sbx net unmute  <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>]
 ```
 
 Each takes one rule back out of the config file it was written to, in the vocabulary it was
@@ -139,7 +139,8 @@ overlay cannot be un-loaded (the overlay takes rules and has no retraction), so 
 the session; a session flag here is refused rather than silently ignored.
 
 `sbx config rm network.allow <rule>` is the same removal through the generic
-[config surface](config), and stays the only route for `[proc]` rule lists.
+[config surface](config). For `[proc]` rule lists, prefer the dedicated
+[`sbx proc unallow` / `undeny`](proc) verbs.
 
 ```sh
 sbx net unallow api.example.com              # take a persisted allow back out
@@ -150,7 +151,7 @@ sbx net unmute  play.googleapis.com -a agy   # stop suppressing that refusal's l
 ## sbx net mute
 
 ```
-sbx net mute <rule> [-l|--local|-g|--global] [-a|--app <name>] [--session [--all]]
+sbx net mute <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>] [--session [--all]]
 ```
 
 `mute` adds a [`[network] mute`](../networking/observability#muting-noisy-refusals-network-mute-selinux-dontaudit)
@@ -184,14 +185,15 @@ sbx net mute play.googleapis.com --session -a agy   # quiet a running agy sessio
 ```
 sbx net pending [-a <app>] [--json]
 sbx net pending allow|deny <id>|--all [-a <app>] [--session] [--save [-l|-g]]
-sbx net pending watch [-i <secs>] [-a <app>]
+sbx net pending watch [-i|--interval <secs>] [-a|--app <name>]
 ```
 
 Under `[network] mode = "ask"`, a request no rule decides parks until answered. With no
 verb, lists what is parked (id `<pid>.<seq>`; identical retries collapse to `×N`).
 `allow <id>`/`deny <id>` answer a whole destination; `--all` drains; `--session`
 remembers for the live session; `--save` persists a rule; `watch` redraws live. See
-[Ask mode](../networking/ask).
+[Ask mode](../networking/ask). `watch` needs a terminal: in a pipe, use the one-shot
+listing or add `--json`.
 
 ## `sbx net stats`
 
@@ -208,9 +210,9 @@ recording is on by default (a trusted `[network] stats = false` disables it). Se
 ## `sbx net logs`
 
 ```
-sbx net logs [-a <app>] [--host <h>] [--verdict allow|deny|blocked|error] [-n <N>]
+sbx net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked|error] [-n <N>]
              [--all] [--with-query] [--with-status] [--with-headers] [--with-body]
-             [-f|--follow] [-i <secs>] [--json]
+             [-f|--follow] [-i|--interval <secs>] [--json]
 ```
 
 A chronological, per-request record of every egress decision a **running** session's

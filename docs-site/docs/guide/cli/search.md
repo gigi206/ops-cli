@@ -10,6 +10,7 @@ sbx search <query>
 
 Discover the `nix:` tools a project can declare, via [nixhub](https://www.nixhub.io/).
 Host-side and read-only: it resolves nothing into the sandbox and needs no trust.
+Only the first word is searched; extra words are ignored.
 
 See also: [`packages`](../configuration/packages) · [`[tools]`](../configuration/tools) · [Provisioning](../concepts/provisioning).
 

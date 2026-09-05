@@ -7,8 +7,8 @@ description: "List and invoke the declared operations a session offers, and read
 ```
 sbx task list [<operation>] [--session <id>]
 sbx task secrets [<operation>] [--session <id>]
-sbx task run <operation> [--param KEY=VALUE]... [--env KEY=VALUE]... [--detach] [--session <id>]
-sbx task result <invocation> [--session <id>]
+sbx task run <operation> [-p|--param KEY=VALUE]... [-e|--env KEY=VALUE]... [--detach] [--session <id>] [--json]
+sbx task result <invocation> [--session <id>] [--json]
 sbx task status [<invocation>|<operation>] [--session <id>]
 sbx task show <invocation>|<operation> [--session <id>]
 sbx task stop <invocation>|<operation> [--session <id>]
@@ -23,7 +23,9 @@ an ephemeral sibling cage, with a credential the caller never holds. Declared as
 socket sbx binds there) **and on the host**, so an operation is testable exactly as the agent sees
 it, down to the `<operation>` filter: `sbx task list build` narrows the listing on either side, and
 a name nothing declares is refused on either side with the names that are declared. `--session` is
-host-only, since a cage reaches exactly one plane, its own. `status`, `stop`, `result`, `logs` and `run --detach` are **host-only**, and by construction
+host-only, since a cage reaches exactly one plane, its own (the plane address travels as
+`SBX_TASK_SOCKET`, which is also how `--session` is refused inside a cage rather than
+silently dropped). `status`, `stop`, `result`, `logs` and `run --detach` are **host-only**, and by construction
 rather than by check: they live on a second socket that is never bound into a cage. The record is not
 for the recorded party to read, and an invocation id is per session: a cage able to stop one could
 stop the invocation *you* started, and same-uid leaves no way to tell the two callers apart. Starting

@@ -50,13 +50,17 @@ The rules a signer manifest is held to, each refused at load rather than at laun
   shown a credential's requests and, where it reads one, the credential itself.
 - **`sets_headers` is required and non-empty.** A signer that sets nothing
   authenticates nothing, and the list is what makes the manifest a review surface:
-  reading it tells you every header this plugin can write.
+  reading it tells you every header this plugin can write. Each of `sets_headers`
+  and `sees_headers` holds at most 32 headers; every entry is a well-formed HTTP
+  token, named once (duplicates count across case and `_`/`-` spellings, so
+  `x-api-key` and `x_api_key` collide by design).
 - **Some headers no manifest may declare.** `Host` chooses where the credential
   lands; `Content-Length`, `Transfer-Encoding` and `Trailer` choose where `sbx`
   thinks the request ends; `Connection`, `Upgrade`, `TE`, `Expect` and the
   `Proxy-*` family belong to the hop rather than to the request. Where a request
   goes, where it ends and what the connection becomes are sbx's, never a plugin's.
-  The refusal is case-insensitive, since a header name is.
+  The refusal is case-insensitive, since a header name is, and it also catches
+  `snake_case` spellings (`content_length`, `PROXY_CONNECTION`).
 - **`sees_headers` is empty by default.** A request carries whatever the cage put on
   it, including credentials an app obtained by its own sign-in, which belong to no
   declaration. A plugin that must see one says which.

@@ -272,7 +272,7 @@ Pairs with [`gui = "wayland"`](gui) for the display; sbx seeds its MITM CA into 
 store so the Chromium app trusts a filtering posture's proxy.
 
 **A non-Electron app: `libs`.** The curated library set is shared by `deb:`, `appimage:` and
-`tarball:`, and it covers the Electron/Chromium shape. An app built on something else (a Wails or
+`tarball:` (all three backends accept it), and it covers the Electron/Chromium shape. An app built on something else (a Wails or
 GTK shell links `libwebkit2gtk`, `libsoup`, `libjavascriptcoregtk`) has `NEEDED` entries that set
 does not carry, and `autoPatchelfHook` fails the build naming them. Add them **per package** in its
 table, with `libs`:
@@ -400,7 +400,8 @@ Anything else fails the build with a message naming what it found: two executabl
 ambiguity, not a pick-the-first situation. The same three shapes apply to `deb:` and `appimage:`,
 which share this install phase.
 
-**When none of the three fits, name the program yourself** with `main` in the package's own table:
+**When none of the three fits, name the program yourself** with `main` in the package's own table
+(accepted for `tarball:`, `deb:` and `appimage:`; refused for `binary:`, whose download *is* the program):
 
 ```toml
 [packages]

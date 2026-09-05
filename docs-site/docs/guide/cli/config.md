@@ -136,7 +136,8 @@ sbx config unset <key> [-l|-g|-c <file>] [-a|--app <name>] [--trust]
 ```
 
 These edit **one layer file**, preserving its other keys, its comments and its
-formatting. `get` reads the raw declared value in that file; for the effective value
+formatting. `get` reads the raw declared value in that file (an unset key exits 1);
+for the effective value
 across layers, use [`show`](#sbx-config-show).
 
 | Verb | What it edits |
@@ -235,8 +236,10 @@ Every field of the schema, and the verb that edits it. `<name>` is yours to choo
 matrix: they bootstrap the restrictive posture when there is none, refuse a rule that
 would sit inert under the current mode, and never flip a deliberate `shared` or `none`.
 `sbx config add` would write a rule that looks set and decides nothing, so it refuses and
-names the verb. Removal is not redirected: taking a rule out cannot leave an inert one,
-and it is in fact the only way to remove an `allow` or `deny` rule from a file.
+names the verb. Removal is not redirected: taking a rule out cannot leave an inert one.
+`sbx config rm` is the generic removal route; the dedicated verbs
+([`sbx net unallow` / `undeny`](net), [`sbx proc unallow` / `undeny`](proc)) do the same
+through the posture-aware surface.
 
 **Records, one field at a time with `set`:** a table's own keys are reachable through the
 dotted path, so nothing needs an editor just for being nested. A key that itself contains a
@@ -257,7 +260,7 @@ read whole than assemble field by field.
 |---|---|
 | `-l, --local` | the project `.sbx.toml` (the default) |
 | `-g, --global` | the global `sbx.toml` |
-| `-c <file>` | an explicit config file |
+| `-c, --config <file>` | an explicit config file |
 | `-a, --app <name>` | address the key under that app (`app.<name>.<key>` inline, or `-g` its profile) |
 
 Writing a trusted project file re-arms its [trust gate](../concepts/trust); pass

@@ -88,9 +88,10 @@ host, unfiltered".
 | `ca_roots` | `false` hands the cage the session CA alone instead of pairing it with the public roots (default `true`): see below |
 | `http2` | hosts the proxy man-in-the-middles as **HTTP/2** (ALPN `h2`, for gRPC) instead of HTTP/1.1: see below |
 | `capture` | how much of each inspected exchange to keep for [`sbx net logs --with-body`](../networking/observability#seeing-the-traffic-network-capture): `"off"` (default), `"headers"`, `"bodies"` |
-| `capture_max_kb` | bytes kept per captured body, in KiB (default `8`, ceiling `1024`); inert unless `capture = "bodies"` |
+| `capture_max_kb` | bytes kept per captured body, in KiB (default `8`, ceiling `1024`); inert unless `capture = "bodies"`; above the ceiling it is clamped, not refused |
 | `websocket_secret` | what a configured secret seen leaving through a WebSocket does: `"warn"` (default, record it) or `"block"` (record it and close the tunnel): see below |
 | `shared_credential` | groups of hosts that are one service, so a credential the cage obtained by its own sign-in may travel among them: see below |
+| `groups` | reusable `[network.groups]` sets of egress entries, referenced as `@<name>`: see [Egress groups](../networking/groups) |
 | `default_methods` | an **app's** read-by-default verbs (see below) |
 
 Every duration field (`ask_timeout`, `idle_timeout`, a task's `timeout`, a service's

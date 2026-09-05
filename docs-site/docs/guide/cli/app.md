@@ -5,14 +5,14 @@ description: "Launch, import, export and inspect the named application profiles.
 # `sbx app`
 
 ```
-sbx app run <name> [--detach] [--observe] [--net-learn[=level] [--global|--local] [--dry-run]] [override flags] [-- <args>...]
+sbx app run <name> [--detach] [--observe] [--net-learn[=level] [-g|--global|-l|--local] [--dry-run]] [override flags] [-- <args>...]
 sbx app upgrade <name>
 sbx app import <file> [--as <name>] [--force] [--with-deps]
 sbx app export <name> [--out <file>]
 sbx app rm <name>... [--purge] [--gc]
 sbx app list
 sbx app show <name> [--json]
-sbx app prune <name> [--yes]
+sbx app prune <name> [-y|--yes]
 ```
 
 `sbx app run <name>` launches a named application profile: a project `[app.<name>]`
@@ -28,10 +28,12 @@ See also: [The app framework](../apps/) · [`[app.<name>]`](../configuration/app
 | `--detach` | launch in the background as a session [`sbx session`](session) can see |
 | `--observe` | record what the app does, its processes ([`sbx proc logs`](proc#logs), also streamed inline to stderr on a non-interactive foreground run under a non-enforcing `[proc]` mode) and its file writes ([`sbx fs logs`](fs#logs)); works for interactive and detached launches too, see [`sbx run`](run#observing-a-run---observe) |
 | `--net-learn[=domain\|path\|exact]` | run under the app's real posture, then add the egress rules it was refused for lack of one to the app's profile (default level `domain`); see [Learning an app's egress](#learning-an-apps-egress---net-learn) |
-| `-g, --global` / `-l, --local` | with `--net-learn`: write the learned rules to the global app profile / the project config (default local) |
-| `--dry-run` | with `--net-learn`: print the rules that would be added without writing them |
-| `--config` / `--env` / `--net` / `--gui` / `--proc` / `--notify` / `--nixpkgs` / `--bind` / `--forward` / `--limit` / `--package` / `--seccomp` / `--device` / `--gpu` / `--audio` / `--dbus` | typed one-shot [overrides](../configuration/overrides), applied **after** the app's overlay (the final word) |
+| `-g, --global` / `-l, --local` | with `--net-learn`: write the learned rules to the global app profile / the project config (default local); refused without `--net-learn` |
+| `--dry-run` | with `--net-learn`: print the rules that would be added without writing them; refused without `--net-learn` |
+| `--config` / `--env` / `--net` / `--gui` / `--proc` / `--notify` / `--nixpkgs` / `--bind` / `--forward` / `--limit` / `--package` / `--seccomp` / `--device` / `--gpu` / `--audio` / `--dbus` | typed one-shot [overrides](../configuration/overrides), applied **after** the app's overlay (the final word); value-taking flags also accept `--flag=value` |
 | `-- <args>...` | appended to the app's declared command |
+
+`--detach`, `--observe` and `--dry-run` take no value: `--detach=x` is refused (usage, exit 2).
 
 Arguments after a `--` are appended to the app's `cmd`, so you can pass a flag to the
 launched program without editing the profile: e.g. `sbx app run claude-code -- -c` runs
@@ -155,7 +157,7 @@ of is not sent to it.
 |---|---|
 | `import <file> [--as <name>] [--force] [--with-deps]` | place a portable profile (trusted by location); the granted posture is printed |
 | `export <name> [--out <file>]` | write a named app out as a portable profile (stdout by default) |
-| `rm <name>` | remove an **imported** profile (a project `[app.<name>]` lives in that project's `.sbx.toml`) |
+| `rm <name>...` | remove an **imported** profile (a project `[app.<name>]` lives in that project's `.sbx.toml`) |
 | `rm <name> --purge` | also remove the app's isolated **home(s)**, the tools its `mise:` backends installed, its config, and its login state |
 | `rm <name> --purge --gc` | after the purge, sweep the **current project's** nix store too (one command; requires `--purge`) |
 | `list` | list the imported profiles **and** the apps with an installed home (with disk size) |
@@ -256,7 +258,10 @@ down per home and per pool, empty ones included.
 
 ### Removing an app
 
-`rm <name>` deletes only the imported profile. To also reclaim what a launch left on
+`rm <name>` deletes only the imported profile. Without `--purge` a missing profile is
+an error (a project `[app.<name>]` overlay lives in that project's `.sbx.toml`: edit it
+there); with `--purge` it is tolerated, since homes may remain after the profile is gone.
+To also reclaim what a launch left on
 disk, add `--purge`: it removes the app's [isolated home(s)](../apps/home): the
 global one and any per-project ones: which hold the tools installed by the app's
 `mise:` backends, its config, and its login/session state, freed immediately. A running
@@ -314,11 +319,11 @@ Read-only: no trust gate, no launch, no network. `--json` emits the same model f
 tool from a former profile, or one added by hand: from every home the app has. Each is
 deleted from the home's `mise/installs/` and dropped from that home's `mise/config.toml`
 `[tools]` so a later launch does not re-equip it. It **previews by default** (listing what
-would go, with sizes) and applies only with `--yes`. The app's declared tools, its
+would go, with sizes) and applies only with `-y` / `--yes`. The app's declared tools, its
 login/session state, and any `nix:`/`deb:`/`flake:` build are left untouched: to remove the
 whole home instead, use [`sbx app rm --purge`](#removing-an-app).
 
-`--yes` is **refused while a session of that app is running**: the tools are in the home
+`--yes` (`-y`) is **refused while a session of that app is running**: the tools are in the home
 that session is using, so deleting them takes an interpreter or a `PATH` entry out from
 under a command in flight, and what the agent then reports looks nothing like what
 happened. Stop it with `sbx session stop` and retry. The preview deletes nothing, so

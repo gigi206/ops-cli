@@ -1,4 +1,4 @@
-//! `sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|binary|provision] [--project <path>]`: roll the
+//! `sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|binary|distro|provision] [--project <path>]`: roll the
 //! managed channels and `[packages]` backends forward by re-resolving and rewriting their locks, so
 //! versions advance only on an explicit upgrade, never on an sbx binary update. `--project`
 //! retargets every roll at another project, exactly as running the command from that directory

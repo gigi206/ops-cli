@@ -34,14 +34,14 @@ See also: [Declared operations](../tasks/) · [`sbx task`](../cli/task) · [`[se
 |---|---|
 | `description` | one line, listed to the caller: this is the operation's documentation |
 | `cmd` | the argv list; `{param}` substitutes **inside** one element, never into extra elements |
-| `params` | the caller-supplied values, each [bounded](../tasks/parameters) |
+| `params` | the caller-supplied values, each [bounded](../tasks/parameters) (`match` / `enum` / `default` per parameter) |
 | `env` | fixed environment for the command |
 | `env_allow` | the variable **names** a caller may set for one invocation, names only, [values are not bounded](../tasks/parameters#caller-set-variables) |
 | `stdout` / `stderr` | `"show"` (default) or `"hide"` |
 | `timeout` | this task's wall-clock ceiling (`"20s"`), overriding `[task.defaults]` |
 | `max_output` | this task's per-stream capture ceiling (`"64KiB"`), overriding `[task.defaults]` |
 | `network` | the egress this task's cage gets, as allowlist entries (empty = no network); a [`tcp://` rule](../tasks/network) also gets a listener |
-| `secret` | the credentials the command's environment carries, [by name](../tasks/credentials) |
+| `secret` | the credentials the command's environment carries, [by name](../tasks/credentials) (`encode = "raw"` / `"base64"` / `"url"` / `"json-string"` per credential) |
 | `inject` | the credentials [injected on the wire](../tasks/credentials#wire-injected-credentials-the-strongest-form), which never enter the cage |
 | `packages` | the `mise:` tools the command needs (the [task tool pool](../tasks/execution#the-task-tool-pool)) |
 | `spawn` | the programs the command may run [beside itself](../tasks/execution#what-the-command-may-run-spawn), absent means no supervision |
@@ -66,7 +66,9 @@ nonce      = false     # unforgeable substitution placeholders, see Output
 
 Declared as a `[task.defaults]` sub-table rather than bare keys beside the entries, so a setting can
 never be swallowed by whichever task table happens to precede it in the file. A task can therefore
-not be named `defaults`.
+not be named `defaults`. A `timeout` takes `"30s"`, `"5m"`, `"2h"` or bare seconds, and may never
+be zero. A `max_output` takes bytes with an optional `B` / `KiB` / `MiB` / `K` / `M` suffix
+(`"64KiB"`, `"1MiB"`, `"4096"`), and must be positive.
 
 The per-session invocation quota (500) and the 512-invocation log ring behind
 [`sbx task logs`](../cli/task#logs) are **fixed**, unlike the ceilings above: they are not

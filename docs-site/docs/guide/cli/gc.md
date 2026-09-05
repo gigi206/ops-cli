@@ -5,7 +5,7 @@ description: "Reclaim the space sbx's per-project nix stores leave behind."
 # `sbx gc`
 
 ```
-sbx gc [--all] [--prune] [--optimise]
+sbx gc [--all] [--prune] [--optimise|--optimize]
 ```
 
 Reclaim `sbx`'s nix store space. By default it sweeps the **current project's**

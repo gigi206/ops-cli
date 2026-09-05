@@ -20,7 +20,9 @@ benign text and leak the value through the positions of its own placeholders. Th
 unless a trusted layer set [`[redact] min_len`](../secrets/redaction#the-length-floor), and it is the
 same one the egress tripwires use, so a value watched for on the wire is watched for here too. A
 spelling left below the floor is named at launch: the command still receives the credential, and it
-would otherwise look substituted without being.
+would otherwise look substituted without being. Substitution runs on bytes, longest
+needle first (a value containing another is named after the longest match), left to
+right without overlap; an empty needle is declined rather than matched everywhere.
 
 The refusal paths are on that list because they are text the **command** composed rather than text it
 printed: a program name is chosen by whoever calls `execve`, so a command that built one out of its
@@ -40,7 +42,7 @@ Two things to keep in mind:
   by printing the credential as many times as it likes: a channel out of a cage whose streams were
   hidden to close one. The log holds the total, so hiding a stream is not a blind spot for you.
 
-`nonce = true` makes each invocation's placeholders unforgeable: they read `${NAME@a91f3c}` where the
+`[task.defaults] nonce = true` makes each invocation's placeholders unforgeable: they read `${NAME@a91f3c}` where the
 nonce is drawn per call and reported out of band, so the command could not have predicted it, and a
 placeholder copied from an earlier result is detectably stale. Escaping the command's own `${…}` was
 considered and rejected, it is imitable, and it would corrupt legitimate payloads (shell, CI YAML,

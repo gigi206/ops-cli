@@ -38,7 +38,9 @@ See also: [Quick start](../getting-started/quickstart) · [`sbx app`](app) · [O
 | `--dbus[=true\|false]` | one-shot in-cage desktop portal (bare `--dbus` = true) |
 | `--` | end `sbx`'s own flags; everything after runs literally |
 
-Every flag has an `SBX_*` environment equivalent. See
+Every flag has an `SBX_*` environment equivalent. Every value-taking flag also
+accepts the inline `--flag=value` spelling (so `--env=K=V` keeps `K=V`). `--detach`
+and `--observe` take no value: `--detach=x` is refused (usage, exit 2). See
 [One-shot overrides](../configuration/overrides) for the full precedence and merge
 rules.
 

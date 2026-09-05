@@ -41,7 +41,7 @@ distro = "oci:ghcr.io/owner/image@sha256:0123…"            # an exact image
 distro = "oci:registry.example.com:8443/team/base:2024a"   # a private registry, with a port
 ```
 
-The table form adds three keys: `auth` for [a private registry](#a-private-registry), and
+The table form adds four keys: `image` for naming the image as a table value, `auth` for [a private registry](#a-private-registry), and
 `from` plus `run` for [building your own userland](#building-your-own-userland).
 
 The registry is written out. A bare `debian:10` is refused, because a reference with no

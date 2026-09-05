@@ -21,7 +21,10 @@ binds = [
 ```
 
 `binds` is a **security field**: honored only from a trusted source. An untrusted
-project gets no bind at all, so it can never obtain a writable one.
+project gets no bind at all, so it can never obtain a writable one. An unrecognized
+`mode` falls closed to read-only with a warning (a `RW` suggests `rw`), and a table
+without a `path` is skipped on its own with a warning: one bad entry never drops the
+whole layer.
 
 See also: [Security model](../concepts/security-model) · [The trust gate](../concepts/trust) · [`sbx config edit`](../cli/config).
 

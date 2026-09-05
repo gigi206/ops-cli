@@ -25,6 +25,8 @@ region = { match = "^[a-z]{2}-[a-z]+-[0-9]$", default = "eu-west-1" }
 A parameter with no `default` is **required**: a missing value is an error, never an empty
 substitution (`psql -c ""` is a different command than the one declared). An undeclared `{name}` in
 `cmd`, and a declared parameter no `cmd` element uses, are both refused at validation.
+A parameter name holds letters, digits, `_` or `-` (empty, braces and NUL refused), and a
+`match` pattern is anchored whole-value (`\A(?:…)\z`).
 
 ## A pattern that matches everything (possible, not recommended)
 

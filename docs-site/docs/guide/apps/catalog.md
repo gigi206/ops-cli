@@ -28,7 +28,9 @@ catalogue. See [`sbx app import`](../cli/app#importing-what-it-references-in-one
 See also: [Portable profiles](profiles) · [The app framework](../apps/) · [Bundles](../configuration/bundles) · [Secrets](../secrets/) · the repository `examples/README.md`.
 
 The tables below list every shipped profile, grouped by **how you interact with it**: a
-terminal agent, a desktop window, or a UI served in your host browser. Each profile's own
+terminal agent, a desktop window, or a UI served in your host browser. The grouping is
+editorial (51 terminal agents, 17 desktop applications, 6 browser-served UIs); the
+exhaustive fact is the total, 74 profiles, each with its row below. Each profile's own
 header carries its packaging specifics; how the artifacts are built and fit together, and
 the "not here yet, and why" triage, live in `examples/README.md`.
 

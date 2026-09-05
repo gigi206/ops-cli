@@ -59,7 +59,10 @@ sets a machine-wide property, and nothing in an `[env]` table says that.
 The value is an IANA zone name as it appears in the database (`Europe/Paris`, `UTC`,
 `America/Argentina/Salta`, `Etc/GMT+3`). A name the database does not carry is **warned and
 ignored**: the cage keeps `UTC` rather than failing to start, because a misspelled zone should
-cost you a wrong clock, not a session.
+cost you a wrong clock, not a session. Before that, the syntax is checked: `/`-separated
+segments of letters, digits, `_`, `+` and `-`, each non-empty and none `.` or `..`, no
+leading or trailing slash: so `../../etc/shadow` and `/etc/shadow` are refused before
+either could become a link target.
 
 ## Where it is declared
 

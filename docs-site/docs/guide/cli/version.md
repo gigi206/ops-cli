@@ -8,7 +8,8 @@ description: "Print the version of this sbx build."
 sbx version
 ```
 
-Print the version of this sbx build.
+Print the version of this sbx build. Takes no argument: anything extra is refused
+(usage, exit 2).
 
 `sbx --version` and `sbx -V` are accepted spellings of the same command, so a script probing
 for a version finds it under whichever one it tries. All three write one line to stdout and

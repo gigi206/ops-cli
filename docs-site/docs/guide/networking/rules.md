@@ -63,7 +63,8 @@ allow = ["api.github.com"]
 `api.github.com` matches `api.github.com` and nothing else. It does **not** match
 `github.com`, `sub.api.github.com`, or the classic spoof `api.github.com.evil.com`.
 This spoof-safety is by construction, not by escaping: an exact host is compared as
-a whole label sequence.
+a whole label sequence. Both sides are canonicalized once: lowercased, every trailing
+dot stripped (`evil.com.` reads as `evil.com`), IPs normalized to one textual form.
 
 A bare host is an **inspected L7** rule on **port 443** (see [ports](#ports) and
 [L7 vs L4](#raw-l4-splice-tcp)). Writing `https://api.github.com` means exactly the same
@@ -200,6 +201,9 @@ Three `re:` caveats:
 A `re:` rule is never scheme-split (its pattern may itself contain `://`) and is
 always inspected L7. A leading `{` in a `re:` body is part of the regex (a `{n,m}`
 quantifier), not a method prefix: the method prefix, if any, sits *before* `re:`.
+A pattern anchored on a scheme other than `https://` (`^http://`, `^tcp://`,
+`^ws://`, `^wss://`, `^ftp://`) is refused: the tested URL is always rebuilt as
+`https://…`, so such a pattern could never match.
 
 ---
 
@@ -252,8 +256,13 @@ allow = [
 - A rule with **no** prefix applies to every verb, *unless* it is an app's unscoped
   allow rule, which a per-app [`default_methods`](modes#default_methods-apps-only)
   may narrow to a read-only set at resolution.
-- `{*}` means **all verbs, on purpose**: it is never rewritten by `default_methods`,
+- `{*}` means **all HTTP verbs, on purpose** (never a WebSocket upgrade): it is never rewritten by `default_methods`,
   so it is how you opt a host back out to every verb under a read-by-default app.
+- `{WS}` is the WebSocket-upgrade pseudo-verb the proxy checks for an `Upgrade: websocket`
+  handshake: neither a bare rule nor `{*}` opens a WebSocket, only a rule that names `WS`
+  explicitly (`{WS}` or `{GET,WS}` / `{*,WS}` for verbs plus the upgrade). On a `deny`
+  rule the asymmetry does not apply: a deny `*` covers every verb, WebSocket included,
+  since narrowing a deny would weaken it.
 - `{GET,HEAD}` etc. is an explicit, fixed set (sorted and de-duplicated so equal
   specs compare and display identically).
 
@@ -313,7 +322,9 @@ Key properties:
 - It is **strictly opt-in**, exactly like a raw splice: only an explicit `http://`
   allow opens the clear. A bare or `https://` allow rule for the same host does
   **not**, `allow = ["legacy.example.com"]` permits HTTPS on 443, never HTTP on 80.
-  The default posture (`deny`/`allow`/`ask`) never opens cleartext on its own.
+  The default posture (`deny`/`allow`/`ask`) never opens cleartext on its own. Under
+  `ask`, an unmatched cleartext request is denied outright, never parked: opening
+  cleartext is a deliberate config act, not a live decision.
 - It defaults to **port 80** (override with `:port`) and keeps the full HTTP
   vocabulary, a `{VERB}` method prefix and a `/path` both work, unlike `tcp://`.
 - A credential is **never** injected into a cleartext request (a bearer must not
@@ -417,6 +428,10 @@ Key properties of a raw splice:
   that host:port. A host with no `tcp://` rule is always inspected.
 - Its only controls are the host:port match and the [SSRF guard](architecture#the-ssrf-guard):
   there is no path, no method, no Host/SNI anti-fronting.
+- An **exact host** carrying both an inspected rule and a `tcp://` rule with overlapping
+  ports is warned about at load (a config warning, never enforcement): the layer split
+  decides, but the overlap is usually a mistake. `*.domain` and `re:` hosts are never
+  flagged, since their overlap is not decidable.
 - The [credential machinery is bypassed](../secrets/injection) wholesale on a
   spliced host, there is no request head to inspect, so a `[secret]` injection, the
   response redaction, and the outbound-secret tripwire are all inert for a

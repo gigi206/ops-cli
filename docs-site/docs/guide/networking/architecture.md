@@ -167,6 +167,11 @@ The recipients are those two domains' operators and the resolver the host uses, 
 a third party of the cage's choosing. Pin exact hosts instead of wildcards where that
 residue matters.
 
+Each successful, non-empty resolution is cached for `dns_cache_ttl` (default 60 seconds;
+`0` disables the cache). Failures are never cached and never retried here: the client
+retries the whole request, which re-resolves. Past 1024 cached hosts a name still
+resolves but is no longer remembered (expired entries are swept first).
+
 ### The TLS-terminating MITM (path/URL granularity)
 
 A plain CONNECT proxy only sees `host:port` for an HTTPS tunnel: the path is inside
@@ -282,7 +287,7 @@ exactly on the first byte of the TLS handshake: a byte-wise reader has to name t
 spellings, where a line-wise one gets them from testing each line.
 
 A head also carries a deadline, and it is one budget for the whole head rather than one
-per read of it. A socket's receive timeout bounds a single read, and a head is read a byte
+per read of it. A socket's receive timeout (30 seconds per read and write) bounds a single read, and a head is read a byte
 or a line at a time, so a caller that sends one byte just inside that timeout resets it on
 every byte: bounded only by the 16 KiB head ceiling, such a connection would occupy one of
 `max_connections` for as long as it cared to, and the thread it holds is host-side, outside
@@ -291,6 +296,11 @@ once. A head that is truncated, oversized, past its budget or not valid UTF-8 is
 `400 bad-request:head` and recorded in [`sbx net logs`](observability#sbx-net-logs); a
 caller that connects and closes without sending a byte is not an attempt, and leaves
 nothing behind.
+
+Four hop headers are never forwarded upstream: `Connection`, `Proxy-Connection`,
+`Proxy-Authorization` (a credential for the proxy hop, never the origin) and `Expect`
+(answered by the proxy directly). A client copy of a header sbx injects is stripped too,
+so the injected value is the only one the upstream sees.
 
 **Inbound, the rule is fail-open.** The proxy reads the response head, then applies the
 standard delimitation rules in order:
@@ -454,7 +464,13 @@ IP: a public address is reachable subject to policy; a **private/loopback/CGNAT*
 address is refused **unless** the deciding rule names that *exact* host (an explicit
 IP-literal or exact-host allow: a deliberate internal target). A `*.domain`, regex,
 or built-in match does not grant the internal exception, and **cloud-metadata and
-link-local** addresses are *always* refused (no exception, ever).
+link-local** addresses are *always* refused (no exception, ever). "Private" covers the
+RFC 1918 ranges, loopback, the CGNAT shared range `100.64.0.0/10`, the TEST-NET
+documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`), the
+benchmarking range `198.18.0.0/15`, the reserved `240.0.0.0/4`, ULA `fc00::/7` and
+documentation `2001:db8::/32`; link-local, multicast, unspecified and broadcast are
+blocked outright and never reachable. A dial is bounded by the socket timeout, trying
+the permitted addresses in order and reporting the last error.
 
 Every v6 spelling that carries a v4 inside it is unwrapped first and classified by the
 address it embeds, so the guard cannot be dodged by an alternate encoding: v4-mapped
@@ -506,6 +522,29 @@ would stall its siblings), `ssrf-blocked`, `host-mismatch`, `ip-literal`,
 `upstream-cert-rejected`, `upstream-http2-unsupported`, `upstream-closed`, and
 `interim-head-cap`. A genuine upstream status (a real `404`) is relayed verbatim with no
 such header.
+
+The statuses behind them: policy and guard refusals are `403` (`denied-*`,
+`outbound-secret`, `ssrf-blocked`, `ip-literal`, `ws-injection-refused`,
+`signer-refused`), a too-large signer body is `413`, the shared ceilings are `503`
+(`splice-cap`, `connection-cap`, `body-buffer-cap`), a fronting mismatch is `421`,
+a malformed request is `400`, a destination-less one `405`, and transport failures are
+`502`. `bad-request` is sub-categorized (`:transfer-encoding`, `:dup-content-length`,
+`:dup-host`, `:dup-transfer-encoding`, `:invalid-content-length`, `:control-char`,
+`:chunked`, `:head`); a well-formed `chunked` body is de-chunked with a synthesized
+`Content-Length`, not refused.
+
+Three ceilings bound the proxy's own memory: at most 256 parked `ask` requests (past
+that, immediate `asked-denied`), 128 concurrent raw `tcp://` splices (`503 splice-cap`),
+and 8 interim `1xx` heads per exchange (`502 interim-head-cap`). A `connection-cap`
+refusal is answered on accept, under 50ms, before the request is even read. Bodies held
+for pool reuse stay under 256 KiB per body; past that they stream. The request-body
+budget is 16 times the per-request cap, floored by available memory.
+
+On an `http2` host three more reasons exist: `http2-handshake` (no common ALPN),
+`http2-required` (negotiated anything but `h2`: never downgraded to HTTP/1.1), and
+`http2-stream-cap` (`429` past 256 concurrent streams, announced in `SETTINGS`).
+Header lists are capped at 64 KiB per leg, and an extended-`CONNECT` over h2 is
+`405 method-not-allowed` (gRPC is POST).
 
 `upstream-http2-unsupported` belongs to a host designated
 [`http2`](../configuration/network#http2-and-grpc) alone: gRPC is HTTP/2 end to end and the

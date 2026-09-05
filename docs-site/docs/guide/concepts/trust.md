@@ -89,6 +89,11 @@ flowchart TB
 Only the `trusted` outcome applies a security field. The free fields apply on all three,
 `env` minus its reserved keys under the two that are not trusted.
 
+The key is the directory you are standing in, not the file's target: only the parent
+directories are canonicalized, never the final component. A `.sbx.toml` that is a symlink
+to another project's config therefore never inherits that project's trust: the decision
+stays the property of one directory.
+
 Because the hash covers the *whole file*, any edit, even to a free field, re-arms
 the gate. This is deliberate: after editing a trusted file, its security fields stop
 applying until you run `sbx trust` again.

@@ -71,6 +71,12 @@ const DATA_ENTRIES: &[Entry] = &[
         enumerate: Enumerate::None,
     },
     Entry {
+        label: "plugin-state/",
+        rel: "plugin-state",
+        desc: "private writable state of plugins declaring `state = true` (one per plugin)",
+        enumerate: Enumerate::Dirs,
+    },
+    Entry {
         label: "distro/",
         rel: "distro",
         desc: "unpacked distribution root filesystems (one per image digest)",

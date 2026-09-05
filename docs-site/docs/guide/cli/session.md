@@ -6,7 +6,7 @@ description: "List, attach to and stop the live sandbox sessions, and read what 
 
 ```
 sbx session ls
-sbx session logs <id> [-f] [-n <N>] [--all]
+sbx session logs <id> [-f|--follow] [-n|--lines <N>] [--all]
 sbx session attach <id> [-- command [args...]]
 sbx session stop <id>...|--all [--delay <secs>]
 ```
@@ -55,7 +55,7 @@ The `PID` column is the `<id>` used by `sbx session attach <id>`, `sbx session l
 ## `logs`
 
 ```
-sbx session logs <id> [-f] [-n <N>] [--all]
+sbx session logs <id> [-f|--follow] [-n|--lines <N>] [--all]
 ```
 
 Show a **detached** session's output. A session started with `--detach` has no terminal, so
@@ -139,8 +139,11 @@ not a fresh cage that merely shares the home. With no command it opens an **inte
 
 | Operand | Meaning |
 |---|---|
-| `<id>` | the PID `sbx session ls` shows for the session |
+| `<id>` | the PID `sbx session ls` shows for the session (exactly one) |
 | `-- command [args...]` | run this command in the cage instead of an interactive shell |
+
+A `--` with nothing after it is refused (usage, exit 2): attach either takes a command
+or opens a shell.
 
 A bare `sbx session attach` needs a terminal on stdin. A `-- command` adapts to its stdin: from
 a terminal it runs through a **pty** (interactive tools keep job control and resize), from a pipe
@@ -199,6 +202,10 @@ the whole cage subtree. Either ids or `--all` is required, not both.
 | `<id>...` | the PIDs `sbx session ls` shows for the sessions to stop |
 | `--all` | stop every live session (mutually exclusive with explicit ids) |
 | `--delay <secs>` | seconds to wait after `SIGTERM` before `SIGKILL` (default 10; `0` = at once) |
+
+A bare `--` ends the options: everything after it is read as an id, even `--all`
+(ids are PIDs, so `sbx session stop -- --all` reports an unknown session rather than
+stopping everything).
 
 `--all` targets every session, interactive shells included.
 

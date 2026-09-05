@@ -48,8 +48,21 @@ The important subtrees:
 | `sessions/` | the daemonless session registry ([`sbx session ls`](../housekeeping/sessions)) |
 | `logs/` | detached sessions' captured output, read by [`sbx session logs <id>`](../cli/session#logs) |
 | `egress/` | per-launch egress proxy sockets and CA material |
+| `proc/` | per-launch exec-enforcement sockets |
 | `fs/` | per-launch filesystem plumbing: the observation socket, and `mask-<pid>/` holding the two decoys an [`[fs]`](../configuration/fs) policy mounts |
+| `tasks/` | per-launch declared-operation sockets (one directory per session) |
+| `broker/` | per-launch broker-plugin sockets and their record |
+| `signer/` | per-launch signer-plugin record sockets |
+| `ssh-agent/` | per-launch ssh-agent fence sockets and their record |
+| `forward/` | per-launch inbound port-forward sockets |
+| `distro/` | unpacked distribution root filesystems (one per image digest) |
+| `dbus/` | per-launch filtered D-Bus proxy sockets |
+| `portal/` | per-launch in-cage desktop portal state |
+| `audio/` | generated ALSA config for the audio hole |
+| `fontconfig/` | generated fontconfig for the Wayland hole |
 | `mise/`, `mise-plugin/` | the host-side mise home and the embedded `nix:` backend plugin |
+| `mise-stage/` | staging area for a mise engine being provisioned |
+| `flake-inline/` | staged inline `[flakes.*]` sources, one content-keyed directory each |
 | `plugins/` | installed [plugins](../plugins/), and their recorded origins under `plugins/.origins/` |
 | `plugin-state/<name>/` | the private writable directory a plugin declaring [`state = true`](../plugins/manifest) is given, one per plugin, owner-only and never bound into an agent's cage |
 | `stores/<name>/` | cached, verified remote [plugin stores](../plugins/) |

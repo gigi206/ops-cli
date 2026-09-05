@@ -4,10 +4,12 @@ description: "Changing any configuration field for a single launch, with `--conf
 
 # One-shot overrides
 
-A one-shot override changes **any** configuration field for a **single launch**,
+A one-shot override changes **almost any** configuration field for a **single launch**,
 without editing a file. It is carried on the command line (or the environment) and is
 the **authoritative final word**: it beats a trusted project config *and* an app's own
-posture.
+posture. The exceptions are declarations that belong in a reviewed config rather than on
+a command line (`distro`, `[task.*]`, `[plugin.*]`, `[broker.*]`, the resolver tables,
+`[app.*]`, `[bundle.*]`, `[mise]`, `[network] groups`): see below.
 
 See also: [Configuration overview](../configuration/) · [`sbx run`](../cli/run) · [`sbx app`](../cli/app) · [Environment variables](../reference/environment-variables).
 
@@ -24,7 +26,11 @@ project config.
 ### Whole-schema blob: `--config` / `SBX_CONFIG`
 
 Inline TOML (or `@<file>`) shaped exactly like an `sbx.toml`, so it can set **any**
-field. Repeatable (later wins).
+field. Repeatable (later wins). A few declarations are not one-shot launch fields and are
+ignored in a blob (with a notice for `[app.*]`, `[bundle.*]`, `[mise]` and `[network] groups`):
+the `distro` userland, `[task.*]` operations, `[plugin.*]` / `[broker.*]` plugin bindings and
+the `flakes` / `tarball` / `deb` / `appimage` / `binary` resolver tables belong in a config
+that is read and reviewed, not assembled on a command line.
 
 ```sh
 sbx run --config 'network = "none"' -- ./build.sh
@@ -229,10 +235,11 @@ a collection is **unioned** (see below).
 
 One uniform rule across all four tiers:
 
-- **Scalars** (`nixpkgs`, `network`, `gui`, `proc`, `notify`, `[redact] min_len`) are
+- **Scalars** (`nixpkgs`, `timezone`, `network`, `gui`, `gpu`, `audio`, `dbus`, `proc`,
+  `notify`, `allow_insecure_http`, `secret`, `[redact] min_len`) are
   **replaced** by the highest tier that sets them.
 - **Collections** (`env`, `packages`, `binds`, `forward`, `limits`, `seccomp`,
-  `devices`, `[fs]`) are **unioned**, the higher tier winning per key/entry: so `--bind` *adds*
+  `devices`, `[fs]`, `open`, `service`, `ssh_agent`) are **unioned**, the higher tier winning per key/entry: so `--bind` *adds*
   to whatever the blobs bound, and `--limit tasks_max=…` tunes one limit without dropping
   a blob's `memory_max`.
 
@@ -246,7 +253,8 @@ stops being published: an override moves a forward, it never closes one. See
 `[fs]` is the one collection where the union is not just a merge convention but the whole
 guarantee: an override can close *more* of the project for one launch
 (`--config '[fs] deny = ["scratch.key"]'`), and there is no spelling that reopens what a
-config layer closed.
+config layer closed. Its `scan_max_kb` ceiling folds the same way between override tiers:
+the larger window wins.
 
 ## Fail-closed on an invalid value
 

@@ -110,6 +110,8 @@ the report says which case yours is:
   footprint is smaller still where the filesystem compresses. No per-file measurement can see
   either saving (`du` has the same blind spot), so the sizes are honest **upper bounds**: the true
   on-disk total is smaller, and can be well below what the report shows.
+- Where the sharing probe itself fails, the report says so: every size may then be an upper
+  bound, claimed as neither exact nor CoW-measured.
 
 On a [storage volume](storage) the report closes that gap with a real number: the `btrfs volume`
 line shows the image's actual host footprint, so you see both the apparent tree size and what it

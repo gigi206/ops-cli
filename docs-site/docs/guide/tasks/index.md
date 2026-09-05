@@ -27,7 +27,7 @@ PGPASSWORD = "sops://secrets.enc.yaml#db.password"
 The agent then runs:
 
 ```sh
-sbx task list
+sbx task list   # `ls` is an accepted alias
 sbx task run db-query --param sql="SELECT id FROM users"
 ```
 
@@ -36,7 +36,10 @@ cage of its own, and returns the exit status and the output.
 
 Trusted-only, like `[binds]`/`[seccomp]`/`[devices]`: an untrusted project may neither declare a task
 nor loosen one. Declarable in the global config, a project's `.sbx.toml`, an app profile
-(`[app.<name>.task.<task>]`) and a bundle (`[bundle.<name>.task.<task>]`).
+(`[app.<name>.task.<task>]`) and a bundle (`[bundle.<name>.task.<task>]`). The name
+`defaults` is reserved for the settings table and is not a task name. Per-task ceilings
+default from `[task.defaults]`: `timeout = "30s"`, `max_output = "64KiB"`; a `timeout`
+may never be zero (no indefinite operation).
 
 See also: [Parameters](parameters) · [Credentials](credentials) · [Execution](execution) ·
 [Output](output) · [Reaching a non-HTTP service](network) · [`[task]` reference](../configuration/task) ·
@@ -130,6 +133,10 @@ question: what a session running *now* is offering.
 
 Each session allows a bounded number of invocations (500). It is refused past that rather than
 degraded, because an exit-status oracle over a credential gets cheaper the more calls it can make.
+At most 4 detached invocations run at once, 8 live invocations in total (detached included):
+past that the call is refused. Detached results are kept for collection (32, oldest evicted).
+The runner polls every 20ms; `stop` waits 3s of grace, then the invocation reports
+`137` (`128 + SIGKILL`).
 The quota, and the 512-invocation log ring behind [`sbx task logs`](../cli/task#logs), are
 **fixed**: unlike the per-task [`timeout` and `max_output` ceilings](../configuration/task#section-defaults),
 they are not `[task.defaults]` knobs.

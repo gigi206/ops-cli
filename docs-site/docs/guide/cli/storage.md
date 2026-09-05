@@ -16,7 +16,8 @@ sbx storage unuse
 
 Gives sbx a filesystem of its own for its data directory: a **sparse image file carrying a
 compressed btrfs filesystem**, which grows as it is written and costs the host a **single
-inode** no matter how many files it holds.
+inode** no matter how many files it holds. Each verb lists only the flags it uses; a flag
+that belongs to another verb is accepted by the parser and ignored.
 
 Optional. Without it sbx behaves exactly as it always has: see
 [Directory layout](../concepts/directory-layout).
@@ -147,7 +148,7 @@ volume would leave that behind, not move it.
 
 The image is created **beside** the data directory (`<xdg-data>/sbx-storage.btrfs`), never
 inside it, the volume is what that directory becomes. `--image <path>` puts it elsewhere, on
-another disk for instance.
+another disk for instance; it must be absolute, and is refused before anything mounts otherwise.
 
 Adopting a volume records its path as one quoted line in `storage.toml`, which is read back
 without unescaping. So the path may be anything absolute that carries no quote, no backslash and
@@ -330,7 +331,8 @@ sbx storage migrate               # copy, verify, then switch over
 
 `migrate` keeps the original authoritative for the whole copy and sets it aside under a
 dated name rather than deleting it, so an interruption before the switch leaves the
-installation exactly as it was.
+installation exactly as it was. Migrating into a volume that already holds a data
+directory (`store`, `projects`, `apps`) is refused, unless `--force` overrides it.
 
 Living with it:
 

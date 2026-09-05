@@ -56,6 +56,9 @@ land in the middle of a command would be a quoting surface rather than a conveni
 
 Scheme matching is case-insensitive, as URI schemes are, so a provider that redirects to
 `CURSOR://callback` reaches the same handler as one that redirects to `cursor://callback`.
+The key is lowercased at load. A key that is not a scheme (a letter, then letters, digits,
+`+`, `-` or `.`: a MIME type or a URL is refused) drops that entry with a warning, as does
+an entry with an unrecognized `mode`, an empty `cmd`, or control characters.
 
 An entry is chosen by its scheme alone, whatever shape the rest of the URI takes:
 `cursor://callback`, `cursor:/callback` and `cursor:callback` all reach the same handler. The `//`

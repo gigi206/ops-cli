@@ -76,6 +76,8 @@ running*, which is what the next section is about.
 **Listing an interpreter concedes most of the guard**, and sbx says so at load. `sh`, `python`, `awk`
 and the like can take a credential apart and put it back together with builtins alone, and nothing
 they do that way is an `execve` to decide. The same is true if `cmd` is itself a shell script.
+(The warned set is `sh`, `bash`, `dash`, `zsh`, `ksh`, `fish`, `env`, `python`, `python3`,
+`perl`, `ruby`, `node`, `awk`, `gawk`, `xargs`.)
 
 ## What each program may run in turn: `[exec.<program>]`
 
@@ -123,6 +125,7 @@ plausibly runs.
 | `[exec.git.ssh]` | a program is the whole address |
 | `[exec.git] spawn = []` | that is what having no section already means |
 | `[exec.git*]` | a caller is one executable, so two patterns matching it would both claim it |
+| `spawn = { git = [...] }` or `spawn = ["git", { ssh = [...] }]` | the per-parent graph: parsed only to be refused by name, since the filter governs the whole tree at any depth |
 
 A pattern may still appear in a `spawn` list, where the answer is only yes or no. It just cannot
 *address* a node, the program it admits then has no section, and may run nothing.

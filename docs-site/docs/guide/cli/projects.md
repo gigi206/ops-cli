@@ -7,7 +7,7 @@ description: "List, inspect and remove the per-project runtime trees."
 ```
 sbx projects list [--json]
 sbx projects show <id> [--json]
-sbx projects rm <id>... [--dead] [--markerless] [--dry-run] [--yes] [--gc] [--force]
+sbx projects rm <id>... [--dead] [--markerless] [--dry-run|-n] [--yes|-y] [--gc] [--force|-f]
 ```
 
 List, inspect, and remove the **per-project runtime trees**: the directories under

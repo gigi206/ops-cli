@@ -51,7 +51,9 @@ value is **dropped with a warning** (falling back to the default) rather than re
   number with an **uppercase** `K`/`M`/`G`/`T`/`P`/`E` suffix. No lowercase, no `B`
   suffix, no `i` (so `16G`, not `16GiB` or `16g`).
 - **Tasks**, `infinity`, or a positive integer (`0` is rejected). A percentage is
-  **not** accepted for tasks (systemd rejects `TasksMax=100%`).
+  **not** accepted for tasks (systemd rejects `TasksMax=100%`). A negative number is
+  dropped per field with a warning: values parse signed precisely so one bad field
+  cannot invalidate the whole layer.
 
 ### The bare-number footgun
 

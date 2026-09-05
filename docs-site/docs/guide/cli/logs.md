@@ -10,7 +10,8 @@ sbx logs [<id>] [--feed <a,b,...>] [-n|--lines <N>] [-f|--follow] [--json]
 
 One running session's **seven feeds in one column of time**: what it execs, where it goes, what it
 writes, what it asked your keys to sign, what its plugins decided and formed, and the declared
-operations it invoked. `sbx log` is an accepted alias.
+operations it invoked. `sbx log` is an accepted alias. At most one session id: a second one
+is refused (usage, exit 2).
 
 Most feeds are also readable on their own, and those views show more of their own detail. This one
 answers the question none of them can on its own: **what happened in what order**. It is also the

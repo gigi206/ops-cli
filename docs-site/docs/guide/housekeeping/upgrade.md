@@ -33,7 +33,7 @@ lock.
 ## The upgrade targets
 
 ```sh
-sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|binary|provision]
+sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|binary|distro|provision]
 ```
 
 | Target | Rolls forward |
@@ -45,8 +45,9 @@ sbx upgrade [all|nix|mise|flake|deb|appimage|tarball|binary|provision]
 | `appimage` | the project's and apps' `appimage:` packages |
 | `tarball` | the project's and apps' `tarball:` packages |
 | `binary` | the project's and apps' `binary:` packages |
-| `all` | every lock-rewriting target above (the default); `provision` is not part of it |
-| `provision` | re-runs the apps' bundle install steps in-cage, one cage per app |
+| `distro` | the declared [`distro`](../configuration/distro) image, re-resolved to the digest the registry serves now |
+| `all` | every lock-rewriting target above (the default), plus the bundles' install steps under their own guards |
+| `provision` | re-runs the apps' bundle install steps in-cage, one cage per app, regardless of their guards |
 
 See [`sbx upgrade`](../cli/upgrade) for the flags (`-a <name>`, `--project <path>`) and
 the per-target behavior.

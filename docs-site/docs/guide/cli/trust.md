@@ -16,7 +16,7 @@ edit re-arms the gate.
 | Option | Meaning |
 |---|---|
 | `[path]` | the config to act on (default `./.sbx.toml`) |
-| `--show` | report the trust state without changing it |
+| `--show` | report the trust state without changing it (accepted before or after `[path]`) |
 
 See also: [The trust gate](../concepts/trust) · [`sbx untrust`](untrust) · [Configuration overview](../configuration/).
 

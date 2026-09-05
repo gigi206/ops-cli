@@ -18,7 +18,8 @@ gui = "none"        # the default: no display access
 ignored from an untrusted one: because exposing a compositor socket is a
 confidentiality and integrity choice (clipboard access, and on some compositors screen
 capture or input injection). `offscreen` grants no host access at all, but rides the same
-gate so the postures stay one ordered field.
+gate so the postures stay one ordered field. An unrecognized value is warned about and
+ignored, keeping the prior posture rather than guessing.
 
 See also: [Security model](../concepts/security-model) · [`[app.<name>]`](apps).
 

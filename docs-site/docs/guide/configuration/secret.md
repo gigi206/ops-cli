@@ -55,8 +55,8 @@ host ``) and in the `sbx config show --json` view, so the two spellings meet the
 
 | Field | Meaning |
 |---|---|
-| `name` | a logical name for the inventory, defaulting to the section key (the destination host) |
-| `description` | one line saying what the credential is for, printed beside the name |
+| `name` | a logical name for the inventory, defaulting to the section key (the destination host): `1-64` characters of letters, digits, `_`, `-`, `.`; empty means omit it |
+| `description` | one line saying what the credential is for, printed beside the name; control characters become spaces and it is capped at 200 characters, never refused |
 | `kind` | the broker kind; defaults to the only kind today, `"http-header"` |
 | `key` | a **terse** source name, expanded through `[secret.defaults]` (optionally pinned `key@resolver`) |
 | `from` | an **explicit** source: one `scheme://locator` ref, or an array = a fallback chain |
@@ -67,7 +67,11 @@ host ``) and in the `sbx config show --json` view, so the two spellings meet the
 
 A secret must have **exactly one** of `key` or `from`. It must have a `header` and a
 `type`, either on itself or from `[secret.defaults]`: a secret that names neither is
-an **explicit error**, never a silent (and likely wrong) default.
+an **explicit error**, never a silent (and likely wrong) default. The `header` must be
+non-empty and carry no control character, space or `:`; the `prefix` no control character;
+a `type` outside `bearer` / `basic` / `raw` is an error. The destination is always one
+concrete inspected-TLS host: no `{verb}` prefix, no `tcp://` or `http://` scheme, no
+`*.domain` wildcard, no `re:` regex.
 
 ### `sign`: a credential computed from the request
 
@@ -218,7 +222,10 @@ app profile (below) to narrow that to one tool.
 An `[app.<name>.secret]` section declares credentials for that app, gated and
 effective the same way. Since an app's home is isolated and its egress bounded, a
 credential is injected on the wire to the allowlisted host and never persists in the
-cage. See [`[app.<name>]`](apps) and [the app framework](../apps/).
+cage. An app that opens a filtering posture over a non-filtering baseline still inherits
+the baseline's declared credentials (re-judged under its own posture): the effective set
+is re-derived from what was declared, not from what the baseline posture cleared. See
+[`[app.<name>]`](apps) and [the app framework](../apps/).
 
 ## Viewing
 

@@ -230,14 +230,19 @@ Five bounds keep this narrow:
   set by aiming at hosts it knows are refused. The bound is the **last** refusal, not
   the first: a request the policy allowed and the SSRF guard then blocked teaches
   nothing either;
+- only five headers are watched (`authorization`, `x-api-key`, `api-key`,
+  `x-auth-token`, `x-goog-api-key`): a short explicit list, never a heuristic that
+  could sweep in a correlation id. The token is the value past a `Bearer` / `Basic` /
+  `Token` prefix, however cased, trimmed: the bare spelling is what leaks;
 - the tripwire is scoped to **other** destinations, so an app re-sending its own
   session token to its own service is not refused for holding it, where that service is
   the acquiring host and whatever `shared_credential` groups with it;
 - observation happens **after** the outbound scan, so the request that teaches a
   value is never refused by that value;
 - a short value is ignored, on a stricter floor than for a declared secret, since
-  one that occurs by chance would refuse ordinary requests;
-- the number kept is capped, because every needle is scanned against every request
+  one that occurs by chance would refuse ordinary requests: at least 16 characters
+  (raised together with `[redact] min_len` when that is higher);
+- the number kept is capped at 8, because every needle is scanned against every request
   head and every response chunk. Reaching the cap drops the least recently learned
   value rather than turning learning off, so a credential the app obtains late in a
   session is covered from the moment it is seen;

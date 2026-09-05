@@ -48,7 +48,8 @@ is invisible: `sbx config show` cannot list it, and a reader has to find it insi
 
 ## The shape of an entry
 
-The key is the service's name. The value is either the argv to run, or a table adding when it runs:
+The key is the service's name (`1-64` characters of letters, digits, `.`, `_` or `-`).
+The value is either the argv to run, or a table adding when it runs:
 
 | field         | meaning                                                                    |
 |---------------|----------------------------------------------------------------------------|
@@ -125,7 +126,9 @@ enable = [
 
 If one member cannot be read, the whole condition is dropped rather than the one member: dropping a
 single term of an `and` would quietly loosen what the profile asked for, and a service running under
-half a condition is worse than one running under none.
+half a condition is worse than one running under none. An `enable` that is `[]`, that names
+no `env`, that carries both `is` and `not`, neither, or empty values, is dropped the same way:
+the service then starts unconditionally.
 
 A list of conditions is always an `and`, and there is no way to write an `or` **across different
 variables**, nor to negate a list as a whole. That is where the field stops: a service that would
@@ -153,7 +156,9 @@ ready = { tcp = 8100, timeout = "30s" }
 application anyway** and says which service it did not see come up. That direction is deliberate: a
 gate that failed the launch would turn a slow auxiliary process into a broken application, and the
 application is the thing you asked for. If it needs the service and the service is late, the
-application's own error is the accurate one.
+application's own error is the accurate one. The port is `1-65535` (`0` or out of range
+drops the gate with a warning); a `timeout` of zero drops it too; a malformed gate keeps
+its default with a warning.
 
 The check is a TCP connection and nothing more. It says a socket is accepting, not that the service
 behind it is ready to answer, and no richer probe is offered, because sbx cannot fail the launch on

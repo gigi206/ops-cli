@@ -12,7 +12,9 @@ sbx doctor
 `doctor` verifies the load-bearing runtime requirements **before** anything can run,
 and reports the store location and channel revision. A missing requirement is a
 **hard failure with a remediation hint**: never a silent fallback to a weaker
-engine, because a weaker engine would mean no security boundary.
+engine, because a weaker engine would mean no security boundary. On a fresh install,
+before the first launch, the store reports itself absent (created on first use) and the
+channel unresolved (seeded on first launch): informational, not failures.
 
 See also: [Installation](installation) · [Security model](../concepts/security-model) · [Enforcement stack](../concepts/enforcement).
 
@@ -37,7 +39,7 @@ sbx doctor — runtime preflight
          · optional — needed only for `sbx plugins store`, not to run a sandbox
   [ ok ] store             ~/.local/share/sbx/store (present)
   [ ok ] channel           nixos-unstable @ 0954f7e (locked)
-  [ ok ] storage           type: directory (ext4) at ~/.local/share/sbx
+  [ ok ] storage           type: local (ext4) at ~/.local/share/sbx
 
 sbx: prerequisites OK.
 ```

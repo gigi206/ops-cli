@@ -38,7 +38,11 @@ one step, no in-place `git pull`, so no merge/dirty-tree/partial-write state. A
 failed or unverifiable fetch leaves any prior cache untouched. The verified cache
 lives under the owner-only `<data>/stores/<name>/`. An accepted catalogue
 revision is recorded, and a re-fetch **refuses a rollback**: a store cannot be
-downgraded to an older, superseded catalogue (anti-rollback).
+downgraded to an older, superseded catalogue (anti-rollback). The two bookkeeping
+files degrade oppositely: an unreadable `store.toml` (the pinned key) is a hard
+failure, while an unreadable `catalogue.lock` (the rollback floor) degrades to `0`.
+A control character in a catalogue text field refuses the entry, so no store can
+smuggle a terminal escape into a display.
 
 Two limits of that floor are worth stating, because both are about what it does
 not claim:
@@ -217,17 +221,26 @@ Without a terminal it refuses unless `--yes` says an operator meant it, so nothi
 rotates a signing identity unattended. The new key must actually sign the fetched
 catalogue, the **rollback floor is carried over** (a new key does not reopen a
 superseded catalogue), and `--trust`: re-accepting whatever the store now ships, leaves it flagged as unconfirmed, exactly like a first-use acceptance.
+Rekeying to the already-pinned key is refused (`already pinned to that key`), not a
+no-op success.
 
 Rotating is not the same as `store rm` + `store add`: that path also ends with a new
 key pinned, but silently, which is why `rekey` exists.
 
 **`store install`** uses only the cached, verified catalogue: it re-verifies the
 plugin's pinned hash and places it exactly as a local install would: no network.
+A catalogue entry's `path` is a plain repo-relative path (no `..`, no absolute parts)
+and its `sha256` exactly 64 lowercase hex characters; a control character anywhere in
+the catalogue refuses the entry. A symlink at any level of a catalogued path refuses
+the install: it is never followed.
 
 **`store publish`** is the **operator/signer** counterpart of `add`, never
 reachable from a cage. It walks a directory of plugins, pins each by its
 `dir_digest`, and builds and signs `catalogue.toml` with `--rev` (monotonic, so
-consumers refuse a rollback). The **signing key is the store's secret and never
+consumers refuse a rollback). A publish refuses an empty tree, a subdirectory without
+a `plugin.toml`, and two plugins sharing one name; an omitted `--rev` continues the
+sequence (`1`, then `+1`). It writes `.gitattributes` (`* -text`) so the signed bytes
+survive a clone verbatim. The **signing key is the store's secret and never
 leaves the operator's host**; the public key it prints is what consumers pin with
 `add --key`.
 

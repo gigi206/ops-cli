@@ -58,7 +58,9 @@ tasks_max = 4096
 | `env` | free | overlaid on the baseline `env`, app wins on collision |
 | `binds` | security | added to the baseline binds |
 | `packages` | security | overrides a baseline tool of the same name |
-| `flakes`, `tarball`, `deb`, `appimage` | security | the resolver tables pairing with this app's packages, `[app.<name>.flakes.<tool>]` etc. (see [packages](packages)) |
+| `flakes`, `tarball`, `deb`, `appimage`, `binary` | security | the resolver tables pairing with this app's packages, `[app.<name>.flakes.<tool>]` etc. (see [packages](packages)) |
+| `accepts_fresh_releases` | security | package names exempted from the new-release cooling-off period, unioned onto the baseline's |
+| `allow_insecure_http` | security | plaintext-fetch posture for this app, overriding the baseline when set |
 | `network` | security | overrides the baseline posture when set |
 | `proc` | security | overrides the baseline exec posture when set (see [proc](proc)) |
 | `notify` | security | overrides the baseline refusal-notification policy when set (see [notify](notify)) |
@@ -66,16 +68,19 @@ tasks_max = 4096
 | `gpu`, `audio`, `dbus` | security | override the baseline when set (see [gpu](gpu), [audio](audio), [dbus](dbus)) |
 | `forward` | security | host loopback forwards folded onto the baseline's **by cage port**: an app adds a forward, or moves one to another host port, but never closes one (see [forward](../networking/forward)) |
 | `secret` | security | credentials for this app's egress |
+| `open` | security | URI handlers for this app, overriding the baseline's on the same scheme |
+| `service` | security | auxiliary processes for this app, overriding the baseline's under the same name |
 | `task` | security | this app's declared operations, `[app.<name>.task.<task>]`, unioned onto the baseline's (see [task](task)) |
 | `limits` | security | per-field override of the baseline cgroup limits |
 | `seccomp`, `devices`, `ssh_agent` | security | unioned onto the baseline's, which is how a deploy key is granted to *one* agent rather than every cage (see [seccomp](seccomp), [devices](devices), [ssh-agent](ssh-agent)) |
 | `fs` | ungated | project paths this app closes, **unioned** onto the baseline's: an app closes more for its own cage and can never reopen what the project closed (see [fs](fs)) |
-| `home_scope` | integrity-gated | `"global"` (default) or `"project"`: see [Per-app home](../apps/home) |
+| `home_scope` | integrity-gated | `"global"` (default) or `"project"`: see [Per-app home](../apps/home); an unrecognized value is warned about and ignored, keeping `global` |
 
 ### A key an app does not have
 
 An app profile is a **subset** of this schema, not all of it: baseline fields like
-[`timezone`](timezone), `nixpkgs` and `[network] groups` belong to the config that holds the app,
+[`timezone`](timezone), `nixpkgs`, `distro`, `mise`, `plugin`, `broker`, `bundle`, `redact`
+and `[network] groups` belong to the config that holds the app,
 not to the app. Writing one under `[app.<name>]`, or at the top level of a profile file, parses and does nothing.
 sbx names the key at launch instead of dropping it in silence, and says that such a field is
 declared at the top level of `sbx.toml` or `.sbx.toml`. The same report catches a plain misspelling.

@@ -11,7 +11,7 @@ a table of their own and refuse some of what follows, and each says so on its ow
 
 ```toml
 name        = "vault"          # optional; defaults to the directory name
-type        = "resolver"       # required; "resolver" or "broker" (see below)
+type        = "resolver"       # required; "resolver", "broker" or "signer" (the last two add a table of their own, see below)
 scheme      = "vault"          # the scheme:// this plugin claims; unique in the registry
 exec        = "bin/resolve"    # directory-relative, traversal-free path to the executable
 version     = "1.2.0"          # optional, display-only
@@ -32,9 +32,14 @@ brokers     = []                   # broker plugins whose fenced socket replaces
   could be added without breaking the registry, and one has been: see
   [The broker type](broker).
 - `scheme` cannot be a built-in (`env`, `file`, `sops`): the built-in always
-  wins, and a plugin claiming one is dropped.
+  wins, and a plugin claiming one is dropped. It holds lowercase letters, digits,
+  `+`, `-` and `.`, starting with a lowercase letter.
 - `exec` is resolved against the plugin directory and must be traversal-free.
-- `version`/`description` are display-only: `sbx` never compares or acts on the
+- `name` defaults to the directory name: letters, digits, `.`, `_` or `-`, never
+  starting with a dot.
+- An unknown key anywhere in `plugin.toml` or `[sandbox]` refuses the plugin with a
+  warning: a misspelled grant must never read as granted. `version`/`description`
+  are display-only: `sbx` never compares or acts on the
   version.
 - `[sandbox]` declares only the resolver-specific extra; the runner supplies the
   structural environment (a minimal `PATH`, a read-only host userland, `HOME`,
@@ -65,8 +70,9 @@ brokers     = []                   # broker plugins whose fenced socket replaces
   refresher. If the application also holds a working refresh token, both will
   eventually exchange, the provider will see a reused token, and the session
   dies. Give the application a placeholder before its first run.
-- `programs` names the host tools the plugin runs, **by name, never by path**.
-  For each one sbx searches its own `PATH` (the one your shell gives it), so a
+- `programs` names the host tools the plugin runs, **by name, never by path**: a bare
+  name of letters, digits, `.`, `_`, `-` or `+`, never starting with a dot, never a
+  path. For each one sbx searches its own `PATH` (the one your shell gives it), so a
   tool you can run is a tool the plugin can run, whatever installed it: a
   package manager, Homebrew, a nix profile, `~/.local/bin`. The binary is bound
   read-only under `/run/sbx-programs/`, which leads the cage's `PATH`, so the
@@ -91,7 +97,9 @@ brokers     = []                   # broker plugins whose fenced socket replaces
     asked the question, and a store path whose closure cannot be read fails the
     launch naming why, rather than binding nothing and dying later at `execve`.
 - `allow_paths` is for the plugin's **data**: a token file, a database, a
-  socket. `HOME` in the cage is a private tmpfs, so a tool that derives a
+  socket. Only `~`, `$HOME` and `$XDG_RUNTIME_DIR` are expanded; any other `$` is
+  refused, a literal must be absolute, and a variable that is not set drops just that
+  entry with a warning. `HOME` in the cage is a private tmpfs, so a tool that derives a
   location from it (a password store, a GnuPG keyring, a token file) looks where
   nothing exists: bind the host path and point the tool at it. Naming `PATH` in `allow_env` has no effect; the structural value wins.
   - On a **broker** or a **signer** the entry must be a regular file. A socket, a
@@ -130,6 +138,8 @@ brokers     = []                   # broker plugins whose fenced socket replaces
   age identity), so the value never travels where another user could read it:
   see [the cage's environment is not readable by other
   users](../concepts/security-model#the-cages-environment-is-not-readable-by-other-users).
+  Names hold letters, digits and `_`, starting with a letter or `_`: anything else
+  refuses the plugin.
 - `allow_env_paths` is for a variable whose **value is a path to bind**
   (`PASSWORD_STORE_DIR`, `GNUPGHOME`, `VAULT_CACERT`). A manifest can only name
   the paths it knows in advance, yet every tool it drives offers a way to move
@@ -160,7 +170,8 @@ brokers     = []                   # broker plugins whose fenced socket replaces
   - Both sides consent. The manifest asks by name; the grant is answered only
     where a **global** `[broker.<name>]` binds that name and the broker comes
     up. A name nothing binds is a warning and no socket, never a fall back to
-    the raw resource.
+    the raw resource. Each entry is a valid install name, named once: a duplicate
+    or malformed name refuses the plugin.
   - `sbx plugins info <scheme>` shows the grant and whether this machine
     answers it.
 

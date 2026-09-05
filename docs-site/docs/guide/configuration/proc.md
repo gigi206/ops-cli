@@ -19,6 +19,10 @@ project and dropped (with a warning) from an untrusted one: an untrusted project
 nor loosen the enforcement of its own agent. It can be set on the baseline **or** per app
 ([`[app.<name>.proc]`](apps)); an app's policy replaces the baseline's for that app.
 
+A table without a `mode` keeps its `allow`/`deny` lists and inherits the posture from the
+parent layer; an unrecognized `mode` drops the table with a warning, keeping the parent
+posture rather than guessing.
+
 ## Modes
 
 | Mode | What it does |

@@ -63,7 +63,8 @@ sbx fs logs 12345 --json | jq .path     # machine-readable
 
 This is the way to watch an observed session **from another terminal**, and, like
 [`sbx proc logs`](proc#logs), the **only** way to watch a [detached](run) (`--detach`) one.
-The events are held in the supervisor's memory for the session's lifetime, read over a per-session
+The events are held in the supervisor's memory for the session's lifetime (the last 1000),
+read over a per-session
 control socket that is never exposed inside the cage; nothing is written to disk or kept after the
 session exits.
 
