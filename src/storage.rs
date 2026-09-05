@@ -1052,42 +1052,16 @@ pub(crate) fn mkfs_command(
             bin,
         } => {
             let mut c = Command::new(bwrap);
-            // The mandatory syscall denylist, which "as everywhere else" below has to include or
-            // the claim is not true: this argv is assembled by hand rather than through the
-            // `SandboxSpec` keystone, and had the namespaces and the capabilities without it.
-            // What holds this list in step with the keystone's hardening is a test,
-            // `crate::sandbox::argv`'s `the_hand_built_argument_lists_carry_the_keystones_hardening`.
+            // The mandatory syscall denylist, which the shared hardening below does not carry:
+            // it is a pair of descriptors compiled per call, not a flag, and the caller is what
+            // holds them open across the exec. This argv is assembled by hand rather than through
+            // the `SandboxSpec` keystone, and had the namespaces and the capabilities without it.
             let seccomp = crate::sandbox::seccomp::memfds(&Default::default())
                 .expect("the statically-defined filters compile");
             c.args(crate::sandbox::seccomp::argv_prefix(&seccomp));
-            // Every namespace unshared and every capability dropped, as everywhere else sbx
-            // runs a helper. The network included: formatting needs none.
-            for ns in [
-                "--unshare-user",
-                "--unshare-ipc",
-                "--unshare-pid",
-                "--unshare-net",
-                "--unshare-uts",
-                "--unshare-cgroup",
-            ] {
-                c.arg(ns);
-            }
-            c.arg("--clearenv").arg("--die-with-parent");
-            c.arg("--cap-drop").arg("ALL");
-            // A session of its own, so the cage cannot reach the terminal sbx was launched from.
-            // The filters above do not cover it: they refuse `ioctl(TIOCSTI)`, while a controlling
-            // terminal kept across the launch is reachable by opening `/dev/tty` and reading it.
-            c.arg("--new-session");
-            // The UTS namespace unshared above inherits the hostname it was created from, so
-            // leaving it unset is what *reveals* the host's — name the cage instead.
-            c.arg("--hostname")
-                .arg(crate::sandbox::naming::cage_hostname("mkfs"));
-            // The store backs the relocated binary; `/proc`, `/dev` and a `/tmp` tmpfs make a
-            // minimal usable root.
-            c.arg("--ro-bind").arg(store_nix).arg("/nix");
-            c.arg("--proc").arg("/proc");
-            c.arg("--dev").arg("/dev");
-            c.arg("--tmpfs").arg("/tmp");
+            // The hardening and the minimal root, from the one definition every helper cage
+            // shares. The network is unshared there too: formatting reaches nothing.
+            c.args(crate::sandbox::helper_argv("mkfs", store_nix));
             // The seed is read; the image's directory is written. Each is bound at its own
             // path so the arguments below stay valid inside.
             //

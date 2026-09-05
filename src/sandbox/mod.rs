@@ -8,6 +8,10 @@
 
 // Launch core: the SandboxSpec -> bwrap-argv -> cage pipeline, plus the terminal.
 mod argv;
+// The one definition of a helper cage's argument list, reached from outside `sandbox` by the
+// storage helper. Re-exported item by item rather than opening the module, whose other contents
+// belong to the launch path.
+pub(crate) use argv::helper_argv;
 // Installing a file so no reader ever sees half of it: temp sibling, then rename.
 mod atomicfile;
 mod binds;

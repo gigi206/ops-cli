@@ -291,9 +291,8 @@ fn ensure_home(layout: &Layout) -> io::Result<PathBuf> {
 /// loads them without a trust prompt. Empty for a config-free invocation, which is
 /// run from the private home instead and trusts nothing.
 ///
-/// The hardening below is the keystone's, reproduced here rather than inherited. What holds the
-/// two in step is a test, not this sentence:
-/// [`crate::sandbox::argv`]'s `the_hand_built_argument_lists_carry_the_keystones_hardening`.
+/// The hardening and the minimal root come from [`crate::sandbox::helper_argv`], the definition
+/// this cage shares with the storage helper; only what is specific to running mise is added here.
 pub(super) fn bwrap_argv(
     store_nix: &Path,
     home_src: &Path,
@@ -305,50 +304,12 @@ pub(super) fn bwrap_argv(
     let path = |p: &Path| p.as_os_str().to_os_string();
     let home = |sub: &str| OsString::from(format!("{MISE_HOME}{sub}"));
 
-    let mut a: Vec<OsString> = Vec::new();
+    // The hardening and the minimal root, from the one definition every helper cage shares —
+    // every namespace isolated, the network included, since provisioning the engine and running
+    // it offline needs no connectivity (a later, online step toggles this).
+    let mut a = super::helper_argv("mise", store_nix);
 
-    // Isolate every namespace, the network included — provisioning the engine and
-    // running it offline needs no connectivity (a later, online step toggles this).
-    for ns in [
-        "--unshare-user",
-        "--unshare-ipc",
-        "--unshare-pid",
-        "--unshare-net",
-        "--unshare-uts",
-        "--unshare-cgroup",
-    ] {
-        a.push(lit(ns));
-    }
-    // Start from a clean environment and die with the launcher, so no host variable
-    // leaks into mise and no helper outlives sbx.
-    a.push(lit("--clearenv"));
-    a.push(lit("--die-with-parent"));
-    // The same unconditional capability drop the main cage's `to_argv` applies (bwrap then also
-    // sets no_new_privs itself). This argv is hand-built — mise runs before a `SandboxSpec` exists —
-    // so it is set explicitly here rather than inherited.
-    a.push(lit("--cap-drop"));
-    a.push(lit("ALL"));
-    // A session of its own, so this cage cannot reach the terminal sbx was launched from. The
-    // syscall filters do not cover this: they refuse `ioctl(TIOCSTI)`, while a controlling
-    // terminal kept across the launch is reachable by opening `/dev/tty` and reading it. What
-    // runs here is a downloaded engine over a project's own files.
-    a.push(lit("--new-session"));
-    // The UTS namespace unshared above inherits the hostname it was created from, so leaving it
-    // unset is what *reveals* the host's — name the cage instead, as `to_argv` does.
-    a.push(lit("--hostname"));
-    a.push(lit(&super::naming::cage_hostname("mise")));
-
-    // The store backs the relocated binary; the private home is the sole writable
-    // surface. `/proc`, `/dev`, and a `/tmp` tmpfs round out a minimal usable root.
-    a.push(lit("--ro-bind"));
-    a.push(path(store_nix));
-    a.push(lit("/nix"));
-    a.push(lit("--proc"));
-    a.push(lit("/proc"));
-    a.push(lit("--dev"));
-    a.push(lit("/dev"));
-    a.push(lit("--tmpfs"));
-    a.push(lit("/tmp"));
+    // The private home, bound read-write: the sole writable surface in this cage.
     a.push(lit("--bind"));
     a.push(path(home_src));
     a.push(lit(MISE_HOME));

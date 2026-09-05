@@ -147,6 +147,63 @@ fn env_fd(spec: &SandboxSpec) -> io::Result<Option<File>> {
     super::memfd::write(c"sbx-args", &bytes).map(Some)
 }
 
+/// The argument list a *helper* cage starts from — the hardening, then a minimal usable root.
+///
+/// Two cages in this crate are not launches: they run one of sbx's own fixed operations, decided
+/// at the call site before any configuration has been resolved, so no [`SandboxSpec`] exists for
+/// them to be built from. They used to assemble the flags below by hand, each carrying a comment
+/// promising to stay in step with [`to_argv`]; the promise was not kept, and what it cost is the
+/// reason this function exists.
+///
+/// `slug` names the cage. A fresh UTS namespace inherits the hostname it was created from, so
+/// unsharing it without naming the cage is what reveals the host's hostname rather than hiding it.
+///
+/// The network is unshared unconditionally, unlike in a launch: neither helper reaches it.
+///
+/// [`to_argv`] does not call this, and the parity test in this module is what holds the two in
+/// step instead. Its own emission is conditional flag by flag — the network follows the policy, the
+/// session and the parent-death signal each have a shape that omits them, and the netns-holder
+/// branch replaces the namespace flags with a uid/gid pair — so there is no prefix to share, only
+/// a set of flags to agree on.
+pub(crate) fn helper_argv(slug: &str, store_nix: &Path) -> Vec<OsString> {
+    let mut a: Vec<OsString> = Vec::new();
+    for ns in [
+        "--unshare-user",
+        "--unshare-ipc",
+        "--unshare-pid",
+        "--unshare-net",
+        "--unshare-uts",
+        "--unshare-cgroup",
+    ] {
+        a.push(lit(ns));
+    }
+    // Start from a clean environment, die with the launcher, drop every capability, and take a
+    // session of its own — the last of which the syscall filters do not stand in for: they refuse
+    // `ioctl(TIOCSTI)`, while a controlling terminal kept across the launch is reachable by
+    // opening `/dev/tty` and reading it.
+    a.push(lit("--clearenv"));
+    a.push(lit("--die-with-parent"));
+    a.push(lit("--cap-drop"));
+    a.push(lit("ALL"));
+    a.push(lit("--new-session"));
+    a.push(lit("--hostname"));
+    a.push(OsString::from(super::naming::cage_hostname(slug)));
+
+    // The store backs the relocated binary these cages run; `/proc`, `/dev` and a `/tmp` tmpfs
+    // round out a minimal usable root. Nothing here is writable — each caller adds its own single
+    // write surface after this.
+    a.push(lit("--ro-bind"));
+    a.push(store_nix.as_os_str().to_os_string());
+    a.push(lit("/nix"));
+    a.push(lit("--proc"));
+    a.push(lit("/proc"));
+    a.push(lit("--dev"));
+    a.push(lit("/dev"));
+    a.push(lit("--tmpfs"));
+    a.push(lit("/tmp"));
+    a
+}
+
 /// Build the bubblewrap argument list for `spec`. Pure: same Spec in, same argv
 /// out, no I/O and no globals read. The environment is represented by the
 /// [`ENV_ARGS_PLACEHOLDER`] that [`compose`] resolves — nothing here is what
@@ -1001,14 +1058,15 @@ mod tests {
     /// list of its own, belongs in one of them the day it is written.
     #[test]
     fn every_bubblewrap_argument_list_outside_compose_is_accounted_for() {
-        // Builds its list by hand because what it runs is not a `SandboxSpec`: the argument set is
-        // fixed and known at the call site rather than resolved from a project's configuration. It
-        // therefore prepends the filters itself, and applies the scope itself for the same reason —
-        // what a spec would have carried has to be added where the list is assembled. This cage
-        // drives provisioning off a project's own files.
+        // Builds its list around `helper_argv` rather than from a `SandboxSpec`: the argument set
+        // is fixed and known at the call site rather than resolved from a project's configuration.
+        // The shared definition carries the hardening and the minimal root; the filters and the
+        // scope are not flags, so each is added where the list is assembled — what a spec would
+        // have carried has to come from somewhere. This cage drives provisioning off a project's
+        // own files, which is why it owes the scope.
         const ASSEMBLES_BY_HAND_IN_A_SCOPE: &[&str] = &["src/sandbox/mise.rs"];
-        // The same hand-built shape, running one of sbx's own fixed operations rather than anything
-        // a project chose: formatting an image sbx owns. It owes the filters and no scope.
+        // The same shape, running one of sbx's own fixed operations rather than anything a project
+        // chose: formatting an image sbx owns. It owes the filters and no scope.
         const ASSEMBLES_BY_HAND_UNSCOPED: &[&str] = &["src/storage.rs"];
         // These spawn their cage through the shared launch command, which is what carries the
         // filters, the netns holder and the scope in one step. Each runs code sbx did not write: a
