@@ -24,11 +24,11 @@ jobs:
     name: bats + shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Cache apt packages
         id: apt-cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             /var/cache/apt/archives/*.deb
@@ -101,9 +101,9 @@ jobs:
     name: hadolint Dockerfile
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: hadolint Dockerfile
-        uses: hadolint/hadolint-action@v3.3.0
+        uses: hadolint/hadolint-action@v3.5.0
         with:
           dockerfile: Dockerfile
           # DL3008: apt pin — intentional for pacman base image, not applicable
@@ -119,7 +119,7 @@ jobs:
           #         arguments (annotated inline as `# shellcheck disable=SC2086`).
           ignore: DL3008,DL3059,DL3004,SC1091,SC2028,SC2086
       - name: hadolint Dockerfile.debian
-        uses: hadolint/hadolint-action@v3.3.0
+        uses: hadolint/hadolint-action@v3.5.0
         with:
           dockerfile: Dockerfile.debian
           # Same ignore list as the Arch Dockerfile above — Dockerfile.debian
@@ -133,7 +133,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Run trivy filesystem scan
         # Scans the working tree for CVEs in pinned dependencies + misconfigs
         # in Dockerfiles / workflows. Non-blocking (exit-code 0) so a new
@@ -157,7 +157,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Generate SBOM (CycloneDX JSON)
         # syft scans the working tree for declared / installed dependencies and
         # emits a Software Bill of Materials. We publish two formats:
@@ -169,14 +169,14 @@ jobs:
         # Pinned by commit SHA: the previous `@v0` floating-major tag would
         # silently accept a hostile retag. Human-readable version in the
         # comment for review at update time.
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           path: .
           format: cyclonedx-json
           output-file: sbom-cyclonedx.json
           upload-artifact: false
       - name: Generate SBOM (SPDX JSON)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           path: .
           format: spdx-json
@@ -200,7 +200,7 @@ jobs:
       matrix:
         runtime: [docker, podman, nerdctl]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install docker
         if: matrix.runtime == 'docker'
@@ -327,7 +327,7 @@ jobs:
     outputs:
       image: ${{ steps.filter.outputs.image }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - id: filter
         uses: dorny/paths-filter@v4
         with:
@@ -366,7 +366,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [bats, hadolint, image_changes]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install bats
         run: |
@@ -403,7 +403,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [bats, hadolint, image_changes]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install bats
         run: |
