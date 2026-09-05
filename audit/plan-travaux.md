@@ -8,7 +8,12 @@ Chaque item porte sa **preuve** — le test ou la mesure qui le ferme — et les
 qu'il déclenche. Les trois portes courtes (`mise run fmt`, `mise run lint`, `mise run rustdoc`) sont
 dues à chaque item et ne sont pas répétées ; la suite complète reste à la main du mainteneur.
 
-## 0. `--new-session` sur les deux cages construites à la main — correctif de sécurité
+**Où en est ce plan.** Les items 0 et 5 sont livrés (`5b632da`, `179925a`). L'item 2 est clos : sa
+prémisse a été mesurée fausse. L'item 4 est remplacé — la mesure de sa prémisse a trouvé autre
+chose, et cette autre chose est un défaut. Restent 3, puis 1, dans cet ordre : la prémisse du
+premier est la mieux tenue des deux.
+
+## 0. `--new-session` sur les deux cages construites à la main — LIVRÉ (`5b632da`)
 
 **Ce que la mesure a montré, et pourquoi cet item a changé de nature.** Il était prévu comme un test
 de parité laissant ouverte la question « oubli ou exemption ». La mesure a tranché : c'est un oubli,
@@ -69,10 +74,26 @@ même chose.
 **Ce que ça casse.** Rien de mesuré. La garde d'exhaustivité (`src/sandbox/argv.rs:921`) ne lit que
 les appels à `argv_prefix(`/`compose(`, jamais les drapeaux : elle est indifférente à ce changement.
 
+**Ce que la réalisation a ajouté au plan.** Un second écart, trouvé en écrivant la ligne de base
+plutôt qu'en la déduisant de `to_argv`. Les deux cages désolidarisent le namespace UTS sans nommer
+d'hôte ; un namespace UTS neuf hérite du nom qui l'a créé, donc le désolidariser sans nommer la
+cage est ce qui **révèle** le nom de l'hôte au lieu de le cacher. Mesuré : `hostname` dans la cage
+imprimait celui de l'hôte. Les deux se nomment maintenant par `naming::cage_hostname`. La leçon
+vaut au-delà de cet item : la prédiction « rouge sur `--new-session` et sur lui seul » était une
+conjecture, et l'écrire avant de lancer le test est ce qui a empêché de rétrécir la ligne de base
+pour la faire verdir.
+
 ## 1. Retourner le sens de la dérivation CLI
 
 **Objectif.** Que la complétion lise une déclaration d'options, au lieu de deviner la grammaire en
 analysant la prose des pages d'aide.
+
+**Prémisse mesurée, et elle est faible.** Les quatre lecteurs de prose totalisent six correctifs
+dans toute l'histoire du dépôt : `operand_slots` 2, `metavar_of` 1, `is_literal` 1,
+`flag_takes_value` 2. Ce n'est pas une dette active. Ce qui reste vrai est la *forme* du risque, pas
+sa fréquence : un désaccord entre la complétion et le parseur ne se signale pas, il se constate. Cet
+item se justifie par ce silence, pas par un compteur — et il passe donc après l'item 3, dont la
+prémisse se compte.
 
 **Première étape, qui n'est pas du code : une capture d'or.** Enregistrer, avant de toucher quoi
 que ce soit, la sortie de l'oracle `__complete` pour tous les verbes et toutes les profondeurs — et
@@ -113,29 +134,43 @@ cas la garde de wrapping des `///` et celle du guide s'appliquent.
 **Découpe.** Faisable verbe par verbe : la déclaration peut coexister avec la prose pendant la
 transition, les lecteurs interrogeant la déclaration quand elle existe et la prose sinon.
 
-## 2. Un palier de tests rapide
+## 2. Un palier de tests rapide — CLOS, prémisse mesurée fausse
 
-**Objectif.** Une cible entre « un filtre » et « tout », pour les tests qui ne lancent aucun moteur.
+**Ce que le plan supposait.** « La séparation existe déjà dans les faits : elle est portée par
+`skip_incapable!` ; il s'agit de l'exposer, pas de l'inventer. » C'est faux à la granularité qu'un
+sélecteur de tests peut atteindre.
 
-**Geste.** Une tâche `mise.toml` — `test-fast` — excluant ce qui exige `bwrap` ou `nix`. La
-séparation existe déjà dans les faits : elle est portée par `skip_incapable!` (190 sites) ; il
-s'agit de l'exposer, pas de l'inventer.
+**Trois mesures, et ce que chacune ferme.**
 
-**Preuve.** La tâche tourne sur un hôte volontairement incapable et ne signale aucun saut : un
-palier rapide qui saute des tests n'est pas un palier, c'est la même suite qui ment plus vite.
+| mesure | résultat | ce qu'elle élimine |
+| --- | --- | --- |
+| répartition des sauts | 33 fichiers ; `cgroup.rs` porte 21 tests et 12 sites de saut | un `--skip` par module emporte les tests purs du même module |
+| ce que lisent les prédicats | 16 sites gatent sur `bash`, `socat` ou `head` dans le PATH ; d'autres sur l'userns non privilégié | cacher les moteurs par variable d'environnement ne couvre pas la population : l'userns n'est pas une variable |
+| l'invocation de la CI | `cargo test --bins` provisionne de vrais stores nix depuis `cache.nixos.org` | le palier ne peut pas être `--bins` tel quel |
 
-**Fichiers.** `mise.toml`, et le commentaire qui l'accompagne — les tâches y sont documentées sur
-place, ce qui est le seul endroit où ce palier se décrit.
+**Les trois réalisations écartées, et pourquoi.** Un `--skip` par module : mesuré comme emportant
+des tests purs. Une liste de noms, ou une garde qui scanne les sources pour la tenir à jour : elle
+se périme, et une garde qui lit du texte pour retrouver la fonction englobante est le mécanisme qui
+a déjà donné un faux chiffre dans cet audit. Un `#[ignore]` ou une feature : cela change ce que
+`cargo test --bins` lance par défaut, donc ce que la CI lance, et un palier qui retire
+silencieusement des tests à la porte est exactement le piège que cet item devait éviter.
 
-**Ce que ça casse.** Rien, à une condition à écrire dans la description de la tâche : `test-fast`
-ne remplace pas `test-cage` avant un envoi. Un palier rapide promu en porte est un piège que ce
-dépôt a déjà nommé ailleurs.
+**Ce qui reste vrai, et qui n'a pas besoin d'un palier.** `mise run test` rend déjà les sauts
+bruyants par `SBX_SKIP_LOG`, et `mise run test-cage` les transforme en échecs. Entre « un filtre »
+et « tout », le filtre ciblé reste l'outil, et c'est ce que fait `CLAUDE.md`.
 
-**Gardes.** Aucune.
+**Ce qui rouvrirait l'item.** Un mécanisme de sélection qui n'existe pas aujourd'hui : une
+annotation portée par le test lui-même, lisible par le harnais, qui ne change pas ce qu'une
+invocation sans elle exécute.
 
 ## 3. Une seule table de configuration convertie
 
 **Objectif.** Mesurer ce que coûte une déclaration unique par champ, avant d'engager les 140 types.
+
+**Prémisse mesurée, et c'est la mieux tenue du plan.** Plus de vingt-cinq commits touchent au moins
+trois des quatre étages (`src/config/schema.rs`, `mod.rs`, `view.rs`, `src/cli/config/render.rs`)
+dans le même geste, et une bonne moitié les touche tous les quatre. Ajouter un champ traverse
+réellement les quatre étages, à chaque fois.
 
 **Geste.** Choisir **une** table — `[fs]` est la plus petite, `[network]` la plus représentative —
 et faire dériver d'une déclaration unique les quatre étages qu'elle traverse aujourd'hui : le
@@ -172,59 +207,55 @@ rougit, la macro a rendu un champ invisible, ce qui est précisément le risque 
 **Décision à prendre après, pas avant.** Généraliser ou s'arrêter là. La conversion d'une table
 donne le chiffre qui manque : combien de lignes et de lisibilité une déclaration unique coûte.
 
-## 4. `httparse` pour l'analyse de la tête HTTP/1.1
+## 4. `httparse` — ABANDONNÉ, et remplacé par ce que sa mesure a trouvé
 
-**Décision prise : redéplier derrière `httparse`, comportement inchangé côté réponse.** On ne
-change pas l'implémentation et le comportement dans le même geste, sinon la capture d'or ne prouve
-plus rien. Durcir reste possible ensuite, sur ses propres mérites. Deux conditions accompagnent ce
-choix, et aucune n'est optionnelle.
+**Trois faits mesurés, chacun suffisant.**
 
-**Condition 1 — le redépliage doit reproduire l'actuel à l'octet près.** `httparse` rend
-`b"hello\r\n there"`. `parse_head` découpe aujourd'hui sur `\r\n` **et** sur `\n` seul
-(`src/sandbox/proxy/wire.rs:55`), puis `trim()` la continuation et la joint à la valeur du dessus
-par une espace. Le redépliage doit rendre exactement ce résultat, `trim` compris — sans quoi le diff
-d'octets rougira sur un cas légitime, et le réflexe sera de corriger le test plutôt que le code.
-Trois cas à écrire avant la substitution : `hello\r\n there`, `hello\n\tthere`, et deux folds
-consécutifs.
+1. **`parse_head` n'a été corrigé qu'une fois.** `git log -L` sur le corps de la fonction rend deux
+   commits, dont un refactor pur d'extraction de module. La densité de correctifs du proxy, qui
+   motivait cet item, ne vient pas de là : elle vient de la politique et du cadrage.
+2. **`parse_head` analyse les requêtes *et* les réponses.** `response_framing` et
+   `response_keeps_alive` lui passent des têtes de réponse. `httparse` a un type par sens, et sa
+   ligne de tête n'est pas la même chose des deux côtés.
+3. **La ligne de requête est conservée verbatim.** `reserialize_request` la réémet telle quelle.
+   `httparse` la décompose en méthode, cible et version ; la recomposer normaliserait les octets sur
+   le fil, c'est-à-dire exactement la propriété que ce module construit délibérément.
 
-**Condition 2 — côté requête, le comportement change, et c'est voulu.** `httparse` refuse un fold
-dans une requête, sans option pour l'accepter, là où `parse_head` le déplie et le relaie. La requête
-vient de la cage, c'est-à-dire de l'adversaire dans le modèle de menace, et le dépôt est
-fail-closed : le refus est le bon comportement. Mais ce n'est pas un statu quo, donc la capture d'or
-doit porter **cette différence-là et elle seule**, comme un écart attendu et documenté — un rouge
-non annoncé se lirait comme une régression.
+**Ce que la mesure a trouvé à la place : une seconde orthographe du défaut de pliage.** Voir
+l'item 4′ ci-dessous. Ce n'est pas un argument pour `httparse` : un analyseur de bloc d'en-têtes ne
+voit pas le relais, et n'aurait rien fermé ici.
 
-**Geste.** Remplacer le corps de `parse_head` (`src/sandbox/proxy/wire.rs:53`) par `httparse`,
-configuré pour refuser les laxismes que ce dépôt a fermés à la main —
-`allow_multiple_spaces_in_request_line_delimiters`, `allow_spaces_after_header_name_in_responses`,
-`ignore_invalid_headers_in_*` restant à leur valeur stricte. La structure `Head` et tout ce qui la
-lit ne bougent pas.
+## 4′. Une espace avant le deux-points ouvre une désynchronisation côté réponse
 
-**Preuve, dans cet ordre.** D'abord un test de trois lignes confirmant ce que l'audit infère du type
-`Header { name: &'a str }` : casse et ordre du wire préservés. Puis les tests existants de
-`src/sandbox/proxy/tests.rs` sur le parsing de tête, sans modification — ils encodent les cas payés
-en correctifs, et ce sont eux l'oracle.
+**La chaîne, lue de bout en bout dans le code.** `parse_head` découpe sur le premier `:` puis
+`trim()` le nom : `Content-Length : 5` est donc lu comme un `content-length` propre.
+`response_framing` en tire `Length(5)`. `persistent` devient vrai, et `offer_reuse_in_head` relaie
+la tête au client **verbatim** — la ligne malformée comprise — en y ajoutant l'offre de réutilisation
+de sbx. sbx lit donc 5 octets de corps et annonce au client qu'une autre réponse suit, sur une tête
+que la RFC 9112 §5.1 déclare malformée et qu'un destinataire lit autrement.
 
-**Contrainte de sécurité, non négociable.** `parse_head` refuse aujourd'hui une tête non-UTF-8
-(`src/sandbox/proxy/wire.rs:54`). `httparse` rend `value: &'a [u8]`. Une intégration qui convertit
-par `from_utf8_lossy`, ou qui conserve les octets dans `Head`, **admettrait** ce que le code refuse
-— et `reserialize_request` le réémettrait vers l'amont. La conversion doit donc être `from_utf8`
-**strict**, et son échec doit refuser la tête exactement comme aujourd'hui. Le test qui le ferme
-envoie un octet non-UTF-8 dans une valeur d'en-tête et attend le refus ; il s'écrit avant la
-substitution, pas après.
+C'est la même classe que le pliage obsolète que ce dépôt a déjà fermé — deux vues d'une même tête —
+mais par une autre orthographe, et du côté où la tête n'est pas réémise. Le côté requête est
+indemne pour la raison inverse : il est réémis, donc normalisé par sbx.
 
-**Fichiers.** `src/sandbox/proxy/wire.rs`, `Cargo.toml`.
+**Preuve, dans cet ordre.** D'abord l'unité : ce que rend `parse_head` sur la tête ci-dessus, puis
+ce que rend `response_framing`. Puis la conséquence, qui est ce qui compte : deux réponses sur une
+même connexion tenue en vie, la première portant l'espace, et ce que le client reçoit comme seconde
+tête.
 
-**Ce que ça casse.** `httparse` rend des tranches empruntées là où `Head` possède des `String` :
-copier à la frontière, ou propager une durée de vie. La première option est la bonne pour un premier
-jet — la seconde traverserait tout le plan. Le type de la valeur, lui, reste `String` : c'est ce qui
-porte la contrainte ci-dessus.
+**Le correctif appartient à `parse_head`, pas à une garde de plus.** Refuser, ce qui dégrade en
+`ToEof` et `Connection: close` — le repli que la fonction documente déjà. C'est plus strict que la
+normalisation actuelle du côté requête, et c'est la posture du dépôt.
 
-**Gardes.** `Cargo.toml` justifie chaque dépendance par un paragraphe et pose une politique « pur
-Rust, sans C » ; l'entrée `httparse` doit porter le sien, disant ce qu'il remplace et pourquoi ce
-n'est pas `hyper`.
+**Deux voisins de la même famille, énumérés sans être corrigés ici.** Une ligne sans `:` est
+silencieusement abandonnée par `parse_head`, et relayée verbatim au client sur une réponse ; et
+`parse_head` découpe sur un `\n` seul, là où un client qui n'accepte que CRLF lit une autre tête.
+Le plan HTTP/2 n'a ni l'un ni l'autre, HPACK décodant dans des types qui les refusent : la parité
+entre plans est ce qui les nomme.
 
-## 5. Une définition unique du socle de durcissement
+**Fichiers.** `src/sandbox/proxy/wire.rs`, `src/sandbox/proxy/tests.rs`.
+
+## 5. Une définition unique du socle de durcissement — LIVRÉ (`179925a`)
 
 **Dû, puisque l'item 0 a conclu à un oubli avec conséquence.** Un drapeau manquait aux deux copies
 et rien ne le disait ; le test de parité ferme ce cas précis, une définition partagée ferme la
@@ -238,10 +269,12 @@ que gardée.
 
 **Fichiers.** `src/sandbox/argv.rs`, `src/sandbox/spec.rs`, `src/sandbox/mise.rs`, `src/storage.rs`.
 
-**Ce que ça casse.** `mise.rs` compose ensuite avec `cgroup::wrap` et `netns::wrap`, qui prennent un
-`(programme, argv)` : le helper doit rendre la même paire. La garde d'exhaustivité de
-`src/sandbox/argv.rs:921` sert de filet pendant la bascule — ses six catégories devront être
-révisées si les copies cessent d'assembler à la main.
+**Ce que ça casse.** Rien : les argv émis sont identiques à l'octet, comparés à une capture prise
+avant la bascule. `helper_argv(slug, store_nix)` rend le durcissement et la racine minimale ; chaque
+appelant ajoute ensuite ce qui lui est propre. Le keystone ne l'appelle pas, et son commentaire dit
+pourquoi plutôt que de le laisser redécouvrir : son émission est conditionnelle drapeau par drapeau.
+Les catégories de la garde d'exhaustivité n'ont pas bougé — les filtres et le scope ne sont pas des
+drapeaux, ce qui est précisément pourquoi ils ne sont pas passés dans la définition partagée.
 
 ## Non planifié
 
