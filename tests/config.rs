@@ -3783,6 +3783,51 @@ fn a_forced_bundle_import_names_what_it_dropped_and_keeps_the_bundle_it_replaced
     );
 }
 
+/// A forced import that loses nothing but declares MORE names what it added — the side that widens.
+///
+/// The shipped fragments gain settings over time, and the one that made this visible was a
+/// `shared_credential` group: a config imported before the field existed had none, the app it
+/// belonged to refused its own account API as an outbound leak, and re-importing the shipped bundle
+/// announced the fix as a fragment that "differed only in layout".
+#[test]
+fn a_forced_bundle_import_names_what_the_incoming_fragment_adds() {
+    let fx = Project::new("cfg");
+    let before = fx.proj.path().join("before.toml");
+    std::fs::write(
+        &before,
+        "[bundle.demo-agent]\nallow = [\"{GET} https://api.example.com\"]\n",
+    )
+    .unwrap();
+    assert!(
+        fx.run(&["bundle", "import", before.to_str().unwrap()])
+            .status
+            .success()
+    );
+
+    // The same bundle, one security field richer: where a credential the cage signed in for may
+    // travel. Nothing is lost, so the old warning called the whole thing a layout difference.
+    let after = fx.proj.path().join("after.toml");
+    std::fs::write(
+        &after,
+        "[bundle.demo-agent]\nallow = [\"{GET} https://api.example.com\"]\n\
+         shared_credential = [[\"api.example.com\", \"app.example.com\"]]\n",
+    )
+    .unwrap();
+    let forced = fx.run(&["bundle", "import", "--force", after.to_str().unwrap()]);
+    assert!(forced.status.success());
+    let err = String::from_utf8_lossy(&forced.stderr).to_string();
+    assert!(
+        err.contains("shared_credential") && !err.contains("only in layout"),
+        "the added group must be named rather than read as a reflow:\n{err}"
+    );
+    // And it reaches the listing the warning sends the reader to.
+    let listed = fx.run(&["bundle", "demo-agent"]);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("api.example.com, app.example.com"),
+        "the listing must name the hosts the group covers"
+    );
+}
+
 #[test]
 fn sbx_bundle_import_export_round_trips_and_the_imported_bundle_is_usable() {
     // The portability loop, end to end: a fragment someone else wrote is imported into the global

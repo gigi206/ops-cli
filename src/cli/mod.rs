@@ -335,52 +335,80 @@ pub(crate) fn keep_replaced_fragments<T>(
             noun,
             name,
             &settings_dropped_by(&before, &after),
+            &settings_dropped_by(&after, &before),
             &kept,
         ));
     }
     Ok(notes)
 }
 
-/// The overwrite warning for one replaced fragment: what its replacement no longer declares, and
-/// where the previous one is. A few dropped lines are named in full (the point is to recognize one's
-/// own edit); beyond that the count stands in, because the kept fragment is the better place to read
-/// the rest. `noun` is what the sentence calls the entry — a `bundle`, an `egress group`.
+/// The overwrite warning for one replaced fragment: what its replacement no longer declares, what
+/// it declares on top, and where the previous one is. A few lines of each side are named in full
+/// (the point is to recognize one's own edit); beyond that the count stands in, because the kept
+/// fragment is the better place to read the rest. `noun` is what the sentence calls the entry — a
+/// `bundle`, an `egress group`.
+///
+/// Both sides are reported, because only the losing one used to be and the other is the one that
+/// WIDENS: a fragment that dropped nothing and added a `shared_credential` group — the hosts a
+/// credential the cage signed in for may travel to — was announced as differing "only in layout".
+/// Both texts come from the family's own exporter before they are compared, so a line on one side
+/// alone is a declaration gained or lost rather than the same one reflowed.
 pub(crate) fn render_replaced_fragment(
     noun: &str,
     name: &str,
     dropped: &[String],
+    added: &[String],
     kept: &Path,
 ) -> String {
-    const NAMED: usize = 3;
     let kept = kept.display();
-    if dropped.is_empty() {
-        return format!(
+    let back = format!(
+        "the previous fragment is kept at {kept}, so a per-machine entry can be read back and \
+         re-imported"
+    );
+    match (lines_named(dropped), lines_named(added)) {
+        (None, None) => format!(
             "replaced {noun} `{name}`, which differed only in layout — the previous fragment is \
              kept at {kept}"
-        );
+        ),
+        (Some((count, list)), None) => format!(
+            "replaced {noun} `{name}`, which declared {count} the new one does not: {list} — {back}"
+        ),
+        (None, Some((count, list))) => format!(
+            "replaced {noun} `{name}`, which drops nothing and declares {count} the previous one \
+             did not: {list} — {back}"
+        ),
+        (Some((lost, lost_list)), Some((gained, gained_list))) => format!(
+            "replaced {noun} `{name}`, which declared {lost} the new one does not: {lost_list}, \
+             and declares {gained} the previous one did not: {gained_list} — {back}"
+        ),
     }
-    let named = dropped
+}
+
+/// One side of that comparison, as the count of lines it holds and the first few named in full.
+/// `None` for an empty side, so the sentence above leaves it out rather than saying "0 lines".
+fn lines_named(lines: &[String]) -> Option<(String, String)> {
+    const NAMED: usize = 3;
+    if lines.is_empty() {
+        return None;
+    }
+    let named = lines
         .iter()
         .take(NAMED)
         .map(|l| format!("`{l}`"))
         .collect::<Vec<_>>()
         .join(", ");
-    let rest = dropped.len().saturating_sub(NAMED);
+    let rest = lines.len().saturating_sub(NAMED);
     let more = if rest > 0 {
         format!(" (and {rest} more)")
     } else {
         String::new()
     };
-    format!(
-        "replaced {noun} `{name}`, which declared {} the new one does not: {named}{more} — the \
-         previous fragment is kept at {kept}, so a per-machine entry can be read back and \
-         re-imported",
-        if dropped.len() == 1 {
-            "1 line".to_string()
-        } else {
-            format!("{} lines", dropped.len())
-        },
-    )
+    let count = if lines.len() == 1 {
+        "1 line".to_string()
+    } else {
+        format!("{} lines", lines.len())
+    };
+    Some((count, format!("{named}{more}")))
 }
 
 /// Fold a name repeated in one multi-name removal (`sbx app rm`, `sbx plugins rm`) down to a single

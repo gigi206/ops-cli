@@ -103,6 +103,7 @@ pub(super) fn render_app_detail(
         deny,
         mute,
         http2,
+        shared_credential,
         builtin,
         ..
     } = &view.network
@@ -116,6 +117,17 @@ pub(super) fn render_app_detail(
         }
         for rule in deny {
             let _ = writeln!(o, "    {warn}deny{r}  {n}{rule}{r}");
+        }
+        // The host groups a credential the cage signed in for may travel across. Ahead of
+        // `--details`, unlike `mute` and `http2`: those decide nothing about what leaves the cage,
+        // while a group widens the outbound tripwire — and an app takes it from a bundle rather
+        // than writing it, so this view is where its reader meets it at all.
+        for group in shared_credential {
+            let _ = writeln!(
+                o,
+                "    {dim}shared_credential{r} {n}{}{r}",
+                group.join(", ")
+            );
         }
         if details {
             for rule in mute {
@@ -652,6 +664,26 @@ pub(super) fn sample_app_detail_view() -> config::view::AppDetailView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `shared_credential` group is shown here, and without `--details`: it widens the outbound
+    /// tripwire — the hosts a credential the cage signed in for may travel to — and an app takes it
+    /// from a bundle rather than writing it, so a reader auditing the launch meets it nowhere else.
+    #[test]
+    fn render_app_detail_shows_a_shared_credential_group_without_details() {
+        let p = style::Palette::plain();
+        let mut view = sample_app_detail_view();
+        if let config::view::NetworkView::Allowlist {
+            shared_credential, ..
+        } = &mut view.network
+        {
+            shared_credential.push(vec!["claude.ai".into(), "api.anthropic.com".into()]);
+        }
+        let out = render_app_detail(&view, &p, false);
+        assert!(
+            out.contains("shared_credential claude.ai, api.anthropic.com"),
+            "{out}"
+        );
+    }
 
     #[test]
     fn render_app_detail_shows_effective_values_tagged_inherited_or_app_set() {

@@ -2029,10 +2029,12 @@ pub(crate) struct NetworkTable {
     /// under the separator rule an `allow` list's wildcard obeys, so a service spread over regional
     /// names is written once.
     ///
-    /// A group needs at least two hosts to mean anything, and no group may cover an entry an
-    /// earlier one already covers — that would leave "the same service" ambiguous rather than
-    /// merely wide. Either shape is dropped with a warning, which is the fail-closed direction: the
-    /// tripwire then keeps the per-host exemption it had before the declaration.
+    /// A group needs two hosts to mean anything — unless its one entry is a `*.domain` wildcard,
+    /// which widens the exemption from the acquiring host to a whole domain and so says something
+    /// on its own — and no group may cover an entry an earlier one already covers, which would
+    /// leave "the same service" ambiguous rather than merely wide. Either shape is dropped with a
+    /// warning, which is the fail-closed direction: the tripwire then keeps the per-host exemption
+    /// it had before the declaration.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) shared_credential: Vec<Vec<String>>,
     /// Named reusable egress groups, `[network.groups]` — each `name = [ "<entry>", … ]`, where an

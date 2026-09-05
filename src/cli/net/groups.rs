@@ -425,21 +425,35 @@ mod tests {
             "egress group",
             "ci",
             &["\"{GET} https://x\",".to_string()],
+            &[],
             kept,
         );
         assert!(one.contains("`ci`") && one.contains("1 line"), "{one}");
         assert!(one.contains("ci.group.replaced"), "{one}");
         let many: Vec<String> = (0..5).map(|i| format!("\"e{i}\",")).collect();
-        let lots = crate::cli::render_replaced_fragment("egress group", "ci", &many, kept);
+        let lots = crate::cli::render_replaced_fragment("egress group", "ci", &many, &[], kept);
         assert!(
             lots.contains("5 lines") && lots.contains("(and 2 more)"),
             "{lots}"
         );
         // A group that differs only in layout still names where the previous fragment went.
-        let none = crate::cli::render_replaced_fragment("egress group", "ci", &[], kept);
+        let none = crate::cli::render_replaced_fragment("egress group", "ci", &[], &[], kept);
         assert!(
             none.contains("only in layout") && none.contains(".replaced"),
             "{none}"
+        );
+        // Entries the incoming group adds are named too: a wider group is what an import of the
+        // same name most often is.
+        let gained = crate::cli::render_replaced_fragment(
+            "egress group",
+            "ci",
+            &[],
+            &["\"{GET} https://added.example\",".to_string()],
+            kept,
+        );
+        assert!(
+            !gained.contains("only in layout") && gained.contains("added.example"),
+            "{gained}"
         );
     }
 

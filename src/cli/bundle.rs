@@ -73,53 +73,7 @@ fn bundle_list(args: &[OsString]) -> ExitCode {
     if json {
         let obj: Vec<_> = selected
             .iter()
-            .map(|(name, b)| {
-                serde_json::json!({
-                    "name": name,
-                    "packages": b.packages,
-                    "env": b.env.keys().collect::<Vec<_>>(),
-                    "allow": b.allow,
-                    "deny": b.deny,
-                    "mute": b.mute,
-                    "secrets": b.secret.as_ref().map(|s| s.hosts.len()).unwrap_or(0),
-                    // Everything below is what a consuming app also folds in. Left out, a `--json`
-                    // audit of an imported fragment reported a bundle as harmless while it carried
-                    // a declared operation, a service or a URI handler.
-                    "provision": b.provision.is_some(),
-                    "tasks": b.task.as_ref()
-                        .map(|t| t.tasks.keys().collect::<Vec<_>>())
-                        .unwrap_or_default(),
-                    "services": b.service.keys().collect::<Vec<_>>(),
-                    "open": b.open.keys().collect::<Vec<_>>(),
-                    "flakes": b.flakes.keys().collect::<Vec<_>>(),
-                    // Keyed on the `resolve` command rather than on the table holding it: the same
-                    // table may carry `libs` alone, which rolls nothing, so listing every table
-                    // here would report an upgrade path a `--json` audit cannot act on. The
-                    // library attributes such a table does grant are reported beside it.
-                    "resolvers": {
-                        "tarball": resolver_names(&b.tarball),
-                        "deb": resolver_names(&b.deb),
-                        "appimage": resolver_names(&b.appimage),
-                        "binary": resolver_names(&b.binary),
-                    },
-                    "libs": {
-                        "tarball": lib_names(&b.tarball),
-                        "deb": lib_names(&b.deb),
-                        "appimage": lib_names(&b.appimage),
-                        "binary": lib_names(&b.binary),
-                    },
-                    // Beside `libs` for the same reason: it is the other half of what such a table
-                    // grants, and it decides which file in the artefact the launch actually runs.
-                    "main": {
-                        "tarball": main_names(&b.tarball),
-                        "deb": main_names(&b.deb),
-                        "appimage": main_names(&b.appimage),
-                        "binary": main_names(&b.binary),
-                    },
-                    "accepts_fresh_releases": b.accepts_fresh_releases,
-                    "undescribed": undescribed_sections(b),
-                })
-            })
+            .map(|(name, b)| bundle_json(name, b))
             .collect();
         println!("{}", serde_json::json!({ "bundles": obj }));
         return ExitCode::SUCCESS;
@@ -128,6 +82,63 @@ fn bundle_list(args: &[OsString]) -> ExitCode {
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     print!("{}", render_bundles(&selected, names.is_empty(), &pal));
     ExitCode::SUCCESS
+}
+
+/// One bundle as `--json`: every section it declares, in the shape an audit can act on.
+///
+/// A function of its own rather than a literal inside the command, so the guard in the tests can
+/// ask this rendering the same question it asks the listing. The two answer for the same schema and
+/// fell out of step once already — a section that reaches only one of them is invisible to half the
+/// readers, and this one is read by the half that is a script.
+fn bundle_json(name: &str, b: &config::RawBundle) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "packages": b.packages,
+        "env": b.env.keys().collect::<Vec<_>>(),
+        "allow": b.allow,
+        "deny": b.deny,
+        "mute": b.mute,
+        // The groups whole, not counted: which hosts one covers IS the widening, and an
+        // audit that reads this instead of the listing has no second place to find it.
+        "shared_credential": b.shared_credential,
+        "secrets": b.secret.as_ref().map(|s| s.hosts.len()).unwrap_or(0),
+        // Everything below is what a consuming app also folds in. Left out, a `--json`
+        // audit of an imported fragment reported a bundle as harmless while it carried
+        // a declared operation, a service or a URI handler.
+        "provision": b.provision.is_some(),
+        "tasks": b.task.as_ref()
+            .map(|t| t.tasks.keys().collect::<Vec<_>>())
+            .unwrap_or_default(),
+        "services": b.service.keys().collect::<Vec<_>>(),
+        "open": b.open.keys().collect::<Vec<_>>(),
+        "flakes": b.flakes.keys().collect::<Vec<_>>(),
+        // Keyed on the `resolve` command rather than on the table holding it: the same
+        // table may carry `libs` alone, which rolls nothing, so listing every table
+        // here would report an upgrade path a `--json` audit cannot act on. The
+        // library attributes such a table does grant are reported beside it.
+        "resolvers": {
+            "tarball": resolver_names(&b.tarball),
+            "deb": resolver_names(&b.deb),
+            "appimage": resolver_names(&b.appimage),
+            "binary": resolver_names(&b.binary),
+        },
+        "libs": {
+            "tarball": lib_names(&b.tarball),
+            "deb": lib_names(&b.deb),
+            "appimage": lib_names(&b.appimage),
+            "binary": lib_names(&b.binary),
+        },
+        // Beside `libs` for the same reason: it is the other half of what such a table
+        // grants, and it decides which file in the artefact the launch actually runs.
+        "main": {
+            "tarball": main_names(&b.tarball),
+            "deb": main_names(&b.deb),
+            "appimage": main_names(&b.appimage),
+            "binary": main_names(&b.binary),
+        },
+        "accepts_fresh_releases": b.accepts_fresh_releases,
+        "undescribed": undescribed_sections(b),
+    })
 }
 
 /// Report every unknown name at once, pointing at what *is* defined. `None` when all names resolve.
@@ -217,6 +228,15 @@ fn render_bundles(
         }
         for e in &b.mute {
             out.push_str(&format!("  mute     {e}\n"));
+        }
+        // Named with the egress rules it rides beside, though it is not one: a group grants no
+        // reach, it widens where a credential the cage signed in for may travel. The hosts are
+        // printed in full — which names a group covers IS the grant.
+        for group in &b.shared_credential {
+            out.push_str(&format!(
+                "  shared   {} (one service for a credential the app signs in for)\n",
+                group.join(", ")
+            ));
         }
         if let Some(secret) = &b.secret {
             for host in secret.hosts.keys() {
@@ -316,6 +336,7 @@ const DESCRIBED_BUNDLE_SECTIONS: &[&str] = &[
     "allow",
     "deny",
     "mute",
+    "shared_credential",
     "secret",
     "provision",
     "task",
@@ -785,12 +806,13 @@ mod tests {
             "bundle",
             "demo",
             &["allow = [\"x\"]".to_string()],
+            &[],
             kept,
         );
         assert!(one.contains("`demo`") && one.contains("1 line"), "{one}");
         assert!(one.contains("demo.bundle.replaced"), "{one}");
         let many: Vec<String> = (0..5).map(|i| format!("k{i} = {i}")).collect();
-        let lots = crate::cli::render_replaced_fragment("bundle", "demo", &many, kept);
+        let lots = crate::cli::render_replaced_fragment("bundle", "demo", &many, &[], kept);
         assert!(
             lots.contains("5 lines") && lots.contains("(and 2 more)"),
             "{lots}"
@@ -800,10 +822,25 @@ mod tests {
             "{lots}"
         );
         // A bundle that differs only in layout still names where the previous fragment went.
-        let none = crate::cli::render_replaced_fragment("bundle", "demo", &[], kept);
+        let none = crate::cli::render_replaced_fragment("bundle", "demo", &[], &[], kept);
         assert!(
             none.contains("only in layout") && none.contains(".replaced"),
             "{none}"
+        );
+        // A fragment that loses nothing but declares MORE is not a layout difference, and the
+        // added line is the one worth naming: it is the side that widens what a bundle grants.
+        let gained = crate::cli::render_replaced_fragment(
+            "bundle",
+            "demo",
+            &[],
+            &["shared_credential = [[\"a.example\", \"b.example\"]]".to_string()],
+            kept,
+        );
+        assert!(
+            !gained.contains("only in layout")
+                && gained.contains("1 line")
+                && gained.contains("shared_credential"),
+            "{gained}"
         );
     }
 
@@ -1039,5 +1076,90 @@ mod tests {
             !grants.iter().any(|g| g.contains("section")),
             "a described section must not also be reported as undescribed: {grants:?}"
         );
+    }
+
+    /// Every field a bundle serializes is accounted for by name, so nothing it declares reaches the
+    /// reader only as an unnamed section.
+    ///
+    /// Two halves, because the two ways to fall behind are different. The destructure is exhaustive
+    /// on purpose: a field added to `RawBundle` fails to compile here rather than joining the
+    /// catch-all quietly, which is how `shared_credential` came to be announced twice — `grants_of`
+    /// counted the group and the catch-all named the key again, as a section to read before an
+    /// import that had already taken it. The fragment below then asks the question through the TOML
+    /// the schema actually parses, so a renamed key is compared the way an import compares it.
+    #[test]
+    fn every_field_a_bundle_serializes_has_a_line_of_its_own() {
+        let empty = config::RawBundle::default();
+        let config::RawBundle {
+            packages: _,
+            accepts_fresh_releases: _,
+            env: _,
+            allow: _,
+            deny: _,
+            mute: _,
+            shared_credential: _,
+            secret: _,
+            provision: _,
+            task: _,
+            flakes: _,
+            open: _,
+            service: _,
+            tarball: _,
+            deb: _,
+            appimage: _,
+            binary: _,
+            // The catch-all's own map: being named by its key is what this one is for.
+            rest: _,
+        } = &empty;
+
+        let full: config::RawBundle = toml::from_str(concat!(
+            "packages = { helper = \"nix:helper\" }\n",
+            "accepts_fresh_releases = [\"helper\"]\n",
+            "env = { HELPER_QUIET = \"1\" }\n",
+            "allow = [\"{*} https://api.example.com\"]\n",
+            "deny = [\"https://blocked.example.com\"]\n",
+            "mute = [\"https://noisy.example.com\"]\n",
+            "shared_credential = [[\"api.example.com\", \"app.example.com\"]]\n",
+            "provision = [\"/bin/true\"]\n",
+            "secret.\"api.example.com\" = { from = \"env:API_KEY\" }\n",
+            "task.deploy = { cmd = [\"deploy\"] }\n",
+            "flakes.helper = { flake = \"{ outputs = _: {}; }\" }\n",
+            "open = { helper = [\"/bin/true\"] }\n",
+            "service = { db = [\"/bin/true\"] }\n",
+            "tarball.helper = { resolve = [\"/bin/true\"] }\n",
+            "deb.helper = { resolve = [\"/bin/true\"] }\n",
+            "appimage.helper = { resolve = [\"/bin/true\"] }\n",
+            "binary.helper = { resolve = [\"/bin/true\"] }\n",
+        ))
+        .expect("the fragment parses");
+        assert!(
+            undescribed_sections(&full).is_empty(),
+            "a field with no line of its own: {:?}",
+            undescribed_sections(&full)
+        );
+        assert!(
+            !grants_of(&full).iter().any(|g| g.contains("section")),
+            "{:?}",
+            grants_of(&full)
+        );
+        // And the listing the import warning sends the reader to shows it: describing a section is
+        // a promise that this view accounts for it, so dropping it out of the catch-all without a
+        // line here would replace a clumsy mention with none at all.
+        let name = "full".to_string();
+        let listed = render_bundles(&[(&name, &full)], false, &style::Palette::plain());
+        assert!(
+            listed.contains("api.example.com, app.example.com"),
+            "the listing must name the hosts a group covers: {listed}"
+        );
+        assert!(!listed.contains("section  ["), "{listed}");
+        // And the machine-readable half, which is where an audit reads instead of the listing.
+        // Describing a section silences the catch-all in BOTH, so a section named nowhere else
+        // would leave `--json` with no trace of it at all.
+        let as_json = bundle_json("full", &full).to_string();
+        assert!(
+            as_json.contains("\"shared_credential\":[[\"api.example.com\",\"app.example.com\"]]"),
+            "{as_json}"
+        );
+        assert!(!as_json.contains("\"undescribed\":[\""), "{as_json}");
     }
 }

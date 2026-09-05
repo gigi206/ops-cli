@@ -3663,9 +3663,11 @@ fn parse_http2_hosts(
 ///
 /// Two shapes are dropped with a warning, both fail-closed — the tripwire keeps the per-host
 /// exemption it had without the declaration. A group of fewer than two distinct hosts states
-/// nothing a credential's own host does not already say. And a host in two groups leaves "the same
-/// service" undecided: the sets would have to be merged to be usable, which is a wider grant than
-/// either group asked for, so the second group is refused instead and named.
+/// nothing a credential's own host does not already say, unless that entry is a `*.domain`
+/// wildcard: that one widens the exemption to a whole domain, which the acquiring host alone does
+/// not. And a host in two groups leaves "the same service" undecided: the sets would have to be
+/// merged to be usable, which is a wider grant than either group asked for, so the second group is
+/// refused instead and named.
 fn parse_shared_credential(
     warnings: &mut Vec<String>,
     source_label: &str,
