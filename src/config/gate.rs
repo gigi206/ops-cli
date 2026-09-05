@@ -4,8 +4,16 @@
 //! Apart from the resolution engine next door because the two answer different questions. The
 //! engine decides which layer a field comes from and folds it into the resolved set; the gate
 //! decides whether that layer is trusted enough to have a say. Every gated field asks the gate the
-//! same question, which is why the answer is spelled once here rather than once per field — a field
-//! added without its gate then has nowhere to hide.
+//! same question, which is why the answer is spelled once here rather than once per field.
+//!
+//! That is a statement about the **vocabulary**, not about the coverage, and the difference is worth
+//! writing down. A field added to `RawConfig` breaks the compilation of three exhaustive
+//! destructurings, all of them in the override plane: `apply_override`, `overlay_into` and
+//! `push_env_source_notices`. Each forces an author to say what a one-shot override does with the
+//! new field. Nothing makes the same demand of the layering engine: the fields `resolve` and
+//! `resolve_app` gate are reached by hand-written lines, so a field nobody wrote a line for is
+//! simply not read there, and `RawApp` has no exhaustive destructuring in the engine at all. Every
+//! field shipped today is reached by such a line; what says so is a reading, not a compiler.
 //!
 //! The refusal wording lives here for the same reason. A dropped field is visible to a user only as
 //! the sentence that says so, and there is more than one producer of that sentence — the gate's own
@@ -20,7 +28,8 @@ use super::*;
 /// A security field is honoured only from a trusted layer; an untrusted or changed one gets a
 /// warning and the value accumulated so far stands. Every gated field asks that same question, so
 /// the layer carries one of these and the decision is made in a single place rather than spelled
-/// out once per field — and a field added without its gate has nowhere to hide.
+/// out once per field. What decides *which* fields ask it is the resolution engine's own list of
+/// lines, not this type: see the module header.
 pub(super) struct Gate<'a> {
     pub(super) trusted: bool,
     pub(super) state: TrustState,
