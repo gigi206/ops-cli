@@ -83,6 +83,9 @@ pub(crate) enum PluginKind {
 ///
 /// A resolver is unrestricted here by design: reaching a vault over the network is what most of them
 /// are for. The two that are restricted hold, or stand in front of, the secret itself.
+///
+/// This answers what the manifest *declared*. What its grant paths turn out to **be** is the other
+/// half of the same rule, and it is asked by [`check_kind_grant_paths`], at the same two sites.
 pub(crate) fn check_kind_sandbox(kind: PluginKind, grant: &SandboxGrant) -> Result<(), String> {
     match kind {
         PluginKind::Resolver => Ok(()),
