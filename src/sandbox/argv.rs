@@ -890,33 +890,47 @@ mod tests {
 
     /// Every bubblewrap argument list this crate assembles either comes from [`compose`], which
     /// loads the mandatory filters, or is one of the hand-built lists named below, and each of
-    /// those loads them itself.
+    /// those loads them itself; and every cage that runs code sbx did not write also carries the
+    /// resource scope.
     ///
     /// The population is every file that spawns bubblewrap by name, plus every file calling
     /// [`to_argv`] or `argv_prefix` outside the two that define them. The first criterion is the
     /// one that matters: a list written by hand names neither function, and the process it starts
-    /// is the only trace it leaves. Sorting the population into three kinds is the whole point of
-    /// the guard: it asks a new file's author which kind it is, and each kind carries an obligation
-    /// the guard then checks. Nothing in the type system asks that question, and the failure it
+    /// is the only trace it leaves. Sorting the population into kinds is the whole point of the
+    /// guard: it asks a new file's author which kind it is, and each kind carries an obligation the
+    /// guard then checks. Nothing in the type system asks that question, and the failure it
     /// prevents is an absence: an argument list assembled beside the one definition, running a cage
     /// that behaves exactly like a hardened one until something inside it makes a syscall the
     /// denylist exists to refuse.
     ///
-    /// The three lists are this guard's upkeep. A file that starts spawning bubblewrap, or
-    /// assembling a list of its own, belongs in one of them the day it is written.
+    /// A kind states two things, because a cage owes two: the filters, and whether it runs inside
+    /// sbx's resource scope. The scope is owed by every cage that runs something sbx did not write
+    /// (a configuration's own command, a plugin, mise over a project's files), so that a runaway
+    /// there is bounded the way a runaway in a session is; a cage running one of sbx's own fixed
+    /// probes is named as such and stays outside, and the kind it is listed under says so.
+    ///
+    /// The lists are this guard's upkeep. A file that starts spawning bubblewrap, or assembling a
+    /// list of its own, belongs in one of them the day it is written.
     #[test]
     fn every_bubblewrap_argument_list_outside_compose_is_accounted_for() {
-        // Both build their list by hand because what they run is not a `SandboxSpec`: the argument
-        // set is fixed and known at the call site rather than resolved from a project's
-        // configuration. Each therefore prepends the filters itself.
-        const ASSEMBLES_BY_HAND: &[&str] = &["src/sandbox/mise.rs", "src/storage.rs"];
-        // These spawn bubblewrap themselves rather than through the launch command, and the list
-        // they hand it is the composed one.
-        const SPAWNS_THE_COMPOSED_LIST: &[&str] = &[
-            "src/sandbox/resolve.rs",
-            "src/sandbox/resolver.rs",
-            "src/sandbox/smoke.rs",
-        ];
+        // Builds its list by hand because what it runs is not a `SandboxSpec`: the argument set is
+        // fixed and known at the call site rather than resolved from a project's configuration. It
+        // therefore prepends the filters itself, and applies the scope itself for the same reason —
+        // what a spec would have carried has to be added where the list is assembled. This cage
+        // drives provisioning off a project's own files.
+        const ASSEMBLES_BY_HAND_IN_A_SCOPE: &[&str] = &["src/sandbox/mise.rs"];
+        // The same hand-built shape, running one of sbx's own fixed operations rather than anything
+        // a project chose: formatting an image sbx owns. It owes the filters and no scope.
+        const ASSEMBLES_BY_HAND_UNSCOPED: &[&str] = &["src/storage.rs"];
+        // These spawn their cage through the shared launch command, which is what carries the
+        // filters, the netns holder and the scope in one step. Each runs code sbx did not write: a
+        // profile's own `resolve` command, and a plugin from a store.
+        const RUNS_THE_SHARED_LAUNCH_COMMAND: &[&str] =
+            &["src/sandbox/resolve.rs", "src/sandbox/resolver.rs"];
+        // Spawns bubblewrap itself rather than through the launch command, and the list it hands it
+        // is the composed one. `doctor`'s probe is sbx's own, fixed, and reports on the host rather
+        // than running anything for a project, so it owes no scope.
+        const SPAWNS_THE_COMPOSED_LIST: &[&str] = &["src/sandbox/smoke.rs"];
         // These read the pure list to assert something about what it contains, and run nothing.
         const READS_THE_LIST: &[&str] = &["src/sandbox/binds/tests.rs"];
         // The two definitions themselves: this module, and the one that compiles a filter into a
@@ -950,13 +964,20 @@ mod tests {
             if DEFINES_THEM.contains(&relative.as_str()) {
                 continue;
             }
-            // What each kind owes. A hand-built list owes the filters' descriptors; a composed one
-            // owes the call that compiles them; a file that only reads the list owes nothing, and
-            // spawning bubblewrap is what would make it something else.
-            let honoured = if ASSEMBLES_BY_HAND.contains(&relative.as_str()) {
-                crate::testutil::calls_function(&text, "argv_prefix(")
+            let calls = |needle: &str| crate::testutil::calls_function(&text, needle);
+            // What each kind owes. A hand-built list owes the filters' descriptors, and the scope
+            // too where the kind says so; a cage run through the shared launch command owes that
+            // call, which carries both; a composed one owes the call that compiles the filters; a
+            // file that only reads the list owes nothing, and spawning bubblewrap is what would
+            // make it something else.
+            let honoured = if ASSEMBLES_BY_HAND_IN_A_SCOPE.contains(&relative.as_str()) {
+                calls("argv_prefix(") && calls("cgroup::wrap(")
+            } else if ASSEMBLES_BY_HAND_UNSCOPED.contains(&relative.as_str()) {
+                calls("argv_prefix(")
+            } else if RUNS_THE_SHARED_LAUNCH_COMMAND.contains(&relative.as_str()) {
+                calls("cage_command(")
             } else if SPAWNS_THE_COMPOSED_LIST.contains(&relative.as_str()) {
-                crate::testutil::calls_function(&text, "argv::compose(")
+                calls("argv::compose(")
             } else {
                 !spawns
             };
@@ -967,8 +988,10 @@ mod tests {
         }
         population.sort();
 
-        let mut declared: Vec<String> = ASSEMBLES_BY_HAND
+        let mut declared: Vec<String> = ASSEMBLES_BY_HAND_IN_A_SCOPE
             .iter()
+            .chain(ASSEMBLES_BY_HAND_UNSCOPED)
+            .chain(RUNS_THE_SHARED_LAUNCH_COMMAND)
             .chain(SPAWNS_THE_COMPOSED_LIST)
             .chain(READS_THE_LIST)
             .map(|s| (*s).to_string())
@@ -981,8 +1004,8 @@ mod tests {
         );
         assert!(
             owes.is_empty(),
-            "these start a cage without the mandatory seccomp filters, or read the list and spawn \
-             from it: {owes:?}"
+            "these start a cage without the mandatory seccomp filters, without the resource scope \
+             their kind owes, or read the list and spawn from it: {owes:?}"
         );
     }
 }

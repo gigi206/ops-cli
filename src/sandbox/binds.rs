@@ -1629,11 +1629,7 @@ pub(crate) fn build_spec(
     // directory name. Carried on the spec so the scope, hostname, and session listing all
     // read the same slug. Computed here (not only at the end) because the synthetic
     // `/etc/hosts` maps the cage hostname derived from it.
-    let app = match runtime {
-        Runtime::ProjectDefault => None,
-        Runtime::GlobalApp(name) | Runtime::ProjectApp(name) => Some(name),
-    };
-    let slug = super::naming::cage_slug(app, &project);
+    let slug = super::naming::cage_slug(runtime.app(), &project);
 
     // Materialize the synthetic `/etc/hosts` beside the other synthetic files (outside every
     // writable mount, so the agent has no writable alias to rewrite the name resolution it

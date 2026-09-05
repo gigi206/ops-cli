@@ -316,6 +316,10 @@ fn scope_wrapper(limits: &Limits, cage_slug: &str) -> Option<(PathBuf, Vec<OsStr
     Some((systemd_run, prefix))
 }
 
+/// How many transient scopes this process has asked for, which is the second half of what makes
+/// each one's unit name unique. See [`scope_prefix`] for the first half and why one is not enough.
+static SCOPE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// The argv `systemd-run` is invoked with, up to and including the `--` that ends it: how a scope is
 /// asked for, separate from whether one is worth asking for.
 ///
@@ -335,9 +339,14 @@ fn scope_prefix(systemd_run: &Path, props: &[String], cage_slug: &str) -> Vec<Os
         // Name the scope after the cage so it reads legibly in `systemctl --user`,
         // `ps`, and `systemd-cgls` instead of the opaque `run-p<pid>-i<pid>.scope`
         // systemd would auto-assign. `systemd-run` fails a launch outright on a live
-        // unit-name collision, so uniqueness is load-bearing, not cosmetic: the launcher
-        // pid distinguishes two cages of one project (which share a slug), and the one
-        // multi-cage path in a single process (`sbx upgrade`) runs its cages sequentially.
+        // unit-name collision, so uniqueness is load-bearing, not cosmetic — and a slug
+        // does not provide it: two cages of one project share one, and a single launcher
+        // stands up many (the session's own, a task's, a pool install's, a build's, a
+        // resolve command's, a plugin's), often within the same instant.
+        //
+        // So the name carries both discriminants, drawn here because this is the one
+        // place a scope is asked for: the launcher's pid separates processes, and
+        // [`SCOPE_SEQ`] separates the cages of one process.
         //
         // Uniqueness rests on those two facts and not on `--collect`, which reclaims a
         // name only once systemd considers the scope finished — and systemd learns that a
@@ -347,7 +356,11 @@ fn scope_prefix(systemd_run: &Path, props: &[String], cage_slug: &str) -> Vec<Os
         // for good. Reusing a name is therefore never safe on the strength of `--collect`.
         OsString::from(format!(
             "--unit={}",
-            super::naming::scope_unit(cage_slug, std::process::id())
+            super::naming::scope_unit(
+                cage_slug,
+                SCOPE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                std::process::id(),
+            )
         )),
     ];
     // Say what to do with the dollars rather than assume it. `systemd-run` substitutes variable
@@ -388,9 +401,9 @@ pub(crate) fn wrap(
 
 /// The launcher pid encoded in a cage scope's unit name, or `None` when `name` is not one.
 ///
-/// [`super::naming::scope_unit`] builds the name as `sbx-<slug>-<pid>.scope`, and a slug may itself
-/// contain dashes and digits, so the pid is the segment after the **last** dash. Reading it as a
-/// suffix instead would let `sbx-probe-342.scope` answer for pid 42, which would be enough for
+/// [`super::naming::scope_unit`] builds the name as `sbx-<slug>-<n>-<pid>.scope`, and a slug may
+/// itself contain dashes and digits, so the pid is the segment after the **last** dash. Reading it
+/// as a suffix instead would let `sbx-probe-342.scope` answer for pid 42, which would be enough for
 /// [`sweep_stale_scopes`] to stop a live cage.
 pub(crate) fn scope_launcher_pid(name: &str) -> Option<u32> {
     name.strip_prefix("sbx-")?
@@ -408,8 +421,8 @@ pub(crate) fn scope_launcher_pid(name: &str) -> Option<u32> {
 /// one's. That matters because both consumers of [`cage_scope_dirs`] read a directory and then act
 /// through *this* user's manager: [`sweep_stale_scopes`] decides reclaimability from a
 /// `cgroup.procs` it found and then issues `systemctl --user stop <name>`, and the teardown's member
-/// lookup takes the first directory whose name embeds the target pid and treats its `cgroup.procs`
-/// as the cage's members. Scope names are not unique across users — they are derived from a project
+/// lookup takes every directory whose name embeds the target pid and treats their `cgroup.procs` as
+/// the cage's members. Scope names are not unique across users — they are derived from a project
 /// slug and a launcher pid, both of which two users can share — so a foreign directory answering for
 /// a local unit is a decision read from one uid's cgroup and applied to another's.
 fn user_slice_root(uid: u32) -> PathBuf {
@@ -1004,9 +1017,46 @@ mod tests {
         );
         // The pid segment is the launcher's, keeping concurrent same-slug scopes distinct.
         assert!(
-            unit.contains(&std::process::id().to_string()),
-            "the unit carries the launcher pid: {unit}"
+            unit.ends_with(&format!("-{}.scope", std::process::id())),
+            "the unit ends on the launcher pid: {unit}"
         );
+    }
+
+    /// Two cages of one launcher get two unit names, even when they share a slug.
+    ///
+    /// A transient unit name is refused while the previous holder is still loaded, and the launcher
+    /// pid cannot separate two cages the same process stands up. The helpers a launch runs (a task,
+    /// a pool install, a `[distro] run` build, a resolve command, a plugin) follow each other
+    /// closely enough that the first name is still held when the second is asked for, so the
+    /// difference has to be in the name rather than in the timing.
+    #[test]
+    fn two_scopes_of_one_launcher_are_named_apart() {
+        let Some(systemd_run) = crate::pathfind::find_on_path("systemd-run") else {
+            skip_incapable!("skipping the scope-name uniqueness check: no systemd-run");
+            return;
+        };
+        let props = vec!["TasksMax=16384".to_string()];
+        let unit_of = |prefix: Vec<OsString>| {
+            prefix
+                .iter()
+                .find_map(|a| Some(a.to_str()?.strip_prefix("--unit=")?.to_string()))
+                .expect("a --unit= argument is present")
+        };
+        let first = unit_of(scope_prefix(&systemd_run, &props, "demo-app"));
+        let second = unit_of(scope_prefix(&systemd_run, &props, "demo-app"));
+        assert_ne!(
+            first, second,
+            "one launcher's two cages must not ask for the same transient unit"
+        );
+        // Both still name the cage and end on the launcher, which is what every reader of a unit
+        // name takes from it.
+        for unit in [&first, &second] {
+            assert!(
+                unit.starts_with("sbx-demo-app-")
+                    && unit.ends_with(&format!("-{}.scope", std::process::id())),
+                "the unit keeps its slug and its pid: {unit}"
+            );
+        }
     }
 
     #[test]
@@ -1053,8 +1103,13 @@ mod tests {
                 scope_launcher_pid(name).is_some(),
                 "the walk yielded a directory that is not a cage scope: {name}"
             );
+            // The tree is live, and a scope this walk listed can reach its terminal state before
+            // the next line runs: systemd then collects the unit and the whole directory goes with
+            // it. So the absence of the file is only a finding while the directory is still there,
+            // asked in that order. A scope that vanished is the disappearance every consumer of the
+            // walk already answers for, by reading an unreadable cgroup as one still in use.
             assert!(
-                dir.join("cgroup.procs").exists(),
+                dir.join("cgroup.procs").exists() || !dir.exists(),
                 "a cage scope carries a cgroup.procs: {}",
                 dir.display()
             );

@@ -113,12 +113,15 @@ pub(crate) fn cage_name(app: Option<&str>, project: &Path) -> String {
     cage_hostname(&cage_slug(app, project))
 }
 
-/// The transient systemd scope's unit name for a slug: `sbx-<slug>-<pid>.scope`. The pid
-/// is the launcher's, present only to keep the name unique among concurrently live scopes
-/// (two cages of one project share a slug); systemd requires a live unit name be unique
-/// and `--collect` frees it on exit, so a finished cage never blocks the next.
-pub(crate) fn scope_unit(slug: &str, pid: u32) -> String {
-    format!("sbx-{slug}-{pid}.scope")
+/// The transient systemd scope's unit name for a slug: `sbx-<slug>-<n>-<pid>.scope`.
+///
+/// Two numbers, because a name must be unique among the units systemd currently holds and a slug
+/// alone is not: `pid` is the launcher's, separating the cages of two concurrent launches, and `n`
+/// separates the cages one launcher stands up, which follow each other closely enough that the
+/// previous name is not always free again. The pid stays last, so the launcher a scope belongs to
+/// is the segment after the final dash wherever a name is read back.
+pub(crate) fn scope_unit(slug: &str, n: u32, pid: u32) -> String {
+    format!("sbx-{slug}-{n}-{pid}.scope")
 }
 
 #[cfg(test)]
@@ -194,9 +197,12 @@ mod tests {
     #[test]
     fn a_scope_unit_carries_the_sbx_prefix_and_pid() {
         assert_eq!(
-            scope_unit("demo-app", 4089496),
-            "sbx-demo-app-4089496.scope"
+            scope_unit("demo-app", 0, 4089496),
+            "sbx-demo-app-0-4089496.scope"
         );
-        assert_eq!(scope_unit("ops-cli", 62727), "sbx-ops-cli-62727.scope");
+        assert_eq!(scope_unit("ops-cli", 7, 62727), "sbx-ops-cli-7-62727.scope");
+        // The launcher's pid stays the last segment whatever the counter reached, which is what
+        // every reader of a unit name takes it from.
+        assert!(scope_unit("ops-cli", 41, 62727).ends_with("-62727.scope"));
     }
 }

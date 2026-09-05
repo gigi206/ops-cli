@@ -1,9 +1,14 @@
 //! Integration tests for `sbx projects`: the built binary lists and removes the per-project
-//! runtime trees under `<data>/projects/<id>`. Host-side filesystem work — no sandbox and no
+//! runtime trees under `<data>/projects/<id>`. Mostly host-side filesystem work — no sandbox and no
 //! network — against redirected XDG dirs and fabricated trees (a directory with a `project` marker
 //! whose recorded path is present = `idle`, absent = `dead`, or no marker = `markerless`). They
 //! never touch the shared store, so `--gc` is exercised only in its no-op branch here; its real
 //! shared-store collection is proven end-to-end in `run.rs`.
+//!
+//! One test is not host-side: what a sweep does *not* provision can only be read off a real
+//! preparation, so it seeds a project store with a launch first and skips where the host cannot
+//! sandbox. The registry it declares is a refusing loopback port, so it still reaches no network of
+//! its own.
 //!
 //! One test does read the *order* of `sbx gc --all`'s two passes, and the second of those passes
 //! needs `nix-store` to run at all. It skips where the tool is absent rather than reading the
@@ -764,6 +769,71 @@ fn gc_provisions_nothing_for_a_project_that_has_no_store() {
         "gc provisioned the base userland ({}) only to report there was nothing to reclaim:\n{}",
         base_roots.display(),
         text(&out)
+    );
+}
+
+/// `sbx gc` reclaims without provisioning the distribution a project declares.
+///
+/// The sweep decides what to keep from the locks on disk and the sessions that are live, so it
+/// needs no userland at all. Fetching an image and running a project's build commands in order to
+/// free space would be work done for a question that never asked for it, and on a project whose
+/// derived tree does not exist yet it would create one before deciding whether it was worth
+/// keeping.
+///
+/// Driven against a registry that cannot answer, which is what makes the two arms decisive. A
+/// launch does stand on that userland, so it fails naming the refused connection; the sweep, in the
+/// same project against the same declaration, exits cleanly. The control arm is what says the
+/// declaration was in force at all: without it a sweep that provisioned nothing would be
+/// indistinguishable from a configuration the launcher never read.
+#[test]
+fn gc_reclaims_without_provisioning_the_declared_distribution() {
+    let fx = Project::new("projects");
+    // Seeds the project store, which is what carries the sweep past its "no per-project store yet"
+    // early return and into the preparation this test is about.
+    probe_or_skip!(
+        "the gc-provisions-no-distribution check",
+        fx.run(&["run", "--", "true"])
+    );
+
+    // A registry that refuses rather than one that is slow: port 1 on loopback answers
+    // `Connection refused` at once, so nothing here waits on a network or reaches one.
+    fx.write_project("distro = \"oci:127.0.0.1:1/nope:latest\"\n");
+    let trusted = fx.run(&["trust", ".sbx.toml"]);
+    assert!(
+        trusted.status.success(),
+        "sbx trust failed:\n{}",
+        text(&trusted)
+    );
+
+    // The control arm. A launch runs *on* that userland, so the declaration reaches the provisioner
+    // and the refusal is what comes back.
+    let launched = fx.run(&["run", "--", "true"]);
+    let launch_output = text(&launched);
+    assert!(
+        !launched.status.success(),
+        "a launch on an unreachable image must fail:\n{launch_output}"
+    );
+    assert!(
+        launch_output.contains("cannot provision") && launch_output.contains("Connection refused"),
+        "the launch must fail on the refused registry connection:\n{launch_output}"
+    );
+
+    // And the sweep does not.
+    let swept = fx.run(&["gc"]);
+    let sweep_output = text(&swept);
+    assert!(
+        swept.status.success(),
+        "a sweep must not need the declared userland:\n{sweep_output}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&swept.stderr).contains("cannot provision"),
+        "the sweep provisioned the declared distribution:\n{sweep_output}"
+    );
+    // ...and it did run: a sweep that returned before deciding anything would also print no
+    // provisioning error.
+    assert!(
+        String::from_utf8_lossy(&swept.stdout).contains("collectable now"),
+        "the sweep must report what it would reclaim:\n{sweep_output}"
     );
 }
 

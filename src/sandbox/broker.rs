@@ -1046,7 +1046,12 @@ impl PluginProcess {
             writer,
             reader_side,
             env,
-        } = super::resolver::spawn_caged_plugin(bwrap, &plan, PLUGIN_DEADLINE)?;
+        } = super::resolver::spawn_caged_plugin(
+            bwrap,
+            &plan,
+            PLUGIN_DEADLINE,
+            &super::resolver::plugin_cage_limits(),
+        )?;
 
         let mut me = Self {
             child,

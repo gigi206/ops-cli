@@ -110,10 +110,11 @@ fn a_lapse_in_trust_does_not_look_like_a_removed_inline_flake() {
 /// does not exist yet it creates one on the way. The sweep reads neither: it keys what to keep on
 /// the locks on disk and the sessions that are live.
 ///
-/// Guarded by reading this module rather than by running one, because the failure is a
-/// substitution and not an absence. The wrong preparation compiles, reports the same numbers, and
-/// differs only in what it did first. Driving it instead would need a project store, which only a
-/// real launch creates.
+/// Guarded by reading this module because the failure is a substitution and not an absence: the
+/// wrong preparation compiles, reports the same numbers, and differs only in what it did first, so
+/// nothing in the sweep's own output says which one ran. The behaviour is pinned as well, by an
+/// end-to-end test that declares an image no registry answers for and reads a launch and a sweep
+/// apart; that one needs a project store and a host that can sandbox, and this one needs neither.
 #[test]
 fn the_sweep_prepares_without_provisioning_a_distribution() {
     let text = std::fs::read_to_string(

@@ -1145,8 +1145,9 @@ impl TaskEngine {
             NetPolicy::Isolated,
             argv,
         )
-        // The invocation number is part of the cage's name because it is part of its identity: the
-        // name becomes a systemd scope, and systemd refuses a launch outright on a live collision.
+        // The invocation number is part of the cage's name because it is part of its identity: it
+        // is the one number naming this invocation everywhere else it is named, and a cage shown in
+        // `systemctl --user` or `systemd-cgls` reads back to the invocation that stood it up.
         .map(|s| s.with_cage_slug(format!("{}-task{invocation}", self.slug)))
         .map_err(|e| format!("cannot build the task cage: {e:?}"))
     }

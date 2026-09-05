@@ -3247,10 +3247,14 @@ fn mark_limit_origins(
     }
 }
 
-/// The global config's resource limits, for `doctor` (host-level, with no project context). Reads
+/// The global config's resource limits, for the two answers that have no project context. Reads
 /// the global config — trusted by location — and validates its `[limits]`, discarding warnings:
 /// `doctor` surfaces availability, while `sbx config` is the project-aware, warning-bearing view.
 /// An absent or limit-free global config yields the built-in defaults (all-`None`).
+///
+/// The second reader is the cage a plugin runs in, which
+/// [`crate::sandbox::resolver`] resolves these ceilings for: it stands outside any one launch and
+/// is sbx's own machinery rather than a project's, so the host's table is the one that bounds it.
 pub(crate) fn global_limits() -> crate::sandbox::cgroup::Limits {
     let mut warnings = Vec::new();
     let global = read_global(&mut warnings);

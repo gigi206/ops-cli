@@ -379,6 +379,9 @@ pub(super) fn build(
     // `nix:` bins and every direct package's bin on PATH (so a command that needs e.g. `jq` declares
     // it), and sbx's own store + CA bundle bound. The cage is built once, here: a resolver never sees
     // another resolver's bin, only the direct layer's.
+    // The same name the session's own cage will carry, so a resolve command shows up under the
+    // project or app it is resolving for; the cage marks it as its own.
+    let resolve_slug = crate::sandbox::naming::cage_slug(runtime.app(), &prep.cwd);
     let resolve_cage = {
         let mut bins = prep.userland.bin_paths.clone();
         bins.extend(bin_paths.iter().cloned());
@@ -388,6 +391,8 @@ pub(super) fn build(
             shell_bin: prep.userland.shell_bin.as_path(),
             ca_bundle: prep.userland.ca_bundle_src.as_path(),
             bins,
+            limits: &prep.cfg.limits,
+            slug: &resolve_slug,
         }
     };
     for kind in crate::sandbox::prebuilt::RESOLVE_ORDER {
@@ -2343,6 +2348,10 @@ fn mise_env(prep: &Prepared) -> Result<Vec<(String, String)>, ExitCode> {
         &mise_bin,
         &mise_cfg.files,
         &stage,
+        &prep.cfg.limits,
+        // The project's own name: a mise file is the project's, never an app's, so nothing here is
+        // resolved on an app's behalf.
+        &crate::sandbox::naming::cage_slug(None, &prep.cwd),
     )
     .map_err(|e| {
         crate::diag::error(&format!("sbx: mise [env] resolution failed: {e}"));

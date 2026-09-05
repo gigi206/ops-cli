@@ -55,6 +55,13 @@ all: this is the process running code you did not write, and it is also the
 process a signer's credential is handed to. Nothing relaxes that denylist for a
 plugin, since a plugin brings no config of its own.
 
+The same reasoning puts it inside a **cgroup v2 scope** of its own, so a plugin that forks or
+allocates without end is bounded exactly as a runaway in the sandbox would be. The ceilings are the
+ones the **global** [`[limits]`](../configuration/limits) declares, not a project's: a plugin is
+sbx's machinery rather than the project's, and it is started before a launch exists and outlives
+each request inside one. Like everywhere else, the scope is best-effort and never the boundary. See
+[the enforcement stack](../concepts/enforcement#which-cages-run-inside-a-scope).
+
 **stderr is the diagnostic channel, and must never carry the value.** It is
 folded into the error of a failed run, and relayed as an `sbx: warning:` line
 when a run resolves *nothing*: so a plugin can explain a misspelled locator or

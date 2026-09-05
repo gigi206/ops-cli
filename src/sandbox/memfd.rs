@@ -97,7 +97,8 @@ mod tests {
     /// creates a descriptor, since that is who owes the child a way to keep it.
     ///
     /// The list of staging entry points is this guard's upkeep, and it has been short twice: keyed
-    /// on `cage_command` alone it missed two harnesses, and without `compose_cage` it missed every
+    /// on the shared launch command alone it missed two harnesses that stage their own descriptors
+    /// and spawn bubblewrap directly, and without the plugin path's own composition it missed every
     /// plugin cage. Both times a suite that launches real cages found what reading did not. A new
     /// way to stage a descriptor belongs in that list the day it is written.
     ///
@@ -116,7 +117,6 @@ mod tests {
                 "memfd::write(",
                 "memfds(",
                 "argv::compose(",
-                "compose_cage(",
             ]
             .iter()
             .any(|needle| crate::testutil::calls_function(text, needle))

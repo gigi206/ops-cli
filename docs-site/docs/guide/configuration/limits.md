@@ -19,6 +19,13 @@ tasks_max   = 8192
 project, ignored from an untrusted one: because loosening a limit (a higher
 `tasks_max`, an unbounded ceiling) reduces the anti-DoS protection.
 
+What it bounds is every cage a launch stands up, not only the session: a task, a task pool install,
+a userland build under [`[distro] run`](distro), a `<backend>:resolve` command and the `mise` run
+that resolves a project's `[env]` each get a scope carrying these ceilings. A **plugin** cage is the
+one exception and takes the global `[limits]` wherever it runs, since it is sbx's own machinery
+rather than the project's. See
+[the enforcement stack](../concepts/enforcement#which-cages-run-inside-a-scope).
+
 See also: [Enforcement stack](../concepts/enforcement) · [The trust gate](../concepts/trust) · [`[app.<name>]`](apps).
 
 ## The fields
@@ -74,9 +81,17 @@ the host:
 systemctl --user list-units --all 'sbx-*' --plain --no-pager
 ```
 
-The unit is named `sbx-<slug>-<pid>.scope`, where the pid is the `sbx` process that
-launched the cage. `ps` and `systemd-cgls` show the same name, and
+The unit is named `sbx-<slug>-<n>-<pid>.scope`, where the pid is the `sbx` process that launched
+the cage and `n` counts the cages that process has stood up. Two numbers, because a transient unit
+name must be free when it is asked for and neither alone is enough: the pid separates two
+concurrent launches, while `n` separates the cages of one launch (its session, its tasks, a
+userland build, a resolve command, a plugin), which follow each other closely enough that the
+previous name is not always released yet. `ps` and `systemd-cgls` show the same name, and
 [`sbx session ls`](../cli/session) is the same view from sbx's side.
+
+A launch owns more than one unit, because a launch stands up more than one cage. Which ones, and
+which ceilings each takes, is in
+[the enforcement stack](../concepts/enforcement#which-cages-run-inside-a-scope).
 
 A scope normally disappears on its own once its cage exits: systemd watches the scope's
 cgroup and reclaims the unit when it empties. That watch is an inotify watch, and a

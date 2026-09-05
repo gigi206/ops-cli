@@ -259,44 +259,55 @@ fn union_cage_members(mut subtree: Vec<(u32, u64)>, scope: Vec<(u32, u64)>) -> V
     subtree
 }
 
-/// The members of the cage's transient resource-limit scope, as `(pid, start_ticks)`.
+/// The members of every transient resource-limit scope this launcher stood up, as
+/// `(pid, start_ticks)`.
 ///
-/// The launch wraps the cage in a systemd user scope whose unit name embeds the launcher's pid —
-/// `sbx-<slug>-<pid>.scope`, the same pid the session record pins — and the scope's cgroup lists
-/// exactly the cage's processes. Reading it gives a teardown a reliable member set even when the
-/// ppid subtree does not (a scope can reparent the cage off the launcher). Empty when no scope was
-/// created (the best-effort degraded launch on a host without a usable systemd user manager), in
-/// which case the ppid subtree is the only source and covers that case.
+/// The launch wraps each cage in a systemd user scope whose unit name ends on the launcher's pid —
+/// `sbx-<slug>-<n>-<pid>.scope`, the same pid the session record pins — and each scope's cgroup
+/// lists exactly that cage's processes. Reading them gives a teardown a reliable member set even
+/// when the ppid subtree does not (a scope can reparent a cage off the launcher). Empty when no
+/// scope was created (the best-effort degraded launch on a host without a usable systemd user
+/// manager), in which case the ppid subtree is the only source and covers that case.
+///
+/// **Every** such scope, not one of them. A launch owns more than one cage: the session's, and one
+/// apiece for the helpers it stands up (a declared operation, a pool install, a userland build, a
+/// resolve command, a plugin), and a plugin's lives as long as the session does. They are told
+/// apart only by their slug, so singling one out would mean reading some arbitrary cage's
+/// processes and calling them the session's. They are also all this launcher's own, and this
+/// launcher is the process being stopped, so taking them together is what the teardown means.
 fn scope_members(pid: u32) -> Vec<(u32, u64)> {
-    let Some(procs) = scope_cgroup_procs(pid) else {
-        return Vec::new();
-    };
-    procs
-        .split_whitespace()
+    scope_cgroup_procs(pid)
+        .iter()
+        .flat_map(|procs| procs.split_whitespace())
         .filter_map(|s| s.parse::<u32>().ok())
         .filter_map(|p| read_start_ticks(p).map(|start| (p, start)))
         .collect()
 }
 
-/// Whether a cgroup directory name is the cage scope for `pid` — `sbx-<slug>-<pid>.scope`. The
-/// `-<pid>` segment is dash-delimited, so a longer pid ending in the same digits (or a slug ending
-/// in digits) cannot match by accident; the name is parsed by the module that builds it, so this
-/// property and the sweep's both rest on one reading of the format.
+/// Whether a cgroup directory name is one of `pid`'s cage scopes — `sbx-<slug>-<n>-<pid>.scope`.
+/// The trailing `-<pid>` segment is dash-delimited, so a longer pid ending in the same digits (or a
+/// counter ending in them) cannot match by accident; the name is parsed by the module that builds
+/// it, so this property and the sweep's both rest on one reading of the format.
+///
+/// One launcher owns several, and the question is deliberately about the launcher rather than about
+/// which of its cages a name belongs to: see [`scope_members`] for why the teardown wants them all.
 fn is_cage_scope(name: &str, pid: u32) -> bool {
     crate::sandbox::cgroup::scope_launcher_pid(name) == Some(pid)
 }
 
-/// Find the cage scope's `cgroup.procs` contents. `None` if no such scope exists (a launch degraded
-/// to no scope) or the cgroup is unreadable.
-fn scope_cgroup_procs(pid: u32) -> Option<String> {
-    let dir = crate::sandbox::cgroup::cage_scope_dirs()
+/// The `cgroup.procs` contents of every cage scope this launcher owns. Empty when it created none
+/// (a launch degraded to no scope), and a scope whose cgroup cannot be read is left out rather than
+/// aborting the rest — a partial member set still tears down what it names.
+fn scope_cgroup_procs(pid: u32) -> Vec<String> {
+    crate::sandbox::cgroup::cage_scope_dirs()
         .into_iter()
-        .find(|d| {
+        .filter(|d| {
             d.file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| is_cage_scope(n, pid))
-        })?;
-    std::fs::read_to_string(dir.join("cgroup.procs")).ok()
+        })
+        .filter_map(|d| std::fs::read_to_string(d.join("cgroup.procs")).ok())
+        .collect()
 }
 
 /// Open a pidfd for `pid`, or the `errno` the kernel refused with.
@@ -849,6 +860,32 @@ mod tests {
         assert!(!is_cage_scope("sbx-probe-42.service", 42));
         assert!(!is_cage_scope("other-probe-42.scope", 42));
         assert!(!is_cage_scope("sbx-probe-99.scope", 42));
+    }
+
+    /// Every scope one launcher stood up answers for that launcher.
+    ///
+    /// A launch owns more than one: the session's own, and one apiece for the helper cages it
+    /// stands up. They differ only in the slug, and a plugin's outlives each request it serves, so
+    /// a member lookup keyed on the launcher must accept them all. Reading one of them as "the
+    /// cage" would hand a teardown some other cage's processes and leave the session running.
+    #[test]
+    fn every_scope_of_one_launcher_answers_for_it() {
+        for name in [
+            // The session's own cage.
+            "sbx-demo-app-0-42.scope",
+            // A declared operation, a pool install, a derived-userland build, a resolve command.
+            "sbx-demo-app-task3-1-42.scope",
+            "sbx-task-pool-2-42.scope",
+            "sbx-demo-app-build-3-42.scope",
+            "sbx-demo-app-resolve-4-42.scope",
+            // A plugin, which stands for the whole session rather than for one request.
+            "sbx-plugin-demo-vault-5-42.scope",
+        ] {
+            assert!(is_cage_scope(name, 42), "{name}");
+        }
+        // Another launcher's cages stay another launcher's, whatever they are named.
+        assert!(!is_cage_scope("sbx-demo-app-0-43.scope", 42));
+        assert!(!is_cage_scope("sbx-plugin-demo-vault-5-43.scope", 42));
     }
 
     /// A pid no process can hold: above `PID_MAX_LIMIT`, the ceiling `/proc/sys/kernel/pid_max`

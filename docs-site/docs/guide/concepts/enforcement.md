@@ -14,12 +14,16 @@ layer is not the whole boundary.
 
 See also: [Security model](security-model) · [`limits`](../configuration/limits) · [Networking](../networking/).
 
-Every launch: `sbx run`, `sbx app`, and even the `sbx doctor`
-smoke: goes through the same three always-on layers:
+Every launch, `sbx run` and `sbx app` alike, goes through the same three always-on layers:
 
 1. **bubblewrap**: namespaces, `no_new_privs`, all capabilities dropped.
 2. **seccomp**: a two-filter syscall denylist (Posture A).
 3. **cgroup v2**: resource limits to bound denial-of-service, best-effort.
+
+The first two hold for every cage `sbx` builds without exception, the `sbx doctor` smoke included.
+The third is the one a cage can sit outside of, and
+[which cages run inside a scope](#which-cages-run-inside-a-scope) names the two that do not, with
+the reason.
 
 ```mermaid
 flowchart TB
@@ -265,6 +269,41 @@ scheduler, and a hard quota would mostly just slow legitimate builds.
 **The memory ceiling is per-cage, not host-global.** `MemoryMax=90%` bounds one
 cage relative to total RAM, so *N* concurrent cages can sum past it. The clean
 host-wide guarantee is the **task cap**; the memory ceiling is per-cage protection.
+
+### Which cages run inside a scope
+
+A launch is not the only cage `sbx` stands up. Deriving a project's userland, resolving a download
+URL, driving `mise` over a project's files, running a plugin: each is a cage of its own, and which
+of them a scope wraps comes down to one question. Does the cage run code `sbx` did not write?
+
+Where it does, the cage runs inside a scope, so a runaway there is bounded exactly as a runaway in
+the session would be:
+
+| Cage | What runs in it |
+|---|---|
+| the session | the command you launched |
+| a [task](../tasks/) | a declared operation, with its credential |
+| a task pool install | `mise`, installing the tools a project's operations declared |
+| a [`[distro] run`](../configuration/distro) build | a distribution's own package tooling, as uid 0 in its namespace |
+| a `<backend>:resolve` command | a profile's own command, on the shared network |
+| the `mise` environment resolution | `mise`, over the files a project declared |
+| a [plugin](../plugins/) (resolver, broker or signer) | third-party code, which may be holding a plaintext credential |
+
+Two cages stay outside, and both run one of `sbx`'s own fixed probes rather than anything a
+configuration chose: the [`sbx doctor`](../getting-started/doctor) smoke, which reports what the
+kernel granted a minimal cage, and the format of `sbx`'s own [storage volume](../cli/storage)
+image. Neither takes an instruction from a project, so a limit would have nothing to bound, and
+putting a probe of the host behind a mechanism the host may not have is the wrong way round.
+
+Which ceilings a cage gets follows the same reading. A cage standing up a launch takes the
+configuration that launch resolved, per app and per one-shot override like the session itself. A
+plugin cage takes the **global** `[limits]` instead: it is `sbx`'s own machinery rather than the
+project's, it is started before a launch exists and outlives each request inside one, and a project
+must not be able to say how much of the host `sbx`'s own helper may consume.
+
+Each cage takes a transient unit of its own rather than joining the session's. `systemd-run --scope`
+creates a unit, it does not join one, so a shared scope is not on offer; and a unit each is what
+gives every cage the same bound plus a name that reads back to it in `systemctl --user`.
 
 ### Best-effort, never the boundary
 

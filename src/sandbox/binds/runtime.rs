@@ -42,6 +42,18 @@ pub(crate) enum Runtime<'a> {
     ProjectApp(&'a str),
 }
 
+impl<'a> Runtime<'a> {
+    /// The app this launch is for, when it is one. Which of the two app runtimes it is says where
+    /// the home lives, never who the launch is: everything that names a launch — its cage slug, its
+    /// hostname, its scope, the lock it resolves against — asks only for the name.
+    pub(crate) fn app(self) -> Option<&'a str> {
+        match self {
+            Runtime::ProjectDefault => None,
+            Runtime::GlobalApp(name) | Runtime::ProjectApp(name) => Some(name),
+        }
+    }
+}
+
 /// Host-side runtime paths for `project` under sbx's data directory, for the given
 /// [`Runtime`]. The home and the synthetic `/etc` are always siblings so the latter sits
 /// outside every read-write bind (module integrity note). An app name is a validated single

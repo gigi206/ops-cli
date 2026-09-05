@@ -23,11 +23,10 @@ fn engine_with(
 /// The engine, wired to a real provisioned userland — or `None` to skip.
 ///
 /// `slug` has to be this test's alone. It names the cage, and from there the systemd scope
-/// (`sbx-<slug>-task<n>-<pid>.scope`), the cage hostname, and the tool pool. The pid in that
-/// scope name distinguishes two cages of one project because production launches them from
-/// separate processes; tests are threads of a single one, so every test here shares that pid
-/// and only the slug can tell their scopes apart. Sharing it makes `systemd-run` refuse the
-/// second launch outright on the live unit name, whichever test happens to reach it first.
+/// (`sbx-<slug>-task<n>-<seq>-<pid>.scope`), the cage hostname, and the tool pool. A distinct
+/// slug is what keeps each test's cages legible as its own; the scope name would stay unique
+/// without it, since the launcher counts the scopes it asks for, but two tests sharing a slug
+/// would then be indistinguishable in `systemctl --user` and would share a tool pool.
 fn engine_for(tasks: Vec<TaskSpec>, project: &Path, slug: &str) -> Option<(TaskEngine, TmpDir)> {
     engine_on(tasks, project, slug, None)
 }

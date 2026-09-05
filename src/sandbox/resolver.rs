@@ -120,7 +120,8 @@ pub(super) struct CagedPlugin {
     pub(super) writer: std::os::unix::net::UnixStream,
     /// The same connection, cloned, for the buffered reader that consumes answers.
     pub(super) reader_side: std::os::unix::net::UnixStream,
-    /// The descriptor files [`compose_cage`] produced, held for as long as bwrap needs to read them.
+    /// The descriptor files [`plugin_cage_command`] produced, held for as long as bwrap needs to
+    /// read them.
     pub(super) env: Vec<std::fs::File>,
 }
 
@@ -143,6 +144,7 @@ pub(super) fn spawn_caged_plugin(
     bwrap: &Path,
     plan: &CagePlan<'_>,
     deadline: std::time::Duration,
+    limits: &super::cgroup::Limits,
 ) -> io::Result<CagedPlugin> {
     use std::os::unix::net::UnixStream;
     use std::process::{Command, Stdio};
@@ -150,16 +152,16 @@ pub(super) fn spawn_caged_plugin(
     let (ours, theirs) = UnixStream::pair()?;
     ours.set_read_timeout(Some(deadline))?;
     ours.set_write_timeout(Some(deadline))?;
-    let (argv, env) = compose_cage(plan)?;
+    let (prog, argv, env) = plugin_cage_command(bwrap, plan, limits)?;
 
     let reader_side = ours.try_clone()?;
-    let mut command = Command::new(bwrap);
+    let mut command = Command::new(prog);
     command
         .args(argv)
         .stdin(Stdio::from(std::os::fd::OwnedFd::from(theirs.try_clone()?)))
         .stdout(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
         .stderr(Stdio::null());
-    // The descriptors `compose_cage` staged are close-on-exec; this is what carries them into the
+    // The descriptors the composition staged are close-on-exec; this is what carries them into the
     // one exec that reads them. See [`super::memfd::write`].
     super::memfd::inherit_across_exec(&mut command, &env);
     let child = command.spawn().map_err(|e| {
@@ -177,22 +179,19 @@ pub(super) fn spawn_caged_plugin(
     })
 }
 
-/// Vet the executable, resolve everything the grant asks of this host, and build the argv that
+/// Vet the executable, resolve everything the grant asks of this host, and describe the cage that
 /// runs the plugin under it. Everything up to the point where a caller decides *how* to run it:
 /// a resolver waits for its output, a broker keeps talking to it.
 ///
-/// The returned files are descriptors bwrap is told to read: the cage's environment, and the
-/// compiled seccomp filters. They must stay open until bwrap has read them — which for a
-/// long-running child means for as long as the child lives.
-///
-/// The filters are the same mandatory denylist every agent cage carries, and they are here because
-/// this cage is the one running code sbx did not write. Until they were, a plugin from a store had
-/// the `ptrace`/`bpf`/`perf_event_open`/`userfaultfd`/keyring set and the whole mount-and-namespace
-/// family available to it, while the agent's own cage refused them: the wrong way round, since the
-/// plugin is also the process that may be told a credential. A plugin has no config of its own, so
-/// nothing relaxes them here — [`SandboxSpec`] carries the unrelaxed policy by default and this path
-/// never sets another.
-pub(super) fn compose_cage(plan: &CagePlan<'_>) -> io::Result<(Vec<OsString>, Vec<std::fs::File>)> {
+/// The mandatory seccomp denylist is not a step a caller takes: it is compiled into the argument
+/// list this spec composes to. The filters are the same ones every agent cage carries, and they are
+/// here because this cage is the one running code sbx did not write. Until they were, a plugin from
+/// a store had the `ptrace`/`bpf`/`perf_event_open`/`userfaultfd`/keyring set and the whole
+/// mount-and-namespace family available to it, while the agent's own cage refused them: the wrong
+/// way round, since the plugin is also the process that may be told a credential. A plugin has no
+/// config of its own, so nothing relaxes them here — [`SandboxSpec`] carries the unrelaxed policy by
+/// default and this path never sets another.
+pub(super) fn cage_spec_for(plan: &CagePlan<'_>) -> io::Result<SandboxSpec> {
     // The grant rules this plugin's *type* imposes, applied again where the grant is honoured. The
     // manifest loader already refused them, so nothing reaches here today — which is the point: the
     // check that matters is the one standing between a grant and the cage it builds, not the one
@@ -279,10 +278,48 @@ pub(super) fn compose_cage(plan: &CagePlan<'_>) -> io::Result<(Vec<OsString>, Ve
             )
         })?;
 
-    // The returned descriptor is where the cage's environment is read from, and the reason it is a
-    // descriptor is this cage in particular: a plugin's `allow_env` is how it is handed its *own*
-    // credential (a vault token, an age key), and an argument list is world-readable.
-    super::argv::compose(&spec)
+    // The cage's environment travels on a descriptor rather than the argument list, and the reason
+    // is this cage in particular: a plugin's `allow_env` is how it is handed its *own* credential (a
+    // vault token, an age key), and an argument list is world-readable.
+    //
+    // The slug names the plugin as it was configured, sanitized to the charset a scope name and a
+    // hostname accept, so a plugin cage reads back to the plugin in `systemctl --user` and `ps`.
+    Ok(spec.with_cage_slug(format!(
+        "plugin-{}",
+        super::naming::sanitize_label(plugin.configured_as)
+    )))
+}
+
+/// The plugin cage as a command to run: the composed argument list with its filters, and the
+/// resource scope that bounds it.
+///
+/// A plugin runs code sbx did not write, so it is bounded like every other cage that does — through
+/// the same shared launch command a session goes through, rather than a second assembly beside it.
+/// The ceilings are the **host's** own ([`plugin_cage_limits`]): a plugin is sbx's machinery, not
+/// the project's, and a project must not be able to say how much of the host one may consume.
+///
+/// The returned files are descriptors bwrap is told to read: the cage's environment, and the
+/// compiled seccomp filters. They must stay open until bwrap has read them — which for a
+/// long-running child means for as long as the child lives.
+pub(super) fn plugin_cage_command(
+    bwrap: &Path,
+    plan: &CagePlan<'_>,
+    limits: &super::cgroup::Limits,
+) -> io::Result<(PathBuf, Vec<OsString>, Vec<std::fs::File>)> {
+    super::launch::cage_command(bwrap, &cage_spec_for(plan)?, limits)
+}
+
+/// The ceilings a plugin cage runs under, in one definition for all three plugin types.
+///
+/// The global configuration's `[limits]`, because a plugin cage stands outside any one launch: a
+/// resolver runs before the agent's cage exists and again on the refresh thread while it does, a
+/// broker and a signer are started for a session and outlive each request in it, and `sbx plugins`
+/// runs one with no project configuration loaded at all. Reading the host's own table gives every
+/// one of them the same answer, and leaves the ceiling on sbx's machinery where the host set it
+/// rather than where a project did. An absent or limit-free global config yields the built-in
+/// defaults, which is what a cage with nothing declared runs under everywhere else.
+pub(super) fn plugin_cage_limits() -> super::cgroup::Limits {
+    crate::config::global_limits()
 }
 
 /// How long sbx waits on one host-side resolution that reaches nothing but itself.
@@ -494,17 +531,25 @@ pub(crate) fn run(
     reff: &str,
     brokers: &[super::broker::Reachable],
 ) -> io::Result<String> {
-    run_within(bwrap, plugin, reff, brokers, deadline_for(brokers))
+    run_within(
+        bwrap,
+        plugin,
+        reff,
+        brokers,
+        deadline_for(brokers),
+        &plugin_cage_limits(),
+    )
 }
 
-/// [`run`], with the deadline passed in so a test can prove the bound without waiting out a real
-/// one.
+/// [`run`], with the deadline and the ceilings passed in so a test can prove the bound without
+/// waiting out a real one, and stand a cage up against ceilings of its own choosing.
 fn run_within(
     bwrap: &Path,
     plugin: &ResolverPlugin,
     reff: &str,
     brokers: &[super::broker::Reachable],
     deadline: std::time::Duration,
+    limits: &super::cgroup::Limits,
 ) -> io::Result<String> {
     let plan = CagePlan {
         kind: crate::plugins::PluginKind::Resolver,
@@ -519,8 +564,8 @@ fn run_within(
     };
     // `env` holds the descriptors open until bwrap has run, and prepares the exec that inherits
     // them — they are close-on-exec until then.
-    let (argv, env) = compose_cage(&plan)?;
-    let mut cmd = Command::new(bwrap);
+    let (prog, argv, env) = plugin_cage_command(bwrap, &plan, limits)?;
+    let mut cmd = Command::new(prog);
     cmd.args(argv);
     super::memfd::inherit_across_exec(&mut cmd, &env);
     let out = match output_within(
@@ -1320,7 +1365,8 @@ mod tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let p = plugin_in(dir.path(), SandboxGrant::default());
-        let (argv, keep_open) = compose_cage(&plan_for(&p, "test://x")).expect("a cage argv");
+        let spec = cage_spec_for(&plan_for(&p, "test://x")).expect("a cage spec");
+        let (argv, keep_open) = crate::sandbox::argv::compose(&spec).expect("a cage argv");
 
         // Two filters, each on its own descriptor, ahead of everything else — the same shape the
         // agent's launch emits.
@@ -1364,9 +1410,61 @@ mod tests {
         }
     }
 
+    /// A plugin cage runs inside sbx's own resource scope.
+    ///
+    /// This is the cage running code sbx did not write, so a runaway in it is bounded the way a
+    /// runaway in a session is. Read from inside the cage rather than off the command line, so what
+    /// is asserted is the control group the process actually landed in.
+    #[test]
+    fn a_plugin_cage_runs_inside_the_resource_limit_scope() {
+        let dir = crate::testutil::TmpDir::new();
+        let exec = dir.path().join("resolve");
+        std::fs::write(&exec, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let seen = dir.path().join("cgroup.txt");
+        let fake = dir.path().join("fake-bwrap");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\ncat /proc/self/cgroup > '{}'\n", seen.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Whether this host can carry a scope at all is the launch path's own decision, taken
+        // against the same ceilings the cage will run under: where it applies none there is nothing
+        // to assert, and saying so is not the same as passing.
+        let limits = crate::sandbox::cgroup::Limits::default();
+        let (wrapper, _) = crate::sandbox::cgroup::wrap(&fake, Vec::new(), &limits, "probe");
+        if wrapper == fake {
+            skip_incapable!(
+                "skipping the plugin scope check: this host applies no resource limits"
+            );
+            return;
+        }
+
+        let p = plugin_in(dir.path(), SandboxGrant::default());
+        let mut caged = spawn_caged_plugin(
+            &fake,
+            &plan_for(&p, "test://x"),
+            std::time::Duration::from_secs(5),
+            &limits,
+        )
+        .expect("the recorded cage starts");
+        caged.child.wait().expect("the recorded cage exits");
+
+        let cgroup = std::fs::read_to_string(&seen).unwrap();
+        let unit = format!("-{}.scope", std::process::id());
+        assert!(
+            cgroup.contains("sbx-plugin-test-") && cgroup.contains(&unit),
+            "a plugin cage runs outside sbx's own resource scope: {cgroup}"
+        );
+    }
+
     /// The grant a plugin's *type* forbids is refused where the grant is honoured, not only where
-    /// the manifest was read. Driven through `compose_cage` with a plan built by hand, which is
-    /// exactly the shape a second loader — a cache, a regression — would produce: the manifest
+    /// the manifest was read. Driven through the cage description with a plan built by hand, which
+    /// is exactly the shape a second loader — a cache, a regression — would produce: the manifest
     /// check cannot see it, so this one has to.
     #[test]
     fn a_broker_or_signer_that_asks_for_the_network_is_refused_at_the_spawn() {
@@ -1398,7 +1496,7 @@ mod tests {
                 args: Vec::new(),
                 brokers: &[],
             };
-            let err = compose_cage(&plan).expect_err("the type forbids this grant");
+            let err = cage_spec_for(&plan).expect_err("the type forbids this grant");
             assert_eq!(
                 err.kind(),
                 io::ErrorKind::PermissionDenied,
@@ -1429,7 +1527,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        compose_cage(&plan_for(&plugin, "test://x"))
+        cage_spec_for(&plan_for(&plugin, "test://x"))
             .expect("a resolver may reach the network; the type guard must not touch it");
     }
 
@@ -2564,6 +2662,9 @@ printf 'run-%s' "$n""#,
             "test://x",
             &[],
             std::time::Duration::from_millis(500),
+            // The built-in ceilings, said here rather than read off this machine's own global
+            // config: what bounds the cage under test is the test's own choice.
+            &crate::sandbox::cgroup::Limits::default(),
         )
         .expect_err("a plugin past its deadline must not resolve");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");

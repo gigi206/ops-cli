@@ -48,6 +48,14 @@ pub(crate) struct ResolveCage<'a> {
     /// fails at upgrade — loudly, one `re-resolve failed` line per package — while launches keep
     /// working off the pin already recorded.
     pub(crate) bins: Vec<PathBuf>,
+    /// The resource ceilings this cage runs under. The command is a profile's own, arbitrary and
+    /// running on the shared network, so it is bounded like every other cage that runs code sbx did
+    /// not write; the caller supplies the configuration's ceilings, since it is the one that loaded
+    /// them.
+    pub(crate) limits: &'a crate::sandbox::cgroup::Limits,
+    /// The name slug the cage is known by, extended with this cage's own role. It is the project's
+    /// or app's, so a resolve command shows up under whatever it is resolving for.
+    pub(crate) slug: &'a str,
 }
 
 /// The owning counterpart of [`ResolveCage`], for `sbx upgrade`. A [`ResolveCage`] borrows its
@@ -60,6 +68,8 @@ pub(crate) struct UpgradeCage {
     shell_bin: PathBuf,
     ca_bundle: PathBuf,
     bins: Vec<PathBuf>,
+    limits: crate::sandbox::cgroup::Limits,
+    slug: String,
 }
 
 impl UpgradeCage {
@@ -104,6 +114,11 @@ impl UpgradeCage {
             shell_bin: userland.shell_bin.clone(),
             ca_bundle: userland.ca_bundle_src.clone(),
             bins,
+            // The same ceilings a launch of this project would run under: a roll runs the project's
+            // resolve commands, so it is the project's configuration that says how much they may
+            // consume. There is no app here for the same reason there is no app lock above.
+            limits: cfg.limits.clone(),
+            slug: super::naming::cage_slug(None, project),
         })
     }
 
@@ -115,6 +130,8 @@ impl UpgradeCage {
             shell_bin: self.shell_bin.as_path(),
             ca_bundle: self.ca_bundle.as_path(),
             bins: self.bins.clone(),
+            limits: &self.limits,
+            slug: &self.slug,
         }
     }
 }
@@ -189,6 +206,7 @@ fn resolve_cage_spec(
         NetPolicy::Shared,
         command.iter().map(OsString::from).collect(),
     )
+    .map(|s| s.with_cage_slug(format!("{}-resolve", cage.slug)))
 }
 
 /// Run a `resolve` command in its hermetic cage and return the validated download URL it prints. Fails
@@ -213,11 +231,12 @@ pub(crate) fn resolve_url(
             "cannot build the resolve sandbox for `{name}`: {e:?}"
         ))
     })?;
-    // `held` keeps the descriptors the composed list names — the seccomp filters and the cage's
-    // environment — open until bwrap has read them, and is read below to prepare the exec that
-    // inherits them.
-    let (argv, held) = super::argv::compose(&spec)?;
-    let mut command = Command::new(cage.bwrap);
+    // Through the shared launch command rather than by composing an argv here: that is what carries
+    // the mandatory seccomp filters and the resource scope this cage is bounded by. `held` keeps the
+    // descriptors the composed list names — the filters and the cage's environment — open until
+    // bwrap has read them, and is read below to prepare the exec that inherits them.
+    let (prog, argv, held) = super::launch::cage_command(cage.bwrap, &spec, cage.limits)?;
+    let mut command = Command::new(prog);
     command
         .args(argv)
         .stdin(Stdio::null())
@@ -289,8 +308,17 @@ mod tests {
             shell_bin: Box::leak(shell.to_path_buf().into_boxed_path()),
             ca_bundle: Box::leak(ca.to_path_buf().into_boxed_path()),
             bins: bins.iter().map(PathBuf::from).collect(),
+            limits: &INERT_LIMITS,
+            slug: "demo-app",
         }
     }
+
+    /// The default ceilings, which is what a configuration declaring no `[limits]` resolves to.
+    static INERT_LIMITS: crate::sandbox::cgroup::Limits = crate::sandbox::cgroup::Limits {
+        memory_high: None,
+        memory_max: None,
+        tasks_max: None,
+    };
 
     fn contains_pair(argv: &[OsString], flag: &str, first: &str) -> bool {
         argv.windows(2).any(|w| w[0] == flag && w[1] == first)
@@ -433,6 +461,8 @@ mod tests {
             shell_bin: Path::new("/nix/store/abc-bash/bin/bash"),
             ca_bundle: Path::new("/data/store/ca-bundle.crt"),
             bins: Vec::new(),
+            limits: &INERT_LIMITS,
+            slug: "demo-app",
         };
         let command = vec!["sh".to_string(), "-c".to_string(), "true".to_string()];
         let url = resolve_url(&cage, "probe", &command, |_, _| true, false, "`.tar.gz`")
@@ -443,6 +473,63 @@ mod tests {
         assert!(
             argv.lines().any(|l| l == "--add-seccomp-fd"),
             "a resolve cage is handed no seccomp filter: {argv}"
+        );
+    }
+
+    /// A resolve command runs inside sbx's own resource scope.
+    ///
+    /// The command is a profile's, not sbx's, and it runs on the shared network with whatever the
+    /// project's tools give it: a runaway there is bounded the way a runaway in a session is. Read
+    /// from inside the cage rather than off the command line, so what is asserted is the control
+    /// group the process actually landed in.
+    #[test]
+    fn a_resolve_cage_runs_inside_the_resource_limit_scope() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = crate::testutil::TmpDir::new();
+        let seen = tmp.join("cgroup.txt");
+        let fake = tmp.join("fake-bwrap");
+        // The stand-in also answers with a URL, or the caller fails before there is anything to
+        // read back.
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\ncat /proc/self/cgroup > '{}'\necho https://example.com/x.tar.gz\n",
+                seen.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Whether this host can carry a scope at all is the launch path's own decision, taken
+        // against the same ceilings the cage will run under: where it applies none there is nothing
+        // to assert, and saying so is not the same as passing.
+        let limits = crate::sandbox::cgroup::Limits::default();
+        let (wrapper, _) = crate::sandbox::cgroup::wrap(&fake, Vec::new(), &limits, "probe");
+        if wrapper == fake {
+            skip_incapable!(
+                "skipping the resolve scope check: this host applies no resource limits"
+            );
+            return;
+        }
+
+        let cage = ResolveCage {
+            bwrap: fake.as_path(),
+            store_src: PathBuf::from("/data/store/nix"),
+            shell_bin: Path::new("/nix/store/abc-bash/bin/bash"),
+            ca_bundle: Path::new("/data/store/ca-bundle.crt"),
+            bins: Vec::new(),
+            limits: &limits,
+            slug: "demo-app",
+        };
+        let command = vec!["sh".to_string(), "-c".to_string(), "true".to_string()];
+        resolve_url(&cage, "probe", &command, |_, _| true, false, "`.tar.gz`")
+            .expect("the recorded cage answers");
+
+        let cgroup = std::fs::read_to_string(&seen).unwrap();
+        let unit = format!("-{}.scope", std::process::id());
+        assert!(
+            cgroup.contains("sbx-demo-app-resolve-") && cgroup.contains(&unit),
+            "a resolve cage runs outside sbx's own resource scope: {cgroup}"
         );
     }
 }

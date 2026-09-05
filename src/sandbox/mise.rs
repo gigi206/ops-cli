@@ -107,21 +107,27 @@ pub(crate) fn bin(root: &Path) -> PathBuf {
 /// the keys mise needs. `project_binds` exposes the authorized project mise files
 /// (empty for a config-free invocation such as `--version`). Ensures the private
 /// home exists (owner-only) before returning the command.
+///
+/// `limits` and `slug` bound the cage and name it. mise is a program sbx did not write, run over
+/// files a project chose, so it is held to the ceilings the launch resolved like every other cage
+/// that runs something the project decided; `slug` is the launch's own, marked as this helper's, so
+/// the cage reads back to the project it is resolving for.
 fn command(
     bwrap: &Path,
     layout: &Layout,
     mise_bin: &Path,
     project_binds: &[ProjectBind],
     args: &[OsString],
+    limits: &super::cgroup::Limits,
+    slug: &str,
 ) -> io::Result<(Command, Vec<std::fs::File>)> {
     let home_src = ensure_home(layout)?;
     let store_nix = store::physical_path(layout, Path::new("/nix"));
-    let mut cmd = Command::new(bwrap);
     // The mandatory syscall denylist, as every other cage sbx builds carries it. This one is
     // assembled by hand rather than through the `SandboxSpec` keystone, which is how it came to have
     // the namespaces and the dropped capabilities but not the filters — and this is the cage that
-    // runs tool installation, the part of provisioning most shaped by what a project asks for.
-    // Nothing relaxes it: `[seccomp] allow` is a launch's grant to its own cage, not to a helper.
+    // drives provisioning off what a project asks for. Nothing relaxes it: `[seccomp] allow` is a
+    // launch's grant to its own cage, not to a helper.
     let seccomp = super::seccomp::memfds(&super::seccomp::SeccompPolicy::default())?;
     let mut argv = super::seccomp::argv_prefix(&seccomp);
     argv.extend(bwrap_argv(
@@ -131,7 +137,12 @@ fn command(
         mise_bin,
         args,
     ));
-    cmd.args(argv);
+    // The resource scope, applied here for the reason the filters are: this list is built by hand,
+    // so what a `SandboxSpec` would have carried has to be added where the list is assembled. The
+    // launcher exec-chains into bwrap, so the descriptors below still reach it.
+    let (prog, args) = super::cgroup::wrap(bwrap, argv, limits, slug);
+    let mut cmd = Command::new(prog);
+    cmd.args(args);
     // Prepared before the command leaves this function: the descriptors are close-on-exec, and the
     // exec bwrap performs inherits them only because of this.
     super::memfd::inherit_across_exec(&mut cmd, &seccomp);
@@ -159,10 +170,20 @@ pub(crate) fn resolve_env(
     mise_bin: &Path,
     files: &[(String, Vec<u8>)],
     stage_dir: &Path,
+    limits: &super::cgroup::Limits,
+    slug: &str,
 ) -> io::Result<Vec<(String, String)>> {
     let binds = stage_files(stage_dir, files)?;
     let args = [OsString::from("env"), OsString::from("--json-extended")];
-    let (mut cmd, _seccomp) = command(bwrap, layout, mise_bin, &binds, &args)?;
+    let (mut cmd, _seccomp) = command(
+        bwrap,
+        layout,
+        mise_bin,
+        &binds,
+        &args,
+        limits,
+        &format!("{slug}-mise"),
+    )?;
     let out = cmd.output()?;
     if !out.status.success() {
         return Err(io::Error::other(format!(
@@ -416,6 +437,8 @@ mod tests {
             Path::new("/nix/store/abc-mise/bin/mise"),
             &[],
             &[OsString::from("--version")],
+            &crate::sandbox::cgroup::Limits::default(),
+            "demo-app-mise",
         )
         .expect("a cage command");
 
@@ -423,7 +446,14 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        let fds: Vec<usize> = argv
+        // Where the host can carry a scope, the launcher's prefix leads and bwrap is spliced in
+        // after it; where it cannot, bwrap is the program and the list is its own. Either way the
+        // filters lead the arguments bwrap itself receives, which is what has to be asserted.
+        let start = argv
+            .iter()
+            .position(|a| a == "/nix/store/abc-bwrap/bin/bwrap")
+            .map_or(0, |i| i + 1);
+        let fds: Vec<usize> = argv[start..]
             .iter()
             .enumerate()
             .filter(|(_, a)| *a == "--add-seccomp-fd")
@@ -444,6 +474,57 @@ mod tests {
         ] {
             assert!(argv.iter().any(|a| a == flag), "missing {flag}: {argv:?}");
         }
+    }
+
+    /// The mise cage runs inside sbx's own resource scope.
+    ///
+    /// mise is a program sbx did not write, driven over the files a project declared, so a runaway
+    /// here is bounded the way a runaway in a session is. Read from inside the cage rather than off
+    /// the command line, so what is asserted is the control group the process actually landed in.
+    #[test]
+    fn the_cage_runs_inside_the_resource_limit_scope() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::testutil::TmpDir::new();
+        let layout = Layout::under(&dir.path().join("sbx"));
+        let seen = dir.path().join("cgroup.txt");
+        let fake = dir.path().join("fake-bwrap");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\ncat /proc/self/cgroup > '{}'\n", seen.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Whether this host can carry a scope at all is the launch path's own decision, asked here
+        // through the report `doctor` reads: an empty property set is the same verdict the launch
+        // takes, and where it applies none there is nothing to assert. Saying so is not the same as
+        // passing. Asked this way rather than by composing a wrapper, because the guard that keeps
+        // this file honest reads the file for that call, and a test making it would answer for the
+        // code under test.
+        let limits = super::super::cgroup::Limits::default();
+        if super::super::cgroup::probe(&limits).properties.is_empty() {
+            skip_incapable!("skipping the mise scope check: this host applies no resource limits");
+            return;
+        }
+
+        let (mut cmd, _seccomp) = command(
+            &fake,
+            &layout,
+            Path::new("/nix/store/abc-mise/bin/mise"),
+            &[],
+            &[OsString::from("--version")],
+            &limits,
+            "demo-app-mise",
+        )
+        .expect("a cage command");
+        cmd.status().expect("the recorded cage runs");
+
+        let cgroup = std::fs::read_to_string(&seen).unwrap();
+        let unit = format!("-{}.scope", std::process::id());
+        assert!(
+            cgroup.contains("sbx-demo-app-mise-") && cgroup.contains(&unit),
+            "a mise cage runs outside sbx's own resource scope: {cgroup}"
+        );
     }
 
     #[test]
@@ -709,6 +790,8 @@ mod run_tests {
             &mise_bin,
             &[],
             &[OsString::from("--version")],
+            &crate::sandbox::cgroup::Limits::default(),
+            "demo-app-mise",
         )
         .expect("build the mise command");
         let out = cmd.output().expect("run mise");
@@ -804,8 +887,16 @@ mod run_tests {
         );
 
         let stage = layout.data_dir().join("mise-stage");
-        let env = resolve_env(&bwrap, &layout, &mise_bin, &files, &stage)
-            .expect("resolve mise [env] (config bound read-only)");
+        let env = resolve_env(
+            &bwrap,
+            &layout,
+            &mise_bin,
+            &files,
+            &stage,
+            &crate::sandbox::cgroup::Limits::default(),
+            "demo-app",
+        )
+        .expect("resolve mise [env] (config bound read-only)");
 
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         // happy path: the authorized `[env]` entries are mapped, from both the

@@ -487,7 +487,12 @@ impl SignerProcess {
             writer,
             reader_side,
             env,
-        } = super::resolver::spawn_caged_plugin(bwrap, &plan, SIGN_DEADLINE)?;
+        } = super::resolver::spawn_caged_plugin(
+            bwrap,
+            &plan,
+            SIGN_DEADLINE,
+            &super::resolver::plugin_cage_limits(),
+        )?;
 
         let mut me = Self {
             child,

@@ -90,18 +90,10 @@ pub(crate) struct Context<'a> {
     /// exactly the process a launch would never leave unbounded, and the launch it is standing up
     /// for has not started yet, so nothing else is holding the line.
     pub(crate) limits: &'a crate::sandbox::cgroup::Limits,
-    /// The launch's own name slug, which each build cage extends with a counter of its own. It
-    /// names the cage everywhere a cage is named, so a build shows up under the project it is for.
+    /// The launch's own name slug, which a build cage marks as its own. It names the cage
+    /// everywhere a cage is named, so a build shows up under the project it is for.
     pub(crate) slug: &'a str,
 }
-
-/// How many build cages this process has stood up, which is what separates their scope names.
-///
-/// A transient scope's unit name must be unique among live units. The launcher's process id already
-/// separates two concurrent launches; within one process the cages of a `run` list follow each other
-/// closely enough that a name is not always free again by the time the next one asks for it, so the
-/// counter is what keeps each request answerable.
-static BUILD_CAGE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Run every command of `ctx` on the tree at `rootfs`, in order, stopping at the first failure.
 ///
@@ -248,10 +240,9 @@ fn one(
         // command — the same wrapper a launch uses, so there is one definition of that bridge.
         argv = crate::sandbox::egress::wrap_command(ctx.socat, ctx.shell, argv, &[]);
     }
-    let seq = BUILD_CAGE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let spec = SandboxSpec::new(PathBuf::from("/"), mounts, env, net, argv)
         .map(SandboxSpec::rooted_in_its_namespace)
-        .map(|s| s.with_cage_slug(format!("{}-build{seq}", ctx.slug)))
+        .map(|s| s.with_cage_slug(format!("{}-build", ctx.slug)))
         .map_err(|e| io::Error::other(format!("building the cage for `{command}`: {e:?}")))?;
 
     // Through the shared launch command rather than by composing an argv here: that is what carries

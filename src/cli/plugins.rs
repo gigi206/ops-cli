@@ -2355,7 +2355,7 @@ fn print_grant_programs(
 /// The `sbx plugins info` grant lines every kind of plugin shares.
 ///
 /// `programs`, `allow_paths`, `mask_paths`, `allow_env` and `allow_env_paths` are refused to no
-/// type: one `compose_cage` builds all three cages from the same grant, so a broker's or a signer's
+/// type: one cage description is built from the grant for all three, so a broker's or a signer's
 /// declaration binds exactly what a resolver's does. Printing them from one place is what keeps the
 /// three pages saying so — a page that shows the grant for one kind and not the others reads as a
 /// kind that cannot ask, which is the opposite of what the loader does.
