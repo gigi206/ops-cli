@@ -45,6 +45,9 @@ zig                             = "0.13.0"
 # provisions the `llvm-tools-preview` rustup component (llvm-cov / llvm-profdata) itself, so
 # nothing else is needed. Run `mise run coverage`.
 "aqua:taiki-e/cargo-llvm-cov"      = "0.8.7"
+# Dependency advisories, for both lockfiles (`mise run audit`). Pinned like the other build tools:
+# an audit that reads the RustSec database is only as reproducible as the client that reads it.
+"cargo:cargo-audit"             = "0.22.2"
 # Docs site (Docusaurus) runs on Node. Its dependencies are pinned in
 # docs-site/package.json (the lockfile source of truth); `mise run docs-install`
 # materialises them into docs-site/node_modules via `npm install`. Keep the two in
@@ -83,6 +86,13 @@ run = [
   "cargo clippy --all-targets -- -D warnings",
   "cargo clippy --manifest-path proc-shim/Cargo.toml --all-targets -- -D warnings",
 ]
+
+[tasks.audit]
+description = "Check both lockfiles against the RustSec advisory database (sbx and the in-cage shim)"
+# The shim is named separately for the reason `fmt` gives: it is its own workspace root, so no
+# cargo invocation rooted here reaches its lockfile. `h2` 0.4.15 sat in the sbx lock three weeks
+# after its advisory before anything read it; this is what reads it.
+run = ["cargo audit", "cargo audit -f proc-shim/Cargo.lock"]
 
 [tasks.rustdoc]
 description = "Build the crate's own rustdoc, denying warnings (a doc reference that resolves to nothing)"
