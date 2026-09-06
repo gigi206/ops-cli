@@ -821,6 +821,186 @@ fn gui_store_roots(
     gui_roots
 }
 
+/// Stand up the refusal notifier (`[notify]`) and announce what the trust gate already dropped.
+///
+/// First, because it must exist before the first lens that can refuse anything: the exec
+/// supervisor below takes it, and nothing may be refused in the gap. The credential set it redacts
+/// against is filled in later, once the egress proxy has resolved this launch's secrets — the
+/// needles are shared by `Arc`, so the supervisor holds the same set that resolution fills.
+///
+/// The trust drops are announced here rather than left in the launch's warning list because the
+/// symptom otherwise arrives much later and in disguise: a cage that is not shaped the way its
+/// config plainly reads.
+fn notify_wiring(
+    prep: &Prepared,
+    runtime: binds::Runtime,
+) -> Arc<crate::sandbox::notify_sink::NotifyWiring> {
+    // The refusal notifier (`[notify]`), stood up before the first lens that can refuse anything and
+    // held for the whole launch. The credential set it redacts against is filled in below, once the
+    // egress proxy has resolved this launch's secrets — the exec supervisor needs the notifier before
+    // that resolution happens, and nothing can be refused in between.
+    let notify_needles: crate::sandbox::notify_sink::Needles = Arc::new(RwLock::new(Vec::new()));
+    // Which sandbox every announcement names. The pid is this launcher's — the one `sbx session ls`
+    // lists and `sbx session attach`/`sbx session stop` take — so a notification points at something
+    // to act on.
+    let notify_origin = crate::notify::Origin {
+        app: match runtime {
+            binds::Runtime::GlobalApp(name) | binds::Runtime::ProjectApp(name) => name.to_string(),
+            binds::Runtime::ProjectDefault => String::new(),
+        },
+        project: prep
+            .cwd
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        pid: std::process::id(),
+    };
+    let notify_wiring = Arc::new(crate::sandbox::notify_sink::NotifyWiring {
+        notifier: Arc::new(crate::sandbox::notify_sink::Notifier::start(
+            prep.cfg.notify,
+            Arc::clone(&notify_needles),
+            &notify_origin,
+        )),
+        needles: notify_needles,
+    });
+
+    // The trust lens: a security field this project declared and sbx dropped, because the config
+    // carrying it is not trusted. Announced here, once the notifier exists, because the symptom
+    // otherwise arrives much later and in disguise — a cage that is not shaped the way its config
+    // plainly reads, with the explanation buried in the launch's warning list.
+    for warning in prep
+        .cfg
+        .warnings
+        .iter()
+        .filter(|w| crate::config::is_trust_drop(w))
+    {
+        notify_wiring.notifier.block(crate::notify::Block {
+            event: crate::notify::NotifyEvent::Trust,
+            subject: warning.clone(),
+            reason: "not-trusted".to_string(),
+            detail: String::new(),
+            fix: "sbx trust".to_string(),
+        });
+    }
+
+    notify_wiring
+}
+
+/// The supervisor behind the exec and content lenses, and the cage-side wiring it needs.
+///
+/// Field order is the drop order the two locals this replaced had — `proc_enforce_guard` was
+/// declared first, so on an early exit `proc_binds` dropped first — and it is reproduced here for
+/// the rule rather than for an effect: a `Vec<ExtraBind>` is plain data, and only `guard` has a
+/// `Drop` that does anything. No `Drop` of its own, so the launch moves `guard` out into the
+/// [`LaunchGuard`] literal.
+struct ProcLens {
+    /// What the cage needs mounted for the shim to reach the supervisor: the shim binary itself and
+    /// the handoff socket.
+    binds: Vec<binds::ExtraBind>,
+    /// The running supervisor. `Some` forces the supervised launch path — its receive loop is a
+    /// host thread that must outlive the cage.
+    guard: Option<crate::sandbox::proc_enforce::ProcEnforce>,
+}
+
+/// Stand up the seccomp user-notification supervisor when this launch declared either lens, and
+/// register the wrap that puts the shim innermost.
+///
+/// The two lenses ride **one** supervisor — it is the same notification listener, read for a
+/// different syscall — so `[fs] scan` brings it up on its own rather than depending on `[proc]`,
+/// which would tie one guarantee to an unrelated one. With `[proc]` off the exec side is a denylist
+/// with nothing on it, which is what the shim's filter produces anyway.
+///
+/// Fail-closed throughout: a scan that will not compile, a shim that cannot be placed, or a
+/// supervisor that will not start refuses the launch. A cage that ran anyway would report a
+/// protection it does not have.
+fn proc_lens<'a>(
+    prep: &'a Prepared,
+    notify_wiring: &crate::sandbox::notify_sink::NotifyWiring,
+    wraps: &mut Vec<(WrapLayer, CommandWrap<'a>)>,
+) -> Result<ProcLens, ExitCode> {
+    // Exec enforcement (`[proc] mode = enforce|ask`): stand up the seccomp user-notification
+    // supervisor and wrap the command with the in-cage shim, **innermost** — so only the agent
+    // command and its children are filtered, not the provisioning/egress plumbing wrapped around it
+    // below. What makes that exemption safe rather than a hole is `plumbing_pins`: the programs
+    // those outer preambles run are pinned read-only from the shared store, so an unfiltered
+    // preamble cannot be an agent-supplied one. Its guard forces the supervised path (a live parent
+    // for the supervisor thread).
+    // Fail-closed: if the supervisor cannot be stood up, the launch is refused rather than running the
+    // command unenforced.
+    let mut proc_enforce_guard = None;
+    let mut proc_binds: Vec<binds::ExtraBind> = Vec::new();
+    // The content lens rides the same supervisor as exec enforcement — it is the same notification
+    // listener, read for a different syscall. So `[fs] scan` brings the supervisor up on its own:
+    // making it depend on `[proc]` would tie one guarantee to an unrelated one.
+    let content_lens = if prep.cfg.fs.scan.is_empty() {
+        None
+    } else {
+        let ceiling = prep
+            .cfg
+            .fs
+            .scan_max_kb
+            .and_then(|kb| usize::try_from(kb.saturating_mul(1024)).ok())
+            .unwrap_or(crate::open_policy::MAX_SCAN_DEFAULT);
+        match crate::open_policy::OpenPolicy::compile(&prep.cfg.fs.scan, ceiling) {
+            Ok(policy) => policy.map(|policy| {
+                // Canonical, because the bound is applied to paths the kernel has resolved.
+                let root = std::fs::canonicalize(&prep.cwd).unwrap_or_else(|_| prep.cwd.clone());
+                (policy, root)
+            }),
+            Err(e) => {
+                // Refused rather than dropped: a launch that ran with a scan it could not build
+                // would report a protection it does not have.
+                crate::diag::error(&format!(
+                    "sbx: cannot build the `[fs] scan` content scanner: {e}"
+                ));
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    };
+    if prep.cfg.proc.enforcing() || content_lens.is_some() {
+        // The shim is sbx's own embedded binary, laid down under the data directory. Refusing when
+        // it cannot be placed is the point: the alternative would be binding some other executable
+        // into the cage, which is the exposure the dedicated shim exists to remove.
+        let shim_bin = crate::store::ensure_proc_shim(&prep.layout).map_err(|e| {
+            crate::diag::error(&format!("sbx: cannot place the exec-enforcement shim: {e}"));
+            ExitCode::FAILURE
+        })?;
+        // With `[proc]` off, the exec side is a denylist with nothing on it: every `execve` is
+        // notified and allowed, which is what the shim's filter produces anyway. The lens is what
+        // this launch asked for.
+        let exec_policy = if prep.cfg.proc.enforcing() {
+            prep.cfg.proc.clone()
+        } else {
+            crate::proc_policy::ProcPolicy::new(crate::proc_policy::ProcMode::Enforce, &[], &[])
+        };
+        let (guard, wiring) = crate::sandbox::proc_enforce::start(
+            prep.layout.data_dir(),
+            &shim_bin,
+            exec_policy,
+            content_lens,
+            Arc::clone(&notify_wiring.notifier),
+        )
+        .map_err(|e| {
+            crate::diag::error(&format!("sbx: cannot start exec enforcement: {e}"));
+            ExitCode::FAILURE
+        })?;
+        // The flag rides in the closure so the filter the cage installs matches the lens the
+        // supervisor was started with — the two are decided once, together.
+        let open_lens = wiring.open_lens;
+        wraps.push((
+            WrapLayer::ProcEnforce,
+            Box::new(move |cmd| crate::sandbox::proc_enforce::wrap_command(cmd, open_lens)),
+        ));
+        proc_binds = wiring.binds;
+        proc_enforce_guard = Some(guard);
+    }
+
+    Ok(ProcLens {
+        binds: proc_binds,
+        guard: proc_enforce_guard,
+    })
+}
+
 /// Build the spec for `cmd`, reporting a clean error as an `ExitCode`. The
 /// configuration resolved in [`super::prepare_with`] drives this: a trust-gated `.sbx.toml` adds
 /// environment and host binds — read-only, or read-write with `mode = "rw"` (its security
@@ -951,130 +1131,11 @@ pub(super) fn build(
     // blocks run in, so a block may register its wrap wherever the value it needs becomes available.
     let mut wraps: Vec<(WrapLayer, CommandWrap)> = Vec::new();
 
-    // Exec enforcement (`[proc] mode = enforce|ask`): stand up the seccomp user-notification
-    // supervisor and wrap the command with the in-cage shim, **innermost** — so only the agent
-    // command and its children are filtered, not the provisioning/egress plumbing wrapped around it
-    // below. What makes that exemption safe rather than a hole is `plumbing_pins`: the programs
-    // those outer preambles run are pinned read-only from the shared store, so an unfiltered
-    // preamble cannot be an agent-supplied one. Its guard forces the supervised path (a live parent
-    // for the supervisor thread).
-    // Fail-closed: if the supervisor cannot be stood up, the launch is refused rather than running the
-    // command unenforced.
-    // The refusal notifier (`[notify]`), stood up before the first lens that can refuse anything and
-    // held for the whole launch. The credential set it redacts against is filled in below, once the
-    // egress proxy has resolved this launch's secrets — the exec supervisor needs the notifier before
-    // that resolution happens, and nothing can be refused in between.
-    let notify_needles: crate::sandbox::notify_sink::Needles = Arc::new(RwLock::new(Vec::new()));
-    // Which sandbox every announcement names. The pid is this launcher's — the one `sbx session ls`
-    // lists and `sbx session attach`/`sbx session stop` take — so a notification points at something
-    // to act on.
-    let notify_origin = crate::notify::Origin {
-        app: match runtime {
-            binds::Runtime::GlobalApp(name) | binds::Runtime::ProjectApp(name) => name.to_string(),
-            binds::Runtime::ProjectDefault => String::new(),
-        },
-        project: prep
-            .cwd
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        pid: std::process::id(),
-    };
-    let notify_wiring = Arc::new(crate::sandbox::notify_sink::NotifyWiring {
-        notifier: Arc::new(crate::sandbox::notify_sink::Notifier::start(
-            prep.cfg.notify,
-            Arc::clone(&notify_needles),
-            &notify_origin,
-        )),
-        needles: notify_needles,
-    });
+    // The refusal notifier, and the trust drops it announces. Held for the whole launch.
+    let notify_wiring = notify_wiring(prep, runtime);
 
-    // The trust lens: a security field this project declared and sbx dropped, because the config
-    // carrying it is not trusted. Announced here, once the notifier exists, because the symptom
-    // otherwise arrives much later and in disguise — a cage that is not shaped the way its config
-    // plainly reads, with the explanation buried in the launch's warning list.
-    for warning in prep
-        .cfg
-        .warnings
-        .iter()
-        .filter(|w| crate::config::is_trust_drop(w))
-    {
-        notify_wiring.notifier.block(crate::notify::Block {
-            event: crate::notify::NotifyEvent::Trust,
-            subject: warning.clone(),
-            reason: "not-trusted".to_string(),
-            detail: String::new(),
-            fix: "sbx trust".to_string(),
-        });
-    }
-
-    let mut proc_enforce_guard = None;
-    let mut proc_binds: Vec<binds::ExtraBind> = Vec::new();
-    // The content lens rides the same supervisor as exec enforcement — it is the same notification
-    // listener, read for a different syscall. So `[fs] scan` brings the supervisor up on its own:
-    // making it depend on `[proc]` would tie one guarantee to an unrelated one.
-    let content_lens = if prep.cfg.fs.scan.is_empty() {
-        None
-    } else {
-        let ceiling = prep
-            .cfg
-            .fs
-            .scan_max_kb
-            .and_then(|kb| usize::try_from(kb.saturating_mul(1024)).ok())
-            .unwrap_or(crate::open_policy::MAX_SCAN_DEFAULT);
-        match crate::open_policy::OpenPolicy::compile(&prep.cfg.fs.scan, ceiling) {
-            Ok(policy) => policy.map(|policy| {
-                // Canonical, because the bound is applied to paths the kernel has resolved.
-                let root = std::fs::canonicalize(&prep.cwd).unwrap_or_else(|_| prep.cwd.clone());
-                (policy, root)
-            }),
-            Err(e) => {
-                // Refused rather than dropped: a launch that ran with a scan it could not build
-                // would report a protection it does not have.
-                crate::diag::error(&format!(
-                    "sbx: cannot build the `[fs] scan` content scanner: {e}"
-                ));
-                return Err(ExitCode::FAILURE);
-            }
-        }
-    };
-    if prep.cfg.proc.enforcing() || content_lens.is_some() {
-        // The shim is sbx's own embedded binary, laid down under the data directory. Refusing when
-        // it cannot be placed is the point: the alternative would be binding some other executable
-        // into the cage, which is the exposure the dedicated shim exists to remove.
-        let shim_bin = crate::store::ensure_proc_shim(&prep.layout).map_err(|e| {
-            crate::diag::error(&format!("sbx: cannot place the exec-enforcement shim: {e}"));
-            ExitCode::FAILURE
-        })?;
-        // With `[proc]` off, the exec side is a denylist with nothing on it: every `execve` is
-        // notified and allowed, which is what the shim's filter produces anyway. The lens is what
-        // this launch asked for.
-        let exec_policy = if prep.cfg.proc.enforcing() {
-            prep.cfg.proc.clone()
-        } else {
-            crate::proc_policy::ProcPolicy::new(crate::proc_policy::ProcMode::Enforce, &[], &[])
-        };
-        let (guard, wiring) = crate::sandbox::proc_enforce::start(
-            prep.layout.data_dir(),
-            &shim_bin,
-            exec_policy,
-            content_lens,
-            Arc::clone(&notify_wiring.notifier),
-        )
-        .map_err(|e| {
-            crate::diag::error(&format!("sbx: cannot start exec enforcement: {e}"));
-            ExitCode::FAILURE
-        })?;
-        // The flag rides in the closure so the filter the cage installs matches the lens the
-        // supervisor was started with — the two are decided once, together.
-        let open_lens = wiring.open_lens;
-        wraps.push((
-            WrapLayer::ProcEnforce,
-            Box::new(move |cmd| crate::sandbox::proc_enforce::wrap_command(cmd, open_lens)),
-        ));
-        proc_binds = wiring.binds;
-        proc_enforce_guard = Some(guard);
-    }
+    // The exec and content lenses, and the supervisor both ride on.
+    let proc_lens = proc_lens(prep, &notify_wiring, &mut wraps)?;
 
     let mut autoequip_env: Vec<(String, String)> = Vec::new();
     let global_mise = crate::sandbox::packages::mise_packages(&prep.cfg.packages);
@@ -1978,7 +2039,7 @@ pub(super) fn build(
     extra_binds.extend(forward_binds);
     extra_binds.extend(gui_binds);
     extra_binds.extend(provisioned.inline_flake_binds);
-    extra_binds.extend(proc_binds);
+    extra_binds.extend(proc_lens.binds);
     // The store paths every wrap's preamble runs from, pinned read-only over the project's
     // writable store. Emitted here, with the launcher's other extra binds, because that is what
     // puts them *after* the structural `/nix` — a pin emitted before it would be covered by it,
@@ -2398,7 +2459,7 @@ pub(super) fn build(
         || signer_feed.is_some()
         || forward_guard.is_some()
         || portal_stack.host_dir.is_some()
-        || proc_enforce_guard.is_some()
+        || proc_lens.guard.is_some()
         || task_plane.is_some()
     {
         Some(LaunchGuard {
@@ -2412,7 +2473,7 @@ pub(super) fn build(
             notify: portal_stack.notify_relay,
             theme: portal_stack.theme_relay,
             portal: portal_stack.host_dir,
-            proc_enforce: proc_enforce_guard,
+            proc_enforce: proc_lens.guard,
             task: task_plane,
         })
     } else {
