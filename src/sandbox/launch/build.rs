@@ -1694,6 +1694,306 @@ fn ssh_agent_broker(
     })
 }
 
+/// One GUI hole's contribution to the cage: what it binds, and what it names in the environment.
+///
+/// Three holes fill this in — the display, the GPU, the audio userspace — and the launch appends
+/// them in that order, which is the order the pushes had when they shared two accumulators. Plain
+/// data, so no `Drop`.
+#[derive(Default)]
+struct GuiWiring {
+    /// Read-only host sockets, `/sys` subtrees and generated configuration files.
+    binds: Vec<binds::ExtraBind>,
+    /// The variables that point the cage's clients and loaders at them.
+    env: Vec<(String, String)>,
+}
+
+/// The display hole: the fontconfig configuration, the compositor socket, the GUI data set and the
+/// in-cage portal's runtime directory.
+///
+/// Only the compositor socket *file* is bound, never `$XDG_RUNTIME_DIR` itself — that directory
+/// also holds the dbus session bus, pulse and the gpg/ssh agents, which binding it would hand to
+/// the cage. The bind is read-only, which is enough for a same-uid `connect()`.
+///
+/// Best-effort throughout: with no socket found, the app runs without a display and fails on its
+/// own. Not binding is the fail-closed direction for a display hole.
+///
+/// The keys set here (`WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, `FONTCONFIG_FILE`, `XDG_DATA_DIRS`) are
+/// data paths rather than code-load paths, so an untrusted `[env]` that re-points one only
+/// self-DoSes its own cage's lookup and none of them needs a denylist entry.
+fn display_binds(
+    prep: &Prepared,
+    font_layer: Option<&crate::sandbox::fonts::FontLayer>,
+    guidata_layer: Option<&crate::sandbox::guidata::GuiDataLayer>,
+    portal_stack: &PortalStack,
+) -> GuiWiring {
+    let GuiWiring {
+        binds: mut mounts,
+        mut env,
+    } = GuiWiring::default();
+
+    // GUI hole: under `gui = "wayland"`, bind the host's Wayland compositor socket read-only so a
+    // graphical app can map a window. The cage runs same-uid, so a read-only bind suffices to
+    // connect(). Only the socket *file* is bound, never `$XDG_RUNTIME_DIR` itself — that directory
+    // also holds the dbus session bus, pulse, and the gpg/ssh agents, which binding the directory
+    // would hand to the cage. Best-effort: with no compositor socket found, warn and run without
+    // it (the app fails on its own) — not binding is the fail-closed direction for a display hole.
+    // The cage env (`WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`) is fixed here by sbx; an untrusted
+    // `[env]` could only mispoint a client at a nonexistent socket (self-DoS), never redirect the
+    // bind, whose source path is set by sbx — so these keys need no denylist entry.
+
+    // Fonts: bind the generated fontconfig configuration read-only and name it to the cage's
+    // fontconfig. The font *files* were provisioned and seeded above; this points fontconfig at
+    // them so text renders rather than boxes — and a browser engine renders nothing at all
+    // without it (it dies mid-page), which is why this is wired for every posture that draws,
+    // `offscreen` included, not only for a windowed one. Independent of the compositor socket
+    // below and best-effort (a staging failure warns, the app runs without fonts).
+    // `FONTCONFIG_FILE` is fixed by sbx; a project `[env]` could override it (highest
+    // precedence), but that only re-points the agent's own in-cage fontconfig at its own config —
+    // self-sabotage, not an escape (it already controls what runs in the cage) — so the key needs
+    // no denylist entry, exactly like `WAYLAND_DISPLAY`.
+    if let Some(layer) = &font_layer {
+        let conf = crate::sandbox::fonts::fonts_conf_for(layer);
+        match crate::sandbox::fonts::stage(prep.layout.data_dir(), &conf) {
+            Ok(path) => {
+                mounts.push(binds::ExtraBind {
+                    src: path,
+                    dest: PathBuf::from(crate::sandbox::fonts::FONTS_CONF_INCAGE),
+                    writable: false,
+                });
+                env.push((
+                    "FONTCONFIG_FILE".to_string(),
+                    crate::sandbox::fonts::FONTS_CONF_INCAGE.to_string(),
+                ));
+            }
+            Err(e) => crate::diag::warn(&format!(
+                "this `gui` posture renders but the font configuration could not be \
+                 staged ({e}) — text may not render"
+            )),
+        }
+    }
+
+    if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
+        let display = std::env::var("WAYLAND_DISPLAY").ok();
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
+        match resolve_wayland_hole(display.as_deref(), runtime_dir.as_deref()) {
+            Ok((socket, socket_env)) if socket.exists() => {
+                mounts.push(binds::ExtraBind {
+                    src: socket.clone(),
+                    dest: socket,
+                    writable: false,
+                });
+                env.extend(socket_env);
+            }
+            Ok((socket, _)) => crate::diag::warn(&format!(
+                "`gui = \"wayland\"` but the compositor socket `{}` does not exist — \
+                 running without a display",
+                socket.display()
+            )),
+            Err(reason) => crate::diag::warn(&format!(
+                "`gui = \"wayland\"` but {reason} — running without a display"
+            )),
+        }
+
+        // GUI data: point the cage's glib/GTK at the provisioned, seeded schemas + themes via one
+        // `XDG_DATA_DIRS` entry, so a GTK dialog finds `org.gtk.Settings.FileChooser` (else it
+        // aborts) and the in-cage portal's file dialog finds the named `Adwaita-dark` theme. An
+        // app's own launcher prepends its GTK data dirs, so sbx's entry (carrying the themes) stays
+        // reachable at the tail. `XDG_DATA_DIRS` is a data path, not a code-load path (unlike the
+        // mesa driver vars), so it needs no untrusted-`[env]` denylist entry — a project that
+        // re-points it only sabotages its own cage's schema/theme lookup.
+        if let Some(layer) = &guidata_layer {
+            env.extend(layer.env.iter().cloned());
+        }
+
+        // In-cage portal: point the app's D-Bus/portal client at the private bus and the GTK
+        // backend (the bus itself is started by the outermost command wrap, below). The `XDG_*`
+        // keys are data paths, not code-load paths, so — like `WAYLAND_DISPLAY` — a project `[env]`
+        // that re-points them only self-DoSes its own cage's portal lookup and needs no denylist.
+        if let Some(p) = &portal_stack.portal {
+            env.extend(crate::sandbox::portal::env(&p.gtk_root));
+            // Bind the portal's host runtime directory (read-write) at the cage path the bus config,
+            // env, and command wrap all reference, so the in-cage dbus-daemon writes its config and
+            // creates its socket there — and the socket is reachable from the host for the relay.
+            if let Some(hd) = &portal_stack.host_dir {
+                mounts.push(binds::ExtraBind {
+                    src: hd.dir().to_path_buf(),
+                    dest: PathBuf::from(crate::sandbox::portal::CAGE_DIR),
+                    writable: true,
+                });
+            }
+        }
+    }
+
+    GuiWiring { binds: mounts, env }
+}
+
+/// The GPU hole: mesa's driver paths, the minimal `/sys` DRM subtree, and this host's proprietary
+/// bridges.
+///
+/// The render node itself is granted through the device-bind mechanism, not here. The `/sys` paths
+/// are enumerated with an existence check and then bound firmly, so a device vanishing between
+/// enumeration and exec fails the launch — an accepted rarity, not "never fails".
+///
+/// The driver-path variables are sbx-controlled *and* reserved against an untrusted `[env]`,
+/// because they load code; a trusted config may still override them, which is self-harm on its own
+/// cage rather than an escape.
+fn gpu_binds(prep: &Prepared, hw: &HardwareLayers) -> GuiWiring {
+    let GuiWiring {
+        binds: mut mounts,
+        mut env,
+    } = GuiWiring::default();
+
+    // GPU: when `gpu = true`, point the cage's libgbm/libEGL at mesa's own drivers (provisioned and
+    // seeded above) and read-only-bind the minimal `/sys` DRM subtree the driver reads to enumerate
+    // the device. The render node itself is granted through the device-bind mechanism below. Mostly
+    // best-effort: a failed mesa provision or an absent render node degrades to software rendering.
+    // The `/sys` paths are checked for existence at enumeration (`drm_sys_paths`) and bound firmly —
+    // the same firm-`--ro-bind`-after-`.exists()` shape the Wayland socket uses — so a device
+    // vanishing between enumeration and exec (a GPU hot-unplug) would fail the launch, an accepted
+    // rarity, not "never fails".
+    // The driver-path env vars mesa `dlopen`s from are sbx-controlled *and* reserved against an
+    // untrusted `[env]` (they load code, so `is_reserved_env_key` denylists them alongside `LD_*`);
+    // a *trusted* config may still override them — self-harm on its own cage, not an escape.
+    if prep.cfg.gpu {
+        if let Some(layer) = &hw.gpu {
+            env.extend(layer.env.iter().cloned());
+        }
+        for path in crate::sandbox::gpu::drm_sys_paths() {
+            mounts.push(binds::ExtraBind {
+                src: path.clone(),
+                dest: path,
+                writable: false,
+            });
+        }
+        // Under WSL the render node above is real and its driver is mesa's `d3d12`, which reaches
+        // the GPU through libraries Windows provides in this directory rather than nixpkgs. Both
+        // halves are needed and neither works alone: bound and not on the loader path, the cage
+        // still answers `cannot open shared object file`; on the path and not bound, there is
+        // nothing to open. `LD_LIBRARY_PATH` is in the same reserved class as the driver-path
+        // variables above, for the same reason — it loads code, so it is sbx's to set and an
+        // untrusted `[env]` may not.
+        if let Some(bridge) = crate::sandbox::gpu::wsl_bridge() {
+            env.push(("LD_LIBRARY_PATH".to_string(), bridge.display().to_string()));
+            mounts.push(binds::ExtraBind {
+                src: bridge.clone(),
+                dest: bridge,
+                writable: false,
+            });
+        }
+
+        // The NVIDIA bridge: this host's proprietary userspace, which is version-locked to its
+        // kernel module and so cannot be provisioned hermetically the way mesa is. Same shape as
+        // the WSL bridge above — host libraries plus the loader path — with the one difference
+        // that is the whole trick: each real file is bound *under the name the loader asks for*,
+        // because a soname bound onto itself resolves to its versioned target and disappears.
+        //
+        // Scope is compute (CUDA) and offscreen rendering. On a hybrid host a windowed client
+        // still renders on the integrated GPU, inside the cage exactly as outside it: the
+        // compositor holds that device, and the one workaround is GLX under X11, which sbx never
+        // offers. Nothing here approaches that refusal.
+        if let Some(nv) = &hw.nvidia {
+            // Composed by `gpu::nvidia_wiring`, which is pure over its inputs so the composition
+            // itself is unit-tested: both of this wiring's defects lived in the joining of lists,
+            // not in resolving them, and neither had a test to fail.
+            let kernel = std::fs::read_to_string("/proc/driver/nvidia/version")
+                .ok()
+                .and_then(|text| crate::sandbox::gpu::kernel_module_version(&text));
+            let mut notes = Vec::new();
+            let wiring = crate::sandbox::gpu::nvidia_wiring(
+                nv,
+                hw.gpu.as_ref().map_or(&[][..], |layer| &layer.env),
+                hw.gpu.as_ref().and_then(|layer| layer.glvnd.as_deref()),
+                kernel.as_deref(),
+                &mut notes,
+            );
+            for note in &notes {
+                crate::diag::warn(note);
+            }
+            mounts.extend(
+                wiring
+                    .binds
+                    .into_iter()
+                    .map(|(src, dest)| binds::ExtraBind {
+                        src,
+                        dest,
+                        writable: false,
+                    }),
+            );
+            env.extend(wiring.env);
+        }
+    }
+
+    GuiWiring { binds: mounts, env }
+}
+
+/// The audio hole: the host PulseAudio socket, the provisioned client userspace, and the loader
+/// paths a `dlopen`ing engine needs.
+///
+/// Both halves must be present: no host socket, or a failed provision, means no audio. The socket
+/// bind and `PULSE_SERVER` are firm and independent of the provision; the client libraries, the
+/// ALSA-to-pulse shim and the Python `find_library` shim are added only where the userspace was
+/// provisioned. Best-effort throughout, never a failed launch.
+fn audio_binds(prep: &Prepared, hw: &HardwareLayers) -> GuiWiring {
+    let GuiWiring {
+        binds: mut mounts,
+        mut env,
+    } = GuiWiring::default();
+
+    // Audio: when `audio = true`, bind the host PulseAudio socket read-only at the fixed cage path
+    // and point the app's loader at the provisioned libpulse (both provisioned/seeded above). Both
+    // pieces must be present — no host socket, or a failed provision, means no audio (best-effort, a
+    // warning, never a failed launch). The socket bind is read-only: same-uid, so a `connect()` still
+    // works (exactly like the Wayland socket). `PULSE_SERVER` is a data path (an untrusted `[env]`
+    // only self-DoSes its own cage's audio), so it needs no denylist entry; `LD_LIBRARY_PATH` is
+    // already reserved against an untrusted `[env]` (a code-load path, alongside `LD_*`).
+    if prep.cfg.audio {
+        let host_socket =
+            crate::sandbox::audio::host_socket(std::env::var("XDG_RUNTIME_DIR").ok().as_deref());
+        match host_socket {
+            Some(sock) if sock.exists() => {
+                // The socket bind + `PULSE_SERVER` are firm (independent of the userspace provision);
+                // the client libraries, the ALSA→pulse shim's `asound.conf`, and its env are added
+                // only when the userspace was provisioned (best-effort — a failed provision already
+                // warned, and the app then simply finds no audio).
+                mounts.push(binds::ExtraBind {
+                    src: sock,
+                    dest: PathBuf::from(crate::sandbox::audio::CAGE_SOCK),
+                    writable: false,
+                });
+                if let Some(alsa) = hw.audio.as_ref().and_then(|l| l.alsa.as_ref()) {
+                    mounts.push(binds::ExtraBind {
+                        src: alsa.asound_conf.clone(),
+                        dest: PathBuf::from(crate::sandbox::audio::ASOUND_CONF_INCAGE),
+                        writable: false,
+                    });
+                }
+                // The `find_library` shim directory (for a Python PortAudio tool), bound read-only and
+                // placed on `PYTHONPATH` by `audio::env`. Present only when PortAudio provisioned.
+                if let Some(pyshim) = hw.audio.as_ref().and_then(|l| l.pyshim.as_ref()) {
+                    mounts.push(binds::ExtraBind {
+                        src: pyshim.clone(),
+                        dest: PathBuf::from(crate::sandbox::audio::PYSHIM_INCAGE),
+                        writable: false,
+                    });
+                }
+                // Pass the base C++/glibc runtime dirs (the same set as NIX_LD_LIBRARY_PATH) so a
+                // voice speech-to-text engine's `dlopen`ed native library (ctranslate2/onnxruntime)
+                // finds `libstdc++.so.6` — `dlopen` consults LD_LIBRARY_PATH, not NIX_LD_LIBRARY_PATH.
+                env.extend(crate::sandbox::audio::env(
+                    hw.audio.as_ref(),
+                    &prep.userland.foreign_lib_paths,
+                ));
+            }
+            _ => crate::diag::warn(
+                "`audio = true` but no PulseAudio socket was found at \
+                 `$XDG_RUNTIME_DIR/pulse/native` — the app runs without audio",
+            ),
+        }
+    }
+
+    GuiWiring { binds: mounts, env }
+}
+
 /// Build the spec for `cmd`, reporting a clean error as an `ExitCode`. The
 /// configuration resolved in [`super::prepare_with`] drives this: a trust-gated `.sbx.toml` adds
 /// environment and host binds — read-only, or read-write with `mode = "rw"` (its security
@@ -1965,232 +2265,19 @@ pub(super) fn build(
     // The filtering ssh-agent, when the grant resolves to a key the host agent holds.
     let ssh_agent = ssh_agent_broker(prep, &notify_wiring)?;
 
-    // GUI hole: under `gui = "wayland"`, bind the host's Wayland compositor socket read-only so a
-    // graphical app can map a window. The cage runs same-uid, so a read-only bind suffices to
-    // connect(). Only the socket *file* is bound, never `$XDG_RUNTIME_DIR` itself — that directory
-    // also holds the dbus session bus, pulse, and the gpg/ssh agents, which binding the directory
-    // would hand to the cage. Best-effort: with no compositor socket found, warn and run without
-    // it (the app fails on its own) — not binding is the fail-closed direction for a display hole.
-    // The cage env (`WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`) is fixed here by sbx; an untrusted
-    // `[env]` could only mispoint a client at a nonexistent socket (self-DoS), never redirect the
-    // bind, whose source path is set by sbx — so these keys need no denylist entry.
-    let mut gui_binds: Vec<binds::ExtraBind> = Vec::new();
-    let mut gui_env: Vec<(String, String)> = Vec::new();
-
-    // Fonts: bind the generated fontconfig configuration read-only and name it to the cage's
-    // fontconfig. The font *files* were provisioned and seeded above; this points fontconfig at
-    // them so text renders rather than boxes — and a browser engine renders nothing at all
-    // without it (it dies mid-page), which is why this is wired for every posture that draws,
-    // `offscreen` included, not only for a windowed one. Independent of the compositor socket
-    // below and best-effort (a staging failure warns, the app runs without fonts).
-    // `FONTCONFIG_FILE` is fixed by sbx; a project `[env]` could override it (highest
-    // precedence), but that only re-points the agent's own in-cage fontconfig at its own config —
-    // self-sabotage, not an escape (it already controls what runs in the cage) — so the key needs
-    // no denylist entry, exactly like `WAYLAND_DISPLAY`.
-    if let Some(layer) = &font_layer {
-        let conf = crate::sandbox::fonts::fonts_conf_for(layer);
-        match crate::sandbox::fonts::stage(prep.layout.data_dir(), &conf) {
-            Ok(path) => {
-                gui_binds.push(binds::ExtraBind {
-                    src: path,
-                    dest: PathBuf::from(crate::sandbox::fonts::FONTS_CONF_INCAGE),
-                    writable: false,
-                });
-                gui_env.push((
-                    "FONTCONFIG_FILE".to_string(),
-                    crate::sandbox::fonts::FONTS_CONF_INCAGE.to_string(),
-                ));
-            }
-            Err(e) => crate::diag::warn(&format!(
-                "this `gui` posture renders but the font configuration could not be \
-                 staged ({e}) — text may not render"
-            )),
-        }
-    }
-
-    if matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
-        let display = std::env::var("WAYLAND_DISPLAY").ok();
-        let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
-        match resolve_wayland_hole(display.as_deref(), runtime_dir.as_deref()) {
-            Ok((socket, env)) if socket.exists() => {
-                gui_binds.push(binds::ExtraBind {
-                    src: socket.clone(),
-                    dest: socket,
-                    writable: false,
-                });
-                gui_env.extend(env);
-            }
-            Ok((socket, _)) => crate::diag::warn(&format!(
-                "`gui = \"wayland\"` but the compositor socket `{}` does not exist — \
-                 running without a display",
-                socket.display()
-            )),
-            Err(reason) => crate::diag::warn(&format!(
-                "`gui = \"wayland\"` but {reason} — running without a display"
-            )),
-        }
-
-        // GUI data: point the cage's glib/GTK at the provisioned, seeded schemas + themes via one
-        // `XDG_DATA_DIRS` entry, so a GTK dialog finds `org.gtk.Settings.FileChooser` (else it
-        // aborts) and the in-cage portal's file dialog finds the named `Adwaita-dark` theme. An
-        // app's own launcher prepends its GTK data dirs, so sbx's entry (carrying the themes) stays
-        // reachable at the tail. `XDG_DATA_DIRS` is a data path, not a code-load path (unlike the
-        // mesa driver vars), so it needs no untrusted-`[env]` denylist entry — a project that
-        // re-points it only sabotages its own cage's schema/theme lookup.
-        if let Some(layer) = &guidata_layer {
-            gui_env.extend(layer.env.iter().cloned());
-        }
-
-        // In-cage portal: point the app's D-Bus/portal client at the private bus and the GTK
-        // backend (the bus itself is started by the outermost command wrap, below). The `XDG_*`
-        // keys are data paths, not code-load paths, so — like `WAYLAND_DISPLAY` — a project `[env]`
-        // that re-points them only self-DoSes its own cage's portal lookup and needs no denylist.
-        if let Some(p) = &portal_stack.portal {
-            gui_env.extend(crate::sandbox::portal::env(&p.gtk_root));
-            // Bind the portal's host runtime directory (read-write) at the cage path the bus config,
-            // env, and command wrap all reference, so the in-cage dbus-daemon writes its config and
-            // creates its socket there — and the socket is reachable from the host for the relay.
-            if let Some(hd) = &portal_stack.host_dir {
-                gui_binds.push(binds::ExtraBind {
-                    src: hd.dir().to_path_buf(),
-                    dest: PathBuf::from(crate::sandbox::portal::CAGE_DIR),
-                    writable: true,
-                });
-            }
-        }
-    }
-
-    // GPU: when `gpu = true`, point the cage's libgbm/libEGL at mesa's own drivers (provisioned and
-    // seeded above) and read-only-bind the minimal `/sys` DRM subtree the driver reads to enumerate
-    // the device. The render node itself is granted through the device-bind mechanism below. Mostly
-    // best-effort: a failed mesa provision or an absent render node degrades to software rendering.
-    // The `/sys` paths are checked for existence at enumeration (`drm_sys_paths`) and bound firmly —
-    // the same firm-`--ro-bind`-after-`.exists()` shape the Wayland socket uses — so a device
-    // vanishing between enumeration and exec (a GPU hot-unplug) would fail the launch, an accepted
-    // rarity, not "never fails".
-    // The driver-path env vars mesa `dlopen`s from are sbx-controlled *and* reserved against an
-    // untrusted `[env]` (they load code, so `is_reserved_env_key` denylists them alongside `LD_*`);
-    // a *trusted* config may still override them — self-harm on its own cage, not an escape.
-    if prep.cfg.gpu {
-        if let Some(layer) = &hw.gpu {
-            gui_env.extend(layer.env.iter().cloned());
-        }
-        for path in crate::sandbox::gpu::drm_sys_paths() {
-            gui_binds.push(binds::ExtraBind {
-                src: path.clone(),
-                dest: path,
-                writable: false,
-            });
-        }
-        // Under WSL the render node above is real and its driver is mesa's `d3d12`, which reaches
-        // the GPU through libraries Windows provides in this directory rather than nixpkgs. Both
-        // halves are needed and neither works alone: bound and not on the loader path, the cage
-        // still answers `cannot open shared object file`; on the path and not bound, there is
-        // nothing to open. `LD_LIBRARY_PATH` is in the same reserved class as the driver-path
-        // variables above, for the same reason — it loads code, so it is sbx's to set and an
-        // untrusted `[env]` may not.
-        if let Some(bridge) = crate::sandbox::gpu::wsl_bridge() {
-            gui_env.push(("LD_LIBRARY_PATH".to_string(), bridge.display().to_string()));
-            gui_binds.push(binds::ExtraBind {
-                src: bridge.clone(),
-                dest: bridge,
-                writable: false,
-            });
-        }
-
-        // The NVIDIA bridge: this host's proprietary userspace, which is version-locked to its
-        // kernel module and so cannot be provisioned hermetically the way mesa is. Same shape as
-        // the WSL bridge above — host libraries plus the loader path — with the one difference
-        // that is the whole trick: each real file is bound *under the name the loader asks for*,
-        // because a soname bound onto itself resolves to its versioned target and disappears.
-        //
-        // Scope is compute (CUDA) and offscreen rendering. On a hybrid host a windowed client
-        // still renders on the integrated GPU, inside the cage exactly as outside it: the
-        // compositor holds that device, and the one workaround is GLX under X11, which sbx never
-        // offers. Nothing here approaches that refusal.
-        if let Some(nv) = &hw.nvidia {
-            // Composed by `gpu::nvidia_wiring`, which is pure over its inputs so the composition
-            // itself is unit-tested: both of this wiring's defects lived in the joining of lists,
-            // not in resolving them, and neither had a test to fail.
-            let kernel = std::fs::read_to_string("/proc/driver/nvidia/version")
-                .ok()
-                .and_then(|text| crate::sandbox::gpu::kernel_module_version(&text));
-            let mut notes = Vec::new();
-            let wiring = crate::sandbox::gpu::nvidia_wiring(
-                nv,
-                hw.gpu.as_ref().map_or(&[][..], |layer| &layer.env),
-                hw.gpu.as_ref().and_then(|layer| layer.glvnd.as_deref()),
-                kernel.as_deref(),
-                &mut notes,
-            );
-            for note in &notes {
-                crate::diag::warn(note);
-            }
-            gui_binds.extend(
-                wiring
-                    .binds
-                    .into_iter()
-                    .map(|(src, dest)| binds::ExtraBind {
-                        src,
-                        dest,
-                        writable: false,
-                    }),
-            );
-            gui_env.extend(wiring.env);
-        }
-    }
-
-    // Audio: when `audio = true`, bind the host PulseAudio socket read-only at the fixed cage path
-    // and point the app's loader at the provisioned libpulse (both provisioned/seeded above). Both
-    // pieces must be present — no host socket, or a failed provision, means no audio (best-effort, a
-    // warning, never a failed launch). The socket bind is read-only: same-uid, so a `connect()` still
-    // works (exactly like the Wayland socket). `PULSE_SERVER` is a data path (an untrusted `[env]`
-    // only self-DoSes its own cage's audio), so it needs no denylist entry; `LD_LIBRARY_PATH` is
-    // already reserved against an untrusted `[env]` (a code-load path, alongside `LD_*`).
-    if prep.cfg.audio {
-        let host_socket =
-            crate::sandbox::audio::host_socket(std::env::var("XDG_RUNTIME_DIR").ok().as_deref());
-        match host_socket {
-            Some(sock) if sock.exists() => {
-                // The socket bind + `PULSE_SERVER` are firm (independent of the userspace provision);
-                // the client libraries, the ALSA→pulse shim's `asound.conf`, and its env are added
-                // only when the userspace was provisioned (best-effort — a failed provision already
-                // warned, and the app then simply finds no audio).
-                gui_binds.push(binds::ExtraBind {
-                    src: sock,
-                    dest: PathBuf::from(crate::sandbox::audio::CAGE_SOCK),
-                    writable: false,
-                });
-                if let Some(alsa) = hw.audio.as_ref().and_then(|l| l.alsa.as_ref()) {
-                    gui_binds.push(binds::ExtraBind {
-                        src: alsa.asound_conf.clone(),
-                        dest: PathBuf::from(crate::sandbox::audio::ASOUND_CONF_INCAGE),
-                        writable: false,
-                    });
-                }
-                // The `find_library` shim directory (for a Python PortAudio tool), bound read-only and
-                // placed on `PYTHONPATH` by `audio::env`. Present only when PortAudio provisioned.
-                if let Some(pyshim) = hw.audio.as_ref().and_then(|l| l.pyshim.as_ref()) {
-                    gui_binds.push(binds::ExtraBind {
-                        src: pyshim.clone(),
-                        dest: PathBuf::from(crate::sandbox::audio::PYSHIM_INCAGE),
-                        writable: false,
-                    });
-                }
-                // Pass the base C++/glibc runtime dirs (the same set as NIX_LD_LIBRARY_PATH) so a
-                // voice speech-to-text engine's `dlopen`ed native library (ctranslate2/onnxruntime)
-                // finds `libstdc++.so.6` — `dlopen` consults LD_LIBRARY_PATH, not NIX_LD_LIBRARY_PATH.
-                gui_env.extend(crate::sandbox::audio::env(
-                    hw.audio.as_ref(),
-                    &prep.userland.foreign_lib_paths,
-                ));
-            }
-            _ => crate::diag::warn(
-                "`audio = true` but no PulseAudio socket was found at \
-                 `$XDG_RUNTIME_DIR/pulse/native` — the app runs without audio",
-            ),
-        }
-    }
+    // The three GUI holes, appended in the order their pushes had.
+    let mut gui = display_binds(
+        prep,
+        font_layer.as_ref(),
+        guidata_layer.as_ref(),
+        &portal_stack,
+    );
+    let gpu = gpu_binds(prep, &hw);
+    gui.binds.extend(gpu.binds);
+    gui.env.extend(gpu.env);
+    let audio = audio_binds(prep, &hw);
+    gui.binds.extend(audio.binds);
+    gui.env.extend(audio.env);
 
     // In-cage portal: wrap the command so the private session bus is stood up before the app runs.
     // The **outermost** layer, so its preamble (`dbus-daemon --fork`, which blocks until the socket
@@ -2220,7 +2307,7 @@ pub(super) fn build(
     extra_binds.extend(ssh_agent.binds);
     extra_binds.extend(brokers_up.reachable.iter().map(broker::Reachable::bind));
     extra_binds.extend(forward_up.binds);
-    extra_binds.extend(gui_binds);
+    extra_binds.extend(gui.binds);
     extra_binds.extend(provisioned.inline_flake_binds);
     extra_binds.extend(proc_lens.binds);
     // The store paths every wrap's preamble runs from, pinned read-only over the project's
@@ -2382,7 +2469,7 @@ pub(super) fn build(
     // under WSL, the GPU bridge — and each pushed its own entry. A shared key is won by one source,
     // so a cage with both grants kept whichever came last and silently lost the other's
     // directories, which for `claude-desktop` is both of them.
-    merge_loader_path(&mut gui_env);
+    merge_loader_path(&mut gui.env);
 
     // Environment. Each source is tagged with where it belongs, and `EnvLayer` — not this list's
     // order — decides which one wins a shared key. The structural HOME/PATH/... are added by the
@@ -2392,7 +2479,7 @@ pub(super) fn build(
     let extra_env = extra_cage_env(vec![
         (EnvLayer::Passthrough, passthrough_env()),
         (EnvLayer::Cacert, binds::cacert_env()),
-        (EnvLayer::Gui, gui_env),
+        (EnvLayer::Gui, gui.env),
         (EnvLayer::AutoEquip, autoequip_env),
         (EnvLayer::Mise, mise_env(prep)?),
         (EnvLayer::Egress, egress_env),
