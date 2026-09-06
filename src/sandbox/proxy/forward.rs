@@ -77,7 +77,7 @@ pub(super) fn handle_https_forward(
         &mut client,
         ctx,
         Plane::HttpsForward,
-        RawRequest {
+        &RawRequest {
             head,
             head_bytes,
             method,
@@ -338,7 +338,7 @@ pub(super) fn handle_https_forward(
         )
     }) {
         Ok(pair) => pair,
-        Err(e) => return refuse_upstream(&mut client, ctx, &host, port, verb, &path, e),
+        Err(e) => return refuse_upstream(&mut client, ctx, &host, port, verb, &path, &e),
     };
 
     // The request is permitted and the upstream TLS handshake is validated — record the one `allow`.
@@ -505,7 +505,7 @@ pub(super) fn handle_https_forward(
                 acquire_upstream(ctx, None, ip, port, &host)
             }) {
                 Ok(pair) => pair,
-                Err(e) => return refuse_upstream(&mut client, ctx, &host, port, verb, &path, e),
+                Err(e) => return refuse_upstream(&mut client, ctx, &host, port, verb, &path, &e),
             };
             upstream = fresh;
             from_pool = false;
@@ -569,7 +569,7 @@ pub(super) fn handle_https_forward(
         // This plane's client leg is the proxy's own listening socket, spoken in cleartext and
         // served one request at a time — there is nothing on it to keep alive, whatever the
         // upstream leg does or says it does.
-        ClientLeg::Close,
+        &ClientLeg::Close,
     )?;
     // An upstream that produced no final head leaves nothing to relay, and an empty success would
     // be indistinguishable from a genuine zero-byte response — see the tunneled path. Which cause
@@ -604,7 +604,7 @@ pub(super) fn handle_https_forward(
     } = relay_response_body(
         &mut up_br,
         &mut client,
-        framing,
+        &framing,
         &flow.down,
         capture.as_ref(),
         masks_reflection,

@@ -41,7 +41,7 @@ pub(super) fn handle_cleartext(
         &mut client,
         ctx,
         Plane::Cleartext,
-        RawRequest {
+        &RawRequest {
             head,
             head_bytes,
             method,
@@ -282,7 +282,7 @@ pub(super) fn handle_cleartext(
         method,
         // One request per connection on this plane, so the client is told `close` in sbx's own
         // words rather than in whatever the upstream chose to answer.
-        ClientLeg::Close,
+        &ClientLeg::Close,
     )?;
     // An upstream that produced no final head is answered rather than fallen through, and on this
     // plane that is load-bearing rather than symmetry with the other two. With no final head the
@@ -313,7 +313,7 @@ pub(super) fn handle_cleartext(
         ctx.set_status(allow_seq, code);
     }
     // Count upstream→client (`down`) through the body; the head was counted as it was relayed.
-    let counted = CountingReader::new(FramedBody::new(up_br, framing), flow.down.clone());
+    let counted = CountingReader::new(FramedBody::new(up_br, &framing), flow.down.clone());
     let mut response = tee_response(counted, capture.as_ref());
     pump_to_eof(&mut response, &mut client)
 }

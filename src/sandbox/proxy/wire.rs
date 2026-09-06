@@ -799,10 +799,10 @@ pub(super) struct FramedBody<R> {
 }
 
 impl<R: BufRead> FramedBody<R> {
-    pub(super) fn new(inner: R, framing: BodyFraming) -> Self {
+    pub(super) fn new(inner: R, framing: &BodyFraming) -> Self {
         let state = match framing {
             BodyFraming::Empty => BodyState::Done { as_framed: true },
-            BodyFraming::Length(n) => BodyState::Length(n),
+            BodyFraming::Length(n) => BodyState::Length(*n),
             BodyFraming::Chunked => BodyState::ChunkSize,
             BodyFraming::ToEof => BodyState::ToEof,
         };
@@ -965,7 +965,8 @@ mod tests {
     /// Read a whole framed body, returning the bytes the relay would forward.
     fn framed(head: &[u8], method: &str, wire: &[u8]) -> Vec<u8> {
         let framing = response_framing(head, method);
-        let mut body = FramedBody::new(io::BufReader::new(io::Cursor::new(wire.to_vec())), framing);
+        let mut body =
+            FramedBody::new(io::BufReader::new(io::Cursor::new(wire.to_vec())), &framing);
         let mut out = Vec::new();
         body.read_to_end(&mut out).unwrap();
         out
@@ -974,7 +975,8 @@ mod tests {
     /// Read a whole framed body and report whether it ended where its framing said it would.
     fn framed_verdict(head: &[u8], method: &str, wire: &[u8]) -> bool {
         let framing = response_framing(head, method);
-        let mut body = FramedBody::new(io::BufReader::new(io::Cursor::new(wire.to_vec())), framing);
+        let mut body =
+            FramedBody::new(io::BufReader::new(io::Cursor::new(wire.to_vec())), &framing);
         body.read_to_end(&mut Vec::new()).unwrap();
         body.ended_as_framed()
     }
@@ -1058,7 +1060,7 @@ mod tests {
         // caller having to notice and say so.
         let mut body = FramedBody::new(
             io::BufReader::new(io::Cursor::new(b"hello world".to_vec())),
-            BodyFraming::Length(11),
+            &BodyFraming::Length(11),
         );
         let mut some = [0u8; 5];
         body.read_exact(&mut some).unwrap();
@@ -1420,7 +1422,9 @@ mod tests {
         assert!(complete);
         let framing = response_framing(&head, "GET");
         let mut out = Vec::new();
-        FramedBody::new(src, framing).read_to_end(&mut out).unwrap();
+        FramedBody::new(src, &framing)
+            .read_to_end(&mut out)
+            .unwrap();
         assert_eq!(
             out, b"hello world",
             "the body buffered alongside the head must not be lost"
@@ -1449,7 +1453,7 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
         );
         let mut out = Vec::new();
-        FramedBody::new(src, response_framing(&head, "GET"))
+        FramedBody::new(src, &response_framing(&head, "GET"))
             .read_to_end(&mut out)
             .unwrap();
         assert_eq!(out, b"5\r\nhello\r\n0\r\n\r\n");

@@ -54,7 +54,7 @@ const MAX_HEADER_LIST: u32 = 64 * 1024;
 /// per-connection current-thread runtime, confined here.
 pub(super) fn handle(
     client: std::os::unix::net::UnixStream,
-    connect_host: String,
+    connect_host: &str,
     port: u16,
     ctx: &ProxyCtx,
 ) -> io::Result<()> {
@@ -62,7 +62,7 @@ pub(super) fn handle(
         .enable_all()
         .build()
         .map_err(io::Error::other)?;
-    rt.block_on(serve(client, &connect_host, port, ctx))
+    rt.block_on(serve(client, connect_host, port, ctx))
 }
 
 /// Accept the tunnel, terminate TLS as h2, then drive stream acceptance and every in-flight

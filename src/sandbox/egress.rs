@@ -1402,14 +1402,14 @@ fn read_source(
 ) -> io::Result<Option<String>> {
     match source {
         SecretSource::Env(var) => match std::env::var(var) {
-            Ok(value) => classify_value(value, header, &format!("${var}")),
+            Ok(value) => classify_value(&value, header, &format!("${var}")),
             Err(std::env::VarError::NotPresent) => Ok(None),
             Err(std::env::VarError::NotUnicode(_)) => Err(io::Error::other(format!(
                 "the secret for `{header}` reads ${var}, which is not valid Unicode"
             ))),
         },
         SecretSource::File(path) => match std::fs::read_to_string(path) {
-            Ok(value) => classify_value(value, header, &path.display().to_string()),
+            Ok(value) => classify_value(&value, header, &path.display().to_string()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(io::Error::other(format!(
                 "the secret for `{header}` cannot read {}: {e}",
@@ -1446,7 +1446,7 @@ fn read_source(
         SecretSource::Plugin { plugin, locator } => {
             let reff = format!("{}://{locator}", plugin.scheme);
             let raw = super::resolver::run(bwrap, plugin, &reff, brokers)?;
-            classify_value(raw, header, &format!("{} {locator}", plugin.scheme))
+            classify_value(&raw, header, &format!("{} {locator}", plugin.scheme))
         }
     }
 }
@@ -1530,7 +1530,7 @@ fn run_sops(
             file.display()
         ))
     })?;
-    classify_value(value, header, &format!("sops {}", file.display()))
+    classify_value(&value, header, &format!("sops {}", file.display()))
 }
 
 /// Strip the single trailing line ending a source's raw output commonly carries and which is not
@@ -1546,8 +1546,8 @@ pub(super) fn strip_trailing_line_ending(s: &str) -> &str {
 /// commonly ends in one), then an empty result is a clean **absent** (`Ok(None)` — fall through to
 /// the next source), while an embedded CR/LF/NUL is a **hard** error (`Err`) — it cannot be an HTTP
 /// header value, and a found-but-malformed secret must fail closed rather than fall through.
-fn classify_value(raw: String, header: &str, label: &str) -> io::Result<Option<String>> {
-    let trimmed = strip_trailing_line_ending(&raw);
+fn classify_value(raw: &str, header: &str, label: &str) -> io::Result<Option<String>> {
+    let trimmed = strip_trailing_line_ending(raw);
     if trimmed.is_empty() {
         return Ok(None);
     }

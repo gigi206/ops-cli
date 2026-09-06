@@ -327,7 +327,7 @@ fn launch(
         warn_ask_under_detach(&prep.cfg.network);
         launch_detached(prep, runtime, kind, cmd, label, observe)
     } else {
-        launch_foreground(prep, runtime, kind, cmd, observe)
+        launch_foreground(&prep, runtime, kind, cmd, observe)
     }
 }
 
@@ -352,13 +352,13 @@ fn warn_ask_under_detach(network: &crate::config::NetworkPolicy) {
 /// Run the cage in the foreground: this process becomes the cage (exec) or supervises it
 /// (allowlist), and its exit status becomes sbx's.
 fn launch_foreground(
-    prep: Prepared,
+    prep: &Prepared,
     runtime: binds::Runtime,
     kind: Kind,
     cmd: Vec<OsString>,
     observe: bool,
 ) -> ExitCode {
-    let (spec, guard) = match build(&prep, runtime, cmd) {
+    let (spec, guard) = match build(prep, runtime, cmd) {
         Ok(v) => v,
         Err(code) => return code,
     };

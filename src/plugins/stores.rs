@@ -94,7 +94,7 @@ pub(crate) fn add(
     pubkey: [u8; 32],
     git: &Path,
 ) -> Result<Added, String> {
-    add_inner(layout, name, url, TrustChoice::Pinned(pubkey), git)
+    add_inner(layout, name, url, &TrustChoice::Pinned(pubkey), git)
 }
 
 /// Configure a new remote plugin store on **trust on first use**: clone it, read the public key it
@@ -109,7 +109,7 @@ pub(crate) fn add_tofu(
     url: &str,
     git: &Path,
 ) -> Result<Added, String> {
-    add_inner(layout, name, url, TrustChoice::Tofu, git)
+    add_inner(layout, name, url, &TrustChoice::Tofu, git)
 }
 
 /// The shared body of [`add`] and [`add_tofu`]. Fail-closed and all-or-nothing — a bad name, an
@@ -120,7 +120,7 @@ fn add_inner(
     layout: &crate::store::Layout,
     name: &str,
     url: &str,
-    trust: TrustChoice,
+    trust: &TrustChoice,
     git: &Path,
 ) -> Result<Added, String> {
     // The name becomes a directory under the data dir, so it is held to the same safe
@@ -145,7 +145,7 @@ fn add_inner(
     // store ships, learned only now. Either way the catalogue must verify against it, so a TOFU pin
     // is still self-consistent (the catalogue is signed by the very key being pinned).
     let (pubkey, tofu) = match trust {
-        TrustChoice::Pinned(k) => (k, false),
+        TrustChoice::Pinned(k) => (*k, false),
         TrustChoice::Tofu => (read_repo_pubkey(&checkout)?, true),
     };
 

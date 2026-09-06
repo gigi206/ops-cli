@@ -328,13 +328,13 @@ fn start_fs(data_dir: &Path, pid: u32, project: &Path) -> (Option<FsWatcher>, Op
 /// observation in prose and `reader` names the command that would have read it, so the warning says
 /// which of the two feeds went quiet — with both stood up, an unqualified one would not.
 fn bind_lens(
-    dir: PathBuf,
+    dir: &Path,
     socket: PathBuf,
     lens: &str,
     reader: &str,
     serve: impl FnOnce(UnixListener) -> std::io::Result<()> + Send + 'static,
 ) -> Option<PathBuf> {
-    if let Err(e) = super::lens::ensure_control_dir(&dir) {
+    if let Err(e) = super::lens::ensure_control_dir(dir) {
         crate::diag::warn(&format!(
             "could not create the {lens} directory ({e}) — `{reader}` will not see this session"
         ));
@@ -354,7 +354,7 @@ fn bind_lens(
 fn bind_control(data_dir: &Path, pid: u32, ring: &Arc<ExecRing>) -> Option<PathBuf> {
     let serve_ring = ring.clone();
     bind_lens(
-        proc_control_dir(data_dir),
+        &proc_control_dir(data_dir),
         proc_control_socket(data_dir, pid),
         "process-observation",
         "sbx proc logs",
@@ -367,7 +367,7 @@ fn bind_control(data_dir: &Path, pid: u32, ring: &Arc<ExecRing>) -> Option<PathB
 fn bind_fs_control(data_dir: &Path, pid: u32, ring: &Arc<FsRing>) -> Option<PathBuf> {
     let serve_ring = ring.clone();
     bind_lens(
-        fs_control_dir(data_dir),
+        &fs_control_dir(data_dir),
         fs_control_socket(data_dir, pid),
         "filesystem-observation",
         "sbx fs logs",

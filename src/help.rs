@@ -253,7 +253,7 @@ pub fn maybe_help(cmd: &str, rest: &[OsString]) -> Option<ExitCode> {
 /// the page for the full command path given after the verb. Each token is folded to the
 /// canonical name it stands for, against the path resolved so far; a token that names no
 /// command is kept as typed, so an unknown path is reported in the words the user used.
-pub fn dispatch(args: Vec<OsString>) -> ExitCode {
+pub fn dispatch(args: &[OsString]) -> ExitCode {
     let mut path: Vec<&str> = Vec::new();
     for tok in args
         .iter()

@@ -397,11 +397,14 @@ fn programs(policy: &SeccompPolicy) -> Vec<Vec<u8>> {
 /// the caller must also keep the returned files alive until bwrap has read them. (No `memfd` seal
 /// is applied or needed — the file is written, rewound, and read once by bwrap.)
 pub(crate) fn memfds(policy: &SeccompPolicy) -> io::Result<Vec<File>> {
-    programs(policy).into_iter().map(write_to_memfd).collect()
+    programs(policy)
+        .into_iter()
+        .map(|p| write_to_memfd(&p))
+        .collect()
 }
 
-fn write_to_memfd(bytes: Vec<u8>) -> io::Result<File> {
-    super::memfd::write(c"sbx-seccomp", &bytes)
+fn write_to_memfd(bytes: &[u8]) -> io::Result<File> {
+    super::memfd::write(c"sbx-seccomp", bytes)
 }
 
 /// The bwrap flags that load `memfds` as additional seccomp filters, to be placed

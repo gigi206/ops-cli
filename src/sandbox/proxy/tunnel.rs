@@ -505,7 +505,7 @@ pub(super) fn serve_tunneled_request(
                 port,
                 &imethod,
                 &itarget,
-                e,
+                &e,
             ));
         }
     };
@@ -758,7 +758,7 @@ pub(super) fn serve_tunneled_request(
                         port,
                         &imethod,
                         &itarget,
-                        e,
+                        &e,
                     ));
                 }
             };
@@ -838,7 +838,7 @@ pub(super) fn serve_tunneled_request(
         // open to one. Everything else about reuse is decided from the response, but this half of it
         // belongs to the client and answering keep-alive over a `Connection: close` would be sbx
         // telling the client something the client did not ask for.
-        if inner.keeps_alive() {
+        &if inner.keeps_alive() {
             ClientLeg::MayReuse { idle: ctx.idle }
         } else {
             ClientLeg::Close
@@ -886,7 +886,7 @@ pub(super) fn serve_tunneled_request(
     } = relay_response_body(
         &mut up_br,
         br.get_mut(),
-        framing,
+        &framing,
         &flow.down,
         capture.as_ref(),
         masks_reflection,

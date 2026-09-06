@@ -510,7 +510,7 @@ fn handle_client(mut client: UnixStream, ctx: &ProxyCtx) -> io::Result<()> {
     // confined to [`h2mitm`]; the synchronous HTTP/1.1 path below is untouched. Read from the config
     // policy — h2 selection is launch-static, not `--session`-overlaid.
     if ctx.policy.speaks_http2(&connect_host, port) {
-        return h2mitm::handle(client, connect_host, port, ctx);
+        return h2mitm::handle(client, &connect_host, port, ctx);
     }
 
     // 3. Accept the tunnel, then terminate TLS with a leaf minted for the SNI host.
@@ -908,7 +908,7 @@ fn refuse_upstream<W: Write>(
     port: u16,
     method: &str,
     target: &str,
-    err: UpstreamError,
+    err: &UpstreamError,
 ) -> io::Result<()> {
     let (reason, detail) = match err {
         // The shape every plane can produce, answered in the one place that spells it.
@@ -1656,7 +1656,7 @@ struct RelayedBody {
 fn relay_response_body<R: Read, W: Write>(
     up: &mut BufReader<R>,
     out: &mut W,
-    framing: BodyFraming,
+    framing: &BodyFraming,
     down: &Arc<AtomicU64>,
     capture: Option<&CaptureGuard>,
     masks_reflection: bool,
@@ -1724,7 +1724,7 @@ fn relay_response_head<R: BufRead, W: Write>(
     capture: Option<&CaptureGuard>,
     redactions: &[SecretNeedle],
     request_method: &str,
-    client_leg: ClientLeg,
+    client_leg: &ClientLeg,
 ) -> io::Result<RelayedHead> {
     let mut interim_seen = 0usize;
     loop {
@@ -1775,7 +1775,7 @@ fn relay_response_head<R: BufRead, W: Write>(
         // speaks about, so it crosses untouched.
         let wire = match client_leg {
             _ if !final_head => head.clone(),
-            ClientLeg::MayReuse { idle } if persistent => offer_reuse_in_head(&head, idle),
+            ClientLeg::MayReuse { idle } if persistent => offer_reuse_in_head(&head, *idle),
             ClientLeg::Close | ClientLeg::MayReuse { .. } => force_close_in_head(&head),
         };
         write_head_to_client(wire, client, down, redactions)?;
@@ -2252,10 +2252,10 @@ fn admit_absolute_form(
     client: &mut UnixStream,
     ctx: &ProxyCtx,
     plane: Plane,
-    req: RawRequest<'_>,
+    req: &RawRequest<'_>,
     needles: &[SecretNeedle],
 ) -> io::Result<Option<AbsoluteForm>> {
-    let RawRequest {
+    let &RawRequest {
         head,
         head_bytes,
         method,

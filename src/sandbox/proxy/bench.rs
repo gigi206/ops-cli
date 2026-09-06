@@ -365,7 +365,7 @@ fn read_framed_response<R: BufRead>(br: &mut R) -> io::Result<usize> {
         BodyFraming::ToEof
     };
     let mut body = Vec::new();
-    FramedBody::new(br, framing).read_to_end(&mut body)?;
+    FramedBody::new(br, &framing).read_to_end(&mut body)?;
     Ok(head.len() + body.len())
 }
 

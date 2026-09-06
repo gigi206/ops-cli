@@ -366,7 +366,7 @@ fn read_one_response<R: BufRead>(br: &mut R, request: &[u8]) -> io::Result<OneRe
         } else {
             BodyFraming::ToEof
         };
-        match FramedBody::new(&mut *br, framing).read_to_end(&mut out) {
+        match FramedBody::new(&mut *br, &framing).read_to_end(&mut out) {
             Ok(_) => {}
             Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
             Err(e) => return Err(e),
@@ -2558,7 +2558,7 @@ fn a_one_request_leg_states_its_own_close_over_an_upstream_that_offered_reuse() 
         None,
         &[],
         "GET",
-        ClientLeg::Close,
+        &ClientLeg::Close,
     )
     .unwrap();
 
@@ -2611,7 +2611,7 @@ fn every_relayed_head_is_counted_including_an_interim_one() {
             None,
             &needles,
             "GET",
-            ClientLeg::Close,
+            &ClientLeg::Close,
         )
         .unwrap();
         assert_eq!(
@@ -2670,7 +2670,7 @@ fn an_upstream_that_only_sends_interim_heads_is_cut_off() {
         None,
         &[],
         "GET",
-        ClientLeg::Close,
+        &ClientLeg::Close,
     )
     .unwrap();
     let crossed = String::from_utf8_lossy(&client)
