@@ -138,7 +138,7 @@ pub(super) fn net_groups_export(args: &[OsString]) -> ExitCode {
 
     // Select all groups (sorted) or the named subset. An unknown name is an explicit error.
     let selected: std::collections::BTreeMap<String, Vec<String>> = if names.is_empty() {
-        groups.clone()
+        groups
     } else {
         let missing: Vec<&str> = names
             .iter()
