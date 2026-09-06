@@ -1,0 +1,23 @@
+[1msbx config[0m — app [1;36mquiet[0m resolved for [1;36m/proj[0m
+  [1mcmd:[0m     [33m(no command)[0m
+  [1mhome:[0m    global (shared across projects)  [2m(default)[0m
+  [1mnetwork:[0m shared [2m(host network)[0m  [2m(default)[0m
+  [1mproc:[0m     [2m(0 allow, 0 deny)[0m  [2m(default)[0m
+  [1mnotify:[0m  [2mper event[0m  [2m(default)[0m
+  [1mgui:[0m     offscreen [2m(fonts + proxy CA, no display)[0m  [2m(default)[0m
+  [1mgpu:[0m     disabled  [2m(default)[0m
+  [1mallow_insecure_http:[0m disabled  [2m(default)[0m
+  [1maudio:[0m   disabled  [2m(default)[0m
+  [1mdbus:[0m    disabled  [2m(default)[0m
+  [1mlimits:[0m  MemoryHigh=70% [2m(default)[0m, MemoryMax=90% [2m(default)[0m, TasksMax=4096 [2m(default)[0m
+  [1mforward:[0m (none)  [2m(default)[0m
+  [1mseccomp:[0m (mandatory denylist)  [2m(default)[0m
+  [1mdevices:[0m (none — minimal /dev)  [2m(default)[0m
+  [1mfs scan:[0m /home/demo/.ssh [2m(content closed at every open; built-in ceiling)[0m  [2m(default)[0m
+  [1mssh-agent:[0m id_ed25519 [2m(keys the cage may sign with)[0m  [2m(default)[0m
+  [1menv:[0m     [2m(none)[0m
+  [1mbinds:[0m   [2m(none)[0m
+  [1mpackages:[0m [2m(none)[0m  [2m· inherits 2 baseline[0m
+  [1mnixpkgs:[0m [1;36mnixos-unstable[0m  ([2mdefault[0m)
+  [1mopen:[0m [2m(none — a URI is printed, not opened)[0m
+  [1msecrets:[0m [2m(none)[0m

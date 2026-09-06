@@ -1,0 +1,63 @@
+[1msbx config[0m — app [1;36mloaded[0m resolved for [1;36m/proj[0m
+  [1mcmd:[0m     loaded-agent --serve  [32m(app:project)[0m
+  [1minstall:[0m npm ci  [2m(from bundle demo-bundle, runs once before cmd)[0m
+  [1minstall:[0m demo-tool setup  [2m(from bundle demo-tools, runs once before cmd)[0m
+  [1mhome:[0m    project (one home per directory)  [1;36m(app:global)[0m
+  [1mnetwork:[0m ask  [32m(app:project)[0m
+    [2mask timeout: none (wait indefinitely until answered)[0m
+    [2mask notice: off (parked requests are silent — answer via [36msbx net pending[0m[2m)[0m
+    [2mcapture: bodies (up to 64 KiB per body) — read it with [36msbx net logs --with-body[0m[2m[0m
+    [2mwebsocket secret: block (a tunnel carrying one out is closed)[0m
+    [2mconnection reuse: on (a request may ride an upstream connection an earlier one left behind)[0m
+    [2mcage ca: session CA only (no public roots; a tool that checks the store's shape may refuse it)[0m
+    [2mdns cache: 30s (a resolved address stands for that long)[0m
+    [2midle timeout: 90s (a connection with nothing to carry is closed after that)[0m
+    [2mmax connections: 64 (one beyond it is refused [36mconnection-cap[0m[2m, not queued)[0m
+    [2mbody ceiling: 8 MiB (the most of one request body held; a larger streamed upload is refused)[0m
+    allow [1;36mapi.example.com[0m
+    allow [1;36mregistry.example.org[0m
+    [33mdeny[0m  [1;36mtelemetry.example.net[0m
+    [2mshared_credential[0m [1;36mexample.com, api.example.com[0m
+    [2mmute[0m  [1;36mlogs.example.com[0m
+    [2mmute[0m  [1;36mbeacon.example.com[0m
+    [2mhttp2[0m [1;36mgrpc.example.com[0m
+    [2mbuilt-in (always allowed, so self-equip works):[0m
+      allow [1;36mcache.nixos.org[0m
+      allow [1;36mchannels.nixos.org[0m
+    [2m(deny wins over allow)[0m
+  [1mproc:[0m    enforce [2m(2 allow, 1 deny)[0m  [32m(app:project)[0m
+  [1mnotify:[0m  [2mper event[0m [2m(a repeat waits 300s)[0m  [1;36m(app:global)[0m
+      [2mnet-refusal[0m once
+      [2mfs-refusal[0m off
+  [1mgui:[0m     wayland [2m(exposure depends on your compositor)[0m  [1;36m(app:global)[0m
+  [1mgpu:[0m     enabled  [32m(app:project)[0m
+  [1mallow_insecure_http:[0m enabled  [1;36m(app:global)[0m
+  [1maudio:[0m   enabled  [32m(app:project)[0m
+  [1mdbus:[0m    in-cage portal  [1;36m(app:global)[0m
+  [1mlimits:[0m  MemoryHigh=4G [1;36m(app:global)[0m, MemoryMax=8G [32m(app:project)[0m, TasksMax=512 [33m(override)[0m
+  [1mforward:[0m 8080, 3000:3001 [2m(host loopback → cage loopback)[0m  [32m(app:project)[0m
+  [1mseccomp:[0m allow userfaultfd, perf_event_open [2m(syscalls re-permitted)[0m  [1;36m(app:global)[0m
+  [1mdevices:[0m /dev/kvm, /dev/net/tun [2m(host device nodes exposed)[0m  [32m(app:project)[0m
+  [1mfs deny:[0m /home/demo/.gnupg, /home/demo/.aws [2m(closed to the cage)[0m  [1;36m(app:global)[0m
+  [1mfs scan:[0m /home/demo/.config, /home/demo/.local [2m(content closed at every open; first 128 KiB of each file)[0m  [1;36m(app:global)[0m
+  [1mfs readonly:[0m /home/demo/src [2m(readable, not writable)[0m  [1;36m(app:global)[0m
+  [1mssh-agent:[0m id_ed25519, id_rsa [2m(keys the cage may sign with, each signature confirmed on your desktop)[0m  [32m(app:project)[0m
+  [1menv:[0m     [1;36mDEMO_TOKEN[0m, [1;36mDEMO_REGION[0m
+    [1;36mDEMO_TOKEN[0m=placeholder
+    [1;36mDEMO_REGION[0m=eu-west
+  [1mbinds:[0m   [1;36m/data[0m, [1;36m/scratch[0m [33m(rw)[0m  [2m· inherits 3 baseline[0m
+  [1mpackages:[0m [1;36mjq[0m [2m(nix)[0m, [1;36mdemo-tool[0m [33m(flake, withheld)[0m  [2m· inherits 1 baseline[0m
+    [1;36mjq[0m -> nix:jq  [2m(host-side, durable)[0m
+    [1;36mdemo-tool[0m -> flake:github:example/demo-tool  [33m(withheld: the project is untrusted)[0m
+  [1mnixpkgs:[0m [1;36mnixos-23.11[0m @ [2m1f2e3d4[0m  ([1;36mglobal[0m)
+  [1mopen:[0m
+    [1;36mhttps://[0m demo-browser [2m(detach)[0m
+    [1;36mdemo://[0m demo-agent open [2m(exec)[0m
+  [1mservice:[0m
+    [1;36mapi[0m demo-api --port 9119 [2m(waits for :9119 up to 20s)[0m [2m[only when DEMO_API is set][0m
+    [1;36mwatcher[0m demo-watch
+  [1msecrets:[0m [1;36mAuthorization[0m -> [1;36mapi.example.com[0m, [1;36mX-Api-Key[0m -> [1;36mregistry.example.org[0m  [2m· inherits 1 baseline[0m
+    [1;36mAuthorization[0m -> [1;36mapi.example.com[0m  [2m(bearer, from env:DEMO_TOKEN)[0m
+    [1;36mX-Api-Key[0m -> [1;36mregistry.example.org[0m  [2m(raw, from file:~/.demo/key)[0m
+  [33mnote: the project is untrusted, so its `binds` were dropped[0m
+  [33mnote: `caps` is not a field sbx accepts[0m

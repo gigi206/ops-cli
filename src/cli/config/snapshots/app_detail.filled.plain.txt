@@ -1,0 +1,50 @@
+sbx config — app loaded resolved for /proj
+  cmd:     loaded-agent --serve  (app:project)
+  install: npm ci  (from bundle demo-bundle, runs once before cmd)
+  install: demo-tool setup  (from bundle demo-tools, runs once before cmd)
+  home:    project (one home per directory)  (app:global)
+  network: ask  (app:project)
+    ask timeout: none (wait indefinitely until answered)
+    ask notice: off (parked requests are silent — answer via `sbx net pending`)
+    capture: bodies (up to 64 KiB per body) — read it with `sbx net logs --with-body`
+    websocket secret: block (a tunnel carrying one out is closed)
+    cage ca: session CA only (no public roots; a tool that checks the store's shape may refuse it)
+    dns cache: 30s (a resolved address stands for that long)
+    idle timeout: 90s (a connection with nothing to carry is closed after that)
+    max connections: 64 (one beyond it is refused `connection-cap`, not queued)
+    body ceiling: 8 MiB (the most of one request body held; a larger streamed upload is refused)
+    allow api.example.com
+    allow registry.example.org
+    deny  telemetry.example.net
+    shared_credential example.com, api.example.com
+    (2 mute, 1 http2 — see --details)
+  proc:    enforce (2 allow, 1 deny)  (app:project)
+  notify:  per event (a repeat waits 300s)  (app:global)
+      net-refusal once
+      fs-refusal off
+  gui:     wayland (exposure depends on your compositor)  (app:global)
+  gpu:     enabled  (app:project)
+  allow_insecure_http: enabled  (app:global)
+  audio:   enabled  (app:project)
+  dbus:    in-cage portal  (app:global)
+  limits:  MemoryHigh=4G (app:global), MemoryMax=8G (app:project), TasksMax=512 (override)
+  forward: 8080, 3000:3001 (host loopback → cage loopback)  (app:project)
+  seccomp: allow userfaultfd, perf_event_open (syscalls re-permitted)  (app:global)
+  devices: /dev/kvm, /dev/net/tun (host device nodes exposed)  (app:project)
+  fs deny: /home/demo/.gnupg, /home/demo/.aws (closed to the cage)  (app:global)
+  fs scan: /home/demo/.config, /home/demo/.local (content closed at every open; first 128 KiB of each file)  (app:global)
+  fs readonly: /home/demo/src (readable, not writable)  (app:global)
+  ssh-agent: id_ed25519, id_rsa (keys the cage may sign with, each signature confirmed on your desktop)  (app:project)
+  env:     DEMO_TOKEN, DEMO_REGION
+  binds:   /data, /scratch (rw)  · inherits 3 baseline
+  packages: jq (nix), demo-tool (flake, withheld)  · inherits 1 baseline
+  nixpkgs: nixos-23.11 @ 1f2e3d4  (global)
+  open:
+    https:// demo-browser (detach)
+    demo:// demo-agent open (exec)
+  service:
+    api demo-api --port 9119 (waits for :9119 up to 20s) [only when DEMO_API is set]
+    watcher demo-watch
+  secrets: Authorization -> api.example.com, X-Api-Key -> registry.example.org  · inherits 1 baseline
+  note: the project is untrusted, so its `binds` were dropped
+  note: `caps` is not a field sbx accepts

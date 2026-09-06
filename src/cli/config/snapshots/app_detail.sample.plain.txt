@@ -1,0 +1,21 @@
+sbx config — app demo resolved for /proj
+  cmd:     demo-agent  (app:global)
+  home:    global (shared across projects)  (default)
+  network: deny  (app:global)
+    allow api.example.com
+  proc:     (0 allow, 0 deny)  (inherited)
+  gui:     none  (inherited)
+  gpu:     disabled  (inherited)
+  audio:   disabled  (inherited)
+  dbus:    disabled  (inherited)
+  limits:  MemoryHigh=70% (inherited), MemoryMax=90% (inherited), TasksMax=2048 (app:project)
+  forward: (none)  (inherited)
+  seccomp: (mandatory denylist)  (inherited)
+  devices: (none — minimal /dev)  (inherited)
+  at their default: notify, allow_insecure_http — see --details
+  env:     DEMO_TOKEN  · inherits 2 baseline
+  binds:   (none)
+  packages: (none)
+  nixpkgs: nixos-23.11 @ 9ae611a  (project pin)
+  open: (none — a URI is printed, not opened)
+  secrets: (none)

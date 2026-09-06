@@ -661,9 +661,373 @@ pub(super) fn sample_app_detail_view() -> config::view::AppDetailView {
     }
 }
 
+/// A per-app view with every posture left at its default — the fixture that reaches the *folded*
+/// half of [`posture_shown`], which the mixed [`sample_app_detail_view`] cannot: there four
+/// postures carry a baseline value and stay on screen.
+///
+/// It carries, around that fold, the shapes the mixed fixture leaves unrendered: an app no layer
+/// gave a command, a network posture that filters nothing, an offscreen display, a scan set under
+/// the built-in ceiling, an ssh-agent grant that confirms nothing, a channel with no locked
+/// revision, and a collection that is empty and still inherits.
+#[cfg(test)]
+fn all_defaults_app_detail_view() -> config::view::AppDetailView {
+    use config::view::*;
+    AppDetailView {
+        name: "quiet".into(),
+        cwd: "/proj".into(),
+        cmd: None,
+        cmd_origin: ProvenanceView::Default,
+        provisions: Vec::new(),
+        home_scope: "global (shared across projects)".into(),
+        home_scope_origin: ProvenanceView::Default,
+        nixpkgs: ChannelView {
+            source: "nixos-unstable".into(),
+            origin: "default".into(),
+            locked_rev: None,
+        },
+        network: NetworkView::Shared,
+        network_origin: ProvenanceView::Default,
+        proc: ProcView::default(),
+        proc_origin: ProvenanceView::Default,
+        notify: Default::default(),
+        notify_origin: ProvenanceView::Default,
+        gui: GuiView::Offscreen,
+        gui_origin: ProvenanceView::Default,
+        gpu: false,
+        gpu_origin: ProvenanceView::Default,
+        allow_insecure_http: false,
+        allow_insecure_http_origin: ProvenanceView::Default,
+        audio: false,
+        audio_origin: ProvenanceView::Default,
+        dbus: false,
+        dbus_origin: ProvenanceView::Default,
+        forward: vec![],
+        forward_origin: ProvenanceView::Default,
+        seccomp: vec![],
+        seccomp_origin: ProvenanceView::Default,
+        devices: vec![],
+        devices_origin: ProvenanceView::Default,
+        fs_deny: Vec::new(),
+        fs_readonly: Vec::new(),
+        fs_scan: vec!["/home/demo/.ssh".into()],
+        fs_scan_max_kb: None,
+        fs_origin: ProvenanceView::Default,
+        ssh_agent: vec!["id_ed25519".into()],
+        ssh_agent_confirm: false,
+        ssh_agent_origin: ProvenanceView::Default,
+        limits: LimitsView {
+            memory_high: LimitView {
+                value: "70%".into(),
+                origin: ProvenanceView::Default,
+            },
+            memory_max: LimitView {
+                value: "90%".into(),
+                origin: ProvenanceView::Default,
+            },
+            tasks_max: LimitView {
+                value: "4096".into(),
+                origin: ProvenanceView::Default,
+            },
+        },
+        env: vec![],
+        env_inherited: 0,
+        binds: vec![],
+        binds_inherited: 0,
+        packages: vec![],
+        packages_inherited: 2,
+        secrets: vec![],
+        secrets_inherited: 0,
+        open: vec![],
+        service: vec![],
+        notes: vec![],
+    }
+}
+
+/// A per-app view with every field an app can carry set to something — the fixture that reaches the
+/// branches a posture only takes when somebody configured it.
+///
+/// Against the two fixtures beside it, this one is what renders the `install:` rows, a deny rule
+/// beside an allow, the counted `mute`/`http2` tail the compact view prints instead of listing
+/// them, a wayland display, every posture in its enabled spelling, a forward that remaps its port,
+/// the three mask sets, a confirmed ssh-agent grant, a withheld package, the handler and service
+/// tables, injected credentials, and the dropped-field notes. Its fold is empty, so the summary
+/// line the other two print is absent here — the other half of that branch.
+#[cfg(test)]
+fn filled_app_detail_view() -> config::view::AppDetailView {
+    use config::view::*;
+    AppDetailView {
+        name: "loaded".into(),
+        cwd: "/proj".into(),
+        cmd: Some("loaded-agent --serve".into()),
+        cmd_origin: ProvenanceView::Project,
+        provisions: vec![
+            AppProvisionView {
+                bundle: "demo-bundle".into(),
+                cmd: "npm ci".into(),
+            },
+            AppProvisionView {
+                bundle: "demo-tools".into(),
+                cmd: "demo-tool setup".into(),
+            },
+        ],
+        home_scope: "project (one home per directory)".into(),
+        home_scope_origin: ProvenanceView::Global,
+        nixpkgs: ChannelView {
+            source: "nixos-23.11".into(),
+            origin: "global".into(),
+            locked_rev: Some("1f2e3d4c5b6a7988".into()),
+        },
+        network: NetworkView::Allowlist {
+            default_action: NetDefaultView::Ask,
+            ask_timeout: Some("none".into()),
+            ask_notice: Some(false),
+            allow: vec!["api.example.com".into(), "registry.example.org".into()],
+            deny: vec!["telemetry.example.net".into()],
+            mute: vec!["logs.example.com".into(), "beacon.example.com".into()],
+            shared_credential: vec![vec!["example.com".into(), "api.example.com".into()]],
+            http2: vec!["grpc.example.com".into()],
+            capture: "bodies".to_string(),
+            capture_max_kb: Some(64),
+            websocket_secret: "block".to_string(),
+            pool: true,
+            ca_roots: false,
+            dns_cache_ttl: Some(30),
+            idle_timeout: Some(90),
+            max_connections: Some(64),
+            body_max_mb: Some(8),
+            builtin: vec!["cache.nixos.org".into(), "channels.nixos.org".into()],
+        },
+        network_origin: ProvenanceView::Project,
+        proc: ProcView {
+            mode: "enforce".into(),
+            allow: vec!["git".into(), "npm".into()],
+            deny: vec!["curl".into()],
+        },
+        proc_origin: ProvenanceView::Project,
+        notify: NotifyView {
+            events: vec![
+                ("net-refusal".into(), "once".into()),
+                ("fs-refusal".into(), "off".into()),
+            ],
+            repeat_after: "300s".into(),
+        },
+        notify_origin: ProvenanceView::Global,
+        gui: GuiView::Wayland,
+        gui_origin: ProvenanceView::Global,
+        gpu: true,
+        gpu_origin: ProvenanceView::Project,
+        allow_insecure_http: true,
+        allow_insecure_http_origin: ProvenanceView::Global,
+        audio: true,
+        audio_origin: ProvenanceView::Project,
+        dbus: true,
+        dbus_origin: ProvenanceView::Global,
+        forward: vec![
+            config::ForwardPort::same(8080),
+            config::ForwardPort {
+                host: 3000,
+                cage: 3001,
+            },
+        ],
+        forward_origin: ProvenanceView::Project,
+        seccomp: vec!["userfaultfd".into(), "perf_event_open".into()],
+        seccomp_origin: ProvenanceView::Global,
+        devices: vec!["/dev/kvm".into(), "/dev/net/tun".into()],
+        devices_origin: ProvenanceView::Project,
+        fs_deny: vec!["/home/demo/.gnupg".into(), "/home/demo/.aws".into()],
+        fs_readonly: vec!["/home/demo/src".into()],
+        fs_scan: vec!["/home/demo/.config".into(), "/home/demo/.local".into()],
+        fs_scan_max_kb: Some(128),
+        fs_origin: ProvenanceView::Global,
+        ssh_agent: vec!["id_ed25519".into(), "id_rsa".into()],
+        ssh_agent_confirm: true,
+        ssh_agent_origin: ProvenanceView::Project,
+        limits: LimitsView {
+            memory_high: LimitView {
+                value: "4G".into(),
+                origin: ProvenanceView::Global,
+            },
+            memory_max: LimitView {
+                value: "8G".into(),
+                origin: ProvenanceView::Project,
+            },
+            tasks_max: LimitView {
+                value: "512".into(),
+                origin: ProvenanceView::Override,
+            },
+        },
+        env: vec![
+            AppEnvVar {
+                key: "DEMO_TOKEN".into(),
+                value: "placeholder".into(),
+            },
+            AppEnvVar {
+                key: "DEMO_REGION".into(),
+                value: "eu-west".into(),
+            },
+        ],
+        env_inherited: 0,
+        binds: vec![
+            BindView {
+                path: "/data".into(),
+                writable: false,
+                layer: None,
+            },
+            BindView {
+                path: "/scratch".into(),
+                writable: true,
+                layer: None,
+            },
+        ],
+        binds_inherited: 3,
+        packages: vec![
+            PackageView {
+                name: "jq".into(),
+                backend: "nix".into(),
+                locator: "jq".into(),
+                realised: "host-side, durable".into(),
+                trusted: true,
+                withheld_reason: None,
+                pinned_rev: None,
+            },
+            PackageView {
+                name: "demo-tool".into(),
+                backend: "flake".into(),
+                locator: "github:example/demo-tool".into(),
+                realised: "host-side, durable".into(),
+                trusted: false,
+                withheld_reason: Some("the project is untrusted".into()),
+                pinned_rev: Some("abcdef0123456789".into()),
+            },
+        ],
+        packages_inherited: 1,
+        secrets: vec![
+            SecretView {
+                header: "Authorization".into(),
+                to: "api.example.com".into(),
+                shape: "bearer".into(),
+                sources: "env:DEMO_TOKEN".into(),
+            },
+            SecretView {
+                header: "X-Api-Key".into(),
+                to: "registry.example.org".into(),
+                shape: "raw".into(),
+                sources: "file:~/.demo/key".into(),
+            },
+        ],
+        secrets_inherited: 1,
+        open: vec![
+            OpenView {
+                scheme: "https".into(),
+                cmd: "demo-browser".into(),
+                mode: "detach".into(),
+            },
+            OpenView {
+                scheme: "demo".into(),
+                cmd: "demo-agent open".into(),
+                mode: "exec".into(),
+            },
+        ],
+        service: vec![
+            ServiceView {
+                name: "api".into(),
+                cmd: "demo-api --port 9119".into(),
+                enable: Some("DEMO_API is set".into()),
+                ready: Some(ServiceReadyView {
+                    tcp: 9119,
+                    timeout_secs: 20,
+                }),
+            },
+            ServiceView {
+                name: "watcher".into(),
+                cmd: "demo-watch".into(),
+                enable: None,
+                ready: None,
+            },
+        ],
+        notes: vec![
+            "the project is untrusted, so its `binds` were dropped".into(),
+            "`caps` is not a field sbx accepts".into(),
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::format::assert_snapshot;
     use super::*;
+
+    /// Each fixture with the four documents it must render: plain and colored, each compact and
+    /// under `--details`, in that order.
+    ///
+    /// Held as `include_str!` so a snapshot file that goes missing fails the build rather than the
+    /// run, and so the text compared against is the file on disk rather than a literal an edit
+    /// could quietly bring into line with a regression.
+    #[allow(clippy::type_complexity)]
+    fn fixtures() -> Vec<(&'static str, config::view::AppDetailView, [&'static str; 4])> {
+        vec![
+            (
+                "sample",
+                sample_app_detail_view(),
+                [
+                    include_str!("snapshots/app_detail.sample.plain.txt"),
+                    include_str!("snapshots/app_detail.sample.plain.details.txt"),
+                    include_str!("snapshots/app_detail.sample.colored.txt"),
+                    include_str!("snapshots/app_detail.sample.colored.details.txt"),
+                ],
+            ),
+            (
+                "defaults",
+                all_defaults_app_detail_view(),
+                [
+                    include_str!("snapshots/app_detail.defaults.plain.txt"),
+                    include_str!("snapshots/app_detail.defaults.plain.details.txt"),
+                    include_str!("snapshots/app_detail.defaults.colored.txt"),
+                    include_str!("snapshots/app_detail.defaults.colored.details.txt"),
+                ],
+            ),
+            (
+                "filled",
+                filled_app_detail_view(),
+                [
+                    include_str!("snapshots/app_detail.filled.plain.txt"),
+                    include_str!("snapshots/app_detail.filled.plain.details.txt"),
+                    include_str!("snapshots/app_detail.filled.colored.txt"),
+                    include_str!("snapshots/app_detail.filled.colored.details.txt"),
+                ],
+            ),
+        ]
+    }
+
+    /// The whole document, byte for byte, for every fixture under both palettes and both settings
+    /// of `--details`.
+    ///
+    /// The substring assertions beside this one each pin a line; none of them pins the *document*,
+    /// so a section that moved, one that stopped rendering, or a line that changed hue passes all
+    /// of them. The colored palette is rendered as well as the plain one for the last of those:
+    /// under `Palette::plain` every span is the empty string, so a line whose color changed renders
+    /// identically and a snapshot taken there could not see it.
+    #[test]
+    fn render_app_detail_renders_each_fixture_byte_for_byte() {
+        for (stem, view, expected) in fixtures() {
+            for (p, (paint, pal)) in [
+                ("plain", style::Palette::plain()),
+                ("colored", style::Palette::colored()),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                for (d, details) in [false, true].into_iter().enumerate() {
+                    let suffix = if details { ".details" } else { "" };
+                    assert_snapshot(
+                        &format!("app_detail.{stem}.{paint}{suffix}"),
+                        expected[p * 2 + d],
+                        &render_app_detail(&view, &pal, details),
+                    );
+                }
+            }
+        }
+    }
 
     /// A `shared_credential` group is shown here, and without `--details`: it widens the outbound
     /// tripwire — the hosts a credential the cage signed in for may travel to — and an app takes it

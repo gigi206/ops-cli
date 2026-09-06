@@ -1,0 +1,21 @@
+[1msbx config[0m — app [1;36mdemo[0m resolved for [1;36m/proj[0m
+  [1mcmd:[0m     demo-agent  [1;36m(app:global)[0m
+  [1mhome:[0m    global (shared across projects)  [2m(default)[0m
+  [1mnetwork:[0m deny  [1;36m(app:global)[0m
+    allow [1;36mapi.example.com[0m
+  [1mproc:[0m     [2m(0 allow, 0 deny)[0m  [2m(inherited)[0m
+  [1mgui:[0m     none  [2m(inherited)[0m
+  [1mgpu:[0m     disabled  [2m(inherited)[0m
+  [1maudio:[0m   disabled  [2m(inherited)[0m
+  [1mdbus:[0m    disabled  [2m(inherited)[0m
+  [1mlimits:[0m  MemoryHigh=70% [2m(inherited)[0m, MemoryMax=90% [2m(inherited)[0m, TasksMax=2048 [32m(app:project)[0m
+  [1mforward:[0m (none)  [2m(inherited)[0m
+  [1mseccomp:[0m (mandatory denylist)  [2m(inherited)[0m
+  [1mdevices:[0m (none — minimal /dev)  [2m(inherited)[0m
+  [2mat their default: notify, allow_insecure_http — see --details[0m
+  [1menv:[0m     [1;36mDEMO_TOKEN[0m  [2m· inherits 2 baseline[0m
+  [1mbinds:[0m   [2m(none)[0m
+  [1mpackages:[0m [2m(none)[0m
+  [1mnixpkgs:[0m [1;36mnixos-23.11[0m @ [2m9ae611a[0m  ([32mproject pin[0m)
+  [1mopen:[0m [2m(none — a URI is printed, not opened)[0m
+  [1msecrets:[0m [2m(none)[0m

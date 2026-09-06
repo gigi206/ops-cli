@@ -1,0 +1,46 @@
+  [1mapps:[0m
+    [1;36malpha[0m: alpha
+      [2mhome:[0m global (shared across projects)
+    [1;36mbeta[0m: [33m(no command)[0m
+      [2minstall:[0m 2 step(s) run before cmd
+      [2mhome:[0m project (one home per directory)
+      [2menv:[0m 2 set
+      [2mbinds:[0m 2
+      [2mopen:[0m
+        [1;36mhttps://[0m demo-browser [2m(detach)[0m
+        [1;36mdemo://[0m demo-agent open [2m(exec)[0m
+      [2mservice:[0m
+        [1;36mapi[0m demo-api --port 9119 [2m(waits for :9119 up to 20s)[0m [2m[only when DEMO_API is set][0m
+        [1;36mwatcher[0m demo-watch
+      [2mpackages:[0m jq, demo-tool @ abcdef0, demo-agent [33m(withheld)[0m
+      [2mnetwork:[0m ask [2m(2 allow, 1 deny)[0m
+      [2mgui:[0m wayland [2m(exposure depends on your compositor)[0m
+      [2mallow_insecure_http:[0m enabled
+      [2mgpu:[0m enabled [2m(mesa)[0m
+      [2maudio:[0m enabled [2m(microphone + playback)[0m
+      [2mdbus:[0m in-cage portal [2m(file chooser + theme + notifications)[0m
+      [2mlimits:[0m MemoryHigh=4G, MemoryMax=8G, TasksMax=512
+      [2mforward:[0m 8080, 3000:3001 (host loopback → cage)
+      [2mseccomp allow:[0m userfaultfd, perf_event_open
+      [2mdevices:[0m /dev/kvm, /dev/net/tun
+      [2mfs deny:[0m /home/demo/.gnupg, /home/demo/.aws
+      [2mfs scan:[0m /home/demo/.config
+      [2mfs readonly:[0m /home/demo/src
+      [2mssh-agent:[0m id_ed25519, id_rsa
+      [2msecrets:[0m 2 injected host-side
+      [33mnote: the project is untrusted, so its `binds` were dropped[0m
+      [33mnote: `caps` is not a field sbx accepts[0m
+    [1;36mgamma[0m: gamma
+      [2mhome:[0m global (shared across projects)
+      [2mnetwork:[0m shared [2m(host network)[0m
+      [2mgui:[0m none
+      [2mallow_insecure_http:[0m disabled
+      [2mgpu:[0m disabled
+      [2maudio:[0m disabled
+      [2mdbus:[0m disabled
+      [2mlimits:[0m TasksMax=256
+    [1;36mdelta[0m: delta
+      [2mhome:[0m global (shared across projects)
+      [2mnetwork:[0m none [2m(isolated — no network)[0m
+      [2mgui:[0m offscreen [2m(fonts + proxy CA, no display)[0m
+      [2mlimits:[0m MemoryHigh=2G, MemoryMax=3G

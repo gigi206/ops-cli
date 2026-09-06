@@ -1,0 +1,66 @@
+  apps:
+    alpha: alpha
+      home: global (shared across projects)
+    beta: (no command)
+      install:
+        npm ci  (from bundle demo-bundle)
+        demo-tool setup  (from bundle demo-tools)
+      home: project (one home per directory)
+      env:
+        DEMO_TOKEN=placeholder
+        DEMO_REGION=eu-west
+      binds:
+        /data
+        /scratch (rw)
+      open:
+        https:// demo-browser (detach)
+        demo:// demo-agent open (exec)
+      service:
+        api demo-api --port 9119 (waits for :9119 up to 20s) [only when DEMO_API is set]
+        watcher demo-watch
+      packages:
+        jq -> nix:jq  (host-side, durable)
+        demo-tool -> flake:github:example/demo-tool  @ abcdef0 (host-side, durable, pinned)
+        demo-agent -> nix:demo-agent  (withheld: the project is untrusted)
+      network: ask
+        ask timeout: 30s
+        ask notice: off
+        allow api.example.com
+        allow registry.example.org
+        deny  telemetry.example.net
+        built-in (always allowed, so self-equip works):
+          allow cache.nixos.org
+          allow channels.nixos.org
+        (deny wins over allow)
+      gui: wayland (exposure depends on your compositor)
+      allow_insecure_http: enabled
+      gpu: enabled (mesa)
+      audio: enabled (microphone + playback)
+      dbus: in-cage portal (file chooser + theme + notifications)
+      limits: MemoryHigh=4G, MemoryMax=8G, TasksMax=512
+      forward: 8080, 3000:3001 (host loopback → cage)
+      seccomp allow: userfaultfd, perf_event_open
+      devices: /dev/kvm, /dev/net/tun
+      fs deny: /home/demo/.gnupg, /home/demo/.aws
+      fs scan: /home/demo/.config
+      fs readonly: /home/demo/src
+      ssh-agent: id_ed25519, id_rsa
+      secrets (injected host-side):
+        Authorization -> api.example.com  (bearer, from env:DEMO_TOKEN)
+        X-Api-Key -> registry.example.org  (raw, from file:~/.demo/key)
+      note: the project is untrusted, so its `binds` were dropped
+      note: `caps` is not a field sbx accepts
+    gamma: gamma
+      home: global (shared across projects)
+      network: shared (host network)
+      gui: none
+      allow_insecure_http: disabled
+      gpu: disabled
+      audio: disabled
+      dbus: disabled
+      limits: TasksMax=256
+    delta: delta
+      home: global (shared across projects)
+      network: none (isolated — no network)
+      gui: offscreen (fonts + proxy CA, no display)
+      limits: MemoryHigh=2G, MemoryMax=3G

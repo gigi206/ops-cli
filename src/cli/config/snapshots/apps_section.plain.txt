@@ -1,0 +1,46 @@
+  apps:
+    alpha: alpha
+      home: global (shared across projects)
+    beta: (no command)
+      install: 2 step(s) run before cmd
+      home: project (one home per directory)
+      env: 2 set
+      binds: 2
+      open:
+        https:// demo-browser (detach)
+        demo:// demo-agent open (exec)
+      service:
+        api demo-api --port 9119 (waits for :9119 up to 20s) [only when DEMO_API is set]
+        watcher demo-watch
+      packages: jq, demo-tool @ abcdef0, demo-agent (withheld)
+      network: ask (2 allow, 1 deny)
+      gui: wayland (exposure depends on your compositor)
+      allow_insecure_http: enabled
+      gpu: enabled (mesa)
+      audio: enabled (microphone + playback)
+      dbus: in-cage portal (file chooser + theme + notifications)
+      limits: MemoryHigh=4G, MemoryMax=8G, TasksMax=512
+      forward: 8080, 3000:3001 (host loopback → cage)
+      seccomp allow: userfaultfd, perf_event_open
+      devices: /dev/kvm, /dev/net/tun
+      fs deny: /home/demo/.gnupg, /home/demo/.aws
+      fs scan: /home/demo/.config
+      fs readonly: /home/demo/src
+      ssh-agent: id_ed25519, id_rsa
+      secrets: 2 injected host-side
+      note: the project is untrusted, so its `binds` were dropped
+      note: `caps` is not a field sbx accepts
+    gamma: gamma
+      home: global (shared across projects)
+      network: shared (host network)
+      gui: none
+      allow_insecure_http: disabled
+      gpu: disabled
+      audio: disabled
+      dbus: disabled
+      limits: TasksMax=256
+    delta: delta
+      home: global (shared across projects)
+      network: none (isolated — no network)
+      gui: offscreen (fonts + proxy CA, no display)
+      limits: MemoryHigh=2G, MemoryMax=3G

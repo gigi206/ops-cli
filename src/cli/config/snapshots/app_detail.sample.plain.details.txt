@@ -1,0 +1,32 @@
+sbx config — app demo resolved for /proj
+  cmd:     demo-agent  (app:global)
+  home:    global (shared across projects)  (default)
+  network: deny  (app:global)
+    connection reuse: on (a request may ride an upstream connection an earlier one left behind)
+    cage ca: session CA + public roots (an ordinary, full trust store)
+    dns cache: 60s (built-in default; a resolved address stands for that long)
+    idle timeout: 10s (built-in default; a connection with nothing to carry is closed after that)
+    max connections: 512 (built-in default; one beyond it is refused `connection-cap`, not queued)
+    body ceiling: 64 MiB (built-in default; the most of one request body held; a larger streamed upload is refused)
+    allow api.example.com
+    built-in (always allowed, so self-equip works):
+      allow cache.nixos.org
+    (deny wins over allow)
+  proc:     (0 allow, 0 deny)  (inherited)
+  notify:  per event  (default)
+  gui:     none  (inherited)
+  gpu:     disabled  (inherited)
+  allow_insecure_http: disabled  (default)
+  audio:   disabled  (inherited)
+  dbus:    disabled  (inherited)
+  limits:  MemoryHigh=70% (inherited), MemoryMax=90% (inherited), TasksMax=2048 (app:project)
+  forward: (none)  (inherited)
+  seccomp: (mandatory denylist)  (inherited)
+  devices: (none — minimal /dev)  (inherited)
+  env:     DEMO_TOKEN  · inherits 2 baseline
+    DEMO_TOKEN=placeholder
+  binds:   (none)
+  packages: (none)
+  nixpkgs: nixos-23.11 @ 9ae611a  (project pin)
+  open: (none — a URI is printed, not opened)
+  secrets: (none)

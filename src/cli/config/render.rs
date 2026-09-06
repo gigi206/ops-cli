@@ -1191,6 +1191,7 @@ pub(super) fn render_config(
 #[cfg(test)]
 mod tests {
     use super::super::app_detail;
+    use super::super::format::assert_snapshot;
     use super::*;
 
     /// One declared app at an inert default, named `name` and running a command of the same name —
@@ -1358,6 +1359,232 @@ mod tests {
             network_origin: ProvenanceView::Project,
             ..blank_config_view()
         }
+    }
+
+    /// Four app overlays that between them reach every branch of [`apps_section`]: a minimal one
+    /// that declares nothing but its command, one that sets every field an overlay can carry and
+    /// declares no command at all, one on the host network with every optional posture turned
+    /// explicitly *off*, and one isolated from the network with an offscreen display.
+    ///
+    /// `sample_config_view` carries no app at all, so the section returns `None` on it and nothing
+    /// below its `apps:` header was ever rendered by a test.
+    fn sample_apps() -> Vec<config::view::AppView> {
+        use config::view::*;
+        let minimal = blank_app_view("alpha");
+        let loaded = AppView {
+            cmd: None,
+            provisions: vec![
+                AppProvisionView {
+                    bundle: "demo-bundle".into(),
+                    cmd: "npm ci".into(),
+                },
+                AppProvisionView {
+                    bundle: "demo-tools".into(),
+                    cmd: "demo-tool setup".into(),
+                },
+            ],
+            env: vec![
+                AppEnvVar {
+                    key: "DEMO_TOKEN".into(),
+                    value: "placeholder".into(),
+                },
+                AppEnvVar {
+                    key: "DEMO_REGION".into(),
+                    value: "eu-west".into(),
+                },
+            ],
+            binds: vec![
+                BindView {
+                    path: "/data".into(),
+                    writable: false,
+                    layer: None,
+                },
+                BindView {
+                    path: "/scratch".into(),
+                    writable: true,
+                    layer: None,
+                },
+            ],
+            open: vec![
+                OpenView {
+                    scheme: "https".into(),
+                    cmd: "demo-browser".into(),
+                    mode: "detach".into(),
+                },
+                OpenView {
+                    scheme: "demo".into(),
+                    cmd: "demo-agent open".into(),
+                    mode: "exec".into(),
+                },
+            ],
+            service: vec![
+                ServiceView {
+                    name: "api".into(),
+                    cmd: "demo-api --port 9119".into(),
+                    enable: Some("DEMO_API is set".into()),
+                    ready: Some(ServiceReadyView {
+                        tcp: 9119,
+                        timeout_secs: 20,
+                    }),
+                },
+                ServiceView {
+                    name: "watcher".into(),
+                    cmd: "demo-watch".into(),
+                    enable: None,
+                    ready: None,
+                },
+            ],
+            packages: vec![
+                PackageView {
+                    name: "jq".into(),
+                    backend: "nix".into(),
+                    locator: "jq".into(),
+                    realised: "host-side, durable".into(),
+                    trusted: true,
+                    withheld_reason: None,
+                    pinned_rev: None,
+                },
+                PackageView {
+                    name: "demo-tool".into(),
+                    backend: "flake".into(),
+                    locator: "github:example/demo-tool".into(),
+                    realised: "host-side, durable".into(),
+                    trusted: true,
+                    withheld_reason: None,
+                    pinned_rev: Some("abcdef0123456789".into()),
+                },
+                PackageView {
+                    name: "demo-agent".into(),
+                    backend: "nix".into(),
+                    locator: "demo-agent".into(),
+                    realised: "host-side, durable".into(),
+                    trusted: false,
+                    withheld_reason: Some("the project is untrusted".into()),
+                    pinned_rev: None,
+                },
+            ],
+            network: Some(AppNetworkView::Allowlist {
+                default_action: NetDefaultView::Ask,
+                ask_timeout: Some("30s".into()),
+                ask_notice: Some(false),
+                allow: vec!["api.example.com".into(), "registry.example.org".into()],
+                deny: vec!["telemetry.example.net".into()],
+                builtin: vec!["cache.nixos.org".into(), "channels.nixos.org".into()],
+            }),
+            gui: Some(GuiView::Wayland),
+            gpu: Some(true),
+            allow_insecure_http: Some(true),
+            audio: Some(true),
+            dbus: Some(true),
+            limits: Some(AppLimitsView {
+                memory_high: Some("4G".into()),
+                memory_max: Some("8G".into()),
+                tasks_max: Some("512".into()),
+            }),
+            forward: vec![
+                crate::config::ForwardPort::same(8080),
+                crate::config::ForwardPort {
+                    host: 3000,
+                    cage: 3001,
+                },
+            ],
+            seccomp: vec!["userfaultfd".into(), "perf_event_open".into()],
+            devices: vec!["/dev/kvm".into(), "/dev/net/tun".into()],
+            fs_deny: vec!["/home/demo/.gnupg".into(), "/home/demo/.aws".into()],
+            fs_scan: vec!["/home/demo/.config".into()],
+            fs_readonly: vec!["/home/demo/src".into()],
+            ssh_agent: vec!["id_ed25519".into(), "id_rsa".into()],
+            secrets: vec![
+                SecretView {
+                    header: "Authorization".into(),
+                    to: "api.example.com".into(),
+                    shape: "bearer".into(),
+                    sources: "env:DEMO_TOKEN".into(),
+                },
+                SecretView {
+                    header: "X-Api-Key".into(),
+                    to: "registry.example.org".into(),
+                    shape: "raw".into(),
+                    sources: "file:~/.demo/key".into(),
+                },
+            ],
+            notes: vec![
+                "the project is untrusted, so its `binds` were dropped".into(),
+                "`caps` is not a field sbx accepts".into(),
+            ],
+            home_scope: "project (one home per directory)".into(),
+            ..blank_app_view("beta")
+        };
+        let opened_out = AppView {
+            network: Some(AppNetworkView::Shared),
+            gui: Some(GuiView::None),
+            gpu: Some(false),
+            allow_insecure_http: Some(false),
+            audio: Some(false),
+            dbus: Some(false),
+            limits: Some(AppLimitsView {
+                memory_high: None,
+                memory_max: None,
+                tasks_max: Some("256".into()),
+            }),
+            ..blank_app_view("gamma")
+        };
+        let closed_in = AppView {
+            network: Some(AppNetworkView::Isolated),
+            gui: Some(GuiView::Offscreen),
+            limits: Some(AppLimitsView {
+                memory_high: Some("2G".into()),
+                memory_max: Some("3G".into()),
+                tasks_max: None,
+            }),
+            ..blank_app_view("delta")
+        };
+        vec![minimal, loaded, opened_out, closed_in]
+    }
+
+    /// The whole `apps:` block, byte for byte, under both palettes and both settings of
+    /// `--details`.
+    ///
+    /// Every other assertion on this section is a substring check, so a block that moved, one that
+    /// stopped rendering, or a line that changed hue passes them all. The colored palette is
+    /// rendered as well as the plain one for the last of those: under `Palette::plain` every span
+    /// is the empty string, so a line whose color changed renders identically and a snapshot taken
+    /// there could not see it.
+    #[test]
+    fn the_apps_section_renders_its_fixture_byte_for_byte() {
+        let expected = [
+            include_str!("snapshots/apps_section.plain.txt"),
+            include_str!("snapshots/apps_section.plain.details.txt"),
+            include_str!("snapshots/apps_section.colored.txt"),
+            include_str!("snapshots/apps_section.colored.details.txt"),
+        ];
+        let apps = sample_apps();
+        for (p, (paint, pal)) in [
+            ("plain", style::Palette::plain()),
+            ("colored", style::Palette::colored()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (d, details) in [false, true].into_iter().enumerate() {
+                let suffix = if details { ".details" } else { "" };
+                let out = apps_section(&apps, &pal, details)
+                    .expect("a non-empty roster renders a section");
+                assert_snapshot(
+                    &format!("apps_section.{paint}{suffix}"),
+                    expected[p * 2 + d],
+                    &out,
+                );
+            }
+        }
+    }
+
+    /// An empty roster renders nothing at all — the section's early return, which no snapshot can
+    /// pin because there is no document to compare.
+    #[test]
+    fn the_apps_section_is_silent_without_a_single_app() {
+        assert!(apps_section(&[], &style::Palette::plain(), false).is_none());
+        assert!(apps_section(&[], &style::Palette::colored(), true).is_none());
     }
 
     /// A section renders on its own, which is the point of splitting the renderer up: before, the

@@ -458,6 +458,37 @@ fn channel_origin_kind(label: &str) -> config::view::ProvenanceView {
     }
 }
 
+/// Assert a rendered document is byte-for-byte its stored snapshot, naming the first line that
+/// differs.
+///
+/// A bare `assert_eq!` over two multi-line documents prints each of them Debug-escaped on a single
+/// line, where a one-character difference is unfindable. Reporting the line number with the
+/// expected and the rendered text is what makes a failing snapshot say what changed, which is the
+/// whole value of pinning the output rather than a substring of it.
+#[cfg(test)]
+pub(super) fn assert_snapshot(name: &str, expected: &str, actual: &str) {
+    if expected == actual {
+        return;
+    }
+    let expected_lines: Vec<&str> = expected.lines().collect();
+    let actual_lines: Vec<&str> = actual.lines().collect();
+    for (i, (e, a)) in expected_lines.iter().zip(actual_lines.iter()).enumerate() {
+        assert!(
+            e == a,
+            "{name}: line {} differs\n  expected: {e:?}\n  rendered: {a:?}",
+            i + 1
+        );
+    }
+    panic!(
+        "{name}: the snapshot has {} lines, the render {}\n  first unmatched: {:?}",
+        expected_lines.len(),
+        actual_lines.len(),
+        expected_lines
+            .get(actual_lines.len())
+            .or_else(|| actual_lines.get(expected_lines.len()))
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
