@@ -1035,7 +1035,7 @@ fn alternation_cells(tail: &str) -> Option<Vec<String>> {
 /// it here made the completion disagree with the parser twice over: it offered `true`/`false` as
 /// the next word, which the parser would then read as the command, and it swallowed a real operand
 /// typed there, shifting every slot after it.
-fn flag_takes_value(flag: &str, path: &[&str]) -> bool {
+pub(crate) fn flag_takes_value(flag: &str, path: &[&str]) -> bool {
     help::options_of(path)
         .iter()
         .any(|(row, _)| flag_tail(row, flag).is_some_and(|tail| !tail_is_fused(tail)))

@@ -1396,6 +1396,70 @@ mod tests {
     use super::*;
     use crate::testutil::TmpDir;
 
+    /// The completion and the parser must answer one question the same way: does this flag
+    /// consume the word after it?
+    ///
+    /// They answer it from different places and always have. The parser decides in
+    /// [`take_override_flag`], which gives the optional-value flags a dedicated path so a bare
+    /// `--gpu` never swallows the argument behind it; the completion decides in
+    /// `cli::completion::flag_takes_value`, by reading the grammar out of the option row on the
+    /// help page. Nothing but agreement links the two, and when it lapsed the cost was silent:
+    /// the completion offered `true`/`false` as the next word, which the parser then read as the
+    /// command, and it swallowed a real operand typed there, shifting every slot after it.
+    ///
+    /// The parser's half is obtained by **running it**, not by repeating its list here. A test
+    /// that wrote out which flags take a value would agree with itself, and the disagreement it
+    /// exists to catch is between two implementations. The population comes from the pages, so a
+    /// flag documented later is covered without this test being touched; a flag the parser does
+    /// not claim is skipped, because for those the parser's answer is not this function's.
+    #[test]
+    fn the_completion_and_the_parser_agree_on_which_override_flag_eats_the_next_word() {
+        const SENTINEL: &str = "an-operand-no-flag-may-eat";
+        let mut checked = 0usize;
+        for path in [&["run"][..], &["shell"][..], &["app", "run"][..]] {
+            for (row, _) in help::options_of(path) {
+                for token in row.split([' ', ',', '\t']) {
+                    // The flag name alone: an option row writes its grammar with the value
+                    // attached (`--gpu[=true|false]`, `--app <name>`), and both readers below are
+                    // asked about the name.
+                    let Some(flag) = token.strip_prefix("--") else {
+                        continue;
+                    };
+                    let flag = format!("--{}", flag.split(['[', '=']).next().unwrap_or(""));
+                    if flag.len() <= 2 {
+                        continue;
+                    }
+
+                    // The parser's own answer, measured: hand it the flag followed by a word
+                    // nothing may consume, and see whether the word survives.
+                    let mut head = vec![OsString::from(&flag), OsString::from(SENTINEL)];
+                    let mut cli = config::CliOverrides::default();
+                    if take_override_flag(&mut head, &mut cli, path[0]).is_none() {
+                        continue; // not an override flag; its grammar is decided elsewhere
+                    }
+                    let parser_eats_it = !head.iter().any(|w| w == SENTINEL);
+
+                    assert_eq!(
+                        cli::completion::flag_takes_value(&flag, path),
+                        parser_eats_it,
+                        "{flag} on `sbx {}`: the completion and the parser disagree about whether \
+                         the next word belongs to it",
+                        path.join(" ")
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        // A population read from the pages can silently shrink — a row format that changes, a
+        // page that moves — and an assertion nothing reaches is not a guard. The three pages carry
+        // thirty-two flag/page pairs between them; the floor is set below one page's worth, so
+        // losing a whole page's rows is what trips it rather than a single flag being renamed.
+        assert!(
+            checked >= 24,
+            "only {checked} override flags were reached; the option rows are no longer being read"
+        );
+    }
+
     #[test]
     fn read_sysctl_trims_value_and_handles_absence() {
         let dir = TmpDir::new();
