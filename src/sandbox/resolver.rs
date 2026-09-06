@@ -1036,10 +1036,7 @@ fn nix_closure_once(
     use std::sync::{Mutex, OnceLock};
     static ANSWERED: OnceLock<ClosureMemo> = OnceLock::new();
     let answered = ANSWERED.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let key = (
-        layout.map(|l| l.store_dir().to_path_buf()),
-        program.to_path_buf(),
-    );
+    let key = (layout.map(|l| l.store_dir()), program.to_path_buf());
     // A poisoned lock is not a reason to re-run the query: the map is a memo whose only mutation is
     // the insert below, so an unwind cannot leave it half-written. That is the "recovers" half of
     // `sandbox::locks`'s rule, decided there rather than re-argued here.

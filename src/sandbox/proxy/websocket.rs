@@ -165,7 +165,7 @@ pub(super) fn relay_upgrade(
         // bodiless-method rule applies here.
         let framing = response_framing(&resp_head, "GET");
         // Count the declined response body (`down`) as it streams back to the client.
-        let counted = CountingReader::new(FramedBody::new(up_br, framing), down.clone());
+        let counted = CountingReader::new(FramedBody::new(up_br, framing), down);
         let mut body = tee_response(counted, capture);
         // Teed ahead of the masking, as on every other plane: the capture masks its own buffers at
         // filing time, so what is stored is masked either way.

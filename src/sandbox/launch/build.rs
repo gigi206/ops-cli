@@ -2092,7 +2092,7 @@ pub(super) fn build(
             )
             .with_notifier(Arc::clone(&notify_wiring))
             .with_brokers(brokers.clone())
-            .with_signer_log(signer_ring.clone())
+            .with_signer_log(signer_ring)
             // A task's proxy appends to the session's egress ring rather than opening one of its
             // own, which nothing would read: see `Egress::event_log`.
             .with_egress_log(
@@ -2105,7 +2105,7 @@ pub(super) fn build(
             // launch already staged: a task cage is derived from the agent's, and pointing it at a
             // second set would be two answers to one question.
             let engine = match (&fs_decoys, fs_masks.is_empty()) {
-                (Some(decoys), false) => engine.with_fs_masks(fs_masks.clone(), decoys.clone()),
+                (Some(decoys), false) => engine.with_fs_masks(fs_masks, decoys.clone()),
                 _ => engine,
             };
             // The task tool pool, when any task declares a `mise:` tool. Filled host-side now — a

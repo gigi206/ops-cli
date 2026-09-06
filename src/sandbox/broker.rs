@@ -1745,7 +1745,7 @@ pub(crate) fn start(
     // The accept loop's own copy: the wiring returned below reads the manifest again, and the
     // launcher's `plugin` outlives neither.
     let serving = plugin.clone();
-    let serving_ring = ring.clone();
+    let serving_ring = ring;
     std::thread::spawn(move || {
         let plugin = serving;
         let ring = serving_ring;

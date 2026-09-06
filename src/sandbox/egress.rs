@@ -941,7 +941,7 @@ pub(crate) fn start(
         // the launch is up — never a race with the first `sbx net pending`/`sbx net log`.
         let control_listener = UnixListener::bind(&control_uds)?;
         let control_log = log.clone();
-        let control_capture = capture.clone();
+        let control_capture = capture;
         let control_stop = stop.clone();
         std::thread::spawn(move || {
             let _ = super::control::serve(
@@ -1006,7 +1006,7 @@ pub(crate) fn start(
     // Bind+listen happens here on the main thread, before the thread accepts, so connections
     // queue from the moment the cage can reach the socket — no first-request race.
     let listener = UnixListener::bind(&host_uds)?;
-    let serve_ctx = ctx.clone();
+    let serve_ctx = ctx;
     let proxy_stop = stop.clone();
     std::thread::spawn(move || {
         // A serve error ends the proxy thread; the cage then loses egress (fail-closed).

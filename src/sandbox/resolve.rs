@@ -112,7 +112,7 @@ impl UpgradeCage {
             bwrap,
             store_src: crate::store::physical_path(layout, Path::new("/nix")),
             shell_bin: userland.shell_bin.clone(),
-            ca_bundle: userland.ca_bundle_src.clone(),
+            ca_bundle: userland.ca_bundle_src,
             bins,
             // The same ceilings a launch of this project would run under: a roll runs the project's
             // resolve commands, so it is the project's configuration that says how much they may

@@ -867,7 +867,7 @@ pub(crate) fn start(
 
     let filter = Filter::new(allow);
     let host_sock = host_sock.to_path_buf();
-    let serving = ring.clone();
+    let serving = ring;
     let confirm = confirm_with.map(|askpass| Arc::new(Confirmer::new(askpass)));
     std::thread::spawn(move || serve(listener, host_sock, filter, serving, confirm));
 
