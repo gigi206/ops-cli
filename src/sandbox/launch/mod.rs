@@ -854,12 +854,7 @@ struct PreparedConfig {
 fn prepare_config(cwd: PathBuf, ov: &crate::config::Override) -> Result<PreparedConfig, ExitCode> {
     // The data directory is resolved first: it is where sbx looks for (and, under the
     // bundled features, materializes) the engines it owns, so `resolve_bwrap` needs it.
-    let Some(layout) = Layout::from_env() else {
-        eprintln!(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
-        );
-        return Err(ExitCode::FAILURE);
-    };
+    let layout = crate::layout_or_fail()?;
     let mut cfg = crate::config::load(&cwd);
     // The override's nixpkgs channel must land before the lock target is chosen. A set-but-invalid
     // channel is a hard error (no safe baseline fallback for a supply-chain field).

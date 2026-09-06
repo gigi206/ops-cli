@@ -75,11 +75,9 @@ pub(super) fn render_gui_stop_hint(name: &str, pid: u32, pal: &crate::style::Pal
 /// confined at least as tightly as the agent. See [`mod@crate::sandbox::attach`] for the mechanism and its
 /// one inherent residual (the command binary comes from the agent's own mount namespace).
 pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
-    let Some(layout) = Layout::from_env() else {
-        eprintln!(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
-        );
-        return ExitCode::FAILURE;
+    let layout = match crate::layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     let sessions = match crate::session::Registry::at(layout.data_dir()).list() {
         Ok(s) => s,
@@ -350,11 +348,9 @@ fn render_no_active_sessions(pal: &crate::style::Palette) -> String {
 ///   matching how `sbx session stop <id>` already treats a shell), so it can trip this residual on a shell
 ///   open elsewhere; stop a single agent by pid to avoid it.
 pub(crate) fn stop(ids: &[&str], grace: Duration, all: bool) -> ExitCode {
-    let Some(layout) = crate::store::Layout::from_env() else {
-        eprintln!(
-            "sbx: cannot resolve the data directory (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)."
-        );
-        return ExitCode::FAILURE;
+    let layout = match crate::layout_or_fail() {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     let registry = crate::session::Registry::at(layout.data_dir());
     let sessions = match registry.list() {

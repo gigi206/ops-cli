@@ -302,7 +302,8 @@ fn current_project_id() -> Option<String> {
 }
 
 /// Resolve sbx's on-disk layout, mapping an unresolvable data directory to an error exit. Shared by
-/// every verb that reads or writes under the data directory: one condition deserves one sentence,
+/// every path that reads or writes under the data directory — the CLI verbs, the configuration step
+/// of a launch, and the session verbs that join or stop a cage: one condition deserves one sentence,
 /// and the remedy — the variables that decide where the directory is — has to be in it.
 fn layout_or_fail() -> Result<store::Layout, ExitCode> {
     store::Layout::from_env().ok_or_else(|| {
