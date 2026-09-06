@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cargo-callgraph": {
+      "command": "cargo",
+      "args": ["callgraph", "mcp"]
+    }
+  }
+}

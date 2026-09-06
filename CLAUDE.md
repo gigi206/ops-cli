@@ -2,7 +2,19 @@
 
 ## Environment
 
-- A Rust LSP (rust-analyzer) is available for code analysis.
+- Code navigation: `rg` to locate (5ms) — blind to re-exports/
+  aliases and matches comments, always confirm hits via LSP.
+- LSP (rust-analyzer) for exact 1-hop resolution (definition,
+  references, call hierarchy) — one hop per call, no global view.
+- `cargo-callgraph` MCP for ≥2 hops, call paths, impact analysis,
+  dead-code/bottlenecks — qualified patterns only
+  (`cli::dispatch`, never `dispatch`), depth ≤3, never dump
+  the full JSON (10MB+); first index takes minutes, then cached.
+- MCP graph goes stale on any Rust edit (cache keys on
+  Cargo.toml mtime only): call `generate_callgraph` with
+  `reload: true` after touching sources, before trusting results.
+- semgrep for versioned policy rules enforced in CI, not for
+  exploration — one pattern per spelling, no call resolution.
 - Golden rule: never assume, ALWAYS verify!
 
 ## Development rules
