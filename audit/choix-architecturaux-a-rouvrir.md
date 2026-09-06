@@ -477,3 +477,26 @@ dérivation depuis la prose qui pose problème, pas eux. Le découpage en crates
 de compilation qui n'existe pas. Et `hyper` (§4) perdrait la fidélité de relais que `wire.rs`
 construit délibérément, tout en imposant un runtime au plan majoritaire — ce qui retire du même
 coup son seul moteur au basculement vers tokio (§8).
+
+## Ce que l'exécution a corrigé dans cet audit
+
+Cette section est ajoutée après coup, et volontairement à la fin plutôt qu'en réécrivant ce qui
+précède : les mesures du corps restent ce qu'elles étaient, et trois des conclusions qu'elles
+portaient n'ont pas survécu à leur mise en œuvre. Ce qui suit dit lesquelles, et sur quoi.
+
+**L'ordre annoncé plus haut n'est plus le bon, et deux de ses cinq entrées sont closes.**
+[`plan-travaux.md`](plan-travaux.md) fait foi ; ce qui suit résume ce qui a changé de sens.
+
+| ce que cet audit concluait | ce que la mise en œuvre a mesuré |
+| --- | --- |
+| §4 : redéplier `parse_head` derrière `httparse` | abandonné. La fonction n'a été corrigée qu'une fois dans toute l'histoire du dépôt ; elle analyse les requêtes **et** les réponses là où `httparse` a un type par sens ; et la ligne de requête est conservée verbatim là où `httparse` la décompose. |
+| §7 : un palier de tests rapide, « bénéfice immédiat, aucune contrepartie » | clos. La séparation est par test et entrelacée — `cgroup.rs` porte 21 tests et 12 sites de saut — et aucun sélecteur n'atteint cette granularité. La contrepartie était de ne pas exister. |
+| §2 : dériver les quatre étages d'une déclaration unique | clos sur `[fs]`, la plus petite table. Ses champs ne sont pas copiés d'un étage à l'autre : ils y changent de type pour une raison, s'y replient par une règle, et l'un d'eux y franchit une porte de confiance. |
+| §6 : retourner le sens de la dérivation CLI | réduit. Deux correctifs en tout sur les quatre lecteurs de prose, aucun côté parseur : l'accord tient depuis toujours, et ce qui manquait était le mécanisme qui dirait qu'il a cessé de tenir. |
+| §1 : la parité du socle de durcissement | tenu, et l'écart était pire que décrit. La cage sans `--new-session` conserve le terminal de contrôle du lanceur, y lit et y écrit ; et les deux cages révélaient aussi le nom de l'hôte. |
+
+**Et un défaut que cet audit n'avait pas vu.** Une espace avant le deux-points d'un en-tête était
+supprimée par `parse_head`, ce qui donnait à sbx une lecture de la tête que rien d'autre ne devait
+partager — et, du côté réponse où la tête n'est pas réémise, un cadrage de corps suivi d'une offre
+de réutilisation de la connexion. Il n'a pas été trouvé en exécutant un item, mais en **vérifiant la
+prémisse** de celui qu'il a fallu abandonner.

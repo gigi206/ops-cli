@@ -8,10 +8,22 @@ Chaque item porte sa **preuve** — le test ou la mesure qui le ferme — et les
 qu'il déclenche. Les trois portes courtes (`mise run fmt`, `mise run lint`, `mise run rustdoc`) sont
 dues à chaque item et ne sont pas répétées ; la suite complète reste à la main du mainteneur.
 
-**Où en est ce plan.** Les items 0 et 5 sont livrés (`5b632da`, `179925a`). L'item 2 est clos : sa
-prémisse a été mesurée fausse. L'item 4 est remplacé — la mesure de sa prémisse a trouvé autre
-chose, et cette autre chose est un défaut. Restent 3, puis 1, dans cet ordre : la prémisse du
-premier est la mieux tenue des deux.
+**Où en est ce plan : il est terminé.** Trois items livrés (`5b632da`, `179925a`, `84b8f7f`), un
+défaut corrigé qu'il ne contenait pas (`75dd077`), deux items clos par leur propre mesure.
+
+| item | issue |
+| --- | --- |
+| 0 — `--new-session` sur les cages construites à la main | livré `5b632da`, plus un second écart trouvé en l'écrivant |
+| 1 — dérivation CLI | réduit par sa mesure à un test de parité, livré `84b8f7f` |
+| 2 — palier de tests rapide | clos : prémisse mesurée fausse, aucune sélection honnête n'existe |
+| 3 — table de configuration convertie | clos : les étages portent des sémantiques, pas des copies |
+| 4 — `httparse` | abandonné sur trois mesures |
+| 4′ — espace avant le deux-points | trouvé en mesurant l'item 4, corrigé `75dd077` |
+| 5 — définition unique du socle | livré `179925a` |
+
+Deux items sur six sont sortis de leur mesure autrement qu'ils y étaient entrés, et le seul défaut
+exploitable de la série n'était dans aucune version de ce plan : il est venu de la vérification
+d'une prémisse, pas de son exécution.
 
 ## 0. `--new-session` sur les deux cages construites à la main — LIVRÉ (`5b632da`)
 
@@ -83,7 +95,7 @@ vaut au-delà de cet item : la prédiction « rouge sur `--new-session` et sur l
 conjecture, et l'écrire avant de lancer le test est ce qui a empêché de rétrécir la ligne de base
 pour la faire verdir.
 
-## 1. La dérivation CLI — RÉDUITE À CE QUE LA MESURE SOUTIENT : un test de parité
+## 1. La dérivation CLI — RÉDUITE, PUIS LIVRÉE : un test de parité (`84b8f7f`)
 
 **Ce que l'item proposait.** Retourner le sens de la dérivation : une déclaration typée par option,
 dont l'aide serait *rendue* et dont la complétion lirait la grammaire, au lieu de l'analyser dans la
@@ -107,7 +119,10 @@ parseur répond en s'exécutant — `take_override_flag` sur une tête `[drapeau
 sentinelle reste ou ne reste pas — et non par une liste recopiée dans le test. La population vient
 des pages, donc un drapeau documenté plus tard est couvert sans toucher au test.
 
-**Preuve.** Le test est rouge si l'on rétablit le défaut que `bff6ff2` a corrigé.
+**Preuve, et elle a été faite.** Le test est rouge si l'on rétablit le défaut que `bff6ff2` a
+corrigé : il nomme alors `--gpu` sur `sbx run`. Il atteint trente-deux couples drapeau/page sur les
+trois pages, et porte un plancher sous la valeur d'une page — une page dont les lignes cessent
+d'être lues le fait rougir, au lieu de le réduire silencieusement à rien.
 
 **Fichiers.** `src/main.rs`, `src/cli/completion.rs`.
 
