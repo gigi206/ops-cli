@@ -561,6 +561,266 @@ fn provision_tools(prep: &Prepared, runtime: binds::Runtime) -> Result<Provision
     })
 }
 
+/// The in-cage desktop portal and the two host relays that serve it.
+///
+/// Field order is the drop order, and it is the order the four locals this replaced were declared
+/// in — `portal_host`, `notify_relay`, `theme_relay`, then the provisioned stack — reversed, since
+/// locals drop in reverse declaration order and a struct's fields drop in declaration order. The
+/// one edge that is load-bearing is the notifications relay's: it must disconnect from the private
+/// bus before `host_dir` removes the directory that socket lives in, and it does here.
+///
+/// No `Drop` of its own: the launch moves `host_dir`, `notify_relay` and `theme_relay` out one at a
+/// time into the [`LaunchGuard`] literal, which is what finally owns them.
+struct PortalStack {
+    /// The live theme relay, mirroring host light/dark changes into the cage's GSettings keyfile.
+    /// It writes only a host-side file, so its position relative to `host_dir` is not load-bearing.
+    theme_relay: Option<crate::sandbox::theme_relay::ThemeRelay>,
+    /// The desktop-notifications relay bridging the private bus to the host daemon. Dropped before
+    /// `host_dir`, so it disconnects before the socket it is attached to is removed.
+    notify_relay: Option<crate::sandbox::notify_relay::NotifyRelay>,
+    /// The portal's host-side runtime directory. Dropping it removes the directory, the private
+    /// bus socket and the generated bus configuration.
+    host_dir: Option<crate::sandbox::portal::HostDir>,
+    /// The provisioned portal stack — `dbus-daemon`, `xdg-desktop-portal` and the GTK backend —
+    /// whose store roots join the project store and whose programs the command wrap runs. `Some`
+    /// implies `host_dir` is `Some`.
+    portal: Option<crate::sandbox::portal::Provision>,
+    /// The host's light/dark preference at launch, seeding the cage's scheme. `None` when there is
+    /// no portal to seed, or when the host would not answer.
+    scheme: Option<String>,
+}
+
+/// Provision the in-cage desktop portal and start the relays it needs, or degrade to no portal.
+///
+/// Wanted under `gui = "wayland"` **and** `dbus = true`, and gated on both because the GTK backend
+/// renders through the compositor. Every failure here costs the file chooser and nothing else: the
+/// app runs, falling back to its own dialog. `dbus = true` without a display is warned about rather
+/// than silently ignored.
+fn portal_stack(prep: &Prepared, runtime: binds::Runtime) -> PortalStack {
+    let mut portal_host: Option<crate::sandbox::portal::HostDir> = None;
+    let mut notify_relay: Option<crate::sandbox::notify_relay::NotifyRelay> = None;
+    let mut theme_relay: Option<crate::sandbox::theme_relay::ThemeRelay> = None;
+
+    // In-cage desktop portal: under `gui = "wayland"` AND `dbus = true`, provision the portal
+    // stack (dbus + xdg-desktop-portal + the GTK backend) host-side — before the seed, so its roots
+    // join the project store — and read the host theme, best-effort, to seed the cage's light/dark
+    // scheme at launch. The wrap that starts the private bus is applied after every other command
+    // wrap (below), so the bus is up before the app. Best-effort: a provisioning failure warns and
+    // the app runs without an in-cage portal (its file chooser then falls back to its own dialog).
+    // Requires the Wayland display (the GTK backend renders through the compositor), so it is gated
+    // on both. Unlike the filtered host bus, the private bus touches no host socket, so the network
+    // posture does not gate it.
+    // The portal's host-side runtime directory, bound into the cage so the in-cage dbus-daemon's
+    // socket is reachable from the host (the notifications relay attaches there). Created alongside
+    // the provision so `portal` being `Some` implies the directory exists; a create failure drops the
+    // portal (fail-closed: no bus rather than a broken one). Held until the launch ends by the guard.
+    let portal = if prep.cfg.dbus && matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
+        match crate::sandbox::portal::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
+            Ok(p) => match crate::sandbox::portal::HostDir::create(&prep.layout) {
+                Ok(hd) => {
+                    // Start the desktop-notifications relay against the private-bus socket the portal
+                    // exposes on the host. It waits for the in-cage dbus-daemon to create the socket,
+                    // then owns `org.freedesktop.Notifications` on the private bus and forwards to the
+                    // host daemon (re-emitting its signals back). Best-effort: no host bus or a socket
+                    // that never appears just leaves the app without notifications — the in-cage picker
+                    // and at-launch theme are unaffected.
+                    notify_relay = Some(crate::sandbox::notify_relay::NotifyRelay::start(
+                        hd.socket(),
+                    ));
+                    // Start the live-theme relay: it mirrors later host light/dark switches into the
+                    // in-cage GSettings keyfile (through the home bind), so the in-cage portal
+                    // re-emits SettingChanged and the app follows the change live. The home is
+                    // derived exactly as `build_spec` binds it, so both target the same file — and it
+                    // is handed over unjoined because the relay walks the rest of the way itself,
+                    // refusing a symlink at every cage-writable component.
+                    // Best-effort: a home path that cannot be resolved just leaves the at-launch theme.
+                    if let Ok(home) = binds::home_src(prep.layout.data_dir(), &prep.cwd, runtime) {
+                        theme_relay = Some(crate::sandbox::theme_relay::ThemeRelay::start(home));
+                    }
+                    portal_host = Some(hd);
+                    Some(p)
+                }
+                Err(e) => {
+                    crate::diag::warn(&format!(
+                        "`dbus = true` but the portal runtime directory could not be created \
+                         ({e}) — running without an in-cage file chooser"
+                    ));
+                    None
+                }
+            },
+            Err(e) => {
+                crate::diag::warn(&format!(
+                    "`dbus = true` but the in-cage portal could not be provisioned ({e}) — \
+                     running without an in-cage file chooser"
+                ));
+                None
+            }
+        }
+    } else if prep.cfg.dbus {
+        // `dbus = true` without a display: the in-cage portal's GTK backend renders on the
+        // compositor, so it cannot stand up. Warn rather than silently doing nothing.
+        crate::diag::warn(
+            "`dbus = true` needs `gui = \"wayland\"` (the in-cage portal renders on the \
+             compositor) — running without a desktop portal",
+        );
+        None
+    } else {
+        None
+    };
+    // The host light/dark preference, read host-side (best-effort) to seed the cage theme. Read
+    // over the session bus directly rather than by running a provisioned `dbus-send`: a binary in
+    // sbx's relocated store names an interpreter under a `/nix` the host does not have, so it
+    // could not be executed here at all.
+    let portal_scheme = portal
+        .as_ref()
+        .and_then(|_| crate::sandbox::theme_relay::read_host_color_scheme());
+
+    PortalStack {
+        theme_relay,
+        notify_relay,
+        host_dir: portal_host,
+        portal,
+        scheme: portal_scheme,
+    }
+}
+
+/// The host-side layers a rendering or hardware-facing cage needs in its store.
+///
+/// Four independent holes with one doctrine: each is wanted only under some posture, each is
+/// fetched by a `provision` of the shared shape, and none of them may fail a launch — see
+/// [`optional_layer`]. What a hole that cannot be provisioned costs is the feature it serves.
+///
+/// None of these owns a host resource, so the type has no `Drop`.
+struct HardwareLayers {
+    /// `certutil`, for importing sbx's per-session MITM CA into a Chromium/Electron cage's NSS db.
+    /// Wanted only where the cage both renders and filters egress.
+    ca_trust: Option<crate::sandbox::catrust::CaTrust>,
+    /// This host's NVIDIA bridge, when there is one. Resolved **once** for its three readers — the
+    /// GPU layer's provisioning, the binds and env, and the device grant — because it walks the
+    /// host's driver directories and `/dev`, and three walks would be three chances to disagree.
+    nvidia: Option<crate::sandbox::gpu::NvidiaBridge>,
+    /// mesa's DRI drivers, under `gpu = true`.
+    gpu: Option<crate::sandbox::gpu::GpuLayer>,
+    /// The PulseAudio client userspace, under `audio = true`.
+    audio: Option<crate::sandbox::audio::AudioLayer>,
+}
+
+/// Provision the CA-trust, GPU and audio layers this posture asks for, and resolve the NVIDIA
+/// bridge that two of them read.
+///
+/// Provisioned before the project store is seeded, so every root joins it and the cage reads all of
+/// them through `/nix`. Each is best-effort: a fetch that fails warns and costs its own feature.
+fn hardware_layers(prep: &Prepared) -> HardwareLayers {
+    // CA trust for a Chromium/Electron engine under a filtering posture: Chromium ignores the
+    // CA-file env vars sbx sets and reads its own NSS db, so under the egress MITM it rejects
+    // sbx's per-session CA and every page fails to load. When the cage BOTH renders (`gui =
+    // "wayland"` for a window, `"offscreen"` for a headless browser) AND filters egress,
+    // provision `certutil` (part of the rendering hole, like the fonts) so the command wrap below
+    // can import the bound CA into the cage's NSS db. Gated to exactly those cages — a plain CLI
+    // tool needs nothing (its env-reading TLS already trusts the CA), and `shared`/`none` has no
+    // MITM CA. Best-effort: a provisioning failure warns and the app runs (and fails its own
+    // HTTPS) rather than blocking the launch.
+    let ca_trust = optional_layer(
+        prep,
+        prep.cfg.gui.renders()
+            && matches!(prep.cfg.network, crate::config::NetworkPolicy::Allowlist(_)),
+        crate::sandbox::catrust::provision,
+        |e| {
+            format!(
+                "this `gui` posture renders under a network allowlist but certutil could not \
+                 be provisioned ({e}) — a Chromium/Electron engine will not trust the egress \
+                 proxy"
+            )
+        },
+    );
+
+    // Under `gpu = true`, provision mesa's DRI drivers host-side so the cage can render with
+    // hardware acceleration. Provisioned here — before the seed — so mesa's store root joins the
+    // project store and the cage reads the drivers through `/nix`; the env pointing libgbm/libEGL
+    // at them is applied in the launch block below. Best-effort, like the fonts: a fetch that fails
+    // warns and the app runs (falling back to software rendering) rather than failing the launch.
+    // Resolved once for its three readers: the GPU layer's provisioning (which adds GLVND only
+    // where there is a bridge to serve), the binds and env below, and the device grant further
+    // down. It walks the host's driver directories and `/dev`, so asking three times would be
+    // three walks and, worse, three chances to disagree.
+    let nvidia = prep
+        .cfg
+        .gpu
+        .then(crate::sandbox::gpu::nvidia_bridge)
+        .flatten();
+    let gpu_layer = optional_layer(
+        prep,
+        prep.cfg.gpu,
+        |nix, layout, nixpkgs| {
+            crate::sandbox::gpu::provision(nix, layout, nixpkgs, nvidia.as_ref())
+        },
+        |e| {
+            format!(
+                "`gpu = true` but the mesa drivers could not be provisioned \
+                 ({e}) — rendering may fall back to software"
+            )
+        },
+    );
+
+    // Under `audio = true`, provision the PulseAudio client library (`libpulse.so.0`) host-side so
+    // the cage can open capture/playback streams. Provisioned here — before the seed — so its store
+    // root joins the project store and the cage reads the library through `/nix`; the env pointing
+    // the app's loader at it (and the socket bind) is applied in the launch block below. Best-effort,
+    // like the fonts and mesa: a fetch that fails warns and the app runs (without audio).
+    let audio_layer = optional_layer(
+        prep,
+        prep.cfg.audio,
+        crate::sandbox::audio::provision,
+        |e| {
+            format!(
+                "`audio = true` but the audio userspace could not be provisioned \
+                 ({e}) — the app runs without audio"
+            )
+        },
+    );
+
+    HardwareLayers {
+        ca_trust,
+        nvidia,
+        gpu: gpu_layer,
+        audio: audio_layer,
+    }
+}
+
+/// The GUI-hole store roots to seed alongside the packages and tools: the fonts, plus — when the
+/// posture provisioned them — certutil, mesa (with its GLVND paths), the audio userspace, the GUI
+/// data set and the portal stack.
+///
+/// Gathered in one place so the seed takes one list: the cage reads every one of them through
+/// `/nix`, and a root left out of it is a library the cage cannot open.
+fn gui_store_roots(
+    font_roots: &[PathBuf],
+    hw: &HardwareLayers,
+    guidata: Option<&crate::sandbox::guidata::GuiDataLayer>,
+    portal: Option<&crate::sandbox::portal::Provision>,
+) -> Vec<PathBuf> {
+    let mut gui_roots: Vec<PathBuf> = font_roots.to_vec();
+
+    if let Some(ct) = &hw.ca_trust {
+        gui_roots.push(ct.root.clone());
+    }
+    if let Some(layer) = &hw.gpu {
+        gui_roots.push(layer.root.clone());
+        gui_roots.extend(layer.glvnd.iter().cloned());
+    }
+    if let Some(layer) = &hw.audio {
+        gui_roots.extend(layer.roots.iter().cloned());
+    }
+    if let Some(layer) = guidata {
+        gui_roots.push(layer.root.clone());
+    }
+    if let Some(p) = portal {
+        gui_roots.extend(p.roots.iter().cloned());
+    }
+
+    gui_roots
+}
+
 /// Build the spec for `cmd`, reporting a clean error as an `ExitCode`. The
 /// configuration resolved in [`super::prepare_with`] drives this: a trust-gated `.sbx.toml` adds
 /// environment and host binds — read-only, or read-write with `mode = "rw"` (its security
@@ -630,170 +890,20 @@ pub(super) fn build(
         },
     );
 
-    // In-cage desktop portal: under `gui = "wayland"` AND `dbus = true`, provision the portal
-    // stack (dbus + xdg-desktop-portal + the GTK backend) host-side — before the seed, so its roots
-    // join the project store — and read the host theme, best-effort, to seed the cage's light/dark
-    // scheme at launch. The wrap that starts the private bus is applied after every other command
-    // wrap (below), so the bus is up before the app. Best-effort: a provisioning failure warns and
-    // the app runs without an in-cage portal (its file chooser then falls back to its own dialog).
-    // Requires the Wayland display (the GTK backend renders through the compositor), so it is gated
-    // on both. Unlike the filtered host bus, the private bus touches no host socket, so the network
-    // posture does not gate it.
-    // The portal's host-side runtime directory, bound into the cage so the in-cage dbus-daemon's
-    // socket is reachable from the host (the notifications relay attaches there). Created alongside
-    // the provision so `portal` being `Some` implies the directory exists; a create failure drops the
-    // portal (fail-closed: no bus rather than a broken one). Held until the launch ends by the guard.
-    let mut portal_host: Option<crate::sandbox::portal::HostDir> = None;
-    let mut notify_relay: Option<crate::sandbox::notify_relay::NotifyRelay> = None;
-    let mut theme_relay: Option<crate::sandbox::theme_relay::ThemeRelay> = None;
-    let portal = if prep.cfg.dbus && matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland) {
-        match crate::sandbox::portal::provision(&prep.nix, &prep.layout, &prep.nixpkgs) {
-            Ok(p) => match crate::sandbox::portal::HostDir::create(&prep.layout) {
-                Ok(hd) => {
-                    // Start the desktop-notifications relay against the private-bus socket the portal
-                    // exposes on the host. It waits for the in-cage dbus-daemon to create the socket,
-                    // then owns `org.freedesktop.Notifications` on the private bus and forwards to the
-                    // host daemon (re-emitting its signals back). Best-effort: no host bus or a socket
-                    // that never appears just leaves the app without notifications — the in-cage picker
-                    // and at-launch theme are unaffected.
-                    notify_relay = Some(crate::sandbox::notify_relay::NotifyRelay::start(
-                        hd.socket(),
-                    ));
-                    // Start the live-theme relay: it mirrors later host light/dark switches into the
-                    // in-cage GSettings keyfile (through the home bind), so the in-cage portal
-                    // re-emits SettingChanged and the app follows the change live. The home is
-                    // derived exactly as `build_spec` binds it, so both target the same file — and it
-                    // is handed over unjoined because the relay walks the rest of the way itself,
-                    // refusing a symlink at every cage-writable component.
-                    // Best-effort: a home path that cannot be resolved just leaves the at-launch theme.
-                    if let Ok(home) = binds::home_src(prep.layout.data_dir(), &prep.cwd, runtime) {
-                        theme_relay = Some(crate::sandbox::theme_relay::ThemeRelay::start(home));
-                    }
-                    portal_host = Some(hd);
-                    Some(p)
-                }
-                Err(e) => {
-                    crate::diag::warn(&format!(
-                        "`dbus = true` but the portal runtime directory could not be created \
-                         ({e}) — running without an in-cage file chooser"
-                    ));
-                    None
-                }
-            },
-            Err(e) => {
-                crate::diag::warn(&format!(
-                    "`dbus = true` but the in-cage portal could not be provisioned ({e}) — \
-                     running without an in-cage file chooser"
-                ));
-                None
-            }
-        }
-    } else if prep.cfg.dbus {
-        // `dbus = true` without a display: the in-cage portal's GTK backend renders on the
-        // compositor, so it cannot stand up. Warn rather than silently doing nothing.
-        crate::diag::warn(
-            "`dbus = true` needs `gui = \"wayland\"` (the in-cage portal renders on the \
-             compositor) — running without a desktop portal",
-        );
-        None
-    } else {
-        None
-    };
-    // The host light/dark preference, read host-side (best-effort) to seed the cage theme. Read
-    // over the session bus directly rather than by running a provisioned `dbus-send`: a binary in
-    // sbx's relocated store names an interpreter under a `/nix` the host does not have, so it
-    // could not be executed here at all.
-    let portal_scheme = portal
-        .as_ref()
-        .and_then(|_| crate::sandbox::theme_relay::read_host_color_scheme());
+    // The in-cage desktop portal, its host runtime directory and the two relays that serve it.
+    let portal_stack = portal_stack(prep, runtime);
 
-    // CA trust for a Chromium/Electron engine under a filtering posture: Chromium ignores the
-    // CA-file env vars sbx sets and reads its own NSS db, so under the egress MITM it rejects
-    // sbx's per-session CA and every page fails to load. When the cage BOTH renders (`gui =
-    // "wayland"` for a window, `"offscreen"` for a headless browser) AND filters egress,
-    // provision `certutil` (part of the rendering hole, like the fonts) so the command wrap below
-    // can import the bound CA into the cage's NSS db. Gated to exactly those cages — a plain CLI
-    // tool needs nothing (its env-reading TLS already trusts the CA), and `shared`/`none` has no
-    // MITM CA. Best-effort: a provisioning failure warns and the app runs (and fails its own
-    // HTTPS) rather than blocking the launch.
-    let ca_trust = optional_layer(
-        prep,
-        prep.cfg.gui.renders()
-            && matches!(prep.cfg.network, crate::config::NetworkPolicy::Allowlist(_)),
-        crate::sandbox::catrust::provision,
-        |e| {
-            format!(
-                "this `gui` posture renders under a network allowlist but certutil could not \
-                 be provisioned ({e}) — a Chromium/Electron engine will not trust the egress \
-                 proxy"
-            )
-        },
+    // The rendering and hardware holes this posture asks for, provisioned before the seed so their
+    // store roots join the project store.
+    let hw = hardware_layers(prep);
+
+    // Every GUI-hole store root this launch provisioned, gathered for the seed below.
+    let gui_roots = gui_store_roots(
+        font_roots,
+        &hw,
+        guidata_layer.as_ref(),
+        portal_stack.portal.as_ref(),
     );
-
-    // Under `gpu = true`, provision mesa's DRI drivers host-side so the cage can render with
-    // hardware acceleration. Provisioned here — before the seed — so mesa's store root joins the
-    // project store and the cage reads the drivers through `/nix`; the env pointing libgbm/libEGL
-    // at them is applied in the launch block below. Best-effort, like the fonts: a fetch that fails
-    // warns and the app runs (falling back to software rendering) rather than failing the launch.
-    // Resolved once for its three readers: the GPU layer's provisioning (which adds GLVND only
-    // where there is a bridge to serve), the binds and env below, and the device grant further
-    // down. It walks the host's driver directories and `/dev`, so asking three times would be
-    // three walks and, worse, three chances to disagree.
-    let nvidia = prep
-        .cfg
-        .gpu
-        .then(crate::sandbox::gpu::nvidia_bridge)
-        .flatten();
-    let gpu_layer = optional_layer(
-        prep,
-        prep.cfg.gpu,
-        |nix, layout, nixpkgs| {
-            crate::sandbox::gpu::provision(nix, layout, nixpkgs, nvidia.as_ref())
-        },
-        |e| {
-            format!(
-                "`gpu = true` but the mesa drivers could not be provisioned \
-                 ({e}) — rendering may fall back to software"
-            )
-        },
-    );
-
-    // Under `audio = true`, provision the PulseAudio client library (`libpulse.so.0`) host-side so
-    // the cage can open capture/playback streams. Provisioned here — before the seed — so its store
-    // root joins the project store and the cage reads the library through `/nix`; the env pointing
-    // the app's loader at it (and the socket bind) is applied in the launch block below. Best-effort,
-    // like the fonts and mesa: a fetch that fails warns and the app runs (without audio).
-    let audio_layer = optional_layer(
-        prep,
-        prep.cfg.audio,
-        crate::sandbox::audio::provision,
-        |e| {
-            format!(
-                "`audio = true` but the audio userspace could not be provisioned \
-                 ({e}) — the app runs without audio"
-            )
-        },
-    );
-
-    // The GUI-hole store roots to seed: the fonts plus (when present) certutil, mesa, and
-    // libpulseaudio, so the cage reads them all through `/nix`.
-    let mut gui_roots: Vec<PathBuf> = font_roots.to_vec();
-    if let Some(ct) = &ca_trust {
-        gui_roots.push(ct.root.clone());
-    }
-    if let Some(layer) = &gpu_layer {
-        gui_roots.push(layer.root.clone());
-        gui_roots.extend(layer.glvnd.iter().cloned());
-    }
-    if let Some(layer) = &audio_layer {
-        gui_roots.extend(layer.roots.iter().cloned());
-    }
-    if let Some(layer) = &guidata_layer {
-        gui_roots.push(layer.root.clone());
-    }
-    if let Some(p) = &portal {
-        gui_roots.extend(p.roots.iter().cloned());
-    }
 
     // Seed the project's own writable store with the closure of everything the cage
     // resolves through `/nix` — the base userland, every provisioned tool, and (under the
@@ -1504,7 +1614,7 @@ pub(super) fn build(
         // Chromium/Electron app trusts the egress proxy (it ignores the CA-file env vars). It sits
         // outside the egress wrap — it runs, then execs the egress-wrapped command. Only present
         // when `ca_trust` was provisioned (gui = "wayland" under this allowlist).
-        if let Some(ct) = &ca_trust {
+        if let Some(ct) = &hw.ca_trust {
             wraps.push((
                 WrapLayer::CaTrust,
                 Box::new(|cmd| {
@@ -1691,12 +1801,12 @@ pub(super) fn build(
         // backend (the bus itself is started by the outermost command wrap, below). The `XDG_*`
         // keys are data paths, not code-load paths, so — like `WAYLAND_DISPLAY` — a project `[env]`
         // that re-points them only self-DoSes its own cage's portal lookup and needs no denylist.
-        if let Some(p) = &portal {
+        if let Some(p) = &portal_stack.portal {
             gui_env.extend(crate::sandbox::portal::env(&p.gtk_root));
             // Bind the portal's host runtime directory (read-write) at the cage path the bus config,
             // env, and command wrap all reference, so the in-cage dbus-daemon writes its config and
             // creates its socket there — and the socket is reachable from the host for the relay.
-            if let Some(hd) = &portal_host {
+            if let Some(hd) = &portal_stack.host_dir {
                 gui_binds.push(binds::ExtraBind {
                     src: hd.dir().to_path_buf(),
                     dest: PathBuf::from(crate::sandbox::portal::CAGE_DIR),
@@ -1718,7 +1828,7 @@ pub(super) fn build(
     // untrusted `[env]` (they load code, so `is_reserved_env_key` denylists them alongside `LD_*`);
     // a *trusted* config may still override them — self-harm on its own cage, not an escape.
     if prep.cfg.gpu {
-        if let Some(layer) = &gpu_layer {
+        if let Some(layer) = &hw.gpu {
             gui_env.extend(layer.env.iter().cloned());
         }
         for path in crate::sandbox::gpu::drm_sys_paths() {
@@ -1754,7 +1864,7 @@ pub(super) fn build(
         // still renders on the integrated GPU, inside the cage exactly as outside it: the
         // compositor holds that device, and the one workaround is GLX under X11, which sbx never
         // offers. Nothing here approaches that refusal.
-        if let Some(nv) = &nvidia {
+        if let Some(nv) = &hw.nvidia {
             // Composed by `gpu::nvidia_wiring`, which is pure over its inputs so the composition
             // itself is unit-tested: both of this wiring's defects lived in the joining of lists,
             // not in resolving them, and neither had a test to fail.
@@ -1764,8 +1874,8 @@ pub(super) fn build(
             let mut notes = Vec::new();
             let wiring = crate::sandbox::gpu::nvidia_wiring(
                 nv,
-                gpu_layer.as_ref().map_or(&[][..], |layer| &layer.env),
-                gpu_layer.as_ref().and_then(|layer| layer.glvnd.as_deref()),
+                hw.gpu.as_ref().map_or(&[][..], |layer| &layer.env),
+                hw.gpu.as_ref().and_then(|layer| layer.glvnd.as_deref()),
                 kernel.as_deref(),
                 &mut notes,
             );
@@ -1807,7 +1917,7 @@ pub(super) fn build(
                     dest: PathBuf::from(crate::sandbox::audio::CAGE_SOCK),
                     writable: false,
                 });
-                if let Some(alsa) = audio_layer.as_ref().and_then(|l| l.alsa.as_ref()) {
+                if let Some(alsa) = hw.audio.as_ref().and_then(|l| l.alsa.as_ref()) {
                     gui_binds.push(binds::ExtraBind {
                         src: alsa.asound_conf.clone(),
                         dest: PathBuf::from(crate::sandbox::audio::ASOUND_CONF_INCAGE),
@@ -1816,7 +1926,7 @@ pub(super) fn build(
                 }
                 // The `find_library` shim directory (for a Python PortAudio tool), bound read-only and
                 // placed on `PYTHONPATH` by `audio::env`. Present only when PortAudio provisioned.
-                if let Some(pyshim) = audio_layer.as_ref().and_then(|l| l.pyshim.as_ref()) {
+                if let Some(pyshim) = hw.audio.as_ref().and_then(|l| l.pyshim.as_ref()) {
                     gui_binds.push(binds::ExtraBind {
                         src: pyshim.clone(),
                         dest: PathBuf::from(crate::sandbox::audio::PYSHIM_INCAGE),
@@ -1827,7 +1937,7 @@ pub(super) fn build(
                 // voice speech-to-text engine's `dlopen`ed native library (ctranslate2/onnxruntime)
                 // finds `libstdc++.so.6` — `dlopen` consults LD_LIBRARY_PATH, not NIX_LD_LIBRARY_PATH.
                 gui_env.extend(crate::sandbox::audio::env(
-                    audio_layer.as_ref(),
+                    hw.audio.as_ref(),
                     &prep.userland.foreign_lib_paths,
                 ));
             }
@@ -1842,7 +1952,7 @@ pub(super) fn build(
     // The **outermost** layer, so its preamble (`dbus-daemon --fork`, which blocks until the socket
     // is ready) runs first, then execs the rest of the wrapped command. Only present under
     // `gui = "wayland"` + `dbus = true` with a successful provision.
-    if let Some(p) = &portal {
+    if let Some(p) = &portal_stack.portal {
         wraps.push((
             WrapLayer::Portal,
             Box::new(|cmd| {
@@ -1852,7 +1962,7 @@ pub(super) fn build(
                     &p.xdp_root,
                     &p.gtk_root,
                     &p.update_desktop_db,
-                    portal_scheme.as_deref(),
+                    portal_stack.scheme.as_deref(),
                     cmd,
                 )
             }),
@@ -1879,11 +1989,11 @@ pub(super) fn build(
     // under `gui = "wayland"`, so they are collected from the layers here rather than carried on
     // `Userland` with the ones every posture has.
     let mut gui_programs: Vec<&Path> = Vec::new();
-    if let Some(p) = &portal {
+    if let Some(p) = &portal_stack.portal {
         gui_programs.push(&p.dbus_daemon);
         gui_programs.push(&p.update_desktop_db);
     }
-    if let Some(ct) = &ca_trust {
+    if let Some(ct) = &hw.ca_trust {
         gui_programs.push(&ct.certutil);
     }
     extra_binds.extend(plumbing_pins(&prep.userland, &gui_programs, &prep.layout));
@@ -2090,7 +2200,7 @@ pub(super) fn build(
     // Deduped: a trusted `[devices] allow = [...]` alongside `gpu = true` must not emit a bind twice.
     let mut devices = prep.cfg.devices.clone();
     if prep.cfg.gpu {
-        let nvidia_nodes = nvidia.iter().flat_map(|nv| nv.devices.iter().cloned());
+        let nvidia_nodes = hw.nvidia.iter().flat_map(|nv| nv.devices.iter().cloned());
         for node in crate::sandbox::gpu::render_nodes()
             .into_iter()
             .chain(nvidia_nodes)
@@ -2287,7 +2397,7 @@ pub(super) fn build(
         || broker_feed.is_some()
         || signer_feed.is_some()
         || forward_guard.is_some()
-        || portal_host.is_some()
+        || portal_stack.host_dir.is_some()
         || proc_enforce_guard.is_some()
         || task_plane.is_some()
     {
@@ -2299,9 +2409,9 @@ pub(super) fn build(
             broker_feed,
             signer_feed,
             forward: forward_guard,
-            notify: notify_relay,
-            theme: theme_relay,
-            portal: portal_host,
+            notify: portal_stack.notify_relay,
+            theme: portal_stack.theme_relay,
+            portal: portal_stack.host_dir,
             proc_enforce: proc_enforce_guard,
             task: task_plane,
         })
