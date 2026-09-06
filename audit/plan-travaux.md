@@ -83,56 +83,36 @@ vaut au-delà de cet item : la prédiction « rouge sur `--new-session` et sur l
 conjecture, et l'écrire avant de lancer le test est ce qui a empêché de rétrécir la ligne de base
 pour la faire verdir.
 
-## 1. Retourner le sens de la dérivation CLI
+## 1. La dérivation CLI — RÉDUITE À CE QUE LA MESURE SOUTIENT : un test de parité
 
-**Objectif.** Que la complétion lise une déclaration d'options, au lieu de deviner la grammaire en
-analysant la prose des pages d'aide.
+**Ce que l'item proposait.** Retourner le sens de la dérivation : une déclaration typée par option,
+dont l'aide serait *rendue* et dont la complétion lirait la grammaire, au lieu de l'analyser dans la
+prose des pages. Un refactor traversant quatre-vingt-dix pages, précédé d'une capture d'or.
 
-**Prémisse mesurée, et elle est faible.** Les quatre lecteurs de prose totalisent six correctifs
-dans toute l'histoire du dépôt : `operand_slots` 2, `metavar_of` 1, `is_literal` 1,
-`flag_takes_value` 2. Ce n'est pas une dette active. Ce qui reste vrai est la *forme* du risque, pas
-sa fréquence : un désaccord entre la complétion et le parseur ne se signale pas, il se constate. Cet
-item se justifie par ce silence, pas par un compteur — et il passe donc après l'item 3, dont la
-prémisse se compte.
+**Ce que l'histoire du dépôt en dit.** Deux correctifs, dans toute l'histoire, sur les quatre
+lecteurs de prose — `bff6ff2` sur `flag_takes_value`, `b7da0e0` sur `operand_slots` ; les autres
+commits sont la fonctionnalité qui les a introduits. Et **zéro** du côté du parseur :
+`take_override_flag` compte neuf commits, tous des ajouts de drapeaux et un renommage, aucun
+correctif de divergence.
 
-**Première étape, qui n'est pas du code : une capture d'or.** Enregistrer, avant de toucher quoi
-que ce soit, la sortie de l'oracle `__complete` pour tous les verbes et toutes les profondeurs — et
-avec elle celle du parseur : `--help` de chaque verbe, et un jeu d'overrides `--config`/`--env`
-couvrant les drapeaux à valeur fusionnée comme `--gpu[=true|false]`. Le refactor est censé être sans
-effet observable des deux côtés ; sans cette capture, rien ne le prouve, et la comparaison doit être
-un diff d'octets.
+**Ce que ça change.** L'accord entre la complétion et le parseur tient depuis toujours ; ce qui
+manque n'est pas une architecture, c'est le mécanisme qui *dirait* qu'il a cessé de tenir. Un
+refactor traversant achèterait la même propriété au prix d'une réécriture, et en la déplaçant : la
+déclaration deviendrait elle-même le lieu où l'erreur se commet. Le geste proportionné est le test
+de parité — que le plan prévoyait déjà, mais comme filet d'un refactor plutôt que comme livrable.
 
-**Geste.** Introduire dans la table de `help` une déclaration typée par option — nom, présence et
-nature de la valeur, fusionnée ou suivante — et faire que la ligne d'aide en soit *rendue*. Puis
-remplacer les lecteurs de prose par des lecteurs de cette déclaration : `operand_slots`
-(`src/cli/completion.rs:643`), `metavar_of` (`:701`), `is_literal` (`:732`, avec sa stop-list de
-mots anglais) et `flag_takes_value` (`:1038`).
+**Geste.** Un test qui, pour chaque drapeau documenté sur une page où le parseur d'overrides
+s'applique, pose **la même question aux deux côtés** : le mot suivant est-il consommé ? Le côté
+parseur répond en s'exécutant — `take_override_flag` sur une tête `[drapeau, sentinelle]`, et la
+sentinelle reste ou ne reste pas — et non par une liste recopiée dans le test. La population vient
+des pages, donc un drapeau documenté plus tard est couvert sans toucher au test.
 
-**Le sens de la dérivation est une contrainte de sécurité, pas un détail.** `take_override_flag`
-(`src/main.rs:482`) n'est pas un lecteur de prose : c'est le parseur des overrides `--config` et
-`--env`, qui sont autoritaires et traversent la porte de lecture de configuration. La déclaration
-nourrit **la complétion**, et elle seule ; le parseur garde sa logique. Un **test de parité**
-compare les deux réponses, drapeau par drapeau, et c'est lui qui remplace l'accord tenu à la main.
-À aucun moment le parseur ne lit la déclaration : une déclaration incomplète changerait alors ce
-qu'un override consomme, c'est-à-dire le bug que le commentaire de `src/cli/completion.rs:1030`
-raconte, déplacé du côté où il compte.
+**Preuve.** Le test est rouge si l'on rétablit le défaut que `bff6ff2` a corrigé.
 
-**Preuve.** Le diff d'octets contre la capture d'or, et `tests/completion.rs` qui exerce déjà les
-scripts émis et l'oracle `__complete` sur chaque chemin.
+**Fichiers.** `src/main.rs`, `src/cli/completion.rs`.
 
-**Fichiers.** `src/help/pages.rs`, `src/help.rs`, `src/cli/completion.rs`, `src/main.rs`,
-`tests/completion.rs`.
-
-**Ce que ça casse.** C'est le seul item du plan avec une suite dédiée à casser puis rétablir. La
-prose des pages doit rester lisible une fois rendue depuis la déclaration — si le rendu appauvrit
-une page, la déclaration est trop pauvre, pas la page trop riche.
-
-**Gardes.** La parité aide/complétion et les tests de résolution de page du dispatcher. Aucun verbe
-nouveau, donc `docs_coverage` ne bouge pas — sauf si le rendu change le texte d'une page, auquel
-cas la garde de wrapping des `///` et celle du guide s'appliquent.
-
-**Découpe.** Faisable verbe par verbe : la déclaration peut coexister avec la prose pendant la
-transition, les lecteurs interrogeant la déclaration quand elle existe et la prose sinon.
+**Ce qui rouvrirait le refactor.** Un troisième correctif de la même famille, ou une page dont la
+prose ne peut plus exprimer une grammaire que le parseur accepte.
 
 ## 2. Un palier de tests rapide — CLOS, prémisse mesurée fausse
 
@@ -163,49 +143,40 @@ et « tout », le filtre ciblé reste l'outil, et c'est ce que fait `CLAUDE.md`.
 annotation portée par le test lui-même, lisible par le harnais, qui ne change pas ce qu'une
 invocation sans elle exécute.
 
-## 3. Une seule table de configuration convertie
+## 3. Une seule table de configuration convertie — CLOS par sa propre mesure
 
-**Objectif.** Mesurer ce que coûte une déclaration unique par champ, avant d'engager les 140 types.
+**L'item était une mesure, et la mesure a répondu.** Son énoncé était « mesurer ce que coûte une
+déclaration unique par champ, avant d'engager les 140 types », avec une décision à prendre après.
+Lire `[fs]` de bout en bout à travers ses quatre étages *est* cette mesure, et elle dit de s'arrêter
+— mais pas pour la raison que le plan prévoyait.
 
-**Prémisse mesurée, et c'est la mieux tenue du plan.** Plus de vingt-cinq commits touchent au moins
-trois des quatre étages (`src/config/schema.rs`, `mod.rs`, `view.rs`, `src/cli/config/render.rs`)
-dans le même geste, et une bonne moitié les touche tous les quatre. Ajouter un champ traverse
-réellement les quatre étages, à chaque fois.
+**Ce que le plan supposait.** Que les quatre étages sont quatre représentations parallèles d'une
+même chose, dont une déclaration unique pourrait rendre les copies. Le chiffre qui motivait l'item
+reste vrai : plus de vingt-cinq commits touchent au moins trois étages dans le même geste. Mais un
+champ qui *traverse* quatre étages et un champ qui y est *copié* quatre fois ne sont pas le même
+fait, et c'est le second que l'item supposait.
 
-**Geste.** Choisir **une** table — `[fs]` est la plus petite, `[network]` la plus représentative —
-et faire dériver d'une déclaration unique les quatre étages qu'elle traverse aujourd'hui : le
-`Raw*`, le type résolu, la vue, l'entrée de rendu. Macro déclarative de préférence à un type
-paramétré par l'étage : moins intrusive, et elle laisse les commentaires par champ où ils sont.
+**Trois mesures sur la plus petite table, choisie parce que si la prémisse tenait quelque part,
+c'est là qu'elle tiendrait.**
 
-**Preuve.** Aucun changement de comportement observable : la même configuration produit le même
-`sbx config show`, les mêmes messages de refus, le même `--json`. Les tests de `src/config/tests.rs`
-qui portent sur cette table passent sans être modifiés — s'il faut les toucher, la conversion a
-changé quelque chose.
+| champ | ce qu'il fait de différent par étage |
+| --- | --- |
+| `scan_max_kb` | `Option<i64>` au parse, `Option<u64>` résolu — un `u64` refusait `-1` au *parse*, ce qui faisait échouer le fichier entier ; le signe est une décision d'étage |
+| `scan_max_kb` | se replie par le **maximum**, et le commentaire dit que le repli a valu `min` une fois, laissant un plafond ambiant battre celui de la ligne de commande |
+| `scan_max_kb` | refusé d'un projet non fiable (`src/config/apps.rs:856`), là où les trois listes ne le sont pas |
 
-**Fichiers.** `src/config/schema.rs`, `mod.rs`, `view.rs`, `overrides.rs`, `src/cli/config/`.
+Chacune est une **sémantique par champ**, pas une copie par étage. Une macro devrait porter le
+changement de type, la règle de repli, la porte de confiance et les paragraphes qui expliquent
+chacun — ou la déclaration ne serait qu'un index vers une prose restée ailleurs.
 
-**Ce que ça casse, et comment on le sait.** Trois propriétés à préserver, dont la première est une
-garde de sécurité et demande son propre mécanisme de preuve.
+**Ce qui reste vrai.** La destructuration exhaustive de `overrides.rs` reste la garde qu'elle est,
+et son propre commentaire dit que l'oubli silencieux s'est produit **trois fois** avant elle.
+Vingt-cinq commits à trois étages ne sont pas le coût d'avoir des couches : c'est le coût d'avoir
+des règles.
 
-La destructuration exhaustive de `RawConfig` dans `overrides.rs` donne aujourd'hui l'exhaustivité au
-compilateur : un champ ajouté sans être traité ne compile pas. Une macro peut rendre cette garde
-**inerte sans rien casser de visible** — si la destructuration générée porte un `..`, ou si elle
-passe par une méthode elle-même générée, le champ oublié compile et l'override est silencieusement
-ignoré. C'est exactement la forme du défaut que ce dépôt a déjà rencontré sur le plan d'override, et
-« la macro préserve l'exhaustivité » est une affirmation qui doit être testée, pas déclarée. Le test
-qui la ferme : un champ ajouté à la macro dans un cas de compilation qui **doit** échouer
-(`compile_fail`), ou à défaut une assertion que le nombre de champs déclarés et le nombre de bras
-traités sont égaux. Cet item ne commence pas sans lui.
-
-Les deux autres : la documentation par champ, souvent le seul endroit où une règle est écrite ; et
-la lecture des champs par `src/docs_coverage.rs`, qui doit apprendre à lire la macro.
-
-**Gardes.** `docs_coverage` sur les champs de configuration nommés dans le guide. La conversion
-n'ajoute aucun champ, donc la garde doit rester verte sans écrire une ligne de prose — si elle
-rougit, la macro a rendu un champ invisible, ce qui est précisément le risque à mesurer.
-
-**Décision à prendre après, pas avant.** Généraliser ou s'arrêter là. La conversion d'une table
-donne le chiffre qui manque : combien de lignes et de lisibilité une déclaration unique coûte.
+**Ce qui rouvrirait l'item.** Une table dont les champs sont homogènes sur les quatre étages —
+même type brut et résolu, même règle de repli, aucune porte de confiance, aucune prose par champ.
+S'il en existe une, c'est le pilote.
 
 ## 4. `httparse` — ABANDONNÉ, et remplacé par ce que sa mesure a trouvé
 
@@ -247,11 +218,13 @@ tête.
 `ToEof` et `Connection: close` — le repli que la fonction documente déjà. C'est plus strict que la
 normalisation actuelle du côté requête, et c'est la posture du dépôt.
 
-**Deux voisins de la même famille, énumérés sans être corrigés ici.** Une ligne sans `:` est
-silencieusement abandonnée par `parse_head`, et relayée verbatim au client sur une réponse ; et
-`parse_head` découpe sur un `\n` seul, là où un client qui n'accepte que CRLF lit une autre tête.
-Le plan HTTP/2 n'a ni l'un ni l'autre, HPACK décodant dans des types qui les refusent : la parité
-entre plans est ce qui les nomme.
+**Un voisin énuméré, et un faux voisin écarté.** Une ligne sans `:` est silencieusement
+abandonnée par `parse_head` et relayée verbatim au client sur une réponse ; sans deux-points elle
+n'est un en-tête pour personne, donc rien ne s'en cadre, et elle reste une différence de lecture
+sans conséquence mesurée. Le découpage sur un `\n` seul, lui, **n'est pas un défaut** : la RFC 9112
+§2.2 autorise un destinataire à reconnaître un LF seul comme fin de ligne, et le guide écrit
+explicitement que les quatre orthographes de la ligne vide terminent une tête sur chaque plan.
+C'est une tolérance choisie et documentée.
 
 **Fichiers.** `src/sandbox/proxy/wire.rs`, `src/sandbox/proxy/tests.rs`.
 
