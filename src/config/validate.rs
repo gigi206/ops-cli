@@ -330,9 +330,9 @@ pub(super) fn validate_mise_engine(
 pub(super) fn validate_gui(
     warnings: &mut Vec<String>,
     source_label: &str,
-    value: String,
+    value: &str,
 ) -> Option<GuiPolicy> {
-    match value.as_str() {
+    match value {
         "none" => Some(GuiPolicy::None),
         "offscreen" => Some(GuiPolicy::Offscreen),
         "wayland" => Some(GuiPolicy::Wayland),

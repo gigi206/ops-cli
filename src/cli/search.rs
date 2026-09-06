@@ -39,8 +39,8 @@ fn parse_search_args(args: &[OsString]) -> Result<&str, Vec<String>> {
     query.ok_or_else(|| vec![usage()])
 }
 
-pub(crate) fn run(args: Vec<OsString>) -> ExitCode {
-    let query = match parse_search_args(&args) {
+pub(crate) fn run(args: &[OsString]) -> ExitCode {
+    let query = match parse_search_args(args) {
         Ok(query) => query,
         Err(lines) => {
             for line in lines {

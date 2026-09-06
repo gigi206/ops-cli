@@ -74,7 +74,7 @@ pub(super) fn render_gui_stop_hint(name: &str, pid: u32, pal: &crate::style::Pal
 /// confinement (seccomp denylist + `no_new_privs` + capability drop) so the joined process is
 /// confined at least as tightly as the agent. See [`mod@crate::sandbox::attach`] for the mechanism and its
 /// one inherent residual (the command binary comes from the agent's own mount namespace).
-pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
+pub(crate) fn attach(id: &str, cmd: &[OsString]) -> ExitCode {
     let layout = match crate::layout_or_fail() {
         Ok(l) => l,
         Err(code) => return code,
@@ -132,7 +132,7 @@ pub(crate) fn attach(id: &str, cmd: Vec<OsString>) -> ExitCode {
 
     // The in-cage argv: the interactive rc shell for a bare attach, or the command run through
     // `bash -c 'exec "$@"'` so bash resolves it on the cage PATH and execs it in place.
-    let argv_owned = match attach_argv(&cmd) {
+    let argv_owned = match attach_argv(cmd) {
         Ok(a) => a,
         Err(e) => {
             crate::diag::error(&format!("sbx session attach: {e}"));

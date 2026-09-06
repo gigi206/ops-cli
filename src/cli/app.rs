@@ -25,7 +25,7 @@ use crate::{config, diag, help, layout_or_fail, sandbox, session, store, style, 
 /// `run` verb, so the first token is always a subcommand and an app name can never collide with one
 /// — an app may be named `run`, `upgrade`, `show`, etc., and is reached as `sbx app run <name>`.
 /// That invariant is what makes adding a subcommand here safe: it can never shadow an app.
-pub(crate) fn app_cmd(args: Vec<OsString>) -> ExitCode {
+pub(crate) fn app_cmd(args: &[OsString]) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("run") => app_run(&args[1..]),
         Some("upgrade") => crate::cli::upgrade::app_upgrade_cmd(&args[1..]),
@@ -57,7 +57,7 @@ pub(crate) fn app_cmd(args: Vec<OsString>) -> ExitCode {
 fn app_run(args: &[OsString]) -> ExitCode {
     match parse_app_launch(args) {
         Ok(launch) => {
-            let ov = match build_override(launch.cli) {
+            let ov = match build_override(&launch.cli) {
                 Ok(ov) => ov,
                 Err(code) => return code,
             };
@@ -70,7 +70,7 @@ fn app_run(args: &[OsString]) -> ExitCode {
                 launch.net_learn.as_ref().map(|nl| nl.gran),
             );
             match (outcome.learned, launch.net_learn) {
-                (Some(synth), Some(nl)) => finish_net_learn(&launch.name, synth, &nl),
+                (Some(synth), Some(nl)) => finish_net_learn(&launch.name, &synth, &nl),
                 _ => outcome.code,
             }
         }
@@ -83,7 +83,7 @@ fn app_run(args: &[OsString]) -> ExitCode {
 /// profile. The exit code reflects the *learning* outcome, not the agent's exit — a `--net-learn` run
 /// is expected to fail hosts it lacks rules for, so its non-zero exit is not this command's failure;
 /// only a write error is.
-fn finish_net_learn(name: &str, synth: sandbox::Synthesis, nl: &NetLearn) -> ExitCode {
+fn finish_net_learn(name: &str, synth: &sandbox::Synthesis, nl: &NetLearn) -> ExitCode {
     use config::manage::EgressList;
     for note in &synth.notes {
         diag::warn(note);
@@ -575,7 +575,7 @@ fn dep_plan(
                 m.name
             ));
         }
-        let mut fragment = config::read_bundle_fragment(file).map_err(nothing_written)?;
+        let mut fragment = config::read_bundle_fragment(file).map_err(|e| nothing_written(&e))?;
         let Some(bundle) = fragment.remove(&m.name) else {
             return Err(format!(
                 "{} no longer declares `{}`; nothing was written",
@@ -603,7 +603,8 @@ fn dep_plan(
                 m.name
             ));
         }
-        let mut fragment = config::read_net_groups_fragment(file).map_err(nothing_written)?;
+        let mut fragment =
+            config::read_net_groups_fragment(file).map_err(|e| nothing_written(&e))?;
         let Some(entries) = fragment.remove(&m.name) else {
             return Err(format!(
                 "{} no longer declares `{}`; nothing was written",
@@ -616,7 +617,7 @@ fn dep_plan(
     Ok(DepPlan { bundles, groups })
 }
 
-fn nothing_written(e: String) -> String {
+fn nothing_written(e: &str) -> String {
     format!("{e}; nothing was written")
 }
 

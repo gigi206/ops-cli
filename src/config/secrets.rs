@@ -25,7 +25,7 @@ pub(super) fn apply_secret_section(
             RawHostSecrets::Many(v) => v,
         };
         for raw in list {
-            match validate_host_secret(&host, raw, defaults, plugins) {
+            match validate_host_secret(&host, &raw, defaults, plugins) {
                 Ok(secret) => upsert_secret(out, warnings, source, secret),
                 Err(e) => warnings.push(format!("{source}: ignoring secret for `{host}` — {e}")),
             }
@@ -119,7 +119,7 @@ pub(super) fn upsert_secret(
 /// drops the secret. `kind` is optional, defaulting to the only kind today.
 pub(super) fn validate_host_secret(
     host: &str,
-    raw: RawHostSecret,
+    raw: &RawHostSecret,
     defaults: &SecretDefaults,
     plugins: &PluginRegistry,
 ) -> Result<HeaderSecret, String> {
@@ -129,7 +129,7 @@ pub(super) fn validate_host_secret(
             "unknown kind `{kind}` (the only secret kind today is \"http-header\")"
         ));
     }
-    let sources = resolve_host_sources(&raw, defaults, plugins)?;
+    let sources = resolve_host_sources(raw, defaults, plugins)?;
     let to = validate_secret_target(host)?;
     // A signer answers what a fixed value cannot, and it answers *all* of it: which headers this
     // request carries comes from the plugin's reviewed manifest, so a declaration may not also

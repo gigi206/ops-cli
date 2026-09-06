@@ -51,7 +51,7 @@ const FILES: &str = "__sbx_files__";
 /// flag added there is completable without a second declaration. Naming no shell, or naming one sbx
 /// does not emit, prints the page and exits 2 rather than emitting something a shell would source
 /// and misbehave on.
-pub(crate) fn completion_cmd(args: Vec<OsString>) -> ExitCode {
+pub(crate) fn completion_cmd(args: &[OsString]) -> ExitCode {
     let Some(shell) = args.first() else {
         eprint!("{}", help::page_usage(&["completion"]).unwrap_or_default());
         return ExitCode::from(2);
@@ -82,7 +82,7 @@ pub(crate) fn completion_cmd(args: Vec<OsString>) -> ExitCode {
 }
 
 /// The hidden completion oracle. Never invoked by a user directly.
-pub(crate) fn complete_cmd(args: Vec<OsString>) -> ExitCode {
+pub(crate) fn complete_cmd(args: &[OsString]) -> ExitCode {
     // The separator is always sent. Requiring it keeps the protocol explicit instead of
     // guessing at the shape of an invocation that does not match the emitted scripts.
     let rest = match args.split_first() {

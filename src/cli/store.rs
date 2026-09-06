@@ -83,12 +83,12 @@ struct SharedStoreView {
 }
 
 /// `sbx store` — report sbx's on-disk footprint.
-pub(crate) fn store_cmd(args: Vec<OsString>) -> ExitCode {
-    if let Some(code) = help::maybe_help("store", &args) {
+pub(crate) fn store_cmd(args: &[OsString]) -> ExitCode {
+    if let Some(code) = help::maybe_help("store", args) {
         return code;
     }
     let mut json = false;
-    for a in &args {
+    for a in args {
         match a.to_str() {
             Some("--json") => json = true,
             Some(other) => {

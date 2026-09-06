@@ -520,7 +520,7 @@ fn resolve_app(
             }
         }
         if let Some(value) = app.gui
-            && let Some(policy) = validate_gui(&mut warnings, &source, value)
+            && let Some(policy) = validate_gui(&mut warnings, &source, &value)
         {
             gui = Some(policy);
             gui_origin = Provenance::Global;
@@ -760,7 +760,7 @@ fn resolve_app(
                 &mut gui_origin,
                 "`gui` posture",
                 &mut warnings,
-                |w, _| validate_gui(w, &source, value).map(Some),
+                |w, _| validate_gui(w, &source, &value).map(Some),
             );
         }
         // `gpu` mirrors `gui`: an untrusted project may not open GPU rendering, on its own app or

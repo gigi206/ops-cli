@@ -40,7 +40,7 @@ use render::render_config;
 /// warnings on stderr;
 /// `--json` prints the same resolved model as a JSON document. The verbs read and edit a single
 /// raw layer file (the project `.sbx.toml`, the global config, or an explicit path).
-pub(crate) fn config_cmd(args: Vec<OsString>) -> ExitCode {
+pub(crate) fn config_cmd(args: &[OsString]) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("show") => config_show(&args[1..]),
         Some("get") => config_get(&args[1..]),

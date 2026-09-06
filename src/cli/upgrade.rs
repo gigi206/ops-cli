@@ -186,10 +186,10 @@ fn parse_upgrade_args(args: &[OsString]) -> ParsedArgs {
 /// runs the whole thing against another project instead of the current directory. The
 /// lock-rewriting parts need nix (to resolve) but not the sandbox boundary; the in-cage `mise:`
 /// roll needs the sandbox and degrades to a warning where it is unavailable.
-pub(crate) fn upgrade_cmd(args: Vec<OsString>) -> ExitCode {
+pub(crate) fn upgrade_cmd(args: &[OsString]) -> ExitCode {
     // Parse an optional target word and an optional `--project <path>`, in any order, before
     // touching anything so a typo fails cleanly.
-    let (what, project_arg, app_arg) = match parse_upgrade_args(&args) {
+    let (what, project_arg, app_arg) = match parse_upgrade_args(args) {
         ParsedArgs::Help => return help::show(&["upgrade"]),
         ParsedArgs::Run { what, project, app } => (what, project, app),
         ParsedArgs::Error(message) => {

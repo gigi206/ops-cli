@@ -8371,7 +8371,7 @@ fn vhs(
     secret: RawHostSecret,
     defaults: &SecretDefaults,
 ) -> Result<HeaderSecret, String> {
-    validate_host_secret(host, secret, defaults, &PluginRegistry::default())
+    validate_host_secret(host, &secret, defaults, &PluginRegistry::default())
 }
 
 /// [`resolve`] with no installed plugins — the default for the layering tests.
@@ -9739,7 +9739,7 @@ fn plugin(scheme: &str) -> crate::plugins::ResolverPlugin {
 fn vhs_with(secret: RawHostSecret, plugins: &PluginRegistry) -> Result<HeaderSecret, String> {
     validate_host_secret(
         "api.github.com",
-        secret,
+        &secret,
         &SecretDefaults::default(),
         plugins,
     )
@@ -9752,7 +9752,7 @@ fn vhs_with_defaults(
     defaults: &SecretDefaults,
     plugins: &PluginRegistry,
 ) -> Result<HeaderSecret, String> {
-    validate_host_secret("api.github.com", secret, defaults, plugins)
+    validate_host_secret("api.github.com", &secret, defaults, plugins)
 }
 
 /// A plugin declaring the variables it reads, so the `[plugin.<name>]` validation has something
@@ -10261,7 +10261,7 @@ fn a_terse_key_pinned_to_a_plugin_scheme_resolves_through_it() {
     let reg = PluginRegistry::with([plugin("pass")]);
     let s = validate_host_secret(
         "api.github.com",
-        terse("tok@pass"),
+        &terse("tok@pass"),
         &SecretDefaults::default(),
         &reg,
     )
@@ -10344,7 +10344,7 @@ fn a_terse_key_naming_no_installed_plugin_is_rejected() {
     let reg = PluginRegistry::with([plugin("pass")]);
     let err = validate_host_secret(
         "api.github.com",
-        terse("tok@pas"),
+        &terse("tok@pas"),
         &SecretDefaults::default(),
         &reg,
     )

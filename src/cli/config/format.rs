@@ -115,9 +115,9 @@ struct NetTransport {
 /// means "reuse is on and the cache is the built-in one", which is exactly what someone asking for
 /// details wants spelled out. Only the resolver cache can say *which* of the two it is, because the
 /// view keeps its unset state (`None`) while `pool` arrives already collapsed to a `bool`.
-fn write_net_transport(o: &mut String, t: NetTransport, details: bool, pal: &style::Palette) {
+fn write_net_transport(o: &mut String, t: &NetTransport, details: bool, pal: &style::Palette) {
     use std::fmt::Write as _;
-    let NetTransport {
+    let &NetTransport {
         pool,
         ca_roots,
         dns_cache_ttl,
@@ -341,7 +341,7 @@ pub(super) fn write_net_posture_head(
             }
             write_net_transport(
                 o,
-                NetTransport {
+                &NetTransport {
                     pool: *pool,
                     ca_roots: *ca_roots,
                     dns_cache_ttl: *dns_cache_ttl,

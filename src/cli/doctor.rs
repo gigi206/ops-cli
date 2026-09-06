@@ -423,7 +423,7 @@ fn report_security_boundary(
             Userns::Ok => println!(
                 "         {dim}· user namespaces: capability-bearing (cannot prove without bubblewrap){r}"
             ),
-            other => classify_namespace_failure(pal, other, remediation),
+            other => classify_namespace_failure(pal, &other, remediation),
         }
         return;
     };
@@ -484,7 +484,7 @@ fn classify_launch_failure(
             }
             remediation.push(BWRAP_LAUNCH_REMEDIATION);
         }
-        other => classify_namespace_failure(pal, other, remediation),
+        other => classify_namespace_failure(pal, &other, remediation),
     }
 }
 
@@ -494,7 +494,7 @@ fn classify_launch_failure(
 /// namespace is not `Ok`.
 fn classify_namespace_failure(
     pal: &style::Palette,
-    userns: Userns,
+    userns: &Userns,
     remediation: &mut Vec<&'static str>,
 ) {
     let fail = tag_fail(pal);

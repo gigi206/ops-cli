@@ -988,7 +988,7 @@ impl Resolved {
             &mut notes,
         );
         if !fatal.is_empty() {
-            return Err(override_fatal_error(fatal, notes));
+            return Err(override_fatal_error(&fatal, notes));
         }
         let OverrideScalars {
             network: new_network,
@@ -1287,7 +1287,7 @@ impl Resolved {
         if fatal.is_empty() {
             Ok(())
         } else {
-            Err(override_fatal_error(fatal, notes))
+            Err(override_fatal_error(&fatal, notes))
         }
     }
 }
@@ -1344,7 +1344,7 @@ fn build_override_scalars(
         }
     }
     if let Some(value) = gui {
-        match validate_gui(notes, OVERRIDE_SOURCE, value) {
+        match validate_gui(notes, OVERRIDE_SOURCE, &value) {
             Some(policy) => scalars.gui = Some(policy),
             None => fatal.push("gui".to_string()),
         }
@@ -1403,7 +1403,7 @@ fn build_override_scalars(
 /// Assemble the hard-error message list for a one-shot override with invalid scalar values: a
 /// summary naming the offending fields, then the specific validator notes (so the exact reason
 /// survives the aborted launch, which discards `self.warnings`).
-fn override_fatal_error(fatal: Vec<String>, notes: Vec<String>) -> Vec<String> {
+fn override_fatal_error(fatal: &[String], notes: Vec<String>) -> Vec<String> {
     let fields = fatal
         .iter()
         .map(|f| format!("`{f}`"))
@@ -1929,7 +1929,7 @@ fn resolve(
     let mut gui_origin = Provenance::Default;
     let mut gui = match global
         .gui
-        .and_then(|v| validate_gui(&mut warnings, GLOBAL_CONFIG, v))
+        .and_then(|v| validate_gui(&mut warnings, GLOBAL_CONFIG, &v))
     {
         Some(policy) => {
             gui_origin = Provenance::Global;
@@ -2352,7 +2352,7 @@ fn resolve(
                 &mut gui_origin,
                 "`gui` posture",
                 &mut warnings,
-                |w, _| validate_gui(w, PROJECT_CONFIG, value),
+                |w, _| validate_gui(w, PROJECT_CONFIG, &value),
             );
         }
         // `timezone` is **not** a security field, so it applies whatever the project's verdict —

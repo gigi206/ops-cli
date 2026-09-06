@@ -9,8 +9,8 @@ use crate::cli::logs;
 use crate::{diag, format_log_time, help, sandbox, style};
 
 /// `sbx ssh-agent <subcommand>`. Currently one subcommand, `logs`; `log` is accepted as an alias.
-pub(crate) fn ssh_agent_cmd(args: Vec<OsString>) -> ExitCode {
-    if let Some(code) = help::maybe_help("ssh-agent", &args) {
+pub(crate) fn ssh_agent_cmd(args: &[OsString]) -> ExitCode {
+    if let Some(code) = help::maybe_help("ssh-agent", args) {
         return code;
     }
     match args.first().and_then(|a| a.to_str()) {

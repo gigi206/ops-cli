@@ -535,8 +535,8 @@ fn take_override_flag(
 /// environment, surfacing its notices. Fail-closed: a malformed override (bad TOML, an unreadable
 /// `@file`, a `--env`/`--limit`/`--package` without `=`, a bad `--net`/`--bind` value) is a usage
 /// error (exit 2), never a silent drop that would launch a different posture than asked.
-fn build_override(cli: config::CliOverrides) -> Result<config::Override, ExitCode> {
-    match config::overrides::collect(&cli) {
+fn build_override(cli: &config::CliOverrides) -> Result<config::Override, ExitCode> {
+    match config::overrides::collect(cli) {
         Ok(ov) => {
             for notice in ov.notices() {
                 diag::warn(notice);

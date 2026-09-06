@@ -7,11 +7,11 @@ use std::process::ExitCode;
 
 use crate::{help, sandbox, style};
 
-pub(crate) fn run(args: Vec<OsString>) -> ExitCode {
+pub(crate) fn run(args: &[OsString]) -> ExitCode {
     let mut prune = false;
     let mut all = false;
     let mut optimise = false;
-    for a in &args {
+    for a in args {
         match a.to_str() {
             Some("--prune") => prune = true,
             Some("--all") => all = true,

@@ -66,8 +66,8 @@ fn occupied_subtrees(dir: &Path) -> Vec<&'static str> {
         .collect()
 }
 
-pub(crate) fn storage_cmd(args: Vec<OsString>) -> ExitCode {
-    if let Some(code) = help::maybe_help("storage", &args) {
+pub(crate) fn storage_cmd(args: &[OsString]) -> ExitCode {
+    if let Some(code) = help::maybe_help("storage", args) {
         return code;
     }
     match args.first().and_then(|a| a.to_str()) {

@@ -239,7 +239,7 @@ const ENV_LABELS: TypedLabels = TypedLabels {
 /// structurally-bad typed value (a `--limit` with no `=`, a `--bind` with an empty path) is an
 /// `Err(message)`.
 pub(crate) fn collect(cli: &CliOverrides) -> Result<Override, String> {
-    collect_from(cli, scan_ambient())
+    collect_from(cli, &scan_ambient())
 }
 
 /// Read the ambient `SBX_*` override variables from the environment. Exact names first, then the
@@ -306,7 +306,7 @@ fn env_nonempty(key: &str) -> Option<String> {
 /// The pure core of [`collect`]: the ambient environment is passed in. Builds the four precedence
 /// tiers (`SBX_CONFIG` blob, `SBX_*` typed, `--config` blob, `--*` typed), folds each into one
 /// overlay per the uniform merge rule, and records the one-time notices.
-fn collect_from(cli: &CliOverrides, ambient: AmbientOverrides) -> Result<Override, String> {
+fn collect_from(cli: &CliOverrides, ambient: &AmbientOverrides) -> Result<Override, String> {
     // An unknown key is reported per blob, here, because it does not survive far enough to be
     // reported anywhere else: `overlay_into` carries the fields it understands and drops the
     // unknown-key bag with them. Reported rather than refused, for the reason a file's are —
@@ -1270,11 +1270,11 @@ mod tests {
             audio: owned(cli.audio),
             dbus: owned(cli.dbus),
         };
-        collect_from(&overrides, AmbientOverrides::default())
+        collect_from(&overrides, &AmbientOverrides::default())
     }
 
     fn ambient(a: AmbientOverrides) -> Result<Override, String> {
-        collect_from(&CliOverrides::default(), a)
+        collect_from(&CliOverrides::default(), &a)
     }
 
     fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -1391,7 +1391,7 @@ mod tests {
                 forward: owned(&["1455", "8080,9090"]),
                 ..Default::default()
             },
-            AmbientOverrides {
+            &AmbientOverrides {
                 forward: vec!["3000".into()],
                 ..Default::default()
             },
@@ -1466,7 +1466,7 @@ mod tests {
                 gpu: owned(&["false"]),
                 ..Default::default()
             },
-            AmbientOverrides {
+            &AmbientOverrides {
                 gpu: Some("true".into()),
                 dbus: Some("true".into()),
                 ..Default::default()
@@ -1554,7 +1554,7 @@ mod tests {
                 config: owned(&["network = \"none\""]),
                 ..Default::default()
             },
-            AmbientOverrides {
+            &AmbientOverrides {
                 config: Some("network = \"shared\"".into()),
                 ..Default::default()
             },
@@ -1713,7 +1713,7 @@ mod tests {
                 env: owned(&["K=from-cli-env"]),
                 ..Default::default()
             },
-            AmbientOverrides {
+            &AmbientOverrides {
                 config: Some("[env]\nK = \"from-sbx-config\"\nONLY_SBX = \"o\"".into()),
                 env: pairs(&[("K", "from-sbx-env")]),
                 ..Default::default()
@@ -2215,7 +2215,7 @@ mod tests {
                 net: owned(&["ask"]),
                 ..Default::default()
             },
-            AmbientOverrides {
+            &AmbientOverrides {
                 net: Some("shared".into()),
                 ..Default::default()
             },
@@ -2229,7 +2229,7 @@ mod tests {
                 config: owned(&["network = \"none\""]),
                 ..Default::default()
             },
-            AmbientOverrides {
+            &AmbientOverrides {
                 net: Some("shared".into()),
                 ..Default::default()
             },
@@ -2247,7 +2247,7 @@ mod tests {
                 limits: owned(&["tasks_max=4096"]),
                 ..Default::default()
             },
-            AmbientOverrides {
+            &AmbientOverrides {
                 binds: owned(&["/a"]),
                 limits: pairs(&[("memory_max", "80%")]),
                 ..Default::default()
@@ -2272,7 +2272,7 @@ mod tests {
                 binds: owned(&["/data:rw"]),
                 ..Default::default()
             },
-            AmbientOverrides {
+            &AmbientOverrides {
                 binds: owned(&["/data:ro"]),
                 ..Default::default()
             },
@@ -2355,7 +2355,7 @@ mod tests {
                 devices: owned(&["/dev/dri"]),
                 ..Default::default()
             },
-            AmbientOverrides {
+            &AmbientOverrides {
                 seccomp: owned(&["ptrace"]),
                 devices: owned(&["/dev/kvm"]),
                 ..Default::default()
@@ -2429,7 +2429,7 @@ mod tests {
                 config: owned(&["[fs]\ndeny = [\"cli.key\"]"]),
                 ..Default::default()
             },
-            AmbientOverrides {
+            &AmbientOverrides {
                 config: Some("[fs]\ndeny = [\"ambient.key\"]".to_string()),
                 ..Default::default()
             },
@@ -2484,7 +2484,7 @@ mod tests {
                 config: owned(&["[fs]\ndeny = [\"cli.key\"]"]),
                 ..Default::default()
             },
-            AmbientOverrides {
+            &AmbientOverrides {
                 config: Some("[fs]\ndeny = [\"ambient.key\"]".to_string()),
                 ..Default::default()
             },
@@ -2527,7 +2527,7 @@ mod tests {
                 config: owned(&["[fs]\ndeny = [\"cli.key\"]"]),
                 ..Default::default()
             },
-            AmbientOverrides::default(),
+            &AmbientOverrides::default(),
         )
         .unwrap();
         assert!(
@@ -2643,7 +2643,7 @@ mod tests {
                 proc: owned(&["enforce"]),
                 ..Default::default()
             },
-            AmbientOverrides {
+            &AmbientOverrides {
                 proc: Some("observe".into()),
                 ..Default::default()
             },
@@ -2725,7 +2725,7 @@ mod tests {
                 notify: owned(&["always"]),
                 ..Default::default()
             },
-            AmbientOverrides {
+            &AmbientOverrides {
                 notify: Some("off".into()),
                 ..Default::default()
             },
@@ -2777,7 +2777,7 @@ mod tests {
                 config: owned(&["[ssh_agent]\nallow = [\"build-key\"]\nconfirm = false"]),
                 ..Default::default()
             },
-            AmbientOverrides {
+            &AmbientOverrides {
                 config: Some("[ssh_agent]\nallow = [\"deploy-key\"]\nconfirm = true".to_string()),
                 ..Default::default()
             },
@@ -2805,7 +2805,7 @@ mod tests {
                 config: owned(&["[fs]\nscan_max_kb = 512"]),
                 ..Default::default()
             },
-            AmbientOverrides {
+            &AmbientOverrides {
                 config: Some("[fs]\nscan = [\"AKIA[0-9A-Z]{16}\"]\nscan_max_kb = 1".to_string()),
                 ..Default::default()
             },

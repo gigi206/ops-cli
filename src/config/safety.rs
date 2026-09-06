@@ -65,7 +65,7 @@ pub(crate) fn check_safe_file(f: &std::fs::File, path: &Path) -> io::Result<()> 
     // SAFETY: `geteuid` takes no argument and only reads this process's own effective uid — the
     // identity the verdict below weighs the file's owner against.
     let euid = unsafe { libc::geteuid() };
-    verdict(m.uid(), m.mode(), euid).map_err(|e| with_path(e, path))
+    verdict(m.uid(), m.mode(), euid).map_err(|e| with_path(&e, path))
 }
 
 /// Open `path`, gate the OPEN descriptor with [`check_safe_file`], and read its
@@ -92,7 +92,7 @@ pub(crate) fn read_safe_bytes(path: &Path) -> io::Result<Vec<u8>> {
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
-        .map_err(|e| with_path(e, path))?;
+        .map_err(|e| with_path(&e, path))?;
     check_safe_file(&f, path)?;
     // Read one byte past the ceiling so "exactly at the ceiling" and "over it" are distinguishable,
     // the way `read_line_bounded` distinguishes them in the proxy's framing reader.
@@ -100,10 +100,10 @@ pub(crate) fn read_safe_bytes(path: &Path) -> io::Result<Vec<u8>> {
     f.by_ref()
         .take(MAX_CONFIG_BYTES + 1)
         .read_to_end(&mut out)
-        .map_err(|e| with_path(e, path))?;
+        .map_err(|e| with_path(&e, path))?;
     if out.len() as u64 > MAX_CONFIG_BYTES {
         return Err(with_path(
-            refuse(&format!("larger than {MAX_CONFIG_BYTES} bytes")),
+            &refuse(&format!("larger than {MAX_CONFIG_BYTES} bytes")),
             path,
         ));
     }
@@ -112,7 +112,7 @@ pub(crate) fn read_safe_bytes(path: &Path) -> io::Result<Vec<u8>> {
 
 /// Prefix an error with the file path, so a failure that aborts a command names
 /// which file failed rather than emitting a bare, unactionable I/O error.
-fn with_path(e: io::Error, path: &Path) -> io::Error {
+fn with_path(e: &io::Error, path: &Path) -> io::Error {
     io::Error::new(e.kind(), format!("{}: {e}", path.display()))
 }
 

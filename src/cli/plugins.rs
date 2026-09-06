@@ -23,7 +23,7 @@ use crate::{diag, help, layout_or_fail, plugins, store, style};
 /// — it reads `<data>/plugins`, not a project's `.sbx.toml`. The inspection verbs, the placement
 /// verbs and the whole `store` tree dispatch from here; anything else is named and answered with
 /// the page, whose Subcommands list is the surface (no inert stubs).
-pub(crate) fn plugins_cmd(args: Vec<OsString>) -> ExitCode {
+pub(crate) fn plugins_cmd(args: &[OsString]) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("list") | Some("ls") => {
             match crate::cli::reject_extra(&["plugins", "list"], &args[1..]) {
@@ -1459,7 +1459,7 @@ fn plugins_store_rekey(args: &[OsString]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    match stores::rekey(&layout, name, choice, &git) {
+    match stores::rekey(&layout, name, &choice, &git) {
         Ok(done) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
             println!(
@@ -2184,7 +2184,7 @@ fn plugins_info(key: Option<&str>) -> ExitCode {
     println!("  scheme:      {n}{}://{r}", p.scheme);
     print_about(
         &layout,
-        About {
+        &About {
             version: p.version.as_deref(),
             description: p.description.as_deref(),
             dir_name: p.dir_name(),
@@ -2238,7 +2238,7 @@ struct About<'a> {
 /// what was installed" is exactly the reassurance a user opens it for.
 fn print_about(
     layout: &store::Layout,
-    about: About<'_>,
+    about: &About<'_>,
     runnable: Result<(), String>,
     pal: &style::Palette,
 ) {
@@ -2460,7 +2460,7 @@ fn info_broker(
     println!("{h}broker plugin:{r} {n}{}{r}", p.name);
     print_about(
         layout,
-        About {
+        &About {
             version: p.version.as_deref(),
             description: p.description.as_deref(),
             dir_name: p.dir_name(),
@@ -2552,7 +2552,7 @@ fn info_signer(
     println!("{h}signer plugin:{r} {n}{}{r}", p.name);
     print_about(
         layout,
-        About {
+        &About {
             version: p.version.as_deref(),
             description: p.description.as_deref(),
             dir_name: p.dir_name(),

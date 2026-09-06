@@ -18,8 +18,8 @@ use std::process::ExitCode;
 use crate::{config, diag, help, style};
 
 /// `sbx secret <subcommand>`: currently `list`.
-pub(crate) fn secret_cmd(args: Vec<OsString>) -> ExitCode {
-    if let Some(code) = help::maybe_help("secret", &args) {
+pub(crate) fn secret_cmd(args: &[OsString]) -> ExitCode {
+    if let Some(code) = help::maybe_help("secret", args) {
         return code;
     }
     match args.first().and_then(|a| a.to_str()) {

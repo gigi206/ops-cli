@@ -609,8 +609,8 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         // Internal: the oracle the emitted completion scripts call on every completion
         // request. Answers with the candidates for the words typed so far and nothing
         // else — never invoked by a user directly, so it carries no page of its own.
-        "__complete" => completion::complete_cmd(rest),
-        "completion" => completion::completion_cmd(rest),
+        "__complete" => completion::complete_cmd(&rest),
+        "completion" => completion::completion_cmd(&rest),
         // The version of this build. `--version`/`-V` reach here too: `main` resolves both to
         // this verb, so the three spellings are one implementation and one page.
         "version" => match reject_extra(&["version"], &rest) {
@@ -624,19 +624,19 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
             Err(code) => code,
             Ok(()) => doctor::doctor(),
         },
-        "session" | "sessions" => session::session_cmd(rest),
+        "session" | "sessions" => session::session_cmd(&rest),
         "trust" => trust::trust_cmd(rest),
         "untrust" => trust::untrust_cmd(rest),
-        "config" => config::config_cmd(rest),
-        "upgrade" => upgrade::upgrade_cmd(rest),
-        "gc" => gc::run(rest),
-        "projects" | "project" => projects::projects_cmd(rest),
-        "storage" => storage::storage_cmd(rest),
-        "store" => store::store_cmd(rest),
+        "config" => config::config_cmd(&rest),
+        "upgrade" => upgrade::upgrade_cmd(&rest),
+        "gc" => gc::run(&rest),
+        "projects" | "project" => projects::projects_cmd(&rest),
+        "storage" => storage::storage_cmd(&rest),
+        "store" => store::store_cmd(&rest),
         "path" => crate::path_cmd(&rest),
         "run" => match parse_run_launch(rest) {
             Err(code) => code,
-            Ok(launch) => match crate::build_override(launch.cli) {
+            Ok(launch) => match crate::build_override(&launch.cli) {
                 Err(code) => code,
                 Ok(ov) => crate::sandbox::run(launch.cmd, launch.detach, launch.observe, ov),
             },
@@ -650,18 +650,18 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
             }
             crate::sandbox::run_mise(rest)
         }
-        "app" => app::app_cmd(rest),
-        "search" => search::run(rest),
-        "test" => test::test_cmd(rest),
+        "app" => app::app_cmd(&rest),
+        "search" => search::run(&rest),
+        "test" => test::test_cmd(&rest),
         "bundle" => bundle::bundle_cmd(&rest),
-        "net" => net::net_cmd(rest),
-        "ssh-agent" => sshagent::ssh_agent_cmd(rest),
-        "proc" => proc::proc_cmd(rest),
-        "fs" => fs::fs_cmd(rest),
+        "net" => net::net_cmd(&rest),
+        "ssh-agent" => sshagent::ssh_agent_cmd(&rest),
+        "proc" => proc::proc_cmd(&rest),
+        "fs" => fs::fs_cmd(&rest),
         "logs" | "log" => logs::run_merged(&rest),
-        "task" | "tasks" => task::task_cmd(rest),
-        "secret" | "secrets" => secret::secret_cmd(rest),
-        "plugins" => plugins::plugins_cmd(rest),
+        "task" | "tasks" => task::task_cmd(&rest),
+        "secret" | "secrets" => secret::secret_cmd(&rest),
+        "plugins" => plugins::plugins_cmd(&rest),
         other => {
             diag::error(&format!("sbx: unknown command '{other}'"));
             diag::hint("Run `sbx --help` for the list of commands.");

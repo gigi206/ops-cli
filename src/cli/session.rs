@@ -18,8 +18,8 @@ use crate::{
 /// A `--help` at any depth is intercepted by [`help::maybe_help`], which resolves the deepest
 /// subcommand named — under its own name or an accepted alias — and shows that page. A bare
 /// `sbx session` prints the namespace page; an unknown subcommand is a usage error.
-pub(crate) fn session_cmd(args: Vec<OsString>) -> ExitCode {
-    if let Some(code) = help::maybe_help("session", &args) {
+pub(crate) fn session_cmd(args: &[OsString]) -> ExitCode {
+    if let Some(code) = help::maybe_help("session", args) {
         return code;
     }
     match args.first().and_then(|a| a.to_str()) {
@@ -29,7 +29,7 @@ pub(crate) fn session_cmd(args: Vec<OsString>) -> ExitCode {
             Ok(()) => list_sessions(),
         },
         Some("logs") | Some("log") => logs_cmd(&args[1..]),
-        Some("attach") => attach_cmd(args[1..].to_vec()),
+        Some("attach") => attach_cmd(&args[1..]),
         Some("stop") => stop_cmd(args[1..].to_vec()),
         None => {
             eprint!("{}", help::page_usage(&["session"]).unwrap_or_default());
@@ -155,12 +155,12 @@ fn list_sessions() -> ExitCode {
 /// is the PID `sbx session ls` shows — exactly one; a missing, extra, or non-UTF-8 operand, or a
 /// bare `--` with no command, is a usage error; a well-formed id that matches no live session is
 /// reported by `attach` itself.
-fn attach_cmd(args: Vec<OsString>) -> ExitCode {
+fn attach_cmd(args: &[OsString]) -> ExitCode {
     // Everything after the first `--` is the command to run in the cage; before it is the id alone.
     let dashdash = args.iter().position(|a| a == "--");
-    let (head, cmd): (&[OsString], Vec<OsString>) = match dashdash {
-        Some(i) => (&args[..i], args[i + 1..].to_vec()),
-        None => (&args[..], Vec::new()),
+    let (head, cmd): (&[OsString], &[OsString]) = match dashdash {
+        Some(i) => (&args[..i], &args[i + 1..]),
+        None => (args, &[]),
     };
     let usage = || {
         diag::error(&format!(

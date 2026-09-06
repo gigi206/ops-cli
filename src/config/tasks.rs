@@ -874,7 +874,7 @@ fn validate_task_injections(
             RawHostSecrets::Many(v) => v,
         };
         for one in list {
-            let secret = validate_host_secret(&host, one, defaults, plugins)?;
+            let secret = validate_host_secret(&host, &one, defaults, plugins)?;
             // The (target, header) uniqueness `secrets::upsert_secret` keeps for the session path,
             // kept here too — its doc gives the reason: "Two secrets to the same host and header
             // would otherwise inject two copies of the header upstream." The runtime does not

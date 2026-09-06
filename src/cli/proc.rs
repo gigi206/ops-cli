@@ -24,8 +24,8 @@ use crate::{
 
 /// `sbx proc <subcommand>`: observe what a running sandbox is doing inside its cage. `ls` snapshots
 /// a session's process tree. Read-only and host-side — the observability sibling of `sbx net`.
-pub(crate) fn proc_cmd(args: Vec<OsString>) -> ExitCode {
-    if let Some(code) = help::maybe_help("proc", &args) {
+pub(crate) fn proc_cmd(args: &[OsString]) -> ExitCode {
+    if let Some(code) = help::maybe_help("proc", args) {
         return code;
     }
     match args.first().and_then(|a| a.to_str()) {

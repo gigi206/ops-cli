@@ -32,8 +32,8 @@ use crate::{diag, help, layout_or_fail, print_json, sandbox, store, style};
 const REFUSED_EXIT: u8 = 125;
 
 /// `sbx task <subcommand>`: `list`, `secrets`, `run`, `status`, `show`, `stop`, or `logs`.
-pub(crate) fn task_cmd(args: Vec<OsString>) -> ExitCode {
-    if let Some(code) = help::maybe_help("task", &args) {
+pub(crate) fn task_cmd(args: &[OsString]) -> ExitCode {
+    if let Some(code) = help::maybe_help("task", args) {
         return code;
     }
     match args.first().and_then(|a| a.to_str()) {

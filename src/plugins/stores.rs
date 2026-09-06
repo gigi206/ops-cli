@@ -885,7 +885,7 @@ pub(crate) struct Rekeyed {
 pub(crate) fn rekey(
     layout: &crate::store::Layout,
     name: &str,
-    trust: TrustChoice,
+    trust: &TrustChoice,
     git: &Path,
 ) -> Result<Rekeyed, String> {
     let cfg = read_configured(layout, name)?;
@@ -893,7 +893,7 @@ pub(crate) fn rekey(
     let (stage, checkout) = staged_clone(layout, STAGE_PREFIX, &cfg.url, git)?;
 
     let (pubkey, tofu) = match trust {
-        TrustChoice::Pinned(k) => (k, false),
+        TrustChoice::Pinned(k) => (*k, false),
         TrustChoice::Tofu => (read_repo_pubkey(&checkout)?, true),
     };
     if pubkey == cfg.pubkey {
@@ -2296,7 +2296,7 @@ mod tests {
         // A rotation to a key that does not sign this store is refused: the pin would end up on a
         // key that verifies nothing the store holds.
         let unrelated = pubkey_of(&keypair());
-        let err = rekey(&layout, "hub", TrustChoice::Pinned(unrelated), &git).unwrap_err();
+        let err = rekey(&layout, "hub", &TrustChoice::Pinned(unrelated), &git).unwrap_err();
         assert!(err.contains("does not sign this store"), "{err}");
         assert_eq!(
             read_configured(&layout, "hub").unwrap().pubkey,
@@ -2305,14 +2305,20 @@ mod tests {
 
         // Rotating to the key already pinned is not a rotation, and must not read as success —
         // whatever made `update` fail would otherwise be papered over.
-        let err = rekey(&layout, "hub", TrustChoice::Pinned(pubkey_of(&first)), &git).unwrap_err();
+        let err = rekey(
+            &layout,
+            "hub",
+            &TrustChoice::Pinned(pubkey_of(&first)),
+            &git,
+        )
+        .unwrap_err();
         assert!(err.contains("already pinned to that key"), "{err}");
 
         // The real new key: the pin moves, the floor is carried over, and the store works again.
         let done = rekey(
             &layout,
             "hub",
-            TrustChoice::Pinned(pubkey_of(&second)),
+            &TrustChoice::Pinned(pubkey_of(&second)),
             &git,
         )
         .expect("rotate to the announced key");
@@ -2345,7 +2351,7 @@ mod tests {
         let err = rekey(
             &layout,
             "hub",
-            TrustChoice::Pinned(pubkey_of(&second)),
+            &TrustChoice::Pinned(pubkey_of(&second)),
             &git,
         )
         .unwrap_err();

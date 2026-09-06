@@ -10,8 +10,8 @@ use crate::{diag, format_log_time, help, sandbox, style};
 
 /// `sbx fs <subcommand>`: observe the files a running session writes in its project tree. Currently
 /// one subcommand, `logs`; `log` is accepted as an alias.
-pub(crate) fn fs_cmd(args: Vec<OsString>) -> ExitCode {
-    if let Some(code) = help::maybe_help("fs", &args) {
+pub(crate) fn fs_cmd(args: &[OsString]) -> ExitCode {
+    if let Some(code) = help::maybe_help("fs", args) {
         return code;
     }
     match args.first().and_then(|a| a.to_str()) {

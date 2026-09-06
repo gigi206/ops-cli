@@ -46,7 +46,7 @@ use stats::net_stats;
 /// drives the live `ask`-posture control plane, and `stats` reports the per-host allow/deny/blocked
 /// decision counters a launch recorded. Distinct from `sbx test net <url>` (the URL matcher): `net`
 /// is the listing/management surface.
-pub(crate) fn net_cmd(args: Vec<OsString>) -> ExitCode {
+pub(crate) fn net_cmd(args: &[OsString]) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("rules") => net_rules(&args[1..]),
         Some("groups") => net_groups(&args[1..]),

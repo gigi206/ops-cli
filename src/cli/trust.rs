@@ -41,9 +41,9 @@ pub(crate) fn trust_cmd(args: Vec<OsString>) -> ExitCode {
     };
     let path = config_path_arg(path);
     if show {
-        show_trust(path)
+        show_trust(&path)
     } else {
-        record_trust(path)
+        record_trust(&path)
     }
 }
 
@@ -70,15 +70,15 @@ fn parse_trust_args(args: Vec<OsString>) -> Result<(bool, Option<OsString>), Str
 
 /// Record trust for a config's current contents, so its security-relevant fields
 /// are honored until the file changes again.
-fn record_trust(path: std::path::PathBuf) -> ExitCode {
+fn record_trust(path: &Path) -> ExitCode {
     let store_dir = match trust_store_dir() {
         Ok(d) => d,
         Err(code) => return code,
     };
-    match trust::trust(&store_dir, &path) {
+    match trust::trust(&store_dir, path) {
         Ok(()) => {
             let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-            println!("{}", render_trust_recorded(&path, &pal));
+            println!("{}", render_trust_recorded(path, &pal));
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -97,14 +97,14 @@ fn render_trust_recorded(path: &Path, pal: &style::Palette) -> String {
 
 /// Report a config's current trust state. A query never changes anything, so it
 /// succeeds whatever the state — the verdict is the message, not the exit code.
-fn show_trust(path: std::path::PathBuf) -> ExitCode {
+fn show_trust(path: &Path) -> ExitCode {
     let store_dir = match trust_store_dir() {
         Ok(d) => d,
         Err(code) => return code,
     };
-    let state = trust::state(&store_dir, &path);
+    let state = trust::state(&store_dir, path);
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    println!("{}", render_trust_verdict(&path, state, &pal));
+    println!("{}", render_trust_verdict(path, state, &pal));
     ExitCode::SUCCESS
 }
 

@@ -12,8 +12,8 @@ use crate::{diag, help, sandbox, style};
 /// `sbx projects` — manage the per-project runtime trees under `<data>/projects/`: `list` (the
 /// default) and `rm`. The reaping primitives it drives are shared with `sbx gc` (which keeps the
 /// nix-store side); this is the discoverable front-end over the project-tree lifecycle.
-pub(crate) fn projects_cmd(args: Vec<OsString>) -> ExitCode {
-    if let Some(code) = help::maybe_help("projects", &args) {
+pub(crate) fn projects_cmd(args: &[OsString]) -> ExitCode {
+    if let Some(code) = help::maybe_help("projects", args) {
         return code;
     }
     match args.first().and_then(|a| a.to_str()) {
