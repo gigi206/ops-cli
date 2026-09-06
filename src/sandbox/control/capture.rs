@@ -341,7 +341,7 @@ pub(crate) struct CaptureRing {
     /// Every needle value the live state has carried since this ring was built, which is what the
     /// masking actually runs against. See [`CaptureRing::needles`] for why sharing the live state
     /// is necessary but not sufficient.
-    history: Mutex<std::sync::Arc<Vec<SecretNeedle>>>,
+    history: Mutex<std::sync::Arc<[SecretNeedle]>>,
 }
 
 struct CaptureInner {
@@ -370,7 +370,7 @@ impl CaptureRing {
             }),
             // Seeded with the state as first resolved, so a credential re-resolved before this ring
             // ever files anything is still masked out of the exchange that carried the old value.
-            history: Mutex::new(std::sync::Arc::new(credentials.snapshot().needles.clone())),
+            history: Mutex::new(std::sync::Arc::from(credentials.snapshot().needles.clone())),
             caps,
             credentials,
         }
@@ -472,7 +472,7 @@ impl CaptureRing {
     /// the ordinary insert pays one comparison per needle and no allocation. What it costs is the
     /// retired values kept in host memory for the life of the launch — never written, never
     /// rendered, and exactly what the live credential state already does with the current ones.
-    fn needles(&self) -> std::sync::Arc<Vec<SecretNeedle>> {
+    fn needles(&self) -> std::sync::Arc<[SecretNeedle]> {
         let current = self.credentials.snapshot();
         let mut history = locked(&self.history);
         if current
@@ -482,7 +482,7 @@ impl CaptureRing {
         {
             return history.clone();
         }
-        let mut merged: Vec<SecretNeedle> = history.as_ref().clone();
+        let mut merged: Vec<SecretNeedle> = history.to_vec();
         for n in &current.needles {
             if !merged.iter().any(|h| h.as_bytes() == n.as_bytes()) {
                 merged.push(n.clone());
@@ -523,7 +523,7 @@ impl CaptureRing {
         let mut merged = superseded;
         merged.extend(spent);
         merged.extend(live);
-        *history = std::sync::Arc::new(merged);
+        *history = std::sync::Arc::from(merged);
         history.clone()
     }
 
