@@ -370,6 +370,9 @@ pub(super) struct Statx {
 /// leaves the caller to resolve inside the cage's root instead of taking an unknown mount for one
 /// the cage has.
 pub(super) fn mount_id(fd: libc::c_int) -> Option<u64> {
+    // SAFETY: `Statx` is a `repr(C)` block of integers and integer arrays, so all-zero is a valid
+    // value for it; the `statx` below fills it, and only a field whose bit the kernel set in `mask`
+    // is read afterwards.
     let mut buf: Statx = unsafe { std::mem::zeroed() };
     // SAFETY: buf is a live, correctly-sized statx buffer, and the empty path with `AT_EMPTY_PATH`
     // asks about the descriptor itself — the one question an `O_PATH` probe can answer.
@@ -433,6 +436,8 @@ pub(super) fn probe_in_cage_root(pid: u32, absolute: &Path) -> Result<libc::c_in
     }
     // Zeroed and then filled: the struct is non-exhaustive, and a zero in a field this call does
     // not use is what the kernel reads as "unset" anyway.
+    // SAFETY: `open_how` is three `u64`s, so all-zero is a valid value — and the value the kernel
+    // reads as "unset" for the fields this call leaves alone.
     let mut how: libc::open_how = unsafe { std::mem::zeroed() };
     how.flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
     how.resolve = libc::RESOLVE_IN_ROOT;

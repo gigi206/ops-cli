@@ -55,6 +55,8 @@ pub(super) fn launch_detached(
     // build the cage, spawn the proxy thread) before any `exec`.
     match unsafe { libc::fork() } {
         -1 => {
+            // SAFETY: `fork` failed, so no second process shares them: both ends are the ones
+            // `pipe2` returned above and this is their only close.
             unsafe {
                 libc::close(read_fd);
                 libc::close(write_fd);
@@ -67,11 +69,15 @@ pub(super) fn launch_detached(
         }
         0 => {
             // Child: the parent's read end is not ours.
+            // SAFETY: the child has its own descriptor table across the `fork`, so it closes its
+            // own copy of the pipe's read end and leaves the parent's untouched.
             unsafe { libc::close(read_fd) };
             detached_child(prep, runtime, kind, cmd, write_fd, observe)
         }
         child => {
             // Parent: the child's write end is not ours.
+            // SAFETY: the parent's descriptor table is its own across the `fork`; this closes the
+            // parent's copy of the write end, which nothing else here holds.
             unsafe { libc::close(write_fd) };
             detach_parent(read_fd, child, prep.layout.data_dir(), label)
         }
@@ -135,6 +141,8 @@ fn detached_child(
     // Ready: tell the parent, then hand stdout/stderr to the log and drop the pipe.
     signal_detach_ready(write_fd);
     redirect_to_log(&log);
+    // SAFETY: the readiness byte has been written and this daemon has been the write end's only
+    // owner since the fork, so this is its single close.
     unsafe { libc::close(write_fd) };
     // The log fd is now duplicated onto 1/2; the owning handle is no longer needed.
     drop(log);
@@ -391,6 +399,8 @@ fn trust_drop_notes(
 /// Close the readiness pipe without a success byte and exit non-zero — the daemon failed to set
 /// up. The parent sees the pipe close as failure.
 fn fail_detached(write_fd: libc::c_int) -> ! {
+    // SAFETY: `write_fd` is the readiness pipe's write end, owned by this daemon since the fork and
+    // not yet closed; the process exits on the next line, so nothing can use it afterwards.
     unsafe { libc::close(write_fd) };
     std::process::exit(1);
 }

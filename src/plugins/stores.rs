@@ -1049,6 +1049,9 @@ fn swap_into_place(stage: &Path, dest: &Path) -> Result<(), String> {
         .map_err(|_| "the staging path contains a NUL byte".to_string())?;
     let c_dest = std::ffi::CString::new(dest.as_os_str().as_bytes())
         .map_err(|_| "the store path contains a NUL byte".to_string())?;
+    // SAFETY: the raw `renameat2` is given its documented argument list — two `AT_FDCWD`-relative
+    // paths and the `RENAME_EXCHANGE` flag. `c_stage` and `c_dest` are live NUL-terminated
+    // `CString`s that outlive the call, and the kernel only reads them.
     let rc = unsafe {
         libc::syscall(
             libc::SYS_renameat2,

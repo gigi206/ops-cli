@@ -360,6 +360,8 @@ fn dir_name_of<'a>(dir: &'a Path, name: &'a str) -> &'a str {
 pub(crate) fn check_exec_at(exec: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(exec).map_err(|e| e.to_string())?;
+    // SAFETY: `geteuid` has no pointer argument and no failure mode; it reads the effective uid
+    // `verdict_exec` compares the executable's owner to.
     let euid = unsafe { libc::geteuid() };
     verdict_exec(meta.mode(), meta.uid(), euid)
 }
@@ -377,6 +379,8 @@ fn verdict_source(exec: &Path) -> Result<(), String> {
             exec.display()
         )
     })?;
+    // SAFETY: no argument, nothing mutated — `geteuid` reads this process's own effective uid, the
+    // one the source executable's ownership is checked against below.
     let euid = unsafe { libc::geteuid() };
     if meta.mode() & libc::S_IFMT != libc::S_IFREG {
         return Err(format!(

@@ -647,6 +647,8 @@ fn recv_loop(notif_fd: libc::c_int, stop: &AtomicBool, cx: &Deciding<'_>) {
             }
             continue;
         }
+        // SAFETY: `seccomp_notif` is an integer header around a `seccomp_data` of integers, so an
+        // all-zero value is valid for it; the RECV ioctl below fills it before anything is read.
         let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
         // SAFETY: req is a live, correctly-sized seccomp_notif for the RECV ioctl to fill.
         // `ioctl`'s request argument is `c_ulong` on glibc but `c_int` on musl, so cast the

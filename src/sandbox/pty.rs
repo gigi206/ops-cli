@@ -72,6 +72,9 @@ pub(crate) fn pump(
     let mut last_ctrl_c: Option<Instant> = None;
 
     loop {
+        // SAFETY: `fds` is a live stack array of three `pollfd`s and the count passed is its own
+        // length, so `poll` writes `revents` only within it. An entry set to `-1` (stdin after EOF,
+        // or an absent resize relay) is skipped by the kernel rather than dereferenced.
         let r = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
         if r < 0 {
             let e = io::Error::last_os_error();
@@ -91,6 +94,8 @@ pub(crate) fn pump(
         // master -> stdout. Quit when the master closes (the child exited), which
         // on Linux surfaces as EIO rather than a clean EOF.
         if fds[1].revents != 0 {
+            // SAFETY: `master` is the pty master this relay was handed, closed by the caller only
+            // after `pump` returns; `buf` is a live stack array and the length passed is its own.
             let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
                 write_all(1, &buf[..n as usize])?;
@@ -108,6 +113,9 @@ pub(crate) fn pump(
         // stdin -> master. When the user's stdin ends, stop forwarding it but
         // keep relaying the master until the child exits.
         if stdin_open && fds[0].revents != 0 {
+            // SAFETY: fd 0 is the process's own stdin, which the relay never closes — an EOF
+            // neutralizes only the `pollfd` entry — and `buf` is a live stack array bounded by its
+            // own length.
             let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
                 let chunk = &buf[..n as usize];
@@ -144,6 +152,9 @@ pub(crate) fn pump(
 
     let mut status: libc::c_int = 0;
     loop {
+        // SAFETY: `child` is the pid the caller forked and this loop is its only reaper, so the
+        // number cannot yet name a recycled process; `status` is a live local for the kernel to
+        // fill.
         let r = unsafe { libc::waitpid(child, &mut status, 0) };
         if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
             continue;
@@ -169,10 +180,14 @@ pub(crate) fn exit_code(status: libc::c_int) -> i32 {
 /// brief grace for a clean shutdown, then `SIGKILL`, the same escalation `sbx session stop` uses. Invoked
 /// from the pty relay when a graphical session is force-quit with a double Ctrl+C.
 fn terminate_and_reap(child: libc::pid_t) -> io::Result<i32> {
+    // SAFETY: `child` has not been reaped — this function is what reaps it — so the pid still names
+    // the forked cage; `kill` takes two integers and no pointer.
     unsafe { libc::kill(child, libc::SIGTERM) };
     // Poll for a graceful exit for up to ~2s before the hard kill.
     for _ in 0..40 {
         let mut status: libc::c_int = 0;
+        // SAFETY: `child` stays unreaped until one of these polls returns it, so the pid is still
+        // its own; `status` is a live local the kernel fills.
         let r = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
         if r == child {
             return Ok(exit_code(status));
@@ -182,9 +197,13 @@ fn terminate_and_reap(child: libc::pid_t) -> io::Result<i32> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    // SAFETY: the grace loop above left without reaping `child` (a reaped or vanished one returns
+    // from inside it), so the pid still names the forked cage.
     unsafe { libc::kill(child, libc::SIGKILL) };
     let mut status: libc::c_int = 0;
     loop {
+        // SAFETY: `child` was signalled but not reaped, so the pid still names it; `status` is a
+        // live local for the kernel to fill.
         let r = unsafe { libc::waitpid(child, &mut status, 0) };
         if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
             continue;
@@ -197,6 +216,9 @@ fn terminate_and_reap(child: libc::pid_t) -> io::Result<i32> {
 /// Write the whole buffer, retrying short writes and interrupts.
 pub(crate) fn write_all(fd: libc::c_int, mut buf: &[u8]) -> io::Result<()> {
     while !buf.is_empty() {
+        // SAFETY: `fd` is a descriptor the caller keeps open across the call, and the
+        // pointer/length pair is the remaining slice of the caller's live buffer, which `write`
+        // only reads.
         let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
         if n < 0 {
             let e = io::Error::last_os_error();
@@ -267,14 +289,24 @@ impl WinchRelay {
         // disposition. The handler is async-signal-safe (see `winch_handler`).
         let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
         act.sa_sigaction = winch_handler as *const () as libc::sighandler_t;
+        // SAFETY: `act` is a live local, so `sa_mask` is a valid signal set for `sigemptyset` to
+        // clear in place.
         unsafe { libc::sigemptyset(&mut act.sa_mask) };
         // No `SA_RESTART`: a resize should interrupt the blocking `poll` (the self-pipe is the
         // primary wakeup; the `EINTR` is a harmless second one the loop already handles).
         act.sa_flags = 0;
+        // SAFETY: `sigaction` is integers, a signal set and a handler pointer, for which all-zero
+        // is a valid value; the call below overwrites it with the old disposition before anything
+        // reads it.
         let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: `act` is fully initialized above — handler, cleared mask, zero flags — and
+        // `previous` is a live local for the kernel to fill; neither is retained past the call.
         if unsafe { libc::sigaction(libc::SIGWINCH, &act, &mut previous) } != 0 {
             let e = io::Error::last_os_error();
             WINCH_WRITE_FD.store(-1, Ordering::Relaxed);
+            // SAFETY: both ends are the ones `pipe2` returned above and nothing has closed them.
+            // The handler was never installed (the `sigaction` failed) and the atomic was reset on
+            // the line before, so no signal can reach these descriptors.
             unsafe {
                 libc::close(read_fd);
                 libc::close(write_fd);
@@ -297,8 +329,14 @@ impl Drop for WinchRelay {
     fn drop(&mut self) {
         // Restore the previous handler *first*, so `winch_handler` can no longer run, before
         // clearing the fd it reads and closing the pipe — no signal can then touch a closed fd.
+        // SAFETY: `self.previous` was filled by the checked `sigaction` in `install` — `Self`
+        // exists only after that call returned 0 — and a null third argument asks the kernel to
+        // discard the disposition being replaced.
         unsafe { libc::sigaction(libc::SIGWINCH, &self.previous, std::ptr::null_mut()) };
         WINCH_WRITE_FD.store(-1, Ordering::Relaxed);
+        // SAFETY: both fds are the `pipe2` ends this relay owns and has not closed. The previous
+        // handler was restored and the atomic cleared above, so `winch_handler` can no longer write
+        // to them.
         unsafe {
             libc::close(self.read_fd);
             libc::close(self.write_fd);
@@ -312,6 +350,9 @@ impl Drop for WinchRelay {
 fn drain_and_resize(pipe_fd: libc::c_int, master: libc::c_int) {
     let mut sink = [0u8; 64];
     // The read end is non-blocking, so this stops at `EAGAIN`.
+    // SAFETY: this is reached only after `poll` reported `pipe_fd` readable, which the `-1`
+    // placeholder for an absent relay never is, so it is the live relay's read end; `sink` is a
+    // stack array bounded by its own length.
     while unsafe { libc::read(pipe_fd, sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
     copy_winsize(0, master);
 }
@@ -319,8 +360,14 @@ fn drain_and_resize(pipe_fd: libc::c_int, master: libc::c_int) {
 /// Copy `src`'s window size onto `dst` (`TIOCGWINSZ` → `TIOCSWINSZ`). Best effort: if `src` has no
 /// size (not a terminal), `dst` is left unchanged.
 pub(crate) fn copy_winsize(src: libc::c_int, dst: libc::c_int) {
+    // SAFETY: `winsize` is four `c_ushort`s, so all-zero is a valid value; it is passed on only
+    // after the `ioctl` below has filled it.
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: `TIOCGWINSZ` takes a `struct winsize *` out-param, which is what `ws` is; a `src`
+    // that is not a terminal is refused with `ENOTTY` rather than written through.
     if unsafe { libc::ioctl(src, libc::TIOCGWINSZ, &mut ws) } == 0 {
+        // SAFETY: `TIOCSWINSZ` only reads the `struct winsize *` it is given, and `ws` was filled
+        // by the successful `TIOCGWINSZ` on the line above.
         unsafe { libc::ioctl(dst, libc::TIOCSWINSZ, &ws) };
     }
 }
@@ -334,12 +381,20 @@ pub(crate) struct RawMode {
 
 impl RawMode {
     pub(crate) fn enable(fd: libc::c_int) -> io::Result<Self> {
+        // SAFETY: `termios` is flag words, speeds and a control-character array — all-zero is a
+        // valid value — and `tcgetattr` fills it below before anything reads it.
         let mut original: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: `original` is a live local `termios` for `tcgetattr` to fill; a descriptor that
+        // is not a terminal is answered with `ENOTTY` instead of a write.
         if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
             return Err(io::Error::last_os_error());
         }
         let mut raw = original;
+        // SAFETY: `raw` is a live local copy of the settings `tcgetattr` just returned, which is
+        // what `cfmakeraw` rewrites in place.
         unsafe { libc::cfmakeraw(&mut raw) };
+        // SAFETY: `raw` is a fully initialized `termios` — the settings just read, put into raw
+        // mode by `cfmakeraw` — which `tcsetattr` reads without retaining.
         if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -349,6 +404,9 @@ impl RawMode {
 
 impl Drop for RawMode {
     fn drop(&mut self) {
+        // SAFETY: `self.original` was filled by the checked `tcgetattr` in `enable` — `Self` exists
+        // only after it returned 0 — and `self.fd` is the terminal that call succeeded on, which
+        // this guard never closes.
         unsafe { libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.original) };
     }
 }
@@ -378,7 +436,11 @@ pub(super) unsafe fn fork_with_pty(
 ) -> io::Result<i32> {
     // Carry the real terminal's window size onto the pty so the inner shell wraps correctly from
     // the start.
+    // SAFETY: all-zero is a valid `winsize` (four `c_ushort`s), and it is handed to `openpty` only
+    // on the branch where the `ioctl` below filled it.
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: fd 0 is the process's own stdin and `TIOCGWINSZ` takes the `struct winsize *` out-
+    // param `ws` is; a stdin that is not a terminal fails with `ENOTTY` and writes nothing.
     let winp = if unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) } == 0 {
         &ws as *const libc::winsize
     } else {
@@ -404,6 +466,8 @@ pub(super) unsafe fn fork_with_pty(
 
     // The master must never reach the sandbox. The parent keeps it (and never execs), so
     // close-on-exec is exactly right; the slave's controlling-terminal setup is the child's.
+    // SAFETY: `master` is the descriptor `openpty` just returned and nothing has closed it; both
+    // `fcntl` commands take an integer argument rather than a pointer.
     unsafe {
         let flags = libc::fcntl(master, libc::F_GETFD);
         libc::fcntl(master, libc::F_SETFD, flags | libc::FD_CLOEXEC);
@@ -414,6 +478,8 @@ pub(super) unsafe fn fork_with_pty(
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let e = io::Error::last_os_error();
+        // SAFETY: `fork` failed, so no second process shares them: `master` and `slave` are the
+        // pair `openpty` returned and this is their only close.
         unsafe {
             libc::close(master);
             libc::close(slave);
@@ -421,6 +487,9 @@ pub(super) unsafe fn fork_with_pty(
         return Err(e);
     }
     if pid == 0 {
+        // SAFETY: this is the child, between `fork` and `exec`, and `close` is a raw syscall.
+        // `master` is the child's own copy of the descriptor, so closing it leaves the parent's
+        // alone.
         unsafe { libc::close(master) };
         child(slave);
     } else {
@@ -431,6 +500,8 @@ pub(super) unsafe fn fork_with_pty(
     }
 
     // Parent: drop the slave, go raw, relay.
+    // SAFETY: only the parent reaches this line — the child branch above never returns — and its
+    // `slave` is its own copy of the descriptor, still open and used nowhere else here.
     unsafe { libc::close(slave) };
     let _raw = RawMode::enable(0)?;
     // Install the resize relay *after* the fork so the child never inherits the handler. sbx keeps
@@ -447,6 +518,8 @@ pub(super) unsafe fn fork_with_pty(
     let winch_fd = winch.as_ref().map_or(-1, WinchRelay::read_fd);
     let status = pump(master, pid, winch_fd, gui);
     drop(winch);
+    // SAFETY: the parent has held `master` since `openpty` and `pump` has returned, so nothing is
+    // still reading it; this is its only close.
     unsafe { libc::close(master) };
     status
 }

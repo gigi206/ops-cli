@@ -1127,6 +1127,8 @@ fn cage_can_load(path: &Path) -> bool {
 /// lookup would be a second chance to disagree.
 pub(crate) fn locate_program(name: &str) -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt;
+    // SAFETY: `geteuid` reads this process's own effective uid through no pointer; it is the
+    // identity every candidate found on `PATH` is weighed against below.
     let euid = unsafe { libc::geteuid() };
     let mut usable = Vec::new();
     for cand in crate::pathfind::find_all_on_path(name) {

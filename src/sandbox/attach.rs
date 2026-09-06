@@ -374,6 +374,10 @@ pub(super) unsafe fn enter_and_exec(
     argv: *const *const libc::c_char,
     envp: *const *const libc::c_char,
 ) -> ! {
+    // SAFETY: the caller upholds this function's own contract above — it runs in a freshly forked
+    // child that will `exec` — so every call below is a raw syscall on state prepared before the
+    // fork (`cage`'s pidfd, `filters`, `argv`, `envp`), and no path leaves the block except `_exit`
+    // or the `exec` in the grandchild.
     unsafe {
         // One atomic join of every cage namespace we do not already share — *including* the
         // user namespace — through the pidfd. The kernel orders the user-namespace entry
@@ -441,6 +445,10 @@ unsafe fn confine_and_exec(
     argv: *const *const libc::c_char,
     envp: *const *const libc::c_char,
 ) -> ! {
+    // SAFETY: the caller upholds this function's contract above — this is the process that will
+    // `exec`, after the pid-namespace fork — so only raw syscalls run here. `argv` and `envp` are
+    // the NUL-terminated arrays the caller keeps alive across the call, and `filters` holds the
+    // filter programs installed below.
     unsafe {
         match tty {
             // setsid + make the pty slave our controlling terminal + dup it onto stdio — the

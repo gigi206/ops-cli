@@ -83,6 +83,8 @@ fn list_sessions() -> ExitCode {
     }
 
     let uptime = uptime_seconds();
+    // SAFETY: `sysconf` takes a single integer name and returns a process-wide configuration value;
+    // no pointer is passed and nothing is mutated.
     let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     // Each row is materialized first so the column widths can flex to the widest value: an
     // app session's KIND is `app:<name>` and a cage name is `sbx-<slug>`, either of which can

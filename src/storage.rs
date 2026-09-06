@@ -753,6 +753,8 @@ fn discard_queue_under(sysfs: &Path, loop_dev: &str) -> Option<u64> {
 pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statvfs` is a struct of integer counters, for which all-zero is a valid value; the
+    // call below fills it before any field is read.
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: a valid NUL-terminated path and a zeroed struct the call fills in.
     if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
@@ -1345,6 +1347,8 @@ impl FsKind {
 pub(crate) fn fs_kind(path: &Path) -> Option<FsKind> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statfs` is integer counters and an `fsid_t` of integers, so all-zero is a valid
+    // value; the call below overwrites it before `f_type` is read.
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     // SAFETY: a valid NUL-terminated path and a zeroed struct the call fills in.
     if unsafe { libc::statfs(c_path.as_ptr(), &mut st) } != 0 {

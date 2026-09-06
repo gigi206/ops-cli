@@ -226,6 +226,10 @@ fn supervise_attach(
     // The capture is by value, so the parent's copy of the cage handle (and its pidfd) is released
     // as soon as the fork returns rather than held for the session; the child has its own.
     let in_child = move |slave: libc::c_int| -> std::convert::Infallible {
+        // SAFETY: the enclosing closure is `fork_with_pty`'s child, so this runs between `fork` and
+        // `exec`, which is exactly `enter_and_exec`'s contract: `filters`, `argv` and `envp` were
+        // built before the fork and moved in, the cage handle carries its own pidfd, and the call
+        // never returns.
         unsafe {
             crate::sandbox::attach::enter_and_exec(
                 &cage,
@@ -276,6 +280,9 @@ fn run_attach_direct(
         return Err(io::Error::last_os_error());
     }
     if child == 0 {
+        // SAFETY: reached only in the freshly forked child (`child == 0`), which is what
+        // `enter_and_exec` requires: everything it reads — the cage handle's pidfd, `filters`,
+        // `argv`, `envp` — was prepared before the fork, and the call never returns.
         unsafe {
             crate::sandbox::attach::enter_and_exec(
                 &cage,
@@ -294,6 +301,8 @@ fn run_attach_direct(
     // setup failure), so `WEXITSTATUS` alone carries the command's exit code.
     let mut status: libc::c_int = 0;
     loop {
+        // SAFETY: `child` is the pid `fork` returned and this loop is its only reaper, so the
+        // number still names that process; `status` is a live local for the kernel to fill.
         if unsafe { libc::waitpid(child, &mut status, 0) } >= 0 {
             break;
         }

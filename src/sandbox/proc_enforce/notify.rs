@@ -78,6 +78,9 @@ pub(super) fn notif_id_valid(notif_fd: libc::c_int, id: u64) -> bool {
 
 /// Answer a notification with `CONTINUE` (let the real syscall run).
 pub(super) fn respond_continue(notif_fd: libc::c_int, id: u64) {
+    // SAFETY: `seccomp_notif_resp` is four integer fields, for which all-zero is a valid value and
+    // the kernel's "no error, no return value" answer; `id` and `flags` are set below before it is
+    // handed over.
     let mut resp: libc::seccomp_notif_resp = unsafe { std::mem::zeroed() };
     resp.id = id;
     resp.flags = libc::SECCOMP_USER_NOTIF_FLAG_CONTINUE as u32;
@@ -86,6 +89,8 @@ pub(super) fn respond_continue(notif_fd: libc::c_int, id: u64) {
 
 /// Answer a notification with an errno (the syscall never runs).
 pub(super) fn respond_errno(notif_fd: libc::c_int, id: u64, errno: libc::c_int) {
+    // SAFETY: an all-zero `seccomp_notif_resp` is a valid one — integer fields only — and leaves
+    // `val` and `flags` at the unset values this answer wants; `id` and `error` are filled below.
     let mut resp: libc::seccomp_notif_resp = unsafe { std::mem::zeroed() };
     resp.id = id;
     resp.error = -errno;
@@ -119,6 +124,8 @@ pub(super) fn respond_with_fd(
     if ADDFD_UNAVAILABLE.load(Ordering::Relaxed) {
         return false;
     }
+    // SAFETY: `seccomp_notif_addfd` is an integer-only request struct, so all-zero is a valid
+    // starting state; every field the ADDFD ioctl reads is assigned below.
     let mut addfd: libc::seccomp_notif_addfd = unsafe { std::mem::zeroed() };
     addfd.id = id;
     addfd.flags = libc::SECCOMP_ADDFD_FLAG_SEND as u32;
@@ -279,6 +286,9 @@ pub(super) fn recv_fd_raw(stream: &UnixStream) -> io::Result<libc::c_int> {
         iov_len: 1,
     };
     let mut cbuf = CmsgBuf::zeroed();
+    // SAFETY: `msghdr` is pointers and lengths, for which the all-zero value (null pointers, zero
+    // lengths) is valid; the iov and control fields are pointed at the live `iov` and `cbuf` below
+    // before `recvmsg` reads any of them.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;

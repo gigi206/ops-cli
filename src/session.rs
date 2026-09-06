@@ -752,6 +752,8 @@ fn is_alive(session: &Session) -> bool {
 /// A caller that recorded a start time must pair this with that match ([`is_alive`] does); one
 /// keyed by a bare pid cannot, and merely keeps a stale entry a while longer.
 pub(crate) fn pid_is_live(pid: u32) -> bool {
+    // SAFETY: `kill` takes two integers and no pointer, and signal `0` performs only the existence
+    // and permission check — nothing is delivered, whatever process `pid` currently names.
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     if rc != 0
         && let Some(libc::ESRCH) | Some(libc::EPERM) = io::Error::last_os_error().raw_os_error()

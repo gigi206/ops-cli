@@ -332,6 +332,8 @@ fn engine_probe(path: &Path) -> EngineProbe {
         Ok(m) => m,
         Err(_) => return EngineProbe::Absent,
     };
+    // SAFETY: `geteuid` reads process-owned state and takes no pointer; it supplies the identity
+    // `host_exec_verdict` compares the engine binary's owner to.
     let euid = unsafe { libc::geteuid() };
     match host_exec_verdict(meta.uid(), meta.mode(), euid) {
         Ok(()) => EngineProbe::Trusted,

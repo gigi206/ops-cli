@@ -712,6 +712,9 @@ fn format_log_time(at_epoch_ms: u128) -> String {
     // SAFETY: `localtime_r` writes the broken-down local time into our stack `tm` and reads only the
     // `time_t` we pass; it is the thread-safe variant, so no shared state is mutated.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `secs` is a live `time_t` the call only reads, and `tm` is the live local it fills;
+    // `localtime_r` retains neither past the call, and `tm` is read only on the branch where the
+    // call returned non-null.
     if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
         return "--:--:--".to_string();
     }

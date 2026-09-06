@@ -2047,7 +2047,11 @@ pub(super) fn build(
     let spec = if prep.cfg.gui.renders() && spec.net == NetPolicy::Isolated {
         match std::env::current_exe() {
             Ok(exe) => spec.with_netns_dummy(crate::sandbox::spec::NetnsDummy {
+                // SAFETY: `getuid` takes no pointer and reads this process's own real uid — the
+                // identity the holder maps to root inside the user namespace it creates.
                 uid: unsafe { libc::getuid() },
+                // SAFETY: `getgid` likewise reads this process's own real gid, mapped to root
+                // alongside the uid above.
                 gid: unsafe { libc::getgid() },
                 holder_exe: exe,
             }),

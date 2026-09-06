@@ -662,6 +662,9 @@ pub(super) fn relay_websocket(
             break;
         }
         // Indefinite: an idle live channel parks here, not in a read, so it is never cut.
+        // SAFETY: `fds` is a live two-element stack array holding the client and upstream
+        // descriptors, both open for the length of the tunnel, and the count passed is the array's
+        // own — so `poll` writes `revents` only within it.
         let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
         if rc < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {

@@ -70,13 +70,18 @@ pub(crate) fn run_holder(argv: &[OsString]) -> ! {
 
     // Capture the host credentials before entering the user namespace (afterwards we are the
     // namespace's overflow uid until the map is written).
+    // SAFETY: `getuid` reads this process's own real uid; it takes no pointer and cannot fail.
     let uid = unsafe { libc::getuid() };
+    // SAFETY: `getgid` reads this process's own real gid, the other half of the pair written into
+    // the namespace's maps below.
     let gid = unsafe { libc::getgid() };
 
     // A new user namespace, then map our real uid/gid to root inside it — the single-uid self-map
     // an unprivileged process is allowed to write. This gives us CAP_NET_ADMIN over the network
     // namespace created next. `setgroups` must be denied before `gid_map` (a kernel requirement for
     // an unprivileged user namespace).
+    // SAFETY: `unshare` takes only a flag word — no pointer, no buffer — and its effect is confined
+    // to this process's own namespace set; a refusal is reported through the return value.
     if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
         die(&format!(
             "__netns-holder: unshare(CLONE_NEWUSER): {}",
@@ -92,6 +97,8 @@ pub(crate) fn run_holder(argv: &[OsString]) -> ! {
     }
 
     // A fresh, empty network namespace owned by that user namespace.
+    // SAFETY: a flag word is the whole argument list, and the new network namespace replaces this
+    // process's own; failure comes back as a return value, not a fault.
     if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
         die(&format!(
             "__netns-holder: unshare(CLONE_NEWNET): {}",
@@ -110,6 +117,8 @@ pub(crate) fn run_holder(argv: &[OsString]) -> ! {
     let cargs: Vec<CString> = argv.iter().map(to_cstring).collect();
     let mut ptrs: Vec<*const libc::c_char> = cargs.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(std::ptr::null());
+    // SAFETY: `prog` and every `CString` in `cargs` are alive for the duration of the call, and
+    // `ptrs` holds their pointers terminated by the null `execv` reads as the end of the vector.
     unsafe {
         libc::execv(prog.as_ptr(), ptrs.as_ptr());
     }
@@ -162,12 +171,16 @@ fn configure_dummy() {
         let _ = add_dummy_addr(fd, idx);
         let _ = set_link_up(fd, idx);
     }
+    // SAFETY: `fd` is the netlink socket `nl_open` handed this function, which is its only owner
+    // and has not closed it — every use above is done.
     unsafe { libc::close(fd) };
 }
 
 /// Open a `NETLINK_ROUTE` socket. `SOCK_CLOEXEC` so it can never leak across the `execve` into bwrap
 /// (it is also closed explicitly once configuration is done).
 fn nl_open() -> io::Result<libc::c_int> {
+    // SAFETY: `socket` takes three integer arguments and returns a descriptor or `-1`; no pointer
+    // is involved.
     let fd = unsafe {
         libc::socket(
             libc::AF_NETLINK,
@@ -184,6 +197,8 @@ fn nl_open() -> io::Result<libc::c_int> {
 /// The kernel index of an interface by name, or `None` if it does not exist in this namespace.
 fn if_index(name: &str) -> Option<u32> {
     let c = CString::new(name).ok()?;
+    // SAFETY: `c` is a live NUL-terminated interface name the call only reads; a name that does not
+    // exist in this namespace is answered with `0`.
     let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
     (idx != 0).then_some(idx)
 }
@@ -285,6 +300,8 @@ fn nl_request(fd: libc::c_int, msg_type: u16, extra_flags: u16, body: &[u8]) -> 
     buf.extend_from_slice(&0u32.to_ne_bytes()); // nlmsg_pid (kernel fills its own)
     buf.extend_from_slice(body);
 
+    // SAFETY: `fd` is the caller's live netlink socket, and the pointer/length pair is `buf`'s own
+    // — a `Vec` alive across the call, from which `send` only reads.
     let sent = unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), 0) };
     if sent < 0 {
         return Err(io::Error::last_os_error());
@@ -296,6 +313,8 @@ fn nl_request(fd: libc::c_int, msg_type: u16, extra_flags: u16, body: &[u8]) -> 
 /// negative value is `-errno`.
 fn read_ack(fd: libc::c_int) -> io::Result<()> {
     let mut rbuf = [0u8; 1024];
+    // SAFETY: `fd` is the caller's live netlink socket, and `rbuf` is a live stack array whose own
+    // length bounds what the kernel may write into it.
     let n = unsafe { libc::recv(fd, rbuf.as_mut_ptr().cast(), rbuf.len(), 0) };
     if n < 0 {
         return Err(io::Error::last_os_error());

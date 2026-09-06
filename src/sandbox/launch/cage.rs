@@ -367,6 +367,10 @@ pub(super) fn supervise(
             // SAFETY: `_exit` in a fork child, the only safe way out of here.
             unsafe { libc::_exit(127) };
         }
+        // SAFETY: this runs between `fork` and `exec` in `fork_with_pty`'s child, so it may call
+        // only async-signal-safe code: `login_tty`, `execv` and `_exit` are raw syscalls, and
+        // `program_c` and `argv` were built before the fork and moved into the closure, so nothing
+        // here allocates.
         unsafe {
             // login_tty: setsid + make the slave our controlling terminal + dup it onto
             // stdin/out/err. This is what gives the sandbox a controlling terminal (and thus job

@@ -62,6 +62,8 @@ pub(crate) fn check_safe_file(f: &std::fs::File, path: &Path) -> io::Result<()> 
     let m = f.metadata()?;
     // The owner check uses the EFFECTIVE uid (`geteuid`), the identity whose
     // files we are willing to act on; a pure syscall, musl-safe.
+    // SAFETY: `geteuid` takes no argument and only reads this process's own effective uid — the
+    // identity the verdict below weighs the file's owner against.
     let euid = unsafe { libc::geteuid() };
     verdict(m.uid(), m.mode(), euid).map_err(|e| with_path(e, path))
 }
