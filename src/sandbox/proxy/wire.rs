@@ -1118,7 +1118,7 @@ mod tests {
         );
         assert!(
             matches!(response_framing(spaced, "GET"), BodyFraming::ToEof),
-            "so the body delimits by close, and the connection is not framed by a length only sbx              reads"
+            "the body must delimit by close, not by a length only sbx reads"
         );
         assert!(
             !response_keeps_alive(spaced),

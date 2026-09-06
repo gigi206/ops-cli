@@ -4614,15 +4614,6 @@ fn two_requests_carrying_the_same_credential_share_a_connection() {
     assert_eq!(upstream.connections(), 1);
 }
 
-/// A connection is only reusable if the message that just crossed it accounted for every byte the
-/// upstream sent. Anything past the end means the connection has moved on from that message, and
-/// nobody knows to what.
-///
-/// Both body sizes are here because the residue lands somewhere different in each, and a
-/// different guard catches it. A small response is read through the proxy's own buffered reader,
-/// so the residue stays there; a body past that reader's capacity is read straight through to the
-/// TLS session, so the residue ends up inside **rustls** instead. Checking one place would hand a
-/// poisoned connection to the next request in the other case.
 /// A response head only sbx can read must not become a connection both sides think they agree on.
 ///
 /// `Content-Length : 5` is malformed -- RFC 9112 §5.1 admits no whitespace before the colon -- and
@@ -4630,8 +4621,8 @@ fn two_requests_carrying_the_same_credential_share_a_connection() {
 /// whatever its own parser makes of it. Framing the body by it and then offering the connection for
 /// another request is the response-side desync: sbx stops after five bytes and reads what follows
 /// as the next head, while the client is still delimiting the first body. Measured before the
-/// parser refused it, the cage was handed
-/// `Content-Length : 5` alongside sbx's own `Connection: keep-alive` and `Keep-Alive: timeout=10`.
+/// parser refused it, the cage was handed `Content-Length : 5` alongside sbx's own
+/// `Connection: keep-alive` and `Keep-Alive: timeout=10`.
 #[test]
 fn a_response_head_sbx_alone_can_frame_does_not_keep_the_connection() {
     let response: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Length : 5\r\n\r\nhello";
@@ -4668,6 +4659,15 @@ fn a_response_head_sbx_alone_can_frame_does_not_keep_the_connection() {
     );
 }
 
+/// A connection is only reusable if the message that just crossed it accounted for every byte the
+/// upstream sent. Anything past the end means the connection has moved on from that message, and
+/// nobody knows to what.
+///
+/// Both body sizes are here because the residue lands somewhere different in each, and a
+/// different guard catches it. A small response is read through the proxy's own buffered reader,
+/// so the residue stays there; a body past that reader's capacity is read straight through to the
+/// TLS session, so the residue ends up inside **rustls** instead. Checking one place would hand a
+/// poisoned connection to the next request in the other case.
 #[test]
 fn a_connection_holding_bytes_past_the_message_is_not_reused() {
     for (len, where_it_lands) in [(5usize, "the proxy's reader"), (RELAY_CHUNK * 2, "rustls")] {

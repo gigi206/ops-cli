@@ -461,10 +461,10 @@ mod tests {
     ];
 
     /// Two argument lists in this crate are assembled by hand rather than through
-    /// [`SandboxSpec`], because what they run is fixed at the call site and no spec exists yet:
-    /// the one driving mise over a project's files, and the one formatting a storage image.
-    /// Both stated in prose that they were kept in step with the keystone's baseline, and a
-    /// promise held by hand is the shape this test replaces.
+    /// [`SandboxSpec`], because what they run is fixed at the call site and no spec exists yet: the
+    /// one driving mise over a project's files, and the one formatting a storage image. Both stated
+    /// in prose that they were kept in step with the keystone's baseline, and a promise held by
+    /// hand is the shape this test replaces.
     ///
     /// It is what the exhaustiveness guard below cannot ask. That guard checks that a file
     /// building a list *declares itself*, and that it prepends the syscall filters; it never
