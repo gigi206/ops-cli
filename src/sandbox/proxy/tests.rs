@@ -4623,6 +4623,51 @@ fn two_requests_carrying_the_same_credential_share_a_connection() {
 /// so the residue stays there; a body past that reader's capacity is read straight through to the
 /// TLS session, so the residue ends up inside **rustls** instead. Checking one place would hand a
 /// poisoned connection to the next request in the other case.
+/// A response head only sbx can read must not become a connection both sides think they agree on.
+///
+/// `Content-Length : 5` is malformed -- RFC 9112 §5.1 admits no whitespace before the colon -- and
+/// a response head crosses to the cage as it arrived, so the cage's client reads that line as
+/// whatever its own parser makes of it. Framing the body by it and then offering the connection for
+/// another request is the response-side desync: sbx stops after five bytes and reads what follows
+/// as the next head, while the client is still delimiting the first body. Measured before the
+/// parser refused it, the cage was handed
+/// `Content-Length : 5` alongside sbx's own `Connection: keep-alive` and `Keep-Alive: timeout=10`.
+#[test]
+fn a_response_head_sbx_alone_can_frame_does_not_keep_the_connection() {
+    let response: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Length : 5\r\n\r\nhello";
+    let (addr, upstream_ca, up) = spawn_upstream("upstream.test", response);
+    let (ctx, proxy_ca_der) = reuse_ctx(upstream_ca, true, vec![]);
+    let pool_ctx = ctx.clone();
+    let got = through_proxy(
+        ctx,
+        proxy_ca_der,
+        "upstream.test",
+        "upstream.test",
+        addr.port(),
+        b"GET /one HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+    )
+    .unwrap();
+    up.join().unwrap();
+    assert!(
+        got.to_ascii_lowercase().contains("connection: close"),
+        "a head sbx cannot read must not carry an offer of reuse: {got:?}"
+    );
+    assert!(
+        !got.to_ascii_lowercase().contains("keep-alive"),
+        "nor the upstream's own hop parameters: {got:?}"
+    );
+    // Degrading is not refusing: the response still crosses in full, delimited by the close.
+    assert!(
+        got.ends_with("hello"),
+        "the body still reaches the cage: {got:?}"
+    );
+    assert_eq!(
+        pool_ctx.pool.as_ref().unwrap().len(),
+        0,
+        "and the connection is not parked for a later request"
+    );
+}
+
 #[test]
 fn a_connection_holding_bytes_past_the_message_is_not_reused() {
     for (len, where_it_lands) in [(5usize, "the proxy's reader"), (RELAY_CHUNK * 2, "rustls")] {

@@ -279,6 +279,18 @@ must be a tab, visible ASCII, or above ASCII. Without it a single carriage retur
 a header value reaches a lenient upstream as a header of the caller's own choosing,
 including one placed in front of a credential the proxy strips and replaces.
 
+The same rule reaches a second spelling, and this one matters most in the *other*
+direction. A field name separated from its colon by a space or a tab -- `Content-Length :
+5` -- is malformed, and a recipient is required to reject such a message. Trimming the
+name and carrying on gives the proxy a clean header nobody else owes it. Outbound that
+would be harmless, since the request is written out again from what the proxy parsed;
+inbound it is not, because a response head crosses to the cage exactly as it arrived. The
+proxy would frame the body by a length the tool in the cage reads as something else, stop
+there, offer the connection for another request, and read the rest of the real body as
+the next response. So the head is refused wherever it is read: outbound as `400
+bad-request:head`, inbound by falling to the last row of the table below -- relayed to the
+close, on a connection announced as ending here.
+
 **Where a head ends, and how long it may take to get there.** A head ends at a blank
 line, and a recipient accepts a bare line feed as a line terminator, so that blank line
 has four spellings. All four end a head, on every plane that reads one. That matters most

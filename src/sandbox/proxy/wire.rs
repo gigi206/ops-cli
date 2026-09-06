@@ -38,7 +38,8 @@ pub(crate) fn header_name_eq(a: &str, b: &str) -> bool {
 }
 
 /// Parse a head's bytes into its request (or status) line and headers. A non-UTF-8 or empty head is
-/// an error, and so is a head that opens with an obsolete line fold.
+/// an error, and so is a head that opens with an obsolete line fold, or one whose field name is
+/// separated from its colon by whitespace.
 ///
 /// A line beginning with SP or HTAB is a **continuation** of the header above it (the obsolete line
 /// folding of RFC 9112 §5.2), not a header of its own. Splitting it on `:` like any other line —
@@ -76,6 +77,16 @@ pub(super) fn parse_head(bytes: &[u8]) -> io::Result<Head> {
             continue;
         }
         if let Some((k, v)) = line.split_once(':') {
+            // Whitespace between the field name and the colon is malformed (RFC 9112 §5.1), and
+            // trimming it away — which is what this did — is what gives sbx a reading nobody else
+            // owes it. On the request side that was harmless, since the head is written out again
+            // from what was parsed; on the response side the head crosses to the cage as it
+            // arrived, so sbx would frame the body by a `Content-Length` the cage's client reads as
+            // something else, and then offer the connection for another request. Refused rather
+            // than normalized, so both planes answer one head the same way.
+            if k.ends_with([' ', '\t']) {
+                return Err(invalid("whitespace before the field colon"));
+            }
             headers.push((k.trim().to_string(), v.trim().to_string()));
         }
     }
@@ -1080,6 +1091,64 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nEtag: x\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    /// The same defect as the fold above, in a second spelling, and on the side where the head is
+    /// not written out again.
+    ///
+    /// `Content-Length : 5` is malformed: RFC 9112 §5.1 admits no whitespace between a field name
+    /// and its colon, and says a recipient must reject such a message. Splitting on the colon and
+    /// trimming the name -- which is what this did -- gave sbx a clean `content-length` nobody else
+    /// need agree with. It framed the body at five bytes, announced the connection reusable, and
+    /// relayed the malformed line to the cage verbatim, since a response head crosses as it
+    /// arrived. Whatever the cage's client makes of that line, it is not what sbx made of it, and
+    /// the bytes after the fifth are then read as the head of the next response.
+    ///
+    /// The request side never had this: a request is reserialized from what sbx parsed, so the
+    /// upstream sees sbx's reading and not the client's spelling. Refusing here is stricter than
+    /// that normalization, and it is the posture the framing readers already take -- an unreadable
+    /// head delimits by close, which is correct rather than merely safe.
+    #[test]
+    fn whitespace_before_a_field_colon_is_refused_rather_than_trimmed_away() {
+        let spaced = &b"HTTP/1.1 200 OK\r\nContent-Length : 5\r\n\r\n"[..];
+        assert!(
+            parse_head(spaced).is_err(),
+            "a name separated from its colon is not a name"
+        );
+        assert!(
+            matches!(response_framing(spaced, "GET"), BodyFraming::ToEof),
+            "so the body delimits by close, and the connection is not framed by a length only sbx              reads"
+        );
+        assert!(
+            !response_keeps_alive(spaced),
+            "and a connection nothing is known about is not offered for another request"
+        );
+
+        // A horizontal tab is the other spelling of the same thing.
+        assert!(
+            parse_head(b"HTTP/1.1 200 OK\r\nContent-Length\t: 5\r\n\r\n").is_err(),
+            "HTAB before the colon is whitespace too"
+        );
+
+        // What stays legal: whitespace *after* the colon is the ordinary optional whitespace of
+        // RFC 9112 §5, and a value's own internal spaces are its own.
+        let ok = parse_head(b"HTTP/1.1 200 OK\r\nX-Note:   a b  \r\nContent-Length: 5\r\n\r\n")
+            .expect("optional whitespace after the colon is not this");
+        assert_eq!(ok.header("x-note"), Some("a b"));
+        assert!(matches!(
+            response_framing(
+                b"HTTP/1.1 200 OK\r\nX-Note:   a b  \r\nContent-Length: 5\r\n\r\n",
+                "GET"
+            ),
+            BodyFraming::Length(5)
+        ));
+
+        // And the request side refuses it too, rather than normalizing it away: one answer per
+        // head, whichever plane asked.
+        assert!(
+            parse_head(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length : 5\r\n\r\n").is_err(),
+            "a request head carries the same rule"
         );
     }
 
