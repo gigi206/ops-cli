@@ -1076,7 +1076,6 @@ mod tests {
     /// Held as `include_str!` so a snapshot file that goes missing fails the build rather than the
     /// run, and so the text compared against is the file on disk rather than a literal an edit
     /// could quietly bring into line with a regression.
-    #[allow(clippy::type_complexity)]
     fn fixtures() -> Vec<(&'static str, config::view::AppDetailView, [&'static str; 4])> {
         vec![
             (
