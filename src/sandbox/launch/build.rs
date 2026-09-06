@@ -2307,6 +2307,13 @@ pub(super) fn build(
     // the proxy's artifacts until the launch ends; the proxy thread outlives the cage
     // because the launcher supervises rather than exec-replacing (see `run`). Other
     // postures never touch any of this.
+    //
+    // Inline, unlike the blocks around it, because it does not fit through a signature: it is given
+    // `prep`, `runtime`, the notifier, the brokers, the signer ring, the tcp plan, the CA-trust
+    // layer and the wrap list, and hands back a guard, a bind list and an environment — eleven
+    // values. The three declarations sit here rather than where the block runs so their drop order
+    // on an early exit is the one they have always had: the forwarder below is declared after them
+    // and therefore torn down first.
     let mut egress_guard = None;
     let mut egress_binds: Vec<binds::ExtraBind> = Vec::new();
     let mut egress_env: Vec<(String, String)> = Vec::new();
@@ -2708,6 +2715,11 @@ pub(super) fn build(
     // launch has not happened yet (so bwrap finds the bound socket present). A failure here aborts
     // the launch rather than running a cage whose declared operations silently do not exist — the
     // agent would keep trying and never learn why.
+    //
+    // Inline for the reason the egress block is: it is given `prep`, the finished spec, the socket
+    // path, the notifier, the brokers, the signer ring, the session's egress log and the `[fs]`
+    // masks with their decoys — nine values for one result. It also has to sit *after* the spec is
+    // final, which is the last thing any phase could be given.
     let task_plane = match &task.path {
         None => None,
         Some(_) => {
