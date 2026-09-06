@@ -7,6 +7,12 @@
 //! requirement is a hard failure with remediation — never a silent fallback to
 //! a weaker engine, because that would mean no security boundary at all.
 
+// A production `unsafe` block must state the invariant it rests on, so a reader can check the
+// call against its contract without reconstructing it. Scoped to `not(test)`: the in-crate test
+// modules reach for raw syscalls to build their own fixtures, and this gate is about the code
+// that ships.
+#![cfg_attr(not(test), warn(clippy::undocumented_unsafe_blocks))]
+
 // Declared before every other module, and only for that reason: `macro_rules!` are textually
 // scoped, so `#[macro_use]` lifts the skip macros into scope for the modules that follow. A module
 // declared above this one would not see them.
