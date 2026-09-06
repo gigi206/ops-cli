@@ -1174,165 +1174,32 @@ fn inline_flake_build<'a>(
     }
 }
 
-/// Build the spec for `cmd`, reporting a clean error as an `ExitCode`. The
-/// configuration resolved in [`super::prepare_with`] drives this: a trust-gated `.sbx.toml` adds
-/// environment and host binds — read-only, or read-write with `mode = "rw"` (its security
-/// fields honored only once trusted)
-/// and provisions its declared tools onto `PATH`. Whatever the gate dropped or
-/// withheld is surfaced as a warning; a declared tool that fails to realise is fatal,
-/// since it is a stated requirement.
-pub(super) fn build(
-    prep: &Prepared,
-    runtime: binds::Runtime,
-    cmd: Vec<OsString>,
-) -> Result<(SandboxSpec, Option<LaunchGuard>), ExitCode> {
-    for warning in &prep.cfg.warnings {
-        crate::diag::warn_config(warning);
-    }
+/// The loopback forwarders a launch declared, and what the cage needs mounted to reach them.
+///
+/// Field order is the drop order the two locals had: `forward_guard` was declared first, so
+/// `binds` dropped first on an early exit. Only `guard` has a meaningful `Drop` — it closes the
+/// host listeners and unlinks the socket directory. No `Drop` of its own.
+struct ForwardUp {
+    /// The bound socket directory the in-cage preamble connects through.
+    binds: Vec<binds::ExtraBind>,
+    /// The running forwarder. `Some` forces the supervised path: its accept loops are host threads
+    /// that must outlive the cage.
+    guard: Option<forward::Forwarder>,
+}
 
-    // Reclaim the per-launch runtime files of launches that are gone, before standing up our own.
-    // Their RAII guards unlink on a clean exit, but a cage normally ends on a signal (Ctrl-C,
-    // `sbx session stop`, a detached session killed later) and a `Drop` does not run then — so each
-    // cage tidies up after its predecessors. Silent and best-effort: routine housekeeping, and a
-    // live launch's files are never touched (its pid still reads as live). The same self-healing
-    // doctrine the session registry applies to its records.
-    //
-    // This sits in `build` — the one function that actually stands up a cage — rather than in
-    // `prepare`, which `sbx gc` also calls: a gc *dry run* must touch nothing, and sweeping from
-    // there would have deleted these files while reporting them as merely reclaimable.
-    crate::sandbox::gc::sweep_runtime_dirs(prep.layout.data_dir(), true);
-    crate::sandbox::gc::fold_egress_counters(prep.layout.data_dir(), true);
-
-    // Every declared tool, realised host-side into sbx's store; the inline flakes staged for the
-    // in-cage build the wrap below performs.
-    let provisioned = provision_tools(prep, runtime)?;
-
-    // Under `gui = "wayland"`, provision the GUI font set host-side so the cage renders text
-    // rather than boxes. Provisioned here — before the seed — so its store roots join the
-    // project store and the cage reads the fonts through `/nix`. Best-effort, like the display
-    // socket below: a font fetch that fails (no network on a first launch) warns and the app
-    // runs without fonts rather than failing the launch.
-    let font_layer = optional_layer(
-        prep,
-        prep.cfg.gui.renders(),
-        crate::sandbox::fonts::provision,
-        |e| {
-            format!(
-                "this `gui` posture renders but the font set could not be provisioned \
-                 ({e}) — text may not render"
-            )
-        },
-    );
-    let font_roots: &[PathBuf] = font_layer.as_ref().map_or(&[], |l| l.roots.as_slice());
-
-    // Under `gui = "wayland"`, provision the GUI data set (GSettings schemas + GTK themes)
-    // host-side. A GTK dialog (the file chooser Electron falls back to without a desktop portal)
-    // aborts FATAL without the schemas (`No GSettings schemas are installed`); the themes let the
-    // in-cage portal's file dialog render in the host light/dark theme. Provisioned here — before
-    // the seed — so its store root joins the project store. Best-effort like the fonts: a fetch
-    // that fails warns and the app runs (a GTK dialog will still crash, but the rest is unaffected).
-    let guidata_layer = optional_layer(
-        prep,
-        matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland),
-        crate::sandbox::guidata::provision,
-        |e| {
-            format!(
-                "`gui = \"wayland\"` but the GUI data (GSettings schemas + themes) could not \
-                 be provisioned ({e}) — a GTK dialog (file chooser) may crash"
-            )
-        },
-    );
-
-    // The in-cage desktop portal, its host runtime directory and the two relays that serve it.
-    let portal_stack = portal_stack(prep, runtime);
-
-    // The rendering and hardware holes this posture asks for, provisioned before the seed so their
-    // store roots join the project store.
-    let hw = hardware_layers(prep);
-
-    // Every GUI-hole store root this launch provisioned, gathered for the seed below.
-    let gui_roots = gui_store_roots(
-        font_roots,
-        &hw,
-        guidata_layer.as_ref(),
-        portal_stack.portal.as_ref(),
-    );
-
-    // Seed the project's own writable store with the closure of everything the cage
-    // resolves through `/nix` — the base userland, every provisioned tool, and (under the
-    // GUI hole) the fonts and certutil — then back `/nix` with it read-write. The cage reads and
-    // writes only its own store, so an agent that installs a toolchain writes into the project's
-    // copy. Which store backs `/nix` is sbx's
-    // decision, not a configurable field, so an untrusted project cannot keep the shared
-    // store mounted or widen its access. The shared store reaches the cage only through the
-    // read-only plumbing pins below (see [`plumbing_pins`]), which is the one place a cage sees
-    // any of it — and only as bytes it cannot write.
-    let project_store = match seed_project_store(
-        prep,
-        &provisioned.package_roots,
-        &provisioned.tool_roots,
-        &gui_roots,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            crate::diag::error(&format!("sbx: cannot prepare the project's store: {e}"));
-            return Err(ExitCode::FAILURE);
-        }
-    };
-    let nix_mount = {
-        let src = project_store.store_dir().join("nix");
-        // Probed here (host-side, real path) so assembly stays pure: a btrfs-backed
-        // store makes the in-cage nix leave the inherited `btrfs.compression`
-        // attribute in place, else its canonicalisation aborts a build.
-        let on_btrfs = crate::storage::on_btrfs(&src);
-        binds::NixMount {
-            src,
-            writable: true,
-            on_btrfs,
-        }
-    };
-
-    // The wraps each block below contributes. They are nested by `WrapLayer`, not by the order the
-    // blocks run in, so a block may register its wrap wherever the value it needs becomes available.
-    let mut wraps: Vec<(WrapLayer, CommandWrap)> = Vec::new();
-
-    // The refusal notifier, and the trust drops it announces. Held for the whole launch.
-    let notify_wiring = notify_wiring(prep, runtime);
-
-    // The exec and content lenses, and the supervisor both ride on.
-    let proc_lens = proc_lens(prep, &notify_wiring, &mut wraps)?;
-
-    // Mise-backed tools are equipped in-cage at launch rather than host-provisioned, in two
-    // distinct lanes. The app's `[packages] mise:` tools are durable, trusted-only declarations,
-    // equipped **globally** (`mise use -g`, written to the home's global mise config). The
-    // project's local `.mise.toml` non-`nix:` tools (an `aqua:`/`npm:`/registry backend) are the
-    // **open** self-equip toolchain, equipped **locally** (`mise install`) with the in-cage mise
-    // told to trust the project config so they resolve through the shims on PATH. Both fetch, so
-    // both wrap the command *before* the egress wrap below — under an allowlist the forwarder is
-    // up before either install — and both are skipped under `network = "none"`.
-    // The two mise equip lanes, and the one environment key the open lane needs.
-    let autoequip_env = mise_equip_lanes(prep, runtime, &mut wraps);
-
-    // The inline flakes' in-cage build, wrapped around the command.
-    inline_flake_build(
-        prep,
-        &provisioned.flake_pairs,
-        &provisioned.inline_flake_names,
-        &mut wraps,
-    );
-
-    // A network allowlist runs the Model-B egress path: stand up the host filtering
-    // proxy on a per-launch socket, wire the cage to reach it (the bound socket, the
-    // CA it trusts, the proxy environment) and wrap the command so the cage starts the
-    // forwarder before running it. The cage's netns is empty (`net_policy` maps the
-    // allowlist to isolation), so this bound socket is the only egress. The guard keeps
-    // the proxy's artifacts until the launch ends; the proxy thread outlives the cage
-    // because the launcher supervises rather than exec-replacing (see `run`). Other
-    // postures never touch any of this.
-    let mut egress_guard = None;
-    let mut egress_binds: Vec<binds::ExtraBind> = Vec::new();
-    let mut egress_env: Vec<(String, String)> = Vec::new();
-
+/// Open the declared `forward` ports on host loopback and bridge them into the cage.
+///
+/// This is what lets a host process — an OAuth `localhost:<port>` callback, a browser reaching a
+/// dev server — talk to a service the agent started inside an empty-netns cage. Registered inside
+/// the egress wrap, so under an allowlist both forwarders are up before the command runs.
+///
+/// Skipped under `network = "shared"`, where the cage shares the host netns and a cage loopback
+/// service is already on host loopback: the forwarder would be a no-op, and saying so is better
+/// than wiring one. A port already in use fails the launch closed.
+fn forward_ports<'a>(
+    prep: &'a Prepared,
+    wraps: &mut Vec<(WrapLayer, CommandWrap<'a>)>,
+) -> Result<ForwardUp, ExitCode> {
     // Forwarder loopback forward ports: a declared `forward` opens a host loopback port and
     // bridges it into the cage, so a host process (an OAuth `localhost:<port>` callback, or a
     // dev server) can reach a service the agent started inside the empty-netns cage. Applied
@@ -1378,6 +1245,44 @@ pub(super) fn build(
             forward_guard = Some(guard);
         }
     }
+
+    Ok(ForwardUp {
+        binds: forward_binds,
+        guard: forward_guard,
+    })
+}
+
+/// The broker plugins standing in front of a host resource, and the record they share.
+///
+/// Field order is the drop order the three locals had — `broker_guards`, `reachable`, then
+/// `feed` were declared in that order, so on an early exit `feed` dropped first, then the
+/// reachables, then the guards. That is the **opposite** of the order [`LaunchGuard`]'s own `Drop`
+/// uses on the success path, which tears the brokers down and only then their shared feed. Both
+/// satisfy the property either order is there to give — a reader following the record sees the last
+/// decision before the socket goes — so this reproduces what the locals did rather than changing
+/// it. No `Drop` of its own: the launch moves `guards` and `feed` out separately.
+struct BrokersUp {
+    /// The reader's end of the shared decision record. `None` when no broker stood up, which takes
+    /// the launch back to needing no live parent.
+    feed: Option<broker::BrokerFeed>,
+    /// What the cage is told about each standing broker: the socket to bind and the variables that
+    /// point its clients at it.
+    reachable: Vec<broker::Reachable>,
+    /// One guard per standing broker. Each owns a socket file and a detached accept loop.
+    guards: Vec<broker::Broker>,
+}
+
+/// Stand up one broker per `[broker.<name>]`, pairing an installed plugin with the host resource
+/// the global config bound it to.
+///
+/// Ahead of the egress proxy, and that order is load-bearing: a resolver plugin may be given a
+/// broker, and the proxy resolves this launch's secrets as it starts, so a broker stood up
+/// afterwards would not exist at the moment the resolver needing it runs.
+///
+/// Every failure degrades to *no broker* rather than to an unfenced one, and says which: a cage
+/// without a broker cannot reach that resource, which is the fail-closed direction. Only failing to
+/// stand up a broker the config asked for and could otherwise have is fatal.
+fn broker_plugins(prep: &Prepared) -> Result<BrokersUp, ExitCode> {
     // Broker plugins: the same shape as the ssh-agent broker below, for a protocol sbx does not
     // implement itself. Each `[broker.<name>]` pairs an installed plugin with the host resource
     // the global config bound it to; sbx serves the socket, holds the host connection, and the
@@ -1605,6 +1510,178 @@ pub(super) fn build(
         }
     }
 
+    Ok(BrokersUp {
+        feed: broker_feed,
+        reachable: brokers,
+        guards: broker_guards,
+    })
+}
+
+/// Build the spec for `cmd`, reporting a clean error as an `ExitCode`. The
+/// configuration resolved in [`super::prepare_with`] drives this: a trust-gated `.sbx.toml` adds
+/// environment and host binds — read-only, or read-write with `mode = "rw"` (its security
+/// fields honored only once trusted)
+/// and provisions its declared tools onto `PATH`. Whatever the gate dropped or
+/// withheld is surfaced as a warning; a declared tool that fails to realise is fatal,
+/// since it is a stated requirement.
+pub(super) fn build(
+    prep: &Prepared,
+    runtime: binds::Runtime,
+    cmd: Vec<OsString>,
+) -> Result<(SandboxSpec, Option<LaunchGuard>), ExitCode> {
+    for warning in &prep.cfg.warnings {
+        crate::diag::warn_config(warning);
+    }
+
+    // Reclaim the per-launch runtime files of launches that are gone, before standing up our own.
+    // Their RAII guards unlink on a clean exit, but a cage normally ends on a signal (Ctrl-C,
+    // `sbx session stop`, a detached session killed later) and a `Drop` does not run then — so each
+    // cage tidies up after its predecessors. Silent and best-effort: routine housekeeping, and a
+    // live launch's files are never touched (its pid still reads as live). The same self-healing
+    // doctrine the session registry applies to its records.
+    //
+    // This sits in `build` — the one function that actually stands up a cage — rather than in
+    // `prepare`, which `sbx gc` also calls: a gc *dry run* must touch nothing, and sweeping from
+    // there would have deleted these files while reporting them as merely reclaimable.
+    crate::sandbox::gc::sweep_runtime_dirs(prep.layout.data_dir(), true);
+    crate::sandbox::gc::fold_egress_counters(prep.layout.data_dir(), true);
+
+    // Every declared tool, realised host-side into sbx's store; the inline flakes staged for the
+    // in-cage build the wrap below performs.
+    let provisioned = provision_tools(prep, runtime)?;
+
+    // Under `gui = "wayland"`, provision the GUI font set host-side so the cage renders text
+    // rather than boxes. Provisioned here — before the seed — so its store roots join the
+    // project store and the cage reads the fonts through `/nix`. Best-effort, like the display
+    // socket below: a font fetch that fails (no network on a first launch) warns and the app
+    // runs without fonts rather than failing the launch.
+    let font_layer = optional_layer(
+        prep,
+        prep.cfg.gui.renders(),
+        crate::sandbox::fonts::provision,
+        |e| {
+            format!(
+                "this `gui` posture renders but the font set could not be provisioned \
+                 ({e}) — text may not render"
+            )
+        },
+    );
+    let font_roots: &[PathBuf] = font_layer.as_ref().map_or(&[], |l| l.roots.as_slice());
+
+    // Under `gui = "wayland"`, provision the GUI data set (GSettings schemas + GTK themes)
+    // host-side. A GTK dialog (the file chooser Electron falls back to without a desktop portal)
+    // aborts FATAL without the schemas (`No GSettings schemas are installed`); the themes let the
+    // in-cage portal's file dialog render in the host light/dark theme. Provisioned here — before
+    // the seed — so its store root joins the project store. Best-effort like the fonts: a fetch
+    // that fails warns and the app runs (a GTK dialog will still crash, but the rest is unaffected).
+    let guidata_layer = optional_layer(
+        prep,
+        matches!(prep.cfg.gui, crate::config::GuiPolicy::Wayland),
+        crate::sandbox::guidata::provision,
+        |e| {
+            format!(
+                "`gui = \"wayland\"` but the GUI data (GSettings schemas + themes) could not \
+                 be provisioned ({e}) — a GTK dialog (file chooser) may crash"
+            )
+        },
+    );
+
+    // The in-cage desktop portal, its host runtime directory and the two relays that serve it.
+    let portal_stack = portal_stack(prep, runtime);
+
+    // The rendering and hardware holes this posture asks for, provisioned before the seed so their
+    // store roots join the project store.
+    let hw = hardware_layers(prep);
+
+    // Every GUI-hole store root this launch provisioned, gathered for the seed below.
+    let gui_roots = gui_store_roots(
+        font_roots,
+        &hw,
+        guidata_layer.as_ref(),
+        portal_stack.portal.as_ref(),
+    );
+
+    // Seed the project's own writable store with the closure of everything the cage
+    // resolves through `/nix` — the base userland, every provisioned tool, and (under the
+    // GUI hole) the fonts and certutil — then back `/nix` with it read-write. The cage reads and
+    // writes only its own store, so an agent that installs a toolchain writes into the project's
+    // copy. Which store backs `/nix` is sbx's
+    // decision, not a configurable field, so an untrusted project cannot keep the shared
+    // store mounted or widen its access. The shared store reaches the cage only through the
+    // read-only plumbing pins below (see [`plumbing_pins`]), which is the one place a cage sees
+    // any of it — and only as bytes it cannot write.
+    let project_store = match seed_project_store(
+        prep,
+        &provisioned.package_roots,
+        &provisioned.tool_roots,
+        &gui_roots,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::diag::error(&format!("sbx: cannot prepare the project's store: {e}"));
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    let nix_mount = {
+        let src = project_store.store_dir().join("nix");
+        // Probed here (host-side, real path) so assembly stays pure: a btrfs-backed
+        // store makes the in-cage nix leave the inherited `btrfs.compression`
+        // attribute in place, else its canonicalisation aborts a build.
+        let on_btrfs = crate::storage::on_btrfs(&src);
+        binds::NixMount {
+            src,
+            writable: true,
+            on_btrfs,
+        }
+    };
+
+    // The wraps each block below contributes. They are nested by `WrapLayer`, not by the order the
+    // blocks run in, so a block may register its wrap wherever the value it needs becomes available.
+    let mut wraps: Vec<(WrapLayer, CommandWrap)> = Vec::new();
+
+    // The refusal notifier, and the trust drops it announces. Held for the whole launch.
+    let notify_wiring = notify_wiring(prep, runtime);
+
+    // The exec and content lenses, and the supervisor both ride on.
+    let proc_lens = proc_lens(prep, &notify_wiring, &mut wraps)?;
+
+    // Mise-backed tools are equipped in-cage at launch rather than host-provisioned, in two
+    // distinct lanes. The app's `[packages] mise:` tools are durable, trusted-only declarations,
+    // equipped **globally** (`mise use -g`, written to the home's global mise config). The
+    // project's local `.mise.toml` non-`nix:` tools (an `aqua:`/`npm:`/registry backend) are the
+    // **open** self-equip toolchain, equipped **locally** (`mise install`) with the in-cage mise
+    // told to trust the project config so they resolve through the shims on PATH. Both fetch, so
+    // both wrap the command *before* the egress wrap below — under an allowlist the forwarder is
+    // up before either install — and both are skipped under `network = "none"`.
+    // The two mise equip lanes, and the one environment key the open lane needs.
+    let autoequip_env = mise_equip_lanes(prep, runtime, &mut wraps);
+
+    // The inline flakes' in-cage build, wrapped around the command.
+    inline_flake_build(
+        prep,
+        &provisioned.flake_pairs,
+        &provisioned.inline_flake_names,
+        &mut wraps,
+    );
+
+    // A network allowlist runs the Model-B egress path: stand up the host filtering
+    // proxy on a per-launch socket, wire the cage to reach it (the bound socket, the
+    // CA it trusts, the proxy environment) and wrap the command so the cage starts the
+    // forwarder before running it. The cage's netns is empty (`net_policy` maps the
+    // allowlist to isolation), so this bound socket is the only egress. The guard keeps
+    // the proxy's artifacts until the launch ends; the proxy thread outlives the cage
+    // because the launcher supervises rather than exec-replacing (see `run`). Other
+    // postures never touch any of this.
+    let mut egress_guard = None;
+    let mut egress_binds: Vec<binds::ExtraBind> = Vec::new();
+    let mut egress_env: Vec<(String, String)> = Vec::new();
+
+    // The declared loopback forwarders, bridged into the cage.
+    let forward_up = forward_ports(prep, &mut wraps)?;
+
+    // The broker plugins, stood up ahead of the egress proxy that may resolve through one.
+    let brokers_up = broker_plugins(prep)?;
+
     // Where each `tcp://` destination lives inside the cage. Computed before the launch because two
     // things need it: the preamble's listeners, and the `/etc/hosts` entries that make the
     // declaration's own host name resolve to them.
@@ -1690,7 +1767,7 @@ pub(super) fn build(
             "",
             Some(&notify_wiring),
             prep.cfg.redact_min_len,
-            &brokers,
+            &brokers_up.reachable,
             // The session's own proxy opens the ring every reader finds; a task's shares it.
             None,
             // This is the agent's plane: what it is refused is what `--net-learn` may learn.
@@ -2086,8 +2163,8 @@ pub(super) fn build(
     // project path, so they neither shadow nor are shadowed by a structural mount.
     let mut extra_binds = egress_binds;
     extra_binds.extend(sshagent_binds);
-    extra_binds.extend(brokers.iter().map(broker::Reachable::bind));
-    extra_binds.extend(forward_binds);
+    extra_binds.extend(brokers_up.reachable.iter().map(broker::Reachable::bind));
+    extra_binds.extend(forward_up.binds);
     extra_binds.extend(gui_binds);
     extra_binds.extend(provisioned.inline_flake_binds);
     extra_binds.extend(proc_lens.binds);
@@ -2267,7 +2344,11 @@ pub(super) fn build(
         (EnvLayer::SshAgent, sshagent_env),
         (
             EnvLayer::Broker,
-            brokers.iter().flat_map(|b| b.env.clone()).collect(),
+            brokers_up
+                .reachable
+                .iter()
+                .flat_map(|b| b.env.clone())
+                .collect(),
         ),
         (EnvLayer::Task, task_env),
         (EnvLayer::Config, prep.cfg.env.clone()),
@@ -2441,7 +2522,7 @@ pub(super) fn build(
                 prep.cfg.redact_min_len,
             )
             .with_notifier(Arc::clone(&notify_wiring))
-            .with_brokers(brokers.clone())
+            .with_brokers(brokers_up.reachable.clone())
             .with_signer_log(signer_ring)
             // A task's proxy appends to the session's egress ring rather than opening one of its
             // own, which nothing would read: see `Egress::event_log`.
@@ -2505,10 +2586,10 @@ pub(super) fn build(
 
     let guard = if egress_guard.is_some()
         || sshagent_guard.is_some()
-        || !broker_guards.is_empty()
-        || broker_feed.is_some()
+        || !brokers_up.guards.is_empty()
+        || brokers_up.feed.is_some()
         || signer_feed.is_some()
-        || forward_guard.is_some()
+        || forward_up.guard.is_some()
         || portal_stack.host_dir.is_some()
         || proc_lens.guard.is_some()
         || task_plane.is_some()
@@ -2517,10 +2598,10 @@ pub(super) fn build(
             notify_sink: Some(Arc::clone(&notify_wiring)),
             egress: egress_guard,
             ssh_agent: sshagent_guard,
-            brokers: broker_guards,
-            broker_feed,
+            brokers: brokers_up.guards,
+            broker_feed: brokers_up.feed,
             signer_feed,
-            forward: forward_guard,
+            forward: forward_up.guard,
             notify: portal_stack.notify_relay,
             theme: portal_stack.theme_relay,
             portal: portal_stack.host_dir,
