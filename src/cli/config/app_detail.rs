@@ -37,28 +37,17 @@ fn posture_shown(
     false
 }
 
-/// Render one app's *effective* configuration with per-field provenance — the `config show --app
-/// <name>` view. Every scalar shows the value the app would launch with, tagged `app:global`/
-/// `app:project` (the app set it), `inherited` (it took a value the baseline configured) or
-/// `default` (nobody configured it); collections show the overlay's own additions and a count of
-/// the baseline entries they inherit, with the entry lists and the allowlist rules expanded under
-/// `--details`. A posture left entirely at its default is folded out of the default view and named
-/// on the summary line instead ([`posture_shown`]). Color and layout only over
-/// [`config::view::AppDetailView`]; every span empties under a non-terminal.
-pub(super) fn render_app_detail(
-    view: &config::view::AppDetailView,
-    pal: &style::Palette,
-    details: bool,
-) -> String {
-    use config::view::{GuiView, LimitView, NetworkView, ProvenanceView};
+/// Whether nobody configured a field — the judgement [`posture_shown`] folds on, and the one
+/// question the posture helpers below ask of a provenance.
+fn at_default(origin: config::view::ProvenanceView) -> bool {
+    origin == config::view::ProvenanceView::Default
+}
+
+/// The document's title line and what this app runs: the command, the install steps its
+/// bundles put before it, and where its persistent home is keyed.
+fn app_detail_head(o: &mut String, view: &config::view::AppDetailView, pal: &style::Palette) {
     use std::fmt::Write as _;
     let (h, n, warn, dim, r) = (pal.head, pal.name, pal.warn, pal.dim, pal.reset);
-    let mut o = String::new();
-    // The postures nobody configured, in the order they would have been printed. Filled as the
-    // fields below are skipped, and spelled out once after them.
-    let mut folded: Vec<&'static str> = Vec::new();
-    let untouched = |origin: ProvenanceView| origin == ProvenanceView::Default;
-
     let _ = writeln!(
         o,
         "{h}sbx config{r} — app {n}{}{r} resolved for {n}{}{r}",
@@ -94,10 +83,22 @@ pub(super) fn render_app_detail(
         view.home_scope,
         app_provenance_tag(view.home_scope_origin, pal)
     );
+}
 
+/// The effective network posture and, when it filters, the policy under it: the rules this app
+/// may reach by, the credential groups they may carry, and what `--details` adds to them.
+fn app_detail_network(
+    o: &mut String,
+    view: &config::view::AppDetailView,
+    pal: &style::Palette,
+    details: bool,
+) {
+    use config::view::NetworkView;
+    use std::fmt::Write as _;
+    let (n, warn, dim, r) = (pal.name, pal.warn, pal.dim, pal.reset);
     // The effective network posture + provenance; the allowlist's rules expand under `--details`.
     let net_tag = app_provenance_tag(view.network_origin, pal);
-    write_net_posture_head(&mut o, &view.network, &net_tag, details, pal);
+    write_net_posture_head(o, &view.network, &net_tag, details, pal);
     if let NetworkView::Allowlist {
         allow,
         deny,
@@ -164,10 +165,23 @@ pub(super) fn render_app_detail(
             }
         }
     }
+}
 
+/// The scalar postures, each shown or folded on its own provenance: process/exec, refusal
+/// notifications, display, GPU, plaintext fetches, audio and D-Bus.
+fn app_detail_postures(
+    o: &mut String,
+    view: &config::view::AppDetailView,
+    pal: &style::Palette,
+    details: bool,
+    folded: &mut Vec<&'static str>,
+) {
+    use config::view::GuiView;
+    use std::fmt::Write as _;
+    let (h, dim, r) = (pal.head, pal.dim, pal.reset);
     // The effective process/exec posture — shown whenever somebody set it, `off` included, so the
     // inherited story is visible.
-    if posture_shown(details, untouched(view.proc_origin), "proc", &mut folded) {
+    if posture_shown(details, at_default(view.proc_origin), "proc", folded) {
         let proc_tag = app_provenance_tag(view.proc_origin, pal);
         let _ = writeln!(
             o,
@@ -180,18 +194,13 @@ pub(super) fn render_app_detail(
 
     // The effective refusal notifications — shown whenever somebody set them, even when every event
     // agrees, and spelled out per event only when they differ.
-    if posture_shown(
-        details,
-        untouched(view.notify_origin),
-        "notify",
-        &mut folded,
-    ) {
+    if posture_shown(details, at_default(view.notify_origin), "notify", folded) {
         let notify_tag = app_provenance_tag(view.notify_origin, pal);
-        write_notify(&mut o, &view.notify, "  ", &notify_tag, pal);
+        write_notify(o, &view.notify, "  ", &notify_tag, pal);
     }
 
     // The effective GUI posture — shown whenever somebody set it, `none` included.
-    if posture_shown(details, untouched(view.gui_origin), "gui", &mut folded) {
+    if posture_shown(details, at_default(view.gui_origin), "gui", folded) {
         let gui_tag = app_provenance_tag(view.gui_origin, pal);
         match view.gui {
             GuiView::Wayland => {
@@ -213,7 +222,7 @@ pub(super) fn render_app_detail(
     }
 
     // The effective GPU posture — shown either way whenever somebody set it.
-    if posture_shown(details, untouched(view.gpu_origin), "gpu", &mut folded) {
+    if posture_shown(details, at_default(view.gpu_origin), "gpu", folded) {
         let gpu_tag = app_provenance_tag(view.gpu_origin, pal);
         let _ = writeln!(
             o,
@@ -227,9 +236,9 @@ pub(super) fn render_app_detail(
     // one that turned it on.
     if posture_shown(
         details,
-        untouched(view.allow_insecure_http_origin),
+        at_default(view.allow_insecure_http_origin),
         "allow_insecure_http",
-        &mut folded,
+        folded,
     ) {
         let tag = app_provenance_tag(view.allow_insecure_http_origin, pal);
         let _ = writeln!(
@@ -244,7 +253,7 @@ pub(super) fn render_app_detail(
     }
 
     // The effective audio posture — shown either way whenever somebody set it.
-    if posture_shown(details, untouched(view.audio_origin), "audio", &mut folded) {
+    if posture_shown(details, at_default(view.audio_origin), "audio", folded) {
         let audio_tag = app_provenance_tag(view.audio_origin, pal);
         let _ = writeln!(
             o,
@@ -254,7 +263,7 @@ pub(super) fn render_app_detail(
     }
 
     // The effective D-Bus posture — shown either way whenever somebody set it.
-    if posture_shown(details, untouched(view.dbus_origin), "dbus", &mut folded) {
+    if posture_shown(details, at_default(view.dbus_origin), "dbus", folded) {
         let dbus_tag = app_provenance_tag(view.dbus_origin, pal);
         let dbus_label = if view.dbus {
             "in-cage portal"
@@ -263,7 +272,19 @@ pub(super) fn render_app_detail(
         };
         let _ = writeln!(o, "  {h}dbus:{r}    {dbus_label}{dbus_tag}");
     }
+}
 
+/// The effective cgroup limits: one line, three cells, each carrying the layer that set it.
+fn app_detail_limits(
+    o: &mut String,
+    view: &config::view::AppDetailView,
+    pal: &style::Palette,
+    details: bool,
+    folded: &mut Vec<&'static str>,
+) {
+    use config::view::LimitView;
+    use std::fmt::Write as _;
+    let (h, r) = (pal.head, pal.reset);
     // The effective cgroup limits — every field its provenance (inherited from the baseline, or the
     // app layer that tuned it).
     let cell = |label_name: &str, v: &LimitView| {
@@ -273,10 +294,10 @@ pub(super) fn render_app_detail(
     let l = &view.limits;
     // One line, three origins: it folds only when no cell was set by anyone. A single tuned cell
     // keeps the whole line, since the other two are the context that tuning is read against.
-    let limits_untouched = untouched(l.memory_high.origin)
-        && untouched(l.memory_max.origin)
-        && untouched(l.tasks_max.origin);
-    if posture_shown(details, limits_untouched, "limits", &mut folded) {
+    let limits_untouched = at_default(l.memory_high.origin)
+        && at_default(l.memory_max.origin)
+        && at_default(l.tasks_max.origin);
+    if posture_shown(details, limits_untouched, "limits", folded) {
         let _ = writeln!(
             o,
             "  {h}limits:{r}  {}, {}, {}",
@@ -285,15 +306,22 @@ pub(super) fn render_app_detail(
             cell("TasksMax", &l.tasks_max),
         );
     }
+}
 
+/// The three grants an app takes as a union with the baseline's: the inbound loopback
+/// forwards, the seccomp relaxation, and the host device nodes.
+fn app_detail_grants(
+    o: &mut String,
+    view: &config::view::AppDetailView,
+    pal: &style::Palette,
+    details: bool,
+    folded: &mut Vec<&'static str>,
+) {
+    use std::fmt::Write as _;
+    let (h, dim, r) = (pal.head, pal.dim, pal.reset);
     // Effective inbound loopback forward ports — the app's own ∪ the baseline's. Shown even when
     // empty so the inherited story is visible (a non-empty baseline set shows as `inherited`).
-    if posture_shown(
-        details,
-        untouched(view.forward_origin),
-        "forward",
-        &mut folded,
-    ) {
+    if posture_shown(details, at_default(view.forward_origin), "forward", folded) {
         let forward_tag = app_provenance_tag(view.forward_origin, pal);
         if view.forward.is_empty() {
             let _ = writeln!(o, "  {h}forward:{r} (none){forward_tag}");
@@ -313,12 +341,7 @@ pub(super) fn render_app_detail(
 
     // Effective seccomp relaxation — the app's own ∪ the baseline's. Shown even when empty so the
     // inherited story is visible (a relaxation the app takes from the baseline reads as `inherited`).
-    if posture_shown(
-        details,
-        untouched(view.seccomp_origin),
-        "seccomp",
-        &mut folded,
-    ) {
+    if posture_shown(details, at_default(view.seccomp_origin), "seccomp", folded) {
         let seccomp_tag = app_provenance_tag(view.seccomp_origin, pal);
         if view.seccomp.is_empty() {
             let _ = writeln!(o, "  {h}seccomp:{r} (mandatory denylist){seccomp_tag}");
@@ -333,12 +356,7 @@ pub(super) fn render_app_detail(
 
     // Effective host device grant — the app's own ∪ the baseline's. Shown even when empty so the
     // inherited story is visible (a device the app takes from the baseline reads as `inherited`).
-    if posture_shown(
-        details,
-        untouched(view.devices_origin),
-        "devices",
-        &mut folded,
-    ) {
+    if posture_shown(details, at_default(view.devices_origin), "devices", folded) {
         let devices_tag = app_provenance_tag(view.devices_origin, pal);
         if view.devices.is_empty() {
             let _ = writeln!(o, "  {h}devices:{r} (none — minimal /dev){devices_tag}");
@@ -350,7 +368,12 @@ pub(super) fn render_app_detail(
             );
         }
     }
+}
 
+/// What the fold cost, on one line: every posture the view hid, and the flag that brings it back.
+fn app_detail_folded(o: &mut String, folded: &[&'static str], pal: &style::Palette) {
+    use std::fmt::Write as _;
+    let (dim, r) = (pal.dim, pal.reset);
     // What the fold cost, on one line: every hidden posture named, and the flag that brings them
     // back. Nothing disappears without saying so — a reader must never have to guess whether a
     // field is absent because it is unset or because the view chose not to show it.
@@ -361,7 +384,13 @@ pub(super) fn render_app_detail(
             folded.join(", ")
         );
     }
+}
 
+/// The effective filesystem masks: what is closed to the cage outright, what is closed at the
+/// content level, and what it may read but not write.
+fn app_detail_fs(o: &mut String, view: &config::view::AppDetailView, pal: &style::Palette) {
+    use std::fmt::Write as _;
+    let (h, dim, r) = (pal.head, pal.dim, pal.reset);
     // The effective mask set — the app's own ∪ the baseline's. Shown only when something is
     // closed: "none" would say nothing a reader does not already assume.
     let fs_tag = app_provenance_tag(view.fs_origin, pal);
@@ -390,7 +419,13 @@ pub(super) fn render_app_detail(
             view.fs_readonly.join(", ")
         );
     }
+}
 
+/// The effective ssh-agent grant: the keys the cage may sign with, and whether each signature
+/// is confirmed on the host desktop first.
+fn app_detail_ssh_agent(o: &mut String, view: &config::view::AppDetailView, pal: &style::Palette) {
+    use std::fmt::Write as _;
+    let (h, dim, r) = (pal.head, pal.dim, pal.reset);
     // The effective ssh-agent grant — the app's own keys unioned with the baseline's, tagged with
     // where they came from. Shown only when something is granted: "none" would say nothing the
     // baseline view does not already say.
@@ -407,7 +442,18 @@ pub(super) fn render_app_detail(
             app_provenance_tag(view.ssh_agent_origin, pal)
         );
     }
+}
 
+/// The three collections an overlay adds to and the channel they resolve against: the
+/// environment, the host binds, the packages, and the nixpkgs the last of those are built from.
+fn app_detail_collections(
+    o: &mut String,
+    view: &config::view::AppDetailView,
+    pal: &style::Palette,
+    details: bool,
+) {
+    use std::fmt::Write as _;
+    let (h, n, r) = (pal.head, pal.name, pal.reset);
     // Collections: what the overlay adds, by name, then how many baseline entries it inherits.
     // Names rather than counts, because the names are what distinguishes this app — `1 own` is
     // true of half the catalogue. What each entry *is* (a value, a backend line, a credential's
@@ -468,6 +514,12 @@ pub(super) fn render_app_detail(
     // from a project with a trusted pin builds against that pin. Rendered by the baseline view's
     // own `channel_text`, so a channel reads identically wherever it appears.
     let _ = writeln!(o, "  {h}nixpkgs:{r} {}", channel_text(&view.nixpkgs, pal));
+}
+
+/// The effective URI handler table: what a link the cage opens is handed to.
+fn app_detail_open(o: &mut String, view: &config::view::AppDetailView, pal: &style::Palette) {
+    use std::fmt::Write as _;
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
     // What a link opens with, effective. Listed in full rather than summarised as a count: this is
     // the answer someone opens this view to find when a sign-in goes nowhere, and it is short.
     if view.open.is_empty() {
@@ -485,7 +537,12 @@ pub(super) fn render_app_detail(
             );
         }
     }
+}
 
+/// The effective auxiliary services: what else the cage starts beside the app's own command.
+fn app_detail_service(o: &mut String, view: &config::view::AppDetailView, pal: &style::Palette) {
+    use std::fmt::Write as _;
+    let (h, r) = (pal.head, pal.reset);
     // The auxiliary processes the cage starts before its command. Listed, never counted, and only
     // when there are any: this section exists so a second process running beside the app is a line
     // someone can read rather than a `nohup` buried in a shell script.
@@ -495,6 +552,18 @@ pub(super) fn render_app_detail(
             let _ = writeln!(o, "{}", service_line(s, pal, "    "));
         }
     }
+}
+
+/// The credentials this app injects, by destination and — under `--details` — by shape and
+/// source. Never a value: sbx reads those host-side and prints none of them.
+fn app_detail_secrets(
+    o: &mut String,
+    view: &config::view::AppDetailView,
+    pal: &style::Palette,
+    details: bool,
+) {
+    use std::fmt::Write as _;
+    let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
     let _ = writeln!(
         o,
         "  {h}secrets:{r} {}",
@@ -517,10 +586,54 @@ pub(super) fn render_app_detail(
             );
         }
     }
+}
 
+/// What this app's resolution dropped or ignored, one note per line.
+fn app_detail_notes(o: &mut String, view: &config::view::AppDetailView, pal: &style::Palette) {
+    use std::fmt::Write as _;
+    let (warn, r) = (pal.warn, pal.reset);
     for note in &view.notes {
         let _ = writeln!(o, "  {warn}note: {note}{r}");
     }
+}
+
+/// Render one app's *effective* configuration with per-field provenance — the `config show --app
+/// <name>` view. Every scalar shows the value the app would launch with, tagged `app:global`/
+/// `app:project` (the app set it), `inherited` (it took a value the baseline configured) or
+/// `default` (nobody configured it); collections show the overlay's own additions and a count of
+/// the baseline entries they inherit, with the entry lists and the allowlist rules expanded under
+/// `--details`. A posture left entirely at its default is folded out of the default view and named
+/// on the summary line instead ([`posture_shown`]). Color and layout only over
+/// [`config::view::AppDetailView`]; every span empties under a non-terminal.
+///
+/// The document is one block per section, each written by a helper below and called in reading
+/// order from here, so this body is the table of contents of what `config show --app` prints.
+pub(super) fn render_app_detail(
+    view: &config::view::AppDetailView,
+    pal: &style::Palette,
+    details: bool,
+) -> String {
+    let mut o = String::new();
+    // The postures nobody configured, in the order they would have been printed. Filled as the
+    // helpers below skip them, and spelled out once after them by `app_detail_folded`.
+    let mut folded: Vec<&'static str> = Vec::new();
+
+    // One helper per block of the document, called in the order they are read. The order is
+    // load-bearing (it is the reading order of an app's resolved configuration), so it lives here
+    // as a sequence of calls rather than inside the blocks themselves.
+    app_detail_head(&mut o, view, pal);
+    app_detail_network(&mut o, view, pal, details);
+    app_detail_postures(&mut o, view, pal, details, &mut folded);
+    app_detail_limits(&mut o, view, pal, details, &mut folded);
+    app_detail_grants(&mut o, view, pal, details, &mut folded);
+    app_detail_folded(&mut o, &folded, pal);
+    app_detail_fs(&mut o, view, pal);
+    app_detail_ssh_agent(&mut o, view, pal);
+    app_detail_collections(&mut o, view, pal, details);
+    app_detail_open(&mut o, view, pal);
+    app_detail_service(&mut o, view, pal);
+    app_detail_secrets(&mut o, view, pal, details);
+    app_detail_notes(&mut o, view, pal);
     o
 }
 
