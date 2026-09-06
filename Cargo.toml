@@ -95,6 +95,12 @@ sha2 = "0.11"
 [profile.release]
 strip = true
 lto = true
+# The test suite runs under the dev profile, where integer overflow panics. Keeping the checks in
+# the shipped binary means it behaves as the tests proved, and an overflow on a path no test covers
+# ends in a panic (the connection or the launch fails closed) rather than in a value that wrapped
+# silently. The parsers already do their length arithmetic in `checked_`/`saturating_` forms; this
+# covers what they missed. Cost measured on a glibc release build: under one percent of size.
+overflow-checks = true
 
 # Keep the debug build's disk footprint down. `line-tables-only` retains file+line for panic
 # backtraces (how the test suite is debugged) but drops the variable/type DWARF that only a
