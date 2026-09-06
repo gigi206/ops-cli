@@ -1517,6 +1517,183 @@ fn broker_plugins(prep: &Prepared) -> Result<BrokersUp, ExitCode> {
     })
 }
 
+/// Where each `tcp://` destination lives inside the cage, and the rules that reach nothing.
+///
+/// Computed before the launch because two things need it: the in-cage preamble's listeners, and the
+/// `/etc/hosts` entries that make each declaration's own host name resolve to them.
+///
+/// The three diagnostics are half the reason it is a phase. A destination with no in-cage listener,
+/// an inspected rule naming a loopback host the cage exempts from its proxy, and a privileged port
+/// that only ssh is wired to reach: each reads as *allowed* on every surface that reports a
+/// verdict, so an author who is not told concludes the host is reachable when it is not.
+fn tcp_plan(prep: &Prepared) -> egress::TcpPlan {
+    // Where each `tcp://` destination lives inside the cage. Computed before the launch because two
+    // things need it: the preamble's listeners, and the `/etc/hosts` entries that make the
+    // declaration's own host name resolve to them.
+    let mut tcp_plan = egress::TcpPlan::default();
+    if let crate::config::NetworkPolicy::Allowlist(policy) = &prep.cfg.network {
+        tcp_plan = egress::tcp_destinations(policy);
+        for skipped in &tcp_plan.skipped {
+            crate::diag::warn(&format!(
+                "no in-cage listener for {skipped} — the rule still governs the proxy, but a client \
+                 that cannot speak an HTTP CONNECT proxy will have to tunnel itself"
+            ));
+        }
+        // An inspected rule naming a loopback host is permitted by the policy and taken by nothing:
+        // the cage exempts those hosts from its proxy, and only a `tcp://` rule earns a listener. A
+        // warning, not a note — the rule reads as allowed on every surface that reports a verdict,
+        // so an author who is not told concludes the host's loopback is out of reach.
+        for rule in egress::unreachable_loopback_rules(policy) {
+            crate::diag::warn_config(&format!(
+                "`{rule}` allows a host the cage reaches through no client: {exempt} are exempt \
+                 from the cage's proxy (`no_proxy`, so the agent's own in-cage services stay \
+                 intra-cage), and only a `tcp://` rule gets an in-cage listener — declare \
+                 `tcp://<host>:<port>` to reach the service on YOUR loopback",
+                exempt = egress::PROXY_EXEMPT_HOSTS.join(", ")
+            ));
+        }
+        // A privileged port has no listener either, but ssh is wired for it — so this is a note,
+        // not a warning: what an author must know is that *ssh* works as written while another
+        // client on such a port still has to ask the proxy itself.
+        for dest in &tcp_plan.connect_only {
+            let ports: Vec<String> = dest.ports.iter().map(u16::to_string).collect();
+            crate::diag::note(&format!(
+                "tcp://{}:{} is a privileged port, which the cage cannot listen on — ssh reaches it \
+                 through the cage's CONNECT proxy (wired in /etc/ssh/ssh_config); another client \
+                 has to ask for that CONNECT itself",
+                dest.host,
+                ports.join(",")
+            ));
+        }
+    }
+
+    tcp_plan
+}
+
+/// The filtering ssh-agent in front of the host's own, and the wiring that points the cage at it.
+///
+/// Field order is the drop order the three locals had — `sshagent_guard` was declared first, so on
+/// an early exit the two plain-data fields dropped before it. Only `guard` has a `Drop` that does
+/// anything: it closes the listener and unlinks the socket. No `Drop` of its own.
+struct SshAgentUp {
+    /// The bound agent socket the cage connects through.
+    binds: Vec<binds::ExtraBind>,
+    /// `$SSH_AUTH_SOCK` as the cage reads it.
+    env: Vec<(String, String)>,
+    /// The running broker. `Some` forces the supervised path: its accept loop is a host thread.
+    guard: Option<sshagent::SshAgent>,
+}
+
+/// Stand up the ssh-agent broker when `[ssh_agent] allow` names keys the host agent holds.
+///
+/// The cage may sign with those keys and do nothing else — not list the rest, not add a key,
+/// not wipe the set — because sbx serves a filtering socket rather than binding the host
+/// agent's. Independent of the network posture: it rides a bound Unix socket, so the empty
+/// netns is untouched. Where a signature is then *spent* is the egress allowlist's business.
+///
+/// A grant that resolves to nothing is a warning and no agent, never a silent partial: no agent
+/// running, no held key matching, and no askpass helper for a `confirm` grant are each a mistake
+/// worth naming where it is made. Only failing to *stand up* the broker is fatal.
+fn ssh_agent_broker(
+    prep: &Prepared,
+    notify_wiring: &crate::sandbox::notify_sink::NotifyWiring,
+) -> Result<SshAgentUp, ExitCode> {
+    // The ssh-agent broker: a filtering agent socket in front of the host's own, so the cage can
+    // sign with the keys `[ssh_agent] allow` names and do nothing else — not list the rest, not add
+    // a key, not wipe the set. Independent of the network posture: it rides a bound Unix socket, so
+    // the empty netns is untouched. Where a signature is then *spent* is the egress allowlist's
+    // business: a `git push` also needs a `tcp://<host>:22` rule, and — since a capability-less cage
+    // cannot bind a privileged port — an explicit `CONNECT` to reach it.
+    //
+    // A grant that resolves to nothing is a warning and no agent, never a silent partial: the two
+    // ways that happens — no agent running, no held key matching — are both a mistake worth naming
+    // at the moment it is made. Only a failure to *stand up* the broker is fatal, like the egress
+    // proxy's: the user asked for it and it cannot be provided.
+    let mut sshagent_guard = None;
+    let mut sshagent_binds: Vec<binds::ExtraBind> = Vec::new();
+    let mut sshagent_env: Vec<(String, String)> = Vec::new();
+    if !prep.cfg.ssh_agent.is_empty() {
+        let grant = prep.cfg.ssh_agent.join(", ");
+        match sshagent::host_socket() {
+            None => crate::diag::warn_config(&format!(
+                "`[ssh_agent] allow` names {grant} but no agent is running on the host \
+                 (`$SSH_AUTH_SOCK` is unset) — the cage gets no agent"
+            )),
+            Some(host_sock) => {
+                let filter = sshagent::Filter::new(&prep.cfg.ssh_agent);
+                match sshagent::admission(&host_sock, &filter) {
+                    Err(e) => crate::diag::warn(&format!(
+                        "cannot reach the host ssh-agent at {} ({e}) — the cage gets no agent",
+                        host_sock.display()
+                    )),
+                    Ok(a) if a.admitted.is_empty() => crate::diag::warn_config(&format!(
+                        "no key the host agent holds matches `[ssh_agent] allow` ({grant}) — the \
+                         cage gets no agent. `ssh-add -l` prints the fingerprint and comment an \
+                         entry may name."
+                    )),
+                    // `confirm` asks for a prompt on every signature, which takes an askpass helper
+                    // on the host. Resolved once, before anything is stood up, so the decision to
+                    // refuse and the wiring that follows it cannot be answered by two searches.
+                    Ok(a) => match sshagent::confirmation(
+                        prep.cfg.ssh_agent_confirm,
+                        sshagent::Confirmer::askpass(),
+                    ) {
+                        // The absence of a helper refuses the grant: running the broker anyway
+                        // would hand the cage a key *and* silently drop the one condition the
+                        // grant was made under.
+                        sshagent::Confirmation::NoHelper => crate::diag::warn(&format!(
+                            "`[ssh_agent] confirm` asks for a prompt on every signature, but no \
+                             askpass helper was found on the host (`$SSH_ASKPASS`, `ssh-askpass` on \
+                             PATH, or OpenSSH's own) — the cage gets no agent rather than a grant \
+                             whose confirmation would never appear. Install one (e.g. the \
+                             `ssh-askpass` package), or drop `confirm`. Grant: {}",
+                            a.admitted.join(", ")
+                        )),
+                        confirmation => {
+                            let (guard, wiring) = sshagent::start(
+                                &prep.layout,
+                                &prep.cfg.ssh_agent,
+                                &host_sock,
+                                confirmation.helper(),
+                                Arc::clone(&notify_wiring.notifier),
+                            )
+                            .map_err(|e| {
+                                crate::diag::error(&format!(
+                                    "sbx: cannot start the ssh-agent broker: {e}"
+                                ));
+                                ExitCode::FAILURE
+                            })?;
+                            crate::diag::note(&format!(
+                                "ssh-agent: the cage may sign with {}{}{}",
+                                a.admitted.join(", "),
+                                match a.withheld {
+                                    0 => String::new(),
+                                    1 => " (1 other key withheld)".to_string(),
+                                    n => format!(" ({n} other keys withheld)"),
+                                },
+                                if prep.cfg.ssh_agent_confirm {
+                                    " — each signature asks you first"
+                                } else {
+                                    ""
+                                }
+                            ));
+                            sshagent_binds = wiring.binds;
+                            sshagent_env = wiring.env;
+                            sshagent_guard = Some(guard);
+                        }
+                    },
+                }
+            }
+        }
+    }
+
+    Ok(SshAgentUp {
+        binds: sshagent_binds,
+        env: sshagent_env,
+        guard: sshagent_guard,
+    })
+}
+
 /// Build the spec for `cmd`, reporting a clean error as an `ExitCode`. The
 /// configuration resolved in [`super::prepare_with`] drives this: a trust-gated `.sbx.toml` adds
 /// environment and host binds — read-only, or read-write with `mode = "rw"` (its security
@@ -1682,45 +1859,9 @@ pub(super) fn build(
     // The broker plugins, stood up ahead of the egress proxy that may resolve through one.
     let brokers_up = broker_plugins(prep)?;
 
-    // Where each `tcp://` destination lives inside the cage. Computed before the launch because two
-    // things need it: the preamble's listeners, and the `/etc/hosts` entries that make the
-    // declaration's own host name resolve to them.
-    let mut tcp_plan = egress::TcpPlan::default();
-    if let crate::config::NetworkPolicy::Allowlist(policy) = &prep.cfg.network {
-        tcp_plan = egress::tcp_destinations(policy);
-        for skipped in &tcp_plan.skipped {
-            crate::diag::warn(&format!(
-                "no in-cage listener for {skipped} — the rule still governs the proxy, but a client \
-                 that cannot speak an HTTP CONNECT proxy will have to tunnel itself"
-            ));
-        }
-        // An inspected rule naming a loopback host is permitted by the policy and taken by nothing:
-        // the cage exempts those hosts from its proxy, and only a `tcp://` rule earns a listener. A
-        // warning, not a note — the rule reads as allowed on every surface that reports a verdict,
-        // so an author who is not told concludes the host's loopback is out of reach.
-        for rule in egress::unreachable_loopback_rules(policy) {
-            crate::diag::warn_config(&format!(
-                "`{rule}` allows a host the cage reaches through no client: {exempt} are exempt \
-                 from the cage's proxy (`no_proxy`, so the agent's own in-cage services stay \
-                 intra-cage), and only a `tcp://` rule gets an in-cage listener — declare \
-                 `tcp://<host>:<port>` to reach the service on YOUR loopback",
-                exempt = egress::PROXY_EXEMPT_HOSTS.join(", ")
-            ));
-        }
-        // A privileged port has no listener either, but ssh is wired for it — so this is a note,
-        // not a warning: what an author must know is that *ssh* works as written while another
-        // client on such a port still has to ask the proxy itself.
-        for dest in &tcp_plan.connect_only {
-            let ports: Vec<String> = dest.ports.iter().map(u16::to_string).collect();
-            crate::diag::note(&format!(
-                "tcp://{}:{} is a privileged port, which the cage cannot listen on — ssh reaches it \
-                 through the cage's CONNECT proxy (wired in /etc/ssh/ssh_config); another client \
-                 has to ask for that CONNECT itself",
-                dest.host,
-                ports.join(",")
-            ));
-        }
-    }
+    // Where each `tcp://` destination lives inside the cage.
+    let tcp_plan = tcp_plan(prep);
+
     // The session's signer record, stood up when a signer is named anywhere this launch will run
     // one: a `[[secret]]` the agent's own proxy resolves, or a `[task.<name>.inject]` a declared
     // operation's proxy will. One ring and one socket for all of them, like the notifier — a proxy
@@ -1821,94 +1962,8 @@ pub(super) fn build(
         egress_guard = Some(guard);
     }
 
-    // The ssh-agent broker: a filtering agent socket in front of the host's own, so the cage can
-    // sign with the keys `[ssh_agent] allow` names and do nothing else — not list the rest, not add
-    // a key, not wipe the set. Independent of the network posture: it rides a bound Unix socket, so
-    // the empty netns is untouched. Where a signature is then *spent* is the egress allowlist's
-    // business: a `git push` also needs a `tcp://<host>:22` rule, and — since a capability-less cage
-    // cannot bind a privileged port — an explicit `CONNECT` to reach it.
-    //
-    // A grant that resolves to nothing is a warning and no agent, never a silent partial: the two
-    // ways that happens — no agent running, no held key matching — are both a mistake worth naming
-    // at the moment it is made. Only a failure to *stand up* the broker is fatal, like the egress
-    // proxy's: the user asked for it and it cannot be provided.
-    let mut sshagent_guard = None;
-    let mut sshagent_binds: Vec<binds::ExtraBind> = Vec::new();
-    let mut sshagent_env: Vec<(String, String)> = Vec::new();
-    if !prep.cfg.ssh_agent.is_empty() {
-        let grant = prep.cfg.ssh_agent.join(", ");
-        match sshagent::host_socket() {
-            None => crate::diag::warn_config(&format!(
-                "`[ssh_agent] allow` names {grant} but no agent is running on the host \
-                 (`$SSH_AUTH_SOCK` is unset) — the cage gets no agent"
-            )),
-            Some(host_sock) => {
-                let filter = sshagent::Filter::new(&prep.cfg.ssh_agent);
-                match sshagent::admission(&host_sock, &filter) {
-                    Err(e) => crate::diag::warn(&format!(
-                        "cannot reach the host ssh-agent at {} ({e}) — the cage gets no agent",
-                        host_sock.display()
-                    )),
-                    Ok(a) if a.admitted.is_empty() => crate::diag::warn_config(&format!(
-                        "no key the host agent holds matches `[ssh_agent] allow` ({grant}) — the \
-                         cage gets no agent. `ssh-add -l` prints the fingerprint and comment an \
-                         entry may name."
-                    )),
-                    // `confirm` asks for a prompt on every signature, which takes an askpass helper
-                    // on the host. Resolved once, before anything is stood up, so the decision to
-                    // refuse and the wiring that follows it cannot be answered by two searches.
-                    Ok(a) => match sshagent::confirmation(
-                        prep.cfg.ssh_agent_confirm,
-                        sshagent::Confirmer::askpass(),
-                    ) {
-                        // The absence of a helper refuses the grant: running the broker anyway
-                        // would hand the cage a key *and* silently drop the one condition the
-                        // grant was made under.
-                        sshagent::Confirmation::NoHelper => crate::diag::warn(&format!(
-                            "`[ssh_agent] confirm` asks for a prompt on every signature, but no \
-                             askpass helper was found on the host (`$SSH_ASKPASS`, `ssh-askpass` on \
-                             PATH, or OpenSSH's own) — the cage gets no agent rather than a grant \
-                             whose confirmation would never appear. Install one (e.g. the \
-                             `ssh-askpass` package), or drop `confirm`. Grant: {}",
-                            a.admitted.join(", ")
-                        )),
-                        confirmation => {
-                            let (guard, wiring) = sshagent::start(
-                                &prep.layout,
-                                &prep.cfg.ssh_agent,
-                                &host_sock,
-                                confirmation.helper(),
-                                Arc::clone(&notify_wiring.notifier),
-                            )
-                            .map_err(|e| {
-                                crate::diag::error(&format!(
-                                    "sbx: cannot start the ssh-agent broker: {e}"
-                                ));
-                                ExitCode::FAILURE
-                            })?;
-                            crate::diag::note(&format!(
-                                "ssh-agent: the cage may sign with {}{}{}",
-                                a.admitted.join(", "),
-                                match a.withheld {
-                                    0 => String::new(),
-                                    1 => " (1 other key withheld)".to_string(),
-                                    n => format!(" ({n} other keys withheld)"),
-                                },
-                                if prep.cfg.ssh_agent_confirm {
-                                    " — each signature asks you first"
-                                } else {
-                                    ""
-                                }
-                            ));
-                            sshagent_binds = wiring.binds;
-                            sshagent_env = wiring.env;
-                            sshagent_guard = Some(guard);
-                        }
-                    },
-                }
-            }
-        }
-    }
+    // The filtering ssh-agent, when the grant resolves to a key the host agent holds.
+    let ssh_agent = ssh_agent_broker(prep, &notify_wiring)?;
 
     // GUI hole: under `gui = "wayland"`, bind the host's Wayland compositor socket read-only so a
     // graphical app can map a window. The cage runs same-uid, so a read-only bind suffices to
@@ -2162,7 +2217,7 @@ pub(super) fn build(
     // (socket + CA) and the GUI socket. Their destinations are sbx's or the host's, never a
     // project path, so they neither shadow nor are shadowed by a structural mount.
     let mut extra_binds = egress_binds;
-    extra_binds.extend(sshagent_binds);
+    extra_binds.extend(ssh_agent.binds);
     extra_binds.extend(brokers_up.reachable.iter().map(broker::Reachable::bind));
     extra_binds.extend(forward_up.binds);
     extra_binds.extend(gui_binds);
@@ -2341,7 +2396,7 @@ pub(super) fn build(
         (EnvLayer::AutoEquip, autoequip_env),
         (EnvLayer::Mise, mise_env(prep)?),
         (EnvLayer::Egress, egress_env),
-        (EnvLayer::SshAgent, sshagent_env),
+        (EnvLayer::SshAgent, ssh_agent.env),
         (
             EnvLayer::Broker,
             brokers_up
@@ -2585,7 +2640,7 @@ pub(super) fn build(
     };
 
     let guard = if egress_guard.is_some()
-        || sshagent_guard.is_some()
+        || ssh_agent.guard.is_some()
         || !brokers_up.guards.is_empty()
         || brokers_up.feed.is_some()
         || signer_feed.is_some()
@@ -2597,7 +2652,7 @@ pub(super) fn build(
         Some(LaunchGuard {
             notify_sink: Some(Arc::clone(&notify_wiring)),
             egress: egress_guard,
-            ssh_agent: sshagent_guard,
+            ssh_agent: ssh_agent.guard,
             brokers: brokers_up.guards,
             broker_feed: brokers_up.feed,
             signer_feed,
