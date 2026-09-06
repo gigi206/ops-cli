@@ -1,6 +1,6 @@
 # CI — runs on every push and pull request.
 #
-# Mirrors `mise run ci` (fmt + clippy + rustdoc + test). Unlike the local full run, the
+# Mirrors `mise run ci` (fmt + clippy + rustdoc + audit + test). Unlike the local full run, the
 # integration e2e that need userns + nix + network are skipped on a hosted
 # runner; here they are simply not selected unless their source file changed.
 #
@@ -90,6 +90,23 @@ jobs:
       - run: cargo doc --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # The same version `mise.toml [tools]` pins, from the same source (crates.io), so the advisory
+      # read here is the one `mise run audit` makes locally. Built from source rather than fetched
+      # as a prebuilt: that keeps the trust in crates.io and the toolchain already on this runner,
+      # with no third-party action added to the chain.
+      - run: cargo install cargo-audit --locked --version 0.22.2
+      - run: cargo audit
+      # `proc-shim/` is its own workspace root (see the fmt job), so its lockfile is named here.
+      - run: cargo audit -f proc-shim/Cargo.lock
 
   test:
     name: test (change-driven)

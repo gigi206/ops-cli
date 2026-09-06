@@ -123,6 +123,7 @@ mise run fmt     # cargo fmt --check, for sbx and for proc-shim/
 mise run lint    # cargo clippy --all-targets -- -D warnings, for sbx and for proc-shim/
 mise run rustdoc # cargo doc with -D warnings (a doc reference that resolves to nothing)
 mise run test    # cargo test --no-fail-fast (the heavy sandbox e2e skip without userns/nix/network)
+mise run audit   # cargo audit against the RustSec advisory database, for both lockfiles
 mise run ci      # all of the above
 ```
 

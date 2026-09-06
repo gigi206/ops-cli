@@ -259,8 +259,8 @@ cargo clippy --bins --features bundled-nix,bundled-bwrap -- -D warnings
 '''
 
 [tasks.ci]
-description = "Full local reproduction of the CI pipeline (fmt + lint + rustdoc + test)"
-depends = ["fmt", "lint", "rustdoc", "test"]
+description = "Full local reproduction of the CI pipeline (fmt + lint + rustdoc + audit + test)"
+depends = ["fmt", "lint", "rustdoc", "audit", "test"]
 
 [tasks.docs-install]
 description = "Install the Docusaurus docs-site dependencies into docs-site/node_modules (Node tool + pinned npm packages from [tools])"
