@@ -284,6 +284,65 @@ fn cage_timezone(declared: Option<&str>, zoneinfo_src: &Path) -> String {
     fallback()
 }
 
+/// Append the assembled [`SandboxSpec`] and a one-line summary of its [`LaunchGuard`] to the file
+/// `$SBX_DEBUG_SPEC_DUMP` names, so two builds of [`build()`] can be compared byte for byte.
+///
+/// This exists for one purpose: [`build()`] is reached only through a real launch, so the only way
+/// to hold a change to it against what it emitted before is to run launches and diff their specs.
+/// The dump is that record.
+///
+/// Debug-only, and compiled out rather than merely gated: the spec carries the cage's whole
+/// environment, and a release binary must have no way to write it anywhere. Both this function and
+/// its one call site are `#[cfg(debug_assertions)]`, so a release build contains neither.
+///
+/// Credentials are redacted before the spec is formatted: every [`SandboxSpec::secret_env`] entry
+/// keeps its name and is reduced to the byte length of its value, so a resolved credential never
+/// reaches the file. The guard is summarised rather than printed — it owns live sockets and host
+/// threads and has no `Debug` — as one line naming which of its resources this launch stood up.
+///
+/// Best-effort and silent: a path that cannot be written is a developer's own diagnostic going
+/// missing, never a reason to fail a launch that is otherwise ready to run.
+#[cfg(debug_assertions)]
+fn debug_dump_spec(spec: &SandboxSpec, guard: Option<&LaunchGuard>) {
+    use std::io::Write;
+
+    let Some(path) = std::env::var_os("SBX_DEBUG_SPEC_DUMP") else {
+        return;
+    };
+    let mut redacted = spec.clone();
+    redacted.secret_env = redacted
+        .secret_env
+        .iter()
+        .map(|(name, value)| (name.clone(), format!("<{} bytes>", value.len())))
+        .collect();
+    let mark = |present: bool| if present { "some" } else { "none" };
+    let summary = match guard {
+        None => "guard: none".to_string(),
+        Some(g) => format!(
+            "guard: egress={} ssh_agent={} brokers={} broker_feed={} signer_feed={} forward={} \
+             notify={} theme={} portal={} proc_enforce={} task={}",
+            mark(g.egress.is_some()),
+            mark(g.ssh_agent.is_some()),
+            g.brokers.len(),
+            mark(g.broker_feed.is_some()),
+            mark(g.signer_feed.is_some()),
+            mark(g.forward.is_some()),
+            mark(g.notify.is_some()),
+            mark(g.theme.is_some()),
+            mark(g.portal.is_some()),
+            mark(g.proc_enforce.is_some()),
+            mark(g.task.is_some()),
+        ),
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{redacted:#?}\n{summary}");
+    }
+}
+
 /// Build the spec for `cmd`, reporting a clean error as an `ExitCode`. The
 /// configuration resolved in [`super::prepare_with`] drives this: a trust-gated `.sbx.toml` adds
 /// environment and host binds — read-only, or read-write with `mode = "rw"` (its security
@@ -2180,6 +2239,8 @@ pub(super) fn build(
     } else {
         None
     };
+    #[cfg(debug_assertions)]
+    debug_dump_spec(&spec, guard.as_ref());
     Ok((spec, guard))
 }
 
