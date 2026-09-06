@@ -1,18 +1,29 @@
 //! The one function that stands up a cage, alone with the helpers only it uses.
 //!
-//! `build` is a single linear assembly and is kept whole deliberately. Its blocks — the
+//! `build` is a single linear assembly, and it reads as the table of contents of that assembly: the
 //! provisioning of packages, tools, fonts, GPU, audio and portals; the project store seed; then the
-//! wired planes: notification sink, process enforcement, the mise and flake equip lanes, the
+//! wired planes — notification sink, process enforcement, the mise and flake equip lanes, the
 //! forwarder, the brokers, the egress proxy, the ssh-agent, the fs masks, the control-plane pins,
-//! the task socket and the environment layering — each contribute values that three statements at
-//! the end consume together. Carving a block out would move eight or ten locals across a signature
-//! and would split the surface [`super::super`] asks a security review to audit in one place; the
-//! file boundary is what sharpens that surface instead, by making it something a reader opens
-//! rather than a range they scroll to.
+//! the task socket and the environment layering — each standing up what the three statements at the
+//! end consume together. The order those blocks run in is load-bearing throughout and is unchanged
+//! by where their code lives.
+//!
+//! A block is a `fn` in **this file** when its result fits through a signature: about eight values,
+//! counting what it is given and what it hands on. That bound is the whole rule, and it is what
+//! keeps a phase from becoming a second copy of `build` with a longer argument list. Four blocks do
+//! not fit and stay inline, with the counts stated where they sit — the egress proxy and the task
+//! plane (each needs the better part of a dozen values), the environment layering, and the spec
+//! literal itself, which is the statement every other block exists to fill in. Nothing moves to
+//! another file: the surface [`super::super`] asks a security review to audit stays here, and
+//! [`crate::sandbox::argv`]'s exhaustiveness guard classifies files by what they name.
 //!
 //! Everything the cage keeps hold of on the host — the supervisor threads, the temporary trees, the
 //! sockets — is owned by [`LaunchGuard`], whose drop order is part of the contract rather than an
-//! accident of field order.
+//! accident of field order. A phase that carries such a resource states the same thing about its
+//! own fields: on an early exit the locals dropped in reverse declaration order, and a struct's
+//! fields drop in declaration order, so each phase result declares them in the order that
+//! reproduces what the locals did. None of those types implements `Drop` — the guard literal moves
+//! fields out of them one at a time.
 
 use super::equip::{
     MISE_EQUIP_VERB, auto_equip_tokens, equip_announcement, mise_token_display, wrap_flake_equip,
@@ -343,35 +354,45 @@ fn debug_dump_spec(spec: &SandboxSpec, guard: Option<&LaunchGuard>) {
     }
 }
 
-/// Build the spec for `cmd`, reporting a clean error as an `ExitCode`. The
-/// configuration resolved in [`super::prepare_with`] drives this: a trust-gated `.sbx.toml` adds
-/// environment and host binds — read-only, or read-write with `mode = "rw"` (its security
-/// fields honored only once trusted)
-/// and provisions its declared tools onto `PATH`. Whatever the gate dropped or
-/// withheld is surfaced as a warning; a declared tool that fails to realise is fatal,
-/// since it is a stated requirement.
-pub(super) fn build(
-    prep: &Prepared,
-    runtime: binds::Runtime,
-    cmd: Vec<OsString>,
-) -> Result<(SandboxSpec, Option<LaunchGuard>), ExitCode> {
-    for warning in &prep.cfg.warnings {
-        crate::diag::warn_config(warning);
-    }
+/// What a launch provisions before it can be assembled: every declared tool realised into sbx's
+/// store, and the in-cage build of the inline flakes staged and queued.
+///
+/// The four backends this covers are provisioned **host-side** — the `nix:` package layer, the
+/// exact-pinned `nix:` mise toolchain, the prebuilt `deb:`/`appimage:`/`tarball:` forms (both the
+/// direct and the `<backend>:resolve` shape), and a remote `flake:` — and each contributes a `bin`
+/// directory to `bin_paths` and a store root to seed. Only an inline `[flakes.<name>]` is left to
+/// build inside the cage, which is why it hands on a queue rather than a result.
+///
+/// No field owns a host resource, so this type has no `Drop` and the launch may move fields out of
+/// it one at a time.
+struct Provisioned {
+    /// The bin directories to prepend to the cage `PATH`, ahead of the base userland's, in the
+    /// order the layers were provisioned: the pinned mise toolchain first, then `[packages]`, then
+    /// the prebuilt backends, then the inline flakes' out-links.
+    bin_paths: Vec<PathBuf>,
+    /// The `[packages]` store roots to seed into the project's own store, including every prebuilt
+    /// backend's.
+    package_roots: Vec<PathBuf>,
+    /// The `nix:` mise toolchain's store roots, seeded alongside them.
+    tool_roots: Vec<PathBuf>,
+    /// One quad per inline flake for the in-cage `nix build` wrap: the build ref, the
+    /// content-hash-keyed target out-link, the stable good out-link `PATH` resolves through, and
+    /// the flake's name.
+    flake_pairs: Vec<(String, PathBuf, PathBuf, String)>,
+    /// The inline flakes' names, for the announcement and for the `network = "none"` warning.
+    inline_flake_names: Vec<String>,
+    /// The read-only binds that put each staged inline flake at `/opt/sbx/flakes/<name>`.
+    inline_flake_binds: Vec<binds::ExtraBind>,
+}
 
-    // Reclaim the per-launch runtime files of launches that are gone, before standing up our own.
-    // Their RAII guards unlink on a clean exit, but a cage normally ends on a signal (Ctrl-C,
-    // `sbx session stop`, a detached session killed later) and a `Drop` does not run then — so each
-    // cage tidies up after its predecessors. Silent and best-effort: routine housekeeping, and a
-    // live launch's files are never touched (its pid still reads as live). The same self-healing
-    // doctrine the session registry applies to its records.
-    //
-    // This sits in `build` — the one function that actually stands up a cage — rather than in
-    // `prepare`, which `sbx gc` also calls: a gc *dry run* must touch nothing, and sweeping from
-    // there would have deleted these files while reporting them as merely reclaimable.
-    crate::sandbox::gc::sweep_runtime_dirs(prep.layout.data_dir(), true);
-    crate::sandbox::gc::fold_egress_counters(prep.layout.data_dir(), true);
-
+/// Realise every declared tool into sbx's store and stage the inline flakes, or fail the launch
+/// naming what could not be provisioned.
+///
+/// A **declared** package is a requirement, so a provisioning failure aborts here rather than
+/// running a cage without it; a *withheld* (untrusted) one only warns, and a staging failure for an
+/// inline flake warns and skips that flake. The order of the layers is the order of `bin_paths`,
+/// and it is the precedence order on the cage `PATH`.
+fn provision_tools(prep: &Prepared, runtime: binds::Runtime) -> Result<Provisioned, ExitCode> {
     // Provision the project's declared tools into sbx's store, against the project's
     // effective nixpkgs reference; their bin dirs are prepended to PATH below. A
     // withheld (untrusted) tool only warns; an admitted tool that fails to realise is
@@ -529,6 +550,49 @@ pub(super) fn build(
         inline_flake_names.push(name.clone());
         flake_pairs.push((build_ref, target, good, name));
     }
+
+    Ok(Provisioned {
+        bin_paths,
+        package_roots: packages.roots,
+        tool_roots: tools.roots,
+        flake_pairs,
+        inline_flake_names,
+        inline_flake_binds,
+    })
+}
+
+/// Build the spec for `cmd`, reporting a clean error as an `ExitCode`. The
+/// configuration resolved in [`super::prepare_with`] drives this: a trust-gated `.sbx.toml` adds
+/// environment and host binds — read-only, or read-write with `mode = "rw"` (its security
+/// fields honored only once trusted)
+/// and provisions its declared tools onto `PATH`. Whatever the gate dropped or
+/// withheld is surfaced as a warning; a declared tool that fails to realise is fatal,
+/// since it is a stated requirement.
+pub(super) fn build(
+    prep: &Prepared,
+    runtime: binds::Runtime,
+    cmd: Vec<OsString>,
+) -> Result<(SandboxSpec, Option<LaunchGuard>), ExitCode> {
+    for warning in &prep.cfg.warnings {
+        crate::diag::warn_config(warning);
+    }
+
+    // Reclaim the per-launch runtime files of launches that are gone, before standing up our own.
+    // Their RAII guards unlink on a clean exit, but a cage normally ends on a signal (Ctrl-C,
+    // `sbx session stop`, a detached session killed later) and a `Drop` does not run then — so each
+    // cage tidies up after its predecessors. Silent and best-effort: routine housekeeping, and a
+    // live launch's files are never touched (its pid still reads as live). The same self-healing
+    // doctrine the session registry applies to its records.
+    //
+    // This sits in `build` — the one function that actually stands up a cage — rather than in
+    // `prepare`, which `sbx gc` also calls: a gc *dry run* must touch nothing, and sweeping from
+    // there would have deleted these files while reporting them as merely reclaimable.
+    crate::sandbox::gc::sweep_runtime_dirs(prep.layout.data_dir(), true);
+    crate::sandbox::gc::fold_egress_counters(prep.layout.data_dir(), true);
+
+    // Every declared tool, realised host-side into sbx's store; the inline flakes staged for the
+    // in-cage build the wrap below performs.
+    let provisioned = provision_tools(prep, runtime)?;
 
     // Under `gui = "wayland"`, provision the GUI font set host-side so the cage renders text
     // rather than boxes. Provisioned here — before the seed — so its store roots join the
@@ -740,7 +804,12 @@ pub(super) fn build(
     // store mounted or widen its access. The shared store reaches the cage only through the
     // read-only plumbing pins below (see [`plumbing_pins`]), which is the one place a cage sees
     // any of it — and only as bytes it cannot write.
-    let project_store = match seed_project_store(prep, &packages.roots, &tools.roots, &gui_roots) {
+    let project_store = match seed_project_store(
+        prep,
+        &provisioned.package_roots,
+        &provisioned.tool_roots,
+        &gui_roots,
+    ) {
         Ok(s) => s,
         Err(e) => {
             crate::diag::error(&format!("sbx: cannot prepare the project's store: {e}"));
@@ -1002,18 +1071,18 @@ pub(super) fn build(
     // command *before* the egress wrap and is skipped under `network = "none"`. The wrap
     // short-circuits when the out-link is already realised in the project's store, so a warm launch is
     // a no-op and an already-built flake runs offline.
-    if !flake_pairs.is_empty() {
+    if !provisioned.flake_pairs.is_empty() {
         if matches!(prep.cfg.network, crate::config::NetworkPolicy::Isolated) {
             crate::diag::warn_config(&format!(
                 "inline flakes [{}] are declared but `network = \"none\"` — they \
                  cannot be built and will be absent unless already present",
-                inline_flake_names.join(", ")
+                provisioned.inline_flake_names.join(", ")
             ));
         } else {
             crate::diag::error(&format!(
                 "sbx: building inline flakes in-cage via nix build: {} (each flake's fetch \
                  host must be in [network].allow under an allowlist)",
-                inline_flake_names.join(", ")
+                provisioned.inline_flake_names.join(", ")
             ));
             wraps.push((
                 WrapLayer::FlakeEquip,
@@ -1022,7 +1091,7 @@ pub(super) fn build(
                         &prep.userland.nix_bin,
                         &prep.userland.shell_bin,
                         &binds::flake_roots_dir(),
-                        &flake_pairs,
+                        &provisioned.flake_pairs,
                         cmd,
                     )
                 }),
@@ -1798,7 +1867,7 @@ pub(super) fn build(
     extra_binds.extend(brokers.iter().map(broker::Reachable::bind));
     extra_binds.extend(forward_binds);
     extra_binds.extend(gui_binds);
-    extra_binds.extend(inline_flake_binds);
+    extra_binds.extend(provisioned.inline_flake_binds);
     extra_binds.extend(proc_binds);
     // The store paths every wrap's preamble runs from, pinned read-only over the project's
     // writable store. Emitted here, with the launcher's other extra binds, because that is what
@@ -1999,7 +2068,7 @@ pub(super) fn build(
     let overlay = binds::Overlay {
         env: &extra_env,
         binds: &prep.cfg.binds,
-        bin_paths: &bin_paths,
+        bin_paths: &provisioned.bin_paths,
         timezone: &timezone,
         fresh_release_tokens: &fresh_release_tokens,
         ignored_mise_paths: &prep.cfg.mise_ignored,
