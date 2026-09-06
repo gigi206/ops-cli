@@ -1994,6 +1994,164 @@ fn audio_binds(prep: &Prepared, hw: &HardwareLayers) -> GuiWiring {
     GuiWiring { binds: mounts, env }
 }
 
+/// The `[fs]` masks this launch stages, and the decoys the binds point at.
+///
+/// Plain data — the decoy directory is reclaimed by the runtime sweep, not by a `Drop` — so this
+/// type has no `Drop` and no drop order to reproduce.
+struct FsMasks {
+    /// What each named project path is masked with, carried on into every task cage so a denied
+    /// path is closed there too unless the task's own `unmask` names it.
+    masks: crate::sandbox::fsmask::Expanded,
+    /// The staged decoy files the masks bind over their targets. `None` when nothing is masked.
+    decoys: Option<crate::sandbox::fsmask::Decoys>,
+}
+
+/// Close the project paths `[fs]` names, appending the masking binds to `extra_binds`.
+///
+/// Appended *among* the launcher's extra binds — that is, after the structural mounts — because a
+/// mask emitted before the project's own mount would be covered by it. Unlike the rest of that
+/// list, these destinations **are** project paths, which is the point: they are the only binds
+/// meant to land on one.
+///
+/// Fail-closed: a refusal from the expansion, or decoys that cannot be staged, aborts the launch.
+/// A session that ran anyway would leave open exactly the files the config asked to close.
+fn stage_fs_masks(
+    prep: &Prepared,
+    extra_binds: &mut Vec<binds::ExtraBind>,
+) -> Result<FsMasks, ExitCode> {
+    // Close the project paths `[fs]` names. Emitted among the launcher's extra binds — that is,
+    // *after* the structural mounts — because a mask emitted before the project's own mount would
+    // be covered by it, which is exactly why a `binds` entry aimed inside the project masks nothing
+    // today. Unlike the rest of this block their destinations *are* project paths, which is the
+    // point: they are the only binds here meant to land on one.
+    let fs_masks = crate::sandbox::fsmask::expand(&prep.cwd, &prep.cfg.fs);
+    for warning in &fs_masks.warnings {
+        crate::diag::warn_config(warning);
+    }
+    if let Some(reason) = &fs_masks.refused {
+        crate::diag::error(&format!("sbx: {reason}"));
+        return Err(ExitCode::FAILURE);
+    }
+    let fs_decoys = if fs_masks.is_empty() {
+        None
+    } else {
+        let dir = crate::sandbox::fsmask::mask_dir(prep.layout.data_dir(), std::process::id());
+        match crate::sandbox::fsmask::stage_decoys(&dir) {
+            Ok(decoys) => {
+                extra_binds.extend(crate::sandbox::fsmask::agent_binds(&fs_masks, &decoys));
+                Some(decoys)
+            }
+            Err(e) => {
+                // Fail closed: without the decoys nothing masks those paths, and a session that
+                // ran anyway would leave open exactly the files the config asked to close.
+                crate::diag::error(&format!(
+                    "sbx: cannot stage the `[fs]` masks ({e}) — the paths they name would stay open"
+                ));
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    };
+
+    Ok(FsMasks {
+        masks: fs_masks,
+        decoys: fs_decoys,
+    })
+}
+
+/// The task control plane's cage-side surface: where its socket crosses, and what names it.
+///
+/// Plain data. The socket *file* is created later, by the plane itself; this only decides the paths
+/// and the binds, so that bwrap finds them present at launch.
+struct TaskSocket {
+    /// The host path of the control socket, or `None` when this session declares no operation.
+    path: Option<PathBuf>,
+    /// The variables an in-cage caller finds the socket and the generated client through.
+    env: Vec<(String, String)>,
+}
+
+/// Derive the task control plane's paths and append its binds, when this session declares an
+/// operation.
+///
+/// This is the **one** control plane that crosses into the cage. Its surface is three commands, and
+/// the invocation log lives on a second, host-only socket the recorded party cannot read. Three
+/// choices carry the containment: the socket's *file* is bound rather than its directory, so in-cage
+/// code cannot unlink it and serve its own listener at the same path; the client is a generated
+/// script rather than sbx itself, so the cage holds no binary able to act on sbx's own state; and
+/// the output directory is bound **read-only**, so an agent cannot plant the input a
+/// credential-bearing command later reads back.
+fn task_socket(prep: &Prepared, extra_binds: &mut Vec<binds::ExtraBind>) -> TaskSocket {
+    let mut task_env: Vec<(String, String)> = Vec::new();
+
+    // Declared operations: when this session has any, the task control socket crosses into the cage
+    // and a generated client is bound read-only beside it, so an in-cage caller can list and invoke
+    // a task. Both paths are derived here (before the spec) and both are created below (before the
+    // launch), so bwrap finds them present. This is the ONE control plane that crosses — its surface
+    // is three commands, and the invocation log lives on a second, host-only socket that the
+    // recorded party cannot read.
+    let task_socket = (!prep.cfg.tasks.is_empty()).then(|| {
+        let path =
+            crate::sandbox::task_control::task_dir(prep.layout.data_dir(), std::process::id())
+                .join("control.sock");
+        extra_binds.push(binds::ExtraBind {
+            src: path.clone(),
+            // Writable so a connect is never refused on a permission subtlety; the *file* is bound,
+            // never its directory, so in-cage code cannot unlink it and serve its own listener at
+            // the same path.
+            dest: PathBuf::from(crate::sandbox::task_control::CAGE_TASK_UDS),
+            writable: true,
+        });
+        task_env.push((
+            crate::sandbox::task_control::TASK_SOCKET_ENV.to_string(),
+            crate::sandbox::task_control::CAGE_TASK_UDS.to_string(),
+        ));
+        // The client is a generated script, never sbx itself: the cage must not hold a binary able
+        // to act on sbx's own state, and "it cannot because nothing it needs is mounted" is a
+        // property no test could hold onto. See `task_shim`.
+        extra_binds.push(binds::ExtraBind {
+            src: crate::sandbox::task_control::shim_path(
+                prep.layout.data_dir(),
+                std::process::id(),
+            ),
+            dest: PathBuf::from(crate::sandbox::task_control::TASK_SHIM_INCAGE),
+            writable: false,
+        });
+        task_env.push((
+            "SBX_TASK_CLI".to_string(),
+            crate::sandbox::task_control::TASK_SHIM_INCAGE.to_string(),
+        ));
+        // Where an `output`-declaring task's artifacts become readable. Bound **read-only**, and only
+        // when some task declares `output` — an agent that can write here could plant the input a
+        // credential-bearing command later reads back, which is the one thing the direction of this
+        // mount has to prevent.
+        //
+        // The *parent* is bound, because a cage's mounts are fixed when it is built and no
+        // invocation can add one afterwards: each task's directory then appears inside it as it is
+        // created, since a bind mount shows the tree rather than a copy of it.
+        if prep.cfg.tasks.iter().any(|t| t.output) {
+            let root = crate::sandbox::task::output_root_for(&prep.layout, &prep.cwd)
+                .and_then(|root| std::fs::create_dir_all(&root).map(|()| root));
+            if let Err(e) = &root {
+                crate::diag::warn(&format!(
+                    "cannot create this project's task output directory ({e}) — an operation \
+                     declaring `output` will refuse rather than run"
+                ));
+            } else if let Ok(root) = root {
+                extra_binds.push(binds::ExtraBind {
+                    src: root,
+                    dest: PathBuf::from(crate::sandbox::task::TASK_OUT_AGENT),
+                    writable: false,
+                });
+            }
+        }
+        path
+    });
+
+    TaskSocket {
+        path: task_socket,
+        env: task_env,
+    }
+}
+
 /// Build the spec for `cmd`, reporting a clean error as an `ExitCode`. The
 /// configuration resolved in [`super::prepare_with`] drives this: a trust-gated `.sbx.toml` adds
 /// environment and host binds — read-only, or read-write with `mode = "rw"` (its security
@@ -2329,38 +2487,8 @@ pub(super) fn build(
     }
     extra_binds.extend(plumbing_pins(&prep.userland, &gui_programs, &prep.layout));
 
-    // Close the project paths `[fs]` names. Emitted among the launcher's extra binds — that is,
-    // *after* the structural mounts — because a mask emitted before the project's own mount would
-    // be covered by it, which is exactly why a `binds` entry aimed inside the project masks nothing
-    // today. Unlike the rest of this block their destinations *are* project paths, which is the
-    // point: they are the only binds here meant to land on one.
-    let fs_masks = crate::sandbox::fsmask::expand(&prep.cwd, &prep.cfg.fs);
-    for warning in &fs_masks.warnings {
-        crate::diag::warn_config(warning);
-    }
-    if let Some(reason) = &fs_masks.refused {
-        crate::diag::error(&format!("sbx: {reason}"));
-        return Err(ExitCode::FAILURE);
-    }
-    let fs_decoys = if fs_masks.is_empty() {
-        None
-    } else {
-        let dir = crate::sandbox::fsmask::mask_dir(prep.layout.data_dir(), std::process::id());
-        match crate::sandbox::fsmask::stage_decoys(&dir) {
-            Ok(decoys) => {
-                extra_binds.extend(crate::sandbox::fsmask::agent_binds(&fs_masks, &decoys));
-                Some(decoys)
-            }
-            Err(e) => {
-                // Fail closed: without the decoys nothing masks those paths, and a session that
-                // ran anyway would leave open exactly the files the config asked to close.
-                crate::diag::error(&format!(
-                    "sbx: cannot stage the `[fs]` masks ({e}) — the paths they name would stay open"
-                ));
-                return Err(ExitCode::FAILURE);
-            }
-        }
-    };
+    // The `[fs]` masks, staged and bound over the project paths they close.
+    let fs = stage_fs_masks(prep, &mut extra_binds)?;
 
     // Pin sbx's own control plane in place whenever a read-write bind contains it: each root's host
     // path is frozen as a mountpoint chain (read-write intermediates, a read-only leaf), so in-cage
@@ -2400,70 +2528,8 @@ pub(super) fn build(
         }
     }
 
-    // Declared operations: when this session has any, the task control socket crosses into the cage
-    // and a generated client is bound read-only beside it, so an in-cage caller can list and invoke
-    // a task. Both paths are derived here (before the spec) and both are created below (before the
-    // launch), so bwrap finds them present. This is the ONE control plane that crosses — its surface
-    // is three commands, and the invocation log lives on a second, host-only socket that the
-    // recorded party cannot read.
-    let mut task_env: Vec<(String, String)> = Vec::new();
-    let task_socket = (!prep.cfg.tasks.is_empty()).then(|| {
-        let path =
-            crate::sandbox::task_control::task_dir(prep.layout.data_dir(), std::process::id())
-                .join("control.sock");
-        extra_binds.push(binds::ExtraBind {
-            src: path.clone(),
-            // Writable so a connect is never refused on a permission subtlety; the *file* is bound,
-            // never its directory, so in-cage code cannot unlink it and serve its own listener at
-            // the same path.
-            dest: PathBuf::from(crate::sandbox::task_control::CAGE_TASK_UDS),
-            writable: true,
-        });
-        task_env.push((
-            crate::sandbox::task_control::TASK_SOCKET_ENV.to_string(),
-            crate::sandbox::task_control::CAGE_TASK_UDS.to_string(),
-        ));
-        // The client is a generated script, never sbx itself: the cage must not hold a binary able
-        // to act on sbx's own state, and "it cannot because nothing it needs is mounted" is a
-        // property no test could hold onto. See `task_shim`.
-        extra_binds.push(binds::ExtraBind {
-            src: crate::sandbox::task_control::shim_path(
-                prep.layout.data_dir(),
-                std::process::id(),
-            ),
-            dest: PathBuf::from(crate::sandbox::task_control::TASK_SHIM_INCAGE),
-            writable: false,
-        });
-        task_env.push((
-            "SBX_TASK_CLI".to_string(),
-            crate::sandbox::task_control::TASK_SHIM_INCAGE.to_string(),
-        ));
-        // Where an `output`-declaring task's artifacts become readable. Bound **read-only**, and only
-        // when some task declares `output` — an agent that can write here could plant the input a
-        // credential-bearing command later reads back, which is the one thing the direction of this
-        // mount has to prevent.
-        //
-        // The *parent* is bound, because a cage's mounts are fixed when it is built and no
-        // invocation can add one afterwards: each task's directory then appears inside it as it is
-        // created, since a bind mount shows the tree rather than a copy of it.
-        if prep.cfg.tasks.iter().any(|t| t.output) {
-            let root = crate::sandbox::task::output_root_for(&prep.layout, &prep.cwd)
-                .and_then(|root| std::fs::create_dir_all(&root).map(|()| root));
-            if let Err(e) = &root {
-                crate::diag::warn(&format!(
-                    "cannot create this project's task output directory ({e}) — an operation \
-                     declaring `output` will refuse rather than run"
-                ));
-            } else if let Ok(root) = root {
-                extra_binds.push(binds::ExtraBind {
-                    src: root,
-                    dest: PathBuf::from(crate::sandbox::task::TASK_OUT_AGENT),
-                    writable: false,
-                });
-            }
-        }
-        path
-    });
+    // The task control plane's socket and client, where this session declares an operation.
+    let task = task_socket(prep, &mut extra_binds);
 
     // Two holes contribute directories to the cage's loader path — the audio client libraries and,
     // under WSL, the GPU bridge — and each pushed its own entry. A shared key is won by one source,
@@ -2492,7 +2558,7 @@ pub(super) fn build(
                 .flat_map(|b| b.env.clone())
                 .collect(),
         ),
-        (EnvLayer::Task, task_env),
+        (EnvLayer::Task, task.env),
         (EnvLayer::Config, prep.cfg.env.clone()),
     ]);
 
@@ -2642,7 +2708,7 @@ pub(super) fn build(
     // launch has not happened yet (so bwrap finds the bound socket present). A failure here aborts
     // the launch rather than running a cage whose declared operations silently do not exist — the
     // agent would keep trying and never learn why.
-    let task_plane = match &task_socket {
+    let task_plane = match &task.path {
         None => None,
         Some(_) => {
             let engine = crate::sandbox::task::TaskEngine::from_cage(
@@ -2677,8 +2743,8 @@ pub(super) fn build(
             // there too unless the task's own `unmask` names it. The decoys are the ones this
             // launch already staged: a task cage is derived from the agent's, and pointing it at a
             // second set would be two answers to one question.
-            let engine = match (&fs_decoys, fs_masks.is_empty()) {
-                (Some(decoys), false) => engine.with_fs_masks(fs_masks, decoys.clone()),
+            let engine = match (&fs.decoys, fs.masks.is_empty()) {
+                (Some(decoys), false) => engine.with_fs_masks(fs.masks, decoys.clone()),
                 _ => engine,
             };
             // The task tool pool, when any task declares a `mise:` tool. Filled host-side now — a
