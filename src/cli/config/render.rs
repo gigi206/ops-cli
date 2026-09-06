@@ -772,354 +772,485 @@ fn tasks_section(tasks: &[config::view::TaskView], pal: &style::Palette) -> Opti
     Some(o)
 }
 
+/// One app's headline row: the command it runs, the install steps its bundles put before that
+/// command, and where its home is keyed.
+fn app_row_command(
+    o: &mut String,
+    app: &config::view::AppView,
+    pal: &style::Palette,
+    details: bool,
+) {
+    use std::fmt::Write as _;
+    let (n, warn, dim, r) = (pal.name, pal.warn, pal.dim, pal.reset);
+    match &app.cmd {
+        Some(cmd) => {
+            let _ = writeln!(o, "    {n}{}{r}: {cmd}", app.name);
+        }
+        // No layer declared a command — the app cannot launch, so flag it.
+        None => {
+            let _ = writeln!(o, "    {n}{}{r}: {warn}(no command){r}", app.name);
+        }
+    }
+    // Beside the command, for the reason the per-app view puts it there: an install step is a
+    // command that runs inside this cage before `cmd`, so it belongs where a reader looks for
+    // what this app executes. `AppView` has carried it all along and this section never read
+    // it, so the aggregate listing showed an app's shape with the commands left out.
+    if !app.provisions.is_empty() {
+        if details {
+            let _ = writeln!(o, "      {dim}install:{r}");
+            for step in &app.provisions {
+                let _ = writeln!(
+                    o,
+                    "        {n}{}{r}  {dim}(from bundle {}){r}",
+                    step.cmd, step.bundle
+                );
+            }
+        } else {
+            let _ = writeln!(
+                o,
+                "      {dim}install:{r} {} step(s) run before cmd",
+                app.provisions.len()
+            );
+        }
+    }
+    let _ = writeln!(o, "      {dim}home:{r} {}", app.home_scope);
+}
+
+/// The environment this overlay adds over the baseline — counted, or spelled out per variable
+/// under `--details`.
+fn app_row_env(o: &mut String, app: &config::view::AppView, pal: &style::Palette, details: bool) {
+    use std::fmt::Write as _;
+    let (n, dim, r) = (pal.name, pal.dim, pal.reset);
+    // The environment this overlay adds over the baseline — a count by default, each
+    // `KEY=value` under `--details`, mirroring the baseline `env` section. A free field; the
+    // value shown is the one that enters the cage (a placeholder for a credential profile),
+    // never the injected secret, which sbx reads host-side and never prints.
+    if !app.env.is_empty() {
+        if details {
+            let _ = writeln!(o, "      {dim}env:{r}");
+            for e in &app.env {
+                let _ = writeln!(o, "        {n}{}{r}={}", e.key, e.value);
+            }
+        } else {
+            let _ = writeln!(o, "      {dim}env:{r} {} set", app.env.len());
+        }
+    }
+}
+
+/// The host binds this overlay adds — counted, or listed by canonical path and mode under
+/// `--details`.
+fn app_row_binds(o: &mut String, app: &config::view::AppView, pal: &style::Palette, details: bool) {
+    use std::fmt::Write as _;
+    let (n, dim, r) = (pal.name, pal.dim, pal.reset);
+    // The host binds this overlay adds — a security field, so what host paths
+    // `sbx app <name>` exposes (and whether read-write) is visible here, the same as the
+    // baseline `binds` section. A count by default, each canonical path under `--details`.
+    if !app.binds.is_empty() {
+        if details {
+            let _ = writeln!(o, "      {dim}binds:{r}");
+            for b in &app.binds {
+                let _ = writeln!(
+                    o,
+                    "        {n}{}{r}{}",
+                    b.path,
+                    bind_mode_tag(b.writable, pal)
+                );
+            }
+        } else {
+            let _ = writeln!(o, "      {dim}binds:{r} {}", app.binds.len());
+        }
+    }
+}
+
+/// The URI handlers this overlay adds, its bundles folded in.
+fn app_row_open(o: &mut String, app: &config::view::AppView, pal: &style::Palette) {
+    use std::fmt::Write as _;
+    let (n, dim, r) = (pal.name, pal.dim, pal.reset);
+    // The URI handlers this overlay adds, its bundles' folded in. Listed by default, not
+    // counted: a handler is what a sign-in link reaches, which is precisely what
+    // distinguishes this app from every other one.
+    if !app.open.is_empty() {
+        let _ = writeln!(o, "      {dim}open:{r}");
+        for e in &app.open {
+            let _ = writeln!(
+                o,
+                "        {n}{}://{r} {} {dim}({}){r}",
+                e.scheme, e.cmd, e.mode
+            );
+        }
+    }
+}
+
+/// The auxiliary processes this overlay starts beside the app.
+fn app_row_service(o: &mut String, app: &config::view::AppView, pal: &style::Palette) {
+    use std::fmt::Write as _;
+    let (dim, r) = (pal.dim, pal.reset);
+    // The auxiliary processes this overlay adds, its bundles' folded in. Listed for the
+    // reason the field exists: what else this app starts is part of what it is.
+    if !app.service.is_empty() {
+        let _ = writeln!(o, "      {dim}service:{r}");
+        for s in &app.service {
+            let _ = writeln!(o, "{}", service_line(s, pal, "        "));
+        }
+    }
+}
+
+/// The packages this overlay declares — names with their pin and withheld marker, or one full
+/// line each under `--details`.
+fn app_row_packages(
+    o: &mut String,
+    app: &config::view::AppView,
+    pal: &style::Palette,
+    details: bool,
+) {
+    use std::fmt::Write as _;
+    let (warn, dim, r) = (pal.warn, pal.dim, pal.reset);
+    // The packages this overlay declares. Compact by default — names with ` @ <rev>` for a
+    // pinned `flake:` one and ` (withheld)` for one the trust gate would withhold at launch,
+    // so an untrusted app package reads as withheld here without `--details`. `--details`
+    // expands to one full line per package (backend, locator, realisation), the same line
+    // the baseline `packages` section renders, so the two never drift.
+    if !app.packages.is_empty() {
+        if details {
+            let _ = writeln!(o, "      {dim}packages:{r}");
+            for p in &app.packages {
+                let _ = writeln!(o, "{}", package_line(p, pal, "        "));
+            }
+        } else {
+            let pkgs = app
+                .packages
+                .iter()
+                .map(|p| {
+                    // A withheld package stands as its name plus the marker — neither its
+                    // pin nor its realisation, since it is not built; the same short-circuit
+                    // the full `--details` line takes, so the two paths agree.
+                    if p.withheld_reason.is_some() {
+                        return format!("{} {warn}(withheld){r}", p.name);
+                    }
+                    match &p.pinned_rev {
+                        Some(rev) => format!("{} @ {}", p.name, short_rev(rev)),
+                        None => p.name.clone(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(o, "      {dim}packages:{r} {pkgs}");
+        }
+    }
+}
+
+/// The network posture this overlay sets, and under `--details` the policy beneath it: the
+/// rules it may reach by and the built-in hosts every app shares.
+fn app_row_network(
+    o: &mut String,
+    app: &config::view::AppView,
+    pal: &style::Palette,
+    details: bool,
+) {
+    use config::view::AppNetworkView;
+    use std::fmt::Write as _;
+    let (n, warn, dim, r) = (pal.name, pal.warn, pal.dim, pal.reset);
+    // An overlay is a compact summary by default — one line per field; an allowlist shows
+    // just its rule counts. `--details` expands that to the individual allow/deny rules
+    // and the always-allowed built-in hosts, so what `sbx app <name>` can reach is visible
+    // here (the baseline `network` section shows the built-in set only when the *baseline*
+    // is an allowlist, which a profile's app-overlay allowlist is not).
+    if let Some(net) = &app.network {
+        match net {
+            AppNetworkView::Shared => {
+                let _ = writeln!(o, "      {dim}network:{r} shared {dim}(host network){r}");
+            }
+            AppNetworkView::Isolated => {
+                let _ = writeln!(
+                    o,
+                    "      {dim}network:{r} none {dim}(isolated — no network){r}"
+                );
+            }
+            AppNetworkView::Allowlist {
+                default_action,
+                ask_timeout,
+                ask_notice,
+                allow,
+                deny,
+                builtin,
+            } if details => {
+                let _ = writeln!(
+                    o,
+                    "      {dim}network:{r} {}",
+                    net_mode_word(*default_action)
+                );
+                if let Some(t) = ask_timeout {
+                    let _ = writeln!(o, "        {dim}ask timeout: {t}{r}");
+                }
+                if matches!(ask_notice, Some(false)) {
+                    let _ = writeln!(o, "        {dim}ask notice: off{r}");
+                }
+                for rule in allow {
+                    let _ = writeln!(o, "        allow {n}{rule}{r}");
+                }
+                for rule in deny {
+                    let _ = writeln!(o, "        {warn}deny{r}  {n}{rule}{r}");
+                }
+                let _ = writeln!(
+                    o,
+                    "        {dim}built-in (always allowed, so self-equip works):{r}"
+                );
+                for host in builtin {
+                    let _ = writeln!(o, "          allow {n}{host}{r}");
+                }
+                let _ = writeln!(o, "        {dim}(deny wins over allow){r}");
+            }
+            AppNetworkView::Allowlist {
+                default_action,
+                allow,
+                deny,
+                ..
+            } => {
+                let _ = writeln!(
+                    o,
+                    "      {dim}network:{r} {} {dim}({} allow, {} deny){r}",
+                    net_mode_word(*default_action),
+                    allow.len(),
+                    deny.len()
+                );
+            }
+        }
+    }
+}
+
+/// The scalar postures this overlay sets, each silent where it inherits the baseline: display,
+/// plaintext fetches, GPU, audio and D-Bus.
+fn app_row_postures(o: &mut String, app: &config::view::AppView, pal: &style::Palette) {
+    use config::view::GuiView;
+    use std::fmt::Write as _;
+    let (dim, r) = (pal.dim, pal.reset);
+    // The GUI posture the overlay sets, matched like the baseline `gui` line: `wayland`
+    // carries the same compositor-exposure caveat, so an app that opens a display explains
+    // it the same way; an explicit `none` (the app closing a display the baseline may open)
+    // stays a bare word — there is nothing to caveat.
+    match &app.gui {
+        Some(GuiView::Wayland) => {
+            let _ = writeln!(
+                o,
+                "      {dim}gui:{r} wayland {dim}(exposure depends on your compositor){r}"
+            );
+        }
+        Some(GuiView::Offscreen) => {
+            let _ = writeln!(
+                o,
+                "      {dim}gui:{r} offscreen {dim}(fonts + proxy CA, no display){r}"
+            );
+        }
+        Some(GuiView::None) => {
+            let _ = writeln!(o, "      {dim}gui:{r} none");
+        }
+        None => {}
+    }
+    // The plaintext-fetch posture the overlay sets; `None` inherits the baseline's.
+    match app.allow_insecure_http {
+        Some(true) => {
+            let _ = writeln!(o, "      {dim}allow_insecure_http:{r} enabled");
+        }
+        Some(false) => {
+            let _ = writeln!(o, "      {dim}allow_insecure_http:{r} disabled");
+        }
+        None => {}
+    }
+    // The GPU posture the overlay sets (`Some(true)`/`Some(false)`); `None` inherits.
+    match app.gpu {
+        Some(true) => {
+            let _ = writeln!(o, "      {dim}gpu:{r} enabled {dim}(mesa){r}");
+        }
+        Some(false) => {
+            let _ = writeln!(o, "      {dim}gpu:{r} disabled");
+        }
+        None => {}
+    }
+    // The audio posture the overlay sets (`Some(true)`/`Some(false)`); `None` inherits.
+    match app.audio {
+        Some(true) => {
+            let _ = writeln!(
+                o,
+                "      {dim}audio:{r} enabled {dim}(microphone + playback){r}"
+            );
+        }
+        Some(false) => {
+            let _ = writeln!(o, "      {dim}audio:{r} disabled");
+        }
+        None => {}
+    }
+    // The D-Bus posture the overlay sets; `None` inherits.
+    match app.dbus {
+        Some(true) => {
+            let _ = writeln!(
+                o,
+                "      {dim}dbus:{r} in-cage portal {dim}(file chooser + theme + notifications){r}"
+            );
+        }
+        Some(false) => {
+            let _ = writeln!(o, "      {dim}dbus:{r} disabled");
+        }
+        None => {}
+    }
+}
+
+/// The cgroup limits this overlay overrides — only the cells it tunes, never the effective set.
+fn app_row_limits(o: &mut String, app: &config::view::AppView, pal: &style::Palette) {
+    use std::fmt::Write as _;
+    let (dim, r) = (pal.dim, pal.reset);
+    // The cgroup limits this overlay overrides — only the fields it tunes, since an app
+    // does not carry the full effective set (an unset field inherits the baseline, shown in
+    // `sbx doctor`). Mirrors the baseline `limits:` line but lists the app's own overrides.
+    if let Some(limits) = &app.limits {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(v) = &limits.memory_high {
+            parts.push(format!("MemoryHigh={v}"));
+        }
+        if let Some(v) = &limits.memory_max {
+            parts.push(format!("MemoryMax={v}"));
+        }
+        if let Some(v) = &limits.tasks_max {
+            parts.push(format!("TasksMax={v}"));
+        }
+        let _ = writeln!(o, "      {dim}limits:{r} {}", parts.join(", "));
+    }
+}
+
+/// The three grants this overlay adds of its own, not the baseline-merged set: the inbound
+/// loopback forwards, the seccomp relaxation, and the host device nodes.
+fn app_row_grants(o: &mut String, app: &config::view::AppView, pal: &style::Palette) {
+    use std::fmt::Write as _;
+    let (dim, r) = (pal.dim, pal.reset);
+    // The host loopback ports this overlay adds (its own, not the baseline-merged set). A
+    // compact list under the app's roster entry; the effective set is in `config show --app`.
+    if !app.forward.is_empty() {
+        let ports = app
+            .forward
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(o, "      {dim}forward:{r} {ports} (host loopback → cage)");
+    }
+    // The seccomp relaxation this overlay adds (its own allow tokens, not the merged set).
+    if !app.seccomp.is_empty() {
+        let _ = writeln!(o, "      {dim}seccomp allow:{r} {}", app.seccomp.join(", "));
+    }
+    // The host device grant this overlay adds (its own `/dev/` paths, not the merged set).
+    if !app.devices.is_empty() {
+        let _ = writeln!(o, "      {dim}devices:{r} {}", app.devices.join(", "));
+    }
+}
+
+/// The filesystem masks this overlay adds of its own: closed outright, closed at the content
+/// level, and readable but not writable.
+fn app_row_fs(o: &mut String, app: &config::view::AppView, pal: &style::Palette) {
+    use std::fmt::Write as _;
+    let (dim, r) = (pal.dim, pal.reset);
+    if !app.fs_deny.is_empty() {
+        let _ = writeln!(o, "      {dim}fs deny:{r} {}", app.fs_deny.join(", "));
+    }
+    if !app.fs_scan.is_empty() {
+        let _ = writeln!(o, "      {dim}fs scan:{r} {}", app.fs_scan.join(", "));
+    }
+    if !app.fs_readonly.is_empty() {
+        let _ = writeln!(
+            o,
+            "      {dim}fs readonly:{r} {}",
+            app.fs_readonly.join(", ")
+        );
+    }
+}
+
+/// The ssh-agent keys this overlay grants of its own.
+fn app_row_ssh_agent(o: &mut String, app: &config::view::AppView, pal: &style::Palette) {
+    use std::fmt::Write as _;
+    let (dim, r) = (pal.dim, pal.reset);
+    // The ssh-agent keys this overlay grants (its own entries, not the merged set) — the
+    // whole point of the per-app field is that one app may sign where another may not, so a
+    // listing that folded it into the baseline would hide exactly what it is for.
+    if !app.ssh_agent.is_empty() {
+        let _ = writeln!(o, "      {dim}ssh-agent:{r} {}", app.ssh_agent.join(", "));
+    }
+}
+
+/// The credentials this overlay injects — counted, or listed by destination, shape and source
+/// under `--details`. Never a value: sbx reads those host-side and prints none of them.
+fn app_row_secrets(
+    o: &mut String,
+    app: &config::view::AppView,
+    pal: &style::Palette,
+    details: bool,
+) {
+    use std::fmt::Write as _;
+    let (n, dim, r) = (pal.name, pal.dim, pal.reset);
+    // The credentials this overlay injects (its own `[secret]` sections, gated; the merge
+    // unions them with the baseline only for the launch) — a count by default, expanded
+    // under `--details` to each by destination and source, the same metadata the baseline
+    // section shows. Never the value; sbx reads that host-side.
+    if !app.secrets.is_empty() {
+        if details {
+            let _ = writeln!(o, "      {dim}secrets (injected host-side):{r}");
+            for s in &app.secrets {
+                let _ = writeln!(
+                    o,
+                    "        {n}{}{r} -> {n}{}{r}  {dim}({}, from {}){r}",
+                    s.header, s.to, s.shape, s.sources
+                );
+            }
+        } else {
+            let _ = writeln!(
+                o,
+                "      {dim}secrets:{r} {} injected host-side",
+                app.secrets.len()
+            );
+        }
+    }
+}
+
+/// What this overlay's own resolution dropped or ignored, one note per line.
+fn app_row_notes(o: &mut String, app: &config::view::AppView, pal: &style::Palette) {
+    use std::fmt::Write as _;
+    let (warn, r) = (pal.warn, pal.reset);
+    for note in &app.notes {
+        let _ = writeln!(o, "      {warn}note: {note}{r}");
+    }
+}
+
 /// Named application profiles, each a gated overlay over the baseline: the command it runs, what
 /// its overlay adds, and its own dropped-field notes (so `sbx app <name>` holds no surprises).
 ///
 /// Security fields appear only when their source was trusted, exactly as at launch.
+///
+/// One app's entry is a block per field group, each written by a helper above and called in reading
+/// order, so this loop body is the table of contents of one row.
 fn apps_section(
     apps: &[config::view::AppView],
     pal: &style::Palette,
     details: bool,
 ) -> Option<String> {
-    use config::view::{AppNetworkView, GuiView};
     use std::fmt::Write as _;
-    let (h, n, warn, dim, r) = (pal.head, pal.name, pal.warn, pal.dim, pal.reset);
+    let (h, r) = (pal.head, pal.reset);
     if apps.is_empty() {
         return None;
     }
     let mut o = String::new();
     let _ = writeln!(o, "  {h}apps:{r}");
     for app in apps {
-        match &app.cmd {
-            Some(cmd) => {
-                let _ = writeln!(o, "    {n}{}{r}: {cmd}", app.name);
-            }
-            // No layer declared a command — the app cannot launch, so flag it.
-            None => {
-                let _ = writeln!(o, "    {n}{}{r}: {warn}(no command){r}", app.name);
-            }
-        }
-        // Beside the command, for the reason the per-app view puts it there: an install step is a
-        // command that runs inside this cage before `cmd`, so it belongs where a reader looks for
-        // what this app executes. `AppView` has carried it all along and this section never read
-        // it, so the aggregate listing showed an app's shape with the commands left out.
-        if !app.provisions.is_empty() {
-            if details {
-                let _ = writeln!(o, "      {dim}install:{r}");
-                for step in &app.provisions {
-                    let _ = writeln!(
-                        o,
-                        "        {n}{}{r}  {dim}(from bundle {}){r}",
-                        step.cmd, step.bundle
-                    );
-                }
-            } else {
-                let _ = writeln!(
-                    o,
-                    "      {dim}install:{r} {} step(s) run before cmd",
-                    app.provisions.len()
-                );
-            }
-        }
-        let _ = writeln!(o, "      {dim}home:{r} {}", app.home_scope);
-        // The environment this overlay adds over the baseline — a count by default, each
-        // `KEY=value` under `--details`, mirroring the baseline `env` section. A free field; the
-        // value shown is the one that enters the cage (a placeholder for a credential profile),
-        // never the injected secret, which sbx reads host-side and never prints.
-        if !app.env.is_empty() {
-            if details {
-                let _ = writeln!(o, "      {dim}env:{r}");
-                for e in &app.env {
-                    let _ = writeln!(o, "        {n}{}{r}={}", e.key, e.value);
-                }
-            } else {
-                let _ = writeln!(o, "      {dim}env:{r} {} set", app.env.len());
-            }
-        }
-        // The host binds this overlay adds — a security field, so what host paths
-        // `sbx app <name>` exposes (and whether read-write) is visible here, the same as the
-        // baseline `binds` section. A count by default, each canonical path under `--details`.
-        if !app.binds.is_empty() {
-            if details {
-                let _ = writeln!(o, "      {dim}binds:{r}");
-                for b in &app.binds {
-                    let _ = writeln!(
-                        o,
-                        "        {n}{}{r}{}",
-                        b.path,
-                        bind_mode_tag(b.writable, pal)
-                    );
-                }
-            } else {
-                let _ = writeln!(o, "      {dim}binds:{r} {}", app.binds.len());
-            }
-        }
-        // The URI handlers this overlay adds, its bundles' folded in. Listed by default, not
-        // counted: a handler is what a sign-in link reaches, which is precisely what
-        // distinguishes this app from every other one.
-        if !app.open.is_empty() {
-            let _ = writeln!(o, "      {dim}open:{r}");
-            for e in &app.open {
-                let _ = writeln!(
-                    o,
-                    "        {n}{}://{r} {} {dim}({}){r}",
-                    e.scheme, e.cmd, e.mode
-                );
-            }
-        }
-        // The auxiliary processes this overlay adds, its bundles' folded in. Listed for the
-        // reason the field exists: what else this app starts is part of what it is.
-        if !app.service.is_empty() {
-            let _ = writeln!(o, "      {dim}service:{r}");
-            for s in &app.service {
-                let _ = writeln!(o, "{}", service_line(s, pal, "        "));
-            }
-        }
-        // The packages this overlay declares. Compact by default — names with ` @ <rev>` for a
-        // pinned `flake:` one and ` (withheld)` for one the trust gate would withhold at launch,
-        // so an untrusted app package reads as withheld here without `--details`. `--details`
-        // expands to one full line per package (backend, locator, realisation), the same line
-        // the baseline `packages` section renders, so the two never drift.
-        if !app.packages.is_empty() {
-            if details {
-                let _ = writeln!(o, "      {dim}packages:{r}");
-                for p in &app.packages {
-                    let _ = writeln!(o, "{}", package_line(p, pal, "        "));
-                }
-            } else {
-                let pkgs = app
-                    .packages
-                    .iter()
-                    .map(|p| {
-                        // A withheld package stands as its name plus the marker — neither its
-                        // pin nor its realisation, since it is not built; the same short-circuit
-                        // the full `--details` line takes, so the two paths agree.
-                        if p.withheld_reason.is_some() {
-                            return format!("{} {warn}(withheld){r}", p.name);
-                        }
-                        match &p.pinned_rev {
-                            Some(rev) => format!("{} @ {}", p.name, short_rev(rev)),
-                            None => p.name.clone(),
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let _ = writeln!(o, "      {dim}packages:{r} {pkgs}");
-            }
-        }
-        // An overlay is a compact summary by default — one line per field; an allowlist shows
-        // just its rule counts. `--details` expands that to the individual allow/deny rules
-        // and the always-allowed built-in hosts, so what `sbx app <name>` can reach is visible
-        // here (the baseline `network` section shows the built-in set only when the *baseline*
-        // is an allowlist, which a profile's app-overlay allowlist is not).
-        if let Some(net) = &app.network {
-            match net {
-                AppNetworkView::Shared => {
-                    let _ = writeln!(o, "      {dim}network:{r} shared {dim}(host network){r}");
-                }
-                AppNetworkView::Isolated => {
-                    let _ = writeln!(
-                        o,
-                        "      {dim}network:{r} none {dim}(isolated — no network){r}"
-                    );
-                }
-                AppNetworkView::Allowlist {
-                    default_action,
-                    ask_timeout,
-                    ask_notice,
-                    allow,
-                    deny,
-                    builtin,
-                } if details => {
-                    let _ = writeln!(
-                        o,
-                        "      {dim}network:{r} {}",
-                        net_mode_word(*default_action)
-                    );
-                    if let Some(t) = ask_timeout {
-                        let _ = writeln!(o, "        {dim}ask timeout: {t}{r}");
-                    }
-                    if matches!(ask_notice, Some(false)) {
-                        let _ = writeln!(o, "        {dim}ask notice: off{r}");
-                    }
-                    for rule in allow {
-                        let _ = writeln!(o, "        allow {n}{rule}{r}");
-                    }
-                    for rule in deny {
-                        let _ = writeln!(o, "        {warn}deny{r}  {n}{rule}{r}");
-                    }
-                    let _ = writeln!(
-                        o,
-                        "        {dim}built-in (always allowed, so self-equip works):{r}"
-                    );
-                    for host in builtin {
-                        let _ = writeln!(o, "          allow {n}{host}{r}");
-                    }
-                    let _ = writeln!(o, "        {dim}(deny wins over allow){r}");
-                }
-                AppNetworkView::Allowlist {
-                    default_action,
-                    allow,
-                    deny,
-                    ..
-                } => {
-                    let _ = writeln!(
-                        o,
-                        "      {dim}network:{r} {} {dim}({} allow, {} deny){r}",
-                        net_mode_word(*default_action),
-                        allow.len(),
-                        deny.len()
-                    );
-                }
-            }
-        }
-        // The GUI posture the overlay sets, matched like the baseline `gui` line: `wayland`
-        // carries the same compositor-exposure caveat, so an app that opens a display explains
-        // it the same way; an explicit `none` (the app closing a display the baseline may open)
-        // stays a bare word — there is nothing to caveat.
-        match &app.gui {
-            Some(GuiView::Wayland) => {
-                let _ = writeln!(
-                    o,
-                    "      {dim}gui:{r} wayland {dim}(exposure depends on your compositor){r}"
-                );
-            }
-            Some(GuiView::Offscreen) => {
-                let _ = writeln!(
-                    o,
-                    "      {dim}gui:{r} offscreen {dim}(fonts + proxy CA, no display){r}"
-                );
-            }
-            Some(GuiView::None) => {
-                let _ = writeln!(o, "      {dim}gui:{r} none");
-            }
-            None => {}
-        }
-        // The plaintext-fetch posture the overlay sets; `None` inherits the baseline's.
-        match app.allow_insecure_http {
-            Some(true) => {
-                let _ = writeln!(o, "      {dim}allow_insecure_http:{r} enabled");
-            }
-            Some(false) => {
-                let _ = writeln!(o, "      {dim}allow_insecure_http:{r} disabled");
-            }
-            None => {}
-        }
-        // The GPU posture the overlay sets (`Some(true)`/`Some(false)`); `None` inherits.
-        match app.gpu {
-            Some(true) => {
-                let _ = writeln!(o, "      {dim}gpu:{r} enabled {dim}(mesa){r}");
-            }
-            Some(false) => {
-                let _ = writeln!(o, "      {dim}gpu:{r} disabled");
-            }
-            None => {}
-        }
-        // The audio posture the overlay sets (`Some(true)`/`Some(false)`); `None` inherits.
-        match app.audio {
-            Some(true) => {
-                let _ = writeln!(
-                    o,
-                    "      {dim}audio:{r} enabled {dim}(microphone + playback){r}"
-                );
-            }
-            Some(false) => {
-                let _ = writeln!(o, "      {dim}audio:{r} disabled");
-            }
-            None => {}
-        }
-        // The D-Bus posture the overlay sets; `None` inherits.
-        match app.dbus {
-            Some(true) => {
-                let _ = writeln!(
-                    o,
-                    "      {dim}dbus:{r} in-cage portal {dim}(file chooser + theme + notifications){r}"
-                );
-            }
-            Some(false) => {
-                let _ = writeln!(o, "      {dim}dbus:{r} disabled");
-            }
-            None => {}
-        }
-        // The cgroup limits this overlay overrides — only the fields it tunes, since an app
-        // does not carry the full effective set (an unset field inherits the baseline, shown in
-        // `sbx doctor`). Mirrors the baseline `limits:` line but lists the app's own overrides.
-        if let Some(limits) = &app.limits {
-            let mut parts: Vec<String> = Vec::new();
-            if let Some(v) = &limits.memory_high {
-                parts.push(format!("MemoryHigh={v}"));
-            }
-            if let Some(v) = &limits.memory_max {
-                parts.push(format!("MemoryMax={v}"));
-            }
-            if let Some(v) = &limits.tasks_max {
-                parts.push(format!("TasksMax={v}"));
-            }
-            let _ = writeln!(o, "      {dim}limits:{r} {}", parts.join(", "));
-        }
-        // The host loopback ports this overlay adds (its own, not the baseline-merged set). A
-        // compact list under the app's roster entry; the effective set is in `config show --app`.
-        if !app.forward.is_empty() {
-            let ports = app
-                .forward
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            let _ = writeln!(o, "      {dim}forward:{r} {ports} (host loopback → cage)");
-        }
-        // The seccomp relaxation this overlay adds (its own allow tokens, not the merged set).
-        if !app.seccomp.is_empty() {
-            let _ = writeln!(o, "      {dim}seccomp allow:{r} {}", app.seccomp.join(", "));
-        }
-        // The host device grant this overlay adds (its own `/dev/` paths, not the merged set).
-        if !app.devices.is_empty() {
-            let _ = writeln!(o, "      {dim}devices:{r} {}", app.devices.join(", "));
-        }
-        if !app.fs_deny.is_empty() {
-            let _ = writeln!(o, "      {dim}fs deny:{r} {}", app.fs_deny.join(", "));
-        }
-        if !app.fs_scan.is_empty() {
-            let _ = writeln!(o, "      {dim}fs scan:{r} {}", app.fs_scan.join(", "));
-        }
-        if !app.fs_readonly.is_empty() {
-            let _ = writeln!(
-                o,
-                "      {dim}fs readonly:{r} {}",
-                app.fs_readonly.join(", ")
-            );
-        }
-        // The ssh-agent keys this overlay grants (its own entries, not the merged set) — the
-        // whole point of the per-app field is that one app may sign where another may not, so a
-        // listing that folded it into the baseline would hide exactly what it is for.
-        if !app.ssh_agent.is_empty() {
-            let _ = writeln!(o, "      {dim}ssh-agent:{r} {}", app.ssh_agent.join(", "));
-        }
-        // The credentials this overlay injects (its own `[secret]` sections, gated; the merge
-        // unions them with the baseline only for the launch) — a count by default, expanded
-        // under `--details` to each by destination and source, the same metadata the baseline
-        // section shows. Never the value; sbx reads that host-side.
-        if !app.secrets.is_empty() {
-            if details {
-                let _ = writeln!(o, "      {dim}secrets (injected host-side):{r}");
-                for s in &app.secrets {
-                    let _ = writeln!(
-                        o,
-                        "        {n}{}{r} -> {n}{}{r}  {dim}({}, from {}){r}",
-                        s.header, s.to, s.shape, s.sources
-                    );
-                }
-            } else {
-                let _ = writeln!(
-                    o,
-                    "      {dim}secrets:{r} {} injected host-side",
-                    app.secrets.len()
-                );
-            }
-        }
-        for note in &app.notes {
-            let _ = writeln!(o, "      {warn}note: {note}{r}");
-        }
+        app_row_command(&mut o, app, pal, details);
+        app_row_env(&mut o, app, pal, details);
+        app_row_binds(&mut o, app, pal, details);
+        app_row_open(&mut o, app, pal);
+        app_row_service(&mut o, app, pal);
+        app_row_packages(&mut o, app, pal, details);
+        app_row_network(&mut o, app, pal, details);
+        app_row_postures(&mut o, app, pal);
+        app_row_limits(&mut o, app, pal);
+        app_row_grants(&mut o, app, pal);
+        app_row_fs(&mut o, app, pal);
+        app_row_ssh_agent(&mut o, app, pal);
+        app_row_secrets(&mut o, app, pal, details);
+        app_row_notes(&mut o, app, pal);
     }
     Some(o)
 }
