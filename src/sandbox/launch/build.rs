@@ -1001,6 +1001,179 @@ fn proc_lens<'a>(
     })
 }
 
+/// Register the two mise equip lanes, and hand back the environment the open lane needs.
+///
+/// Mise-backed tools are equipped **in-cage at launch** rather than provisioned host-side, in two
+/// distinct lanes with different owners. Lane 1 is the app's `[packages] mise:` tools: durable,
+/// trusted-only declarations, equipped globally into the cage's own mise config, with `--pin` so
+/// the installed version is what the shim resolves for the life of the launch. Lane 2 is the
+/// project's own `.mise.toml` non-`nix:` tools: the open self-equip toolchain, equipped locally
+/// with `install`, which reads that file and writes nothing — the pin belongs to the config sbx
+/// owns, never to the user's.
+///
+/// Both fetch, so both wrap the command inside the egress wrap, and both are skipped under
+/// `network = "none"` with a warning rather than a refusal: an already-equipped tool still resolves
+/// through its persisted shim.
+///
+/// The two lanes share [`WrapLayer::MiseEquip`] and the sort is stable, so they must be registered
+/// in this order and from this one place.
+fn mise_equip_lanes<'a>(
+    prep: &'a Prepared,
+    runtime: binds::Runtime,
+    wraps: &mut Vec<(WrapLayer, CommandWrap<'a>)>,
+) -> Vec<(String, String)> {
+    let mut autoequip_env: Vec<(String, String)> = Vec::new();
+    let global_mise = crate::sandbox::packages::mise_packages(&prep.cfg.packages);
+    let auto_equip = auto_equip_tokens(&prep.cfg);
+    // A global app's Lane-1 `mise use -g` must install an app `[packages] mise:` tool into the
+    // app-global home pool (installed once, shared across projects, and where `sbx app show`/`list`/
+    // `gc` read), not the ambient per-project primary. Pin the equip step there for a global app;
+    // for `sbx run`/a per-project app the ambient primary is already the app-global home, so no pin.
+    let app_global_mise_dir =
+        matches!(runtime, binds::Runtime::GlobalApp(_)).then(binds::mise_app_global_data_dir);
+    if !global_mise.is_empty() || !auto_equip.is_empty() {
+        if matches!(prep.cfg.network, crate::config::NetworkPolicy::Isolated) {
+            // `network = "none"`: a mise tool cannot be fetched, so skip the equip (it would only
+            // fail). An already-equipped tool still resolves through its persisted shim, so this
+            // is a warning, not a hard error.
+            let declared = mise_token_display(global_mise.iter().chain(auto_equip.iter()));
+            crate::diag::warn_config(&format!(
+                "mise tools [{declared}] are declared but `network = \"none\"` — they \
+                 cannot be fetched and will be absent unless already equipped"
+            ));
+        } else {
+            if !auto_equip.is_empty() {
+                if !prep.in_batch {
+                    // The display copy only. The tokens handed to `wrap_mise_equip` below stay raw
+                    // on purpose: they ride `\"$@\"` positionally and must reach mise exactly as the
+                    // project wrote them.
+                    let shown = mise_token_display(auto_equip.iter());
+                    crate::diag::error(&format!(
+                        "sbx: equipping non-nix tools in-cage via mise: {shown} (each backend's \
+                         host must be in [network].allow under an allowlist)"
+                    ));
+                }
+                wraps.push((
+                    WrapLayer::MiseEquip,
+                    Box::new(move |cmd| {
+                        wrap_mise_equip(
+                            &prep.userland.mise_bin,
+                            &prep.userland.shell_bin,
+                            // `install`, and deliberately no `--pin` here: this lane equips the
+                            // tools the PROJECT's own `.mise.toml` asks for, and that file belongs
+                            // to the user. `install` reads it and writes nothing; pinning would
+                            // rewrite a version the project chose to leave floating, in a file sbx
+                            // does not own. The pin belongs to lane 1 below, whose config file is
+                            // the cage's own and is sbx's to write.
+                            "install",
+                            &auto_equip,
+                            // Lane 2 (project `.mise.toml` tools) runs under the ambient primary —
+                            // the per-project pool for a global app, which is where these belong.
+                            None,
+                            cmd,
+                        )
+                    }),
+                ));
+                // Tell the in-cage mise to trust the project config so the installed tools
+                // resolve. This applies for the whole launch, so an agent's own `sbx mise` in a
+                // project that declares non-`nix:` tools also trusts the project config — a
+                // conscious, slightly wider reach than autoequip alone, and consistent with the
+                // open self-equip posture. A distinct key, so its position in the env layering is
+                // immaterial; a trusted config could still override it (self-harm only).
+                autoequip_env.push((
+                    "MISE_TRUSTED_CONFIG_PATHS".to_string(),
+                    prep.cwd.to_string_lossy().into_owned(),
+                ));
+            }
+            if !global_mise.is_empty() {
+                if !prep.in_batch {
+                    eprintln!("{}", equip_announcement(&global_mise));
+                }
+                wraps.push((
+                    WrapLayer::MiseEquip,
+                    Box::new(move |cmd| {
+                        wrap_mise_equip(
+                            &prep.userland.mise_bin,
+                            &prep.userland.shell_bin,
+                            // `--pin` writes the RESOLVED version into the cage's mise config
+                            // instead of the floating request. Without it the config keeps saying
+                            // `latest`, and the tool on the cage PATH is a shim — a symlink back to
+                            // mise — which re-resolves that request on every exec: the day upstream
+                            // publishes a version the pool does not hold, the shim refuses to run
+                            // and the app stops launching, with nothing about the cage having
+                            // changed. Pinning is what actually freezes a launch at the installed
+                            // version. Its other half is `--bump` on the roll (see
+                            // [`mise_upgrade_cmd`]): an exact pin is a range `mise upgrade` would
+                            // consider already satisfied, so without it the roll would go quiet.
+                            // Neither half works alone.
+                            MISE_EQUIP_VERB,
+                            &global_mise,
+                            // Pin the install to the app-global home pool for a global app (see
+                            // above); None for other runtimes, where the ambient primary is already
+                            // app-global.
+                            app_global_mise_dir.as_deref(),
+                            cmd,
+                        )
+                    }),
+                ));
+            }
+        }
+    }
+
+    autoequip_env
+}
+
+/// Register the in-cage build of this launch's inline flakes.
+///
+/// Local content the user staged is built **inside** the cage, never host-side — which is exactly
+/// what `is_valid_flake_ref` refuses for a remote ref, and a remote `flake:` package is built
+/// host-side by `packages::provision` instead. The build fetches its inputs, so like the mise lanes
+/// it wraps the command inside the egress wrap and is skipped under `network = "none"`.
+///
+/// The wrap short-circuits on an out-link already realised in the project's store, so a warm launch
+/// is a no-op and an already-built flake runs offline.
+fn inline_flake_build<'a>(
+    prep: &'a Prepared,
+    flake_pairs: &'a [(String, PathBuf, PathBuf, String)],
+    inline_flake_names: &[String],
+    wraps: &mut Vec<(WrapLayer, CommandWrap<'a>)>,
+) {
+    // Inline `[flakes.<name>]` flakes are built in-cage with `nix build --out-link` — the local
+    // content the user staged is contained by the cage, never built host-side (which
+    // `is_valid_flake_ref` refuses for a remote ref; a remote `flake:` package is built host-side by
+    // `packages::provision`). The build fetches its inputs, so (like the mise equip) it wraps the
+    // command *before* the egress wrap and is skipped under `network = "none"`. The wrap
+    // short-circuits when the out-link is already realised in the project's store, so a warm launch is
+    // a no-op and an already-built flake runs offline.
+    if !flake_pairs.is_empty() {
+        if matches!(prep.cfg.network, crate::config::NetworkPolicy::Isolated) {
+            crate::diag::warn_config(&format!(
+                "inline flakes [{}] are declared but `network = \"none\"` — they \
+                 cannot be built and will be absent unless already present",
+                inline_flake_names.join(", ")
+            ));
+        } else {
+            crate::diag::error(&format!(
+                "sbx: building inline flakes in-cage via nix build: {} (each flake's fetch \
+                 host must be in [network].allow under an allowlist)",
+                inline_flake_names.join(", ")
+            ));
+            wraps.push((
+                WrapLayer::FlakeEquip,
+                Box::new(move |cmd| {
+                    wrap_flake_equip(
+                        &prep.userland.nix_bin,
+                        &prep.userland.shell_bin,
+                        &binds::flake_roots_dir(),
+                        flake_pairs,
+                        cmd,
+                    )
+                }),
+            ));
+        }
+    }
+}
+
 /// Build the spec for `cmd`, reporting a clean error as an `ExitCode`. The
 /// configuration resolved in [`super::prepare_with`] drives this: a trust-gated `.sbx.toml` adds
 /// environment and host binds — read-only, or read-write with `mode = "rw"` (its security
@@ -1119,14 +1292,6 @@ pub(super) fn build(
         }
     };
 
-    // Mise-backed tools are equipped in-cage at launch rather than host-provisioned, in two
-    // distinct lanes. The app's `[packages] mise:` tools are durable, trusted-only declarations,
-    // equipped **globally** (`mise use -g`, written to the home's global mise config). The
-    // project's local `.mise.toml` non-`nix:` tools (an `aqua:`/`npm:`/registry backend) are the
-    // **open** self-equip toolchain, equipped **locally** (`mise install`) with the in-cage mise
-    // told to trust the project config so they resolve through the shims on PATH. Both fetch, so
-    // both wrap the command *before* the egress wrap below — under an allowlist the forwarder is
-    // up before either install — and both are skipped under `network = "none"`.
     // The wraps each block below contributes. They are nested by `WrapLayer`, not by the order the
     // blocks run in, so a block may register its wrap wherever the value it needs becomes available.
     let mut wraps: Vec<(WrapLayer, CommandWrap)> = Vec::new();
@@ -1137,138 +1302,24 @@ pub(super) fn build(
     // The exec and content lenses, and the supervisor both ride on.
     let proc_lens = proc_lens(prep, &notify_wiring, &mut wraps)?;
 
-    let mut autoequip_env: Vec<(String, String)> = Vec::new();
-    let global_mise = crate::sandbox::packages::mise_packages(&prep.cfg.packages);
-    let auto_equip = auto_equip_tokens(&prep.cfg);
-    // A global app's Lane-1 `mise use -g` must install an app `[packages] mise:` tool into the
-    // app-global home pool (installed once, shared across projects, and where `sbx app show`/`list`/
-    // `gc` read), not the ambient per-project primary. Pin the equip step there for a global app;
-    // for `sbx run`/a per-project app the ambient primary is already the app-global home, so no pin.
-    let app_global_mise_dir =
-        matches!(runtime, binds::Runtime::GlobalApp(_)).then(binds::mise_app_global_data_dir);
-    if !global_mise.is_empty() || !auto_equip.is_empty() {
-        if matches!(prep.cfg.network, crate::config::NetworkPolicy::Isolated) {
-            // `network = "none"`: a mise tool cannot be fetched, so skip the equip (it would only
-            // fail). An already-equipped tool still resolves through its persisted shim, so this
-            // is a warning, not a hard error.
-            let declared = mise_token_display(global_mise.iter().chain(auto_equip.iter()));
-            crate::diag::warn_config(&format!(
-                "mise tools [{declared}] are declared but `network = \"none\"` — they \
-                 cannot be fetched and will be absent unless already equipped"
-            ));
-        } else {
-            if !auto_equip.is_empty() {
-                if !prep.in_batch {
-                    // The display copy only. The tokens handed to `wrap_mise_equip` below stay raw
-                    // on purpose: they ride `\"$@\"` positionally and must reach mise exactly as the
-                    // project wrote them.
-                    let shown = mise_token_display(auto_equip.iter());
-                    crate::diag::error(&format!(
-                        "sbx: equipping non-nix tools in-cage via mise: {shown} (each backend's \
-                         host must be in [network].allow under an allowlist)"
-                    ));
-                }
-                wraps.push((
-                    WrapLayer::MiseEquip,
-                    Box::new(move |cmd| {
-                        wrap_mise_equip(
-                            &prep.userland.mise_bin,
-                            &prep.userland.shell_bin,
-                            // `install`, and deliberately no `--pin` here: this lane equips the
-                            // tools the PROJECT's own `.mise.toml` asks for, and that file belongs
-                            // to the user. `install` reads it and writes nothing; pinning would
-                            // rewrite a version the project chose to leave floating, in a file sbx
-                            // does not own. The pin belongs to lane 1 below, whose config file is
-                            // the cage's own and is sbx's to write.
-                            "install",
-                            &auto_equip,
-                            // Lane 2 (project `.mise.toml` tools) runs under the ambient primary —
-                            // the per-project pool for a global app, which is where these belong.
-                            None,
-                            cmd,
-                        )
-                    }),
-                ));
-                // Tell the in-cage mise to trust the project config so the installed tools
-                // resolve. This applies for the whole launch, so an agent's own `sbx mise` in a
-                // project that declares non-`nix:` tools also trusts the project config — a
-                // conscious, slightly wider reach than autoequip alone, and consistent with the
-                // open self-equip posture. A distinct key, so its position in the env layering is
-                // immaterial; a trusted config could still override it (self-harm only).
-                autoequip_env.push((
-                    "MISE_TRUSTED_CONFIG_PATHS".to_string(),
-                    prep.cwd.to_string_lossy().into_owned(),
-                ));
-            }
-            if !global_mise.is_empty() {
-                if !prep.in_batch {
-                    eprintln!("{}", equip_announcement(&global_mise));
-                }
-                wraps.push((
-                    WrapLayer::MiseEquip,
-                    Box::new(move |cmd| {
-                        wrap_mise_equip(
-                            &prep.userland.mise_bin,
-                            &prep.userland.shell_bin,
-                            // `--pin` writes the RESOLVED version into the cage's mise config
-                            // instead of the floating request. Without it the config keeps saying
-                            // `latest`, and the tool on the cage PATH is a shim — a symlink back to
-                            // mise — which re-resolves that request on every exec: the day upstream
-                            // publishes a version the pool does not hold, the shim refuses to run
-                            // and the app stops launching, with nothing about the cage having
-                            // changed. Pinning is what actually freezes a launch at the installed
-                            // version. Its other half is `--bump` on the roll (see
-                            // [`mise_upgrade_cmd`]): an exact pin is a range `mise upgrade` would
-                            // consider already satisfied, so without it the roll would go quiet.
-                            // Neither half works alone.
-                            MISE_EQUIP_VERB,
-                            &global_mise,
-                            // Pin the install to the app-global home pool for a global app (see
-                            // above); None for other runtimes, where the ambient primary is already
-                            // app-global.
-                            app_global_mise_dir.as_deref(),
-                            cmd,
-                        )
-                    }),
-                ));
-            }
-        }
-    }
+    // Mise-backed tools are equipped in-cage at launch rather than host-provisioned, in two
+    // distinct lanes. The app's `[packages] mise:` tools are durable, trusted-only declarations,
+    // equipped **globally** (`mise use -g`, written to the home's global mise config). The
+    // project's local `.mise.toml` non-`nix:` tools (an `aqua:`/`npm:`/registry backend) are the
+    // **open** self-equip toolchain, equipped **locally** (`mise install`) with the in-cage mise
+    // told to trust the project config so they resolve through the shims on PATH. Both fetch, so
+    // both wrap the command *before* the egress wrap below — under an allowlist the forwarder is
+    // up before either install — and both are skipped under `network = "none"`.
+    // The two mise equip lanes, and the one environment key the open lane needs.
+    let autoequip_env = mise_equip_lanes(prep, runtime, &mut wraps);
 
-    // Inline `[flakes.<name>]` flakes are built in-cage with `nix build --out-link` — the local
-    // content the user staged is contained by the cage, never built host-side (which
-    // `is_valid_flake_ref` refuses for a remote ref; a remote `flake:` package is built host-side by
-    // `packages::provision`). The build fetches its inputs, so (like the mise equip) it wraps the
-    // command *before* the egress wrap and is skipped under `network = "none"`. The wrap
-    // short-circuits when the out-link is already realised in the project's store, so a warm launch is
-    // a no-op and an already-built flake runs offline.
-    if !provisioned.flake_pairs.is_empty() {
-        if matches!(prep.cfg.network, crate::config::NetworkPolicy::Isolated) {
-            crate::diag::warn_config(&format!(
-                "inline flakes [{}] are declared but `network = \"none\"` — they \
-                 cannot be built and will be absent unless already present",
-                provisioned.inline_flake_names.join(", ")
-            ));
-        } else {
-            crate::diag::error(&format!(
-                "sbx: building inline flakes in-cage via nix build: {} (each flake's fetch \
-                 host must be in [network].allow under an allowlist)",
-                provisioned.inline_flake_names.join(", ")
-            ));
-            wraps.push((
-                WrapLayer::FlakeEquip,
-                Box::new(|cmd| {
-                    wrap_flake_equip(
-                        &prep.userland.nix_bin,
-                        &prep.userland.shell_bin,
-                        &binds::flake_roots_dir(),
-                        &provisioned.flake_pairs,
-                        cmd,
-                    )
-                }),
-            ));
-        }
-    }
+    // The inline flakes' in-cage build, wrapped around the command.
+    inline_flake_build(
+        prep,
+        &provisioned.flake_pairs,
+        &provisioned.inline_flake_names,
+        &mut wraps,
+    );
 
     // A network allowlist runs the Model-B egress path: stand up the host filtering
     // proxy on a per-launch socket, wire the cage to reach it (the bound socket, the
