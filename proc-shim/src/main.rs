@@ -30,6 +30,10 @@
 //! a file's content and refuse the open before any byte reaches the cage. It is opt-in: the traffic
 //! is orders of magnitude heavier than `execve`'s.
 
+// Every `unsafe` block here states the invariant it rests on: this binary is what sbx binds
+// inside a cage, so its raw syscalls are the ones an in-cage adversary faces directly.
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 use std::ffi::{CString, OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -321,10 +325,15 @@ fn send_fd(stream: &UnixStream, fd: libc::c_int) -> io::Result<()> {
     };
     // Control buffer sized and aligned for exactly one fd.
     let mut cbuf = CmsgBuf::zeroed();
+    // SAFETY: `msghdr` is pointers, lengths and a flag word, for which all-zero is a valid value
+    // (a null name and control pointer with zero lengths); every field `sendmsg` reads is set
+    // below before the call.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cbuf.as_mut_ptr();
+    // SAFETY: `CMSG_SPACE` is a pure size computation over its integer argument; it reads no
+    // memory and returns the aligned control-buffer length `CmsgBuf` was sized for.
     msg.msg_controllen =
         unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) } as _;
     // SAFETY: msg's control buffer is live, sized, and aligned for a `cmsghdr` ([`CmsgBuf`]); we
