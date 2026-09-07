@@ -91,12 +91,43 @@ pub(crate) fn storage_cmd(args: &[OsString]) -> ExitCode {
 }
 
 /// Pull the options these verbs share out of an argument list.
+#[derive(Debug)]
 struct Opts {
     image: Option<PathBuf>,
     size: Option<String>,
     label: Option<String>,
     json: bool,
     force: bool,
+}
+
+/// Parse the options of one `storage` verb, admitting only the ones that verb reads.
+///
+/// The five options are shared by the parser and were accepted by every verb, so `sbx storage use
+/// --size 50G` exited 0 having ignored the size, and `sbx storage status --force` was taken for a
+/// command. An option a verb never reads is a question about a different verb, and answering it
+/// with silence reads as agreement.
+fn parse_opts_for(args: Vec<OsString>, verb: &str, permitted: &[&str]) -> Result<Opts, String> {
+    let opts = parse_opts(args)?;
+    for (flag, present) in [
+        ("--image", opts.image.is_some()),
+        ("--size", opts.size.is_some()),
+        ("--label", opts.label.is_some()),
+        ("--json", opts.json),
+        ("--force", opts.force),
+    ] {
+        if present && !permitted.contains(&flag) {
+            return Err(format!(
+                "`{flag}` is not read by `storage {verb}` (it takes {}) — refusing rather than \
+                 ignoring it",
+                if permitted.is_empty() {
+                    "no options".to_string()
+                } else {
+                    permitted.join(", ")
+                }
+            ));
+        }
+    }
+    Ok(opts)
 }
 
 fn parse_opts(args: Vec<OsString>) -> Result<Opts, String> {
@@ -137,6 +168,14 @@ fn fail(msg: impl std::fmt::Display) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// A malformed invocation, which is exit 2 everywhere else in this CLI. These refusals went out as
+/// [`fail`], so `sbx storage init --image` (no value) answered 1, the code that means the command
+/// ran and did not work.
+fn fail_usage(msg: impl std::fmt::Display) -> ExitCode {
+    diag::error(&format!("sbx storage: {msg}"));
+    ExitCode::from(2)
+}
+
 /// Fail early, with one message naming every missing prerequisite, when this host cannot mount a
 /// btrfs volume — rather than surfacing the first obstacle deep inside the mount sequence, where
 /// the message would be about a socket or a device instead of about the missing capability.
@@ -152,9 +191,9 @@ fn ensure_mountable(image: &Path) -> Result<(), String> {
 }
 
 fn init(args: Vec<OsString>) -> ExitCode {
-    let opts = match parse_opts(args) {
+    let opts = match parse_opts_for(args, "init", &["--image", "--size", "--label"]) {
         Ok(o) => o,
-        Err(e) => return fail(e),
+        Err(e) => return fail_usage(e),
     };
     let image = match image_path(opts.image) {
         Ok(p) => p,
@@ -204,9 +243,9 @@ fn init(args: Vec<OsString>) -> ExitCode {
 }
 
 fn up(args: Vec<OsString>) -> ExitCode {
-    let opts = match parse_opts(args) {
+    let opts = match parse_opts_for(args, "up", &["--image"]) {
         Ok(o) => o,
-        Err(e) => return fail(e),
+        Err(e) => return fail_usage(e),
     };
     let image = match image_path(opts.image) {
         Ok(p) => p,
@@ -238,9 +277,9 @@ fn up(args: Vec<OsString>) -> ExitCode {
 }
 
 fn down(args: Vec<OsString>) -> ExitCode {
-    let opts = match parse_opts(args) {
+    let opts = match parse_opts_for(args, "down", &["--image"]) {
         Ok(o) => o,
-        Err(e) => return fail(e),
+        Err(e) => return fail_usage(e),
     };
     let image = match image_path(opts.image) {
         Ok(p) => p,
@@ -287,9 +326,9 @@ fn down(args: Vec<OsString>) -> ExitCode {
 /// `sbx storage use`: record that sbx's data lives in the volume, so every later command
 /// mounts and follows it with nothing to remember.
 fn use_volume(args: Vec<OsString>) -> ExitCode {
-    let opts = match parse_opts(args) {
+    let opts = match parse_opts_for(args, "use", &["--image", "--force"]) {
         Ok(o) => o,
-        Err(e) => return fail(e),
+        Err(e) => return fail_usage(e),
     };
     let image = match image_path(opts.image) {
         Ok(p) => p,
@@ -347,9 +386,9 @@ fn use_volume(args: Vec<OsString>) -> ExitCode {
 /// single atomic write; and only then is the original set aside, under a name that says what
 /// it is. An interruption before the switch leaves the installation exactly as it was.
 fn migrate(args: Vec<OsString>) -> ExitCode {
-    let opts = match parse_opts(args) {
+    let opts = match parse_opts_for(args, "migrate", &["--image", "--force"]) {
         Ok(o) => o,
-        Err(e) => return fail(e),
+        Err(e) => return fail_usage(e),
     };
     let image = match image_path(opts.image) {
         Ok(p) => p,
@@ -622,8 +661,8 @@ fn set_aside(dir: &Path, skip: &[&str]) -> std::io::Result<Option<PathBuf>> {
 fn unuse_volume(args: Vec<OsString>) -> ExitCode {
     // Parsed for its validation alone: `unuse` clears the pointer wherever it is, so none of
     // the shared options bear on it — but a mistyped one must still be an error, not ignored.
-    if let Err(e) = parse_opts(args) {
-        return fail(e);
+    if let Err(e) = parse_opts_for(args, "unuse", &[]) {
+        return fail_usage(e);
     }
     let dir = match default_dir() {
         Ok(d) => d,
@@ -726,9 +765,9 @@ struct StatusView {
 }
 
 fn status(args: Vec<OsString>) -> ExitCode {
-    let opts = match parse_opts(args) {
+    let opts = match parse_opts_for(args, "status", &["--image", "--json"]) {
         Ok(o) => o,
-        Err(e) => return fail(e),
+        Err(e) => return fail_usage(e),
     };
     let image = match image_path(opts.image) {
         Ok(p) => p,
@@ -1235,6 +1274,43 @@ mod tests {
         // An option that swallows the next argument must not silently take nothing.
         assert!(parse_opts(vec!["--image".into()]).is_err());
         assert!(parse_opts(vec!["--size".into()]).is_err());
+    }
+
+    /// The five options are shared by one parser, so every verb accepted every one of them: `sbx
+    /// storage use --size 50G` exited 0 having ignored the size, and `sbx storage status --force`
+    /// was taken for a command. An option a verb never reads is a question about a different verb,
+    /// and silence reads as agreement.
+    #[test]
+    fn a_verb_refuses_an_option_it_does_not_read() {
+        let v = |a: &[&str]| -> Vec<OsString> { a.iter().map(OsString::from).collect() };
+
+        let err = parse_opts_for(v(&["--size", "50G"]), "use", &["--image", "--force"])
+            .expect_err("`use` does not read a size");
+        assert!(
+            err.contains("--size") && err.contains("storage use"),
+            "{err}"
+        );
+        assert!(
+            parse_opts_for(v(&["--force"]), "status", &["--image", "--json"]).is_err(),
+            "`status` does not act on anything, so it takes no `--force`"
+        );
+        assert!(
+            parse_opts_for(v(&["--image", "/vol/a"]), "unuse", &[]).is_err(),
+            "`unuse` reads no option at all"
+        );
+
+        // Witness: each verb still takes its own, and the values still arrive.
+        let o = parse_opts_for(
+            v(&["--image", "/vol/a", "--size", "50G"]),
+            "init",
+            &["--image", "--size", "--label"],
+        )
+        .expect("`init` reads all three");
+        assert_eq!(
+            (o.image.as_deref(), o.size.as_deref()),
+            (Some(Path::new("/vol/a")), Some("50G"))
+        );
+        assert!(parse_opts_for(v(&["--json"]), "status", &["--image", "--json"]).is_ok());
     }
 
     #[test]

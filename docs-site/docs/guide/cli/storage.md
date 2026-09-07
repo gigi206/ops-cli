@@ -16,8 +16,10 @@ sbx storage unuse
 
 Gives sbx a filesystem of its own for its data directory: a **sparse image file carrying a
 compressed btrfs filesystem**, which grows as it is written and costs the host a **single
-inode** no matter how many files it holds. Each verb lists only the flags it uses; a flag
-that belongs to another verb is accepted by the parser and ignored.
+inode** no matter how many files it holds. Each verb takes only the flags listed
+above for it: a flag belonging to another verb is refused with a usage error rather than
+accepted and ignored, so `sbx storage use --size 50G` says the size is not read there
+instead of exiting 0 having thrown it away.
 
 Optional. Without it sbx behaves exactly as it always has: see
 [Directory layout](../concepts/directory-layout).
