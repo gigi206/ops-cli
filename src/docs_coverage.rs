@@ -571,8 +571,15 @@ fn every_named_table_example_uses_real_keys() {
                         let Some(row) = row.as_table() else { continue };
                         for key in row.keys() {
                             // A sub-table is a nested family of its own (`[task.x.secret]`,
-                            // `[app.x.network]`), named by the parent struct's own field.
-                            if !fields.contains(key) && !row[key].is_table() {
+                            // `[app.x.network]`) — and it is named by the parent struct's own
+                            // field, so it is already in `fields` and needs no exception. The
+                            // exception that used to stand here excused *every* key whose value
+                            // was a table, which is the shape a mistyped section takes:
+                            // `[task.db-query.bogus]` read as a nested family nobody had to
+                            // declare. Measured both ways on an injected one, it passed with the
+                            // exception and is caught without it, while the shipped pages stay
+                            // green either way.
+                            if !fields.contains(key) {
                                 let at = path.display().to_string();
                                 offenders.push(format!("{at}: [{family}.{entry_name}] `{key}`"));
                             }
