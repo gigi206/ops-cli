@@ -63,11 +63,6 @@ fn shell_quoted(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// Launch the minimal hardened probe via `bwrap` and report what the kernel saw.
-///
-/// Errors only when the probe could not be run at all (the spec is constant and
-/// valid, so a failure is bubblewrap not spawning); a launch that runs but is not
-/// hardened is a successful call returning a non-hardened report.
 /// How long the probe launch may take before `doctor` reports it as stuck rather than waiting on it.
 ///
 /// The probe starts a minimal cage and reads `/proc/self/status`. It provisions nothing, touches no
@@ -76,6 +71,11 @@ fn shell_quoted(value: &str) -> String {
 /// diagnose a broken launch path was the one that hung on it, with no output to say why.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Launch the minimal hardened probe via `bwrap` and report what the kernel saw.
+///
+/// Errors only when the probe could not be run at all (the spec is constant and
+/// valid, so a failure is bubblewrap not spawning); a launch that runs but is not
+/// hardened is a successful call returning a non-hardened report.
 pub(crate) fn run(bwrap: &Path) -> io::Result<SmokeReport> {
     let work = ScratchDir::new()?;
 
