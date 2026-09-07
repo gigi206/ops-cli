@@ -207,6 +207,47 @@ fn an_opaque_marker_empties_the_directory_it_sits_in() {
 }
 
 #[test]
+fn an_opaque_marker_never_empties_through_a_symlink_an_earlier_layer_planted() {
+    // The escape the parent-chain check does not catch: the link is the marker's *own* directory,
+    // whose final component `safe_path` exempts because a member may replace a link. An opaque
+    // marker does not replace it, it reads the entries below, so following the link would empty
+    // whatever it names outside the root.
+    for target in ["an absolute target", "a relative target"] {
+        let tmp = crate::testutil::TmpDir::new();
+        let root = tmp.join("root");
+        let outside = tmp.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep"), "keep").unwrap();
+        let link = if target.starts_with("an absolute") {
+            outside.to_str().unwrap().to_string()
+        } else {
+            "../outside".to_string()
+        };
+
+        apply_tar(
+            tmp.path(),
+            &root,
+            &tar_of(&[("opt", Member::Symlink(&link))]),
+        )
+        .expect("a symlink is data, so the first layer applies");
+
+        let blob = tmp.join("opaque");
+        fs::write(&blob, tar_of(&[("opt/.wh..wh..opq", Member::File(""))])).unwrap();
+        let err = apply(&blob, "application/vnd.oci.image.layer.v1.tar", &root)
+            .expect_err("emptying through the planted link is refused");
+        assert!(err.to_string().contains("is a symlink"), "{err}");
+        assert!(
+            outside.join("keep").exists(),
+            "nothing outside the root was emptied, with {target}"
+        );
+        assert!(
+            root.join("opt").symlink_metadata().unwrap().is_symlink(),
+            "and the link itself is left as the data it is, with {target}"
+        );
+    }
+}
+
+#[test]
 fn a_layer_media_type_with_no_decoder_is_refused_by_name() {
     let tmp = crate::testutil::TmpDir::new();
     let blob = tmp.join("zstd");

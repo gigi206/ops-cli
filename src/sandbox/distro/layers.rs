@@ -196,7 +196,23 @@ fn remove(path: &Path) -> io::Result<()> {
 }
 
 /// Empty a directory without removing it: what an opaque marker means.
+///
+/// A symlink is refused rather than followed. This is the one place that reads *through* the path
+/// `safe_path` hands back, whose final component is deliberately left unresolved so that a layer
+/// may replace a link: that holds for `write_member`, where every branch unlinks what is there
+/// before creating anything, and it does not hold for a read of the entries below. A link has no
+/// entries of its own, so an honest image never asks for this, and following one would empty the
+/// directory it names instead.
 fn clear_directory(dir: &Path) -> io::Result<()> {
+    if dir
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return Err(io::Error::other(format!(
+            "an opaque marker names `{}`, which is a symlink: emptying it would reach through",
+            dir.display()
+        )));
+    }
     let Ok(entries) = fs::read_dir(dir) else {
         return Ok(());
     };
