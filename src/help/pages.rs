@@ -1809,7 +1809,7 @@ pub(super) const PAGES: &[Page] = &[
                 "logical size at init, e.g. 200G (default 200G)",
             ),
             (
-                "--label <name>",
+                "--label <fs-label>",
                 "filesystem label, which names the mount point",
             ),
             ("--json", "emit `status` as a JSON document"),
@@ -1998,7 +1998,7 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["app", "import"],
-        synopsis: "sbx app import <file> [--as <name>] [--force] [--with-deps]",
+        synopsis: "sbx app import <file> [--as <new-name>] [--force] [--with-deps]",
         summary: "place a portable app profile (trusted by location)",
         options: &[
             (
@@ -2006,7 +2006,7 @@ pub(super) const PAGES: &[Page] = &[
                 "the portable profile (a top-level TOML app definition) to import",
             ),
             (
-                "--as <name>",
+                "--as <new-name>",
                 "name the imported app (default: the source file's stem)",
             ),
             (

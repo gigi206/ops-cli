@@ -1060,6 +1060,11 @@ fn flag_metavar_kind(name: &str) -> Option<ValueKind> {
         "path" | "locator" | "location" | "image" | "file" | "key-file" | "dir" | "dir:"
         | "src" => Some(ValueKind::Files),
         "session" | "id" | "pid" => Some(ValueKind::Sessions),
+        // `name` is the app vocabulary because some twenty pages write `-a, --app <name>`. A page
+        // whose value is a name that does not exist yet, or is not an app's at all, writes a
+        // metavariable of its own — `<new-name>`, `<fs-label>` — since this table is keyed by the
+        // word alone: offering installed apps for `app import --as` named exactly the values the
+        // parser refuses.
         "app" | "profile" | "name" | "sketch" => Some(ValueKind::Apps),
         "store" => Some(ValueKind::Stores),
         "plugin" => Some(ValueKind::Plugins),
@@ -1081,6 +1086,11 @@ fn flag_literals(path: &[&str], flag: &str) -> Option<Vec<String>> {
             &["none", "shared", "ask", "allow", "deny", "allow=", "deny="]
         }
         (["net", "logs"], "--verdict") => &["allow", "deny", "blocked", "error"],
+        // The parser takes four literals here, and the option row spells the value `<src>`, which
+        // the metavariable vocabulary reads as a path: completion offered filenames for a flag
+        // that accepts none of them. A cell list is what a symbolic posture is completed from, and
+        // this is one.
+        (["net", "rules"], "--source") => &["config", "builtin", "session"],
         // `logs --feed` takes a comma-joined subset of a closed set. The names come from the feed
         // table itself rather than a second copy of it, so a feed added there is offered here.
         // What is completed is one name: a shell splits on whitespace, so the value after a comma
@@ -2087,6 +2097,12 @@ mod tests {
         // A seccomp relaxation token (`ptrace`, `clone:newuser`), whose vocabulary belongs
         // to the filter builder rather than to the CLI grammar.
         "token",
+        // A name that does not exist yet: the one an import is being given. Offering the installed
+        // apps would name exactly the values the parser refuses, which is what the plain `<name>`
+        // spelling used to do here.
+        "new-name",
+        // A filesystem label, which names a mount point rather than anything sbx keeps a list of.
+        "fs-label",
     ];
 
     #[test]
