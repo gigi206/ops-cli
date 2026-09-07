@@ -3122,6 +3122,14 @@ pub(super) fn warn_unknown_keys(warnings: &mut Vec<String>, source: &str, raw: &
     if let Some(fs) = &raw.fs {
         report(" under `[fs]`", &fs.rest);
     }
+    if let Some(mise) = &raw.mise {
+        report(" under `[mise]`", &mise.rest);
+    }
+    // A `[plugin.<name>]` table names the variables one plugin reads, so an unknown key there is
+    // named with the plugin it was written under: two plugins can misspell different things.
+    for (name, plugin) in &raw.plugin {
+        report(&format!(" under `[plugin.{name}]`"), &plugin.rest);
+    }
     // `[network]` is reported where it is validated, not here: its table form is one variant of an
     // untagged enum, so the bare-string posture must stay a parse success, and the unknown keys are
     // named alongside the mode and the rules that did take effect.

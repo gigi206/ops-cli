@@ -242,6 +242,55 @@ fn an_amending_overlay_keeps_the_posture_of_the_layer_below_it() {
     }
 }
 
+/// A capture ceiling written alone in an amending overlay bounds the capture below it.
+///
+/// The overlay inherits the layer's level, so a `capture_max_kb` on its own is a ceiling on the
+/// bodies that layer is keeping. It was read against "no level declared here", so it was announced
+/// as only meaningful with `capture = "bodies"` and dropped — while the bodies it was written to
+/// bound went on being captured whole. The witness is the same overlay under a layer that captures
+/// nothing, where the ceiling really is inert and still says so.
+#[test]
+fn a_capture_ceiling_alone_in_an_overlay_bounds_the_capture_it_amends() {
+    use crate::allowlist::{DefaultAction, EgressPolicy};
+    use crate::sandbox::control::CaptureLevel;
+    for (below, bounded, warns) in [
+        (CaptureLevel::Bodies, true, false),
+        (CaptureLevel::Off, false, true),
+    ] {
+        let parent = NetworkPolicy::Allowlist(Box::new(
+            EgressPolicy::new(vec![], vec![])
+                .with_default(DefaultAction::Deny)
+                .with_capture(below, None),
+        ));
+        let field = NetworkField::Table(NetworkTable {
+            capture_max_kb: Some(64),
+            ..net_table_defaults()
+        });
+        let mut w = Vec::new();
+        let policy = super::validate_network_amending(
+            &mut w,
+            "app `demo`",
+            field,
+            &NetGroups::new(),
+            &parent,
+        )
+        .expect("the overlay validates");
+        let NetworkPolicy::Allowlist(p) = &policy else {
+            panic!("an amending overlay stays a filtering policy");
+        };
+        assert_eq!(
+            p.capture_body_kb() == 64,
+            bounded,
+            "{below:?}: the ceiling must reach the capture it amends"
+        );
+        assert_eq!(
+            w.iter().any(|m| m.contains("capture_max_kb")),
+            warns,
+            "{below:?}: {w:?}"
+        );
+    }
+}
+
 /// A `shared_credential` group reaches the policy the proxy reads, canonicalized, so the credential
 /// store and a request's host are compared in one spelling.
 #[test]
@@ -11376,6 +11425,53 @@ fn an_unknown_key_is_named_rather_than_passed_over_in_silence() {
     );
     // The layer still loads: the sibling that *was* understood is in effect.
     assert_eq!(r.limits.memory_max.as_deref(), Some("8G"));
+}
+
+/// Two tables that kept their unknown keys and reported them to nobody.
+///
+/// `[mise]` and `[plugin.<name>]` collect what sbx does not know, the way every other table does,
+/// and the sweep that names them walked past both. A misspelling there is the same thing it is
+/// anywhere else: a field the writer believes is in effect. The `[plugin.<name>]` warning names
+/// the plugin, since two of them can misspell different things.
+#[test]
+fn an_unknown_key_under_mise_or_a_plugin_table_is_named() {
+    let raw = RawConfig {
+        mise: Some(schema::RawMise {
+            rest: [("engne".to_string(), schema::RawIgnored)]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        }),
+        plugin: [(
+            "vault".to_string(),
+            schema::RawPluginConfig {
+                rest: [("evn".to_string(), schema::RawIgnored)]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..RawConfig::default()
+    };
+    let r = resolve_no_plugins(raw, None);
+
+    let mise = r
+        .warnings
+        .iter()
+        .find(|w| w.contains("`engne`"))
+        .unwrap_or_else(|| panic!("{:?}", r.warnings));
+    assert!(mise.contains("[mise]"), "placed in its table: {mise}");
+    let plugin = r
+        .warnings
+        .iter()
+        .find(|w| w.contains("`evn`"))
+        .unwrap_or_else(|| panic!("{:?}", r.warnings));
+    assert!(
+        plugin.contains("[plugin.vault]"),
+        "and named with its plugin: {plugin}"
+    );
 }
 
 #[test]

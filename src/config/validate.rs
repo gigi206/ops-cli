@@ -951,7 +951,10 @@ pub(super) fn validate_network_table(
     // `sbx net logs --with-headers/--with-body`. Never a verdict. An unknown level is dropped with a
     // warning and the capture stays off — fail-closed, since the value names how much plaintext the
     // launch retains.
-    let mut capture = None;
+    // An amending table starts from the layer below, so the level it inherits is that layer's: a
+    // ceiling written alone in an overlay bounds the capture the profile turned on, and reading it
+    // against "no level" declared it inert while the bodies it bounds were being kept.
+    let mut capture = amends_below.then(|| policy.capture_level());
     if let Some(raw) = &table.capture {
         match crate::sandbox::control::CaptureLevel::parse(raw) {
             Some(level) => {
@@ -963,6 +966,12 @@ pub(super) fn validate_network_table(
                  \"headers\", or \"bodies\") — the traffic capture stays off"
             )),
         }
+    } else if let Some(level) = capture.filter(|l| l.captures_bodies())
+        && table.capture_max_kb.is_some()
+    {
+        // The ceiling alone, over a layer that captures bodies: applied to that level rather than
+        // dropped, which is what "amends" means for every other setting in this table.
+        policy = policy.with_capture(level, table.capture_max_kb);
     }
     // `capture_max_kb` bounds a captured *body*, so it is inert under `off` and `headers` exactly as
     // it is with no `capture` at all. The check keys off the effective level rather than the
