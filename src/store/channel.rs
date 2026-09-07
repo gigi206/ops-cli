@@ -553,11 +553,16 @@ pub(crate) fn write_lock(lock_path: &Path, source: &str, rev: &str) -> io::Resul
 /// Resolve a channel reference to its current locked revision via
 /// `nix flake metadata`, so provisioning can pin that exact revision.
 fn resolve_channel_rev(nix: &Path, channel: &str) -> io::Result<String> {
-    let out = Command::new(nix)
-        .env("NO_COLOR", "1")
-        .args(["--extra-experimental-features", "nix-command flakes"])
-        .args(["flake", "metadata", channel])
-        .output()?;
+    // Bounded for the reason the other `flake metadata` call is: it reaches the network, and
+    // `output()` waits for as long as the far end keeps the connection open without sending.
+    let out = crate::sandbox::resolver::output_within(
+        Command::new(nix)
+            .env("NO_COLOR", "1")
+            .args(["--extra-experimental-features", "nix-command flakes"])
+            .args(["flake", "metadata", channel]),
+        std::time::Duration::from_secs(60),
+        &format!("`nix flake metadata {channel}`"),
+    )?;
     if !out.status.success() {
         return Err(io::Error::other(format!(
             "nix flake metadata {channel} failed: {}",

@@ -457,7 +457,7 @@ fn drain<R: io::Read + Send + 'static>(
 /// The kill goes through a **pidfd**. It pins one process, so it cannot land on whatever inherited
 /// a pid — and the resolver cage, whose `--die-with-parent` init is the process being signalled,
 /// comes down whole with it, the same teardown a session stop relies on.
-pub(super) fn output_within(
+pub(crate) fn output_within(
     cmd: &mut Command,
     deadline: std::time::Duration,
     what: &str,

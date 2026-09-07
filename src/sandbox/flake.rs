@@ -127,16 +127,27 @@ fn write_pins(
     super::atomicfile::write_atomic(&path, body.as_bytes())
 }
 
+/// How long a `nix flake metadata` may take. It is a handful of HTTP requests against a forge, so
+/// a minute is far beyond a slow one; without a bound, a far end that accepts and then says nothing
+/// holds the launch for as long as it cares to.
+const FLAKE_METADATA_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Resolve a declared `flake:` reference to its current immutable pin via `nix flake metadata`.
 /// The flake (the part before `#`) is locked to a revision and an immutable URL; the output
 /// attribute is reattached, so the result is the exact reference a launch builds. Uses sbx's
 /// nix with the flakes feature, like the nixhub fetcher.
 fn resolve(nix: &Path, layout: &Layout, reference: &str) -> io::Result<FlakePin> {
     let (base, attr) = split_attr(reference);
-    let out = store::nix_command(nix, layout)
-        .args(["--extra-experimental-features", "nix-command flakes"])
-        .args(["flake", "metadata", base, "--json"])
-        .output()?;
+    // Bounded: this reaches the network, and `output()` waits for as long as the far end keeps the
+    // connection open without sending. A metadata read is a handful of HTTP requests, so a minute
+    // is far beyond a slow one and short of a launch that never returns.
+    let out = crate::sandbox::resolver::output_within(
+        store::nix_command(nix, layout)
+            .args(["--extra-experimental-features", "nix-command flakes"])
+            .args(["flake", "metadata", base, "--json"]),
+        FLAKE_METADATA_DEADLINE,
+        &format!("`nix flake metadata {base}`"),
+    )?;
     if !out.status.success() {
         return Err(io::Error::other(format!(
             "`nix flake metadata {base}` failed: {}",
