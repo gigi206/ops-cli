@@ -278,6 +278,24 @@ struct WslToastSink {
     /// inside it lost its refusal entirely. Measured — a cage that refused a request and exited
     /// announced nothing at all.
     diagnosed: bool,
+    /// The toasts already handed to Windows, kept so they can be reaped.
+    ///
+    /// A toast is spawned and never waited on, deliberately: an announcement must not cost a
+    /// launch an interop round-trip of its own time. A child nobody waits on stays a zombie in the
+    /// supervisor's table until the supervisor itself exits, and the supervisor outlives the
+    /// session — one entry per announcement delivered, on a process whose whole job is to keep
+    /// running. Reaped on the way into the next delivery, which is the next moment this sink is
+    /// alive and not in a hurry.
+    pending: Vec<std::process::Child>,
+}
+
+/// Drop the toasts that have finished, keeping those still running.
+///
+/// `try_wait` is what reaps: it collects the status of a child that has exited, and answers `None`
+/// for one that has not. A child dropped without that is never collected at all, so the ones that
+/// answered are the ones removed here.
+fn reap_finished(pending: &mut Vec<std::process::Child>) {
+    pending.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
 }
 
 impl Sink for WslToastSink {
@@ -292,13 +310,16 @@ impl Sink for WslToastSink {
         // interop round-trip of its own time on one. A failure to spawn is not a transport that is
         // gone either — the stderr half above is the delivery that always lands — so this sink
         // never asks to be replaced.
-        if let Some(powershell) = crate::pathfind::find_on_path("powershell.exe") {
-            let _ = std::process::Command::new(powershell)
+        reap_finished(&mut self.pending);
+        if let Some(powershell) = crate::pathfind::find_on_path("powershell.exe")
+            && let Ok(child) = std::process::Command::new(powershell)
                 .args(["-NoProfile", "-Command", &toast_script(summary, body)])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .spawn();
+                .spawn()
+        {
+            self.pending.push(child);
         }
         if !self.diagnosed {
             self.diagnosed = true;
@@ -660,6 +681,7 @@ impl Notifier {
                     None if crate::sandbox::theme_relay::host_is_wsl() => Box::new(WslToastSink {
                         context: context.clone(),
                         diagnosed: false,
+                        pending: Vec::new(),
                     }),
                     None => {
                         crate::diag::note(
@@ -1749,5 +1771,55 @@ mod tests {
             &crate::notify::Origin::default(),
         );
         assert!(started.handle.is_none());
+    }
+
+    #[test]
+    fn a_delivered_toast_is_collected_rather_than_left_a_zombie() {
+        // The toast is spawned and never waited on, so this asserts on what the delivery path
+        // calls on its way in. The exited child is measured in the process table before and after:
+        // a `Z` state is precisely the leak, one entry per announcement, in a supervisor that
+        // outlives the session.
+        fn state_of(pid: u32) -> Option<char> {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            // The command name sits in parentheses and may hold spaces; the state is the field
+            // after the closing one.
+            stat.rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .next()?
+                .chars()
+                .next()
+        }
+        let sh = crate::pathfind::find_on_path("sh").expect("a shell on PATH");
+        let spawn = |script: &str| {
+            std::process::Command::new(&sh)
+                .arg("-c")
+                .arg(script)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("the shell spawns")
+        };
+
+        let mut pending = vec![spawn("exit 0"), spawn("sleep 30")];
+        let done = pending[0].id();
+        let alive = pending[1].id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while state_of(done) != Some('Z') && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            state_of(done),
+            Some('Z'),
+            "the witness: a child nobody waits on is a zombie"
+        );
+
+        reap_finished(&mut pending);
+        assert_ne!(state_of(done), Some('Z'), "and the reap collects it");
+        assert_eq!(pending.len(), 1, "the one still running is kept");
+        assert_eq!(pending[0].id(), alive);
+        let _ = pending[0].kill();
+        let _ = pending[0].wait();
     }
 }
