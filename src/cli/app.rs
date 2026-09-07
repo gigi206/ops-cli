@@ -121,7 +121,11 @@ fn finish_net_learn(name: &str, synth: &sandbox::Synthesis, nl: &NetLearn) -> Ex
             synth.rules.len()
         );
         for rule in &synth.rules {
-            println!("  allow {rule}");
+            // The preview is the only per-rule review `--net-learn` offers, and a learned rule's
+            // path is built from a request the cage chose. The synthesizer already refuses a rule
+            // its classifier rejects, so nothing reaches here carrying a control byte; sanitising
+            // anyway is what keeps that true of this line rather than of the gate behind it.
+            println!("  allow {}", crate::sandbox::sanitize(rule));
         }
         return ExitCode::SUCCESS;
     }

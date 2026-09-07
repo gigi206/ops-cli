@@ -114,9 +114,11 @@ channel, for three honest reasons:
   nothing needed refusing.
 
 So the cage's real confidentiality/integrity boundaries stay what they always were: confinement by
-absence (a secret that isn't mounted can't be read), the read-only store, and the
-[network allowlist](network). `[proc]` adds **visibility and a hard veto on what the agent execs**
-on top of them.
+absence (a secret that isn't mounted can't be read) and the [network allowlist](network). The store
+at `/nix` is not one of them: a launch binds a per-project copy of it read-write, under the uid that
+owns its files, so the programs a rule may name sit in a tree the cage may also rewrite. What that
+per-project copy protects is the *shared* store behind it, which no cage ever writes into. `[proc]`
+adds **visibility and a hard veto on what the agent execs** on top of the two that are boundaries.
 
 The `enforce`/`ask` feed (`sbx proc logs`) shows the resolved **exec path** the agent is running (the
 thing policy matches on), not the full argv: a `curl https://…` appears as `…/bin/curl`.

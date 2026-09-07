@@ -122,7 +122,7 @@ pub(crate) fn synthesize(
     let mut usable: Vec<&LogEvent> = Vec::new();
     // Refusals another plane's proxy pushed into this session's ring, collapsed into one note: they
     // are counted rather than listed, because a task loop can produce thousands of them and the
-    // operator's question is "did any of my rules come from a task?", not "which".
+    // operator's question is "did any of my rules come from somewhere else?", not "which".
     let mut foreign = 0usize;
     for e in events {
         if !LEARNABLE.contains(&e.reason.as_str()) {
@@ -154,9 +154,10 @@ pub(crate) fn synthesize(
     }
     if foreign > 0 {
         notes.push(format!(
-            "skipped {foreign} egress refusal(s) a declared task's own proxy logged — a \
-             task's `network` list is declared with the task, so opening those here would \
-             widen this profile for something the task, not the app, asked for"
+            "skipped {foreign} egress refusal(s) another plane logged into this session's ring — \
+             a declared task's proxy, a distro build's, or one whose origin was not recorded. \
+             What such a refusal asked for is declared with the task or the build, so opening it \
+             here would widen this profile for something the app never asked for"
         ));
     }
 
@@ -176,15 +177,20 @@ pub(crate) fn synthesize(
         ));
     }
 
-    // Final gate: never hand the write path a rule its own classifier would reject. A drop here is
-    // rare (the host already passed a sanity gate) but is surfaced, not swallowed.
+    // Final gate: never hand the write path a rule its own classifier would reject. The host
+    // already passed a sanity gate, but the path did not: it comes from `canonical_segments`, which
+    // percent-decodes, so a request the cage chose reaches the rule text as the bytes it decodes to
+    // rather than as the characters that were sent. A drop is surfaced, not swallowed -- and the
+    // note goes through the crate's sanitiser, because a note that quoted such a rule verbatim
+    // would put on the operator's terminal exactly what dropping the rule kept off it.
     let mut out: Vec<String> = Vec::new();
     for r in rules {
         if classify(&r).is_ok() {
             out.push(r);
         } else {
             notes.push(format!(
-                "skipped a synthesized rule the classifier rejected: `{r}`"
+                "skipped a synthesized rule the classifier rejected: `{}`",
+                crate::sandbox::sanitize(&r)
             ));
         }
     }
@@ -1098,7 +1104,7 @@ mod tests {
             out.rules
         );
         assert!(
-            out.notes.iter().any(|n| n.contains("declared task")),
+            out.notes.iter().any(|n| n.contains("another plane")),
             "and the skip must be surfaced, not silent: {:?}",
             out.notes
         );
@@ -1121,6 +1127,121 @@ mod tests {
         );
 
         // The agent's own refusal for the same destination is learned exactly as before.
+        assert_eq!(
+            synthesize(
+                &[ev(
+                    "evil.test",
+                    443,
+                    Some("GET"),
+                    Some("/x"),
+                    "denied-default"
+                )],
+                &empty_policy(),
+                Granularity::Domain,
+            )
+            .rules,
+            vec!["{*} https://evil.test".to_string()]
+        );
+    }
+
+    /// A rule this synthesizer proposes is one the write path would take, whatever the cage wrote
+    /// in the request that produced it.
+    ///
+    /// The path a learned rule carries comes from [`canonical_segments`], which percent-decodes:
+    /// a request for `/a%1B%5B31mRED` reduces to a segment holding a raw escape sequence, and the
+    /// three printable characters the cage sent are not what ends up in the rule. That rule is then
+    /// echoed by the `--dry-run` preview and by `sbx net rules`, so a cage that chooses its own
+    /// request paths chooses text on the operator's terminal.
+    ///
+    /// Both granularities that read a path are covered, and the witness is the same refusal with a
+    /// plain path: it still learns, so this cannot be satisfied by a synthesizer that proposes
+    /// nothing.
+    #[test]
+    fn a_rule_the_write_path_would_refuse_is_never_proposed() {
+        for gran in [Granularity::Path, Granularity::Exact] {
+            let painted = ev(
+                "esc.test",
+                443,
+                Some("GET"),
+                Some("/a%1B%5B31mRED/b"),
+                "denied-default",
+            );
+            let out = synthesize(&[painted], &empty_policy(), gran);
+            assert!(
+                out.rules.iter().all(|r| classify(r).is_ok()),
+                "{gran:?}: a proposed rule must be one the write path takes: {:?}",
+                out.rules
+            );
+            assert!(
+                out.rules
+                    .iter()
+                    .all(|r| !r.chars().any(char::is_control)),
+                "{gran:?}: and it must carry no control byte: {:?}",
+                out.rules
+            );
+            assert!(
+                !out.notes.is_empty(),
+                "{gran:?}: a learnable refusal dropped without a note is a silent drop"
+            );
+            assert!(
+                out.notes
+                    .iter()
+                    .all(|n| !n.chars().any(char::is_control)),
+                "{gran:?}: and the note that says so must not itself carry the bytes it is \
+                 reporting: {:?}",
+                out.notes
+            );
+
+            // The witness: the same refusal with an ordinary path still becomes a rule.
+            let plain = ev(
+                "plain.test",
+                443,
+                Some("GET"),
+                Some("/a/b"),
+                "denied-default",
+            );
+            assert!(
+                !synthesize(&[plain], &empty_policy(), gran).rules.is_empty(),
+                "{gran:?}: an ordinary refusal must still be learned"
+            );
+        }
+    }
+
+    /// Every plane the ring can carry that is not the agent's is named here, so the gate stays a
+    /// positive list.
+    ///
+    /// [`from_agent`] admits [`Plane::Agent`] and nothing else, which is the shape that holds: a
+    /// plane added later is excluded until someone says otherwise. Rewritten as a negative list —
+    /// "everything except a task's" — it would admit each new plane silently, and a distro build's
+    /// refusals are exactly the ones that would then widen the agent's allowlist for commands the
+    /// project's own build wrote. Naming each plane is what makes that rewrite fail here.
+    #[test]
+    fn no_plane_but_the_agents_is_learned_from() {
+        for plane in [Plane::Task, Plane::Build, Plane::Unknown] {
+            let refusal = ev_from(
+                "evil.test",
+                443,
+                Some("GET"),
+                Some("/x"),
+                "denied-default",
+                Proto::Https,
+                plane,
+            );
+            let out = synthesize(&[refusal], &empty_policy(), Granularity::Domain);
+            assert!(
+                out.rules.is_empty(),
+                "a refusal on {plane:?} must not become an app rule: {:?}",
+                out.rules
+            );
+            assert!(
+                out.notes.iter().any(|n| n.contains("another plane")),
+                "and the skip must be surfaced, not silent, on {plane:?}: {:?}",
+                out.notes
+            );
+        }
+
+        // The witness: the identical refusal on the agent's own plane is still learned, so the
+        // assertions above cannot be satisfied by a synthesizer that learns nothing at all.
         assert_eq!(
             synthesize(
                 &[ev(

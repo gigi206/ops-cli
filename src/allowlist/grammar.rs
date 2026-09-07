@@ -42,6 +42,34 @@ pub(crate) fn classify(entry: &str) -> Result<Rule, String> {
     classify_in(entry, Slot::Allow)
 }
 
+/// Refuse an entry carrying a control character, before any of it is peeled.
+///
+/// A rule's text does not stay inside the matcher. It is written into a config file, listed by
+/// `sbx net rules`, echoed by the `--net-learn` preview, and quoted in diagnostics. A newline in it
+/// paints a line of its own on each of those surfaces and an escape sequence repaints the ones
+/// around it, so an entry the operator never typed can be made to read like one they did. Text
+/// reaches this grammar from places a cage chooses: a learned rule's path comes from a request the
+/// cage issued, percent-decoded, so three printable characters on the wire become one control byte
+/// here.
+///
+/// The same rule, for the same reason, as [`crate::proc_policy::validate_rule`] on the exec side --
+/// stated separately because the two grammars share no vocabulary: an exec rule is a path or a
+/// basename with a length ceiling, while an egress entry may be a regex of any length.
+///
+/// Checked on the whole entry before the method prefix, the scheme or the kind is read, so the
+/// answer does not depend on which of the four kinds the text would have become. The refusal
+/// renders the entry through the crate's one sanitiser, so reporting it cannot do what it refuses.
+fn reject_control_bytes(entry: &str, slot: Slot) -> Result<(), String> {
+    if entry.chars().any(char::is_control) {
+        return Err(format!(
+            "a `{}` entry must not contain control characters (including newlines): `{}`",
+            slot.label(),
+            crate::sandbox::sanitize(entry)
+        ));
+    }
+    Ok(())
+}
+
 /// Classify one declared entry (in `slot`'s list) by its syntax, or report why it is malformed. The
 /// optional pieces are peeled in order: a leading `{VERB,...}` method prefix, then — for a non-`re:`
 /// entry — a `tcp://`/`http://`/`https://` scheme that selects the enforcement [`Layer`]. A `re:`
@@ -51,6 +79,7 @@ pub(crate) fn classify(entry: &str) -> Result<Rule, String> {
 /// vocabulary (method, path) like the default inspected layer, only on a plaintext transport. A value
 /// that fits no kind is rejected so it can never be read as an unintended kind.
 pub(crate) fn classify_in(entry: &str, slot: Slot) -> Result<Rule, String> {
+    reject_control_bytes(entry, slot)?;
     let (methods, rest) = split_method_prefix(entry.trim())?;
     let rest = rest.trim();
     // `re:` patterns may contain `://`, so they are never scheme-split — always inspected over TLS.
@@ -477,10 +506,27 @@ pub(crate) fn parse_url_target(url: &str) -> Result<(String, u16, String), Strin
         };
         (h, port)
     };
-    if !(is_valid_hostname(host) || host.parse::<IpAddr>().is_ok()) {
-        return Err(format!("URL `{url}` has an invalid host `{host}`"));
-    }
-    Ok((canonical_host(host), port, path))
+    let canonical = canonical_target_host(host)
+        .ok_or_else(|| format!("URL `{url}` has an invalid host `{host}`"))?;
+    Ok((canonical, port, path))
+}
+
+/// A **request** host, folded to the one spelling a verdict is taken against, or `None` when what
+/// is left is not a host at all.
+///
+/// Canonicalize first, then validate — which is the opposite order from a rule, and deliberately
+/// so. A rule is a declaration and is held to the strict spelling [`is_valid_hostname`] describes:
+/// it may not carry the absolute-FQDN trailing dot, because a list that spelled one host two ways
+/// would match neither reliably. A target is a *request*, and the proxy answers requests through
+/// [`canonical_host`] — lowercased, every trailing root dot dropped, an IP literal reduced to its
+/// canonical text — before any rule is consulted. Validating the raw spelling would leave the
+/// tester refusing forms the wire decides, which is the one divergence a tester exists to prevent.
+///
+/// What the folding does not do is invent a host: a spelling that reduces to nothing, or to labels
+/// no name can carry, is still refused here.
+fn canonical_target_host(host: &str) -> Option<String> {
+    let canonical = canonical_host(host);
+    (is_valid_hostname(&canonical) || canonical.parse::<IpAddr>().is_ok()).then_some(canonical)
 }
 
 /// Parse a `tcp://host:port` target naming one **L4 request** (for `sbx test net tcp://…`) into
@@ -533,12 +579,9 @@ pub(crate) fn parse_tcp_target(target: &str) -> Result<(String, u16), String> {
             "tcp:// target `{target}` has port 0, which is not valid"
         ));
     }
-    if !(is_valid_hostname(host) || host.parse::<IpAddr>().is_ok()) {
-        return Err(format!(
-            "tcp:// target `{target}` has an invalid host `{host}`"
-        ));
-    }
-    Ok((canonical_host(host), port))
+    let canonical = canonical_target_host(host)
+        .ok_or_else(|| format!("tcp:// target `{target}` has an invalid host `{host}`"))?;
+    Ok((canonical, port))
 }
 
 /// Parse a `host[:ports]/path` entry into a `Url` rule. The part before the first `/` is the

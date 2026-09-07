@@ -8295,16 +8295,20 @@ fn a_secret_without_a_name_is_named_after_its_host() {
 
 /// A default name comes from the classified **host**, not from the raw section key.
 ///
-/// A key may carry a path, and a path is held to nothing like `is_valid_hostname` — measured,
-/// `classify` accepts a control byte, a newline, an ESC introducer and a `}` inside one. The name
-/// is rendered as `${name}` wherever a value is withheld and into every diagnostic naming the
-/// credential, so a default taken from the key could forge a placeholder or drive the terminal
-/// reading it. Those are the two things `validate_secret_name` refuses for a name an author wrote,
-/// and the default skipped that gate entirely.
+/// A key may carry a path, and a path is held to nothing like `is_valid_hostname`: `classify`
+/// accepts a `}` and the `${...}` spelling inside one. The name is rendered as `${name}` wherever
+/// a value is withheld and into every diagnostic naming the credential, so a default taken from
+/// the key could forge a placeholder. That is what `validate_secret_name` refuses for a name an
+/// author wrote, and the default skipped that gate entirely.
+///
+/// The other half of what a path could carry is closed one layer down: the rule grammar refuses a
+/// control character in any entry, so a key spelling one is not classified at all. Both halves are
+/// asserted here, because the second is the reason the first no longer needs its own hostile
+/// fixture.
 #[test]
 fn a_default_secret_name_is_the_host_alone_and_never_a_path_the_key_carried() {
     let poisoned = vhs(
-        "api.example.com/v1\u{1b}[31m}",
+        "api.example.com/v1}${OTHER}",
         raw_secret_from(vec!["env://TOKEN"]),
         &SecretDefaults::default(),
     )
@@ -8312,6 +8316,16 @@ fn a_default_secret_name_is_the_host_alone_and_never_a_path_the_key_carried() {
     assert_eq!(
         poisoned.name, "api.example.com",
         "the path, and everything a path may carry, is not part of the default name"
+    );
+
+    assert!(
+        vhs(
+            "api.example.com/v1\u{1b}[31m",
+            raw_secret_from(vec!["env://TOKEN"]),
+            &SecretDefaults::default(),
+        )
+        .is_err(),
+        "a target carrying a control byte is refused by the grammar, not named after"
     );
 
     // A plain URL-scoped target takes the same route, so the rule is one rule and not a special

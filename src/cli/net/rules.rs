@@ -359,17 +359,24 @@ fn render_net_rules(
         } else {
             tag
         };
+        // Sanitised on the way out, not on the way in: the classifier refuses a control byte in a
+        // rule, which is where that fact belongs, but this listing renders whatever a config file
+        // holds and a file is not re-classified when it is read. A newline would put a rule on two
+        // lines here and an escape sequence would repaint the rows around it, so the render does
+        // not rest on the writer's gate. The comparison that built `tag` above is on the declared
+        // text, because that is a decision rather than a rendering.
+        let text = crate::sandbox::sanitize(&rule.rule);
         match rule.kind {
             NetRuleKind::Allow => {
-                let _ = writeln!(o, "  {ok}allow{r} {n}{}{r}  {dim}({tag}){r}", rule.rule);
+                let _ = writeln!(o, "  {ok}allow{r} {n}{text}{r}  {dim}({tag}){r}");
             }
             NetRuleKind::Deny => {
-                let _ = writeln!(o, "  {err}deny{r}  {n}{}{r}  {dim}({tag}){r}", rule.rule);
+                let _ = writeln!(o, "  {err}deny{r}  {n}{text}{r}  {dim}({tag}){r}");
             }
             // A `mute` (`dontaudit`) rule suppresses the log line of a request that is *denied*
             // anyway — dim, so it never reads as a third verdict beside allow/deny.
             NetRuleKind::Mute => {
-                let _ = writeln!(o, "  {dim}mute{r}  {n}{}{r}  {dim}({tag}){r}", rule.rule);
+                let _ = writeln!(o, "  {dim}mute{r}  {n}{text}{r}  {dim}({tag}){r}");
             }
         }
     }
@@ -738,6 +745,43 @@ mod tests {
         // An empty result distinguishes "nothing declared" from "the filter matched nothing".
         assert!(render_net_rules("deny", "", &[], 0, &p).contains("no rules declared"));
         assert!(render_net_rules("deny", "", &[], 3, &p).contains("no rules match the filter"));
+    }
+
+    /// A rule's text reaches the terminal through this listing, so it is sanitised on the way out.
+    ///
+    /// The classifier refuses a control byte in a rule, which is where the fact belongs. This
+    /// listing renders whatever a config file holds, and a file written by hand, by another tool
+    /// or by an older sbx is not re-classified when it is read. A newline in a rule paints a line
+    /// of its own here, and an escape sequence repaints the rows around it, so the render is not
+    /// left resting on the writer's gate.
+    #[test]
+    fn a_listed_rule_cannot_paint_the_terminal() {
+        use config::view::{NetRuleKind, NetRuleView, RuleSourceView};
+        let p = style::Palette::plain();
+        let rules = [NetRuleView {
+            kind: NetRuleKind::Allow,
+            source: RuleSourceView::Config,
+            rule: "ctl.test/a\nb\u{1b}[31m".into(),
+            group: None,
+            catch_all: false,
+        }];
+        let refs: Vec<&NetRuleView> = rules.iter().collect();
+        let out = render_net_rules("deny", "", &refs, refs.len(), &p);
+
+        assert!(
+            !out.lines()
+                .any(|l| l.contains('\u{1b}') || l.contains('\u{7}')),
+            "no control byte may reach the terminal: {out:?}"
+        );
+        assert!(
+            out.contains("allow ctl.test/a b [31m  (config)"),
+            "the rule is still shown, with each control byte replaced: {out:?}"
+        );
+        assert_eq!(
+            out.lines().filter(|l| l.contains("ctl.test")).count(),
+            1,
+            "and one rule stays one line: {out:?}"
+        );
     }
 
     #[test]

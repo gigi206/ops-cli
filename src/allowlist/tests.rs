@@ -1579,6 +1579,88 @@ fn parse_url_target_extracts_host_port_and_path() {
     assert!(parse_url_target("not a url").is_err());
 }
 
+/// The absolute-FQDN spelling is decided by the proxy, so the verb that exists to answer "what
+/// would the proxy decide?" has to accept it.
+///
+/// A trailing dot is what DNS calls the root, and `canonical_host` strips every one of them on both
+/// sides of a match -- which is what keeps `evil.com.` from walking past a `deny evil.com`. Rules
+/// themselves can never carry one (`is_valid_hostname` refuses it), and that asymmetry is the
+/// point: the *rule* side stays strict while the *request* side normalizes. A target is a request,
+/// not a declaration, so refusing it there left the one form a reader most needs to check
+/// uncheckable by the tester.
+/// A control byte has no place in an egress rule, and the classifier is where that is settled.
+///
+/// A rule's text is not only matched: it is written into a config file, echoed by `sbx net rules`
+/// and by the `--net-learn` recap, and printed in a diagnostic. A newline in it paints a line of
+/// its own on every one of those surfaces, and an escape sequence repaints the ones around it. The
+/// exec policy already refuses exactly this in a `[proc]` rule, for exactly this reason; the egress
+/// grammar had no equivalent, and a path a cage chose is one of the ways text arrives here.
+///
+/// Checked on the whole entry before any part of it is peeled, so the answer does not depend on
+/// which of the four kinds the text would have turned into.
+#[test]
+fn a_rule_carrying_a_control_byte_is_refused_by_the_classifier() {
+    for entry in [
+        "ctl.test/a\nb",
+        "esc.test/a\u{1b}[31mRED",
+        "{GET} ctl.test/\u{7}",
+        "re:^https://ctl\\.test/\u{1b}",
+        "tcp://ctl.test\u{1b}:22",
+        "ctl.test\u{0}",
+    ] {
+        let err = classify_in(entry, Slot::Allow)
+            .expect_err("a control byte must not reach a rule");
+        assert!(
+            err.contains("control"),
+            "the refusal must say why, for `{entry:?}`: {err}"
+        );
+    }
+    // The witness: the same shapes without the control byte are accepted, so the guard is not
+    // refusing the whole grammar.
+    for entry in [
+        "ctl.test/ab",
+        "esc.test/a[31mRED",
+        "{GET} ctl.test/x",
+        "re:^https://ctl\\.test/",
+        "tcp://ctl.test:22",
+        "ctl.test",
+    ] {
+        assert!(
+            classify_in(entry, Slot::Allow).is_ok(),
+            "`{entry}` must still classify"
+        );
+    }
+}
+
+#[test]
+fn a_target_carries_the_absolute_fqdn_form_the_proxy_normalizes() {
+    assert_eq!(
+        parse_url_target("https://api.github.com./x").unwrap(),
+        ("api.github.com".to_string(), 443, "/x".to_string()),
+        "a trailing root dot is stripped, exactly as the proxy strips it"
+    );
+    assert_eq!(
+        parse_url_target("https://API.GITHUB.COM.:8443").unwrap(),
+        ("api.github.com".to_string(), 8443, "/".to_string()),
+        "and it composes with the lowercasing the same canonicalization does"
+    );
+    assert_eq!(
+        parse_tcp_target("tcp://ssh.example.com.:22").unwrap(),
+        ("ssh.example.com".to_string(), 22),
+        "the L4 target parser answers about the same wire and normalizes the same way"
+    );
+    // The witness: what the canonicalization does not create is a way to name nothing. A host that
+    // is only dots reduces to the empty string, which is not a host in any list.
+    assert!(
+        parse_url_target("https://./x").is_err(),
+        "a host with nothing left after the dots is still refused"
+    );
+    assert!(
+        parse_url_target("https://api..github.com/x").is_err(),
+        "and an interior empty label is still refused"
+    );
+}
+
 #[test]
 fn a_url_rule_matches_an_ipv6_host() {
     let a = allow(&["[::1]:8080/secret"]);
