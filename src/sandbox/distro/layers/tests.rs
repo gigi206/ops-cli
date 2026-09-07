@@ -89,10 +89,12 @@ fn apply_tar_within(dir: &Path, root: &Path, bytes: &[u8], budget: &mut Budget) 
 #[test]
 fn an_image_that_unpacks_past_its_ceilings_is_refused_rather_than_filling_the_disk() {
     let tmp = crate::testutil::TmpDir::new();
-    let archive = tar_of(&[("big", Member::File("0123456789"))]);
+    let body = "x".repeat(100);
+    let archive = tar_of(&[("big", Member::File(&body))]);
 
-    // Ten bytes to write and nine left: the refusal names the member it stopped on, and the file
-    // on disk holds only what the ceiling allowed, never the whole member.
+    // A hundred bytes to write and nine left: the refusal names the member it stopped on, and the
+    // file on disk holds the nine the ceiling allowed plus the one that proves it was exceeded,
+    // never the hundred. Measuring after the copy would leave the whole member on disk.
     let mut budget = Budget {
         bytes: MAX_UNPACKED_BYTES - 9,
         members: 0,
@@ -101,11 +103,11 @@ fn an_image_that_unpacks_past_its_ceilings_is_refused_rather_than_filling_the_di
     let err = apply_tar_within(tmp.path(), &root, &archive, &mut budget)
         .expect_err("past the byte ceiling");
     assert!(err.to_string().contains("unpack to more than"), "{err}");
-    assert!(
+    assert_eq!(
         std::fs::metadata(root.join("big"))
             .map(|m| m.len())
-            .unwrap()
-            <= 10,
+            .unwrap(),
+        10,
         "the member is bounded as it is copied, not measured after it lands"
     );
 
@@ -123,11 +125,8 @@ fn an_image_that_unpacks_past_its_ceilings_is_refused_rather_than_filling_the_di
     let mut budget = Budget::new();
     let root = tmp.join("ok");
     apply_tar_within(tmp.path(), &root, &archive, &mut budget).unwrap();
-    assert_eq!(
-        std::fs::read_to_string(root.join("big")).unwrap(),
-        "0123456789"
-    );
-    assert_eq!((budget.bytes, budget.members), (10, 1));
+    assert_eq!(std::fs::read_to_string(root.join("big")).unwrap(), body);
+    assert_eq!((budget.bytes, budget.members), (100, 1));
 }
 
 #[test]
