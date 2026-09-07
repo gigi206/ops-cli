@@ -77,6 +77,7 @@ pub(crate) mod egress_stats;
 mod forward;
 pub(crate) mod netlearn;
 mod netns;
+mod nettap;
 mod proxy;
 pub(crate) mod redact;
 
@@ -155,6 +156,7 @@ pub(crate) use launch::{
 pub(crate) use naming::cage_name;
 pub(crate) use netlearn::{Granularity, Synthesis};
 pub(crate) use netns::run_holder;
+pub(crate) use nettap::run_tap;
 pub(crate) use nixhub::{ToolUpgrade, current_system, parse_nix_tools, upgrade_tools};
 /// The one way a value the cage chose is made fit for a line-based wire or a terminal. Re-exported
 /// because the host-side process view (`sbx proc ls`) renders the same argv the exec feed does, from

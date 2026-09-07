@@ -616,6 +616,12 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         // reports itself online, then execs the real `bwrap …` command. Never invoked by a user
         // directly. `rest` is `[bwrap, bwrap-args…]`; it never returns.
         "__netns-holder" => crate::sandbox::run_holder(&rest),
+        // Internal: the transparent-capture tap. Forked by the holder into the cage's network
+        // namespace (host mount/pid namespaces kept), it answers the cage's DNS with synthetic
+        // addresses and hands every redirected connection to the same host proxy, named. Never
+        // invoked by a user directly, so it carries no page of its own. `rest` is
+        // `[<egress socket path>]`; it never returns.
+        "__net-tap" => crate::sandbox::run_tap(&rest),
         // Internal: the oracle the emitted completion scripts call on every completion
         // request. Answers with the candidates for the words typed so far and nothing
         // else — never invoked by a user directly, so it carries no page of its own.

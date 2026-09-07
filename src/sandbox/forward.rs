@@ -307,9 +307,18 @@ fn accept_loop(listener: TcpListener, sock: PathBuf, shutdown: Arc<AtomicBool>) 
     }
 }
 
-/// Pump one TCP connection to the in-cage forwarder's Unix socket, both ways, until the cage side
-/// closes, then tear both sockets down so neither copy can hang. The shape is the proxy's raw
-/// tunnel (`proxy::splice::splice_copy`), and for the same reason.
+/// Pump one TCP connection to the in-cage forwarder's Unix socket, both ways.
+///
+/// The cage side is reached through [`dial_cage_socket`], never by dialing the path directly: the
+/// name lives in a directory the cage can write. The copying itself is [`pump_tcp_uds`].
+fn bridge(client: TcpStream, sock: &Path) -> io::Result<()> {
+    let uds = dial_cage_socket(sock)?;
+    pump_tcp_uds(client, uds)
+}
+
+/// Copy a TCP connection and a Unix-socket connection into each other until one side ends, then
+/// tear both sockets down so neither copy can hang. The shape is the proxy's raw tunnel
+/// (`proxy::splice::splice_copy`), and for the same reason.
 ///
 /// The half-close each direction sends on EOF is what a well-behaved peer needs, and it is not
 /// enough on its own: this used to spawn both copies and join both, so the bridge returned only
@@ -322,10 +331,9 @@ fn accept_loop(listener: TcpListener, sock: PathBuf, shutdown: Arc<AtomicBool>) 
 /// So the cage→host direction runs inline and decides: when it ends, both sockets are shut down
 /// `Both`, which returns the spawned copy's blocked read and makes the join always complete.
 ///
-/// The cage side is reached through [`dial_cage_socket`], never by dialing the path directly: the
-/// name lives in a directory the cage can write.
-fn bridge(client: TcpStream, sock: &Path) -> io::Result<()> {
-    let uds = dial_cage_socket(sock)?;
+/// Shared with [`super::nettap`], whose captured connections have exactly this shape — a cage-side
+/// TCP stream and a host-side Unix socket to the proxy — so the teardown rule keeps one spelling.
+pub(super) fn pump_tcp_uds(client: TcpStream, uds: UnixStream) -> io::Result<()> {
     // Two handles per socket (read + write), plus one each to force the teardown after the inline
     // copy ends. `try_clone` dups the fd, so every handle refers to the same socket.
     let mut client_rd = client.try_clone()?;
