@@ -1134,7 +1134,10 @@ impl TaskEngine {
             let (mask_mounts, unused) =
                 super::fsmask::task_mounts(masks, decoys, &self.project, &task.unmask);
             for warning in unused {
-                crate::diag::warn(&format!("task `{}`: {warning}", task.name));
+                // Through the filtering surface: the text names an `unmask` entry, which a config
+                // chose. The grammar refuses a control byte in one, so this is the second half of
+                // the same answer rather than the only one.
+                crate::diag::warn_config(&format!("task `{}`: {warning}", task.name));
             }
             mounts.extend(mask_mounts);
         }

@@ -1109,9 +1109,9 @@ mod tests {
         /// the four launchers that already spell it the second way were outside the population
         /// this guard is named for. A file cannot start a cage without holding the path from
         /// somewhere, and every source of it in this crate is spelled `bwrap` — a field, a
-        /// parameter, a lookup by that name — so the file-level mention is the durable half.
-        /// Comment lines are dropped first: a file that only *mentions* bubblewrap in prose is
-        /// talking about it, not running it.
+        /// parameter, a lookup by that name — so the file-level mention is the durable half. Comment
+        /// lines are dropped first: a file that only *mentions* bubblewrap in prose is talking about
+        /// it, not running it.
         ///
         /// The limit, since a text scan has one: a file that holds the path under a name of its own
         /// invention and never writes `bwrap` anywhere in its code is still invisible here. Closing

@@ -768,6 +768,27 @@ fn scalar_value(val: &str) -> Value {
     }
 }
 
+/// Admit one egress rule text into `slot`'s list, or say why it is refused.
+///
+/// The one definition every path that writes a rule into a config goes through: the `sbx net`
+/// verbs, and the layer validation below, which is what a `sbx config set network.allow '[…]'`
+/// passes through. A `@group` reference is admitted on its name alone, since the group it names is
+/// resolved at load and may not exist yet.
+pub(crate) fn admit_egress_rule(rule: &str, slot: crate::allowlist::Slot) -> Result<(), String> {
+    let trimmed = rule.trim();
+    if let Some(group) = trimmed.strip_prefix('@') {
+        if !super::is_valid_group_name(group) {
+            return Err(format!(
+                "invalid group reference {rule:?}: a group name must be 1–64 of [A-Za-z0-9._-]"
+            ));
+        }
+        return Ok(());
+    }
+    crate::allowlist::classify_in(rule, slot)
+        .map(|_| ())
+        .map_err(|e| format!("invalid rule {rule:?}: {}", crate::sandbox::sanitize(&e)))
+}
+
 /// Whether the edited document still parses as a config layer **and** says what it appears to say.
 /// A `set`/`unset` that leaves the layer unparseable is worse than a no-op: the loader drops the
 /// WHOLE layer with only a warning, silently reverting every security field it carried, so a write
@@ -785,21 +806,10 @@ fn scalar_value(val: &str) -> Value {
 /// strings too, so `sbx config add fs.deny /etc/shadow` parsed, committed, and was dropped by
 /// [`super::apply_fs`] at the next load — a mask the user was told had been written, over a path
 /// the cage goes on reading.
-pub(crate) fn admit_egress_rule(rule: &str, slot: crate::allowlist::Slot) -> Result<(), String> {
-    let trimmed = rule.trim();
-    if let Some(group) = trimmed.strip_prefix('@') {
-        if !super::is_valid_group_name(group) {
-            return Err(format!(
-                "invalid group reference {rule:?}: a group name must be 1–64 of [A-Za-z0-9._-]"
-            ));
-        }
-        return Ok(());
-    }
-    crate::allowlist::classify_in(rule, slot)
-        .map(|_| ())
-        .map_err(|e| format!("invalid rule {rule:?}: {}", crate::sandbox::sanitize(&e)))
-}
-
+///
+/// The rule lists are the third: `network.allow`/`deny`/`mute` and `proc.allow`/`deny` hold plain
+/// strings the resolver drops entry by entry, and the verbs that write one rule admit it first, so
+/// a whole list written at once meets the same grammar.
 fn validate_layer(doc: &DocumentMut) -> Result<(), String> {
     let raw = super::schema::parse(doc.to_string().as_bytes())?;
     // The rule lists, baseline and per app. `sbx net allow` and `sbx proc allow` admit a rule

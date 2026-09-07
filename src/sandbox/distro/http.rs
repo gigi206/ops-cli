@@ -197,6 +197,8 @@ pub(super) fn head(url: &str, headers: &[(&str, &str)]) -> io::Result<Response> 
     request(url, headers, "HEAD")
 }
 
+/// The shared body of [`get`] and [`head`], parameterised by the method, so the redirect walk and
+/// the header handling are written once and the two cannot answer differently about a URL.
 fn request(url: &str, headers: &[(&str, &str)], method: &str) -> io::Result<Response> {
     let mut current = url.to_string();
     let mut carry = headers;

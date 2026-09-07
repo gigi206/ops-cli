@@ -132,6 +132,18 @@ pub(crate) fn validate_entry(entry: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err("is empty".to_string());
     }
+    // No control byte. Every refusal an entry earns is printed, and an entry is a config-chosen
+    // value: a newline or an escape sequence in one reaches a terminal through whichever warning
+    // names it, and the surfaces that filter their own output cannot help a value that was never
+    // supposed to carry one. Refused here, once, rather than filtered at each of the places an
+    // entry is named.
+    if let Some(bad) = trimmed.chars().find(|c| c.is_control()) {
+        return Err(format!(
+            "must not contain a control character (found {}) — an entry is named back in \
+             diagnostics, and a control byte there rewrites what a terminal shows",
+            bad.escape_debug()
+        ));
+    }
     if trimmed.starts_with('/') {
         return Err(
             "must be relative to the project root (host paths outside the project are \
@@ -471,5 +483,29 @@ mod tests {
             !matches_component("a*c", "a/c") && !matches_component("*", "a/b"),
             "no wildcard consumes a separator (the literal `/` of a pattern still does)"
         );
+    }
+
+    /// A control byte in an entry is refused, not carried into the diagnostic that names it.
+    ///
+    /// Every refusal an entry earns prints the entry, and a `[task] unmask` entry travels furthest:
+    /// its "matches nothing" warning is raised from the task cage's own path. An escape sequence
+    /// there rewrites what a terminal shows. The witnesses are the ordinary entries this must not
+    /// start refusing.
+    #[test]
+    fn an_entry_carrying_a_control_byte_is_refused() {
+        for entry in [
+            "secrets\u{1b}[2K.env",
+            "a\nb",
+            "\u{7}",
+            "sub/\u{1b}]0;title\u{7}x",
+        ] {
+            let why = validate_entry(entry)
+                .err()
+                .unwrap_or_else(|| panic!("`{}` must be refused", entry.escape_debug()));
+            assert!(why.contains("control character"), "{why}");
+        }
+        for entry in [".env", "secrets/", "sub/*.env", "./config/prod.key"] {
+            validate_entry(entry).unwrap_or_else(|e| panic!("`{entry}` is an ordinary entry: {e}"));
+        }
     }
 }
