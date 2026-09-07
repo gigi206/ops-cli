@@ -181,6 +181,25 @@ pub(crate) enum Verdict {
     Ask,
 }
 
+impl Verdict {
+    /// The stricter of two verdicts about the same `execve`, for a syscall that has more than one
+    /// name to be decided under.
+    ///
+    /// One `execve` carries one path, but an explicitly invoked dynamic loader runs a program its
+    /// own arguments name ([`loader_targets`]), and both are the policy's to speak about. The order
+    /// is refuse, then ask, then allow: a `deny` on either name stops the call, and a name that
+    /// would be put to a person is put to them rather than let through on the strength of the
+    /// other. It is the same precedence [`ProcPolicy::decide_chain`] applies between the `deny` and
+    /// `allow` sets, and for the same reason.
+    pub(crate) fn stricter(self, other: Verdict) -> Verdict {
+        match (self, other) {
+            (Verdict::Deny, _) | (_, Verdict::Deny) => Verdict::Deny,
+            (Verdict::Ask, _) | (_, Verdict::Ask) => Verdict::Ask,
+            (Verdict::Allow, Verdict::Allow) => Verdict::Allow,
+        }
+    }
+}
+
 /// The resolved process/exec policy: the mode plus the classified allow/deny rules. Pure — the
 /// enforcement supervisor calls [`decide`](ProcPolicy::decide) for every notified `execve`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -314,6 +333,117 @@ impl ProcPolicy {
             ProcMode::Off | ProcMode::Observe | ProcMode::Enforce => Verdict::Allow,
         }
     }
+}
+
+/// Whether a file **name** is a dynamic loader -- the program interpreter an ELF binary is started
+/// by, and the one program whose own command line names another program to run.
+///
+/// Asked of a basename, because that is what identifies a loader wherever a userland puts it: a nix
+/// closure keeps it under `/nix/store/…-glibc-…/lib/`, a distro image under `/lib64` or
+/// `/lib/<triple>/`, and both spell it the same way. The shapes are glibc's
+/// (`ld-linux-x86-64.so.2`, `ld-linux-aarch64.so.1`), musl's (`ld-musl-x86_64.so.1`), and the bare
+/// `ld.so`/`ld.so.1` some architectures ship -- an `ld-` or `ld.so` prefix together with a `.so`,
+/// which is narrow enough that `ldconfig` and `ld` itself are not loaders here.
+pub(crate) fn is_dynamic_loader(basename: &str) -> bool {
+    basename.contains(".so") && (basename.starts_with("ld-") || basename.starts_with("ld.so"))
+}
+
+/// The options a dynamic loader accepts that take a **value** in the following word.
+///
+/// glibc's `rtld` and musl's `ldso` compare whole words, so neither accepts a `--option=value`
+/// spelling: the value is always the next element. Measured on glibc 2.43, `--library-path=/x` is
+/// answered with "unrecognized option" while `--library-path /x` runs. That is what makes the value
+/// a word the walk below must step over rather than read as the program -- otherwise
+/// `ld.so --library-path /x /usr/bin/curl` would be decided as `/x`.
+const LOADER_VALUE_OPTIONS: &[&[u8]] = &[
+    b"--library-path",
+    b"--preload",
+    b"--audit",
+    b"--argv0",
+    b"--inhibit-rpath",
+    b"--glibc-hwcaps-prepend",
+    b"--glibc-hwcaps-mask",
+];
+
+/// The options that take no value, so the word after one may be the program.
+const LOADER_FLAGS: &[&[u8]] = &[
+    b"--list",
+    b"--verify",
+    b"--inhibit-cache",
+    b"--list-tunables",
+    b"--list-diagnostics",
+    b"--help",
+    b"--version",
+];
+
+/// The programs a dynamic loader named on the command line would load, read from its own `argv`.
+///
+/// `execve("/lib64/ld-linux-x86-64.so.2", ["…", "/usr/bin/curl"], …)` is **one** syscall. The kernel
+/// runs the loader, and the loader maps and enters `curl` inside that same call, so nothing further
+/// is notified: a policy that reads only the notified path decides about the loader and never about
+/// the program. Both are decided here, and the caller takes the stricter answer, so a `deny` on a
+/// program holds whether or not an interpreter was named in front of it.
+///
+/// **The walk.** `argv[0]` is the loader's own name and is skipped. From there: a word beginning
+/// with `--` is an option (both loaders test exactly that, so a single-dash word is a *program*
+/// name and is classified as one -- measured, `ld.so -x /bin/true` reports "cannot open shared
+/// object file `-x`"); a `--` on its own ends the options and the next word is the program; an
+/// option in [`LOADER_VALUE_OPTIONS`] takes the following word with it. The first word that is
+/// none of those is the program, and the walk stops there -- what follows are the program's own
+/// arguments, and classifying those would refuse `ld.so /bin/grep curl` for a `deny` on `curl`.
+///
+/// **Where the walk stops being sure.** An option neither list names is one this build does not
+/// know. If it takes a value in the loader the cage actually runs, the word after it is that value
+/// and the program is further along -- so from an unknown option onwards *every* non-option word is
+/// classified, and the walk does not stop at the first. That is the arm that costs precision, and
+/// it is entered only where precision was already gone.
+///
+/// `None` means the question was not settled, and the caller refuses on it: a name that is not
+/// valid UTF-8 (the policy matches `String`s, and a name it cannot carry is one no rule can speak
+/// about), or an argument list that ran past what the supervisor read (`complete` is false) without
+/// the walk having concluded. `Some(<empty>)` is the settled answer that the loader names no
+/// program at all -- `ld.so --version`, or a value option with nothing after it -- where the loader
+/// prints its usage and runs nothing, and the executed path's own verdict stands alone.
+pub(crate) fn loader_targets(argv: &[&[u8]], complete: bool) -> Option<Vec<String>> {
+    let name = |w: &[u8]| std::str::from_utf8(w).ok().map(str::to_string);
+    let mut out: Vec<String> = Vec::new();
+    let mut uncertain = false;
+    let mut concluded = false;
+    let mut i = 1;
+    while i < argv.len() {
+        let word = argv[i];
+        if word == b"--" {
+            if let Some(program) = argv.get(i + 1) {
+                out.push(name(program)?);
+                concluded = true;
+            }
+            break;
+        }
+        if word.starts_with(b"--") {
+            if LOADER_VALUE_OPTIONS.contains(&word) {
+                i += 2;
+                continue;
+            }
+            if !LOADER_FLAGS.contains(&word) {
+                uncertain = true;
+            }
+            i += 1;
+            continue;
+        }
+        out.push(name(word)?);
+        if !uncertain {
+            concluded = true;
+            break;
+        }
+        i += 1;
+    }
+    // Running off the end of a list that was itself cut short says nothing: the program may be in
+    // the part that was not read. Refusing is safe here in a way allowing is not -- the syscall
+    // never runs on a refusal.
+    if !concluded && !complete {
+        return None;
+    }
+    Some(out)
 }
 
 /// The final path component (the basename), or the whole string when there is no `/`. Taken from an
@@ -593,6 +723,141 @@ mod tests {
         assert!(policy(ProcMode::Enforce, &[], &[]).enforcing());
         assert!(policy(ProcMode::Ask, &[], &[]).enforcing());
         assert!(!policy(ProcMode::Observe, &[], &[]).enforcing());
+    }
+
+    /// The loader test is on the name, because that is what identifies one wherever a userland
+    /// puts it -- and it has to stay narrow enough that the linker and `ldconfig` are not loaders.
+    #[test]
+    fn a_loader_is_recognised_by_its_name_and_nothing_else_is() {
+        for name in [
+            "ld-linux-x86-64.so.2",
+            "ld-linux-aarch64.so.1",
+            "ld-linux.so.2",
+            "ld-musl-x86_64.so.1",
+            "ld.so",
+            "ld.so.1",
+        ] {
+            assert!(is_dynamic_loader(name), "`{name}` is a program interpreter");
+        }
+        for name in [
+            "ld",
+            "ldd",
+            "ldconfig",
+            "libc.so.6",
+            "old-loader",
+            "sold.so",
+        ] {
+            assert!(!is_dynamic_loader(name), "`{name}` is not one");
+        }
+    }
+
+    /// What a loader's command line says it will run, under the option grammar both loaders share.
+    #[test]
+    fn a_loaders_command_line_names_the_program_it_will_run() {
+        let argv = |words: &[&str]| -> Vec<Vec<u8>> {
+            words.iter().map(|w| w.as_bytes().to_vec()).collect()
+        };
+        let walk = |words: &[&str], complete: bool| {
+            let owned = argv(words);
+            let borrowed: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+            loader_targets(&borrowed, complete)
+        };
+
+        assert_eq!(
+            walk(&["ld.so", "/usr/bin/curl"], true),
+            Some(vec!["/usr/bin/curl".to_string()]),
+            "the plain form"
+        );
+        assert_eq!(
+            walk(&["ld.so", "/usr/bin/curl", "--version"], true),
+            Some(vec!["/usr/bin/curl".to_string()]),
+            "the program's own arguments are its own: classifying them would refuse \
+             `ld.so /bin/grep curl` for a rule about curl"
+        );
+        assert_eq!(
+            walk(&["ld.so", "--library-path", "/x", "/usr/bin/curl"], true),
+            Some(vec!["/usr/bin/curl".to_string()]),
+            "an option's value is stepped over, or the cage picks what the rule is matched against"
+        );
+        assert_eq!(
+            walk(
+                &["ld.so", "--inhibit-cache", "--list", "/usr/bin/curl"],
+                true
+            ),
+            Some(vec!["/usr/bin/curl".to_string()]),
+            "a flag takes no value"
+        );
+        assert_eq!(
+            walk(&["ld.so", "--", "/usr/bin/curl"], true),
+            Some(vec!["/usr/bin/curl".to_string()]),
+            "`--` ends the options"
+        );
+        assert_eq!(
+            walk(&["ld.so", "-x"], true),
+            Some(vec!["-x".to_string()]),
+            "a single dash is not an option to either loader, so such a word is the program"
+        );
+
+        // An option this build does not know may take a value in the loader the cage runs, which
+        // would put the program one word further along. From there every non-option word is
+        // classified rather than the first one only.
+        assert_eq!(
+            walk(
+                &["ld.so", "--from-a-later-glibc", "value", "/usr/bin/curl"],
+                true
+            ),
+            Some(vec!["value".to_string(), "/usr/bin/curl".to_string()]),
+            "an unknown option gives up precision rather than coverage"
+        );
+
+        // Settled answers that name no program: the loader prints its usage and runs nothing.
+        assert_eq!(walk(&["ld.so", "--version"], true), Some(Vec::new()));
+        assert_eq!(walk(&["ld.so"], true), Some(Vec::new()));
+        assert_eq!(walk(&["ld.so", "--library-path"], true), Some(Vec::new()));
+
+        // Unsettled answers, which the caller refuses on.
+        assert_eq!(
+            walk(&["ld.so", "--inhibit-cache"], false),
+            None,
+            "a list cut short before the walk concluded says nothing about the program"
+        );
+        assert_eq!(
+            walk(&["ld.so", "--from-a-later-glibc", "/usr/bin/curl"], false),
+            None,
+            "and the uncertain arm runs to the end, so a short list leaves it unsettled"
+        );
+        assert_eq!(
+            walk(&["ld.so", "/usr/bin/curl"], false),
+            Some(vec!["/usr/bin/curl".to_string()]),
+            "but a walk that concluded inside what was read does not need the rest"
+        );
+
+        let odd = [b"ld.so".to_vec(), b"/usr/bin/\xffcurl".to_vec()];
+        let borrowed: Vec<&[u8]> = odd.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            loader_targets(&borrowed, true),
+            None,
+            "a name the policy cannot carry is one no rule can speak about"
+        );
+    }
+
+    /// Deny beats ask beats allow, which is what lets one syscall be decided under two names.
+    #[test]
+    fn the_stricter_of_two_verdicts_is_the_one_that_holds() {
+        use Verdict::{Allow, Ask, Deny};
+        for (a, b, want) in [
+            (Allow, Allow, Allow),
+            (Allow, Ask, Ask),
+            (Ask, Allow, Ask),
+            (Ask, Ask, Ask),
+            (Allow, Deny, Deny),
+            (Deny, Allow, Deny),
+            (Ask, Deny, Deny),
+            (Deny, Ask, Deny),
+            (Deny, Deny, Deny),
+        ] {
+            assert_eq!(a.stricter(b), want, "{a:?} with {b:?}");
+        }
     }
 
     #[test]

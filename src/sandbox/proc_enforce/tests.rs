@@ -1613,14 +1613,15 @@ fn a_target_named_by_its_descriptor_is_undecidable_rather_than_substituted() {
     // descriptor-named target the allowlist holds still runs.
     let plain_fd = std::fs::File::open(&plain).expect("hold the control fixture");
     assert_eq!(
-        exec_verdict(
+        decided(exec_verdict(
             &parts.cx(&policy),
             &[],
             me,
             plain_fd.as_raw_fd(),
             empty.as_ptr() as u64,
+            0,
             None
-        ),
+        )),
         (Verdict::Allow, allowed.clone()),
         "a target named through its descriptor is still decided by that name"
     );
@@ -1628,14 +1629,15 @@ fn a_target_named_by_its_descriptor_is_undecidable_rather_than_substituted() {
 
     let odd_fd = std::fs::File::open(&odd).expect("hold the fixture");
     assert_eq!(
-        exec_verdict(
+        decided(exec_verdict(
             &parts.cx(&policy),
             &[],
             me,
             odd_fd.as_raw_fd(),
             empty.as_ptr() as u64,
+            0,
             None
-        ),
+        )),
         (Verdict::Deny, "<unreadable>".to_string()),
         "a link whose bytes no name can carry must take the mode's default, not be decided and \
          recorded under the same path with those bytes replaced"
@@ -2519,6 +2521,122 @@ fn a_denied_execve_returns_eperm_and_the_payload_never_runs() {
     );
 }
 
+/// The dynamic loader this test binary was itself started by, as the kernel maps it.
+///
+/// Read from `/proc/self/maps` rather than guessed from a list of well-known paths: the loader is
+/// mapped into every dynamically linked process, so the line that names it is this host's own
+/// answer, whatever libc and whatever architecture. `None` where nothing in the map looks like one,
+/// which is a statically linked test binary and not a host without a loader.
+fn own_dynamic_loader() -> Option<PathBuf> {
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    maps.lines()
+        .filter_map(|l| l.split_whitespace().nth(5))
+        .map(PathBuf::from)
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(crate::proc_policy::is_dynamic_loader)
+        })
+}
+
+/// A program a rule denies does not run because a dynamic loader was named in front of it.
+///
+/// `ld.so /usr/bin/curl` is a single `execve`, and the path it carries is the loader's. The kernel
+/// loads and runs `curl` inside that call, so a supervisor deciding on the notified path alone sees
+/// `ld-linux-x86-64.so.2`, matches no `curl` rule, and hands the decision to the mode's unmatched
+/// default -- an allow under a denylist. Nothing is forged and nothing is written: the loader and
+/// the program are both the system's own, and the whole manoeuvre is one line of shell.
+///
+/// So the loader's own argument list is read as well, and the program it names is decided too, on
+/// the stricter of the two answers. The witness arms are what keep this from passing for the wrong
+/// reason: the same invocation under a policy that denies something else must run to completion, and
+/// the loader alone under the denying policy must still be allowed.
+#[test]
+fn a_program_a_loader_is_asked_to_run_is_decided_by_its_own_name() {
+    let Some(loader) = own_dynamic_loader() else {
+        return;
+    };
+    let loader = loader.to_str().expect("utf-8 loader path").to_string();
+
+    // The witness: the same command under a policy that denies something else runs to completion,
+    // so the refusal below is the rule and not the loader failing to work here at all.
+    let elsewhere = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/nonexistent".to_string()]);
+    let (code, ring) =
+        run_under_supervisor(&[&loader, "/bin/true"], &elsewhere, &ProcOverlay::new());
+    assert_eq!(
+        code,
+        Some(0),
+        "the loader must really run its argument here, or this test measures nothing"
+    );
+    assert!(
+        ring.snapshot(None)
+            .events
+            .iter()
+            .any(|e| e.verdict == "allow"),
+        "and that invocation is recorded as allowed"
+    );
+
+    // The finding: a `deny` on the program's own name stops it, even named through the loader.
+    let denied = ProcPolicy::new(ProcMode::Enforce, &[], &["true".to_string()]);
+    let (code, ring) = run_under_supervisor(&[&loader, "/bin/true"], &denied, &ProcOverlay::new());
+    assert_eq!(
+        code,
+        Some(126),
+        "a denied program must not run because a loader was named in front of it"
+    );
+    let events = ring.snapshot(None).events;
+    assert!(
+        events.iter().any(|e| e.verdict == "deny"),
+        "and the refusal is recorded: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.verdict == "deny" && e.command.contains("/bin/true")),
+        "the record names the program the rule spoke about, not only the loader: {events:?}"
+    );
+
+    // An option that takes a value is stepped over rather than read as the program. Without that,
+    // "the first word that is not an option" is a word the cage picks: `--library-path /x` would
+    // put `/x` in front of the program and the rule would be matched against it.
+    let (code, _) = run_under_supervisor(
+        &[
+            &loader,
+            "--library-path",
+            "/nonexistent-libpath",
+            "/bin/true",
+        ],
+        &denied,
+        &ProcOverlay::new(),
+    );
+    assert_eq!(
+        code,
+        Some(126),
+        "an option's value must not be mistaken for the program the loader will run"
+    );
+
+    // The other half of the same rule: the loader is not itself denied by a rule about what it was
+    // asked to load, so running it against an allowed program still works -- through the same
+    // value-taking option, so the step-over is pinned in both directions.
+    let (code, _) = run_under_supervisor(
+        &[
+            &loader,
+            "--library-path",
+            "/nonexistent-libpath",
+            "/usr/bin/sh",
+            "-c",
+            "exit 7",
+        ],
+        &denied,
+        &ProcOverlay::new(),
+    );
+    assert_eq!(
+        code,
+        Some(7),
+        "a rule about one program must not close the loader to every other"
+    );
+}
+
 /// The other half: an allowed target is `CONTINUE`d and really runs, so the shim is replaced by
 /// the payload and the payload's own exit code is what comes back.
 #[test]
@@ -2727,6 +2845,14 @@ impl DecidingParts {
     }
 }
 
+/// The two halves of a decision a test compares: the verdict and the name it is recorded under.
+///
+/// The third and fourth -- the file the errno is chosen from, and why a refusal refused -- are
+/// asserted where they are the subject, not on every decision.
+fn decided(d: Decided) -> (Verdict, String) {
+    (d.verdict, d.shown)
+}
+
 /// An address mapped in no process, in a process this one is not the ancestor of: between them
 /// they refuse both halves of the read, whichever the host's `ptrace_scope` allows. This is how
 /// the tests below reach the branch a hardened host would reach for every decision.
@@ -2791,7 +2917,7 @@ fn an_execve_whose_target_cannot_be_read_takes_the_modes_default_and_every_one_i
         let (pid, addr) = UNREADABLE;
         for _ in 0..3 {
             assert_eq!(
-                exec_verdict(&cx, &[], pid, libc::AT_FDCWD, addr, None),
+                decided(exec_verdict(&cx, &[], pid, libc::AT_FDCWD, addr, 0, None)),
                 (expected, "<unreadable>".to_string()),
                 "under {mode:?}"
             );

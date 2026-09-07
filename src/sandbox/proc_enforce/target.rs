@@ -218,6 +218,79 @@ pub(super) fn read_exec_path(
     String::from_utf8(read_path_bytes(pid, addr, notif)?).ok()
 }
 
+/// How many `argv` elements one notified exec is read for.
+///
+/// The walk in [`crate::proc_policy::loader_targets`] only ever needs the loader's own options and
+/// the program after them, which is a handful of words; a whole `argv` can be megabytes, and this
+/// read is on the one thread every other notification in the cage queues behind. So the read is
+/// bounded and the bound is reported: a list longer than this comes back marked incomplete, and a
+/// walk that had not concluded inside it refuses rather than answers from a prefix.
+pub(super) const ARGV_WORDS_READ: usize = 64;
+
+/// Read a parked target's argument list as the byte strings it holds, up to [`ARGV_WORDS_READ`]
+/// elements.
+///
+/// Returns `(words, complete)`, where `complete` says the list's terminating null was reached
+/// inside the bound. The strings are bytes and not names: a Linux `argv` element is bytes like a
+/// path is, and deciding which of them can be carried as a name belongs to whoever reads one (see
+/// [`read_exec_path`] for the same rule on the path beside it).
+///
+/// One handle for the whole list rather than one per element: the ordering that makes the read
+/// safe is [`open_target_mem`]'s, taken once, and reopening `/proc/<pid>/mem` per word would pay
+/// that cost per word as well. Nothing here closes the TOCTOU window either -- a sibling thread can
+/// rewrite the vector between this read and a `CONTINUE`, which is why a verdict formed from it is
+/// only ever used to make a decision *stricter*.
+pub(super) fn read_argv(
+    pid: u32,
+    addr: u64,
+    notif: Option<(libc::c_int, u64)>,
+) -> Option<(Vec<Vec<u8>>, bool)> {
+    use std::io::{Read, Seek, SeekFrom};
+    if addr == 0 {
+        return None;
+    }
+    let mut file = open_target_mem(pid, notif)?;
+    let mut pointers: Vec<u64> = Vec::new();
+    let mut complete = false;
+    for i in 0..ARGV_WORDS_READ {
+        let at = addr.checked_add((i as u64).checked_mul(8)?)?;
+        file.seek(SeekFrom::Start(at)).ok()?;
+        let mut word = [0u8; 8];
+        file.read_exact(&mut word).ok()?;
+        let p = u64::from_ne_bytes(word);
+        if p == 0 {
+            complete = true;
+            break;
+        }
+        pointers.push(p);
+    }
+    let mut words = Vec::with_capacity(pointers.len());
+    for p in pointers {
+        file.seek(SeekFrom::Start(p)).ok()?;
+        let mut buf = [0u8; 4096];
+        let n = file.read(&mut buf).ok()?;
+        let end = buf[..n].iter().position(|&b| b == 0).unwrap_or(n);
+        words.push(buf[..end].to_vec());
+    }
+    Some((words, complete))
+}
+
+/// Where a notified exec keeps its argument vector, by syscall number -- the third of the mappings
+/// [`open_args`] and [`exec_args`] state, and read for the reason
+/// [`crate::proc_policy::loader_targets`] gives.
+///
+/// `execve(path, argv, envp)` puts it second and `execveat(dirfd, path, argv, envp, flags)` third,
+/// the same one-register shift that separates their paths. `None` for any other syscall.
+pub(super) fn exec_argv_arg(nr: libc::c_int, args: &[u64; 6]) -> Option<u64> {
+    if nr as libc::c_long == libc::SYS_execve {
+        return Some(args[1]);
+    }
+    if nr as libc::c_long == libc::SYS_execveat {
+        return Some(args[2]);
+    }
+    None
+}
+
 /// Where a notified open keeps its directory descriptor and its path pointer, by syscall number.
 ///
 /// The three forms do not agree on argument order: `open(path, …)` has no descriptor at all and is

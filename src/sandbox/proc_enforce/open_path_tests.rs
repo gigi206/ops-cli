@@ -134,6 +134,35 @@ fn each_exec_form_is_read_from_its_own_registers() {
     );
 }
 
+/// The argument vector rides one register behind the path, on both forms, and the shift is the
+/// same one that separates their paths.
+///
+/// Read for the loader case: `ld.so /usr/bin/curl` is one `execve` whose path is the loader's, so
+/// the name a rule speaks about is in the vector. Reading the wrong register there would hand the
+/// walk an integer as an address, the argument list would not be established, and such an exec is
+/// refused -- so a wrong mapping here does not open a hole, it closes every loader invocation.
+#[test]
+fn each_exec_form_keeps_its_argument_vector_one_register_behind_its_path() {
+    let args: [u64; 6] = [11, 22, 33, 44, 55, 66];
+    assert_eq!(
+        exec_argv_arg(libc::SYS_execve as libc::c_int, &args),
+        Some(22),
+        "`execve(path, argv, envp)` puts the vector second"
+    );
+    assert_eq!(
+        exec_argv_arg(libc::SYS_execveat as libc::c_int, &args),
+        Some(33),
+        "`execveat(dirfd, path, argv, envp, flags)` puts it third"
+    );
+    for nr in [libc::SYS_openat, libc::SYS_read] {
+        assert_eq!(
+            exec_argv_arg(nr as libc::c_int, &args),
+            None,
+            "syscall {nr} carries no argument vector"
+        );
+    }
+}
+
 #[test]
 fn a_syscall_that_is_neither_an_open_nor_an_exec_is_decided_by_neither() {
     // The two mappings partition the five numbers the shim's filter notifies on, and agree that

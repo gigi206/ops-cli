@@ -149,7 +149,7 @@ use notify::{
 use open_lens::{OpenLens, handle_open, probe_in_cage_root};
 use pending::SWEEP_EVERY;
 use report::{Undecidable, unmatched_word};
-use target::{exec_args, open_args, read_exec_path};
+use target::{exec_args, exec_argv_arg, open_args, read_argv, read_exec_path};
 
 /// Where the exec shim is bound read-only inside the cage, and where the notification handoff
 /// socket appears. Both under `/opt/sbx`, beside the egress CA — a path the cage cannot reach outside
@@ -436,8 +436,9 @@ fn exec_verdict(
     pid: u32,
     dirfd: libc::c_int,
     addr: u64,
+    argv_addr: u64,
     notif: Option<(libc::c_int, u64)>,
-) -> (Verdict, String) {
+) -> Decided {
     let named = read_exec_path(pid, addr, notif)
         .filter(|p| !p.is_empty())
         // `execveat(fd, "", …, AT_EMPTY_PATH)` names its target by the descriptor and passes an
@@ -464,8 +465,49 @@ fn exec_verdict(
         let path = crate::proc_policy::lexical_path(&path).into_owned();
         // Decide against the config policy folded with the live `--session` overlay (deny wins
         // across both). The overlay read-lock is held only for this decision.
-        let verdict = cx.overlay.decide(cx.policy, caller, &path);
-        return (verdict, path);
+        let mut verdict = cx.overlay.decide(cx.policy, caller, &path);
+        // A dynamic loader named on the command line runs the program its own arguments name,
+        // inside this one syscall and with no notification of its own, so the rule the cage is
+        // reaching around is the one about *that* program. Read only for a loader: an ordinary exec
+        // pays nothing for this.
+        if crate::proc_policy::is_dynamic_loader(basename_of(&path)) {
+            let Some(named) = loader_programs(pid, argv_addr, notif) else {
+                // The one place this gate refuses a target it could not establish. Everywhere else
+                // an unreadable read takes the mode's default, because refusing every one would
+                // brick a cage on a process reaped mid-decision; here the population is a single
+                // exec of a program interpreter, and what could not be established is exactly the
+                // name a rule would have spoken about. A refusal is also the safe direction: the
+                // syscall never runs on one.
+                return Decided {
+                    verdict: Verdict::Deny,
+                    shown: path.clone(),
+                    probed: path,
+                    because: Because::UnreadableLoaderArgv,
+                };
+            };
+            for program in &named {
+                verdict = verdict.stricter(cx.overlay.decide(cx.policy, caller, program));
+            }
+            if !named.is_empty() {
+                // The record is the loader's own command line, because that is what was run and
+                // what the verdict was taken across. Showing the program alone would name a file
+                // the syscall did not carry; showing the loader alone would hide the rule that
+                // decided.
+                let shown = format!("{path} {}", named.join(" "));
+                return Decided {
+                    verdict,
+                    shown,
+                    probed: path,
+                    because: Because::Policy,
+                };
+            }
+        }
+        return Decided {
+            verdict,
+            shown: path.clone(),
+            probed: path,
+            because: Because::Policy,
+        };
     }
     // Fall back to the mode's unmatched default rather than guess a name match — allow under a
     // denylist, park under ask, refuse under an allowlist, where an undecidable target is exactly
@@ -478,7 +520,64 @@ fn exec_verdict(
             unmatched_word(cx.policy)
         ));
     }
-    (cx.policy.unmatched(), "<unreadable>".to_string())
+    Decided {
+        verdict: cx.policy.unmatched(),
+        shown: "<unreadable>".to_string(),
+        probed: "<unreadable>".to_string(),
+        because: Because::Policy,
+    }
+}
+
+/// What one notified exec was decided to be, and the two names that decision is spoken about.
+///
+/// They are two because a target can be named through another program: an explicitly invoked
+/// dynamic loader runs what its arguments name, so the record has to carry both while the errno a
+/// refusal answers with is about the file the syscall would have opened. Carried together with the
+/// verdict because one read produces all of them.
+struct Decided {
+    verdict: Verdict,
+    /// What the ring records and an announcement names.
+    shown: String,
+    /// The file the `execve` itself carried, which is what a refusal's errno is chosen from.
+    probed: String,
+    /// What refused, for the announcement that has to say so.
+    because: Because,
+}
+
+/// Why a refusal refused, in the one distinction an announcement has to draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Because {
+    /// A rule the policy or the live overlay carries.
+    Policy,
+    /// A dynamic loader was named, and what it would load could not be established from its
+    /// argument list -- so no rule could speak about it, and it is refused rather than run.
+    UnreadableLoaderArgv,
+}
+
+/// The final component of an already-folded path, for the loader test.
+///
+/// The same component [`crate::proc_policy`] matches a basename rule against, spelled here because
+/// its own is private to the matcher and this is a different question about the same string.
+fn basename_of(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(i) => &path[i + 1..],
+        None => path,
+    }
+}
+
+/// The programs a notified loader `execve` would run, read from the parked target's own `argv`.
+///
+/// `None` is a question that was not settled -- the argument list could not be read at all, or was
+/// read and did not conclude -- and the caller refuses on it. `Some(<empty>)` is the settled answer
+/// that the loader names no program.
+fn loader_programs(
+    pid: u32,
+    argv_addr: u64,
+    notif: Option<(libc::c_int, u64)>,
+) -> Option<Vec<String>> {
+    let (words, complete) = read_argv(pid, argv_addr, notif)?;
+    let borrowed: Vec<&[u8]> = words.iter().map(Vec::as_slice).collect();
+    crate::proc_policy::loader_targets(&borrowed, complete)
 }
 
 /// What one supervisor needs to decide a notification, carried together because every step of the
@@ -717,15 +816,24 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
         return;
     };
     let caller = caller_chain(cx, req.pid);
-    let (verdict, shown) = exec_verdict(
+    let decided = exec_verdict(
         cx,
         &caller,
         req.pid,
         exec_dirfd,
         path_addr,
+        // `None` for a syscall with no argument vector, which the exec pair does not have -- the
+        // same mapping the path came from, read from its own register.
+        exec_argv_arg(req.data.nr, &req.data.args).unwrap_or(0),
         notif_of(notif_fd, req.id),
     );
-    let shown = shown.as_str();
+    let Decided {
+        verdict,
+        shown,
+        probed,
+        because,
+    } = &decided;
+    let (verdict, shown) = (*verdict, shown.as_str());
     let by = caller.last().map(String::as_str).unwrap_or_default();
     match verdict {
         Verdict::Allow => {
@@ -733,7 +841,7 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
             respond_continue(notif_fd, req.id);
         }
         Verdict::Deny => {
-            let errno = refusal_errno(req.pid, shown);
+            let errno = refusal_errno(req.pid, probed);
             // A name lookup is one `execve` per `PATH` entry, so a program found in the fourth
             // directory leaves three refusals behind it — of files that were never there. Recorded
             // apart from a refusal of something real, because they are the same event a cage with
@@ -755,10 +863,19 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
                     event: crate::notify::NotifyEvent::Proc,
                     subject: shown.to_string(),
                     reason: "denied-by-policy".to_string(),
-                    detail: if by.is_empty() {
-                        "the exec policy does not allow this program to run".to_string()
-                    } else {
-                        format!("`{by}` is not allowed to run it by the exec policy")
+                    detail: match because {
+                        // Said apart from a rule's refusal, because it is not one: nothing in the
+                        // policy named this program, and the reader's next move is different.
+                        Because::UnreadableLoaderArgv => "this is a dynamic loader, and the \
+                             program its arguments name could not be read — so the exec policy had \
+                             no name to match and it was refused rather than run"
+                            .to_string(),
+                        Because::Policy if by.is_empty() => {
+                            "the exec policy does not allow this program to run".to_string()
+                        }
+                        Because::Policy => {
+                            format!("`{by}` is not allowed to run it by the exec policy")
+                        }
                     },
                     // No `sbx proc allow` suggestion: under `enforce` the rule that refused is a
                     // deliberate `deny` entry, and a one-line "allow it" would invite undoing the
