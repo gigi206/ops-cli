@@ -1262,7 +1262,65 @@ mod tests {
                 });
             }
         }
+        heads.push(root_head());
         heads
+    }
+
+    /// The root dispatcher, read the same way and answered by the same property.
+    ///
+    /// [`super::dispatch`] takes its verb as an already-extracted `&str` from `main`, so it does
+    /// not spell the idiom the scan above looks for and was never in the population. Nor did the
+    /// completeness check reach it: a page of length one has `[]` for a parent, and the filter that
+    /// builds the parent list dropped it. Between the two, a verb wired into the root `match` with
+    /// no page ran, appeared in neither `--help` nor completion, and its refusal printed a usage
+    /// line naming something else, with every guard green. The same defect one level down is red.
+    fn root_head() -> Head {
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli/mod.rs");
+        let text = std::fs::read_to_string(&file).expect("the root dispatcher must be readable");
+        let at = text
+            .find("pub(crate) fn dispatch(name: &str")
+            .expect("the root dispatcher is where its own doc says it is");
+        let body = &text[at..];
+        let start = body
+            .find("\n    match name {")
+            .expect("its match on the verb")
+            + 1;
+        let lines: Vec<&str> = body[start..].lines().collect();
+        let mut verbs = Vec::new();
+        let mut depth = 0i32;
+        for line in &lines {
+            // Depth 1 is this match's own arm list, for the reason the scan above counts it:
+            // a nested match holds another vocabulary.
+            if depth == 1
+                && let Some(arrow) = line.find("=>")
+                && line.trim_start().starts_with('"')
+            {
+                let mut quoted = line[..arrow].split('"');
+                quoted.next();
+                while let Some(word) = quoted.next() {
+                    // A leading `__` is this CLI's mark for a verb sbx invokes on itself: the
+                    // netns holder it re-execs and the completion oracle a shell script calls.
+                    // Neither is a command a user types, so neither has a page, and the help
+                    // sweep does not offer them either.
+                    if !word.starts_with("__") {
+                        verbs.push(word.to_string());
+                    }
+                    if quoted.next().is_none() {
+                        break;
+                    }
+                }
+            }
+            depth += line.matches('{').count() as i32;
+            depth -= line.matches('}').count() as i32;
+            if depth <= 0 {
+                break;
+            }
+        }
+        Head {
+            file: format!("{}: the root dispatcher", file.display()),
+            path: Vec::new(),
+            verbs,
+        }
     }
 
     /// Whether `path`'s page names `verb`, as a subcommand of its own or in an option row.
@@ -1313,9 +1371,11 @@ mod tests {
         // family with subcommand pages and no head, and says so here instead of being skipped.
         // (Two dispatchers are *not* covered by this, `storage` and `proc pending`, whose verbs
         // live in their parent's option rows rather than in pages of their own.)
+        // A page of length one has the root for a parent, and the root dispatches it: dropping
+        // those was how the root stayed outside its own population.
         let mut parents: Vec<Vec<String>> = crate::help::all_paths()
             .iter()
-            .filter(|p| p.len() > 1)
+            .filter(|p| !p.is_empty())
             .map(|p| p[..p.len() - 1].iter().map(|w| (*w).to_string()).collect())
             .collect();
         parents.sort();
@@ -1335,13 +1395,17 @@ mod tests {
                 head.file
             );
             for verb in &head.verbs {
+                let under = head.path.join(" ");
+                let (spelled, named) = if under.is_empty() {
+                    (format!("sbx {verb}"), "top-level".to_string())
+                } else {
+                    (format!("sbx {under} {verb}"), format!("`{under}`"))
+                };
                 assert!(
                     page_names_verb(&head.path, verb),
-                    "{}: `sbx {} {verb}` is routed, but the `{}` page names it neither as a \
+                    "{}: `{spelled}` is routed, but the {named} page names it neither as a \
                      subcommand nor in an option row — add its page, or its row",
                     head.file,
-                    head.path.join(" "),
-                    head.path.join(" ")
                 );
             }
         }
