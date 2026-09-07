@@ -1579,15 +1579,6 @@ fn parse_url_target_extracts_host_port_and_path() {
     assert!(parse_url_target("not a url").is_err());
 }
 
-/// The absolute-FQDN spelling is decided by the proxy, so the verb that exists to answer "what
-/// would the proxy decide?" has to accept it.
-///
-/// A trailing dot is what DNS calls the root, and `canonical_host` strips every one of them on both
-/// sides of a match -- which is what keeps `evil.com.` from walking past a `deny evil.com`. Rules
-/// themselves can never carry one (`is_valid_hostname` refuses it), and that asymmetry is the
-/// point: the *rule* side stays strict while the *request* side normalizes. A target is a request,
-/// not a declaration, so refusing it there left the one form a reader most needs to check
-/// uncheckable by the tester.
 /// A control byte has no place in an egress rule, and the classifier is where that is settled.
 ///
 /// A rule's text is not only matched: it is written into a config file, echoed by `sbx net rules`
@@ -1632,6 +1623,15 @@ fn a_rule_carrying_a_control_byte_is_refused_by_the_classifier() {
     }
 }
 
+/// The absolute-FQDN spelling is decided by the proxy, so the verb that exists to answer "what
+/// would the proxy decide?" has to accept it.
+///
+/// A trailing dot is what DNS calls the root, and `canonical_host` strips every one of them on both
+/// sides of a match -- which is what keeps `evil.com.` from walking past a `deny evil.com`. Rules
+/// themselves can never carry one (`is_valid_hostname` refuses it), and that asymmetry is the
+/// point: the *rule* side stays strict while the *request* side normalizes. A target is a request,
+/// not a declaration, so refusing it there left the one form a reader most needs to check
+/// uncheckable by the tester.
 #[test]
 fn a_target_carries_the_absolute_fqdn_form_the_proxy_normalizes() {
     assert_eq!(
