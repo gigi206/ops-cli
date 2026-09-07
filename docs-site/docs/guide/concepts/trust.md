@@ -98,10 +98,21 @@ Because the hash covers the *whole file*, any edit, even to a free field, re-arm
 the gate. This is deliberate: after editing a trusted file, its security fields stop
 applying until you run `sbx trust` again.
 
-When a project also has mise config files (`.mise.toml`, `mise.toml`,
-`.tool-versions`, `mise.local.toml`), they are hashed **together** with `.sbx.toml`,
-so editing either re-arms the gate and a mise `[env]` cannot change under a trusted
-posture without re-trusting.
+When a project also has mise config files, they are hashed **together** with
+`.sbx.toml`, so editing either re-arms the gate and a mise `[env]` cannot change under
+a trusted posture without re-trusting. The set is mise's whole same-directory
+discovery, in its precedence order:
+
+```
+.mise.local.toml  mise.local.toml  .mise.toml  mise.toml
+mise/config.toml  .mise/config.toml  .config/mise.toml  .config/mise/config.toml
+.tool-versions
+```
+
+Three of them sit in a subdirectory of the project, which mise reads exactly as it
+reads the top-level ones. What stays out is what lives outside the project root the
+gate anchors on: a parent directory's config, the user-global one, and the
+env-specific `mise.<env>.toml`.
 
 That is also why a command that **writes and trusts in one step** (`sbx net allow
 --local`, `sbx proc allow --local`, `sbx config set --trust`) declines to create a

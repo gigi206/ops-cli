@@ -44,25 +44,35 @@ pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
     out
 }
 
-/// Candidate mise config filenames beside the `.sbx.toml`, highest precedence
-/// first. Every one that exists is part of "the project's mise configuration" — all
-/// are folded into the trust hash. The set covers mise's *same-directory* discovery
-/// names: the local override, the two canonical config files, and the idiomatic
-/// `.tool-versions`. It stays in lockstep with the set a later stage authorizes mise
-/// to read, or an unhashed file would reach resolution — which is why the wider
-/// reaches of mise's own discovery (parent-directory configs, the user-global config,
-/// env-specific `mise.<env>.toml`) are deliberately *out*: they live outside the
-/// project root the trust gate anchors on, so admitting them would let a file sbx
-/// never hashed steer resolution.
+/// Candidate mise config paths beside the `.sbx.toml`, highest precedence first. Every one
+/// that exists is part of "the project's mise configuration" — all are folded into the trust
+/// hash. The set is mise's *same-directory* discovery, all of it: the two local overrides, the
+/// two canonical config files, the three a project may keep in a subdirectory rather than at
+/// its top level, and the idiomatic `.tool-versions`. It stays in lockstep with the set a later
+/// stage authorizes mise to read, or an unhashed file would reach resolution — which is why the
+/// wider reaches of mise's own discovery (parent-directory configs, the user-global config,
+/// env-specific `mise.<env>.toml`) are deliberately *out*: they live outside the project root
+/// the trust gate anchors on, so admitting them would let a file sbx never hashed steer
+/// resolution.
+///
+/// Three of these name a file in a subdirectory, so an entry here is a relative path rather
+/// than a filename. Two of them end in `config.toml`, which is why [`mise_inputs_for`] tags a
+/// part of the hash with this whole path: two files sharing a tag would cost the framing the
+/// property it exists for.
 const MISE_CONFIG_NAMES: &[&str] = &[
+    ".mise.local.toml",
     "mise.local.toml",
     ".mise.toml",
     "mise.toml",
+    "mise/config.toml",
+    ".mise/config.toml",
+    ".config/mise.toml",
+    ".config/mise/config.toml",
     ".tool-versions",
 ];
 
-/// Every mise file beside `config_path` (the `.sbx.toml`) that exists, in
-/// precedence order — empty when the directory has none. *All* of them are folded
+/// Every mise file under the directory of `config_path` (the `.sbx.toml`) that
+/// exists, in precedence order — empty when the directory has none. *All* of them are folded
 /// into the trust hash, not just the first: the direnv "any change re-prompts"
 /// superset, so a tool entry hidden in a lower-precedence file cannot ride along
 /// unhashed. Pure path logic; the authoritative, safety-gated read is
@@ -87,13 +97,18 @@ pub(crate) fn mise_files_for(config_path: &Path) -> Vec<PathBuf> {
 /// companion file means the project's trusted content cannot be confirmed, so every
 /// caller must fail closed rather than fall back to the `.sbx.toml` alone.
 pub(crate) fn mise_inputs_for(config_path: &Path) -> io::Result<MiseInputs> {
+    let dir = config_path.parent();
     let mut out = Vec::new();
     for path in mise_files_for(config_path) {
         let bytes = crate::config::safety::read_safe_bytes(&path)?;
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        // The path relative to the project, not the filename: `.config/mise/config.toml` and
+        // `.mise/config.toml` share the second and would share a tag, which is exactly what the
+        // framing in `content_hash` may not allow.
+        let name = dir
+            .and_then(|d| path.strip_prefix(d).ok())
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
         out.push((name, bytes));
     }
     Ok(out)
@@ -928,19 +943,107 @@ mod tests {
         assert_eq!(mise_files_for(&cfg), vec![proj.join(".tool-versions")]);
 
         // every same-directory candidate is returned, highest precedence first —
-        // none is dropped, so a tool or env entry in any of them is hashed
-        std::fs::write(proj.join("mise.toml"), b"").unwrap();
-        std::fs::write(proj.join(".mise.toml"), b"").unwrap();
-        std::fs::write(proj.join("mise.local.toml"), b"").unwrap();
+        // none is dropped, so a tool or env entry in any of them is hashed. Three sit in a
+        // subdirectory of the project, which mise reads the same way it reads the top-level ones.
+        for dir in [".config/mise", ".mise", "mise"] {
+            std::fs::create_dir_all(proj.join(dir)).unwrap();
+        }
+        for name in [
+            "mise.toml",
+            ".mise.toml",
+            "mise.local.toml",
+            ".mise.local.toml",
+            "mise/config.toml",
+            ".mise/config.toml",
+            ".config/mise.toml",
+            ".config/mise/config.toml",
+        ] {
+            std::fs::write(proj.join(name), b"").unwrap();
+        }
         assert_eq!(
             mise_files_for(&cfg),
             vec![
+                proj.join(".mise.local.toml"),
                 proj.join("mise.local.toml"),
                 proj.join(".mise.toml"),
                 proj.join("mise.toml"),
+                proj.join("mise/config.toml"),
+                proj.join(".mise/config.toml"),
+                proj.join(".config/mise.toml"),
+                proj.join(".config/mise/config.toml"),
                 proj.join(".tool-versions"),
             ]
         );
+    }
+
+    #[test]
+    fn a_mise_file_in_a_subdirectory_re_arms_the_gate_like_a_top_level_one() {
+        // The five names the set did not carry. mise reads them from the project directory the
+        // same way it reads `mise.toml`, so a `[tools]`, an `[env]` or a `_.source` in one of them
+        // steers what the cage runs — and a marker that does not cover them says the project is
+        // unchanged while that file says something new. The four the set already carried are the
+        // witness: they are edited in the same loop, and they re-arm.
+        for name in [
+            ".mise.local.toml",
+            "mise/config.toml",
+            ".mise/config.toml",
+            ".config/mise.toml",
+            ".config/mise/config.toml",
+            // the witnesses
+            "mise.local.toml",
+            ".mise.toml",
+            "mise.toml",
+            ".tool-versions",
+        ] {
+            let store = TmpDir::new();
+            let proj = TmpDir::new();
+            let cfg = proj.join(".sbx.toml");
+            std::fs::write(&cfg, b"x = 1\n").unwrap();
+            if let Some(parent) = std::path::Path::new(name).parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(proj.path().join(parent)).unwrap();
+            }
+            std::fs::write(proj.join(name), b"[env]\nA = \"1\"\n").unwrap();
+
+            trust(store.path(), &cfg).unwrap();
+            assert_eq!(state(store.path(), &cfg), TrustState::Trusted, "{name}");
+
+            std::fs::write(proj.join(name), b"[env]\nA = \"2\"\n").unwrap();
+            assert_eq!(
+                state(store.path(), &cfg),
+                TrustState::Changed,
+                "editing {name} must re-arm the gate"
+            );
+        }
+    }
+
+    #[test]
+    fn two_mise_files_named_config_toml_are_told_apart_by_the_hash() {
+        // `.mise/config.toml` and `.config/mise/config.toml` share a filename. The framing tags
+        // each part, so tagging by filename would give the two the same tag and let their contents
+        // be swapped under one marker.
+        let proj = TmpDir::new();
+        let cfg = proj.join(".sbx.toml");
+        std::fs::write(&cfg, b"x = 1\n").unwrap();
+        std::fs::create_dir_all(proj.join(".mise")).unwrap();
+        std::fs::create_dir_all(proj.join(".config/mise")).unwrap();
+        std::fs::write(proj.join(".mise/config.toml"), b"a\n").unwrap();
+        std::fs::write(proj.join(".config/mise/config.toml"), b"b\n").unwrap();
+        let before = content_hash(b"x = 1\n", &mise_inputs_for(&cfg).unwrap());
+
+        // Swap the two bodies: the set of (name, bytes) pairs is different, so the hash must be.
+        std::fs::write(proj.join(".mise/config.toml"), b"b\n").unwrap();
+        std::fs::write(proj.join(".config/mise/config.toml"), b"a\n").unwrap();
+        let after = content_hash(b"x = 1\n", &mise_inputs_for(&cfg).unwrap());
+        assert_ne!(before, after, "the two files are told apart by their tag");
+
+        let tags: Vec<String> = mise_inputs_for(&cfg)
+            .unwrap()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(tags, vec![".mise/config.toml", ".config/mise/config.toml"]);
     }
 
     #[test]

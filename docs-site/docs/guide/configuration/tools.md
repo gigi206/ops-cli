@@ -6,7 +6,9 @@ description: "Honoring a project's mise configuration as its per-project dev too
 # `[tools]`: a project's mise toolchain
 
 `sbx` honors a project's [mise](https://mise.jdx.dev/) configuration
-(`.mise.toml` / `mise.toml` / `.tool-versions`) as its per-project dev toolchain.
+(`.mise.toml` / `mise.toml` / `.tool-versions`, and every other name mise reads from
+the project directory: see [the trust gate](../concepts/trust)) as its per-project
+dev toolchain.
 This is distinct from the trusted-only [`[packages]`](packages) field: `[tools]`
 is the **open, local, self-equip** path, the way an agent equips a project's tools
 from inside the cage.
