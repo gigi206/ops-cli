@@ -1180,3 +1180,50 @@ fn sbx_app_rm_purge_refuses_while_a_session_is_live() {
         "purge removed the home despite the live session"
     );
 }
+
+/// `sbx app export --out` wrote with a straight `fs::write`, while the two other exporters that
+/// compose a config file (`bundle export --out`, `net groups export --out`) go through the writer
+/// that lands a temporary beside the destination and renames. A straight write truncates first, so
+/// an interrupted export leaves a fragment at a path whose whole purpose is to be imported back;
+/// and it follows a symlink at the destination, so `--out` into a directory the cage can write
+/// turns into a write through somebody else's name.
+#[test]
+fn app_export_does_not_write_through_a_symlink_at_its_destination() {
+    let fx = Project::new("app");
+    fx.write_profile("demo-app", &demo_profile());
+
+    let victim = fx.proj.path().join("victim.toml");
+    std::fs::write(&victim, b"original\n").unwrap();
+    let out_path = fx.proj.path().join("export.toml");
+    std::os::unix::fs::symlink(&victim, &out_path).unwrap();
+
+    let out = fx.run(&[
+        "app",
+        "export",
+        "demo-app",
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    assert!(
+        std::fs::read_to_string(&victim).unwrap() == "original\n",
+        "the link's target was written through: {}",
+        text(&out)
+    );
+
+    // Witness: an ordinary destination still receives the profile, and it reads back as one.
+    let plain = fx.proj.path().join("plain.toml");
+    let out = fx.run(&[
+        "app",
+        "export",
+        "demo-app",
+        "--out",
+        plain.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "sbx app export failed: {}",
+        text(&out)
+    );
+    let written = std::fs::read_to_string(&plain).unwrap();
+    assert!(written.contains("cmd = \"demo\""), "{written}");
+}

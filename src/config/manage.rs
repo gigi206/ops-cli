@@ -1676,10 +1676,11 @@ fn write_doc(path: &Path, doc: &DocumentMut) -> Result<String, ManageError> {
     Ok(text)
 }
 
-/// Write `text` to `path` on the terms [`write_doc`] describes — the body of it, shared with the
-/// one other place sbx writes a config file it composed: `sbx bundle export --out`. A fragment
-/// written straight through leaves a truncated file at a destination whose whole purpose is to be
-/// imported back, which is the half-write this function exists to prevent for the config itself.
+/// Write `text` to `path` on the terms [`write_doc`] describes — the body of it, shared with every
+/// other place sbx writes a config file it composed: `sbx bundle export --out`, `sbx net groups
+/// export --out` and `sbx app export --out`. A fragment written straight through leaves a truncated
+/// file at a destination whose whole purpose is to be imported back, which is the half-write this
+/// function exists to prevent for the config itself.
 ///
 /// `fresh_mode` is what a file that does not exist yet is given; an existing one keeps its own
 /// either way. The two callers want different answers and neither should inherit the other's:

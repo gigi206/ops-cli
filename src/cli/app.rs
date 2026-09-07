@@ -891,7 +891,13 @@ fn app_export(args: &[OsString]) -> ExitCode {
         }
         Some(path) => {
             let path = Path::new(path);
-            if let Err(e) = std::fs::write(path, &bytes) {
+            // Through the writer the other two exporters use: a profile is written to be imported
+            // back, and a straight `fs::write` truncates first, so an interrupted export leaves a
+            // fragment at the destination that `sbx app import` will happily read as a whole
+            // profile. It also follows a symlink at the destination, which `--out` into a
+            // cage-writable directory turns into a write through somebody else's name.
+            let text = String::from_utf8_lossy(&bytes);
+            if let Err(e) = config::manage::write_text(path, &text, None) {
                 diag::error(&format!("sbx: cannot write {}: {e}", path.display()));
                 return ExitCode::FAILURE;
             }
