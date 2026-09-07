@@ -127,10 +127,15 @@ fn write_pins(
     super::atomicfile::write_atomic(&path, body.as_bytes())
 }
 
-/// How long a `nix flake metadata` may take. It is a handful of HTTP requests against a forge, so
-/// a minute is far beyond a slow one; without a bound, a far end that accepts and then says nothing
-/// holds the launch for as long as it cares to.
-const FLAKE_METADATA_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a `nix flake metadata` may take.
+///
+/// Not a handful of HTTP requests: to report the `narHash` nix fetches the source itself, so a cold
+/// `flake metadata` on nixpkgs took 31 s on this host over a good link. Five minutes is the same
+/// window a human-paced host step of the secret chain gets, and it leaves that measurement an
+/// order of magnitude of headroom for a slow one. The bound is not about how long a resolution
+/// should take; it is so that a far end which accepts and then says nothing cannot hold the launch
+/// for as long as it cares to.
+pub(crate) const FLAKE_METADATA_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Resolve a declared `flake:` reference to its current immutable pin via `nix flake metadata`.
 /// The flake (the part before `#`) is locked to a revision and an immutable URL; the output
@@ -139,8 +144,7 @@ const FLAKE_METADATA_DEADLINE: std::time::Duration = std::time::Duration::from_s
 fn resolve(nix: &Path, layout: &Layout, reference: &str) -> io::Result<FlakePin> {
     let (base, attr) = split_attr(reference);
     // Bounded: this reaches the network, and `output()` waits for as long as the far end keeps the
-    // connection open without sending. A metadata read is a handful of HTTP requests, so a minute
-    // is far beyond a slow one and short of a launch that never returns.
+    // connection open without sending. See [`FLAKE_METADATA_DEADLINE`] for why the window is wide.
     let out = crate::sandbox::resolver::output_within(
         store::nix_command(nix, layout)
             .args(["--extra-experimental-features", "nix-command flakes"])

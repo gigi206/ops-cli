@@ -206,6 +206,12 @@ client (e.g. `bun install`) builds fine: the cage allowlist governs only the app
 **runtime** egress. Pins advance with
 [`sbx upgrade flake`](../housekeeping/upgrade).
 
+Resolving a `flake:` ref to its current pin (`nix flake metadata`) is bounded at **five
+minutes**, and so is resolving a nixpkgs channel. That is not a target: nix fetches the
+source to hash it, so a cold resolution of nixpkgs takes tens of seconds on a good link.
+The bound is there so that a forge which accepts the connection and then says nothing
+cannot hold a launch open indefinitely, and it fails naming the reference it was reading.
+
 ## `[flakes]`: an inline nix flake
 
 When a tool ships **only** as a flake you author yourself, or you want to package a

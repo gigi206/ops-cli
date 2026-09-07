@@ -53,7 +53,7 @@ mod broker;
 pub(crate) mod broker_control;
 mod deb;
 pub(crate) mod distro;
-mod flake;
+pub(crate) mod flake;
 pub(crate) mod flake_inline;
 mod mise;
 mod miseplugin;
