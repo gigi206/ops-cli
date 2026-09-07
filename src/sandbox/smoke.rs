@@ -21,6 +21,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 /// What a live launch revealed about the sandbox. Each field is a fact the kernel
 /// reported from inside the running sandbox, so a caller can both decide go/no-go
@@ -67,6 +68,14 @@ fn shell_quoted(value: &str) -> String {
 /// Errors only when the probe could not be run at all (the spec is constant and
 /// valid, so a failure is bubblewrap not spawning); a launch that runs but is not
 /// hardened is a successful call returning a non-hardened report.
+/// How long the probe launch may take before `doctor` reports it as stuck rather than waiting on it.
+///
+/// The probe starts a minimal cage and reads `/proc/self/status`. It provisions nothing, touches no
+/// network and runs no workload, so a host where it has not finished in this long has a problem
+/// worth reporting, which is what `doctor` exists to do. Unbounded, the one command whose job is to
+/// diagnose a broken launch path was the one that hung on it, with no output to say why.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(crate) fn run(bwrap: &Path) -> io::Result<SmokeReport> {
     let work = ScratchDir::new()?;
 
@@ -88,7 +97,34 @@ pub(crate) fn run(bwrap: &Path) -> io::Result<SmokeReport> {
     let mut command = Command::new(bwrap);
     command.args(argv);
     super::memfd::inherit_across_exec(&mut command, &held);
-    let out = command.output()?;
+    // Spawned rather than run through `output()`, which waits without a deadline. The pipes are
+    // asked for explicitly because `spawn` does not inherit `output()`'s: the probe writes a few
+    // lines of `/proc` and never fills one.
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait()? {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(held);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "the sandbox probe did not finish within {}s",
+                        PROBE_TIMEOUT.as_secs()
+                    ),
+                ));
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    let out = child.wait_with_output()?;
     drop(held);
     let stdout = String::from_utf8_lossy(&out.stdout);
 
