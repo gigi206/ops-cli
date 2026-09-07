@@ -992,7 +992,7 @@ pub(super) fn validate_env_name(name: &str) -> Result<(), String> {
             "`{name}` contains `{bad}` — a variable name is letters, digits, and `_`"
         ));
     }
-    const REFUSED_PREFIXES: &[&str] = &["LD_", "NIX_LD"];
+    const REFUSED_PREFIXES: &[&str] = &["LD_", "NIX_LD", "GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
     const REFUSED: &[&str] = &[
         "PATH",
         "HOME",
@@ -1012,6 +1012,14 @@ pub(super) fn validate_env_name(name: &str) -> Result<(), String> {
         "PERL5OPT",
         "RUBYOPT",
         "GIT_SSH_COMMAND",
+        // The same commands through git's configuration rather than through one variable each:
+        // a file named here carries `core.sshCommand`, `core.hooksPath` and the rest. The
+        // numbered inline pairs are covered by the prefix list above.
+        "GIT_CONFIG",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
         "SSH_ASKPASS",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
@@ -1342,6 +1350,8 @@ mod tests {
             "BASH_ENV",
             "NODE_OPTIONS",
             "GIT_SSH_COMMAND",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_KEY_0",
             "SSL_CERT_FILE",
             "HTTPS_PROXY",
         ] {

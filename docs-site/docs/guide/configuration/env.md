@@ -68,6 +68,24 @@ few structural keys:
   `GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_EDITOR`, `LESSOPEN`, `LESSCLOSE`,
   `SSH_ASKPASS`, `SUDO_ASKPASS`. These carry an argv rather than a file to source, so
   the first `git fetch` or the first paged file runs whatever the value names.
+- The same commands through git's own configuration: `GIT_CONFIG`,
+  `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_PARAMETERS`,
+  `GIT_CONFIG_COUNT` with the numbered `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`
+  pairs it counts, plus `GIT_EXEC_PATH` and `GIT_TEMPLATE_DIR`. A git configuration
+  file carries `core.sshCommand`, `core.hooksPath`, `core.fsmonitor`, `core.pager`,
+  `diff.external` and `credential.helper`, so naming one reaches every command the
+  line above does and more.
+- A module directory a desktop library loads from: `GIO_EXTRA_MODULES`,
+  `GST_PLUGIN_SYSTEM_PATH_1_0`, `GST_PLUGIN_PATH`, `ALSA_PLUGIN_DIR`, `GTK_MODULES`,
+  `GTK_PATH`, `QT_PLUGIN_PATH`, alongside the GPU driver paths below. `sbx` sets these
+  for a cage with audio or a GUI, and a project's `[env]` has the last word over the
+  layer that set them, so an untrusted one could aim a trusted app at a library in the
+  project tree. `XDG_DATA_DIRS` stays free: what is found through it is data.
+- mise's namespace, whole: anything starting with `MISE_`, and `CI`. The same
+  namespace that carries data paths carries the keys deciding **which files mise
+  executes**: `MISE_TRUSTED_CONFIG_PATHS` is mise's own trust gate, and `CI` tells
+  mise to approve without asking. A project's own mise file is read in its cage by
+  design; which other files are is not the project's to say.
 - A search path an interpreter imports from: `PYTHONPATH`, `PYTHONHOME`, `NODE_PATH`,
   `PERL5LIB`, `RUBYLIB`, `CLASSPATH`, `LUA_PATH`, `LUA_CPATH`, `GEM_PATH`, `R_LIBS`,
   `JULIA_LOAD_PATH`, `PSModulePath`. Nothing is named and nothing is executed directly;

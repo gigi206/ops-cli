@@ -70,6 +70,14 @@ config) never reaches resolution.
 A trusted project's mise `[env]` also maps into the cage, extracted by provenance so
 only variables whose source is an authorized mise file are kept.
 
+An untrusted project's `[env]` is not mapped, and that is the whole of what withholding
+it means. The file is the project's own and stays where it is: the in-cage mise reads it,
+which is what keeps a non-`nix:` `[tools]` entry working on an untrusted project. So a
+variable that file sets is resolved by any `mise` run inside the cage, including through a
+shim, and the reserved-key denylist that filters a `.sbx.toml`'s own `[env]` does not reach
+there. It is not in the cage's ambient environment, so an ordinary command does not see it.
+Keep out of a project's mise file what you would not want a `mise` in its cage to resolve.
+
 ## `[tools]` vs `[packages]`
 
 | | `[tools]` (mise file) | [`[packages]`](packages) |

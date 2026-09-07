@@ -130,7 +130,7 @@ validated, so the declaration never loads rather than failing at invocation:
 
 | Refused | Why |
 |---|---|
-| a variable that steers how a program **loads or connects** | `LD_*`, `NIX_LD*`, `PATH`, `HOME`, `IFS`, `ENV`, `BASH_ENV`, `SHELL`, `GCONV_PATH`, `GLIBC_TUNABLES`, `LOCPATH`, `NLSPATH`, `HOSTALIASES`, `RESOLV_HOST_CONF`, `PYTHONSTARTUP`, `PYTHONPATH`, `NODE_OPTIONS`, `PERL5OPT`, `RUBYOPT`, `GIT_SSH_COMMAND`, `SSH_ASKPASS`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` (case-insensitive): the command and its trust anchors are sbx's choice, not a caller's |
+| a variable that steers how a program **loads or connects** | `LD_*`, `NIX_LD*`, `PATH`, `HOME`, `IFS`, `ENV`, `BASH_ENV`, `SHELL`, `GCONV_PATH`, `GLIBC_TUNABLES`, `LOCPATH`, `NLSPATH`, `HOSTALIASES`, `RESOLV_HOST_CONF`, `PYTHONSTARTUP`, `PYTHONPATH`, `NODE_OPTIONS`, `PERL5OPT`, `RUBYOPT`, `GIT_SSH_COMMAND`, the `GIT_CONFIG*` family (which reaches the same commands through git's own configuration), `SSH_ASKPASS`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` (case-insensitive): the command and its trust anchors are sbx's choice, not a caller's |
 | a name also declared in [`secret`](credentials) | one name, one source, so a caller can never supply the credential the task exists to hold on its behalf |
 | a name also fixed in `env` | the fixed value says "this is the declaration's", the allowlist says "this is the caller's"; sbx refuses rather than picks |
 

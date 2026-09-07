@@ -1360,10 +1360,10 @@ pub(crate) const SHELL_RC_INCAGE: &str = "/opt/sbx/bashrc";
 ///   canonicalisation — which strips extended attributes — fails with
 ///   `Permission denied` on a file the builder already made read-only; ignoring
 ///   the attribute keeps in-cage builds working there. The `NIX_CONFIG` key is on the
-///   untrusted-only env denylist. `MISE_DATA_DIR`/`MISE_SHARED_INSTALL_DIRS` are data
-///   paths (not code-load paths like `NIX_LD`), so — like `MISE_EXPERIMENTAL`/`MISE_YES`
-///   — they are not denylisted: an untrusted `[env]` override only mispoints the
-///   project's own cage's mise (self-sabotage), never a loader/`AT_SECURE` escape.
+///   untrusted-only env denylist, and so is every key set here: `MISE_` is reserved as a
+///   whole prefix, because the same namespace that holds these data paths also holds the
+///   keys that choose **which files mise executes**. An untrusted `[env]` therefore cannot
+///   overwrite what is set here; a trusted one still can, as it can for every reserved key.
 ///
 /// `per_project_primary` selects the split: `true` for a global app (primary moves
 /// per-project, app-global installs become the read-only fallback), `false` otherwise

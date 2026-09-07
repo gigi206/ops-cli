@@ -252,6 +252,33 @@ pub(crate) fn is_reserved_env_key(key: &str) -> bool {
                 | "GIT_EXTERNAL_DIFF"
                 | "GIT_PAGER"
                 | "GIT_EDITOR"
+                // The same commands one indirection further out, which is the step the manifest
+                // group above is here for. A git configuration file carries `core.sshCommand`,
+                // `core.hooksPath`, `core.fsmonitor`, `core.pager`, `diff.external`,
+                // `credential.helper` and the `filter.<x>` pair, so a value naming one of those
+                // files — or carrying the settings inline — reaches every command the five names
+                // above do, and more. `GIT_EXEC_PATH` is where git finds its own subcommands and
+                // `GIT_TEMPLATE_DIR` the hooks a clone copies in, which is the same reach again.
+                | "GIT_CONFIG"
+                | "GIT_CONFIG_GLOBAL"
+                | "GIT_CONFIG_SYSTEM"
+                | "GIT_CONFIG_PARAMETERS"
+                | "GIT_CONFIG_COUNT"
+                | "GIT_EXEC_PATH"
+                | "GIT_TEMPLATE_DIR"
+                // The directories a desktop library `dlopen`s a module from, which is the group
+                // `LIBGL_DRIVERS_PATH` opens: sbx sets each of these for a cage that has audio or
+                // a GUI, and the `[env]` of a project has the last word over the layer that set
+                // them, so an untrusted one could aim a trusted app's glib, GStreamer, ALSA, GTK
+                // or Qt at a `.so` in the project tree. `XDG_DATA_DIRS` stays free: what is found
+                // through it is data — schemas, icons, mime — not a library to load.
+                | "GIO_EXTRA_MODULES"
+                | "GST_PLUGIN_SYSTEM_PATH_1_0"
+                | "GST_PLUGIN_PATH"
+                | "ALSA_PLUGIN_DIR"
+                | "GTK_MODULES"
+                | "GTK_PATH"
+                | "QT_PLUGIN_PATH"
                 | "LESSOPEN"
                 | "LESSCLOSE"
                 | "SSH_ASKPASS"
@@ -332,6 +359,27 @@ pub(crate) fn is_reserved_env_key(key: &str) -> bool {
         // A prefix, not a substring: `TRAE_SBX_UPDATE` and `HERMES_WEBUI_SBX_GATEWAY` are an app's
         // own variables and stay free.
         || key.starts_with("SBX_")
+        // The numbered half of git's inline configuration: `GIT_CONFIG_COUNT` is above, and the
+        // pairs it counts are named `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`. The index is
+        // the writer's to choose, so this is the `BASH_FUNC_` case again: a per-name list cannot
+        // cover it.
+        || key.starts_with("GIT_CONFIG_KEY_")
+        || key.starts_with("GIT_CONFIG_VALUE_")
+        // mise's own namespace, whole, for the reason `SBX_` is: sbx sets part of it into the cage
+        // and mise reads the rest to decide **which files it executes**. `MISE_TRUSTED_CONFIG_PATHS`
+        // is the sharpest — it is mise's own trust gate, and a value of `/` opens every config file
+        // on the machine — with `MISE_GLOBAL_CONFIG_FILE`, `MISE_CONFIG_FILE`, `MISE_ENV` and
+        // `MISE_OVERRIDE_CONFIG_FILENAMES` each choosing a file another way, and `MISE_DATA_DIR`
+        // naming the directory whose `plugins/*/bin` entries mise runs. A project's own mise file
+        // is read in its cage by design; which *other* files are is not the project's to say. The
+        // few sbx sets for the cage (`MISE_YES`, `MISE_EXPERIMENTAL`, the data dirs) are reserved
+        // with them, since the rule is that the keys sbx sets are the keys it protects.
+        || key.starts_with("MISE_")
+        // The variable mise reads as "this is automation, approve without asking", which reaches
+        // `MISE_TRUSTED_CONFIG_PATHS`'s destination by a name that looks like nothing at all. It
+        // is the one entry here that is also an ordinary thing to want to set, which is why it is
+        // named rather than left to a prefix: a trusted project still sets it.
+        || key == "CI"
 }
 
 /// The proxy-control variables, matched case-insensitively (tools honor both

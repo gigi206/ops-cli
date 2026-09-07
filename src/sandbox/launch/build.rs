@@ -2959,6 +2959,13 @@ fn store_root_of(logical: &Path) -> Option<PathBuf> {
 /// the project declares no mise file, or it is withheld — an untrusted or changed
 /// mise file only warns (its `[env]` is held back, like its security fields).
 ///
+/// Held back from the cage's environment, which is the whole of what this decides. The file is
+/// not made inert: it is the project's own, it stays where it is, and the cage's mise reads it,
+/// which is what keeps a non-`nix:` `[tools]` entry working on an untrusted project. A `mise`
+/// invocation inside the cage therefore still resolves that file's `[env]`, and the reserved-key
+/// denylist that filters a `.sbx.toml`'s own `[env]` does not reach it. The warning says so
+/// rather than claiming a containment this does not build.
+///
 /// mise is provisioned via nix and driven from sbx's store against the **engine**
 /// channel — never this launch's possibly-pinned base reference (mise runs in its own
 /// store view, free of the one-channel rule; see [`Prepared::engine_ref`]). The files
@@ -2971,7 +2978,8 @@ fn mise_env(prep: &Prepared) -> Result<Vec<(String, String)>, ExitCode> {
     };
     if mise_cfg.state != crate::trust::TrustState::Trusted {
         crate::diag::warn_config(&format!(
-            "mise file `{}` withheld ({}): its `[env]` is not applied",
+            "mise file `{}` withheld ({}): its `[env]` is not mapped into the cage — the cage's \
+             own mise still reads the file, so a `mise` there resolves it",
             mise_cfg.name,
             crate::config::untrusted_reason(mise_cfg.state)
         ));

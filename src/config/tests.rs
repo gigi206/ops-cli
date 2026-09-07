@@ -5271,6 +5271,38 @@ fn reserved_key_predicate_covers_the_ld_family_and_startup_hooks() {
         // suffix as-is, so the suffix has to be reserved on its own account.
         "SBX_ENV_BASH_FUNC_ls%%",
         "SBX_ENV_NODE_OPTIONS",
+        // git's configuration by the file route and the inline one: each reaches
+        // `core.sshCommand`, `core.hooksPath` and the rest, which is where `GIT_SSH_COMMAND`
+        // above already goes. The numbered pairs are a prefix, since the index is the writer's.
+        "GIT_CONFIG",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_CONFIG_KEY_17",
+        "GIT_EXEC_PATH",
+        "GIT_TEMPLATE_DIR",
+        // The module directories a desktop library loads from, the group `LIBGL_DRIVERS_PATH`
+        // opens: sbx sets each for a cage with audio or a GUI, and a project's `[env]` has the
+        // last word over the layer that set it.
+        "GIO_EXTRA_MODULES",
+        "GST_PLUGIN_SYSTEM_PATH_1_0",
+        "GST_PLUGIN_PATH",
+        "ALSA_PLUGIN_DIR",
+        "GTK_MODULES",
+        "GTK_PATH",
+        "QT_PLUGIN_PATH",
+        // mise's namespace, whole: these choose which files mise executes, and
+        // `MISE_TRUSTED_CONFIG_PATHS` is mise's own trust gate.
+        "MISE_TRUSTED_CONFIG_PATHS",
+        "MISE_GLOBAL_CONFIG_FILE",
+        "MISE_ENV",
+        "MISE_DATA_DIR",
+        "MISE_YES",
+        // and the one name that reaches the same place without looking like anything.
+        "CI",
     ] {
         assert!(is_reserved_env_key(k), "{k} should be reserved");
     }
@@ -5291,6 +5323,12 @@ fn reserved_key_predicate_covers_the_ld_family_and_startup_hooks() {
         "OPEN_DESIGN_SBX_UPDATE",
         "HERMES_WEBUI_SBX_GATEWAY",
         "MY_SBX_TOKEN",
+        // What is found through this one is data — schemas, icons, mime — not a library to
+        // load, so it stays out of the group above it.
+        "XDG_DATA_DIRS",
+        // A prefix again: an app's own variable that merely starts with the same letters.
+        "CIRCLE_TOKEN",
+        "MISERLY",
     ] {
         assert!(!is_reserved_env_key(k), "{k} should be allowed");
     }
