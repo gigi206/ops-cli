@@ -124,7 +124,7 @@ impl OpenPolicy {
         // asks the same function before a launch ever reaches here.
         for pattern in patterns {
             validate_pattern(pattern)
-                .map_err(|e| format!("the pattern `{pattern}` is not a valid regex: {e}"))?;
+                .map_err(|e| format!("the pattern `{pattern}` is not usable as a shape: {e}"))?;
         }
         let set = RegexSetBuilder::new(patterns)
             .size_limit(SET_SIZE_LIMIT)
