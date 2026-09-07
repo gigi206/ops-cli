@@ -879,6 +879,29 @@ fn validate_layer(doc: &DocumentMut) -> Result<(), String> {
                 .to_string());
         }
     }
+    // A bare-string `binds` entry carrying `:ro`/`:rw`. That suffix is the *command line's*
+    // spelling — `sbx run --bind /data:rw` takes it apart — and a config file has never read it: a
+    // bare string is a path, whole. So `sbx config add binds /data:rw` wrote a path literally named
+    // `/data:rw`, reported it as added, and the launch dropped it as a path that is not there,
+    // while the user's directory stayed unbound. Refused with the shape a file does read, rather
+    // than translated, because a config's two forms are already the whole grammar.
+    let app_binds = raw.app.values().map(|a| &a.binds);
+    for entry in std::iter::once(&raw.binds).chain(app_binds).flatten() {
+        let super::schema::RawBind::Path(path) = entry else {
+            continue;
+        };
+        for suffix in [":rw", ":ro"] {
+            if let Some(base) = path.strip_suffix(suffix) {
+                let mode = &suffix[1..];
+                return Err(format!(
+                    "`binds` entry `{path}` ends in `{suffix}`, which is the command line's \
+                     spelling and not a config's: a bare string here is a path, whole, so this \
+                     would bind a directory of that name and be dropped as missing. Write it as \
+                     `{{ path = \"{base}\", mode = \"{mode}\" }}`"
+                ));
+            }
+        }
+    }
     // The baseline `[fs]` and every app's, since an app's table is loaded through the same
     // `apply_fs` and dropped by it on the same grounds.
     let app_fs = raw.app.values().filter_map(|a| a.fs.as_ref());
@@ -2358,6 +2381,39 @@ mod tests {
         for (key, value) in [
             ("network.allow", r#"["api.example.test", "@group"]"#),
             ("proc.deny", r#"["curl"]"#),
+        ] {
+            let p = doc_at(tmp.path(), "[network]\nmode = \"deny\"\n");
+            set(&p, key, value).unwrap_or_else(|e| panic!("`{key} = {value}` is valid: {e}"));
+        }
+    }
+
+    /// `:ro`/`:rw` is the command line's bind spelling, and a config file has never read it: a
+    /// bare string there is a path, whole. `sbx config add binds /data:rw` wrote a path literally
+    /// named `/data:rw`, reported it as added, and the launch dropped it as a path that is not
+    /// there, leaving the directory unbound and the user told otherwise.
+    #[test]
+    fn a_bind_written_the_command_lines_way_is_refused_with_the_shape_a_file_reads() {
+        let tmp = crate::testutil::TmpDir::new();
+        for (key, value) in [
+            ("binds", r#"["/data:rw"]"#),
+            ("binds", r#"["/data:ro"]"#),
+            ("app.demo.binds", r#"["/data:rw"]"#),
+        ] {
+            let p = doc_at(tmp.path(), "[network]\nmode = \"deny\"\n");
+            let before = std::fs::read_to_string(&p).unwrap();
+            let err = set(&p, key, value)
+                .err()
+                .unwrap_or_else(|| panic!("`{key} = {value}` must be refused"));
+            assert!(
+                format!("{err}").contains("mode = "),
+                "the refusal names the shape a file reads: {err}"
+            );
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), before);
+        }
+        // Witness: a plain path, and the table form the refusal points at, both write.
+        for (key, value) in [
+            ("binds", r#"["/data"]"#),
+            ("binds", r#"[{ path = "/data", mode = "rw" }]"#),
         ] {
             let p = doc_at(tmp.path(), "[network]\nmode = \"deny\"\n");
             set(&p, key, value).unwrap_or_else(|e| panic!("`{key} = {value}` is valid: {e}"));

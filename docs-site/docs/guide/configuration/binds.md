@@ -133,3 +133,8 @@ SBX_BIND=/etc/ssl/custom:ro sbx run
 The mode is the suffix after the **last** `:`, and only when it is exactly `ro` or
 `rw`. A one-shot bind *adds* to whatever the config binds. The command line beats the
 environment, and both beat the config file. See [One-shot overrides](overrides).
+
+That suffix belongs to the command line alone. In a file, a bare string is a path,
+whole, so `binds = ["/work/scratch:rw"]` names a directory called `/work/scratch:rw`
+and binds nothing. `sbx config add binds /work/scratch:rw` refuses for that reason and
+names the table form to write instead.
