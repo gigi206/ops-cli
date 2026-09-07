@@ -642,6 +642,26 @@ The `apt:` index is the opposite case and shows why the two are separated: there
 repository root yourself, so a `.deb` URL derived from a root you wrote as `http://` follows the
 choice you already made.
 
+### What the `https://` requirement covers, and where it stops
+
+The refusal above reads the URL **you wrote**. It does not follow that URL to see where it leads, and
+for the fetches nix performs the difference is not one `sbx` can close today.
+
+`sbx` fetches distro images itself, and there every hop is checked: a server that answers an
+`https://` request with a redirect to `http://` is refused at that hop rather than followed. The
+`deb:`, `appimage:`, `tarball:` and `binary:` artefacts are fetched by nix instead, inside its own
+process. nix follows such a redirect, reports the hash and the store path without naming the URL that
+finally answered, and offers no setting that constrains the protocols a redirect may reach. So a
+vendor whose own redirect leaves TLS takes the fetch with it, and neither the lock nor the launch
+output says so: the lock records the URL `sbx` asked for.
+
+What still holds in that case is the hash, and it holds differently depending on where the hash came
+from. A `.deb` tracked through an `apt:` index carries a digest the index published, and `sbx` hands
+that digest to nix before the fetch, so an artefact that is not the promised one never enters the
+store. Every other backend pins on first sight, and that first sight is the fetch this section is
+about: the pin then records what arrived, which is the same limit the paragraph below describes for
+a URL you wrote as plaintext yourself.
+
 Be clear about what you give up. Over plaintext, anyone on the network path can replace the artefact
 in flight, and the replacement is what gets pinned, unpacked and put on the cage's `PATH`. The
 content hash still does its job, and its job is narrower than it looks: it binds the pin to whatever

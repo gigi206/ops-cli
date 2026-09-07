@@ -2353,4 +2353,26 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
             }
         }
     }
+
+    /// The one digest in the tree that attests an artefact independently reaches nix as one.
+    ///
+    /// `prefetch_hash` takes the digest before the fetch, so a `.deb` that is not the one the
+    /// index promised never enters the store. Every other backend passes `None` and pins what
+    /// arrived, which is the honest answer where nothing attests the bytes; `apt:` is the case
+    /// where something does, and dropping the argument there would silently turn a checked fetch
+    /// into a first-sight one, with no failure to notice it by. The guide's plaintext section
+    /// tells readers this separation exists, so it is held here rather than left to the call site.
+    #[test]
+    fn the_apt_index_digest_is_handed_to_the_fetch_that_uses_it() {
+        let source = include_str!("deb.rs");
+        let call = source
+            .split("prefetch_hash(")
+            .nth(1)
+            .expect("deb.rs fetches through prefetch_hash");
+        let args = call.split(')').next().unwrap();
+        assert!(
+            args.contains("expected"),
+            "the apt index's digest is the argument that makes this fetch a checked one: {args}"
+        );
+    }
 }
