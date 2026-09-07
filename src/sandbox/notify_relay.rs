@@ -204,6 +204,15 @@ impl HostBus for HostNotificationsProxy<'static> {
 /// which an unwind cannot leave half-applied, and panicking instead would end the thread serving the
 /// private bus — removing the check rather than tightening it. Poisoning cannot arise from this
 /// module in any case: nothing that can panic runs while the guard is held.
+///
+/// The limit, since a set of numbers cannot see it: the ids are the *host daemon's*, and a daemon
+/// that restarts begins counting again. Ids this set still holds then name notifications the new
+/// daemon handed to somebody else, so the check that keeps the cage off a foreign notification
+/// reads them as the cage's own and lets it replace or close one. Following that needs a
+/// `NameOwnerChanged` subscription on the notifications bus name, emptying the set when the owner
+/// changes; the connection this relay already holds is where it would go. Not built here, and said
+/// rather than left for a reader to discover: the window is a daemon restart during one session,
+/// and what it costs is a foreign toast dismissed.
 #[derive(Default)]
 struct OwnedIds(Mutex<HashSet<u32>>);
 
@@ -292,6 +301,15 @@ const SUMMARY_MAX: usize = 200;
 /// run to several paragraphs — and still a ceiling. Characters, as for the summary.
 const BODY_MAX: usize = 4096;
 
+/// The most characters a relayed notification's identity fields may carry.
+///
+/// The daemon gives the sending application a line of its own and shows it whole, so an `app_name`
+/// the cage chose is the one field a length ceiling was missing from while the summary, the body
+/// and every action label had one. The icon is a theme name here (a path is replaced before this),
+/// and no theme name is anywhere near this. Short on purpose: this names an application, not
+/// content.
+const APP_IDENTITY_MAX: usize = 128;
+
 /// The most action entries a relayed notification may carry. The list is `(id, label)` pairs, so
 /// this is even on purpose: an odd cut would hand the daemon half a pair, which is a malformed
 /// action rather than one fewer. A list the cage sent odd stays as the cage sent it — that is its
@@ -349,9 +367,9 @@ impl Served {
         let id = self
             .host
             .notify(NotifyCall {
-                app_name: relayed_app_name(&app_name),
+                app_name: bounded(relayed_app_name(&app_name), APP_IDENTITY_MAX),
                 replaces_id,
-                app_icon: relayed_app_icon(&app_icon).to_string(),
+                app_icon: bounded(relayed_app_icon(&app_icon).to_string(), APP_IDENTITY_MAX),
                 summary: bounded(summary, SUMMARY_MAX),
                 body: bounded(body, BODY_MAX),
                 actions: actions
@@ -878,5 +896,41 @@ mod tests {
             calls[1].app_icon, "dialog-warning",
             "a bare theme name resolves against the user's own theme and is still forwarded"
         );
+    }
+
+    /// The identity fields are bounded like every other field the cage chooses.
+    ///
+    /// The daemon gives the sending application a line of its own and shows it whole, and the
+    /// summary, the body and each action label already had a ceiling. A name a cage sends is as
+    /// much its own text as a summary is. The witnesses are the shapes a real notification carries,
+    /// which must pass through unchanged.
+    #[test]
+    fn a_cage_chosen_app_name_and_icon_are_bounded_like_the_rest() {
+        let long = "n".repeat(APP_IDENTITY_MAX * 4);
+        let relayed = bounded(relayed_app_name(&long), APP_IDENTITY_MAX);
+        assert_eq!(relayed.chars().count(), APP_IDENTITY_MAX);
+        assert!(
+            relayed.starts_with(RELAYED_BY),
+            "and the supervisor's own prefix survives the cut: {relayed}"
+        );
+
+        let icon = bounded(
+            relayed_app_icon(&"i".repeat(APP_IDENTITY_MAX * 4)).to_string(),
+            APP_IDENTITY_MAX,
+        );
+        assert_eq!(icon.chars().count(), APP_IDENTITY_MAX);
+
+        for (name, icon) in [("Claude", "dialog-information"), ("", "")] {
+            assert_eq!(
+                bounded(relayed_app_name(name), APP_IDENTITY_MAX),
+                relayed_app_name(name),
+                "an ordinary app name is untouched"
+            );
+            assert_eq!(
+                bounded(relayed_app_icon(icon).to_string(), APP_IDENTITY_MAX),
+                relayed_app_icon(icon),
+                "and so is a theme name"
+            );
+        }
     }
 }
