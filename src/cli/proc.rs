@@ -557,7 +557,7 @@ fn proc_ls(args: &[OsString]) -> ExitCode {
         target.label(),
         target.project.display()
     );
-    print!("{}", observe::render_human(&tree));
+    crate::cli::print_document(&observe::render_human(&tree));
     ExitCode::SUCCESS
 }
 

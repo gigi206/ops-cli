@@ -112,7 +112,7 @@ pub(super) fn net_stats(args: &[OsString]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    print!("{}", render_stats(&project, app.as_deref(), &tally, &pal));
+    crate::cli::print_document(&render_stats(&project, app.as_deref(), &tally, &pal));
     ExitCode::SUCCESS
 }
 

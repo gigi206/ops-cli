@@ -80,7 +80,7 @@ fn bundle_list(args: &[OsString]) -> ExitCode {
     }
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    print!("{}", render_bundles(&selected, names.is_empty(), &pal));
+    crate::cli::print_document(&render_bundles(&selected, names.is_empty(), &pal));
     ExitCode::SUCCESS
 }
 

@@ -215,7 +215,7 @@ fn net_test(args: &[OsString]) -> ExitCode {
                     );
                     return ExitCode::SUCCESS;
                 }
-                print!("{}", render_l4_decision(target, &l4, &pal));
+                crate::cli::print_document(&render_l4_decision(target, &l4, &pal));
                 return ExitCode::SUCCESS;
             }
             // The whole verdict is assembled by one presenter, so what this command prints for a

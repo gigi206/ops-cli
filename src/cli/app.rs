@@ -1467,7 +1467,7 @@ fn app_show(args: &[OsString]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    print!("{}", render_app_show(&view, &pal));
+    crate::cli::print_document(&render_app_show(&view, &pal));
     ExitCode::SUCCESS
 }
 

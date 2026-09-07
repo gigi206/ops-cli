@@ -153,7 +153,7 @@ pub(super) fn net_rules(args: &[OsString]) -> ExitCode {
         .map(|n| format!(" (app {n})"))
         .unwrap_or_default();
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    print!("{}", render_net_rules(mode, &scope, &shown, total, &pal));
+    crate::cli::print_document(&render_net_rules(mode, &scope, &shown, total, &pal));
     ExitCode::SUCCESS
 }
 

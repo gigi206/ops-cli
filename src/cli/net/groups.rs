@@ -94,7 +94,7 @@ pub(super) fn net_groups_list(args: &[OsString]) -> ExitCode {
     }
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    print!("{}", render_net_groups(&groups, &names, &pal));
+    crate::cli::print_document(&render_net_groups(&groups, &names, &pal));
     ExitCode::SUCCESS
 }
 

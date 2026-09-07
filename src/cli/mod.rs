@@ -31,6 +31,25 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+/// Write a whole rendered document to stdout, surviving a reader that has gone away.
+///
+/// Rust ignores `SIGPIPE`, so a bare `print!` whose write fails **panics**: `sbx config show |
+/// head -1` ended in `failed printing to stdout` and exit 101, on a pipeline the shell reports as
+/// having worked. The verbs that stream (`logs`, `net logs --follow`, `proc live`) have carried
+/// this discipline from the start and say so in [`logs`]'s own module documentation; the verbs
+/// that render one document and return had not, and `config show` is the largest thing sbx prints.
+///
+/// A failed write is discarded here rather than acted on, which is the opposite of what a follow
+/// loop must do and right for the same reason: a document is written once, so there is nothing
+/// left to stop. Whatever the command still has to say goes to stderr, which the reader closing
+/// stdout did not ask to lose.
+pub(crate) fn print_document(text: &str) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(text.as_bytes());
+    let _ = out.flush();
+}
+
 /// Refuse an argument a verb does not take, rather than ignoring it. Silently dropping one is worse
 /// than not supporting it: `sbx plugins store ls --installed` would print the whole listing, which
 /// reads as a filtered result and quietly answers a different question than the one asked — and a
@@ -1409,5 +1428,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A whole rendered document written with a bare `print!` panics when the reader has gone
+    /// away: Rust ignores `SIGPIPE`, so `sbx config show | head -1` ended in `failed printing to
+    /// stdout` and exit 101 on a pipeline the shell reports as fine. `config show` is the largest
+    /// thing sbx prints (63 KiB on an ordinary project, past the pipe buffer on any project with a
+    /// sizeable `[env]`), and it was one of seven verbs rendering a document that way.
+    ///
+    /// The population is found in the source rather than listed here, so the next verb that
+    /// renders a document is held to the rule without anyone remembering to add it. `eprint!` is
+    /// left alone: stderr is not what a `| head` closes.
+    #[test]
+    fn no_verb_writes_a_whole_document_to_stdout_with_a_bare_print() {
+        let root = format!("{}/", env!("CARGO_MANIFEST_DIR"));
+        let mut offenders: Vec<String> = Vec::new();
+        for file in crate::testutil::crate_sources() {
+            if crate::testutil::is_test_only_source(&file) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            let production = crate::testutil::production_half(&text);
+            for (at, _) in production.match_indices("print!(\"{}\"") {
+                // `eprint!` ends in the same four characters; only the bare one is at issue.
+                if production[..at].ends_with('e') {
+                    continue;
+                }
+                let line = production[..at].matches('\n').count() + 1;
+                let relative = file.display().to_string().replacen(&root, "", 1);
+                offenders.push(format!("{relative}:{line}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these panic on `| head`; write them with `cli::print_document`:\n  {}",
+            offenders.join("\n  ")
+        );
     }
 }

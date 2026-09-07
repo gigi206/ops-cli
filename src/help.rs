@@ -196,7 +196,7 @@ pub fn show(path: &[&str]) -> ExitCode {
     match find(path) {
         Some(page) => {
             let pal = Palette::for_stream(std::io::stdout().is_terminal());
-            print!("{}", render(page, &pal));
+            crate::cli::print_document(&render(page, &pal));
             ExitCode::SUCCESS
         }
         None => {
@@ -265,7 +265,7 @@ pub fn dispatch(args: &[OsString]) -> ExitCode {
     }
     if path.is_empty() {
         let pal = Palette::for_stream(std::io::stdout().is_terminal());
-        print!("{}", top_level(&pal));
+        crate::cli::print_document(&top_level(&pal));
         ExitCode::SUCCESS
     } else {
         show(&path)

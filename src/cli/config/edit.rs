@@ -542,7 +542,7 @@ pub(super) fn config_path_cmd(args: &[OsString]) -> ExitCode {
         // exists yet — that is the common first-run state, not an error.
         let layers = config::manage::resolution_layers(&cwd);
         let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-        print!("{}", render_resolution_layers(&layers, &pal));
+        crate::cli::print_document(&render_resolution_layers(&layers, &pal));
         return ExitCode::SUCCESS;
     }
 

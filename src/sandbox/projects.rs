@@ -438,7 +438,7 @@ pub(crate) fn projects_show(id: &str, json: bool, pal: &crate::style::Palette) -
         }
         return ExitCode::SUCCESS;
     }
-    print!("{}", render_project_show(&view, pal));
+    crate::cli::print_document(&render_project_show(&view, pal));
     ExitCode::SUCCESS
 }
 

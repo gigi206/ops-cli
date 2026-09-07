@@ -392,7 +392,7 @@ fn path_cmd(args: &[OsString]) -> ExitCode {
         }
     } else {
         let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-        print!("{}", paths::render(&view, &pal));
+        crate::cli::print_document(&paths::render(&view, &pal));
         if refused {
             ExitCode::FAILURE
         } else {

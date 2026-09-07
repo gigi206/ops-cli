@@ -260,7 +260,7 @@ pub(super) fn net_logs(args: &[OsString]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    print!("{}", render_logs(&sessions, &context, &view, &pal, true));
+    crate::cli::print_document(&render_logs(&sessions, &context, &view, &pal, true));
     ExitCode::SUCCESS
 }
 

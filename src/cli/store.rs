@@ -116,7 +116,7 @@ pub(crate) fn store_cmd(args: &[OsString]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
-    print!("{}", render(&view, &pal));
+    crate::cli::print_document(&render(&view, &pal));
     ExitCode::SUCCESS
 }
 
