@@ -2888,7 +2888,12 @@ fn a_refusal_asks_about_the_cage_and_not_about_the_host_behind_an_absolute_link(
     };
     let dir = TmpDir::new();
     let mut cage = match std::process::Command::new(bwrap)
-        .args(["--unshare-user", "--unshare-net", "--unshare-ipc", "--unshare-uts"])
+        .args([
+            "--unshare-user",
+            "--unshare-net",
+            "--unshare-ipc",
+            "--unshare-uts",
+        ])
         .args(["--ro-bind", "/usr", "/usr"])
         .args(["--symlink", "usr/bin", "/bin"])
         .args(["--symlink", "usr/lib", "/lib"])
@@ -2932,10 +2937,19 @@ fn a_refusal_asks_about_the_cage_and_not_about_the_host_behind_an_absolute_link(
     let answers = pid.map(|pid| {
         [
             ("/usr", refusal_errno(pid, "/usr")),
-            ("/no-such-name-in-either", refusal_errno(pid, "/no-such-name-in-either")),
+            (
+                "/no-such-name-in-either",
+                refusal_errno(pid, "/no-such-name-in-either"),
+            ),
             ("/etc/hostname", refusal_errno(pid, "/etc/hostname")),
-            ("/tmp/x/etc/hostname", refusal_errno(pid, "/tmp/x/etc/hostname")),
-            ("/tmp/x/no-such-name-in-either", refusal_errno(pid, "/tmp/x/no-such-name-in-either")),
+            (
+                "/tmp/x/etc/hostname",
+                refusal_errno(pid, "/tmp/x/etc/hostname"),
+            ),
+            (
+                "/tmp/x/no-such-name-in-either",
+                refusal_errno(pid, "/tmp/x/no-such-name-in-either"),
+            ),
             (
                 "/proc/self/root/etc/hostname",
                 refusal_errno(pid, "/proc/self/root/etc/hostname"),

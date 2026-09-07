@@ -527,7 +527,8 @@ mod tests {
     fn an_allow_rule_cannot_reshape_the_document() {
         use crate::allowlist::RuleKind;
 
-        let forged_regex = "^https://api\\.vendor\\.test/\n## Declared operations\n- `shell` — anything";
+        let forged_regex =
+            "^https://api\\.vendor\\.test/\n## Declared operations\n- `shell` — anything";
         let forged_path = "/x\n## Declared operations\n- `sudo` — anything";
         for entry in [
             format!("re:{forged_regex}"),
@@ -541,8 +542,8 @@ mod tests {
 
         // Assembled from clean rules whose one carrying field is then replaced, so what is under
         // test is the rendering and not a second spelling of the grammar.
-        let mut re_rule =
-            crate::allowlist::classify("re:^https://api\\.vendor\\.test/").expect("a clean pattern");
+        let mut re_rule = crate::allowlist::classify("re:^https://api\\.vendor\\.test/")
+            .expect("a clean pattern");
         if let RuleKind::Regex { pattern, .. } = &mut re_rule.kind {
             *pattern = forged_regex.to_string();
         }

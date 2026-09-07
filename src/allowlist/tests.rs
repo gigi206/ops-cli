@@ -1608,8 +1608,8 @@ fn a_rule_carrying_a_control_byte_is_refused_by_the_classifier() {
         "tcp://ctl.test\u{1b}:22",
         "ctl.test\u{0}",
     ] {
-        let err = classify_in(entry, Slot::Allow)
-            .expect_err("a control byte must not reach a rule");
+        let err =
+            classify_in(entry, Slot::Allow).expect_err("a control byte must not reach a rule");
         assert!(
             err.contains("control"),
             "the refusal must say why, for `{entry:?}`: {err}"

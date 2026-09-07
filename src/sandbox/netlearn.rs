@@ -1173,9 +1173,7 @@ mod tests {
                 out.rules
             );
             assert!(
-                out.rules
-                    .iter()
-                    .all(|r| !r.chars().any(char::is_control)),
+                out.rules.iter().all(|r| !r.chars().any(char::is_control)),
                 "{gran:?}: and it must carry no control byte: {:?}",
                 out.rules
             );
@@ -1184,9 +1182,7 @@ mod tests {
                 "{gran:?}: a learnable refusal dropped without a note is a silent drop"
             );
             assert!(
-                out.notes
-                    .iter()
-                    .all(|n| !n.chars().any(char::is_control)),
+                out.notes.iter().all(|n| !n.chars().any(char::is_control)),
                 "{gran:?}: and the note that says so must not itself carry the bytes it is \
                  reporting: {:?}",
                 out.notes
