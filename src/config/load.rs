@@ -602,7 +602,12 @@ fn read_project(
         }
     };
 
-    match schema::parse(&bytes) {
+    let mut dropped = Vec::new();
+    let parsed = schema::parse_layer(&bytes, &mut dropped);
+    for d in dropped {
+        warnings.push(format!("{}: {d}", path.display()));
+    }
+    match parsed {
         Ok(cfg) => Some((cfg, state, mise_inputs)),
         Err(e) => {
             warnings.push(format!("ignoring {}: {e}", path.display()));
@@ -664,13 +669,20 @@ fn mise_status(
 /// latter two leaving a warning.
 fn read_layer(path: &Path, warnings: &mut Vec<String>) -> Option<RawConfig> {
     match safety::read_safe_bytes(path) {
-        Ok(bytes) => match schema::parse(&bytes) {
-            Ok(cfg) => Some(cfg),
-            Err(e) => {
-                warnings.push(format!("ignoring {}: {e}", path.display()));
-                None
+        Ok(bytes) => {
+            let mut dropped = Vec::new();
+            let parsed = schema::parse_layer(&bytes, &mut dropped);
+            for d in dropped {
+                warnings.push(format!("{}: {d}", path.display()));
             }
-        },
+            match parsed {
+                Ok(cfg) => Some(cfg),
+                Err(e) => {
+                    warnings.push(format!("ignoring {}: {e}", path.display()));
+                    None
+                }
+            }
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => {
             warnings.push(format!("ignoring {e}"));

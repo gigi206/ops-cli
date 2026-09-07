@@ -2254,6 +2254,63 @@ fn with_location<T: serde::de::DeserializeOwned>(text: &str, message: String) ->
     }
 }
 
+/// Parse a config **layer**, letting one mistyped value cost the value rather than the file.
+///
+/// [`parse`] is all-or-nothing, which is what the write gate and the override blob want: a
+/// document that does not say what it appears to say must not commit. A file already on disk is a
+/// different question. The rule everywhere else in this loader is that a wrong field costs the
+/// field and the rest still applies, and a *type* error was the one place it did not: `[network]
+/// allow = "github.com"` — a string where a list belongs — dropped the whole `.sbx.toml`, taking
+/// `[env]`, `[packages]`, every app and the `mode` the user was relying on with it. The warning
+/// named the file, so nothing was hidden; what was lost was everything else the file said.
+///
+/// The offending key is found by the same elimination [`locate_type_error`] uses for the message,
+/// removed, and the document re-parsed. Each removal is reported through `dropped`, with the path
+/// and the line, so the field that went is named as loudly as the file used to be.
+///
+/// The limit is written rather than hidden: elimination can only name a culprit when removing
+/// **one** key makes the document parse. A file with two type errors is not recovered, and it
+/// still costs the file, with the parser's own message. That is the case this was not built for —
+/// a person makes one typo — and pretending otherwise would mean guessing.
+pub(crate) fn parse_layer(bytes: &[u8], dropped: &mut Vec<String>) -> Result<RawConfig, String> {
+    let text = std::str::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}"))?;
+    let first = match toml::from_str::<RawConfig>(text) {
+        Ok(cfg) => return Ok(cfg),
+        Err(e) => e.to_string(),
+    };
+    // A syntax error is not recoverable by removing a key: the document does not parse as TOML at
+    // all, so there is no table to take one out of.
+    let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return Err(with_location::<RawConfig>(text, first));
+    };
+    for _ in 0..MAX_RECOVERED_FIELDS {
+        let Some((path, line)) = locate_type_error::<RawConfig>(&doc.to_string()) else {
+            break;
+        };
+        let steps: Vec<String> = path.split('.').map(String::from).collect();
+        let Some((key, parents)) = steps.split_last() else {
+            break;
+        };
+        if !remove_at(&mut doc, parents, key) {
+            break;
+        }
+        dropped.push(match line {
+            Some(n) => format!("ignoring `{path}` (line {n}): it is not the type this field takes"),
+            None => format!("ignoring `{path}`: it is not the type this field takes"),
+        });
+        if let Ok(cfg) = toml::from_str::<RawConfig>(&doc.to_string()) {
+            return Ok(cfg);
+        }
+    }
+    dropped.clear();
+    Err(with_location::<RawConfig>(text, first))
+}
+
+/// How many mistyped values [`parse_layer`] will drop before giving the file up. Elimination names
+/// a culprit only when removing one key makes the document parse, so in practice the loop runs
+/// once; the bound is what keeps a pathological document from re-parsing the file all day.
+const MAX_RECOVERED_FIELDS: usize = 4;
+
 /// Parse config bytes as TOML. The error is a human-readable string: the loader
 /// turns it into a warning and ignores the layer rather than aborting a command,
 /// so a malformed config never wedges the sandbox.
@@ -2329,6 +2386,50 @@ sshpass = \"nix:sshpass\"
         let text = "network = 42\ngui = 7\n";
         let err = parse(text.as_bytes()).unwrap_err();
         assert!(!err.contains("is the one at fault"), "{err}");
+    }
+
+    /// Everywhere else in this loader a wrong field costs the field. A *type* error was the one
+    /// place it cost the file: `[network] allow = "github.com"` — a string where a list belongs —
+    /// made the whole `.sbx.toml` unparseable, so `[env]`, `[packages]`, every app and the `mode`
+    /// the user was relying on went with it, and the cage came up on the layer below. The file was
+    /// named in a warning, so nothing was hidden; what was lost was everything else it said.
+    #[test]
+    fn one_mistyped_value_costs_the_value_and_not_the_file() {
+        let text =
+            "[env]\nKEEPME = \"yes\"\n\n[network]\nmode = \"deny\"\nallow = \"github.com\"\n";
+        // Strict parsing is what the write gate and the override blob want, and it still refuses.
+        assert!(parse(text.as_bytes()).is_err());
+
+        let mut dropped = Vec::new();
+        let cfg = parse_layer(text.as_bytes(), &mut dropped)
+            .expect("the rest of the layer still parses once the mistyped value is out");
+        assert_eq!(cfg.env.get("KEEPME").map(String::as_str), Some("yes"));
+        assert!(
+            matches!(cfg.network, Some(NetworkField::Table(_))),
+            "the table itself survives, holding the `mode` the file declared"
+        );
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert!(
+            dropped[0].contains("network.allow") && dropped[0].contains("line 6"),
+            "the field that went is named as loudly as the file used to be: {dropped:?}"
+        );
+
+        // Witness: the same file with the right type drops nothing and says the same thing.
+        let good = text.replace("allow = \"github.com\"", "allow = [\"github.com\"]");
+        let mut none = Vec::new();
+        let cfg = parse_layer(good.as_bytes(), &mut none).unwrap();
+        assert_eq!(cfg.env.get("KEEPME").map(String::as_str), Some("yes"));
+        assert!(none.is_empty(), "{none:?}");
+    }
+
+    /// The written limit. Elimination names a culprit only when removing one key makes the document
+    /// parse, so two mistyped values are not recovered — and then the file costs the file, with the
+    /// parser's own message and nothing dropped behind the reader's back.
+    #[test]
+    fn two_mistyped_values_still_cost_the_file_and_report_nothing_dropped() {
+        let mut dropped = Vec::new();
+        assert!(parse_layer(b"network = 42\ngui = 7\n", &mut dropped).is_err());
+        assert!(dropped.is_empty(), "{dropped:?}");
     }
 
     /// A syntax error is not a type error: nothing is located, because the document cannot even be

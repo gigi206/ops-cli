@@ -127,6 +127,15 @@ skipped rather than failing the parse. A malformed TOML file (or one that fails 
 [safety gate](../concepts/trust#the-safety-gate)) is dropped with a warning, never
 a hard failure that wedges a launch.
 
+A value of the **wrong type** costs that value, not the file. `allow = "github.com"`
+where a list belongs is named in a warning with its line and dropped, and everything
+else the file says (the `mode` beside it, `[env]`, `[packages]`, every app) still
+applies. The limit, since it is worth knowing rather than discovering: the value at
+fault is found by removing one key and seeing whether the file then parses, so a file
+with **two** mistyped values is not recovered and is dropped whole, with the parser's
+own message. Nothing is ever dropped silently: one warning names the value, the other
+names the file.
+
 ## A worked example
 
 ```toml
