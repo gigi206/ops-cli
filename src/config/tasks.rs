@@ -2007,6 +2007,7 @@ mod tests {
                 timeout: Some("90s".into()),
                 max_output: None,
                 nonce: None,
+                ..Default::default()
             },
             &TaskLayer {
                 source: "sbx.toml",
@@ -2124,6 +2125,7 @@ mod tests {
                 timeout: Some("5m".into()),
                 nonce: None,
                 max_output: Some("1MiB".into()),
+                ..Default::default()
             },
             &TaskLayer {
                 source: "global config",
@@ -2147,6 +2149,7 @@ mod tests {
                 timeout: Some("nope".into()),
                 nonce: None,
                 max_output: Some("0".into()),
+                ..Default::default()
             },
             &TaskLayer {
                 source: ".sbx.toml",

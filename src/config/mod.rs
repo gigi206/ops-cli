@@ -3125,6 +3125,23 @@ pub(super) fn warn_unknown_keys(warnings: &mut Vec<String>, source: &str, raw: &
     if let Some(mise) = &raw.mise {
         report(" under `[mise]`", &mise.rest);
     }
+    // `[distro]` is an untagged enum: only its table form has keys to misspell, and the bare
+    // locator string stays a parse success either way.
+    if let Some(schema::DistroField::Table(distro)) = &raw.distro {
+        report(" under `[distro]`", &distro.rest);
+    }
+    // The two `defaults` tables are named apart from the entries beside them: `[task.defaults]`
+    // sits among the `[task.<name>]` tables, and a key misspelled in one is not the other's.
+    if let Some(task) = &raw.task
+        && let Some(defaults) = &task.defaults
+    {
+        report(" under `[task.defaults]`", &defaults.rest);
+    }
+    if let Some(secret) = &raw.secret
+        && let Some(defaults) = &secret.defaults
+    {
+        report(" under `[secret.defaults]`", &defaults.rest);
+    }
     // A `[plugin.<name>]` table names the variables one plugin reads, so an unknown key there is
     // named with the plugin it was written under: two plugins can misspell different things.
     for (name, plugin) in &raw.plugin {

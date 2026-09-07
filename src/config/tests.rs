@@ -9599,6 +9599,7 @@ fn raw_defaults(
         }),
         file: file_dir.map(|d| RawFileDefaults { dir: d.into() }),
         resolver: BTreeMap::new(),
+        ..Default::default()
     }
 }
 
@@ -11534,6 +11535,55 @@ fn an_unknown_key_under_mise_or_a_plugin_table_is_named() {
     );
 }
 
+/// The three tables the sweep still walked past, and for a sharper reason than `[mise]`.
+///
+/// `[distro]`, `[task.defaults]` and `[secret.defaults]` had no `rest` bag at all, so a key sbx
+/// does not know was not merely unreported: it was dropped at the parse with nothing left to name.
+/// Each decides something the writer cares about, and each is written by hand: which userland the
+/// cage runs, the ceiling every task inherits, which resolver a terse key reaches through. A
+/// misspelling in one reads as a setting in force while deciding nothing.
+///
+/// Written as TOML rather than as a literal struct, because the bag is what is being added: the
+/// same document had to parse before, and the keys had to be gone.
+#[test]
+fn an_unknown_key_under_distro_or_a_defaults_table_is_named() {
+    let doc = "\
+[distro]
+image = \"oci:docker.io/library/debian:stable\"
+imge = \"typo\"
+
+[task.defaults]
+timeout = \"30s\"
+timeuot = \"30s\"
+
+[secret.defaults]
+header = \"Authorization\"
+heder = \"Authorization\"
+";
+    let raw: RawConfig =
+        toml::from_str(doc).expect("the document parses; unknown keys are ignored");
+    let r = resolve_no_plugins(raw, None);
+
+    for (key, table) in [
+        ("imge", "[distro]"),
+        ("timeuot", "[task.defaults]"),
+        ("heder", "[secret.defaults]"),
+    ] {
+        let w = r
+            .warnings
+            .iter()
+            .find(|w| w.contains(&format!("`{key}`")))
+            .unwrap_or_else(|| panic!("`{key}` was never named: {:?}", r.warnings));
+        assert!(w.contains(table), "and placed in {table}: {w}");
+    }
+
+    // The sibling that *was* understood stays in effect, so the bag reports without swallowing.
+    assert_eq!(
+        r.distro.as_deref(),
+        Some("oci:docker.io/library/debian:stable")
+    );
+}
+
 #[test]
 fn an_unknown_key_under_network_is_named() {
     // `[network]` is the largest table in the schema and the one most often written by hand, so a
@@ -12636,6 +12686,7 @@ fn raw_distro_full(
                 from: from.map(str::to_string),
                 run: run.map(|r| r.iter().map(|c| (*c).to_string()).collect()),
                 auth: auth.map(str::to_string),
+                ..Default::default()
             },
         )),
         ..RawConfig::default()

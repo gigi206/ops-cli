@@ -1098,6 +1098,9 @@ pub(crate) struct DistroTable {
     /// history, the backup and the diff. That is the same rule `[secret]` follows, and the same
     /// resolver runs it.
     pub(crate) auth: Option<String>,
+    /// Unknown keys in this table, kept so they can be reported.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
 /// The command form of an app's `cmd`: a full argv (`["demo-app", "--flag"]`) or a bare
@@ -1494,6 +1497,9 @@ pub(crate) struct RawSecretDefaults {
     /// rather than leaving two mechanisms to disagree over the same expansion.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) resolver: BTreeMap<String, RawResolverDefaults>,
+    /// Unknown keys in this table, kept so they can be reported.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
 /// The `sops` resolver binding: a terse key `k` expands to `sops://<file>#k`.
@@ -1556,6 +1562,9 @@ pub(crate) struct RawTaskDefaults {
     /// expects; on, a placeholder in *this* output cannot have been forged by the command (it could
     /// not predict the nonce), and one copied from an earlier result is detectably stale.
     pub(crate) nonce: Option<bool>,
+    /// Unknown keys in this table, kept so they can be reported.
+    #[serde(flatten)]
+    pub(crate) rest: BTreeMap<String, RawIgnored>,
 }
 
 /// A `[task.<name>]` table: one **declared operation** — a fixed command sbx runs in an ephemeral
