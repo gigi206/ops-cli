@@ -399,7 +399,12 @@ fn render_net_groups(
             let _ = writeln!(o, "  {dim}(empty){r}");
         }
         for e in entries {
-            match net_group_entry_issue(e) {
+            // The entry is config text and reaches a terminal here. A name cannot carry a control
+            // byte (the loader withholds a group whose name is not `[A-Za-z0-9._-]`), an entry can:
+            // the sibling path prints these through `warn_config`, which filters, and this one is
+            // the human render that did not.
+            let e = crate::sandbox::sanitize(e);
+            match net_group_entry_issue(&e) {
                 None => {
                     let _ = writeln!(o, "  {e}");
                 }

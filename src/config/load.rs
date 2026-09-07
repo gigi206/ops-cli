@@ -452,7 +452,19 @@ pub(super) fn read_global(warnings: &mut Vec<String>) -> RawConfig {
 pub(crate) fn net_groups() -> (BTreeMap<String, Vec<String>>, Vec<String>) {
     let mut warnings = Vec::new();
     let global = read_global(&mut warnings);
-    (groups_of(global.network), warnings)
+    // A name the resolver refuses is withheld here too, with the resolver's own sentence. The
+    // listing verbs read this map, and a group whose name no policy will ever accept was shown as
+    // defined, answered for by name, and re-exported — while `net rules --expand` and every launch
+    // ignored it. Two truths about one file, and the raw name printed to a terminal besides.
+    let mut groups = groups_of(global.network);
+    groups.retain(|name, _| {
+        let ok = super::is_valid_group_name(name);
+        if !ok {
+            warnings.push(super::invalid_net_group_name(name));
+        }
+        ok
+    });
+    (groups, warnings)
 }
 
 /// The `groups` table a raw `network` field carries, or an empty map when the field is absent or

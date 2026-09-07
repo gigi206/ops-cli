@@ -242,6 +242,34 @@ fn an_amending_overlay_keeps_the_posture_of_the_layer_below_it() {
     }
 }
 
+/// A group the resolver refuses is not shown as defined by the verb that lists groups.
+///
+/// `sbx net groups` reads the raw table, and the resolver refuses a name outside
+/// `[A-Za-z0-9._-]`. So a global config declaring `"bad name"` had the group listed, answered for
+/// by name and re-exported by `export`, while `net rules --expand` and every launch ignored it and
+/// every `@bad name` reference with it: two truths about one file. The witness is the valid group
+/// beside it, which stays.
+#[test]
+fn a_net_group_the_resolver_refuses_is_withheld_from_the_listing_too() {
+    let mut warnings = Vec::new();
+    let raw: BTreeMap<String, Vec<String>> = [
+        ("good".to_string(), vec!["api.example.test".to_string()]),
+        ("bad name".to_string(), vec!["api.example.test".to_string()]),
+    ]
+    .into_iter()
+    .collect();
+    let groups = build_net_groups(&mut warnings, raw);
+    assert!(groups.contains_key("good"), "the valid group resolves");
+    assert!(!groups.contains_key("bad name"));
+    let why = warnings
+        .iter()
+        .find(|w| w.contains("bad name"))
+        .unwrap_or_else(|| panic!("{warnings:?}"));
+    // The sentence the listing verb prints is the resolver's own, so the two cannot describe one
+    // group differently.
+    assert_eq!(*why, super::invalid_net_group_name("bad name"));
+}
+
 /// A capture ceiling written alone in an amending overlay bounds the capture below it.
 ///
 /// The overlay inherits the layer's level, so a `capture_max_kb` on its own is a ceiling on the

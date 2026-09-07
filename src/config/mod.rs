@@ -3938,6 +3938,15 @@ fn take_net_groups(field: &mut Option<NetworkField>) -> BTreeMap<String, Vec<Str
     }
 }
 
+/// What a net group whose name the resolver refuses earns, written once: the resolver says it, and
+/// so must the inventory verbs, or `sbx net groups` describes a group no policy will ever have.
+pub(crate) fn invalid_net_group_name(name: &str) -> String {
+    format!(
+        "{GLOBAL_CONFIG}: ignoring net group `{}`: a name must be 1–64 of [A-Za-z0-9._-]",
+        crate::sandbox::sanitize(name)
+    )
+}
+
 /// Validate and pre-classify the global `[network.groups]` table into a [`NetGroups`] map. Each
 /// group's name is charset-validated (an invalid name is skipped with a warning), and each entry
 /// is classified like an `allow`/`deny` entry — a malformed one is dropped with a warning naming
@@ -3956,9 +3965,7 @@ fn build_net_groups(warnings: &mut Vec<String>, raw: BTreeMap<String, Vec<String
     let mut groups = NetGroups::new();
     for (name, entries) in raw {
         if !is_valid_group_name(&name) {
-            warnings.push(format!(
-                "{GLOBAL_CONFIG}: ignoring net group `{name}`: a name must be 1–64 of [A-Za-z0-9._-]"
-            ));
+            warnings.push(invalid_net_group_name(&name));
             continue;
         }
         let mut rules = Vec::new();
