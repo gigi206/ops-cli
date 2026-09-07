@@ -8,6 +8,9 @@ enum Member<'a> {
     File(&'a str),
     Dir,
     Symlink(&'a str),
+    /// A member written with an explicit entry type, for the shapes an archiver picks and this
+    /// unpacker has to recognise as files.
+    Typed(tar::EntryType, &'a str),
 }
 
 fn tar_of(members: &[(&str, Member<'_>)]) -> Vec<u8> {
@@ -29,6 +32,14 @@ fn tar_of(members: &[(&str, Member<'_>)]) -> Vec<u8> {
                 header.set_size(0);
                 header.set_cksum();
                 builder.append_data(&mut header, path, &[][..]).unwrap();
+            }
+            Member::Typed(kind, body) => {
+                header.set_entry_type(*kind);
+                header.set_size(body.len() as u64);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, path, body.as_bytes())
+                    .unwrap();
             }
             Member::Symlink(target) => {
                 header.set_entry_type(tar::EntryType::Symlink);
@@ -409,4 +420,102 @@ fn a_member_with_no_final_component_that_climbs_is_still_refused() {
             "`{name}`: {err}"
         );
     }
+}
+
+/// A member an archiver spelled as contiguous or sparse is written, not dropped.
+///
+/// `is_file()` answers for the `0`/`\0` types only. A `7` is a regular file on every filesystem
+/// this runs on, and a GNU sparse entry is read back with its holes filled by the tar reader, so
+/// both fell into the branch for device nodes and were skipped without a word: an image built by
+/// GNU tar with `--sparse` lost the file it declares. The witness is the same member as a plain
+/// regular file, in the same loop.
+#[test]
+fn a_contiguous_or_sparse_member_lands_like_the_regular_file_it_is() {
+    // A GNU sparse entry is covered by the predicate for the same reason and is not exercised
+    // here: a well-formed one carries header fields (`real_size`, the extent map) this fixture
+    // does not write, and the tar reader refuses the malformed header before the unpacker sees
+    // the member at all.
+    for kind in [tar::EntryType::Continuous, tar::EntryType::Regular] {
+        let tmp = crate::testutil::TmpDir::new();
+        let root = tmp.join("root");
+        apply_tar(
+            tmp.path(),
+            &root,
+            &tar_of(&[
+                ("etc/", Member::Dir),
+                ("etc/data", Member::Typed(kind, "x")),
+            ]),
+        )
+        .unwrap_or_else(|e| panic!("{kind:?} applies: {e}"));
+        assert!(
+            root.join("etc/data").is_file(),
+            "{kind:?}: the member the image declares must land"
+        );
+    }
+}
+
+/// A member of a type this cannot write is refused rather than dropped.
+///
+/// The fallback used to return `Ok(())` for everything that was not a file, a directory, a link or
+/// a hard link, which is how the two above went missing. Device nodes, fifos and sockets keep the
+/// skip: the cage mounts its own `/dev`, and unprivileged creation would fail anyway.
+#[test]
+fn a_member_of_an_unwritable_type_is_named_rather_than_skipped() {
+    let tmp = crate::testutil::TmpDir::new();
+    let root = tmp.join("root");
+    let err = apply_tar(
+        tmp.path(),
+        &root,
+        &tar_of(&[("weird", Member::Typed(tar::EntryType::new(b'Z'), ""))]),
+    )
+    .expect_err("an unknown member type is refused");
+    assert!(err.to_string().contains("does not write"), "{err}");
+
+    // The witness: a device node is still skipped, and the layer applies.
+    let tmp = crate::testutil::TmpDir::new();
+    let root = tmp.join("root");
+    apply_tar(
+        tmp.path(),
+        &root,
+        &tar_of(&[
+            ("dev/null", Member::Typed(tar::EntryType::Char, "")),
+            ("etc/keep", Member::File("k")),
+        ]),
+    )
+    .expect("a device node is skipped, not refused");
+    assert!(root.join("etc/keep").is_file());
+    assert!(!root.join("dev/null").exists());
+}
+
+/// An opaque marker at the layer's own root empties the root, as every other applier does.
+///
+/// `safe_path` refuses a member that names the root itself, which is right for a member being
+/// written and wrong for one that names a directory to empty. A squashed layer carrying
+/// `.wh..wh..opq` at its root had the whole image refused.
+#[test]
+fn an_opaque_marker_at_the_layer_root_empties_the_root() {
+    let tmp = crate::testutil::TmpDir::new();
+    let root = tmp.join("root");
+    apply_tar(
+        tmp.path(),
+        &root,
+        &tar_of(&[("etc/", Member::Dir), ("etc/old", Member::File("old"))]),
+    )
+    .unwrap();
+
+    let blob = tmp.join("opaque-root");
+    fs::write(
+        &blob,
+        tar_of(&[
+            (".wh..wh..opq", Member::File("")),
+            ("etc/", Member::Dir),
+            ("etc/new", Member::File("new")),
+        ]),
+    )
+    .unwrap();
+    apply(&blob, "application/vnd.oci.image.layer.v1.tar", &root)
+        .expect("a root-level opaque marker applies");
+
+    assert!(!root.join("etc/old").exists(), "the root was emptied");
+    assert!(root.join("etc/new").is_file(), "and refilled by this layer");
 }

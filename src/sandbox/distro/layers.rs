@@ -117,7 +117,16 @@ fn unpack<R: io::Read>(archive: &mut tar::Archive<R>, root: &Path) -> io::Result
         };
 
         if name == OPAQUE {
-            let dir = safe_path(root, path.parent().unwrap_or(Path::new("")))?;
+            let parent = path.parent().unwrap_or(Path::new(""));
+            // A marker at the layer's own root says everything the lower layers put at the root is
+            // gone. `safe_path` refuses a member that names the root itself, which is right for a
+            // member being *written* and wrong here: this one names a directory to empty, and
+            // every other applier empties the root for it. Refusing cost the whole image.
+            let dir = if parent.components().all(|c| matches!(c, Component::CurDir)) {
+                root.to_path_buf()
+            } else {
+                safe_path(root, parent)?
+            };
             clear_directory(&dir)?;
             continue;
         }
@@ -285,7 +294,11 @@ fn write_member<R: io::Read>(
         return Ok(());
     }
 
-    if kind.is_file() {
+    // Three spellings of "this member is a file". A GNU sparse entry (`S`) is read back with its
+    // holes filled by the tar crate, and a `7` (contiguous) is a regular file on every filesystem
+    // this runs on: both took the fallback below and were dropped without a word, so an image
+    // built by GNU tar with `--sparse` lost the file it declared.
+    if kind.is_file() || kind.is_gnu_sparse() || kind == tar::EntryType::Continuous {
         remove(dest)?;
         let mut file = fs::File::create(dest)?;
         io::copy(entry, &mut file)?;
@@ -298,7 +311,17 @@ fn write_member<R: io::Read>(
 
     // A device node, fifo or socket: unprivileged creation would fail, and the cage mounts its own
     // `/dev` over whatever the image carries. Skipping is not a loss of anything the cage would use.
-    Ok(())
+    if kind.is_block_special() || kind.is_character_special() || kind.is_fifo() {
+        return Ok(());
+    }
+    // Anything else is a type this does not know how to write, and dropping it is how a member the
+    // image declares goes missing in silence. Named and refused, the way every other shape this
+    // cannot honour is.
+    Err(io::Error::other(format!(
+        "layer member `{}` is of a type this unpacker does not write ({:?})",
+        dest.display(),
+        kind
+    )))
 }
 
 #[cfg(test)]

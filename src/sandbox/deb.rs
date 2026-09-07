@@ -511,6 +511,12 @@ fn attest_index(
 
 /// Write a pinned key with the directory it lives in, owner-only, so what sbx verified cannot be
 /// replaced by anything a project can reach.
+///
+/// Through the crate's atomic write: the pin is the thing every later resolve of this repository is
+/// measured against, and a truncated one is not a weaker pin but an unreadable file, which a first
+/// pin would then write again from whatever the repository serves that day. `write_atomic` gives
+/// the rename the file deserves, and the mode goes on the temp so the published name is never
+/// briefly wider than owner-only.
 fn write_pinned_key(path: &Path, armored: &str) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     if let Some(parent) = path.parent() {
@@ -519,7 +525,7 @@ fn write_pinned_key(path: &Path, armored: &str) -> io::Result<()> {
             .mode(0o700)
             .create(parent)?;
     }
-    std::fs::write(path, armored)
+    crate::sandbox::atomicfile::write_atomic_mode(path, armored.as_bytes(), Some(0o600))
 }
 
 /// The `Valid-Until` a signed `Release` carries, verbatim. Returned as the repository wrote it so a
