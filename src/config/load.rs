@@ -472,7 +472,26 @@ fn groups_of(field: Option<schema::NetworkField>) -> BTreeMap<String, Vec<String
 pub(crate) fn bundles() -> (BTreeMap<String, RawBundle>, Vec<String>) {
     let mut warnings = Vec::new();
     let global = read_global(&mut warnings);
+    // The unknown keys, named here rather than only where an app pulls the bundle in. That fold is
+    // the only place they were reported, so a bundle nobody references — one just written, which is
+    // when a misspelling is likeliest — was never read by it: `sbx bundle` listed the stray key as
+    // "a section" and said nothing was wrong with it.
+    for (name, bundle) in &global.bundle {
+        for key in bundle.rest.keys() {
+            warnings.push(unknown_bundle_key(name, key));
+        }
+    }
     (global.bundle, warnings)
+}
+
+/// What an unknown key on a bundle earns, written once: the fold that resolves a bundle into an app
+/// and the inventory verbs both say it, and a bundle should not be described two ways depending on
+/// whether something happens to reference it.
+pub(crate) fn unknown_bundle_key(name: &str, key: &str) -> String {
+    format!(
+        "bundle `{name}`: ignoring unknown key `{key}` — sbx does not know this field on a bundle \
+         (a bundle carries no `cmd` and no posture; those belong to the app)"
+    )
 }
 
 /// Read a portable `[bundle.<name>]` fragment from `path` (the file `sbx bundle import` is given),
@@ -1152,10 +1171,7 @@ fn expand_bundles(
             // neither by design, so writing one is a natural mistake that changed nothing and said
             // nothing.
             for key in bundle.rest.keys() {
-                notes.push(format!(
-                    "bundle `{name}`: ignoring unknown key `{key}` — sbx does not know this field \
-                     on a bundle (a bundle carries no `cmd` and no posture; those belong to the app)"
-                ));
+                notes.push(unknown_bundle_key(name, key));
             }
             // Stamp each declared operation with the bundle it came from, here — the fold below
             // makes a bundle's entry indistinguishable from one the app wrote itself, which is the

@@ -1751,6 +1751,25 @@ pub(crate) fn export_bundles(
     struct Fragment<'a> {
         bundle: &'a std::collections::BTreeMap<String, super::RawBundle>,
     }
+    // A key sbx does not know is kept as a marker, not as a value: it serialises to an empty table,
+    // so exporting a bundle that carries one writes `[bundle.b.cmd]` with nothing in it and the
+    // fragment is no longer the file it came from. "As authored" would be false, and a reader
+    // importing it back would lose the value silently, so the export refuses and names the key.
+    let stray: Vec<String> = bundles
+        .iter()
+        .flat_map(|(name, b)| {
+            b.rest
+                .keys()
+                .map(move |k| format!("`{name}` carries `{k}`"))
+        })
+        .collect();
+    if !stray.is_empty() {
+        return Err(format!(
+            "a bundle carries a key sbx does not know, whose value this export cannot carry ({}) \
+             — remove it, or correct the spelling, and export again",
+            stray.join(", ")
+        ));
+    }
     toml::to_string(&Fragment { bundle: bundles }).map_err(|e| e.to_string())
 }
 
@@ -3744,5 +3763,28 @@ mod tests {
             ino,
             "a real addition still rewrites the file"
         );
+    }
+
+    /// An export refuses a bundle carrying a key sbx does not know, rather than emptying it.
+    ///
+    /// An unknown key is kept as a marker so it can be *reported*, and it serialises to an empty
+    /// table: exporting one wrote `[bundle.b.cmd]` with no value, so the fragment was no longer
+    /// the file it came from and a re-import lost the value in silence. The witness is a bundle of
+    /// known fields, which exports as it always did.
+    #[test]
+    fn export_refuses_a_bundle_whose_unknown_key_it_cannot_carry() {
+        let mut with_stray = super::super::RawBundle::default();
+        with_stray
+            .rest
+            .insert("cmd".to_string(), super::super::schema::RawIgnored);
+        let bundles = [("b".to_string(), with_stray)].into_iter().collect();
+        let why = export_bundles(&bundles).expect_err("an unrepresentable key is refused");
+        assert!(why.contains("`b` carries `cmd`"), "{why}");
+
+        let plain = [("b".to_string(), super::super::RawBundle::default())]
+            .into_iter()
+            .collect();
+        let text = export_bundles(&plain).expect("an ordinary bundle exports");
+        assert!(text.contains("[bundle.b]"), "{text}");
     }
 }
