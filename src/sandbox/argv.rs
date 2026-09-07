@@ -1138,8 +1138,12 @@ mod tests {
                 continue;
             }
             let text = std::fs::read_to_string(&file).unwrap_or_default();
-            // The production half: a file's own `#[cfg(test)]` module builds nothing the binary
+            // The production half: a file's own `cfg(test)` module builds nothing the binary
             // ships, and reading it here would put a module in a launcher category for a fixture.
+            // The attribute is named without its brackets on purpose: `production_half` splits on
+            // the last literal occurrence of the bracketed form, so writing it here would move this
+            // file's own cut past its test module and offer these fixtures to every guard that
+            // reads a production half -- which is exactly what it did.
             let production = crate::testutil::production_half(&text);
             let names_the_list = ["to_argv(", "argv_prefix("]
                 .iter()
