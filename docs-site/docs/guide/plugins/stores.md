@@ -42,7 +42,11 @@ downgraded to an older, superseded catalogue (anti-rollback). The two bookkeepin
 files degrade oppositely: an unreadable `store.toml` (the pinned key) is a hard
 failure, while an unreadable `catalogue.lock` (the rollback floor) degrades to `0`.
 A control character in a catalogue text field refuses the entry, so no store can
-smuggle a terminal escape into a display.
+smuggle a terminal escape into a display. The clone itself is bounded at five
+minutes: it runs quietly, so a server that accepts the connection and then never
+answers would otherwise leave `store add` waiting with nothing on screen to read.
+A store is a catalogue repository fetched at depth 1, so the bound is far past any
+honest fetch; a slow link is not what it stops.
 
 Two limits of that floor are worth stating, because both are about what it does
 not claim:

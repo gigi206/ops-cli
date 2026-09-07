@@ -442,9 +442,12 @@ fn drain<R: io::Read + Send + 'static>(
 /// so a caller can tell it apart from the command's own failures; a spawn failure comes back
 /// untouched, so its kind still reads (`NotFound` for a binary that is not installed).
 ///
-/// The one definition of how long a host-side step of the secret chain may take: the resolver
-/// runner and the sops path both come through here, so "this did not answer" means the same thing
-/// whichever source a secret came from.
+/// The one definition of how long a host-side step sbx waits on may take. The resolver runner and
+/// the sops path come through here, so "this did not answer" means the same thing whichever source
+/// a secret came from; so do the steps that are not the secret chain at all and face the same
+/// question, a flake resolution, a channel query and a plugin store clone. Each names its own
+/// deadline, because what is a reasonable wait is the caller's to know; what is shared is that the
+/// wait ends, that the process is killed rather than left, and that the error reads `TimedOut`.
 ///
 /// **What is bounded is the wait, not the process** — and the difference is the whole design.
 ///

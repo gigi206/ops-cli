@@ -1076,16 +1076,34 @@ fn swap_into_place(stage: &Path, dest: &Path) -> Result<(), String> {
     }
 }
 
+/// How long a store clone may take before sbx stops waiting for it.
+///
+/// The clone is `--quiet` and its output is captured, so a server that accepts the connection and
+/// then answers slowly forever produces no sign of itself: `sbx plugins store add` waits, prints
+/// nothing, and the user has no failure to read. git's own `GIT_TERMINAL_PROMPT=0` covers a
+/// credential prompt and nothing covers this.
+///
+/// Generous rather than tight, because what it must not do is fail a slow but honest fetch: a
+/// store is a catalogue repository cloned at `--depth 1`, so five minutes is far past any real
+/// one. The same figure bounds a flake resolution, and nix uses it for a stalled download.
+const CLONE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Clone a git repository into `dest` (which must not yet exist) with a hardened `git`
 /// invocation. Shallow (`--depth 1`, honored over `file://` and `https://`) and single-branch
 /// — a store is fetched for its current content, never its history.
+///
+/// Bounded by [`CLONE_DEADLINE`]: the URL is one a user passed to `sbx plugins store add`, or one
+/// a configured store recorded, and neither is a reason to wait on it forever.
 fn clone(git: &Path, url: &str, dest: &Path) -> Result<(), String> {
-    let out = git_command(git)
-        .args(["clone", "--quiet", "--depth", "1", "--single-branch", "--"])
+    let mut cmd = git_command(git);
+    cmd.args(["clone", "--quiet", "--depth", "1", "--single-branch", "--"])
         .arg(url)
-        .arg(dest)
-        .output()
-        .map_err(|e| format!("could not run git: {e}"))?;
+        .arg(dest);
+    let out = crate::sandbox::resolver::output_within(&mut cmd, CLONE_DEADLINE, "the store clone")
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::TimedOut => format!("could not fetch the store: {e}"),
+            _ => format!("could not run git: {e}"),
+        })?;
     if out.status.success() {
         return Ok(());
     }
@@ -2777,5 +2795,54 @@ mod tests {
             .unwrap()
             .flatten()
             .any(|e| e.file_name().to_string_lossy().starts_with(".store-stage-"))
+    }
+
+    /// A `git` that never answers ends the fetch, rather than the fetch waiting on it.
+    ///
+    /// The clone is `--quiet` and its output is captured, so an unbounded wait here is a silent
+    /// one: nothing is printed while it lasts, and the URL that causes it is one a user typed or a
+    /// configured store recorded. The stand-in stands for the server, not for git: what has to be
+    /// bounded is sbx's wait, and a process that sleeps produces exactly the shape a socket that
+    /// accepts and never speaks does.
+    #[test]
+    fn a_clone_that_never_answers_ends_at_the_deadline() {
+        let base = crate::testutil::TmpDir::new();
+        let git = base.path().join("git");
+        std::fs::write(&git, "#!/bin/sh\nsleep 600\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The bound under test is `CLONE_DEADLINE`; waiting five minutes to see it is not a test,
+        // so the deadline is exercised through the same call with a short one and the constant is
+        // asserted separately. Both halves matter: a bound that is never applied, and one applied
+        // with a figure nobody chose.
+        let mut cmd = super::git_command(&git);
+        cmd.arg("clone");
+        let started = std::time::Instant::now();
+        let err = crate::sandbox::resolver::output_within(
+            &mut cmd,
+            std::time::Duration::from_millis(300),
+            "the store clone",
+        )
+        .expect_err("a git that never answers must not be waited on");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the wait outlived the deadline it was given: {:?}",
+            started.elapsed()
+        );
+
+        assert_eq!(
+            super::CLONE_DEADLINE,
+            std::time::Duration::from_secs(300),
+            "the figure the doc explains"
+        );
+        // Assembled rather than written, so this assertion's own text is not what satisfies it:
+        // a literal naming the call it looks for is found by `include_str!` in this very file.
+        let needle = format!("{}(&mut cmd, {}", "output_within", "CLONE_DEADLINE");
+        assert!(
+            include_str!("stores.rs").contains(&needle),
+            "the clone must reach that bound, not merely define it"
+        );
     }
 }
