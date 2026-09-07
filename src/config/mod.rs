@@ -3316,6 +3316,15 @@ fn mark_limit_origins(
     }
 }
 
+/// The global config's path, for a caller that has to recognise it rather than read it.
+///
+/// The one file trusted by location, alongside the profiles under [`profiles_dir`]: a verb that
+/// records or reports trust has to tell that pair apart from a project config, or it writes a
+/// marker no reader consults.
+pub(crate) fn global_config_path() -> Option<std::path::PathBuf> {
+    global_path()
+}
+
 /// The global config's resource limits, for the two answers that have no project context. Reads
 /// the global config — trusted by location — and validates its `[limits]`, discarding warnings:
 /// `doctor` surfaces availability, while `sbx config` is the project-aware, warning-bearing view.

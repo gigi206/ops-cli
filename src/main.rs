@@ -226,8 +226,13 @@ fn split_session_flags(args: &[OsString]) -> (bool, bool, Vec<OsString>) {
 /// name that must be valid. `namespace` names the command family, for the usage line and for the
 /// refusal that names it back.
 ///
-/// The rule comes back as written: `proc` trims it and `net` does not, so that choice stays with the
-/// caller rather than being imposed here.
+/// The rule comes back **trimmed**, for both families. `proc` trimmed it and `net` did not, so the
+/// egress verbs decided on `rule.trim()` and then wrote the raw bytes: a rule pasted with a space
+/// around it was admitted, written with the space, and read by the loader as the same rule — but
+/// the writer de-duplicates on an exact string, so adding it again wrote a second entry, `net
+/// rules` listed it twice, and `net unallow` on the tidy spelling removed only one of them. No
+/// grammar here gives a leading or trailing space a meaning, so there is nothing for the two
+/// families to disagree about.
 fn split_one_rule(
     namespace: &str,
     verb: &str,
@@ -241,7 +246,7 @@ fn split_one_rule(
         }
     };
     let rule = match parsed.positionals.as_slice() {
-        [r] => r.clone(),
+        [r] => r.trim().to_string(),
         [] => {
             diag::error(&format!(
                 "sbx: usage: {}",

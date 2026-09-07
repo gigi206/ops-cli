@@ -69,7 +69,6 @@ fn proc_add_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCode 
         Ok(v) => v,
         Err(code) => return code,
     };
-    let rule = rule.trim().to_string();
     if let Err(e) = proc_policy::validate_rule(&rule) {
         diag::error(&format!("sbx: invalid rule {rule:?}: {e}"));
         return ExitCode::from(2);
@@ -140,7 +139,6 @@ fn proc_remove_rule(list: config::manage::ProcList, args: &[OsString]) -> ExitCo
         Ok(v) => v,
         Err(code) => return code,
     };
-    let rule = rule.trim().to_string();
     // The rule is NOT validated here, unlike the add path. A config file may already hold a rule a
     // later grammar would refuse, and refusing to remove it would leave the user no way out but a
     // hand edit; matching is an exact string compare, so an invalid rule simply matches nothing.

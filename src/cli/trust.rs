@@ -40,10 +40,49 @@ pub(crate) fn trust_cmd(args: Vec<OsString>) -> ExitCode {
         }
     };
     let path = config_path_arg(path);
+    // The global config and the app profiles under `apps/` are trusted **by location**: no reader
+    // ever looks for a marker on either, so recording one writes a file nothing consults and says
+    // a gate was closed that does not exist. The editing verbs answer this way already; the verb
+    // whose whole subject is trust did not, and `--show` then reported a verdict — "trusted", and
+    // "changed since it was trusted" after the next edit — about a gate the loader never opens.
+    if trusted_by_location(&path) {
+        diag::note(&format!(
+            "{} is trusted by location; `sbx trust` is not needed",
+            path.display()
+        ));
+        return ExitCode::SUCCESS;
+    }
     if show {
         show_trust(&path)
     } else {
         record_trust(&path)
+    }
+}
+
+/// Whether this path is one the loader trusts for being where it is: the global config, or a
+/// profile under the imported-app directory. Compared on the canonical parent, like the trust store
+/// keys, so a path reached through a symlinked home answers the same.
+fn trusted_by_location(path: &Path) -> bool {
+    let canon = |p: &Path| {
+        let parent = p
+            .parent()
+            .map(|d| d.canonicalize().unwrap_or_else(|_| d.to_path_buf()));
+        parent.map(|d| d.join(p.file_name().unwrap_or_default()))
+    };
+    let this = canon(path);
+    if this.is_none() {
+        return false;
+    }
+    if let Some(global) = crate::config::global_config_path()
+        && canon(&global) == this
+    {
+        return true;
+    }
+    match (crate::config::profiles_dir(), path.parent()) {
+        (Some(dir), Some(parent)) => {
+            dir.canonicalize().ok() == parent.canonicalize().ok() && dir.canonicalize().is_ok()
+        }
+        _ => false,
     }
 }
 
@@ -146,6 +185,15 @@ pub(crate) fn untrust_cmd(args: Vec<OsString>) -> ExitCode {
         return code;
     }
     let path = config_path_arg(args.into_iter().next());
+    // The same pair as `trust`: a file trusted by location has no marker to revoke, and answering
+    // "was not trusted" about it would describe a gate that does not exist.
+    if trusted_by_location(&path) {
+        diag::note(&format!(
+            "{} is trusted by location; there is no marker to revoke",
+            path.display()
+        ));
+        return ExitCode::SUCCESS;
+    }
     let store_dir = match trust_store_dir() {
         Ok(d) => d,
         Err(code) => return code,

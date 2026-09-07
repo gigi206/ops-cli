@@ -277,3 +277,61 @@ fn a_rule_write_that_changes_nothing_leaves_the_project_trusted() {
         );
     }
 }
+
+/// The two files trusted by location are answered, not given a marker.
+///
+/// The global config and the profiles under `apps/` carry no per-file gate: no reader looks for a
+/// marker on either. `sbx trust` wrote one anyway and said "trusted", so `--show` then reported a
+/// verdict about a gate the loader never opens — and "changed since it was trusted" after the next
+/// edit of a file whose fields apply as soon as they are read. The editing verbs have answered this
+/// way since an earlier audit; the verb whose subject *is* trust had not. The witness is a project
+/// config in the same run, which still records one.
+#[test]
+fn a_file_trusted_by_location_is_told_so_rather_than_given_a_marker() {
+    let state = TmpDir::new("trust");
+    let config = TmpDir::new("trust");
+    let sbx_dir = config.path().join("sbx");
+    std::fs::create_dir_all(sbx_dir.join("apps")).unwrap();
+    let global = sbx_dir.join("sbx.toml");
+    std::fs::write(&global, b"network = \"deny\"\n").unwrap();
+    let profile = sbx_dir.join("apps/demo.toml");
+    std::fs::write(&profile, b"cmd = \"true\"\n").unwrap();
+
+    for path in [&global, &profile] {
+        let out = sbx()
+            .arg("trust")
+            .arg(path)
+            .env("XDG_CONFIG_HOME", config.path())
+            .env("XDG_STATE_HOME", state.path())
+            .output()
+            .expect("spawn sbx trust");
+        let said = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{}: {said}", path.display());
+        assert!(
+            said.contains("trusted by location"),
+            "{}: {said}",
+            path.display()
+        );
+        assert_eq!(
+            marker_count(state.path()),
+            0,
+            "{}: nothing to record",
+            path.display()
+        );
+    }
+
+    // The witness: an ordinary project config still gets its marker.
+    let proj = TmpDir::new("trust");
+    let cfg = proj.path().join(".sbx.toml");
+    std::fs::write(&cfg, b"network = \"deny\"\n").unwrap();
+    let out = sbx()
+        .arg("trust")
+        .arg(&cfg)
+        .env("XDG_CONFIG_HOME", config.path())
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .expect("spawn sbx trust");
+    assert!(out.status.success());
+    assert_eq!(marker_count(state.path()), 1);
+}
