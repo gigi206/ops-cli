@@ -1070,39 +1070,81 @@ mod tests {
         const ASSEMBLES_BY_HAND_UNSCOPED: &[&str] = &["src/storage.rs"];
         // These spawn their cage through the shared launch command, which is what carries the
         // filters, the netns holder and the scope in one step. Each runs code sbx did not write: a
-        // profile's own `resolve` command, and a plugin from a store.
-        const RUNS_THE_SHARED_LAUNCH_COMMAND: &[&str] =
-            &["src/sandbox/resolve.rs", "src/sandbox/resolver.rs"];
+        // profile's own `resolve` command, a plugin from a store, a declared task's command, and an
+        // image's own build steps.
+        const RUNS_THE_SHARED_LAUNCH_COMMAND: &[&str] = &[
+            "src/sandbox/distro/build.rs",
+            "src/sandbox/resolve.rs",
+            "src/sandbox/resolver.rs",
+            "src/sandbox/task.rs",
+        ];
         // Spawns bubblewrap itself rather than through the launch command, and the list it hands it
         // is the composed one. `doctor`'s probe is sbx's own, fixed, and reports on the host rather
-        // than running anything for a project, so it owes no scope.
-        const SPAWNS_THE_COMPOSED_LIST: &[&str] = &["src/sandbox/smoke.rs"];
+        // than running anything for a project, so it owes no scope; the session launcher and the
+        // task pool each run a project's own code and take the scope with the composed list.
+        const SPAWNS_THE_COMPOSED_LIST: &[&str] = &[
+            "src/sandbox/launch/cage.rs",
+            "src/sandbox/smoke.rs",
+            "src/sandbox/taskpool.rs",
+        ];
+        // Holds a `bwrap` path to hand on and starts no cage with it. The processes these do spawn
+        // are host-side tools of their own — `sops` decrypting a secret — so what they owe is that
+        // the path travels and nothing here starts a cage beside the ones above.
+        const HANDS_THE_PATH_ON: &[&str] = &["src/sandbox/egress.rs"];
         // These read the pure list to assert something about what it contains, and run nothing.
-        const READS_THE_LIST: &[&str] = &["src/sandbox/binds/tests.rs"];
-        // The two definitions themselves: this module, and the one that compiles a filter into a
-        // descriptor and names it.
-        const DEFINES_THEM: &[&str] = &["src/sandbox/argv.rs", "src/sandbox/seccomp.rs"];
+        const READS_THE_LIST: &[&str] = &[];
+        // The definitions themselves: this module, the one that compiles a filter into a descriptor
+        // and names it, and the one that wraps a launch in its resource scope.
+        const DEFINES_THEM: &[&str] = &[
+            "src/sandbox/argv.rs",
+            "src/sandbox/cgroup.rs",
+            "src/sandbox/seccomp.rs",
+        ];
 
-        /// Whether `text` starts a process whose program is named `bwrap`, however it holds it:
-        /// `Command::new(bwrap)`, `Command::new(&bwrap)`, `Command::new(cage.bwrap)`.
-        fn spawns_bwrap_by_name(text: &str) -> bool {
-            text.match_indices("Command::new(").any(|(i, needle)| {
-                let rest = &text[i + needle.len()..];
-                rest.split(')')
-                    .next()
-                    .is_some_and(|arg| arg.contains("bwrap"))
-            })
+        /// Whether `text` holds a `bwrap` path in code **and** starts a process.
+        ///
+        /// Not "does the token `bwrap` sit between the parentheses of a `Command::new`", which is
+        /// what this asked before and which is a question about a local variable's name:
+        /// `Command::new(bwrap)` was seen and `Command::new(prog)` was not, one rename apart, and
+        /// the four launchers that already spell it the second way were outside the population
+        /// this guard is named for. A file cannot start a cage without holding the path from
+        /// somewhere, and every source of it in this crate is spelled `bwrap` — a field, a
+        /// parameter, a lookup by that name — so the file-level mention is the durable half.
+        /// Comment lines are dropped first: a file that only *mentions* bubblewrap in prose is
+        /// talking about it, not running it.
+        ///
+        /// The limit, since a text scan has one: a file that holds the path under a name of its own
+        /// invention and never writes `bwrap` anywhere in its code is still invisible here. Closing
+        /// that means carrying a type rather than a path through every launcher, which is the
+        /// answer if a shape appears that this cannot see.
+        fn holds_bwrap_and_spawns(text: &str) -> bool {
+            let code: String = text
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            code.contains("bwrap") && code.contains("Command::new(")
         }
 
         let root = format!("{}/", env!("CARGO_MANIFEST_DIR"));
         let mut population: Vec<String> = Vec::new();
         let mut owes: Vec<String> = Vec::new();
+        let declared_test_only = crate::testutil::test_only_sources();
         for file in crate::testutil::crate_sources() {
+            // Production code only. A test that stands up a cage of its own answers to the suite
+            // it is in, and nothing it builds is shipped; carrying test files here would mean
+            // classifying each smoke test as a launcher kind, which says nothing about the binary.
+            if crate::testutil::is_test_only_source(&file) || declared_test_only.contains(&file) {
+                continue;
+            }
             let text = std::fs::read_to_string(&file).unwrap_or_default();
+            // The production half: a file's own `#[cfg(test)]` module builds nothing the binary
+            // ships, and reading it here would put a module in a launcher category for a fixture.
+            let production = crate::testutil::production_half(&text);
             let names_the_list = ["to_argv(", "argv_prefix("]
                 .iter()
-                .any(|needle| crate::testutil::calls_function(&text, needle));
-            let spawns = spawns_bwrap_by_name(&text);
+                .any(|needle| crate::testutil::calls_function(production, needle));
+            let spawns = holds_bwrap_and_spawns(production);
             if !names_the_list && !spawns {
                 continue;
             }
@@ -1110,7 +1152,7 @@ mod tests {
             if DEFINES_THEM.contains(&relative.as_str()) {
                 continue;
             }
-            let calls = |needle: &str| crate::testutil::calls_function(&text, needle);
+            let calls = |needle: &str| crate::testutil::calls_function(production, needle);
             // What each kind owes. A hand-built list owes the filters' descriptors, and the scope
             // too where the kind says so; a cage run through the shared launch command owes that
             // call, which carries both; a composed one owes the call that compiles the filters; a
@@ -1124,6 +1166,10 @@ mod tests {
                 calls("cage_command(")
             } else if SPAWNS_THE_COMPOSED_LIST.contains(&relative.as_str()) {
                 calls("argv::compose(")
+            } else if HANDS_THE_PATH_ON.contains(&relative.as_str()) {
+                // Nothing to check in the text: the claim is that no cage starts here, and the
+                // three calls above are what starting one looks like.
+                !calls("argv::compose(") && !calls("argv_prefix(") && !calls("cage_command(")
             } else {
                 !spawns
             };
@@ -1139,6 +1185,7 @@ mod tests {
             .chain(ASSEMBLES_BY_HAND_UNSCOPED)
             .chain(RUNS_THE_SHARED_LAUNCH_COMMAND)
             .chain(SPAWNS_THE_COMPOSED_LIST)
+            .chain(HANDS_THE_PATH_ON)
             .chain(READS_THE_LIST)
             .map(|s| (*s).to_string())
             .collect();
