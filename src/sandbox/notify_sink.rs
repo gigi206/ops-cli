@@ -246,8 +246,11 @@ fn toast_script(title: &str, body: &str) -> String {
 /// looks, so this is read once per launch and reported once, rather than left to be discovered by
 /// a refusal that seemed not to happen.
 fn toast_is_visible() -> Option<bool> {
+    // See `read_windows_color_scheme`: interop is a `PATH` lookup like any other, and the one
+    // search refuses the relative entry that would resolve it from the project tree.
+    let powershell = crate::pathfind::find_on_path("powershell.exe")?;
     let ask = |script: &str| -> Option<u32> {
-        let out = std::process::Command::new("powershell.exe")
+        let out = std::process::Command::new(&powershell)
             .args(["-NoProfile", "-Command", script])
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -289,12 +292,14 @@ impl Sink for WslToastSink {
         // interop round-trip of its own time on one. A failure to spawn is not a transport that is
         // gone either — the stderr half above is the delivery that always lands — so this sink
         // never asks to be replaced.
-        let _ = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-Command", &toast_script(summary, body)])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+        if let Some(powershell) = crate::pathfind::find_on_path("powershell.exe") {
+            let _ = std::process::Command::new(powershell)
+                .args(["-NoProfile", "-Command", &toast_script(summary, body)])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
         if !self.diagnosed {
             self.diagnosed = true;
             // Last, so neither the line above nor the toast waits on it. What it explains is a

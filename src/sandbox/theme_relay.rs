@@ -107,7 +107,11 @@ fn windows_fallback(is_wsl: bool, read: impl FnOnce() -> Option<String>) -> Opti
 /// Windows, which is an interop round-trip per poll for a value that changes twice a day. A cage
 /// therefore opens in the desktop's theme and keeps it for the session.
 fn read_windows_color_scheme() -> Option<String> {
-    let mut child = std::process::Command::new("reg.exe")
+    // Interop is still a program looked up on `PATH`, so it goes through the one search that reads
+    // absolute entries only: an empty element resolves from the current directory, which here is
+    // the project tree the cage writes.
+    let reg = crate::pathfind::find_on_path("reg.exe")?;
+    let mut child = std::process::Command::new(reg)
         .args([
             "query",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",

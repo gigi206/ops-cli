@@ -186,4 +186,49 @@ mod tests {
         );
         assert_eq!(find_all_in_dirs("tool", dirs()), vec![dir.join("tool")]);
     }
+
+    /// No production launch names its program by a bare literal, because such a name never reaches
+    /// this module.
+    ///
+    /// The rule here is universal: only an absolute `PATH` entry may name a program. It is written
+    /// once, in [`candidates`], and a `Command::new("tool")` never arrives there — a program
+    /// holding no `/` is looked up by `execvp(3)` against the **inherited** `PATH`, where POSIX
+    /// gives an empty element the meaning "the current directory". A launch's current directory is
+    /// the project tree, which sbx treats as untrusted by construction, so a repository shipping a
+    /// `sops` of its own would be the one handed its own encrypted file to decrypt.
+    ///
+    /// What this reads is the literal written at the call. A program held in a variable cannot be
+    /// judged from the text, and neither can one a helper takes as an argument: the `sops` site was
+    /// spelled `Path::new("sops")` two calls away and is pinned by its own test instead. So this
+    /// closes the spelling that five sites used, not the class — which is why the lookup is a
+    /// function every caller can reach rather than a rule kept in a comment.
+    #[test]
+    fn no_production_launch_names_its_program_by_a_bare_literal() {
+        let root = format!("{}/", env!("CARGO_MANIFEST_DIR"));
+        let declared_test_only = crate::testutil::test_only_sources();
+        let mut offenders: Vec<String> = Vec::new();
+        for file in crate::testutil::crate_sources() {
+            if crate::testutil::is_test_only_source(&file) || declared_test_only.contains(&file) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            let production = crate::testutil::production_half(&text);
+            for (at, needle) in production.match_indices("Command::new(\"") {
+                let Some(name) = production[at + needle.len()..].split('"').next() else {
+                    continue;
+                };
+                if name.contains('/') {
+                    continue;
+                }
+                let line = production[..at].matches('\n').count() + 1;
+                let relative = file.display().to_string().replacen(&root, "", 1);
+                offenders.push(format!("{relative}:{line} runs `{name}`"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these leave the program to `execvp` and the inherited `PATH`:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
 }

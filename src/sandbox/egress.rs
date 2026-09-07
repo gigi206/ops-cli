@@ -1424,13 +1424,22 @@ fn read_source(
             // (which would let a permission problem downgrade to a weaker fallback source).
             match path.try_exists() {
                 Ok(false) => Ok(None),
-                Ok(true) => run_sops(
-                    Path::new("sops"),
-                    &path,
-                    key.as_deref(),
-                    header,
-                    super::resolver::HOST_RESOLUTION_DEADLINE,
-                ),
+                // Located through the one `PATH` search, which reads absolute entries only. An
+                // empty element means the current directory to `execvp`, and the current directory
+                // here is the project tree: without this, a repository could ship the `sops` that
+                // is handed its own encrypted file to decrypt.
+                Ok(true) => match crate::pathfind::find_on_path("sops") {
+                    Some(sops) => run_sops(
+                        &sops,
+                        &path,
+                        key.as_deref(),
+                        header,
+                        super::resolver::HOST_RESOLUTION_DEADLINE,
+                    ),
+                    None => Err(io::Error::other(format!(
+                        "the secret for `{header}` needs sops, which is not installed or not on PATH"
+                    ))),
+                },
                 Err(e) => Err(io::Error::other(format!(
                     "the secret for `{header}` cannot stat {}: {e}",
                     path.display()
@@ -2853,6 +2862,85 @@ mod tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         let err = res.expect_err("an unreadable parent must be a hard error, not absent");
         assert!(err.to_string().contains("cannot stat"), "{err}");
+    }
+
+    /// The `sops` that decrypts a secret comes from an **absolute** `PATH` entry, never from one a
+    /// relative entry resolves against the working directory.
+    ///
+    /// The guard in [`crate::pathfind`] reads the program literal written at a `Command::new`, and
+    /// this call site does not spell one: the program travels two calls as a `Path`, so the
+    /// property is pinned here instead. Both arms plant the same executable and differ only in how
+    /// `PATH` spells the directory holding it. The empty element POSIX reads as the working
+    /// directory belongs to the same class, since every non-absolute entry is dropped together.
+    #[test]
+    fn the_sops_that_decrypts_comes_from_an_absolute_path_entry() {
+        let _lock = env_lock();
+        let dir = TmpDir::new();
+        fake_sops(&dir, "echo decrypted-by-the-planted-binary");
+        let file = dir.join("prod.enc.yaml");
+        std::fs::write(&file, "a: b\n").unwrap();
+        let source = SecretSource::Sops { file, key: None };
+        let read = || {
+            read_source(
+                &source,
+                "Authorization",
+                dir.path(),
+                Path::new(UNUSED_BWRAP),
+                &[],
+            )
+        };
+
+        // The same directory named relatively: one `..` per component of the working directory,
+        // then the absolute path without its leading separator. This is what an entry resolved
+        // against the cwd reaches, and the planted binary is really there.
+        let cwd = std::env::current_dir().unwrap();
+        let mut relative = PathBuf::new();
+        for _ in cwd
+            .components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            relative.push("..");
+        }
+        relative.push(dir.path().strip_prefix("/").expect("an absolute temp dir"));
+        assert!(
+            relative.join("sops").symlink_metadata().is_ok(),
+            "the relative spelling really does reach the planted binary"
+        );
+
+        let refused = {
+            let _path = EnvVar::set("PATH", &relative);
+            read()
+        };
+        let err = refused.expect_err("a relative entry never names the decrypting binary");
+        assert!(
+            err.to_string().contains("not installed or not on PATH"),
+            "{err}"
+        );
+
+        // The witness: the same file, named absolutely, is found and run. The host's own entries
+        // stay behind it, since the planted script's shebang needs an interpreter and first match
+        // wins in front of them anyway.
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let mut witness = dir.path().as_os_str().to_os_string();
+        witness.push(":");
+        witness.push(&inherited);
+        let _path = EnvVar::set("PATH", &witness);
+        // Retried on a transient
+        // spawn failure for the reason `run_sops_retrying_spawn` documents.
+        let mut found = read();
+        for _ in 0..100 {
+            match &found {
+                Err(e) if e.to_string().contains("could not run sops") => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    found = read();
+                }
+                _ => break,
+            }
+        }
+        assert_eq!(
+            found.expect("an absolute entry finds it").as_deref(),
+            Some("decrypted-by-the-planted-binary")
+        );
     }
 
     #[test]

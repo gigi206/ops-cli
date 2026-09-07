@@ -178,6 +178,61 @@ pub(crate) fn is_test_only_source(path: &Path) -> bool {
         .is_some_and(|stem| stem == "tests" || stem.ends_with("_tests"))
 }
 
+/// Every source the crate compiles **only under `cfg(test)`**, because the module that declares it
+/// says so.
+///
+/// [`is_test_only_source`] answers from the path alone, which covers the `tests.rs` convention and
+/// nothing beyond it. A file its parent declares as `#[cfg(test)] mod <name>;` carries no marker of
+/// its own and is named like production code — `catalogue_freshness.rs`, `bench.rs` — so a guard
+/// reading it as production reports a site no shipped binary contains, and the author who reads the
+/// failure has nothing to fix. The declaration is the only place that fact is written, so it is
+/// where this reads it.
+pub(crate) fn test_only_sources() -> std::collections::BTreeSet<PathBuf> {
+    let mut out = std::collections::BTreeSet::new();
+    for file in crate_sources() {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        // The directory this file's own modules live in: beside it for a `mod.rs` or the crate
+        // root, in a subdirectory named after it otherwise.
+        let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let Some(parent) = file.parent() else {
+            continue;
+        };
+        let dir = if stem == "mod" || stem == "main" || stem == "lib" {
+            parent.to_path_buf()
+        } else {
+            parent.join(stem)
+        };
+        for (i, _) in text.match_indices("#[cfg(test)]") {
+            let rest = text[i + "#[cfg(test)]".len()..].trim_start();
+            let rest = rest.strip_prefix("pub(crate)").unwrap_or(rest).trim_start();
+            let rest = rest.strip_prefix("pub").unwrap_or(rest).trim_start();
+            let Some(rest) = rest.strip_prefix("mod ") else {
+                continue;
+            };
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            // A `mod x { … }` written inline carries its own `#[cfg(test)]` into the file this
+            // walk already reads; only the `mod x;` form names a second file.
+            if name.is_empty() || !rest[name.len()..].trim_start().starts_with(';') {
+                continue;
+            }
+            for candidate in [
+                dir.join(format!("{name}.rs")),
+                dir.join(&name).join("mod.rs"),
+            ] {
+                if candidate.is_file() {
+                    out.insert(candidate);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The production half of a source file: everything before its **last** `#[cfg(test)]`, or the
 /// whole text when it declares no test module.
 ///

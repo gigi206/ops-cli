@@ -689,7 +689,16 @@ pub(super) fn config_edit(args: &[OsString]) -> ExitCode {
         .or_else(|| std::env::var_os("EDITOR"))
         .unwrap_or_else(|| OsString::from("vi"));
     let editor = editor_os.to_string_lossy();
-    let status = std::process::Command::new("sh")
+    // The shell is located through the one `PATH` search, which reads absolute entries only: an
+    // empty element means the current directory to `execvp`, and this verb runs from whatever tree
+    // the user is standing in, a project's included.
+    let Some(shell) = crate::pathfind::find_on_path("sh") else {
+        diag::error(&format!(
+            "sbx: config: could not launch the editor `{editor}`: no `sh` on PATH"
+        ));
+        return ExitCode::FAILURE;
+    };
+    let status = std::process::Command::new(shell)
         .arg("-c")
         .arg(format!("{editor} \"$@\""))
         .arg("sh")
