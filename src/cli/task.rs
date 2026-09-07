@@ -1565,6 +1565,14 @@ fn no_match(verb: &str, operation: &str, known: &[String]) -> ExitCode {
 /// A plane that has gone since it was listed is reported and skipped rather than taken as an empty
 /// answer: a session ending between the listing and the read is ordinary, and silently showing one
 /// session's rows as if they were all of them would be a lie about what is out there.
+///
+/// The report is a warning, and the exit status stays the one the listing earned. That is the same
+/// call `task run` makes for a partial result, for the reason written there: an exit code alone
+/// would read as the command having failed on its own. It holds here because every verb that
+/// gathers renders a table for a reader who sees the warning beside it: the two paths that emit
+/// JSON, `task run` and `task result`, address a single plane and never come through here. A
+/// machine consumer of a partial listing would need the partialness in the document rather than in
+/// the status, and there is no such document to put it in.
 fn gather<T>(
     planes: &[Plane],
     verb: &str,
