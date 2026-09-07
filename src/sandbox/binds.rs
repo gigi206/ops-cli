@@ -336,18 +336,40 @@ pub(super) const DISTRO_SUPPLIED: &[&str] = &[
 /// distribution often makes of `/etc/resolv.conf`. Replacing one would be sbx editing the image
 /// rather than adding to it, and the mount that lands there follows the link the way every other
 /// reader of that image does.
+///
+/// Above that last component, a symlink is refused rather than followed, and the walk comes first.
+/// The image's layers and its `[distro] run` steps both write this tree, and `layers.rs` refuses
+/// exactly this for their own members: a first layer shipping `etc` as a link and a second writing
+/// `etc/passwd` would otherwise land on the host's. The same holds for the paths *this* function
+/// writes, which are not the image's, and the walk has to precede the "does the image carry it?"
+/// question because `symlink_metadata` on the destination answers about wherever the link points.
 pub(super) fn create_distro_mountpoints(rootfs: &Path) -> io::Result<()> {
     for (path, kind) in DISTRO_MOUNTPOINTS {
-        let dest = rootfs.join(path.trim_start_matches('/'));
+        let rel = path.trim_start_matches('/');
+        let (parent_rel, name) = rel.rsplit_once('/').map_or(("", rel), |(p, n)| (p, n));
+        let parent =
+            crate::sandbox::cagedir::ensure_under(rootfs, parent_rel, 0o755).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("cannot make the mountpoint `{path}`: {e}"),
+                )
+            })?;
+        let dest = parent.join(name);
         if dest.symlink_metadata().is_ok() {
             continue;
         }
         match kind {
-            Mountpoint::Dir => std::fs::create_dir_all(&dest)?,
+            Mountpoint::Dir => {
+                use std::os::unix::fs::DirBuilderExt as _;
+                std::fs::DirBuilder::new()
+                    .mode(0o755)
+                    .create(&dest)
+                    .or_else(|e| match e.kind() {
+                        io::ErrorKind::AlreadyExists => Ok(()),
+                        _ => Err(e),
+                    })?;
+            }
             Mountpoint::File => {
-                if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
                 std::fs::File::create(&dest)?;
             }
         }

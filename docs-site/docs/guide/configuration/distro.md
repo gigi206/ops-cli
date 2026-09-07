@@ -223,6 +223,13 @@ Nothing is read from them: each is a name to mount over, and what the cage sees 
 of those paths is the mount `sbx` puts there. A path the image already carries is left
 exactly as the image left it, symlinks included.
 
+A symlink *above* one of those paths is a different matter, and the unpack stops on it. An
+image whose `/etc` is a link, or that a `[distro] run` step leaves as one, would have every
+file `sbx` adds under it written wherever the link points, on the host and outside the tree.
+The layers are already refused this for their own members, and the paths `sbx` adds get the
+same answer. Every base image names these as real directories, so an image this refuses is
+one worth looking at.
+
 ## Where the project can live
 
 `/home` and `/opt` are covered with a private tmpfs, which is where the cage's home and, for

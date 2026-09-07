@@ -2208,6 +2208,43 @@ fn the_mountpoints_a_tree_is_given_are_empty_and_of_the_right_kind() {
 }
 
 #[test]
+fn a_mountpoint_is_never_created_through_a_link_the_image_put_above_it() {
+    // The escape `layers.rs` refuses for the image's own members, on the paths sbx adds to the
+    // tree: a first layer ships `etc` as a link, and everything written under it lands wherever
+    // the link points. Two spellings, because a relative target needs to know nothing about the
+    // host — from the unpack directory, `..` is already outside the tree.
+    for target in ["absolute", "relative"] {
+        let tmp = crate::testutil::TmpDir::new();
+        let rootfs = tmp.path().join("tree/rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        std::fs::remove_dir_all(rootfs.join("etc")).ok();
+        let link = if target == "absolute" {
+            outside.clone()
+        } else {
+            PathBuf::from("../../outside")
+        };
+        std::os::unix::fs::symlink(&link, rootfs.join("etc")).unwrap();
+
+        let err = crate::sandbox::binds::create_distro_mountpoints(&rootfs)
+            .expect_err("a link above a mountpoint must be refused");
+        assert!(err.to_string().contains("is a symlink"), "{err}");
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            0,
+            "{target}: nothing was written through the link"
+        );
+        assert_eq!(
+            std::fs::read_link(rootfs.join("etc")).unwrap(),
+            link,
+            "{target}: the link is reported, not replaced"
+        );
+    }
+}
+
+#[test]
 fn a_distribution_cage_carries_no_nix_ld_substitution() {
     // The shim is not mounted over an image's own loader, so the two variables that steer it name a
     // substitution that cannot happen. A hermetic cage still gets both.
