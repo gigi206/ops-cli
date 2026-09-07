@@ -32,7 +32,7 @@ pub(super) fn is_websocket_upgrade(head: &Head) -> bool {
             .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
             .unwrap_or(false)
     };
-    head.request_line.split_whitespace().next() == Some("GET")
+    wire::request_line_method(&head.request_line) == Some("GET")
         && names_token("upgrade", "websocket")
         && names_token("connection", "upgrade")
 }

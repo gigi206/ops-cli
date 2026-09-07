@@ -225,11 +225,9 @@ pub(super) fn handle_cleartext(
     //    origin server, unlike a proxy, expects the path, not the absolute-form URL. No credential is
     //    injected (a header secret never rides a cleartext request). `Connection: close` is forced so
     //    the upstream closes after the one response (the reserializer strips hop-by-hop headers).
-    let version = head
-        .request_line
-        .split_whitespace()
-        .nth(2)
-        .unwrap_or("HTTP/1.1");
+    // On SP, as an origin server reads it: `split_whitespace` also ends a token at a Unicode
+    // space, so a target carrying one yields a version read out of the target itself.
+    let version = wire::request_line_version(&head.request_line).unwrap_or("HTTP/1.1");
     let origin = Head {
         request_line: format!("{method} {path} {version}"),
         headers: head.headers.clone(),

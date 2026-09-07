@@ -369,11 +369,9 @@ pub(super) fn handle_https_forward(
     //    pipelined second request is never forwarded, so it cannot skip the per-request check. The
     //    forwarded bytes are materialized when the proxy still holds all of them — the same binding
     //    that decided whether this request could take a parked connection, so the two cannot drift.
-    let version = head
-        .request_line
-        .split_whitespace()
-        .nth(2)
-        .unwrap_or("HTTP/1.1");
+    // On SP, as an origin server reads it: `split_whitespace` also ends a token at a Unicode
+    // space, so a target carrying one yields a version read out of the target itself.
+    let version = wire::request_line_version(&head.request_line).unwrap_or("HTTP/1.1");
     let origin = Head {
         request_line: format!("{method} {path} {version}"),
         headers: head.headers.clone(),

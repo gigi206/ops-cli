@@ -275,7 +275,23 @@ pub(super) fn request_line_parts(line: &str) -> Option<(String, String)> {
 /// [`Head::keeps_alive`](super::Head)); a fourth added later inherits the split rather than copying
 /// the wrong one.
 pub(super) fn request_line_is_http11(line: &str) -> bool {
-    line.split(' ').nth(2) == Some("HTTP/1.1")
+    request_line_version(line) == Some("HTTP/1.1")
+}
+
+/// The version token of a request line, read on SP as an origin server reads it.
+///
+/// The same split, for the two planes that rebuild the line rather than ask about it: a forward
+/// and a cleartext request are reserialized with their own version, and reading it with
+/// `split_whitespace` finds `HTTP/1.1` inside a *target* carrying a Unicode space. The line they
+/// rebuild would then declare a version the caller never sent. `None` where the line has no third
+/// token, which the parse upstream of both callers has already refused.
+pub(super) fn request_line_version(line: &str) -> Option<&str> {
+    line.split(' ').nth(2)
+}
+
+/// The method token of a request line, on the same split and for the same reason.
+pub(super) fn request_line_method(line: &str) -> Option<&str> {
+    line.split(' ').next()
 }
 
 /// Split a CONNECT authority `host:port` (port required) into its parts, handling a bracketed
@@ -1578,22 +1594,34 @@ mod tests {
         );
     }
 
-    /// Every reader of the request line's version token goes through [`request_line_is_http11`].
-    /// The three that exist were written independently and all three had the same defect, so the
-    /// rule is pinned by a count rather than by three comments: a fourth reader either calls the
-    /// helper or fails here.
+    /// Every reader of the request line goes through a helper that splits it the way an origin
+    /// server does.
+    ///
+    /// The readers that existed were written independently and had the same defect, so the rule is
+    /// pinned by a count rather than by a comment on each: a new one either calls a helper or fails
+    /// here. Two things the first version of this guard got wrong, both of which let a real reader
+    /// through. It named three files and there are five — the cleartext plane and the WebSocket
+    /// plane read the line too — and it matched the literal `request_line.split_whitespace`, which
+    /// rustfmt had already broken across three lines in the very file the list did name, so that
+    /// file counted zero while carrying one. Whitespace is squeezed out of the source before the
+    /// match now, and the population is every plane.
     #[test]
-    fn no_plane_reads_the_version_token_with_a_unicode_aware_split() {
+    fn no_plane_reads_the_request_line_with_a_unicode_aware_split() {
         for (name, src) in [
             ("proxy/mod.rs", include_str!("mod.rs")),
             ("proxy/tunnel.rs", include_str!("tunnel.rs")),
             ("proxy/forward.rs", include_str!("forward.rs")),
+            ("proxy/cleartext.rs", include_str!("cleartext.rs")),
+            ("proxy/websocket.rs", include_str!("websocket.rs")),
         ] {
+            // The source with its own whitespace squeezed out, so a chain the formatter wrapped
+            // reads as one token here: that wrapping is what hid a reader inside a named file.
+            let squeezed: String = src.split_whitespace().collect::<Vec<_>>().join("");
             assert_eq!(
-                src.matches("request_line.split_whitespace").count(),
+                squeezed.matches("request_line.split_whitespace").count(),
                 0,
-                "{name} reads the version token with a split the origin does not use — call \
-                 `request_line_is_http11` instead"
+                "{name} reads the request line with a split the origin does not use — call \
+                 `request_line_is_http11` or `request_line_version` instead"
             );
         }
     }
