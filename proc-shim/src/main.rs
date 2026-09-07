@@ -115,16 +115,21 @@ const OPEN_LENS_FLAG: &str = "open-lens";
 
 /// The open-family syscalls the content lens notifies on.
 ///
-/// `open` is listed beside `openat`/`openat2` because x86-64 still carries it: glibc routes through
-/// `openat`, but a static binary or a direct `syscall(2)` can issue the older number, and a lens
-/// that watched only `openat` would be a one-line walk around.
+/// `open` and `creat` are listed beside `openat`/`openat2` because x86-64 still carries both: glibc
+/// routes each of them through `openat`, but a static binary or a direct `syscall(2)` can issue the
+/// older number, and a lens that watched only `openat` would be a one-line walk around. `creat` is
+/// the narrower of the two — it is `open` with `O_WRONLY|O_CREAT|O_TRUNC` fixed, so it never reads —
+/// but the lens refuses a truncating write of a file whose content matches, and that refusal is
+/// exactly what the older number would have gone around.
 ///
-/// A syscall absent from the target's ABI is simply not in this list — `open` does not exist on
-/// aarch64, where `openat` is the only form.
+/// A syscall absent from the target's ABI is simply not in this list — neither `open` nor `creat`
+/// exists on aarch64, where `openat` is the only form.
 fn open_lens_syscalls() -> Vec<libc::c_long> {
     vec![
         #[cfg(target_arch = "x86_64")]
         libc::SYS_open,
+        #[cfg(target_arch = "x86_64")]
+        libc::SYS_creat,
         libc::SYS_openat,
         libc::SYS_openat2,
     ]

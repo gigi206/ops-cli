@@ -62,11 +62,17 @@ pub(super) const OPEN_HOW_VER0: u64 = 24;
 
 /// The flags a notified open was called with, by syscall number.
 ///
-/// The three forms do not agree on where they keep them, exactly as they disagree on the path (see
+/// The four forms do not agree on where they keep them, exactly as they disagree on the path (see
 /// [`open_args`]): `open(path, flags, …)` and `openat(dirfd, path, flags, …)` pass a register, while
 /// `openat2(dirfd, path, how, size)` passes a pointer to a `struct open_how` whose first field is the
 /// flag word. Reading the wrong register would serve a descriptor opened for something other than
 /// what the cage asked for, so the mapping is explicit and unit-tested rather than inferred.
+///
+/// `creat(path, mode)` carries no flag word at all: the form *is* its flags, fixed by the ABI at
+/// `O_WRONLY|O_CREAT|O_TRUNC`. They are spelled out here rather than read, which is the only shape
+/// in this mapping whose answer comes from the syscall's definition instead of the caller's
+/// registers — and the reason a `creat` is served exactly like the `open` glibc would have issued
+/// in its place.
 ///
 /// `None` means the flags could not be established, and a caller that cannot establish them must not
 /// serve the open from a descriptor.
@@ -81,6 +87,10 @@ pub(super) fn open_flags(
     #[cfg(target_arch = "x86_64")]
     if nr as libc::c_long == libc::SYS_open {
         return Some(args[1]);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if nr as libc::c_long == libc::SYS_creat {
+        return Some((libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC) as u64);
     }
     if nr as libc::c_long == libc::SYS_openat {
         return Some(args[2]);
@@ -112,6 +122,12 @@ pub(super) fn open_mode(
     #[cfg(target_arch = "x86_64")]
     if nr as libc::c_long == libc::SYS_open {
         return Some(args[2]);
+    }
+    // `creat(path, mode)` puts the mode where the other forms put their flags: it is the second
+    // argument, not the third, because there is no flag word in front of it.
+    #[cfg(target_arch = "x86_64")]
+    if nr as libc::c_long == libc::SYS_creat {
+        return Some(args[1]);
     }
     if nr as libc::c_long == libc::SYS_openat {
         return Some(args[3]);
@@ -293,17 +309,17 @@ pub(super) fn exec_argv_arg(nr: libc::c_int, args: &[u64; 6]) -> Option<u64> {
 
 /// Where a notified open keeps its directory descriptor and its path pointer, by syscall number.
 ///
-/// The three forms do not agree on argument order: `open(path, …)` has no descriptor at all and is
-/// implicitly relative to the working directory, while `openat(dirfd, path, …)` and
-/// `openat2(dirfd, path, …)` lead with one. Reading the path from the wrong register would scan an
-/// unrelated address, so the mapping is explicit and unit-tested rather than inferred at the call
-/// site.
+/// The four forms do not agree on argument order: `open(path, …)` and `creat(path, mode)` have no
+/// descriptor at all and are implicitly relative to the working directory, while
+/// `openat(dirfd, path, …)` and `openat2(dirfd, path, …)` lead with one. Reading the path from the
+/// wrong register would scan an unrelated address, so the mapping is explicit and unit-tested
+/// rather than inferred at the call site.
 ///
 /// `None` for any other syscall: the same receive loop also carries `execve`, which is decided
 /// elsewhere.
 pub(super) fn open_args(nr: libc::c_int, args: &[u64; 6]) -> Option<(libc::c_int, u64)> {
     #[cfg(target_arch = "x86_64")]
-    if nr as libc::c_long == libc::SYS_open {
+    if nr as libc::c_long == libc::SYS_open || nr as libc::c_long == libc::SYS_creat {
         return Some((libc::AT_FDCWD, args[0]));
     }
     if nr as libc::c_long == libc::SYS_openat || nr as libc::c_long == libc::SYS_openat2 {

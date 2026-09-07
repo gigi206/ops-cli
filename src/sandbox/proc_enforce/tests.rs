@@ -186,6 +186,74 @@ fn an_allowed_open_hands_the_cage_the_inode_that_was_scanned() {
     );
 }
 
+/// A `creat` is a notified open, because it is one.
+///
+/// `creat(path, mode)` is `open(path, O_WRONLY|O_CREAT|O_TRUNC, mode)` with the flags fixed by the
+/// ABI, and x86-64 still carries the older number: glibc routes through `openat`, but a direct
+/// `syscall(2)` reaches it. A lens watching only the three modern forms left one spelling of a
+/// truncating write unnotified — and a truncating write of a file that currently holds a match is
+/// exactly what the scan refuses.
+///
+/// Driven through `python3` because the payload has to issue the syscall itself; skipped, and said
+/// so, where the interpreter is not on this host. The assertion is on the file rather than on the
+/// return value: what the refusal has to be worth is the content still being there.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn a_creat_is_notified_like_the_open_it_is() {
+    let Some(python) = ["/usr/bin/python3", "/bin/python3"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+    else {
+        eprintln!("CREAT-LENS: skipped, no python3 on this host");
+        return;
+    };
+    const SECRET: &str = "sk-ABC123DEF456GHI789";
+    const PATTERN: &str = r"sk-[A-Za-z0-9]{12,}";
+
+    let dir = TmpDir::new();
+    let payload = |target: &std::path::Path| {
+        format!(
+            "import ctypes\n\
+             libc=ctypes.CDLL('libc.so.6',use_errno=True)\n\
+             rc=libc.syscall({},b'{}',0o600)\n\
+             print('rc',rc,ctypes.get_errno())\n",
+            libc::SYS_creat,
+            target.to_str().expect("utf-8 fixture path")
+        )
+    };
+
+    // The witness: the same call, on a file the pattern does not match, truncates it. Without this
+    // the assertion below would pass on a payload that never issued the syscall at all.
+    let plain = dir.join("plain.txt");
+    std::fs::write(&plain, "nothing to see here\n").expect("write the plain fixture");
+    let (_, out) = run_with_open_lens(
+        &[python, "-c", &payload(&plain)],
+        &[PATTERN],
+        &dir.join("."),
+    );
+    let after = std::fs::read(&plain).expect("the plain fixture survives the run");
+    if !after.is_empty() {
+        eprintln!("CREAT-LENS: skipped, the witness did not truncate: {out}");
+        return;
+    }
+
+    // The finding: the same call on a file whose content matches leaves it intact.
+    let secret = dir.join("secret.txt");
+    let held = format!("API key: {SECRET}\n");
+    std::fs::write(&secret, &held).expect("write the secret fixture");
+    let (_, out) = run_with_open_lens(
+        &[python, "-c", &payload(&secret)],
+        &[PATTERN],
+        &dir.join("."),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&secret).expect("the secret fixture is still readable"),
+        held,
+        "a `creat` truncated a file the scan refuses to open: the older syscall number walked \
+         around the lens ({out})"
+    );
+}
+
 #[test]
 fn a_non_regular_first_target_no_longer_lets_the_swap_through() {
     // The door increment one left open, and the cheapest one to walk: the supervisor decides on
@@ -614,6 +682,15 @@ fn each_open_form_keeps_its_mode_where_its_own_abi_puts_it() {
     let mut args = [0u64; 6];
     args[2] = 0o600;
     args[3] = 0o640;
+    // A second vector for `creat`, whose mode is the second argument: reusing the one above would
+    // pass by reading `args[2]`, which is where `open` keeps it — the very confusion under test.
+    // Guarded like the assertion it serves, since `creat` is x86_64-only.
+    #[cfg(target_arch = "x86_64")]
+    let args_creat = {
+        let mut a = [0u64; 6];
+        a[1] = 0o600;
+        a
+    };
     // `open` is x86_64-only; aarch64 offers `openat` alone. Guarded the way the sibling
     // assertion in `open_path_tests.rs` is, so the whole tree compiles for that target and not
     // only the binary.
@@ -627,6 +704,19 @@ fn each_open_form_keeps_its_mode_where_its_own_abi_puts_it() {
         ),
         Some(0o600),
         "`open` keeps its mode in the third argument"
+    );
+    // `creat` has no flag word in front of its mode, so the mode sits one register earlier than
+    // in every other form — the one place this mapping is not `open`'s shifted by a descriptor.
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(
+        open_mode(
+            std::process::id(),
+            libc::SYS_creat as libc::c_int,
+            &args_creat,
+            None
+        ),
+        Some(0o600),
+        "`creat(path, mode)` keeps its mode in the second argument"
     );
     assert_eq!(
         open_mode(
@@ -1310,6 +1400,20 @@ fn each_open_form_keeps_its_flags_where_its_own_abi_puts_them() {
         ),
         Some(0x111),
         "`open` keeps its flags in the second argument"
+    );
+    // `creat` is the one form whose flags are not in any register: the ABI fixes them, so the
+    // answer must be the constant and must ignore what the registers happen to hold — a `creat`
+    // served as a read would hand the cage a descriptor it did not ask for.
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(
+        open_flags(
+            std::process::id(),
+            libc::SYS_creat as libc::c_int,
+            &args,
+            None
+        ),
+        Some((libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC) as u64),
+        "`creat` carries no flag word: the form is its flags"
     );
     assert_eq!(
         open_flags(

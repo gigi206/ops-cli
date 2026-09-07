@@ -13,6 +13,12 @@ fn each_open_form_is_read_from_its_own_registers() {
         "`open(path, …)` carries no descriptor: the path is the first argument, and the \
          form is implicitly relative to the working directory"
     );
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(
+        open_args(libc::SYS_creat as libc::c_int, &args),
+        Some((libc::AT_FDCWD, 11)),
+        "`creat(path, mode)` is `open` with its flags fixed: no descriptor, path first"
+    );
     assert_eq!(
         open_args(libc::SYS_openat as libc::c_int, &args),
         Some((11, 22)),
@@ -165,7 +171,7 @@ fn each_exec_form_keeps_its_argument_vector_one_register_behind_its_path() {
 
 #[test]
 fn a_syscall_that_is_neither_an_open_nor_an_exec_is_decided_by_neither() {
-    // The two mappings partition the five numbers the shim's filter notifies on, and agree that
+    // The two mappings partition the numbers the shim's filter notifies on, and agree that
     // anything else belongs to neither: the receive loop refuses such a notification instead of
     // judging it as an exec against a register that means something else.
     let args: [u64; 6] = [11, 22, 33, 44, 55, 66];
