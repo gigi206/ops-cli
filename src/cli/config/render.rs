@@ -14,6 +14,14 @@ use super::format::{
 
 /// The layered environment, after the trust gate. Shown even when empty: a reader looking for a
 /// variable they set needs to see that nothing carries it.
+///
+/// The key and the value pass through [`crate::sandbox::sanitize`]. `[env]` is the one table a
+/// project supplies that applies **without** trust, so an escape sequence in a value reached this
+/// line from a repository nobody approved: `E1 = "v\u{1b}[2K…"` erased the lines above it, which
+/// on this surface are the warnings saying the project is untrusted. Every other field a project
+/// supplies is either gated by trust or reported through `diag::warn`, which has sanitized all
+/// along. `--json` and `sbx config get` keep the bytes: one is a document for a machine, the other
+/// is the value itself.
 fn env_section(env: &[config::view::EnvVar], pal: &style::Palette) -> String {
     use std::fmt::Write as _;
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
@@ -26,8 +34,8 @@ fn env_section(env: &[config::view::EnvVar], pal: &style::Palette) -> String {
             let _ = writeln!(
                 o,
                 "    {n}{}{r}={}{}",
-                e.key,
-                e.value,
+                crate::sandbox::sanitize(&e.key),
+                crate::sandbox::sanitize(&e.value),
                 opt_provenance_tag(e.layer, pal)
             );
         }
@@ -829,7 +837,12 @@ fn app_row_env(o: &mut String, app: &config::view::AppView, pal: &style::Palette
         if details {
             let _ = writeln!(o, "      {dim}env:{r}");
             for e in &app.env {
-                let _ = writeln!(o, "        {n}{}{r}={}", e.key, e.value);
+                let _ = writeln!(
+                    o,
+                    "        {n}{}{r}={}",
+                    crate::sandbox::sanitize(&e.key),
+                    crate::sandbox::sanitize(&e.value)
+                );
             }
         } else {
             let _ = writeln!(o, "      {dim}env:{r} {} set", app.env.len());
@@ -2539,6 +2552,34 @@ mod tests {
                 ),
             "--details must list each credential by destination and source:\n{expanded}"
         );
+    }
+
+    /// `[env]` is the one table a project supplies that applies **without** trust, and its key and
+    /// value reached this render verbatim. A `.sbx.toml` from a repository nobody approved could
+    /// therefore paint the terminal of anyone who ran `sbx config show` in it, and `\x1b[2K` erases
+    /// the lines above, which on this surface are the warnings saying the project is untrusted.
+    #[test]
+    fn an_env_value_cannot_paint_the_terminal_of_whoever_reads_the_config() {
+        let pal = style::Palette::plain();
+        let env = vec![
+            config::view::EnvVar {
+                key: "K\u{1b}[31m".to_string(),
+                value: "v\u{1b}[2Kwiped".to_string(),
+                layer: None,
+            },
+            config::view::EnvVar {
+                key: "PLAIN".to_string(),
+                value: "ordinary value".to_string(),
+                layer: None,
+            },
+        ];
+        let out = env_section(&env, &pal);
+        assert!(
+            !out.contains('\u{1b}'),
+            "no escape reaches the terminal: {out:?}"
+        );
+        // Witness: an ordinary pair is untouched, so the render is not mangling values.
+        assert!(out.contains("PLAIN=ordinary value"), "{out}");
     }
 
     #[test]
