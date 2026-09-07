@@ -41,11 +41,15 @@ shown, whether it is handed the credential's plaintext or a marker standing in f
 and whether sbx [holds the request body](../plugins/signer#what-a-signer-is-told-about-the-body)
 to tell it a digest.
 
-A plugin's name is one namespace across the kinds reached by name, so a broker and a
-signer cannot share one. Two plugins answering to one name are both disabled, exactly
-as two claimants of one scheme are: `list` reports it under `name conflicts`, `info
-<name>` names every claimant and exits non-zero, and every install path refuses a name
-another plugin already holds.
+A plugin's name is one namespace across **every** kind, so a broker and a signer
+cannot share one, and neither can two resolvers. A resolver is reached by its
+`scheme://`, so two of them are never ambiguous to the resolution path, but a name is
+what a config writes: `[plugin.<name>] env` is applied to every plugin whose name
+matches, so two resolvers under one name would each be handed the other's credentials.
+Two plugins answering to one name are both disabled, exactly as two claimants of one
+scheme are: `list` reports it under `name conflicts`, `info <name>` names every
+claimant and exits non-zero, and every install path refuses a name another plugin
+already holds.
 
 Each listing reports where a plugin came from: a named store (with its URL) or a
 local directory (with its path). A plugin installed before origins were recorded

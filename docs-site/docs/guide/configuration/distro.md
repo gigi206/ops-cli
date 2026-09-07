@@ -230,6 +230,18 @@ The layers are already refused this for their own members, and the paths `sbx` a
 same answer. Every base image names these as real directories, so an image this refuses is
 one worth looking at.
 
+### What a layer may contain
+
+A layer's members are applied as the image declares them: regular files (including the
+contiguous and GNU sparse spellings), directories, symlinks, hard links, and the
+whiteout markers that delete a path a lower layer created. A device node, block or
+character, and a fifo are skipped: the cage mounts its own `/dev` over whatever the
+image carries, and creating either unprivileged would fail anyway. Any **other** member
+type stops the unpack and is named, rather than being dropped in silence: a member the
+image declares and the cage never sees is a difference between the published image and
+the tree it runs on, and it would surface much later as a missing file nobody can
+account for.
+
 ## Where the project can live
 
 `/home` and `/opt` are covered with a private tmpfs, which is where the cage's home and, for
