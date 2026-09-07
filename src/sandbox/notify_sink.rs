@@ -857,6 +857,13 @@ impl Drop for Notifier {
         // Signal, close this notifier's own sender, then wait for the thread to finish what is
         // queued: a refusal that fired in the last moments of a session is still worth hearing about,
         // and the flag bounds the wait whatever else is holding the channel open.
+        //
+        // The flag bounds the *loop*, which polls it every `STOP_POLL`. It does not bound a delivery
+        // already in flight: a sink's send is a call to something outside this process, a desktop
+        // daemon over D-Bus or a Windows toast through `powershell.exe`, and a peer that accepts the
+        // call and does not answer holds this join for as long as it likes. Bounding that belongs on
+        // the send, where the peer is known, rather than here, where abandoning the thread would
+        // drop the announcement the whole path exists to deliver.
         self.stop.store(true, Ordering::Relaxed);
         self.tx = None;
         if let Some(h) = self.handle.take() {

@@ -496,6 +496,15 @@ impl Drop for NotifyRelay {
         // Closing the channel makes the relay's `shutdown.recv()` branch fire, breaking its loop so
         // `run` returns and the thread exits; then join it, so the relay has disconnected from the
         // private bus before the portal's host directory (holding the socket) is removed.
+        //
+        // **The join is unbounded, and one thing can hold it**: the loop selects on the shutdown
+        // channel, so a quiet bus ends it at once, but a relayed signal is emitted onto the private
+        // bus with an `await` inside the branch, outside the select. A cage that has stopped reading
+        // its end and has filled the socket buffer parks the task there, and the shutdown branch is
+        // not reached until it completes. The wait is still the right default: detaching instead
+        // would leave the connection live while the directory holding its socket is removed, which
+        // is the ordering this join exists to guarantee. What would replace it is a bound on the
+        // emit rather than on the join.
         self.shutdown.close();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
