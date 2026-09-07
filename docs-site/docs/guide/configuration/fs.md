@@ -114,6 +114,13 @@ The rules, and why each one is there:
   file is refused rather than guessed at.
 - **An entry matching nothing is a warning**, never a failed launch: a profile may name a
   file only some checkouts carry.
+- **An entry that cannot be looked at stops the launch**, which is a different answer from
+  matching nothing. The cage runs as your own uid and holds the project writable, so it can
+  close a directory of its own and have the next launch read its masked path as absent: the
+  entry would match nothing, the warning would read like a stale config line, no mount would
+  be laid, and the session after that could put the mode back and read the file. So "not
+  there" is the only error that warns. Every other one refuses, whether it came from the
+  entry itself, from listing the directory a pattern sits in, or from following a link.
 - **A `*` also matches a name starting with a dot**, unlike a shell glob. `secrets/*` covers
   `secrets/.env`. The difference is deliberate: for a mask, covering more is the safe direction.
 

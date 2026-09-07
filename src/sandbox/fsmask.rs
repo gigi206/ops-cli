@@ -252,6 +252,33 @@ pub(crate) fn expand(project: &Path, policy: &FsPolicy) -> Expanded {
     out
 }
 
+/// The refusal a path that cannot be looked at earns, whichever call could not look at it.
+///
+/// One sentence in one place, because it is one decision taken at three sites: `NotFound` is "not
+/// there" and every other error is "cannot be looked at", and the second refuses the launch. The
+/// cage runs as the user's own uid and holds the project tree writable, so it can `chmod 000` a
+/// directory and have the next launch read its own masked path as absent — the entry matches
+/// nothing, the launch says so as a warning about a seemingly stale config entry, no mount is
+/// laid, and the session after that puts the mode back and reads the file. That is the mask
+/// switched off by the thing it exists to close.
+fn unreadable_refusal(verb: &str, path: &Path, e: &std::io::Error) -> String {
+    format!(
+        "cannot {verb} `{}` ({e}) — an entry that cannot be resolved is refused rather than \
+         reported as matching nothing, because an unreadable path and one hidden to defeat the \
+         mask are the same answer from here",
+        path.display()
+    )
+}
+
+/// Why a candidate yielded no mask. The two are not interchangeable: one is a line the author can
+/// read and delete, the other stops the launch.
+enum NotMasked {
+    /// Reported, and the launch continues: the path is not there, or the entry cannot mean it.
+    Warn(String),
+    /// The launch stops.
+    Refuse(String),
+}
+
 /// Resolve one list of entries into the paths it covers, warning on each entry that yields none and
 /// on each candidate the matcher could not judge.
 fn resolve_list(
@@ -265,12 +292,41 @@ fn resolve_list(
     for entry in entries {
         let dir_only = entry.ends_with('/');
         let body = entry.trim_end_matches('/');
-        let (mut hits, mut unjudged) = match body.rsplit_once('/') {
+        let mut unresolvable = false;
+        let listing = match body.rsplit_once('/') {
             // A wildcard sits only in the last component (the grammar guarantees it), so at most
             // one directory is read, and only when there is a wildcard to match.
             Some((parent, last)) if has_wildcard(last) => match_in_dir(&root.join(parent), last),
             None if has_wildcard(body) => match_in_dir(root, body),
-            _ => (vec![root.join(body)], Vec::new()),
+            _ => Ok((vec![root.join(body)], Vec::new())),
+        };
+        let (mut hits, mut unjudged) = match listing {
+            Ok(both) => both,
+            // A directory that is not there covers nothing, and neither does a pattern under a
+            // path that is a file: both are entries their author can read and correct, and the
+            // "matches nothing" warning below is what says so.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                (Vec::new(), Vec::new())
+            }
+            Err(e) => {
+                let dir = match body.rsplit_once('/') {
+                    Some((parent, _)) => root.join(parent),
+                    None => root.to_path_buf(),
+                };
+                refused.get_or_insert_with(|| {
+                    format!(
+                        "`[fs] {field}` entry `{entry}`: {}",
+                        unreadable_refusal("list", &dir, &e)
+                    )
+                });
+                unresolvable = true;
+                (Vec::new(), Vec::new())
+            }
         };
         hits.sort();
         // Sorted for the same reason the hits are: the warning list a launch prints must not depend
@@ -288,7 +344,6 @@ fn resolve_list(
             ));
         }
         let mut matched = 0;
-        let mut unresolvable = false;
         for candidate in hits {
             // "Not there" and "cannot be looked at" are different answers, and `Path::exists` gives
             // the same one to both: it is `metadata(..).is_ok()`, false for an absent path and
@@ -310,11 +365,8 @@ fn resolve_list(
                 Err(e) => {
                     refused.get_or_insert_with(|| {
                         format!(
-                            "`[fs] {field}` entry `{entry}`: cannot look at `{}` ({e}) — an entry \
-                             that cannot be resolved is refused rather than reported as matching \
-                             nothing, because an unreadable path and one hidden to defeat the mask \
-                             are the same answer from here",
-                            candidate.display()
+                            "`[fs] {field}` entry `{entry}`: {}",
+                            unreadable_refusal("look at", &candidate, &e)
                         )
                     });
                     unresolvable = true;
@@ -330,9 +382,13 @@ fn resolve_list(
                     }
                 }
                 Ok(None) => {}
-                Err(reason) => warnings.push(format!(
+                Err(NotMasked::Warn(reason)) => warnings.push(format!(
                     "`[fs] {field}` entry `{entry}`: {reason} — that path stays open to the cage"
                 )),
+                Err(NotMasked::Refuse(reason)) => {
+                    refused.get_or_insert(format!("`[fs] {field}` entry `{entry}`: {reason}"));
+                    unresolvable = true;
+                }
             }
         }
         // Not said of an entry that could not be resolved: "matches nothing" reads as a stale
@@ -349,20 +405,19 @@ fn resolve_list(
 }
 
 /// The entries of `dir` whose name matches `pattern`, and — separately — the entries that could not
-/// be matched at all. Both are empty when the directory cannot be read (an entry naming a directory
-/// that is absent matches nothing, which its own warning covers).
+/// be matched at all. The error of a directory that cannot be read is handed back rather than
+/// folded into "no entries": the caller is the one that knows an absent directory covers nothing
+/// while an unreadable one is the mask being switched off from inside the cage.
 ///
 /// The second list exists because a Linux filename is arbitrary non-NUL bytes while
 /// [`matches_component`] compares `str`s: a name that is not valid UTF-8 can never match any pattern,
 /// so folding it into "did not match" would turn a path the entry could not cover into one it
 /// deliberately left out. The caller warns about each, which is the whole difference between a mask
 /// with a known gap and a mask that reports success it did not achieve.
-fn match_in_dir(dir: &Path, pattern: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return (Vec::new(), Vec::new());
-    };
+fn match_in_dir(dir: &Path, pattern: &str) -> std::io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let (mut hits, mut unjudged) = (Vec::new(), Vec::new());
-    for entry in entries.flatten() {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
         let name = entry.file_name();
         match name.to_str() {
             Some(n) if matches_component(pattern, n) => hits.push(entry.path()),
@@ -370,7 +425,7 @@ fn match_in_dir(dir: &Path, pattern: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
             None => unjudged.push(entry.path()),
         }
     }
-    (hits, unjudged)
+    Ok((hits, unjudged))
 }
 
 /// Judge one candidate path that is known to be there: it must resolve inside the project and match
@@ -388,29 +443,44 @@ fn admit(
     candidate: &Path,
     entry: &str,
     dir_only: bool,
-) -> Result<Option<Masked>, String> {
-    let canon = candidate
-        .canonicalize()
-        .map_err(|e| format!("cannot resolve `{}` ({e})", candidate.display()))?;
+) -> Result<Option<Masked>, NotMasked> {
+    // Resolving follows the path, so it answers about the target rather than about the link
+    // `resolve_list` has already looked at. A dangling link is a stale entry; a target behind a
+    // directory this launch may not traverse is the same answer as one hidden to defeat the mask,
+    // and is refused for the same reason.
+    let canon = candidate.canonicalize().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            NotMasked::Warn(format!("cannot resolve `{}` ({e})", candidate.display()))
+        } else {
+            NotMasked::Refuse(unreadable_refusal("resolve", candidate, &e))
+        }
+    })?;
     if !canon.starts_with(root) {
-        return Err(format!(
+        return Err(NotMasked::Warn(format!(
             "`{}` resolves to `{}`, outside the project — `[fs]` closes paths of the project it is \
              declared in, and nothing else",
             candidate.display(),
             canon.display()
-        ));
+        )));
     }
     if canon == root {
-        return Err("names the project root itself, which would close the whole tree".to_string());
+        return Err(NotMasked::Warn(
+            "names the project root itself, which would close the whole tree".to_string(),
+        ));
     }
-    let meta = std::fs::metadata(&canon)
-        .map_err(|e| format!("cannot stat `{}` ({e})", canon.display()))?;
+    let meta = std::fs::metadata(&canon).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            NotMasked::Warn(format!("cannot stat `{}` ({e})", canon.display()))
+        } else {
+            NotMasked::Refuse(unreadable_refusal("stat", &canon, &e))
+        }
+    })?;
     let is_dir = meta.is_dir();
     if dir_only && !is_dir {
-        return Err(format!(
+        return Err(NotMasked::Warn(format!(
             "`{}` is not a directory, but the entry ends in `/`",
             canon.display()
-        ));
+        )));
     }
     Ok(Some(Masked {
         path: canon,
@@ -847,6 +917,100 @@ mod tests {
             "and it must not read as a stale config entry: {:?}",
             hidden.warnings
         );
+    }
+
+    #[test]
+    fn a_wildcard_entry_hidden_behind_an_unreadable_parent_refuses_the_launch() {
+        // The same defeat as the literal entry above, through the branch that reads a directory.
+        // `read_dir` on a `chmod 000` parent fails, and an empty listing reads exactly like a
+        // pattern that matched nothing — the warning an author would delete the entry over.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("a.env"), b"SECRET").unwrap();
+
+        let ok = expand(&root, &policy(&["sub/*.env"], &[]));
+        assert_eq!(ok.denied.len(), 1, "honoured while the parent is readable");
+        assert!(ok.refused.is_none());
+
+        std::fs::set_permissions(&sub, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+        let hidden = expand(&root, &policy(&["sub/*.env"], &[]));
+        std::fs::set_permissions(&sub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        assert!(
+            hidden.refused.is_some(),
+            "a wildcard entry the cage hid must refuse the launch, not warn: {:?}",
+            hidden.warnings
+        );
+        assert!(
+            !hidden
+                .warnings
+                .iter()
+                .any(|w| w.contains("matches nothing")),
+            "and it must not read as a stale config entry: {:?}",
+            hidden.warnings
+        );
+    }
+
+    #[test]
+    fn an_entry_naming_a_link_into_an_unreadable_directory_refuses_the_launch() {
+        // The third site: the link itself is there, so `symlink_metadata` succeeds and the entry
+        // reaches `admit`, where following it needs the directory the cage closed.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("secrets.env"), b"SECRET").unwrap();
+        std::os::unix::fs::symlink(sub.join("secrets.env"), root.join("link.env")).unwrap();
+
+        let ok = expand(&root, &policy(&["link.env"], &[]));
+        assert_eq!(ok.denied.len(), 1, "honoured while the target is reachable");
+        assert!(ok.refused.is_none());
+
+        std::fs::set_permissions(&sub, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+        let hidden = expand(&root, &policy(&["link.env"], &[]));
+        std::fs::set_permissions(&sub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        assert!(
+            hidden.refused.is_some(),
+            "a link whose target the cage hid must refuse the launch, not warn: {:?}",
+            hidden.warnings
+        );
+    }
+
+    #[test]
+    fn an_entry_that_is_merely_absent_or_misspelt_still_only_warns() {
+        // The boundary the refusal must not cross. Neither of these is a path anyone hid: one
+        // names a directory that is not there, the other puts a pattern under a file. Both are
+        // entries their author can read and correct, so both keep the warning.
+        let tmp = TmpDir::new();
+        let root = project(&tmp);
+        std::fs::write(root.join("notadir"), b"x").unwrap();
+
+        for entry in ["nothere/*.env", "notadir/*.env"] {
+            let out = expand(&root, &policy(&[entry], &[]));
+            assert!(
+                out.refused.is_none(),
+                "`{entry}` must not refuse the launch: {:?}",
+                out.refused
+            );
+            assert!(
+                out.warnings.iter().any(|w| w.contains("matches nothing")),
+                "`{entry}` must say it matches nothing: {:?}",
+                out.warnings
+            );
+        }
     }
 
     #[test]
