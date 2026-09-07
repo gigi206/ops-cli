@@ -236,12 +236,18 @@ a collection is **unioned** (see below).
 One uniform rule across all four tiers:
 
 - **Scalars** (`nixpkgs`, `timezone`, `network`, `gui`, `gpu`, `audio`, `dbus`, `proc`,
-  `notify`, `allow_insecure_http`, `secret`, `[redact] min_len`) are
+  `notify`, `allow_insecure_http`, `[redact] min_len`) are
   **replaced** by the highest tier that sets them.
 - **Collections** (`env`, `packages`, `binds`, `forward`, `limits`, `seccomp`,
-  `devices`, `[fs]`, `open`, `service`, `ssh_agent`) are **unioned**, the higher tier winning per key/entry: so `--bind` *adds*
+  `devices`, `[fs]`, `open`, `service`, `ssh_agent`, `secret`) are **unioned**, the higher tier winning per key/entry: so `--bind` *adds*
   to whatever the blobs bound, and `--limit tasks_max=…` tunes one limit without dropping
   a blob's `memory_max`.
+
+`secret` is keyed by destination host, so two tiers naming different hosts both apply and
+a tier naming a host another already declared replaces that one entry. Its `defaults`
+sub-table (the resolver order and per-resolver bindings) is the exception and is replaced
+outright: two orders are not additive, and interleaving them would make the answer depend
+on which tier was written first rather than on which one ranks higher.
 
 `forward` is keyed by its **cage** port, the one the caged service listens on. Naming a cage
 port the config already forwards moves it to your host port instead of opening a second hole,

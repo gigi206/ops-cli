@@ -533,7 +533,6 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
         ("gpu", gpu.is_some(), cli_side.gpu.is_some()),
         ("audio", audio.is_some(), cli_side.audio.is_some()),
         ("dbus", dbus.is_some(), cli_side.dbus.is_some()),
-        ("secret", secret.is_some(), cli_side.secret.is_some()),
         ("redact", redact.is_some(), cli_side.redact.is_some()),
         (
             "allow_insecure_http",
@@ -552,6 +551,11 @@ fn push_env_source_notices(env_side: &RawConfig, cli_side: &RawConfig, notices: 
         ("limits", limits.is_some()),
         ("forward", forward.is_some()),
         ("seccomp", seccomp.is_some()),
+        // Moved here from the replaced-scalar list above with the merge itself: a CLI `[secret]`
+        // no longer replaces an ambient one, it is *added to* it, so an `SBX_CONFIG` credential
+        // now reaches the launch whenever the command line carries a `[secret]` of its own, and
+        // that is worth saying every time rather than only when the command line is silent.
+        ("secret", secret.is_some()),
         ("devices", devices.is_some()),
         // `[fs]` sat in the scalar list above, where a field is only noted when the CLI left it
         // unset — but `overlay_into` folds it through `union_fs_opt`, so a CLI `[fs]` does not
@@ -673,9 +677,7 @@ fn overlay_into(mut base: RawConfig, higher: RawConfig) -> RawConfig {
     if dbus.is_some() {
         base.dbus = dbus;
     }
-    if secret.is_some() {
-        base.secret = secret;
-    }
+    base.secret = union_secret(base.secret, secret);
     // A scalar table: the higher blob's floor replaces the lower's outright. There is nothing to
     // union — two floors are not additive, and taking the stricter of the two would make the answer
     // depend on which blob was written first rather than on which one ranks higher.
@@ -827,6 +829,35 @@ fn union_binds(mut base: Vec<RawBind>, higher: Vec<RawBind>) -> Vec<RawBind> {
         }
     }
     base
+}
+
+/// Fold a higher blob's `[secret]` onto a lower one: the host entries merge by host name, the
+/// higher blob's winning on an equal name.
+///
+/// `[secret]` is keyed by destination host, exactly like `env`, `packages`, `open` and `service`
+/// are keyed by name, and those four have always merged. This one replaced the whole table, so a
+/// `SBX_CONFIG` declaring the credential for one host and a `--config` declaring another left only
+/// the second, with no notice: the launch went out without a credential the user had written, and
+/// the symptom is a `401` from a host nobody was told had been dropped.
+///
+/// `defaults` is the exception and replaces outright, because it is a scalar table (the resolver
+/// order and per-resolver bindings): two orders are not additive, and interleaving them would make
+/// the answer depend on which blob was written first rather than on which one ranks higher.
+fn union_secret(
+    base: Option<schema::RawSecretSection>,
+    higher: Option<schema::RawSecretSection>,
+) -> Option<schema::RawSecretSection> {
+    match (base, higher) {
+        (b, None) => b,
+        (None, h) => h,
+        (Some(mut b), Some(h)) => {
+            if h.defaults.is_some() {
+                b.defaults = h.defaults;
+            }
+            b.hosts.extend(h.hosts);
+            Some(b)
+        }
+    }
 }
 
 /// Union two limit tables per field, a higher-tier field winning. So `--limit tasks_max=…` tunes one
@@ -1814,6 +1845,43 @@ mod tests {
         );
         assert!(ov.raw.limits.is_some(), "limits dropped in merge");
         assert!(ov.raw.secret.is_some(), "secret dropped in merge");
+    }
+
+    /// `[secret]` is keyed by destination host, exactly as `env`, `packages`, `open` and `service`
+    /// are keyed by name, and those four have always merged. This one replaced the whole table: an
+    /// `SBX_CONFIG` declaring the credential for one host and a `--config` declaring another left
+    /// only the second, with no notice at all. The launch then went out without a credential the
+    /// user had written, and the symptom is a `401` from a host nobody was told had been dropped.
+    #[test]
+    fn two_secret_blobs_keep_both_hosts_and_say_so() {
+        let ov = collect_cli(Cli {
+            config: &[
+                "[secret.\"a.test\"]\nheader = \"Authorization\"\nfrom = \"env://A\"",
+                "[secret.\"b.test\"]\nheader = \"Authorization\"\nfrom = \"env://B\"",
+            ],
+            ..Cli::default()
+        })
+        .unwrap();
+        let section = ov.raw.secret.as_ref().expect("a `[secret]` survives");
+        let hosts: Vec<&str> = section.hosts.keys().map(String::as_str).collect();
+        assert_eq!(hosts, vec!["a.test", "b.test"], "both hosts are declared");
+
+        // The higher blob still wins on an equal host, which is what makes it an override.
+        let ov = collect_cli(Cli {
+            config: &[
+                "[secret.\"a.test\"]\nheader = \"Authorization\"\nfrom = \"env://LOW\"",
+                "[secret.\"a.test\"]\nheader = \"Authorization\"\nfrom = \"env://HIGH\"",
+            ],
+            ..Cli::default()
+        })
+        .unwrap();
+        let section = ov.raw.secret.as_ref().expect("a `[secret]` survives");
+        assert_eq!(section.hosts.len(), 1);
+        assert!(
+            format!("{:?}", section.hosts).contains("HIGH"),
+            "the higher blob wins on an equal host: {:?}",
+            section.hosts
+        );
     }
 
     #[test]
