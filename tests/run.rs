@@ -279,6 +279,7 @@ fn the_cage_resolves_localhost_via_a_synthetic_hosts_file() {
 
 #[test]
 fn a_malformed_one_shot_override_is_a_hard_error_and_does_not_launch() {
+    use std::os::unix::ffi::OsStrExt;
     // Fail-closed: a malformed `--config` is a usage error (exit 2) surfaced before any sandbox
     // work — never a silent drop that would launch a different posture than asked. Needs no capable
     // host (it fails at parse time).
@@ -322,6 +323,37 @@ fn a_malformed_one_shot_override_is_a_hard_error_and_does_not_launch() {
     assert!(
         stderr.contains("network") && stderr.contains("refusing to launch"),
         "the error should name the field and refuse: {stderr}"
+    );
+
+    // The third way a value can be malformed: it is not text at all. `--bind` takes a path and on
+    // Linux a path is bytes, which is why the entry point reads `args_os`; the flag loop read each
+    // whole token as text and simply *ended* on the first one that was not, handing it on as the
+    // command. So `--net=<bytes>` dropped the posture override without a word and launched on the
+    // baseline, which is the outcome the two halves above exist to prevent. Parse-time, so this
+    // needs no capable host either.
+    let mut token = std::ffi::OsString::from("--net=");
+    token.push(std::ffi::OsStr::from_bytes(&[0x80]));
+    let bad_bytes = sbx()
+        .args([
+            std::ffi::OsString::from("run"),
+            token,
+            std::ffi::OsString::from("--"),
+            std::ffi::OsString::from("false"),
+        ])
+        .current_dir(project.path())
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("spawn sbx run");
+    assert_eq!(
+        bad_bytes.status.code(),
+        Some(2),
+        "an override value that is not text must exit 2, not launch: {}",
+        String::from_utf8_lossy(&bad_bytes.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&bad_bytes.stderr);
+    assert!(
+        stderr.contains("--net") && stderr.contains("not valid text"),
+        "the error should name the flag and the reason: {stderr}"
     );
 }
 

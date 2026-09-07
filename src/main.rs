@@ -46,7 +46,7 @@ mod testutil;
 mod trust;
 mod version;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -430,21 +430,12 @@ fn take_flag_value(
     // half is not text would otherwise fail `to_str()` as a whole and fall through to the
     // next-argument path, which then consumes an unrelated argument as this flag's value. Reaching
     // the refusal below instead is what makes the message name the real mistake.
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let bytes = token.as_os_str().as_bytes();
-        if let Some(eq) = bytes.iter().position(|b| *b == b'=') {
-            let inline = std::ffi::OsStr::from_bytes(&bytes[eq + 1..]);
-            let Some(text) = inline.to_str() else {
-                diag::error(&format!(
-                    "sbx: {verb}: `{flag}` value is not valid text: {inline:?} — sbx reads \
-                     override values as UTF-8"
-                ));
-                return Err(ExitCode::from(2));
-            };
-            sink.push(text.to_string());
-            return Ok(());
-        }
+    if let Some(inline) = flag_inline(&token) {
+        let Some(text) = inline.to_str() else {
+            return Err(refuse_nontext_value(verb, flag, inline));
+        };
+        sink.push(text.to_string());
+        return Ok(());
     }
     // `--flag value`: the value is the next argument.
     //
@@ -476,10 +467,45 @@ fn take_flag_value(
     }
 }
 
+/// The inline value of `raw` — what follows the first `=` — or `None` when the token carries none.
+///
+/// Returned as bytes rather than text: whether a value must be UTF-8 is the caller's question, and
+/// answering it here would fold "no value" into "a value I could not read", which are different
+/// invocations. A bare `--gpu` means `true`; `--gpu=<bytes>` asked for something unreadable and is
+/// a usage error.
+fn flag_inline(raw: &OsStr) -> Option<&OsStr> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = raw.as_bytes();
+    let eq = bytes.iter().position(|b| *b == b'=')?;
+    Some(OsStr::from_bytes(&bytes[eq + 1..]))
+}
+
+/// The one refusal for a flag value that is not text, so the launch verbs, the boolean flags and
+/// the app parser all name it the same way. Overrides decide how the workload is confined, so a
+/// value the parser cannot read is a usage error rather than a silent fallback to the baseline.
+fn refuse_nontext_value(verb: &str, flag: &str, value: &OsStr) -> ExitCode {
+    diag::error(&format!(
+        "sbx: {verb}: `{flag}` value is not valid text: {value:?} — sbx reads override values as UTF-8"
+    ));
+    ExitCode::from(2)
+}
+
 /// The bare flag name of `raw`, stripping a `=value` suffix — so `--config` and `--config=x` both
-/// dispatch on `--config`.
-fn flag_name(raw: &str) -> &str {
-    raw.split_once('=').map(|(f, _)| f).unwrap_or(raw)
+/// dispatch on `--config`. `None` when that name is not text, which for these parsers means the
+/// token is not a flag at all and belongs to the caller.
+///
+/// The name is cut out of the raw **bytes**, apart from the value. A flag's own name is ASCII, but
+/// the value behind the `=` need not be — `--bind` takes a path, and on Linux a path is bytes — so
+/// asking `to_str()` of the whole token answers `None` for the value's sake. Every caller reads
+/// `None` as "not a flag": the launch parsers then hand the token on as the command, and the
+/// override is dropped without a word, running the workload under the baseline posture. That is
+/// the one outcome [`build_override`] promises never to produce, and reading the name apart from
+/// the value is what keeps the promise reachable through the inline spelling.
+fn flag_name(raw: &OsStr) -> Option<&str> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = raw.as_bytes();
+    let end = bytes.iter().position(|b| *b == b'=').unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..end]).ok()
 }
 
 /// Consume one leading boolean override flag (`--gpu`/`--dbus`) from `head` into `sink`. Unlike
@@ -488,14 +514,29 @@ fn flag_name(raw: &str) -> &str {
 /// so `--gpu <app>` leaves the app name in place. The raw `true`/`false` string is pushed as-is; the
 /// override collector validates it (a value other than true/false is a usage error there), keeping the
 /// grammar identical for the CLI flag and its `SBX_GPU`/`SBX_DBUS` environment twin.
-fn take_flag_bool(head: &mut Vec<OsString>, sink: &mut Vec<String>) {
+///
+/// An inline value that is not text is a usage error, in the same words [`take_flag_value`] uses.
+/// The distinction that makes it one is between *absent* and *present but unreadable*: a bare
+/// `--gpu` carries no value and means `true`, while `--gpu=<bytes>` carries one, and folding the
+/// second into the first would launch with the GPU exposed on an invocation that asked for
+/// something the parser could not read.
+fn take_flag_bool(
+    head: &mut Vec<OsString>,
+    sink: &mut Vec<String>,
+    verb: &str,
+    flag: &str,
+) -> Result<(), ExitCode> {
     let token = head.remove(0);
-    // `--gpu=value`: the value is inline; a bare `--gpu` normalizes to `true`.
-    let value = match token.to_str().and_then(|s| s.split_once('=')) {
-        Some((_, v)) => v.to_string(),
-        None => "true".to_string(),
+    // `--gpu=value`: the value is inline; a bare `--gpu` carries none and normalizes to `true`.
+    let Some(inline) = flag_inline(&token) else {
+        sink.push("true".to_string());
+        return Ok(());
     };
-    sink.push(value);
+    let Some(text) = inline.to_str() else {
+        return Err(refuse_nontext_value(verb, flag, inline));
+    };
+    sink.push(text.to_string());
+    Ok(())
 }
 
 /// If the leading token of `head` is a one-shot override flag, consume it and its value into `cli`
@@ -511,22 +552,23 @@ fn take_override_flag(
 ) -> Option<Result<(), ExitCode>> {
     // Resolve the flag name to an owned string first, ending the borrow of `head` before the value
     // is taken (which mutates `head`).
-    let name = flag_name(head.first()?.to_str()?).to_string();
+    //
+    // The name comes from `flag_name`, which reads it out of the bytes: a token whose *value* is
+    // not text must still be recognised as the flag it is, or the refusals below are unreachable
+    // through the inline spelling and the override is dropped in silence.
+    let name = flag_name(head.first()?)?.to_string();
     // The boolean flags are optional-value (`--gpu`, `--gpu=true`, `--gpu=false`) and must never
     // consume the following argument — else `sbx app --gpu <name>` would swallow the app name — so
     // they take a dedicated path rather than the value-required `take_flag_value`.
     match name.as_str() {
         "--gpu" => {
-            take_flag_bool(head, &mut cli.gpu);
-            return Some(Ok(()));
+            return Some(take_flag_bool(head, &mut cli.gpu, verb, &name));
         }
         "--audio" => {
-            take_flag_bool(head, &mut cli.audio);
-            return Some(Ok(()));
+            return Some(take_flag_bool(head, &mut cli.audio, verb, &name));
         }
         "--dbus" => {
-            take_flag_bool(head, &mut cli.dbus);
-            return Some(Ok(()));
+            return Some(take_flag_bool(head, &mut cli.dbus, verb, &name));
         }
         _ => {}
     }
@@ -1543,6 +1585,75 @@ mod tests {
         let mut sink = Vec::new();
         assert!(take_flag_value(&mut head, &mut sink, "run", "--bind").is_ok());
         assert_eq!(sink, vec!["/tmp/x".to_string()]);
+    }
+
+    /// The entry point decides whether a token is an override flag at all, and it decided it on a
+    /// UTF-8 view of the *whole* token. A flag whose value is bytes -- `--bind=<path>` on a
+    /// directory that is not text, `--net=<bytes>` out of a mistyped shell -- then answered `None`,
+    /// which tells the caller "this is not an override flag": the override was dropped without a
+    /// word and the launch continued under the base posture. That is the one outcome
+    /// [`build_override`] promises never to produce.
+    ///
+    /// [`take_flag_value`] already cuts the inline value out of the bytes for this same reason; the
+    /// gate above it did not, so the refusal it holds was unreachable through the inline spelling.
+    /// Cutting the name out of the bytes here is what makes it reachable, and this pins both halves
+    /// of that: the token is claimed (`Some`, not `None`), and claimed as a refusal.
+    #[test]
+    fn an_override_flag_whose_value_is_not_text_is_refused_rather_than_dropped() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = OsString::from_vec(vec![b'/', 0x80, b'x']);
+
+        // A value-taking flag: `--bind=<bytes>` must reach the refusal rather than fall through.
+        let mut inline = OsString::from("--bind=");
+        inline.push(&bad);
+        let mut head = vec![inline, OsString::from("--unrelated")];
+        let mut cli = config::CliOverrides::default();
+        assert!(
+            matches!(take_override_flag(&mut head, &mut cli, "run"), Some(Err(_))),
+            "`--bind=<bytes>` must be claimed and refused, not handed back as an unknown token"
+        );
+        assert!(
+            cli.binds.is_empty(),
+            "nothing is accepted from a refused value"
+        );
+
+        // An optional-value flag: `--gpu=<bytes>` must not normalize to `true`. Reaching
+        // `take_flag_bool` at all is what the fix above changes, so the boolean path has to answer
+        // like the value path -- otherwise the fix moves the silent drop into a silent `true`.
+        let mut inline = OsString::from("--gpu=");
+        inline.push(&bad);
+        let mut head = vec![inline];
+        let mut cli = config::CliOverrides::default();
+        assert!(
+            matches!(take_override_flag(&mut head, &mut cli, "run"), Some(Err(_))),
+            "`--gpu=<bytes>` must be refused, never read as a bare `--gpu` meaning true"
+        );
+        assert!(
+            cli.gpu.is_empty(),
+            "a refused boolean leaves no value behind"
+        );
+
+        // The witness for the `None` arm: a flag whose *name* is not text is genuinely not an
+        // override flag, and the caller must still get it back to report as an unknown one.
+        let mut head = vec![OsString::from_vec(vec![b'-', b'-', 0x80])];
+        let mut cli = config::CliOverrides::default();
+        assert!(take_override_flag(&mut head, &mut cli, "run").is_none());
+
+        // And both ordinary forms still parse, so the gate is not claiming everything.
+        let mut head = vec![OsString::from("--bind=/tmp/x")];
+        let mut cli = config::CliOverrides::default();
+        assert!(matches!(
+            take_override_flag(&mut head, &mut cli, "run"),
+            Some(Ok(()))
+        ));
+        assert_eq!(cli.binds, vec!["/tmp/x".to_string()]);
+        let mut head = vec![OsString::from("--gpu")];
+        let mut cli = config::CliOverrides::default();
+        assert!(matches!(
+            take_override_flag(&mut head, &mut cli, "run"),
+            Some(Ok(()))
+        ));
+        assert_eq!(cli.gpu, vec!["true".to_string()]);
     }
 
     #[test]

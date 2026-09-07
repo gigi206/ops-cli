@@ -27,7 +27,7 @@ pub(crate) mod trust;
 pub(crate) mod upgrade;
 
 use crate::diag;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -514,9 +514,14 @@ pub(crate) fn import_remedy(verb: &str, missing: &[MissingRef]) -> String {
 ///
 /// The help flags are deliberately not passed in: a page shown for `--help=x` misleads nobody,
 /// while these decide how the workload runs.
-pub(crate) fn refuse_flag_value(raw: &str, valueless: &[&str], path: &[&str]) -> Option<ExitCode> {
-    let flag = crate::flag_name(raw);
-    if !raw.contains('=') || !valueless.contains(&flag) {
+pub(crate) fn refuse_flag_value(
+    raw: &OsStr,
+    valueless: &[&str],
+    path: &[&str],
+) -> Option<ExitCode> {
+    use std::os::unix::ffi::OsStrExt;
+    let flag = crate::flag_name(raw)?;
+    if !raw.as_bytes().contains(&b'=') || !valueless.contains(&flag) {
         return None;
     }
     diag::error(&format!("sbx: `{flag}` takes no value"));
@@ -552,11 +557,19 @@ fn parse_run_launch(mut cmd: Vec<OsString>) -> Result<RunLaunch, ExitCode> {
     let mut detach = false;
     let mut observe = false;
     let mut cli = crate::config::CliOverrides::default();
-    while let Some(raw) = cmd.first().and_then(|a| a.to_str()) {
-        if let Some(code) = refuse_flag_value(raw, RUN_VALUELESS_FLAGS, &["run"]) {
+    // The loop turns on the flag *name*, owned, so the token's own bytes stay available to the
+    // refusal below and to the value parsers, which take paths. Reading the whole token as text
+    // here ended the loop on the first argument that was not — handing a dropped `--net=<bytes>`
+    // on as the command instead of refusing it.
+    while let Some(name) = cmd
+        .first()
+        .and_then(|a| crate::flag_name(a))
+        .map(str::to_string)
+    {
+        if let Some(code) = refuse_flag_value(&cmd[0], RUN_VALUELESS_FLAGS, &["run"]) {
             return Err(code);
         }
-        match crate::flag_name(raw) {
+        match name.as_str() {
             "--detach" => {
                 detach = true;
                 cmd.remove(0);
@@ -750,6 +763,46 @@ mod tests {
         assert_eq!(l.cli.env, vec!["A=1".to_string()]);
         assert!(!l.detach);
         assert_eq!(l.cmd, v(&["--detach=false"]));
+    }
+
+    /// The launch parser reads each leading token to decide what it is, and it read the whole
+    /// token as text. A flag whose *value* is bytes — `--bind` takes a path, and on Linux a path is
+    /// bytes — then ended the loop instead of being refused: the flag was handed on as the command
+    /// and the override vanished. Measured before the fix, `sbx run --net=<bytes> true` ran as far
+    /// as starting the egress proxy without a word about `--net`, which is a different confinement
+    /// than the one asked for.
+    ///
+    /// The unit test on `take_override_flag` cannot see this: the gate it pins was never reached
+    /// from here. This one asks the question through the parser the binary actually calls, which
+    /// is the only place the two halves — recognizing the flag, and refusing its value — meet.
+    #[test]
+    fn a_run_override_whose_value_is_not_text_ends_the_launch_rather_than_the_loop() {
+        use std::os::unix::ffi::OsStringExt;
+        let with_bytes = |flag: &str| -> Vec<OsString> {
+            let mut token = OsString::from(flag);
+            token.push(OsString::from_vec(vec![0x80]));
+            vec![token, OsString::from("true")]
+        };
+        // One per parsing path: a value-taking flag, a path-taking one, and an optional-value
+        // boolean — the boolean is the one the fix newly reaches, and it must not read a value it
+        // cannot parse as the bare flag's `true`.
+        for flag in ["--net=", "--bind=", "--gpu="] {
+            assert!(
+                parse_run_launch(with_bytes(flag)).is_err(),
+                "`{flag}<bytes>` must be a usage error, not an override dropped in silence"
+            );
+        }
+
+        // The witness: the same flags with text values still parse, and the command survives them.
+        let l = parse_run_launch(vec![
+            OsString::from("--net=none"),
+            OsString::from("--gpu=false"),
+            OsString::from("true"),
+        ])
+        .unwrap();
+        assert_eq!(l.cli.net, vec!["none".to_string()]);
+        assert_eq!(l.cli.gpu, vec!["false".to_string()]);
+        assert_eq!(l.cmd, vec![OsString::from("true")]);
     }
 
     #[test]

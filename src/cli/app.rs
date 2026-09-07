@@ -203,17 +203,21 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
     while !head.is_empty() {
         // Decide on the leading token, then act — the match ends the immutable borrow so a
         // value-taking flag can mutate the queue.
-        let Some(raw) = head[0].to_str().map(str::to_string) else {
+        // The flag *name*, not the whole token: `--bind=<bytes>` is a flag whose value is not
+        // text, and reading the token whole reported it as a malformed app name — naming the
+        // wrong mistake, and on the `run` verb dropping the override in silence instead.
+        let Some(flag) = flag_name(&head[0]).map(str::to_string) else {
             diag::error(&format!(
                 "sbx: app name must be valid text — usage: {}",
                 help::synopsis_of(&["app", "run"])
             ));
             return Err(ExitCode::from(2));
         };
-        if let Some(code) = refuse_flag_value(&raw, APP_LAUNCH_VALUELESS_FLAGS, &["app", "run"]) {
+        if let Some(code) = refuse_flag_value(&head[0], APP_LAUNCH_VALUELESS_FLAGS, &["app", "run"])
+        {
             return Err(code);
         }
-        match flag_name(&raw) {
+        match flag.as_str() {
             "--detach" => {
                 detach = true;
                 head.remove(0);
@@ -225,14 +229,21 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
             // `--net-learn[=domain|path|exact]`: the value after `=` picks the granularity; a bare
             // flag is the widest, `domain`.
             "--net-learn" => {
-                let gran = match raw.split_once('=') {
-                    Some((_, value)) => match sandbox::Granularity::parse(value) {
-                        Ok(g) => g,
-                        Err(e) => {
-                            diag::error(&format!("sbx: {e}"));
-                            return Err(ExitCode::from(2));
+                let gran = match crate::flag_inline(&head[0]) {
+                    // The value decides how widely learned rules are written, so one the parser
+                    // cannot read is refused rather than quietly taken as the widest default.
+                    Some(inline) => {
+                        let Some(value) = inline.to_str() else {
+                            return Err(crate::refuse_nontext_value("app", &flag, inline));
+                        };
+                        match sandbox::Granularity::parse(value) {
+                            Ok(g) => g,
+                            Err(e) => {
+                                diag::error(&format!("sbx: {e}"));
+                                return Err(ExitCode::from(2));
+                            }
                         }
-                    },
+                    }
                     None => sandbox::Granularity::default(),
                 };
                 learn_gran = Some(gran);
@@ -256,9 +267,9 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
             _ => match take_override_flag(&mut head, &mut cli, "app") {
                 Some(res) => res?,
                 None => {
-                    if raw.starts_with('-') {
+                    if flag.starts_with('-') {
                         diag::error(&format!(
-                            "sbx: unknown flag {raw} — usage: {}",
+                            "sbx: unknown flag {flag} — usage: {}",
                             help::synopsis_of(&["app", "run"])
                         ));
                         return Err(ExitCode::from(2));
@@ -270,7 +281,17 @@ fn parse_app_launch(args: &[OsString]) -> Result<AppLaunch, ExitCode> {
                         ));
                         return Err(ExitCode::from(2));
                     }
-                    name = Some(raw);
+                    // The name is the whole token: nothing was cut from it — a name carrying an
+                    // `=` is not a flag — and quoting it back as typed is what makes the
+                    // "no app named" report recognizable.
+                    let Some(whole) = head[0].to_str().map(str::to_string) else {
+                        diag::error(&format!(
+                            "sbx: app name must be valid text — usage: {}",
+                            help::synopsis_of(&["app", "run"])
+                        ));
+                        return Err(ExitCode::from(2));
+                    };
+                    name = Some(whole);
                     head.remove(0);
                 }
             },
