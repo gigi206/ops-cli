@@ -138,6 +138,30 @@ fn send<S: Read + Write>(
     headers: &[(&str, &str)],
     method: &str,
 ) -> io::Result<Head<S>> {
+    // Every variable part of this request is checked for a control byte before a single one is
+    // written. The host and target come from a `Location` a registry chose, and a header value
+    // from the token its auth challenge handed back; the response-head reader splits on `\r\n`, so
+    // a bare `\n` in a header value survives into these strings intact. Written into a request
+    // line or a header, it ends the line and whatever follows it is a request of the registry's
+    // composing. Refused rather than escaped: nothing sbx fetches names a control byte, so there
+    // is no legitimate value to preserve.
+    for (what, value) in [
+        ("the request target", url.target.as_str()),
+        ("the host", url.host.as_str()),
+    ]
+    .into_iter()
+    .chain(
+        headers
+            .iter()
+            .flat_map(|(n, v)| [("a header name", *n), ("a header value", *v)]),
+    ) {
+        if value.chars().any(char::is_control) {
+            return Err(io::Error::other(format!(
+                "{what} carries a control character ({value:?}): refusing to compose a request \
+                 from it"
+            )));
+        }
+    }
     let mut request = format!(
         "{method} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: sbx\r\nAccept-Encoding: identity\r\n\
          Connection: close\r\n",

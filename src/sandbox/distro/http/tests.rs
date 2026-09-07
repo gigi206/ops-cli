@@ -7,6 +7,83 @@ fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// A pair of in-memory ends, so a test can read the bytes `send` actually wrote.
+#[derive(Debug)]
+struct Wire {
+    written: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+    response: std::io::Cursor<Vec<u8>>,
+}
+
+impl Read for Wire {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.response.read(buf)
+    }
+}
+
+impl Write for Wire {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.written.borrow_mut().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The response head is split on `\r\n`, so a bare `\n` inside a header value survives into the
+/// string this fetch carries forward: a registry's `Location`, or the token its auth challenge
+/// hands back and the next request re-sends. Written into a request line or a header, that byte
+/// ends the line, and what follows it is a request the registry composed. Nothing sbx fetches
+/// names a control byte, so it is refused rather than escaped.
+#[test]
+fn a_control_byte_in_a_request_part_is_refused_before_a_byte_is_written() {
+    let wire = || Wire {
+        written: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        response: std::io::Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()),
+    };
+    let url = |host: &str, target: &str| Url {
+        host: host.to_string(),
+        port: 443,
+        target: target.to_string(),
+    };
+
+    for (u, hs) in [
+        (url("r.test", "/v2/\nGET /other HTTP/1.1"), vec![]),
+        (url("r.test\nX-Injected: 1", "/v2/"), vec![]),
+        (
+            url("r.test", "/v2/"),
+            vec![("Authorization", "Bearer a\nX-Injected: 1")],
+        ),
+        (url("r.test", "/v2/"), vec![("X-A\nX-B", "v")]),
+    ] {
+        let w = wire();
+        let seen = std::rc::Rc::clone(&w.written);
+        let err = send(w, &u, &hs, "GET").expect_err("a control byte must be refused");
+        assert!(err.to_string().contains("control character"), "{err}");
+        assert!(
+            seen.borrow().is_empty(),
+            "the refusal lands before a byte reaches the wire"
+        );
+    }
+
+    // Witness: the ordinary shape still composes, and the header rides where it belongs.
+    let w = wire();
+    let seen = std::rc::Rc::clone(&w.written);
+    send(
+        w,
+        &url("r.test", "/v2/library/debian/manifests/10"),
+        &[("Authorization", "Bearer abc")],
+        "GET",
+    )
+    .expect("an ordinary request composes");
+    let text = String::from_utf8(seen.borrow().clone()).unwrap();
+    assert!(
+        text.starts_with("GET /v2/library/debian/manifests/10 HTTP/1.1\r\n"),
+        "{text}"
+    );
+    assert!(text.contains("\r\nAuthorization: Bearer abc\r\n"), "{text}");
+}
+
 #[test]
 fn a_url_splits_into_host_port_and_request_target() {
     let u = parse_url("https://registry-1.docker.io/v2/library/debian/manifests/10").unwrap();
