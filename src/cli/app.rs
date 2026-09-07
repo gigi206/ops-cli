@@ -880,6 +880,12 @@ fn app_export(args: &[OsString]) -> ExitCode {
             // fragment at the destination that `sbx app import` will happily read as a whole
             // profile. It also follows a symlink at the destination, which `--out` into a
             // cage-writable directory turns into a write through somebody else's name.
+            //
+            // No mode of sbx's own, which is the same decision `sbx bundle export` states: `--out
+            // <file>` and a shell redirect are one command spelled two ways, so the destination
+            // takes the umask like any other file the user asked for at a path they named. The
+            // owner-only rule holds for what sbx writes *unasked* into its own directories, which
+            // is the snapshot `keep_replaced_file` keeps, not for an artifact handed on.
             let text = String::from_utf8_lossy(&bytes);
             if let Err(e) = config::manage::write_text(path, &text, None) {
                 diag::error(&format!("sbx: cannot write {}: {e}", path.display()));

@@ -184,6 +184,10 @@ pub(super) fn net_groups_export(args: &[OsString]) -> ExitCode {
 /// truncated group list at exactly the path someone later imports as though it were complete; the
 /// shared writer renames a finished temp file into place, and creates the destination's parent
 /// directory so a path into a not-yet-existing backup directory is written rather than refused.
+///
+/// With no mode of sbx's own, for the reason `sbx bundle export` gives: `--out <file>` and a shell
+/// redirect are one command spelled two ways, so the destination takes the umask. The owner-only
+/// rule is for what sbx writes unasked into its own directories.
 fn write_groups_fragment(path: &Path, fragment: &str, count: usize) -> ExitCode {
     match config::manage::write_text(path, fragment, None) {
         Ok(()) => {
