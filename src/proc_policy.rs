@@ -38,8 +38,9 @@
 //! an inode. And a **relative** target stays relative: it is matched as the process spelled it,
 //! which is what lets a declaration name `./build.sh` and have it match, and it means an absolute
 //! path rule says nothing about a target reached by `chdir` plus a bare name. A rule that must hold
-//! wherever its program is spelled from is a basename rule, which is the form the shipped denylists
-//! use.
+//! wherever its program is spelled from is a basename rule, which is the form to reach for: sbx
+//! ships no `[proc]` rules of its own, so there is no worked example to copy, and this is the
+//! sentence that stands in for one.
 
 /// The process/exec lens mode, resolved from `[proc] mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

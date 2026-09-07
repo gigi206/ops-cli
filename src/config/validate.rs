@@ -414,7 +414,7 @@ fn warn_on_path_shaped_proc_rules(
                 "{source_label}: `proc.deny` {} written as a path, which matches that spelling \
                  and no other: no symlink is resolved, so the same program reached by another \
                  name still runs. A basename rule (`curl`) holds wherever the program is spelled \
-                 from, which is the form the shipped denylists use.",
+                 from, and is the form to reach for.",
                 quoted_rules(&named)
             ));
         }

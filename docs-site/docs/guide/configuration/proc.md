@@ -64,8 +64,9 @@ a path, because the shape promises more than the lens delivers. The two limits d
 
 - A path `deny` matches that spelling and no other. No symlink is resolved, so `deny = ["/usr/bin/*"]`
   says nothing about the same program reached as `/tmp/mycurl` or through a bind mount. A basename
-  rule (`curl`) holds wherever the program is spelled from, which is why the shipped denylists use
-  that form.
+  rule (`curl`) holds wherever the program is spelled from, which is the form to reach for. sbx
+  ships no `[proc]` rules of its own: the rules in force are the ones you write, so there is no
+  worked denylist to copy the shape from.
 - A path `allow` is a guard-rail rather than a guarantee. The supervisor reads the target, decides,
   and then the kernel **re-resolves** it to run it, so a second thread in the cage can point the name
   elsewhere in between. Refusing a path is not exposed to this (the syscall never runs); allowing one
