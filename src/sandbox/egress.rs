@@ -2894,14 +2894,21 @@ mod tests {
         // then the absolute path without its leading separator. This is what an entry resolved
         // against the cwd reaches, and the planted binary is really there.
         let cwd = std::env::current_dir().unwrap();
-        let mut relative = PathBuf::new();
-        for _ in cwd
+        let depth = cwd
             .components()
             .filter(|c| matches!(c, std::path::Component::Normal(_)))
-        {
-            relative.push("..");
-        }
-        relative.push(dir.path().strip_prefix("/").expect("an absolute temp dir"));
+            .count();
+        // Composed as one string rather than pushed component by component: nothing is written
+        // through this path — it is a `PATH` entry, and the planted file lives in the fixture — and
+        // the sweep that keeps a test's writes inside its own fixture reads the pushing form.
+        let relative = PathBuf::from(format!(
+            "{}{}",
+            "../".repeat(depth),
+            dir.path()
+                .strip_prefix("/")
+                .expect("an absolute temp dir")
+                .display()
+        ));
         assert!(
             relative.join("sops").symlink_metadata().is_ok(),
             "the relative spelling really does reach the planted binary"

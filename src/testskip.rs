@@ -41,8 +41,23 @@ macro_rules! __skip_note {
             // count then reads one skip as two. Folded here, at the writer, so the contract holds
             // for every reason a future site passes; the terminal copy above keeps its shape.
             let line = format!("{}\n", reason.replace(['\n', '\r'], " "));
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                let _ = f.write_all(line.as_bytes());
+            // A failure to open or to write is said out loud. The log exists so a run can report
+            // how many of its green tests did nothing, and a swallowed error makes that count
+            // silently short — the one way this file can mislead. Not a panic: a test that ran
+            // must not fail over its own bookkeeping, and stderr is where the skip itself went.
+            match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(mut f) => {
+                    if let Err(e) = f.write_all(line.as_bytes()) {
+                        eprintln!(
+                            "sbx: this skip is missing from {}: {e}",
+                            std::path::Path::new(&path).display()
+                        );
+                    }
+                }
+                Err(e) => eprintln!(
+                    "sbx: this skip is missing from {}: {e}",
+                    std::path::Path::new(&path).display()
+                ),
             }
         }
         if $enforced
