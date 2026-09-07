@@ -86,15 +86,28 @@ fn app_in_args(project: &Path, data: &Path, name: &str, extra: &[&str]) -> Outpu
         .expect("spawn sbx app")
 }
 
+/// An `sbx` aimed at a test's own directories: everything [`sbx`] isolates, plus the data dir, the
+/// trust-store dir and the project as the working directory. The stdio is the caller's to choose.
+///
+/// Every launch a test makes goes through here, including the ones it backgrounds. A child built
+/// from a bare `Command::new` inherits none of this — in particular not `XDG_CONFIG_HOME`, so it
+/// reads the developer's own global config, where a single `[secret]` whose source is absent from
+/// the test environment stops the egress proxy from starting and leaves the test watching a log
+/// that will never have a line in it.
+fn sbx_session_in(project: &Path, data: &Path, state: &Path) -> Command {
+    let mut cmd = sbx();
+    cmd.current_dir(project)
+        .env("XDG_DATA_HOME", data)
+        .env("XDG_STATE_HOME", state);
+    cmd
+}
+
 /// `sbx <args>` from `project` with both the data dir and the trust-store dir
 /// redirected, so a test can trust a project and launch it without touching the
 /// real `$HOME` or the user's trust store.
 fn sbx_in(project: &Path, data: &Path, state: &Path, args: &[&str]) -> Output {
-    sbx()
+    sbx_session_in(project, data, state)
         .args(args)
-        .current_dir(project)
-        .env("XDG_DATA_HOME", data)
-        .env("XDG_STATE_HOME", state)
         .output()
         .expect("spawn sbx")
 }
@@ -3797,7 +3810,7 @@ fn sbx_net_logs_reads_a_running_sessions_live_egress() {
     // reader compose. Because the log is live-only (it dies with the session), the session
     // MUST be alive during the read — hence the background child. Skips (never fails) when the host
     // cannot sandbox or the cache is unreachable.
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
 
     let project = TmpDir::prefixed("r", "logs-proj");
@@ -3832,8 +3845,11 @@ fn sbx_net_logs_reads_a_running_sessions_live_egress() {
 
     // A background session: one allowed fetch (logged `allow`), one denied fetch (logged `deny`),
     // then a sleep long enough to read its live log. The denied fetch fails; `sh` continues.
+    // The session's stderr is kept rather than dropped: this launch does the provisioning and
+    // starts the proxy, so when the log stays empty its refusal is the only thing that says why.
+    let session_log = state.path().join("session-stderr.log");
     let child = KillOnDrop(
-        Command::new(env!("CARGO_BIN_EXE_sbx"))
+        sbx_session_in(project.path(), data.path(), state.path())
             .args([
                 "run",
                 "--",
@@ -3843,11 +3859,10 @@ fn sbx_net_logs_reads_a_running_sessions_live_egress() {
                  nix-prefetch-url --type sha256 https://example.com/nix-cache-info; \
                  sleep 300",
             ])
-            .current_dir(project.path())
-            .env("XDG_DATA_HOME", data.path())
-            .env("XDG_STATE_HOME", state.path())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(
+                std::fs::File::create(&session_log).expect("create the session stderr log"),
+            ))
             .spawn()
             .expect("spawn the background sbx run"),
     );
@@ -3926,13 +3941,14 @@ fn sbx_net_logs_reads_a_running_sessions_live_egress() {
     // Tear the background session down before asserting, so a failure never leaks a live cage.
     drop(child);
 
+    let said = std::fs::read_to_string(&session_log).unwrap_or_default();
     assert!(
         saw_allow && saw_deny,
-        "the live log must show the allowed host's allow and the denied host's deny:\n{last}"
+        "the live log must show the allowed host's allow and the denied host's deny:\n{last}\nthe session said:\n{said}"
     );
     assert!(
         saw_status,
-        "`--with-status` must surface the allowed fetch's upstream 200 (proxy→ring→reader):\n{last}"
+        "`--with-status` must surface the allowed fetch's upstream 200:\n{last}\nthe session said:\n{said}"
     );
     assert!(
         human_out.contains("egress log:") && human_out.contains("cache.nixos.org"),
@@ -3949,7 +3965,7 @@ fn sbx_net_logs_follow_streams_a_running_sessions_egress() {
     // + per-session cursor + append. Skips (never fails) when the host cannot sandbox or the cache is
     // unreachable.
     use std::io::BufRead as _;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -3983,7 +3999,8 @@ fn sbx_net_logs_follow_streams_a_running_sessions_egress() {
     );
 
     // The background session: one allowed and one denied egress, then a sleep long enough to tail.
-    let session = Command::new(env!("CARGO_BIN_EXE_sbx"))
+    let session_log = state.path().join("session-stderr.log");
+    let session = sbx_session_in(project.path(), data.path(), state.path())
         .args([
             "run",
             "--",
@@ -3993,11 +4010,10 @@ fn sbx_net_logs_follow_streams_a_running_sessions_egress() {
              nix-prefetch-url --type sha256 https://example.com/nix-cache-info; \
              sleep 300",
         ])
-        .current_dir(project.path())
-        .env("XDG_DATA_HOME", data.path())
-        .env("XDG_STATE_HOME", state.path())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(&session_log).expect("create the session stderr log"),
+        ))
         .spawn()
         .expect("spawn the background sbx run");
     let session = KillOnDrop(session);
@@ -4007,11 +4023,8 @@ fn sbx_net_logs_follow_streams_a_running_sessions_egress() {
 
     // The follower streams new events as NDJSON over a pipe; a thread accumulates them so the test
     // can watch the stream grow.
-    let mut follower = Command::new(env!("CARGO_BIN_EXE_sbx"))
+    let mut follower = sbx_session_in(project.path(), data.path(), state.path())
         .args(["net", "logs", "--follow", "--interval", "1", "--json"])
-        .current_dir(project.path())
-        .env("XDG_DATA_HOME", data.path())
-        .env("XDG_STATE_HOME", state.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -4081,13 +4094,14 @@ fn sbx_net_logs_follow_streams_a_running_sessions_egress() {
     drop(session);
 
     let out = captured.lock().unwrap().clone();
+    let said = std::fs::read_to_string(&session_log).unwrap_or_default();
     assert!(
         line_has(&out, "cache.nixos.org", "allow"),
-        "the --follow stream must show the allowed host's allow:\n{out}"
+        "the --follow stream must show the allowed host's allow:\n{out}\nthe session said:\n{said}"
     );
     assert!(
         line_has(&out, "example.com", "deny"),
-        "the --follow stream must show the denied host's deny:\n{out}"
+        "the --follow stream must show the denied host's deny:\n{out}\nthe session said:\n{said}"
     );
 }
 

@@ -26,6 +26,11 @@
 // worse than no count at all. Reach them with `#[macro_use] mod common;`.
 include!("../../src/testskip.rs");
 
+// Where a fixture tree lives, included for the same reason: this module needs the root to isolate a
+// launch's global config, and a second spelling of it would put that isolation somewhere the rest
+// of the suite does not clean.
+include!("../../src/testroot.rs");
+
 /// Gate a test on this host being able to build a cage, skipping it — with the probe's own
 /// diagnosis — when it cannot.
 ///
@@ -82,9 +87,20 @@ pub mod project;
 use std::process::{Command, Output};
 
 /// Run the binary under test with `args`.
+///
+/// The global config is isolated the way the launching suites isolate theirs: a fixed empty
+/// directory under the test tree. Without it, a verb that reads the global config — the apps a
+/// completion offers, the profiles a listing names — answers out of the developer's own
+/// `~/.config/sbx`, and the assertion then measures that machine. The locale is pinned for the
+/// reason [`project::Project::cmd_in`] gives.
 pub fn sbx(args: &[&str]) -> Output {
+    let config = fixture_root().join("isolated-config");
+    let _ = std::fs::create_dir_all(&config);
     Command::new(env!("CARGO_BIN_EXE_sbx"))
         .args(args)
+        .env("XDG_CONFIG_HOME", config)
+        .env("LC_ALL", "C.UTF-8")
+        .env_remove("LANG")
         .output()
         .expect("spawn sbx")
 }
