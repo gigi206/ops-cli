@@ -771,6 +771,7 @@ pub(super) fn sample_app_detail_view() -> config::view::AppDetailView {
         secrets: vec![],
         secrets_inherited: 0,
         notes: vec![],
+        warnings: vec![],
     }
 }
 
@@ -853,6 +854,7 @@ fn all_defaults_app_detail_view() -> config::view::AppDetailView {
         open: vec![],
         service: vec![],
         notes: vec![],
+        warnings: vec![],
     }
 }
 
@@ -1062,6 +1064,7 @@ fn filled_app_detail_view() -> config::view::AppDetailView {
             "the project is untrusted, so its `binds` were dropped".into(),
             "`caps` is not a field sbx accepts".into(),
         ],
+        warnings: vec![],
     }
 }
 

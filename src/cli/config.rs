@@ -222,6 +222,12 @@ fn config_show_app(cwd: &Path, name: &str, json: bool, details: bool) -> ExitCod
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     print!("{}", render_app_detail(&view, &pal, details));
+    // After the document and on stderr, as `config show` does: a profile the loader threw away is
+    // the first thing a reader of this view needs, and it is attributed to no app, so it has no
+    // other way here.
+    for w in &view.warnings {
+        diag::warn_config(w);
+    }
     ExitCode::SUCCESS
 }
 

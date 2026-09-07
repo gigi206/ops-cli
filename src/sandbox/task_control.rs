@@ -488,10 +488,10 @@ impl TaskLog {
         // that had lost nothing. Append order is contiguous, so the gap is arithmetic on the oldest
         // entry still held.
         // `saturating_add`, because `after` is whatever the caller put on the wire — and on this
-        // socket the caller is the cage. `after + 1` at `u64::MAX` panics in a debug build and wraps
-        // in a release one (nothing sets `overflow-checks`), and the wrap lands here as a fabricated
-        // eviction count rather than as a failure. Saturating gives the true answer for that cursor
-        // too: nothing can be newer than `u64::MAX`, so nothing was missed.
+        // socket the caller is the cage. `after + 1` at `u64::MAX` panics in every build, the
+        // release profile having carried `overflow-checks` since the day the tests that prove this
+        // arithmetic started describing the shipped binary. Saturating gives the true answer for
+        // that cursor too: nothing can be newer than `u64::MAX`, so nothing was missed.
         let evicted = match inner.entries.front() {
             Some(oldest) if oldest.cursor > after.saturating_add(1) => oldest.cursor - after - 1,
             _ => 0,

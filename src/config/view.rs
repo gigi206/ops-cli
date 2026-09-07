@@ -976,6 +976,13 @@ pub(crate) struct AppDetailView {
     pub(crate) service: Vec<ServiceView>,
     /// Notes about what this app's resolution dropped or ignored.
     pub(crate) notes: Vec<String>,
+    /// What the loader said about the **files** it read, carried here rather than dropped.
+    ///
+    /// A profile that no longer parses, a config the safety gate refused: neither is attributed to
+    /// an app, so neither reaches `notes`, and this is the one view whose whole purpose is to
+    /// explain why a setting is what it is. It reported a resolved posture with no word about the
+    /// profile it had thrown away. The two sibling views print these already.
+    pub(crate) warnings: Vec<String>,
 }
 
 /// Assemble the view for a directory: load and resolve the configuration, then project it (plus
@@ -1899,6 +1906,7 @@ fn app_detail_view(
         },
 
         notes,
+        warnings: baseline.warnings.clone(),
     }
 }
 
