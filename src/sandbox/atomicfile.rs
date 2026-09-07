@@ -15,8 +15,15 @@
 use std::io;
 use std::path::Path;
 
-/// Write `bytes` to `path` atomically: a unique temp sibling (named by pid, so concurrent launches
-/// do not collide on it) written then renamed over `path`.
+/// Write `bytes` to `path` atomically: a temp sibling written, then renamed over `path`.
+///
+/// The temp's name carries the target's own name, the pid **and** [`unique()`]. The first two
+/// separate stagings of different files and of different processes; the third separates two
+/// stagings of the *same* file inside one process, and that is not the cosmetic case. Two writers
+/// sharing a temp do not merely lose one update: the second truncates the inode the first is still
+/// writing into, so the rename publishes one writer's head followed by the other's tail — a file
+/// that is present, is the right name, and is not the TOML it promises to be. With the temps
+/// separate, the loser of the race is a whole body that a later rename replaces.
 ///
 /// The temp is a **hidden** sibling, and that is not cosmetic: the router directory bound at
 /// `/opt/sbx/open` leads the cage's `PATH`, so a temp named after the file it replaces would put a
@@ -46,7 +53,7 @@ pub(crate) fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) ->
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
+    let tmp = dir.join(format!(".{name}.tmp.{}.{}", std::process::id(), unique()));
     let staged = || -> io::Result<()> {
         // Written and flushed to the device before the rename, rather than through `fs::write`.
         // The rename orders itself against the data only if the data is already durable: without
@@ -132,6 +139,52 @@ mod tests {
         let plain = dir.join("plain");
         write_atomic(&plain, b"x").unwrap();
         assert_eq!(std::fs::read(&plain).unwrap(), b"x");
+    }
+
+    /// Two stagings running at once publish two whole files, never one file made of both.
+    ///
+    /// The failure this holds off is not the lost update — one of two writers to the same name
+    /// always loses — but the torn publish: with a shared temp, the second writer truncates the
+    /// inode the first is still filling, and the rename installs a head from one body and a tail
+    /// from the other. So the assertion is on the *content*: whichever body wins, the file holds
+    /// that one entire and nothing of the other. Bodies large enough that a write is not one
+    /// syscall, because a torn file needs the two writes to interleave.
+    #[test]
+    fn two_concurrent_stagings_publish_a_whole_body_and_never_a_mixture() {
+        let base = crate::testutil::TmpDir::new();
+        let dir = base.path().join("stage");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("contended");
+        let a = vec![b'a'; 512 * 1024];
+        let b = vec![b'b'; 512 * 1024];
+
+        for round in 0..16 {
+            std::thread::scope(|s| {
+                let one = s.spawn(|| write_atomic(&target, &a));
+                let two = s.spawn(|| write_atomic(&target, &b));
+                // Both report success: a writer whose temp another one renamed away fails its own
+                // rename with ENOENT, which is the same defect seen from the other end.
+                for (which, r) in [("a", one.join()), ("b", two.join())] {
+                    let r = r.expect("staging thread");
+                    assert!(r.is_ok(), "round {round}, writer {which}: {r:?}");
+                }
+            });
+            let published = std::fs::read(&target).unwrap();
+            assert!(
+                published == a || published == b,
+                "the published file is neither whole body: {} bytes, {} of them 'a'",
+                published.len(),
+                published.iter().filter(|&&c| c == b'a').count()
+            );
+            // And the staging leaves nothing behind under either name.
+            let leftovers: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains(".tmp."))
+                .collect();
+            assert!(leftovers.is_empty(), "temps left behind: {leftovers:?}");
+        }
     }
 
     /// No caller in `binds` publishes a file and *then* makes it what it has to be.

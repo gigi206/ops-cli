@@ -249,35 +249,13 @@ pub(crate) fn one_file(
 ///
 /// Written to a temp and renamed, so a crash mid-write cannot leave a truncated snapshot in place
 /// of the bytes it was meant to preserve — the snapshot is taken *because* the original is about to
-/// go.
+/// go. That staging is [`crate::sandbox::atomicfile::write_atomic_mode`]'s and not a second copy of
+/// it: this function once carried its own, which named the temp `.replaced-<pid>.tmp` and so gave
+/// every destination in a directory the same scratch file. The mode goes on before the rename for
+/// the reason that function states, and a snapshot left from an earlier overwrite keeps none of its
+/// permissions, because `rename` replaces the entry rather than the inode's bits.
 pub(crate) fn keep_replaced_file(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
-    let tmp = dir.join(format!(".replaced-{}.tmp", std::process::id()));
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    if let Err(e) = f.write_all(bytes) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    drop(f);
-    // A snapshot left from an earlier overwrite may carry the mode the old write gave it, and a
-    // rename onto it would keep that inode's permissions nowhere — `rename` replaces the entry, so
-    // the new file's `0600` is what remains.
-    if let Err(e) = std::fs::rename(&tmp, dest) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
+    crate::sandbox::atomicfile::write_atomic_mode(dest, bytes, Some(0o600))
 }
 
 /// The settings a replaced file carried that the incoming one does not — what a `--force` import
@@ -692,10 +670,54 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        OneFile, OneName, dedupe_names, one_name, parse_one_file, parse_one_name, parse_run_launch,
+        OneFile, OneName, dedupe_names, keep_replaced_file, one_name, parse_one_file,
+        parse_one_name, parse_run_launch,
     };
     use std::ffi::OsString;
     use std::path::PathBuf;
+
+    /// Two snapshots taken at once are two files, and each holds its own bytes.
+    ///
+    /// The staging this delegates to names its temp after the destination. The copy it replaced
+    /// named it `.replaced-<pid>.tmp`, which every destination in a directory shared, so two
+    /// snapshots in flight wrote into one inode and one of them renamed it away from under the
+    /// other. The overwrite that these snapshots precede is the reason the case matters: the
+    /// original is about to go, and a snapshot that lost the race is the copy that no longer
+    /// exists.
+    #[test]
+    fn two_snapshots_in_one_directory_keep_their_own_bytes() {
+        let base = crate::testutil::TmpDir::new();
+        let dir = base.path().join("kept");
+        std::fs::create_dir_all(&dir).unwrap();
+        let one = dir.join("profile-one.toml.replaced");
+        let two = dir.join("profile-two.toml.replaced");
+        let a = vec![b'a'; 512 * 1024];
+        let b = vec![b'b'; 512 * 1024];
+
+        for round in 0..16 {
+            std::thread::scope(|s| {
+                let first = s.spawn(|| keep_replaced_file(&one, &a));
+                let second = s.spawn(|| keep_replaced_file(&two, &b));
+                for (which, r) in [("one", first.join()), ("two", second.join())] {
+                    let r = r.expect("snapshot thread");
+                    assert!(r.is_ok(), "round {round}, snapshot {which}: {r:?}");
+                }
+            });
+            assert_eq!(std::fs::read(&one).unwrap(), a, "round {round}");
+            assert_eq!(std::fs::read(&two).unwrap(), b, "round {round}");
+        }
+
+        // Owner-only, which is the reason this function exists rather than a `std::fs::write`.
+        use std::os::unix::fs::PermissionsExt as _;
+        for kept in [&one, &two] {
+            assert_eq!(
+                std::fs::metadata(kept).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "{}",
+                kept.display()
+            );
+        }
+    }
 
     /// `--detach` and `--observe` decide how the workload runs, so a `=value` suffix has to be
     /// refused rather than stripped. `flag_name` exists so that `--config` and `--config=x` reach

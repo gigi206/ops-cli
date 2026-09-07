@@ -13,7 +13,7 @@ mod argv;
 // belong to the launch path.
 pub(crate) use argv::helper_argv;
 // Installing a file so no reader ever sees half of it: temp sibling, then rename.
-mod atomicfile;
+pub(crate) mod atomicfile;
 mod binds;
 // Making a directory under a tree the cage can write, with symlinks refused — the rule several
 // host-side placements share, stated once.

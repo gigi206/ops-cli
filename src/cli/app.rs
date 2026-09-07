@@ -761,30 +761,14 @@ fn drop_replaced_copy(name: &str) {
 /// passes the safety gate) and are then renamed into place — atomic, like every other on-disk
 /// placement sbx makes: a failed or interrupted write never leaves a partial profile at the real
 /// name, and a `--force` overwrite keeps the previous profile until the new one is fully written.
+///
+/// The staging is [`crate::sandbox::atomicfile::write_atomic_mode`]'s. It was a second, hand-rolled
+/// copy of it until the two were compared: the copy named its temp `.import-<pid>.tmp`, which every
+/// profile in the directory shared, and it renamed without flushing, so a machine that lost power
+/// just after the rename could come back with a profile that was present and held zeros.
 fn write_profile_file(dir: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
-    let tmp = dir.join(format!(".import-{}.tmp", std::process::id()));
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    if let Err(e) = f.write_all(bytes) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    drop(f);
-    if let Err(e) = std::fs::rename(&tmp, dest) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
+    debug_assert_eq!(dest.parent(), Some(dir));
+    crate::sandbox::atomicfile::write_atomic_mode(dest, bytes, Some(0o600))
 }
 
 /// The overwrite warning: what the replacement no longer carries, and where the previous bytes are.
