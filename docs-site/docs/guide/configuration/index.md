@@ -136,6 +136,12 @@ with **two** mistyped values is not recovered and is dropped whole, with the par
 own message. Nothing is ever dropped silently: one warning names the value, the other
 names the file.
 
+Note the direction, if you knew the old behaviour: a file that used to vanish now
+applies. A trusted project writing `mode = "allow"` beside a mistyped `allow` list
+used to fall back to whatever the global config said, which could be `deny`; now the
+project's own `mode` takes effect, because that is what the project wrote and what
+you trusted. The mistyped value itself is still dropped, and still named.
+
 ## A worked example
 
 ```toml
