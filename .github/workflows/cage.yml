@@ -79,6 +79,9 @@ on:
       - Cargo.toml
       - Cargo.lock
       - build.rs
+      # The bundled-engine lint below reads its pinned nixpkgs references out of this file, so a
+      # roll of that pin is a change this workflow has to re-run on.
+      - mise.toml
 
 permissions:
   contents: read
@@ -317,3 +320,52 @@ jobs:
               echo "None: every selected test ran."
             fi
           } | tee -a "$GITHUB_STEP_SUMMARY"
+  # The `bundled-nix` / `bundled-bwrap` feature paths, which no other workflow compiles: the
+  # default CI builds without them, so a change that breaks one is found at release time, by the
+  # one build that has to work.
+  #
+  # Here rather than in `ci.yml` because the features embed static engines realised with `nix`, and
+  # this is the workflow that already installs it. Its own job, so a lint failure reports as itself
+  # rather than reddening the cage suites, and neither waits on the other.
+  #
+  # The two references are read out of `mise.toml` instead of being written again: they pin a
+  # nixpkgs revision, and a second copy of a pin is a second thing to roll. `mise run lint-bundled`
+  # is the same three commands locally.
+  lint-bundled:
+    name: lint the bundled-engine feature paths
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Realise the pinned static engines and lint against them
+        run: |
+          set -euo pipefail
+          # The flake reference each task pins, taken from the task itself. A reference that stops
+          # matching fails here rather than silently linting the wrong thing.
+          realise() {
+            ref=$(grep -oE "github:NixOS/nixpkgs/[0-9a-f]{40}#pkgsStatic\.$1\b" mise.toml | head -1)
+            [ -n "$ref" ] || { echo "no pinned reference for pkgsStatic.$1 in mise.toml" >&2; exit 1; }
+            for out in $(nix build "$ref" --no-link --print-out-paths); do
+              if [ -e "$out/bin/$2" ]; then echo "$out/bin/$2"; return 0; fi
+            done
+            echo "no bin/$2 in the pkgsStatic.$1 outputs" >&2
+            exit 1
+          }
+          SBX_BUNDLED_NIX="$(realise nix nix)"
+          SBX_BUNDLED_BWRAP="$(realise bubblewrap bwrap)"
+          export SBX_BUNDLED_NIX SBX_BUNDLED_BWRAP
+          echo "nix:   $SBX_BUNDLED_NIX"
+          echo "bwrap: $SBX_BUNDLED_BWRAP"
+          cargo clippy --bins --features bundled-nix,bundled-bwrap -- -D warnings
