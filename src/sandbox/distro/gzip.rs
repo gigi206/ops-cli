@@ -43,6 +43,53 @@ pub(super) struct GzipReader<R> {
 impl<R: BufRead> GzipReader<R> {
     /// Read and check the gzip header, leaving `inner` positioned at the deflate stream.
     pub(super) fn new(mut inner: R) -> io::Result<Self> {
+        read_header(&mut inner)?;
+        Ok(GzipReader {
+            inner,
+            // Raw, because the gzip framing is handled here and what follows is a bare deflate
+            // stream with no zlib header of its own.
+            state: InflateState::new_boxed(DataFormat::Raw),
+            // Empty, not CHUNK-sized: this buffer holds *inflated* bytes, and a pre-sized one would
+            // hand the caller a block of zeros before a single byte had been inflated.
+            out: Vec::new(),
+            at: 0,
+            done: false,
+        })
+    }
+
+    /// Position `inner` at the next member's deflate stream, or say there is none.
+    ///
+    /// A gzip *file* is a sequence of members (RFC 1952 §2.2), and `gzip -dc` concatenates them:
+    /// an image layer an appending tool produced, an eStargz index, a `cat a.tar.gz b.tar.gz`,
+    /// all carry more than one. Stopping at the first left the rest of the archive unread, and for
+    /// a layer that is files the image declares and the cage never sees, with the unpack reporting
+    /// success. Trailing zero bytes are skipped the way `gzip` skips them; anything else after the
+    /// last member is refused rather than ignored, because it is not an archive this can read.
+    fn next_member(&mut self) -> io::Result<bool> {
+        loop {
+            let input = self.inner.fill_buf()?;
+            if input.is_empty() {
+                return Ok(false);
+            }
+            if input[0] == 0 {
+                let zeros = input.iter().take_while(|b| **b == 0).count();
+                self.inner.consume(zeros);
+                continue;
+            }
+            if input.len() >= 2 && input[..2] != MAGIC {
+                return Err(io::Error::other(
+                    "trailing data after the gzip member that is not another member",
+                ));
+            }
+            read_header(&mut self.inner)?;
+            return Ok(true);
+        }
+    }
+}
+
+/// Read and check one member's header, leaving `inner` positioned at its deflate stream.
+fn read_header<R: BufRead>(inner: &mut R) -> io::Result<()> {
+    {
         let mut fixed = [0u8; 10];
         inner.read_exact(&mut fixed)?;
         if fixed[0..2] != MAGIC {
@@ -63,25 +110,15 @@ impl<R: BufRead> GzipReader<R> {
         }
         for flag in [FNAME, FCOMMENT] {
             if flags & flag != 0 {
-                skip_zero_terminated(&mut inner)?;
+                skip_zero_terminated(inner)?;
             }
         }
         if flags & FHCRC != 0 {
             let mut crc = [0u8; 2];
             inner.read_exact(&mut crc)?;
         }
-        Ok(GzipReader {
-            inner,
-            // Raw, because the gzip framing is handled here and what follows is a bare deflate
-            // stream with no zlib header of its own.
-            state: InflateState::new_boxed(DataFormat::Raw),
-            // Empty, not CHUNK-sized: this buffer holds *inflated* bytes, and a pre-sized one would
-            // hand the caller a block of zeros before a single byte had been inflated.
-            out: Vec::new(),
-            at: 0,
-            done: false,
-        })
     }
+    Ok(())
 }
 
 /// Consume a zero-terminated header field.
@@ -121,7 +158,17 @@ impl<R: BufRead> Read for GzipReader<R> {
             );
             self.inner.consume(result.bytes_consumed);
             match result.status {
-                Ok(MZStatus::StreamEnd) => self.done = true,
+                Ok(MZStatus::StreamEnd) => {
+                    // This member's trailer (CRC32 and ISIZE), which the raw inflate leaves
+                    // behind, and then whatever follows it: see `next_member`.
+                    let mut trailer = [0u8; 8];
+                    self.inner.read_exact(&mut trailer)?;
+                    if self.next_member()? {
+                        self.state = InflateState::new_boxed(DataFormat::Raw);
+                    } else {
+                        self.done = true;
+                    }
+                }
                 Ok(_) => {
                     // No progress on either side with input still expected means the stream ended
                     // mid-member; reporting it is better than spinning.
