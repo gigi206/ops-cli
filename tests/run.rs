@@ -1958,6 +1958,22 @@ fn transient_fetch_failure(log: &str) -> bool {
         "transferred only",
         "unable to download",
     ];
+    // `unable to download` is nix's wrapper around every fetch failure, and it carries the reason
+    // after it: `Couldn't resolve host` on one run and `HTTP error 404` on another. A definite
+    // client answer is not a property of the network. A 404 or a 403 is a URL this code fabricated
+    // or a release that moved, which is precisely the regression these e2es exist to catch, and
+    // reading it as transient turned that regression into a green skip. A 408 and a 429 are the
+    // two 4xx that *are* about the moment, so they are left to the signatures above.
+    const DEFINITE: [&str; 5] = [
+        "HTTP error 400",
+        "HTTP error 401",
+        "HTTP error 403",
+        "HTTP error 404",
+        "HTTP error 410",
+    ];
+    if DEFINITE.iter().any(|s| log.contains(s)) {
+        return false;
+    }
     SIGNATURES.iter().any(|s| log.contains(s))
 }
 
@@ -8755,4 +8771,31 @@ fn a_broker_that_cannot_be_provided_warns_and_the_launch_still_succeeds() {
         left.is_empty(),
         "a launch whose brokers all fell away leaves nothing behind: {left:?}"
     );
+}
+
+/// `unable to download` is nix's wrapper around every fetch failure, so the signature matched a
+/// `404` as readily as a reset connection, and a build that failed because this code fabricated a
+/// URL skipped green. These e2es exist to catch exactly that. A definite client answer vetoes the
+/// skip; the reasons that really are about the moment still take it.
+#[test]
+fn a_definite_http_answer_is_not_a_transient_fetch_failure() {
+    // The shape a fabricated or moved URL produces, and the one a busy mirror does.
+    assert!(!transient_fetch_failure(
+        "error: unable to download 'https://example.test/x.tar.gz': HTTP error 404"
+    ));
+    assert!(!transient_fetch_failure(
+        "error: unable to download 'https://example.test/x.tar.gz': HTTP error 403"
+    ));
+    assert!(transient_fetch_failure(
+        "error: unable to download 'https://example.test/x.tar.gz': Couldn't resolve host"
+    ));
+    assert!(transient_fetch_failure("error: Truncated tar archive"));
+    // A 429 is about the moment, so it is still a skip through its own signature.
+    assert!(transient_fetch_failure(
+        "error: unable to download 'https://example.test/x': Connection timed out (HTTP error 429)"
+    ));
+    // And an unrelated failure is neither.
+    assert!(!transient_fetch_failure(
+        "error: builder for '/nix/store/x' failed with exit code 1"
+    ));
 }
