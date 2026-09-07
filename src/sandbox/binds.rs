@@ -591,6 +591,9 @@ struct SandboxPaths<'a> {
     /// Synthetic `/etc/machine-id`; bound read-only at `/etc/machine-id` and
     /// `/var/lib/dbus/machine-id`.
     machine_id_src: &'a Path,
+    /// Synthetic `/etc/resolv.conf` naming the transparent-capture tap, bound read-only in place of
+    /// the host's. `None` whenever no tap is wired, which leaves the host's file bound as before.
+    resolv_conf_src: Option<&'a Path>,
     /// The generated desktop-entry directory and mime defaults, present only when `[open]` declares
     /// a handler. Bound read-only *inside the writable home*, at the locations the XDG lookup
     /// prefers: `$XDG_DATA_HOME` and `$XDG_CONFIG_HOME` are unset in the cage, so their defaults
@@ -885,9 +888,18 @@ fn cage_mounts(
             src: userland.ca_bundle_src.clone(),
             dest: PathBuf::from("/etc/ssl/certs/ca-certificates.crt"),
         },
-        Mount::RoBindTry {
-            src: PathBuf::from("/etc/resolv.conf"),
-            dest: PathBuf::from("/etc/resolv.conf"),
+        // The cage's resolver: sbx's own file when the tap answers DNS, the host's otherwise. Both
+        // land at the same destination, so exactly one `/etc/resolv.conf` mount exists either way —
+        // never one shadowing the other, whose order would then decide which resolver the cage got.
+        match paths.resolv_conf_src {
+            Some(src) => Mount::RoBind {
+                src: src.to_path_buf(),
+                dest: PathBuf::from("/etc/resolv.conf"),
+            },
+            None => Mount::RoBindTry {
+                src: PathBuf::from("/etc/resolv.conf"),
+                dest: PathBuf::from("/etc/resolv.conf"),
+            },
         },
         // Fresh kernel views and a private tmp.
         Mount::Proc {
@@ -1515,6 +1527,10 @@ pub(crate) fn build_spec(
     seccomp: super::seccomp::SeccompPolicy,
     devices: &[PathBuf],
     open: &std::collections::BTreeMap<String, crate::config::OpenHandler>,
+    // Whether the launch stands the transparent-capture tap up. When it does, the cage resolves
+    // through the tap rather than through the host's resolver, so `/etc/resolv.conf` is sbx's own
+    // file instead of a bind of the host's.
+    capture_resolver: bool,
     cmd: Vec<OsString>,
 ) -> io::Result<SandboxSpec> {
     use std::fs::DirBuilder;
@@ -1689,6 +1705,20 @@ pub(crate) fn build_spec(
     let machine_id = rt.etc_dir.join("machine-id");
     super::atomicfile::write_atomic(&machine_id, machine_id_contents(&rt.home_src).as_bytes())?;
 
+    // The resolver the cage is pointed at, when the transparent-capture tap is standing: every
+    // query goes to the tap, which answers it itself. Materialized beside the other synthetic
+    // `/etc` files and, like them, outside every writable mount — a cage that could rewrite this
+    // file could point itself at nothing and turn its own capture off. Without the tap there is no
+    // such file and the mount below stays the host's resolv.conf, exactly as before.
+    let tap_resolv = rt.etc_dir.join("resolv.conf");
+    let tap_resolv_src = if capture_resolver {
+        super::atomicfile::write_atomic(&tap_resolv, super::nettap::resolv_conf().as_bytes())?;
+        Some(tap_resolv.as_path())
+    } else {
+        let _ = std::fs::remove_file(&tap_resolv);
+        None
+    };
+
     // Under a declared distribution the cage root is read-only, so every mount this launch makes
     // needs a writable ancestor already there. Computed before the plan rather than from it: the
     // destinations that are not sbx's own are exactly the two known here, the project and the
@@ -1713,6 +1743,7 @@ pub(crate) fn build_spec(
         hosts_src: &hosts,
         ssh_config_src,
         machine_id_src: &machine_id,
+        resolv_conf_src: tap_resolv_src,
         open_apps_src,
         open_mimeapps_src,
     };

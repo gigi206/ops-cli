@@ -183,6 +183,10 @@ impl Drop for Egress {
 pub(crate) struct Wiring {
     pub(crate) binds: Vec<ExtraBind>,
     pub(crate) env: Vec<(String, String)>,
+    /// The host-side socket this proxy serves. The cage reaches it through the bind above; the
+    /// transparent-capture tap ([`super::nettap`]) dials it by this real path, from outside the
+    /// cage's mount namespace, so the launcher has to carry it out of here.
+    pub(crate) host_uds: PathBuf,
 }
 
 /// Wrap `cmd` so the cage starts the forwarder before running it: a static bash that
@@ -1061,14 +1065,18 @@ pub(crate) fn start(
 
     Ok((
         Egress {
-            host_uds,
+            host_uds: host_uds.clone(),
             ca_file,
             control_uds,
             stats,
             log,
             stop,
         },
-        Wiring { binds, env },
+        Wiring {
+            binds,
+            env,
+            host_uds,
+        },
     ))
 }
 

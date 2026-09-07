@@ -622,6 +622,12 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
         // invoked by a user directly, so it carries no page of its own. `rest` is
         // `[<egress socket path>]`; it never returns.
         "__net-tap" => crate::sandbox::run_tap(&rest),
+        // Internal: `doctor`'s transparent-capture probe. Creates a throwaway user+network
+        // namespace and tries to install the redirect rules in it, so the answer is a measurement
+        // rather than an inference about the kernel. A subcommand because `doctor` cannot unshare
+        // itself. Never invoked by a user directly, so it carries no page of its own. `rest` is
+        // `[<nft path>]`; it never returns.
+        "__net-probe" => crate::sandbox::run_probe(&rest),
         // Internal: the oracle the emitted completion scripts call on every completion
         // request. Answers with the candidates for the words typed so far and nothing
         // else — never invoked by a user directly, so it carries no page of its own.

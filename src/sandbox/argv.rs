@@ -605,6 +605,7 @@ mod tests {
                 uid: 4242,
                 gid: 4343,
                 holder_exe: PathBuf::from("/opt/sbx"),
+                tap: None,
             },
         );
         let argv = to_argv(&s);
@@ -1088,9 +1089,12 @@ mod tests {
             "src/sandbox/taskpool.rs",
         ];
         // Holds a `bwrap` path to hand on and starts no cage with it. The processes these do spawn
-        // are host-side tools of their own — `sops` decrypting a secret — so what they owe is that
-        // the path travels and nothing here starts a cage beside the ones above.
-        const HANDS_THE_PATH_ON: &[&str] = &["src/sandbox/egress.rs"];
+        // are host-side tools of their own — `sops` decrypting a secret, the capture tap and the
+        // `nft` that points traffic at it — so what they owe is that the path travels and nothing
+        // here starts a cage beside the ones above. The netns holder is the sharpest case: it
+        // *becomes* bubblewrap through `execv`, having assembled no list of its own — the list it
+        // execs is the composed one, handed to it whole by the launcher.
+        const HANDS_THE_PATH_ON: &[&str] = &["src/sandbox/egress.rs", "src/sandbox/netns.rs"];
         // These read the pure list to assert something about what it contains, and run nothing.
         const READS_THE_LIST: &[&str] = &[];
         // The definitions themselves: this module, the one that compiles a filter into a descriptor

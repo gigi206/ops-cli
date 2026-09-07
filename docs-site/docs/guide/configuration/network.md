@@ -202,6 +202,37 @@ allow = ["cache.nixos.org"]
 dns_cache_ttl = 60   # seconds (0 = resolve every request)
 ```
 
+## Clients that ignore the proxy variables
+
+sbx points `http_proxy`, `https_proxy` and their siblings at the in-cage forwarder, and most tools
+follow them. Some do not: a library that builds its own HTTP client, a Node process whose `fetch`
+uses undici's global dispatcher, a binary with its own transport. Such a client resolves the name
+itself, connects straight to the address and, in an empty network namespace, fails with a name
+resolution error or `EAI_AGAIN`.
+
+Where the host allows it, sbx routes that client anyway. Before the cage starts, sbx installs
+redirect rules in the cage's own network namespace and runs a small **capture tap** inside it. The
+tap answers the cage's DNS itself, handing out a placeholder address per name, and when the client
+connects to that address the tap turns it back into the name and opens the connection through the
+same proxy, so the request meets the **same** policy as any other: host, path, method, the
+anti-fronting check, credential injection, the SSRF guard. Nothing is loosened; a name the allowlist
+does not permit is refused exactly as it would be through the proxy.
+
+Two consequences worth knowing:
+
+- A client that connects to a **literal IP address** (or to one it cached before the cage started)
+  did not ask the tap for it, so the tap has no name to check it against and refuses it, saying so.
+  Allow such a destination the ordinary way (by name) or, for a protocol that cannot be inspected,
+  with a `tcp://` rule.
+- The rules need a kernel that will take them (NAT support, and module loading not locked down) and
+  the `nft` command on the host. Where either is missing, launches are unaffected and keep the
+  behaviour above: a proxy-blind client fails to connect. Nothing is silently loosened, and
+  [`sbx doctor`](../cli/doctor) reports which of the two you have, once, with the reason:
+
+```
+  [ ok ] capture           a client that ignores the proxy variables is still routed
+```
+
 ## Reusing connections (`pool`)
 
 A request that has finished hands its connection to the next one going to the same place,

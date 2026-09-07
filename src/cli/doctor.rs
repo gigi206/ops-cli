@@ -125,6 +125,7 @@ pub(crate) fn doctor() -> ExitCode {
         );
     }
     report_resource_limits(&pal, &config::global_limits());
+    report_transparent_capture(&pal);
 
     // The nix that drives the store. Its absence is load-bearing too — without
     // nix, sbx cannot provision a project's tools. Resolution follows override,
@@ -252,6 +253,51 @@ pub(crate) fn doctor() -> ExitCode {
             crate::diag::hint(&format!("       {}•{} {hint}", epal.err, epal.reset));
         }
         ExitCode::FAILURE
+    }
+}
+
+/// Report whether a filtering launch can capture the traffic of a client that ignores the proxy
+/// environment variables.
+///
+/// Context, never a prerequisite — the same standing as resource limits, and for the same reason:
+/// where it is unavailable the cage still runs and still filters, the difference being that such a
+/// client fails at `connect(2)` instead of being routed and named. Reported here because that is
+/// otherwise invisible: a launch says nothing about it, precisely so a host without the machinery
+/// is not nagged on every run.
+///
+/// The answer comes from actually installing the rules in a throwaway namespace. Reading kernel
+/// configuration instead would be inference: whether an unprivileged namespace may autoload the nat
+/// modules is not stated in any single file, and it is the question that decides this.
+fn report_transparent_capture(pal: &style::Palette) {
+    let (dim, r) = (pal.dim, pal.reset);
+    let Ok(exe) = std::env::current_exe() else {
+        println!(
+            "         {dim}· transparent capture: unknown (sbx cannot locate its own binary){r}"
+        );
+        return;
+    };
+    match sandbox::probe_capture(&exe) {
+        sandbox::CaptureSupport::Ready => {
+            println!(
+                "  {} capture           a client that ignores the proxy variables is still routed",
+                tag_ok(pal)
+            );
+            println!(
+                "         {dim}· proven by installing the redirect rules in a throwaway namespace{r}"
+            );
+        }
+        other => {
+            println!(
+                "  {} capture           proxy-blind clients will fail to connect, not be routed",
+                tag_warn(pal)
+            );
+            if let sandbox::CaptureSupport::Refused(why) = &other {
+                println!("         {dim}· the kernel refused: {why}{r}");
+            }
+            if let Some(hint) = other.remediation() {
+                println!("         {dim}· {hint}{r}");
+            }
+        }
     }
 }
 

@@ -494,3 +494,56 @@ fn collect_roots_unions_base_then_packages_then_tools_then_fonts() {
             .contains(&PathBuf::from("/nix/store/dejavu"))
     );
 }
+
+/// The holder is what a filtering launch now runs behind, and two downstream decisions read
+/// this one answer: whether to install the redirect rules, and whether the cage's
+/// `/etc/resolv.conf` names the tap's resolver. They must never be able to disagree — a cage
+/// pointed at a resolver no tap answers has no DNS at all, which is a break, not a degradation.
+#[test]
+fn an_as_root_cage_never_runs_behind_the_holder() {
+    // The holder maps the cage back to the host uid, which is the opposite of what `as_root`
+    // asks for, so the two are mutually exclusive by construction rather than by luck.
+    assert!(
+        super::build::holder_plan(
+            NetPolicy::Isolated,
+            true,
+            true,
+            Some(std::path::Path::new("/x.sock"))
+        )
+        .is_none(),
+        "an as_root cage must not be given the holder"
+    );
+}
+
+#[test]
+fn a_shared_network_posture_needs_no_holder() {
+    assert!(
+        super::build::holder_plan(
+            NetPolicy::Shared,
+            false,
+            true,
+            Some(std::path::Path::new("/x.sock"))
+        )
+        .is_none(),
+        "there is nothing to capture and no empty namespace to reassure a browser about"
+    );
+}
+
+#[test]
+fn an_isolated_cage_with_neither_a_browser_nor_a_proxy_needs_no_holder() {
+    assert!(super::build::holder_plan(NetPolicy::Isolated, false, false, None).is_none());
+}
+
+/// `holder_plan` reads `as_root` as a parameter because the spec that would carry it does not
+/// exist yet at the call site, and the caller passes `false`. That is only sound while nothing
+/// on this path sets it — so pin exactly that, for the next person to add a launch mode here.
+#[test]
+fn nothing_on_the_launch_path_maps_the_cage_to_root() {
+    let text = std::fs::read_to_string("src/sandbox/launch/build.rs").expect("the launch path");
+    let production = crate::testutil::production_half(&text);
+    assert!(
+        !crate::testutil::calls_function(production, ".as_root("),
+        "this file now maps a cage to uid 0; `holder_plan` is called with a hard-coded \
+             `false` and would silently give that cage the holder. Thread the real value in."
+    );
+}

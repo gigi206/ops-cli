@@ -80,6 +80,17 @@ pub(crate) const TAP_PORT: u16 = 18044;
 /// The port the redirect rule sends captured DNS to (both transports).
 pub(crate) const TAP_DNS_PORT: u16 = 18045;
 
+/// The address the cage's `resolv.conf` names. Any non-loopback address would do — the redirect
+/// catches port 53 whatever its destination — but naming one that is obviously sbx's keeps a packet
+/// capture legible, and putting it in the *high* half of the synthetic block keeps it clear of
+/// every address allocation can reach (see [`FAKE_IP_MAX_INDEX`]).
+pub(crate) const CAGE_RESOLVER: Ipv4Addr = Ipv4Addr::new(198, 19, 255, 254);
+
+/// The line the tap prints on stdout once all three listeners are bound. The holder waits for it
+/// before installing the redirect rules, so no connection is ever bent toward a port with nothing
+/// behind it.
+pub(crate) const READY: &str = "ready";
+
 /// The high half of the synthetic address range, `198.18.0.0/15` — the block IANA set aside for
 /// inter-network benchmarking, so it is never a real destination. It is also already classified as
 /// non-public by the proxy's SSRF guard, which means a synthetic address that somehow reached the
@@ -129,6 +140,142 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// frozen kernel ABI, so it is spelled out here for the same reason the netlink constants are in
 /// [`super::netns`].
 const SO_ORIGINAL_DST: libc::c_int = 80;
+
+/// The `resolv.conf` the cage is given when the tap is wired: one nameserver, [`CAGE_RESOLVER`],
+/// which the redirect rule catches whatever the client sends to it.
+///
+/// `options single-request` keeps glibc from firing the `A` and `AAAA` lookups down one socket in
+/// parallel — the tap answers both, but serialising them makes a lost datagram cost one retry
+/// rather than two. No `use-vc`: the tap serves TCP as well, but UDP is the cheaper path and a
+/// client falls back on its own when it needs to.
+pub(crate) fn resolv_conf() -> String {
+    format!("nameserver {CAGE_RESOLVER}\noptions single-request\n")
+}
+
+/// The nftables program that bends the cage's traffic to the tap, in its own table so it can be
+/// read and removed as a unit and never touches a chain something else shares.
+///
+/// Three rules, in an order that is load-bearing (a nat statement is terminal, so the first match
+/// decides):
+///
+/// 1. `udp dport 53` and 2. `tcp dport 53` reach the resolver — **before** the general rule, or a
+///    DNS query to a public resolver would be captured as ordinary traffic and never answered.
+/// 3. everything else TCP, except to loopback, reaches the tap. The exclusion is what keeps the
+///    egress forwarder's own `127.0.0.1` connections (and a workload's intra-cage loopback service)
+///    out of the capture: they are not egress and have no name to recover.
+///
+/// `meta l4proto tcp` is not decoration — nftables refuses a `redirect to :port` that is not
+/// preceded by a transport-protocol match, because the port it rewrites has no meaning without one.
+pub(crate) fn redirect_ruleset() -> String {
+    format!(
+        "table ip {TABLE} {{\n  \
+         chain output {{\n    \
+         type nat hook output priority dstnat; policy accept;\n    \
+         udp dport 53 redirect to :{dns}\n    \
+         tcp dport 53 redirect to :{dns}\n    \
+         meta l4proto tcp ip daddr != 127.0.0.0/8 redirect to :{tap}\n  \
+         }}\n\
+         }}\n",
+        TABLE = NFT_TABLE,
+        dns = TAP_DNS_PORT,
+        tap = TAP_PORT,
+    )
+}
+
+/// The nftables table the redirect lives in — sbx's own, never a shared chain.
+const NFT_TABLE: &str = "sbx";
+
+/// Install [`redirect_ruleset`] with `nft`. Called by the holder, inside the network namespace it
+/// owns and holds `CAP_NET_ADMIN` over; the cage that inherits that namespace is in a *nested* user
+/// namespace and cannot read or remove what this writes.
+///
+/// The rules need `nf_nat` and the nat chain type. A kernel that has them as modules loads them on
+/// demand even for this unprivileged namespace, so the ordinary host needs nothing prepared; a
+/// kernel built without them, or one with `kernel.modules_disabled=1`, fails here and the caller
+/// degrades to the environment-variable path alone.
+pub(crate) fn install_redirect(nft: &Path) -> io::Result<()> {
+    let mut child = std::process::Command::new(nft)
+        .arg("-f")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("nft: no stdin"))?
+        .write_all(redirect_ruleset().as_bytes())?;
+    let out = child.wait_with_output()?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "nft refused the redirect rules: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    )))
+}
+
+/// What `doctor` found when it asked whether this host can capture transparently. The question is
+/// answered by *doing* it in a throwaway namespace, never by reading kernel configuration: the
+/// prerequisites (a nat chain type, `nf_nat`, and a kernel willing to autoload them for an
+/// unprivileged namespace) interact in ways no single file states.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CaptureSupport {
+    /// The rules installed. A launch under a filtering posture will capture.
+    Ready,
+    /// No `nft` on the host's PATH, so nothing can install them.
+    NoNft,
+    /// `nft` is there and the kernel refused, with its own words.
+    Refused(String),
+}
+
+impl CaptureSupport {
+    /// What the user is told, and what to do about it. `None` when there is nothing to fix.
+    pub(crate) fn remediation(&self) -> Option<&'static str> {
+        match self {
+            CaptureSupport::Ready => None,
+            CaptureSupport::NoNft => Some(
+                "install `nft` (the nftables CLI) to let sbx route clients that ignore the proxy \
+                 environment variables; without it such a client fails to connect instead",
+            ),
+            CaptureSupport::Refused(_) => Some(
+                "this kernel will not take the redirect rules (no NAT support, or module loading \
+                 is locked down). Egress still works: a client that ignores the proxy environment \
+                 variables fails to connect rather than being routed",
+            ),
+        }
+    }
+}
+
+/// Ask the running kernel whether the redirect rules can be installed, by installing them in a
+/// throwaway user+network namespace that dies with the probe. Bounded: a probe that hangs is
+/// reported as a refusal rather than holding `doctor` open.
+///
+/// `exe` is sbx's own path — the probe runs as `<exe> __net-probe <nft>`, because the question
+/// cannot be answered in-process (`unshare` is not something `doctor` may do to itself).
+pub(crate) fn probe_capture(exe: &Path) -> CaptureSupport {
+    let Some(nft) = crate::pathfind::find_on_path("nft") else {
+        return CaptureSupport::NoNft;
+    };
+    let out = std::process::Command::new(exe)
+        .arg("__net-probe")
+        .arg(&nft)
+        .stdin(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(out) if out.status.success() => CaptureSupport::Ready,
+        Ok(out) => {
+            let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            CaptureSupport::Refused(if why.is_empty() {
+                "the probe failed without saying why".to_string()
+            } else {
+                why
+            })
+        }
+        Err(e) => CaptureSupport::Refused(format!("the probe could not run ({e})")),
+    }
+}
 
 /// The name↔address table that lets a captured connection carry a name.
 ///
@@ -562,6 +709,10 @@ fn serve(uds: &Path, table: &Arc<Mutex<FakeIps>>) -> io::Result<()> {
     let dns_udp = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, TAP_DNS_PORT))?;
     let dns_tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, TAP_DNS_PORT))?;
     let captured = TcpListener::bind((Ipv4Addr::LOCALHOST, TAP_PORT))?;
+
+    // Every listener is bound; the holder may now install the rules that point at them.
+    println!("{READY}");
+    io::stdout().flush()?;
 
     {
         let table = Arc::clone(table);

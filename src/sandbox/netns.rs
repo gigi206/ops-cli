@@ -26,7 +26,7 @@
 //!    *nested* user namespace (same-uid, via `--uid`/`--gid`) and inherits this network namespace,
 //!    dummy included. The cage stays cap-dropped, non-root, and same-uid at the host level.
 
-use super::spec::NetnsDummy;
+use super::spec::{NetnsDummy, TapWiring};
 use std::ffi::{CString, OsString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -51,8 +51,17 @@ pub(crate) fn holder_wrap(
     match dummy {
         None => (bwrap.to_path_buf(), bwrap_argv),
         Some(nd) => {
-            let mut argv = Vec::with_capacity(bwrap_argv.len() + 2);
+            let mut argv = Vec::with_capacity(bwrap_argv.len() + 6);
             argv.push(OsString::from("__netns-holder"));
+            if let Some(tap) = &nd.tap {
+                argv.push(OsString::from("--tap"));
+                argv.push(tap.uds.as_os_str().to_owned());
+                argv.push(OsString::from("--nft"));
+                argv.push(tap.nft.as_os_str().to_owned());
+            }
+            // Always emitted, tap or no tap: it is what makes the command unambiguous to parse, so
+            // a bwrap argument that happens to spell `--tap` can never be read as the holder's own.
+            argv.push(OsString::from("--"));
             argv.push(bwrap.as_os_str().to_owned());
             argv.extend(bwrap_argv);
             (nd.holder_exe.clone(), argv)
@@ -60,56 +69,60 @@ pub(crate) fn holder_wrap(
     }
 }
 
+/// The holder's own options, split from the command it will exec.
+///
+/// Returns `None` when the argument list has no `--`, which is a caller that did not come through
+/// [`holder_wrap`]; the holder refuses rather than guessing where its options end.
+fn split_holder_args(argv: &[OsString]) -> Option<(Option<TapWiring>, &[OsString])> {
+    let sep = argv.iter().position(|a| a == "--")?;
+    let (opts, rest) = argv.split_at(sep);
+    let rest = &rest[1..];
+    let mut uds = None;
+    let mut nft = None;
+    let mut i = 0;
+    while i < opts.len() {
+        match opts[i].to_str() {
+            Some("--tap") => uds = opts.get(i + 1).map(PathBuf::from),
+            Some("--nft") => nft = opts.get(i + 1).map(PathBuf::from),
+            _ => return None,
+        }
+        i += 2;
+    }
+    let tap = match (uds, nft) {
+        (Some(uds), Some(nft)) => Some(TapWiring { uds, nft }),
+        // Half a wiring is not one: the launcher emits both or neither.
+        _ => None,
+    };
+    Some((tap, rest))
+}
+
 /// The `__netns-holder` subcommand body. `argv` is `[bwrap, bwrap-args…]`. Sets up the user and
 /// network namespaces, adds the dummy interface, then `execve`s the command. Never returns: it
 /// either becomes the command or exits non-zero with a diagnostic.
 pub(crate) fn run_holder(argv: &[OsString]) -> ! {
+    let Some((tap, argv)) = split_holder_args(argv) else {
+        die("__netns-holder: malformed arguments (no `--` before the command)");
+    };
     if argv.is_empty() {
         die("__netns-holder: no command to exec");
     }
 
-    // Capture the host credentials before entering the user namespace (afterwards we are the
-    // namespace's overflow uid until the map is written).
-    // SAFETY: `getuid` reads this process's own real uid; it takes no pointer and cannot fail.
-    let uid = unsafe { libc::getuid() };
-    // SAFETY: `getgid` reads this process's own real gid, the other half of the pair written into
-    // the namespace's maps below.
-    let gid = unsafe { libc::getgid() };
-
-    // A new user namespace, then map our real uid/gid to root inside it — the single-uid self-map
-    // an unprivileged process is allowed to write. This gives us CAP_NET_ADMIN over the network
-    // namespace created next. `setgroups` must be denied before `gid_map` (a kernel requirement for
-    // an unprivileged user namespace).
-    // SAFETY: `unshare` takes only a flag word — no pointer, no buffer — and its effect is confined
-    // to this process's own namespace set; a refusal is reported through the return value.
-    if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
-        die(&format!(
-            "__netns-holder: unshare(CLONE_NEWUSER): {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let _ = std::fs::write("/proc/self/setgroups", "deny");
-    if let Err(e) = std::fs::write("/proc/self/uid_map", format!("0 {uid} 1")) {
-        die(&format!("__netns-holder: write uid_map: {e}"));
-    }
-    if let Err(e) = std::fs::write("/proc/self/gid_map", format!("0 {gid} 1")) {
-        die(&format!("__netns-holder: write gid_map: {e}"));
-    }
-
-    // A fresh, empty network namespace owned by that user namespace.
-    // SAFETY: a flag word is the whole argument list, and the new network namespace replaces this
-    // process's own; failure comes back as a return value, not a fault.
-    if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
-        die(&format!(
-            "__netns-holder: unshare(CLONE_NEWNET): {}",
-            std::io::Error::last_os_error()
-        ));
+    if let Err(e) = enter_user_and_net_ns() {
+        die(&format!("__netns-holder: {e}"));
     }
 
     // Best-effort: loopback up + the black-hole dummy. A failure here (e.g. the `dummy` kernel
     // module is unavailable) leaves a loopback-only namespace — the cage still launches, just
     // without the online signal — so it is never fatal.
     configure_dummy();
+
+    // Stand the transparent-capture tap up, if the launcher wired one. Best-effort by design: the
+    // tap is not a containment layer, so every failure here degrades to the environment-variable
+    // egress path — which is what the cage had before this existed — rather than failing the
+    // launch. The empty namespace and the host proxy are untouched either way.
+    if let Some(tap) = &tap {
+        wire_tap(tap);
+    }
 
     // Become the command. `execve` preserves both namespaces; bwrap makes its own nested user
     // namespace and inherits this network namespace, dummy included.
@@ -129,6 +142,196 @@ pub(crate) fn run_holder(argv: &[OsString]) -> ! {
     ));
 }
 
+/// Enter a fresh user namespace mapped to root, then a fresh network namespace owned by it.
+///
+/// This is what gives an unprivileged process `CAP_NET_ADMIN` over the namespace it is about to
+/// configure — the interface, and the redirect rules — while the cage that later inherits the
+/// network namespace sits in a *nested* user namespace and holds no capability over it.
+///
+/// Shared by the holder and by `doctor`'s probe, so what the probe proves is what the launch does.
+fn enter_user_and_net_ns() -> std::io::Result<()> {
+    // Capture the host credentials before entering the user namespace (afterwards we are the
+    // namespace's overflow uid until the map is written).
+    // SAFETY: `getuid` reads this process's own real uid; it takes no pointer and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    // SAFETY: `getgid` reads this process's own real gid, the other half of the pair written into
+    // the namespace's maps below.
+    let gid = unsafe { libc::getgid() };
+
+    // A new user namespace, then map our real uid/gid to root inside it — the single-uid self-map
+    // an unprivileged process is allowed to write. `setgroups` must be denied before `gid_map` (a
+    // kernel requirement for an unprivileged user namespace).
+    // SAFETY: `unshare` takes only a flag word — no pointer, no buffer — and its effect is confined
+    // to this process's own namespace set; a refusal is reported through the return value.
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let _ = std::fs::write("/proc/self/setgroups", "deny");
+    std::fs::write("/proc/self/uid_map", format!("0 {uid} 1"))?;
+    std::fs::write("/proc/self/gid_map", format!("0 {gid} 1"))?;
+
+    // A fresh, empty network namespace owned by that user namespace.
+    // SAFETY: a flag word is the whole argument list, and the new network namespace replaces this
+    // process's own; failure comes back as a return value, not a fault.
+    if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The `__net-probe` subcommand body: answer whether this host can install the redirect rules, by
+/// installing them — in a throwaway namespace that dies with this process, so nothing is left
+/// behind and the host's own networking is never touched.
+///
+/// It exists as a subcommand because the question cannot be answered in-process: `unshare` is not
+/// something `doctor` may do to itself. `argv` is `[<nft path>]`.
+pub(crate) fn run_probe(argv: &[OsString]) -> ! {
+    let Some(nft) = argv.first().map(PathBuf::from) else {
+        eprintln!("__net-probe: no nft path given");
+        std::process::exit(2);
+    };
+    if let Err(e) = enter_user_and_net_ns() {
+        eprintln!("a private network namespace could not be created ({e})");
+        std::process::exit(1);
+    }
+    match super::nettap::install_redirect(&nft) {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Start the tap and point the namespace's traffic at it.
+///
+/// Order matters and is the reason the tap announces itself: the rules are installed **after** it
+/// reports every listener bound, so no connection is ever bent toward a port with nothing behind it.
+/// A tap that never reports leaves the rules uninstalled, which is exactly the degraded mode.
+///
+/// The child inherits this network namespace (it is spawned before the `execve`) but keeps the
+/// host's mount and pid namespaces, so it is invisible and unreachable from inside the cage while
+/// still able to dial the host-side egress socket by its real path. `PR_SET_PDEATHSIG` ties it to
+/// this process, which `execve` turns into `bwrap`: when the cage ends, so does the tap.
+fn wire_tap(tap: &TapWiring) {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => return degraded(&format!("cannot locate sbx's own binary ({e})")),
+    };
+    let mut child = match std::process::Command::new(exe)
+        .arg("__net-tap")
+        .arg(&tap.uds)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .pre_exec_pdeathsig()
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => return degraded(&format!("cannot start the capture tap ({e})")),
+    };
+    match tap_is_ready(&mut child) {
+        Ok(()) => {}
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return degraded(&format!("the capture tap did not come up ({e})"));
+        }
+    }
+    if let Err(e) = super::nettap::install_redirect(&tap.nft) {
+        let _ = child.kill();
+        let _ = child.wait();
+        degraded(&format!("{e}"));
+        return;
+    }
+    // Last, and only now: the route that gives a connect somewhere to go. The redirect is already
+    // in place, so the first packet that could use this route is bent to the tap before it is sent.
+    //
+    // A failure here is the one branch where tearing down is the wrong instinct. Without the route,
+    // the kernel's route lookup — which precedes the `nat` `OUTPUT` hook for locally generated
+    // traffic — refuses every connect with `ENETUNREACH` before netfilter is consulted at all. The
+    // rules and the tap are therefore unreachable rather than harmful, and the cage behaves exactly
+    // as it did before capture existed. Killing the tap would change nothing for the cage and would
+    // open a window where a connect could arrive at a port that had just stopped listening.
+    if let Err(e) = with_netlink(add_default_route) {
+        degraded(&format!("the capture route could not be installed ({e})"));
+    }
+}
+
+/// Run one netlink operation against `dummy0`, opening and closing the socket around it.
+fn with_netlink(op: impl Fn(libc::c_int, u32) -> io::Result<()>) -> io::Result<()> {
+    let fd = nl_open()?;
+    let index =
+        if_index("dummy0").ok_or_else(|| io::Error::other("the cage has no `dummy0` interface"))?;
+    let out = op(fd, index);
+    // SAFETY: `fd` is this function's own netlink socket, opened above and used nowhere else.
+    unsafe { libc::close(fd) };
+    out
+}
+
+/// Wait for the tap's readiness line, bounded so a tap that hangs cannot hold the launch.
+fn tap_is_ready(child: &mut std::process::Child) -> std::io::Result<()> {
+    use std::io::{BufRead, BufReader};
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("no pipe to the tap"))?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let read = BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(read.map(|_| line));
+    });
+    match rx.recv_timeout(TAP_READY_TIMEOUT) {
+        Ok(Ok(line)) if line.trim() == super::nettap::READY => Ok(()),
+        Ok(Ok(line)) => Err(std::io::Error::other(format!(
+            "unexpected greeting {:?}",
+            line.trim()
+        ))),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(std::io::Error::other("timed out")),
+    }
+}
+
+/// How long the holder waits for the tap to report its listeners bound. Binding three loopback
+/// sockets is immediate; this bounds a tap that cannot bind at all (a port already taken) so the
+/// launch degrades in a moment rather than stalling.
+const TAP_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Say why the cage is launching without transparent capture, then carry on. Never fatal: the
+/// difference is that a proxy-blind client fails at `connect(2)` instead of being named, which is
+/// the behaviour every cage had before the tap existed.
+fn degraded(why: &str) {
+    // A warning, never an error: the launch succeeds and filters exactly as before, so this belongs
+    // to the same channel as any other piece of hardening that could not be applied. `sbx doctor`
+    // classes capture the same way, and the guide says launches are unaffected — three statements
+    // that have to agree.
+    crate::diag::warn(&format!(
+        "transparent capture unavailable ({why}); a client that ignores the proxy variables will \
+         fail to connect rather than be routed"
+    ));
+}
+
+/// `Command::pre_exec` with the one call the tap needs between fork and exec.
+trait PreExecPdeathsig {
+    fn pre_exec_pdeathsig(&mut self) -> &mut Self;
+}
+
+impl PreExecPdeathsig for std::process::Command {
+    fn pre_exec_pdeathsig(&mut self) -> &mut Self {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the closure runs in the forked child before `execve`, where only
+        // async-signal-safe calls are allowed. `prctl` is one: it takes no allocation, no lock and
+        // no pointer into this process's heap, and its failure is ignored (the tap would then
+        // outlive the cage only until its own reads fail).
+        unsafe {
+            self.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            })
+        }
+    }
+}
+
 // Netlink protocol constants (stable Linux UAPI from <linux/netlink.h>, <linux/rtnetlink.h>,
 // <linux/if_link.h>, <linux/if_addr.h>). Defined here rather than pulled from `libc`: the wire
 // numbers are a frozen kernel ABI, and the attribute-type constants in particular are not uniformly
@@ -140,10 +343,19 @@ const NLM_F_CREATE: u16 = 0x400;
 const NLMSG_ERROR: u16 = 0x2;
 const RTM_NEWLINK: u16 = 16;
 const RTM_NEWADDR: u16 = 20;
+const RTM_NEWROUTE: u16 = 24;
 const IFLA_IFNAME: u16 = 3;
 const IFLA_LINKINFO: u16 = 18;
 const IFLA_INFO_KIND: u16 = 1; // nested inside IFLA_LINKINFO
 const IFA_ADDRESS: u16 = 1;
+const RTA_OIF: u16 = 4;
+const RTA_GATEWAY: u16 = 5;
+/// `RT_SCOPE_UNIVERSE`, `RTPROT_STATIC`, `RTN_UNICAST` and the main table id: the ordinary shape of
+/// a default route, spelled out for the same reason the constants above are.
+const RT_TABLE_MAIN: u8 = 254;
+const RTPROT_STATIC: u8 = 4;
+const RT_SCOPE_UNIVERSE: u8 = 0;
+const RTN_UNICAST: u8 = 1;
 const IFA_LOCAL: u16 = 2;
 
 /// The fixed byte length of a `nlmsghdr` (u32 len, u16 type, u16 flags, u32 seq, u32 pid).
@@ -244,6 +456,49 @@ fn ifinfomsg(index: u32, flags: u32, change: u32) -> Vec<u8> {
     b.extend_from_slice(&change.to_ne_bytes()); // ifi_change
     b
 }
+
+/// Install a default route through the black-hole `dummy0`, so a connect to any address has
+/// somewhere to go.
+///
+/// Only ever called when the capture tap is standing, and that gate is the whole point. For a
+/// locally generated packet the kernel looks the route up **before** the `nat` `OUTPUT` hook runs,
+/// so without a route a connect fails `ENETUNREACH` and the redirect rule is never consulted: the
+/// tap would listen to silence. With the tap, every such connect is bent to loopback before a packet
+/// reaches `dummy0` at all.
+///
+/// Adding it *without* the tap would be a regression rather than a gift: the packets would reach the
+/// dummy, which drops them, turning a fast, legible `ENETUNREACH` into a silent timeout.
+fn add_default_route(fd: libc::c_int, index: u32) -> io::Result<()> {
+    nl_request(
+        fd,
+        RTM_NEWROUTE,
+        NLM_F_CREATE | NLM_F_EXCL,
+        &default_route_body(index),
+    )
+}
+
+/// The `RTM_NEWROUTE` body: an `rtmsg` with a zero destination prefix (that is what makes it the
+/// default route), then the gateway and the output interface.
+fn default_route_body(index: u32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(12);
+    body.push(libc::AF_INET as u8); // rtm_family
+    body.push(0); // rtm_dst_len: 0 = the default route
+    body.push(0); // rtm_src_len
+    body.push(0); // rtm_tos
+    body.push(RT_TABLE_MAIN); // rtm_table
+    body.push(RTPROT_STATIC); // rtm_protocol
+    body.push(RT_SCOPE_UNIVERSE); // rtm_scope
+    body.push(RTN_UNICAST); // rtm_type
+    body.extend_from_slice(&0u32.to_ne_bytes()); // rtm_flags
+    push_attr(&mut body, RTA_GATEWAY, &GATEWAY_OCTETS);
+    push_attr(&mut body, RTA_OIF, &index.to_ne_bytes());
+    body
+}
+
+/// The gateway the default route names: another address inside the dummy's own `/24`, so it is
+/// reachable through the connected route the address installs and needs no interface of its own.
+/// Nothing answers at it, and nothing has to: every packet is redirected before it is sent.
+const GATEWAY_OCTETS: [u8; 4] = [DUMMY_OCTETS[0], DUMMY_OCTETS[1], DUMMY_OCTETS[2], 1];
 
 /// The `RTM_NEWLINK` body that creates `dummy0`: an `ifinfomsg` (index 0 = kernel-assigned, no flags)
 /// followed by `IFLA_IFNAME` and an `IFLA_LINKINFO` nesting `IFLA_INFO_KIND = "dummy"`.
@@ -425,22 +680,143 @@ mod tests {
             uid: 1000,
             gid: 1000,
             holder_exe: PathBuf::from("/opt/sbx"),
+            tap: None,
         };
         let (prog, out) = holder_wrap(
             Path::new("/usr/bin/bwrap"),
             vec![OsString::from("--cap-drop"), OsString::from("ALL")],
             Some(&nd),
         );
-        // The program becomes sbx itself, invoked as `__netns-holder <bwrap> <args…>`.
+        // The program becomes sbx itself, invoked as `__netns-holder -- <bwrap> <args…>`.
         assert_eq!(prog, PathBuf::from("/opt/sbx"));
         assert_eq!(
             out,
             vec![
                 OsString::from("__netns-holder"),
+                OsString::from("--"),
                 OsString::from("/usr/bin/bwrap"),
                 OsString::from("--cap-drop"),
                 OsString::from("ALL"),
             ]
         );
+    }
+
+    /// The default route is what makes the redirect reachable at all: for a locally generated
+    /// packet the kernel looks the route up **before** the `nat` `OUTPUT` hook, so without one a
+    /// connect fails `ENETUNREACH` and the tap listens to silence. Measured that way on a real
+    /// launch, which is why the body is pinned here.
+    #[test]
+    fn the_default_route_body_is_a_zero_prefix_through_the_dummys_own_subnet() {
+        let body = default_route_body(7);
+        assert_eq!(body[0], libc::AF_INET as u8); // rtm_family
+        assert_eq!(
+            body[1], 0,
+            "a zero destination prefix is what makes it the default route"
+        );
+        assert_eq!(body[4], RT_TABLE_MAIN);
+        assert_eq!(body[7], RTN_UNICAST);
+        assert!(
+            contains(&body, &GATEWAY_OCTETS),
+            "the gateway rides as an attribute"
+        );
+        assert!(
+            contains(&body, &7u32.to_ne_bytes()),
+            "so does the output interface"
+        );
+        assert_eq!(align4(body.len()), body.len());
+        // The gateway must sit inside the dummy's own /24, or it is unreachable and the route is
+        // refused: the connected route the address installs is the only one that can carry it.
+        assert_eq!(GATEWAY_OCTETS[..3], DUMMY_OCTETS[..3]);
+        assert_ne!(
+            GATEWAY_OCTETS, DUMMY_OCTETS,
+            "never the dummy's own address"
+        );
+    }
+
+    fn holder_with_tap() -> NetnsDummy {
+        NetnsDummy {
+            uid: 1000,
+            gid: 1000,
+            holder_exe: PathBuf::from("/opt/sbx"),
+            tap: Some(TapWiring {
+                uds: PathBuf::from("/run/sbx/proxy.sock"),
+                nft: PathBuf::from("/usr/sbin/nft"),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_wired_tap_rides_the_holder_argv_and_comes_back_out_of_it() {
+        let (_, argv) = holder_wrap(
+            Path::new("/usr/bin/bwrap"),
+            vec![OsString::from("--cap-drop"), OsString::from("ALL")],
+            Some(&holder_with_tap()),
+        );
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from("__netns-holder"),
+                OsString::from("--tap"),
+                OsString::from("/run/sbx/proxy.sock"),
+                OsString::from("--nft"),
+                OsString::from("/usr/sbin/nft"),
+                OsString::from("--"),
+                OsString::from("/usr/bin/bwrap"),
+                OsString::from("--cap-drop"),
+                OsString::from("ALL"),
+            ]
+        );
+        // What `holder_wrap` writes, `split_holder_args` must read back — the two are one contract,
+        // and the holder is a separate process, so nothing else can catch them drifting apart.
+        let (tap, rest) = split_holder_args(&argv[1..]).expect("parsed");
+        assert_eq!(tap, holder_with_tap().tap);
+        assert_eq!(rest[0], OsString::from("/usr/bin/bwrap"));
+        assert_eq!(rest.len(), 3);
+    }
+
+    #[test]
+    fn the_separator_is_what_keeps_a_bwrap_argument_from_being_read_as_the_holders() {
+        // `--tap` here belongs to bwrap's side of the separator and must stay there.
+        let argv = vec![
+            OsString::from("--"),
+            OsString::from("/usr/bin/bwrap"),
+            OsString::from("--tap"),
+            OsString::from("/not/ours"),
+        ];
+        let (tap, rest) = split_holder_args(&argv).expect("parsed");
+        assert_eq!(tap, None, "nothing before the separator, so no wiring");
+        assert_eq!(rest.len(), 3);
+    }
+
+    #[test]
+    fn a_malformed_holder_argv_is_refused_rather_than_guessed() {
+        // No separator at all: a caller that did not come through `holder_wrap`.
+        assert!(split_holder_args(&[OsString::from("/usr/bin/bwrap")]).is_none());
+        // An option the holder does not know.
+        assert!(
+            split_holder_args(&[
+                OsString::from("--wat"),
+                OsString::from("x"),
+                OsString::from("--"),
+                OsString::from("/usr/bin/bwrap"),
+            ])
+            .is_none()
+        );
+    }
+
+    /// Half a wiring is not one: without the socket there is nothing to hand a captured connection
+    /// to, and without `nft` no rule can be installed. Either alone must degrade, never half-wire.
+    #[test]
+    fn half_a_tap_wiring_is_no_wiring() {
+        for opts in [
+            vec![OsString::from("--tap"), OsString::from("/run/s.sock")],
+            vec![OsString::from("--nft"), OsString::from("/usr/sbin/nft")],
+        ] {
+            let mut argv = opts;
+            argv.push(OsString::from("--"));
+            argv.push(OsString::from("/usr/bin/bwrap"));
+            let (tap, _) = split_holder_args(&argv).expect("parsed");
+            assert_eq!(tap, None);
+        }
     }
 }

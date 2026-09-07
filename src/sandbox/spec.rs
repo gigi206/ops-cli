@@ -204,8 +204,25 @@ pub(crate) struct NetnsDummy {
     pub(super) uid: u32,
     /// The host gid the cage is mapped to (`--gid`).
     pub(super) gid: u32,
-    /// Absolute path to sbx's own binary, invoked as `<exe> __netns-holder <bwrap> <args…>`.
+    /// Absolute path to sbx's own binary, invoked as `<exe> __netns-holder … -- <bwrap> <args…>`.
     pub(super) holder_exe: PathBuf,
+    /// What the holder needs to stand the transparent-capture tap up inside the namespace it
+    /// creates, or `None` to leave the cage with the environment-variable egress path alone.
+    pub(super) tap: Option<TapWiring>,
+}
+
+/// The transparent-capture tap's wiring, resolved by the launcher and carried to the holder.
+///
+/// Both paths are host-side and are used *before* `bwrap` runs, in the holder's own mount namespace
+/// — the cage never sees either. `None` on [`NetnsDummy::tap`] is the degraded mode: the namespace
+/// is still pre-created (for the dummy interface), simply with no redirect and no tap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TapWiring {
+    /// The host-side egress socket the proxy serves — what the tap dials for each captured
+    /// connection, by its real path.
+    pub(super) uds: PathBuf,
+    /// The `nft` binary that installs the redirect rules.
+    pub(super) nft: PathBuf,
 }
 
 impl SandboxSpec {

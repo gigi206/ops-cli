@@ -84,6 +84,7 @@ fn base_paths() -> SandboxPaths<'static> {
         hosts_src: Path::new("/data/sbx/projects/abc/etc/hosts"),
         ssh_config_src: None,
         machine_id_src: Path::new("/data/sbx/projects/abc/etc/machine-id"),
+        resolv_conf_src: None,
         open_apps_src: None,
         open_mimeapps_src: None,
     }
@@ -1212,6 +1213,7 @@ fn build_spec_refuses_an_open_pin_parent_the_cage_pointed_out_of_the_home() {
         crate::sandbox::seccomp::SeccompPolicy::default(),
         &[],
         &open,
+        false,
         vec![OsString::from("/bin/sh")],
     )
     .expect_err("a repointed pin parent must fail the launch");
@@ -1905,6 +1907,7 @@ fn assemble_binds_the_per_project_mise_pool_and_puts_both_shims_on_path() {
         hosts_src: Path::new("/data/sbx/apps/demo-app/etc/hosts"),
         ssh_config_src: None,
         machine_id_src: Path::new("/data/sbx/apps/demo-app/etc/machine-id"),
+        resolv_conf_src: None,
         open_apps_src: None,
         open_mimeapps_src: None,
     };
@@ -2031,6 +2034,7 @@ fn build_spec_registers_the_nix_plugin_under_both_pools_for_a_global_app() {
         crate::sandbox::seccomp::SeccompPolicy::default(),
         &[],
         &Default::default(),
+        false,
         vec![OsString::from("/bin/sh")],
     )
     .expect("build spec");
@@ -2302,5 +2306,89 @@ fn a_distribution_leads_the_base_userland_on_path_but_not_the_declared_tools() {
         dirs.iter().filter(|d| **d == "/usr/bin").count(),
         1,
         "{path}"
+    );
+}
+
+/// With the transparent-capture tap standing, the cage resolves through it, so `/etc/resolv.conf`
+/// must be sbx's own file rather than a bind of the host's — and there must be exactly **one** such
+/// mount either way. Two would make the cage's resolver depend on which one landed last.
+#[test]
+fn the_capture_tap_replaces_the_cages_resolver_with_exactly_one_mount() {
+    let data = TmpDir::new();
+    let project = TmpDir::new();
+    std::fs::write(project.path().join("README"), b"hi").unwrap();
+    let overlay = Overlay {
+        env: &[],
+        binds: &[],
+        bin_paths: &[],
+        timezone: DEFAULT_ZONE,
+        fresh_release_tokens: &[],
+        ignored_mise_paths: &[],
+    };
+    let spec_of = |capture: bool| {
+        build_spec(
+            data.path(),
+            project.path(),
+            Runtime::ProjectDefault,
+            &userland(),
+            &nix_mount(),
+            &overlay,
+            &[],
+            NetPolicy::Isolated,
+            "",
+            &Default::default(),
+            crate::sandbox::seccomp::SeccompPolicy::default(),
+            &[],
+            &Default::default(),
+            capture,
+            vec![OsString::from("/bin/sh")],
+        )
+        .expect("build spec")
+    };
+
+    let with_tap = spec_of(true);
+    let resolvers: Vec<_> = with_tap
+        .mounts
+        .iter()
+        .filter(|m| m.dest() == Path::new("/etc/resolv.conf"))
+        .collect();
+    assert_eq!(
+        resolvers.len(),
+        1,
+        "exactly one resolver mount: {resolvers:?}"
+    );
+    let src = match resolvers[0] {
+        Mount::RoBind { src, .. } => src.clone(),
+        other => panic!("the tap's resolver must be a plain read-only bind, got {other:?}"),
+    };
+    assert_ne!(
+        src.as_path(),
+        Path::new("/etc/resolv.conf"),
+        "with a tap the cage must not read the host's resolver"
+    );
+    let body = std::fs::read_to_string(&src).expect("the synthetic resolver");
+    assert!(
+        body.contains(&crate::sandbox::nettap::CAGE_RESOLVER.to_string()),
+        "{body}"
+    );
+
+    let without = spec_of(false);
+    let resolvers: Vec<_> = without
+        .mounts
+        .iter()
+        .filter(|m| m.dest() == Path::new("/etc/resolv.conf"))
+        .collect();
+    assert_eq!(resolvers.len(), 1, "still exactly one: {resolvers:?}");
+    match resolvers[0] {
+        Mount::RoBindTry { src, .. } => assert_eq!(
+            src,
+            Path::new("/etc/resolv.conf"),
+            "without a tap the host's resolver is what the cage reads"
+        ),
+        other => panic!("expected the host's resolver, tried: {other:?}"),
+    }
+    assert!(
+        !src.exists(),
+        "the synthetic file is removed when no tap is wired, so a later launch cannot read a stale one"
     );
 }

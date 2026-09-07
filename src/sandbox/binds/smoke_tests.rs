@@ -75,6 +75,7 @@ fn the_generated_argv_launches_a_working_hermetic_shell() {
         crate::sandbox::seccomp::SeccompPolicy::default(),
         &[],
         &Default::default(),
+        false,
         cmd,
     )
     .expect("build spec");
@@ -236,6 +237,7 @@ fn the_nix_ld_shim_serves_foreign_binaries_and_unskews_cross_channel_tools() {
         crate::sandbox::seccomp::SeccompPolicy::default(),
         &[],
         &Default::default(),
+        false,
         vec![foreign.clone().into_os_string()],
     )
     .expect("build foreign spec");
@@ -285,6 +287,7 @@ fn the_nix_ld_shim_serves_foreign_binaries_and_unskews_cross_channel_tools() {
         crate::sandbox::seccomp::SeccompPolicy::default(),
         &[],
         &Default::default(),
+        false,
         vec![OsString::from("hello")],
     )
     .expect("build cross spec");
@@ -430,6 +433,7 @@ fn the_cage_runs_from_a_writable_per_project_store_seeded_with_the_base_closure(
         crate::sandbox::seccomp::SeccompPolicy::default(),
         &[],
         &Default::default(),
+        false,
         cmd,
     )
     .expect("build spec");
@@ -602,6 +606,7 @@ fn the_cage_builds_a_fresh_derivation_offline_from_the_seeded_base() {
         crate::sandbox::seccomp::SeccompPolicy::default(),
         &[],
         &Default::default(),
+        false,
         cmd,
     )
     .expect("build spec");
@@ -772,6 +777,7 @@ fn the_cage_self_equips_a_nix_tool_via_mise() {
         crate::sandbox::seccomp::SeccompPolicy::default(),
         &[],
         &Default::default(),
+        false,
         cmd,
     )
     .expect("build spec");
@@ -903,6 +909,7 @@ fn a_mise_used_tool_is_activated_on_path_in_a_later_launch() {
             crate::sandbox::seccomp::SeccompPolicy::default(),
             &[],
             &Default::default(),
+            false,
             cmd,
         )
         .expect("build spec");
@@ -1037,6 +1044,7 @@ fn a_global_app_cage_puts_both_mise_shims_dirs_on_path_and_splits_the_pool() {
         crate::sandbox::seccomp::SeccompPolicy::default(),
         &[],
         &Default::default(),
+        false,
         cmd,
     )
     .expect("build spec");
@@ -1149,6 +1157,7 @@ fn a_declared_distribution_is_the_cage_root_and_every_mount_still_lands() {
         crate::sandbox::seccomp::SeccompPolicy::default(),
         &[],
         &Default::default(),
+        false,
         cmd,
     )
     .expect("build spec");

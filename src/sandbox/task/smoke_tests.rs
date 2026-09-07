@@ -91,6 +91,7 @@ fn engine_on(
         super::super::seccomp::SeccompPolicy::default(),
         &[],
         &Default::default(),
+        false,
         vec![OsString::from("/bin/true")],
     )
     .ok()?;

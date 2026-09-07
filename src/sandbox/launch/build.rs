@@ -2340,6 +2340,10 @@ pub(super) fn build(
     let mut egress_guard = None;
     let mut egress_binds: Vec<binds::ExtraBind> = Vec::new();
     let mut egress_env: Vec<(String, String)> = Vec::new();
+    // The host-side egress socket, carried out of the block for the netns holder: the
+    // transparent-capture tap dials it from *outside* the cage, so it needs the real path, not the
+    // bind's in-cage name. `None` under any posture that stands no proxy up.
+    let mut proxy_host_uds: Option<std::path::PathBuf> = None;
 
     // The declared loopback forwarders, bridged into the cage.
     let forward_up = forward_ports(prep, &mut wraps)?;
@@ -2447,6 +2451,7 @@ pub(super) fn build(
         }
         egress_binds = wiring.binds;
         egress_env = wiring.env;
+        proxy_host_uds = Some(wiring.host_uds);
         egress_guard = Some(guard);
     }
 
@@ -2667,6 +2672,20 @@ pub(super) fn build(
     // `WrapLayer`'s ordering is unchanged: this moves the composed startup to where the app's bare
     // command already was, so every pairwise constraint the enum documents holds exactly as before.
     let startup_cmd = wrap_cage_command(startup_cmd, wraps);
+    // The netns holder, decided **before** the spec is built, because two things downstream read
+    // the same answer and they must not be able to disagree: the holder itself, and the cage's
+    // `/etc/resolv.conf` (which names the tap's resolver, and would leave the cage with no DNS at
+    // all if it were substituted for a tap that then never stood up).
+    let holder = holder_plan(
+        net_policy(&prep.cfg.network),
+        // Always false on this path: nothing here maps the cage to uid 0, and a test pins that no
+        // root-mapping builder call appears in this file — so the exclusion below is expressed
+        // once, in the predicate, rather than read from a spec that does not exist yet.
+        false,
+        prep.cfg.gui.renders(),
+        proxy_host_uds.as_deref(),
+    );
+    let capture_resolver = holder.as_ref().is_some_and(|h| h.tap.is_some());
     let spec = binds::build_spec(
         prep.layout.data_dir(),
         &prep.cwd,
@@ -2696,43 +2715,16 @@ pub(super) fn build(
         // install steps, then its services. Composed here — the one function that stands up a cage —
         // so every path reaching a cage gets the same start-up in the same order, and so both read
         // the config *after* the app overlay and any one-shot override have had their say.
+        capture_resolver,
         startup_cmd,
     )
     .map_err(|e| {
         crate::diag::error(&format!("sbx: cannot prepare the sandbox: {e}"));
         ExitCode::FAILURE
     })?;
-    // A graphical cage under an isolated network namespace (any filtering posture — the namespace
-    // is empty but for loopback) reads as *offline* to an in-cage browser: Chromium decides
-    // `navigator.onLine` from the presence of a non-loopback interface, not from real reachability,
-    // so a graphical agent panel freezes on "No internet" even though proxy egress works. Route the
-    // launch through the netns holder (see `crate::sandbox::netns`), which pre-creates the namespace with a
-    // black-hole `dummy0` interface so the browser reports online — no egress is opened (the dummy
-    // has no route; all traffic still goes through the proxy on loopback). Gated to the rendering
-    // postures, the only ones running a browser engine (a headless `offscreen` engine reads
-    // `navigator.onLine` the same way a windowed one does), and only when sbx's own path is
-    // resolvable, so the launch never falls back to a cage without `--unshare-net` (which would
-    // share the host network).
-    let spec = if prep.cfg.gui.renders() && spec.net == NetPolicy::Isolated {
-        match std::env::current_exe() {
-            Ok(exe) => spec.with_netns_dummy(crate::sandbox::spec::NetnsDummy {
-                // SAFETY: `getuid` takes no pointer and reads this process's own real uid — the
-                // identity the holder maps to root inside the user namespace it creates.
-                uid: unsafe { libc::getuid() },
-                // SAFETY: `getgid` likewise reads this process's own real gid, mapped to root
-                // alongside the uid above.
-                gid: unsafe { libc::getgid() },
-                holder_exe: exe,
-            }),
-            Err(e) => {
-                crate::diag::error(&format!(
-                    "sbx: netns holder unavailable ({e}); the cage runs without an online signal"
-                ));
-                spec
-            }
-        }
-    } else {
-        spec
+    let spec = match holder {
+        Some(nd) => spec.with_netns_dummy(nd),
+        None => spec,
     };
     // Stand the task plane up now: the spec is final (so a task cage can be derived from it) and the
     // launch has not happened yet (so bwrap finds the bound socket present). A failure here aborts
@@ -2857,6 +2849,68 @@ pub(super) fn build(
     #[cfg(debug_assertions)]
     debug_dump_spec(&spec, guard.as_ref());
     Ok((spec, guard))
+}
+
+/// Whether this launch runs behind the netns holder, and with what.
+///
+/// The holder pre-creates the cage's network namespace instead of letting bwrap unshare one. Two
+/// things need that, and either one is enough:
+///
+///   - a **graphical** cage reads as *offline* to an in-cage browser under an isolated namespace:
+///     Chromium decides `navigator.onLine` from the presence of a non-loopback interface, not from
+///     real reachability, so a panel freezes on "No internet" even though proxy egress works. The
+///     holder adds a black-hole `dummy0` that flips the signal and opens no egress.
+///   - the **transparent-capture tap** ([`crate::sandbox::nettap`]) needs redirect rules installed
+///     in that namespace before the cage starts, which only the holder can do: it owns the user
+///     namespace the network namespace belongs to, and the cage is nested inside a different one.
+///
+/// `None` under any of: a posture that is not isolated (there is nothing to capture and no browser
+/// to reassure), an `as_root` cage (the holder path maps the cage back to the host uid, which is
+/// the opposite of what a distro build asks for), or sbx being unable to resolve its own path (the
+/// launch must never fall back to a cage without `--unshare-net`, which would share the host
+/// network).
+///
+/// The tap rides along only when a proxy was stood up (so there is a socket to hand captured
+/// connections to) **and** `nft` is on the host's PATH. Neither absence is announced here: capture
+/// is an addition, not a requirement, and a line on every launch would be noise. `sbx doctor` is
+/// where it is reported, once, with the reason.
+pub(super) fn holder_plan(
+    net: NetPolicy,
+    as_root: bool,
+    gui_renders: bool,
+    proxy_host_uds: Option<&std::path::Path>,
+) -> Option<crate::sandbox::spec::NetnsDummy> {
+    if net != NetPolicy::Isolated || as_root {
+        return None;
+    }
+    let tap = proxy_host_uds.and_then(|uds| {
+        crate::pathfind::find_on_path("nft").map(|nft| crate::sandbox::spec::TapWiring {
+            uds: uds.to_path_buf(),
+            nft,
+        })
+    });
+    if !gui_renders && tap.is_none() {
+        return None;
+    }
+    match std::env::current_exe() {
+        Ok(exe) => Some(crate::sandbox::spec::NetnsDummy {
+            // SAFETY: `getuid` takes no pointer and reads this process's own real uid — the
+            // identity the holder maps to root inside the user namespace it creates.
+            uid: unsafe { libc::getuid() },
+            // SAFETY: `getgid` likewise reads this process's own real gid, mapped to root
+            // alongside the uid above.
+            gid: unsafe { libc::getgid() },
+            holder_exe: exe,
+            tap,
+        }),
+        Err(e) => {
+            crate::diag::error(&format!(
+                "sbx: netns holder unavailable ({e}); the cage runs without an online signal and \
+                 without transparent capture"
+            ));
+            None
+        }
+    }
 }
 
 /// Translate the resolved configuration's network posture into the cage's net

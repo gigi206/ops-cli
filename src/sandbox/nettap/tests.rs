@@ -534,3 +534,55 @@ fn allocation_stays_inside_the_low_half_of_the_synthetic_block() {
     );
     assert_eq!(addr_for(0), None, "the network address is never handed out");
 }
+
+/// The rule order is load-bearing: a nat statement is terminal, so the first match decides. With
+/// the general TCP rule first, a DNS query to a public resolver would be captured as ordinary
+/// traffic and never answered — the cage would resolve nothing at all.
+#[test]
+fn the_ruleset_reaches_the_resolver_before_the_general_capture() {
+    let rules = redirect_ruleset();
+    let dns_udp = rules.find(&format!("udp dport 53 redirect to :{TAP_DNS_PORT}"));
+    let dns_tcp = rules.find(&format!("tcp dport 53 redirect to :{TAP_DNS_PORT}"));
+    let general = rules.find(&format!("redirect to :{TAP_PORT}"));
+    let (dns_udp, dns_tcp, general) = (
+        dns_udp.expect("udp/53"),
+        dns_tcp.expect("tcp/53"),
+        general.expect("capture"),
+    );
+    assert!(dns_udp < general && dns_tcp < general, "{rules}");
+}
+
+/// Two properties nftables itself enforces, and one the egress path depends on. They are asserted
+/// on the text because the kernel is what proves them and a unit test cannot install a rule: the
+/// ruleset was measured against a live namespace, and this pins the spelling that passed.
+#[test]
+fn the_ruleset_keeps_what_nftables_and_the_egress_forwarder_require() {
+    let rules = redirect_ruleset();
+    assert!(
+        rules.contains("meta l4proto tcp ip daddr != 127.0.0.0/8"),
+        "nftables refuses a `redirect to :port` with no transport-protocol match, and the \
+         loopback exclusion is what keeps the egress forwarder's own connections out: {rules}"
+    );
+    assert!(
+        rules.starts_with("table ip sbx {"),
+        "the rules live in sbx's own table, never a shared chain: {rules}"
+    );
+    assert!(
+        rules.contains("type nat hook output priority dstnat"),
+        "{rules}"
+    );
+}
+
+#[test]
+fn the_cage_resolver_file_names_an_address_the_redirect_catches() {
+    let body = resolv_conf();
+    assert!(body.contains(&CAGE_RESOLVER.to_string()), "{body}");
+    assert!(
+        !CAGE_RESOLVER.is_loopback(),
+        "a loopback resolver would be excluded from the redirect by the rule above"
+    );
+    assert!(
+        body.lines().any(|l| l.starts_with("nameserver ")),
+        "glibc needs a nameserver line: {body}"
+    );
+}
