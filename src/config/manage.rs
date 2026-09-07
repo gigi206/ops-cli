@@ -919,7 +919,7 @@ fn validate_layer(doc: &DocumentMut) -> Result<(), String> {
         for pattern in &fs.scan {
             if let Err(reason) = crate::open_policy::validate_pattern(pattern) {
                 return Err(format!(
-                    "`[fs] scan` pattern `{pattern}` is not a regular expression ({reason}) — it \
+                    "`[fs] scan` pattern `{pattern}` is not usable as a shape ({reason}) — it \
                      would be dropped at load, and no file closed for carrying that shape"
                 ));
             }

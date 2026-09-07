@@ -92,6 +92,13 @@ pub(crate) struct OpenPolicy {
 /// Exposed so the config layer can refuse an entry where the user can still see which line is
 /// wrong, rather than failing the whole launch at scan-build time with the set's own error.
 pub(crate) fn validate_pattern(pattern: &str) -> Result<(), String> {
+    // The empty pattern compiles, and matches every content there is. A list holding one answers
+    // "matched" on every open, so the shapes beside it stop deciding anything: under `enforce` the
+    // scan closes files the list never named, under `observe` it reports one per open. Refused
+    // here rather than dropped, because a person who typed it is owed the line that did nothing.
+    if pattern.is_empty() {
+        return Err("an empty pattern matches every file, so it names no shape".to_string());
+    }
     regex::bytes::RegexBuilder::new(pattern)
         .size_limit(SET_SIZE_LIMIT)
         .build()
@@ -112,11 +119,11 @@ impl OpenPolicy {
             return Ok(None);
         }
         // Validated one at a time first: `RegexSet`'s own error names the set, not the entry, and a
-        // person editing a list of hundreds needs the one that is wrong.
+        // person editing a list of hundreds needs the one that is wrong. Through
+        // [`validate_pattern`], so that what a pattern may be has one definition: the config layer
+        // asks the same function before a launch ever reaches here.
         for pattern in patterns {
-            regex::bytes::RegexBuilder::new(pattern)
-                .size_limit(SET_SIZE_LIMIT)
-                .build()
+            validate_pattern(pattern)
                 .map_err(|e| format!("the pattern `{pattern}` is not a valid regex: {e}"))?;
         }
         let set = RegexSetBuilder::new(patterns)
@@ -184,6 +191,36 @@ mod tests {
         OpenPolicy::compile(&owned, MAX_SCAN_DEFAULT)
             .expect("the test patterns compile")
             .expect("a non-empty list yields a policy")
+    }
+
+    /// A pattern names a shape a file's content may carry, and the empty string is carried by
+    /// every content there is. Left in a list it makes the scan answer "matched" on every open:
+    /// under `enforce` that closes files the list never meant to name, and under `observe` it
+    /// buries the real shapes in a notice per open. Either way the protection reads as present.
+    ///
+    /// It is a valid regex, so nothing downstream can tell it from a shape someone meant, and the
+    /// entry is named rather than dropped in silence because a person who typed one wants to know
+    /// which line did nothing. Both validators answer alike: `compile` asks this function rather
+    /// than building its own opinion of what a pattern may be.
+    #[test]
+    fn an_empty_pattern_is_refused_rather_than_matching_every_file() {
+        assert!(
+            validate_pattern("").is_err(),
+            "the empty pattern matches every content, so it cannot stand as a shape"
+        );
+        assert!(
+            OpenPolicy::compile(&[String::new()], MAX_SCAN_DEFAULT).is_err(),
+            "the set builder must refuse it too, or the two validators disagree"
+        );
+
+        // The witnesses: an ordinary shape is accepted, and one that does not compile is still
+        // refused for its own reason rather than this one.
+        assert!(validate_pattern(r"sk-[A-Za-z0-9]{12,}").is_ok());
+        let bad = validate_pattern("(unclosed").expect_err("an unclosed group is not a regex");
+        assert!(
+            !bad.contains("empty"),
+            "a broken pattern must keep its own reason: {bad}"
+        );
     }
 
     #[test]

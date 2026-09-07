@@ -177,6 +177,13 @@ would pass everything while still looking like a scan, and so is a negative numb
 ceiling at all. Where two layers both set it, the **larger** window is the one that applies: a
 bigger number closes more files.
 
+An **empty** pattern is refused for the mirror-image reason, and named in the launch warnings
+with the rest of the line kept: it is a valid regex that every file matches, so a list holding
+one would close everything under `enforce` and report every open under `observe`, while the
+shapes beside it stopped deciding anything. A pattern that does not compile is refused the same
+way, for its own reason. In both cases the remaining patterns still apply, so one bad line does
+not cost you the list.
+
 This is the one key in the table that a trust gate holds. The rest of `[fs]` is honoured from an
 untrusted project because nothing in it can widen what another layer closed; a ceiling can, by
 being lowered, so an untrusted layer's `scan_max_kb` is refused rather than merely out-voted, and
