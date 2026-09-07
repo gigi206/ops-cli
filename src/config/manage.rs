@@ -809,7 +809,10 @@ pub(crate) fn admit_egress_rule(rule: &str, slot: crate::allowlist::Slot) -> Res
 ///
 /// The rule lists are the third: `network.allow`/`deny`/`mute` and `proc.allow`/`deny` hold plain
 /// strings the resolver drops entry by entry, and the verbs that write one rule admit it first, so
-/// a whole list written at once meets the same grammar.
+/// a whole list written at once meets the same grammar. `[seccomp] allow` is the fourth, and the
+/// only list `sbx config add` reaches that had no admission at all: `sbx config add seccomp.allow
+/// 'bad!!!'` reported the entry as added, and the launch then dropped it, leaving a cage the config
+/// says reopened a syscall and the kernel says did not.
 fn validate_layer(doc: &DocumentMut) -> Result<(), String> {
     let raw = super::schema::parse(doc.to_string().as_bytes())?;
     // The rule lists, baseline and per app. `sbx net allow` and `sbx proc allow` admit a rule
@@ -843,6 +846,23 @@ fn validate_layer(doc: &DocumentMut) -> Result<(), String> {
             for entry in entries {
                 crate::proc_policy::validate_rule(entry)
                     .map_err(|why| format!("`[proc]` rule `{entry}`: {why}"))?;
+            }
+        }
+    }
+    // `[seccomp] allow` is a list of plain strings too, dropped entry by entry by
+    // [`super::apply_seccomp`], and it is the one that costs the most to get wrong in the other
+    // direction: a syscall the user believes they reopened stays denied, and the cage refuses work
+    // the config says it permits. The entries are comma-splittable there, so they are split the
+    // same way here rather than being held to a shape the loader does not require.
+    let app_seccomp = raw.app.values().filter_map(|a| a.seccomp.as_ref());
+    for sc in raw.seccomp.iter().chain(app_seccomp) {
+        for entry in &sc.allow {
+            for token in entry.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                crate::sandbox::seccomp::resolve_allow(token).map_err(|why| {
+                    format!(
+                        "`[seccomp] allow` entry `{token}`: {why} — it would be dropped at load,                          and the syscall never reopened"
+                    )
+                })?;
             }
         }
     }
@@ -2338,6 +2358,48 @@ mod tests {
         for (key, value) in [
             ("network.allow", r#"["api.example.test", "@group"]"#),
             ("proc.deny", r#"["curl"]"#),
+        ] {
+            let p = doc_at(tmp.path(), "[network]\nmode = \"deny\"\n");
+            set(&p, key, value).unwrap_or_else(|e| panic!("`{key} = {value}` is valid: {e}"));
+        }
+    }
+
+    /// `[seccomp] allow` was the one list `sbx config add` reaches with no admission of its own.
+    /// `sbx config add seccomp.allow 'bad!!!'` answered `added \`bad!!!\` to \`seccomp.allow\``,
+    /// and the next launch dropped the entry with a warning, leaving a config that says a syscall
+    /// was reopened and a kernel that says it was not. Every other broad-typed list here has been
+    /// held to the loader's own parser for exactly this reason; this one had been left out of the
+    /// sentence that says so.
+    #[test]
+    fn a_seccomp_allowance_the_launch_would_drop_is_refused_at_the_write() {
+        let tmp = crate::testutil::TmpDir::new();
+        for (key, value) in [
+            ("seccomp.allow", r#"["bad!!!"]"#),
+            // The comma form the loader splits, with one good token and one that resolves to
+            // nothing: the entry as written would have reopened only half of what it names.
+            ("seccomp.allow", r#"["unshare,nosuchcall"]"#),
+            ("app.demo.seccomp.allow", r#"["bad!!!"]"#),
+        ] {
+            let p = doc_at(tmp.path(), "[network]\nmode = \"deny\"\n");
+            let before = std::fs::read_to_string(&p).unwrap();
+            let err = set(&p, key, value)
+                .err()
+                .unwrap_or_else(|| panic!("`{key} = {value}` must be refused"));
+            assert!(
+                matches!(err, ManageError::InvalidValue(_, _)),
+                "`{key}`: {err}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&p).unwrap(),
+                before,
+                "`{key}`: a refused set leaves the file byte-for-byte unchanged"
+            );
+        }
+        // The witness: a name the denylist carries still writes, in both spellings, so the check is
+        // an admission and not a refusal of the field.
+        for (key, value) in [
+            ("seccomp.allow", r#"["unshare"]"#),
+            ("seccomp.allow", r#"["unshare,clone3"]"#),
         ] {
             let p = doc_at(tmp.path(), "[network]\nmode = \"deny\"\n");
             set(&p, key, value).unwrap_or_else(|e| panic!("`{key} = {value}` is valid: {e}"));

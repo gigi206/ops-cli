@@ -173,6 +173,13 @@ than a string that would make the loader drop the whole layer. Handing a list a 
 value is refused instead of dropping its other entries, and the error names the three
 ways to say what you meant.
 
+Every value the loader would drop is refused here instead, so a write that reports
+success is one the next launch honours. That covers the egress and `proc` rule lists,
+`forward` remaps, the `[fs]` entries and patterns, and `[seccomp] allow`: a name that is
+not in sbx's denylist is refused at the write rather than committed and dropped, since a
+config claiming a syscall is reopened and a kernel that still denies it is the worst of
+the two outcomes.
+
 `add` and `rm` are the safe half: they never restate a list, so nothing is lost by
 omission. Adding an entry already present, or removing one that is not there, changes
 nothing and says so. That matters beyond tidiness: an unchanged file keeps its trust
