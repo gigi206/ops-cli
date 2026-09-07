@@ -724,6 +724,20 @@ impl PluginRegistry {
         // to be compared against the other, so the other type's claimant stayed live under a name
         // every surface reports as ambiguous. Two brokers and one signer named `foo` left
         // `sign = "foo"` resolving to that signer.
+        // A resolver claims its **scheme**, so two of them are never ambiguous to the resolution
+        // path. They are ambiguous everywhere a *name* is what a config writes: `[plugin.<name>]
+        // env` is applied to every plugin whose `name` matches, and that table is where a token
+        // for one plugin is written, so two resolvers sharing a name each receive the other's.
+        // Indexed here by name rather than claimed by it, since the scheme is what makes them
+        // usable at all.
+        let mut resolvers_by_name: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (scheme, plugin) in &resolvers {
+            resolvers_by_name
+                .entry(plugin.name.clone())
+                .or_default()
+                .push(scheme.clone());
+        }
+
         let shared: std::collections::BTreeSet<String> = brokers
             .keys()
             .filter(|name| signers.contains_key(*name))
@@ -734,12 +748,28 @@ impl PluginRegistry {
                     .filter(|name| brokers.contains_key(*name) || signers.contains_key(*name))
                     .cloned(),
             )
+            .chain(
+                resolvers_by_name
+                    .iter()
+                    .filter(|(name, schemes)| {
+                        schemes.len() > 1
+                            || brokers.contains_key(*name)
+                            || signers.contains_key(*name)
+                            || name_conflicts.contains_key(*name)
+                    })
+                    .map(|(name, _)| name.clone()),
+            )
             .collect();
         for name in shared {
             // The claimants already recorded for this name are kept: a conflict names every plugin
             // that has to be dealt with, and replacing the entry would drop the two that made the
             // name ambiguous in the first place.
             let mut claimants = name_conflicts.remove(&name).unwrap_or_default();
+            for scheme in resolvers_by_name.get(&name).into_iter().flatten() {
+                if let Some(plugin) = resolvers.remove(scheme) {
+                    claimants.push(plugin.dir_name().to_string());
+                }
+            }
             if let Some(plugin) = brokers.remove(&name) {
                 claimants.push(plugin.dir_name().to_string());
             }
@@ -2105,6 +2135,56 @@ mod tests {
             check_grant_control_plane_for([("allow_paths", Path::new(entry))], &roots)
                 .unwrap_or_else(|why| panic!("`{entry}` is not the control plane: {why}"));
         }
+    }
+
+    /// Two resolvers under one name are as ambiguous as two under one scheme, and disabled too.
+    ///
+    /// A resolver claims its scheme, so the resolution path can always tell two apart. A `name`
+    /// is what a *config* writes: `[plugin.<name>] env` is applied to every plugin whose name
+    /// matches, and that table is where a token for one plugin is put, so two resolvers answering
+    /// to one name each receive the other's credentials. The sweep that already disabled a broker
+    /// and a signer sharing a name did not look at resolvers at all. Its two arms are the witness
+    /// here: distinct names stay live.
+    #[test]
+    fn two_resolvers_under_one_name_are_disabled_like_two_under_one_scheme() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::testutil::TmpDir::new();
+        let plugins = dir.path().join("plugins");
+        let write = |sub: &str, name: &str, scheme: &str| {
+            let at = plugins.join(sub);
+            std::fs::create_dir_all(&at).unwrap();
+            std::fs::write(
+                at.join("plugin.toml"),
+                format!("name = \"{name}\"\ntype = \"resolver\"\nexec = \"run\"\nscheme = \"{scheme}\"\n"),
+            )
+            .unwrap();
+            let exec = at.join("run");
+            std::fs::write(&exec, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+
+        // The witness: two resolvers, two names, two schemes — both live.
+        write("va", "vault", "vault");
+        write("vb", "other", "vaultb");
+        let mut warnings = Vec::new();
+        let registry = PluginRegistry::load(&plugins, &mut warnings);
+        assert!(
+            registry.resolver("vault").is_some() && registry.resolver("vaultb").is_some(),
+            "two distinct names stay live: {warnings:?}"
+        );
+
+        // The same tree with one name shared: neither is left to answer under it.
+        write("vb", "vault", "vaultb");
+        let mut warnings = Vec::new();
+        let registry = PluginRegistry::load(&plugins, &mut warnings);
+        assert!(
+            registry.resolver("vault").is_none() && registry.resolver("vaultb").is_none(),
+            "a shared name disables every claimant"
+        );
+        let why = registry
+            .name_conflict("vault")
+            .expect("the name is reported");
+        assert_eq!(why, ["va", "vb"], "and both claimants are named");
     }
 
     /// The other direction of the same overlap: a grant that *contains* a root reaches it.

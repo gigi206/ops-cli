@@ -2749,10 +2749,11 @@ mod tests {
         let key = repo.path().join("store.key");
 
         let err = publish(repo.path(), &key, Some(1)).unwrap_err();
+        // The registry answers first: a name two plugins claim is ambiguous wherever a config
+        // writes one, so it disables both and says so, and a publish refuses on that warning
+        // rather than reaching its own duplicate check with the plugins already dropped.
         assert!(
-            err.contains("plugins/pass")
-                && err.contains("plugins/pgsign")
-                && err.contains("name = \"pass\""),
+            err.contains("`pass`") && err.contains("`pgsign`") && err.contains("more than one"),
             "the refusal must name the claim and both claimants: {err}"
         );
         assert!(
