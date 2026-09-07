@@ -312,6 +312,16 @@ sbx net logs --with-headers --host api.example.com
 #   > authorization: <injected by sbx>
 ```
 
+## The desktop notifications a cage raises are masked too
+
+Under `dbus = true` a caged app raises its own desktop notifications, and `sbx`
+forwards them to the host's daemon, which journals them: text a cage wrote outlives
+the cage on the host. Every forwarded summary, body and action label passes the same
+byte-exact scan as `sbx`'s own refusal announcements, so a credential this launch
+resolved becomes its placeholder before the host daemon sees it. A launch that
+resolved no credential forwards the app's text unchanged, since a needle is a value
+`sbx` itself injected and it is matched whole.
+
 ## Honest scope: these are backstops, not the boundary
 
 Both tripwires are **byte-exact**. They catch a secret sent or reflected

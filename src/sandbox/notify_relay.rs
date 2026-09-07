@@ -336,6 +336,38 @@ struct Served {
     /// Shared with the signal pump in [`run`], which rules the host's close signals on it and drops
     /// each id as it goes.
     ours: Arc<OwnedIds>,
+    /// The launch's credential set, filled in by the egress proxy once it has resolved this
+    /// launch's secrets and shared by `Arc`, exactly as the refusal notifier holds it. Empty until
+    /// then, and empty for a launch with no secrets.
+    needles: crate::sandbox::notify_sink::Needles,
+}
+
+impl Served {
+    /// Replace this launch's credentials with their placeholders before a string leaves for the
+    /// host daemon.
+    ///
+    /// The relay carries text the *cage* wrote to a daemon that journals it, and journald keeps it
+    /// on the host after the cage is gone. sbx's own announcements have been held to this from the
+    /// start, in the words of [`crate::sandbox::notify_sink`]'s module header: agent-chosen text is
+    /// redacted before it reaches a daemon. The app's own notifications travel the same road to the
+    /// same daemon and were the half nobody had held to it. Nothing legitimate is lost: a needle is
+    /// a credential sbx itself injected, matched whole, so an app's real message is untouched.
+    fn redacted(&self, text: String) -> String {
+        let Ok(needles) = self.needles.read() else {
+            // A poisoned lock is not a reason to forward a credential: an empty needle set would
+            // redact nothing, so the text is dropped to its placeholder-free skeleton instead.
+            return String::new();
+        };
+        if needles.is_empty() {
+            return text;
+        }
+        crate::sandbox::redact::redact_string(
+            &text,
+            &needles,
+            &crate::sandbox::redact::Placeholder::Plain,
+        )
+        .0
+    }
 }
 
 #[interface(name = "org.freedesktop.Notifications")]
@@ -370,12 +402,12 @@ impl Served {
                 app_name: bounded(relayed_app_name(&app_name), APP_IDENTITY_MAX),
                 replaces_id,
                 app_icon: bounded(relayed_app_icon(&app_icon).to_string(), APP_IDENTITY_MAX),
-                summary: bounded(summary, SUMMARY_MAX),
-                body: bounded(body, BODY_MAX),
+                summary: bounded(self.redacted(summary), SUMMARY_MAX),
+                body: bounded(self.redacted(body), BODY_MAX),
                 actions: actions
                     .into_iter()
                     .take(ACTIONS_MAX)
-                    .map(|a| bounded(a, SUMMARY_MAX))
+                    .map(|a| bounded(self.redacted(a), SUMMARY_MAX))
                     .collect(),
                 hints: relayed_hints,
                 expire_timeout,
@@ -429,12 +461,15 @@ impl NotifyRelay {
     /// exposes (the in-cage `dbus-daemon` creates it there through the bind); the thread waits for it
     /// to appear, then attaches. Infallible — a failure inside the thread warns and leaves the app
     /// without notifications (best-effort), never blocking the launch.
-    pub(crate) fn start(private_socket: PathBuf) -> NotifyRelay {
+    pub(crate) fn start(
+        private_socket: PathBuf,
+        needles: crate::sandbox::notify_sink::Needles,
+    ) -> NotifyRelay {
         let (shutdown, rx) = async_channel::bounded::<()>(1);
         let handle = std::thread::Builder::new()
             .name("sbx-notify-relay".to_string())
             .spawn(move || {
-                if let Err(e) = async_io::block_on(run(private_socket, rx)) {
+                if let Err(e) = async_io::block_on(run(private_socket, rx, needles)) {
                     // A connection error to the private bus is almost always the cage tearing down
                     // (the in-cage dbus-daemon went away) — a benign teardown race on a short-lived
                     // launch, not worth alarming the user. Only a genuinely unexpected failure (e.g.
@@ -473,6 +508,7 @@ impl Drop for NotifyRelay {
 async fn run(
     private_socket: PathBuf,
     shutdown: async_channel::Receiver<()>,
+    needles: crate::sandbox::notify_sink::Needles,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Wait for the in-cage dbus-daemon to create its socket (the portal wrap starts it before the
     // app). Give up quietly after the bound — a portal that never came up already warned elsewhere.
@@ -494,6 +530,7 @@ async fn run(
     let served = Served {
         host: Box::new(host.clone()),
         ours: Arc::clone(&ours),
+        needles,
     };
     let address = format!("unix:path={}", private_socket.display());
     let private_conn = connection::Builder::address(address.as_str())?
@@ -608,7 +645,60 @@ mod tests {
         Served {
             host: Box::new(host.clone()),
             ours: Arc::new(OwnedIds::default()),
+            needles: Arc::new(std::sync::RwLock::new(Vec::new())),
         }
+    }
+
+    /// A relay whose launch has resolved one credential, so a test can watch what leaves for the
+    /// host daemon.
+    fn served_with_needle(host: &FakeHost, name: &str, value: &str) -> Served {
+        Served {
+            host: Box::new(host.clone()),
+            ours: Arc::new(OwnedIds::default()),
+            needles: Arc::new(std::sync::RwLock::new(vec![
+                crate::sandbox::proxy::SecretNeedle::named(name, value.as_bytes().to_vec()),
+            ])),
+        }
+    }
+
+    /// The relay carries text the *cage* wrote to a daemon that journals it, and journald keeps it
+    /// on the host after the cage is gone. sbx's own announcements have been redacted before
+    /// reaching a daemon from the start, in the words of `notify_sink`'s module header; the app's
+    /// own notifications travel the same road to the same daemon and were the half that was not.
+    #[test]
+    fn a_credential_in_a_caged_apps_notification_does_not_reach_the_host_daemon() {
+        let host = FakeHost::default();
+        let with_secret = served_with_needle(&host, "gh_token", "ghp-abcdefghij");
+        async_io::block_on(with_secret.notify(
+            "caged-app".to_string(),
+            0,
+            String::new(),
+            "token ghp-abcdefghij".to_string(),
+            "and again ghp-abcdefghij here".to_string(),
+            vec!["open ghp-abcdefghij".to_string()],
+            HashMap::new(),
+            -1,
+        ))
+        .expect("the recording host accepts the call");
+
+        let calls = locked(&host.calls);
+        let call = calls.first().expect("one forwarded call");
+        assert_eq!(call.summary, "token ${gh_token}");
+        assert_eq!(call.body, "and again ${gh_token} here");
+        assert_eq!(call.actions, vec!["open ${gh_token}".to_string()]);
+        drop(calls);
+
+        // Witness: a launch that resolved no credential forwards the app's text untouched, so the
+        // redaction is not a filter on ordinary messages.
+        let host = FakeHost::default();
+        let plain = served(&host);
+        notify(&plain, 0);
+        let calls = locked(&host.calls);
+        let call = calls.first().expect("one forwarded call");
+        assert_eq!(
+            (call.summary.as_str(), call.body.as_str()),
+            ("summary", "body")
+        );
     }
 
     /// One `Notify` as the caged app makes it, answered with the id the relay returns to the cage.

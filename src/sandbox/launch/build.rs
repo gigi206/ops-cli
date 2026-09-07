@@ -596,7 +596,11 @@ struct PortalStack {
 /// renders through the compositor. Every failure here costs the file chooser and nothing else: the
 /// app runs, falling back to its own dialog. `dbus = true` without a display is warned about rather
 /// than silently ignored.
-fn portal_stack(prep: &Prepared, runtime: binds::Runtime) -> PortalStack {
+fn portal_stack(
+    prep: &Prepared,
+    runtime: binds::Runtime,
+    needles: crate::sandbox::notify_sink::Needles,
+) -> PortalStack {
     let mut portal_host: Option<crate::sandbox::portal::HostDir> = None;
     let mut notify_relay: Option<crate::sandbox::notify_relay::NotifyRelay> = None;
     let mut theme_relay: Option<crate::sandbox::theme_relay::ThemeRelay> = None;
@@ -626,6 +630,7 @@ fn portal_stack(prep: &Prepared, runtime: binds::Runtime) -> PortalStack {
                     // and at-launch theme are unaffected.
                     notify_relay = Some(crate::sandbox::notify_relay::NotifyRelay::start(
                         hd.socket(),
+                        needles,
                     ));
                     // Start the live-theme relay: it mirrors later host light/dark switches into the
                     // in-cage GSettings keyfile (through the home bind), so the in-cage portal
@@ -834,12 +839,12 @@ fn gui_store_roots(
 fn notify_wiring(
     prep: &Prepared,
     runtime: binds::Runtime,
+    notify_needles: crate::sandbox::notify_sink::Needles,
 ) -> Arc<crate::sandbox::notify_sink::NotifyWiring> {
     // The refusal notifier (`[notify]`), stood up before the first lens that can refuse anything and
     // held for the whole launch. The credential set it redacts against is filled in below, once the
     // egress proxy has resolved this launch's secrets — the exec supervisor needs the notifier before
     // that resolution happens, and nothing can be refused in between.
-    let notify_needles: crate::sandbox::notify_sink::Needles = Arc::new(RwLock::new(Vec::new()));
     // Which sandbox every announcement names. The pid is this launcher's — the one `sbx session ls`
     // lists and `sbx session attach`/`sbx session stop` take — so a notification points at something
     // to act on.
@@ -2236,7 +2241,11 @@ pub(super) fn build(
     );
 
     // The in-cage desktop portal, its host runtime directory and the two relays that serve it.
-    let portal_stack = portal_stack(prep, runtime);
+    // The credential set both notification paths redact against, created here because the portal's
+    // relay starts before the refusal notifier and the two must hold the *same* set: it is filled in
+    // later, once the egress proxy has resolved this launch's secrets.
+    let notify_needles: crate::sandbox::notify_sink::Needles = Arc::new(RwLock::new(Vec::new()));
+    let portal_stack = portal_stack(prep, runtime, Arc::clone(&notify_needles));
 
     // The rendering and hardware holes this posture asks for, provisioned before the seed so their
     // store roots join the project store.
@@ -2289,7 +2298,7 @@ pub(super) fn build(
     let mut wraps: Vec<(WrapLayer, CommandWrap)> = Vec::new();
 
     // The refusal notifier, and the trust drops it announces. Held for the whole launch.
-    let notify_wiring = notify_wiring(prep, runtime);
+    let notify_wiring = notify_wiring(prep, runtime, notify_needles);
 
     // The exec and content lenses, and the supervisor both ride on.
     let proc_lens = proc_lens(prep, &notify_wiring, &mut wraps)?;
