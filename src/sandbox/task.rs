@@ -1693,28 +1693,41 @@ impl TaskEngine {
         cur
     }
 
-    /// The interpreter a cage path's `#!` line names, or `None` when the file is not a script.
+    /// The interpreter a cage path's `#!` line names, or `None` when the file is not a script and
+    /// when the line names nothing this policy could speak about.
     ///
     /// Only the first token after `#!` — Linux passes the rest as a single argument to the
     /// interpreter, so `#!/usr/bin/env bash` runs **`env`**, and it is `env` that goes on to run
-    /// bash. Reporting `bash` here would name a program that is not what the process becomes.
+    /// bash. Reporting `bash` here would name a program that is not what the process becomes. The
+    /// grammar is [`crate::proc_policy::shebang_interpreter`], which is the same reading the exec
+    /// supervisor decides a notified `execve` against.
     fn shebang_of(&self, incage: &str, task: &TaskSpec) -> Option<String> {
         use std::io::Read;
-        // The kernel reads at most one BINPRM_BUF_SIZE page of `#!` line; far less is enough to
-        // decide, and a bounded read keeps a named pipe or a huge binary from being pulled in.
-        const PROBE: usize = 512;
         let host = self.host_path(Path::new(incage), task)?;
-        let mut head = [0u8; PROBE];
-        let read = std::fs::File::open(&host).ok()?.read(&mut head).ok()?;
-        let line = head[..read].split(|b| *b == b'\n').next()?;
-        let rest = line.strip_prefix(b"#!")?;
-        let interpreter = std::str::from_utf8(rest).ok()?.split_whitespace().next()?;
-        // A relative interpreter is resolved against the caller's working directory, which is not a
-        // fact this policy has. Leaving it unresolved keeps the node honest rather than inventing a
-        // path that would match nothing anyway.
-        interpreter
-            .starts_with('/')
-            .then(|| interpreter.to_string())
+        // The amount the kernel itself reads before it decides, which also keeps a named pipe or a
+        // huge binary from being pulled in. Filled rather than read once: a short read would hand
+        // the grammar a line the file has not finished writing out.
+        let mut head = [0u8; crate::proc_policy::SCRIPT_HEAD];
+        let mut file = std::fs::File::open(&host).ok()?;
+        let mut filled = 0;
+        while filled < head.len() {
+            match file.read(&mut head[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            }
+        }
+        // One grammar for the whole product: the supervisor decides a notified `execve` against the
+        // same reading, so a node keyed here on a different one would govern a caller the
+        // supervisor never sees. `Unsettled` (a relative interpreter, a name no rule can carry)
+        // reads as "not a script" for this caller, which leaves the node on the file rather than
+        // inventing a path that would match nothing anyway.
+        match crate::proc_policy::shebang_interpreter(&head[..filled]) {
+            crate::proc_policy::ScriptHead::Interpreter(path) => Some(path),
+            crate::proc_policy::ScriptHead::NotScript
+            | crate::proc_policy::ScriptHead::Unsettled => None,
+        }
     }
 
     /// The exec policy for one invocation: what each program may run, keyed by the program running
@@ -1738,10 +1751,18 @@ impl TaskEngine {
         // The command's own node comes from the shim: the shim's exec of the command is the first
         // notified `execve`, and a policy that did not admit it would refuse the task outright.
         let command = self.resolve_spawn_entry(&task.cmd[0], &path_dirs, task)?;
-        let mut callers: BTreeMap<String, Vec<ProcRule>> = BTreeMap::from([(
-            super::proc_enforce::SHIM_CAGE_PATH.to_string(),
-            vec![ProcRule::new(&command)],
-        )]);
+        // Both the file and what it is entered as, because a `#!` command is *two* programs inside
+        // that one `execve`: the kernel loads the interpreter within the call that named the
+        // script, and the supervisor decides the exec against both. Admitting only the script would
+        // refuse the task at its first step, under a policy whose whole purpose is to let the
+        // command run.
+        let entered_as = self.entered_as(&command, task);
+        let mut admits = vec![ProcRule::new(&command)];
+        if entered_as != command {
+            admits.push(ProcRule::new(&entered_as));
+        }
+        let mut callers: BTreeMap<String, Vec<ProcRule>> =
+            BTreeMap::from([(super::proc_enforce::SHIM_CAGE_PATH.to_string(), admits)]);
 
         // A target is matched against the path the process **asked** for, before symlinks — which is
         // what keeps `ls` meaning `ls`. Resolving targets the way callers are resolved would make
@@ -1770,7 +1791,6 @@ impl TaskEngine {
         // started the script, so from its first instruction the process is `bash`, `python`, `env` —
         // never the file. Keyed by the file, the node would govern a caller that never exists, and
         // its whole list would sit there being read by nothing.
-        let entered_as = self.entered_as(&command, task);
         node(&task.cmd[0], &entered_as, resolve_all(declared)?)?;
         for (program, entries) in &task.exec {
             let incage = self.resolve_spawn_entry(program, &path_dirs, task)?;

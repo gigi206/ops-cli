@@ -234,6 +234,21 @@ impl ProcPolicy {
         }
     }
 
+    /// Whether this policy can refuse anything at all.
+    ///
+    /// True for the one shape a launch takes when only the **content lens** asked for a supervisor:
+    /// `[proc]` is off, and the exec side is built as an `enforce` denylist with nothing on it so
+    /// that every `execve` is notified and allowed. Nothing there can decide a second program, so
+    /// the reads that would find one are not worth taking -- and a refusal formed on a read that
+    /// failed would stop a program no rule speaks about. `ask` and `confine` are never this: the
+    /// first parks an unmatched target and the second refuses it, both of which are decisions.
+    pub(crate) fn governs_nothing(&self) -> bool {
+        self.mode == ProcMode::Enforce
+            && self.allow.is_empty()
+            && self.deny.is_empty()
+            && self.graph.is_none()
+    }
+
     /// A per-caller allowlist: an unmatched target is refused, and what is matched depends on which
     /// program is doing the running.
     pub(crate) fn confined(graph: CallerGraph) -> ProcPolicy {
@@ -444,6 +459,88 @@ pub(crate) fn loader_targets(argv: &[&[u8]], complete: bool) -> Option<Vec<Strin
         return None;
     }
     Some(out)
+}
+
+/// How many bytes of a file's start decide whether it is a script, and which interpreter it names.
+///
+/// `BINPRM_BUF_SIZE`, the whole of what the kernel itself reads before it makes that decision, so
+/// reading the same amount is what makes this walk answer the kernel's question rather than a
+/// smaller one: measured, a `#!` line longer than this is **truncated and still run**, so a walk
+/// that stopped at the first newline it found in fewer bytes would disagree with the exec it is
+/// deciding.
+pub(crate) const SCRIPT_HEAD: usize = 256;
+
+/// What the first bytes of an `execve` target say about a second program running inside that call.
+///
+/// Three states and not two, because "no interpreter" is two different answers to the caller. A file
+/// that is not a script names no second program and its own path's verdict stands alone; a `#!` line
+/// this walk could not settle names one it cannot put to a rule, and is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScriptHead {
+    /// The first two bytes are not `#!`, so the kernel runs the file itself and nothing else.
+    NotScript,
+    /// The absolute path of the interpreter the kernel will run instead of the named file.
+    Interpreter(String),
+    /// A `#!` line that is there and cannot be turned into a name a rule could speak about.
+    Unsettled,
+}
+
+/// The interpreter a `#!` line names, read from the first [`SCRIPT_HEAD`] bytes of an exec target.
+///
+/// `execve("./script")` on a file whose first two bytes are `#!` is a *single* syscall that runs a
+/// *different* program: the kernel reads the line, and executes the interpreter it names with the
+/// script's path appended. A supervisor deciding on the notified path alone therefore decides
+/// `./script` and never `/bin/sh`, which is the rule the cage was reaching around. So the line is
+/// read and the interpreter decided too, on the stricter of the two verdicts.
+///
+/// The grammar is the kernel's, measured rather than assumed:
+///
+/// * The line ends at the first `\n` **or** `\0`; a NUL cuts it exactly as a newline does.
+/// * Spaces and tabs between `#!` and the path are skipped.
+/// * At most one argument follows, and it is **not** judged -- the same rule
+///   [`loader_targets`] states for a loader's arguments. `#!/usr/bin/env python3` is decided as
+///   `/usr/bin/env`, so a payload carried in that argument runs only under an interpreter a rule
+///   already allows.
+///
+/// [`ScriptHead::Unsettled`] is the answer wherever the name a rule would match cannot be
+/// established, and the caller refuses on it: an empty interpreter, one that is not valid UTF-8 (the
+/// policy matches `String`s), a **relative** path (the kernel execs it against a working directory
+/// this walk does not resolve), or a word running to the end of a head that was itself cut short --
+/// where the path may continue in bytes neither the kernel nor this read has.
+pub(crate) fn shebang_interpreter(head: &[u8]) -> ScriptHead {
+    let Some(line) = head.strip_prefix(b"#!") else {
+        return ScriptHead::NotScript;
+    };
+    // A head filled to the ceiling may be the start of a longer line, which is what makes a word
+    // ending at its edge undecidable below. A shorter one is the whole file, so its end is a real
+    // end of line.
+    let truncated = head.len() >= SCRIPT_HEAD;
+    let terminator = line.iter().position(|b| *b == b'\n' || *b == 0);
+    // Whether what follows is a whole line: one the file ended, or one a terminator closed. A head
+    // filled to the ceiling with neither is a line that may go on in bytes this read does not have.
+    let ended = terminator.is_some() || !truncated;
+    let line = match terminator {
+        Some(end) => &line[..end],
+        None => line,
+    };
+    let rest = &line[line
+        .iter()
+        .position(|b| *b != b' ' && *b != b'\t')
+        .unwrap_or(line.len())..];
+    let word = &rest[..rest
+        .iter()
+        .position(|b| *b == b' ' || *b == b'\t')
+        .unwrap_or(rest.len())];
+    // A word the head's own edge ended is a word that may go on in bytes this read does not have.
+    if word.is_empty() || (!ended && word.len() == rest.len()) {
+        return ScriptHead::Unsettled;
+    }
+    match std::str::from_utf8(word) {
+        Ok(path) if path.starts_with('/') => {
+            ScriptHead::Interpreter(lexical_path(path).into_owned())
+        }
+        _ => ScriptHead::Unsettled,
+    }
 }
 
 /// The final path component (the basename), or the whole string when there is no `/`. Taken from an
@@ -838,6 +935,69 @@ mod tests {
             loader_targets(&borrowed, true),
             None,
             "a name the policy cannot carry is one no rule can speak about"
+        );
+    }
+
+    /// The `#!` grammar this walk reads is the kernel's own, so each arm here was measured against
+    /// a real `execve` before it was written down.
+    #[test]
+    fn a_shebang_line_names_its_interpreter_and_nothing_further() {
+        use ScriptHead::{Interpreter, NotScript, Unsettled};
+        let interp = |s: &str| Interpreter(s.to_string());
+
+        assert_eq!(
+            shebang_interpreter(b"#!/bin/sh\necho hi\n"),
+            interp("/bin/sh")
+        );
+        // Spaces and tabs between `#!` and the path are skipped, both measured.
+        assert_eq!(shebang_interpreter(b"#! /bin/sh\n"), interp("/bin/sh"));
+        assert_eq!(shebang_interpreter(b"#!\t/bin/sh\n"), interp("/bin/sh"));
+        // One argument may follow, and it is not judged: `env` is the interpreter here.
+        assert_eq!(
+            shebang_interpreter(b"#!/usr/bin/env python3\n"),
+            interp("/usr/bin/env")
+        );
+        // A NUL cuts the line exactly as a newline does, which is what the kernel was seen to do.
+        assert_eq!(shebang_interpreter(b"#!/bin/sh\0-x\n"), interp("/bin/sh"));
+        // A last line with no newline at all is still a whole line: the file ended it.
+        assert_eq!(shebang_interpreter(b"#!/bin/sh"), interp("/bin/sh"));
+        // Folded like every other path a rule is matched against.
+        assert_eq!(shebang_interpreter(b"#!/bin//./sh\n"), interp("/bin/sh"));
+
+        // Not a script: the file's own path is the only thing the exec runs.
+        assert_eq!(shebang_interpreter(b"\x7fELF\x02\x01"), NotScript);
+        assert_eq!(shebang_interpreter(b"#/bin/sh\n"), NotScript);
+        assert_eq!(shebang_interpreter(b""), NotScript);
+
+        // Unsettled, and the caller refuses on each: no name a rule could speak about.
+        assert_eq!(shebang_interpreter(b"#!\n"), Unsettled, "no interpreter");
+        assert_eq!(shebang_interpreter(b"#!   \n"), Unsettled, "blank only");
+        assert_eq!(
+            shebang_interpreter(b"#!bin/sh\n"),
+            Unsettled,
+            "a relative interpreter is exec'd against a directory this walk does not resolve"
+        );
+        let mut odd = b"#!/bin/s".to_vec();
+        odd.push(0xff);
+        odd.push(b'\n');
+        assert_eq!(
+            shebang_interpreter(&odd),
+            Unsettled,
+            "a name the policy cannot carry is one no rule can speak about"
+        );
+
+        // A word running to the edge of a head that was itself cut short may go on in bytes this
+        // read does not have, so it is not a settled name. Measured: the kernel truncates such a
+        // line and runs it anyway, which is why the ceiling cannot simply be treated as a line end.
+        let long = [b"#!/bin/".to_vec(), vec![b'x'; SCRIPT_HEAD]].concat();
+        assert_eq!(shebang_interpreter(&long[..SCRIPT_HEAD]), Unsettled);
+        // But a word the truncated head did end is settled, argument or not.
+        let mut ended = b"#!/bin/sh ".to_vec();
+        ended.extend(std::iter::repeat_n(b'x', SCRIPT_HEAD));
+        assert_eq!(
+            shebang_interpreter(&ended[..SCRIPT_HEAD]),
+            interp("/bin/sh"),
+            "the interpreter is whole; only its argument was cut, and arguments are not judged"
         );
     }
 

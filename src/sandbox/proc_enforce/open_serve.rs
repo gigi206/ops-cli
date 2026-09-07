@@ -299,7 +299,7 @@ pub(super) fn serve_creation(
     // is not one to create in, whatever it holds.
     // Never `own`: a file is created in a directory a mount vouches for, and no anonymous inode is
     // a directory to create in.
-    let Ok(parent) = vouched_probe(lens, req.pid, parent, false) else {
+    let Ok(parent) = vouched_probe(lens.mounts(), req.pid, parent, false) else {
         return Creation::Declined;
     };
     let Ok(cbase) = std::ffi::CString::new(base) else {

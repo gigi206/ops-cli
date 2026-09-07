@@ -93,19 +93,32 @@
 //!   only make `execve` **more** restrictive (this filter's `USER_NOTIF` outranks a later `ALLOW`), so
 //!   it can deny its own `execve` but never run a denied binary without the supervisor's `CONTINUE`.
 //!
-//! One route the kernel does **not** close, and this enumeration used to read as though there were
-//! none: the interpreter a `#!` line names. `execve("./script")` on a file whose first two bytes are
-//! `#!` is a single syscall — the kernel loads the named interpreter inside that same call, and no
-//! second `execve` is ever issued — so the supervisor is notified of `./script` and never of
-//! `/bin/sh`. A `deny` on `/bin/sh` therefore does not stop a script that runs under it, and the same
-//! holds for every `binfmt_misc` handler (a registered interpreter for a `.jar`, a `.py`, a wine
-//! binary): the enrolled interpreter runs without a notification of its own. The rule that leaves is
-//! exact, and is the one to hold: **a rule decides what may be `execve`d, and an interpreter reached
-//! through a `#!` line is decided by the script's own path, not by the interpreter's.** Under
-//! `confine` that means a script is exactly as confined as the allowlist entry that let the *script*
-//! run. Closing it needs the target's first two bytes read through a vouched probe (the shape the
-//! open lens already walks) and the interpreter decided as well, on the stricter of the two verdicts;
-//! that is not done today, and saying so is not the same as doing it.
+//! Two routes the kernel does not close by issuing a second `execve`, and only one of them is shut
+//! here. `execve("./script")` on a file whose first two bytes are `#!` is a single syscall — the
+//! kernel loads the named interpreter inside that same call — so the supervisor is notified of
+//! `./script` and never of `/bin/sh`. That one is closed: the target's first bytes are read through
+//! a vouched probe (the shape the open lens walks, [`exec_head`]), the `#!` line is parsed
+//! ([`crate::proc_policy::shebang_interpreter`]), and the interpreter is decided as well, on the
+//! stricter of the two verdicts. The interpreter's own *argument* is not decided, for the reason
+//! [`crate::proc_policy::loader_targets`] gives about a loader's: `#!/usr/bin/env python3` is
+//! decided as `/usr/bin/env`, so a payload spelled there runs only under an interpreter a rule
+//! already allows.
+//!
+//! **`binfmt_misc` is the route that stays open.** A registered handler for a `.jar`, a `.py` or a
+//! wine binary runs an interpreter that nothing in the file names, so no read of the file can find
+//! it; the enrolled interpreter runs without a notification of its own, and a rule about it is not
+//! consulted. Under `confine` such a target is exactly as confined as the allowlist entry that let
+//! the *file* run.
+//!
+//! Two consequences of reading the file are written here because they are the price. A target this
+//! supervisor can reach and **not read** is refused rather than run, whatever the policy says about
+//! its path: measured, a script in mode `0111` is unreadable to a same-uid supervisor while
+//! `execve` on it succeeds and the interpreter starts — with the payload spelled in the
+//! interpreter's own argument (`#!/usr/bin/perl -esystem(…)`) the script is never needed at all, so
+//! taking the path's verdict alone there would run a denied interpreter behind a file the cage made
+//! unreadable on purpose. The cost is that an execute-only file does not run under an exec policy.
+//! And the line read is the line of that moment: a `deny` formed on it holds, while an allow is as
+//! TOCTOU-racy as every other `CONTINUE` below.
 //!
 //! So a `deny` is a hard stop on the `execve` it names. What exec enforcement is *not* is a full
 //! containment boundary: an agent can do harm **in-process** (in its own interpreter) without
@@ -142,11 +155,12 @@ mod target;
 pub(crate) use overlay::ProcOverlay;
 pub(crate) use pending::PendingExec;
 
+use cagepath::open_target_path;
 use notify::{
     notif_id_valid, notif_of, notif_recv_code, poll_events, poll_readable, recv_fd,
     respond_continue, respond_errno,
 };
-use open_lens::{OpenLens, handle_open, probe_in_cage_root};
+use open_lens::{CageMounts, OpenLens, handle_open, probe_and_vouch, probe_in_cage_root};
 use pending::SWEEP_EVERY;
 use report::{Undecidable, unmatched_word};
 use target::{exec_args, exec_argv_arg, open_args, read_argv, read_exec_path};
@@ -354,6 +368,7 @@ fn start_inner(
     let undecidable = Arc::new(Undecidable::default());
     let counted = undecidable.clone();
     let lens = open.map(|(policy, root)| OpenLens::new(policy, root));
+    let exec_mounts = CageMounts::default();
     let lens_armed = lens.is_some();
     let handle = std::thread::spawn(move || {
         supervise(
@@ -366,6 +381,8 @@ fn start_inner(
                 pending: &pending,
                 notifier: &notifier,
                 open: lens.as_ref(),
+                // One cache either way: the lens keeps its own, and a launch without one gets this.
+                mounts: lens.as_ref().map_or(&exec_mounts, |l| l.mounts()),
                 undecidable: &counted,
             },
         );
@@ -502,6 +519,65 @@ fn exec_verdict(
                 };
             }
         }
+        // A `#!` line makes one `execve` run a *different* program too: the kernel reads the line
+        // and executes the interpreter it names, with the script's path appended. The supervisor is
+        // notified of the script and never of the interpreter, so a rule about `/bin/sh` is decided
+        // against `./script` unless the line is read here. Not read when the path's own verdict is
+        // already `deny`, where no stricter answer exists and the read would buy nothing.
+        // Skipped where the policy could not act on what a read found: `[proc]` off with the
+        // content lens armed builds an `enforce` denylist with nothing on it, and there a refusal
+        // formed on an unreadable file would stop a program no rule speaks about. Skipped too when
+        // the path's own verdict is already `deny`, where no stricter answer exists.
+        if verdict != Verdict::Deny && (!cx.policy.governs_nothing() || cx.overlay.has_rules()) {
+            match exec_head(cx.mounts, pid, dirfd, &path, notif) {
+                Ok(head) => match crate::proc_policy::shebang_interpreter(&head) {
+                    // The file is what runs; its own verdict already stands.
+                    crate::proc_policy::ScriptHead::NotScript => {}
+                    crate::proc_policy::ScriptHead::Interpreter(interp) => {
+                        let with = cx.overlay.decide(cx.policy, caller, &interp);
+                        let stricter = verdict.stricter(with);
+                        // Named in the record only where it changed the answer, which is the
+                        // difference from a loader: there the notified path (`ld.so`) says nothing
+                        // about what runs, while here it is the program the user launched and the
+                        // interpreter is worth naming exactly when it is what decided.
+                        if stricter != verdict {
+                            return Decided {
+                                verdict: stricter,
+                                shown: format!("{path} (#! {interp})"),
+                                probed: path,
+                                because: Because::Policy,
+                            };
+                        }
+                    }
+                    crate::proc_policy::ScriptHead::Unsettled => {
+                        return Decided {
+                            verdict: Verdict::Deny,
+                            shown: path.clone(),
+                            probed: path,
+                            because: Because::UnreadableShebang,
+                        };
+                    }
+                },
+                // The target is gone, was never there, or this kernel has no scoped resolution to
+                // reach it with: the exec fails on its own, and `probe_in_cage_root` has already
+                // said the last of the three out loud.
+                Err(libc::ENOENT) | Err(libc::ESRCH) | Err(libc::ENOSYS) => {}
+                // Reached and not readable, which is the one arm that must refuse. Measured: a
+                // script in mode `0111` cannot be read by a same-uid supervisor, yet `execve` on it
+                // succeeds and the interpreter runs -- with `#!/usr/bin/perl -esystem(...)` the
+                // payload rides in the interpreter's own argument and never needs the script at
+                // all. Taking the path's verdict alone there would let a denied interpreter run
+                // behind a file the cage made unreadable on purpose.
+                Err(_) => {
+                    return Decided {
+                        verdict: Verdict::Deny,
+                        shown: path.clone(),
+                        probed: path,
+                        because: Because::UnreadableShebang,
+                    };
+                }
+            }
+        }
         return Decided {
             verdict,
             shown: path.clone(),
@@ -552,6 +628,9 @@ enum Because {
     /// A dynamic loader was named, and what it would load could not be established from its
     /// argument list -- so no rule could speak about it, and it is refused rather than run.
     UnreadableLoaderArgv,
+    /// The target is a script, or is a file this supervisor could reach and not read, so the
+    /// interpreter the kernel would run inside the same syscall could not be named.
+    UnreadableShebang,
 }
 
 /// The final component of an already-folded path, for the loader test.
@@ -563,6 +642,58 @@ fn basename_of(path: &str) -> &str {
         Some(i) => &path[i + 1..],
         None => path,
     }
+}
+
+/// The first bytes of the file an `execve` names, read the way the cage's own walk would reach it.
+///
+/// [`crate::proc_policy::SCRIPT_HEAD`] bytes, which is what the kernel itself reads before deciding
+/// whether the file is a script. Fewer are returned only when the file is shorter.
+///
+/// Resolved through [`probe_and_vouch`] and not by opening the path directly, for the reason
+/// [`refusal_errno`] gives at length: prefixing `/proc/<pid>/root` keeps the walk on the cage's
+/// mounts only until it meets a symlink whose target begins with `/`, and such a target restarts
+/// resolution at this process's root. A walk that left is either vouched for by a second resolution
+/// inside the cage's root or it is an error here, because reading the *wrong* file is how a script
+/// gets its interpreter decided as something the cage chose.
+///
+/// The errno distinguishes two things for the caller. `ENOENT`/`ESRCH` mean there was nothing to
+/// read -- the exec will fail on its own, or the target is already gone -- and the path's own
+/// verdict stands. Anything else, `EACCES` first among them, means a file that is *there* and whose
+/// first bytes this supervisor cannot see, and the caller refuses on it.
+fn exec_head(
+    mounts: &CageMounts,
+    pid: u32,
+    dirfd: libc::c_int,
+    path: &str,
+    notif: Option<(libc::c_int, u64)>,
+) -> Result<Vec<u8>, libc::c_int> {
+    use std::io::Read;
+    use std::os::unix::io::AsRawFd;
+    let probe = probe_and_vouch(mounts, pid, &open_target_path(pid, dirfd, path), false)?;
+    // The probe is an `O_PATH` descriptor, which no read answers; reopening through it reads the
+    // object already resolved rather than whatever the path names a moment later -- and it is also
+    // where a file the cage may execute and not read says `EACCES`.
+    let mut file = std::fs::File::open(format!("/proc/self/fd/{}", probe.as_raw_fd()))
+        .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
+    let mut head = vec![0u8; crate::proc_policy::SCRIPT_HEAD];
+    let mut filled = 0;
+    while filled < head.len() {
+        match file.read(&mut head[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.raw_os_error().unwrap_or(libc::EIO)),
+        }
+    }
+    head.truncate(filled);
+    // Every path above named a pid, and a target reaped mid-decision can have its number reissued
+    // under the read. Asked after it, like the argument list's own -- see [`target::open_target_mem`].
+    if let Some((notif_fd, id)) = notif
+        && !notif_id_valid(notif_fd, id)
+    {
+        return Err(libc::ESRCH);
+    }
+    Ok(head)
 }
 
 /// The programs a notified loader `execve` would run, read from the parked target's own `argv`.
@@ -590,6 +721,13 @@ struct Deciding<'a> {
     notifier: &'a crate::sandbox::notify_sink::Notifier,
     /// The content lens, when this launch asked for one.
     open: Option<&'a OpenLens>,
+    /// The mounts each cage namespace can see, which is what tells a supervisor's own path walk
+    /// that stayed inside the cage from one that left it through an absolute symlink.
+    ///
+    /// Held here and not only inside the lens because the exec path needs the same question
+    /// answered and the lens is optional: a launch with no `[open]` policy still reads the first
+    /// bytes of what it is about to run, and a walk it cannot vouch for is one it must not read.
+    mounts: &'a CageMounts,
     /// Shared with the [`ProcEnforce`] that owns this supervisor, which reports the totals once the
     /// thread has been joined.
     undecidable: &'a Undecidable,
@@ -869,6 +1007,11 @@ fn handle_notif(notif_fd: libc::c_int, req: &libc::seccomp_notif, cx: &Deciding<
                         Because::UnreadableLoaderArgv => "this is a dynamic loader, and the \
                              program its arguments name could not be read — so the exec policy had \
                              no name to match and it was refused rather than run"
+                            .to_string(),
+                        Because::UnreadableShebang => "the first bytes of this file could not \
+                             be read, so the interpreter a `#!` line may name could not be \
+                             decided — and a file this sandbox can reach without reading runs its \
+                             interpreter all the same, so it was refused rather than run"
                             .to_string(),
                         Because::Policy if by.is_empty() => {
                             "the exec policy does not allow this program to run".to_string()

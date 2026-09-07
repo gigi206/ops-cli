@@ -123,6 +123,37 @@ adds **visibility and a hard veto on what the agent execs** on top of the two th
 The `enforce`/`ask` feed (`sbx proc logs`) shows the resolved **exec path** the agent is running (the
 thing policy matches on), not the full argv: a `curl https://…` appears as `…/bin/curl`.
 
+### A program named through another program
+
+One `execve` can run a program other than the one it names, and sbx decides both. Two shapes reach
+that far:
+
+- **A dynamic loader on the command line.** `ld-linux-x86-64.so.2 /usr/bin/curl` is a single
+  `execve` whose path is the loader's, so a `deny = "curl"` matched on that path alone would not
+  fire. sbx reads the loader's own argument list and decides the program it names too, taking the
+  stricter of the two answers. Options that consume the next word (`--library-path`, `--preload`)
+  are stepped over rather than mistaken for the program.
+- **A `#!` line.** `./deploy.sh` starting with `#!/bin/sh` is a single `execve` as well: the kernel
+  reads the line and runs `/bin/sh` inside that same call, with no second syscall to notify. sbx
+  reads the first 256 bytes of the target, the amount the kernel itself reads, and decides the
+  interpreter too. So `deny = "sh"` stops a shell script, not only a shell typed at a prompt.
+
+In both shapes the interpreter's **arguments** are not decided, only the program: `#!/usr/bin/env
+python3` is decided as `/usr/bin/env`, and `ld.so /bin/grep curl` is not refused by a rule about
+`curl`. A payload written in an argument therefore runs only under an interpreter a rule already
+allows.
+
+Two consequences follow from reading the file, and both are deliberate:
+
+- **A file sbx can execute but not read is refused.** A script in mode `0111` is unreadable even to
+  its owner, yet the kernel still runs its interpreter, and a payload spelled in the interpreter's
+  argument never needs the script at all. Since what the `#!` line would have said is exactly what
+  could not be established, the answer is a refusal. The cost: an execute-only file does not run
+  under an exec policy, however it is spelled.
+- **`binfmt_misc` stays open.** A handler registered for `.jar`, `.py` or a wine binary runs an
+  interpreter that nothing in the file names, so no read can find it. Under `confine` such a target
+  is exactly as confined as the allowlist entry that let the file itself run.
+
 ## What enforcement puts inside the cage
 
 Only the kernel can hand out the descriptor that lets a supervisor decide an `execve`, and only the

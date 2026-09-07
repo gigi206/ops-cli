@@ -42,6 +42,13 @@ impl ProcOverlay {
         }
     }
 
+    /// Whether a session has added any rule, which is what makes a policy that governs nothing on
+    /// its own start governing something.
+    pub(crate) fn has_rules(&self) -> bool {
+        let g = read_locked(&self.inner);
+        !g.allow.is_empty() || !g.deny.is_empty()
+    }
+
     /// Add a rule to the overlay (a `Deny` verdict to the deny list, else the allow list), deduped on
     /// the exact raw string. Returns whether it was newly added.
     pub(crate) fn remember(&self, verdict: Verdict, rule: &str) -> bool {

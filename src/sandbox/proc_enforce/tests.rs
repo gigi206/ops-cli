@@ -97,6 +97,7 @@ fn run_with_open_lens(
                     pending: &pending,
                     notifier: &crate::sandbox::notify_sink::Notifier::disabled(),
                     open: Some(&lens),
+                    mounts: lens.mounts(),
                     undecidable: &Undecidable::default(),
                 },
             );
@@ -2242,6 +2243,7 @@ fn run_under_supervisor_notified(
                     pending: &pending,
                     notifier,
                     open: None,
+                    mounts: &CageMounts::default(),
                     undecidable: &Undecidable::default(),
                 },
             );
@@ -2539,6 +2541,126 @@ fn own_dynamic_loader() -> Option<PathBuf> {
         })
 }
 
+/// A program a rule denies does not run because a `#!` line named it instead of the command line.
+///
+/// `execve("./script")` on a file starting with `#!` is a single syscall that runs a *different*
+/// program: the kernel reads the line and executes the interpreter, appending the script's path. The
+/// supervisor is notified of the script and never of the interpreter, so a rule about `sh` is
+/// decided against `s.sh` and hands the answer to the mode's unmatched default. Nothing is forged:
+/// the interpreter is the system's own and the whole manoeuvre is a two-line file.
+///
+/// The witness arm is what keeps this from passing for the wrong reason -- the same script under a
+/// policy denying something else must run to completion and return its own exit code.
+#[test]
+fn the_interpreter_a_shebang_names_is_decided_too() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TmpDir::new();
+    let path = dir.join("s.sh");
+    std::fs::write(&path, "#!/bin/sh\nexit 7\n").expect("write the script");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let script = path.to_str().expect("utf-8 script path").to_string();
+
+    // The witness: the script really runs here, so the refusal below is the rule and not the
+    // harness failing to launch a script at all.
+    let elsewhere = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/nonexistent".to_string()]);
+    let (code, _) = run_under_supervisor(&[&script], &elsewhere, &ProcOverlay::new());
+    assert_eq!(
+        code,
+        Some(7),
+        "the script must really run its interpreter here, or this test measures nothing"
+    );
+
+    // The finding: a `deny` on the interpreter stops it, though the syscall named the script.
+    let denied = ProcPolicy::new(ProcMode::Enforce, &[], &["sh".to_string()]);
+    let (code, ring) = run_under_supervisor(&[&script], &denied, &ProcOverlay::new());
+    assert_eq!(
+        code,
+        Some(126),
+        "a denied interpreter must not run because a `#!` line named it"
+    );
+    let events = ring.snapshot(None).events;
+    assert!(
+        events
+            .iter()
+            .any(|e| e.verdict == "deny" && e.command.contains("/bin/sh")),
+        "the record names the interpreter the rule spoke about, not only the script: {events:?}"
+    );
+}
+
+/// A file this supervisor can reach and not read is refused rather than run.
+///
+/// Measured, and it is the arm that makes the read worth doing: a script in mode `0111` cannot be
+/// read by a same-uid supervisor, yet `execve` on it succeeds and the kernel runs the interpreter --
+/// it is the *interpreter* that then fails to reopen the script, after it has already started. With
+/// `#!/usr/bin/perl -esystem(...)` the payload rides in the interpreter's own argument and the
+/// script is never needed at all. Deciding such a target on its path alone would let a denied
+/// interpreter run behind a file the cage made unreadable on purpose.
+#[test]
+fn a_target_that_can_be_reached_and_not_read_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TmpDir::new();
+    let path = dir.join("x.sh");
+    std::fs::write(&path, "#!/bin/sh\nexit 7\n").expect("write the script");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o111)).expect("chmod");
+    let script = path.to_str().expect("utf-8 script path").to_string();
+    if std::fs::read(&path).is_ok() {
+        return; // running with a capability that overrides the mode; the case cannot be posed
+    }
+
+    // The witness, taken outside the supervisor because that is where the vector lives: the kernel
+    // really does exec this file and really does start `/bin/sh`. The shell's own diagnostic on
+    // stderr and its exit code are what say so -- an `execve` the kernel had refused would return
+    // `EACCES` to the caller instead, and no shell would have run at all.
+    let ran = std::process::Command::new(&path)
+        .output()
+        .expect("spawn the unreadable script");
+    assert_eq!(
+        ran.status.code(),
+        Some(2),
+        "the kernel must really start the interpreter here, or this test measures nothing"
+    );
+    assert!(
+        String::from_utf8_lossy(&ran.stderr).contains("cannot open"),
+        "and the failure must be the shell's own, after it started: {:?}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+
+    // The finding: unreadable is refused, not waved through on the path's own verdict. Refused
+    // under any policy and not only one naming `sh`, which is the deliberate part: what the `#!`
+    // line would have said is exactly what could not be established, so there is no rule to consult
+    // and the only safe answer is the one the syscall never runs on. The cost is stated with it --
+    // an execute-only file does not run under an exec policy, however it is spelled.
+    // But a policy that governs nothing does not refuse it. That shape is not hypothetical: a
+    // launch that arms only the content lens builds exactly this exec side, and stopping an
+    // execute-only file there would be a refusal no rule asked for.
+    let governs_nothing = ProcPolicy::new(ProcMode::Enforce, &[], &[]);
+    assert!(governs_nothing.governs_nothing(), "the premise of this arm");
+    let (code, _) = run_under_supervisor(&[&script], &governs_nothing, &ProcOverlay::new());
+    assert_eq!(
+        code,
+        Some(2),
+        "with nothing to decide, the unreadable file is left to the kernel and the shell's own \
+         failure comes back"
+    );
+
+    for rules in [vec!["sh".to_string()], vec!["/bin/nonexistent".to_string()]] {
+        let policy = ProcPolicy::new(ProcMode::Enforce, &[], &rules);
+        let (code, ring) = run_under_supervisor(&[&script], &policy, &ProcOverlay::new());
+        assert_eq!(
+            code,
+            Some(126),
+            "a file that can be executed and not read must be refused rather than run"
+        );
+        assert!(
+            ring.snapshot(None)
+                .events
+                .iter()
+                .any(|e| e.verdict == "deny"),
+            "and the refusal is recorded"
+        );
+    }
+}
+
 /// A program a rule denies does not run because a dynamic loader was named in front of it.
 ///
 /// `ld.so /usr/bin/curl` is a single `execve`, and the path it carries is the loader's. The kernel
@@ -2806,6 +2928,7 @@ struct DecidingParts {
     notifier: crate::sandbox::notify_sink::Notifier,
     undecidable: Undecidable,
     lens: Option<OpenLens>,
+    mounts: CageMounts,
 }
 
 impl DecidingParts {
@@ -2813,6 +2936,7 @@ impl DecidingParts {
         DecidingParts {
             overlay: ProcOverlay::new(),
             ring: ExecRing::new(8),
+            mounts: CageMounts::default(),
             pending: PendingExec::new(),
             notifier: crate::sandbox::notify_sink::Notifier::disabled(),
             undecidable: Undecidable::default(),
@@ -2840,6 +2964,7 @@ impl DecidingParts {
             pending: &self.pending,
             notifier: &self.notifier,
             open: self.lens.as_ref(),
+            mounts: &self.mounts,
             undecidable: &self.undecidable,
         }
     }

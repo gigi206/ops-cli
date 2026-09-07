@@ -1029,6 +1029,15 @@ fn a_script_commands_node_is_keyed_on_the_interpreter_that_runs_it() {
         Verdict::Deny,
         "and the file itself never runs, so a node on it would be read by nothing"
     );
+    // The shim's own exec of the command is decided against the interpreter as well, since the
+    // kernel runs it inside that one syscall. Admitting only the script would refuse the task at
+    // its first step under a policy whose whole purpose is to let the command run.
+    let shim = [super::super::proc_enforce::SHIM_CAGE_PATH.to_string()];
+    assert_eq!(
+        policy.decide(&shim, "/nix/store/demo/bin/sh"),
+        Verdict::Allow,
+        "the interpreter the command is entered as must be admitted for the command to start"
+    );
 }
 
 /// The same rule, for the nodes `[exec.<program>]` declares — which skipped it.

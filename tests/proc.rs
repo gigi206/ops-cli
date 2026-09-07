@@ -418,6 +418,83 @@ fn run_observe_streams_exec_events() {
     );
 }
 
+/// A `#!` line's interpreter is decided in a real cage, where the script is named relatively.
+///
+/// The unit tests for this run the supervisor in the harness's own mount namespace, so they say
+/// nothing about the walk that reaches the file: here the target is inside the cage's own mounts and
+/// is spelled `./s.sh`, which is resolved against the caller's working directory rather than from a
+/// path the supervisor could read straight off the syscall. Denying `sh` must stop it all the same.
+///
+/// Skipped rather than failed where the witness arm does not run, which is measured and not assumed:
+/// a cage whose root has no `/bin/sh` cannot pose the question at all.
+#[test]
+fn enforce_decides_the_interpreter_a_shebang_names_in_a_real_cage() {
+    let script = "#!/bin/sh\necho SHEBANG-RAN\n";
+    let run_with = |deny: &str| {
+        let (project, data) = (TmpDir::new("p"), TmpDir::new("p"));
+        std::fs::write(
+            project.path().join(".sbx.toml"),
+            format!("[proc]\nmode = \"enforce\"\ndeny = [\"{deny}\"]\n"),
+        )
+        .unwrap();
+        let path = project.path().join("s.sh");
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let trusted = sbx_isolated()
+            .args(["trust"])
+            .current_dir(project.path())
+            .env("XDG_DATA_HOME", data.path())
+            .env("XDG_STATE_HOME", data.path())
+            .output()
+            .expect("sbx trust");
+        assert!(
+            trusted.status.success(),
+            "trust failed: {}",
+            String::from_utf8_lossy(&trusted.stderr)
+        );
+        let run = sbx_isolated()
+            .args(["run", "--", "./s.sh"])
+            .current_dir(project.path())
+            .env("XDG_DATA_HOME", data.path())
+            .env("XDG_STATE_HOME", data.path())
+            .stdin(Stdio::null())
+            .output()
+            .expect("run the script");
+        (
+            String::from_utf8_lossy(&run.stdout).into_owned(),
+            String::from_utf8_lossy(&run.stderr).into_owned(),
+        )
+    };
+
+    {
+        let (project, data) = (TmpDir::new("p"), TmpDir::new("p"));
+        probe_or_skip!(
+            "proc shebang e2e",
+            sandbox_probe(project.path(), data.path())
+        );
+    }
+
+    // The witness: under a policy denying something else the script runs and prints. Where it does
+    // not, this host's cage has no `/bin/sh` to reach and the question cannot be posed here.
+    let (out, err) = run_with("id");
+    if !out.contains("SHEBANG-RAN") {
+        eprintln!("SHEBANG-E2E: skipped, the witness did not run: stdout={out:?} stderr={err:?}");
+        return;
+    }
+    eprintln!("SHEBANG-E2E: witness ran, the question is posed");
+
+    // The finding: a `deny` on the interpreter stops the script, though the syscall named `./s.sh`.
+    let (out, err) = run_with("sh");
+    assert!(
+        !out.contains("SHEBANG-RAN"),
+        "a denied interpreter must not run because a `#!` line named it: stdout={out:?} stderr={err:?}"
+    );
+}
+
 #[test]
 fn enforce_blocks_a_denied_binary_in_a_real_cage() {
     // The headline of the enforcement increment: `[proc] mode = "enforce"` blocks a denied exec

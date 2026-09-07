@@ -501,14 +501,14 @@ pub(super) fn probe_in_cage_root(pid: u32, absolute: &Path) -> Result<libc::c_in
 /// so a secret named through an absolute link is still scanned and still refused, and a store path
 /// named through one is still served.
 pub(super) fn vouched_probe(
-    lens: &OpenLens,
+    mounts: &CageMounts,
     pid: u32,
     probe: std::fs::File,
     own: bool,
 ) -> Result<std::fs::File, libc::c_int> {
     use std::os::unix::io::{AsRawFd, FromRawFd};
     if let Some(id) = mount_id(probe.as_raw_fd())
-        && lens.mounts.holds(pid, id)
+        && mounts.holds(pid, id)
     {
         return Ok(probe);
     }
@@ -557,6 +557,14 @@ pub(super) struct OpenLens {
 }
 
 impl OpenLens {
+    /// The mount sets this lens has learned, for a walk taken outside it.
+    ///
+    /// A launch that arms the lens has one cache of them and would otherwise grow a second, since
+    /// [`vouched_probe`] asks the same question for every walk and not only for an open.
+    pub(super) fn mounts(&self) -> &CageMounts {
+        &self.mounts
+    }
+
     pub(super) fn new(policy: crate::open_policy::OpenPolicy, root: PathBuf) -> OpenLens {
         OpenLens {
             policy,
@@ -581,8 +589,8 @@ impl OpenLens {
 /// describes a path the cage was going to fail on too — which is what lets the answer be given
 /// without a second walk, and closes the last way a `CONTINUE` could be reached by naming something
 /// absent while the answer is formed and putting the secret behind it afterwards.
-fn probe_and_vouch(
-    lens: &OpenLens,
+pub(super) fn probe_and_vouch(
+    mounts: &CageMounts,
     pid: u32,
     target: &Path,
     own: bool,
@@ -603,7 +611,7 @@ fn probe_and_vouch(
     // Before a byte is read from it or it is handed over: is this what the *cage's* walk would have
     // reached? Asked before the type test below, because a device and a FIFO are served from the
     // probe without ever being scanned — and `/dev/stdout` is exactly such a device.
-    vouched_probe(lens, pid, probe, own)
+    vouched_probe(mounts, pid, probe, own)
 }
 
 /// Decide one notified open: does the file it names carry a configured shape?
@@ -628,7 +636,7 @@ pub(super) fn open_is_refused(
     // A path that names the caller's own `/proc` entry is one whose object the caller already holds,
     // which is what lets an anonymous inode behind it be accepted where no mount could vouch for it.
     let own = caller_proc_path(pid, path).is_some();
-    let probe = match probe_and_vouch(lens, pid, &open_target_path(pid, dirfd, path), own) {
+    let probe = match probe_and_vouch(&lens.mounts, pid, &open_target_path(pid, dirfd, path), own) {
         Ok(probe) => probe,
         // Nothing was reached, or what was reached is not what the cage's walk would have found.
         // Before answering with that, one more question: does the path arrive at the caller's own
@@ -640,7 +648,12 @@ pub(super) fn open_is_refused(
             let Some(reached) = proc_self_behind_a_link(pid, dirfd, path) else {
                 return OpenOutcome::failed(e);
             };
-            match probe_and_vouch(lens, pid, &open_target_path(pid, dirfd, &reached), true) {
+            match probe_and_vouch(
+                &lens.mounts,
+                pid,
+                &open_target_path(pid, dirfd, &reached),
+                true,
+            ) {
                 Ok(probe) => probe,
                 // The first answer, not the second: the link was a guess at what the path meant, and
                 // a guess that led nowhere says nothing about the open.
