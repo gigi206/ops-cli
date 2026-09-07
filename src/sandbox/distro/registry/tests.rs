@@ -163,3 +163,45 @@ fn only_a_basic_challenge_is_answered_with_the_credential_itself() {
     // And a Basic challenge with nothing configured falls through rather than inventing an error.
     assert_eq!(basic_answer("Basic realm=\"private\"", None), None);
 }
+
+/// A registry that does not challenge can still serve a layer larger than the document cap.
+///
+/// The challenge probe used to be a `GET`: on a registry that answers `401` first, its body is the
+/// small error document, and on one that does not — quay.io, registry.k8s.io, a local `registry:2`
+/// — it is the blob itself, which the document cap then refused. So no layer past four megabytes
+/// could be fetched from those registries at all, and the tests never saw it because they use a
+/// registry that challenges and a layer under the cap. The probe asks with a `HEAD` now.
+///
+/// This asks the question without moving the blob: the manifest is resolved, the largest layer is
+/// picked, and the probe is run against its URL. What it must not be is an error about a cap.
+#[test]
+fn the_challenge_probe_does_not_read_the_blob_it_asks_about() {
+    let image =
+        crate::sandbox::distro::reference::parse("oci:quay.io/prometheus/prometheus:latest")
+            .expect("a valid reference");
+    let Ok(resolved) = super::resolve(&image, None) else {
+        skip_unreachable!("skipping the unchallenged-registry probe: the registry did not answer");
+        return;
+    };
+    let biggest = resolved
+        .layers
+        .iter()
+        .max_by_key(|l| l.size)
+        .expect("an image has layers");
+    assert!(
+        biggest.size > 4 * 1024 * 1024,
+        "the test needs a layer past the document cap, got {} bytes",
+        biggest.size
+    );
+    let url = v2_url(&image, "blobs", &biggest.digest);
+    let probe = super::super::http::head(&url, &[]).expect("the probe asks and does not read");
+    assert!(
+        (200..400).contains(&probe.status) || probe.status == 401,
+        "the probe reached the registry: status {}",
+        probe.status
+    );
+    assert!(
+        probe.body.is_empty(),
+        "a HEAD carries no body, so nothing was read"
+    );
+}

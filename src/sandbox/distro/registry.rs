@@ -249,7 +249,11 @@ fn get_authenticated_to_writer<W: io::Write>(
     sink: &mut W,
     cap: u64,
 ) -> io::Result<u64> {
-    let probe = http::get(url, &[])?;
+    // A `HEAD`: the question is whether this registry challenges, and the blob's own bytes are
+    // not part of the answer. Asking it with a `GET` meant a registry that does not challenge
+    // answered `200` with the layer, which the document cap then refused for being too large:
+    // no layer past four megabytes could be fetched from quay.io or registry.k8s.io at all.
+    let probe = http::head(url, &[])?;
     if probe.status == 401
         && let Some(challenge) = probe.header("www-authenticate")
     {

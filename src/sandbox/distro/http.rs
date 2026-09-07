@@ -132,9 +132,14 @@ type Head<S> = (u16, Vec<(String, String)>, Vec<u8>, BufReader<S>);
 /// Write a `GET` request, then read the response head and hand back the reader positioned at the
 /// body. Split from [`get`] so the streaming caller ([`get_to_writer`]) reads the body itself
 /// rather than through a buffer sized for a document.
-fn send<S: Read + Write>(stream: S, url: &Url, headers: &[(&str, &str)]) -> io::Result<Head<S>> {
+fn send<S: Read + Write>(
+    stream: S,
+    url: &Url,
+    headers: &[(&str, &str)],
+    method: &str,
+) -> io::Result<Head<S>> {
     let mut request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: sbx\r\nAccept-Encoding: identity\r\n\
+        "{method} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: sbx\r\nAccept-Encoding: identity\r\n\
          Connection: close\r\n",
         url.target, url.host
     );
@@ -177,12 +182,28 @@ fn send<S: Read + Write>(stream: S, url: &Url, headers: &[(&str, &str)]) -> io::
 ///
 /// `headers` are sent on the first request only; see the module note on why a redirect drops them.
 pub(super) fn get(url: &str, headers: &[(&str, &str)]) -> io::Result<Response> {
+    request(url, headers, "GET")
+}
+
+/// The same request without its body: the status and headers only.
+///
+/// For asking a question about a resource whose body is not wanted — whether the registry
+/// challenges for a blob, which is a question about the 401 and its `www-authenticate`. Asking it
+/// with `get` meant buffering whatever the server answered under the document cap, so a registry
+/// that does *not* challenge answered `200` with the blob itself and every layer past four
+/// megabytes was refused for being too large to hold: the probe read the thing it was only meant
+/// to ask about. A body a `HEAD` carries no framing for is not read at all.
+pub(super) fn head(url: &str, headers: &[(&str, &str)]) -> io::Result<Response> {
+    request(url, headers, "HEAD")
+}
+
+fn request(url: &str, headers: &[(&str, &str)], method: &str) -> io::Result<Response> {
     let mut current = url.to_string();
     let mut carry = headers;
     for _ in 0..=MAX_REDIRECTS {
         let parsed = parse_url(&current)?;
         let stream = connect(&parsed)?;
-        let (status, headers, head, mut reader) = send(stream, &parsed, carry)?;
+        let (status, headers, head, mut reader) = send(stream, &parsed, carry, method)?;
         if let Some(location) = redirect_target(status, &headers, &current)? {
             current = location;
             // Past the first hop the request is to somewhere the registry chose, so the caller's
@@ -190,7 +211,13 @@ pub(super) fn get(url: &str, headers: &[(&str, &str)]) -> io::Result<Response> {
             carry = &[];
             continue;
         }
-        let body = read_body(&mut reader, &head, MAX_DOCUMENT)?;
+        // A `HEAD` response describes a body it does not carry, so its `Content-Length` is the
+        // entity's and reading anything would block on bytes the server never sends.
+        let body = if method == "HEAD" {
+            Vec::new()
+        } else {
+            read_body(&mut reader, &head, MAX_DOCUMENT)?
+        };
         return Ok(Response {
             status,
             headers,
@@ -220,7 +247,7 @@ pub(super) fn get_to_writer<W: Write>(
     for _ in 0..=MAX_REDIRECTS {
         let parsed = parse_url(&current)?;
         let stream = connect(&parsed)?;
-        let (status, headers, head, mut reader) = send(stream, &parsed, carry)?;
+        let (status, headers, head, mut reader) = send(stream, &parsed, carry, "GET")?;
         if let Some(location) = redirect_target(status, &headers, &current)? {
             current = location;
             carry = &[];
