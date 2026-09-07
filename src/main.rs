@@ -1064,18 +1064,7 @@ fn inherited_posture(app: Option<&str>, base: &Path) -> config::manage::Inherite
 /// cage named rather than anything a user typed. The caller prints what comes back through
 /// [`diag::error`] and adds nothing to it.
 fn admit_egress_rule(rule: &str, slot: allowlist::Slot) -> Result<(), String> {
-    let trimmed = rule.trim();
-    if let Some(group) = trimmed.strip_prefix('@') {
-        if !config::is_valid_group_name(group) {
-            return Err(format!(
-                "invalid group reference {rule:?}: a group name must be 1–64 of [A-Za-z0-9._-]"
-            ));
-        }
-        return Ok(());
-    }
-    allowlist::classify_in(rule, slot)
-        .map(|_| ())
-        .map_err(|e| format!("invalid rule {rule:?}: {}", sandbox::sanitize(&e)))
+    config::manage::admit_egress_rule(rule, slot)
 }
 
 /// Persist an egress `rule` to the scoped config file, trust-gating a project write and re-trusting

@@ -785,8 +785,57 @@ fn scalar_value(val: &str) -> Value {
 /// strings too, so `sbx config add fs.deny /etc/shadow` parsed, committed, and was dropped by
 /// [`super::apply_fs`] at the next load — a mask the user was told had been written, over a path
 /// the cage goes on reading.
+pub(crate) fn admit_egress_rule(rule: &str, slot: crate::allowlist::Slot) -> Result<(), String> {
+    let trimmed = rule.trim();
+    if let Some(group) = trimmed.strip_prefix('@') {
+        if !super::is_valid_group_name(group) {
+            return Err(format!(
+                "invalid group reference {rule:?}: a group name must be 1–64 of [A-Za-z0-9._-]"
+            ));
+        }
+        return Ok(());
+    }
+    crate::allowlist::classify_in(rule, slot)
+        .map(|_| ())
+        .map_err(|e| format!("invalid rule {rule:?}: {}", crate::sandbox::sanitize(&e)))
+}
+
 fn validate_layer(doc: &DocumentMut) -> Result<(), String> {
     let raw = super::schema::parse(doc.to_string().as_bytes())?;
+    // The rule lists, baseline and per app. `sbx net allow` and `sbx proc allow` admit a rule
+    // against the resolver's own grammar before writing it; `sbx config set network.allow '[…]'`
+    // writes the same list in one go and went through neither, so `"*"`, an uncompilable `re:[`
+    // or a control byte was written, reported as set, blessed by `--trust`, and then dropped at
+    // load with a warning about a file the user had just been told was written.
+    let app_nets = raw.app.values().filter_map(|a| a.network.as_ref());
+    for field in raw.network.iter().chain(app_nets) {
+        let super::schema::NetworkField::Table(t) = field else {
+            continue;
+        };
+        for (slot, entries) in [
+            (crate::allowlist::Slot::Allow, &t.allow),
+            (crate::allowlist::Slot::Deny, &t.deny),
+            (crate::allowlist::Slot::Mute, &t.mute),
+        ] {
+            for entry in entries {
+                admit_egress_rule(entry, slot).map_err(|why| {
+                    format!("{why} — it would be dropped at load, and the rule never applied")
+                })?;
+            }
+        }
+    }
+    let app_procs = raw.app.values().filter_map(|a| a.proc.as_ref());
+    for field in raw.proc.iter().chain(app_procs) {
+        let super::schema::ProcField::Table(t) = field else {
+            continue;
+        };
+        for entries in [&t.allow, &t.deny] {
+            for entry in entries {
+                crate::proc_policy::validate_rule(entry)
+                    .map_err(|why| format!("`[proc]` rule `{entry}`: {why}"))?;
+            }
+        }
+    }
     let apps = raw.app.values().filter_map(|a| a.forward.as_ref());
     for entry in raw.forward.iter().chain(apps).flatten() {
         let mut warnings = Vec::new();
@@ -2224,6 +2273,46 @@ mod tests {
             before,
             "a refused set must leave the file byte-for-byte unchanged"
         );
+    }
+
+    #[test]
+    fn set_refuses_a_rule_list_entry_the_resolver_would_drop() {
+        // `sbx net allow` and `sbx proc allow` admit a rule against the resolver's own grammar
+        // before writing it. `sbx config set network.allow '[…]'` writes the same list in one go,
+        // and it went through neither: the entry was written, reported as set, blessed by a
+        // `--trust`, and then dropped at the next load with a warning about a file the user had
+        // just been told was written. The last two arms are the witness: a list of well-formed
+        // rules still writes.
+        let tmp = crate::testutil::TmpDir::new();
+        for (key, value) in [
+            ("network.allow", r#"["*"]"#),
+            ("network.deny", r#"["re:["]"#),
+            ("network.mute", "[\"ctl\u{1b}x\"]"),
+            ("app.demo.network.allow", r#"["*"]"#),
+            ("proc.deny", "[\"ctl\u{1b}x\"]"),
+        ] {
+            let p = doc_at(tmp.path(), "[network]\nmode = \"deny\"\n");
+            let before = std::fs::read_to_string(&p).unwrap();
+            let err = set(&p, key, value)
+                .err()
+                .unwrap_or_else(|| panic!("`{key} = {value}` must be refused"));
+            assert!(
+                matches!(err, ManageError::InvalidValue(_, _)),
+                "`{key}`: {err}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&p).unwrap(),
+                before,
+                "`{key}`: a refused set leaves the file byte-for-byte unchanged"
+            );
+        }
+        for (key, value) in [
+            ("network.allow", r#"["api.example.test", "@group"]"#),
+            ("proc.deny", r#"["curl"]"#),
+        ] {
+            let p = doc_at(tmp.path(), "[network]\nmode = \"deny\"\n");
+            set(&p, key, value).unwrap_or_else(|e| panic!("`{key} = {value}` is valid: {e}"));
+        }
     }
 
     #[test]
