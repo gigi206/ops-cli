@@ -112,8 +112,13 @@ fn the_commands_run_in_order_on_the_tree_and_a_failure_names_the_one_that_failed
             skip_unreachable!("skipping the distribution build: a layer did not arrive");
             return;
         };
-        crate::sandbox::distro::layers::apply(&blob, &layer.media_type, &rootfs)
-            .expect("the layer applies");
+        crate::sandbox::distro::layers::apply(
+            &blob,
+            &layer.media_type,
+            &rootfs,
+            &mut crate::sandbox::distro::layers::Budget::new(),
+        )
+        .expect("the layer applies");
     }
 
     let ca = tmp.join("ca.crt");

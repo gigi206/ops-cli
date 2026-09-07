@@ -230,6 +230,19 @@ The layers are already refused this for their own members, and the paths `sbx` a
 same answer. Every base image names these as real directories, so an image this refuses is
 one worth looking at.
 
+### How much an image may unpack to
+
+An image's layers together may write at most **64 GiB** and **one million members**.
+Past either, the provision stops and names what it was writing. The fetch of each blob
+is bounded separately, but a compressed layer expands, so a blob inside that bound can
+inflate to orders of magnitude more, and a layer of a million empty files exhausts a
+filesystem's inodes without approaching any size bound at all. Both ceilings are far
+above any userland (a full Debian with every package is under 40 GiB and around half a
+million files), so an image that meets one is not a distribution.
+
+The budget spans the image, not the layer, because the layers are applied over the same
+tree.
+
 ### What a layer may contain
 
 A layer's members are applied as the image declares them: regular files (including the

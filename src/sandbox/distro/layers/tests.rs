@@ -59,7 +59,75 @@ fn apply_tar(dir: &Path, root: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut f = fs::File::create(&blob)?;
     f.write_all(bytes)?;
     drop(f);
-    apply(&blob, "application/vnd.oci.image.layer.v1.tar", root)
+    apply(
+        &blob,
+        "application/vnd.oci.image.layer.v1.tar",
+        root,
+        &mut Budget::new(),
+    )
+}
+
+/// The same, with a budget the caller supplies, so a test can stand near a ceiling instead of
+/// building the terabyte that would reach one.
+fn apply_tar_within(dir: &Path, root: &Path, bytes: &[u8], budget: &mut Budget) -> io::Result<()> {
+    let blob = dir.join("bounded-layer");
+    let mut f = fs::File::create(&blob)?;
+    f.write_all(bytes)?;
+    drop(f);
+    apply(
+        &blob,
+        "application/vnd.oci.image.layer.v1.tar",
+        root,
+        budget,
+    )
+}
+
+/// The fetch was bounded and `safe_path` bounded where a member lands, but nothing bounded how
+/// much arrived. gzip expands, so a blob inside the 8 GiB fetch ceiling inflates to orders of
+/// magnitude more, and a layer of a million empty files exhausts inodes without approaching either
+/// ceiling. Both ends of an image's unpack now have one, spanning the image rather than the layer.
+#[test]
+fn an_image_that_unpacks_past_its_ceilings_is_refused_rather_than_filling_the_disk() {
+    let tmp = crate::testutil::TmpDir::new();
+    let archive = tar_of(&[("big", Member::File("0123456789"))]);
+
+    // Ten bytes to write and nine left: the refusal names the member it stopped on, and the file
+    // on disk holds only what the ceiling allowed, never the whole member.
+    let mut budget = Budget {
+        bytes: MAX_UNPACKED_BYTES - 9,
+        members: 0,
+    };
+    let root = tmp.join("over-bytes");
+    let err = apply_tar_within(tmp.path(), &root, &archive, &mut budget)
+        .expect_err("past the byte ceiling");
+    assert!(err.to_string().contains("unpack to more than"), "{err}");
+    assert!(
+        std::fs::metadata(root.join("big"))
+            .map(|m| m.len())
+            .unwrap()
+            <= 10,
+        "the member is bounded as it is copied, not measured after it lands"
+    );
+
+    // The member ceiling answers the shape that never approaches the byte one.
+    let mut budget = Budget {
+        bytes: 0,
+        members: MAX_MEMBERS,
+    };
+    let err = apply_tar_within(tmp.path(), &tmp.join("over-members"), &archive, &mut budget)
+        .expect_err("past the member ceiling");
+    assert!(err.to_string().contains("more than"), "{err}");
+
+    // Witness: the same archive with a fresh budget applies, so neither ceiling is in the way of
+    // an image. And the budget is spent, which is what makes it span an image's layers.
+    let mut budget = Budget::new();
+    let root = tmp.join("ok");
+    apply_tar_within(tmp.path(), &root, &archive, &mut budget).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("big")).unwrap(),
+        "0123456789"
+    );
+    assert_eq!((budget.bytes, budget.members), (10, 1));
 }
 
 #[test]
@@ -115,8 +183,13 @@ fn an_absolute_or_climbing_member_is_refused_not_sanitised() {
     {
         let blob = tmp.join(&format!("hostile-{i}"));
         fs::write(&blob, tar_with_raw_name(path, "x")).unwrap();
-        let err = apply(&blob, "application/vnd.oci.image.layer.v1.tar", &root)
-            .expect_err("a member that leaves the root is refused");
+        let err = apply(
+            &blob,
+            "application/vnd.oci.image.layer.v1.tar",
+            &root,
+            &mut Budget::new(),
+        )
+        .expect_err("a member that leaves the root is refused");
         assert!(err.to_string().contains("leaves the image root"), "{err}");
     }
     assert!(
@@ -144,8 +217,13 @@ fn a_member_is_never_written_through_a_symlink_an_earlier_layer_planted() {
     let second = tar_of(&[("etc/passwd", Member::File("root:x:0:0:"))]);
     let blob = tmp.join("second");
     fs::write(&blob, &second).unwrap();
-    let err = apply(&blob, "application/vnd.oci.image.layer.v1.tar", &root)
-        .expect_err("writing through the planted link is refused");
+    let err = apply(
+        &blob,
+        "application/vnd.oci.image.layer.v1.tar",
+        &root,
+        &mut Budget::new(),
+    )
+    .expect_err("writing through the planted link is refused");
     assert!(err.to_string().contains("through the symlink"), "{err}");
     assert!(
         !outside.join("passwd").exists(),
@@ -170,7 +248,13 @@ fn a_whiteout_removes_what_a_lower_layer_put_there() {
 
     let blob = tmp.join("whiteout");
     fs::write(&blob, tar_of(&[("var/.wh.gone", Member::File(""))])).unwrap();
-    apply(&blob, "application/vnd.oci.image.layer.v1.tar", &root).unwrap();
+    apply(
+        &blob,
+        "application/vnd.oci.image.layer.v1.tar",
+        &root,
+        &mut Budget::new(),
+    )
+    .unwrap();
 
     assert!(root.join("var/keep").exists(), "the sibling stays");
     assert!(!root.join("var/gone").exists(), "the marked entry is gone");
@@ -206,7 +290,13 @@ fn an_opaque_marker_empties_the_directory_it_sits_in() {
         ]),
     )
     .unwrap();
-    apply(&blob, "application/vnd.oci.image.layer.v1.tar", &root).unwrap();
+    apply(
+        &blob,
+        "application/vnd.oci.image.layer.v1.tar",
+        &root,
+        &mut Budget::new(),
+    )
+    .unwrap();
 
     assert!(!root.join("opt/a").exists(), "the directory was emptied");
     assert!(!root.join("opt/sub").exists(), "including its subtrees");
@@ -244,8 +334,13 @@ fn an_opaque_marker_never_empties_through_a_symlink_an_earlier_layer_planted() {
 
         let blob = tmp.join("opaque");
         fs::write(&blob, tar_of(&[("opt/.wh..wh..opq", Member::File(""))])).unwrap();
-        let err = apply(&blob, "application/vnd.oci.image.layer.v1.tar", &root)
-            .expect_err("emptying through the planted link is refused");
+        let err = apply(
+            &blob,
+            "application/vnd.oci.image.layer.v1.tar",
+            &root,
+            &mut Budget::new(),
+        )
+        .expect_err("emptying through the planted link is refused");
         assert!(err.to_string().contains("is a symlink"), "{err}");
         assert!(
             outside.join("keep").exists(),
@@ -267,6 +362,7 @@ fn a_layer_media_type_with_no_decoder_is_refused_by_name() {
         &blob,
         "application/vnd.oci.image.layer.v1.tar+zstd",
         &tmp.join("root"),
+        &mut Budget::new(),
     )
     .expect_err("an unsupported framing is refused");
     assert!(err.to_string().contains("+zstd"), "{err}");
@@ -292,7 +388,7 @@ fn a_real_image_unpacks_into_a_usable_root_filesystem() {
             skip_unreachable!("skipping the image unpack: a layer did not arrive");
             return;
         };
-        apply(&blob, &layer.media_type, &root).expect("the layer applies");
+        apply(&blob, &layer.media_type, &root, &mut Budget::new()).expect("the layer applies");
     }
     let release = fs::read_to_string(root.join("etc/os-release")).expect("os-release landed");
     assert!(release.contains("ID=alpine"), "{release}");
@@ -513,8 +609,13 @@ fn an_opaque_marker_at_the_layer_root_empties_the_root() {
         ]),
     )
     .unwrap();
-    apply(&blob, "application/vnd.oci.image.layer.v1.tar", &root)
-        .expect("a root-level opaque marker applies");
+    apply(
+        &blob,
+        "application/vnd.oci.image.layer.v1.tar",
+        &root,
+        &mut Budget::new(),
+    )
+    .expect("a root-level opaque marker applies");
 
     assert!(!root.join("etc/old").exists(), "the root was emptied");
     assert!(root.join("etc/new").is_file(), "and refilled by this layer");

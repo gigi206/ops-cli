@@ -53,6 +53,66 @@ use std::fs;
 use std::io::{self, BufReader};
 use std::path::{Component, Path, PathBuf};
 
+/// The most one image's layers may unpack to on disk, and the most members they may carry.
+///
+/// The fetch is bounded ([`super::http::MAX_STREAMED_BODY`], 8 GiB per blob) and `safe_path` bounds
+/// *where* a member lands, but nothing bounded how much arrives: gzip expands, so a blob inside the
+/// fetch ceiling inflates to orders of magnitude more, and a layer of a million empty files
+/// exhausts inodes without approaching either. Both ceilings are far above any userland: a full
+/// Debian with every package installed is under 40 GiB and around half a million files, and the
+/// images this is pointed at are bases an order of magnitude smaller than that.
+///
+/// The budget spans the **image**, not the layer, because the layers of one image are applied over
+/// the same tree and a per-layer ceiling would multiply by however many the manifest lists.
+const MAX_UNPACKED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const MAX_MEMBERS: u64 = 1_000_000;
+
+/// What one image's unpack has spent, carried across its layers. See [`MAX_UNPACKED_BYTES`].
+pub(super) struct Budget {
+    bytes: u64,
+    members: u64,
+}
+
+impl Budget {
+    /// A fresh budget for one image.
+    pub(super) fn new() -> Self {
+        Self {
+            bytes: 0,
+            members: 0,
+        }
+    }
+
+    /// Count one member, refusing past [`MAX_MEMBERS`].
+    fn member(&mut self) -> io::Result<()> {
+        self.members += 1;
+        if self.members > MAX_MEMBERS {
+            return Err(io::Error::other(format!(
+                "this image's layers carry more than {MAX_MEMBERS} members, which is past what a \
+                 userland is: refusing rather than filling the store's filesystem"
+            )));
+        }
+        Ok(())
+    }
+
+    /// What is left of the byte ceiling.
+    fn remaining_bytes(&self) -> u64 {
+        MAX_UNPACKED_BYTES.saturating_sub(self.bytes)
+    }
+
+    /// Record `n` written bytes, refusing past [`MAX_UNPACKED_BYTES`].
+    fn spend(&mut self, n: u64, dest: &Path) -> io::Result<()> {
+        self.bytes = self.bytes.saturating_add(n);
+        if self.bytes > MAX_UNPACKED_BYTES {
+            return Err(io::Error::other(format!(
+                "this image's layers unpack to more than {MAX_UNPACKED_BYTES} bytes (reached at \
+                 `{}`): refusing rather than filling the store's filesystem",
+                dest.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// The prefix a deletion marker carries, and the exact name of the opaque-directory marker.
 const WHITEOUT: &str = ".wh.";
 const OPAQUE: &str = ".wh..wh..opq";
@@ -63,7 +123,12 @@ const OPAQUE: &str = ".wh..wh..opq";
 /// as a tar, and anything else is refused by name rather than guessed at. `zstd` layers are the
 /// refusal that will be met in practice, and naming it is the point: an image pushed that way is
 /// not unpacked wrongly, it is not unpacked at all.
-pub(super) fn apply(blob: &Path, media_type: &str, root: &Path) -> io::Result<()> {
+pub(super) fn apply(
+    blob: &Path,
+    media_type: &str,
+    root: &Path,
+    budget: &mut Budget,
+) -> io::Result<()> {
     fs::create_dir_all(root)?;
     let file = BufReader::new(fs::File::open(blob)?);
     if media_type.ends_with("+zstd") {
@@ -76,15 +141,20 @@ pub(super) fn apply(blob: &Path, media_type: &str, root: &Path) -> io::Result<()
         // the overwhelmingly common framing, and a tar that is not one fails at its header rather
         // than being written as garbage.
         let mut archive = tar::Archive::new(GzipReader::new(file)?);
-        return unpack(&mut archive, root);
+        return unpack(&mut archive, root, budget);
     }
     let mut archive = tar::Archive::new(file);
-    unpack(&mut archive, root)
+    unpack(&mut archive, root, budget)
 }
 
 /// Walk one layer's members, applying each.
-fn unpack<R: io::Read>(archive: &mut tar::Archive<R>, root: &Path) -> io::Result<()> {
+fn unpack<R: io::Read>(
+    archive: &mut tar::Archive<R>,
+    root: &Path,
+    budget: &mut Budget,
+) -> io::Result<()> {
     for entry in archive.entries()? {
+        budget.member()?;
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
         let name = match path.file_name() {
@@ -138,7 +208,7 @@ fn unpack<R: io::Read>(archive: &mut tar::Archive<R>, root: &Path) -> io::Result
         }
 
         let dest = safe_path(root, &path)?;
-        write_member(&mut entry, &dest, root)?;
+        write_member(&mut entry, &dest, root, budget)?;
     }
     Ok(())
 }
@@ -236,6 +306,7 @@ fn write_member<R: io::Read>(
     entry: &mut tar::Entry<'_, R>,
     dest: &Path,
     root: &Path,
+    budget: &mut Budget,
 ) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let kind = entry.header().entry_type();
@@ -301,7 +372,14 @@ fn write_member<R: io::Read>(
     if kind.is_file() || kind.is_gnu_sparse() || kind == tar::EntryType::Continuous {
         remove(dest)?;
         let mut file = fs::File::create(dest)?;
-        io::copy(entry, &mut file)?;
+        // Bounded by what the budget has left, plus the one byte that proves it was exceeded, so
+        // a member declaring a terabyte writes the remainder of the ceiling and no more. The
+        // header's own size is not the check: a tar reader is handed a stream, and a header that
+        // understates its member would write past a ceiling read from it.
+        let allowed = budget.remaining_bytes();
+        let mut bounded = io::Read::take(&mut *entry, allowed + 1);
+        let written = io::copy(&mut bounded, &mut file)?;
+        budget.spend(written, dest)?;
         // The owner keeps read and write access whatever the archive says: the tree is assembled
         // by this user, a later layer has to be able to replace a member of it, and reclaiming the
         // store must not need a recursive `chmod` first.
