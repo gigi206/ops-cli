@@ -676,6 +676,12 @@ fn anchored(pattern: &str) -> String {
 /// Whether a value satisfies a bound. A pattern must match the **whole** value: an unanchored regex
 /// would accept anything containing a match, so the check anchors it here (see [`anchored`]) rather
 /// than trusting the author to have written `^…$`.
+///
+/// The pattern is compiled here, per call, and the bound holds the author's source rather than a
+/// built regex on purpose: that source is what a task's contract renders and what a reader has to
+/// recognise. The compilation cannot fail, because `bound_of` builds the same anchored form and
+/// refuses the declaration when it does not build, so the error arm below is unreachable from a
+/// bound this crate produced and exists for the signature rather than for a live call.
 pub(crate) fn check_value(name: &str, value: &str, bound: &ParamBound) -> Result<(), String> {
     // Before the bound, because it is a fact about the value rather than about what was declared:
     // a NUL cannot be an argument whatever a pattern admits, and a pattern written with `.` admits
