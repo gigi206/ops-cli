@@ -67,13 +67,15 @@ fn a_document_signed_by_another_key_is_refused_before_the_key_is_used() {
     assert!(err.contains("not the pinned one"), "{err}");
     assert!(!err.contains("verification failed"), "{err}");
     // The control that makes the ordering visible: pin the very key being offered, so the
-    // fingerprint gate passes, and the same call now fails at the *signature* instead. Two distinct
+    // fingerprint gate passes, and the same call now fails on the document instead. Two distinct
     // refusals for two distinct reasons — which is what "the fingerprint is compared first" means,
-    // and a single collapsed error would not show.
+    // and a single collapsed error would not show. The document carries one signature and it names
+    // another issuer, so the refusal comes from choosing the packet rather than from verifying it:
+    // one step earlier than it used to, and the same fact.
     let past_the_pin = verify_clearsigned(CLEARSIGNED, &other, &other.fingerprint)
         .expect_err("a document this key did not sign must not verify");
     assert!(
-        past_the_pin.contains("verification failed"),
+        past_the_pin.contains("naming the pinned issuer"),
         "{past_the_pin}"
     );
 }
@@ -99,14 +101,64 @@ fn a_second_signature_is_refused_rather_than_searched_for_a_good_one() {
     // are the bypass: an attacker appends a packet beside a real one.
     let mut two = doc.signature.clone();
     two.extend_from_slice(&doc.signature);
-    let err = parse_signature(&two)
+    let err = parse_signature(&two, &pinned())
         .err()
-        .expect("two signature packets must be refused");
-    assert!(err.contains("exactly one signature packet"), "{err}");
+        .expect("two signature packets from the pinned issuer must be refused");
+    assert!(
+        err.contains("exactly one signature naming the pinned"),
+        "{err}"
+    );
     // One packet still reads, so the refusal is about the count and not about the concatenation
     // being unparseable.
-    assert!(parse_signature(&doc.signature).is_ok());
+    assert!(parse_signature(&doc.signature, &pinned()).is_ok());
     assert!(verify_clearsigned(CLEARSIGNED, &key, &pinned()).is_ok());
+}
+
+/// A document signed by two different issuers is read under the pinned one.
+///
+/// An apt repository rotating its signing key publishes exactly this: the old key and the new one
+/// over the same `InRelease`, so a client holding either keeps working. Refusing on the packet
+/// count made such a document a hard error rather than a fall back to unpinned, so a pinned
+/// repository stopped working the day it rotated. The bypass the count was there to stop is the
+/// arm above, and it is still refused: two packets naming the pinned issuer leave the choice here
+/// rather than to the key.
+#[test]
+fn a_document_signed_by_two_issuers_verifies_under_the_pinned_one() {
+    let doc = split_clearsigned(CLEARSIGNED).unwrap();
+
+    // A second packet naming another issuer: the same bytes with the fingerprint subpacket's
+    // first data byte flipped, so it parses and names somebody else.
+    let mut other = doc.signature.clone();
+    let at = other
+        .windows(20)
+        .position(|w| w == pinned())
+        .expect("the fixture names its issuer");
+    other[at] ^= 0xff;
+    let mut both = other.clone();
+    both.extend_from_slice(&doc.signature);
+
+    assert_ne!(
+        issuer_of_for_test(&both),
+        Some(pinned()),
+        "the doctored packet leads, so a reader taking the first would take the wrong one"
+    );
+    let chosen = parse_signature(&both, &pinned()).expect("the pinned issuer's packet is chosen");
+    let alone = parse_signature(&doc.signature, &pinned()).expect("and it is the same packet");
+    assert_eq!(chosen.value, alone.value);
+    assert_eq!(chosen.trailer, alone.trailer);
+
+    // And a document carrying only the other issuer's packet is refused, not searched.
+    let err = parse_signature(&other, &pinned())
+        .err()
+        .expect("no packet names the pinned issuer");
+    assert!(err.contains("found 0 of 1"), "{err}");
+}
+
+/// The issuer of the first signature packet in `bytes`, for the test above.
+fn issuer_of_for_test(bytes: &[u8]) -> Option<Fingerprint> {
+    let packets = packets(bytes).ok()?;
+    let (_, body) = packets.iter().find(|(tag, _)| *tag == 2)?;
+    issuer_of(body).ok()
 }
 
 #[test]

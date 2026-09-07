@@ -295,20 +295,43 @@ struct Signature {
     value: Vec<u8>,
 }
 
-/// Parse the single signature packet a clearsigned document carries, refusing anything outside the
-/// shape this module serves. The count is checked before the contents: a document carrying a second
-/// signature is refused outright rather than searched for one that verifies.
-fn parse_signature(bytes: &[u8]) -> Result<Signature, String> {
+/// Parse the signature packet the **pinned** issuer wrote, refusing anything outside the shape this
+/// module serves.
+///
+/// A clearsigned document may carry more than one signature, and an apt repository rotating its
+/// signing key publishes exactly that: the old key and the new one over the same `InRelease`, so
+/// that clients holding either keep working. Refusing on the count made such a document unreadable
+/// — a hard error, not a fall back to unpinned — which is the one thing a rotation must not do.
+///
+/// So the packet is chosen by the issuer fingerprint it names, and only the packet naming the
+/// pinned one is parsed. That choice is not a verdict: the fingerprint is an unverified claim by
+/// whoever wrote the packet, and the verification that follows still runs under the pinned key
+/// alone. A packet added by anyone else either names another issuer, and is not chosen, or claims
+/// the pinned one and then fails to verify under it. Zero candidates and more than one are both
+/// refused: the second is a document naming the same issuer twice, which no rotation produces and
+/// which would leave the choice to this function rather than to the key.
+fn parse_signature(bytes: &[u8], pinned: &Fingerprint) -> Result<Signature, String> {
     let packets = packets(bytes)?;
     let signatures: Vec<_> = packets.iter().filter(|(tag, _)| *tag == 2).collect();
-    if signatures.len() != 1 || packets.len() != 1 {
+    if signatures.len() != packets.len() {
         return Err(format!(
-            "expected exactly one signature packet, found {} packet(s) of which {} are signatures",
+            "expected signature packets only, found {} packet(s) of which {} are signatures",
             packets.len(),
             signatures.len()
         ));
     }
-    let body = signatures[0].1;
+    let chosen: Vec<_> = signatures
+        .iter()
+        .filter(|(_, body)| issuer_of(body).is_ok_and(|f| f == *pinned))
+        .collect();
+    if chosen.len() != 1 {
+        return Err(format!(
+            "expected exactly one signature naming the pinned issuer, found {} of {} signature(s)",
+            chosen.len(),
+            signatures.len()
+        ));
+    }
+    let body = chosen[0].1;
     let head = body.get(0..6).ok_or("truncated signature packet")?;
     if head[0] != 4 {
         return Err("only a version 4 signature is read".to_string());
@@ -368,7 +391,7 @@ pub(crate) fn verify_clearsigned(
         ));
     }
     let doc = split_clearsigned(text)?;
-    let signature = parse_signature(&doc.signature)?;
+    let signature = parse_signature(&doc.signature, pinned)?;
     let mut message = doc.signed;
     message.extend_from_slice(&signature.trailer);
     let algorithm = if signature.hash_algorithm == 10 {
@@ -396,6 +419,17 @@ pub(crate) fn issuer_fingerprint(text: &str) -> Result<Fingerprint, String> {
         .iter()
         .find(|(tag, _)| *tag == 2)
         .ok_or("the document carries no signature packet")?;
+    issuer_of(body)
+}
+
+/// The issuer fingerprint one signature packet's body names, read from hashed subpacket 33.
+///
+/// One definition, because two callers ask it for opposite reasons: [`issuer_fingerprint`] asks it
+/// of a document nobody has pinned yet, to learn which key to fetch, and [`parse_signature`] asks
+/// it of each packet to pick the one the pinned key signed. Neither reading attests anything on its
+/// own — it is a claim by whoever wrote the signature — which is why one binds the fetched key back
+/// to it and the other only uses it to choose what to verify.
+fn issuer_of(body: &[u8]) -> Result<Fingerprint, String> {
     let hashed_len = u16::from_be_bytes([
         *body.get(4).ok_or("truncated signature packet")?,
         *body.get(5).ok_or("truncated signature packet")?,

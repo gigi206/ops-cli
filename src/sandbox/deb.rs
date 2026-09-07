@@ -1373,10 +1373,13 @@ SHA256: 3333333333333333333333333333333333333333333333333333333333333333
                 panic!("a repository whose pinned key no longer signs it resolved to {url}")
             }
         };
-        // Refused at the signature, which is the enforcement: this is the whole value of pinning,
-        // and a resolve that merely warned here would leave the TOFU open at every upgrade.
+        // Refused over the signature, which is the enforcement: this is the whole value of
+        // pinning, and a resolve that merely warned here would leave the TOFU open at every
+        // upgrade. The document carries one signature and it names another issuer, so the refusal
+        // comes from choosing the packet to verify rather than from verifying it — one step
+        // earlier, and the same fact about the pin.
         assert!(err.contains("is not valid"), "{err}");
-        assert!(err.contains("signature verification failed"), "{err}");
+        assert!(err.contains("naming the pinned issuer"), "{err}");
         // And with the pin removed the same call resolves, so the refusal is not the network or the
         // index failing under another name.
         std::fs::remove_file(&pin).expect("the pin is removed");
