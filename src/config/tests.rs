@@ -5968,6 +5968,16 @@ fn tarball_backend_parses_and_validates() {
     assert!(is_valid_tarball_url("https://e/app.tar.gz", false));
     assert!(is_valid_tarball_url("https://e/APP.TGZ", false)); // extension is case-insensitive
     assert!(is_valid_tarball_url("https://e/My%20App.tar.gz", false)); // %-encoded space
+    // Semver build metadata: a real release spells it with a `+`, and a project whose upstream
+    // publishes one had no way to name the artifact at all — not in a declared URL, and not
+    // through the asset a `github:` release selects.
+    assert!(is_valid_tarball_url(
+        "https://e/app_1.2.3+build.1_amd64.tar.gz",
+        false
+    ));
+    // A query string is still outside the charset: `?` was not what the barrier cost anyone, and
+    // widening a charset is a decision taken once per character.
+    assert!(!is_valid_tarball_url("https://e/app.tar.gz?v=1", false));
     assert!(!is_valid_tarball_url("http://e/app.tar.gz", false)); // not https
     assert!(!is_valid_tarball_url("https://e/app.deb", false)); // wrong extension
     assert!(!is_valid_tarball_url("https://e/app.tar", false)); // not gz-compressed

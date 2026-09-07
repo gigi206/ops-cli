@@ -685,9 +685,18 @@ const BINARY_RESOLVE_SENTINEL: &str = "binary:resolve";
 /// charset: two byte-identical copies are how a charset drifts on one path and not the other. It was
 /// written out five times before, once per prebuilt backend, so widening it for one of them would
 /// have been a change no reader of the other four could see.
+///
+/// `+` and `=` are in the set for the same reason `%` is: they appear in real release URLs and
+/// neither ends a shell word nor a nix string. A semver build metadata suffix is spelled with a
+/// `+` (`app_1.2.3+build.1_amd64.deb`), and `=` closes a percent-free query parameter, so a
+/// project whose upstream publishes either had no way to name the artifact at all — not in a
+/// declared URL and not through the asset a `github:` release selects. The store name a
+/// `prefetch` derives replaces whatever is not a store-name character, and `+` is one.
 fn is_injection_free_url(url: &str) -> bool {
-    url.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_' | '~' | '%'))
+    url.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, ':' | '/' | '.' | '-' | '_' | '~' | '%' | '+' | '=')
+    })
 }
 
 /// The transport a fetched package source may carry, returning the URL past its scheme so a caller
