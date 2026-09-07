@@ -298,7 +298,14 @@ fn scan_ambient() -> AmbientOverrides {
     a
 }
 
-/// The value of an environment variable, or `None` if unset or empty.
+/// The value of an environment variable, or `None` if unset **or empty**.
+///
+/// Empty reads as absent on purpose, and the flag spelling of the same emptiness does not: `--net
+/// ""` is a usage error. A variable arrives from an environment nobody re-read, where clearing one
+/// is the ordinary way to neutralise a value inherited from a shell profile or a parent process;
+/// a flag arrives from the command line, where an empty security posture is a slip worth naming
+/// rather than a posture worth launching. The rule is stated for users in the overrides guide, and
+/// `SBX_DATA_DIR` documents it the same way.
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
 }

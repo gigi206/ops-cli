@@ -154,6 +154,72 @@ fn config_show_reflects_and_tags_an_ambient_override() {
     );
 }
 
+/// Clearing an `SBX_*` variable is how a shell neutralises one it inherited, so an override that is
+/// set but **empty** reads as absent rather than as a value: the same rule `SBX_DATA_DIR` already
+/// documents. The flag spelling does not follow it, and should not: `--net ""` is a value someone
+/// typed, and an empty security posture is a slip worth naming rather than a posture worth
+/// launching.
+///
+/// The asymmetry is deliberate and now written in the overrides guide. Nothing held it before, so
+/// either half could have drifted into the other without a word: an empty variable becoming a
+/// usage error would break every profile that clears one, and an empty flag becoming a no-op would
+/// launch a workload on a posture nobody chose.
+#[test]
+fn an_empty_ambient_override_reads_as_absent_while_an_empty_flag_is_a_usage_error() {
+    let fx = Project::new("cfg");
+
+    // The witness first: the channel is read at all, and a value in it is tagged as an override.
+    // Without this, the empty case below would pass just as well on a variable sbx never consults.
+    let set = fx
+        .cmd(&["config", "show"])
+        .env("SBX_NET", "none")
+        .output()
+        .expect("spawn sbx");
+    let set_out = String::from_utf8_lossy(&set.stdout);
+    assert!(
+        set_out.contains("network: none") && set_out.contains("(override)"),
+        "SBX_NET must reach the view, or the empty case proves nothing:\n{set_out}"
+    );
+
+    // Empty reads as absent: the view shows the baseline, untagged, and reports nothing.
+    let empty = fx
+        .cmd(&["config", "show"])
+        .env("SBX_NET", "")
+        .output()
+        .expect("spawn sbx");
+    assert!(
+        empty.status.success(),
+        "an empty SBX_NET must not fail the view: {}",
+        String::from_utf8_lossy(&empty.stderr)
+    );
+    let empty_out = String::from_utf8_lossy(&empty.stdout);
+    let line = empty_out
+        .lines()
+        .find(|l| l.trim_start().starts_with("network:"))
+        .unwrap_or_default();
+    assert!(
+        !line.is_empty() && !line.contains("(override)"),
+        "an empty SBX_NET must read as absent, not as an override:\n{empty_out}"
+    );
+
+    // The other half: the flag spelling of the same emptiness refuses, before any sandbox work.
+    let flag = fx
+        .cmd(&["run", "--net", "", "--", "true"])
+        .output()
+        .expect("spawn sbx");
+    assert_eq!(
+        flag.status.code(),
+        Some(2),
+        "an empty --net must be a usage error, not a launch: {}",
+        String::from_utf8_lossy(&flag.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&flag.stderr).contains("refusing to launch"),
+        "the refusal must say it is not launching: {}",
+        String::from_utf8_lossy(&flag.stderr)
+    );
+}
+
 /// An override that does not *parse* is the one failure the view used to hide: the collection
 /// errored, the whole fold was skipped, and the baseline was rendered as if the variable were not
 /// set. A launch in that environment refuses before it starts, so the view was reporting a posture

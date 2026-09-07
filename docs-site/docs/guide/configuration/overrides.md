@@ -81,6 +81,17 @@ sbx run --device /dev/kvm -- ./vm.sh      # grant a device for one run
 SBX_NET=none SBX_BIND=/opt/data:ro sbx run
 ```
 
+Clearing one of these variables is how you switch it off. An `SBX_*` override that is set
+but **empty** reads as **absent**, the same rule
+[`SBX_DATA_DIR`](../reference/environment-variables) follows, so `SBX_NET= sbx run` launches
+on whatever posture the config decides instead of refusing.
+
+The flag does not follow that rule: `--net ""` is a usage error (exit 2). The asymmetry is
+deliberate, because the two say different things. A variable arrives from an environment
+nobody re-read, where emptying it is the ordinary way to neutralise a value inherited from a
+shell profile or a parent process; a flag arrives from the command line, where an empty value
+is a slip worth naming rather than a posture worth launching.
+
 #### `--seccomp` / `--device`: relaxing the cage for one launch
 
 A config file gates [`[seccomp]`](seccomp) and [`[devices]`](devices)
