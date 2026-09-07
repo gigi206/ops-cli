@@ -2181,6 +2181,20 @@ pub(super) fn build(
     crate::sandbox::gc::sweep_runtime_dirs(prep.layout.data_dir(), true);
     crate::sandbox::gc::fold_egress_counters(prep.layout.data_dir(), true);
 
+    // The project's marker, before anything is provisioned rather than after the seed. A
+    // provisioner registers its out-links under `gcroots/projects/<id>/` from its first build,
+    // and `sbx gc --prune` reads a project as gone when `projects/<id>` does not exist: between
+    // the two, a first launch's roots looked exactly like a dead project's for the whole of its
+    // provisioning, and a concurrent prune deleted them — after which the shared-store collection
+    // has nothing holding those builds. Idempotent, and best-effort as it was: a housekeeping
+    // marker never fails a launch, and a launch that dies before the seed leaves a directory
+    // holding only the marker, which is the shape the reaper exists to recognise.
+    if let Ok((id, canonical)) = binds::project_identity(&prep.cwd)
+        && let Err(e) = crate::sandbox::projectstore::write_marker(&prep.layout, &id, &canonical)
+    {
+        crate::diag::warn(&format!("could not record the project marker: {e}"));
+    }
+
     // Every declared tool, realised host-side into sbx's store; the inline flakes staged for the
     // in-cage build the wrap below performs.
     let provisioned = provision_tools(prep, runtime)?;

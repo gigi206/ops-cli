@@ -3094,4 +3094,56 @@ mod tests {
             "the id a launch writes and the id the sweep looks up must be the same string"
         );
     }
+
+    /// A first launch's roots survive a prune that runs while it is still provisioning.
+    ///
+    /// The out-links a provisioner registers under `gcroots/projects/<id>/` exist from its first
+    /// build, and this sweep reads a project as gone when `projects/<id>` is absent. The marker
+    /// that creates that directory used to be written after the seed, so for the whole of a first
+    /// launch's provisioning its roots looked exactly like a dead project's, and a concurrent
+    /// `sbx gc --prune` removed them — after which the shared-store collection has nothing holding
+    /// those builds. The launch writes the marker before it provisions now; this is the sweep's
+    /// half of the pair, with the arm before the marker as its witness.
+    #[test]
+    fn a_project_that_has_only_written_its_marker_keeps_its_roots() {
+        let tmp = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(tmp.path());
+        let gcroots = tmp.path().join("gcroots");
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(gcroots.join("projects/newproj/tool")).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+
+        // The witness: before the marker, the sweep reads the project as gone.
+        let removed = prune_shared_gcroots(
+            &gcroots,
+            &projects,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            false,
+        );
+        assert_eq!(
+            removed,
+            vec![gcroots.join("projects/newproj")],
+            "without a marker the roots are stale"
+        );
+
+        crate::sandbox::projectstore::write_marker(
+            &layout,
+            "newproj",
+            std::path::Path::new("/home/u/proj"),
+        )
+        .expect("the marker is written");
+
+        let removed = prune_shared_gcroots(
+            &gcroots,
+            &layout.data_dir().join("projects"),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            true,
+        );
+        assert!(
+            removed.is_empty() && gcroots.join("projects/newproj/tool").is_dir(),
+            "the marker is what keeps a first launch's roots: {removed:?}"
+        );
+    }
 }

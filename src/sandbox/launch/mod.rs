@@ -1112,8 +1112,10 @@ fn seed_project_store(
     let (id, canonical) = binds::project_identity(&prep.cwd)?;
     let roots = collect_roots(&prep.userland, pkg_roots, tool_roots, font_roots);
     let store = super::projectstore::prepare(&prep.nix_store, &prep.layout, &id, &roots)?;
-    // Record the project's canonical path so a later `sbx gc` can recognise this tree and reclaim
-    // it once the project is gone. Best-effort: a housekeeping marker must never fail a launch.
+    // The canonical path a later `sbx gc` recognises this tree by. Written again here because it
+    // is what keeps the record current when a project moves, and idempotent: the launch already
+    // wrote it before provisioning, where its absence is what a concurrent prune reads as a dead
+    // project. Best-effort: a housekeeping marker must never fail a launch.
     if let Err(e) = super::projectstore::write_marker(&prep.layout, &id, &canonical) {
         crate::diag::warn(&format!("could not record the project marker: {e}"));
     }
