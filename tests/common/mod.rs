@@ -31,6 +31,13 @@ include!("../../src/testskip.rs");
 // of the suite does not clean.
 include!("../../src/testroot.rs");
 
+/// The fixture root, reachable from a suite that builds its own command rather than going through
+/// [`sbx`]. The included definition is private to this module, and a second spelling of the root
+/// would put a suite's files where nothing else cleans them.
+pub fn fixtures_root() -> std::path::PathBuf {
+    fixture_root()
+}
+
 /// Gate a test on this host being able to build a cage, skipping it — with the probe's own
 /// diagnosis — when it cannot.
 ///

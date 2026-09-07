@@ -1123,7 +1123,10 @@ fn persist_egress_rule(
     // and blessed here, and its security fields would apply from the next launch. Hashing what sbx
     // composed means a file changed underneath simply no longer matches its marker — the same
     // fail-safe outcome as the crash, and the one `local_save_permitted`'s gate reads as if it got.
-    if let Some(store) = &store {
+    // Only when something was written: see `AddOutcome::wrote_anything`.
+    if let Some(store) = &store
+        && written.outcome.wrote_anything()
+    {
         trust::trust_written(store, &path, written.text.as_bytes()).map_err(|e| {
             (
                 1,
@@ -1186,7 +1189,10 @@ fn persist_proc_rule(
 
     // Re-trust after the write; the ordering is fail-safe (a crash between leaves a correct-but-
     // untrusted file the next launch drops — the rule does not take effect, never a security hole).
-    if let Some(store) = &store {
+    // Only when something was written: see `AddOutcome::wrote_anything`.
+    if let Some(store) = &store
+        && written.outcome.wrote_anything()
+    {
         trust::trust_written(store, &path, written.text.as_bytes()).map_err(|e| {
             (
                 1,

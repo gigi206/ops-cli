@@ -169,6 +169,20 @@ pub(crate) enum AddOutcome {
     AlreadyPresent,
 }
 
+impl AddOutcome {
+    /// Whether this write changed the file, which is what decides whether the caller owes a
+    /// re-trust.
+    ///
+    /// Written once because two callers ask it and the wrong answer is silent. `Written` carries
+    /// the document text on a no-op too, and that text is `toml_edit`'s rendering rather than the
+    /// bytes on disk: it normalises CRLF to LF and drops a byte-order mark, so attesting to it
+    /// after a no-op records a hash of a file that was never written, and the next launch reads
+    /// the project as changed since it was trusted. Nothing was written, so nothing is attested.
+    pub(crate) fn wrote_anything(&self) -> bool {
+        matches!(self, AddOutcome::Added { .. })
+    }
+}
+
 /// What a write left on disk: what it did (`T` — an [`AddOutcome`], a [`SetOutcome`], a plain
 /// `bool` for the list and key removals), and the exact document text the file now holds.
 ///

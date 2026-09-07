@@ -9,7 +9,15 @@ use std::path::Path;
 use std::process::Command;
 
 fn sbx() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_sbx"))
+    // The global config is isolated the way every other suite isolates it: a launch that reads the
+    // developer's own `~/.config/sbx` measures that machine rather than sbx.
+    let config = common::fixtures_root().join("isolated-config");
+    let _ = std::fs::create_dir_all(&config);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
+    cmd.env("XDG_CONFIG_HOME", config)
+        .env("LC_ALL", "C.UTF-8")
+        .env_remove("LANG");
+    cmd
 }
 
 /// Count the marker files under a redirected trust store.
@@ -200,4 +208,72 @@ fn an_unresolvable_store_is_a_hard_failure() {
         .expect("spawn sbx trust");
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("cannot locate the trust store"));
+}
+
+/// A rule write that changes nothing leaves the project trusted, whatever its line endings.
+///
+/// `Written` carries the document text on a no-op as well, and that text is `toml_edit`'s
+/// rendering rather than the bytes on disk: it normalises CRLF to LF and drops a byte-order mark.
+/// Attesting to it after a no-op recorded a marker for a file that was never written, so the next
+/// launch read the project as changed since it was trusted and dropped every security field, and
+/// every later `--local` write was refused until `sbx trust` was run again. All of it on a command
+/// that printed "no change" and left the file byte-identical.
+#[test]
+fn a_rule_write_that_changes_nothing_leaves_the_project_trusted() {
+    for (label, bytes) in [
+        (
+            "CRLF",
+            b"[network]\r\nmode = \"deny\"\r\nallow = [\"a.example.test\"]\r\n".to_vec(),
+        ),
+        (
+            "LF",
+            b"[network]\nmode = \"deny\"\nallow = [\"a.example.test\"]\n".to_vec(),
+        ),
+    ] {
+        let state = TmpDir::new("trust");
+        let data = TmpDir::new("trust");
+        let proj = TmpDir::new("trust");
+        let cfg = proj.path().join(".sbx.toml");
+        std::fs::write(&cfg, &bytes).unwrap();
+
+        let trusted = sbx()
+            .arg("trust")
+            .arg(&cfg)
+            .env("XDG_STATE_HOME", state.path())
+            .output()
+            .expect("spawn sbx trust");
+        assert!(trusted.status.success(), "{label}: trust failed");
+
+        let again = sbx()
+            .args(["net", "allow", "a.example.test", "--local"])
+            .current_dir(proj.path())
+            .env("XDG_STATE_HOME", state.path())
+            .env("XDG_DATA_HOME", data.path())
+            .output()
+            .expect("spawn sbx net allow");
+        let said = String::from_utf8_lossy(&again.stdout).into_owned()
+            + &String::from_utf8_lossy(&again.stderr);
+        assert!(
+            said.contains("no change"),
+            "{label}: the rule is already there, so the write is a no-op: {said}"
+        );
+        assert_eq!(
+            std::fs::read(&cfg).unwrap(),
+            bytes,
+            "{label}: and the file is untouched"
+        );
+
+        let show = sbx()
+            .args(["trust", "--show"])
+            .arg(&cfg)
+            .env("XDG_STATE_HOME", state.path())
+            .output()
+            .expect("spawn sbx trust --show");
+        let verdict = String::from_utf8_lossy(&show.stdout).into_owned()
+            + &String::from_utf8_lossy(&show.stderr);
+        assert!(
+            verdict.contains("is trusted"),
+            "{label}: a write that changed nothing must not re-arm the gate: {verdict}"
+        );
+    }
 }
