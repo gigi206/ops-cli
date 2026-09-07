@@ -373,6 +373,28 @@ fn whole_reference(source: &str) -> Option<&str> {
     valid_revision(rev).is_some().then_some(rev)
 }
 
+/// The revision a source has to be witnessed on, if any.
+///
+/// Both spellings of a pinned revision are written by hand into a config, and
+/// [`witness_revision`]'s own contract names that as where the question is worth asking. A
+/// `github:NixOS/nixpkgs/<rev>` reference attests nothing a bare revision does not: GitHub keeps
+/// pull-request heads in the *upstream* repository's reference space, so a commit pushed to a fork
+/// and never merged is served whole under the upstream name. The two spellings resolve to the same
+/// revision, so which one was typed decided whether the warning could fire at all.
+///
+/// A whole reference to any other repository yields `None`: the witness asks whether nixpkgs'
+/// `master` history contains the revision, and that question means nothing for another owner. A
+/// branch or channel name yields `None` for the reason the witness states, that nix resolved it
+/// against the repository itself and a branch head is in its own history by construction.
+fn revision_to_witness(source: &str) -> Option<String> {
+    match whole_reference(source) {
+        Some(rev) => source
+            .starts_with(NIXPKGS_FLAKE_PREFIX)
+            .then(|| rev.to_string()),
+        None => valid_revision(source),
+    }
+}
+
 /// The flake reference a `(source, revision)` pair names.
 ///
 /// A whole reference is handed back as written: it already carries its owner, its repository, its
@@ -481,16 +503,19 @@ fn resolve_source_rev(
     source: &str,
     fresh: bool,
 ) -> io::Result<String> {
+    // Witnessed before the pin is handed back, and on whichever spelling carries one: a pinned
+    // revision is opaque, and the name it was written under does not say it belongs to nixpkgs.
+    // The branch form needs no witness, and asking one of a release branch's head would report an
+    // ordinary configuration.
+    if let Some(rev) = revision_to_witness(source) {
+        witness_revision(nix, layout, &rev, fresh);
+    }
     // A whole reference is its own pin: there is no channel behind it to ask, and asking GitHub
     // what a revision resolves to would only echo it back.
     if let Some(rev) = whole_reference(source) {
         return Ok(rev.to_string());
     }
     if let Some(rev) = valid_revision(source) {
-        // Witnessed here and not below: a pinned revision is opaque, and nothing about the name it
-        // was written under says it belongs to nixpkgs. The branch form needs no witness, and
-        // asking one of a release branch's head would report an ordinary configuration.
-        witness_revision(nix, layout, &rev, fresh);
         return Ok(rev);
     }
     resolve_channel_rev(nix, &format!("{NIXPKGS_FLAKE_PREFIX}{source}"))
@@ -711,6 +736,40 @@ mod tests {
     use super::*;
     use crate::store::resolve_nix;
     use crate::testutil::TmpDir;
+
+    /// Both spellings of a pinned revision are written by hand, and only the bare one reached the
+    /// witness. `github:NixOS/nixpkgs/<rev>` attests nothing the bare form does not: GitHub keeps
+    /// pull-request heads in the upstream repository's reference space, so a commit pushed to a
+    /// fork and never merged is served whole under the upstream name. The two forms resolve to the
+    /// same revision, so the spelling alone decided whether the warning could fire.
+    ///
+    /// Asked of the pure decision rather than of `resolve_source_rev`, which spawns nix and reaches
+    /// GitHub: what changed is which sources carry a revision worth witnessing.
+    #[test]
+    fn both_spellings_of_a_pinned_nixpkgs_revision_are_witnessed() {
+        const PINNED: &str = "044bfe75bfe4c7bbe043dc17b5e42ea823b84a09";
+        assert_eq!(revision_to_witness(PINNED).as_deref(), Some(PINNED));
+        assert_eq!(
+            revision_to_witness(&format!("{NIXPKGS_FLAKE_PREFIX}{PINNED}")).as_deref(),
+            Some(PINNED),
+            "the whole reference is written by hand too, and names nothing GitHub withholds"
+        );
+        // An attribute is not part of the revision, and does not change the answer.
+        assert_eq!(
+            revision_to_witness(&format!("{NIXPKGS_FLAKE_PREFIX}{PINNED}#mise")).as_deref(),
+            Some(PINNED)
+        );
+
+        // Another repository is left alone: the witness asks nixpkgs' own history, which says
+        // nothing about an owner it was never about.
+        assert_eq!(
+            revision_to_witness(&format!("github:other/repo/{PINNED}")),
+            None
+        );
+        // A branch needs none: nix resolved it against the repository itself.
+        assert_eq!(revision_to_witness("nixos-25.05"), None);
+        assert_eq!(revision_to_witness("nixpkgs-unstable"), None);
+    }
 
     #[test]
     fn the_witness_asks_about_the_revision_it_was_handed() {
