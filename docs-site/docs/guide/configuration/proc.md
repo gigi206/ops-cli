@@ -143,18 +143,22 @@ python3` is decided as `/usr/bin/env`, and `ld.so /bin/grep curl` is not refused
 `curl`. A payload written in an argument therefore runs only under an interpreter a rule already
 allows.
 
-Two consequences follow from reading the file, and both are deliberate:
+Three more things follow, and all are deliberate:
 
 - **A file sbx can execute but not read is refused.** A script in mode `0111` is unreadable even to
   its owner, yet the kernel still runs its interpreter, and a payload spelled in the interpreter's
   argument never needs the script at all. Since what the `#!` line would have said is exactly what
   could not be established, the answer is a refusal. The cost: an execute-only file does not run
   under an exec policy, however it is spelled.
-- **Two routes stay open**, and reading a file closes neither. A `binfmt_misc` handler registered
-  for `.jar`, `.py` or a wine binary runs an interpreter that nothing in the file names, so no read
-  can find it. And an exec named by a **descriptor with no path**, such as an in-memory file passed
-  to `fexecve`, names an object the walk cannot reach, so its first bytes are not read. Under
-  `confine` both are exactly as confined as the allowlist entry that let the file itself run.
+- **A `binfmt_misc` handler.** A handler registered for `.jar`, `.py`, a wine binary or a
+  foreign-architecture executable makes the kernel run an interpreter that nothing in the file
+  names. sbx reads the registered handlers instead of the file, once per launch, and decides the
+  interpreter of every handler whose magic or extension claims the target. A handler enrolled while
+  a cage is already running is not seen by it, which takes a privilege the cage does not have.
+- **A program run from a descriptor.** An exec can name its target by descriptor rather than by
+  path, and the object behind it need not exist on any filesystem: an in-memory file carrying a
+  `#!` line runs its interpreter just the same. sbx reads such a target through the descriptor the
+  caller already holds, so these are decided like any other.
 
 ## What enforcement puts inside the cage
 

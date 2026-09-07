@@ -543,6 +543,116 @@ pub(crate) fn shebang_interpreter(head: &[u8]) -> ScriptHead {
     }
 }
 
+/// One `binfmt_misc` handler: an interpreter the kernel runs for files it recognises.
+///
+/// `binfmt_misc` lets a userland enrol an interpreter for a shape of file, and the kernel then runs
+/// that interpreter inside the `execve` that named the file -- the same single-syscall substitution
+/// a `#!` line performs, except that **nothing in the file names the interpreter**. A `.jar`, a
+/// `.py` with no `#!`, a wine binary or a foreign-architecture ELF under `qemu` all reach their
+/// interpreter this way, and a rule about that interpreter is not consulted unless the handler is
+/// read as well.
+///
+/// Registered globally in the kernel rather than per namespace, so what this process reads under
+/// `/proc/sys/fs/binfmt_misc` is what a cage's own `execve` will meet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BinfmtRule {
+    /// The program the kernel runs instead of the named file.
+    pub(crate) interpreter: String,
+    /// Where in the file the magic starts.
+    offset: usize,
+    /// The bytes a file must carry at `offset`. Empty for an extension handler.
+    magic: Vec<u8>,
+    /// Bits that matter in the comparison, byte for byte with `magic`. Empty means all of them.
+    mask: Vec<u8>,
+    /// The trailing name component a file must have, without its dot. Empty for a magic handler.
+    extension: String,
+}
+
+/// One handler as the kernel prints it under `/proc/sys/fs/binfmt_misc/<name>`.
+///
+/// The shape is fixed: a first line of `enabled` or `disabled`, then `interpreter <path>`, `flags:`,
+/// and either `offset`/`magic` (with an optional `mask`) or `extension <ext>`. `magic` and `mask`
+/// are printed as hex pairs whatever the bytes are, so both are read that way.
+///
+/// `None` for a handler this walk cannot act on: one the kernel has disabled, one naming no
+/// interpreter, or one whose match this build does not understand -- where reading it as "matches
+/// nothing" is the honest answer, since the alternative is a rule that silently covers less than it
+/// claims.
+pub(crate) fn parse_binfmt_rule(text: &str) -> Option<BinfmtRule> {
+    let unhex = |s: &str| -> Option<Vec<u8>> {
+        let s = s.trim();
+        (s.len().is_multiple_of(2) && s.chars().all(|c| c.is_ascii_hexdigit()))
+            .then(|| {
+                (0..s.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+                    .collect::<Option<Vec<u8>>>()
+            })
+            .flatten()
+    };
+    let mut rule = BinfmtRule {
+        interpreter: String::new(),
+        offset: 0,
+        magic: Vec::new(),
+        mask: Vec::new(),
+        extension: String::new(),
+    };
+    let mut enabled = false;
+    for line in text.lines() {
+        let line = line.trim();
+        match line.split_once(' ') {
+            _ if line == "enabled" => enabled = true,
+            Some(("interpreter", v)) => rule.interpreter = v.trim().to_string(),
+            Some(("offset", v)) => rule.offset = v.trim().parse().ok()?,
+            Some(("magic", v)) => rule.magic = unhex(v)?,
+            Some(("mask", v)) => rule.mask = unhex(v)?,
+            Some(("extension", v)) => rule.extension = v.trim().to_string(),
+            _ => {}
+        }
+    }
+    let matches_something = !rule.magic.is_empty() || !rule.extension.is_empty();
+    (enabled && !rule.interpreter.is_empty() && matches_something).then_some(rule)
+}
+
+/// The interpreter a registered handler would run for this file, if any recognises it.
+///
+/// Asked only of a file that is **not** a script and not an ordinary executable this kernel would
+/// load itself: `binfmt_misc` is tried after the built-in formats, so an `execve` that ELF or the
+/// `#!` handler accepts never reaches one of these.
+///
+/// Every handler that matches is returned rather than the first, because the order the kernel tries
+/// them in is not the order they are read in here, and deciding the union is the answer that cannot
+/// be less strict than the kernel's own. A handler with a `mask` compares only the bits the mask
+/// names; one with an `extension` compares the file's trailing name component, case-sensitively, as
+/// the kernel does.
+pub(crate) fn binfmt_interpreters<'a>(
+    rules: &'a [BinfmtRule],
+    head: &[u8],
+    path: &str,
+) -> Vec<&'a str> {
+    let extension = path.rsplit('/').next().and_then(|n| n.rsplit_once('.'));
+    rules
+        .iter()
+        .filter(|rule| {
+            if !rule.extension.is_empty() {
+                return extension.is_some_and(|(_, ext)| ext == rule.extension);
+            }
+            let Some(window) = head.get(rule.offset..rule.offset + rule.magic.len()) else {
+                return false;
+            };
+            window
+                .iter()
+                .zip(&rule.magic)
+                .enumerate()
+                .all(|(i, (a, b))| {
+                    let bits = rule.mask.get(i).copied().unwrap_or(0xff);
+                    a & bits == b & bits
+                })
+        })
+        .map(|rule| rule.interpreter.as_str())
+        .collect()
+}
+
 /// The final path component (the basename), or the whole string when there is no `/`. Taken from an
 /// already-folded path ([`lexical_path`]), which carries no trailing slash and no `.` of its own, so
 /// the component this returns is the file the target names. Total for any other input too: a string
@@ -999,6 +1109,58 @@ mod tests {
             interp("/bin/sh"),
             "the interpreter is whole; only its argument was cut, and arguments are not judged"
         );
+    }
+
+    /// A registered handler is read the way the kernel prints it, and matches what it says it does.
+    ///
+    /// The first fixture is a real handler as read from this kernel, so the shape is not invented.
+    #[test]
+    fn a_binfmt_handler_names_the_interpreter_it_would_run() {
+        let real = "enabled\ninterpreter /usr/bin/python3.14\nflags: \noffset 0\nmagic 2b0e0d0a\n";
+        let rule = parse_binfmt_rule(real).expect("a usable handler");
+        assert_eq!(rule.interpreter, "/usr/bin/python3.14");
+
+        let rules = vec![rule];
+        // The magic sits at the offset the handler names, and nothing else matches.
+        assert_eq!(
+            binfmt_interpreters(&rules, b"\x2b\x0e\x0d\x0a rest", "/tmp/x.pyc"),
+            vec!["/usr/bin/python3.14"]
+        );
+        assert!(binfmt_interpreters(&rules, b"\x7fELF\x02", "/tmp/x").is_empty());
+        // A head shorter than the window the handler reads matches nothing rather than panicking.
+        assert!(binfmt_interpreters(&rules, b"\x2b\x0e", "/tmp/x").is_empty());
+
+        // An offset handler reads further in, and a mask compares only the bits it names.
+        let masked = parse_binfmt_rule(
+            "enabled\ninterpreter /usr/bin/qemu\nflags: F\noffset 2\nmagic 00ff\nmask 00f0\n",
+        )
+        .expect("a masked handler");
+        let masked = vec![masked];
+        assert_eq!(
+            binfmt_interpreters(&masked, b"xx\x11\xf5", "/tmp/x"),
+            vec!["/usr/bin/qemu"],
+            "only the bits the mask names are compared"
+        );
+        assert!(binfmt_interpreters(&masked, b"xx\x11\x05", "/tmp/x").is_empty());
+
+        // An extension handler compares the trailing name component, case-sensitively.
+        let ext = vec![
+            parse_binfmt_rule("enabled\ninterpreter /usr/bin/jre\nflags: \nextension jar\n")
+                .expect("an extension handler"),
+        ];
+        assert_eq!(
+            binfmt_interpreters(&ext, b"PK\x03\x04", "/srv/app.jar"),
+            vec!["/usr/bin/jre"]
+        );
+        assert!(binfmt_interpreters(&ext, b"PK\x03\x04", "/srv/app.JAR").is_empty());
+        assert!(binfmt_interpreters(&ext, b"PK\x03\x04", "/srv/jar").is_empty());
+        // A dot in a directory above the file is not the file's own extension.
+        assert!(binfmt_interpreters(&ext, b"PK", "/srv/x.jar/app").is_empty());
+
+        // Not usable, and each for its own reason: switched off, no interpreter, nothing to match.
+        assert!(parse_binfmt_rule("disabled\ninterpreter /usr/bin/x\nmagic 00\n").is_none());
+        assert!(parse_binfmt_rule("enabled\ninterpreter \nmagic 00\n").is_none());
+        assert!(parse_binfmt_rule("enabled\ninterpreter /usr/bin/x\nflags: \n").is_none());
     }
 
     /// Deny beats ask beats allow, which is what lets one syscall be decided under two names.

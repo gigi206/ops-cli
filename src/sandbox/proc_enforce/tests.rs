@@ -98,6 +98,7 @@ fn run_with_open_lens(
                     notifier: &crate::sandbox::notify_sink::Notifier::disabled(),
                     open: Some(&lens),
                     mounts: lens.mounts(),
+                    binfmt: &[],
                     undecidable: &Undecidable::default(),
                 },
             );
@@ -2209,6 +2210,21 @@ fn run_under_supervisor_notified(
     path: Option<&str>,
     notifier: &crate::sandbox::notify_sink::Notifier,
 ) -> (Option<i32>, Arc<ExecRing>) {
+    run_under_supervisor_binfmt(payload, policy, overlay, notifs, path, notifier, &[])
+}
+
+/// The same harness with `binfmt_misc` handlers supplied, which registering one for real would
+/// need privilege this test does not have.
+#[allow(clippy::too_many_arguments)]
+fn run_under_supervisor_binfmt(
+    payload: &[&str],
+    policy: &ProcPolicy,
+    overlay: &ProcOverlay,
+    notifs: usize,
+    path: Option<&str>,
+    notifier: &crate::sandbox::notify_sink::Notifier,
+    binfmt: &[crate::proc_policy::BinfmtRule],
+) -> (Option<i32>, Arc<ExecRing>) {
     let dir = TmpDir::new();
     let shim = materialized_shim(&dir);
     let sock_path = dir.join("notif.sock");
@@ -2244,6 +2260,7 @@ fn run_under_supervisor_notified(
                     notifier,
                     open: None,
                     mounts: &CageMounts::default(),
+                    binfmt,
                     undecidable: &Undecidable::default(),
                 },
             );
@@ -2585,6 +2602,149 @@ fn the_interpreter_a_shebang_names_is_decided_too() {
             .any(|e| e.verdict == "deny" && e.command.contains("/bin/sh")),
         "the record names the interpreter the rule spoke about, not only the script: {events:?}"
     );
+}
+
+/// An interpreter `binfmt_misc` would run is decided, though no byte of the file names it.
+///
+/// A registered handler makes the kernel run an interpreter inside the `execve` that named the
+/// file, exactly as a `#!` line does -- except that the file says nothing about which interpreter,
+/// so no reading of its contents can find one. The handler has to be read instead, and it is the
+/// last of the three single-syscall substitutions this supervisor did not see.
+///
+/// The handlers are supplied rather than registered: enrolling one needs privilege a test does not
+/// have. What is exercised is everything downstream of that -- the match against the file's magic,
+/// the rule the interpreter is put to, and the refusal. The fixture claims the ELF magic so an
+/// ordinary binary is what triggers it, which also makes the witness arm exact: the same binary
+/// with no handler in force must run.
+#[test]
+fn an_interpreter_binfmt_misc_would_run_is_decided() {
+    let handler = crate::proc_policy::parse_binfmt_rule(
+        "enabled\ninterpreter /opt/vm/run\nflags: \noffset 0\nmagic 7f454c46\n",
+    )
+    .expect("a usable handler");
+    let denied = ProcPolicy::new(ProcMode::Enforce, &[], &["run".to_string()]);
+    let quiet = crate::sandbox::notify_sink::Notifier::disabled();
+
+    // The witness: with no handler in force the binary runs, so the refusal below is the handler
+    // and not `/bin/true` failing here for some other reason.
+    let (code, _) = run_under_supervisor_binfmt(
+        &["/bin/true"],
+        &denied,
+        &ProcOverlay::new(),
+        1,
+        None,
+        &quiet,
+        &[],
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "the binary must run without a handler, or this test measures nothing"
+    );
+
+    // The finding: the same exec is refused once a handler claims the file, because the rule about
+    // the interpreter it would run is consulted.
+    let (code, ring) = run_under_supervisor_binfmt(
+        &["/bin/true"],
+        &denied,
+        &ProcOverlay::new(),
+        1,
+        None,
+        &quiet,
+        std::slice::from_ref(&handler),
+    );
+    assert_eq!(
+        code,
+        Some(126),
+        "a denied interpreter must not run because a handler, not the file, names it"
+    );
+    let events = ring.snapshot(None).events;
+    assert!(
+        events
+            .iter()
+            .any(|e| e.verdict == "deny" && e.command.contains("/opt/vm/run")),
+        "and the record names the interpreter the rule spoke about: {events:?}"
+    );
+
+    // The other half of the same rule: a handler naming an allowed interpreter does not refuse.
+    let elsewhere = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/nonexistent".to_string()]);
+    let (code, _) = run_under_supervisor_binfmt(
+        &["/bin/true"],
+        &elsewhere,
+        &ProcOverlay::new(),
+        1,
+        None,
+        &quiet,
+        std::slice::from_ref(&handler),
+    );
+    assert_eq!(code, Some(0), "a handler is not itself a refusal");
+}
+
+/// A `#!` line runs from memory too, and both spellings that reach it are decided.
+///
+/// An exec can name its target by **descriptor** rather than by a path, and the object behind it
+/// need not have a name at all: `memfd_create` + a `#!` line + `execveat(fd, "", …, AT_EMPTY_PATH)`
+/// -- which is what `fexecve` issues -- runs the interpreter with nothing on any filesystem to
+/// point at. The plain `execve("/proc/self/fd/<n>")` spelling does the same. Both were measured to
+/// work, and both would slip past a walk that resolves paths: such a descriptor links to
+/// `/memfd:<name> (deleted)`, which resolves nowhere, so the head would not be read and the
+/// interpreter would not be decided.
+///
+/// Driven through `python3` because the payload has to issue the syscall itself; skipped, and said
+/// so, where the interpreter is not on this host.
+#[test]
+fn a_shebang_run_from_a_descriptor_is_decided_too() {
+    let Some(python) = ["/usr/bin/python3", "/bin/python3"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+    else {
+        eprintln!("MEMFD-EXEC: skipped, no python3 on this host");
+        return;
+    };
+    // Two payloads, one per spelling. Each writes a `#!/bin/sh` script into a `memfd` and execs it;
+    // the shell would exit 7, so any other code means it never ran.
+    let common = "import os,ctypes\n\
+         libc=ctypes.CDLL('libc.so.6',use_errno=True)\n\
+         fd=libc.memfd_create(b'payload',0)\n\
+         os.write(fd,b'#!/bin/sh\\nexit 7\\n')\n";
+    let by_fd = format!(
+        "{common}argv=(ctypes.c_char_p*2)(b'payload',None)\n\
+         envp=(ctypes.c_char_p*1)(None)\n\
+         libc.syscall(322,fd,b'',argv,envp,0x1000)\n\
+         os._exit(9)\n"
+    );
+    let by_path = format!("{common}os.execv(f'/proc/self/fd/{{fd}}',['payload'])\nos._exit(9)\n");
+
+    for (spelling, code) in [("AT_EMPTY_PATH", &by_fd), ("/proc/self/fd", &by_path)] {
+        // The witness: under a policy denying something else the shell really runs from memory, so
+        // a refusal below is the rule rather than the payload failing to pose the question.
+        let elsewhere = ProcPolicy::new(ProcMode::Enforce, &[], &["/bin/nonexistent".to_string()]);
+        let (ran, _) =
+            run_under_supervisor_n(&[python, "-c", code], &elsewhere, &ProcOverlay::new(), 2);
+        if ran != Some(7) {
+            eprintln!("MEMFD-EXEC: skipped for {spelling}, the witness did not run: {ran:?}");
+            continue;
+        }
+
+        // The finding: a `deny` on the interpreter stops it, though nothing on any filesystem was
+        // named by the syscall.
+        let denied = ProcPolicy::new(ProcMode::Enforce, &[], &["sh".to_string()]);
+        let (code, ring) =
+            run_under_supervisor_n(&[python, "-c", code], &denied, &ProcOverlay::new(), 2);
+        assert_ne!(
+            code,
+            Some(7),
+            "a denied interpreter must not run from memory through {spelling}"
+        );
+        let events = ring.snapshot(None).events;
+        assert!(
+            events
+                .iter()
+                .any(|e| e.verdict == "deny" && e.command.contains("#! /bin/sh")),
+            "the refusal is recorded, and names the interpreter the rule spoke about, for \
+             {spelling}: {events:?}"
+        );
+    }
 }
 
 /// A file this supervisor can reach and not read is refused rather than run.
@@ -2929,6 +3089,7 @@ struct DecidingParts {
     undecidable: Undecidable,
     lens: Option<OpenLens>,
     mounts: CageMounts,
+    binfmt: Vec<crate::proc_policy::BinfmtRule>,
 }
 
 impl DecidingParts {
@@ -2937,6 +3098,7 @@ impl DecidingParts {
             overlay: ProcOverlay::new(),
             ring: ExecRing::new(8),
             mounts: CageMounts::default(),
+            binfmt: Vec::new(),
             pending: PendingExec::new(),
             notifier: crate::sandbox::notify_sink::Notifier::disabled(),
             undecidable: Undecidable::default(),
@@ -2965,6 +3127,7 @@ impl DecidingParts {
             notifier: &self.notifier,
             open: self.lens.as_ref(),
             mounts: &self.mounts,
+            binfmt: &self.binfmt,
             undecidable: &self.undecidable,
         }
     }

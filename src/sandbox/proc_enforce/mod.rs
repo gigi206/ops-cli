@@ -104,15 +104,23 @@
 //! decided as `/usr/bin/env`, so a payload spelled there runs only under an interpreter a rule
 //! already allows.
 //!
-//! **Two routes stay open, and neither is closed by reading a file.** `binfmt_misc` is the first: a
-//! registered handler for a `.jar`, a `.py` or a wine binary runs an interpreter that nothing in
-//! the file names, so no read can find it; the enrolled interpreter runs without a notification of
-//! its own, and a rule about it is not consulted. The second is an exec named by **descriptor**
-//! whose object has no path -- `execveat(fd, "", …, AT_EMPTY_PATH)` on a `memfd`, which is what
-//! `fexecve` issues. Such a descriptor's `/proc` link reads `/memfd:<name> (deleted)`, measured, and
-//! a walk from the cage's root reaches nothing there, so the head is not read and the verdict is the
-//! one the link's own name took. Under `confine` both are exactly as confined as the allowlist entry
-//! that let the *file* run.
+//! **`binfmt_misc` is the second substitution, and it is closed by reading the kernel rather than
+//! the file.** A registered handler for a `.jar`, a `.py` or a wine binary runs an interpreter that
+//! nothing in the file names, so no reading of its contents can find one; the handlers themselves
+//! are read instead ([`read_binfmt_rules`]), once per launch, and every one whose magic or
+//! extension claims the file has its interpreter decided too. Every match is taken rather than the
+//! first, because the order the kernel tries them in is not the order they are read in here, and
+//! the union cannot be less strict than the kernel's own answer. Handlers are registered globally,
+//! so what this process reads is what the cage's `execve` meets; one enrolled *during* a launch is
+//! not seen by it, which needs a privilege the cage does not have.
+//!
+//! **An exec named by descriptor is read through the caller's own `/proc` entry**, which is the one
+//! place a vouched walk cannot reach: `execveat(fd, "", …, AT_EMPTY_PATH)` on a `memfd` -- what
+//! `fexecve` issues -- and a plain `execve("/proc/self/fd/<n>")` both run a `#!` line from memory,
+//! measured, and such a descriptor links to `/memfd:<name> (deleted)`, which resolves nowhere. The
+//! object is opened through `/proc/<pid>/fd/<n>` instead. That grants nothing, for the reason the
+//! open lens gives about an anonymous inode reached the same way: what the descriptor holds is what
+//! the caller holds already.
 //!
 //! Two consequences of reading the file are written here because they are the price. A target this
 //! supervisor can reach and **not read** is refused rather than run, whatever the policy says about
@@ -159,7 +167,7 @@ mod target;
 pub(crate) use overlay::ProcOverlay;
 pub(crate) use pending::PendingExec;
 
-use cagepath::open_target_path;
+use cagepath::{caller_proc_path, open_target_path};
 use notify::{
     notif_id_valid, notif_of, notif_recv_code, poll_events, poll_readable, recv_fd,
     respond_continue, respond_errno,
@@ -373,6 +381,7 @@ fn start_inner(
     let counted = undecidable.clone();
     let lens = open.map(|(policy, root)| OpenLens::new(policy, root));
     let exec_mounts = CageMounts::default();
+    let binfmt = read_binfmt_rules();
     let lens_armed = lens.is_some();
     let handle = std::thread::spawn(move || {
         supervise(
@@ -387,6 +396,7 @@ fn start_inner(
                 open: lens.as_ref(),
                 // One cache either way: the lens keeps its own, and a launch without one gets this.
                 mounts: lens.as_ref().map_or(&exec_mounts, |l| l.mounts()),
+                binfmt: &binfmt,
                 undecidable: &counted,
             },
         );
@@ -460,8 +470,12 @@ fn exec_verdict(
     argv_addr: u64,
     notif: Option<(libc::c_int, u64)>,
 ) -> Decided {
-    let named = read_exec_path(pid, addr, notif)
-        .filter(|p| !p.is_empty())
+    let pathname = read_exec_path(pid, addr, notif).filter(|p| !p.is_empty());
+    // Whether the target is named by the **descriptor** rather than by a path the syscall carried.
+    // It changes how the file is reached below: an object with no name of its own -- a `memfd`, a
+    // file already unlinked -- is reachable only through the caller's own `/proc` entry.
+    let by_descriptor = pathname.is_none() && dirfd != libc::AT_FDCWD;
+    let named = pathname
         // `execveat(fd, "", …, AT_EMPTY_PATH)` names its target by the descriptor and passes an
         // empty pathname — which is exactly what glibc's `fexecve` issues, so this is the ordinary
         // shape rather than an exotic one. The descriptor's own `/proc` link is the program, read in
@@ -533,10 +547,28 @@ fn exec_verdict(
         // formed on an unreadable file would stop a program no rule speaks about. Skipped too when
         // the path's own verdict is already `deny`, where no stricter answer exists.
         if verdict != Verdict::Deny && (!cx.policy.governs_nothing() || cx.overlay.has_rules()) {
-            match exec_head(cx.mounts, pid, dirfd, &path, notif) {
+            match exec_head(cx.mounts, pid, dirfd, &path, by_descriptor, notif) {
                 Ok(head) => match crate::proc_policy::shebang_interpreter(&head) {
-                    // The file is what runs; its own verdict already stands.
-                    crate::proc_policy::ScriptHead::NotScript => {}
+                    // Not a script -- but a `binfmt_misc` handler may still run an interpreter
+                    // inside this same `execve`, and nothing in the file names it. Asked here
+                    // because the kernel tries the built-in formats first: an exec that ELF or the
+                    // `#!` handler accepts never reaches one of these.
+                    crate::proc_policy::ScriptHead::NotScript => {
+                        let named =
+                            crate::proc_policy::binfmt_interpreters(cx.binfmt, &head, &path);
+                        let mut with = verdict;
+                        for interpreter in &named {
+                            with = with.stricter(cx.overlay.decide(cx.policy, caller, interpreter));
+                        }
+                        if with != verdict {
+                            return Decided {
+                                verdict: with,
+                                shown: format!("{path} (binfmt {})", named.join(" ")),
+                                probed: path,
+                                because: Because::Policy,
+                            };
+                        }
+                    }
                     crate::proc_policy::ScriptHead::Interpreter(interp) => {
                         let with = cx.overlay.decide(cx.policy, caller, &interp);
                         let stricter = verdict.stricter(with);
@@ -651,6 +683,32 @@ fn basename_of(path: &str) -> &str {
     }
 }
 
+/// Where the kernel publishes the interpreters userland has enrolled with `binfmt_misc`.
+const BINFMT_DIR: &str = "/proc/sys/fs/binfmt_misc";
+
+/// The `binfmt_misc` handlers in force, read once per launch.
+///
+/// Read here rather than per `execve` because the set changes only when something registers a
+/// handler, which needs privilege this cage does not have, while an exec-heavy build issues
+/// thousands of decisions. The cost of being one registration stale is that such an interpreter is
+/// decided by the file's own name for the remainder of a launch, which is where every launch stood
+/// before this was read at all.
+///
+/// An empty vector is the ordinary answer on a host with none enrolled, and also what an unreadable
+/// or unmounted `binfmt_misc` gives -- there is nothing to fail here, only handlers this build did
+/// not learn about.
+fn read_binfmt_rules() -> Vec<crate::proc_policy::BinfmtRule> {
+    let Ok(entries) = std::fs::read_dir(BINFMT_DIR) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| !matches!(e.file_name().to_str(), Some("register" | "status")))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|text| crate::proc_policy::parse_binfmt_rule(&text))
+        .collect()
+}
+
 /// The first bytes of the file an `execve` names, read the way the cage's own walk would reach it.
 ///
 /// [`crate::proc_policy::SCRIPT_HEAD`] bytes, which is what the kernel itself reads before deciding
@@ -672,16 +730,39 @@ fn exec_head(
     pid: u32,
     dirfd: libc::c_int,
     path: &str,
+    by_descriptor: bool,
     notif: Option<(libc::c_int, u64)>,
 ) -> Result<Vec<u8>, libc::c_int> {
     use std::io::Read;
     use std::os::unix::io::AsRawFd;
-    let probe = probe_and_vouch(mounts, pid, &open_target_path(pid, dirfd, path), false)?;
-    // The probe is an `O_PATH` descriptor, which no read answers; reopening through it reads the
-    // object already resolved rather than whatever the path names a moment later -- and it is also
-    // where a file the cage may execute and not read says `EACCES`.
-    let mut file = std::fs::File::open(format!("/proc/self/fd/{}", probe.as_raw_fd()))
-        .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
+    // An object the caller already holds is opened through the caller's **own** `/proc` entry, with
+    // no mount asked to vouch for it -- the same exception the open lens makes for an anonymous
+    // inode reached that way, and for the same reason: what `/proc/<pid>/fd/<n>` holds is what the
+    // caller holds already, so reading it grants nothing. Two spellings reach it, and both were
+    // measured to run a `#!` line from memory: `execveat(fd, "", …, AT_EMPTY_PATH)`, which is what
+    // `fexecve` issues, and a plain `execve("/proc/self/fd/<n>")`. It is also the only way to reach
+    // such an object at all: a `memfd` links to `/memfd:<name> (deleted)` and a file unlinked since
+    // to `<path> (deleted)`, neither of which any walk resolves, so vouching would answer `ENOENT`
+    // about the very file the kernel is about to run.
+    let held = by_descriptor
+        .then(|| format!("/proc/{pid}/fd/{dirfd}"))
+        .or_else(|| {
+            caller_proc_path(pid, path).map(|_| {
+                open_target_path(pid, dirfd, path)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        });
+    let mut file = if let Some(target) = held {
+        std::fs::File::open(target).map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?
+    } else {
+        let probe = probe_and_vouch(mounts, pid, &open_target_path(pid, dirfd, path), false)?;
+        // The probe is an `O_PATH` descriptor, which no read answers; reopening through it reads
+        // the object already resolved rather than whatever the path names a moment later -- and it
+        // is also where a file the cage may execute and not read says `EACCES`.
+        std::fs::File::open(format!("/proc/self/fd/{}", probe.as_raw_fd()))
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?
+    };
     let mut head = vec![0u8; crate::proc_policy::SCRIPT_HEAD];
     let mut filled = 0;
     while filled < head.len() {
@@ -735,6 +816,9 @@ struct Deciding<'a> {
     /// answered and the lens is optional: a launch with no `[open]` policy still reads the first
     /// bytes of what it is about to run, and a walk it cannot vouch for is one it must not read.
     mounts: &'a CageMounts,
+    /// The `binfmt_misc` handlers this host has enrolled, which name interpreters no byte of the
+    /// file itself does.
+    binfmt: &'a [crate::proc_policy::BinfmtRule],
     /// Shared with the [`ProcEnforce`] that owns this supervisor, which reports the totals once the
     /// thread has been joined.
     undecidable: &'a Undecidable,
@@ -1121,6 +1205,15 @@ fn caller_chain(cx: &Deciding<'_>, pid: u32) -> Vec<String> {
 /// [`probe_in_cage_root`].
 fn refusal_errno(pid: u32, path: &str) -> libc::c_int {
     if !path.starts_with('/') {
+        return libc::EPERM;
+    }
+    // A name the kernel marks `(deleted)` is not a path the syscall carried: it is what a
+    // descriptor's own `/proc` link reads when the object behind it has no link left -- a `memfd`,
+    // or a file unlinked since it was opened. The object is *there*, and the exec would have run
+    // it, so answering `ENOENT` would both tell the cage the wrong thing and file a real refusal
+    // under the heading this function keeps for a `PATH` walk's misses, where it is neither
+    // announced nor read.
+    if path.ends_with(" (deleted)") {
         return libc::EPERM;
     }
     match probe_in_cage_root(pid, Path::new(path)) {
