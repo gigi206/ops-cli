@@ -210,13 +210,26 @@ fn split_scope(args: &[OsString]) -> Result<ScopeArgs, String> {
 /// `--session` (load the rule into the live overlay of the running session(s) instead of a config
 /// file) and its `--all` scope widener, lifted out before [`split_scope`], which rejects any flag it
 /// does not know. The config-scope flags (`--local`/`--global`/`-c`) and `-a` ride that call.
+///
+/// A bare `--` ends the options here as it does in [`split_scope`], which this runs before. Read
+/// with `any()` over the whole argv, the two flags were taken from *after* the terminator too, so
+/// `sbx net allow -- --all` lost its rule to a flag and answered with a usage line, on the one
+/// spelling that exists to say "what follows is a positional, whatever it looks like". The `--`
+/// itself is left in `rest` for `split_scope` to read, so the terminator keeps working for the
+/// flags that ride that call.
 fn split_session_flags(args: &[OsString]) -> (bool, bool, Vec<OsString>) {
-    let session = args.iter().any(|a| a.to_str() == Some("--session"));
-    let all = args.iter().any(|a| a.to_str() == Some("--all"));
+    let upto = args
+        .iter()
+        .position(|a| a.to_str() == Some("--"))
+        .unwrap_or(args.len());
+    let is_flag = |a: &OsString| matches!(a.to_str(), Some("--session") | Some("--all"));
+    let session = args[..upto].iter().any(|a| a.to_str() == Some("--session"));
+    let all = args[..upto].iter().any(|a| a.to_str() == Some("--all"));
     let rest = args
         .iter()
-        .filter(|a| !matches!(a.to_str(), Some("--session") | Some("--all")))
-        .cloned()
+        .enumerate()
+        .filter(|(i, a)| *i >= upto || !is_flag(a))
+        .map(|(_, a)| a.clone())
         .collect();
     (session, all, rest)
 }
@@ -1769,6 +1782,33 @@ mod tests {
             panic!("`-c` must still select a file scope");
         };
         assert_eq!(p.into_os_string(), raw());
+    }
+
+    /// A bare `--` says "what follows is a positional, whatever it looks like", and this split ran
+    /// before the one that honours it, reading `any()` over the whole argv. So `sbx net allow --
+    /// --all` had its rule taken as a flag and answered with a usage line, on the one spelling that
+    /// exists to prevent exactly that.
+    #[test]
+    fn the_session_flags_end_at_the_terminator_like_every_other_option() {
+        let v = |a: &[&str]| -> Vec<OsString> { a.iter().map(OsString::from).collect() };
+
+        let (session, all, rest) = split_session_flags(&v(&["--", "--all"]));
+        assert!(!session && !all, "after `--` these are the rule, not flags");
+        assert_eq!(rest, v(&["--", "--all"]));
+
+        let (session, all, rest) = split_session_flags(&v(&["--", "--session"]));
+        assert!(!session && !all);
+        assert_eq!(rest, v(&["--", "--session"]));
+
+        // Witness: before the terminator they are still the flags, and still lifted out.
+        let (session, all, rest) = split_session_flags(&v(&["--session", "--all", "api.test"]));
+        assert!(session && all);
+        assert_eq!(rest, v(&["api.test"]));
+
+        // And a terminator with flags on both sides splits at it, not around it.
+        let (session, all, rest) = split_session_flags(&v(&["--session", "--", "--all"]));
+        assert!(session && !all);
+        assert_eq!(rest, v(&["--", "--all"]));
     }
 
     #[test]
