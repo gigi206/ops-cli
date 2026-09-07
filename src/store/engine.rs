@@ -36,7 +36,12 @@ const ENGINE_OVERRIDE_ENV: &str = "SBX_NIX_BIN";
 /// base that resolved and was then refused — in which case that middle tier is simply skipped and
 /// resolution falls through to the host `PATH`.
 ///
-/// Pure resolution — it never writes — so a read-only caller (`sbx doctor`) is safe.
+/// Pure resolution in the shipped build: it never writes, so a read-only caller (`sbx doctor`) is
+/// safe. Under the `bundled-nix` feature it is not, and deliberately so — the first resolution lays
+/// sbx's own static nix into the owned engine directory, once, and every later one finds it there.
+/// That write is idempotent and best-effort (a failure leaves the tier empty and resolution falls
+/// through to `PATH`), but "never writes" is a promise the feature does not keep, and a caller
+/// choosing this function for that reason should know which build it is reading.
 ///
 /// The `Option` form, for the many callers that only need the binary or a message of their own; a
 /// caller that *reports the failure to the user* wants [`try_resolve_nix`] instead, which says
