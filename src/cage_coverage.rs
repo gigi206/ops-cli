@@ -152,28 +152,59 @@ fn test_paths_named_by_ci() -> Vec<(String, String)> {
 /// bare function name in prose is not matched, because an unqualified identifier cannot be told
 /// from any other snake_case word without guessing, and a guard that guesses reports drift where
 /// there is none.
+///
+/// The **module** half is checked too, not only the leaf. A filter names a path, and `--skip` reads
+/// the whole of it: a test that keeps its name and moves to another module leaves the filter
+/// excluding nothing, which is the same silence this guard exists for. The module a source file
+/// declares is derived from its path under `src/` — the crate is a binary, so that path *is* the
+/// module path — and a `tests` segment anywhere in the filter is dropped before the comparison,
+/// since a test module's own nesting is not visible from the file tree.
 #[test]
 fn every_test_a_ci_file_names_exists() {
-    let declared: Vec<String> = walk_sources()
-        .into_iter()
-        .flat_map(|text| {
-            text.match_indices("fn ")
-                .filter_map(|(i, _)| {
-                    let rest = &text[i + 3..];
-                    let end = rest.find(['(', '<', ' ', '\n'])?;
-                    Some(rest[..end].to_string())
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    // Every `fn` a source declares, with the module its file spells. `mod.rs` names the directory
+    // it sits in; any other file names itself.
+    let mut declared: Vec<(String, String)> = Vec::new();
+    for (path, text) in walk_sources_with_paths() {
+        let module = module_path_of(&path);
+        for (i, _) in text.match_indices("fn ") {
+            let rest = &text[i + 3..];
+            let Some(end) = rest.find(['(', '<', ' ', '\n']) else {
+                continue;
+            };
+            declared.push((module.clone(), rest[..end].to_string()));
+        }
+    }
 
     let mut missing = Vec::new();
     for (file, path) in test_paths_named_by_ci() {
         let leaf = path.rsplit("::").next().unwrap_or_default();
-        if !declared.iter().any(|d| d == leaf) {
-            missing.push(format!(
-                "  {file} names `{path}`, and no test is called `{leaf}`"
-            ));
+        // The filter's module half: everything before the leaf, with `tests` segments dropped.
+        let named: Vec<&str> = path
+            .split("::")
+            .take(path.split("::").count().saturating_sub(1))
+            .filter(|seg| *seg != "tests")
+            .collect();
+        let hit = declared.iter().any(|(module, name)| {
+            name == leaf && {
+                let have: Vec<&str> = module.split("::").filter(|s| !s.is_empty()).collect();
+                // The filter may name the module from any depth (`cgroup::tests::x` and
+                // `sandbox::cgroup::tests::x` both reach it), so a suffix match is the question.
+                named.is_empty() || have.ends_with(&named[..])
+            }
+        });
+        if !hit {
+            let where_it_is: Vec<String> = declared
+                .iter()
+                .filter(|(_, name)| name == leaf)
+                .map(|(module, name)| format!("{module}::tests::{name}"))
+                .collect();
+            missing.push(match where_it_is.as_slice() {
+                [] => format!("  {file} names `{path}`, and no test is called `{leaf}`"),
+                found => format!(
+                    "  {file} names `{path}`, but that test is at {}",
+                    found.join(", ")
+                ),
+            });
         }
     }
     assert!(
@@ -183,9 +214,33 @@ fn every_test_a_ci_file_names_exists() {
     );
 }
 
-/// Every `.rs` file under `src/` and `tests/`, as its contents.
-fn walk_sources() -> Vec<String> {
-    fn walk(dir: &Path, out: &mut Vec<String>) {
+/// The module path a source file spells, as a filter would write it: its path under `src/` with
+/// the extension dropped, `mod.rs` naming the directory it sits in, and separators as `::`. A file
+/// under `tests/` is its own integration crate and has no module path, so it answers empty and any
+/// filter naming it matches on the leaf alone.
+fn module_path_of(path: &Path) -> String {
+    let Ok(rel) = path.strip_prefix(root().join("src")) else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    match parts.pop() {
+        Some(last) => {
+            let stem = last.trim_end_matches(".rs");
+            if stem != "mod" && stem != "main" {
+                parts.push(stem.to_string());
+            }
+        }
+        None => return String::new(),
+    }
+    parts.join("::")
+}
+
+/// Every `.rs` file under `src/` and `tests/`, with its path.
+fn walk_sources_with_paths() -> Vec<(PathBuf, String)> {
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
@@ -196,7 +251,7 @@ fn walk_sources() -> Vec<String> {
             } else if path.extension().is_some_and(|e| e == "rs")
                 && let Ok(text) = std::fs::read_to_string(&path)
             {
-                out.push(text);
+                out.push((path, text));
             }
         }
     }

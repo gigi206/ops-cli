@@ -1421,7 +1421,14 @@ mod tests {
     fn the_completion_and_the_parser_agree_on_which_override_flag_eats_the_next_word() {
         const SENTINEL: &str = "an-operand-no-flag-may-eat";
         let mut checked = 0usize;
-        for path in [&["run"][..], &["shell"][..], &["app", "run"][..]] {
+        // Every page the table has, not a list written here. The list named `shell`, a page that
+        // had been merged into `run` seven weeks before this test was written, so it contributed
+        // nothing and the comment counting "the three pages" counted two. A page is in the
+        // population when the parser claims one of its flags, which the skip below decides, so a
+        // launch page added later is covered without this test being touched.
+        for path in help::all_paths() {
+            let path: Vec<&str> = path.to_vec();
+            let path = path.as_slice();
             for (row, _) in help::options_of(path) {
                 for token in row.split([' ', ',', '\t']) {
                     // The flag name alone: an option row writes its grammar with the value
@@ -1439,7 +1446,10 @@ mod tests {
                     // nothing may consume, and see whether the word survives.
                     let mut head = vec![OsString::from(&flag), OsString::from(SENTINEL)];
                     let mut cli = config::CliOverrides::default();
-                    if take_override_flag(&mut head, &mut cli, path[0]).is_none() {
+                    let Some(verb) = path.first() else {
+                        continue;
+                    };
+                    if take_override_flag(&mut head, &mut cli, verb).is_none() {
                         continue; // not an override flag; its grammar is decided elsewhere
                     }
                     let parser_eats_it = !head.iter().any(|w| w == SENTINEL);
@@ -1456,9 +1466,9 @@ mod tests {
             }
         }
         // A population read from the pages can silently shrink — a row format that changes, a
-        // page that moves — and an assertion nothing reaches is not a guard. The three pages carry
-        // thirty-two flag/page pairs between them; the floor is set below one page's worth, so
-        // losing a whole page's rows is what trips it rather than a single flag being renamed.
+        // page that moves — and an assertion nothing reaches is not a guard. The launch pages
+        // carry some thirty flag/page pairs between them; the floor sits below one page's worth,
+        // so losing a whole page's rows is what trips it rather than a single flag being renamed.
         assert!(
             checked >= 24,
             "only {checked} override flags were reached; the option rows are no longer being read"
