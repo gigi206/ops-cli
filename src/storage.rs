@@ -942,10 +942,32 @@ fn lock_image(image: &Path) -> io::Result<ImageLock> {
         .truncate(false)
         .mode(0o600)
         .open(&path)?;
-    // SAFETY: `flock` on a valid owned fd; it blocks until granted and returns 0 on success.
-    // The fd lives in the guard, so the lock is held until the guard drops.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(io::Error::last_os_error());
+    // Asked without blocking first, so a lock somebody else holds can be *named* before it is
+    // waited on. The holder is another sbx in the middle of the same sequence, and that sequence
+    // calls `udisksctl`, which goes through polkit: an authentication prompt takes as long as the
+    // person in front of it, and a second `up` that simply stopped printing reads as a hang.
+    //
+    // The wait itself stays unbounded, and giving up would be the wrong trade: this lock is what
+    // keeps two loop devices off one image, and a bounded wait that expired would hand the caller
+    // the very race the lock exists to prevent. What changes is that the wait is announced.
+    //
+    // SAFETY: `flock` on a valid owned fd. `LOCK_NB` returns `EWOULDBLOCK` instead of blocking when
+    // another open file description holds the lock. The fd lives in the guard, so the lock is held
+    // until the guard drops.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::WouldBlock {
+            return Err(err);
+        }
+        crate::diag::note(&format!(
+            "another sbx is working on {} — waiting for it to finish (it may be waiting for your \
+             authorisation)",
+            image.display()
+        ));
+        // SAFETY: as above, blocking this time now that the wait has been announced.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     Ok(ImageLock(file))
 }
