@@ -42,6 +42,24 @@ use std::process::{Command, Stdio};
 /// writes a cache or a lockfile has somewhere ephemeral to do it without any host path.
 const CAGE_HOME: &str = "/tmp";
 
+/// The filesystems the plugin cage mounts for itself, which no grant may name.
+///
+/// [`cage_spec`] lays these before the grant's own binds, so that a grant naming something *under*
+/// the cage's home is not shadowed by the tmpfs. bwrap resolves a bind's source in the original
+/// root, so the same ordering makes `--ro-bind-try /proc /proc` after `--proc /proc` replace the
+/// cage's procfs with the **host's** — and with it, for every same-uid process, `environ`,
+/// `cmdline`, `maps` and `fd/`, which is where a credential passed by descriptor lives.
+///
+/// Nothing a plugin legitimately reads sits under `/proc` or `/dev`, so a grant naming any path
+/// there is refused. The cage's home is different: a manifest may well name an agent socket beneath
+/// it, so only the mount point itself and the paths above it are refused, and
+/// `every_structural_mount_of_the_plugin_cage_is_named_in_the_grant_denylist` holds this list to
+/// what [`cage_spec`] actually mounts.
+pub(crate) const CAGE_OWN_FILESYSTEMS: &[&str] = &["/proc", "/dev"];
+
+/// The cage's own home, refused to a grant at the mount point and above it, never below.
+pub(crate) const CAGE_HOME_MOUNT: &str = CAGE_HOME;
+
 /// Where a manifest's `programs` are bound, and the first entry of the cage's `PATH`, so a plugin
 /// invokes each one by name. Deliberately not under `/opt/sbx`, which the *agent's* cage already
 /// uses for its own furniture (the proc shim, the fonts config, the egress CA): the two cages
@@ -1708,6 +1726,47 @@ mod tests {
             !argv.iter().any(|a| a.to_string_lossy().contains("broker")),
             "nothing broker-shaped may reach the cage: {argv:?}"
         );
+    }
+
+    /// The denylist a grant is held to names every filesystem this cage mounts for itself.
+    ///
+    /// The two are one fact written twice: `cage_spec` lays these before the grant's binds, and
+    /// bwrap resolves a bind's source in the original root, so a grant naming one replaces it with
+    /// the host's. A mount added here and not there would be reachable again with nothing to say
+    /// so, which is exactly how the `/proc` case arrived.
+    #[test]
+    fn every_structural_mount_of_the_plugin_cage_is_named_in_the_grant_denylist() {
+        let dir = TmpDir::new();
+        let grant = SandboxGrant {
+            state: false,
+            programs: vec![],
+            allow_paths: vec![],
+            allow_env: vec![],
+            allow_env_paths: vec![],
+            mask_paths: vec![],
+            network: false,
+            brokers: vec![],
+        };
+        let p = plugin_in(dir.path(), grant);
+        let spec =
+            cage_spec(&plan_for(&p, "test://x"), &[], &[], &[], &[], &[]).expect("valid spec");
+
+        let named: Vec<&str> = CAGE_OWN_FILESYSTEMS
+            .iter()
+            .copied()
+            .chain(std::iter::once(CAGE_HOME_MOUNT))
+            .collect();
+        for mount in &spec.mounts {
+            let dest = match mount {
+                Mount::Proc { dest } | Mount::Dev { dest } | Mount::Tmpfs { dest } => dest,
+                _ => continue,
+            };
+            assert!(
+                named.contains(&dest.to_string_lossy().as_ref()),
+                "the cage mounts `{}` for itself and no grant rule names it: {named:?}",
+                dest.display()
+            );
+        }
     }
 
     #[test]

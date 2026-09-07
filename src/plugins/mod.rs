@@ -221,6 +221,43 @@ pub(crate) fn check_grant_control_plane_for<'a>(
                 root.display()
             ));
         }
+        // The other direction of the same overlap. A grant that *contains* a root reaches it just
+        // as surely: `$HOME` is one entry, and the mount it becomes carries the global config's
+        // `[plugin.<name>] env`, every plugin's state directory and the trust markers with it. The
+        // sibling surface, a project config's `binds`, has always answered both directions.
+        if let Some(root) = roots
+            .iter()
+            .find(|r| r.starts_with(&canon) && r.as_path() != canon)
+        {
+            return Err(format!(
+                "an `{field}` entry names `{}`, which contains sbx's own control plane `{}` — \
+                 a plugin's grant does not reach the directory holding the other plugins' \
+                 credentials, the store caches, or the trust markers, whether it names it or a \
+                 parent of it",
+                path.display(),
+                root.display()
+            ));
+        }
+        // The cage's own filesystems. A grant is mounted after them, and bwrap resolves a bind's
+        // source in the original root, so naming one replaces what the cage mounted for itself
+        // with the host's copy.
+        let structural = crate::sandbox::resolver::CAGE_OWN_FILESYSTEMS
+            .iter()
+            .map(Path::new)
+            .find(|m| canon.starts_with(m) || m.starts_with(&canon))
+            .or_else(|| {
+                let home = Path::new(crate::sandbox::resolver::CAGE_HOME_MOUNT);
+                home.starts_with(&canon).then_some(home)
+            });
+        if let Some(mount) = structural {
+            return Err(format!(
+                "an `{field}` entry names `{}`, which reaches `{}` — the plugin cage mounts that \
+                 for itself, and a grant is layered over it, so the bind would give the plugin the \
+                 host's copy and every same-uid process's environment and open files with it",
+                path.display(),
+                mount.display()
+            ));
+        }
     }
     Ok(())
 }
@@ -2067,6 +2104,67 @@ mod tests {
         for entry in ["/h/.config/sbx-other/x", "/h/.password-store"] {
             check_grant_control_plane_for([("allow_paths", Path::new(entry))], &roots)
                 .unwrap_or_else(|why| panic!("`{entry}` is not the control plane: {why}"));
+        }
+    }
+
+    /// The other direction of the same overlap: a grant that *contains* a root reaches it.
+    ///
+    /// One entry saying `$HOME` mounts the global config's `[plugin.<name>] env`, every plugin's
+    /// state directory and the trust markers along with everything else, which is the reach the
+    /// rule above exists to refuse. The arms that are already refused are the witness: they are
+    /// checked in the same test, against the same roots.
+    #[test]
+    fn a_grant_path_that_contains_the_control_plane_is_refused_too() {
+        let roots = vec![
+            PathBuf::from("/h/.local/share/sbx"),
+            PathBuf::from("/h/.local/state/sbx/trusted"),
+            PathBuf::from("/h/.config/sbx"),
+        ];
+        for entry in ["/h", "/h/.config", "/h/.local", "/h/.local/share"] {
+            let why = check_grant_control_plane_for([("allow_paths", Path::new(entry))], &roots)
+                .expect_err("a grant containing the control plane reaches it");
+            assert!(why.contains("contains sbx's own control plane"), "{why}");
+            assert!(why.contains(entry), "the entry is named: {why}");
+        }
+        // And a sibling of the roots, containing none of them, is still an ordinary grant.
+        check_grant_control_plane_for(
+            [("allow_paths", Path::new("/h/.local/state/other"))],
+            &roots,
+        )
+        .expect("a path containing no root is not the control plane");
+    }
+
+    /// No grant may name a filesystem the plugin cage mounts for itself.
+    ///
+    /// The grant's binds are laid over those mounts and bwrap resolves a bind's source in the
+    /// original root, so `allow_paths = ["/proc"]` hands the plugin the **host's** procfs: every
+    /// same-uid process's `environ`, `cmdline` and `fd/`, where a credential passed by descriptor
+    /// lives. `/proc` and `/dev` are closed whole; the cage's home is closed at the mount point and
+    /// above it only, because a socket beneath it is a grant a manifest legitimately writes.
+    #[test]
+    fn no_grant_path_may_name_a_filesystem_the_cage_mounts_for_itself() {
+        let roots = vec![PathBuf::from("/h/.config/sbx")];
+        for entry in ["/proc", "/proc/1/environ", "/dev", "/dev/net/tun", "/tmp"] {
+            let why = check_grant_control_plane_for([("allow_paths", Path::new(entry))], &roots)
+                .unwrap_err();
+            assert!(
+                why.contains("the plugin cage mounts that for itself"),
+                "`{entry}`: {why}"
+            );
+        }
+        // The root itself answers to both rules — it contains the control plane and every mount the
+        // cage makes — and is refused by whichever is asked first.
+        check_grant_control_plane_for([("allow_paths", Path::new("/"))], &roots)
+            .expect_err("the root is not a grant");
+        // The grants a manifest really writes: a socket under the cage's home, and an agent socket
+        // under the runtime directory, which is not one of the cage's own mounts.
+        for entry in [
+            "/tmp/agent/S.gpg-agent",
+            "/run/user/1000/gnupg",
+            "/h/.gnupg",
+        ] {
+            check_grant_control_plane_for([("allow_paths", Path::new(entry))], &roots)
+                .unwrap_or_else(|why| panic!("`{entry}` is an ordinary grant: {why}"));
         }
     }
 

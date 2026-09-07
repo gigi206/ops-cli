@@ -62,9 +62,19 @@ brokers     = []                   # broker plugins whose fenced socket replaces
   plugin trees and every plugin's state), the trust-marker store, and the global
   config directory, where `[plugin.<name>] env` carries other plugins'
   credentials in the clear. An entry inside one of them is refused by name, both
-  when the manifest is loaded and again when the cage is built. It is the same
-  list a project config's `binds` is measured against, which is forced read-only
-  rather than refused: a manifest is a fixed file its author can correct.
+  when the manifest is loaded and again when the cage is built, and so is an entry
+  that merely *contains* one: `$HOME` mounts every part of that list along with
+  everything else. It is the same list a project config's `binds` is measured
+  against, which is forced read-only rather than refused: a manifest is a fixed
+  file its author can correct.
+
+  Two other names are refused for a different reason. The cage mounts its own
+  `/proc`, its own `/dev` and a tmpfs for its home, and a grant is layered over
+  them, so an entry naming one would replace what the cage made for itself with the
+  host's copy: granting `/proc` hands the plugin every same-uid process's
+  environment, command line and open files. `/proc` and `/dev` are closed whole,
+  and the cage's home is closed at the mount point and above it. A path *beneath*
+  the home is an ordinary grant, which is how an agent socket is named.
 
   One consequence to plan for: a resolver that refreshes must be the **only**
   refresher. If the application also holds a working refresh token, both will
