@@ -10,7 +10,10 @@
 //! answers were once given eight times over, at which point they had already diverged. The callers
 //! are the cage's synthetic identity and egress contract ([`super::binds`]), the per-project pin
 //! locks ([`super::flake`], [`super::nixhub`], [`super::prebuilt`]), the staged audio shim
-//! ([`super::audio`]) and the desktop mark ([`super::notify_sink`]).
+//! ([`super::audio`]), the desktop mark ([`super::notify_sink`]), the snapshot an overwrite keeps
+//! ([`crate::cli::keep_replaced_file`]) and the profile an import writes ([`crate::cli::app`]).
+//! The last two arrived by deletion rather than by design: each had its own copy of this staging,
+//! and each named its temp from the pid alone.
 
 use std::io;
 use std::path::Path;

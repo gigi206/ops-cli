@@ -649,8 +649,8 @@ for the fetches nix performs the difference is not one `sbx` can close today.
 
 `sbx` fetches distro images itself, and there every hop is checked: a server that answers an
 `https://` request with a redirect to `http://` is refused at that hop rather than followed. The
-`deb:`, `appimage:`, `tarball:` and `binary:` artefacts are fetched by nix instead, inside its own
-process. nix follows such a redirect, reports the hash and the store path without naming the URL that
+`deb:`, `appimage:`, `tarball:` and `binary:` artefacts, and a remote `flake:` reference, are
+fetched by nix instead, inside its own process. nix follows such a redirect, reports the hash and the store path without naming the URL that
 finally answered, and offers no setting that constrains the protocols a redirect may reach. So a
 vendor whose own redirect leaves TLS takes the fetch with it, and neither the lock nor the launch
 output says so: the lock records the URL `sbx` asked for.

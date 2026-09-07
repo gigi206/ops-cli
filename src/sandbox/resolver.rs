@@ -490,6 +490,17 @@ fn output_within_armed_by(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    // Read before anything is signalled, while the child is certainly still there. A caller that
+    // put its command in its own process group (`CommandExt::process_group(0)`) is asking for the
+    // whole group to be ended, and this is what says so: the child leads a group only if it was
+    // moved into one, since a child that inherits sbx's group is not its leader. Without the test,
+    // the group kill below would be a kill on sbx's own group.
+    let pid = child.id();
+    // SAFETY: `getpgid` reads a property of a live process and writes nothing. The pid is the one
+    // `spawn` just returned and is not reaped until `wait` below, so it names this child or
+    // nothing; on a pid that no longer exists the call returns -1, which is not this pid, and the
+    // group kill stays off.
+    let leads_group = unsafe { libc::getpgid(pid as libc::pid_t) } == pid as libc::pid_t;
     let pidfd = match arm(child.id()) {
         Ok(fd) => fd,
         Err(errno) => {
@@ -519,6 +530,18 @@ fn output_within_armed_by(
     let exited = crate::session::wait_for_exit(pidfd, deadline);
     if !exited {
         let _ = crate::session::send_signal(pidfd, libc::SIGKILL);
+        if leads_group {
+            // The pidfd ends one process, and for some commands that is not the same as ending
+            // what they started. Measured on `git clone`: SIGKILL on git leaves the
+            // `git-remote-https` helper it forked running, still blocked on the connection that
+            // caused the timeout, with nothing left to notice its parent is gone. A caller that
+            // asked for its own group gets the group. The pid is a group id and not a process
+            // here, and it cannot have been reused: the child is not reaped until `wait` below.
+            // SAFETY: a negative argument to `kill` names a process group. `leads_group` has
+            // established that the group is this child's own, so the signal reaches what the
+            // child started and nothing sbx did not spawn.
+            unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+        }
     }
     crate::session::close_fd(pidfd);
     // Immediate either way: the poll said the process is gone, or SIGKILL just made it so.

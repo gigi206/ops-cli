@@ -1095,8 +1095,13 @@ const CLONE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 /// Bounded by [`CLONE_DEADLINE`]: the URL is one a user passed to `sbx plugins store add`, or one
 /// a configured store recorded, and neither is a reason to wait on it forever.
 fn clone(git: &Path, url: &str, dest: &Path) -> Result<(), String> {
+    use std::os::unix::process::CommandExt as _;
     let mut cmd = git_command(git);
-    cmd.args(["clone", "--quiet", "--depth", "1", "--single-branch", "--"])
+    // Its own process group, so the deadline reaches what git starts and not only git. git runs
+    // the transport in a `git-remote-https` helper, and that helper is what is blocked on the
+    // server the timeout is about: killed alone, git leaves it behind holding the connection.
+    cmd.process_group(0)
+        .args(["clone", "--quiet", "--depth", "1", "--single-branch", "--"])
         .arg(url)
         .arg(dest);
     let out = crate::sandbox::resolver::output_within(&mut cmd, CLONE_DEADLINE, "the store clone")
@@ -2808,7 +2813,20 @@ mod tests {
     fn a_clone_that_never_answers_ends_at_the_deadline() {
         let base = crate::testutil::TmpDir::new();
         let git = base.path().join("git");
-        std::fs::write(&git, "#!/bin/sh\nsleep 600\n").unwrap();
+        // The stub stands for the server, not for git: what has to be bounded is sbx's wait, and a
+        // process that sleeps produces exactly the shape a socket that accepts and never speaks
+        // does. It forks one child and records its pid, because git does the same -- the transport
+        // runs in a `git-remote-https` helper, and ending git alone leaves that helper holding the
+        // connection. `exec` for the last one so the shell is not a process the kill has to find.
+        let marker = base.path().join("forked.pid");
+        std::fs::write(
+            &git,
+            format!(
+                "#!/bin/sh\nsleep 600 &\necho $! > {}\nexec sleep 600\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -2816,8 +2834,11 @@ mod tests {
         // so the deadline is exercised through the same call with a short one and the constant is
         // asserted separately. Both halves matter: a bound that is never applied, and one applied
         // with a figure nobody chose.
+        use std::os::unix::process::CommandExt as _;
         let mut cmd = super::git_command(&git);
-        cmd.arg("clone");
+        // The same shape `clone` builds: its own process group, which is what makes the kill reach
+        // the transport helper rather than only the process sbx spawned.
+        cmd.process_group(0).arg("clone");
         let started = std::time::Instant::now();
         let err = crate::sandbox::resolver::output_within(
             &mut cmd,
@@ -2832,6 +2853,29 @@ mod tests {
             started.elapsed()
         );
 
+        // And the process the stub forked is gone with it. `kill(pid, 0)` answers about a pid the
+        // test can still name because nothing here reaps it: a survivor reads as alive.
+        let forked: i32 = std::fs::read_to_string(&marker)
+            .expect("the stub records what it forked")
+            .trim()
+            .parse()
+            .expect("a pid");
+        let mut alive = true;
+        for _ in 0..50 {
+            if unsafe { libc::kill(forked, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if alive {
+            unsafe { libc::kill(forked, libc::SIGKILL) };
+        }
+        assert!(
+            !alive,
+            "the deadline ended the command and left {forked} behind holding what caused it"
+        );
+
         assert_eq!(
             super::CLONE_DEADLINE,
             std::time::Duration::from_secs(300),
@@ -2839,10 +2883,16 @@ mod tests {
         );
         // Assembled rather than written, so this assertion's own text is not what satisfies it:
         // a literal naming the call it looks for is found by `include_str!` in this very file.
+        let source = include_str!("stores.rs");
         let needle = format!("{}(&mut cmd, {}", "output_within", "CLONE_DEADLINE");
         assert!(
-            include_str!("stores.rs").contains(&needle),
+            source.contains(&needle),
             "the clone must reach that bound, not merely define it"
+        );
+        let group = format!("cmd.{}(0)", "process_group");
+        assert!(
+            source.contains(&group),
+            "and it must ask for its own group, or the bound ends git and not the transport"
         );
     }
 }
