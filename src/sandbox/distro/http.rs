@@ -25,7 +25,7 @@
 use super::super::proxy::ca;
 use super::super::proxy::wire;
 use std::io::{self, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 /// How many redirects a request follows before giving up. Registries use one for the blob
@@ -114,9 +114,40 @@ fn parse_url(url: &str) -> io::Result<Url> {
 /// Open a validated TLS connection to `url`'s host, using the proxy's own upstream trust anchors so
 /// this fetch is held to exactly the transport the cage's own traffic is.
 fn connect(url: &Url) -> io::Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>> {
-    let addr = (url.host.as_str(), url.port);
-    let sock = TcpStream::connect(addr)
-        .map_err(|e| io::Error::other(format!("connecting to {}:{}: {e}", url.host, url.port)))?;
+    // The connection carries the same deadline the reads do, which is what [`TIMEOUT`] says it is
+    // for. A plain `connect` has none of its own: an address that swallows the SYN is retried by
+    // the kernel until *its* ceiling, and the read and write timeouts below are only armed once a
+    // connection exists, so they never applied to the wait for one.
+    //
+    // The name resolution ahead of it is not covered, and cannot be by this call:
+    // `connect_timeout` takes an address that is already resolved, so the lookup happens first and
+    // keeps the system resolver's own bounds. Those are bounded; a black-holed SYN is not.
+    //
+    // Every resolved address is tried, as `connect` does, so a host that answers on one family
+    // after another is unreachable still connects. The deadline is per address rather than shared:
+    // a name resolving to many addresses is the case where each one deserves its own chance, and
+    // the alternative is a first candidate that eats the whole budget.
+    let mut sock = None;
+    let mut last: Option<io::Error> = None;
+    for candidate in (url.host.as_str(), url.port)
+        .to_socket_addrs()
+        .map_err(|e| io::Error::other(format!("resolving {}:{}: {e}", url.host, url.port)))?
+    {
+        match TcpStream::connect_timeout(&candidate, TIMEOUT) {
+            Ok(s) => {
+                sock = Some(s);
+                break;
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    let sock = sock.ok_or_else(|| {
+        let reason = last.map_or_else(
+            || "the name resolved to no address".to_string(),
+            |e| e.to_string(),
+        );
+        io::Error::other(format!("connecting to {}:{}: {reason}", url.host, url.port))
+    })?;
     sock.set_read_timeout(Some(TIMEOUT))?;
     sock.set_write_timeout(Some(TIMEOUT))?;
     let name = ca::upstream_server_name(&url.host)?;
