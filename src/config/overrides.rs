@@ -315,9 +315,10 @@ fn collect_from(cli: &CliOverrides, ambient: &AmbientOverrides) -> Result<Overri
     // Whether any blob declared egress groups, recorded per blob for the same reason: `network` is
     // a scalar field, so the blob that loses the merge takes its `groups` table out of sight with it.
     let mut blob_groups = false;
-    // Whether any blob declared `[mise]`, recorded per blob for the sharper version of that reason:
-    // `overlay_into` does not carry the table at all, so a later fold would leave nothing to notice.
-    let mut blob_mise = false;
+    // Which fields the fold drops outright any blob declared, recorded per blob for the sharper
+    // version of that reason: `overlay_into` does not carry them at all, so a later fold would
+    // leave nothing to notice.
+    let mut dropped = [false; DROPPED_TABLES.len()];
 
     // Tier 0 — the environment blob.
     let t0 = match &ambient.config {
@@ -325,7 +326,7 @@ fn collect_from(cli: &CliOverrides, ambient: &AmbientOverrides) -> Result<Overri
             let parsed = parse_blob(s).map_err(|e| format!("{SBX_CONFIG}: {e}"))?;
             super::warn_unknown_keys(&mut unknown, SBX_CONFIG, &parsed);
             blob_groups |= declares_net_groups(&parsed);
-            blob_mise |= parsed.mise.is_some();
+            declares_dropped(&parsed, &mut dropped);
             parsed
         }
         None => RawConfig::default(),
@@ -355,7 +356,7 @@ fn collect_from(cli: &CliOverrides, ambient: &AmbientOverrides) -> Result<Overri
         let parsed = parse_blob(c).map_err(|e| format!("--config (#{}): {e}", i + 1))?;
         super::warn_unknown_keys(&mut unknown, &format!("--config (#{})", i + 1), &parsed);
         blob_groups |= declares_net_groups(&parsed);
-        blob_mise |= parsed.mise.is_some();
+        declares_dropped(&parsed, &mut dropped);
         t2 = overlay_into(t2, parsed);
     }
     // Tier 3 — the CLI's typed fragments.
@@ -387,7 +388,7 @@ fn collect_from(cli: &CliOverrides, ambient: &AmbientOverrides) -> Result<Overri
     let cli_side = overlay_into(t2, t3);
 
     let mut notices = unknown;
-    push_ignored_field_notices(&env_side, &cli_side, blob_groups, blob_mise, &mut notices);
+    push_ignored_field_notices(&env_side, &cli_side, blob_groups, &dropped, &mut notices);
     push_env_source_notices(&env_side, &cli_side, &mut notices);
 
     let mut merged = overlay_into(env_side, cli_side);
@@ -401,13 +402,15 @@ fn collect_from(cli: &CliOverrides, ambient: &AmbientOverrides) -> Result<Overri
     })
 }
 
-/// Note the fields an override carries that are not one-shot launch concepts: egress groups and the
-/// mise engine are global-config affordances, and an override shapes *the* launch rather than
-/// defining apps. They are dropped (ignored downstream), so the notice is the only signal.
+/// Note the fields an override carries that are not one-shot launch concepts: egress groups are a
+/// global-config affordance, and an override shapes *the* launch rather than defining apps. They
+/// are dropped (ignored downstream), so the notice is the only signal.
 ///
-/// The fields dropped for the *other* reason — `nixpkgs`, `distro`, `[task.*]`, `[plugin.*]`,
-/// `[broker.*]` and the auto-upgrade resolver tables, each declared in a config someone reads
-/// rather than assembled on a command line — are passed over here without a notice.
+/// The fields [`overlay_into`] drops outright are named too, from [`DROPPED_TABLES`]. They used to
+/// be passed over in silence on the argument that each is declared in a config someone reads rather
+/// than assembled on a command line: true of where they belong, and no help to the author who has
+/// just written one on a command line and is about to watch it govern nothing. A blob that declares
+/// only such a field is an override that changes nothing, and it exited reporting success.
 ///
 /// `blob_groups` and `blob_mise` are decided per blob by the caller rather than read off the merged
 /// sides, for the reason an unknown key is: `network` is a **scalar** field, so a later blob's
@@ -418,7 +421,7 @@ fn push_ignored_field_notices(
     env_side: &RawConfig,
     cli_side: &RawConfig,
     blob_groups: bool,
-    blob_mise: bool,
+    dropped: &[bool; DROPPED_TABLES.len()],
     notices: &mut Vec<String>,
 ) {
     if blob_groups {
@@ -439,12 +442,93 @@ fn push_ignored_field_notices(
                 .to_string(),
         );
     }
-    if blob_mise {
-        notices.push(
-            "ignoring `[mise]` in the override — the engine that installs every `mise:` tool is \
-             set in the global config only, and it governs every cage"
-                .to_string(),
-        );
+    for (declared, (name, _, why)) in dropped.iter().zip(DROPPED_TABLES) {
+        if *declared {
+            notices.push(format!("ignoring `{name}` in the override — {why}"));
+        }
+    }
+}
+
+/// The fields [`overlay_into`] drops outright, each with the test for "this blob declared one" and
+/// the reason it is not carried.
+///
+/// One table rather than a branch per field, because the list is the part that goes stale: the fold
+/// names every field of the schema and binds the dropped ones to `_`, so the compiler makes it
+/// complete, and nothing made this list complete. It named `nixpkgs`, which the fold carries, and
+/// omitted `flakes`, `accepts_fresh_releases` and the four package-table backends, which it does
+/// not. The guard below counts the `_` bindings against this table's length.
+///
+/// The reasons are the fold's own, so an author reads one story whichever side they arrive from.
+#[allow(clippy::type_complexity)]
+const DROPPED_TABLES: &[(&str, fn(&RawConfig) -> bool, &str)] = &[
+    (
+        "distro",
+        |r| r.distro.is_some(),
+        "the substrate a cage is built on is not a one-launch decision",
+    ),
+    (
+        "[mise]",
+        |r| r.mise.is_some(),
+        "the engine that installs every `mise:` tool is set in the global config only, and it \
+         governs every cage",
+    ),
+    (
+        "[flakes.*]",
+        |r| !r.flakes.is_empty(),
+        "an inline `flake.nix` is arbitrary build source, vetted in a config someone reads rather \
+         than assembled for one launch",
+    ),
+    (
+        "[tarball]",
+        |r| !r.tarball.is_empty(),
+        "an auto-upgrade resolver runs a command, and it is listed where it can be reviewed",
+    ),
+    (
+        "[deb]",
+        |r| !r.deb.is_empty(),
+        "an auto-upgrade resolver runs a command, and it is listed where it can be reviewed",
+    ),
+    (
+        "[appimage]",
+        |r| !r.appimage.is_empty(),
+        "an auto-upgrade resolver runs a command, and it is listed where it can be reviewed",
+    ),
+    (
+        "[binary]",
+        |r| !r.binary.is_empty(),
+        "an auto-upgrade resolver runs a command, and it is listed where it can be reviewed",
+    ),
+    (
+        "accepts_fresh_releases",
+        |r| !r.accepts_fresh_releases.is_empty(),
+        "lifting a vendor's cooling-off period is a standing decision about that vendor, weighed \
+         where the package is declared",
+    ),
+    (
+        "[task]",
+        |r| r.task.is_some(),
+        "a declared operation is vetted where it is read and listed, not assembled on a command \
+         line for one launch",
+    ),
+    (
+        "[plugin.*]",
+        |r| !r.plugin.is_empty(),
+        "a plugin's grants are vetted where they are read and listed, not assembled on a command \
+         line for one launch",
+    ),
+    (
+        "[broker.*]",
+        |r| !r.broker.is_empty(),
+        "a broker's `socket` names a host resource to stand in front of, declared where it can be \
+         read and reviewed",
+    ),
+];
+
+/// Which of [`DROPPED_TABLES`] this blob declares, read per blob for the reason `[network] groups`
+/// is: [`overlay_into`] does not carry any of them, so a later fold leaves nothing to notice.
+fn declares_dropped(parsed: &RawConfig, seen: &mut [bool; DROPPED_TABLES.len()]) {
+    for (i, (_, declared, _)) in DROPPED_TABLES.iter().enumerate() {
+        seen[i] |= declared(parsed);
     }
 }
 
@@ -2919,6 +3003,99 @@ mod tests {
                 .contains(&("tasks_max".to_string(), "8192".to_string())),
             "{:?}",
             ambient.limits
+        );
+    }
+
+    /// A blob whose every field the fold drops says so, instead of succeeding at nothing.
+    ///
+    /// This is the shape the notice exists for: one table on a command line, no file to re-read,
+    /// and a launch that behaves exactly as if the flag had not been typed. `[broker.*]` is the
+    /// case that prompted it, and the ambient blob reaches the same notice, since an `SBX_CONFIG`
+    /// left in a shell is the one nobody is looking at.
+    #[test]
+    fn a_blob_that_declares_only_a_dropped_table_is_told_so() {
+        let ov = collect_cli(Cli {
+            config: &["[broker.gpg]\nsocket = \"/run/user/1000/gnupg/S.gpg-agent\""],
+            ..Default::default()
+        })
+        .unwrap();
+        let n = ov
+            .notices()
+            .iter()
+            .find(|n| n.contains("`[broker.*]`"))
+            .unwrap_or_else(|| panic!("the table must be named: {:?}", ov.notices()));
+        assert!(n.contains("host resource"), "with its reason: {n}");
+
+        let amb = ambient(AmbientOverrides {
+            config: Some("distro = \"debian\"".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            amb.notices().iter().any(|n| n.contains("`distro`")),
+            "{:?}",
+            amb.notices()
+        );
+
+        // And a field the fold *carries* is not among them: `nixpkgs` was named as dropped by the
+        // prose this replaced, and it is applied.
+        let carried = collect_cli(Cli {
+            config: &["nixpkgs = \"nixos-24.05\""],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            !carried.notices().iter().any(|n| n.contains("`nixpkgs`")),
+            "{:?}",
+            carried.notices()
+        );
+    }
+
+    /// Every field the fold binds to `_` is one this module names, and no other.
+    ///
+    /// The fold is exhaustive by construction: adding a field to the schema fails to compile until
+    /// it says what becomes of it. Nothing made the *notice* list complete, and it drifted twice
+    /// over, in both directions at once -- it claimed `nixpkgs`, which the fold carries, and missed
+    /// four package-table backends, which it drops. So the two lists are compared here rather than
+    /// kept in step by hand.
+    ///
+    /// `rest` is the exception, and the only one: it is the unknown-key bag, reported per blob
+    /// against the blob that wrote it before this merge runs at all.
+    #[test]
+    fn the_dropped_tables_are_exactly_the_fields_the_fold_lets_go() {
+        let source = include_str!("overrides.rs");
+        let fold = source
+            .split("fn overlay_into")
+            .nth(1)
+            .expect("the fold")
+            .split("} = higher;")
+            .next()
+            .expect("its destructure");
+        let let_go: Vec<&str> = fold
+            .lines()
+            .filter_map(|l| l.trim().strip_suffix(": _,"))
+            .filter(|name| *name != "rest")
+            .collect();
+
+        let table = source
+            .split("const DROPPED_TABLES")
+            .nth(1)
+            .expect("the table")
+            .split("\n];")
+            .next()
+            .expect("its entries");
+        for name in &let_go {
+            assert!(
+                table.contains(&format!("r.{name}.")),
+                "the fold drops `{name}` and nothing names it to the author who wrote it"
+            );
+        }
+        assert_eq!(
+            let_go.len(),
+            DROPPED_TABLES.len(),
+            "the table names {} fields and the fold lets go of {}: {let_go:?}",
+            DROPPED_TABLES.len(),
+            let_go.len()
         );
     }
 }

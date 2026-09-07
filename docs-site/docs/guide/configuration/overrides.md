@@ -27,10 +27,14 @@ project config.
 
 Inline TOML (or `@<file>`) shaped exactly like an `sbx.toml`, so it can set **any**
 field. Repeatable (later wins). A few declarations are not one-shot launch fields and are
-ignored in a blob (with a notice for `[app.*]`, `[bundle.*]`, `[mise]` and `[network] groups`):
-the `distro` userland, `[task.*]` operations, `[plugin.*]` / `[broker.*]` plugin bindings and
-the `flakes` / `tarball` / `deb` / `appimage` / `binary` resolver tables belong in a config
-that is read and reviewed, not assembled on a command line.
+ignored in a blob: the `distro` userland, `[task]` operations, `[plugin.*]` / `[broker.*]`
+plugin bindings, `accepts_fresh_releases`, and the `flakes` / `tarball` / `deb` / `appimage` /
+`binary` resolver tables belong in a config that is read and reviewed, not assembled on a
+command line. So do `[app.*]`, `[bundle.*]`, `[mise]` and a `groups` table under `[network]`.
+
+**Every one of them is named in a notice before the launch.** A blob that declares nothing else
+governs nothing, and there is no file to re-read afterwards to find out why, so the notice is the
+only signal you get. It names the field and the reason it stayed behind.
 
 ```sh
 sbx run --config 'network = "none"' -- ./build.sh
@@ -316,4 +320,5 @@ about what a launch in this environment would do.
   need to keep the read-only default.
 - A `groups` table under `[network]`, and `[app.*]`, are ignored in an override with a
   notice (they are not single-launch concepts). An override *references* a global group
-  with `@<name>`; it defines none.
+  with `@<name>`; it defines none. Every other ignored declaration is noticed the same way,
+  so a blob is never silently a no-op.
