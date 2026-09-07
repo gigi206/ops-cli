@@ -1084,6 +1084,21 @@ fn a_declared_scripts_node_is_keyed_on_its_interpreter_too() {
         ),
         Verdict::Deny
     );
+    // A declared script is `execve`d as **two** names, so admitting only the file refuses it: the
+    // kernel runs the interpreter inside the call that named `build.sh`, and the supervisor decides
+    // the exec against both on the stricter answer. The caller here is the command's own node,
+    // which is what runs `build.sh`.
+    assert_eq!(
+        policy.decide(&["/bin/sh".to_string()], "/nix/store/demo/bin/build.sh"),
+        Verdict::Allow,
+        "the declared script itself"
+    );
+    assert_eq!(
+        policy.decide(&["/bin/sh".to_string()], "/nix/store/demo/bin/sh"),
+        Verdict::Allow,
+        "and the interpreter it is entered as, or the declaration reads as a grant and behaves as \
+         a denial"
+    );
 }
 
 /// What a refusal announces is bounded where it is *built*, because the notifier keeps it: the

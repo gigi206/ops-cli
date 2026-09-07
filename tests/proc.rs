@@ -493,6 +493,13 @@ fn enforce_decides_the_interpreter_a_shebang_names_in_a_real_cage() {
         !out.contains("SHEBANG-RAN"),
         "a denied interpreter must not run because a `#!` line named it: stdout={out:?} stderr={err:?}"
     );
+    // Which exec was refused matters as much as that one was: naming the script proves the refusal
+    // landed on the target the syscall carried, rather than on some launcher in front of it that
+    // would make this pass without the `#!` line ever being read.
+    assert!(
+        err.contains("s.sh"),
+        "the refusal must name the script the exec carried: {err:?}"
+    );
 }
 
 #[test]

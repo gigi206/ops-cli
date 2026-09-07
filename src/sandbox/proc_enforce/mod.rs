@@ -104,11 +104,15 @@
 //! decided as `/usr/bin/env`, so a payload spelled there runs only under an interpreter a rule
 //! already allows.
 //!
-//! **`binfmt_misc` is the route that stays open.** A registered handler for a `.jar`, a `.py` or a
-//! wine binary runs an interpreter that nothing in the file names, so no read of the file can find
-//! it; the enrolled interpreter runs without a notification of its own, and a rule about it is not
-//! consulted. Under `confine` such a target is exactly as confined as the allowlist entry that let
-//! the *file* run.
+//! **Two routes stay open, and neither is closed by reading a file.** `binfmt_misc` is the first: a
+//! registered handler for a `.jar`, a `.py` or a wine binary runs an interpreter that nothing in
+//! the file names, so no read can find it; the enrolled interpreter runs without a notification of
+//! its own, and a rule about it is not consulted. The second is an exec named by **descriptor**
+//! whose object has no path -- `execveat(fd, "", …, AT_EMPTY_PATH)` on a `memfd`, which is what
+//! `fexecve` issues. Such a descriptor's `/proc` link reads `/memfd:<name> (deleted)`, measured, and
+//! a walk from the cage's root reaches nothing there, so the head is not read and the verdict is the
+//! one the link's own name took. Under `confine` both are exactly as confined as the allowlist entry
+//! that let the *file* run.
 //!
 //! Two consequences of reading the file are written here because they are the price. A target this
 //! supervisor can reach and **not read** is refused rather than run, whatever the policy says about
@@ -558,10 +562,13 @@ fn exec_verdict(
                         };
                     }
                 },
-                // The target is gone, was never there, or this kernel has no scoped resolution to
-                // reach it with: the exec fails on its own, and `probe_in_cage_root` has already
-                // said the last of the three out loud.
-                Err(libc::ENOENT) | Err(libc::ESRCH) | Err(libc::ENOSYS) => {}
+                // Nothing was there to read, so there is nothing to refuse: the target is gone,
+                // was never there, sits behind a path component that is not a directory (all three
+                // of which make the `execve` fail on its own), or this kernel has no scoped
+                // resolution to reach it with -- and `probe_in_cage_root` has already said that
+                // last one out loud. Keeping these off the refusing arm is also what keeps a name
+                // lookup walking, for the reason [`refusal_errno`] gives.
+                Err(libc::ENOENT) | Err(libc::ENOTDIR) | Err(libc::ESRCH) | Err(libc::ENOSYS) => {}
                 // Reached and not readable, which is the one arm that must refuse. Measured: a
                 // script in mode `0111` cannot be read by a same-uid supervisor, yet `execve` on it
                 // succeeds and the interpreter runs -- with `#!/usr/bin/perl -esystem(...)` the

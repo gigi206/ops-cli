@@ -150,9 +150,11 @@ Two consequences follow from reading the file, and both are deliberate:
   argument never needs the script at all. Since what the `#!` line would have said is exactly what
   could not be established, the answer is a refusal. The cost: an execute-only file does not run
   under an exec policy, however it is spelled.
-- **`binfmt_misc` stays open.** A handler registered for `.jar`, `.py` or a wine binary runs an
-  interpreter that nothing in the file names, so no read can find it. Under `confine` such a target
-  is exactly as confined as the allowlist entry that let the file itself run.
+- **Two routes stay open**, and reading a file closes neither. A `binfmt_misc` handler registered
+  for `.jar`, `.py` or a wine binary runs an interpreter that nothing in the file names, so no read
+  can find it. And an exec named by a **descriptor with no path**, such as an in-memory file passed
+  to `fexecve`, names an object the walk cannot reach, so its first bytes are not read. Under
+  `confine` both are exactly as confined as the allowlist entry that let the file itself run.
 
 ## What enforcement puts inside the cage
 

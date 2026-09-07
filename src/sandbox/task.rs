@@ -1751,18 +1751,25 @@ impl TaskEngine {
         // The command's own node comes from the shim: the shim's exec of the command is the first
         // notified `execve`, and a policy that did not admit it would refuse the task outright.
         let command = self.resolve_spawn_entry(&task.cmd[0], &path_dirs, task)?;
-        // Both the file and what it is entered as, because a `#!` command is *two* programs inside
-        // that one `execve`: the kernel loads the interpreter within the call that named the
-        // script, and the supervisor decides the exec against both. Admitting only the script would
-        // refuse the task at its first step, under a policy whose whole purpose is to let the
-        // command run.
+        // What one program has to be admitted **as**: the file, and what it is entered as when that
+        // differs. A `#!` target is two programs inside one `execve` -- the kernel loads the
+        // interpreter within the call that named the script -- and the supervisor decides the exec
+        // against both, on the stricter answer. Admitting only the file would refuse every declared
+        // script, in a list whose whole purpose is to let it run. One definition, used for the
+        // shim's own entry below and for every declared entry through `resolve_all`, because the
+        // two are the same question about different lists.
+        let admits = |incage: &str| -> Vec<String> {
+            let entered = self.entered_as(incage, task);
+            match entered == incage {
+                true => vec![incage.to_string()],
+                false => vec![incage.to_string(), entered],
+            }
+        };
         let entered_as = self.entered_as(&command, task);
-        let mut admits = vec![ProcRule::new(&command)];
-        if entered_as != command {
-            admits.push(ProcRule::new(&entered_as));
-        }
-        let mut callers: BTreeMap<String, Vec<ProcRule>> =
-            BTreeMap::from([(super::proc_enforce::SHIM_CAGE_PATH.to_string(), admits)]);
+        let mut callers: BTreeMap<String, Vec<ProcRule>> = BTreeMap::from([(
+            super::proc_enforce::SHIM_CAGE_PATH.to_string(),
+            admits(&command).iter().map(|e| ProcRule::new(e)).collect(),
+        )]);
 
         // A target is matched against the path the process **asked** for, before symlinks — which is
         // what keeps `ls` meaning `ls`. Resolving targets the way callers are resolved would make
@@ -1781,10 +1788,15 @@ impl TaskEngine {
         };
 
         let resolve_all = |entries: &[String]| -> Result<Vec<String>, String> {
-            entries
-                .iter()
-                .map(|e| self.resolve_spawn_entry(e, &path_dirs, task))
-                .collect()
+            let mut out: Vec<String> = Vec::new();
+            for entry in entries {
+                for name in admits(&self.resolve_spawn_entry(entry, &path_dirs, task)?) {
+                    if !out.contains(&name) {
+                        out.push(name);
+                    }
+                }
+            }
+            Ok(out)
         };
         // The command's node is keyed by what the command's process actually **is**, which for a
         // script is its interpreter: the kernel loads that interpreter inside the very `execve` that
