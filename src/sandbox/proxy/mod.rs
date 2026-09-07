@@ -693,6 +693,9 @@ fn rule_destination(proto: super::control::Proto, host: &str, port: u16) -> Stri
         super::control::Proto::Http => ("http://", 80),
         _ => ("", 443),
     };
+    // See `host_token`: an IPv6 literal is bracketed by the one function that knows when to, or
+    // the `:port` this appends turns the address into another one.
+    let host = crate::allowlist::display_host(host);
     if port == default_port {
         format!("{scheme}{host}")
     } else {

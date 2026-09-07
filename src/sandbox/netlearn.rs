@@ -347,6 +347,11 @@ fn host_token(host: &str, port: u16, proto: Proto) -> Option<String> {
         Proto::Http => ("http", 80),
         _ => ("https", 443),
     };
+    // Bracketed where it has to be: an IPv6 literal followed by `:port` reads back as a different
+    // address, so the rule this offers would admit something other than the request it was learned
+    // from. `display_host` is the one place that answers it, and the two producers of this text
+    // share it for the reason the comment on `rule_destination` gives.
+    let host = crate::allowlist::display_host(host);
     Some(if port == default_port {
         format!("{scheme}://{host}")
     } else {
@@ -1139,5 +1144,31 @@ mod tests {
             assert_eq!(Granularity::parse(g.as_str()), Ok(g));
         }
         assert!(Granularity::parse("subtree").is_err());
+    }
+
+    /// An IPv6 literal on a non-default port is offered as a rule that admits the request refused.
+    ///
+    /// Appending `:port` to a bare `2001:db8::1` reads back as another address entirely: the
+    /// grammar splits on the last colon, so the rule names the host `2001:db8:` on that port. The
+    /// suggestion a refusal prints, the notification's copy of it and the candidate net-learn
+    /// records are one text by design, so the bracketing lives in the one function that knows when
+    /// an address needs it. The witnesses are a name and an IPv4, which must not change.
+    #[test]
+    fn an_ipv6_literal_is_offered_as_a_rule_that_reads_back_as_itself() {
+        for (host, port, expect) in [
+            ("2001:db8::1", 8443u16, "https://[2001:db8::1]:8443"),
+            ("::1", 1u16, "https://[::1]:1"),
+            ("2001:db8::1", 443u16, "https://[2001:db8::1]"),
+            ("api.example.test", 8443u16, "https://api.example.test:8443"),
+            ("203.0.113.7", 8443u16, "https://203.0.113.7:8443"),
+        ] {
+            let token = host_token(host, port, crate::sandbox::control::Proto::Https)
+                .unwrap_or_else(|| panic!("`{host}` is a sane host"));
+            assert_eq!(token, expect);
+            // And the rule text parses back to the host and port it was made from, which is the
+            // property the composition exists for.
+            crate::allowlist::classify_in(&token, crate::allowlist::Slot::Allow)
+                .unwrap_or_else(|e| panic!("`{token}` must be a rule: {e}"));
+        }
     }
 }

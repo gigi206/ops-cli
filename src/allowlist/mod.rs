@@ -725,7 +725,12 @@ pub(crate) fn canonical_host(host: &str) -> String {
 
 /// Format a host for display in a URL context, bracketing an IPv6 literal so a following
 /// `:port` is unambiguous (`2001:db8::1` → `[2001:db8::1]`); a hostname or IPv4 is unchanged.
-fn display_host(host: &str) -> String {
+///
+/// Reachable outside this module because every producer that composes a `host:port` rule text owes
+/// the same answer: the refusal's suggested rule, the notification's, and the candidate net-learn
+/// records. A composition without it reads back as another address — `::1` with a port becomes the
+/// host `::` on port `1` — so the rule offered admits something other than the request refused.
+pub(crate) fn display_host(host: &str) -> String {
     match host.parse::<IpAddr>() {
         Ok(ip) if ip.is_ipv6() => format!("[{host}]"),
         _ => host.to_string(),
