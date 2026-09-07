@@ -538,6 +538,12 @@ The app then runs under `ask`, still with `ask_timeout = "45s"`, and with **four
 Name a `mode` in that overlay and it replaces the profile's table like any other, which is what
 declaring a posture means.
 
+The posture it keeps is the profile's, whichever it is: an app on a denylist (`mode = "allow"`)
+stays on it. A table that *replaces* inherits differently, falling back to `deny` when the layer
+below is open, because there a mode-less table's own `allow` list would be inert. Nothing is
+inert here and nothing widens: the overlay adds to a policy that already stood, and a `deny`
+written into a denylist is exactly what tightens it.
+
 This is why `sbx net allow|deny|mute --app <name> --local` writes a mode-less table: the rule
 you add joins the app's own rules instead of standing in for them. It is also why `deny` and
 `mute` are accepted there even though they are refused where no posture exists at all: an app

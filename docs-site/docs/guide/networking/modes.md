@@ -326,7 +326,12 @@ allow = ["api.anthropic.com"]
 Inheritance is deliberately **fail-safe**: only a *filtering* mode is inherited. If
 the parent posture is `allow` (a denylist), `shared`, `none`, or absent, a
 mode-less table falls back to the safe **`deny`** rather than inheriting an open
-posture. So a mode-less table can never silently widen the network: a `mode`
+posture. That is the rule for a table that **replaces** the layer below, which is
+every table but one: the mode-less app overlay
+([the one table that amends](../configuration/network#the-one-table-that-amends-a-mode-less-app-overlay))
+keeps the posture it amends, `allow` included, because it adds to that layer rather
+than standing in for it and a `deny` written there is the gesture that tightens a
+denylist. So a mode-less table can never silently widen the network: a `mode`
 typo is warned about and the layer is ignored, so the parent posture stands
 (the global layer, having no parent, falls back to `deny`). Inheritance follows the layer chain: an app takes the baseline's mode, a
 project takes the global's.

@@ -196,6 +196,52 @@ fn make_groups(defs: &[(&str, &[&str])]) -> (NetGroups, Vec<String>) {
     (build_net_groups(&mut w, raw), w)
 }
 
+/// A mode-less overlay keeps the posture of the layer it amends, including the denylist.
+///
+/// The writer and the resolver have to agree on what "a filtering posture" is. `inherited_posture`
+/// calls every `Allowlist` filtering, whatever its default action, and writes an overlay with no
+/// `mode` on that basis; reading a missing `mode` as `deny` would then move an app from its
+/// profile's denylist to deny-by-default on the one gesture that was meant to close a single host,
+/// and report success for it. The two arms that already agreed are the witness, in the same loop.
+#[test]
+fn an_amending_overlay_keeps_the_posture_of_the_layer_below_it() {
+    use crate::allowlist::{DefaultAction, EgressPolicy};
+    for below in [
+        DefaultAction::Allow,
+        DefaultAction::Deny,
+        DefaultAction::Ask,
+    ] {
+        let parent = NetworkPolicy::Allowlist(Box::new(
+            EgressPolicy::new(vec![], vec![]).with_default(below),
+        ));
+        let field = NetworkField::Table(NetworkTable {
+            deny: vec!["evil.example.test".into()],
+            ..net_table_defaults()
+        });
+        let mut w = Vec::new();
+        let policy = super::validate_network_amending(
+            &mut w,
+            "app `demo`",
+            field,
+            &NetGroups::new(),
+            &parent,
+        )
+        .expect("the overlay validates");
+        let NetworkPolicy::Allowlist(p) = &policy else {
+            panic!("an amending overlay stays a filtering policy: {policy:?}");
+        };
+        assert_eq!(
+            p.default_action(),
+            below,
+            "the overlay must not move the app off the posture it inherited"
+        );
+        assert!(
+            w.is_empty(),
+            "and it does so without a warning to read: {w:?}"
+        );
+    }
+}
+
 /// A `shared_credential` group reaches the policy the proxy reads, canonicalized, so the credential
 /// store and a request's host are compared in one spelling.
 #[test]

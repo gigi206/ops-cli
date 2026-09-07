@@ -762,6 +762,9 @@ pub(super) fn validate_network_table(
              this field (check the spelling; a newer sbx's fields are ignored here on purpose)"
         ));
     }
+    // An amending table with no `mode` of its own is an addition to the layer below, not a policy
+    // of its own. Decided here because the posture it inherits follows from it: see the `None` arm.
+    let amends_below = layering == Layering::Amend && table.mode.is_none();
     // The default action: from an explicit `mode`, or — when omitted — inherited from the parent
     // layer. `none`/`shared` are non-filtering postures that carry no rules, so they return early.
     let action = match table.mode.as_deref() {
@@ -786,6 +789,17 @@ pub(super) fn validate_network_table(
             ));
             return None;
         }
+        // An addition to the layer below keeps that layer's posture, whatever it is. The fallback
+        // in `mode_from_parent` exists for a table that **replaces** the layer below: there, a
+        // mode-less table under an allow-by-default parent would be a rule listing whose own
+        // `allow` entries are inert, so it is turned into a `deny`. An amending table replaces
+        // nothing and opens nothing — a `deny` added to a denylist is the gesture that tightens
+        // it, and for an app that is the only way to write one — so reading its parent as `deny`
+        // would put the app under a posture nobody chose, and report success for it.
+        None if amends_below => match parent {
+            NetworkPolicy::Allowlist(below) => below.default_action(),
+            _ => mode_from_parent(parent),
+        },
         None => mode_from_parent(parent),
     };
     let allow = classify_entries(warnings, source_label, Slot::Allow, table.allow, groups);
@@ -803,11 +817,9 @@ pub(super) fn validate_network_table(
     // reach, and a host named here is unreachable unless an `allow` rule says otherwise.
     let shared_credential =
         parse_shared_credential(warnings, source_label, table.shared_credential);
-    // An amending table with no `mode` of its own is an addition to the layer below, not a policy:
-    // start from that layer so its rules survive and so a setting this table does not redeclare
-    // keeps its value. Every other table is built from its own keys, as the warning at the end of
-    // this function says out loud.
-    let amends_below = layering == Layering::Amend && table.mode.is_none();
+    // The amending table starts from the layer below so its rules survive and so a setting this
+    // table does not redeclare keeps its value. Every other table is built from its own keys, as
+    // the warning at the end of this function says out loud.
     let mut policy = match parent {
         NetworkPolicy::Allowlist(below) if amends_below => {
             let mut p = below
