@@ -441,6 +441,41 @@ fn spawn_ws_upstream() -> (SocketAddr, CertificateDer<'static>, thread::JoinHand
     spawn_ws_upstream_prefixed(b"")
 }
 
+/// An upstream that takes the handshake and closes without answering it. The shape of a server
+/// that was reached and then went away, which on the request planes is `502 upstream-closed`.
+fn spawn_ws_upstream_closing() -> (SocketAddr, CertificateDer<'static>, thread::JoinHandle<()>) {
+    let ca = Arc::new(Ca::ephemeral().unwrap());
+    let ca_der = ca.ca_cert_der();
+    let server_config = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(CertResolver::new(ca))),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        let Ok((sock, _)) = listener.accept() else {
+            return;
+        };
+        let Ok(conn) = ServerConnection::new(server_config) else {
+            return;
+        };
+        let mut tls = StreamOwned::new(conn, sock);
+        let mut br = BufReader::new(&mut tls);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match br.read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) if line == "\r\n" || line == "\n" => break,
+                Ok(_) => {}
+            }
+        }
+        // Read the handshake, answer nothing.
+    });
+    (addr, ca_der, handle)
+}
+
 /// The same upstream, writing `interim` before its `101`. A server may send interim `1xx` heads
 /// ahead of its final one, and the relay has to read past them: taking the first head as the answer
 /// reads a `103 Early Hints` as a declined upgrade.
@@ -1115,6 +1150,66 @@ fn an_interim_head_before_the_101_does_not_decline_the_upgrade() {
         transcript.contains("ECHO:client-frame"),
         "so the tunnel carries frames both ways: {transcript:?}"
     );
+}
+
+/// The WebSocket plane answers an upgrade the upstream never resolved, like the other three.
+///
+/// Two shapes with one answer. An upstream that floods interim heads holds a proxy thread and
+/// pours bytes into the cage: this plane relayed them without a ceiling while the other three stop
+/// at `INTERIM_HEAD_MAX`. An upstream that closes without answering left the tunnel dying with the
+/// error propagated and nothing said, where the request planes write a `502` naming the cause. A
+/// client waiting on an upgrade cannot tell either from a hang.
+#[test]
+fn an_upgrade_the_upstream_never_answers_is_refused_rather_than_dropped() {
+    for (label, prefix, reason) in [
+        (
+            "a flood of interim heads",
+            Box::leak(
+                b"HTTP/1.1 100 Continue\r\n\r\n"
+                    .repeat(64)
+                    .into_boxed_slice(),
+            ) as &'static [u8],
+            "interim-head-cap",
+        ),
+        ("a close before any answer", b"", "upstream-closed"),
+    ] {
+        // The second arm's upstream sends its prefix and nothing else: `spawn_ws_upstream_closing`
+        // shuts the connection down where the handshake response would go.
+        let (addr, upstream_ca, up) = if reason == "upstream-closed" {
+            spawn_ws_upstream_closing()
+        } else {
+            spawn_ws_upstream_prefixed(prefix)
+        };
+        let mut roots = RootCertStore::empty();
+        roots.add(upstream_ca).unwrap();
+        let upstream_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let proxy_ca = Arc::new(Ca::ephemeral().unwrap());
+        let proxy_ca_der = proxy_ca.ca_cert_der();
+        let ctx = Arc::new(
+            ProxyCtx::new(proxy_ca, policy(&["{WS} upstream.test:*"]))
+                .unwrap()
+                .with_upstream(upstream_cfg)
+                .with_resolver(Box::new(|_| Ok(vec![IpAddr::from([127, 0, 0, 1])]))),
+        );
+        let transcript =
+            through_proxy_websocket(ctx, proxy_ca_der, "upstream.test", addr.port()).unwrap();
+        let _ = up.join();
+        assert!(
+            transcript.contains("502") && transcript.contains(reason),
+            "{label}: the client must be told why the upgrade never resolved: {transcript:?}"
+        );
+        if reason == "interim-head-cap" {
+            let crossed = transcript.matches("100 Continue").count();
+            assert!(
+                crossed < 64,
+                "{label}: the flood must stop at the ceiling, {crossed} crossed"
+            );
+        }
+    }
 }
 
 /// A WebSocket upgrade does not bypass the verdict: an upgrade to a host no rule allows is refused

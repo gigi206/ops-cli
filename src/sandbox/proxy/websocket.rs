@@ -75,6 +75,26 @@ pub(super) fn reserialize_upgrade(head: &Head, injections: &[(String, String)]) 
     out.into_bytes()
 }
 
+/// Answer an upgrade the upstream never resolved, and close.
+///
+/// The same `502` and the same reason token the three request planes give, because they are the
+/// same fact about the server: it was reached and it did not answer. A refusal after interim heads
+/// have already crossed is a legal response, and it is the shape `relay_response_head` produces.
+fn refuse_upgrade(
+    br: &mut BufReader<StreamOwned<ServerConnection, UnixStream>>,
+    why: NoFinalHead,
+    host: &str,
+) -> io::Result<()> {
+    write_refusal(
+        br.get_mut(),
+        "502 Bad Gateway",
+        why.tag(),
+        &why.sentence(host),
+    )?;
+    finish_tls(br.get_mut());
+    Ok(())
+}
+
 /// Forward an allowed WebSocket upgrade and, on a `101`, relay the two TLS streams bidirectionally.
 /// The handshake was already inspected by the same verdict as any request (host / path / method /
 /// anti-fronting / SSRF / upstream-cert), so the allowlist still governs which host and path may open
@@ -122,10 +142,27 @@ pub(super) fn relay_upgrade(
     // whole head phase is bounded by one timeout however many interim heads arrive.
     let mut up_br = BufReader::new(upstream);
     let deadline = head_deadline(ctx);
+    let host = inner.header("host").unwrap_or_default().to_string();
+    let mut interim_seen = 0usize;
     let resp_head = loop {
-        let head = read_head_buffered(&mut up_br, HEAD_MAX, deadline)?;
+        // An upstream that closes, resets or runs past the head budget leaves this plane with
+        // nothing to relay. The three request planes answer that with a `502` naming the reason;
+        // this one propagated the error and the tunnel died with the client holding an upgrade
+        // that never resolved and no line saying why. The same answer is given here.
+        let head = match read_head_buffered(&mut up_br, HEAD_MAX, deadline) {
+            Ok(head) => head,
+            Err(_) => return refuse_upgrade(&mut br, NoFinalHead::UpstreamClosed, &host),
+        };
         match parse_status_code(&head) {
             Some(code) if (100..200).contains(&code) && code != 101 => {
+                // Counted before it is written on, as `relay_response_head` counts it: an upstream
+                // that only ever sends interim heads holds one of the proxy's threads and pours
+                // bytes into the cage, and this plane had no ceiling at all while the other three
+                // stopped at the same small number.
+                interim_seen += 1;
+                if interim_seen > INTERIM_HEAD_MAX {
+                    return refuse_upgrade(&mut br, NoFinalHead::InterimCap, &host);
+                }
                 write_head_to_client(head, br.get_mut(), &down, redactions)?;
                 br.get_mut().flush()?;
             }
