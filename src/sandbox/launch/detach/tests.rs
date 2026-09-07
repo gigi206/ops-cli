@@ -231,3 +231,49 @@ fn a_session_header_needs_every_field_to_parse() {
         );
     }
 }
+
+/// A detached session's log outlives its session, and nothing ever removed one: the directory grew
+/// by a file per launch, for as long as the host was used. The ceiling is enforced where a new log
+/// is opened, which is the only moment the directory grows.
+///
+/// The count is what this asserts, plus the one file that must survive whatever else does: the log
+/// this launch is about to append to. Which of the others go is decided by modification time, and
+/// a test that wrote a hundred files in one tick would be asserting the filesystem's timestamp
+/// resolution rather than the rule.
+#[test]
+fn opening_a_detached_log_trims_the_directory_to_its_ceiling() {
+    let dir = crate::testutil::TmpDir::new();
+    let logs = dir.path().join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+
+    // Comfortably past the ceiling, plus a file that is not a log at all: the reaper must leave
+    // anything it does not own alone.
+    for i in 0..(super::MAX_KEPT_LOGS + 45) {
+        std::fs::write(logs.join(format!("{i}.log")), b"x").unwrap();
+    }
+    std::fs::write(logs.join("not-a-log.txt"), b"x").unwrap();
+
+    let opening = logs.join("99999.log");
+    std::fs::write(&opening, b"x").unwrap();
+    super::reap_old_logs(&logs, &opening);
+
+    let kept: Vec<_> = std::fs::read_dir(&logs)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "log"))
+        .collect();
+    assert_eq!(
+        kept.len(),
+        super::MAX_KEPT_LOGS,
+        "the ceiling counts the log being opened"
+    );
+    assert!(
+        kept.contains(&opening),
+        "this launch's own log is never the one reaped"
+    );
+    assert!(
+        logs.join("not-a-log.txt").exists(),
+        "a file that is not a session log is not the reaper's to remove"
+    );
+}

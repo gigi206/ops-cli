@@ -286,6 +286,40 @@ pub(crate) fn parse_session_header(line: &[u8]) -> Option<SessionHeader> {
     })
 }
 
+/// The most detached-session logs kept in `<data>/logs`, counting the one a launch is opening.
+///
+/// A session's log outlives its session on purpose, so `sbx session logs <id>` can still read it
+/// after the session is gone. Nothing else ever removes one, so without a ceiling the directory
+/// grows by a file per detached launch for as long as the host is used.
+const MAX_KEPT_LOGS: usize = 100;
+
+/// Remove the oldest logs beyond [`MAX_KEPT_LOGS`], keeping the newest by modification time.
+///
+/// Called where a new log is opened, which is the only moment the directory grows, so the bound is
+/// enforced by the same act that would breach it.
+///
+/// `opening` is never removed: it is this launch's own log, and it is counted as one of the kept,
+/// which is why the others are trimmed to one fewer. Best-effort throughout — a directory that
+/// cannot be read, a file whose age cannot be told or that cannot be removed, all cost a bounded
+/// directory and never a session that was otherwise ready to run.
+fn reap_old_logs(dir: &Path, opening: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut logs: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p != opening && p.extension().is_some_and(|x| x == "log"))
+        .filter_map(|p| Some((p.metadata().ok()?.modified().ok()?, p)))
+        .collect();
+    // Newest first, so what falls past the ceiling is the tail. Ties break on the path, so two
+    // logs written within one filesystem timestamp are still ordered the same way twice.
+    logs.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    for (_, path) in logs.into_iter().skip(MAX_KEPT_LOGS - 1) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Open (creating, owner-only, appending) the detached session's log, making `<data>/logs` if
 /// absent, and mark the start of this session's output with a header line.
 ///
@@ -303,6 +337,7 @@ fn open_detach_log(path: &Path) -> io::Result<File> {
             .recursive(true)
             .mode(0o700)
             .create(parent)?;
+        reap_old_logs(parent, path);
     }
     let mut file = OpenOptions::new()
         .create(true)

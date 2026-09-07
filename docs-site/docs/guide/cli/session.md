@@ -63,6 +63,11 @@ its stdout and stderr are redirected to `<data>/logs/<id>.log`; this reads that 
 foreground session has no log, its output is on the terminal that started it, and the
 [`MODE` column](#ls) says which is which. `sbx session log` is an accepted alias.
 
+A log outlives the session that wrote it, so it can still be read once the session is gone.
+The **hundred most recent** are kept: opening a new one removes the oldest beyond that, which
+is the only moment the directory grows. Copy a log elsewhere if you need it longer than a
+hundred detached launches.
+
 | Operand / flag | Meaning |
 |---|---|
 | `<id>` | the PID reported when the session was detached (required) |
