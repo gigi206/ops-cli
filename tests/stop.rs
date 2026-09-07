@@ -52,28 +52,18 @@ fn parse_detach_pid(stderr: &[u8]) -> Option<u32> {
 /// reparented to init and cannot be reaped by the test, so a `KillOnDrop` (which holds a `Child`)
 /// does not cover it — this sweeps by the unique `sleep` argument instead, as a backstop for when an
 /// assertion panics before the stop under test runs.
+///
+/// The match is on the whole argv, through [`pids_sleeping_for`]. It was a substring test against
+/// every command line on the machine, and the fingerprints are bare numbers: any process of the
+/// developer's whose command line happened to contain those digits was signalled by a test run.
 struct FingerprintCleanup(Vec<&'static str>);
 
 impl Drop for FingerprintCleanup {
     fn drop(&mut self) {
-        let Ok(entries) = std::fs::read_dir("/proc") else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|s| s.parse::<i32>().ok())
-            else {
-                continue;
-            };
-            let Ok(bytes) = std::fs::read(entry.path().join("cmdline")) else {
-                continue;
-            };
-            let cmdline = String::from_utf8_lossy(&bytes);
-            if self.0.iter().any(|fp| cmdline.contains(fp)) {
-                // SAFETY: a best-effort SIGKILL of a leaked test process matched by its unique
-                // fingerprint; a failure (already gone) is ignored.
+        for fp in &self.0 {
+            for pid in pids_sleeping_for(fp) {
+                // SAFETY: a best-effort SIGKILL of a leaked test process whose whole argv is
+                // `sleep <fingerprint>`; a failure (already gone) is ignored.
                 unsafe { libc::kill(pid, libc::SIGKILL) };
             }
         }
@@ -222,17 +212,45 @@ fn egress_socket_exists(data: &Path) -> bool {
 /// which `from_utf8_lossy` keeps intact). Used to detect an orphaned in-cage process from outside
 /// the cage's pid namespace, which the host still sees.
 fn process_with_arg(needle: &str) -> bool {
+    !pids_sleeping_for(needle).is_empty()
+}
+
+/// The pids of every process whose argv is exactly `sleep <secs>`, for the fingerprint `secs`.
+///
+/// Matched argument by argument against a `/proc/<pid>/cmdline` split on its NULs, never as a
+/// substring of the whole line. A fingerprint here is a bare number, and a substring test against
+/// every command line on the machine matches a port, a pid, a hash prefix or a timestamp that
+/// happens to contain those digits. That is a false positive for the liveness assertions and,
+/// worse, a SIGKILL of an unrelated process of the developer's in the cleanup below.
+fn pids_sleeping_for(secs: &str) -> Vec<i32> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return false;
+        return Vec::new();
     };
+    let mut pids = Vec::new();
     for entry in entries.flatten() {
-        if let Ok(bytes) = std::fs::read(entry.path().join("cmdline"))
-            && String::from_utf8_lossy(&bytes).contains(needle)
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(bytes) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let argv: Vec<&[u8]> = bytes.split(|b| *b == 0).filter(|a| !a.is_empty()).collect();
+        let [program, arg] = argv[..] else {
+            continue;
+        };
+        if arg == secs.as_bytes()
+            && std::path::Path::new(&String::from_utf8_lossy(program).into_owned())
+                .file_name()
+                .is_some_and(|n| n == "sleep")
         {
-            return true;
+            pids.push(pid);
         }
     }
-    false
+    pids
 }
 
 /// Poll `cond` until it is `true` or the deadline passes; returns the final value.
@@ -482,4 +500,40 @@ fn stop_all_stops_every_session() {
             "session {pid} still shows in `sbx session ls` after stop --all:\n{listing}"
         );
     }
+}
+
+/// The fingerprints are bare numbers, and the sweep matched them as a substring of every command
+/// line on the machine: `sleep 131341` contains `31341`, so a test run signalled a process of the
+/// developer's that had nothing to do with it, and the liveness assertions read it as one of the
+/// cage's agents still running. Matched argument by argument now, against an argv that must be
+/// exactly `sleep <fingerprint>`.
+#[test]
+fn the_fingerprint_sweep_matches_a_whole_argv_and_not_a_substring_of_one() {
+    let mut neighbour = std::process::Command::new("sleep")
+        .arg("131341")
+        .spawn()
+        .expect("spawn the neighbour");
+    let mut ours = std::process::Command::new("sleep")
+        .arg("31341")
+        .spawn()
+        .expect("spawn the fingerprinted process");
+    // Both are up before either is looked for.
+    assert!(wait_until(Instant::now() + Duration::from_secs(5), || {
+        pids_sleeping_for("31341").contains(&(ours.id() as i32))
+    }));
+
+    let matched = pids_sleeping_for("31341");
+    assert!(
+        matched.contains(&(ours.id() as i32)),
+        "the fingerprinted process must be found: {matched:?}"
+    );
+    assert!(
+        !matched.contains(&(neighbour.id() as i32)),
+        "a longer number containing the fingerprint is somebody else's process: {matched:?}"
+    );
+
+    let _ = ours.kill();
+    let _ = neighbour.kill();
+    let _ = ours.wait();
+    let _ = neighbour.wait();
 }
