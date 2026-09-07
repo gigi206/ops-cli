@@ -1817,22 +1817,31 @@ pub(crate) fn state_dir_in(data_dir: &Path, name: &OsStr) -> PathBuf {
 /// rename is the atomic part, so a delete that fails part-way cannot leave a directory that is
 /// still reachable under the plugin's name and still holds what was in it.
 ///
-/// Best effort by choice. The tree, the origin record and the out-links are already gone by the
-/// time this runs, so a failure here must not report the plugin as still installed; what it costs
-/// is a directory the next install of that name would inherit, which is the case a failure cannot
-/// avoid anyway.
-fn forget_state(layout: &crate::store::Layout, name: &str) {
+/// The tree, the origin record and the out-links are already gone by the time this runs, so a
+/// failure here must not report the plugin as still installed. It is reported all the same: what is
+/// left is a directory holding what a `state = true` plugin persisted, which for a resolver is a
+/// live credential, and a verb that said it removed the plugin has to say that too. Returns the
+/// path of a leftover it could not delete.
+///
+/// The delete goes through [`crate::sandbox::gc::force_remove_dir_all`], which adds write to a
+/// directory on the way down: a plain recursive delete stops on one the plugin left unwritable,
+/// and the plugin is the party with an interest in this directory surviving.
+fn forget_state(layout: &crate::store::Layout, name: &str) -> Option<PathBuf> {
     let dir = state_dir_in(layout.data_dir(), OsStr::new(name));
     if !dir.exists() {
-        return;
+        return None;
     }
     let trash = layout.data_dir().join(format!(
         ".plugin-state-rm-{}-{}",
         std::process::id(),
         unique()
     ));
-    if std::fs::rename(&dir, &trash).is_ok() {
-        let _ = std::fs::remove_dir_all(&trash);
+    match std::fs::rename(&dir, &trash) {
+        Ok(()) => crate::sandbox::gc::force_remove_dir_all(&trash)
+            .is_err()
+            .then_some(trash),
+        // Not renamed: it is still at its own path, which is the one worth naming.
+        Err(_) => Some(dir),
     }
 }
 
@@ -1840,7 +1849,7 @@ fn forget_state(layout: &crate::store::Layout, name: &str) {
 /// first (so `..`/`/` can never escape the plugins directory), and the target must actually look
 /// like a plugin (carry a `plugin.toml`) so a typo cannot delete an unrelated directory. The
 /// directory is renamed aside atomically — leaving the registry at once — then removed.
-pub(crate) fn remove(layout: &crate::store::Layout, name: &str) -> Result<(), String> {
+pub(crate) fn remove(layout: &crate::store::Layout, name: &str) -> Result<Vec<PathBuf>, String> {
     validate_install_name(name)?;
     let dest = layout.plugins_dir().join(name);
     let meta = match std::fs::symlink_metadata(&dest) {
@@ -1862,7 +1871,10 @@ pub(crate) fn remove(layout: &crate::store::Layout, name: &str) -> Result<(), St
         .data_dir()
         .join(format!(".plugin-rm-{}-{}", std::process::id(), unique()));
     std::fs::rename(&dest, &trash).map_err(|e| format!("cannot remove `{name}`: {e}"))?;
-    let _ = std::fs::remove_dir_all(&trash);
+    let mut left = Vec::new();
+    if crate::sandbox::gc::force_remove_dir_all(&trash).is_err() {
+        left.push(trash);
+    }
     // The provenance record outlives the tree it describes (it is deliberately stored outside it),
     // so drop it here — otherwise a later install of that name would start with a stale origin
     // until it writes its own.
@@ -1878,14 +1890,8 @@ pub(crate) fn remove(layout: &crate::store::Layout, name: &str) -> Result<(), St
     // only key, so the next plugin installed under it — from any store — would be handed the
     // previous one's live credential in a writable bind, which is not what `plugins rm` says it
     // did.
-    forget_state(layout, name);
-    // And the private state directory, which is outside the tree for the third time and is the one
-    // of the three that holds a **secret**: a `state = true` plugin persists what it resolved
-    // there, so a rotating refresh token outlives the plugin unless this runs. The name is the
-    // only key, so the next plugin installed under it — from any store — would be handed the
-    // previous one's live credential in a writable bind, which is not what `plugins rm` says it
-    // did.
-    Ok(())
+    left.extend(forget_state(layout, name));
+    Ok(left)
 }
 
 /// Validate a plugin's on-disk identity: a single, safe directory component. It becomes a directory
@@ -2135,6 +2141,37 @@ mod tests {
             check_grant_control_plane_for([("allow_paths", Path::new(entry))], &roots)
                 .unwrap_or_else(|why| panic!("`{entry}` is not the control plane: {why}"));
         }
+    }
+
+    /// A state directory the plugin left unwritable is still removed, and a leftover is named.
+    ///
+    /// `plugins rm` says it removed the plugin, and the state directory is the one of the three
+    /// things outside the tree that holds a **secret**: a `state = true` resolver persists what it
+    /// resolved there. A plain recursive delete stops on a directory with no write bit, and the
+    /// party with an interest in this surviving is the plugin, which owns it. The walk that adds
+    /// write on the way down is what the rest of housekeeping already uses.
+    #[test]
+    fn a_state_directory_the_plugin_closed_is_still_removed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::testutil::TmpDir::new();
+        let layout = crate::store::Layout::under(dir.path());
+        let state = state_dir_in(layout.data_dir(), OsStr::new("keeper"));
+        std::fs::create_dir_all(state.join("inner")).unwrap();
+        std::fs::write(state.join("inner/token"), b"live-refresh-token").unwrap();
+        // The shape a delete gives up on: a directory whose contents cannot be unlinked.
+        std::fs::set_permissions(state.join("inner"), std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+
+        let left = forget_state(&layout, "keeper");
+        assert!(left.is_none(), "nothing was left behind: {left:?}");
+        assert!(!state.exists(), "the state directory is gone");
+        let residue: Vec<_> = std::fs::read_dir(layout.data_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".plugin-state-rm-"))
+            .collect();
+        assert!(residue.is_empty(), "and so is its temp: {residue:?}");
     }
 
     /// Two resolvers under one name are as ambiguous as two under one scheme, and disabled too.

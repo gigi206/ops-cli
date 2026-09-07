@@ -117,7 +117,7 @@ mod theme_relay;
 
 // Session lifecycle & introspection.
 mod attach;
-mod gc;
+pub(crate) mod gc;
 pub(crate) mod inspect;
 mod observe_feed;
 // The `sbx projects` verb: the per-project runtime trees, listed, shown and reaped. Kept apart from

@@ -1028,9 +1028,10 @@ pub(crate) fn remove(layout: &crate::store::Layout, name: &str) -> Result<(), St
     }
     let tomb = dir.with_file_name(format!(".{name}.removing.{}", std::process::id()));
     std::fs::rename(&dir, &tomb).map_err(|e| format!("cannot remove store `{name}`: {e}"))?;
-    // The store is already gone from its real path; a failure to delete the renamed tree only
-    // leaves a collectable leftover, not a torn store.
-    let _ = std::fs::remove_dir_all(&tomb);
+    // The store is already gone from its real path; a failure to delete the renamed tree leaves a
+    // directory nothing collects — no sweep reads this name — rather than a torn store. The walk
+    // that adds write on the way down is used so a read-only directory is not what stops it.
+    let _ = crate::sandbox::gc::force_remove_dir_all(&tomb);
     Ok(())
 }
 

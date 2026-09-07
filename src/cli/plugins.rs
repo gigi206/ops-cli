@@ -1818,7 +1818,20 @@ fn plugins_remove(args: &[OsString]) -> ExitCode {
     let mut had_error = false;
     for name in &names {
         match plugins::remove(&layout, name) {
-            Ok(()) => println!("{}", render_removed(None, name, &pal)),
+            Ok(left) => {
+                println!("{}", render_removed(None, name, &pal));
+                // What could not be deleted is named. The plugin is gone from the registry either
+                // way (its tree was renamed aside first), but a leftover state directory holds
+                // what a `state = true` plugin persisted, which for a resolver is a live
+                // credential: a verb that reported the removal has to report that too.
+                for path in left {
+                    diag::warn(&format!(
+                        "`{name}` is removed, but `{}` could not be deleted and still holds what \
+                         the plugin kept — remove it by hand",
+                        path.display()
+                    ));
+                }
+            }
             Err(why) => {
                 diag::error(&format!("sbx: cannot remove plugin: {why}"));
                 had_error = true;
