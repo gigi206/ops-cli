@@ -227,6 +227,20 @@ fn parse_stop_args(args: Vec<OsString>) -> Result<StopArgs, ExitCode> {
                     return Err(ExitCode::from(2));
                 };
                 match value.to_str().and_then(|v| v.parse::<u64>().ok()) {
+                    // The grace becomes `Instant::now() + d` in [`crate::session::wait_for_exit`],
+                    // and that addition panics on a duration the clock cannot represent. A config
+                    // duration is already held to this ceiling for exactly that reason
+                    // (`config::parse_duration`); this door was the one that let a value straight
+                    // through, so `--delay 18446744073709551615` aborted the stop with a panic
+                    // instead of refusing an unusable number.
+                    Some(secs) if secs > crate::config::DURATION_MAX_SECS => {
+                        diag::error(&format!(
+                            "sbx: --delay may name at most {} seconds, not '{}'.",
+                            crate::config::DURATION_MAX_SECS,
+                            value.to_string_lossy()
+                        ));
+                        return Err(ExitCode::from(2));
+                    }
                     Some(secs) => delay = Duration::from_secs(secs),
                     None => {
                         diag::error(&format!(
@@ -1079,5 +1093,28 @@ mod tests {
         assert!(parse_stop_args(v(&["--dry-run", "1234"])).is_err());
         // A `--` with nothing after it leaves no target at all, which is a usage error.
         assert!(parse_stop_args(v(&["--"])).is_err());
+    }
+
+    /// The grace becomes `Instant::now() + d` in [`crate::session::wait_for_exit`], and that
+    /// addition panics on a duration the clock cannot represent. `sbx session stop --all --delay
+    /// 18446744073709551615` aborted with `overflow when adding duration to instant` instead of
+    /// refusing the number, and a panicking teardown leaves the cage it was called to collect. A
+    /// config duration has been held to this ceiling all along, for this reason and in these words;
+    /// this door read the value straight into a `Duration`.
+    #[test]
+    fn a_grace_no_clock_can_represent_is_a_usage_error_not_a_panic() {
+        let v = |a: &[&str]| -> Vec<OsString> { a.iter().map(OsString::from).collect() };
+
+        assert!(parse_stop_args(v(&["--all", "--delay", "18446744073709551615"])).is_err());
+        // The ceiling itself, and one second past it: the refusal is a bound, not a parse failure
+        // on long digit strings.
+        let max = crate::config::DURATION_MAX_SECS;
+        let p = parse_stop_args(v(&["--all", "--delay", &max.to_string()])).unwrap();
+        assert_eq!(p.delay, std::time::Duration::from_secs(max));
+        assert!(parse_stop_args(v(&["--all", "--delay", &(max + 1).to_string()])).is_err());
+
+        // Witness: an ordinary grace still parses, so the bound has not made the option unusable.
+        let p = parse_stop_args(v(&["--all", "--delay", "10"])).unwrap();
+        assert_eq!(p.delay, std::time::Duration::from_secs(10));
     }
 }

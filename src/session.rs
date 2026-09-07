@@ -377,7 +377,12 @@ pub(crate) fn wait_for_exit(pidfd: libc::c_int, timeout: Duration) -> bool {
         events: libc::POLLIN,
         revents: 0,
     };
-    let deadline = std::time::Instant::now() + timeout;
+    // `Instant::now() + timeout` panics when the sum is not representable, and this function is
+    // reached from a duration a user writes (`sbx session stop --delay`). That door refuses a value
+    // above `config::DURATION_MAX_SECS`, so `None` is not reachable through it; it stays answered
+    // here because a panic in a teardown path would leave the cage the stop exists to collect.
+    // With no representable end, the window is never narrowed: each `poll` waits the whole of it.
+    let deadline = std::time::Instant::now().checked_add(timeout);
     let mut remaining = timeout;
     loop {
         let ms = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
@@ -390,9 +395,11 @@ pub(crate) fn wait_for_exit(pidfd: libc::c_int, timeout: Duration) -> bool {
             return false;
         }
         // Interrupted: what is left of the original window, or nothing if it elapsed meanwhile.
-        remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return false;
+        if let Some(deadline) = deadline {
+            remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
         }
     }
 }

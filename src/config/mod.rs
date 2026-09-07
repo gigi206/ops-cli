@@ -3841,10 +3841,14 @@ fn parse_duration(raw: &str) -> Result<Option<std::time::Duration>, String> {
     Ok((secs > 0).then(|| std::time::Duration::from_secs(secs)))
 }
 
-/// The largest duration a config may name: one year. Not a policy about how long anything should
-/// wait — every real value is orders of magnitude below it — but the bound that keeps a parsed
-/// duration usable as a deadline (see [`parse_duration`]).
-const DURATION_MAX_SECS: u64 = 365 * 24 * 3600;
+/// The largest duration anything a user writes may name: one year. Not a policy about how long
+/// anything should wait — every real value is orders of magnitude below it — but the bound that
+/// keeps a parsed duration usable as a deadline (see [`parse_duration`]).
+///
+/// A config is not the only door. `sbx session stop --delay` names seconds on the command line and
+/// reaches the same `Instant::now() + d`, so it is held to this ceiling too rather than to a second
+/// one written beside it.
+pub(crate) const DURATION_MAX_SECS: u64 = 365 * 24 * 3600;
 
 /// Pre-classified reusable egress groups: each `[network.groups]` name mapped to the rules its
 /// entries classify to. Built once from the global config (trusted by location) and consulted

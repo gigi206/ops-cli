@@ -201,7 +201,7 @@ the whole cage subtree. Either ids or `--all` is required, not both.
 |---|---|
 | `<id>...` | the PIDs `sbx session ls` shows for the sessions to stop |
 | `--all` | stop every live session (mutually exclusive with explicit ids) |
-| `--delay <secs>` | seconds to wait after `SIGTERM` before `SIGKILL` (default 10; `0` = at once) |
+| `--delay <secs>` | seconds to wait after `SIGTERM` before `SIGKILL` (default 10; `0` = at once). A value above one year is refused, the same ceiling a config duration is held to and for the same reason: the grace becomes a deadline, and a number no clock can represent is not a long wait but an unusable one |
 
 A bare `--` ends the options: everything after it is read as an id, even `--all`
 (ids are PIDs, so `sbx session stop -- --all` reports an unknown session rather than
