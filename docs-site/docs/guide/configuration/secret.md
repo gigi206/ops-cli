@@ -73,6 +73,13 @@ a `type` outside `bearer` / `basic` / `raw` is an error. The destination is alwa
 concrete inspected-TLS host: no `{verb}` prefix, no `tcp://` or `http://` scheme, no
 `*.domain` wildcard, no `re:` regex.
 
+A **port** may be a wildcard where a host may not. `api.example.com` sends the credential to
+`443`, `api.example.com:8443` to that port alone, and `api.example.com:*` to every port of that
+one host. What differs is what the wildcard ranges over: `*.domain` ranges across *hosts*, so a
+host you do not control could ask for the credential, while `:*` stays on the single host you
+named, whose ports are one machine under one administration. The egress allowlist still decides
+which of those ports the cage may reach at all, so one you never allowed never sees the header.
+
 ### `sign`: a credential computed from the request
 
 `header`, `type` and `prefix` form the value **once**, at launch, from the resolved

@@ -9743,6 +9743,24 @@ fn a_secret_to_host_rejects_a_raw_or_cleartext_scheme() {
 }
 
 #[test]
+fn a_secret_to_host_takes_a_port_wildcard_but_not_a_host_one() {
+    // The two wildcards do not reach the same way, and only one of them is refused. `*.domain`
+    // ranges over *hosts*, so a host the user does not control could ask for the credential.
+    // `:*` stays on the single host named, whose ports are one machine under one administration,
+    // and the egress allowlist still decides which of them the cage reaches at all. So the port
+    // wildcard is accepted, and the guide says what it sends where; pinned here because an
+    // accepted form nobody asserts is the kind that drifts into a refusal on the next edit.
+    assert!(validate_secret_target("api.example.com").is_ok());
+    assert!(validate_secret_target("api.example.com:8443").is_ok());
+    assert!(validate_secret_target("api.example.com:*").is_ok());
+    let err = validate_secret_target("*.api.example.com").unwrap_err();
+    assert!(
+        err.contains("wildcard") && err.contains("concrete host"),
+        "{err}"
+    );
+}
+
+#[test]
 fn a_sops_ref_parses_to_a_file_and_key() {
     let s = validate(raw_secret_from(vec![
         "sops://secrets/prod.yaml#db.password",
