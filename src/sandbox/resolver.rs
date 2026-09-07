@@ -490,7 +490,12 @@ fn output_within_armed_by(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    // Read before anything is signalled, while the child is certainly still there. A caller that
+    // Read before anything is signalled, while the child is certainly still there. It answers about
+    // the group the child was *started* in, not one it may join later: a program that calls `setsid`
+    // for itself does so after this line, so the group kill stays off for it. No caller here does
+    // (measured: no `setsid`, `setpgid` or `--new-session` on any command reaching this function).
+    //
+    // A caller that
     // put its command in its own process group (`CommandExt::process_group(0)`) is asking for the
     // whole group to be ended, and this is what says so: the child leads a group only if it was
     // moved into one, since a child that inherits sbx's group is not its leader. Without the test,

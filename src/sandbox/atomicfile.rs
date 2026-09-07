@@ -52,7 +52,7 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// it appears finished.
 pub(crate) fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<()> {
     use std::fs::DirBuilder;
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
@@ -65,7 +65,23 @@ pub(crate) fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) ->
         // right size, and holds zeros. `write_atomic` publishes the pointer to a storage volume and
         // the pin locks a launch resolves against, so an empty-but-present one is the shape that
         // costs most.
-        let file = std::fs::File::create(&tmp)?;
+        //
+        // The mode rides the `open` as well as following it. `create` alone would leave the temp at
+        // the umask's mode for the whole write, and a caller asking for `0600` is asking that the
+        // bytes never exist more readable than that -- a profile carrying `[secret]` locators is
+        // staged in a directory that is not always owner-only. The `set_permissions` after it is
+        // not redundant: `open` masks its mode with the umask, so a `0755` router under a strict
+        // umask still has to be made what it must be, and doing it before the rename keeps the
+        // published path finished from its first instant.
+        let file = match mode {
+            Some(mode) => std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(mode)
+                .open(&tmp)?,
+            None => std::fs::File::create(&tmp)?,
+        };
         {
             use io::Write as _;
             let mut file = &file;
@@ -142,6 +158,64 @@ mod tests {
         let plain = dir.join("plain");
         write_atomic(&plain, b"x").unwrap();
         assert_eq!(std::fs::read(&plain).unwrap(), b"x");
+    }
+
+    /// The temp is never, at any instant, more readable than the mode the caller asked for.
+    ///
+    /// A mode applied after the `open` leaves the bytes at the umask's mode for the whole write and
+    /// flush. The window is not theoretical for what goes through here: an app profile carries
+    /// `[secret]` locators, and it is staged beside its destination, which is not always an
+    /// owner-only directory. So the mode rides the `open`, and this watches the directory during a
+    /// write large enough to last while it looks.
+    #[test]
+    fn a_staged_file_is_never_readable_beyond_the_mode_it_was_asked_for() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = crate::testutil::TmpDir::new();
+        let dir = base.path().join("stage");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A permissive umask, so a temp created without a mode of its own is visibly wider than
+        // what was asked for rather than accidentally equal to it.
+        let previous = unsafe { libc::umask(0o022) };
+
+        let target = dir.join("profile.toml");
+        let body = vec![b'x'; 8 * 1024 * 1024];
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+        let watching = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (w, d, s) = (watching.clone(), dir.clone(), seen.clone());
+        let watcher = std::thread::spawn(move || {
+            while w.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(entries) = std::fs::read_dir(&d) {
+                    for e in entries.flatten() {
+                        if e.file_name().to_string_lossy().contains(".tmp.")
+                            && let Ok(m) = e.metadata()
+                        {
+                            s.lock().unwrap().push(m.permissions().mode() & 0o777);
+                        }
+                    }
+                }
+            }
+        });
+        write_atomic_mode(&target, &body, Some(0o600)).unwrap();
+        watching.store(false, std::sync::atomic::Ordering::Relaxed);
+        watcher.join().unwrap();
+        unsafe { libc::umask(previous) };
+
+        let mut modes = seen.lock().unwrap().clone();
+        modes.sort_unstable();
+        modes.dedup();
+        assert!(
+            !modes.is_empty(),
+            "the watcher never saw the temp, so it asserts nothing about it"
+        );
+        assert!(
+            modes.iter().all(|m| *m & 0o077 == 0),
+            "the temp existed readable beyond its owner: {:?}",
+            modes.iter().map(|m| format!("{m:o}")).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     /// Two stagings running at once publish two whole files, never one file made of both.

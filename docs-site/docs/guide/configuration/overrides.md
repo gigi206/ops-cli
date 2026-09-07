@@ -8,8 +8,9 @@ A one-shot override changes **almost any** configuration field for a **single la
 without editing a file. It is carried on the command line (or the environment) and is
 the **authoritative final word**: it beats a trusted project config *and* an app's own
 posture. The exceptions are declarations that belong in a reviewed config rather than on
-a command line (`distro`, `[task.*]`, `[plugin.*]`, `[broker.*]`, the resolver tables,
-`[app.*]`, `[bundle.*]`, `[mise]`, `[network] groups`): see below.
+a command line (`distro`, `[task]`, `[plugin.*]`, `[broker.*]`, `accepts_fresh_releases`,
+the `flakes` and resolver tables, `[app.*]`, `[bundle.*]`, `[mise]`, `[network] groups`),
+and each is named in a notice before the launch: see below.
 
 See also: [Configuration overview](../configuration/) · [`sbx run`](../cli/run) · [`sbx app`](../cli/app) · [Environment variables](../reference/environment-variables).
 

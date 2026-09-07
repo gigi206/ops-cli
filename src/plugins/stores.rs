@@ -1095,13 +1095,22 @@ const CLONE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 /// Bounded by [`CLONE_DEADLINE`]: the URL is one a user passed to `sbx plugins store add`, or one
 /// a configured store recorded, and neither is a reason to wait on it forever.
 fn clone(git: &Path, url: &str, dest: &Path) -> Result<(), String> {
-    use std::os::unix::process::CommandExt as _;
     let mut cmd = git_command(git);
-    // Its own process group, so the deadline reaches what git starts and not only git. git runs
-    // the transport in a `git-remote-https` helper, and that helper is what is blocked on the
-    // server the timeout is about: killed alone, git leaves it behind holding the connection.
-    cmd.process_group(0)
-        .args(["clone", "--quiet", "--depth", "1", "--single-branch", "--"])
+    // **No process group of its own, and the reason is measured.** A group would let the deadline
+    // reach the transport: git runs it in a `git-remote-https` helper, and a SIGKILL on git alone
+    // leaves that helper on the socket the timeout was about (measured against a listener that
+    // accepts and never speaks: still there thirty seconds later). But the terminal signals a
+    // *group*, so taking git out of sbx's moves the orphan onto Ctrl-C, which is the trigger a
+    // person actually pulls on a hung fetch. Measured both ways on the real binary: in its own
+    // group, `git` and `git-remote-http` survive sbx; in sbx's, the terminal takes all of them.
+    // Pairing the group with `PR_SET_PDEATHSIG` does not settle it either -- git dies on the
+    // signal and its own children do not, so two processes are left instead of two.
+    //
+    // So the wait is bounded and the transport is not, and the honest reading of that is: the
+    // deadline ends sbx's wait, and a helper git left behind ends when the connection does.
+    // `output_within` will kill a group when a command asks for one; closing this would mean
+    // enumerating git's descendants before the kill rather than after, when their parent is gone.
+    cmd.args(["clone", "--quiet", "--depth", "1", "--single-branch", "--"])
         .arg(url)
         .arg(dest);
     let out = crate::sandbox::resolver::output_within(&mut cmd, CLONE_DEADLINE, "the store clone")
@@ -2836,8 +2845,10 @@ mod tests {
         // with a figure nobody chose.
         use std::os::unix::process::CommandExt as _;
         let mut cmd = super::git_command(&git);
-        // The same shape `clone` builds: its own process group, which is what makes the kill reach
-        // the transport helper rather than only the process sbx spawned.
+        // A group of its own, which is what `output_within` needs to reach past the process it
+        // spawned. `clone` does *not* ask for one, and says why: the terminal signals a group, so
+        // taking git out of sbx's moves the orphan onto Ctrl-C. What is held here is that the
+        // mechanism works when a caller can use it.
         cmd.process_group(0).arg("clone");
         let started = std::time::Instant::now();
         let err = crate::sandbox::resolver::output_within(
@@ -2889,10 +2900,23 @@ mod tests {
             source.contains(&needle),
             "the clone must reach that bound, not merely define it"
         );
+        // And the clone does not take a group, which is a decision with two measurements behind
+        // it rather than an omission: see the comment this looks for.
         let group = format!("cmd.{}(0)", "process_group");
+        let clone_body = source
+            .split("fn clone(git:")
+            .nth(1)
+            .expect("the clone")
+            .split("\nfn ")
+            .next()
+            .unwrap();
         assert!(
-            source.contains(&group),
-            "and it must ask for its own group, or the bound ends git and not the transport"
+            !clone_body.contains(&group),
+            "a group here moves the orphan onto Ctrl-C; the reason belongs in the comment"
+        );
+        assert!(
+            clone_body.contains("No process group of its own"),
+            "and that reason has to be written where the decision is"
         );
     }
 }
