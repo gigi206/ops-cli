@@ -120,6 +120,7 @@
 //! | `502` | `upstream-cert-rejected` | the upstream TLS certificate failed validation (never downgraded) |
 //! | `502` | `upstream-http2-unsupported` | a `[network] http2` host will not speak HTTP/2. gRPC is HTTP/2 end to end and this plane does not translate, so it fails closed. Reported whether the upstream refuses the ALPN offer or ignores ALPN and negotiates nothing: both are the same fact about the server, and neither is a certificate problem |
 //! | `502` | `interim-head-cap`       | the upstream answered with more interim `1xx` heads than one exchange carries ([`INTERIM_HEAD_MAX`]). Each is relayed and read past on a leg whose read bound the response stream has already lifted, so an unbounded run holds a proxy thread and pours bytes into the cage; the count is what is bounded, and the wait between heads is the one a slowly streamed body also gets |
+//! | `502` | `upstream-head-too-large` | the upstream sent more than [`HEAD_MAX`] bytes of response head without the blank line that ends it. Relaying what fits would cut one byte stream in two — the head's mask runs over its own bytes and the body's carry starts empty, so a reflected secret straddling the cut is masked by neither — and the truncation already broke the exchange, since the rest of the head would cross as body. Distinct from `bad-request:head`, which is the same shape in the request the cage sent |
 //! | `502` | `upstream-closed`        | the upstream was reached and then closed (or reset the stream) before answering. Distinct from `upstream-unreachable`, which means the connection was never made: this one falls *after* the allow is recorded, so the exchange reads as an allow whose status never arrived, with this error beside it |
 //! | `502` | `injected-header-invalid` | a header sbx was adding could not be one (HTTP/2 plane). A backstop, not a live path: a signer's value is refused at the plugin boundary if it carries a newline or a NUL. Named for its cause rather than folded into `bad-request`, which would blame the caller for a header the caller never sent |
 //!
@@ -1737,6 +1738,24 @@ fn relay_response_head<R: BufRead, W: Write>(
                 no_final: Some(NoFinalHead::UpstreamClosed),
             });
         }
+        // A head that ran past the budget without its blank line, which the reader signals by
+        // handing back more than it was given. Relaying it as a head plus a `ToEof` body is what
+        // this used to do, and it splits one byte stream across two maskers: the head's runs once
+        // over its own bytes and the body's carry starts empty, so a needle straddling the cut is
+        // seen by neither and reaches the cage in the clear. That is the one thing the mask on a
+        // relayed head exists to stop. The truncation was already breaking the exchange — the rest
+        // of the head crossed as body and the connection could not be reused — so the honest answer
+        // is to refuse under its own reason rather than relay a message no client can read. The
+        // other way a head arrives incomplete is an upstream that closed or timed out mid-head:
+        // that one says something different about the server and keeps `upstream-closed`.
+        if !complete && head.len() > HEAD_MAX {
+            return Ok(RelayedHead {
+                head: Vec::new(),
+                framing: BodyFraming::ToEof,
+                persistent: false,
+                no_final: Some(NoFinalHead::HeadTooLarge),
+            });
+        }
         let interim =
             complete && matches!(parse_status_code(&head), Some(c) if (100..200).contains(&c));
         // Counted before it is written on, so the head that breaks the ceiling does not cross
@@ -1851,6 +1870,8 @@ enum NoFinalHead {
     UpstreamClosed,
     /// The upstream answered with more interim `1xx` heads than one exchange may carry.
     InterimCap,
+    /// The upstream ran past [`HEAD_MAX`] without ending its head.
+    HeadTooLarge,
 }
 
 impl NoFinalHead {
@@ -1859,6 +1880,7 @@ impl NoFinalHead {
         match self {
             Self::UpstreamClosed => "upstream-closed",
             Self::InterimCap => "interim-head-cap",
+            Self::HeadTooLarge => "upstream-head-too-large",
         }
     }
 
@@ -1871,6 +1893,9 @@ impl NoFinalHead {
             Self::InterimCap => format!(
                 "`{host}` sent more than {INTERIM_HEAD_MAX} interim `1xx` responses without a \
                  final one"
+            ),
+            Self::HeadTooLarge => format!(
+                "`{host}` sent more than {HEAD_MAX} bytes of response head without ending it"
             ),
         }
     }

@@ -531,9 +531,9 @@ would stall its siblings), `ssrf-blocked`, `host-mismatch`, `ip-literal`,
 `outbound-secret`, `signer-refused`, `signer-body-too-large`, `body-buffer-cap`,
 `connection-cap`, `splice-cap` (the concurrent raw `tcp://` tunnel ceiling),
 `injected-header-invalid`, and the transport-side `dns-failure`, `upstream-unreachable`,
-`upstream-cert-rejected`, `upstream-http2-unsupported`, `upstream-closed`, and
-`interim-head-cap`. A genuine upstream status (a real `404`) is relayed verbatim with no
-such header.
+`upstream-cert-rejected`, `upstream-http2-unsupported`, `upstream-closed`,
+`interim-head-cap`, and `upstream-head-too-large`. A genuine upstream status (a real
+`404`) is relayed verbatim with no such header.
 
 The statuses behind them: policy and guard refusals are `403` (`denied-*`,
 `outbound-secret`, `ssrf-blocked`, `ip-literal`, `ws-injection-refused`,
@@ -581,6 +581,15 @@ interim heads holding a proxy thread and sending bytes into the cage for as long
 likes. A handful is all any real server sends, so past a small ceiling the exchange is
 refused under this reason instead of `upstream-closed`: the two say different things
 about the server and are never used for each other.
+
+`upstream-head-too-large` is the third. A response head has a size budget like a request's,
+and a server that runs past it without the blank line that ends the head has not sent a head
+sbx can relay: what fits would go out as the response and the rest would arrive as its body,
+which no client can read and no connection can be reused after. It also splits one byte
+stream between two maskers, and a reflected credential lying across that cut is masked by
+neither, which is the one thing masking a relayed head is for. So the exchange is refused
+rather than passed on in pieces. This is about the server, not the caller: the same shape in
+a request the cage sent is `bad-request:head`.
 
 `signer-refused` is the one that is not a policy verdict: the policy allowed the host,
 and the request was refused because its credential could not be formed. See

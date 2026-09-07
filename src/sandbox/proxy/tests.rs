@@ -8601,6 +8601,51 @@ fn a_reflected_injected_secret_is_masked_in_the_response() {
     );
 }
 
+/// The seam between the two maskers, which is why a head that never ends is refused rather than
+/// relayed in pieces.
+///
+/// A head past [`HEAD_MAX`] used to cross truncated, with everything after the cut arriving as a
+/// `ToEof` body. The head's mask ran over its own bytes and the body's carry started empty, so a
+/// needle lying across the cut was seen by neither and reached the cage in the clear — the one
+/// thing masking a relayed head exists to stop. Three offsets: wholly inside what would have been
+/// the head, straddling the cut, and past it. The witness that the mask still works on a head this
+/// size is [`a_reflected_injected_secret_is_masked_in_a_response_header`], which ends its head.
+#[test]
+fn a_secret_straddling_the_response_head_budget_never_reaches_the_cage() {
+    const SECRET: &str = "sbx-secret-value";
+    for (label, at) in [
+        ("wholly inside the truncated head", HEAD_MAX - 400),
+        ("straddling the cut", HEAD_MAX - SECRET.len() / 2),
+        ("past the cut", HEAD_MAX + 700),
+    ] {
+        // One header line long enough to exhaust the budget and no blank line after it, so the
+        // reader gives up where the cut falls. The echoed secret sits at `at`.
+        let mut response = Vec::from(&b"HTTP/1.1 200 OK\r\nX-Echo: "[..]);
+        response.resize(at, b'b');
+        response.extend_from_slice(SECRET.as_bytes());
+        response.resize(HEAD_MAX + 2000, b'c');
+        let resp = run_reflecting(
+            vec![injection(
+                "host.test:*",
+                "Authorization",
+                "Bearer sbx-secret-value",
+            )],
+            &[SECRET],
+            Box::leak(response.into_boxed_slice()),
+            b"GET / HTTP/1.1\r\nHost: host.test\r\n\r\n",
+        );
+        assert!(
+            !resp.contains(SECRET),
+            "{label}: the reflected secret reached the cage: {:?}",
+            &resp[resp.len().saturating_sub(200)..]
+        );
+        assert!(
+            resp.contains("502") && resp.contains("upstream-head-too-large"),
+            "{label}: a head that never ends is refused under its own reason: {resp:?}"
+        );
+    }
+}
+
 /// The masking is scoped to injection-target hosts: a response from a host with no injection is
 /// streamed unmasked even with a redaction needle configured. A secret could be present there
 /// only if the agent already had it (and placed it), so masking would buy nothing — and scoping
