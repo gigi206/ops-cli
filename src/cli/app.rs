@@ -102,10 +102,9 @@ fn finish_learning(name: &str, outcome: &sandbox::AppOutcome, learn: &Learning) 
                     Err((_, msg)) => errs.push(msg),
                 }
             }
-            if errs.is_empty() {
-                Ok(lines.join("\n"))
-            } else {
-                Err((1, errs.join("\n")))
+            Written {
+                lines,
+                failure: (!errs.is_empty()).then(|| errs.join("\n")),
             }
         };
         let target = match egress_write_target(&learn.scope, Some(name), &cwd) {
@@ -131,8 +130,22 @@ fn finish_learning(name: &str, outcome: &sandbox::AppOutcome, learn: &Learning) 
         );
     }
     if let Some((synth, gran)) = outcome.proc_learned.as_ref().zip(learn.proc) {
-        let persist = |rules: &[String]| {
-            crate::persist_learned_proc_rules(rules, &learn.scope, Some(name), &cwd)
+        // One call for the whole list, so a gated project config is re-trusted once: either every
+        // rule landed or none did, and there is no half-written list to name.
+        let persist = |rules: &[String]| match crate::persist_learned_proc_rules(
+            rules,
+            &learn.scope,
+            Some(name),
+            &cwd,
+        ) {
+            Ok(msg) => Written {
+                lines: vec![msg],
+                failure: None,
+            },
+            Err((_, msg)) => Written {
+                lines: Vec::new(),
+                failure: Some(msg),
+            },
         };
         let target = match egress_write_target(&learn.scope, Some(name), &cwd) {
             Ok((_, _, target)) => target,
@@ -187,7 +200,17 @@ struct LearnWrite<'a> {
 /// How a lens writes the whole list it learned, returning the line to print or the refusal to
 /// report. Taking the list rather than one rule lets a lens that can write in one act do so, and one
 /// that cannot loop inside its own closure.
-type Persist<'a> = dyn Fn(&[String]) -> Result<String, (u8, String)> + 'a;
+type Persist<'a> = dyn Fn(&[String]) -> Written + 'a;
+
+/// What a write reports: the lines naming what landed, and the refusal when part of it did not.
+///
+/// Not a `Result`, because a list write is not all-or-nothing: the egress path persists one rule per
+/// call, so a failure on the third leaves the first two written — and a caller that printed only the
+/// error would leave the operator believing nothing was.
+struct Written {
+    lines: Vec<String>,
+    failure: Option<String>,
+}
 
 /// Surface the notes (nothing is dropped silently), then either preview the diff (`--dry-run`) or
 /// write the rules.
@@ -230,12 +253,16 @@ fn finish_learn(name: &str, synth: &sandbox::Synthesis, w: &LearnWrite) -> ExitC
         }
         return ExitCode::SUCCESS;
     }
-    match (w.persist)(&synth.rules) {
-        Ok(msg) => {
-            println!("{}", style::prose(&msg, &pal));
-            ExitCode::SUCCESS
-        }
-        Err((_, msg)) => {
+    let written = (w.persist)(&synth.rules);
+    // What landed is named first, and named even when part of the list did not: a write that failed
+    // on its third rule still wrote the first two, and reporting only the error would leave the
+    // operator believing their config was untouched.
+    for line in &written.lines {
+        println!("{}", style::prose(line, &pal));
+    }
+    match &written.failure {
+        None => ExitCode::SUCCESS,
+        Some(msg) => {
             diag::error(&format!("sbx {}: {msg}", w.label));
             ExitCode::FAILURE
         }
@@ -2333,6 +2360,63 @@ mod tests {
         );
         // Nothing countable (only empty pools, the global home removed by hand): named, not blank.
         assert_eq!(describe_home_locations(&app(None, 0, 0)), "empty mise pool");
+    }
+
+    #[test]
+    fn a_write_that_fails_part_way_still_names_what_it_wrote() {
+        // The egress path persists one rule per call, so a refusal on the third leaves the first two
+        // in the file. Reporting only the error would tell the operator their config was untouched
+        // when it was not — and it is the shape a shared applier makes easy to lose, because a
+        // `Result` has room for one of the two answers.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let persist = |rules: &[String]| {
+            seen.borrow_mut().extend_from_slice(rules);
+            Written {
+                lines: vec!["added allow a to the project config".to_string()],
+                failure: Some("could not write b".to_string()),
+            }
+        };
+        let synth = sandbox::Synthesis {
+            rules: vec!["a".to_string(), "b".to_string()],
+            notes: Vec::new(),
+        };
+        let code = finish_learn(
+            "demo-app",
+            &synth,
+            &LearnWrite {
+                label: "net-learn",
+                refused: "was refused nothing",
+                noun: "egress",
+                gran: "domain",
+                dry_run: false,
+                target: "the project config".to_string(),
+                also: None,
+                persist: &persist,
+            },
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
+        // The whole list reached the writer: a failure part way does not stop the rules after it
+        // from being attempted, and what it wrote is carried back to be named.
+        assert_eq!(*seen.borrow(), vec!["a".to_string(), "b".to_string()]);
+
+        // A dry run writes nothing at all, whatever the persister would have done.
+        seen.borrow_mut().clear();
+        let code = finish_learn(
+            "demo-app",
+            &synth,
+            &LearnWrite {
+                label: "proc-learn",
+                refused: "ran nothing new",
+                noun: "exec",
+                gran: "name",
+                dry_run: true,
+                target: "the project config".to_string(),
+                also: Some("and sets the posture"),
+                persist: &persist,
+            },
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(seen.borrow().is_empty(), "a dry run must not write");
     }
 
     #[test]
