@@ -64,9 +64,12 @@ a path, because the shape promises more than the lens delivers. The two limits d
 
 - A path `deny` matches that spelling and no other. No symlink is resolved, so `deny = ["/usr/bin/*"]`
   says nothing about the same program reached as `/tmp/mycurl` or through a bind mount. A basename
-  rule (`curl`) holds wherever the program is spelled from, which is the form to reach for. sbx
-  ships no `[proc]` rules of its own: the rules in force are the ones you write, so there is no
-  worked denylist to copy the shape from.
+  rule (`curl`) holds wherever the program is spelled *from*, which is the form to reach for, and
+  the word to read closely is *from*: it is the directory that stops mattering, not the name. A
+  rule names, and a copy renames, so `cp /usr/bin/curl ./x` produces a program no rule about `curl`
+  speaks about. That is not a hole a stricter rule closes, it is what deciding by name is; see
+  [Honest scope](#honest-scope). sbx ships no `[proc]` rules of its own: the rules in force are the
+  ones you write, so there is no worked denylist to copy the shape from.
 - A path `allow` is a guard-rail rather than a guarantee. The supervisor reads the target, decides,
   and then the kernel **re-resolves** it to run it, so a second thread in the cage can point the name
   elsewhere in between. Refusing a path is not exposed to this (the syscall never runs); allowing one
@@ -90,16 +93,22 @@ on a stalled decision.
 
 ## Honest scope
 
-A `deny` is a **hard stop on `execve`**, even against a hostile agent: the two obvious ways around a
-seccomp exec gate are both closed by the kernel: a foreign-ABI `execve` (the i386 compat call from a
+A `deny` is a **hard stop on the `execve` it names**, even against a hostile agent. Two ways around
+a seccomp exec gate are closed by the kernel: a foreign-ABI `execve` (the i386 compat call from a
 64-bit process) is *killed* by the mandatory syscall denylist's architecture guard rather than
 slipping through, and an agent cannot install its own notification filter to intercept its own
-`execve`s (the kernel allows only one such listener, held here by the launcher). So `deny = "curl"`
-genuinely stops `curl` from executing.
+`execve`s (the kernel allows only one such listener, held here by the launcher). Three more, where
+one `execve` runs a program it does not name, are closed by sbx and described under
+[what one `execve` can run](#what-one-execve-can-run). So `deny = "curl"` stops every `execve`
+whose target is *named* `curl`, from whatever directory, and behind whatever interpreter.
 
-What exec enforcement is **not** is a full containment boundary: it is a **guardrail** on the exec
-channel, for three honest reasons:
+What it does not stop is a *different* program, and that is the first of the four reasons this is a
+guardrail rather than a full containment boundary:
 
+- a rule decides a **name**, and a cage that can write a file can give the same bytes another one:
+  `cp /usr/bin/curl ./x && ./x` is a program no rule about `curl` names. Nothing decided by name
+  reaches that, which is why `[proc]` is a way to keep an agent off the tools you did not mean it
+  to reach, and not a way to bound what it can do with the ones it has;
 - an agent can do harm **in-process** (in its own interpreter) without `execve`ing anything at all, which is also why `allow`ing a shell or a language runtime concedes most of the gate: what it does
   with its own builtins never reaches a syscall to decide;
 - `allow`/approval re-runs the real syscall, which is **TOCTOU-racy** against an adversary that swaps
@@ -124,6 +133,8 @@ The `enforce`/`ask` feed (`sbx proc logs`) shows the resolved **exec path** the 
 thing policy matches on), not the full argv: a `curl https://…` appears as `…/bin/curl`.
 
 ### A program named through another program
+
+## What one `execve` can run
 
 One `execve` can run a program other than the one it names, and sbx decides both. Two shapes reach
 that far:
