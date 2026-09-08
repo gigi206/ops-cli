@@ -789,15 +789,19 @@ fn every_unwatched_tree_is_named_in_the_file_feed_page() {
 /// things that are not checks.
 #[test]
 fn every_check_doctor_prints_is_named_on_its_page() {
-    // A check line is emitted as `"  {} <label>   <detail>"` — the tag, then the label padded out
-    // to its column. The run of spaces is what ends the label.
-    let labels: Vec<String> = include_str!("cli/doctor.rs")
-        .split("\"  {} ")
-        .skip(1)
-        .filter_map(|rest| {
-            let label = rest.split("  ").next()?.trim();
-            (!label.is_empty() && label.chars().all(|c| c.is_ascii_lowercase() || c == ' '))
-                .then(|| label.to_string())
+    // A check line is emitted as `"  <tag> <label>   <detail>"` — the tag, then the label padded
+    // out to its column, the run of spaces ending it. The tag is a positional `{}` or one of the
+    // inline captures, and all four spellings have to be read: the `storage` lines use `{ok}` and
+    // `{warn}`, so a scrape that knew only `{}` would pass while seeing nothing of them.
+    let source = include_str!("cli/doctor.rs");
+    let labels: Vec<String> = ["\"  {} ", "\"  {ok} ", "\"  {warn} ", "\"  {fail} "]
+        .iter()
+        .flat_map(|prefix| {
+            source.split(prefix).skip(1).filter_map(|rest| {
+                let label = rest.split("  ").next()?.trim();
+                (!label.is_empty() && label.chars().all(|c| c.is_ascii_lowercase() || c == ' '))
+                    .then(|| label.to_string())
+            })
         })
         .collect();
     assert!(
