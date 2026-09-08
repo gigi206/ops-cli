@@ -76,7 +76,7 @@ fn a_launch_that_cannot_show_the_observe_feed_says_so() {
     for mode in [ProcMode::Off, ProcMode::Observe] {
         let policy = with(mode);
         assert_eq!(
-            observe_feed_absent_reason(true, false, &policy),
+            observe_feed_absent_reason(true, false, false, &policy),
             None,
             "{mode:?}: the feed is emitted here, so there is nothing to warn about"
         );
@@ -89,7 +89,7 @@ fn a_launch_that_cannot_show_the_observe_feed_says_so() {
     // Every enforcing mode, not just the obvious one.
     for mode in [ProcMode::Enforce, ProcMode::Ask, ProcMode::Confine] {
         let policy = with(mode);
-        let reason = observe_feed_absent_reason(true, false, &policy)
+        let reason = observe_feed_absent_reason(true, false, false, &policy)
             .unwrap_or_else(|| panic!("{mode:?}: no feed and no warning is the silent case"));
         assert!(
             reason.contains("seccomp lens"),
@@ -102,21 +102,52 @@ fn a_launch_that_cannot_show_the_observe_feed_says_so() {
     }
 
     // A terminal takes the inline feed away too, and keeps its own reason.
-    let interactive = observe_feed_absent_reason(true, true, &with(ProcMode::Observe))
+    let interactive = observe_feed_absent_reason(true, true, false, &with(ProcMode::Observe))
         .expect("an interactive terminal has no inline feed either");
     assert!(interactive.contains("interactive terminal"));
 
     // Enforcement is named first: it is the reason that holds whether or not there is a
     // terminal, and the one a reader would otherwise not guess.
     assert_eq!(
-        observe_feed_absent_reason(true, true, &with(ProcMode::Enforce)),
-        observe_feed_absent_reason(true, false, &with(ProcMode::Enforce))
+        observe_feed_absent_reason(true, true, false, &with(ProcMode::Enforce)),
+        observe_feed_absent_reason(true, false, false, &with(ProcMode::Enforce))
     );
 
     // And nothing is said to a launch that never asked.
     for mode in [ProcMode::Off, ProcMode::Observe, ProcMode::Enforce] {
-        assert_eq!(observe_feed_absent_reason(false, true, &with(mode)), None);
+        assert_eq!(
+            observe_feed_absent_reason(false, true, false, &with(mode)),
+            None
+        );
     }
+}
+
+#[test]
+fn a_learning_run_says_it_starts_no_feed_whatever_the_posture() {
+    use crate::proc_policy::{ProcMode, ProcPolicy};
+
+    let with = |mode| ProcPolicy {
+        mode,
+        ..ProcPolicy::default()
+    };
+
+    // A learning launch supervises the cage itself and starts neither lens, so `--observe` on one
+    // would otherwise be accepted, print nothing and stream nothing — the exact failure
+    // `observe_feed_absent_reason` exists to keep from happening. The reason holds under every
+    // posture, including the ones that would otherwise have had a feed.
+    for mode in [ProcMode::Off, ProcMode::Observe, ProcMode::Enforce] {
+        let reason = observe_feed_absent_reason(true, false, true, &with(mode))
+            .expect("a learning run has no feed to show");
+        assert!(
+            reason.contains("learn"),
+            "the reason must name the learning run: {reason}"
+        );
+    }
+    // And it is still `--observe` that gates it: no flag, no warning.
+    assert_eq!(
+        observe_feed_absent_reason(false, false, true, &with(ProcMode::Off)),
+        None
+    );
 }
 
 /// Observation and the `exec`-replace shortcut cannot coexist: the observer's control socket,

@@ -178,7 +178,7 @@ pub(crate) fn run(
     // Observation runs on any path where a parent sbx survives the cage. Its inline stderr feed rides
     // only the non-tty foreground path under a non-enforcing `[proc]` mode; the launches that take it
     // away are told so, and pointed at `sbx proc logs`/`sbx proc live` for the same events.
-    warn_observe_feed_absent(observe, interactive, &prep.cfg.proc);
+    warn_observe_feed_absent(observe, interactive, false, &prep.cfg.proc);
 
     if cmd.is_empty() {
         // No command: open the project shell. Interactive gets the full pty shell (mise activation
@@ -256,7 +256,9 @@ fn may_exec_replace(proc: &crate::proc_policy::ProcPolicy, observe: bool) -> boo
 /// - an interactive terminal, where the feed would fight the command's own screen;
 /// - an enforcing `[proc]` mode, where the exec lens is the seccomp supervisor rather than the
 ///   poller ([`observation_flags`] clears `exec_poll` for exactly this set of modes), so nothing
-///   feeds the inline stream.
+///   feeds the inline stream;
+/// - a learning run, which starts no observation of its own at all: what it records, it records for
+///   the rules it is about to synthesize, and hands to the caller rather than to a feed.
 ///
 /// The enforcing case is worth stating plainly rather than implying a loss: the lens then sees
 /// *more* than the poller ever does, intercepting every `execve` including processes far too
@@ -268,10 +270,18 @@ fn may_exec_replace(proc: &crate::proc_policy::ProcPolicy, observe: bool) -> boo
 fn observe_feed_absent_reason(
     observe: bool,
     interactive: bool,
+    learning: bool,
     proc: &crate::proc_policy::ProcPolicy,
 ) -> Option<&'static str> {
     if !observe {
         return None;
+    }
+    // Before the postures, because it holds whatever they say: a learning launch supervises the cage
+    // itself and starts neither lens, so none of the viewers below have anything to show either.
+    if learning {
+        return Some(
+            "a `--net-learn`/`--proc-learn` run records for its own rules and starts no feed",
+        );
     }
     if proc.enforcing() {
         return Some(
@@ -291,12 +301,16 @@ fn observe_feed_absent_reason(
 fn warn_observe_feed_absent(
     observe: bool,
     interactive: bool,
+    learning: bool,
     proc: &crate::proc_policy::ProcPolicy,
 ) {
-    if let Some(reason) = observe_feed_absent_reason(observe, interactive, proc) {
-        crate::diag::warn(&format!(
-            "--observe: {reason} — watch this session with `sbx proc logs`/`sbx proc live`"
-        ));
+    if let Some(reason) = observe_feed_absent_reason(observe, interactive, learning, proc) {
+        let where_to_look = if learning {
+            "run it again without the learning flag to watch it with `sbx proc logs`/`sbx proc live`"
+        } else {
+            "watch this session with `sbx proc logs`/`sbx proc live`"
+        };
+        crate::diag::warn(&format!("--observe: {reason} — {where_to_look}"));
     }
 }
 
@@ -546,7 +560,12 @@ pub(crate) fn app(
 
     // SAFETY: `isatty` only inspects fd 0.
     let interactive = !detach && unsafe { libc::isatty(0) } == 1;
-    warn_observe_feed_absent(observe, interactive, &prep.cfg.proc);
+    warn_observe_feed_absent(
+        observe,
+        interactive,
+        net_learn.is_some() || proc_learn.is_some(),
+        &prep.cfg.proc,
+    );
 
     // A learning run: launch the app under its real (unchanged) posture, capture what it was not
     // declared for, and hand the synthesized rules back for the caller to write. Foreground-only
