@@ -3611,23 +3611,37 @@ fn net_learn_synthesizes_a_rule_for_a_refused_host_and_writes_it() {
 
 #[test]
 fn proc_learn_writes_the_programs_a_run_ran_and_the_posture_they_are_live_under() {
-    // `sbx app <name> --proc-learn` end to end through the real binary. The app runs two programs;
-    // the launch stands the seccomp user-notification supervisor up under a denylist with nothing on
-    // it, so both run and both are decided; proc-learn snapshots the decided targets after the run
-    // and synthesizes the `allow` rules that would admit them under `ask`.
+    // `sbx app <name> --proc-learn` end to end through the real binary, on the three shapes the
+    // synthesis makes claims about that no unit test can reach through a real cage:
     //
-    // Teeth: `curl` is a program the run actually execed and no rule named, so it must appear in the
-    // dry run; and the real write must carry `mode = "ask"` beside it, because an allow list is inert
-    // under every other posture — the whole reason the write sets one. Skips (never fails) when the
-    // host cannot sandbox or the cache is unreachable.
+    // - a program reached through `PATH` (`curl`), the ordinary case;
+    // - the interpreter of a `#!` script. The app's command names no shell, so `sh` can only be in
+    //   the learned set because the supervisor read the shebang and decided against what it named —
+    //   an `execve` the kernel never reported separately;
+    // - a target invoked by a **relative** path (`./probe.sh`), which the existence probe that
+    //   filters a `PATH` walk's misses must not filter out with them.
+    //
+    // And one negative: the app declares `deny = ["git"]`, so `git` ran into a refusal it was meant
+    // to. It must be reported and never turned into an allow, because deny wins in the matcher and
+    // the rule would be inert beside it. Skips (never fails) when the host cannot sandbox or the
+    // cache is unreachable.
     let project = TmpDir::prefixed("r", "proclearn-proj");
     let data = TmpDir::prefixed("r", "proclearn-data");
     let state = TmpDir::prefixed("r", "proclearn-state");
-    // No `[proc]` table at all: the common case this feature exists for is a project with no exec
-    // policy yet, and the learning run supplies the empty denylist itself.
     let original_config = "[network]\nmode = \"deny\"\nallow = [\"cache.nixos.org\"]\n\n\
-         [app.probe]\ncmd = [\"sh\", \"-c\", \"curl --version >/dev/null 2>&1; true\"]\n";
+         [app.probe]\ncmd = [\"./probe.sh\"]\n\n\
+         [app.probe.proc]\nmode = \"enforce\"\ndeny = [\"git\"]\n";
     std::fs::write(project.path().join(".sbx.toml"), original_config).unwrap();
+    let script = project.path().join("probe.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\ncurl --version >/dev/null 2>&1\ngit --version >/dev/null 2>&1\ntrue\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     probe_or_skip!(
         "proc-learn e2e",
@@ -3666,9 +3680,19 @@ fn proc_learn_writes_the_programs_a_run_ran_and_the_posture_they_are_live_under(
         dry.status.success(),
         "proc-learn --dry-run should succeed regardless of the agent's exit: {dry_out}"
     );
+    for want in ["allow curl", "allow sh", "allow probe.sh"] {
+        assert!(
+            dry_out.contains(want),
+            "proc-learn --dry-run must name `{want}`: {dry_out}"
+        );
+    }
     assert!(
-        dry_out.contains("allow curl"),
-        "proc-learn --dry-run must name a program the run execed: {dry_out}"
+        !dry_out.contains("allow git"),
+        "a denied program must never be proposed as an allow: {dry_out}"
+    );
+    assert!(
+        dry_out.contains("git") && dry_out.contains("deny"),
+        "the denied program must be reported rather than dropped: {dry_out}"
     );
     let cfg_after_dry = std::fs::read_to_string(project.path().join(".sbx.toml")).unwrap();
     assert_eq!(
@@ -3699,8 +3723,18 @@ fn proc_learn_writes_the_programs_a_run_ran_and_the_posture_they_are_live_under(
         "the write must set the posture the learned rules are live under: {cfg_after}"
     );
     assert!(
-        cfg_after.contains("curl"),
-        "the learned rule must be written: {cfg_after}"
+        cfg_after.contains("curl") && cfg_after.contains("probe.sh"),
+        "the learned rules must be written: {cfg_after}"
+    );
+    assert!(
+        cfg_after.contains("git"),
+        "the hand-written deny must survive the posture change: {cfg_after}"
+    );
+    // The posture change is announced, not made quietly: it is what decides whether the next launch
+    // runs an unnamed program or waits for a person.
+    assert!(
+        write_out.contains("ask") && write_out.contains("enforce"),
+        "the write must say which posture it left and which it set: {write_out}"
     );
 }
 

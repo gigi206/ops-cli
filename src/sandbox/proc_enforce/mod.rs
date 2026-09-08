@@ -704,14 +704,38 @@ fn exec_verdict(
 fn decide_target(cx: &Deciding<'_>, caller: &[String], pid: u32, target: &str) -> Verdict {
     let verdict = cx.overlay.decide(cx.policy, caller, target);
     if let Some(learn) = cx.learn
-        && let Ok(fd) = open_lens::probe_in_cage_root(pid, Path::new(target))
+        && learnable(pid, target)
     {
-        // SAFETY: fd is this call's own descriptor, returned by the probe and closed once. Nothing
-        // is read through it — the question was whether it could be opened at all.
-        unsafe { libc::close(fd) };
         learn.record(target);
     }
     verdict
+}
+
+/// Whether a decided target is one a learning run should keep.
+///
+/// The population this excludes is a `PATH` walk's misses. A name lookup is one `execve` per `PATH`
+/// entry, so a program found in the fourth directory is decided against three paths that hold
+/// nothing, and learning those would write rules about files the cage never ran.
+///
+/// Which is why the probe is asked only of an **absolute** target. A `PATH` entry is absolute, so
+/// every candidate a walk produces is; a relative target is what an explicit `./build.sh` carries,
+/// one attempt rather than one of a series, and the caller's own working directory is what it is
+/// resolved against — not a root this supervisor can walk from. Probing it would answer `ENOENT` for
+/// a script that ran perfectly well, and the program the run is most likely to want a rule about is
+/// exactly the one the project invoked by name.
+fn learnable(pid: u32, target: &str) -> bool {
+    if !target.starts_with('/') {
+        return true;
+    }
+    match open_lens::probe_in_cage_root(pid, Path::new(target)) {
+        Ok(fd) => {
+            // SAFETY: fd is this call's own descriptor, returned by the probe and closed once.
+            // Nothing is read through it — the question was whether it could be opened at all.
+            unsafe { libc::close(fd) };
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// What one notified exec was decided to be, and the two names that decision is spoken about.
