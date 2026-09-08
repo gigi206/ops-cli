@@ -673,10 +673,13 @@ pub(crate) fn dispatch(name: &str, rest: Vec<OsString>) -> ExitCode {
                 ExitCode::SUCCESS
             }
         },
-        "doctor" => match reject_extra(&["doctor"], &rest) {
-            Err(code) => code,
-            Ok(()) => doctor::doctor(),
-        },
+        "doctor" => {
+            let (json, rest) = crate::split_json_flag(&rest);
+            match reject_extra(&["doctor"], &rest) {
+                Err(code) => code,
+                Ok(()) => doctor::doctor(json),
+            }
+        }
         "session" | "sessions" => session::session_cmd(&rest),
         "trust" => trust::trust_cmd(rest),
         "untrust" => trust::untrust_cmd(rest),

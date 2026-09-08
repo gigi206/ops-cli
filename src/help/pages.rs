@@ -44,9 +44,12 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["doctor"],
-        synopsis: "sbx doctor",
+        synopsis: "sbx doctor [--json]",
         summary: "verify the runtime prerequisites before anything can run",
-        options: &[],
+        options: &[(
+            "--json",
+            "emit the checks as a document (each with its status, detail and context lines) plus the remediation, for a CI gate",
+        )],
         details: "Checks the load-bearing requirements: capability-bearing unprivileged user\n\
             namespaces (the security boundary everything rests on), the bubblewrap engine,\n\
             and the nix binary that drives the user-owned store. A missing requirement is a\n\

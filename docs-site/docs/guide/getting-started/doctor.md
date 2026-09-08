@@ -6,7 +6,7 @@ description: "The kernel features and host tools a cage needs, and how `sbx doct
 # `sbx doctor` and prerequisites
 
 ```
-sbx doctor
+sbx doctor [--json]
 ```
 
 `doctor` verifies the load-bearing runtime requirements **before** anything can run,
@@ -107,6 +107,25 @@ differently, and the store moves into it:
   and whether the tree is unpacked yet. The line is absent on a host that runs the hermetic
   nix userland, which is the ordinary case and not something missing. A project that
   declares its own image pins it in the project's own lock, which `doctor` does not read.
+
+## As a document (`--json`)
+
+`--json` emits the same pass as a document instead of the report, which is what a CI gate or a
+provisioning script wants: every check with its `status` (`ok`, `warn` or `fail`), its detail, and
+the `·` context lines under it, plus the remediation hints and a single `ok` boolean.
+
+```sh
+sbx doctor --json | jq -r '.checks[] | select(.status == "fail") | .name'
+sbx doctor --json | jq -e .ok > /dev/null || echo "this host cannot run sbx"
+```
+
+The exit status is unchanged: `0` when nothing is missing, `1` when a prerequisite is, so a gate
+can read either the code or the document. The remediation travels **inside** the document rather
+than on stderr beside it, because a red check says what is wrong and only the hint says what to do,
+and splitting them would make the document the less useful half.
+
+Both forms come from the same pass. A second pass that re-probed for the document could disagree
+with the one a reader saw, and a preflight is the worst place to have two answers.
 
 ## Why it hard-fails
 

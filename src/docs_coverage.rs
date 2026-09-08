@@ -789,19 +789,23 @@ fn every_unwatched_tree_is_named_in_the_file_feed_page() {
 /// things that are not checks.
 #[test]
 fn every_check_doctor_prints_is_named_on_its_page() {
-    // A check line is emitted as `"  <tag> <label>   <detail>"` — the tag, then the label padded
-    // out to its column, the run of spaces ending it. The tag is a positional `{}` or one of the
-    // inline captures, and all four spellings have to be read: the `storage` lines use `{ok}` and
-    // `{warn}`, so a scrape that knew only `{}` would pass while seeing nothing of them.
+    // Every check goes through `Report::check(status, name, detail)`, so the name is read out of
+    // the second argument of those calls. That is a stronger scrape than the one it replaced: the
+    // labels used to be a fragment of a format string, padded by hand into a column, so a check
+    // was findable only as long as it was *spelled* like the others — four different tag spellings
+    // had to be enumerated, and a fifth would have gone unseen. A named argument cannot drift that
+    // way. What has not changed is the direction: this reads the source that prints, so it cannot
+    // pass by agreeing with a stale copy.
     let source = include_str!("cli/doctor.rs");
-    let labels: Vec<String> = ["\"  {} ", "\"  {ok} ", "\"  {warn} ", "\"  {fail} "]
-        .iter()
-        .flat_map(|prefix| {
-            source.split(prefix).skip(1).filter_map(|rest| {
-                let label = rest.split("  ").next()?.trim();
-                (!label.is_empty() && label.chars().all(|c| c.is_ascii_lowercase() || c == ' '))
-                    .then(|| label.to_string())
-            })
+    let labels: Vec<String> = source
+        .split(".check(")
+        .skip(1)
+        .filter_map(|rest| {
+            // `check("ok", "storage", …)` — the status, then the name.
+            let mut args = rest.split('"').skip(3);
+            let name = args.next()?.trim().to_string();
+            (!name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == ' '))
+                .then_some(name)
         })
         .collect();
     assert!(

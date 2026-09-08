@@ -247,3 +247,69 @@ fn unknown_command_is_rejected() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("unknown command"));
 }
+
+#[test]
+fn doctor_json_carries_every_check_the_report_prints() {
+    // The document and the report come from one pass, so the two must agree on *what was checked*.
+    // Asserting that correspondence is what keeps a future check from being added to one and not
+    // the other: the `Report` makes that hard, and this makes it visible if it happens anyway.
+    let data = TmpDir::new("dr");
+    let run = |json: bool| {
+        let mut cmd = sbx();
+        cmd.arg("doctor").env("XDG_DATA_HOME", data.path());
+        if json {
+            cmd.arg("--json");
+        }
+        let out = cmd.output().expect("run sbx doctor");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    let human = run(false);
+    let doc: serde_json::Value =
+        serde_json::from_str(&run(true)).expect("`sbx doctor --json` emits a document");
+
+    let checks = doc["checks"].as_array().expect("a checks array");
+    assert!(
+        checks.len() >= 5,
+        "a preflight reports more than a handful of checks: {checks:?}"
+    );
+    for c in checks {
+        let name = c["name"].as_str().expect("each check is named");
+        assert!(
+            human.contains(name),
+            "`{name}` is in the document but not in the report:\n{human}"
+        );
+        assert!(
+            matches!(c["status"].as_str(), Some("ok" | "warn" | "fail")),
+            "unexpected status on `{name}`: {}",
+            c["status"]
+        );
+    }
+    // `ok` is the single boolean a gate reads, and it must agree with the exit status the human
+    // run would have taken: no remediation means nothing is missing.
+    assert_eq!(
+        doc["ok"].as_bool(),
+        Some(doc["remediation"].as_array().is_some_and(Vec::is_empty)),
+        "`ok` must mean `remediation` is empty"
+    );
+}
+
+#[test]
+fn doctor_json_prints_no_prose_beside_the_document() {
+    // The whole point of the flag: one output, parseable end to end. A stray banner or summary
+    // line would leave a caller to strip it, and stripping is what a format exists to avoid.
+    let data = TmpDir::new("dr");
+    let out = sbx()
+        .arg("doctor")
+        .arg("--json")
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("run sbx doctor --json");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("runtime preflight") && !stdout.contains("prerequisites OK"),
+        "the human banner and summary must not ride along:\n{stdout}"
+    );
+    serde_json::from_str::<serde_json::Value>(&stdout)
+        .expect("stdout parses whole, with nothing before or after the document");
+}

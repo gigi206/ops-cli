@@ -38,6 +38,96 @@ const BWRAP_OVERRIDE_REMEDIATION: &str = "fix the ownership or permissions of th
 binary SBX_BWRAP_BIN names (it must be owned by you or root, and not world-writable), or unset \
 SBX_BWRAP_BIN to let sbx resolve bubblewrap itself";
 
+/// One preflight check: what was probed, how it came out, and the context lines under it.
+///
+/// The struct exists so `--json` and the human report answer from the *same* pass. A second pass
+/// that re-probed for the document could disagree with the one the reader saw, and on a preflight
+/// that is the worst possible place for two answers.
+struct Check {
+    name: String,
+    /// `ok`, `warn` or `fail` — the machine-readable form of the `[ ok ]`/`[warn]`/`[FAIL]` tag.
+    status: &'static str,
+    detail: String,
+    /// The `· …` lines under the check: context, never a verdict of their own.
+    notes: Vec<String>,
+}
+
+/// The preflight report as it is built: it prints each check as it is decided (so a slow probe's
+/// result appears before the next one starts) unless a document was asked for, in which case
+/// nothing is printed and everything is collected.
+struct Report<'a> {
+    json: bool,
+    pal: &'a style::Palette,
+    checks: Vec<Check>,
+}
+
+impl<'a> Report<'a> {
+    fn new(json: bool, pal: &'a style::Palette) -> Self {
+        Report {
+            json,
+            pal,
+            checks: Vec::new(),
+        }
+    }
+
+    /// Record one check, printing it unless a document was asked for. The label is padded to the
+    /// column every check shares, so the details line up whatever the probe was called.
+    fn check(&mut self, status: &'static str, name: &str, detail: &str) {
+        if !self.json {
+            let tag = match status {
+                "ok" => tag_ok(self.pal),
+                "warn" => tag_warn(self.pal),
+                _ => tag_fail(self.pal),
+            };
+            if detail.is_empty() {
+                println!("  {tag} {name}");
+            } else {
+                println!("  {tag} {name:<18}{}", style::prose(detail, self.pal));
+            }
+        }
+        self.checks.push(Check {
+            name: name.to_string(),
+            status,
+            detail: detail.to_string(),
+            notes: Vec::new(),
+        });
+    }
+
+    /// Add a context line under the check just recorded. A note with no check open is dropped in
+    /// silence, which cannot happen from this module: every note here follows a check.
+    fn note(&mut self, text: &str) {
+        if !self.json {
+            println!(
+                "         {}",
+                style::dim_prose(&format!("· {text}"), self.pal)
+            );
+        }
+        if let Some(last) = self.checks.last_mut() {
+            last.notes.push(text.to_string());
+        }
+    }
+
+    /// The document `--json` prints, once every check has been recorded. `remediation` is carried
+    /// because it is the part a caller acts on: a red check says what is wrong, the hint says what
+    /// to do, and splitting them across two outputs would make the document the less useful half.
+    fn to_json(&self, remediation: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "checks": self
+                .checks
+                .iter()
+                .map(|c| serde_json::json!({
+                    "name": c.name,
+                    "status": c.status,
+                    "detail": c.detail,
+                    "notes": c.notes,
+                }))
+                .collect::<Vec<_>>(),
+            "ok": remediation.is_empty(),
+            "remediation": remediation,
+        })
+    }
+}
+
 /// A colored `[ ok ]` status tag (green when the stream is a terminal, plain otherwise).
 fn tag_ok(p: &style::Palette) -> String {
     format!("{}[ ok ]{}", p.ok, p.reset)
@@ -56,10 +146,13 @@ fn tag_fail(p: &style::Palette) -> String {
 /// Report the runtime prerequisites and fail hard if a load-bearing one is
 /// missing. Each failing check contributes its own remediation hint, so the
 /// summary never points at the wrong cause.
-pub(crate) fn doctor() -> ExitCode {
-    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+pub(crate) fn doctor(json: bool) -> ExitCode {
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal() && !json);
     let (h, r) = (pal.head, pal.reset);
-    println!("{h}sbx doctor{r} — runtime preflight\n");
+    if !json {
+        println!("{h}sbx doctor{r} — runtime preflight\n");
+    }
+    let mut rep = Report::new(json, &pal);
 
     let mut remediation: Vec<&str> = Vec::new();
 
@@ -74,27 +167,23 @@ pub(crate) fn doctor() -> ExitCode {
     let bwrap = store::try_resolve_bwrap(layout.as_ref());
     match &bwrap {
         Ok(c) => {
-            println!("  {} bubblewrap        {}", tag_ok(&pal), c.path.display());
+            rep.check("ok", "bubblewrap", &c.path.display().to_string());
             let note = if c.apparmor_restricted {
                 " — AppArmor userns restriction active (host engine required)"
             } else {
                 ""
             };
-            println!(
-                "         {dim}· {}{note}{r}",
-                c.source.label(),
-                dim = pal.dim
-            );
+            rep.note(&format!("{}{note}", c.source.label()));
         }
         Err(store::EngineMiss::NotFound) => {
-            println!("  {} bubblewrap        not found", tag_fail(&pal));
+            rep.check("fail", "bubblewrap", "not found");
             remediation.push("install bubblewrap (the sandbox engine)");
         }
         Err(store::EngineMiss::Refused { env, path }) => {
-            println!(
-                "  {} bubblewrap        refused: {env}={}",
-                tag_fail(&pal),
-                path.display()
+            rep.check(
+                "fail",
+                "bubblewrap",
+                &format!("refused: {env}={}", path.display()),
             );
             remediation.push(BWRAP_OVERRIDE_REMEDIATION);
         }
@@ -108,24 +197,20 @@ pub(crate) fn doctor() -> ExitCode {
     // classify a failure (and as the fast gate the launch path uses). The
     // sysctls below are advisory context for the remediation hint.
     report_security_boundary(
-        &pal,
+        &mut rep,
         bwrap.as_ref().ok().map(|c| c.path.as_path()),
         &mut remediation,
     );
     if let Some(v) = read_sysctl("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") {
-        println!(
-            "         {dim}· kernel.apparmor_restrict_unprivileged_userns = {v}{r}",
-            dim = pal.dim
-        );
+        rep.note(&format!(
+            "kernel.apparmor_restrict_unprivileged_userns = {v}"
+        ));
     }
     if let Some(v) = read_sysctl("/proc/sys/kernel/unprivileged_userns_clone") {
-        println!(
-            "         {dim}· kernel.unprivileged_userns_clone = {v}{r}",
-            dim = pal.dim
-        );
+        rep.note(&format!("kernel.unprivileged_userns_clone = {v}"));
     }
-    report_resource_limits(&pal, &config::global_limits());
-    report_transparent_capture(&pal);
+    report_resource_limits(&mut rep, &config::global_limits());
+    report_transparent_capture(&mut rep);
 
     // The nix that drives the store. Its absence is load-bearing too — without
     // nix, sbx cannot provision a project's tools. Resolution follows override,
@@ -134,24 +219,20 @@ pub(crate) fn doctor() -> ExitCode {
     // `<data>/engine/` on first use (idempotent), which a launch would do anyway.
     match store::try_resolve_nix(layout.as_ref()) {
         Ok(nix) => {
-            println!("  {} nix               {}", tag_ok(&pal), nix.display());
+            rep.check("ok", "nix", &nix.display().to_string());
             if let Some(v) = nix_version(&nix) {
-                println!("         {dim}· {v}{r}", dim = pal.dim);
+                rep.note(&v);
             }
         }
         Err(store::EngineMiss::NotFound) => {
-            println!("  {} nix               not found", tag_fail(&pal));
+            rep.check("fail", "nix", "not found");
             remediation.push("install nix (the store engine sbx drives daemonlessly)");
         }
         // Not "not found", and not an install hint: the engine is installed — sbx declined to run
         // the one the override names. Telling this user to install nix would send them after a
         // package they already have.
         Err(store::EngineMiss::Refused { env, path }) => {
-            println!(
-                "  {} nix               refused: {env}={}",
-                tag_fail(&pal),
-                path.display()
-            );
+            rep.check("fail", "nix", &format!("refused: {env}={}", path.display()));
             remediation.push(NIX_OVERRIDE_REMEDIATION);
         }
     }
@@ -161,25 +242,15 @@ pub(crate) fn doctor() -> ExitCode {
     // context, never a boundary failure that blocks `sbx run`.
     match store::resolve_git() {
         Some(git) => {
-            println!("  {} git               {}", tag_ok(&pal), git.display());
+            rep.check("ok", "git", &git.display().to_string());
             // Say it plainly even when present: unlike bubblewrap and nix above, git is not a
             // prerequisite — a sandbox launches without it. It only enables `sbx plugins store`.
-            println!(
-                "         {}",
-                style::dim_prose(
-                    "· optional — needed only for `sbx plugins store`, not to run a sandbox",
-                    &pal
-                )
-            );
+            rep.note("optional — needed only for `sbx plugins store`, not to run a sandbox");
         }
-        None => println!(
-            "  {} {}",
-            tag_warn(&pal),
-            style::prose(
-                "git               not found on PATH — optional, needed only for \
-                 `sbx plugins store`",
-                &pal
-            )
+        None => rep.check(
+            "warn",
+            "git",
+            "not found on PATH — optional, needed only for `sbx plugins store`",
         ),
     }
 
@@ -201,35 +272,28 @@ pub(crate) fn doctor() -> ExitCode {
             } else {
                 ""
             };
-            println!(
-                "  {} store             {} ({state}{origin})",
-                tag_ok(&pal),
-                dir.display()
+            rep.check(
+                "ok",
+                "store",
+                &format!("{} ({state}{origin})", dir.display()),
             );
             match store::read_global_lock(layout) {
-                Some((source, rev)) => println!(
-                    "  {} channel           {source} @ {} (locked)",
-                    tag_ok(&pal),
-                    short_rev(&rev)
+                Some((source, rev)) => rep.check(
+                    "ok",
+                    "channel",
+                    &format!("{source} @ {} (locked)", short_rev(&rev)),
                 ),
-                None => {
-                    println!(
-                        "  {} channel           not yet resolved — seeded on first launch",
-                        tag_ok(&pal)
-                    )
-                }
+                None => rep.check("ok", "channel", "not yet resolved — seeded on first launch"),
             }
-            report_distro(&pal, layout);
+            report_distro(&mut rep, layout);
         }
         None => {
-            println!(
-                "  {} store             unresolved (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
-                tag_warn(&pal)
+            rep.check(
+                "warn",
+                "store",
+                "unresolved (no $SBX_DATA_DIR, $XDG_DATA_HOME or $HOME)",
             );
-            println!(
-                "  {} channel           unresolved (no data directory)",
-                tag_warn(&pal)
-            );
+            rep.check("warn", "channel", "unresolved (no data directory)");
         }
     }
 
@@ -237,7 +301,20 @@ pub(crate) fn doctor() -> ExitCode {
     // failure: it reports whether the data directory lives in a volume, and — when it does not —
     // whether one is worth adopting on this host. It is the standing discoverability anchor, so a
     // one-time proposal declined elsewhere still leaves the path visible here.
-    report_storage(&pal);
+    report_storage(&mut rep);
+
+    // The document is printed instead of the summary, not beside it: a caller asked for one
+    // output, and the remediation it would otherwise miss rides inside it.
+    if json {
+        if let Err(code) = crate::print_json("doctor", &rep.to_json(&remediation)) {
+            return code;
+        }
+        return if remediation.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
 
     println!();
     if remediation.is_empty() {
@@ -268,34 +345,31 @@ pub(crate) fn doctor() -> ExitCode {
 /// The answer comes from actually installing the rules in a throwaway namespace. Reading kernel
 /// configuration instead would be inference: whether an unprivileged namespace may autoload the nat
 /// modules is not stated in any single file, and it is the question that decides this.
-fn report_transparent_capture(pal: &style::Palette) {
-    let (dim, r) = (pal.dim, pal.reset);
+fn report_transparent_capture(rep: &mut Report<'_>) {
     let Ok(exe) = std::env::current_exe() else {
-        println!(
-            "         {dim}· transparent capture: unknown (sbx cannot locate its own binary){r}"
-        );
+        rep.note("transparent capture: unknown (sbx cannot locate its own binary)");
         return;
     };
     match sandbox::probe_capture(&exe) {
         sandbox::CaptureSupport::Ready => {
-            println!(
-                "  {} capture           a client that ignores the proxy variables is still routed",
-                tag_ok(pal)
+            rep.check(
+                "ok",
+                "capture",
+                "a client that ignores the proxy variables is still routed",
             );
-            println!(
-                "         {dim}· proven by installing the redirect rules in a throwaway namespace{r}"
-            );
+            rep.note("proven by installing the redirect rules in a throwaway namespace");
         }
         other => {
-            println!(
-                "  {} capture           proxy-blind clients will fail to connect, not be routed",
-                tag_warn(pal)
+            rep.check(
+                "warn",
+                "capture",
+                "proxy-blind clients will fail to connect, not be routed",
             );
             if let sandbox::CaptureSupport::Refused(why) = &other {
-                println!("         {dim}· the kernel refused: {why}{r}");
+                rep.note(&format!("the kernel refused: {why}"));
             }
             if let Some(hint) = other.remediation() {
-                println!("         {dim}· {hint}{r}");
+                rep.note(hint);
             }
         }
     }
@@ -306,19 +380,22 @@ fn report_transparent_capture(pal: &style::Palette) {
 /// still runs, so an unavailable limiter is reported for context and never
 /// recorded as a missing prerequisite. The probe launches a real transient scope,
 /// so a green line means limiting actually works on this host.
-fn report_resource_limits(pal: &style::Palette, limits: &sandbox::cgroup::Limits) {
+fn report_resource_limits(rep: &mut Report<'_>, limits: &sandbox::cgroup::Limits) {
     // Reflect the *global* config's limits — they apply to every launch regardless of project,
     // and the live probe validates them, so a bad global value surfaces here. A trusted project
     // may further tune them per project; `sbx config` is the project-aware view.
     let report: sandbox::LimitReport = sandbox::resource_limits(limits);
     if report.verified {
-        println!(
-            "  {} resource limits   cage capped via a systemd scope ({})",
-            tag_ok(pal),
-            report.properties.join(", ")
+        rep.check(
+            "ok",
+            "resource limits",
+            &format!(
+                "cage capped via a systemd scope ({})",
+                report.properties.join(", ")
+            ),
         );
     } else if let Some(note) = report.note {
-        println!("  {} resource limits   {note}", tag_warn(pal));
+        rep.check("warn", "resource limits", &note);
     }
 }
 
@@ -332,7 +409,7 @@ fn report_resource_limits(pal: &style::Palette, limits: &sandbox::cgroup::Limits
 /// Silent when no image is pinned. Every other line here is a prerequisite, and a cage on the
 /// hermetic nix userland has no distribution to check: a line reporting its absence would read as
 /// something missing rather than as the ordinary case.
-fn report_distro(pal: &style::Palette, layout: &store::Layout) {
+fn report_distro(rep: &mut Report<'_>, layout: &store::Layout) {
     use crate::sandbox::distro::store::DISTRO_LOCK;
     let Some((locator, Some(digest))) =
         store::read_lock_lines(&layout.data_dir().join(DISTRO_LOCK))
@@ -348,10 +425,13 @@ fn report_distro(pal: &style::Palette, layout: &store::Layout) {
     } else {
         "not unpacked — fetched on the next launch"
     };
-    println!(
-        "  {} distro            {locator} @ {} ({state})",
-        tag_ok(pal),
-        short_rev(digest.trim_start_matches("sha256:"))
+    rep.check(
+        "ok",
+        "distro",
+        &format!(
+            "{locator} @ {} ({state})",
+            short_rev(digest.trim_start_matches("sha256:"))
+        ),
     );
 }
 
@@ -359,13 +439,10 @@ fn report_distro(pal: &style::Palette, layout: &store::Layout) {
 /// when it does not, whether one is available on this host. Read-only and best-effort — it reads
 /// the pointer and probes capabilities, mounting nothing and creating nothing. Anchored to the
 /// *default* data directory (where the image and pointer live), not the possibly-followed one.
-fn report_storage(pal: &style::Palette) {
+fn report_storage(rep: &mut Report<'_>) {
     let Some(default_dir) = store::Layout::default_data_dir() else {
         return;
     };
-    let ok = tag_ok(pal);
-    let warn = tag_warn(pal);
-    let (dim, r) = (pal.dim, pal.reset);
 
     // Set to follow a volume? Read the pointer directly, so the answer stands even when the
     // volume happens to be unmounted right now. The type leads — `volume (<fs>)` here, `local
@@ -378,18 +455,22 @@ fn report_storage(pal: &style::Palette) {
                     .map(|k| k.name())
                     .unwrap_or_else(|| "btrfs".to_string());
                 let comp = storage::compression(&mount_point).unwrap_or_else(|| "off".to_string());
-                println!(
-                    "  {ok} storage           type: volume ({fs}) at {}",
-                    mount_point.display()
+                rep.check(
+                    "ok",
+                    "storage",
+                    &format!("type: volume ({fs}) at {}", mount_point.display()),
                 );
-                println!(
-                    "         {dim}· compression {comp}; the data directory costs the host a \
-                     single inode{r}"
-                );
+                rep.note(&format!(
+                    "compression {comp}; the data directory costs the host a single inode"
+                ));
             }
-            _ => println!(
-                "  {warn} storage           type: volume — set to use {} but it is not mounted",
-                image.display()
+            _ => rep.check(
+                "warn",
+                "storage",
+                &format!(
+                    "type: volume — set to use {} but it is not mounted",
+                    image.display()
+                ),
             ),
         }
         return;
@@ -407,47 +488,46 @@ fn report_storage(pal: &style::Palette) {
     if pre.host_fs.is_some_and(|k| k.is_ephemeral()) {
         // Checked before anything about volumes: that the data directory is in RAM outranks
         // whether one could be mounted, and a volume would not make it survive a reboot either.
-        println!("  {warn} storage           {ty} — nothing here survives a reboot");
-        println!(
-            "         {}",
-            style::dim_prose(
-                "· $SBX_DATA_DIR can point sbx at a directory that persists",
-                pal
-            )
+        rep.check(
+            "warn",
+            "storage",
+            &format!("{ty} — nothing here survives a reboot"),
         );
+        rep.note("$SBX_DATA_DIR can point sbx at a directory that persists");
     } else if pre.host_fs.is_some_and(|k| k.is_cow()) {
-        println!("  {ok} storage           {ty} — already copy-on-write");
-        println!("         {dim}· an encapsulated volume would add little{r}");
+        rep.check("ok", "storage", &format!("{ty} — already copy-on-write"));
+        rep.note("an encapsulated volume would add little");
     } else if pre.recommends_volume() {
-        println!("  {ok} storage           {ty} — a compressed btrfs volume is available");
-        println!(
-            "         {}",
-            style::dim_prose("· adopt one with `sbx storage init`", pal)
+        rep.check(
+            "ok",
+            "storage",
+            &format!("{ty} — a compressed btrfs volume is available"),
         );
+        rep.note("adopt one with `sbx storage init`");
     } else if let Some(blocker) = pre.mount_blocker() {
-        println!("  {warn} storage           {ty} — no encapsulated volume here: {blocker}");
-        println!("         {dim}· $SBX_DATA_DIR can still point sbx at an existing btrfs mount{r}");
+        rep.check(
+            "warn",
+            "storage",
+            &format!("{ty} — no encapsulated volume here: {blocker}"),
+        );
+        rep.note("$SBX_DATA_DIR can still point sbx at an existing btrfs mount");
     } else if pre.remote_session {
         // Mountable in principle, but udisks needs a local active session to do it unattended.
-        println!("  {ok} storage           {ty} — a volume needs a local active session");
-        println!(
-            "         {}",
-            style::dim_prose(
-                "· udisks asks for authentication over SSH; `sbx storage init` to try",
-                pal
-            )
+        rep.check(
+            "ok",
+            "storage",
+            &format!("{ty} — a volume needs a local active session"),
         );
+        rep.note("udisks asks for authentication over SSH; `sbx storage init` to try");
     } else if !pre.kernel_btrfs {
-        println!("  {ok} storage           {ty} — btrfs kernel support not detected");
-        println!(
-            "         {}",
-            style::dim_prose(
-                "· a mount would try to autoload it; `sbx storage init` to try",
-                pal
-            )
+        rep.check(
+            "ok",
+            "storage",
+            &format!("{ty} — btrfs kernel support not detected"),
         );
+        rep.note("a mount would try to autoload it; `sbx storage init` to try");
     } else {
-        println!("  {ok} storage           {ty}");
+        rep.check("ok", "storage", &ty);
     }
 }
 
@@ -456,47 +536,39 @@ fn report_storage(pal: &style::Palette) {
 /// failure — or when there is no engine to launch — the stand-in classifies the
 /// cause so the report blames the right layer and never the wrong one.
 fn report_security_boundary(
-    pal: &style::Palette,
+    rep: &mut Report<'_>,
     bwrap: Option<&Path>,
     remediation: &mut Vec<&'static str>,
 ) {
-    let (dim, r) = (pal.dim, pal.reset);
     let Some(bwrap) = bwrap else {
         // No engine to launch: the stand-in is the only available signal for the
         // boundary. Report it for context (the missing-engine remediation is
         // already recorded), and still flag a broken namespace as its own fault.
         match probe_userns() {
-            Userns::Ok => println!(
-                "         {dim}· user namespaces: capability-bearing (cannot prove without bubblewrap){r}"
-            ),
-            other => classify_namespace_failure(pal, &other, remediation),
+            Userns::Ok => {
+                rep.note("user namespaces: capability-bearing (cannot prove without bubblewrap)")
+            }
+            other => classify_namespace_failure(rep, &other, remediation),
         }
         return;
     };
 
     match sandbox::smoke(bwrap) {
         Ok(report) if report.is_hardened() => {
-            println!(
-                "  {} sandbox           bubblewrap launched a hardened process",
-                tag_ok(pal)
-            );
-            println!(
-                "         {dim}· user namespaces: capability-bearing — proven by the launch{r}"
-            );
-            println!("         {dim}· no_new_privs set, every capability dropped{r}");
+            rep.check("ok", "sandbox", "bubblewrap launched a hardened process");
+            rep.note("user namespaces: capability-bearing — proven by the launch");
+            rep.note("no_new_privs set, every capability dropped");
             if report.host_home_absent {
-                println!("         {dim}· host $HOME absent — the bind layout did not leak it{r}");
+                rep.note("host $HOME absent — the bind layout did not leak it");
             } else {
-                println!(
-                    "         {dim}· note: the host $HOME was visible inside the probe sandbox{r}"
-                );
+                rep.note("note: the host $HOME was visible inside the probe sandbox");
             }
         }
-        Ok(report) => classify_launch_failure(pal, Some(&report.stderr), remediation),
+        Ok(report) => classify_launch_failure(rep, Some(&report.stderr), remediation),
         Err(e) => {
             // The probe could not even spawn bwrap; surface why, then classify.
-            println!("         {dim}· could not run the launch probe: {e}{r}");
-            classify_launch_failure(pal, None, remediation);
+            rep.note(&format!("could not run the launch probe: {e}"));
+            classify_launch_failure(rep, None, remediation);
         }
     }
 }
@@ -505,19 +577,19 @@ fn report_security_boundary(
 /// means the engine itself failed, so blame bubblewrap and surface its own
 /// diagnosis; otherwise the namespace is the cause and is classified as such.
 fn classify_launch_failure(
-    pal: &style::Palette,
+    rep: &mut Report<'_>,
     bwrap_stderr: Option<&str>,
     remediation: &mut Vec<&'static str>,
 ) {
-    let (dim, r) = (pal.dim, pal.reset);
     match probe_userns() {
         Userns::Ok => {
-            println!(
-                "  {} sandbox           bubblewrap could not launch a hardened process",
-                tag_fail(pal)
+            rep.check(
+                "fail",
+                "sandbox",
+                "bubblewrap could not launch a hardened process",
             );
-            println!(
-                "         {dim}· user namespaces: capability-bearing (the failure is in bubblewrap, not the namespace){r}"
+            rep.note(
+                "user namespaces: capability-bearing (the failure is in bubblewrap, not the namespace)",
             );
             for line in bwrap_stderr
                 .unwrap_or_default()
@@ -526,11 +598,11 @@ fn classify_launch_failure(
                 .filter(|l| !l.is_empty())
                 .take(3)
             {
-                println!("         {dim}· {line}{r}");
+                rep.note(line);
             }
             remediation.push(BWRAP_LAUNCH_REMEDIATION);
         }
-        other => classify_namespace_failure(pal, &other, remediation),
+        other => classify_namespace_failure(rep, &other, remediation),
     }
 }
 
@@ -539,23 +611,17 @@ fn classify_launch_failure(
 /// remediation points at the real cause. The caller has already established the
 /// namespace is not `Ok`.
 fn classify_namespace_failure(
-    pal: &style::Palette,
+    rep: &mut Report<'_>,
     userns: &Userns,
     remediation: &mut Vec<&'static str>,
 ) {
-    let fail = tag_fail(pal);
-    match userns {
-        Userns::Unsupported => {
-            println!("  {fail} user namespaces   cannot create one without privilege");
-        }
-        Userns::CapStripped => {
-            println!(
-                "  {fail} user namespaces   created but stripped of capabilities (restricted)"
-            );
-        }
+    let detail = match userns {
+        Userns::Unsupported => "cannot create one without privilege",
+        Userns::CapStripped => "created but stripped of capabilities (restricted)",
         // The caller only reaches here with a non-`Ok` namespace; a transient
         // flip to `Ok` is still a failure to launch, so it is flagged, not hidden.
-        Userns::Ok => println!("  {fail} user namespaces   transient namespace probe failure"),
-    }
+        Userns::Ok => "transient namespace probe failure",
+    };
+    rep.check("fail", "user namespaces", detail);
     remediation.push(USERNS_REMEDIATION);
 }
