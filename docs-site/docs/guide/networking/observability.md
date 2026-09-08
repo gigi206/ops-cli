@@ -188,11 +188,10 @@ one record per session, whoever made the request.
 
 The **transport** column is `https` (inspected TLS), `http` (inspected cleartext), `tcp`
 (a raw `tcp://` splice, or a connection the transparent-capture tap refused), `dns` (a
-name the cage asked that tap for), or `-` (refused before it was known). For an
-inspected request it
-is **suffixed with the HTTP version**, `https/h1` vs `https/h2`, so you can see whether a
-`[network] http2`-designated host is actually being carried as HTTP/2 (the security axis
-is never dropped: it stays `https`, never a bare `h2`).
+name the cage asked that tap for), or `-` (refused before it was known). For an inspected
+request it is **suffixed with the HTTP version**, `https/h1` vs `https/h2`, so you can see
+whether a `[network] http2`-designated host is actually being carried as HTTP/2 (the
+security axis is never dropped: it stays `https`, never a bare `h2`).
 
 The **RPC tag** (`grpc`, `grpc-web`, or `connect`) appears when the request's `Content-Type`
 names a gRPC-family framing, so streaming/RPC traffic reads at a glance. It is **recognized
