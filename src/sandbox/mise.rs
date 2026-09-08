@@ -201,6 +201,12 @@ pub(crate) fn resolve_env(
 /// return the read-only binds that expose them under [`MISE_PROJECT`]. Writing the
 /// already-hashed bytes here — outside any writable mount — is what lets mise read
 /// the authorized content without a path back to the live, possibly-edited file.
+///
+/// A name is the path **relative to the project**, so four of the nine names mise is discovered
+/// under ([`crate::trust::mise_files_for`]) carry a directory: `.config/mise/config.toml` and its
+/// siblings. Their parents are created here, owner-only like the stage root, because the name is
+/// what the bind's destination must spell — flattening it would hand mise the file at a path it
+/// does not read.
 fn stage_files(stage_dir: &Path, files: &[(String, Vec<u8>)]) -> io::Result<Vec<ProjectBind>> {
     use std::fs::{DirBuilder, OpenOptions};
     use std::io::Write as _;
@@ -215,17 +221,34 @@ fn stage_files(stage_dir: &Path, files: &[(String, Vec<u8>)]) -> io::Result<Vec<
     let mut binds = Vec::with_capacity(files.len());
     for (name, bytes) in files {
         let src = stage_dir.join(name);
+        // A nested name brings its own directories, owner-only like the root above.
+        if let Some(parent) = src.parent() {
+            DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
         // Write owner-only to a temp sibling, then rename into place. Two concurrent
         // launches staging the same project then race to a whole-file rename, never a
         // half-truncated read (the bytes are identical, so this only rules out a torn
         // mid-write read that would spuriously fail the launch). Owner-only from
-        // creation so a loose umask never opens a window.
-        let tmp = stage_dir.join(format!("{name}.{}.tmp", std::process::id()));
+        // creation so a loose umask never opens a window. A sibling of the destination
+        // rather than of the root, so `rename` stays within one directory whatever the
+        // name's depth.
+        let tmp = src.with_file_name(format!(
+            "{}.{}.tmp",
+            src.file_name().unwrap_or(name.as_ref()).to_string_lossy(),
+            std::process::id()
+        ));
+        // `O_NOFOLLOW`: the temp name is sbx's to create, so a symlink already standing there is
+        // not a stale file to truncate through — it is a redirection, and the write is refused
+        // rather than sent wherever it points.
         OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&tmp)?
             .write_all(bytes)?;
         std::fs::rename(&tmp, &src)?;
@@ -713,6 +736,62 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&stage).unwrap().permissions().mode() & 0o777,
             0o700
+        );
+    }
+
+    /// Four of the nine names mise is discovered under sit in a subdirectory
+    /// (`crate::trust::MISE_CONFIG_NAMES`), and the name staged here is the path relative to the
+    /// project — `.config/mise/config.toml`, not `config.toml` — because two of those names share
+    /// the last component and would otherwise share a trust tag. Staging has to build that shape,
+    /// or a trusted project written in the form mise's own documentation leads with fails its
+    /// launch outright: `mise_env` treats an unresolvable `[env]` as fatal.
+    #[test]
+    fn stage_files_builds_the_directories_a_nested_mise_name_needs() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = TmpDir::new();
+        let stage = base.join("mise-config");
+        let body = b"[env]\nFOO = \"bar\"\n".to_vec();
+        let files = vec![
+            (".config/mise/config.toml".to_string(), body.clone()),
+            (".mise.toml".to_string(), body.clone()),
+        ];
+
+        let binds = stage_files(&stage, &files).unwrap();
+        assert_eq!(binds.len(), 2);
+        assert_eq!(
+            binds[0].dest,
+            PathBuf::from("/project/.config/mise/config.toml"),
+            "the bind keeps the project-relative shape, or mise reads it at another name"
+        );
+        assert_eq!(binds[0].src, stage.join(".config/mise/config.toml"));
+        assert_eq!(std::fs::read(&binds[0].src).unwrap(), body);
+        assert_eq!(
+            std::fs::metadata(&binds[0].src)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        // The directories staging had to invent are owner-only too: they hold the same bytes.
+        assert_eq!(
+            std::fs::metadata(stage.join(".config/mise"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        // The temp sibling is renamed away, never left beside the file it wrote.
+        let leftovers: Vec<_> = std::fs::read_dir(stage.join(".config/mise"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .filter(|n| n.to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
         );
     }
 }
