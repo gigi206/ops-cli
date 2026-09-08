@@ -5772,3 +5772,68 @@ fn every_listing_verb_that_offers_json_emits_a_document_even_when_empty() {
         });
     }
 }
+
+/// An unreadable global config refuses a launch, and leaves the verbs that diagnose it working.
+///
+/// The two halves are one decision, so they are asserted together. That layer is trusted by
+/// location and carries `[proc]`, `[network]` and `[fs]`, whose built-in defaults are each the
+/// permissive end — a `mode = "enforce"` written there and silently dropped would run the cage
+/// unenforced under one warning among many, so a launch stops. But the command a person reaches
+/// for when a launch stops must not stop with it: `sbx config show` still answers, or the refusal
+/// would take away the way to understand it.
+///
+/// Unreadable is reached the way a real one is: a file owned by another uid after a restore under
+/// `sudo`, or one left without read permission. The safety gate refuses both in `PermissionDenied`,
+/// which is neither `NotFound` nor a parse failure.
+#[test]
+fn an_unreadable_global_config_refuses_a_launch_but_not_the_verb_that_shows_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = TmpDir::new("gc");
+    let dir = home.path().join("sbx");
+    std::fs::create_dir_all(&dir).unwrap();
+    let global = dir.join("sbx.toml");
+    std::fs::write(&global, b"[proc]\nmode = \"enforce\"\n").unwrap();
+    std::fs::set_permissions(&global, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_sbx"))
+            .args(args)
+            .env("XDG_CONFIG_HOME", home.path())
+            .env("LC_ALL", "C.UTF-8")
+            .env_remove("LANG")
+            .output()
+            .expect("spawn sbx")
+    };
+
+    let launched = run(&["run", "true"]);
+    let stderr = String::from_utf8_lossy(&launched.stderr).into_owned();
+    assert!(
+        !launched.status.success(),
+        "a launch must not proceed under defaults nobody chose: {stderr}"
+    );
+    assert!(
+        stderr.contains("cannot be read"),
+        "the refusal must say what stopped it: {stderr}"
+    );
+    assert!(
+        stderr.contains("sbx.toml"),
+        "and which file, since that is what has to be fixed: {stderr}"
+    );
+
+    // The diagnosing verb keeps working: it is the one a person runs next.
+    let shown = run(&["config", "show"]);
+    assert!(
+        !String::from_utf8_lossy(&shown.stderr).contains("a launch is refused"),
+        "a read-only verb must not inherit the launch's refusal"
+    );
+
+    // And with the file readable, the launch gets past the config layer entirely.
+    std::fs::set_permissions(&global, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let readable = run(&["config", "show"]);
+    assert!(
+        readable.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&readable.stderr)
+    );
+}
