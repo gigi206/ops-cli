@@ -126,4 +126,45 @@ impl Project {
             .path()
             .join(format!("sbx/apps/{name}.toml"))
     }
+
+    /// Write a bundle at [`Project::bundle_path`] — the artifact `sbx bundle import` produces,
+    /// trusted by its location beside the global config. A bundle exists only as a file; an inline
+    /// `[bundle.<name>]` in `sbx.toml` is ignored, so every test that needs one routes through
+    /// here.
+    pub fn write_bundle(&self, name: &str, body: &str) {
+        let path = self.bundle_path(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// Where `sbx bundle import` places the bundle for `name`.
+    pub fn bundle_path(&self, name: &str) -> PathBuf {
+        self.config_home
+            .path()
+            .join(format!("sbx/bundles/{name}.toml"))
+    }
+
+    /// Write an egress group at [`Project::group_path`], from its entries — the artifact
+    /// `sbx net groups import` produces. `entries` are written verbatim into the `entries` array,
+    /// so a test states them exactly as an author would.
+    pub fn write_group(&self, name: &str, entries: &[&str]) {
+        let path = self.group_path(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let body = format!(
+            "entries = [{}]\n",
+            entries
+                .iter()
+                .map(|e| format!("{e:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// Where `sbx net groups import` places the group for `name`.
+    pub fn group_path(&self, name: &str) -> PathBuf {
+        self.config_home
+            .path()
+            .join(format!("sbx/net-groups/{name}.toml"))
+    }
 }

@@ -3579,20 +3579,21 @@ fn the_shipped_profiles_import_and_resolve() {
 fn bundle_export_writes_the_same_file_through_the_flag_as_through_a_redirect() {
     use std::os::unix::fs::PermissionsExt as _;
     let fx = Project::new("cfg");
-    fx.write_global(
-        r#"
-[bundle.demo]
-packages = { demo = "mise:aqua:example/demo" }
-"#,
-    );
+    fx.write_bundle("demo", "packages = { demo = \"mise:aqua:example/demo\" }\n");
 
     let redirected = fx.proj.path().join("redirected.toml");
-    let out = fx.run(&["bundle", "export"]);
+    let out = fx.run(&["bundle", "export", "demo"]);
     assert!(out.status.success(), "export to stdout failed: {out:?}");
     std::fs::write(&redirected, &out.stdout).unwrap();
 
     let flagged = fx.proj.path().join("flagged.toml");
-    let out = fx.run(&["bundle", "export", "--out", flagged.to_str().unwrap()]);
+    let out = fx.run(&[
+        "bundle",
+        "export",
+        "demo",
+        "--out",
+        flagged.to_str().unwrap(),
+    ]);
     assert!(out.status.success(), "export to a file failed: {out:?}");
 
     assert_eq!(
@@ -3609,8 +3610,8 @@ packages = { demo = "mise:aqua:example/demo" }
     assert!(
         std::fs::read_to_string(&flagged)
             .unwrap()
-            .contains("[bundle.demo"),
-        "the fragment must actually carry the bundle: {:?}",
+            .contains("mise:aqua:example/demo"),
+        "the file must actually carry the bundle: {:?}",
         std::fs::read_to_string(&flagged).unwrap()
     );
 }
@@ -3622,19 +3623,19 @@ fn install_steps_arrive_in_use_order_and_name_the_bundle_that_declared_them() {
     // everything a launch will say about it — the note before it runs, the error if it fails —
     // names it, and "an install step failed" with no author is not actionable.
     let fx = Project::new("cfg");
-    fx.write_global(
-        r#"
-[bundle.alpha]
-packages = { alpha = "mise:aqua:example/alpha" }
-provision = ["bash", "-c", "alpha-postinstall"]
-
-[bundle.beta]
-packages = { beta = "mise:aqua:example/beta" }
-provision = ["bash", "-c", "beta-postinstall"]
-
-[bundle.plain]
-packages = { plain = "mise:aqua:example/plain" }
-"#,
+    fx.write_bundle(
+        "alpha",
+        "packages = { alpha = \"mise:aqua:example/alpha\" }\n\
+         provision = [\"bash\", \"-c\", \"alpha-postinstall\"]\n",
+    );
+    fx.write_bundle(
+        "beta",
+        "packages = { beta = \"mise:aqua:example/beta\" }\n\
+         provision = [\"bash\", \"-c\", \"beta-postinstall\"]\n",
+    );
+    fx.write_bundle(
+        "plain",
+        "packages = { plain = \"mise:aqua:example/plain\" }\n",
     );
     fx.write_profile(
         "orchestrator",
@@ -3683,9 +3684,9 @@ fn a_bundle_folds_into_a_profile_and_the_profile_still_wins() {
     // gets that tool, its environment and its egress without restating them — while everything it
     // declares itself still overrides the bundle.
     let fx = Project::new("cfg");
-    fx.write_global(
+    fx.write_bundle(
+        "demo-agent",
         r#"
-[bundle.demo-agent]
 packages = { demo-agent = "mise:aqua:example/demo-agent", shared-lib = "nix:jq" }
 env = { DEMO_AGENT_TELEMETRY = "off" }
 allow = ["{*,WS} https://api.example.com", "{GET} https://downloads.example.com"]
@@ -3758,17 +3759,101 @@ allow = ["{*} https://orchestrator.example.com"]
     );
 }
 
+/// A bundle and an egress group live in files; written inline in the global config they are
+/// ignored, with one warning per entry naming it.
+///
+/// Through the real binary, because the failure this prevents is a *silent* one: an app that names
+/// an inline bundle would resolve to no packages and no rules, which `sbx config show` renders as a
+/// perfectly ordinary app. The warning and the empty resolution are asserted together, so a change
+/// that quietly starts honoring the inline table again fails here rather than at someone's launch.
+#[test]
+fn an_inline_bundle_or_group_is_ignored_in_favour_of_the_files() {
+    let fx = Project::new("cfg");
+    fx.write_global(
+        r#"
+[network]
+mode = "deny"
+
+[bundle.legacy]
+packages = { legacy = "nix:hello" }
+allow = ["{GET} https://legacy.example"]
+
+[network.groups]
+legacy-lane = ["lane.example"]
+"#,
+    );
+    fx.write_profile(
+        "demo",
+        "cmd = \"demo\"\nuse = [\"legacy\"]\n[network]\nmode = \"deny\"\nallow = [\"@legacy-lane\"]\n",
+    );
+
+    let listed = fx.run(&["bundle"]);
+    let err = String::from_utf8_lossy(&listed.stderr).to_string();
+    assert!(
+        err.contains("[bundle.legacy]") && err.contains("bundles/<name>.toml"),
+        "the ignored bundle is named, with where one lives:\n{err}"
+    );
+    assert!(
+        err.contains("legacy-lane") && err.contains("net-groups/<name>.toml"),
+        "and so is the ignored group:\n{err}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&listed.stdout).contains("legacy"),
+        "the inline bundle is not listed:\n{}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+
+    // What the app resolves to is the half that would otherwise be silent.
+    let shown = fx.run(&["config", "show", "--app", "demo", "--json"]);
+    let doc: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert!(
+        doc["packages"].as_array().unwrap().is_empty(),
+        "an inline bundle grafts no tool:\n{doc:#}"
+    );
+    assert!(
+        doc["network"]["Allowlist"]["allow"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "…and an inline group expands to nothing:\n{doc:#}"
+    );
+
+    // The same names, filed as the files they belong in, do reach the app.
+    fx.write_bundle(
+        "legacy",
+        "packages = { legacy = \"nix:hello\" }\nallow = [\"{GET} https://legacy.example\"]\n",
+    );
+    fx.write_group("legacy-lane", &["lane.example"]);
+    let shown = fx.run(&["config", "show", "--app", "demo", "--json"]);
+    let doc: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert!(
+        doc["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "legacy"),
+        "the filed bundle reaches the app:\n{doc:#}"
+    );
+    assert_eq!(
+        doc["network"]["Allowlist"]["allow"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "…and the filed group expands beside the bundle's own rule:\n{doc:#}"
+    );
+}
+
 /// The bundle counterpart of a forced profile import: a bundle already declared may carry an entry
 /// added by hand on this machine, and `--force` replaces it. It must name what the incoming
 /// fragment no longer declares, and keep the previous bundle in the portable form that imports back.
 #[test]
 fn a_forced_bundle_import_names_what_it_dropped_and_keeps_the_bundle_it_replaced() {
     let fx = Project::new("cfg");
-    let frag = fx.proj.path().join("fragment.toml");
+    let frag = fx.proj.path().join("demo-agent.toml");
     std::fs::write(
         &frag,
-        "[bundle.demo-agent]\nallow = [\"{GET} https://api.example.com\"]\n\
-         [bundle.demo-agent.packages]\ndemo-agent = \"nix:hello\"\n",
+        "allow = [\"{GET} https://api.example.com\"]\n\
+         [packages]\ndemo-agent = \"nix:hello\"\n",
     )
     .unwrap();
     assert!(
@@ -3781,15 +3866,23 @@ fn a_forced_bundle_import_names_what_it_dropped_and_keeps_the_bundle_it_replaced
     let local = fx.proj.path().join("local.toml");
     std::fs::write(
         &local,
-        "[bundle.demo-agent]\nallow = [\"{GET} https://api.example.com\", \
+        "allow = [\"{GET} https://api.example.com\", \
          \"{GET} https://local.example.org\"]\n\
-         [bundle.demo-agent.packages]\ndemo-agent = \"nix:hello\"\n",
+         [packages]\ndemo-agent = \"nix:hello\"\n",
     )
     .unwrap();
+    // Its file is not named for the bundle, so `--as` says which bundle it lands on.
     assert!(
-        fx.run(&["bundle", "import", "--force", local.to_str().unwrap()])
-            .status
-            .success()
+        fx.run(&[
+            "bundle",
+            "import",
+            "--force",
+            "--as",
+            "demo-agent",
+            local.to_str().unwrap()
+        ])
+        .status
+        .success()
     );
 
     // Re-importing the pristine fragment drops that rule — and says so, by name.
@@ -3801,7 +3894,7 @@ fn a_forced_bundle_import_names_what_it_dropped_and_keeps_the_bundle_it_replaced
         "the dropped rule must be named:\n{err}"
     );
     assert!(
-        err.contains("demo-agent.bundle.replaced"),
+        err.contains("demo-agent.toml.replaced"),
         "the kept fragment must be named:\n{err}"
     );
 
@@ -3809,8 +3902,7 @@ fn a_forced_bundle_import_names_what_it_dropped_and_keeps_the_bundle_it_replaced
     let kept = fx
         .config_home
         .path()
-        .join("sbx")
-        .join("demo-agent.bundle.replaced");
+        .join("sbx/bundles/demo-agent.toml.replaced");
     assert!(kept.exists(), "the previous bundle must be kept");
     // Owner-only, like the config it is a verbatim copy of. Written with `std::fs::write` it took
     // the umask's mode instead, so the original stayed `0600` and its snapshot — carrying the same
@@ -3824,9 +3916,16 @@ fn a_forced_bundle_import_names_what_it_dropped_and_keeps_the_bundle_it_replaced
         );
     }
     assert!(
-        fx.run(&["bundle", "import", "--force", kept.to_str().unwrap()])
-            .status
-            .success()
+        fx.run(&[
+            "bundle",
+            "import",
+            "--force",
+            "--as",
+            "demo-agent",
+            kept.to_str().unwrap()
+        ])
+        .status
+        .success()
     );
     let listed = fx.run(&["bundle", "demo-agent"]);
     assert!(
@@ -3837,7 +3936,14 @@ fn a_forced_bundle_import_names_what_it_dropped_and_keeps_the_bundle_it_replaced
     // A re-import that changes nothing keeps no copy and reports no loss: `local.toml` now declares
     // exactly what the config holds.
     std::fs::remove_file(&kept).unwrap();
-    let again = fx.run(&["bundle", "import", "--force", local.to_str().unwrap()]);
+    let again = fx.run(&[
+        "bundle",
+        "import",
+        "--force",
+        "--as",
+        "demo-agent",
+        local.to_str().unwrap(),
+    ]);
     assert!(again.status.success());
     assert!(
         !kept.exists(),
@@ -3859,15 +3965,17 @@ fn a_forced_bundle_import_names_what_it_dropped_and_keeps_the_bundle_it_replaced
 fn a_forced_bundle_import_names_what_the_incoming_fragment_adds() {
     let fx = Project::new("cfg");
     let before = fx.proj.path().join("before.toml");
-    std::fs::write(
-        &before,
-        "[bundle.demo-agent]\nallow = [\"{GET} https://api.example.com\"]\n",
-    )
-    .unwrap();
+    std::fs::write(&before, "allow = [\"{GET} https://api.example.com\"]\n").unwrap();
     assert!(
-        fx.run(&["bundle", "import", before.to_str().unwrap()])
-            .status
-            .success()
+        fx.run(&[
+            "bundle",
+            "import",
+            "--as",
+            "demo-agent",
+            before.to_str().unwrap()
+        ])
+        .status
+        .success()
     );
 
     // The same bundle, one security field richer: where a credential the cage signed in for may
@@ -3875,11 +3983,18 @@ fn a_forced_bundle_import_names_what_the_incoming_fragment_adds() {
     let after = fx.proj.path().join("after.toml");
     std::fs::write(
         &after,
-        "[bundle.demo-agent]\nallow = [\"{GET} https://api.example.com\"]\n\
+        "allow = [\"{GET} https://api.example.com\"]\n\
          shared_credential = [[\"api.example.com\", \"app.example.com\"]]\n",
     )
     .unwrap();
-    let forced = fx.run(&["bundle", "import", "--force", after.to_str().unwrap()]);
+    let forced = fx.run(&[
+        "bundle",
+        "import",
+        "--force",
+        "--as",
+        "demo-agent",
+        after.to_str().unwrap(),
+    ]);
     assert!(forced.status.success());
     let err = String::from_utf8_lossy(&forced.stderr).to_string();
     assert!(
@@ -3900,11 +4015,10 @@ fn sbx_bundle_import_export_round_trips_and_the_imported_bundle_is_usable() {
     // config, listed, re-exported, and — the point of importing it — actually applies to an app
     // that names it. A round-trip that could not then be *used* would be a nice no-op.
     let fx = Project::new("cfg");
-    let frag = fx.proj.path().join("fragment.toml");
+    let frag = fx.proj.path().join("demo-agent.toml");
     std::fs::write(
         &frag,
         r#"
-[bundle.demo-agent]
 packages = { demo-agent = "mise:aqua:example/demo-agent" }
 allow = ["{*,WS} https://api.example.com"]
 "#,
@@ -3927,7 +4041,7 @@ allow = ["{*,WS} https://api.example.com"]
     let clash = fx.run(&["bundle", "import", frag.to_str().unwrap()]);
     assert!(!clash.status.success());
     assert!(
-        String::from_utf8_lossy(&clash.stderr).contains("bundle already defined"),
+        String::from_utf8_lossy(&clash.stderr).contains("a bundle 'demo-agent' already exists"),
         "the refusal names what collided: {}",
         String::from_utf8_lossy(&clash.stderr)
     );
@@ -3940,7 +4054,10 @@ allow = ["{*,WS} https://api.example.com"]
     let exported = fx.run(&["bundle", "export", "demo-agent"]);
     assert!(exported.status.success());
     let text = String::from_utf8_lossy(&exported.stdout).to_string();
-    assert!(text.contains("[bundle.demo-agent]"), "{text}");
+    assert!(
+        text.contains("mise:aqua:example/demo-agent") && !text.contains("[bundle."),
+        "the export carries the bundle at the top level, named by nothing but its file: {text}"
+    );
 
     // And it applies: a profile naming it gets the tool and the egress rule, verbs intact.
     fx.write_profile(
@@ -3977,12 +4094,12 @@ fn a_bundle_credential_is_dropped_when_the_app_has_no_filtering_posture() {
     // bounding the destination, and a key to send. It must be dropped by the posture re-check, and
     // said out loud — the same note a directly-declared secret gets.
     let fx = Project::new("cfg");
-    fx.write_global(
+    fx.write_bundle(
+        "keyed",
         r#"
-[bundle.keyed]
 packages = { demo = "mise:aqua:example/demo" }
 allow = ["{*} https://api.example.com"]
-[bundle.keyed.secret."api.example.com"]
+[secret."api.example.com"]
 from = "env://DEMO_KEY"
 header = "x-api-key"
 type = "raw"
@@ -4033,9 +4150,9 @@ fn an_untrusted_project_cannot_use_a_bundle_to_graft_trusted_egress_onto_its_app
     // which trusted reach to graft onto an app it controls. Dropped until the project is trusted,
     // and the drop is reported where someone inspecting that app will read it.
     let fx = Project::new("cfg");
-    fx.write_global(
+    fx.write_bundle(
+        "demo-agent",
         r#"
-[bundle.demo-agent]
 packages = { demo-agent = "mise:aqua:example/demo-agent" }
 allow = ["{*} https://api.example.com"]
 "#,

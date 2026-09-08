@@ -82,7 +82,7 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
         if !raw.bundle.is_empty() {
             warnings.push(
                 "ignoring `[bundle.*]` in the project config: bundles are honored only from the \
-                 global config — declare it there (`sbx bundle import`) and reference it with `use`"
+                 global config — bring it in with `sbx bundle import` and reference it with `use`"
                     .to_string(),
             );
             raw.bundle.clear();
@@ -444,7 +444,8 @@ pub(super) fn read_global(warnings: &mut Vec<String>) -> RawConfig {
     // Here rather than in `load_scoped`, unlike the profile merge: `sbx bundle` and `sbx net
     // groups` read the global layer through this function without going through a resolution, so a
     // merge one level up would leave the inventory verbs describing a config nobody launches.
-    merge_config_dirs(&mut global, warnings);
+    let (bundles, groups) = (read_dir_bundles(warnings), read_dir_net_groups(warnings));
+    merge_config_dirs(&mut global, bundles, groups, warnings);
     global
 }
 
@@ -1336,28 +1337,34 @@ pub(crate) fn unknown_group_key(name: &str, key: &str) -> String {
 }
 
 /// Make the `bundles/` and `net-groups/` directories the sole source of their layers, the way
-/// [`merge_profile_apps`] does for apps.
+/// [`merge_profile_apps`] does for apps. The entries are read by the caller and passed in, for the
+/// same reason: the merge stays testable without the process environment deciding where they live.
 ///
 /// A bundle and an egress group each live in a file of their own; an inline `[bundle.<name>]` or
 /// `[network.groups]` in the global config is ignored, with one warning per entry so a config that
 /// still carries them says which. The inline table is *cleared* rather than merged: two declaration
 /// sites for one name would resolve to whichever the merge favored, and the file is the one a verb
 /// writes.
-fn merge_config_dirs(global: &mut RawConfig, warnings: &mut Vec<String>) {
+fn merge_config_dirs(
+    global: &mut RawConfig,
+    bundles: BTreeMap<String, RawBundle>,
+    groups: BTreeMap<String, Vec<String>>,
+    warnings: &mut Vec<String>,
+) {
     for name in global.bundle.keys() {
         warnings.push(format!(
             "bundle `{name}`: an inline [bundle.{name}] in {GLOBAL_CONFIG} is ignored — a bundle \
              lives as a file under {BUNDLES_DIR}/<name>.toml"
         ));
     }
-    global.bundle = read_dir_bundles(warnings);
+    global.bundle = bundles;
     for name in take_net_groups(&mut global.network).keys() {
         warnings.push(format!(
             "group `{name}`: an inline [network.groups] entry in {GLOBAL_CONFIG} is ignored — a \
              group lives as a file under {NET_GROUPS_DIR}/<name>.toml"
         ));
     }
-    global.net_group_files = read_dir_net_groups(warnings);
+    global.net_group_files = groups;
 }
 
 /// Fold every `use = [<bundle>, …]` reference in `apps` into the app that names it, in place and
@@ -2094,6 +2101,102 @@ mod tests {
         let mut warnings = Vec::new();
         let apps = read_profile_apps_from(&dir.path().join("nope"), &mut warnings);
         assert!(apps.is_empty() && warnings.is_empty());
+    }
+
+    /// A bundle and a group are read from their own directories, each entry named by its file, and
+    /// the same three refusals apply to both: a file that is not `*.toml` is not one of them, a
+    /// stem no reference could resolve is dropped with a warning, and a key the shape does not have
+    /// is named rather than left to make the entry look empty.
+    #[test]
+    fn a_bundle_and_a_group_are_named_by_their_file_and_refuse_what_no_reference_resolves() {
+        let dir = TmpDir::new();
+        std::fs::write(
+            dir.path().join("demo.toml"),
+            b"allow = [\"{GET} https://demo.example\"]\n[packages]\ndemo = \"nix:hello\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("notes.md"), b"not a bundle\n").unwrap();
+        std::fs::write(dir.path().join("bad name!.toml"), b"[packages]\n").unwrap();
+        let mut warnings = Vec::new();
+        let bundles = read_dir_bundles_from(dir.path(), &mut warnings);
+        assert_eq!(
+            bundles.keys().collect::<Vec<_>>(),
+            vec!["demo"],
+            "the file name is the bundle name, and nothing else in the directory is a bundle"
+        );
+        assert_eq!(bundles["demo"].packages["demo"], "nix:hello");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "only the unusable name warns; the `.md` is not a bundle at all: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("not a usable bundle name"),
+            "{warnings:?}"
+        );
+
+        let dir = TmpDir::new();
+        std::fs::write(dir.path().join("ci.toml"), b"entries = [\"api.test\"]\n").unwrap();
+        std::fs::write(dir.path().join("typo.toml"), b"allow = [\"api.test\"]\n").unwrap();
+        let mut warnings = Vec::new();
+        let groups = read_dir_net_groups_from(dir.path(), &mut warnings);
+        assert_eq!(groups["ci"], vec!["api.test".to_string()]);
+        assert!(
+            groups["typo"].is_empty(),
+            "a group whose entries went under the wrong key resolves to nothing"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("unknown key `allow`")),
+            "…and says so rather than shipping an empty group: {warnings:?}"
+        );
+    }
+
+    /// An inline `[bundle.<name>]` or `[network.groups]` in the global config is ignored, one
+    /// warning per entry, and the directories are what the loaded config carries. Two declaration
+    /// sites for one name would resolve to whichever the merge favored; the file is the one every
+    /// verb writes.
+    #[test]
+    fn an_inline_bundle_or_group_is_ignored_and_the_directories_are_the_source() {
+        let mut global = schema::parse(
+            b"[network]\nmode = \"deny\"\n\
+              [bundle.legacy]\npackages = { old = \"nix:hello\" }\n\
+              [network.groups]\nlegacy-lane = [\"old.example\"]\n",
+        )
+        .expect("the fixture parses");
+        let mut warnings = Vec::new();
+        let mut filed = RawBundle::default();
+        filed.packages.insert("new".into(), "nix:hello".into());
+        merge_config_dirs(
+            &mut global,
+            BTreeMap::from([("filed".to_string(), filed)]),
+            BTreeMap::from([("filed-lane".to_string(), vec!["new.example".to_string()])]),
+            &mut warnings,
+        );
+
+        assert_eq!(
+            global.bundle.keys().collect::<Vec<_>>(),
+            vec!["filed"],
+            "the directory replaces the inline table rather than merging with it"
+        );
+        assert_eq!(
+            global.net_group_files.keys().collect::<Vec<_>>(),
+            vec!["filed-lane"]
+        );
+        assert!(
+            take_net_groups(&mut global.network).is_empty(),
+            "the inline groups are taken out of the layer, so nothing downstream reads them"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("[bundle.legacy]"))
+                && warnings.iter().any(|w| w.contains("`legacy-lane`")),
+            "each ignored entry is named: {warnings:?}"
+        );
+        // The posture itself survives: only the `groups` sub-table is taken.
+        assert!(
+            matches!(global.network, Some(schema::NetworkField::Table(ref t)) if t.mode.as_deref() == Some("deny")),
+            "the layer keeps its own posture: {:?}",
+            global.network
+        );
     }
 
     #[test]

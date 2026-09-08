@@ -163,8 +163,8 @@ fn report_missing(
     ));
     if bundles.is_empty() {
         diag::error(
-            "sbx: no bundles are declared — add one under [bundle.<name>] in the global config, \
-             or bring one in with `sbx bundle import <file>`",
+            "sbx: no bundles are declared — write one as bundles/<name>.toml beside the global \
+             config, or bring one in with `sbx bundle import <file>`",
         );
     } else {
         let avail: Vec<&str> = bundles.keys().map(String::as_str).collect();
@@ -186,8 +186,8 @@ fn render_bundles(
     if selected.is_empty() {
         let _ = writeln!(
             out,
-            "  {dim}none declared — add one under [bundle.<name>] in the global config, or bring \
-             one in with `sbx bundle import`{r}"
+            "  {dim}none declared — write one as bundles/<name>.toml beside the global config, \
+             or bring one in with `sbx bundle import`{r}"
         );
         return out;
     }

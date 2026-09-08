@@ -571,11 +571,7 @@ fn prune_reports_nothing_when_all_installed_tools_are_declared() {
 #[test]
 fn import_names_the_bundle_file_that_sits_beside_the_profile() {
     let fx = Project::new("app");
-    let bundle = fx.catalogue(
-        "bundle",
-        "demo-tool",
-        "[bundle.demo-tool.packages]\ntool = \"nix:hello\"\n",
-    );
+    let bundle = fx.catalogue("bundle", "demo-tool", "[packages]\ntool = \"nix:hello\"\n");
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
 
     let out = fx.run(&["app", "import", profile.to_str().unwrap()]);
@@ -592,12 +588,13 @@ fn import_names_the_bundle_file_that_sits_beside_the_profile() {
 #[test]
 fn import_keeps_the_placeholder_when_no_file_backs_the_reference() {
     let fx = Project::new("app");
-    // A file IS at the path the layout implies — it just declares a different bundle. This is the
-    // case the content gate exists for: the guess is plausible and running it would change nothing.
+    // A file IS at the path the layout implies — it is just not a bundle. This is the case the
+    // content gate exists for: the guess is plausible, and the import it would suggest fails. A
+    // bundle carries no `cmd`, so an app profile filed under `bundle/` is refused.
     fx.catalogue(
         "bundle",
         "demo-tool",
-        "[bundle.other-tool.packages]\ntool = \"nix:hello\"\n",
+        "cmd = \"demo\"\n[packages]\ntool = \"nix:hello\"\n",
     );
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
 
@@ -620,7 +617,7 @@ fn import_reports_an_egress_group_the_profile_references_and_nothing_defines() {
     let group = fx.catalogue(
         "net-groups",
         "demo-lane",
-        "[network.groups]\ndemo-lane = [\"api.example.com\"]\n",
+        "entries = [\"api.example.com\"]\n",
     );
     let profile = fx.catalogue(
         "app",
@@ -698,12 +695,12 @@ fn bundle_import_reports_the_groups_the_bundle_itself_references() {
     let group = fx.catalogue(
         "net-groups",
         "demo-lane",
-        "[network.groups]\ndemo-lane = [\"api.example.com\"]\n",
+        "entries = [\"api.example.com\"]\n",
     );
     let bundle = fx.catalogue(
         "bundle",
         "demo-tool",
-        "[bundle.demo-tool]\nallow = [\"@demo-lane\"]\n[bundle.demo-tool.packages]\ntool = \"nix:hello\"\n",
+        "allow = [\"@demo-lane\"]\n[packages]\ntool = \"nix:hello\"\n",
     );
 
     let out = fx.run(&["bundle", "import", bundle.to_str().unwrap()]);
@@ -725,33 +722,34 @@ fn with_deps_imports_the_bundle_and_the_group_it_reaches_through_it() {
     fx.catalogue(
         "net-groups",
         "demo-lane",
-        "[network.groups]\ndemo-lane = [\"api.example.com\"]\n",
+        "entries = [\"api.example.com\"]\n",
     );
     fx.catalogue(
         "bundle",
         "demo-tool",
-        "[bundle.demo-tool]\nallow = [\"@demo-lane\"]\n[bundle.demo-tool.packages]\ntool = \"nix:hello\"\n",
+        "allow = [\"@demo-lane\"]\n[packages]\ntool = \"nix:hello\"\n",
     );
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
 
     let out = fx.run(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
     assert!(out.status.success(), "{}", text(&out));
     let t = text(&out);
-    let cfg = fx.global_config();
+    let bundle = std::fs::read_to_string(fx.bundle_path("demo-tool")).unwrap_or_default();
     assert!(
-        cfg.contains("[bundle.demo-tool]"),
-        "the bundle the profile names should be merged:\n{cfg}"
+        bundle.contains("nix:hello"),
+        "the bundle the profile names should be filed under bundles/:\n{bundle}"
     );
     // The group is reached THROUGH the bundle — nothing in the profile's own bytes names it. A plan
     // built from the profile alone would write the bundle and leave its reference dead, which is the
     // majority case in the shipped catalogue.
     //
     // Assert the group's ENTRY, not its name: `demo-lane` also appears as the bundle's own `allow`
-    // reference, so a test that looked for the name would pass with the group table never written —
-    // it would assert that the bundle landed, twice.
+    // reference, and now as a file name besides, so a test that looked for the name would pass with
+    // the group's own file never written.
+    let group = std::fs::read_to_string(fx.group_path("demo-lane")).unwrap_or_default();
     assert!(
-        cfg.contains("api.example.com"),
-        "the group the bundle references should be defined too, not just referenced:\n{cfg}"
+        group.contains("api.example.com"),
+        "the group the bundle references should be defined too, not just referenced:\n{group}"
     );
     // The grant belongs to the bytes, not to the verb: this is the one import where the reader did
     // not name the bundle themselves, so a silent credential or egress rule would be least expected.
@@ -779,11 +777,7 @@ fn with_deps_imports_the_bundle_and_the_group_it_reaches_through_it() {
     // path, never the name the profile is being filed under. Two names in play, only one of which
     // the references answer to.
     let fx = Project::new("app");
-    fx.catalogue(
-        "bundle",
-        "demo-tool",
-        "[bundle.demo-tool.packages]\ntool = \"nix:hello\"\n",
-    );
+    fx.catalogue("bundle", "demo-tool", "[packages]\ntool = \"nix:hello\"\n");
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
     let out = fx.run(&[
         "app",
@@ -796,7 +790,7 @@ fn with_deps_imports_the_bundle_and_the_group_it_reaches_through_it() {
     assert!(out.status.success(), "{}", text(&out));
     assert!(fx.profile_path("renamed").exists(), "{}", text(&out));
     assert!(
-        fx.global_config().contains("[bundle.demo-tool]"),
+        fx.bundle_path("demo-tool").exists(),
         "the bundle the profile names still lands under its own name:\n{}",
         fx.global_config()
     );
@@ -805,12 +799,12 @@ fn with_deps_imports_the_bundle_and_the_group_it_reaches_through_it() {
 #[test]
 fn with_deps_writes_nothing_at_all_when_a_reference_has_no_file() {
     let fx = Project::new("app");
-    // A file IS at the implied path; it declares a different bundle. The reference cannot be
-    // followed, and following the rest would leave the app short of exactly what it names.
+    // A file IS at the implied path; it is not a bundle (it carries a `cmd`). The reference cannot
+    // be followed, and following the rest would leave the app short of exactly what it names.
     fx.catalogue(
         "bundle",
         "demo-tool",
-        "[bundle.other-tool.packages]\ntool = \"nix:hello\"\n",
+        "cmd = \"demo\"\n[packages]\ntool = \"nix:hello\"\n",
     );
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
 
@@ -829,8 +823,8 @@ fn with_deps_writes_nothing_at_all_when_a_reference_has_no_file() {
         text(&out)
     );
     assert!(
-        fx.global_config().is_empty(),
-        "nor may anything have reached the global config"
+        fx.global_config().is_empty() && !fx.bundle_path("demo-tool").exists(),
+        "nor may anything have reached the global config or the bundles directory"
     );
 }
 
@@ -841,11 +835,7 @@ fn with_deps_refuses_a_name_that_would_be_dropped_at_load() {
     // and the fragment declares what it declares. Merged as-is, the bundle would be dropped when the
     // config is read and the app would launch short of the tool it names, with nothing said — the
     // silent shortfall this whole path exists to remove.
-    fx.catalogue(
-        "bundle",
-        "bad name!",
-        "[bundle.\"bad name!\".packages]\ntool = \"nix:hello\"\n",
-    );
+    fx.catalogue("bundle", "bad name!", "[packages]\ntool = \"nix:hello\"\n");
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"bad name!\"]\n");
 
     let out = fx.run(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
@@ -872,7 +862,7 @@ fn with_deps_refuses_a_name_that_would_be_dropped_at_load() {
     fx.catalogue(
         "net-groups",
         "bad name!",
-        "[network.groups]\n\"bad name!\" = [\"api.example.com\"]\n",
+        "entries = [\"api.example.com\"]\n",
     );
     let profile = fx.catalogue(
         "app",
@@ -900,27 +890,28 @@ fn with_deps_refuses_a_name_that_would_be_dropped_at_load() {
 #[test]
 fn with_deps_merges_only_the_referenced_name_from_a_fragment() {
     let fx = Project::new("app");
-    // One file, two bundles. Only the one the profile names may land: a catalogue fragment is not a
-    // manifest of what the reader asked for, and writing the rest widens the import past the
-    // reference — the very thing that made this opt-in.
+    // Two bundles sit in the catalogue; only the one the profile names may land. A catalogue is not
+    // a manifest of what the reader asked for, and writing the rest widens the import past the
+    // reference, the very thing that made this opt-in.
+    fx.catalogue("bundle", "demo-tool", "[packages]\ntool = \"nix:hello\"\n");
     fx.catalogue(
         "bundle",
-        "demo-tool",
-        "[bundle.demo-tool.packages]\ntool = \"nix:hello\"\n\
-         [bundle.demo-spare.packages]\nspare = \"nix:hello\"\n",
+        "demo-spare",
+        "[packages]\nspare = \"nix:hello\"\n",
     );
     let profile = fx.catalogue("app", "demo-app", "cmd = \"demo\"\nuse = [\"demo-tool\"]\n");
 
     let out = fx.run(&["app", "import", profile.to_str().unwrap(), "--with-deps"]);
     assert!(out.status.success(), "{}", text(&out));
-    let cfg = fx.global_config();
     assert!(
-        cfg.contains("demo-tool"),
-        "the referenced bundle should land:\n{cfg}"
+        fx.bundle_path("demo-tool").exists(),
+        "the referenced bundle should land:\n{}",
+        text(&out)
     );
     assert!(
-        !cfg.contains("demo-spare"),
-        "the rest of the fragment must not:\n{cfg}"
+        !fx.bundle_path("demo-spare").exists(),
+        "the rest of the catalogue must not:\n{}",
+        text(&out)
     );
 }
 

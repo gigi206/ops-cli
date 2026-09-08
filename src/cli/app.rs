@@ -708,17 +708,19 @@ fn dep_plan(
 ) -> Result<DepPlan, String> {
     let mut bundles = Vec::new();
     for m in missing_bundles {
-        let Some(file) = m.file.as_ref() else {
-            return Err(unresolvable("bundle", &m.name, src));
-        };
         // A name keys a referenceable identifier and, if invalid, is dropped at load — the silent
-        // shortfall this whole path exists to remove. Fail closed, naming the offender.
+        // shortfall this whole path exists to remove. Fail closed, naming the offender, and BEFORE
+        // asking whether a file backs it: the reader refuses an unusable file name too, so the
+        // question "which file declares this" would answer "none" and hide why.
         if !config::is_valid_bundle_name(&m.name) {
             return Err(format!(
                 "invalid bundle name `{}` (1–64 of [A-Za-z0-9._-]); nothing was written",
                 m.name
             ));
         }
+        let Some(file) = m.file.as_ref() else {
+            return Err(unresolvable("bundle", &m.name, src));
+        };
         let bytes = config::safety::read_safe_bytes(file)
             .map_err(|e| nothing_written(&format!("cannot read {e}")))?;
         let value = config::validate_bundle(&bytes)
@@ -738,15 +740,16 @@ fn dep_plan(
     }
     let mut groups = Vec::new();
     for m in &wanted {
-        let Some(file) = m.file.as_ref() else {
-            return Err(unresolvable("egress group", &m.name, src));
-        };
+        // Before the file question, for the reason the bundle loop above states.
         if !config::is_valid_group_name(&m.name) {
             return Err(format!(
                 "invalid group name `{}` (1–64 of [A-Za-z0-9._-]); nothing was written",
                 m.name
             ));
         }
+        let Some(file) = m.file.as_ref() else {
+            return Err(unresolvable("egress group", &m.name, src));
+        };
         let bytes = config::safety::read_safe_bytes(file)
             .map_err(|e| nothing_written(&format!("cannot read {e}")))?;
         let value = config::validate_group_file(&bytes)

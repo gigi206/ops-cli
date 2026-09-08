@@ -57,8 +57,8 @@ pub(super) fn net_groups_list(args: &[OsString]) -> ExitCode {
             ));
             if groups.is_empty() {
                 diag::error(
-                    "sbx: no egress groups are defined — declare them under [network.groups] in the \
-                     global config",
+                    "sbx: no egress groups are defined — write one as net-groups/<name>.toml \
+                     beside the global config, or bring one in with `sbx net groups import <file>`",
                 );
             } else {
                 let avail: Vec<&str> = groups.keys().map(String::as_str).collect();
@@ -361,7 +361,8 @@ fn render_net_groups(
         if groups.is_empty() {
             let _ = writeln!(
                 o,
-                "  {dim}none defined — declare them under [network.groups] in the global config{r}"
+                "  {dim}none defined — write one as net-groups/<name>.toml beside the global \
+                 config, or bring one in with `sbx net groups import`{r}"
             );
             return o;
         }
