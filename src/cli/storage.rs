@@ -1021,7 +1021,16 @@ fn should_propose(
 /// opposed to a management subcommand, an internal `__*` verb, or a help request. Only a launch
 /// is a moment where proposing a data-directory volume makes sense.
 fn is_launch_invocation(name: &str, rest: &[OsString]) -> bool {
-    if rest
+    // Only sbx's own `--help` counts, so the scan stops at the terminator: everything after `--` is
+    // the payload's command line, where `--help` is an ordinary argument to an ordinary program.
+    // Read over the whole slice, `sbx run -- mytool --help` was classified as a help request and
+    // the proposal this gates was skipped on a launch that is one. It is the same shape
+    // [`crate::split_session_flags`] documents having already met, on a different flag.
+    let upto = rest
+        .iter()
+        .position(|a| a.to_str() == Some("--"))
+        .unwrap_or(rest.len());
+    if rest[..upto]
         .iter()
         .any(|a| matches!(a.to_str(), Some("--help" | "-h")))
     {
@@ -1393,6 +1402,17 @@ mod tests {
         assert!(!is_launch_invocation("__netns-holder", &[os("bwrap")]));
         // A help request is never a launch, even on a launch verb.
         assert!(!is_launch_invocation("run", &[os("--help")]));
+        // The payload's own `--help` is not sbx's: `sbx run -- mytool --help` IS a launch, and the
+        // proposal it gates belongs there. Read over the whole argv, the flag was taken from after
+        // the terminator too -- the shape `split_session_flags` documents having already met once.
+        assert!(is_launch_invocation(
+            "run",
+            &[os("--"), os("mytool"), os("--help")]
+        ));
+        assert!(is_launch_invocation(
+            "run",
+            &[os("--"), os("mytool"), os("-h")]
+        ));
         assert!(!is_launch_invocation("app", &[os("run"), os("-h")]));
     }
 
