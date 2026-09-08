@@ -1085,7 +1085,7 @@ fn flag_literals(path: &[&str], flag: &str) -> Option<Vec<String>> {
         (["run"] | ["app", "run"], "--net") => {
             &["none", "shared", "ask", "allow", "deny", "allow=", "deny="]
         }
-        (["net", "logs"], "--verdict") => &["allow", "deny", "blocked", "error"],
+        (["net", "logs"], "--verdict") => &crate::sandbox::control::LogVerdict::TOKENS,
         // The parser takes four literals here, and the option row spells the value `<src>`, which
         // the metavariable vocabulary reads as a path: completion offered filenames for a flag
         // that accepts none of them. A cell list is what a symbolic posture is completed from, and
@@ -1616,9 +1616,16 @@ mod tests {
                 "run --net does not offer {want:?}: {cells:?}"
             );
         }
-        // `--verdict <allow|deny|blocked|error>` on `net logs`.
+        // `--verdict <v>` on `net logs` offers every verdict the flag parses — the completion is
+        // one of the surfaces that must *offer* the set rather than accept one of it, so it is
+        // derived from the set and this checks the derivation reaches the shell.
         let verdict = names_at(&["net", "logs", "--verdict"], "");
-        assert!(verdict.contains(&"blocked".to_string()));
+        for token in crate::sandbox::control::LogVerdict::TOKENS {
+            assert!(
+                verdict.contains(&token.to_string()),
+                "`--verdict` must offer `{token}`: {verdict:?}"
+            );
+        }
         // An inline `[=…]` list: `--gpu[=true|false]`. The value is fused, so it belongs to the
         // flag's own word and never to the next one: `take_override_flag` gives these three flags a
         // path that does not consume the following argument, so a cell offered there would produce

@@ -210,7 +210,7 @@ recording is on by default (a trusted `[network] stats = false` disables it). Se
 ## `sbx net logs`
 
 ```
-sbx net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked|error] [-n <N>]
+sbx net logs [-a|--app <name>] [--host <h>] [--verdict <v>] [-n <N>]
              [--all] [--with-query] [--with-status] [--with-headers] [--with-body]
              [-f|--follow] [-i|--interval <secs>] [--json]
 ```
@@ -223,7 +223,7 @@ proxy made. **Live-only**: the log lives in the running session's memory and is
 |---|---|
 | `-a`, `--app <name>` | the sessions of one app profile, rather than every session of this project |
 | `--host <h>` | only the events whose destination host matches |
-| `--verdict <v>` | only `allow`, `deny`, `blocked` or `error` events |
+| `--verdict <v>` | only `allow`, `deny`, `blocked`, `error` or `resolved` events. The last is a name the cage asked for rather than a decision, so it is the one value that selects questions instead of answers |
 | `-n <N>` | the last `N` events (the listing is chronological, so this is a tail) |
 | `--all` | also show refusals a [`[network] mute`](../configuration/network) rule suppressed, tagged `muted`; they are counted in `stats` either way |
 | `--with-query` | keep the URL query in the shown path. Dropped by default because a token can ride in one; what is shown is already redacted, the proxy masking configured secret values before an event enters the log |

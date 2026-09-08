@@ -54,7 +54,13 @@ impl LogView {
     }
 }
 
-/// Parse `sbx net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked|error]
+/// The `--verdict` values, as the flag's own messages spell them. Derived from the verdict set so
+/// a new one is offered the moment it is accepted, instead of being a filter nobody can find.
+fn verdict_choices() -> String {
+    sandbox::control::LogVerdict::TOKENS.join("|")
+}
+
+/// Parse `sbx net logs [-a|--app <name>] [--host <h>] [--verdict <v>]
 /// [-n <N>] [--with-query] [--with-status] [--follow] [-i|--interval <secs>] [--json]`. Pure (no
 /// I/O), so every reject path is unit-testable — a missing value, an unknown verdict, a non-numeric
 /// count or interval, a zero interval, or an unknown flag is an error.
@@ -89,14 +95,15 @@ fn parse_log_args(args: &[OsString]) -> Result<LogView, String> {
             Some("--verdict") => {
                 let val = it
                     .next()
-                    .ok_or("`--verdict` needs one of allow|deny|blocked|error")?;
+                    .ok_or_else(|| format!("`--verdict` needs one of {}", verdict_choices()))?;
                 let parsed = val
                     .to_str()
                     .and_then(sandbox::control::LogVerdict::parse)
                     .ok_or_else(|| {
                         format!(
-                            "invalid verdict `{}` — expected allow|deny|blocked|error",
-                            val.to_string_lossy()
+                            "invalid verdict `{}` — expected {}",
+                            val.to_string_lossy(),
+                            verdict_choices()
                         )
                     })?;
                 v.verdict = Some(parsed);

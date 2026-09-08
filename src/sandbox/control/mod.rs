@@ -389,7 +389,7 @@ pub(crate) enum LogVerdict {
 
 impl LogVerdict {
     /// The stable wire/display token for this verdict.
-    pub(crate) fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             LogVerdict::Allow => "allow",
             LogVerdict::Deny => "deny",
@@ -415,16 +415,28 @@ impl LogVerdict {
         }
     }
 
-    /// Every verdict, for the round-trip guard. The fixed array length is the mechanism: a new
-    /// variant that is not added here does not type-check, and one added here without being added
-    /// to [`Self::assert_all_listed`] does not either — both under `cargo test`, where this lives.
-    #[cfg(test)]
-    const ALL: [Self; 5] = [
+    /// Every verdict. The fixed array length is the mechanism that keeps it whole: a new variant
+    /// that is not added here does not type-check, and the exhaustive match the tests hold it
+    /// against catches one added here that the enum does not carry.
+    pub(crate) const ALL: [Self; 5] = [
         LogVerdict::Allow,
         LogVerdict::Deny,
         LogVerdict::Blocked,
         LogVerdict::Error,
         LogVerdict::Resolved,
+    ];
+
+    /// Every verdict's token, for the surfaces that must *offer* the set rather than parse one of
+    /// it: the `--verdict` completion, and the message a rejected value gets. Spelled through
+    /// [`Self::as_str`] so the vocabulary has a single definition — `resolved` was accepted by
+    /// [`Self::parse`] while six separate surfaces still said the set was `allow|deny|blocked|
+    /// error`, which made a working filter undiscoverable.
+    pub(crate) const TOKENS: [&'static str; Self::ALL.len()] = [
+        LogVerdict::Allow.as_str(),
+        LogVerdict::Deny.as_str(),
+        LogVerdict::Blocked.as_str(),
+        LogVerdict::Error.as_str(),
+        LogVerdict::Resolved.as_str(),
     ];
 
     /// Exhaustive by construction: adding a variant breaks this match, which is what makes

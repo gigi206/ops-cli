@@ -2706,7 +2706,7 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["net", "logs"],
-        synopsis: "sbx net logs [-a|--app <name>] [--host <h>] [--verdict allow|deny|blocked|error] \
+        synopsis: "sbx net logs [-a|--app <name>] [--host <h>] [--verdict <v>] \
                    [-n <N>] [--all] [--with-query] [--with-status] [--with-headers] [--with-body] \
                    [-f|--follow] [-i|--interval <secs>] [--json]",
         summary: "the live, per-request egress log of a running session",
@@ -2721,7 +2721,8 @@ pub(super) const PAGES: &[Page] = &[
             ),
             (
                 "--verdict <v>",
-                "only events with this verdict: allow, deny, blocked, or error",
+                "only events with this verdict: allow, deny, blocked, error, or resolved (a name \
+                       the cage asked for, which is not a decision)",
             ),
             ("-n <N>", "show only the most recent N events (per session)"),
             (

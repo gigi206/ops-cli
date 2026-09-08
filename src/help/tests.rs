@@ -101,6 +101,30 @@ fn maybe_help_stops_at_a_double_dash() {
     assert!(maybe_help("app", &v(&["run", "demo-app"])).is_none());
 }
 
+/// The `--verdict` help must name every value the flag accepts.
+///
+/// The flag parses with [`crate::sandbox::control::LogVerdict::parse`], which takes the whole
+/// verdict set, but the set was spelled out by hand in the synopsis, the option row, the completion
+/// values and two error messages. When `resolved` was added, the filter worked and every one of
+/// those surfaces still said `allow|deny|blocked|error`: a working filter nobody could find. The
+/// other surfaces now derive from [`crate::sandbox::control::LogVerdict::TOKENS`]; this page is
+/// prose, so it gets a guard instead.
+#[test]
+fn the_verdict_option_names_every_verdict_it_accepts() {
+    let page = find(&["net", "logs"]).expect("net logs page");
+    let (_, text) = page
+        .options
+        .iter()
+        .find(|(name, _)| name.starts_with("--verdict"))
+        .expect("the page documents `--verdict`");
+    for token in crate::sandbox::control::LogVerdict::TOKENS {
+        assert!(
+            text.contains(token),
+            "`--verdict` accepts `{token}` but its help does not name it: {text}"
+        );
+    }
+}
+
 #[test]
 fn every_page_renders_balanced_in_color() {
     // Guard the whole table, not just one page: a future page that forgets a reset is caught.
