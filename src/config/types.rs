@@ -65,8 +65,9 @@ pub(crate) enum Backend {
     AppImage(String),
     /// `tarball:<url>` — a prebuilt application `.tar.gz`/`.tgz` at an `https://` URL, provisioned
     /// **host-side** into sbx's store exactly like `deb:`/`appimage:` (seeded, offline-reusable): sbx
-    /// resolves the URL to a content hash, then builds a generated derivation that `tar -xz`-extracts
-    /// it and `autoPatchelfHook`s it against the same curated Electron/Chromium library set.
+    /// resolves the URL to a content hash, then builds a generated derivation that decompresses it
+    /// into `tar` under the byte ceiling the prebuilt backends share, and `autoPatchelfHook`s it
+    /// against the same curated Electron/Chromium library set.
     ///
     /// Extraction runs no build script (`dontBuild`) and happens at BUILD time (a plain `tar`, no
     /// runtime namespace op — the FUSE/namespace path is blocked in-cage), so evaluating it host-side
@@ -109,8 +110,8 @@ pub(crate) enum Backend {
     /// `bin/<the [packages] key>`, makes it executable and `autoPatchelfHook`s it.
     ///
     /// The fourth prebuilt form exists because the other three all unpack something, and a vendor
-    /// that publishes a bare executable at a versioned URL fits none of them: `tarball:` would
-    /// `tar -xz` a file that is not an archive. Nothing else differs — same pin-on-first-use, same
+    /// that publishes a bare executable at a versioned URL fits none of them: `tarball:` would try
+    /// to decompress a file that is not an archive. Nothing else differs — same pin-on-first-use, same
     /// per-project lock, same offline rebuild, same trust gate.
     Binary(String),
     /// `binary:resolve` — the auto-upgrade form of [`Backend::Binary`], the exact analogue of

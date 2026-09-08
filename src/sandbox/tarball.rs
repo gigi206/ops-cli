@@ -3,7 +3,7 @@
 //! For a GUI/desktop app distributed only as a plain compressed tarball (no `.deb`, no `.AppImage`,
 //! no nixpkgs attribute, and no *official* flake — the vendor ships a `.tar.gz` you extract and run),
 //! sbx packages the tarball directly: resolve the URL to a content
-//! hash, then build a generated derivation that `tar -xz`-unpacks it and `autoPatchelfHook`s the ELF
+//! hash, then build a generated derivation that unpacks it under a ceiling and `autoPatchelfHook`s the ELF
 //! binaries against the same curated Electron/Chromium library set the `deb:`/`appimage:` backends
 //! use. **No build script runs** (`dontBuild`), so — unlike an arbitrary `flake:` — evaluating and
 //! building it host-side is safe; it is therefore provisioned like `nix:` (into sbx's store, seeded,
@@ -189,7 +189,8 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
 }
 
 /// The `tarball:` backend — the two decisions [`prebuilt::Kind`] leaves to it are its locator form (a
-/// direct URL, always its own download URL) and a plain `tar -xz` unpack. It is the plainest of the
+/// direct URL, always its own download URL) and a gzip unpack bounded by
+/// [`prebuilt::bounded_unpack`]. It is the plainest of the
 /// three, so it takes no `system`: a `.tar.gz` locator names one artefact, with no asset to select.
 pub(crate) struct Tarball;
 

@@ -2,8 +2,8 @@
 //!
 //! The fourth prebuilt backend, and the one for a vendor that publishes a **bare executable** at an
 //! `https://` URL: no `.deb`, no `.AppImage`, no archive of any kind, no nixpkgs attribute and no
-//! official flake. The other three all unpack something, so none of them fits — `tarball:` would
-//! `tar -xz` a file that is not an archive and fail at build time.
+//! official flake. The other three all unpack something, so none of them fits — `tarball:` would try
+//! to decompress a file that is not an archive and fail at build time.
 //!
 //! Everything else is shared with them, deliberately: resolve the URL to a content hash, build a
 //! generated derivation that installs the file and `autoPatchelfHook`s it against the same curated
@@ -271,8 +271,11 @@ mod tests {
         // No unpack, and said so explicitly: stdenv would otherwise try to treat the file as an
         // archive and fail the build on a program that is perfectly fine.
         assert!(expr.contains("dontUnpack = true;"), "{expr}");
+        // Asserted on what an unpack *is* rather than on one spelling of it: `tar -xz` stopped being
+        // the tarball backend's command when its unpack gained a ceiling, and an assertion naming a
+        // command nobody emits any more passes for the wrong reason.
         assert!(
-            !expr.contains("tar -xz"),
+            !expr.contains("tar -x") && !expr.contains("unpackPhase"),
             "nothing is extracted here: {expr}"
         );
 
