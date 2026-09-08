@@ -32,7 +32,7 @@ pub(crate) enum AppHomeScope {
 /// already gated by the trust of the layer that supplied it (the global config, trusted by
 /// location, or a project layer by its verdict). `sbx app <name>` folds this onto the
 /// baseline with [`Resolved::merge_app`].
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct ResolvedApp {
     /// The argv to run. Empty when no layer declared a `cmd` — a launch error, never a
     /// silent default.

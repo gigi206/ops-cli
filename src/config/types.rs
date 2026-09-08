@@ -531,7 +531,7 @@ pub(crate) enum Provenance {
 /// The per-field provenance of the cage's cgroup limits. Each of the three limits is a standalone
 /// scalar with its own default, set independently by either config layer (the `env` model), so
 /// each carries its own [`Provenance`].
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct LimitsOrigin {
     pub(crate) memory_high: Provenance,
     pub(crate) memory_max: Provenance,

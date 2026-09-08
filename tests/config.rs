@@ -5612,3 +5612,48 @@ fn config_edit_trusts_nothing_when_the_editor_never_ran() {
         String::from_utf8_lossy(&after.stderr)
     );
 }
+
+/// The golden harness behind `resolve()`: `$SBX_DEBUG_RESOLVED_DUMP` must be **stable** across runs
+/// of the same configuration and **sensitive** to a change in it. Both halves are asserted, and the
+/// second is the one that matters: a dump that wrote nothing, or wrote a constant, would satisfy
+/// stability on its own and pin nothing at all. That is the shape a harness fails in silently, so
+/// it is calibrated here rather than trusted.
+///
+/// It is what makes any future restructuring of `resolve()` falsifiable: capture before, capture
+/// after, diff.
+#[test]
+fn the_resolved_dump_is_stable_across_runs_and_moves_when_the_config_does() {
+    let p = Project::new("dump");
+    p.write_project("[fs]\ndeny = [\"prod.key\"]\n\n[env]\nFOO = \"bar\"\n");
+
+    let dump_to = |name: &str| -> String {
+        let path = p.proj.path().join(name);
+        let out = p
+            .cmd(&["config", "show"])
+            .env("SBX_DEBUG_RESOLVED_DUMP", &path)
+            .output()
+            .expect("spawn sbx");
+        assert!(
+            out.status.success(),
+            "config show failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read_to_string(&path).expect("the dump was written")
+    };
+
+    let a = dump_to("a.txt");
+    assert!(
+        a.contains("Resolved {") && a.contains("prod.key") && a.contains("FOO"),
+        "the dump must carry the resolved configuration, not a stub: {a}"
+    );
+
+    // Stable: the same configuration resolves to the same bytes.
+    assert_eq!(a, dump_to("b.txt"), "two runs of one config must agree");
+
+    // Sensitive: a changed configuration is a changed dump. Without this half the assertion above
+    // would hold for a harness that emitted a constant.
+    p.write_project("[fs]\ndeny = [\"prod.key\", \"other.key\"]\n\n[env]\nFOO = \"bar\"\n");
+    let c = dump_to("c.txt");
+    assert_ne!(a, c, "a changed config must change the dump");
+    assert!(c.contains("other.key"), "and it must carry the change: {c}");
+}

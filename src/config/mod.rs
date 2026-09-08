@@ -464,7 +464,7 @@ pub(crate) struct BrokerBinding {
 /// the host binds, the declared tools, plus any warnings worth surfacing
 /// (dropped fields, an unparseable or unsafe file). Nothing here is a hard error —
 /// a missing or broken config yields empty defaults, never a failed launch.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct Resolved {
     /// Extra environment, in application order; a later entry overrides an earlier
     /// one at the same key.
@@ -2750,7 +2750,7 @@ fn resolve(
         );
     }
 
-    Resolved {
+    let resolved = Resolved {
         allow_insecure_http,
         allow_insecure_http_origin,
         env,
@@ -2813,6 +2813,47 @@ fn resolve(
         tasks,
         apps,
         warnings,
+    };
+    #[cfg(debug_assertions)]
+    debug_dump_resolved(&resolved);
+    resolved
+}
+
+/// Append the [`Resolved`] this call produced to the file `$SBX_DEBUG_RESOLVED_DUMP` names, so two
+/// runs of [`resolve()`] can be compared byte for byte.
+///
+/// This exists for one purpose, and it is the same one `debug_dump_spec` serves for the launch
+/// pipeline: [`resolve()`] is a single linear pass over some sixty accumulators whose *ordering*
+/// carries meaning, so the only way to hold a change to it against what it produced before is to
+/// run it and diff the results. Without that record, any restructuring of it is unfalsifiable.
+///
+/// Debug-only, and compiled out rather than merely gated, on the same reasoning: a release binary
+/// must have no way to write a resolved configuration anywhere.
+///
+/// **Nothing is redacted, and that is a measured claim rather than an oversight.** No credential
+/// plaintext reaches this struct: `secrets` carries [`crate::config::types::SecretSource`]s, and
+/// every variant of that enum is a *reference* sbx reads the plaintext from at launch — a variable
+/// name, a file path, a sops path and key, a plugin locator — which is why
+/// `SecretSource::describe` can print one whole. What the dump does carry is whatever the config
+/// files themselves hold: an `[env]` value or a `[plugin.<name>]` key is reproduced as written. A
+/// developer pointing this at a path is dumping their own config, and the `debug_assertions` gate
+/// is what keeps that from being possible anywhere else.
+///
+/// Best-effort and silent: a path that cannot be written is a developer's own diagnostic going
+/// missing, never a reason to fail a launch that is otherwise ready to run.
+#[cfg(debug_assertions)]
+fn debug_dump_resolved(resolved: &Resolved) {
+    use std::io::Write as _;
+
+    let Some(path) = std::env::var_os("SBX_DEBUG_RESOLVED_DUMP") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{resolved:#?}");
     }
 }
 
