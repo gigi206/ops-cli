@@ -516,3 +516,158 @@ fn fs_scan_closes_a_matching_file_inside_a_real_cage() {
          leak distinguishable from a false positive.\nstderr: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `sbx fs deny|undeny|readonly|unreadonly` — the mask-writing verbs.
+//
+// They drive the shared `Project` harness rather than the bare `sbx()` above, because a mask write
+// is trust-gated: it needs the trust store (`XDG_STATE_HOME`) and the global config
+// (`XDG_CONFIG_HOME`) redirected too, which `sbx()` does not do.
+// ---------------------------------------------------------------------------
+
+use common::project::Project;
+
+#[test]
+fn fs_deny_writes_the_table_on_a_fresh_project_and_retrusts_it() {
+    let p = Project::new("fsmask");
+    let out = p.run(&["fs", "deny", "prod.key"]);
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stdout.contains("added deny prod.key"), "stdout: {stdout}");
+    assert!(stdout.contains("re-trusted"), "must re-trust: {stdout}");
+
+    let body = std::fs::read_to_string(p.proj.path().join(".sbx.toml")).unwrap();
+    assert!(body.contains("[fs]"), "{body}");
+    assert!(body.contains("deny = [\"prod.key\"]"), "{body}");
+    // No posture is invented, unlike `sbx proc deny` which bootstraps `mode = "enforce"`: a mask
+    // needs none, and inventing one here would change what an unrelated field means.
+    assert!(!body.contains("mode"), "{body}");
+
+    // A second write appends against the now-trusted config, so the trust pre-check passes.
+    let again = p.run(&["fs", "readonly", "Cargo.lock"]);
+    assert_eq!(again.status.code(), Some(0), "second write should append");
+    let body = std::fs::read_to_string(p.proj.path().join(".sbx.toml")).unwrap();
+    assert!(body.contains("readonly = [\"Cargo.lock\"]"), "{body}");
+    assert!(
+        body.contains("deny = [\"prod.key\"]"),
+        "the first one stays: {body}"
+    );
+}
+
+#[test]
+fn fs_undeny_removes_what_fs_deny_wrote_and_is_idempotent() {
+    let p = Project::new("fsmask");
+    p.run(&["fs", "deny", "prod.key"]);
+
+    let out = p.run(&["fs", "undeny", "prod.key"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "stdout: {stdout}");
+    assert!(stdout.contains("removed deny prod.key"), "stdout: {stdout}");
+    let body = std::fs::read_to_string(p.proj.path().join(".sbx.toml")).unwrap();
+    assert!(!body.contains("prod.key"), "{body}");
+
+    // Removing what is already gone is a reported no-op, not an error.
+    let again = p.run(&["fs", "undeny", "prod.key"]);
+    let stdout = String::from_utf8_lossy(&again.stdout);
+    assert_eq!(again.status.code(), Some(0), "stdout: {stdout}");
+    assert!(stdout.contains("no change"), "stdout: {stdout}");
+}
+
+#[test]
+fn fs_undeny_does_not_reach_the_readonly_list() {
+    // The two lists are distinct, so the verb that undoes one must not silently undo the other:
+    // `undeny` reaching a `readonly` entry would widen what the cage can *write*, which nobody
+    // asked for.
+    let p = Project::new("fsmask");
+    p.run(&["fs", "readonly", "Cargo.lock"]);
+    let out = p.run(&["fs", "undeny", "Cargo.lock"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "stdout: {stdout}");
+    assert!(stdout.contains("no change"), "stdout: {stdout}");
+    let body = std::fs::read_to_string(p.proj.path().join(".sbx.toml")).unwrap();
+    assert!(
+        body.contains("readonly = [\"Cargo.lock\"]"),
+        "still there: {body}"
+    );
+
+    // The verb spelled after the list it undoes does remove it.
+    p.run(&["fs", "unreadonly", "Cargo.lock"]);
+    let body = std::fs::read_to_string(p.proj.path().join(".sbx.toml")).unwrap();
+    assert!(!body.contains("Cargo.lock"), "{body}");
+}
+
+#[test]
+fn fs_deny_refuses_an_untrusted_existing_project() {
+    // The gate is not about the mask — `[fs]` is honored from an untrusted source anyway — it is
+    // about the re-trust, which covers the whole file. Same refusal and code as `sbx proc deny`.
+    let p = Project::new("fsmask");
+    p.write_project("binds = [\"/etc\"]\n");
+    let out = p.run(&["fs", "deny", "prod.key"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("not trusted"), "stderr: {stderr}");
+    let body = std::fs::read_to_string(p.proj.path().join(".sbx.toml")).unwrap();
+    assert!(
+        !body.contains("[fs]"),
+        "a refused write leaves the file alone: {body}"
+    );
+}
+
+#[test]
+fn fs_mask_verbs_refuse_the_session_flags_and_say_why() {
+    // A mask is a mount and a cage's mounts are fixed when it is built, so there is no live overlay
+    // to load one into. The refusal must name that, since silence would read as "it worked".
+    let p = Project::new("fsmask");
+    for verb in ["deny", "readonly"] {
+        let out = p.run(&["fs", verb, "prod.key", "--session"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{verb}: {stderr}");
+        assert!(stderr.contains("mount"), "{verb} must say why: {stderr}");
+        assert!(
+            !p.proj.path().join(".sbx.toml").exists(),
+            "{verb} must refuse before writing anything"
+        );
+    }
+}
+
+#[test]
+fn fs_deny_lands_in_the_app_profile_under_a_global_app_scope() {
+    // A global app scope reaches the profile file, not the global config, and the profile *is* the
+    // app — so the table is a bare `[fs]` there rather than an `[app.<name>.fs]`. Asserted because
+    // a mask written to the wrong file is silently inert, which is indistinguishable from working.
+    let p = Project::new("fsmask");
+    let out = p.run(&["fs", "deny", "prod.key", "-g", "-a", "demo"]);
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stdout.contains("app profile"),
+        "it names where it landed: {stdout}"
+    );
+    let body = std::fs::read_to_string(p.profile_path("demo")).expect("the profile was written");
+    assert!(body.contains("[fs]"), "{body}");
+    assert!(body.contains("deny = [\"prod.key\"]"), "{body}");
+    assert!(
+        p.global_config().is_empty(),
+        "the global config is not the target: {}",
+        p.global_config()
+    );
+}
+
+#[test]
+fn fs_deny_scoped_to_an_app_in_the_project_config_nests_under_that_app() {
+    // The other app scope: a `--local -a <name>` write keys the project file by app, so the mask
+    // applies to that app's cage and not to the project's baseline.
+    let p = Project::new("fsmask");
+    let out = p.run(&["fs", "deny", "prod.key", "-a", "demo"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    let body = std::fs::read_to_string(p.proj.path().join(".sbx.toml")).unwrap();
+    assert!(body.contains("[app.demo.fs]"), "{body}");
+    assert!(body.contains("deny = [\"prod.key\"]"), "{body}");
+}

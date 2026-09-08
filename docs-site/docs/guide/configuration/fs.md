@@ -359,19 +359,51 @@ cmd    = ["cat", "secrets/token"]
 unmask = ["secrets/token"]     # ...so this one can be lifted alone
 ```
 
+## Writing a mask
+
+`sbx fs deny <path>` and `sbx fs readonly <path>` write the lists above, and
+`sbx fs undeny` / `sbx fs unreadonly` take an entry back out:
+
+```bash
+sbx fs deny prod.key
+sbx fs deny 'certs/*.pem'          # quote a glob so the shell does not expand it first
+sbx fs readonly Cargo.lock
+```
+
+They write the project `.sbx.toml` by default, the global config with `-g`, and an app's table
+with `-a <name>`; a project write re-trusts the file, on the terms
+[`sbx fs deny`](../cli/fs#deny--readonly) states. Entries are lists, so the generic
+`sbx config set` does not reach them: before these verbs the only way in was
+[`sbx config edit`](../cli/config#edit), which is still how you rewrite several at once.
+
+There is no `--session` form and no `sbx fs rules`, and both absences are the same fact: a mask is
+a mount, resolved at launch, so there is no live overlay to load into or to list. The effective
+masks are in `sbx config show`, below.
+
 ## Closing a path for one launch
 
-`[fs]` has no typed flag of its own, so a mask you want for a single run travels in a
-[one-shot `--config` blob](overrides):
+A mask you want for a single run travels in the typed `--fs` flag, one entry per flag:
+
+```bash
+sbx run --fs deny=.env -- pytest
+sbx run --fs deny=.env --fs readonly=Cargo.lock -- pytest
+```
+
+The side has to be named (`deny=` or `readonly=`) because the table holds two lists, and a bare
+path could only be guessed into one of them. A value naming neither is refused rather than guessed.
+
+`--fs` is the one typed flag that **accumulates** instead of last-wins: every other names a single
+setting, while this one names an entry in a list that unions across every layer. So the flag adds
+to whatever the config files already closed, `SBX_FS` carries one mask from the environment and the
+two accumulate as well, and no spelling of any of them lifts a mask.
+
+The `[fs]` table also travels in a [one-shot `--config` blob](overrides), which is how you set
+`scan` or `scan_max_kb` for a single run:
 
 ```bash
 sbx run --config '[fs]
 deny = [".env"]' -- pytest
 ```
-
-It unions with whatever the config files already closed, exactly like a layer: the blob adds a
-mask for this launch, and no spelling of it lifts one. `SBX_CONFIG` carries the same blob from
-the environment.
 
 ## Seeing what is closed
 

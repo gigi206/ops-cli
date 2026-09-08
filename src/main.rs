@@ -576,6 +576,7 @@ fn take_override_flag(
         "--config" => &mut cli.config,
         "--env" => &mut cli.env,
         "--net" => &mut cli.net,
+        "--fs" => &mut cli.fs,
         "--gui" => &mut cli.gui,
         "--proc" => &mut cli.proc,
         "--notify" => &mut cli.notify,
@@ -1263,6 +1264,72 @@ fn persist_proc_rule(
                 Some(mode) => format!("set proc mode `{mode}` and added {verb} {rule} to {target}"),
                 None => format!("added {verb} {rule} to {target}"),
             };
+            if gated {
+                msg.push_str(&format!("\nre-trusted {}", config::PROJECT_CONFIG));
+            }
+            msg
+        }
+    })
+}
+
+/// Persist one path `entry` to the scoped config file's `[fs]` mask list, trust-gating a project
+/// write and re-trusting it after — the filesystem sibling of [`persist_proc_rule`]. Returns the
+/// success line to print, or `(exit-code, message)` on the same terms as its siblings.
+///
+/// It shares [`open_rule_write`] unchanged, and the reason is worth stating because the table it
+/// writes is the exception elsewhere: `[fs]` masks are honored from an untrusted source, so a mask
+/// written into a file nobody trusts would take effect anyway. What the gate protects is not the
+/// mask, it is the **re-trust** — a project marker covers the whole file, so blessing it for one
+/// appended line would also bless the `binds` and `network` beside it, which is
+/// [`local_save_permitted`]'s invariant and has nothing to do with which table was edited.
+///
+/// There is no `created_mode` arm, unlike the egress and proc paths: `[fs]` carries no posture, so
+/// creating the table cannot change what any other field means.
+fn persist_fs_mask(
+    list: config::manage::FsList,
+    entry: &str,
+    scope: &config::manage::Scope,
+    app: Option<&str>,
+    base: &Path,
+) -> Result<String, (u8, String)> {
+    use config::manage::{self, AddOutcome, FsList};
+    let verb = match list {
+        FsList::Deny => "deny",
+        FsList::Readonly => "readonly",
+    };
+    let RuleWrite {
+        path,
+        app_key,
+        target,
+        store,
+    } = open_rule_write("fs", verb, NO_TRUST_STORE_ON_ADD, scope, app, base)?;
+    let gated = store.is_some();
+
+    let written =
+        manage::add_fs_mask(&path, app_key, list, entry).map_err(|e| (2, e.to_string()))?;
+
+    // Re-trust after the write, on the fail-safe ordering [`persist_proc_rule`] states.
+    if let Some(store) = &store
+        && written.outcome.wrote_anything()
+    {
+        trust::trust_written(store, &path, written.text.as_bytes()).map_err(|e| {
+            (
+                1,
+                format!(
+                    "wrote the mask but could not re-trust {e} — run `sbx trust {}` so the rest of \
+                     the file takes effect",
+                    config::PROJECT_CONFIG
+                ),
+            )
+        })?;
+    }
+
+    Ok(match written.outcome {
+        AddOutcome::AlreadyPresent => {
+            format!("{verb} {entry} is already present in {target} — no change")
+        }
+        AddOutcome::Added { .. } => {
+            let mut msg = format!("added {verb} {entry} to {target}");
             if gated {
                 msg.push_str(&format!("\nre-trusted {}", config::PROJECT_CONFIG));
             }

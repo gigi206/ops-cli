@@ -123,6 +123,11 @@ pub(crate) struct CliOverrides {
     pub(crate) env: Vec<String>,
     /// `--net <posture|allow=…|deny=…>` — the network posture (last wins).
     pub(crate) net: Vec<String>,
+    /// `--fs <deny=<path>|readonly=<path>>` — one filesystem mask for this launch, repeatable and
+    /// **accumulating** rather than last-wins: every other typed flag names one setting, while this
+    /// one names an entry in a list that unions across every layer. A mask only takes access away,
+    /// so two of them never conflict and there is nothing for a later one to win.
+    pub(crate) fs: Vec<String>,
     /// `--gui <none|offscreen|wayland>` — the display posture (last wins).
     pub(crate) gui: Vec<String>,
     /// `--proc <off|observe|enforce|ask>` — the process/exec posture, a bare mode (last wins). The
@@ -188,6 +193,10 @@ struct AmbientOverrides {
     packages: Vec<(String, String)>,
     /// `SBX_SECCOMP` — a seccomp relaxation, a comma-list of allow tokens (e.g. `ptrace,unshare`).
     seccomp: Vec<String>,
+    /// `SBX_FS` — one filesystem mask, `deny=<path>` or `readonly=<path>` (a list is a blob
+    /// concern, like `SBX_BIND`). It accumulates with `--fs` rather than being beaten by it, on
+    /// the reasoning [`CliOverrides::fs`] states.
+    fs: Vec<String>,
     /// `SBX_DEVICE` — one host device path (a list is a blob concern, like `SBX_BIND`).
     devices: Vec<String>,
     /// `SBX_GPU` — the GPU posture (`true`/`false`).
@@ -203,6 +212,7 @@ struct AmbientOverrides {
 /// is validated downstream, never here), so they carry no label.
 struct TypedLabels {
     net: &'static str,
+    fs: &'static str,
     bind: &'static str,
     limit: &'static str,
     package: &'static str,
@@ -214,6 +224,7 @@ struct TypedLabels {
 
 const CLI_LABELS: TypedLabels = TypedLabels {
     net: "--net",
+    fs: "--fs",
     bind: "--bind",
     limit: "--limit",
     package: "--package",
@@ -225,6 +236,7 @@ const CLI_LABELS: TypedLabels = TypedLabels {
 
 const ENV_LABELS: TypedLabels = TypedLabels {
     net: "SBX_NET",
+    fs: "SBX_FS",
     bind: "SBX_BIND",
     limit: "SBX_LIMIT_*",
     package: "SBX_PACKAGE_*",
@@ -268,6 +280,9 @@ fn scan_ambient() -> AmbientOverrides {
     }
     if let Some(v) = env_nonempty("SBX_DEVICE") {
         a.devices.push(v);
+    }
+    if let Some(v) = env_nonempty("SBX_FS") {
+        a.fs.push(v);
     }
     // `std::env::vars` panics when **any** variable in the environment — not merely one sbx reads —
     // carries a name or a value that is not valid Unicode, and this scan runs at the head of every
@@ -341,6 +356,7 @@ fn collect_from(cli: &CliOverrides, ambient: &AmbientOverrides) -> Result<Overri
     // Tier 1 — the environment's typed fragments.
     let t1 = build_typed_fragment(
         ambient.net.as_deref(),
+        &ambient.fs,
         ambient.gui.as_deref(),
         ambient.proc.as_deref(),
         ambient.notify.as_deref(),
@@ -372,6 +388,7 @@ fn collect_from(cli: &CliOverrides, ambient: &AmbientOverrides) -> Result<Overri
     let cli_env = split_kv(&cli.env, "--env")?;
     let t3 = build_typed_fragment(
         cli.net.last().map(String::as_str),
+        &cli.fs,
         cli.gui.last().map(String::as_str),
         cli.proc.last().map(String::as_str),
         cli.notify.last().map(String::as_str),
@@ -1057,6 +1074,7 @@ fn parse_forward_token(token: &str, label: &str) -> Result<schema::RawForward, S
 #[allow(clippy::too_many_arguments)]
 fn build_typed_fragment(
     net: Option<&str>,
+    fs: &[String],
     gui: Option<&str>,
     proc: Option<&str>,
     notify: Option<&str>,
@@ -1150,6 +1168,28 @@ fn build_typed_fragment(
             rest: Default::default(),
             allow: devices.to_vec(),
         });
+    }
+    // `--fs deny=<path>` / `--fs readonly=<path>` carry one mask each into the `[fs]` lists. The
+    // side must be named because the table holds two of them, unlike `--seccomp`/`--device` whose
+    // table has a single `allow`; the entry itself lands verbatim, validated downstream by
+    // `apply_fs` like any other layer's.
+    if !fs.is_empty() {
+        let mut table = RawFs::default();
+        for spec in fs {
+            match spec.split_once('=') {
+                Some(("deny", path)) if !path.is_empty() => table.deny.push(path.to_string()),
+                Some(("readonly", path)) if !path.is_empty() => {
+                    table.readonly.push(path.to_string());
+                }
+                _ => {
+                    return Err(format!(
+                        "{}: expected `deny=<path>` or `readonly=<path>`, got `{spec}`",
+                        lbl.fs
+                    ));
+                }
+            }
+        }
+        raw.fs = Some(table);
     }
     Ok(raw)
 }
@@ -1360,6 +1400,7 @@ mod tests {
         config: &'a [&'a str],
         env: &'a [&'a str],
         net: &'a [&'a str],
+        fs: &'a [&'a str],
         gui: &'a [&'a str],
         proc: &'a [&'a str],
         notify: &'a [&'a str],
@@ -1384,6 +1425,7 @@ mod tests {
             config: owned(cli.config),
             env: owned(cli.env),
             net: owned(cli.net),
+            fs: owned(cli.fs),
             gui: owned(cli.gui),
             proc: owned(cli.proc),
             notify: owned(cli.notify),
@@ -2507,6 +2549,60 @@ mod tests {
         assert_eq!(
             ov.raw.devices.as_ref().map(|d| d.allow.as_slice()),
             Some(&["/dev/kvm".to_string(), "/dev/dri".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn a_typed_fs_flag_names_the_list_it_writes_and_accumulates() {
+        // Two masks, one per list, from one command line. `--fs` is the only typed flag that is not
+        // last-wins: a mask takes access away, so two of them never conflict.
+        let ov = collect_cli(Cli {
+            fs: &["deny=prod.key", "readonly=Cargo.lock", "deny=certs/*.pem"],
+            ..Default::default()
+        })
+        .unwrap();
+        let fs = ov.raw.fs.as_ref().expect("the [fs] table was built");
+        assert_eq!(fs.deny, ["prod.key", "certs/*.pem"]);
+        assert_eq!(fs.readonly, ["Cargo.lock"]);
+    }
+
+    #[test]
+    fn a_typed_fs_flag_refuses_a_value_that_names_no_list() {
+        // Fail-closed and named: `[fs]` holds two lists, so a bare path could only be guessed into
+        // one of them, and guessing `readonly` where `deny` was meant leaves a secret readable.
+        for bad in ["prod.key", "denied=prod.key", "deny=", "=prod.key"] {
+            let err = collect_cli(Cli {
+                fs: &[bad],
+                ..Default::default()
+            })
+            .expect_err(&format!("`{bad}` must be refused"));
+            assert!(err.contains("--fs"), "the flag is named: {err}");
+            assert!(err.contains(bad), "and the value is quoted back: {err}");
+        }
+    }
+
+    #[test]
+    fn an_fs_mask_unions_across_the_env_and_cli_tiers() {
+        // `SBX_FS` + `--fs` accumulate, like `SBX_SECCOMP` + `--seccomp`: the CLI adds to the
+        // environment's mask rather than replacing it. A mask that a later tier silently dropped
+        // would reopen a path the earlier one closed.
+        let ov = collect_from(
+            &CliOverrides {
+                fs: owned(&["deny=cli.key"]),
+                ..Default::default()
+            },
+            &AmbientOverrides {
+                fs: owned(&["deny=ambient.key"]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let fs = ov.raw.fs.as_ref().expect("the [fs] table was built");
+        assert!(fs.deny.contains(&"cli.key".to_string()), "{:?}", fs.deny);
+        assert!(
+            fs.deny.contains(&"ambient.key".to_string()),
+            "the ambient mask must survive the CLI one: {:?}",
+            fs.deny
         );
     }
 

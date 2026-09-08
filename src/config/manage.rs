@@ -101,6 +101,11 @@ pub(crate) enum ManageError {
     /// The `proc` field is neither a mode string nor a table (a malformed config) — refuse rather
     /// than guess.
     MalformedProc(String),
+    /// The `fs` field is not a table (a malformed config) — refuse rather than guess.
+    ///
+    /// It has no bare-string sibling to promote, unlike [`ManageError::MalformedProc`]: `[fs]`
+    /// carries only lists and a ceiling, so there is no one-word spelling of it to accept.
+    MalformedFs(String),
 }
 
 /// Which egress list a rule is added to.
@@ -147,6 +152,29 @@ impl ProcList {
         match self {
             ProcList::Allow => "allow",
             ProcList::Deny => "deny",
+        }
+    }
+}
+
+/// Which filesystem mask list an entry is written to (`[fs].deny` / `[fs].readonly`).
+///
+/// Both take away and neither grants, which is why this is the one security table honored from an
+/// untrusted source — so unlike [`EgressList`] and [`ProcList`] there is no posture to bootstrap
+/// and no mode that could leave an entry inert. An entry is a path pattern, not a rule of a
+/// grammar, and it is validated by [`super::fspolicy`] at launch rather than here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FsList {
+    /// `deny`: the cage may not read the path. The name stays visible.
+    Deny,
+    /// `readonly`: the cage may read the path but not write it.
+    Readonly,
+}
+
+impl FsList {
+    fn key(self) -> &'static str {
+        match self {
+            FsList::Deny => "deny",
+            FsList::Readonly => "readonly",
         }
     }
 }
@@ -299,6 +327,12 @@ impl std::fmt::Display for ManageError {
                 write!(
                     f,
                     "the `proc` field is malformed ({s}) — edit it with `sbx config edit`"
+                )
+            }
+            ManageError::MalformedFs(s) => {
+                write!(
+                    f,
+                    "the `fs` field is malformed ({s}) — edit it with `sbx config edit`"
                 )
             }
         }
@@ -1399,6 +1433,77 @@ pub(crate) fn remove_proc_rule(
     rule: &str,
 ) -> Result<RemoveOutcome, ManageError> {
     remove_rule_from(path, app, "proc", list.key(), rule)
+}
+
+/// Add one path `entry` to `[fs].deny` or `[fs].readonly` in the scoped config file, creating the
+/// table when it is absent. Under `[app.<name>]` when an app is named. Preserves comments and
+/// formatting; idempotent on an exact-string match, which writes nothing.
+///
+/// Shorter than its two siblings because the table it edits has no posture: [`add_proc_rule`] must
+/// bootstrap a mode and refuse a rule that would sit inert under the one already there, and the
+/// egress path does the same. A mask only ever takes access away, so there is no state in which
+/// writing one is a no-op the writer did not ask for, and nothing to refuse.
+pub(crate) fn add_fs_mask(
+    path: &Path,
+    app: Option<&str>,
+    list: FsList,
+    entry: &str,
+) -> Result<Written<AddOutcome>, ManageError> {
+    let mut doc = read_or_empty(path)?;
+    let parent = layer_parent(&mut doc, app)?;
+    let outcome = match parent.get("fs") {
+        None => {
+            let mut t = Table::new();
+            let mut arr = Array::new();
+            arr.push(entry);
+            t.insert(list.key(), value(arr));
+            parent.insert("fs", Item::Table(t));
+            AddOutcome::Added { created_mode: None }
+        }
+        Some(Item::Table(_)) => {
+            let t = parent["fs"]
+                .as_table_mut()
+                .expect("inspected as a regular table");
+            let arr = t
+                .entry(list.key())
+                .or_insert_with(|| value(Array::new()))
+                .as_array_mut()
+                .ok_or_else(|| {
+                    ManageError::MalformedFs(format!("`{}` is not an array", list.key()))
+                })?;
+            push_outcome(arr, entry)
+        }
+        Some(Item::Value(v)) if v.is_inline_table() => {
+            let it = parent["fs"]
+                .as_value_mut()
+                .and_then(Value::as_inline_table_mut)
+                .expect("inspected as an inline table");
+            let arr = it
+                .entry(list.key())
+                .or_insert_with(|| Value::Array(Array::new()))
+                .as_array_mut()
+                .ok_or_else(|| {
+                    ManageError::MalformedFs(format!("`{}` is not an array", list.key()))
+                })?;
+            push_outcome(arr, entry)
+        }
+        Some(_) => return Err(ManageError::MalformedFs("not a table".into())),
+    };
+
+    let text = commit_rule(path, &doc, &outcome)?;
+    Ok(Written { outcome, text })
+}
+
+/// Take one path `entry` back out of `[fs].deny` or `[fs].readonly` — the removal sibling of
+/// [`add_fs_mask`], on the terms [`remove_rule_from`] states: an absent file, an absent table or an
+/// entry that is simply not there are all a clean [`RemoveOutcome::NotPresent`].
+pub(crate) fn remove_fs_mask(
+    path: &Path,
+    app: Option<&str>,
+    list: FsList,
+    entry: &str,
+) -> Result<RemoveOutcome, ManageError> {
+    remove_rule_from(path, app, "fs", list.key(), entry)
 }
 
 /// Take one `rule` out of the array at `key` inside the target's `table` (`network` or `proc`),
@@ -3362,6 +3467,78 @@ mod tests {
             add_egress_rule(&p, None, EgressList::Allow, "x.com", Inherited::Nothing),
             Err(ManageError::MalformedNetwork(_))
         ));
+    }
+
+    #[test]
+    fn add_fs_mask_creates_the_table_on_a_fresh_config_and_carries_no_posture() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "");
+        let out = add_fs_mask(&p, None, FsList::Deny, "prod.key")
+            .unwrap()
+            .outcome;
+        // No `created_mode`, unlike every other bootstrap: `[fs]` has no posture to set, so
+        // creating the table cannot change what another field means.
+        assert_eq!(out, AddOutcome::Added { created_mode: None });
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.contains("[fs]"), "{body}");
+        assert!(body.contains("deny = [\"prod.key\"]"), "{body}");
+        assert!(!body.contains("mode"), "no posture is invented: {body}");
+    }
+
+    #[test]
+    fn add_fs_mask_writes_each_list_beside_the_other_and_is_idempotent() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = doc_at(tmp.path(), "");
+        add_fs_mask(&p, None, FsList::Deny, "prod.key").unwrap();
+        add_fs_mask(&p, None, FsList::Readonly, "Cargo.lock").unwrap();
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.contains("deny = [\"prod.key\"]"), "{body}");
+        assert!(body.contains("readonly = [\"Cargo.lock\"]"), "{body}");
+
+        // An exact-string repeat writes nothing and says so.
+        let again = add_fs_mask(&p, None, FsList::Deny, "prod.key")
+            .unwrap()
+            .outcome;
+        assert_eq!(again, AddOutcome::AlreadyPresent);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), body, "no rewrite");
+    }
+
+    #[test]
+    fn add_fs_mask_refuses_a_malformed_table_rather_than_replacing_it() {
+        let tmp = crate::testutil::TmpDir::new();
+        // `fs` as a scalar has no bare-string form to promote (unlike `proc = "enforce"`), so it is
+        // malformed rather than a posture, and the write must not clobber it.
+        let p = doc_at(tmp.path(), "fs = 42\n");
+        assert!(matches!(
+            add_fs_mask(&p, None, FsList::Deny, "x"),
+            Err(ManageError::MalformedFs(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "fs = 42\n");
+    }
+
+    #[test]
+    fn remove_fs_mask_is_a_no_op_when_the_entry_or_the_file_is_absent() {
+        let tmp = crate::testutil::TmpDir::new();
+        let p = tmp.path().join("nothing-here.toml");
+        assert_eq!(
+            remove_fs_mask(&p, None, FsList::Deny, "x").unwrap(),
+            RemoveOutcome::NotPresent,
+            "an absent file is a clean no-op, never an error"
+        );
+
+        let p = doc_at(tmp.path(), "[fs]\ndeny = [\"prod.key\"]\n");
+        assert_eq!(
+            remove_fs_mask(&p, None, FsList::Readonly, "prod.key").unwrap(),
+            RemoveOutcome::NotPresent,
+            "the entry is in the other list, so this list does not hold it"
+        );
+        assert!(matches!(
+            remove_fs_mask(&p, None, FsList::Deny, "prod.key").unwrap(),
+            RemoveOutcome::Removed { .. }
+        ));
+        // The emptied list is dropped, leaving no `deny = []` residue behind.
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(!body.contains("deny"), "{body}");
     }
 
     #[test]

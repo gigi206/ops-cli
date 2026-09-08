@@ -69,6 +69,7 @@ Ergonomic shorthands for a single field, each with an `SBX_*` environment equiva
 | `--package <name>=<backend:locator>` | `SBX_PACKAGE_<name>` | a package |
 | `--seccomp <token[,token…]>` | `SBX_SECCOMP` | relax the syscall denylist ([`[seccomp]`](seccomp) grammar); repeatable |
 | `--device <path>` | `SBX_DEVICE` | grant a host device node ([`[devices]`](devices)); repeatable |
+| `--fs <deny=<path>\|readonly=<path>>` | `SBX_FS` | close a project path in the cage ([`[fs]`](fs)); repeatable, and it accumulates |
 | `--gpu[=true\|false]` | `SBX_GPU` | the [GPU](gpu) posture (bare `--gpu` means `true`) |
 | `--audio[=true\|false]` | `SBX_AUDIO` | the [audio](audio) posture: microphone and playback (bare `--audio` means `true`) |
 | `--dbus[=true\|false]` | `SBX_DBUS` | the in-cage [desktop portal](dbus) (bare `--dbus` means `true`) |
@@ -78,6 +79,7 @@ sbx run --net none --limit tasks_max=8192 -- ./build.sh
 sbx app run claude-code --net none        # cut the app's network for one run
 sbx run --seccomp ptrace -- gdb ./a.out   # relax the denylist for one debug session
 sbx run --device /dev/kvm -- ./vm.sh      # grant a device for one run
+sbx run --fs deny=.env -- pytest          # close one path for one run
 SBX_NET=none SBX_BIND=/opt/data:ro sbx run
 ```
 
@@ -91,6 +93,22 @@ deliberate, because the two say different things. A variable arrives from an env
 nobody re-read, where emptying it is the ordinary way to neutralise a value inherited from a
 shell profile or a parent process; a flag arrives from the command line, where an empty value
 is a slip worth naming rather than a posture worth launching.
+
+#### `--fs`: the one override that adds instead of replacing
+
+Every other typed flag names a single setting, so a later tier wins and the precedence line
+below settles it. `--fs` names an **entry in a list**, and `[fs]` unions across every layer
+because a mask can only take access away. So `--fs` adds to whatever the config files already
+closed, `SBX_FS` and `--fs` accumulate with each other rather than the flag beating the
+variable, and no spelling of either lifts a mask.
+
+That is also why `[fs]` is the one security table honored from an untrusted project: there is
+nothing to gate when a field cannot grant. The override is still the more-trusted layer, it
+simply has nothing extra to say here.
+
+The side must be named (`deny=` or `readonly=`), because the table holds two lists and a bare
+path could only be guessed into one of them; guessing `readonly` where `deny` was meant leaves a
+secret readable. A value naming neither is a usage error (exit 2), like any other mistyped flag.
 
 #### `--seccomp` / `--device`: relaxing the cage for one launch
 

@@ -150,6 +150,10 @@ pub(super) const PAGES: &[Page] = &[
                 "one-shot host device grant, one path per flag (e.g. /dev/kvm); repeatable",
             ),
             (
+                "--fs <mask>",
+                "one-shot filesystem mask, `deny=<path>` or `readonly=<path>`, one per flag (e.g. deny=prod.key); repeatable, and it adds to the configured masks rather than replacing them",
+            ),
+            (
                 "--gpu[=true|false]",
                 "one-shot GPU posture (bare --gpu means true); --gpu=false disables it",
             ),
@@ -340,6 +344,10 @@ pub(super) const PAGES: &[Page] = &[
             (
                 "--device <path>",
                 "one-shot host device grant, one path per flag (e.g. /dev/kvm); repeatable",
+            ),
+            (
+                "--fs <mask>",
+                "one-shot filesystem mask, `deny=<path>` or `readonly=<path>`, one per flag (e.g. deny=prod.key); repeatable, and it adds to the configured masks rather than replacing them",
             ),
             (
                 "--gpu[=true|false]",
@@ -756,28 +764,133 @@ pub(super) const PAGES: &[Page] = &[
     Page {
         path: &["fs"],
         synopsis: "sbx fs <subcommand> [args...]",
-        summary: "observe the files a running sandbox writes in its project",
+        summary: "observe the files a running sandbox writes, and mask project paths in the cage",
         options: &[],
         details: "The filesystem lens of a running session, sibling of `sbx proc` (processes) and `sbx net`\n\
             (egress). `sbx fs logs` is the file-write feed: the files the agent creates, writes,\n\
             deletes, or moves in its project tree, observed host-side with inotify — available for a\n\
             session launched with observation on (`sbx run --observe`).\n\
             \n\
-            This verb only reports. Closing a path off is the config table of the same name: a\n\
-            `[fs] deny` entry makes a project path unreadable in every cage the session builds (the\n\
-            name stays visible, opening it returns EACCES; a denied directory reads empty, and\n\
-            everything under it is ENOENT), while `[fs] readonly` leaves the real content readable\n\
-            and refuses writes (EROFS). Both mask by mounting over the path inside the cage, so the\n\
-            host file is never modified, moved, or copied.\n\
+            The other four verbs write the config table of the same name. A `[fs] deny` entry makes a\n\
+            project path unreadable in every cage the session builds (the name stays visible, opening\n\
+            it returns EACCES; a denied directory reads empty, and everything under it is ENOENT),\n\
+            while `[fs] readonly` leaves the real content readable and refuses writes (EROFS). Both\n\
+            mask by mounting over the path inside the cage, so the host file is never modified,\n\
+            moved, or copied.\n\
             \n\
             `[fs]` is the one security table honored from an untrusted project too: it can only\n\
             close a path of the project that declares it, and there is no syntax for reopening one.\n\
-            Its entries are lists, so they are written with `sbx config edit` and not with\n\
-            `sbx config set`, and `sbx config show` prints the effective masks with the layer each\n\
-            came from. A single launch takes one in a `--config` blob (there is no typed flag), and\n\
-            one declared operation may read through a mask with `[task.<name>] unmask`.\n\
+            Layers union, so `sbx fs undeny` widens only within the layer it edits, and\n\
+            `sbx config show` prints the effective masks with the layer each came from. A single\n\
+            launch takes one in a `--config` blob, and one declared operation may read through a\n\
+            mask with `[task.<name>] unmask`.\n\
+            \n\
+            Unlike its two siblings this family has no `rules` verb and no `--session` form. A mask\n\
+            is a mount and a cage's mounts are fixed when it is built, so there is no live overlay to\n\
+            list or to load into: what `sbx net rules` and `sbx proc rules` show is exactly that\n\
+            overlay, and the effective masks are already in `sbx config show`.\n\
             \n\
             Run one of the subcommands below.",
+    },
+    Page {
+        path: &["fs", "deny"],
+        synopsis: "sbx fs deny <path> [-l|--local|-g|--global] [-a|--app <name>]",
+        summary: "persist a path mask to a config file's [fs] deny list",
+        options: &[
+            (
+                "<path>",
+                "a project-relative path or glob (`prod.key`, `certs/*.pem`, `secrets/`). A trailing `/` names a directory, which closes whatever appears inside it later",
+            ),
+            ("-l, --local", "write the project .sbx.toml (the default)"),
+            ("-g, --global", "write the global sbx.toml"),
+            (
+                "-a, --app <name>",
+                "write the mask under that app's `[app.<name>.fs]`",
+            ),
+        ],
+        details: "Adds an entry to the `[fs]` deny list: the path is closed to the cage from the next\n\
+            launch on. The name stays visible and the host file is never touched — only the content\n\
+            is masked, by mounting over the path inside the cage.\n\
+            \n\
+            There is no `--session` form, and that is structural rather than an omission: a mask is a\n\
+            mount, and a cage's mounts are fixed when it is built, so `[fs]` resolves at launch and\n\
+            has no live overlay to load into. Close the path and relaunch, or reach for\n\
+            `[fs] scan`, which asks at every open instead of at launch.\n\
+            \n\
+            Layers union and no layer can undo one below it, so this only ever adds. Writing the\n\
+            project config re-trusts it (it must be absent or already trusted first) — the gate is\n\
+            about the re-trust, which covers the whole file, not about the mask: `[fs]` is the one\n\
+            security table honored from an untrusted project, because it can only take access away.",
+    },
+    Page {
+        path: &["fs", "undeny"],
+        synopsis: "sbx fs undeny <path> [-l|--local|-g|--global] [-a|--app <name>]",
+        summary: "remove a path mask from a config file's [fs] deny list (the inverse of `sbx fs deny`)",
+        options: &[
+            (
+                "<path>",
+                "the deny entry to remove — an exact-string match of what was written, as `sbx config show` lists it",
+            ),
+            ("-l, --local", "edit the project .sbx.toml (the default)"),
+            ("-g, --global", "edit the global sbx.toml"),
+            ("-a, --app <name>", "edit that app's `[app.<name>.fs]`"),
+        ],
+        details: "Removes an entry added by `sbx fs deny`. Idempotent: removing one that is not there is a\n\
+            reported no-op, not an error. Editing the project config re-trusts it (only when\n\
+            something actually changed).\n\
+            \n\
+            This removal **widens what the cage can read**, and it widens only within the layer it\n\
+            edits. Masks union across layers, so taking an entry out of the project config leaves a\n\
+            global or app entry for the same path in force; `sbx config show` says which layer set\n\
+            what still stands.",
+    },
+    Page {
+        path: &["fs", "readonly"],
+        synopsis: "sbx fs readonly <path> [-l|--local|-g|--global] [-a|--app <name>]",
+        summary: "persist a path mask to a config file's [fs] readonly list",
+        options: &[
+            (
+                "<path>",
+                "a project-relative path or glob (`Cargo.lock`, `.git/config`). A trailing `/` names a directory",
+            ),
+            ("-l, --local", "write the project .sbx.toml (the default)"),
+            ("-g, --global", "write the global sbx.toml"),
+            (
+                "-a, --app <name>",
+                "write the mask under that app's `[app.<name>.fs]`",
+            ),
+        ],
+        details: "Adds an entry to the `[fs]` readonly list: the path keeps its real content and stays\n\
+            readable in the cage, and a write to it is refused (EROFS). The complement of\n\
+            `sbx fs deny`, for a file a build must read but nothing should edit.\n\
+            \n\
+            One hole is worth knowing before relying on it: a mask covers a *path*, not an inode. A\n\
+            second hard link to the same file inside the project reaches it around the mask — and for\n\
+            a `readonly` entry that second name is writable, not merely readable. sbx warns at launch\n\
+            when a masked file has more than one link.\n\
+            \n\
+            Everything else — no `--session` form, the union across layers, the trust gate on a\n\
+            project write — is as `sbx fs deny` describes it.",
+    },
+    Page {
+        path: &["fs", "unreadonly"],
+        synopsis: "sbx fs unreadonly <path> [-l|--local|-g|--global] [-a|--app <name>]",
+        summary: "remove a path mask from a config file's [fs] readonly list (the inverse of `sbx fs readonly`)",
+        options: &[
+            (
+                "<path>",
+                "the readonly entry to remove — an exact-string match of what was written, as `sbx config show` lists it",
+            ),
+            ("-l, --local", "edit the project .sbx.toml (the default)"),
+            ("-g, --global", "edit the global sbx.toml"),
+            ("-a, --app <name>", "edit that app's `[app.<name>.fs]`"),
+        ],
+        details: "Removes an entry added by `sbx fs readonly`, making the path writable again in the cage\n\
+            from the next launch on. Idempotent, and it widens only within the layer it edits, on the\n\
+            terms `sbx fs undeny` states.\n\
+            \n\
+            The verb is spelled after what it undoes, like `sbx net unmute` and `sbx proc undeny`: a\n\
+            mask is taken back out with the vocabulary it was written in.",
     },
     Page {
         path: &["fs", "logs"],

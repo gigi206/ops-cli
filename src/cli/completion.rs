@@ -2104,6 +2104,10 @@ mod tests {
         // A seccomp relaxation token (`ptrace`, `clone:newuser`), whose vocabulary belongs
         // to the filter builder rather than to the CLI grammar.
         "token",
+        // A one-shot `[fs]` mask: `deny=<path>` or `readonly=<path>`. The side is a closed pair but
+        // the path is not, and completing the two words alone would offer a value the parser
+        // refuses (a side with no path).
+        "mask",
         // A name that does not exist yet: the one an import is being given. Offering the installed
         // apps would name exactly the values the parser refuses, which is what the plain `<name>`
         // spelling used to do here.

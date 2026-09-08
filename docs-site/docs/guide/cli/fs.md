@@ -1,24 +1,101 @@
 ---
-description: "Observe the files a running sandbox writes in its project tree."
+description: "Observe the files a running sandbox writes in its project tree, and close project paths off inside the cage."
 ---
 
 # `sbx fs`
 
 ```
-sbx fs logs [<id>] [-f|--follow] [--json]
+sbx fs logs       [<id>] [-f|--follow] [--json]
+sbx fs deny       <path> [-l|--local|-g|--global] [-a|--app <name>]
+sbx fs undeny     <path> [-l|--local|-g|--global] [-a|--app <name>]
+sbx fs readonly   <path> [-l|--local|-g|--global] [-a|--app <name>]
+sbx fs unreadonly <path> [-l|--local|-g|--global] [-a|--app <name>]
 ```
 
-Observe the **files a running sandbox writes** in its project tree: the filesystem lens of a
-running session, sibling of [`sbx proc`](proc) (processes) and [`sbx net`](net) (egress).
+The filesystem lens of a running session, sibling of [`sbx proc`](proc) (processes) and
+[`sbx net`](net) (egress), and the verbs that write its policy.
+
 `sbx fs logs` is the **file-write feed**: the files the agent creates, writes, deletes, or moves,
 in order, for a session started with observation on
-([`sbx run --observe`](run#observing-a-run---observe)).
+([`sbx run --observe`](run#observing-a-run---observe)). It reports what the agent wrote.
 
-This is the **observation** side of the filesystem. The one that closes paths off is the
-[`[fs]` config table](../configuration/fs), which is a different thing entirely: `sbx fs logs`
-reports what the agent wrote, `[fs] deny` decides what it can read.
+The other four write the [`[fs]` config table](../configuration/fs), which decides what the agent
+can **read**: `deny` closes a project path inside the cage, `readonly` leaves it readable and
+refuses writes, and each has the inverse spelled after it.
 
 See also: [The four lenses](../concepts/observability#the-four-lenses) · [`sbx proc`](proc) · [`sbx net`](net) · [`sbx session`](session).
+
+## `deny` / `readonly`
+
+```
+sbx fs deny     <path> [-l|--local|-g|--global] [-a|--app <name>]
+sbx fs readonly <path> [-l|--local|-g|--global] [-a|--app <name>]
+```
+
+Persist a path mask to a config file's [`[fs]`](../configuration/fs) `deny`/`readonly` list.
+`deny` closes the path to the cage: the name stays visible, opening it is refused, and a denied
+directory reads empty. `readonly` keeps the real content readable and refuses writes. Both mask by
+mounting over the path **inside the cage**, so the host file is never modified, moved, or copied.
+
+| Operand / option | Meaning |
+|---|---|
+| `<path>` | a project-relative path or glob (`prod.key`, `certs/*.pem`, `secrets/`). A trailing `/` names a directory, which closes whatever appears inside it later |
+| `-l`, `--local` | write the project `.sbx.toml` (the default) |
+| `-g`, `--global` | write the global `sbx.toml`, or the app's profile when `-a` names one |
+| `-a`, `--app <name>` | write the mask under that app's `[app.<name>.fs]` |
+
+```sh
+sbx fs deny prod.key               # fresh project: writes [fs] deny = ["prod.key"]
+sbx fs deny 'certs/*.pem'          # quote a glob so the shell does not expand it first
+sbx fs readonly Cargo.lock         # readable, not writable
+sbx fs deny .env -a claude-code    # under that app's [app.claude-code.fs]
+```
+
+There is **no posture to bootstrap**, unlike [`sbx proc deny`](proc#allow--deny): `[fs]` carries no
+mode, so writing a mask cannot leave another field meaning something else, and no mask is ever
+inert.
+
+Writing the project `.sbx.toml` **re-trusts** it (it must be absent or already trusted first), so
+the mask takes effect on the next launch; the global config and app profiles are trusted by
+location. That gate is about the re-trust and not about the mask: a project trust marker covers the
+whole file, so blessing it for one appended line would also bless the `binds` and `network` beside
+it. `[fs]` itself is honored from an untrusted project, because a mask can only take access away.
+
+### There is no `--session` form, and no `rules`
+
+Both absences are structural rather than omissions, and they are the same fact twice.
+
+A mask is a **mount**, and a cage's mounts are fixed when it is built. `[fs]` resolves at launch, so
+there is no live overlay to load a mask into the way
+[`sbx proc deny --session`](proc#--session-load-a-rule-into-a-running-session) does, and nothing for
+a `rules` verb to list: what its two siblings' `rules` shows is exactly that overlay. The effective
+masks and the layer each came from are already in [`sbx config show`](config#show).
+
+To close a path in a session that is already running, add the mask and relaunch. To cover a file
+that appears or changes **mid-session**, reach for
+[`[fs] scan`](../configuration/fs#scan-closing-a-file-by-what-it-holds) instead, which asks at every
+open rather than at launch.
+
+## `undeny` / `unreadonly`
+
+```
+sbx fs undeny     <path> [-l|--local|-g|--global] [-a|--app <name>]
+sbx fs unreadonly <path> [-l|--local|-g|--global] [-a|--app <name>]
+```
+
+Remove a mask added by its namesake, so an entry is undone with the vocabulary it was written in.
+The `<path>` is an **exact-string** match of what was written, as
+[`sbx config show`](config#show) lists it. Idempotent: removing an entry that is not there is a
+reported no-op, not an error. The two do not reach each other's list.
+
+```sh
+sbx fs undeny prod.key             # the cage can read it again from the next launch
+sbx fs unreadonly Cargo.lock       # writable again
+```
+
+This is the removal that **widens what the cage can read**, and it widens only within the layer it
+edits. Masks union across layers and no layer can undo one below it, so taking an entry out of the
+project config leaves a global or app entry for the same path in force.
 
 ## `logs`
 

@@ -28,17 +28,22 @@ beats the environment; a security field set from the environment prints a stderr
 | `SBX_PACKAGE_<name>` | `--package name=…` | a package (`SBX_PACKAGE_hello=nix:hello`) |
 | `SBX_SECCOMP` | `--seccomp` | relax the syscall denylist, a comma-list of [`[seccomp]`](../configuration/seccomp) tokens (`SBX_SECCOMP=ptrace,unshare`) |
 | `SBX_DEVICE` | `--device` | grant one host [device node](../configuration/devices) (`SBX_DEVICE=/dev/kvm`) |
+| `SBX_FS` | `--fs` | close one project path in the cage, `deny=<path>` or `readonly=<path>` (`SBX_FS=deny=prod.key`), per [`[fs]`](../configuration/fs) |
 | `SBX_GPU` | `--gpu` | the [GPU](../configuration/gpu) posture (`true`/`false`) |
 | `SBX_AUDIO` | `--audio` | the [audio](../configuration/audio) posture (`true`/`false`) |
 | `SBX_DBUS` | `--dbus` | the in-cage [desktop portal](../configuration/dbus) (`true`/`false`) |
 
 `SBX_GPU`, `SBX_AUDIO` and `SBX_DBUS` accept only `true` or `false`; any other value is a
 structural error and the launch is refused (exit 2), like a mistyped flag. `SBX_BIND` and
-`SBX_DEVICE` each carry exactly one value (a list is a `--config`/`SBX_CONFIG` concern),
-while `SBX_SECCOMP` and `SBX_FORWARD` take a comma-separated list in a single value.
+`SBX_DEVICE` and `SBX_FS` each carry exactly one value (a list is a `--config`/`SBX_CONFIG`
+concern), while `SBX_SECCOMP` and `SBX_FORWARD` take a comma-separated list in a single value.
 
 Precedence, lowest to highest:
 `SBX_CONFIG < SBX_* typed < --config < --* typed`.
+
+`SBX_FS` is the exception to that last line, and the only one: a mask takes access away, so
+`SBX_FS` and `--fs` **accumulate** rather than the flag beating the variable. A later tier that
+silently dropped a mask would reopen a path an earlier one closed.
 
 ### Examples
 
