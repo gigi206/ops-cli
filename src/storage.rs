@@ -466,9 +466,18 @@ pub(crate) fn loop_for(image: &Path, sys_block: &Path) -> io::Result<Option<Stri
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
         };
-        // The kernel may mark a deleted backing file; compare the path itself.
-        let target = target.trim_end_matches('\n').trim_end_matches(" (deleted)");
-        if Path::new(target) == image || same_file(Path::new(target), &canonical_image) {
+        // The kernel may mark a deleted backing file, so the suffix is stripped — but only as a
+        // *second* reading. A file may legitimately be named `vol (deleted)`, and amputating it
+        // first left the comparison looking for a path nobody has: the literal test failed, and
+        // `same_file` canonicalized a name that does not exist. The name as recorded is therefore
+        // tried before the name with the marker removed, and a missed match here is the second
+        // attachment this function exists to prevent.
+        let target = target.trim_end_matches('\n');
+        let candidates = [target, target.trim_end_matches(" (deleted)")];
+        if candidates
+            .iter()
+            .any(|t| Path::new(t) == image || same_file(Path::new(t), &canonical_image))
+        {
             return Ok(Some(format!("/dev/{}", name.to_string_lossy())));
         }
     }
@@ -1777,6 +1786,28 @@ this line has no separator at all
             loop_for(Path::new("/nowhere.img"), &sys).unwrap(),
             None,
             "an unbacked image must report no device, or `up` would mount someone else's"
+        );
+    }
+
+    /// A file whose name really ends in ` (deleted)` is found under that name.
+    ///
+    /// The marker the kernel appends and a legitimate suffix are the same nine characters, so
+    /// stripping first made the two indistinguishable and lost the second: the literal comparison
+    /// looked for a path nobody had, and `same_file` canonicalized a name that does not exist. The
+    /// cost is not a cosmetic miss — `state` would report the volume detached and `up` would attach
+    /// a second loop device to it.
+    #[test]
+    fn a_backing_file_named_deleted_is_still_its_own_image() {
+        let base = crate::testutil::TmpDir::new();
+        let sys = base.path().join("block");
+        let image = base.path().join("vol (deleted)");
+        std::fs::write(&image, b"x").unwrap();
+        let d = sys.join("loop5").join("loop");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("backing_file"), format!("{}\n", image.display())).unwrap();
+        assert_eq!(
+            loop_for(&image, &sys).unwrap().as_deref(),
+            Some("/dev/loop5")
         );
     }
 
