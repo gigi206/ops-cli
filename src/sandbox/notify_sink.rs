@@ -86,6 +86,17 @@ static LOGO_DARK: &[u8] = include_bytes!("../../assets/sbx-dark.png");
 /// an announcement that never arrives.
 const THEME_READ_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// The longest one notification call may take before the delivery is given up on.
+///
+/// This is the bound the teardown's `join` inherits, and it is the one the flag on the loop cannot
+/// give: the flag ends the *wait for work*, while a call already in flight is a round trip to
+/// something outside this process — a desktop daemon that accepted the call and does not answer
+/// holds the thread, and with it the `Drop` that joins it. Bounded here, at the send, because this
+/// is where the peer is known; a daemon that misses this window is treated as a failed call, so the
+/// existing reconnect-once path runs and only a second timeout falls back to stderr. Wide enough
+/// that a daemon merely busy still lands (a live call is a sub-millisecond round trip).
+const DELIVER_DEADLINE: Duration = Duration::from_secs(5);
+
 /// How often the delivery thread wakes to re-check the stop flag while the queue is empty.
 ///
 /// The channel closing is the normal way the thread ends, but a notifier reached through an `Arc`
@@ -364,6 +375,30 @@ struct DesktopSink {
     address: Option<String>,
 }
 
+/// Drive one notification call to completion under [`DELIVER_DEADLINE`], or report it failed.
+///
+/// A timeout is reported as the call's own failure rather than as its own kind, so the caller's
+/// reconnect-once path applies unchanged: a daemon that was restarted and one that stopped
+/// answering are the same problem from here, and the answer to both is a fresh connection before
+/// giving up on the transport.
+fn bounded_notify(call: impl std::future::Future<Output = Result<u32, ()>>) -> Result<u32, ()> {
+    bounded_notify_within(call, DELIVER_DEADLINE)
+}
+
+/// [`bounded_notify`] with the bound as an argument, so a test can drive the giving-up branch
+/// without waiting the real window out.
+fn bounded_notify_within(
+    call: impl std::future::Future<Output = Result<u32, ()>>,
+    deadline: Duration,
+) -> Result<u32, ()> {
+    async_io::block_on(async {
+        futures_util::select! {
+            sent = call.fuse() => sent,
+            _ = futures_util::FutureExt::fuse(async_io::Timer::after(deadline)) => Err(()),
+        }
+    })
+}
+
 /// One notification call over already-bound proxies. Separated from [`DesktopSink::deliver`] so the
 /// retry after a reconnect runs exactly the same code as the first attempt.
 async fn notify_over(
@@ -554,7 +589,7 @@ impl Sink for DesktopSink {
         body: &str,
         replaces: Option<u32>,
     ) -> Result<Option<u32>, ()> {
-        let sent = async_io::block_on(notify_over(
+        let sent = bounded_notify(notify_over(
             &self.proxy,
             self.settings.as_ref(),
             &self.app_name,
@@ -573,7 +608,7 @@ impl Sink for DesktopSink {
         self.settings = fresh.settings;
         // The id the old daemon handed out means nothing to a new one, so a retry after a reconnect
         // posts a fresh notification rather than trying to revise one that no longer exists.
-        async_io::block_on(notify_over(
+        bounded_notify(notify_over(
             &self.proxy,
             self.settings.as_ref(),
             &self.app_name,
@@ -858,12 +893,13 @@ impl Drop for Notifier {
         // queued: a refusal that fired in the last moments of a session is still worth hearing about,
         // and the flag bounds the wait whatever else is holding the channel open.
         //
-        // The flag bounds the *loop*, which polls it every `STOP_POLL`. It does not bound a delivery
-        // already in flight: a sink's send is a call to something outside this process, a desktop
-        // daemon over D-Bus or a Windows toast through `powershell.exe`, and a peer that accepts the
-        // call and does not answer holds this join for as long as it likes. Bounding that belongs on
-        // the send, where the peer is known, rather than here, where abandoning the thread would
-        // drop the announcement the whole path exists to deliver.
+        // The flag bounds the *loop*, which polls it every `STOP_POLL`; the delivery already in
+        // flight is bounded at the send, by `DELIVER_DEADLINE`, because that is where the peer is
+        // known. Abandoning the thread here instead would drop the announcement the whole path
+        // exists to deliver. So the wait this join can inherit is two windows: a call that times
+        // out is reported as a failed one, which spends the reconnect-once retry before the sink
+        // falls back to stderr. The Windows path costs nothing here — its toast is spawned and
+        // never waited for, and its stderr half has already landed.
         self.stop.store(true, Ordering::Relaxed);
         self.tx = None;
         if let Some(h) = self.handle.take() {
@@ -880,6 +916,31 @@ mod tests {
     use super::*;
     use crate::notify::{NotifyEvent, NotifyMode};
     use std::sync::Mutex;
+
+    /// A daemon that accepts the call and never answers must not hold the session's teardown.
+    ///
+    /// This is the case the stop flag on the delivery loop cannot reach: the flag ends the wait for
+    /// *work*, while a call already in flight is a round trip into another process. Without a bound
+    /// at the send, `Notifier::drop` joins a thread parked in that call for as long as the peer
+    /// cares to hold it. A timeout is reported as the call's own failure, which is what lets the
+    /// caller's reconnect-once path treat "restarted" and "stopped answering" alike.
+    #[test]
+    fn a_daemon_that_never_answers_does_not_hold_the_delivery_thread() {
+        let never = std::future::pending::<Result<u32, ()>>();
+        let started = std::time::Instant::now();
+        let bound = Duration::from_millis(50);
+        assert_eq!(bounded_notify_within(never, bound), Err(()));
+        assert!(
+            started.elapsed() >= bound,
+            "it must actually wait the window, not answer straight away"
+        );
+
+        // A call that answers within the window is untouched, id and all.
+        assert_eq!(
+            bounded_notify_within(std::future::ready(Ok(7)), Duration::from_secs(30)),
+            Ok(7)
+        );
+    }
 
     /// One recorded delivery: what the sink was asked to show, and which notification it revised.
     type Delivery = (String, String, Option<u32>);
