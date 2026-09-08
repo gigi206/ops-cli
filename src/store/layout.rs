@@ -242,9 +242,14 @@ fn follow_volume(default_dir: &Path) -> Option<Result<PathBuf, String>> {
     static RESOLVED: std::sync::OnceLock<Option<Result<PathBuf, String>>> =
         std::sync::OnceLock::new();
     RESOLVED
-        .get_or_init(|| {
-            let image = crate::storage::read_pointer(default_dir)?;
-            Some(crate::storage::ensure_mounted(&image))
+        .get_or_init(|| match crate::storage::read_pointer(default_dir) {
+            Ok(None) => None,
+            Ok(Some(image)) => Some(crate::storage::ensure_mounted(&image)),
+            // A pointer that cannot be read is not an absent one. Answering `None` here would send
+            // the layout to the default directory and provision a fresh, empty store there while
+            // the adopted volume still holds everything — so the failure travels as this
+            // resolution's own, which every caller already renders.
+            Err(e) => Some(Err(format!("cannot read the volume pointer: {e}"))),
         })
         .clone()
 }
@@ -259,7 +264,9 @@ fn follow_volume(default_dir: &Path) -> Option<Result<PathBuf, String>> {
 /// table changes nothing, and a volume that is not mounted simply completes nothing, which is the
 /// right answer for a keystroke that must not be the thing that mounts it.
 fn mounted_volume(default_dir: &Path) -> Option<PathBuf> {
-    let image = crate::storage::read_pointer(default_dir)?;
+    // Unlike `follow_volume`, an unreadable pointer is simply nothing to complete: this answers a
+    // keystroke and must not turn one into an error.
+    let image = crate::storage::read_pointer(default_dir).ok().flatten()?;
     match crate::storage::state(&image) {
         Ok(crate::storage::State::Mounted { mount_point, .. }) => Some(mount_point),
         _ => None,

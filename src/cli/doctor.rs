@@ -448,7 +448,9 @@ fn report_storage(rep: &mut Report<'_>) {
     // volume happens to be unmounted right now. The type leads — `volume (<fs>)` here, `local
     // (<fs>)` below — the one distinction that says whether sbx manages the backing or borrows
     // the host's.
-    if let Some(image) = storage::read_pointer(&default_dir) {
+    // A report: an unreadable pointer is shown as no pointer rather than failing the check
+    // that exists to describe the machine.
+    if let Ok(Some(image)) = storage::read_pointer(&default_dir) {
         match storage::state(&image) {
             Ok(storage::State::Mounted { mount_point, .. }) => {
                 let fs = storage::fs_kind(&mount_point)

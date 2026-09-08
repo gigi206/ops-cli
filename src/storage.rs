@@ -100,8 +100,20 @@ pub(crate) const POINTER: &str = "storage.toml";
 /// Deliberately hand-parsed rather than deserialized: this runs before anything else sbx
 /// does, on a file it wrote itself, and a whole parser in that position is a dependency the
 /// resolution path does not need.
-pub(crate) fn read_pointer(default_data_dir: &Path) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(default_data_dir.join(POINTER)).ok()?;
+///
+/// `Ok(None)` is "no pointer" — the ordinary installation, and the one that must stay free. A
+/// pointer that exists and cannot be read is an `Err` instead, because the two mean opposite
+/// things and only one of them is safe to act on: [`crate::store::layout`] follows this to decide
+/// where sbx's data lives, so reading an unreadable pointer as an absent one provisions a fresh
+/// empty store in the default directory while the adopted volume still holds everything. A parse
+/// that finds no `image` line is `Ok(None)` and not an error — the file may be a leftover comment
+/// block, which is what `sbx storage unuse` is entitled to leave.
+pub(crate) fn read_pointer(default_data_dir: &Path) -> io::Result<Option<PathBuf>> {
+    let text = match std::fs::read_to_string(default_data_dir.join(POINTER)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
     for line in text.lines() {
         let line = line.trim();
         let Some(rest) = line.strip_prefix("image") else {
@@ -112,10 +124,10 @@ pub(crate) fn read_pointer(default_data_dir: &Path) -> Option<PathBuf> {
         };
         let value = value.trim().trim_matches('"');
         if !value.is_empty() {
-            return Some(PathBuf::from(value));
+            return Ok(Some(PathBuf::from(value)));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Whether the pointer file can name `image` — the one rule [`write_pointer`] writes by and the
@@ -2054,6 +2066,41 @@ this line has no separator at all
         );
     }
 
+    /// A pointer that exists and cannot be read is not a machine without one.
+    ///
+    /// The two answers used to be the same `None`, and the one that follows from it is the
+    /// permissive reading: `follow_volume` stops looking, the layout falls back to the default
+    /// data directory, and a fresh empty store is provisioned there while the adopted volume still
+    /// holds everything. `sbx storage status` then reports no volume adopted, which invites an
+    /// `adopt` that overwrites the pointer. Absence stays free; anything else is propagated, the
+    /// way [`loop_for`] and the config loader's global layer propagate theirs.
+    #[test]
+    fn a_pointer_that_cannot_be_read_is_not_an_absent_one() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = crate::testutil::TmpDir::new();
+        let dir = base.path().join("sbx");
+        let image = PathBuf::from("/vol/sbx-storage.btrfs");
+        write_pointer(&dir, &image).expect("written");
+        let path = dir.join(POINTER);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let read = read_pointer(&dir);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            read.is_err(),
+            "an unreadable pointer reported {read:?}, which reads as no volume at all"
+        );
+
+        // And the ordinary two answers are unchanged.
+        assert_eq!(
+            read_pointer(&dir).unwrap().as_deref(),
+            Some(image.as_path())
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(read_pointer(&dir).unwrap(), None);
+    }
+
     #[test]
     fn the_pointer_round_trips_and_its_absence_is_the_ordinary_case() {
         let base = crate::testutil::TmpDir::new();
@@ -2061,10 +2108,13 @@ this line has no separator at all
         let image = PathBuf::from("/vol/sbx-storage.btrfs");
 
         // No pointer is what an ordinary installation looks like, and it must cost nothing.
-        assert_eq!(read_pointer(&dir), None);
+        assert_eq!(read_pointer(&dir).unwrap(), None);
 
         write_pointer(&dir, &image).expect("written");
-        assert_eq!(read_pointer(&dir).as_deref(), Some(image.as_path()));
+        assert_eq!(
+            read_pointer(&dir).unwrap().as_deref(),
+            Some(image.as_path())
+        );
 
         // Still valid TOML for anyone who reads it as such, comments and all.
         let text = std::fs::read_to_string(dir.join(POINTER)).unwrap();
@@ -2074,7 +2124,7 @@ this line has no separator at all
         );
 
         clear_pointer(&dir).expect("cleared");
-        assert_eq!(read_pointer(&dir), None);
+        assert_eq!(read_pointer(&dir).unwrap(), None);
         // Clearing what is not there is not an error: `unuse` must be safe to repeat.
         clear_pointer(&dir).expect("idempotent");
     }
@@ -2126,7 +2176,7 @@ this line has no separator at all
         // rest of an ordinary path still round-trip exactly.
         let ok = PathBuf::from("/vol/mes données/sbx storage (2).btrfs");
         write_pointer(&dir, &ok).expect("an ordinary path is recordable");
-        assert_eq!(read_pointer(&dir).as_deref(), Some(ok.as_path()));
+        assert_eq!(read_pointer(&dir).unwrap().as_deref(), Some(ok.as_path()));
     }
 
     /// Two writers must not share the scratch file, or the rename stops being atomic for the second
@@ -2160,7 +2210,7 @@ this line has no separator at all
         write_pointer(&dir, Path::new("/vol/one.btrfs")).unwrap();
         write_pointer(&dir, Path::new("/vol/two.btrfs")).unwrap();
         assert_eq!(
-            read_pointer(&dir).as_deref(),
+            read_pointer(&dir).unwrap().as_deref(),
             Some(Path::new("/vol/two.btrfs")),
             "the newer record must win outright, never merge with the old"
         );
@@ -2195,7 +2245,7 @@ this line has no separator at all
         std::fs::create_dir_all(&dir).unwrap();
         for junk in ["", "# only a comment\n", "image =\n", "nothing here\n"] {
             std::fs::write(dir.join(POINTER), junk).unwrap();
-            assert_eq!(read_pointer(&dir), None, "{junk:?}");
+            assert_eq!(read_pointer(&dir).unwrap(), None, "{junk:?}");
         }
     }
 

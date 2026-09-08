@@ -173,7 +173,8 @@ fn volume_view() -> Option<VolumeView> {
         return None;
     }
     let default_dir = store::Layout::default_data_dir()?;
-    let image = storage::read_pointer(&default_dir)?;
+    // A read-only view: nothing to show when the pointer is absent or unreadable.
+    let image = storage::read_pointer(&default_dir).ok().flatten()?;
     let host_bytes = storage::image_bytes(&image)?;
     Some(VolumeView {
         image: image.display().to_string(),

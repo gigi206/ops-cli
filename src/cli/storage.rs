@@ -264,7 +264,7 @@ fn up(args: Vec<OsString>) -> ExitCode {
     // in which case `up` was only a manual nudge and there is nothing to suggest.
     let adopted = default_dir()
         .ok()
-        .and_then(|d| storage::read_pointer(&d))
+        .and_then(|d| storage::read_pointer(&d).ok().flatten())
         .as_deref()
         == Some(image.as_path());
     if !adopted {
@@ -308,7 +308,7 @@ fn down(args: Vec<OsString>) -> ExitCode {
     // Unmounting a volume sbx is set to follow is temporary by design: the next command
     // mounts it again. Saying so beats leaving the user to wonder why it came back.
     if let Ok(dir) = default_dir()
-        && storage::read_pointer(&dir).as_deref() == Some(image.as_path())
+        && storage::read_pointer(&dir).ok().flatten().as_deref() == Some(image.as_path())
     {
         let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
         println!(
@@ -400,8 +400,19 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
     };
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
 
-    if storage::read_pointer(&dir).is_some() {
-        return fail("sbx already uses a volume — `sbx storage unuse` first if you meant to");
+    // The guard before a write, so it may not read an unreadable pointer as an absent one: that
+    // is exactly how the pointer of an adopted volume gets overwritten while the volume still
+    // holds the data.
+    match storage::read_pointer(&dir) {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return fail("sbx already uses a volume — `sbx storage unuse` first if you meant to");
+        }
+        Err(e) => {
+            return fail(&format!(
+                "cannot read the volume pointer ({e}) — refusing to adopt over it"
+            ));
+        }
     }
     if !dir.is_dir() {
         return fail(format!(
@@ -668,7 +679,9 @@ fn unuse_volume(args: Vec<OsString>) -> ExitCode {
         Ok(d) => d,
         Err(e) => return fail(e),
     };
-    if storage::read_pointer(&dir).is_none() {
+    // Only a confirmed absence says "not using a volume": an unreadable pointer is precisely what
+    // `unuse` should still be able to clear.
+    if matches!(storage::read_pointer(&dir), Ok(None)) {
         println!("sbx is not using a volume.");
         return ExitCode::SUCCESS;
     }
@@ -780,7 +793,9 @@ fn status(args: Vec<OsString>) -> ExitCode {
 
     // Read from the pointer rather than from the live layout: `status` must say what sbx
     // will do next time, which stands even when the volume happens to be unmounted now.
-    let adopted = default_dir().ok().and_then(|d| storage::read_pointer(&d));
+    let adopted = default_dir()
+        .ok()
+        .and_then(|d| storage::read_pointer(&d).ok().flatten());
     let is_adopted = adopted.as_deref() == Some(image.as_path());
     let mut view = StatusView {
         kind: active_backing_kind(adopted.as_deref()),
@@ -1058,7 +1073,9 @@ pub(crate) fn maybe_propose_on_launch(name: &str, rest: &[OsString]) {
         return;
     };
     let offered = storage::has_been_offered(&default_dir);
-    let has_pointer = storage::read_pointer(&default_dir).is_some();
+    // An unreadable pointer counts as one: this decides whether to offer adoption, and
+    // offering it over a pointer that is merely unreadable is how one gets overwritten.
+    let has_pointer = !matches!(storage::read_pointer(&default_dir), Ok(None));
     let pre = storage::Preflight::probe(&default_dir);
     if !should_propose(
         is_launch,
