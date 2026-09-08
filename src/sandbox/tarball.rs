@@ -140,8 +140,7 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
   # (bubblewrap + seccomp + the empty netns is the boundary), so that helper is never used, and
   # setuid could not take effect in the cage anyway.
   unpackPhase = ''
-    mkdir extracted
-    tar -xz --no-same-permissions --no-same-owner -f $src -C extracted
+@UNPACK@
   '';
   dontConfigure = true;
   dontBuild = true;
@@ -179,6 +178,7 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
         decor.main,
     );
     TEMPLATE
+        .replace("@UNPACK@", &prebuilt::bounded_unpack("gzip -dc $src"))
         .replace("@WRAP@", &wrap)
         .replace("@NIXPKGS@", nixpkgs)
         .replace("@SYSTEM@", system)
@@ -504,7 +504,15 @@ mod tests {
         assert!(expr.contains(&format!("hash = \"{HASH}\";")));
         // gzip tarball extraction with a non-root `tar` so a setuid `chrome-sandbox` does not abort
         // the unpack; unpack-only, no build script (safe host-side); the Electron lib set is present.
-        assert!(expr.contains("tar -xz --no-same-permissions --no-same-owner -f $src"));
+        assert!(expr.contains("tar -x --no-same-permissions --no-same-owner -C extracted"));
+        // The decompressed stream is bounded, which is the number that matters: the download is
+        // compressed, so its size says nothing about what it expands to. The ceiling is in the
+        // expression rather than implied by one, because the builder is what enforces it.
+        assert!(
+            expr.contains("gzip -dc $src | head -c")
+                && expr.contains(&prebuilt::MAX_UNPACKED_BYTES.to_string()),
+            "the unpack must be bounded:\n{expr}"
+        );
         assert!(expr.contains("dontBuild = true;"));
         assert!(expr.contains("nss") && expr.contains("gtk3") && expr.contains("libx11"));
         // generic Electron install: find the app by its resources/app(.asar), wrap the launcher.

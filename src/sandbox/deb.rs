@@ -734,8 +734,7 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
   # + seccomp + the empty netns is the boundary), so that helper is never used, and setuid could not
   # take effect in the cage anyway.
   unpackPhase = ''
-    mkdir extracted
-    dpkg-deb --fsys-tarfile $src | tar -x --no-same-permissions --no-same-owner -C extracted
+@UNPACK@
   '';
   dontConfigure = true;
   dontBuild = true;
@@ -756,6 +755,10 @@ in pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
         decor.main,
     );
     TEMPLATE
+        .replace(
+            "@UNPACK@",
+            &prebuilt::bounded_unpack("dpkg-deb --fsys-tarfile $src"),
+        )
         .replace("@WRAP@", &wrap)
         .replace("@NIXPKGS@", nixpkgs)
         .replace("@SYSTEM@", system)
@@ -875,7 +878,15 @@ mod tests {
         // unpack-only, no build script (safe host-side); the Electron lib set is present. The
         // extraction pipes the data tarball through a non-root `tar` so a setuid file (Chromium's
         // `chrome-sandbox`) does not abort the unpack in the unprivileged nix builder.
-        assert!(expr.contains("dpkg-deb --fsys-tarfile $src | tar -x --no-same-permissions"));
+        // The data tarball is read out of the `.deb` and unpacked under the same ceiling the
+        // `tarball:` backend uses: both expand a compressed stream whose download size bounds
+        // nothing.
+        assert!(
+            expr.contains("dpkg-deb --fsys-tarfile $src | head -c")
+                && expr.contains(&prebuilt::MAX_UNPACKED_BYTES.to_string())
+                && expr.contains("tar -x --no-same-permissions --no-same-owner -C extracted"),
+            "the unpack must be bounded:\n{expr}"
+        );
         assert!(expr.contains("dontBuild = true;"));
         assert!(expr.contains("nss") && expr.contains("gtk3") && expr.contains("libx11"));
         // generic Electron install: find the app by its app.asar, wrap the launcher as bin/<name>

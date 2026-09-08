@@ -188,6 +188,53 @@ const GIO_SEARCH_PATH: &str =
 const XDG_DATA_SEARCH_PATH: &str =
     r#"${pkgs.lib.makeSearchPathOutput "out" "share" finalAttrs.buildInputs}"#;
 
+/// The most a prebuilt archive may unpack to, in the generated builder's `unpackPhase`.
+///
+/// Nothing bounded it: `fetchurl` caps no size, and the archives these backends take are compressed,
+/// so a modest download expands by orders of magnitude — the same hole the distribution path closed
+/// with [`super::distro::layers`]'s budget, on a code path that had no equivalent.
+///
+/// Eight gibibytes is a guardrail, not an estimate. The heaviest thing this population holds is a
+/// prebuilt Electron desktop app, and the two largest in the shipped catalogue unpack to 559 MiB
+/// (`claude-desktop`) and 235 MiB (`warp`) — so the ceiling sits more than an order of magnitude
+/// above anything real, and an order of magnitude below the 64 GiB the distribution budget allows a
+/// whole userland. A build that reaches it has stopped being an application bundle.
+///
+/// What it does **not** bound is the number of members: `tar` offers no such limit, and reproducing
+/// the distribution path's member counter would mean reading the stream in sbx rather than in the
+/// builder. Said out loud in `packages.md` rather than left to be discovered.
+pub(crate) const MAX_UNPACKED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// The `unpackPhase` body that unpacks `producer`'s output under [`MAX_UNPACKED_BYTES`].
+///
+/// The ceiling is applied to the **decompressed** stream, which is the number that matters: a
+/// bounded download says nothing about what it expands to. `head` truncating the stream makes `tar`
+/// fail on an incomplete archive, so the build stops rather than filling the store — and the branch
+/// is there to say why, because "Unexpected EOF in archive" on its own reads as a corrupt download.
+///
+/// Written once and shared, because the two backends that own their unpack differ only in how they
+/// produce the tar stream: `tarball:` decompresses the download, `deb:` reads the data member out of
+/// the archive. `appimage:` is not here — its extraction is nixpkgs' `appimageTools.extract`, not a
+/// phase sbx writes.
+pub(crate) fn bounded_unpack(producer: &str) -> String {
+    bounded_unpack_to(producer, MAX_UNPACKED_BYTES)
+}
+
+/// [`bounded_unpack`] with the ceiling as an argument, so a test can drive the truncating branch
+/// without building an eight-gibibyte archive to reach it.
+fn bounded_unpack_to(producer: &str, ceiling: u64) -> String {
+    let max_unpacked_bytes = ceiling;
+    format!(
+        "mkdir extracted\n\
+         if ! {producer} | head -c {max_unpacked_bytes} | tar -x --no-same-permissions \
+         --no-same-owner -C extracted; then\n\
+         \x20 echo \"sbx: the archive did not unpack: it is not a valid tar stream, or it \
+         exceeds the {max_unpacked_bytes}-byte ceiling sbx puts on a prebuilt unpack\" >&2\n\
+         \x20 exit 1\n\
+         fi"
+    )
+}
+
 /// Fill [`LAUNCHER_WRAP`]'s placeholders. `ld_prefix` is the `LD_LIBRARY_PATH` prefix value: a
 /// `.deb` passes just the `makeLibraryPath` of its `buildInputs`; an AppImage prepends `$out` (its
 /// bundle root holds the Chromium sibling `.so`s — `libEGL.so`, `libffmpeg.so`, …). `main` is the
@@ -2373,6 +2420,67 @@ error: unable to download 'https://example.com/app.deb': Could not resolve hostn
         assert!(
             args.contains("expected"),
             "the apt index's digest is the argument that makes this fetch a checked one: {args}"
+        );
+    }
+
+    #[test]
+    fn the_bounded_unpack_extracts_under_its_ceiling_and_fails_closed_over_it() {
+        // The unpack phase is shell this crate writes and a nix builder runs, so asserting that the
+        // expression *contains* `head -c` proves nothing about what the shell does. This runs it.
+        let tmp = crate::testutil::TmpDir::new();
+        let payload = tmp.path().join("payload");
+        std::fs::create_dir_all(&payload).expect("payload dir");
+        std::fs::write(payload.join("hello.txt"), vec![b'x'; 4096]).expect("payload file");
+        let archive = tmp.path().join("src.tar.gz");
+        let made = std::process::Command::new("tar")
+            .args(["-czf", &archive.to_string_lossy(), "-C"])
+            .arg(&payload)
+            .arg(".")
+            .status();
+        if !made.map(|s| s.success()).unwrap_or(false) {
+            return; // no host `tar`: the phase is a builder's, not this machine's
+        }
+
+        let run = |ceiling: u64| {
+            let work = tmp.path().join(format!("work{ceiling}"));
+            std::fs::create_dir_all(&work).expect("work dir");
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(bounded_unpack_to("gzip -dc \"$src\"", ceiling))
+                .current_dir(&work)
+                .env("src", &archive)
+                .output()
+                .expect("run the generated unpack phase")
+        };
+
+        // Under the ceiling: the archive unpacks, which is the case every real build takes.
+        let ok = run(MAX_UNPACKED_BYTES);
+        assert!(
+            ok.status.success(),
+            "the generated phase must unpack a normal archive: {}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+        assert!(
+            std::fs::metadata(
+                tmp.path()
+                    .join(format!("work{MAX_UNPACKED_BYTES}/extracted/hello.txt"))
+            )
+            .is_ok(),
+            "the payload must land in `extracted`"
+        );
+
+        // Over it: `head` truncates, `tar` refuses an incomplete archive, and the build stops —
+        // rather than filling the store with whatever the stream kept producing.
+        let cut = run(64);
+        assert!(
+            !cut.status.success(),
+            "an archive past the ceiling must fail the build, not unpack partially"
+        );
+        let said = String::from_utf8_lossy(&cut.stderr);
+        assert!(
+            said.contains("ceiling"),
+            "the failure must say why rather than leave tar's EOF to be read as a bad download: \
+             {said}"
         );
     }
 }

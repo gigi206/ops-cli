@@ -587,19 +587,32 @@ backends do not, and each stops at a different place:
 | `deb:`, `appimage:`, `tarball:`, `binary:` | the URL charset, then a hash **recorded on the first fetch** and re-checked on every later one | the artefact has not changed since `sbx` first saw it. It does **not** prove that first fetch was the publisher's: the hash is whatever the download returned, and `sbx upgrade` re-resolves from the same place |
 | `deb:apt:` | the above, plus the `Packages` index checked against the repository's signed `InRelease`, under a signing key pinned on first use | the index is the one the holder of that key published. The **first** pin is trust on first use and proves nothing on its own; from then on a re-keyed repository, or an index served by someone else, is refused |
 
-**How much a prebuilt may unpack to.** Nothing bounds it. `tarball:` runs `tar -xz`, `deb:` pipes
-`dpkg-deb --fsys-tarfile` into `tar`, and `appimage:` extracts a squashfs, each inside the nix
-builder that fetches it, so an archive whose contents expand to far more than its download fills
-the host's store while the build runs. The [distro](distro#how-much-an-image-may-unpack-to) path
-does bound its unpacking, and the difference is where the bytes pass: `sbx` streams an image's
-layers itself and can count them, while these three hand the archive to a program in a builder and
-see only the result.
+**How much a prebuilt may unpack to.** A download's size says nothing about what it expands to, so
+the ceiling is put on the **decompressed** stream: `tarball:` and `deb:` unpack through
+`head -c 8589934592`, and an archive that reaches 8 GiB is truncated, which makes `tar` refuse an
+incomplete archive and fails the build with a message naming the ceiling. Nothing unpacks past it,
+and nothing unpacks halfway.
 
-What limits the exposure is who gets to name the URL, not the archive: `[packages]` is
-trusted-only, so the publisher is one an approved config chose, and after the first fetch the
-recorded hash refuses anything that changed. The first fetch of a compromised or simply broken
-artefact is the case that is open, and it costs disk rather than reaching the cage. If a build
-fills the store, [`sbx gc`](../cli/gc) reclaims it.
+Eight gibibytes is a guardrail rather than an estimate. The heaviest things these backends carry are
+prebuilt Electron desktop apps, and the two largest in the shipped catalogue unpack to 559 MiB and
+235 MiB, so the ceiling sits well above anything real and an order of magnitude below the 64 GiB the
+[distro](distro#how-much-an-image-may-unpack-to) path allows a whole userland. A build that reaches
+it has stopped being an application bundle.
+
+Two things it does not cover, both by construction:
+
+- **The number of members.** `tar` offers no such limit, and counting them would mean streaming the
+  archive through `sbx` instead of through the builder, which is exactly what the distro path does
+  and these backends do not. An archive of a million empty files stays under the byte ceiling.
+- **`appimage:`.** Its extraction is nixpkgs' own `appimageTools.extract`, not a phase `sbx` writes,
+  so there is nowhere to put the ceiling without reaching inside it. `binary:` unpacks nothing at
+  all: the download **is** the program.
+
+What limits the rest is who gets to name the URL, not the archive: `[packages]` is trusted-only, so
+the publisher is one an approved config chose, and after the first fetch the recorded hash refuses
+anything that changed. The first fetch of a compromised or simply broken artefact is the case that
+is open, and it costs disk rather than reaching the cage. If a build fills the store,
+[`sbx gc`](../cli/gc) reclaims it.
 
 **Why the revision is checked.** Pinning `github:NixOS/nixpkgs/<rev>` reads like a guarantee that the
 revision belongs to nixpkgs, and on its own it is not one. GitHub keeps pull request heads in the
