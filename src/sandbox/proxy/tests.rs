@@ -1236,12 +1236,15 @@ fn a_websocket_upgrade_to_a_denied_host_is_refused() {
     );
     let transcript =
         through_proxy_websocket(ctx, proxy_ca_der, "denied.test", addr.port()).unwrap();
+    // Asserted on the status LINE, not on the digits anywhere in the transcript: a refusal names
+    // the target it refused (`denied.test:<port>`), and an ephemeral port carrying `101` — `34101`,
+    // measured on a hosted runner — reads as an upgrade that never happened.
     assert!(
-        transcript.contains("403"),
+        transcript.contains("HTTP/1.1 403"),
         "a denied-host upgrade must be refused, not tunneled: {transcript:?}"
     );
     assert!(
-        !transcript.contains("101"),
+        !transcript.contains("HTTP/1.1 101"),
         "no tunnel may be established to a denied host: {transcript:?}"
     );
 }
@@ -1278,8 +1281,10 @@ fn a_websocket_upgrade_the_upstream_declines_is_relayed_as_a_normal_response() {
         transcript.contains("401") && transcript.contains("not-upgradable"),
         "the declined-upgrade response was not relayed: {transcript:?}"
     );
+    // The status line again, for the reason the denied-host test gives: a bare `101` is a digit
+    // string an ephemeral port can carry.
     assert!(
-        !transcript.contains("101"),
+        !transcript.contains("HTTP/1.1 101"),
         "no upgrade was completed: {transcript:?}"
     );
 }
