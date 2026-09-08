@@ -426,19 +426,33 @@ fn unescape_mountinfo(s: &str) -> String {
 /// for the same bytes. A missed match is not a missed optimization here: it is the second
 /// attachment this function exists to prevent. The literal comparison stays first and answers the
 /// case canonicalization cannot — a backing file the kernel has already marked deleted.
+///
+/// For the same reason, a read that fails is propagated rather than read as "no device". Only
+/// absence answers "no": a sysfs that is not there carries no loop devices, and a `loopN` without a
+/// `loop/` subdirectory is a free one, which is the ordinary case rather than a failure. Every
+/// other error — an unreadable directory, a device that vanishes mid-scan — is a question this
+/// function cannot answer, and `Ok(None)` is the one answer it may not invent: [`state`] turns it
+/// into [`State::Detached`], the invitation to attach a second time. This is the stance the
+/// `mountinfo` read in [`state`] already takes.
 pub(crate) fn loop_for(image: &Path, sys_block: &Path) -> io::Result<Option<String>> {
-    let Ok(entries) = std::fs::read_dir(sys_block) else {
-        return Ok(None);
+    let entries = match std::fs::read_dir(sys_block) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
     };
     let canonical_image = std::fs::canonicalize(image).ok();
-    for e in entries.flatten() {
+    for e in entries {
+        let e = e?;
         let name = e.file_name();
         if !name.as_encoded_bytes().starts_with(b"loop") {
             continue;
         }
         let backing = e.path().join("loop/backing_file");
-        let Ok(target) = std::fs::read_to_string(&backing) else {
-            continue;
+        let target = match std::fs::read_to_string(&backing) {
+            Ok(target) => target,
+            // `loop/` exists only for a bound device, so a free `loopN` has no `backing_file`.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
         };
         // The kernel may mark a deleted backing file; compare the path itself.
         let target = target.trim_end_matches('\n').trim_end_matches(" (deleted)");
@@ -1769,6 +1783,60 @@ this line has no separator at all
         assert_eq!(
             loop_for(&image, &sys).unwrap().as_deref(),
             Some("/dev/loop4")
+        );
+    }
+
+    /// A scan that cannot read must not answer "nothing is attached". `loop_for`'s whole purpose is
+    /// to stop a second attachment onto a volume that already has one, so the one answer it may
+    /// never invent is the permissive one: `state` turns `None` into `State::Detached`, which is
+    /// the invitation to attach again. Absence is the only readable "no" — a sysfs that is not
+    /// there carries no loop devices — and every other failure is propagated, the way the
+    /// `mountinfo` read one line below `loop_for`'s caller already is.
+    #[test]
+    fn an_unreadable_scan_is_an_error_rather_than_no_device() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = crate::testutil::TmpDir::new();
+        let sys = base.path().join("block");
+        let image = base.path().join("vol.btrfs");
+        let d = sys.join("loop7").join("loop");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("backing_file"), format!("{}\n", image.display())).unwrap();
+        // A free `loopN` has no `loop/` at all: the ordinary case, skipped without hiding loop7.
+        std::fs::create_dir_all(sys.join("loop8")).unwrap();
+
+        assert_eq!(
+            loop_for(&image, &sys).unwrap().as_deref(),
+            Some("/dev/loop7"),
+            "a free loop device beside a bound one must not hide it"
+        );
+        // A sysfs that does not exist is a readable "no device", not a failure.
+        assert_eq!(loop_for(&image, &base.path().join("absent")).unwrap(), None);
+
+        // An unreadable directory is not an empty one.
+        std::fs::set_permissions(&sys, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let scanned = loop_for(&image, &sys);
+        std::fs::set_permissions(&sys, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            scanned.is_err(),
+            "an unreadable /sys/block reported {scanned:?}, which `state` would call Detached"
+        );
+
+        // An unreadable `backing_file` is not an unbound device either.
+        std::fs::set_permissions(
+            d.join("backing_file"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        let read = loop_for(&image, &sys);
+        std::fs::set_permissions(
+            d.join("backing_file"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(
+            read.is_err(),
+            "an unreadable backing_file reported {read:?}, hiding the device it names"
         );
     }
 
