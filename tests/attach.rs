@@ -119,8 +119,9 @@ fn drive_attach(pid: u32, data: &Path, script: &[u8]) -> String {
     let mut buf = [0u8; 4096];
     let mut sent = false;
     // Generous: the setns join into a live cage plus the in-cage shell startup can be slow under
-    // heavy parallel load (the whole test suite), and a too-tight deadline would drop the prompt
-    // detection before the script is sent — the source of this test's rare flakiness.
+    // heavy parallel load (the whole test suite). It is not what made this test flaky — a run that
+    // never sent its script had seen the whole prompt and not recognised it, which is what
+    // `common::shell_prompt_seen` now answers in one place.
     let deadline = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline {
         let mut pfd = libc::pollfd {
@@ -135,8 +136,9 @@ fn drive_attach(pid: u32, data: &Path, script: &[u8]) -> String {
             }
             out.extend_from_slice(&buf[..n as usize]);
         }
-        // Readiness is "a `$` appeared" — the hermetic shell falls back to `bash-5.x$ `.
-        if !sent && out.contains(&b'$') {
+        // Readiness is "a prompt appeared": see `common::shell_prompt_seen` for why the last
+        // character is `$` or `#` and never only one of the two.
+        if !sent && common::shell_prompt_seen(&out) {
             unsafe { libc::write(master, script.as_ptr().cast(), script.len()) };
             sent = true;
         }
@@ -266,6 +268,33 @@ fn attach_to_a_running_app_lands_in_the_apps_isolated_home() {
         assert!(
             !m.exists(),
             "the marker landed in the project's shared home — attach used the wrong runtime: {m:?}\n{log}"
+        );
+    }
+}
+
+/// The prompt a cage whose user is root prints counts as a prompt.
+///
+/// The two transcripts are real: the first is what a hosted runner produced when this suite's
+/// sibling in `tests/run.rs` failed — the shell was up and waiting, and the wait for it did not
+/// recognise the line, so the script was never written and the failure read as a shell that never
+/// came up. The second is the attach banner alone, which is what the wait sees before any shell
+/// has spoken; a predicate that answered "ready" to it would send the script into nothing.
+#[test]
+fn a_prompt_is_recognised_whichever_character_the_shell_ends_it_with() {
+    let banner = "sbx: attaching to session 84845 (run) (a shell in its live cage \u{2014} type exit \
+         to leave the agent running)\r\n";
+    assert!(
+        !common::shell_prompt_seen(banner.as_bytes()),
+        "the banner is not a prompt: nothing has been asked of the shell yet"
+    );
+    for prompt in [
+        format!("{banner}root@runnervm:~/.cache/sbx/test-tmp/r-attach-pro-28391-200# "),
+        format!("{banner}(sbx-r-attach-pro-756913-0) /$ "),
+        format!("{banner}bash-5.3$ "),
+    ] {
+        assert!(
+            common::shell_prompt_seen(prompt.as_bytes()),
+            "a shell that printed a prompt is ready to be driven: {prompt:?}"
         );
     }
 }

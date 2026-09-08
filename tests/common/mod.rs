@@ -116,6 +116,21 @@ pub fn stdout_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Whether an attached shell has printed a prompt into `out` and is ready to be driven.
+///
+/// The last character of a shell prompt is bash's `\$`, which it renders `#` when the euid is 0 and
+/// `$` otherwise — the cage's own rc sets `PS1='(\h) \w\$ '`, and the fallback `bash-5.x\$ ` ends
+/// the same way. A wait that looked for `$` alone therefore never fired where the in-cage user is
+/// root: the script was never written, and the failure read as a shell that never came up, with its
+/// prompt sitting in the transcript the assertion printed.
+///
+/// Asked over the whole transcript rather than its tail, because the prompt is what these tests
+/// wait for and nothing before it — the attach banner names a session and a verb — carries either
+/// character.
+pub fn shell_prompt_seen(out: &[u8]) -> bool {
+    out.iter().any(|b| matches!(b, b'$' | b'#'))
+}
+
 /// A process's start-time ticks — field 22 of `/proc/<pid>/stat`.
 ///
 /// This is what pairs with a pid to name one *incarnation* of a process across pid reuse, so it is

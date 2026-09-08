@@ -8059,8 +8059,10 @@ fn sbx_attach_joins_the_live_cage_with_the_confinement_reapplied() {
         awk '/^Seccomp:/{s=$2}/^Seccomp_filters:/{f=$2}/^NoNewPrivs:/{n=$2}/^CapEff:/{c=$2}END{print \"CONFINE=\" s \"-\" n \"-\" c \"-\" f}' /proc/self/status\n\
         exit\n";
 
-    // Send the script once the cage prompt appears (its PS1 ends in `$`), then read until the
-    // session ends (master EIO) or a deadline — the same wait-for-prompt pattern the shell test uses.
+    // Send the script once the cage prompt appears, then read until the session ends (master EIO)
+    // or a deadline — the same wait-for-prompt pattern the shell test uses. What counts as a
+    // prompt is `common::shell_prompt_seen`, in one definition, because its last character is not
+    // the same on every host.
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
     let mut sent = false;
@@ -8078,7 +8080,7 @@ fn sbx_attach_joins_the_live_cage_with_the_confinement_reapplied() {
             }
             out.extend_from_slice(&buf[..n as usize]);
         }
-        if !sent && out.contains(&b'$') {
+        if !sent && common::shell_prompt_seen(&out) {
             unsafe { libc::write(master, script.as_ptr().cast(), script.len()) };
             sent = true;
         }
@@ -8332,7 +8334,7 @@ fn ending_a_session_kills_a_shell_attached_to_it() {
             }
             out.extend_from_slice(&buf[..n as usize]);
         }
-        if !sent && out.contains(&b'$') {
+        if !sent && common::shell_prompt_seen(&out) {
             let cmd = b"echo ALIVE-$((6 * 7))\n";
             unsafe { libc::write(master, cmd.as_ptr().cast(), cmd.len()) };
             sent = true;
