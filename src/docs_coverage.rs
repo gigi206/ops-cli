@@ -1087,7 +1087,6 @@ const UNDOCUMENTED_MODULE_ITEMS: &[(&str, &str)] = &[
     ("config/view.rs", "NetworkView"),
     ("main.rs", "main"),
     ("main.rs", "read_sysctl"),
-    ("observe.rs", "node"),
     ("pathfind.rs", "is_executable"),
     ("paths.rs", "BaseView"),
     ("paths.rs", "ChildView"),

@@ -61,8 +61,8 @@ pub(crate) const MAX_DEPTH: usize = 256;
 /// Build the tree rooted at `root` from a flat table. Pure. Children are ordered
 /// by pid for a stable render; a `visited` set makes a malformed parent graph
 /// (a self-parent or a cycle from a `/proc` read race) terminate rather than
-/// recurse forever, and [`MAX_DEPTH`] stops a chain deep enough to exhaust the stack.
-/// Returns `None` if `root` is not in the table (it exited).
+/// recurse forever, and [`MAX_DEPTH`] stops a chain deep enough to exhaust the stack. Returns
+/// `None` if `root` is not in the table (it exited).
 pub(crate) fn build_tree(table: &BTreeMap<u32, ProcInfo>, root: u32) -> Option<ProcTree> {
     let mut kids: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     for (&pid, info) in table {
