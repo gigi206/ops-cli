@@ -90,6 +90,14 @@ const OBJECT: &str = "/org/freedesktop/Notifications";
 const SOCKET_WAIT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// The longest a relayed signal may take to reach the private bus before the relay gives up on it.
+///
+/// This is the bound the teardown's `join` inherits. Emitting a signal is a write with no reply, so
+/// what can hold it is the socket buffer filling — a cage that has stopped reading its end. Wide
+/// enough that a busy but live cage is never cut (the buffer drains in microseconds when anything
+/// is reading), short enough that a session's teardown is not held by a cage that has stopped.
+const EMIT_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Client proxy onto the **host** notifications daemon. Owned argument types (`Vec<String>`,
 /// `HashMap<String, OwnedValue>`) so a forwarded call needs no lifetime juggling — the `a{sv}` hints
 /// dictionary serialises identically whether its values are borrowed or owned.
@@ -538,14 +546,15 @@ impl Drop for NotifyRelay {
         // `run` returns and the thread exits; then join it, so the relay has disconnected from the
         // private bus before the portal's host directory (holding the socket) is removed.
         //
-        // **The join is unbounded, and one thing can hold it**: the loop selects on the shutdown
-        // channel, so a quiet bus ends it at once, but a relayed signal is emitted onto the private
-        // bus with an `await` inside the branch, outside the select. A cage that has stopped reading
-        // its end and has filled the socket buffer parks the task there, and the shutdown branch is
-        // not reached until it completes. The wait is still the right default: detaching instead
-        // would leave the connection live while the directory holding its socket is removed, which
-        // is the ordering this join exists to guarantee. What would replace it is a bound on the
-        // emit rather than on the join.
+        // The loop's one blocking write is bounded, which is what can hold this join: a relayed
+        // signal is
+        // emitted onto the private bus with an `await` inside a branch, outside the select, so a
+        // cage that has stopped reading its end and filled the socket buffer would park the task
+        // there. The bound is on the emit rather than on this join (`EMIT_DEADLINE`), because
+        // detaching instead would leave the connection live while the directory holding its socket
+        // is removed — the ordering this join exists to guarantee. An emit that times out ends the
+        // loop rather than continuing it: an abandoned write may have left a partial message, and
+        // the next one would append to a fragment.
         self.shutdown.close();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -553,8 +562,27 @@ impl Drop for NotifyRelay {
     }
 }
 
+/// Emit one signal onto the private bus under [`EMIT_DEADLINE`], answering whether it got out.
+///
+/// `false` means the write did not complete in time, and the caller's only correct response is to
+/// stop relaying: an abandoned emit may have left a partial message on the connection, so a second
+/// one would append to a fragment and hand the cage bytes it cannot frame. Ending the loop instead
+/// closes the connection, which is both the honest thing to do with a peer that is no longer
+/// reading and what releases the teardown waiting on this thread.
+async fn emit_bounded<B>(conn: &zbus::Connection, member: &str, body: &B) -> bool
+where
+    B: serde::Serialize + zbus::zvariant::DynamicType,
+{
+    futures_util::select! {
+        r = conn.emit_signal(None::<&str>, OBJECT, IFACE, member, body).fuse() => r.is_ok(),
+        // `Timer` is both a `Future` and a `Stream`, so the future's `fuse` is named explicitly.
+        _ = FutureExt::fuse(async_io::Timer::after(EMIT_DEADLINE)) => false,
+    }
+}
+
 /// The relay body: wait for the private-bus socket, connect both buses, own the notifications name on
-/// the private bus, and pump the host's signals back onto it until shutdown.
+/// the private bus, and pump the host's signals back onto it until shutdown — or until the cage
+/// stops reading its end, which [`emit_bounded`] turns into the same clean return.
 async fn run(
     private_socket: PathBuf,
     shutdown: async_channel::Receiver<()>,
@@ -605,10 +633,10 @@ async fn run(
                     // and an id counter whose deltas count the desktop's notification volume. The
                     // set that decides `replaces_id` decides this too, at no functional cost: the
                     // cage's own click-to-focus and action buttons are precisely the owned ids.
-                    if ours.owns(id) {
-                        let _ = private_conn
-                            .emit_signal(None::<&str>, OBJECT, IFACE, "ActionInvoked", &(id, key.as_str()))
-                            .await;
+                    if ours.owns(id)
+                        && !emit_bounded(&private_conn, "ActionInvoked", &(id, key.as_str())).await
+                    {
+                        break;
                     }
                 },
                 None => break,
@@ -622,10 +650,10 @@ async fn run(
                     // unread (reason 1) — a presence-and-attention oracle, and one that answers for
                     // sbx's *own* refusal toasts, so the cage could tell whether its blocked request
                     // was seen before deciding what to try next.
-                    if ours.closing(id) {
-                        let _ = private_conn
-                            .emit_signal(None::<&str>, OBJECT, IFACE, "NotificationClosed", &(id, reason))
-                            .await;
+                    if ours.closing(id)
+                        && !emit_bounded(&private_conn, "NotificationClosed", &(id, reason)).await
+                    {
+                        break;
                     }
                 },
                 None => break,

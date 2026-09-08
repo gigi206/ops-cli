@@ -409,7 +409,7 @@ fn migrate(args: Vec<OsString>) -> ExitCode {
             return fail("sbx already uses a volume — `sbx storage unuse` first if you meant to");
         }
         Err(e) => {
-            return fail(&format!(
+            return fail(format!(
                 "cannot read the volume pointer ({e}) — refusing to adopt over it"
             ));
         }

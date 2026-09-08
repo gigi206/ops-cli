@@ -103,7 +103,7 @@ pub(crate) const POINTER: &str = "storage.toml";
 ///
 /// `Ok(None)` is "no pointer" — the ordinary installation, and the one that must stay free. A
 /// pointer that exists and cannot be read is an `Err` instead, because the two mean opposite
-/// things and only one of them is safe to act on: [`crate::store::layout`] follows this to decide
+/// things and only one of them is safe to act on: the store layout follows this to decide
 /// where sbx's data lives, so reading an unreadable pointer as an absent one provisions a fresh
 /// empty store in the default directory while the adopted volume still holds everything. A parse
 /// that finds no `image` line is `Ok(None)` and not an error — the file may be a leftover comment
