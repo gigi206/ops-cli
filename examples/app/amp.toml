@@ -14,6 +14,7 @@
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/npm-registry.toml
 #     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #
 # Amp ships on npm as `@ampcode/cli` — a small JS wrapper whose real payload is a single-file
 # native binary published as a PLATFORM OPTIONAL DEPENDENCY (`@ampcode/cli-linux-x64`, an ELF

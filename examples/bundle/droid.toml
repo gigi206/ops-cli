@@ -4,6 +4,7 @@
 #   # then in an app profile:   use = ["droid"]
 #   REQUIRES egress groups — import them once (they are shared, not per-agent):
 #     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #     sbx net groups import examples/net-groups/npm-registry.toml
 #
 # Derived from `examples/app/droid.toml`, whose namesake profile now names this bundle in `use`
@@ -32,6 +33,7 @@ mute = [
     "telemetry.factory.ai",
     "re:^https://otel-collector-123358924663\\.[^.]+\\.run\\.app",
     "@npm-audit",
+    "@npm-jsr",
 ]
 
 [packages]

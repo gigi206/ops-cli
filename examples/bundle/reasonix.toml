@@ -4,6 +4,7 @@
 #   # then in an app profile:   use = ["reasonix"]
 #   REQUIRES egress groups — import them once (they are shared, not per-agent):
 #     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #     sbx net groups import examples/net-groups/npm-registry.toml
 #
 # Derived from `examples/app/reasonix.toml`, whose namesake profile now names this bundle in `use`
@@ -39,6 +40,7 @@ allow = [
 mute = [
     "crash.reasonix.io",                            # Reasonix telemetry/upgrade gateway (denied)
     "@npm-audit",  # npm audit (noisy)
+    "@npm-jsr",  # the JSR mirror the resolver probes (noisy)
 ]
 
 [packages]

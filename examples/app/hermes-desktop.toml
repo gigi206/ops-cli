@@ -14,6 +14,7 @@
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/npm-registry.toml
 #     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #     sbx net groups import examples/net-groups/models-catalog.toml
 #     sbx net groups import examples/net-groups/chromium-background.toml
 #     sbx net groups import examples/net-groups/google-signin-incage.toml

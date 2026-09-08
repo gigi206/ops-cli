@@ -4,6 +4,7 @@
 #   # then in an app profile:   use = ["auggie"]
 #   REQUIRES egress groups — import them once (they are shared, not per-agent):
 #     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #     sbx net groups import examples/net-groups/npm-registry.toml
 #
 # Derived from `examples/app/auggie.toml`, whose namesake profile now names this bundle in `use`
@@ -27,6 +28,7 @@ allow = [
 ]
 mute = [
     "@npm-audit",
+    "@npm-jsr",
     "{POST} https://api.segment.io",
     "{POST} https://*.ingest.us.sentry.io",
 ]

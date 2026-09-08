@@ -4,6 +4,7 @@
 #   # then in an app profile:   use = ["dirac"]
 #   REQUIRES egress groups — import them once (they are shared, not per-agent):
 #     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #     sbx net groups import examples/net-groups/npm-registry.toml
 #
 # Derived from `examples/app/dirac.toml`, whose namesake profile now names this bundle in `use`
@@ -35,6 +36,7 @@ mute = [
     "us.i.posthog.com",
     "us.posthog.com",
     "@npm-audit",
+    "@npm-jsr",
 ]
 
 [packages]

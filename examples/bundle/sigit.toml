@@ -4,6 +4,7 @@
 #   # then in an app profile:   use = ["sigit"]
 #   REQUIRES egress groups — import them once (they are shared, not per-agent):
 #     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #     sbx net groups import examples/net-groups/npm-registry.toml
 #
 # Derived from `examples/app/sigit.toml`, whose namesake profile now names this bundle in `use`
@@ -30,6 +31,7 @@ allow = [
 ]
 mute = [
     "@npm-audit",
+    "@npm-jsr",
     "html.duckduckgo.com",
     # siGit asks its vendor's MCP server for tools at every start, and this profile refuses that
     # host on purpose: a local-model agent whose code never leaves the cage is what it is for. A

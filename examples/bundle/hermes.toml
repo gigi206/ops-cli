@@ -6,6 +6,7 @@
 #     sbx net groups import examples/net-groups/models-catalog.toml
 #     sbx net groups import examples/net-groups/npm-registry.toml
 #     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #
 # Derived from `examples/app/hermes.toml`, whose namesake profile now names this bundle in `use`
 # (thin profile): the bundle is the single source of truth for the agent's packages, env and
@@ -42,6 +43,7 @@ allow = [
 ]
 mute = [
     "@npm-audit",
+    "@npm-jsr",
 ]
 
 [packages]

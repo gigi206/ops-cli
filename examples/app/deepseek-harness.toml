@@ -16,6 +16,7 @@
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/npm-registry.toml
 #     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #
 # `dsh` is a plugin composition engine (Cordis) wearing an agent as its product: the LLM route, the
 # shell executor, every tool, and the web UI itself are plugin rows in a profile's ordered layer

@@ -14,6 +14,7 @@
 #   EGRESS GROUPS — shared lanes, imported once (shared, not per-agent):
 #     sbx net groups import examples/net-groups/npm-registry.toml
 #     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #
 # JetBrains publishes Junie from its own npm scope (`@jetbrains/junie`) — but that package is only
 # a SHIM: its `postinstall` downloads the real build (a ~260 MB zip of a JVM application with a

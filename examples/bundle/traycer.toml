@@ -7,6 +7,7 @@
 #   REQUIRES egress groups — import them once (they are shared, not per-agent):
 #     sbx net groups import examples/net-groups/npm-registry.toml
 #     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #
 # Derived from `examples/app/traycer.toml`, whose namesake profile names this bundle in `use` (thin
 # profile): the bundle is the single source of truth for the agent's packages, env and egress, while
@@ -60,6 +61,7 @@ allow = [
 mute = [
     # npm's audit call on install, refused by the allowlist and not worth a line in the log.
     "@npm-audit",
+    "@npm-jsr",
 ]
 
 [packages]

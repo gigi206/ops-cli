@@ -2,6 +2,9 @@
 #
 #   sbx bundle import examples/bundle/openfox.toml
 #   sbx app import    examples/app/openfox.toml
+#   REQUIRES egress groups — import them once (they are shared, not per-agent):
+#     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #   sbx app run openfox
 #
 # THIS PROFILE IS NOT SELF-CONTAINED, on purpose. The agent's package and hosts come from a shared
@@ -114,6 +117,14 @@ allow = [
     #"tcp://localhost:11434",  # ollama
     #"tcp://localhost:8080",   # llama.cpp
     "{GET,HEAD} https://registry.npmjs.org",
+]
+# The rest of what the install lane reaches for: the vulnerability lookup that follows it, and
+# the JSR mirror it probes while resolving. Both are refused by the allowlist above, and both
+# are refusals a reader can do nothing about — muted so they do not drown the ones that matter
+# (still denied, still counted in `sbx net stats`).
+mute = [
+    "@npm-audit",
+    "@npm-jsr",
 ]
 
 [env]

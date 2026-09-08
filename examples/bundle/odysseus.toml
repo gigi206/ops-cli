@@ -7,6 +7,7 @@
 #     sbx net groups import examples/net-groups/pypi.toml
 #     sbx net groups import examples/net-groups/npm-registry.toml
 #     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #
 # Derived from `examples/app/odysseus.toml`, whose namesake profile names this bundle in `use` (thin
 # profile): the bundle is the single source of truth for what this agent needs, while the profile
@@ -124,6 +125,7 @@ allow = [
 ]
 mute = [
     "@npm-audit",  # npm's audit POST during the front-end install
+    "@npm-jsr",  # the JSR mirror probed during the same install
 ]
 
 [packages]

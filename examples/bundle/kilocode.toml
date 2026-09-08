@@ -29,4 +29,8 @@ mute = [
 ]
 
 [packages]
-kilo = "mise:github:Kilo-Org/kilocode"
+# TWO RELEASE SERIES IN ONE REPOSITORY. Kilo-Org/kilocode tags the CLI `v<version>` and the
+# JetBrains plugin `jetbrains-v<version>`; without a version prefix the two series are one
+# list and the resolver can land on a plugin release. `[version_prefix=v]` keeps the
+# selection on the CLI series.
+kilo = "mise:github:Kilo-Org/kilocode[version_prefix=v]"

@@ -7,6 +7,7 @@
 #   REQUIRES egress groups — import them once (they are shared, not per-agent):
 #     sbx net groups import examples/net-groups/npm-registry.toml
 #     sbx net groups import examples/net-groups/npm-audit.toml
+#     sbx net groups import examples/net-groups/npm-jsr.toml
 #
 # Derived from `examples/app/deepseek-harness.toml`, whose namesake profile names this bundle in
 # `use` (thin profile): the bundle is the single source of truth for the agent's packages, env and
@@ -80,6 +81,7 @@ allow = [
 ]
 mute = [
     "@npm-audit",  # npm's audit endpoint: POSTed by the install, irrelevant to whether it succeeded
+    "@npm-jsr",  # the JSR mirror the resolver probes: nothing here is installed from it
 ]
 
 # THE VENDOR PUBLISHES FASTER THAN mise's FRESHNESS DELAY, so the package resolves to no version

@@ -302,15 +302,15 @@ The 67 shipped bundles, and what each carries:
 | `agy` | 1 (`mise:`) | 9 egress entries | none |
 | `atomic-agent` | 1 (`tarball:`) | 7 egress entries, 2 env vars, a `tarball:` resolver | none |
 | `aider` | 3 (`mise:`, `nix:`) | 2 egress entries | `pypi` |
-| `amp` | 2 (`mise:`, `nix:`) | 4 egress entries, 1 env var, a freshness exemption | `npm-audit`, `npm-registry` |
+| `amp` | 2 (`mise:`, `nix:`) | 5 egress entries, 1 env var, a freshness exemption | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `ante` | 1 (`mise:`) | 4 egress entries | none |
 | `antigravity` | 2 (`nix:`, `tarball:`) | 27 egress entries, a `tarball:` resolver | `chromium-background` |
-| `auggie` | 2 (`mise:`, `nix:`) | 6 egress entries, 1 env var | `npm-audit`, `npm-registry` |
+| `auggie` | 2 (`mise:`, `nix:`) | 7 egress entries, 1 env var | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `autohand` | 2 (`mise:`, `nix:`) | 4 egress entries | `github-install`, `npm-registry` |
 | `claude-code` | 1 (`mise:`) | 6 egress entries, 3 env vars | none |
 | `claude-desktop` | 2 (`deb:`, `nix:`) | 23 egress entries, 3 env vars | `chromium-background`, `google-signin-incage` |
-| `cline` | 3 (`mise:`, `nix:`) | 7 egress entries | `models-catalog`, `npm-audit`, `npm-registry` |
-| `codebuddy` | 2 (`mise:`, `nix:`) | 4 egress entries, 2 env vars | `npm-audit`, `npm-registry` |
+| `cline` | 3 (`mise:`, `nix:`) | 8 egress entries | `models-catalog`, `npm-audit`, `npm-jsr`, `npm-registry` |
+| `codebuddy` | 2 (`mise:`, `nix:`) | 5 egress entries, 2 env vars | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `codex` | 1 (`mise:`) | 6 egress entries | none |
 | `codex-desktop` | 2 (`deb:`, `nix:`) | 17 egress entries, 3 `deb:` library attributes | `chromium-background` |
 | `command-code` | 2 (`mise:`, `nix:`) | 12 egress entries | `github-install`, `npm-registry` |
@@ -320,19 +320,19 @@ The 67 shipped bundles, and what each carries:
 | `cursor` | 2 (`deb:`, `nix:`) | 31 egress entries, 1 env var, a `deb:` resolver | `chromium-background` |
 | `cursor-agent` | 1 (`tarball:`) | 4 egress entries, 1 env var, a `tarball:` resolver | none |
 | `deepagents-code` | 3 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
-| `deepseek-harness` | 5 (`mise:`, `nix:`) | 3 egress entries, 1 env var, an install step, a freshness exemption | `npm-audit`, `npm-registry` |
+| `deepseek-harness` | 5 (`mise:`, `nix:`) | 4 egress entries, 1 env var, an install step, a freshness exemption | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `devin` | 1 (`tarball:`) | 4 egress entries, a `tarball:` resolver | none |
-| `dirac` | 3 (`mise:`, `nix:`) | 5 egress entries | `npm-audit`, `npm-registry` |
-| `droid` | 2 (`mise:`, `nix:`) | 9 egress entries | `npm-audit`, `npm-registry` |
-| `freebuff` | 2 (`mise:`, `nix:`) | 8 egress entries | `npm-audit`, `npm-registry` |
+| `dirac` | 3 (`mise:`, `nix:`) | 6 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
+| `droid` | 2 (`mise:`, `nix:`) | 10 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
+| `freebuff` | 2 (`mise:`, `nix:`) | 9 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `freebuff-desktop` | 2 (`appimage:`, `nix:`) | 26 egress entries, an `appimage:` resolver | `chromium-background`, `github`, `github-api`, `npm-runtime` |
 | `goose` | 1 (`mise:`) | 1 egress entry, 2 env vars | none |
 | `goose-desktop` | 1 (`deb:`) | 2 env vars | none |
 | `grok` | 1 (`binary:`) | 3 egress entries, 1 env var, a `binary:` resolver | none |
-| `hermes` | 2 (`flake:`, `nix:`) | 10 egress entries, 1 env var | `models-catalog`, `npm-audit`, `npm-registry` |
-| `hermes-desktop` | 4 (`flake:`, `mise:`, `nix:`) | 21 egress entries, 1 env var, an install step | `chromium-background`, `google-signin-incage`, `models-catalog`, `npm-audit`, `npm-registry` |
+| `hermes` | 2 (`flake:`, `nix:`) | 11 egress entries, 1 env var | `models-catalog`, `npm-audit`, `npm-jsr`, `npm-registry` |
+| `hermes-desktop` | 4 (`flake:`, `mise:`, `nix:`) | 22 egress entries, 1 env var, an install step | `chromium-background`, `google-signin-incage`, `models-catalog`, `npm-audit`, `npm-jsr`, `npm-registry` |
 | `jcode` | 1 (`mise:`) | 1 egress entry, 2 env vars | none |
-| `junie` | 2 (`mise:`, `nix:`) | 7 egress entries, 1 env var, an install step | `npm-audit`, `npm-registry` |
+| `junie` | 2 (`mise:`, `nix:`) | 8 egress entries, 1 env var, an install step | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `kilocode` | 1 (`mise:`) | 4 egress entries | `models-catalog` |
 | `kimi` | 2 (`mise:`, `nix:`) | 7 egress entries | `models-catalog`, `npm-registry` |
 | `kiro` | 2 (`nix:`) | 34 egress entries, an install step | `chromium-background`, `google-signin-incage` |
@@ -340,11 +340,11 @@ The 67 shipped bundles, and what each carries:
 | `mimo` | 2 (`mise:`, `nix:`) | 6 egress entries | `models-catalog`, `npm-registry` |
 | `muse` | none | 4 egress entries, 1 env var, an install step | none |
 | `nanobot` | 3 (`mise:`, `nix:`) | 1 egress entry | `pypi` |
-| `nova` | 2 (`mise:`, `nix:`) | 5 egress entries | `npm-audit`, `npm-registry` |
-| `odysseus` | 6 (`nix:`) | 6 egress entries, 3 env vars, an install step, a background service | `npm-audit`, `npm-registry`, `pypi` |
+| `nova` | 2 (`mise:`, `nix:`) | 6 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
+| `odysseus` | 6 (`nix:`) | 7 egress entries, 3 env vars, an install step, a background service | `npm-audit`, `npm-jsr`, `npm-registry`, `pypi` |
 | `omp` | 1 (`mise:`) | 1 egress entry | none |
 | `openclaude` | 2 (`mise:`, `nix:`) | 1 egress entry | `npm-registry` |
-| `openclaw` | 2 (`mise:`, `nix:`) | 3 egress entries, 1 env var | `npm-audit`, `npm-registry` |
+| `openclaw` | 2 (`mise:`, `nix:`) | 4 egress entries, 1 env var | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `opencode` | 1 (`mise:`) | 3 egress entries | `models-catalog`, `npm-registry` |
 | `opencode-desktop` | 1 (`deb:`) | 4 egress entries | `models-catalog`, `npm-runtime` |
 | `openfox` | 2 (`mise:`, `nix:`) | an install step | none |
@@ -352,16 +352,16 @@ The 67 shipped bundles, and what each carries:
 | `pi` | 1 (`mise:`) | 1 egress entry | none |
 | `pool` | 1 (`tarball:`) | 1 egress entry, a `tarball:` resolver | none |
 | `prime-agent` | 5 (`nix:`) | 4 egress entries, 1 env var, an install step | `npm-registry`, `pypi` |
-| `qoder` | 3 (`mise:`, `nix:`) | 6 egress entries | `npm-audit`, `npm-registry` |
+| `qoder` | 3 (`mise:`, `nix:`) | 7 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `qwen-code` | 2 (`mise:`, `nix:`) | 3 egress entries | `npm-registry` |
-| `reasonix` | 2 (`mise:`, `nix:`) | 4 egress entries, 1 env var | `npm-audit`, `npm-registry` |
+| `reasonix` | 2 (`mise:`, `nix:`) | 5 egress entries, 1 env var | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `reasonix-desktop` | 1 (`deb:`) | 2 egress entries, 4 env vars, a `deb:` resolver | none |
 | `rovo` | 1 (`nix:`) | 12 egress entries | none |
-| `sigit` | 2 (`mise:`, `nix:`) | 6 egress entries, 1 env var | `npm-audit`, `npm-registry` |
-| `snow` | 2 (`mise:`, `nix:`) | 2 egress entries | `npm-audit`, `npm-registry` |
+| `sigit` | 2 (`mise:`, `nix:`) | 7 egress entries, 1 env var | `npm-audit`, `npm-jsr`, `npm-registry` |
+| `snow` | 2 (`mise:`, `nix:`) | 3 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `stakpak` | 1 (`mise:`) | 4 egress entries | none |
 | `trae` | 2 (`nix:`) | 2 egress entries, an install step | `github`, `pypi` |
-| `traycer` | 2 (`mise:`, `nix:`) | 8 egress entries | `npm-audit`, `npm-registry` |
+| `traycer` | 2 (`mise:`, `nix:`) | 9 egress entries | `npm-audit`, `npm-jsr`, `npm-registry` |
 | `traycer-desktop` | 1 (`deb:`) | 7 egress entries, a `deb:` resolver | none |
 | `vibe` | 4 (`mise:`, `nix:`) | 12 egress entries | `chromium-background`, `pypi` |
 | `vtcode` | 3 (`mise:`, `nix:`) | none | none |
