@@ -612,12 +612,9 @@ fn render_log_line(
         format!("  {n}{}{r}", e.rpc.as_str())
     };
     let vc = verdict_color(e.verdict, pal);
-    // `allow` and `resolved` carry no parenthetical: the first has nothing to explain, and the
-    // second's reason is its own verdict spelled twice.
-    let reason = if matches!(
-        e.verdict,
-        sandbox::control::LogVerdict::Allow | sandbox::control::LogVerdict::Resolved
-    ) {
+    // `allow` and `resolved` carry no parenthetical, by the verdict's own rule — shared with the
+    // unified `sbx logs` feed, which renders the same events.
+    let reason = if e.verdict.reason_restates_verdict() {
         String::new()
     } else {
         format!("  {dim}({}){r}", e.reason)

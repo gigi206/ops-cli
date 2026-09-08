@@ -399,6 +399,18 @@ impl LogVerdict {
         }
     }
 
+    /// Whether this verdict's reason merely restates the verdict, and so is dropped from a rendered
+    /// line: `allow` has nothing to explain, and `resolved`'s reason is its own token spelled twice.
+    /// Every other verdict's reason is the value of the line, because `deny` alone does not say what
+    /// to change.
+    ///
+    /// Shared because two views render the same event: `sbx net logs` and the unified `sbx logs`
+    /// feed. They disagreed once, and the disagreement showed as `resolved  example.com:53
+    /// (resolved)` in one of them.
+    pub(crate) fn reason_restates_verdict(self) -> bool {
+        matches!(self, LogVerdict::Allow | LogVerdict::Resolved)
+    }
+
     /// Parse a verdict token back, or `None` if it is not one of them.
     ///
     /// The inverse of [`Self::as_str`], and the two are a pair a test proves total: this side has a

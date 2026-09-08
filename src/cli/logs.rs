@@ -346,8 +346,10 @@ fn read_net_rows(
                 subject.push_str(&format!("  {method} {path}"));
             }
             // The reason is a stable category token, never a rule's text or a secret's name — and it
-            // is the whole value of a refusal line: `deny` alone does not say what to change.
-            if e.verdict != crate::sandbox::control::LogVerdict::Allow {
+            // is the whole value of a refusal line: `deny` alone does not say what to change. The
+            // verdicts whose reason only spells the verdict again are the type's own rule, so this
+            // view and `sbx net logs` cannot drift into rendering one event two ways.
+            if !e.verdict.reason_restates_verdict() {
                 subject.push_str(&format!("  ({})", e.reason));
             }
             Row {

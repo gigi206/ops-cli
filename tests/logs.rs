@@ -530,6 +530,47 @@ fn the_merged_view_orders_every_feed_by_when_it_happened() {
     );
 }
 
+/// The two views of one egress event must render it the same way.
+///
+/// `sbx net logs` drops a reason that only spells its verdict again; this unified feed kept it, and
+/// a resolution came out as `resolved  example.com:53  (resolved)` here while reading clean there.
+/// The rule lives on the verdict now, and this holds the rendering to it from outside the crate —
+/// including the other half, where a refusal must still carry the category that says what to do.
+#[test]
+fn the_unified_feed_drops_a_reason_that_only_repeats_its_verdict() {
+    let dir = TmpDir::new("l");
+    let data = dir.path();
+    let standin = Standin::new();
+    let pid = standin.pid();
+    write_session_record(data, pid, Path::new("/tmp/demo-app"));
+    serve_lens(
+        data,
+        "egress",
+        pid,
+        &[
+            "event seq=1 at=1700000000100 port=53 verdict=resolved proto=dns reason=resolved \
+           host=example.com",
+            "event seq=2 at=1700000000200 port=443 verdict=blocked proto=tcp reason=dns-bypassed \
+           host=93.184.216.34",
+        ],
+    );
+
+    let out = read_feed(data, &["logs", &pid.to_string()]);
+
+    assert!(
+        out.contains("example.com:53"),
+        "the name the cage asked for is shown: {out}"
+    );
+    assert!(
+        !out.contains("(resolved)"),
+        "a reason that only spells its verdict again must not be rendered: {out}"
+    );
+    assert!(
+        out.contains("93.184.216.34:443") && out.contains("(dns-bypassed)"),
+        "a refusal still carries the category that says what to change: {out}"
+    );
+}
+
 /// A session's brokers share one record, and the view has to show all of them. Read over one
 /// socket carrying two brokers' decisions, which is what a launch with two `[broker.<name>]`
 /// bindings produces: a reader that saw one of them and said nothing of the other would be a

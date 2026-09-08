@@ -48,7 +48,7 @@ The tokens are each feed's own, not a vocabulary invented here:
 | Feed | Tokens |
 |---|---|
 | `proc` | `allow`, `deny`, `ask` under enforcement; `observe` for the poll observer, which records what ran rather than a decision |
-| `net` | `allow`, `deny`, `blocked`, `error` |
+| `net` | `allow`, `deny`, `blocked`, `error`; `resolved` for a name the cage asked the transparent-capture tap for, which is a question rather than a decision |
 | `fs` | `write`, `create`, `remove`, `rename` |
 | `ssh` | `list`, `sign`, `refuse` |
 | `broker` | `forward`, `answer`, `refuse`: what `sbx` observed, with the plugin's own reason appended |

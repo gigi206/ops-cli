@@ -187,7 +187,9 @@ A [task](../tasks/) invocation runs behind a proxy of its own, governed by the t
 one record per session, whoever made the request.
 
 The **transport** column is `https` (inspected TLS), `http` (inspected cleartext), `tcp`
-(a raw `tcp://` splice), or `-` (refused before it was known). For an inspected request it
+(a raw `tcp://` splice, or a connection the transparent-capture tap refused), `dns` (a
+name the cage asked that tap for), or `-` (refused before it was known). For an
+inspected request it
 is **suffixed with the HTTP version**, `https/h1` vs `https/h2`, so you can see whether a
 `[network] http2`-designated host is actually being carried as HTTP/2 (the security axis
 is never dropped: it stays `https`, never a bare `h2`).
@@ -289,10 +291,15 @@ The log's verdicts are a **superset** of the `stats` counters:
   cap).
 - **error**: the request was **allowed but did not complete**: a DNS failure, an
   unreachable upstream, a rejected certificate.
+- **resolved**: a name the cage asked the [transparent-capture
+  tap](../configuration/network#clients-that-ignore-the-proxy-variables) for. Not a
+  decision at all: the tap answers every name without reading the allowlist, because
+  the decision belongs to the connection that may follow. A name resolved and never
+  dialed leaves this line with nothing after it, which is what no other record shows.
 
-`error` is the extra one: it is **not** a `stats` counter (stats count policy
-verdicts, not transport failures), so *the log's lines do not reconcile with
-`sbx net stats` totals*. "Allowed but it failed" reads differently from "the policy
+`error` and `resolved` are the extra ones: neither is a `stats` counter (stats count
+policy verdicts, and these two are a transport failure and a question), so *the log's
+lines do not reconcile with `sbx net stats` totals*. "Allowed but it failed" reads differently from "the policy
 said no", which is the log's whole job: answering *why did it fail just now?*
 
 ### `--with-status` and `--with-query`
