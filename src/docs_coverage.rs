@@ -777,6 +777,44 @@ fn every_unwatched_tree_is_named_in_the_file_feed_page() {
 /// answered by the proxy and shown by `sbx net logs` while appearing nowhere in the guide, so a
 /// reader who met one had no page to look it up on.
 ///
+/// Every check `sbx doctor` can print is named on the page that explains its output.
+///
+/// `doctor`'s lines are the first thing a new user reads, and the page carries both a sample run
+/// and a bullet per check. Neither is generated, so a check added to the command is a line the
+/// reader meets with nothing to look it up by: `capture` printed for three commits while the
+/// documented sample still showed the run without it. The labels are read out of the source that
+/// prints them, so this cannot pass by agreeing with a stale copy.
+///
+/// One direction only: the page may describe a check in more words than its label, and may name
+/// things that are not checks.
+#[test]
+fn every_check_doctor_prints_is_named_on_its_page() {
+    // A check line is emitted as `"  {} <label>   <detail>"` — the tag, then the label padded out
+    // to its column. The run of spaces is what ends the label.
+    let labels: Vec<String> = include_str!("cli/doctor.rs")
+        .split("\"  {} ")
+        .skip(1)
+        .filter_map(|rest| {
+            let label = rest.split("  ").next()?.trim();
+            (!label.is_empty() && label.chars().all(|c| c.is_ascii_lowercase() || c == ' '))
+                .then(|| label.to_string())
+        })
+        .collect();
+    assert!(
+        labels.len() > 5,
+        "the check lines in src/cli/doctor.rs no longer read as ones: {labels:?}"
+    );
+
+    let page = std::fs::read_to_string(guide().join("getting-started/doctor.md"))
+        .expect("docs-site/docs/guide/getting-started/doctor.md must exist");
+    for label in &labels {
+        assert!(
+            page.contains(label.as_str()),
+            "`sbx doctor` prints a `{label}` line that its own page never names"
+        );
+    }
+}
+
 /// The rustdoc table is the source of truth because it sits next to the emitting code; this only
 /// asserts that the guide names each of its tokens. It says nothing about the reverse direction:
 /// the guide legitimately names sub-categories (`bad-request:head`) that are not rows of their own,

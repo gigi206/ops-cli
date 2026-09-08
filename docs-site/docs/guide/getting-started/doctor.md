@@ -33,6 +33,8 @@ sbx doctor — runtime preflight
          · kernel.apparmor_restrict_unprivileged_userns = 0
          · kernel.unprivileged_userns_clone = 1
   [ ok ] resource limits   cage capped via a systemd scope (MemoryHigh=80%, MemoryMax=90%, TasksMax=16384)
+  [ ok ] capture           a client that ignores the proxy variables is still routed
+         · proven by installing the redirect rules in a throwaway namespace
   [ ok ] nix               /nix/var/nix/profiles/default/bin/nix
          · nix (Nix) 2.34.5
   [ ok ] git               /usr/bin/git
@@ -89,10 +91,19 @@ differently, and the store moves into it:
   `wsl.exe` outside the user slice altogether, yet a scope can still be created from
   either.
 
+- **Transparent egress capture.** Whether a filtering launch can route a client that
+  ignores the proxy environment variables, rather than letting it fail to connect. The
+  answer is not read from kernel configuration: `doctor` installs the redirect rules in a
+  throwaway namespace and reports what the kernel did. Like resource limiting this is not
+  the boundary, so a host that cannot take the rules gets a warning naming what is
+  missing, never a failure: egress still works, and a proxy-blind client fails to connect
+  instead of being routed. See
+  [Clients that ignore the proxy variables](../configuration/network#clients-that-ignore-the-proxy-variables).
+
 - **The store location and channel revision.** Where `sbx`'s user-owned store lives
   and which nixpkgs revision the base userland is pinned to.
 
-- **The distribution image**, when the host-level lock pins one: the locator, its digest,
+- **The distribution image** (`distro`), when the host-level lock pins one: the locator, its digest,
   and whether the tree is unpacked yet. The line is absent on a host that runs the hermetic
   nix userland, which is the ordinary case and not something missing. A project that
   declares its own image pins it in the project's own lock, which `doctor` does not read.
