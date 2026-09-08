@@ -683,3 +683,78 @@ fn top_level_commands_are_listed_alphabetically() {
         PAGES.iter().filter(|p| p.path.len() == 1).count()
     );
 }
+
+/// A run of flags the prose offers together must be flags that page actually takes.
+///
+/// `net allow` and `net deny` described "the config-scope flags (`-l`/`-g`/`-c`)". Two of the three
+/// were real; `-c` belonged to `sbx config` and those verbs never parsed it, so a reader who tried
+/// the one the page had just grouped with two working ones got an unknown-option error. A wrong
+/// flag is worse than a missing one, because it is spent before it is doubted.
+///
+/// The unit is the **run**, not the lone mention, and that is what makes this checkable: prose
+/// legitimately names another command's flag in passing ("`sbx proc rules` lists the live
+/// `--session` overlay"), and no syntactic rule tells that apart from a claim about this page. But
+/// a slash-joined run — `` `-l`/`-g`/`-c` `` — is one sentence offering one set, so every member
+/// answers for the same page. A page inherits its ancestors' rows and speaks for its descendants',
+/// since a namespace page describes what its subcommands take.
+#[test]
+fn no_page_offers_a_run_of_flags_one_of_which_it_does_not_take() {
+    let flags_of = |page: &Page| -> Vec<String> {
+        page.options
+            .iter()
+            .flat_map(|(names, _)| names.split(&[',', ' ', '|', '='][..]))
+            .filter(|t| t.starts_with('-'))
+            .map(|t| {
+                t.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                    .to_string()
+            })
+            .collect()
+    };
+    let mut wrong: Vec<String> = Vec::new();
+    for page in PAGES {
+        let mut allowed: Vec<String> = Vec::new();
+        for other in PAGES {
+            if page.path.starts_with(other.path) || other.path.starts_with(page.path) {
+                allowed.extend(flags_of(other));
+            }
+        }
+        // A run is `<code>`/`<code>`[/`<code>`…]: the separator is what marks the members as one
+        // offer rather than as separate mentions. A page may also name a run to say it does *not*
+        // take it ("There is no `--purge`/`--gc` pair here, unlike `sbx app rm`"), which is a
+        // correct sentence about the same tokens — so a run the prose denies is not one it offers.
+        let details = page.details;
+        for (at, run) in details
+            .match_indices("`/`")
+            .map(|(i, _)| (i, &details[i..]))
+        {
+            let sentence_start = details[..at].rfind(['.', '\n']).map_or(0, |i| i + 1);
+            if details[sentence_start..at].contains("no ") {
+                continue;
+            }
+            // Rebuild each side of a separator into the token it names.
+            let before = details[..at].rsplit('`').next().unwrap_or("");
+            let after = run
+                .trim_start_matches("`/`")
+                .split('`')
+                .next()
+                .unwrap_or("");
+            for token in [before, after] {
+                let token = token.trim();
+                if token.len() > 1
+                    && token.starts_with('-')
+                    && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                    && !allowed.iter().any(|a| a == token)
+                {
+                    wrong.push(format!("{}: offers `{token}`", page.path.join(" ")));
+                }
+            }
+        }
+    }
+    wrong.sort();
+    wrong.dedup();
+    assert!(
+        wrong.is_empty(),
+        "these pages offer a run of flags containing one they do not take:\n  {}",
+        wrong.join("\n  ")
+    );
+}
