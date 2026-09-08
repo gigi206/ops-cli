@@ -1,7 +1,13 @@
 //! `sbx test <kind> <target>`: probe whether an access would be allowed and explain why — a
-//! diagnostic surface (currently `net <url>`, testing a URL against the egress policy a launch
-//! serves). No launch, no nix, no network. The app-overlay fold and the `net_mode_word` keyword it
-//! shares with `sbx net`/`sbx config` stay at the crate root, referenced via crate::.
+//! diagnostic surface over the access controls a launch enforces: `net <url>` against the egress
+//! allowlist, `proc <program>` against the `[proc]` exec policy. No launch, no nix, no network. The
+//! app-overlay fold and the `net_mode_word` keyword it shares with `sbx net`/`sbx config` stay at
+//! the crate root, referenced via crate::.
+//!
+//! Both kinds answer by calling the **same** decision the enforcing path calls — `l4_decision` and
+//! the allowlist for egress, [`crate::proc_policy::ProcPolicy::decide`] for exec — rather than
+//! re-deriving a verdict here. A tester with its own copy of the rule would eventually disagree
+//! with the wire, and it would disagree silently, which is worse than not having one.
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -16,6 +22,7 @@ use crate::{allowlist, config, config_cwd, diag, help, sandbox, style};
 pub(crate) fn test_cmd(args: &[OsString]) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("net") => net_test(&args[1..]),
+        Some("proc") => proc_test(&args[1..]),
         // Unknown or no kind: name the mistake (if any), then print the full page so its
         // Subcommands list guides, like bare `sbx net`/`sbx config`.
         other => {
@@ -640,9 +647,241 @@ fn render_injection_note(secret: &config::HeaderSecret, pal: &style::Palette) ->
     )
 }
 
+/// The parsed form of `sbx test proc`: which app's overlay to fold in, the caller chain to decide
+/// under, and the positional program.
+#[derive(Debug)]
+struct ProcTestArgs<'a> {
+    app: Option<String>,
+    /// The chain of programs that led to this exec, outermost first, as `--caller` gave them. Empty
+    /// is the ordinary case: the flat policy ignores it, and only a `[proc.callers]` graph reads it.
+    caller: Vec<String>,
+    program: &'a str,
+}
+
+/// Parse `sbx test proc`'s arguments: an optional `--app/-a <name>`, a repeatable `--caller <path>`,
+/// and the positional program, in any order. Pure — it returns its refusal as the lines to print —
+/// so the grammar and the wording of its usage line are unit-tested, on the same terms as
+/// [`parse_net_test_args`].
+fn parse_proc_test_args(args: &[OsString]) -> Result<ProcTestArgs<'_>, Vec<String>> {
+    let usage = || {
+        vec![
+            "sbx: test proc: a program is required".to_string(),
+            format!("sbx: usage: {}", help::synopsis_of(&["test", "proc"])),
+        ]
+    };
+    let mut app: Option<String> = None;
+    let mut caller: Vec<String> = Vec::new();
+    let mut program: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].to_str() {
+            Some("-a") | Some("--app") => match args.get(i + 1).and_then(|a| a.to_str()) {
+                Some(name) if !name.is_empty() => {
+                    app = Some(name.to_string());
+                    i += 2;
+                }
+                _ => {
+                    return Err(vec![
+                        "sbx: test proc: --app needs an app name".to_string(),
+                        format!("sbx: usage: {}", help::synopsis_of(&["test", "proc"])),
+                    ]);
+                }
+            },
+            Some("--caller") => match args.get(i + 1).and_then(|a| a.to_str()) {
+                Some(path) if !path.is_empty() => {
+                    caller.push(path.to_string());
+                    i += 2;
+                }
+                _ => {
+                    return Err(vec![
+                        "sbx: test proc: --caller needs a program path".to_string(),
+                        format!("sbx: usage: {}", help::synopsis_of(&["test", "proc"])),
+                    ]);
+                }
+            },
+            // Refused rather than taken for the program, like its egress sibling: a mistyped flag
+            // must not silently become the thing under test.
+            Some(flag) if flag.starts_with('-') => {
+                return Err(vec![
+                    format!("sbx: test proc: unknown option `{flag}`"),
+                    format!("sbx: usage: {}", help::synopsis_of(&["test", "proc"])),
+                ]);
+            }
+            Some(value) => {
+                if program.is_some() {
+                    return Err(vec![
+                        "sbx: test proc: at most one program".to_string(),
+                        format!("sbx: usage: {}", help::synopsis_of(&["test", "proc"])),
+                    ]);
+                }
+                program = Some(value);
+                i += 1;
+            }
+            None => {
+                return Err(vec![
+                    "sbx: test proc: argument is not valid UTF-8".to_string(),
+                ]);
+            }
+        }
+    }
+    match program {
+        Some(program) => Ok(ProcTestArgs {
+            app,
+            caller,
+            program,
+        }),
+        None => Err(usage()),
+    }
+}
+
+/// `sbx test proc <program> [-a <app>] [--caller <path>]...`: report whether the resolved `[proc]`
+/// policy would let `<program>` exec, and under which mode — the exec sibling of `sbx test net`.
+///
+/// It calls [`crate::proc_policy::ProcPolicy::decide`], which is the function the supervisor calls
+/// on a real `execve`, so the verdict here is the verdict on the wire. What it cannot answer is the
+/// part that needs a live process: the supervisor resolves the target through the caller's `/proc`
+/// entry, follows a `#!` line and a dynamic loader's argument to the program they really run, and
+/// decides each. Those are read off a running cage; here the program is taken as given.
+fn proc_test(args: &[OsString]) -> ExitCode {
+    let ProcTestArgs {
+        app,
+        caller,
+        program,
+    } = match parse_proc_test_args(args) {
+        Ok(parsed) => parsed,
+        Err(lines) => {
+            for line in lines {
+                diag::error(&line);
+            }
+            return ExitCode::from(2);
+        }
+    };
+
+    let cwd = match config_cwd() {
+        Ok(d) => d,
+        Err(code) => return code,
+    };
+    let mut resolved = config::load(&cwd);
+    for w in &resolved.warnings {
+        diag::warn_config(w);
+    }
+    if let Some(name) = &app
+        && let Err(e) = fold_app_overlay(&mut resolved, name)
+    {
+        diag::error(&format!("sbx: test proc: {e}"));
+        return ExitCode::from(2);
+    }
+
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let (h, r) = (pal.head, pal.reset);
+    let scope = match &app {
+        Some(name) => format!(" (app {name})"),
+        None => String::new(),
+    };
+    let policy = &resolved.proc;
+    let mode = match policy.mode {
+        crate::proc_policy::ProcMode::Off => {
+            println!("{h}proc{scope}:{r} off — nothing is enforced; every program runs");
+            return ExitCode::SUCCESS;
+        }
+        crate::proc_policy::ProcMode::Observe => {
+            "observe (every program runs; execs are recorded, not decided)"
+        }
+        crate::proc_policy::ProcMode::Enforce => "enforce (denylist — everything not denied runs)",
+        crate::proc_policy::ProcMode::Ask => {
+            "ask (an unmatched program parks for a live `sbx proc pending` decision)"
+        }
+        // Not reachable from `[proc] mode` — it is the posture a declared operation runs under,
+        // where the declaration enumerates what may run. Named rather than folded into `enforce`,
+        // whose default is the opposite: here an unmatched program is refused.
+        crate::proc_policy::ProcMode::Confine => {
+            "confine (allowlist — only a declared program runs)"
+        }
+    };
+    println!("{h}proc{scope}:{r} {mode}");
+
+    let verdict = policy.decide(&caller, program);
+    let (word, hue) = match verdict {
+        crate::proc_policy::Verdict::Allow => ("ALLOWED", pal.ok),
+        crate::proc_policy::Verdict::Deny => ("DENIED", pal.err),
+        crate::proc_policy::Verdict::Ask => ("PARKED", pal.warn),
+    };
+    println!("  {hue}{word}{r}  {program}");
+    if !caller.is_empty() {
+        println!(
+            "  {dim}called by: {}{r}",
+            caller.join(" -> "),
+            dim = pal.dim
+        );
+    }
+    // A caller graph decides by *who* is running the program, so a verdict read without naming a
+    // caller answers a different question than the one a real exec asks. Said once, here, rather
+    // than left for the reader to infer from an unexpected DENIED.
+    if policy.graph.is_some() && caller.is_empty() {
+        diag::warn(
+            "this policy carries a caller graph, so what may run depends on who runs it — name the \
+             chain with `--caller <path>` (outermost first) to ask the question a real exec asks",
+        );
+    }
+    ExitCode::SUCCESS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn os(xs: &[&str]) -> Vec<OsString> {
+        xs.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn parse_proc_test_args_takes_the_program_the_app_and_a_caller_chain() {
+        let bare = os(&["curl"]);
+        let p = parse_proc_test_args(&bare).expect("a bare program parses");
+        assert_eq!(p.program, "curl");
+        assert!(p.app.is_none());
+        assert!(p.caller.is_empty());
+
+        // Flags in any order, and `--caller` accumulates in the order given (outermost first).
+        let full = os(&[
+            "--caller",
+            "/bin/sh",
+            "-a",
+            "claude",
+            "--caller",
+            "/bin/make",
+            "git",
+        ]);
+        let p = parse_proc_test_args(&full).expect("flags parse in any order");
+        assert_eq!(p.program, "git");
+        assert_eq!(p.app.as_deref(), Some("claude"));
+        assert_eq!(p.caller, ["/bin/sh", "/bin/make"]);
+    }
+
+    #[test]
+    fn parse_proc_test_args_refuses_what_would_answer_a_different_question() {
+        let refused = |xs: &[&str]| -> Vec<String> {
+            let args = os(xs);
+            parse_proc_test_args(&args).err().unwrap_or_else(|| {
+                panic!("`{xs:?}` must be refused");
+            })
+        };
+
+        // No program: the usage, not a verdict on nothing.
+        let e = parse_proc_test_args(&[]).expect_err("a program is required");
+        assert!(e.iter().any(|l| l.contains("required")), "{e:?}");
+
+        // An unknown flag must not become the program under test: a typo would otherwise read as a
+        // verdict about a program nobody asked about.
+        let e = refused(&["--nope", "curl"]);
+        assert!(e.iter().any(|l| l.contains("--nope")), "{e:?}");
+
+        // A second positional is refused rather than silently ignored.
+        refused(&["curl", "git"]);
+        // A flag with no value is refused rather than swallowing the program.
+        refused(&["curl", "--caller"]);
+        refused(&["curl", "-a"]);
+    }
 
     #[test]
     fn net_decision_is_plain_text_when_uncolored() {

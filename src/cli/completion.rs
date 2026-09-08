@@ -2108,6 +2108,9 @@ mod tests {
         // the path is not, and completing the two words alone would offer a value the parser
         // refuses (a side with no path).
         "mask",
+        // An exec target being asked about: a basename or an in-cage path. What the cage may run is
+        // the question `sbx test proc` exists to answer, so the set cannot be offered as the answer.
+        "program",
         // A name that does not exist yet: the one an import is being given. Offering the installed
         // apps would name exactly the values the parser refuses, which is what the plain `<name>`
         // spelling used to do here.

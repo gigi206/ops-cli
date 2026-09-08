@@ -5,13 +5,18 @@ description: "Report whether an access would be allowed, and why, without launch
 # `sbx test`
 
 ```
-sbx test net [--app <name>] [-X|--method <verb>] <url|tcp://host:port>
+sbx test net  [--app <name>] [-X|--method <verb>] <url|tcp://host:port>
+sbx test proc [--app <name>] [--caller <path>]... <program>
 ```
 
 A diagnostic surface that reports whether an access would be allowed, and why. No
 launch, no nix, no network: it reports a verdict against the resolved policy.
 
-See also: [`sbx net`](net) · [Network modes](../networking/modes) · [Rule grammar](../networking/rules) · [Egress observability](../networking/observability).
+Both kinds answer by calling the **same** decision the enforcing path calls, rather than
+re-deriving a verdict of their own. A tester carrying its own copy of the rule would eventually
+disagree with what the cage does, and it would disagree silently.
+
+See also: [`sbx net`](net) · [`sbx proc`](proc) · [Network modes](../networking/modes) · [Rule grammar](../networking/rules) · [Egress observability](../networking/observability).
 
 ## `sbx test net`
 
@@ -27,6 +32,46 @@ is noted (by header and source, never the value, and not resolved). Reflects the
 | `tcp://host:port` | test a raw L4 splice instead: reports **SPLICED / NOT SPLICED** |
 | `-a, --app <name>` | test against that app's effective policy (baseline + overlay) |
 | `-X, --method <verb>` | the HTTP method to test (default `GET`); a `{GET}` rule only matches that verb (ignored for `tcp://`) |
+
+## `sbx test proc`
+
+Reports **ALLOWED / DENIED / PARKED** against the effective [`[proc]`](../configuration/proc)
+exec policy a launch enforces, and names the mode that decides a program no rule matches.
+Reflects the [trust gate](../concepts/trust) the same way: an untrusted project's `[proc]` is
+dropped, so the tester reports the baseline rather than the policy the file asks for.
+
+| Option | Meaning |
+|---|---|
+| `<program>` | the exec target to test, as the supervisor sees it: a basename (`curl`) or a full in-cage path (`/nix/store/…/bin/git`) |
+| `-a, --app <name>` | test against that app's effective policy (baseline + overlay) |
+| `--caller <path>` | one link of the chain leading to the exec, outermost first; repeatable |
+
+```sh
+sbx test proc curl                      # would this be blocked?
+sbx test proc git -a claude-code        # under that app's policy
+sbx test proc rm --caller /bin/sh       # under a [proc.callers] graph
+```
+
+```
+proc: enforce (denylist — everything not denied runs)
+  DENIED  curl
+```
+
+`--caller` matters only under a [caller graph](../configuration/proc), where what may run depends
+on **who** runs it. Under one, a verdict asked without a caller answers a different question than
+a real exec does, so the tester says as much rather than letting an unexpected `DENIED` be read as
+the policy's answer.
+
+### What it cannot tell you
+
+The verdict is what the **rules** say about the program you named. It is not what a particular
+`execve` would resolve to, because that part needs a live process: on a real exec the supervisor
+resolves the target through the calling process's own `/proc` entry, follows a `#!` line and a
+dynamic loader's argument to the programs they really run, and decides each of them; a target it
+cannot read is decided by the mode's default.
+
+So a script that passes here may still be refused in the cage for its interpreter, and the way to
+see that is the feed: [`sbx proc logs`](proc#logs) on an observed session.
 
 ## Private and internal addresses
 

@@ -1139,3 +1139,74 @@ fn deny_session_loads_a_rule_into_a_running_enforcing_cage() {
         "the --session deny did not load into the live cage: {last}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `sbx test proc` — the exec-policy tester. Host-side: no cage, no nix.
+// ---------------------------------------------------------------------------
+
+use common::project::Project;
+
+#[test]
+fn test_proc_reports_the_verdict_the_policy_would_reach() {
+    let p = Project::new("tproc");
+    p.write_project("[proc]\nmode = \"enforce\"\ndeny = [\"curl\"]\n");
+    // The project config must be trusted for its security fields to apply, exactly as a launch
+    // requires — otherwise this would test the empty baseline and pass for the wrong reason.
+    assert!(p.run(&["trust"]).status.success(), "trust the fixture");
+
+    let verdict = |program: &str| -> String {
+        let out = p.run(&["test", "proc", program]);
+        assert!(
+            out.status.success(),
+            "test proc failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    let denied = verdict("curl");
+    assert!(denied.contains("DENIED"), "{denied}");
+    assert!(denied.contains("enforce"), "the mode is named: {denied}");
+
+    // The other direction, so a tester that printed DENIED for everything would fail here. Under
+    // `enforce` anything unmatched runs.
+    let allowed = verdict("git");
+    assert!(allowed.contains("ALLOWED"), "{allowed}");
+}
+
+#[test]
+fn test_proc_reflects_the_trust_gate_like_a_launch_would() {
+    // An untrusted project's `[proc]` is dropped at load, so the tester must report the baseline
+    // rather than the policy the file asks for. A tester that read the file directly would say
+    // DENIED where the launch would say allowed, which is the failure mode that matters: it would
+    // let someone believe a program is blocked when it is not.
+    let p = Project::new("tproc");
+    p.write_project("[proc]\nmode = \"enforce\"\ndeny = [\"curl\"]\n");
+
+    let out = p.run(&["test", "proc", "curl"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("off"),
+        "an untrusted policy is dropped, so the baseline is off: {stdout}"
+    );
+    assert!(!stdout.contains("DENIED"), "{stdout}");
+}
+
+#[test]
+fn test_proc_refuses_a_line_it_cannot_answer() {
+    let p = Project::new("tproc");
+    // No program: usage, exit 2 — never a verdict about nothing.
+    let out = p.run(&["test", "proc"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("required"));
+
+    // An unknown kind still names itself rather than falling through to a verdict.
+    let out = p.run(&["test", "bogus", "curl"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown kind"));
+}

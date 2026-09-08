@@ -2312,6 +2312,37 @@ pub(super) const PAGES: &[Page] = &[
             `tcp://` rule would tunnel it raw (uninspected) or it would take the inspected L7 path.\n\
             Reflects the trust gate (an untrusted project's policy is dropped). No nix.",
     },
+    Page {
+        path: &["test", "proc"],
+        synopsis: "sbx test proc [--app <name>] [--caller <path>]... <program>",
+        summary: "test a program against the resolved [proc] exec policy",
+        options: &[
+            (
+                "<program>",
+                "the exec target to test, as the supervisor would see it: a basename (`curl`) or a full in-cage path (`/nix/store/…/bin/git`)",
+            ),
+            (
+                "-a, --app <name>",
+                "test against that app's effective policy (baseline + overlay), not the baseline",
+            ),
+            (
+                "--caller <path>",
+                "one link of the chain that leads to the exec, outermost first; repeatable. Only a `[proc.callers]` graph reads it, and under one a verdict without it answers a different question",
+            ),
+        ],
+        details:
+            "Reports ALLOWED/DENIED/PARKED against the effective `[proc]` policy a launch enforces,
+            and names the mode that decides an unmatched program. The verdict comes from the same
+            function the supervisor calls on a real `execve`, so it cannot drift from the wire.
+            Reflects the trust gate (an untrusted project's policy is dropped). No launch, no nix.
+            
+            What it cannot answer is the part that needs a live process. On a real `execve` the
+            supervisor resolves the target through the calling process's own `/proc` entry, follows
+            a `#!` line and a dynamic loader's argument to the program they really run, and decides
+            each of them; a target it cannot read is decided by the mode's default. Here the program
+            is taken as given, so this answers what the *rules* say, not what a particular exec
+            would resolve to.",
+    },
     // ---- net subcommands ----------------------------------------------------------
     Page {
         path: &["net", "rules"],
