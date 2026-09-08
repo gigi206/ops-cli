@@ -573,10 +573,43 @@ async fn emit_bounded<B>(conn: &zbus::Connection, member: &str, body: &B) -> boo
 where
     B: serde::Serialize + zbus::zvariant::DynamicType,
 {
+    emit_bounded_within(conn, member, body, EMIT_DEADLINE).await
+}
+
+/// [`emit_bounded`] with the bound as an argument, so a test can drive the giving-up branch against
+/// a real connection without waiting the real window out.
+async fn emit_bounded_within<B>(
+    conn: &zbus::Connection,
+    member: &str,
+    body: &B,
+    deadline: Duration,
+) -> bool
+where
+    B: serde::Serialize + zbus::zvariant::DynamicType,
+{
+    let write = async {
+        conn.emit_signal(None::<&str>, OBJECT, IFACE, member, body)
+            .await
+            .is_ok()
+    };
+    completes_within(write, deadline).await
+}
+
+/// Whether `write` finished inside `deadline`, `false` if it did not.
+///
+/// Split from [`emit_bounded_within`] so the giving-up branch is reachable from a test: driving it
+/// through a real connection would mean a peer that accepts bytes and never reads them, which needs
+/// zbus's `p2p` feature (and the `uuid` dependency behind it) that this crate deliberately does not
+/// take. What a test can hold to is the rule itself — a write that does not finish in the window is
+/// reported as one that did not happen.
+async fn completes_within(
+    write: impl std::future::Future<Output = bool>,
+    deadline: Duration,
+) -> bool {
     futures_util::select! {
-        r = conn.emit_signal(None::<&str>, OBJECT, IFACE, member, body).fuse() => r.is_ok(),
+        wrote = write.fuse() => wrote,
         // `Timer` is both a `Future` and a `Stream`, so the future's `fuse` is named explicitly.
-        _ = FutureExt::fuse(async_io::Timer::after(EMIT_DEADLINE)) => false,
+        _ = FutureExt::fuse(async_io::Timer::after(deadline)) => false,
     }
 }
 
@@ -666,6 +699,35 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A write no one is reading is reported as one that did not happen.
+    ///
+    /// The cage owns the far end of the private bus. If it stops reading and the transport fills,
+    /// the emit parks — and it parks *inside* a select branch, so the shutdown branch is never
+    /// reached and `Drop`'s join waits on a thread that will not return. The bound is what turns
+    /// that into a `false` the loop can act on; a write that answers in time is untouched, so a
+    /// busy-but-live cage is never cut.
+    #[test]
+    fn a_write_that_never_finishes_is_given_up_on_rather_than_parking() {
+        async_io::block_on(async {
+            let bound = Duration::from_millis(50);
+
+            let started = std::time::Instant::now();
+            assert!(
+                !completes_within(std::future::pending::<bool>(), bound).await,
+                "a write that never finishes must be given up on"
+            );
+            assert!(
+                started.elapsed() >= bound,
+                "it must wait the window out rather than answering straight away"
+            );
+
+            // The ordinary case is untouched, and a failed write stays a failed write: only the
+            // parked one is turned into `false` by the clock.
+            assert!(completes_within(std::future::ready(true), Duration::from_secs(30)).await);
+            assert!(!completes_within(std::future::ready(false), Duration::from_secs(30)).await);
+        });
+    }
 
     /// The first id the double hands out. Well away from `0` and from any small number a test
     /// writes by hand, so an id the cage guessed is never accidentally one of the cage's own.
