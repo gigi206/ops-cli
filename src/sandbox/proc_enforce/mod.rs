@@ -1300,8 +1300,17 @@ fn caller_chain(cx: &Deciding<'_>, pid: u32) -> Vec<String> {
 /// That walk closes the second route out of a root as well, and this is the caller that needs it:
 /// `/proc/self` names the process doing the resolving, so a cage that spells
 /// `/proc/self/root/<path>` would otherwise be answered about the supervisor's filesystem. A scoped
-/// lookup refuses a magic link outright, so nothing further is asked for here — see
-/// [`probe_in_cage_root`].
+/// lookup refuses a magic link outright, so nothing further is asked for once the path names a
+/// process outright — see [`probe_in_cage_root`].
+///
+/// Which is why `self` is spelled out first, with [`caller_proc_path`], exactly as the read of an
+/// exec target does. The kernel answers `self` with the number of whoever performs the lookup, in
+/// the pid namespace of the `/proc` being walked, and this walk is performed from outside the
+/// cage's: the component names a process that is not there, or -- worse, because it is silent --
+/// the supervisor's own entry, so `/proc/self/fd/<n>` is answered about a descriptor the
+/// supervisor holds rather than the one the cage is executing. Either way the answer is about the
+/// wrong process, and an `ENOENT` from it files a refusal of something real under the heading this
+/// function keeps for a `PATH` walk's misses, where it is neither announced nor read.
 fn refusal_errno(pid: u32, path: &str) -> libc::c_int {
     if !path.starts_with('/') {
         return libc::EPERM;
@@ -1315,6 +1324,8 @@ fn refusal_errno(pid: u32, path: &str) -> libc::c_int {
     if path.ends_with(" (deleted)") {
         return libc::EPERM;
     }
+    let named = caller_proc_path(pid, path);
+    let path = named.as_deref().unwrap_or(path);
     match probe_in_cage_root(pid, Path::new(path)) {
         Ok(fd) => {
             // SAFETY: fd is this call's own descriptor, returned by the probe and closed once.

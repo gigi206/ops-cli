@@ -3526,7 +3526,89 @@ fn a_refusal_asks_about_the_cage_and_not_about_the_host_behind_an_absolute_link(
     assert_eq!(
         at("/proc/self/root/etc/hostname"),
         at("/proc/self/root/no-such-name-in-either"),
-        "a magic link answers about the supervisor, so it answers about nothing at all"
+        "`self` names the caller, and the root behind it is the cage's own, so neither name is \
+         answered off the host"
+    );
+}
+
+/// A descriptor the caller really holds is a refusal of something real, not a `PATH` walk's miss.
+///
+/// `execve("/proc/self/fd/<n>")` runs what a descriptor points at, and `self` is answered with the
+/// number of whoever performs the lookup. Asked without spelling the caller out, the probe reads
+/// the *supervisor's* descriptor table: whether it happens to hold that number decides the errno,
+/// so the same refusal is filed as `deny` on one host and as `absent` -- the heading kept for the
+/// names a `PATH` walk passes through, neither announced nor read -- on the next.
+///
+/// The oracle is a number the supervisor does not hold and the caller does. Both arms are asked,
+/// because an answer of `EPERM` to everything would satisfy the first on its own.
+#[test]
+fn a_descriptor_the_caller_holds_is_refused_as_something_that_is_there() {
+    /// A descriptor number the child is made to hold, and one it never opens: two digits, so
+    /// neither collides with what a test harness leaves open around this process.
+    const HELD: libc::c_int = 33;
+    const NEVER: libc::c_int = 34;
+    use std::os::unix::process::CommandExt;
+
+    // The whole discriminator: were this open here, the reading that asks about the supervisor
+    // would answer about it and agree with the right one by accident.
+    // SAFETY: `F_GETFD` reads a flag word for a descriptor number and touches no memory.
+    assert!(
+        unsafe { libc::fcntl(HELD, libc::F_GETFD) } < 0,
+        "this test needs descriptor {HELD} closed in the test process, and it is not"
+    );
+
+    let mut cmd = std::process::Command::new("sleep");
+    cmd.arg("30");
+    // SAFETY: the closure runs in the forked child before `execve`, where only async-signal-safe
+    // calls are allowed. `open`, `dup2` and `close` are; nothing is allocated and no lock is
+    // taken. `dup2` clears close-on-exec on the new descriptor, so it survives into `sleep`.
+    unsafe {
+        cmd.pre_exec(|| {
+            let fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+            if fd < 0 || libc::dup2(fd, HELD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::close(fd);
+            Ok(())
+        });
+    }
+    let Ok(mut child) = cmd.spawn() else {
+        return;
+    };
+    let pid = child.id();
+
+    // Waited for through the child's own `/proc` entry rather than through the answer under test:
+    // the descriptor is set up between fork and exec, so it appears a moment after `spawn`
+    // returns, and a wait that stopped on the assertion's own verdict could not tell a fix from a
+    // race.
+    let held = std::path::PathBuf::from(format!("/proc/{pid}/fd/{HELD}"));
+    for _ in 0..200 {
+        if std::fs::read_link(&held).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let ready = std::fs::read_link(&held).is_ok();
+    // Both answers are taken before the child is torn down, so a failing assertion cannot leave a
+    // `sleep` behind.
+    let answers = (
+        refusal_errno(pid, &format!("/proc/self/fd/{HELD}")),
+        refusal_errno(pid, &format!("/proc/self/fd/{NEVER}")),
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(ready, "the child never came up holding descriptor {HELD}");
+    assert_eq!(
+        answers.0,
+        libc::EPERM,
+        "a descriptor the caller holds is there, whatever the supervisor's own table holds"
+    );
+    assert_eq!(
+        answers.1,
+        libc::ENOENT,
+        "and a number the caller never opened is still absent, or the answer above would be one \
+         given to everything"
     );
 }
 
