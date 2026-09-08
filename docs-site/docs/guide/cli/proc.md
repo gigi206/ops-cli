@@ -8,12 +8,12 @@ description: "Observe, and under `[proc]` enforcement block, what a running sand
 sbx proc ls      [<id>] [--json]
 sbx proc live    [<id>] [-i|--interval <secs>] [--json]
 sbx proc logs    [<id>] [-f|--follow] [--json]
-sbx proc pending [allow|deny <id>]
+sbx proc pending [allow|deny <id>] [--json]
 sbx proc allow   <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>] [--session [--all]]
 sbx proc deny    <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>] [--session [--all]]
 sbx proc unallow <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>]
 sbx proc undeny  <rule> [-l|--local|-g|--global|-c|--config <file>] [-a|--app <name>]
-sbx proc rules   [-a <app>] [--all]
+sbx proc rules   [-a <app>] [--all] [--json]
 ```
 
 Observe, and, under [`[proc]`](../configuration/proc) enforcement, **block**, what a running
@@ -166,8 +166,12 @@ that stopped something.
 ## `pending`
 
 ```
-sbx proc pending [allow|deny <id>]
+sbx proc pending [allow|deny <id>] [--json]
 ```
+
+`--json` on the listing emits each parked `execve` as an object carrying the `id` that
+`pending allow|deny` takes, already assembled: a consumer joining the two numbers itself would be
+re-deriving a format this command owns.
 
 Under [`[proc] mode = "ask"`](../configuration/proc), an `execve` that matches neither the
 `allow` nor the `deny` list is **parked**, the process is blocked in the syscall, awaiting your
@@ -301,7 +305,7 @@ sbx proc undeny  ssh -a claude-code  # from that app's own [proc] list
 ## `rules`
 
 ```
-sbx proc rules [-a|--app <name>] [--all]
+sbx proc rules [-a|--app <name>] [--all] [--json]
 ```
 
 List the live `--session` rule overlay of the running enforcing session(s): the rules loaded with
@@ -313,7 +317,11 @@ widen it.
 sbx proc rules
 # live session rules
 #   479989  deny  curl
+
+sbx proc rules --json | jq '.rules[] | select(.verdict == "deny")'
 ```
+
+`--json` emits the same overlay as a document, the twin of [`sbx net rules --json`](net).
 
 Honest limit: exec-blocking is a **guardrail, not a containment boundary**: it catches every
 `execve`, but an agent can still do harmful work *in-process* (in its own interpreter) without

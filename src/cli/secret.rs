@@ -36,13 +36,23 @@ pub(crate) fn secret_cmd(args: &[OsString]) -> ExitCode {
     }
 }
 
-/// `sbx secret list [--app <name>] [--sources]`: the declared credentials, by name.
+/// `sbx secret list [--app <name>] [--sources] [--json]`: the declared credentials, by name.
+///
+/// `--json` always carries the resolver chain, where the human listing shows it only under
+/// `--sources`: the flag exists to keep a terminal line short, and a consumer has no such
+/// constraint. It is still the chain's *description* — a variable name, a file path, a plugin
+/// locator — never a resolved value, which is the same line `SecretSource::describe` holds.
 fn secret_list(args: &[OsString]) -> ExitCode {
     let mut app: Option<String> = None;
     let mut sources = false;
+    let mut json = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].to_str() {
+            Some("--json") => {
+                json = true;
+                i += 1;
+            }
             Some("--sources") => {
                 sources = true;
                 i += 1;
@@ -86,6 +96,50 @@ fn secret_list(args: &[OsString]) -> ExitCode {
     {
         diag::error(&format!("sbx: secret list: {e}"));
         return ExitCode::from(2);
+    }
+
+    if json {
+        let chain = |ss: &[config::SecretSource]| -> Vec<String> {
+            ss.iter().map(config::SecretSource::describe).collect()
+        };
+        let wire = |sec: &config::HeaderSecret, scope: &str| {
+            serde_json::json!({
+                "name": sec.name,
+                "kind": "wire",
+                "scope": scope,
+                "to": sec.to.to_string(),
+                "headers": sec.headers(),
+                "sources": chain(&sec.sources),
+                "description": sec.description,
+            })
+        };
+        let mut out: Vec<serde_json::Value> = resolved
+            .secrets
+            .iter()
+            .map(|sec| wire(sec, "project"))
+            .collect();
+        for task in &resolved.tasks {
+            for sec in &task.secrets {
+                out.push(serde_json::json!({
+                    "name": sec.var,
+                    "kind": "task-env",
+                    "scope": format!("task {}", task.name),
+                    "task": task.name,
+                    "encode": sec.encode.as_str(),
+                    "sources": chain(&sec.sources),
+                    "description": sec.description,
+                }));
+            }
+            for inj in &task.injections {
+                out.push(wire(inj, &format!("task {}", task.name)));
+            }
+        }
+        if let Err(code) =
+            crate::print_json("secret list", &serde_json::json!({ "credentials": out }))
+        {
+            return code;
+        }
+        return ExitCode::SUCCESS;
     }
 
     let palette = style::Palette::for_stream(std::io::stdout().is_terminal());

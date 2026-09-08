@@ -535,9 +535,13 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["proc", "pending"],
-        synopsis: "sbx proc pending [allow|deny <id>]",
+        synopsis: "sbx proc pending [allow|deny <id>] [--json]",
         summary: "list and decide the execs an ask-mode session has parked",
         options: &[
+            (
+                "--json",
+                "emit the parked execs as JSON, each with the id `pending allow|deny` takes",
+            ),
             (
                 "(none)",
                 "list every parked exec — `<session-pid>.<notif-id>`, cage pid, wait time, and path",
@@ -696,9 +700,10 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["proc", "rules"],
-        synopsis: "sbx proc rules [-a|--app <name>] [--all]",
+        synopsis: "sbx proc rules [-a|--app <name>] [--all] [--json]",
         summary: "list the live --session rule overlay of the running enforcing session(s)",
         options: &[
+            ("--json", "emit the live session rules as JSON"),
             ("-a, --app <name>", "list only the session(s) of that app"),
             (
                 "--all",
@@ -983,9 +988,13 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["secret", "list"],
-        synopsis: "sbx secret list [-a|--app <name>] [--sources]  (alias: sbx secret ls)",
+        synopsis: "sbx secret list [-a|--app <name>] [--sources]  (alias: sbx secret ls) [--json]",
         summary: "the declared credentials, by name",
         options: &[
+            (
+                "--json",
+                "emit the inventory as JSON (always with the resolver chain, never a value)",
+            ),
             (
                 "-a, --app <name>",
                 "fold that app's overlay, so the inventory is what `sbx app run <name>` would carry",
@@ -1308,9 +1317,12 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["session", "ls"],
-        synopsis: "sbx session ls  (alias: sbx session list)",
+        synopsis: "sbx session ls  (alias: sbx session list) [--json]",
         summary: "list the live sandbox sessions",
-        options: &[],
+        options: &[(
+            "--json",
+            "emit the sessions as JSON (age in seconds, not `2h13m`)",
+        )],
         details: "Lists the live sandbox sessions from the on-disk registry (daemonless). Reading\n\
             the registry re-validates and prunes dead records, so the list is always\n\
             current. An app session shows its app name, so you can tell which sessions are\n\
@@ -2210,9 +2222,9 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["app", "list"],
-        synopsis: "sbx app list  (alias: sbx app ls)",
+        synopsis: "sbx app list  (alias: sbx app ls) [--json]",
         summary: "list apps with their profile and installed home",
-        options: &[],
+        options: &[("--json", "emit the apps as JSON (home sizes in bytes)")],
         details: "One row per app: whether it has an imported profile (the `import`/`rm` artifact) and\n\
             whether it has an installed home on disk (its mise tools + login state, with disk size)\n\
             — which `sbx app rm <name> --purge` removes. An app can have a profile with no home yet\n\
@@ -3096,9 +3108,9 @@ pub(super) const PAGES: &[Page] = &[
     // ---- plugins subcommands ------------------------------------------------------
     Page {
         path: &["plugins", "list"],
-        synopsis: "sbx plugins list  (alias: sbx plugins ls)",
+        synopsis: "sbx plugins list  (alias: sbx plugins ls) [--json]",
         summary: "list installed plugins and built-in schemes",
-        options: &[],
+        options: &[("--json", "emit the plugins as JSON, one array per kind")],
         details: "Shows the reserved built-in schemes and every installed plugin, listed by kind:\n\
             a resolver by the scheme it claims, a broker by the protocol it fences, a signer\n\
             by the headers it may set. Each line carries the version, whether it is runnable,\n\
@@ -3110,12 +3122,15 @@ pub(super) const PAGES: &[Page] = &[
     },
     Page {
         path: &["plugins", "info"],
-        synopsis: "sbx plugins info <scheme|name>",
+        synopsis: "sbx plugins info <scheme|name> [--json]",
         summary: "show a plugin's manifest and sandbox grant",
-        options: &[(
-            "<scheme|name>",
-            "the resolver scheme, or the plugin name, to detail",
-        )],
+        options: &[
+            ("--json", "emit the manifest and sandbox grant as JSON"),
+            (
+                "<scheme|name>",
+                "the resolver scheme, or the plugin name, to detail",
+            ),
+        ],
         details: "Includes where the plugin came from. A resolver is named by the scheme it\n\
             claims; a broker and a signer claim none, so each is named by its own name. A\n\
             broker's page adds the protocol facts a launch acts on and whether the global\n\
@@ -3209,9 +3224,10 @@ pub(super) const PAGES: &[Page] = &[
     // ---- plugins store subcommands ------------------------------------------------
     Page {
         path: &["plugins", "store", "list"],
-        synopsis: "sbx plugins store list [<name>] [--installed]  (alias: sbx plugins store ls)",
+        synopsis: "sbx plugins store list [<name>] [--installed]  (alias: sbx plugins store ls) [--json]",
         summary: "list the configured plugin stores and what they offer",
         options: &[
+            ("--json", "emit the stores and their catalogues as JSON"),
             (
                 "[<name>]",
                 "only this store, instead of every configured one",

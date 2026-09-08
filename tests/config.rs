@@ -5726,3 +5726,49 @@ fn bundle_rm_refuses_an_absent_name_and_a_bad_one() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("usage"));
 }
+
+/// Every listing verb that advertises `--json` emits a **document**, including when it has nothing
+/// to list.
+///
+/// The empty case is the one worth a test: five of these verbs print prose on that path
+/// ("no active sandbox sessions", "configured plugin stores: (none)"), and a `--json` that fell
+/// through to it would hand a consumer text where a document was asked for. `plugins store list`
+/// did exactly that until this test was written. Parsing the output is the assertion, so a verb
+/// that prints a document *and* a stray line fails too.
+///
+/// The list is written out rather than derived from the help table: deriving it would make this
+/// test agree with whatever the table says, and the table is the thing a new verb is added to.
+#[test]
+fn every_listing_verb_that_offers_json_emits_a_document_even_when_empty() {
+    let p = Project::new("jsonparity");
+    for verb in [
+        vec!["session", "ls"],
+        vec!["app", "list"],
+        vec!["proc", "rules"],
+        vec!["proc", "pending"],
+        vec!["secret", "list"],
+        vec!["plugins", "list"],
+        vec!["plugins", "store", "list"],
+        vec!["bundle"],
+        vec!["net", "rules"],
+        vec!["net", "groups"],
+        vec!["config", "show"],
+    ] {
+        let mut args = verb.clone();
+        args.push("--json");
+        let out = p.run(&args);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "`sbx {} --json` failed: {}",
+            verb.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_str::<serde_json::Value>(&stdout).unwrap_or_else(|e| {
+            panic!(
+                "`sbx {} --json` did not emit a JSON document ({e}):\n{stdout}",
+                verb.join(" ")
+            )
+        });
+    }
+}

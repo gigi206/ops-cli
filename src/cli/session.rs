@@ -23,11 +23,13 @@ pub(crate) fn session_cmd(args: &[OsString]) -> ExitCode {
         return code;
     }
     match args.first().and_then(|a| a.to_str()) {
-        Some("ls") | Some("list") => match crate::cli::reject_extra(&["session", "ls"], &args[1..])
-        {
-            Err(code) => code,
-            Ok(()) => list_sessions(),
-        },
+        Some("ls") | Some("list") => {
+            let (json, rest) = crate::split_json_flag(&args[1..]);
+            match crate::cli::reject_extra(&["session", "ls"], &rest) {
+                Err(code) => code,
+                Ok(()) => list_sessions(json),
+            }
+        }
         Some("logs") | Some("log") => logs_cmd(&args[1..]),
         Some("attach") => attach_cmd(&args[1..]),
         Some("stop") => stop_cmd(args[1..].to_vec()),
@@ -65,10 +67,16 @@ fn session_mode(s: &session::Session) -> &'static str {
     if s.detached { "detached" } else { "foreground" }
 }
 
-/// `sbx session ls`: list the live sandbox sessions from the on-disk registry. Reading
+/// `sbx session ls [--json]`: list the live sandbox sessions from the on-disk registry. Reading
 /// the registry re-validates and prunes dead records as a side effect, so the
 /// list is always current without a daemon.
-fn list_sessions() -> ExitCode {
+///
+/// `--json` emits the registry's own values rather than this table's: the age is the raw number of
+/// seconds, not `2h13m`, and an unknowable age is `null` rather than `?`. A consumer wants the
+/// number it can compare; the table wants the string a reader can scan. The empty case is an empty
+/// array, never the prose line, so a script does not have to distinguish "no sessions" from a
+/// parse failure.
+fn list_sessions(json: bool) -> ExitCode {
     let layout = match layout_or_fail() {
         Ok(l) => l,
         Err(code) => return code,
@@ -77,15 +85,45 @@ fn list_sessions() -> ExitCode {
         Ok(s) => s,
         Err(code) => return code,
     };
+    let uptime = uptime_seconds();
+    // SAFETY: `sysconf` takes a single integer name and returns a process-wide configuration value;
+    // no pointer is passed and nothing is mutated.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if json {
+        let age_secs = |s: &session::Session| -> Option<u64> {
+            let up = uptime?;
+            if ticks <= 0 {
+                return None;
+            }
+            let started = s.start_ticks as f64 / ticks as f64;
+            Some((up - started).max(0.0) as u64)
+        };
+        let rows: Vec<serde_json::Value> = sessions
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "name": sandbox::cage_name(s.app(), &s.project),
+                    "kind": s.label(),
+                    "app": s.app(),
+                    "detached": s.detached,
+                    "pid": s.pid,
+                    "age_seconds": age_secs(s),
+                    "project": s.project.display().to_string(),
+                })
+            })
+            .collect();
+        if let Err(code) = crate::print_json("session ls", &serde_json::json!({ "sessions": rows }))
+        {
+            return code;
+        }
+        return ExitCode::SUCCESS;
+    }
     if sessions.is_empty() {
         println!("sbx: no active sandbox sessions.");
         return ExitCode::SUCCESS;
     }
 
-    let uptime = uptime_seconds();
-    // SAFETY: `sysconf` takes a single integer name and returns a process-wide configuration value;
-    // no pointer is passed and nothing is mutated.
-    let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let ticks_per_sec = ticks;
     // Each row is materialized first so the column widths can flex to the widest value: an
     // app session's KIND is `app:<name>` and a cage name is `sbx-<slug>`, either of which can
     // exceed a fixed width and shift every following column out of alignment.

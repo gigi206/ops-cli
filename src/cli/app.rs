@@ -32,10 +32,13 @@ pub(crate) fn app_cmd(args: &[OsString]) -> ExitCode {
         Some("import") => app_import(&args[1..]),
         Some("export") => app_export(&args[1..]),
         Some("rm") => app_rm(&args[1..]),
-        Some("list" | "ls") => match crate::cli::reject_extra(&["app", "list"], &args[1..]) {
-            Err(code) => code,
-            Ok(()) => app_list(),
-        },
+        Some("list" | "ls") => {
+            let (json, rest) = crate::split_json_flag(&args[1..]);
+            match crate::cli::reject_extra(&["app", "list"], &rest) {
+                Err(code) => code,
+                Ok(()) => app_list(json),
+            }
+        }
         Some("show") => app_show(&args[1..]),
         Some("prune") => app_prune(&args[1..]),
         // No valid subcommand: a bare `sbx app`, an unknown token, a leading flag, or a non-UTF-8
@@ -1432,7 +1435,7 @@ fn app_rm_purge_one(
 /// inline/project app, or a profile since removed) — so a name may carry a profile, a home, or both.
 /// The full resolved app set — inline, project, and profile apps with their gating — is
 /// `sbx config show`.
-fn app_list() -> ExitCode {
+fn app_list(json: bool) -> ExitCode {
     use std::collections::{BTreeMap, BTreeSet};
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
@@ -1468,6 +1471,39 @@ fn app_list() -> ExitCode {
     let homes: BTreeMap<&str, &sandbox::InstalledApp> =
         installed.iter().map(|a| (a.name.as_str(), a)).collect();
 
+    // One row per app: the union of profile names and installed-home names.
+    let mut names: BTreeSet<&str> = profiles.iter().map(String::as_str).collect();
+    names.extend(homes.keys().copied());
+
+    if json {
+        // Bytes, not `12.4 MiB`: a consumer compares and sums, and the human column is a rendering
+        // of this number rather than the other way round. The empty case is an empty array, so a
+        // script never has to tell "no apps" from a parse failure.
+        let rows: Vec<serde_json::Value> = names
+            .iter()
+            .map(|name| {
+                let home = homes.get(name);
+                serde_json::json!({
+                    "name": name,
+                    "profile": profiles.contains(*name),
+                    "home_bytes": home.map(|a| a.total_bytes()),
+                    "home_locations": home.map(|a| describe_home_locations(a)),
+                })
+            })
+            .collect();
+        if let Err(code) = crate::print_json(
+            "app list",
+            &serde_json::json!({
+                "apps": rows,
+                "total_bytes": installed.iter().map(sandbox::InstalledApp::total_bytes).sum::<u64>(),
+                "profiles_dir": profiles_dir.as_ref().map(|d| d.display().to_string()),
+            }),
+        ) {
+            return code;
+        }
+        return ExitCode::SUCCESS;
+    }
+
     if profiles.is_empty() && installed.is_empty() {
         println!(
             "{dim}no imported app profiles and no installed app homes \
@@ -1475,10 +1511,6 @@ fn app_list() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
-
-    // One row per app: the union of profile names and installed-home names.
-    let mut names: BTreeSet<&str> = profiles.iter().map(String::as_str).collect();
-    names.extend(homes.keys().copied());
 
     // The disk footprint mirrors `sbx projects`: the count of apps and the total across every
     // installed home (a profile with no home contributes nothing).

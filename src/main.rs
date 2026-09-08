@@ -234,6 +234,31 @@ fn split_session_flags(args: &[OsString]) -> (bool, bool, Vec<OsString>) {
     (session, all, rest)
 }
 
+/// Split `--json` off a listing verb's arguments, returning whether it was asked for and the rest.
+///
+/// The `--json` twin of [`split_session_flags`], and it exists for that function's own reason
+/// rather than to save six lines: a bare `--` ends the options here too, so a verb that takes a
+/// positional cannot lose it to a flag spelled after the terminator. Reading the flag with a bare
+/// `any()` over the whole argv is precisely the shape that bug took the first time.
+///
+/// For the verbs whose arguments are already walked in a loop (`sbx proc ls`, `sbx bundle`,
+/// `sbx net rules`) the loop keeps reading its own `--json` arm: this is for the ones that have no
+/// loop, where the alternative is an `any()` and a `filter()` written out per verb.
+fn split_json_flag(args: &[OsString]) -> (bool, Vec<OsString>) {
+    let upto = args
+        .iter()
+        .position(|a| a.to_str() == Some("--"))
+        .unwrap_or(args.len());
+    let json = args[..upto].iter().any(|a| a.to_str() == Some("--json"));
+    let rest = args
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| *i >= upto || a.to_str() != Some("--json"))
+        .map(|(_, a)| a.clone())
+        .collect();
+    (json, rest)
+}
+
 /// The single-rule front that `sbx net allow|deny|mute` and `sbx proc allow|deny` share, on both
 /// their add and their remove paths: the scope flags split off, exactly one positional, and an app
 /// name that must be valid. `namespace` names the command family, for the usage line and for the

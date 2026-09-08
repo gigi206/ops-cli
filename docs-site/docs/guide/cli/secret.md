@@ -21,13 +21,19 @@ See also: [`[secret]`](../configuration/secret) · [`[task]`](../configuration/t
 ## `list`
 
 ```
-sbx secret list [-a|--app <name>] [--sources]
+sbx secret list [-a|--app <name>] [--sources] [--json]
 ```
 
 | Flag | Meaning |
 |---|---|
 | `-a`, `--app <name>` | fold that app's overlay, so the inventory is what `sbx app run <name>` would carry |
 | `--sources` | also show where each value would come from, by locator (a variable name, a file path) |
+| `--json` | emit the inventory as a document |
+
+`--json` always carries the resolver chain, where the human listing shows it only under
+`--sources`: that flag exists to keep a terminal line short, and a consumer has no such
+constraint. It is still the chain's **description** (a variable name, a file path, a plugin
+locator), never a resolved value. Nothing here reads a secret.
 
 ```
 $ sbx secret list

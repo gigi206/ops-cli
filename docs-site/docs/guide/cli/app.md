@@ -300,7 +300,9 @@ copy is not itself a profile (only `*.toml` files are read as profiles) and goes
 ### Listing apps
 
 `sbx app list` (alias `sbx app ls`) shows one row per app with its `HOME` column: the total
-size a `--purge` would reclaim, and where that state lives.
+size a `--purge` would reclaim, and where that state lives. `--json` emits the same rows as a
+document, with the sizes in **bytes** rather than `12.4 MiB`: the human column is a rendering of
+that number, and a consumer compares and sums it.
 
 | Reads | Means |
 |---|---|

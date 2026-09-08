@@ -21,8 +21,8 @@ See also: [Plugins](../plugins/) · [Signed plugin stores](../plugins/stores) ·
 
 | Subcommand | Purpose |
 |---|---|
-| `list` (alias `ls`) | list installed plugins of every kind (with their origin) and the built-in schemes |
-| `info <scheme\|name>` | show a plugin's manifest, sandbox grant, and origin |
+| `list` (alias `ls`) \[`--json`\] | list installed plugins of every kind (with their origin) and the built-in schemes |
+| `info <scheme\|name>` \[`--json`\] | show a plugin's manifest, sandbox grant, and origin |
 | `install <dir>` | install a local plugin directory (`<data>/plugins/<name>`); the built-in schemes are always present, not installed |
 | `rm <name>...` | remove installed plugins of any kind; several names may be given, each removed on its own |
 | `verify [name]` | check installed plugins against the digest recorded at install |
@@ -30,6 +30,13 @@ See also: [Plugins](../plugins/) · [Signed plugin stores](../plugins/stores) ·
 
 `install` is a deliberate user act (an agent in the cage cannot run it); the staged
 copy is validated exactly as the launcher will and refused, fail-closed, on any flaw.
+
+`--json` on `list`, `info` and `store list` emits a document instead of the listing. `list` keeps
+one array per kind rather than flattening them, because the distinction is load-bearing: a
+`scheme://` reaches a resolver and never a broker. `info` carries the sandbox grant whole, which is
+the reason that verb exists. `store list` marks an unconfirmed key as a field rather than as the
+`[key not confirmed elsewhere]` bracket, and lists no stores as an empty array rather than as the
+line telling you how to add one.
 
 A resolver is named by the `scheme://` it claims. A [broker](../configuration/broker)
 claims none, so `info` takes the name `[broker.<name>]` binds, and its page adds the
@@ -72,7 +79,7 @@ A **remote signed store** is a git repository whose catalogue is verified agains
 pinned Ed25519 public key, with anti-rollback on the revision.
 
 ```
-sbx plugins store list [<name>] [--installed]
+sbx plugins store list [<name>] [--installed] [--json]
 sbx plugins store add --name <n> --url <git-url> (--key <hex|@file> | --trust)
 sbx plugins store update [name]
 sbx plugins store install <store> <plugin>

@@ -22,7 +22,7 @@ See also: [Sessions](../housekeeping/sessions) · [`sbx projects`](projects) · 
 ## `ls`
 
 ```
-sbx session ls
+sbx session ls [--json]
 ```
 
 List the live sandbox sessions from the on-disk registry. Reading the registry
@@ -44,6 +44,16 @@ sbx session ls
 
 The `PID` column is the `<id>` used by `sbx session attach <id>`, `sbx session logs <id>` and
 `sbx session stop <id>`.
+
+`--json` emits the same listing as a document, which is what a script wants: it carries the
+registry's own values rather than this table's, so the age is a number of seconds instead of `2m`
+and an unknowable one is `null` instead of `?`. With no live session it is an empty array, never
+the "no active sandbox sessions" line, so a caller does not have to tell that apart from a parse
+failure.
+
+```sh
+sbx session ls --json | jq -r '.sessions[] | select(.detached) | .pid'
+```
 
 `MODE` says how the session was launched, which is also where its output went:
 

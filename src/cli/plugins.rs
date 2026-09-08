@@ -26,15 +26,17 @@ use crate::{diag, help, layout_or_fail, plugins, store, style};
 pub(crate) fn plugins_cmd(args: &[OsString]) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("list") | Some("ls") => {
-            match crate::cli::reject_extra(&["plugins", "list"], &args[1..]) {
+            let (json, rest) = crate::split_json_flag(&args[1..]);
+            match crate::cli::reject_extra(&["plugins", "list"], &rest) {
                 Err(code) => code,
-                Ok(()) => plugins_list(),
+                Ok(()) => plugins_list(json),
             }
         }
         Some("info") => {
-            match crate::cli::reject_extra(&["plugins", "info"], args.get(2..).unwrap_or(&[])) {
+            let (json, rest) = crate::split_json_flag(&args[1..]);
+            match crate::cli::reject_extra(&["plugins", "info"], rest.get(1..).unwrap_or(&[])) {
                 Err(code) => code,
-                Ok(()) => plugins_info(args.get(1).and_then(|a| a.to_str())),
+                Ok(()) => plugins_info(rest.first().and_then(|a| a.to_str()), json),
             }
         }
         Some("install") => {
@@ -379,11 +381,69 @@ impl InstalledIndex {
 /// regular file) is flagged here, using the very check the runner enforces, so the gap between
 /// "discovered" and "runnable" is visible. Discovery warnings (a malformed manifest, an ambiguous
 /// scheme) go to stderr. No nix, no network, no launch.
-fn plugins_list() -> ExitCode {
+fn plugins_list(json: bool) -> ExitCode {
     let (layout, registry, warnings) = match load_plugin_registry() {
         Ok(loaded) => loaded,
         Err(code) => return code,
     };
+
+    if json {
+        // One array per kind rather than one flat list with a `kind` field, because that is the
+        // distinction the human listing makes and it is load-bearing: a `scheme://` reaches a
+        // resolver, never a broker. Flattening them would suggest otherwise.
+        // Three projections rather than one generic row: the kinds answer different questions, and
+        // what identifies each is different — a resolver is reached by its `scheme://`, a broker by
+        // the framing it speaks. A common shape would have to drop exactly that.
+        let doc = serde_json::json!({
+            "builtin_schemes": plugins::builtin_schemes(),
+            "resolvers": registry
+                .resolvers()
+                .map(|p| serde_json::json!({
+                    "name": p.name,
+                    "scheme": p.scheme,
+                    "version": p.version,
+                    "description": p.description,
+                    "network": p.sandbox.network,
+                    "healthy": p.check_exec().is_ok(),
+                }))
+                .collect::<Vec<_>>(),
+            "brokers": registry
+                .brokers()
+                .map(|p| serde_json::json!({
+                    "name": p.name,
+                    "version": p.version,
+                    "description": p.description,
+                    "framing": p.broker.framing.token(),
+                    "max_frame": p.broker.max_frame,
+                    "inspect_replies": p.broker.inspect_replies,
+                    "network": p.sandbox.network,
+                    "healthy": p.check_exec().is_ok(),
+                }))
+                .collect::<Vec<_>>(),
+            "signers": registry
+                .signers()
+                .map(|p| serde_json::json!({
+                    "name": p.name,
+                    "version": p.version,
+                    "description": p.description,
+                    "network": p.sandbox.network,
+                    "healthy": p.check_exec().is_ok(),
+                }))
+                .collect::<Vec<_>>(),
+            // A conflict is why an installed plugin does not resolve, so it belongs in the document
+            // that says which ones do: without it a reader sees a plugin listed and absent from the
+            // resolving set with nothing to explain the gap.
+            "conflicts": registry
+                .conflicts()
+                .map(|(scheme, names)| serde_json::json!({ "scheme": scheme, "plugins": names }))
+                .collect::<Vec<_>>(),
+            "warnings": warnings,
+        });
+        if let Err(code) = crate::print_json("plugins list", &doc) {
+            return code;
+        }
+        return ExitCode::SUCCESS;
+    }
 
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, n, dim, r) = (pal.head, pal.name, pal.dim, pal.reset);
@@ -1532,6 +1592,8 @@ fn plugins_store_remove(name: Option<&str>) -> ExitCode {
 /// plugins it lists — each with its scheme, version, description, and whether it is already
 /// installed from that store. No fetch, no network.
 fn plugins_store_list_cmd(args: &[OsString]) -> ExitCode {
+    let (json, args) = crate::split_json_flag(args);
+    let args = &args[..];
     let (only_installed, only_store) = match parse_store_list_args(args) {
         Ok(parsed) => parsed,
         Err(bad) => {
@@ -1543,7 +1605,7 @@ fn plugins_store_list_cmd(args: &[OsString]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    plugins_store_list(only_installed, only_store.as_deref())
+    plugins_store_list(only_installed, only_store.as_deref(), json)
 }
 
 /// Split `store list`'s arguments into (`--installed`, the store to restrict to), or the first
@@ -1680,7 +1742,7 @@ fn listed_from_catalogue(cat: &catalogue::Catalogue) -> Vec<Listed<'_>> {
 /// listed, for answering "what do I actually have from here" without reading past everything on
 /// offer. The sources themselves are still all shown: a store with nothing installed says so,
 /// rather than vanishing and leaving the user unsure whether it is configured at all.
-fn plugins_store_list(only_installed: bool, only_store: Option<&str>) -> ExitCode {
+fn plugins_store_list(only_installed: bool, only_store: Option<&str>, json: bool) -> ExitCode {
     let layout = store::Layout::from_env();
     // Without a data directory nothing is installed as far as this listing can tell, so every entry
     // renders unmarked rather than the command failing on an inspection verb.
@@ -1704,6 +1766,20 @@ fn plugins_store_list(only_installed: bool, only_store: Option<&str>) -> ExitCod
         }
         names.retain(|n| n == want);
     }
+    // The two "nothing to list" exits come before the human listing and after the JSON one: a
+    // consumer asking for a document must get one whether or not there are stores, or it has to
+    // tell an empty result from a command that printed prose. The human reader wants the opposite —
+    // the line that says how to add a store.
+    let empty = names.is_empty() || layout.is_none();
+    if json && empty {
+        if let Err(code) = crate::print_json(
+            "plugins store list",
+            &serde_json::json!({ "stores": Vec::<serde_json::Value>::new() }),
+        ) {
+            return code;
+        }
+        return ExitCode::SUCCESS;
+    }
     if names.is_empty() {
         println!("{h}configured plugin stores:{r} (none)");
         println!(
@@ -1715,6 +1791,48 @@ fn plugins_store_list(only_installed: bool, only_store: Option<&str>) -> ExitCod
     let Some(layout) = layout.as_ref() else {
         return ExitCode::SUCCESS;
     };
+    if json {
+        let mut stores_out: Vec<serde_json::Value> = Vec::new();
+        for name in &names {
+            let Ok(cfg) = stores::read_configured(layout, name) else {
+                continue;
+            };
+            let catalogue = stores::cached_catalogue(layout, name);
+            let entries: Vec<serde_json::Value> = match &catalogue {
+                Ok(cat) => listed_from_catalogue(cat)
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "name": e.name,
+                            "kind": e.kind.token(),
+                            "scheme": e.scheme,
+                            "version": e.version,
+                            "description": e.description,
+                            "sha256": e.sha256,
+                        })
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            stores_out.push(serde_json::json!({
+                "name": name,
+                "locked_rev": cfg.locked_rev,
+                // The human listing marks this `[key not confirmed elsewhere]`; the field says the
+                // same thing without the bracket, because it is the one fact here a consumer might
+                // gate on.
+                "key_unconfirmed": cfg.tofu,
+                "catalogue_readable": catalogue.is_ok(),
+                "plugins": entries,
+            }));
+        }
+        if let Err(code) = crate::print_json(
+            "plugins store list",
+            &serde_json::json!({ "stores": stores_out }),
+        ) {
+            return code;
+        }
+        return ExitCode::SUCCESS;
+    }
     println!("{h}configured plugin stores{r} (update with: sbx plugins store update <name>):");
     for name in &names {
         let cfg = match stores::read_configured(layout, name) {
@@ -2133,7 +2251,7 @@ fn nothing_answers(key: &str) -> String {
 /// claims a scheme. A built-in scheme is reported as such (not an error); a key nothing installed
 /// answers is a non-zero "no such plugin" naming all three namespaces, since the reader's key was
 /// in one of them. Like `list`, host-level and side-effect-free.
-fn plugins_info(key: Option<&str>) -> ExitCode {
+fn plugins_info(key: Option<&str>, json: bool) -> ExitCode {
     let Some(key) = key else {
         diag::error(&format!(
             "sbx: usage: {}",
@@ -2192,6 +2310,39 @@ fn plugins_info(key: Option<&str>) -> ExitCode {
         diag::hint("       `sbx plugins list` shows every installed plugin.");
         return ExitCode::FAILURE;
     };
+    if json {
+        // The grant is the reason this verb exists, so it is the part the document carries whole:
+        // what the plugin may run, read, and reach. `state` resolves to the directory the human
+        // line names, because "yes" without the path answers only half the question.
+        let doc = serde_json::json!({
+            "name": p.name,
+            "kind": "resolver",
+            "scheme": p.scheme,
+            "version": p.version,
+            "description": p.description,
+            "exec": p.exec.display().to_string(),
+            "healthy": p.check_exec().is_ok(),
+            "grant": {
+                "network": p.sandbox.network,
+                "state_dir": p.sandbox.state.then(|| {
+                    crate::sandbox::resolver::state_dir(p)
+                        .unwrap_or_default()
+                        .display()
+                        .to_string()
+                }),
+                "programs": p.sandbox.programs,
+                "allow_paths": p.sandbox.allow_paths.iter().map(|x| x.display().to_string()).collect::<Vec<_>>(),
+                "mask_paths": p.sandbox.mask_paths.iter().map(|x| x.display().to_string()).collect::<Vec<_>>(),
+                "allow_env": p.sandbox.allow_env,
+                "allow_env_paths": p.sandbox.allow_env_paths,
+                "brokers": p.sandbox.brokers,
+            },
+        });
+        if let Err(code) = crate::print_json("plugins info", &doc) {
+            return code;
+        }
+        return ExitCode::SUCCESS;
+    }
     let (h, n, err, r) = (pal.head, pal.name, pal.err, pal.reset);
     println!("{h}resolver plugin:{r} {n}{}{r}", p.name);
     println!("  scheme:      {n}{}://{r}", p.scheme);

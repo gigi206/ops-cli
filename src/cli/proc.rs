@@ -273,7 +273,8 @@ fn proc_inject_session(
 /// session-scoped rules loaded with `sbx proc allow|deny --session`, which nothing else surfaces.
 fn proc_rules(args: &[OsString]) -> ExitCode {
     let all = args.iter().any(|a| a.to_str() == Some("--all"));
-    let rest: Vec<OsString> = args
+    let (json, rest) = crate::split_json_flag(args);
+    let rest: Vec<OsString> = rest
         .iter()
         .filter(|a| a.to_str() != Some("--all"))
         .cloned()
@@ -344,6 +345,18 @@ fn proc_rules(args: &[OsString]) -> ExitCode {
             }
         }
     }
+    if json {
+        let out: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(pid, verdict, rule)| {
+                serde_json::json!({ "session_pid": pid, "verdict": verdict, "rule": rule })
+            })
+            .collect();
+        if let Err(code) = crate::print_json("proc rules", &serde_json::json!({ "rules": out })) {
+            return code;
+        }
+        return ExitCode::SUCCESS;
+    }
     if rows.is_empty() {
         println!("no live session rules");
         return ExitCode::SUCCESS;
@@ -374,9 +387,10 @@ fn proc_pending(args: &[OsString]) -> ExitCode {
 
 /// List every parked `execve` across the live observed sessions.
 fn proc_pending_list(args: &[OsString]) -> ExitCode {
+    let (json, rest) = crate::split_json_flag(args);
     // Every argument, not just the flag-shaped ones: a stray positional was silently dropped, so
     // `proc pending <something>` printed the full list and read as if it had been filtered by it.
-    if let Err(code) = crate::cli::reject_extra(&["proc", "pending"], args) {
+    if let Err(code) = crate::cli::reject_extra(&["proc", "pending"], &rest) {
         return code;
     }
     let layout = match layout_or_fail() {
@@ -387,6 +401,30 @@ fn proc_pending_list(args: &[OsString]) -> ExitCode {
         Ok(s) => s,
         Err(code) => return code,
     };
+    if json {
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        for s in &sessions {
+            let socket = sandbox::proc_control::proc_control_socket(layout.data_dir(), s.pid);
+            for p in sandbox::proc_control::read_pending(&socket).unwrap_or_default() {
+                out.push(serde_json::json!({
+                    // The id a `sbx proc pending allow|deny` takes, pre-assembled: a consumer that
+                    // had to join the two numbers itself would be re-deriving a format this
+                    // command owns.
+                    "id": format!("{}.{}", s.pid, p.id),
+                    "session_pid": s.pid,
+                    "notif_id": p.id,
+                    "pid": p.pid,
+                    "waiting_seconds": p.waiting_secs,
+                    "path": p.path,
+                }));
+            }
+        }
+        if let Err(code) = crate::print_json("proc pending", &serde_json::json!({ "parked": out }))
+        {
+            return code;
+        }
+        return ExitCode::SUCCESS;
+    }
     let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
     let (h, dim, r) = (pal.head, pal.dim, pal.reset);
     let mut any = false;
