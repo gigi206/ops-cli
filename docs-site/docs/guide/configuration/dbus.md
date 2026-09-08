@@ -56,7 +56,11 @@ The app probes *that* portal and gets three things:
   never follow a switch, whereas the portal channel re-themes a running app.
 - **Notifications**, a host-side relay bridges `org.freedesktop.Notifications` on the private bus to
   the host notifications daemon, so the app's desktop notifications work end to end (including
-  click-to-focus and dismiss).
+  click-to-focus and dismiss). The relay writes the application name itself, drops an icon or hint
+  that names a host file for the daemon to open, cuts the text to a ceiling, and refuses the two
+  ways of asking that a toast stay on screen until it is clicked away (`urgency = critical` and an
+  expiry of `0`, both of which sbx declines for its own toasts as well). A caged app's ordinary
+  notification is unaffected.
 
 The keyring (`org.freedesktop.secrets`) is **never** exposed: the private bus carries only sbx's own
 portal and relays, and touches no host socket.

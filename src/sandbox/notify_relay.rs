@@ -43,9 +43,16 @@
 //!   ceiling. A size rule there would be wrong rather than merely absent — `image-data` carries a
 //!   notification's icon as raw pixel data, so "large" is what a legitimate hint looks like, and a
 //!   cap would refuse the real case while an attacker moved the same bytes into the next hint name.
-//!   What *is* ruled on is which hints cross at all ([`HOST_PATH_HINTS`]). The trigger to revisit:
-//!   a hint the cage can make the host daemon persist or execute, where the question stops being
-//!   size.
+//!   What *is* ruled on is which hints cross at all ([`HOST_PATH_HINTS`]) and, for one of them,
+//!   which value ([`capped_urgency`]). The trigger to revisit: a hint the cage can make the host
+//!   daemon persist or execute, where the question stops being size.
+//! - **Insistence.** Two fields ask the desktop to keep a toast on screen until a person clicks it
+//!   away: `urgency = critical` and `expire_timeout = 0`. Neither is something sbx sends for its
+//!   own announcements — [`super::notify_sink`] writes the reason, that a toast which must be
+//!   dismissed by hand, repeated, is what makes a person turn notifications off — so neither is
+//!   something a cage may ask for through this relay. The urgency hint is dropped at `critical` and
+//!   `0` becomes the daemon's own default ([`capped_urgency`], [`relayed_expire_timeout`]); a lower
+//!   urgency and a finite lifetime are the ordinary case and cross untouched.
 //! - **Other applications' notifications.** `Notify`'s `replaces_id` and `CloseNotification` are
 //!   checked against the ids the host daemon actually returned for this cage's own calls
 //!   ([`OwnedIds`]), so the cage can neither overwrite nor dismiss a notification it never raised,
@@ -266,6 +273,39 @@ const RELAYED_BY: &str = "sandboxed";
 /// puts an avatar or a cover on its own notification.
 const HOST_PATH_HINTS: &[&str] = &["image-path", "image_path", "sound-file"];
 
+/// `urgency = critical`, the level that pins a toast on screen until it is dismissed by hand.
+///
+/// The same number [`crate::sandbox::notify_sink`] refuses to send for sbx's own announcements, and
+/// for the reason written there: a toast that has to be clicked away, repeated, is what makes a
+/// person turn notifications off altogether. A refusal sbx raises itself is worth seeing and is
+/// still not an emergency, so a toast the *cage* asked for cannot be more insistent than that.
+const URGENCY_CRITICAL: u8 = 2;
+
+/// The hints of a relayed call with `urgency` held to what sbx allows its own toasts.
+///
+/// Only the one hint is touched, and only downwards: `low` and `normal` cross unchanged, and a
+/// value of any other type is left alone because it is not an urgency the daemon will read. The
+/// hint is dropped rather than rewritten when it asks for `critical`, which lands the toast on the
+/// daemon's own default, the same place sbx's announcements sit.
+fn capped_urgency(mut hints: HashMap<String, OwnedValue>) -> HashMap<String, OwnedValue> {
+    let asked: Option<u8> = hints.get("urgency").and_then(|v| v.downcast_ref().ok());
+    if asked.is_some_and(|u| u >= URGENCY_CRITICAL) {
+        hints.remove("urgency");
+    }
+    hints
+}
+
+/// The expiry a relayed notification is forwarded with.
+///
+/// `0` means "never expires" in the specification, which is the other way to pin a toast on screen,
+/// and it arrives from the cage. It becomes `-1`, "let the daemon decide", which is what
+/// [`crate::sandbox::notify_sink`] sends for sbx's own toasts. Every other value is a finite
+/// lifetime the app chose and goes through: a notification that expires on its own is the ordinary
+/// case this exists to keep working.
+fn relayed_expire_timeout(asked: i32) -> i32 {
+    if asked == 0 { -1 } else { asked }
+}
+
 /// The application name a relayed notification is announced under: [`RELAYED_BY`], then whatever the
 /// caged app called itself. The cage writes the tail of the line and can never reach in front of the
 /// head, so no toast the relay forwards presents itself as sbx's own or as another application's.
@@ -396,6 +436,7 @@ impl Served {
         // for what a verbatim `app_name` and a verbatim icon path each buy an agent inside the cage.
         let mut relayed_hints = hints;
         relayed_hints.retain(|hint, _| !HOST_PATH_HINTS.contains(&hint.as_str()));
+        relayed_hints = capped_urgency(relayed_hints);
         let id = self
             .host
             .notify(NotifyCall {
@@ -410,7 +451,7 @@ impl Served {
                     .map(|a| bounded(self.redacted(a), SUMMARY_MAX))
                     .collect(),
                 hints: relayed_hints,
-                expire_timeout,
+                expire_timeout: relayed_expire_timeout(expire_timeout),
             })
             .await
             .map_err(|e| fdo::Error::Failed(format!("forward Notify: {e}")))?;
@@ -994,6 +1035,62 @@ mod tests {
         assert_eq!(
             calls[1].app_icon, "dialog-warning",
             "a bare theme name resolves against the user's own theme and is still forwarded"
+        );
+    }
+
+    /// A caged app cannot ask the desktop for more insistence than sbx asks for itself.
+    ///
+    /// Two fields say "keep this on screen until a person clicks it": `urgency = critical` and
+    /// `expire_timeout = 0`. `notify_sink` sends neither for sbx's own announcements, and writes
+    /// the reason — a toast that has to be dismissed by hand, repeated, is what makes a person
+    /// turn notifications off. Everything else in a relayed call is already bounded; these two
+    /// crossed verbatim, so a cage could pin a toast on the host's screen and repeat it.
+    #[test]
+    fn a_relayed_notification_cannot_outrank_sbxs_own() {
+        let host = FakeHost::default();
+        let served = served(&host);
+
+        let urgency = |level: u8| -> HashMap<String, OwnedValue> {
+            let mut h = HashMap::new();
+            h.insert(
+                "urgency".to_string(),
+                zbus::zvariant::Value::from(level)
+                    .try_into()
+                    .expect("a byte is a hint value"),
+            );
+            h
+        };
+        // Critical is dropped; normal crosses untouched, so the cap is a ceiling and not a purge.
+        notify_as(&served, "Slack", 0, "", urgency(2));
+        notify_as(&served, "Slack", 0, "", urgency(1));
+        // A value of another type is not an urgency the daemon reads, and is left alone.
+        let mut typed = HashMap::new();
+        typed.insert("urgency".to_string(), hint("critical"));
+        notify_as(&served, "Slack", 0, "", typed);
+
+        let calls = locked(&host.calls);
+        assert!(
+            !calls[0].hints.contains_key("urgency"),
+            "a critical urgency must not reach the host daemon: {:?}",
+            calls[0].hints
+        );
+        assert!(
+            calls[1].hints.contains_key("urgency"),
+            "a normal urgency is an ordinary notification and still crosses"
+        );
+        assert!(
+            calls[2].hints.contains_key("urgency"),
+            "a hint of another type is not the urgency the cap is about"
+        );
+        drop(calls);
+
+        // `0` is the specification's "never expires", and becomes the daemon's own default.
+        assert_eq!(relayed_expire_timeout(0), -1);
+        assert_eq!(relayed_expire_timeout(-1), -1);
+        assert_eq!(
+            relayed_expire_timeout(5000),
+            5000,
+            "a finite lifetime the app chose is the ordinary case, and goes through"
         );
     }
 
