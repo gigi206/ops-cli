@@ -390,16 +390,19 @@ impl FakeIps {
     }
 }
 
-/// Where the tap reports the names the cage asked for.
+/// Where the tap reports what it saw: the names the cage asked for, and the connections it refused
+/// for want of one.
 ///
-/// The report goes to the proxy's control socket, so a resolution lands in the same record
-/// `sbx net logs` reads rather than in a second place with its own reader. A report is never a
-/// prerequisite: every failure is swallowed, because a cage whose egress works must not lose it
-/// because a log line could not be delivered.
+/// The report goes to the proxy's control socket, so it lands in the same record `sbx net logs`
+/// reads rather than in a second place with its own reader. A report is never a prerequisite:
+/// every failure is swallowed, because a cage whose egress works must not lose it because a log
+/// line could not be delivered.
 ///
-/// Sent **once per name**, when it is first given an address, not once per query: a build resolving
-/// one host a thousand times leaves one entry, and the question the record answers is "which names
-/// did this cage ask for" rather than "how often".
+/// A resolution is sent **once per name**, when it is first given an address, not once per query: a
+/// build resolving one host a thousand times leaves one entry, and the question the record answers
+/// is "which names did this cage ask for" rather than "how often". A name that fell out of the
+/// table and is asked for again is reported again — the record says what was asked, not what is
+/// currently held.
 #[derive(Debug, Default)]
 pub(crate) struct Reporter {
     control: Option<PathBuf>,
@@ -410,16 +413,28 @@ impl Reporter {
         Self { control }
     }
 
-    /// Report one newly resolved name. Best-effort and non-blocking beyond a short write: the
+    /// Report one newly resolved name.
+    pub(crate) fn resolved(&self, host: &str) {
+        self.send(format!("RESOLVED {host}\n"));
+    }
+
+    /// Report one connection to an address the tap never handed out. The address is sent as its two
+    /// parts rather than as one token, so the control plane can check both against a type instead
+    /// of accepting whatever text arrives.
+    pub(crate) fn bypassed(&self, addr: SocketAddrV4) {
+        self.send(format!("BYPASSED {} {}\n", addr.ip(), addr.port()));
+    }
+
+    /// One line to the control plane. Best-effort and non-blocking beyond a short write: the
     /// control plane answers `ok`, which is not read back, because nothing here would do anything
     /// differently on a refusal.
-    pub(crate) fn resolved(&self, host: &str) {
+    fn send(&self, line: String) {
         let Some(control) = &self.control else {
             return;
         };
         if let Ok(mut sock) = UnixStream::connect(control) {
             let _ = sock.set_write_timeout(Some(REPORT_TIMEOUT));
-            let _ = sock.write_all(format!("RESOLVED {host}\n").as_bytes());
+            let _ = sock.write_all(line.as_bytes());
             let _ = sock.flush();
         }
     }
@@ -694,6 +709,22 @@ impl Capture {
             }
         }
     }
+
+    /// What this outcome adds to the egress record, if anything. Kept next to [`Self::describe`] so
+    /// a new outcome cannot be added without deciding whether the reader is owed a line there.
+    ///
+    /// `Proxied` and `Refused` are the proxy's own decisions and already have one under the
+    /// synthesized `CONNECT`; repeating them would put every connection of a proxy-blind client in
+    /// front of the reader twice, once in each of two places. `Direct` is a connection to the tap's
+    /// own port, which is not egress. `ProxyUnreachable` has no record to add to: the process
+    /// holding it is the one that could not be reached. That leaves the address carrying no name —
+    /// invisible to the proxy because it never reaches it, and the refusal transparent capture
+    /// exists to surface.
+    pub(crate) fn report(&self, reporter: &Reporter) {
+        if let Capture::Unmapped { addr } = self {
+            reporter.bypassed(*addr);
+        }
+    }
 }
 
 /// Serve one captured connection: turn its address back into a name, introduce it to the proxy,
@@ -821,7 +852,7 @@ fn serve(uds: &Path, table: &Arc<Mutex<FakeIps>>, reporter: &Arc<Reporter>) -> i
         let reporter = Arc::clone(reporter);
         std::thread::spawn(move || serve_dns_tcp(&dns_tcp, &table, &reporter));
     }
-    serve_captured(&captured, table, uds);
+    serve_captured(&captured, table, reporter, uds);
     Ok(())
 }
 
@@ -896,7 +927,12 @@ fn serve_dns_stream(
 }
 
 /// The captured-TCP loop.
-fn serve_captured(listener: &TcpListener, table: &Arc<Mutex<FakeIps>>, uds: &Path) {
+fn serve_captured(
+    listener: &TcpListener,
+    table: &Arc<Mutex<FakeIps>>,
+    reporter: &Arc<Reporter>,
+    uds: &Path,
+) {
     let cap = super::conncap::ConnCap::new(MAX_CONCURRENT_CONNS);
     loop {
         let (stream, _) = match listener.accept() {
@@ -924,18 +960,20 @@ fn serve_captured(listener: &TcpListener, table: &Arc<Mutex<FakeIps>>, uds: &Pat
             continue;
         };
         let table = Arc::clone(table);
+        let reporter = Arc::clone(reporter);
         let uds = uds.to_path_buf();
         super::conncap::spawn_conn("net-tap", move || {
             let _slot = slot;
             let outcome = serve_capture(stream, dest, &table, &uds);
-            // Only what the proxy cannot see. A proxied capture already has a line in the egress
-            // record — the synthesized `CONNECT` is an ordinary request there — so repeating it
-            // here would put every connection of a proxy-blind client twice in front of the reader,
-            // once in each of two places. The other three outcomes never reach the proxy at all,
-            // and are the whole reason a refusal is now a line instead of a silent `ENETUNREACH`.
+            // Two audiences. The session's stderr gets everything the proxy cannot see, in the
+            // tap's own words — a proxied capture is left out because the synthesized `CONNECT` is
+            // an ordinary request in the egress record and repeating it here would show every
+            // connection of a proxy-blind client twice. The record itself gets only what
+            // [`Capture::report`] judges it is owed.
             if !matches!(outcome, Capture::Proxied { .. }) {
                 eprintln!("__net-tap: {}", outcome.describe());
             }
+            outcome.report(&reporter);
         });
     }
 }

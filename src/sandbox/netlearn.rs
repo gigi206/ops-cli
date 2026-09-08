@@ -1289,23 +1289,26 @@ mod tests {
         }
     }
 
-    /// A resolution is not a refusal, and `--net-learn` must never turn one into a rule. The tap
-    /// answers **every** name without consulting the allowlist, so learning from these would write
-    /// an allow for each host the cage merely asked about — including the ones it asked about
-    /// precisely because they were not allowed. The gate is the reason, not the verdict, and this
-    /// pins that it holds for the verdict the tap writes.
+    /// Neither of the two events the transparent-capture tap writes may become a rule.
+    ///
+    /// A resolution is not a refusal: the tap answers **every** name without consulting the
+    /// allowlist, so learning from those would write an allow for each host the cage merely asked
+    /// about — including the ones it asked about precisely because they were not allowed. A bypass
+    /// *is* a refusal, but of a connection to a bare address, and an address is not something a
+    /// learned rule may name on the reader's behalf: the remedy is for the client to resolve the
+    /// name. The gate is the reason, not the verdict, and this pins that it holds for both.
     #[test]
-    fn a_resolved_name_is_never_learned_into_the_allowlist() {
-        let ev = LogEvent {
+    fn nothing_the_capture_tap_reports_is_learned_into_the_allowlist() {
+        let tap_event = |host: &str, port: u16, verdict, reason: &str, proto| LogEvent {
             seq: 1,
             at_epoch_ms: 0,
-            host: "exfiltration.test".to_string(),
-            port: 53,
+            host: host.to_string(),
+            port,
             method: None,
             path: None,
-            verdict: LogVerdict::Resolved,
-            reason: "resolved".to_string(),
-            proto: Proto::Dns,
+            verdict,
+            reason: reason.to_string(),
+            proto,
             http_ver: crate::sandbox::control::HttpVer::Unknown,
             rpc: crate::sandbox::control::RpcKind::None,
             muted: false,
@@ -1315,9 +1318,27 @@ mod tests {
             awaiting_capture: false,
             secrets_seen: Vec::new(),
         };
-        assert!(
-            rules(&[ev], Granularity::Domain).is_empty(),
-            "a name the cage merely resolved must never become an allow rule"
-        );
+        for ev in [
+            tap_event(
+                "exfiltration.test",
+                53,
+                LogVerdict::Resolved,
+                "resolved",
+                Proto::Dns,
+            ),
+            tap_event(
+                "93.184.216.34",
+                443,
+                LogVerdict::Blocked,
+                "dns-bypassed",
+                Proto::Tcp,
+            ),
+        ] {
+            let reason = ev.reason.clone();
+            assert!(
+                rules(&[ev], Granularity::Domain).is_empty(),
+                "a `{reason}` event must never become an allow rule"
+            );
+        }
     }
 }

@@ -535,6 +535,11 @@ would stall its siblings), `ssrf-blocked`, `host-mismatch`, `ip-literal`,
 `interim-head-cap`, and `upstream-head-too-large`. A genuine upstream status (a real
 `404`) is relayed verbatim with no such header.
 
+One reason in the log comes from somewhere else: `dns-bypassed` is written by the
+[transparent-capture tap](../configuration/network#clients-that-ignore-the-proxy-variables)
+when a client connects to an address no name was handed out for. It carries no header and
+no status, because that connection is closed before the proxy is dialed.
+
 The statuses behind them: policy and guard refusals are `403` (`denied-*`,
 `outbound-secret`, `ssrf-blocked`, `ip-literal`, `ws-injection-refused`,
 `signer-refused`), a too-large signer body is `413`, the shared ceilings are `503`

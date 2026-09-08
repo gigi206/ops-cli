@@ -235,9 +235,17 @@ follow. `--net-learn` therefore never turns one into a rule.
 Two consequences worth knowing:
 
 - A client that connects to a **literal IP address** (or to one it cached before the cage started)
-  did not ask the tap for it, so the tap has no name to check it against and refuses it, saying so.
-  Allow such a destination the ordinary way (by name) or, for a protocol that cannot be inspected,
-  with a `tcp://` rule.
+  did not ask the tap for it, so the tap has no name to check it against and refuses it. That
+  refusal is a line of its own, because it is the tap's alone: the connection never reaches the
+  proxy, so nothing else in the system can record it.
+
+```
+  3825511  08:18:30  tcp  93.184.216.34:443    blocked  (dns-bypassed)
+```
+
+  The reason is deliberately not the proxy's `ip-literal`, which has a different remedy: that one is
+  lifted by a rule naming the address, and this one cannot be. Allow such a destination the ordinary
+  way (by name) or, for a protocol that cannot be inspected, with a `tcp://` rule.
 - The rules need a kernel that will take them (NAT support, and module loading not locked down) and
   the `nft` command on the host. Where either is missing, launches are unaffected and keep the
   behaviour above: a proxy-blind client fails to connect. Nothing is silently loosened, and

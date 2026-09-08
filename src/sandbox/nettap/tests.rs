@@ -691,6 +691,54 @@ fn a_question_that_gets_no_address_is_not_reported() {
     assert!(lines.recv_timeout(Duration::from_millis(300)).is_err());
 }
 
+/// Exactly one capture outcome is owed a line in the egress record, and this pins which.
+///
+/// The address carrying no name never reaches the proxy — the tap closes it — so the proxy cannot
+/// log it and nothing else in the system sees it. The other four must stay out: two are the proxy's
+/// own decisions and would appear twice, one is a connection to the tap's own port rather than
+/// egress, and the last could not be reported anyway because the process that would take the report
+/// is the one that could not be reached.
+#[test]
+fn only_the_address_with_no_name_is_reported_to_the_record() {
+    let dir = TmpDir::new();
+    let control = dir.join("control.sock");
+    let lines = stand_in_control(&control);
+    let reporter = Reporter::new(Some(control));
+
+    for quiet in [
+        Capture::Proxied {
+            host: "github.com".to_string(),
+            port: 443,
+        },
+        Capture::Refused {
+            host: "github.com".to_string(),
+            port: 443,
+        },
+        Capture::ProxyUnreachable {
+            host: "github.com".to_string(),
+            port: 443,
+        },
+        Capture::Direct { port: TAP_PORT },
+    ] {
+        quiet.report(&reporter);
+        assert!(
+            lines.recv_timeout(Duration::from_millis(300)).is_err(),
+            "{} must not be reported: {}",
+            quiet.describe(),
+            "the proxy already holds it, or there is no record to add to"
+        );
+    }
+
+    Capture::Unmapped {
+        addr: SocketAddrV4::new(Ipv4Addr::new(93, 184, 216, 34), 443),
+    }
+    .report(&reporter);
+    assert_eq!(
+        lines.recv_timeout(Duration::from_secs(5)).expect("reported"),
+        "BYPASSED 93.184.216.34 443"
+    );
+}
+
 /// Reporting is never a prerequisite: a tap wired without a control plane, or pointed at a socket
 /// nothing serves, must answer DNS exactly the same. A cage whose egress works must not lose it
 /// because a log line could not be delivered.

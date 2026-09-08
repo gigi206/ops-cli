@@ -358,7 +358,9 @@ pub(crate) const LOG_RING_CAP: usize = 1000;
 /// a request the policy permitted but that could not complete (DNS failed, the host was unreachable,
 /// its certificate was rejected). Keeping `error` distinct from `blocked` (a *refusal*) is the point:
 /// "allowed but it failed" reads differently from "we said no", which is the question the log exists
-/// to answer.
+/// to answer. It also carries `resolved`, which is outside that taxonomy for a second reason:
+/// `sbx net stats` counts the proxy's decisions and is fed by the proxy alone, and a name the
+/// capture tap answered is not a decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LogVerdict {
     /// The request was permitted and egressed.
@@ -368,7 +370,10 @@ pub(crate) enum LogVerdict {
     /// [`Blocked`](Self::Blocked), not here.)
     Deny,
     /// A security guard or protocol check refused the request (SSRF, host/SNI mismatch, an
-    /// outbound-secret leak, the splice cap, an IP-literal target, a malformed/smuggling request).
+    /// outbound-secret leak, the splice cap, an IP-literal target, a malformed/smuggling request),
+    /// or the transparent-capture tap refused a connection to an address it handed out no name for
+    /// (`dns-bypassed`) — the one refusal here the proxy does not make, because that connection
+    /// never reaches it.
     Blocked,
     /// The request was allowed but did not complete: the name did not resolve, the host was
     /// unreachable, or its certificate was rejected. Not a refusal — a downstream failure.
@@ -410,8 +415,9 @@ impl LogVerdict {
         }
     }
 
-    /// Every verdict, for the round-trip guard. Built by a match on `self` so a new variant fails to
-    /// compile here rather than going missing from the guard that would have caught it.
+    /// Every verdict, for the round-trip guard. The fixed array length is the mechanism: a new
+    /// variant that is not added here does not type-check, and one added here without being added
+    /// to [`Self::assert_all_listed`] does not either — both under `cargo test`, where this lives.
     #[cfg(test)]
     const ALL: [Self; 5] = [
         LogVerdict::Allow,
@@ -1308,6 +1314,12 @@ fn handle(
 /// each) then `ok`; `LOG after=<seq>` returns only events past that cursor. `path` is emitted last on
 /// a `pending`/`event` line so a query string's `=` cannot be mistaken for a field separator (the
 /// reader splits each token on its first `=`).
+///
+/// `RESOLVED <host>` and `BYPASSED <addr> <port>` are the transparent-capture tap's two reports —
+/// the names a cage asked for, and a connection it made to an address no name was handed out for —
+/// and both answer `ok`. They are the only verbs whose argument originates in the cage's own
+/// traffic, which is why each is held to a type or a restricted alphabet before it becomes a
+/// record.
 fn dispatch(
     cmd: &str,
     state: &PendingState,
@@ -1454,6 +1466,36 @@ fn dispatch(
                 LogVerdict::Resolved,
                 "resolved",
                 Proto::Dns,
+                HttpVer::Unknown,
+                RpcKind::None,
+                Plane::Agent,
+            );
+            "ok\n".to_string()
+        }
+        Some("BYPASSED") => {
+            // Machine-checked rather than merely sanitised: this verb carries an address the tap
+            // read off a socket, so anything that does not parse as one is a bad request instead of
+            // a log line. The refusal is the tap's own — the connection never reached the proxy, so
+            // without this the one thing transparent capture makes visible would be visible only in
+            // the session's stderr.
+            let Some(addr) = parts.next().and_then(|a| a.parse::<std::net::Ipv4Addr>().ok()) else {
+                return "err bad-request\n".to_string();
+            };
+            let Some(port) = parts.next().and_then(|p| p.parse::<u16>().ok()) else {
+                return "err bad-request\n".to_string();
+            };
+            log.push(
+                false,
+                &addr.to_string(),
+                port,
+                None,
+                None,
+                LogVerdict::Blocked,
+                // Not the proxy's `ip-literal`, which has a different remedy: that one is admitted
+                // by a rule naming the address, and this one cannot be — the tap has no name to
+                // decide with. A reader who sees this must make the client resolve the name.
+                "dns-bypassed",
+                Proto::Tcp,
                 HttpVer::Unknown,
                 RpcKind::None,
                 Plane::Agent,
@@ -1897,6 +1939,84 @@ mod tests {
             dispatch("RULES", &state, &manual, &log, &flows, None)
                 .contains("manual allow https://api.test:8080"),
             "RULES must list the remembered host:port"
+        );
+    }
+
+    /// The tap's bypass report becomes a row in the record the reader actually consults.
+    ///
+    /// This refusal is the tap's alone: the connection is closed before the proxy is dialed, so no
+    /// other part of the system can write it. Without this verb the one thing transparent capture
+    /// newly makes visible — a client that reached an address without ever asking for a name —
+    /// would appear only in the session's stderr, which is not where a refusal is looked for.
+    #[test]
+    fn dispatch_bypassed_records_the_address_no_name_was_handed_out_for() {
+        let state = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        let log = LogRing::new(LOG_RING_CAP);
+        let flows = FlowRegistry::new();
+
+        assert_eq!(
+            dispatch(
+                "BYPASSED 198.18.0.7 443",
+                &state,
+                &manual,
+                &log,
+                &flows,
+                None
+            ),
+            "ok\n"
+        );
+
+        let out = dispatch("LOG", &state, &manual, &log, &flows, None);
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("event "))
+            .unwrap_or_else(|| panic!("the report left no event: {out}"));
+        let fields: BTreeMap<&str, &str> = line
+            .split_whitespace()
+            .skip(1)
+            .filter_map(|t| t.split_once('='))
+            .collect();
+        assert_eq!(fields.get("host"), Some(&"198.18.0.7"), "{line}");
+        assert_eq!(fields.get("port"), Some(&"443"), "{line}");
+        assert_eq!(fields.get("verdict"), Some(&"blocked"), "{line}");
+        // Not the proxy's `ip-literal`: that refusal is lifted by a rule naming the address, and
+        // this one cannot be, so the reader is owed a different word for a different remedy.
+        assert_eq!(fields.get("reason"), Some(&"dns-bypassed"), "{line}");
+        assert_eq!(fields.get("proto"), Some(&"tcp"), "{line}");
+    }
+
+    /// Held to a type, not merely sanitised. The two tap verbs are the only ones whose argument
+    /// comes from the cage's own traffic, and this one names an address — so anything that is not
+    /// one is a bad request and leaves no row, rather than becoming a record of something the tap
+    /// never saw.
+    #[test]
+    fn dispatch_bypassed_refuses_anything_that_is_not_an_address() {
+        let state = Arc::new(PendingState::new());
+        let manual = Arc::new(ManualRules::new());
+        let log = LogRing::new(LOG_RING_CAP);
+        let flows = FlowRegistry::new();
+
+        for bad in [
+            "BYPASSED",
+            "BYPASSED 198.18.0.7",
+            "BYPASSED example.com 443",
+            "BYPASSED 198.18.0.7 https",
+            "BYPASSED 198.18.0.7 70000",
+            "BYPASSED 198.18.0.7.9 443",
+            // IPv6 has no place here: the tap hands out v4 fake addresses and reads a v4 original
+            // destination, so a v6 report is not something it could have produced.
+            "BYPASSED ::1 443",
+        ] {
+            assert_eq!(
+                dispatch(bad, &state, &manual, &log, &flows, None),
+                "err bad-request\n",
+                "`{bad}` must be refused"
+            );
+        }
+        assert!(
+            !dispatch("LOG", &state, &manual, &log, &flows, None).contains("event "),
+            "a refused report must leave no row"
         );
     }
 
