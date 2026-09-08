@@ -52,8 +52,12 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     // join the global app layer before resolution — `resolve_app`/`resolve_apps` then gate and
     // layer them exactly like an inline global app, with no special casing. They ride the global
     // layer, so a `--local` (project-only) view omits them just as it omits the global config.
+    // Carried out of the branch: a global layer that exists and cannot be read is the one fact a
+    // launch must weigh before standing anything up, and `--local` never reads that layer at all.
+    let mut refused = None;
     let mut global = if source.includes_global() {
-        let mut global = read_global(&mut warnings);
+        let (mut global, why) = read_global(&mut warnings);
+        refused = why;
         let profiles = read_profile_apps(&mut warnings);
         merge_profile_apps(&mut global, profiles, &mut warnings);
         global
@@ -173,6 +177,7 @@ pub(crate) fn load_scoped(cwd: &Path, source: Source) -> Resolved {
     // I/O-level notes (unsafe/unparseable files) come first, then the gating notes.
     warnings.extend(std::mem::take(&mut resolved.warnings));
     resolved.warnings = warnings;
+    resolved.refused = refused;
     resolved
 }
 
@@ -435,18 +440,30 @@ fn ancestors_between(bind: &Path, root: &Path) -> Vec<PathBuf> {
 }
 
 /// Read the global config (trusted by location, so no trust marker), defaulting to
-/// empty when it is absent, unsafe, or unparseable.
-pub(super) fn read_global(warnings: &mut Vec<String>) -> RawConfig {
+/// empty when it is absent.
+///
+/// The second half of the pair is the reason the layer could not be read, when it exists and
+/// could not: the merged `RawConfig` is still the empty default, so every read-only verb keeps
+/// working and can show what it has, while a launch has the fact it needs to refuse rather than
+/// proceed under defaults nobody chose. Absence is not a reason — a machine with no global config
+/// is a configured state, and the two must not look alike.
+pub(super) fn read_global(warnings: &mut Vec<String>) -> (RawConfig, Option<String>) {
     let Some(path) = global_path() else {
-        return RawConfig::default();
+        return (RawConfig::default(), None);
     };
-    let mut global = read_layer(&path, warnings).unwrap_or_default();
+    let (mut global, refused) = match read_layer(&path, warnings) {
+        Ok(layer) => (layer.unwrap_or_default(), None),
+        Err(why) => {
+            warnings.push(format!("ignoring {why}"));
+            (RawConfig::default(), Some(why))
+        }
+    };
     // Here rather than in `load_scoped`, unlike the profile merge: `sbx bundle` and `sbx net
     // groups` read the global layer through this function without going through a resolution, so a
     // merge one level up would leave the inventory verbs describing a config nobody launches.
     let (bundles, groups) = (read_dir_bundles(warnings), read_dir_net_groups(warnings));
     merge_config_dirs(&mut global, bundles, groups, warnings);
-    global
+    (global, refused)
 }
 
 /// The reusable egress groups declared in the global config (`[network.groups]`), as their raw
@@ -457,7 +474,7 @@ pub(super) fn read_global(warnings: &mut Vec<String>) -> RawConfig {
 /// malformed one on its own.
 pub(crate) fn net_groups() -> (BTreeMap<String, Vec<String>>, Vec<String>) {
     let mut warnings = Vec::new();
-    let global = read_global(&mut warnings);
+    let (global, _refused) = read_global(&mut warnings);
     // A name the resolver refuses is withheld here too, with the resolver's own sentence. The
     // listing verbs read this map, and a group whose name no policy will ever accept was shown as
     // defined, answered for by name, and re-exported — while `net rules --expand` and every launch
@@ -480,7 +497,7 @@ pub(crate) fn net_groups() -> (BTreeMap<String, Vec<String>>, Vec<String>) {
 /// `sbx bundle`; each bundle is returned as authored, so the caller displays it as declared.
 pub(crate) fn bundles() -> (BTreeMap<String, RawBundle>, Vec<String>) {
     let mut warnings = Vec::new();
-    let global = read_global(&mut warnings);
+    let (global, _refused) = read_global(&mut warnings);
     // The unknown keys, named here rather than only where an app pulls the bundle in. That fold is
     // the only place they were reported, so a bundle nobody references — one just written, which is
     // when a misspelling is likeliest — was never read by it: `sbx bundle` listed the stray key as
@@ -701,9 +718,16 @@ fn mise_status(
 }
 
 /// Read, safety-gate, and parse a config file with no trust marker (the global
-/// layer). `None` when the file is absent, unsafe, or unparseable — each of the
-/// latter two leaving a warning.
-fn read_layer(path: &Path, warnings: &mut Vec<String>) -> Option<RawConfig> {
+/// layer). `Ok(None)` when the file is absent; `Err` when it exists but cannot be
+/// turned into a layer.
+///
+/// Absence is the only reading that may quietly yield nothing. A file that is there and unusable —
+/// refused by the safety gate, unreadable, or unparseable — is not the same as a machine with no
+/// global config, and answering as though it were hands the launch a posture nobody chose: this is
+/// the layer that carries `[proc]`, `[network]` and `[fs]`, whose built-in defaults are the
+/// permissive end of each. The caller decides what to do with the refusal; the gate's own verdict
+/// (`PermissionDenied`, "refusing to load config") already names why.
+fn read_layer(path: &Path, warnings: &mut Vec<String>) -> Result<Option<RawConfig>, String> {
     match safety::read_safe_bytes(path) {
         Ok(bytes) => {
             let mut dropped = Vec::new();
@@ -711,19 +735,12 @@ fn read_layer(path: &Path, warnings: &mut Vec<String>) -> Option<RawConfig> {
             for d in dropped {
                 warnings.push(format!("{}: {d}", path.display()));
             }
-            match parsed {
-                Ok(cfg) => Some(cfg),
-                Err(e) => {
-                    warnings.push(format!("ignoring {}: {e}", path.display()));
-                    None
-                }
-            }
+            parsed
+                .map(Some)
+                .map_err(|e| format!("{}: {e}", path.display()))
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => {
-            warnings.push(format!("ignoring {e}"));
-            None
-        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -1730,7 +1747,7 @@ pub(crate) fn export_profile(cwd: &Path, name: &str) -> Result<Vec<u8>, String> 
     {
         return schema::serialize_app(&app).map(String::into_bytes);
     }
-    let mut global = read_global(&mut warnings);
+    let (mut global, _refused) = read_global(&mut warnings);
     if let Some(app) = global.app.remove(name) {
         return schema::serialize_app(&app).map(String::into_bytes);
     }
@@ -1744,6 +1761,70 @@ pub(crate) fn export_profile(cwd: &Path, name: &str) -> Result<Vec<u8>, String> 
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
+
+    /// A global config that exists and cannot be read is a refusal, not an empty layer.
+    ///
+    /// The two look alike after the fact — both merge nothing — but they mean opposite
+    /// things. This layer is trusted by location and carries `[proc]`, `[network]` and `[fs]`,
+    /// whose built-in defaults are each the permissive end: `ProcMode::Off` for a file that
+    /// said `enforce`. So the reason is kept and a launch weighs it, while absence stays what
+    /// it is, a configured state. The gate refuses an unreadable file in `PermissionDenied`,
+    /// which is what a file restored under `sudo`, owned by another uid, produces.
+    #[test]
+    fn a_global_config_that_cannot_be_read_is_refused_rather_than_defaulted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = TmpDir::new();
+        let dir = home.path().join("sbx");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(GLOBAL_CONFIG);
+
+        let _lock = crate::testutil::env_lock();
+        let _cfg_home = crate::testutil::EnvVar::set("XDG_CONFIG_HOME", home.path());
+
+        // Absent: nothing to refuse, and no warning invented for a machine without one.
+        let mut warnings = Vec::new();
+        assert!(read_global(&mut warnings).1.is_none(), "{warnings:?}");
+
+        // Present and unreadable: refused, and said out loud.
+        std::fs::write(&path, b"[proc]\nmode = \"enforce\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut warnings = Vec::new();
+        let (cfg, refused) = read_global(&mut warnings);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            refused
+                .as_deref()
+                .is_some_and(|w| w.contains(GLOBAL_CONFIG)),
+            "the refusal names the file, since the launch prints it alone: {refused:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("ignoring")),
+            "the note stays too, for the read-only verbs: {warnings:?}"
+        );
+        assert!(
+            cfg.proc.is_none(),
+            "the merged layer is still the empty default, so read-only verbs keep working"
+        );
+
+        // Unparseable: the same refusal — a layer that cannot be parsed was never applied either.
+        std::fs::write(&path, b"[proc\nmode = \"enforce\"\n").unwrap();
+        let mut warnings = Vec::new();
+        let unparseable = read_global(&mut warnings).1;
+        assert!(
+            unparseable
+                .as_deref()
+                .is_some_and(|w| w.contains(GLOBAL_CONFIG)),
+            "an unparseable global layer is refused too, and named: {unparseable:?}"
+        );
+
+        // Readable and valid: no refusal, and the layer is actually applied.
+        std::fs::write(&path, b"[proc]\nmode = \"enforce\"\n").unwrap();
+        let mut warnings = Vec::new();
+        let (cfg, refused) = read_global(&mut warnings);
+        assert!(refused.is_none(), "{warnings:?}");
+        assert!(cfg.proc.is_some(), "the posture the file names is read");
+    }
 
     /// A bundle carrying one package, one env var and one allow entry, keyed by a marker so an
     /// assertion can tell which bundle a value came from.

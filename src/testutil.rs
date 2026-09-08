@@ -359,6 +359,7 @@ pub(crate) fn resolved(
         declared_secrets: vec![],
         apps: apps.into_iter().map(|(n, a)| (n.to_string(), a)).collect(),
         warnings: vec![],
+        refused: None,
     }
 }
 

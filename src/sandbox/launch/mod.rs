@@ -927,6 +927,22 @@ fn prepare_config(cwd: PathBuf, ov: &crate::config::Override) -> Result<Prepared
     // bundled features, materializes) the engines it owns, so `resolve_bwrap` needs it.
     let layout = crate::layout_or_fail()?;
     let mut cfg = crate::config::load(&cwd);
+    // Before anything is stood up: a global config that exists and cannot be read is refused
+    // rather than defaulted through. That layer is where `[proc]`, `[network]` and `[fs]` are
+    // trusted by location, and the built-in default of each is the permissive end — so falling
+    // back would run the cage under a posture nobody chose, announced by one warning among many.
+    // Only a launch refuses; `sbx config show` and the other read-only verbs still report, since
+    // the command that diagnoses this must not be the one it disables.
+    if let Some(why) = &cfg.refused {
+        crate::diag::error(&format!(
+            "sbx: the global config exists but cannot be read: {why}"
+        ));
+        crate::diag::hint(
+            "       a launch is refused rather than run under the built-in defaults; \
+             fix the file or move it aside.",
+        );
+        return Err(ExitCode::from(2));
+    }
     // The override's nixpkgs channel must land before the lock target is chosen. A set-but-invalid
     // channel is a hard error (no safe baseline fallback for a supply-chain field).
     if let Err(e) = cfg.apply_override_channel(ov) {

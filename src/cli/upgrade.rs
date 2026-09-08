@@ -2600,6 +2600,7 @@ mod tests {
             declared_secrets: vec![],
             apps: std::collections::BTreeMap::new(),
             warnings: vec![],
+            refused: None,
         };
 
         let data = TmpDir::new();
