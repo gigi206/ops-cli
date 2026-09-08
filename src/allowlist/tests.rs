@@ -2666,3 +2666,35 @@ fn a_regex_rule_anchored_on_a_non_https_scheme_is_refused() {
     // A pattern merely *containing* a scheme is not anchored on one and is left alone.
     assert!(classify("re:redirect=http://internal").is_ok());
 }
+
+/// Every producer that composes a `host:port` owes the same answer, so the answer is pinned here.
+///
+/// `::1` written beside a port reads as the host `::` on port `1` — a different address. That
+/// matters because the compositions are not decorative: a refusal's suggested rule, a notification,
+/// a candidate net-learn record and a broker's admission warning all hand the reader a rule to copy,
+/// and one composed without brackets admits something other than what was refused. The function
+/// exists to be the single spelling of that; without a test, a "simplification" to `format!` reads
+/// as equivalent.
+#[test]
+fn a_host_is_bracketed_for_display_exactly_when_a_port_would_be_ambiguous() {
+    // An IPv6 literal is bracketed — the case the rule text depends on.
+    assert_eq!(crate::allowlist::display_host("::1"), "[::1]");
+    assert_eq!(
+        crate::allowlist::display_host("2001:db8::1"),
+        "[2001:db8::1]"
+    );
+    // Anything a colon cannot split is left exactly as it was.
+    assert_eq!(crate::allowlist::display_host("10.0.0.1"), "10.0.0.1");
+    assert_eq!(crate::allowlist::display_host("db.internal"), "db.internal");
+    // Already bracketed stays as it is, so composing twice is not composing differently.
+    assert_eq!(crate::allowlist::display_host("[::1]"), "[::1]");
+
+    // And the composed form round-trips through the rule grammar, which is the property the
+    // producers actually rely on: what is offered can be pasted back in.
+    let composed = format!("tcp://{}:5432", crate::allowlist::display_host("::1"));
+    assert_eq!(composed, "tcp://[::1]:5432");
+    assert_eq!(
+        crate::allowlist::parse_tcp_target(&composed).unwrap(),
+        ("::1".to_string(), 5432)
+    );
+}
