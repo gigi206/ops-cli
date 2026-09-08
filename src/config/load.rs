@@ -1127,6 +1127,25 @@ fn read_profile_apps(warnings: &mut Vec<String>) -> BTreeMap<String, RawApp> {
     }
 }
 
+/// The imported app profiles that name `bundle` in their `use`, sorted.
+///
+/// Asked by `sbx bundle rm`, so a removal can say which apps it is about to leave naming a bundle
+/// that no longer exists. The load already warns about such a `use` ("uses bundle `x`, which is not
+/// declared"), but it warns at the *next launch*: this answers the same question at the moment the
+/// file goes away, which is when the user can still decide otherwise.
+///
+/// Only the global profiles are read, and that is the honest limit: a bundle is global, but a
+/// project's own `.sbx.toml` may name one in an `[app.<name>] use` too, and there is no register of
+/// every project on the machine to consult. A caller must not phrase the answer as exhaustive.
+pub(crate) fn apps_using_bundle(bundle: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
+    read_profile_apps(&mut warnings)
+        .into_iter()
+        .filter(|(_, app)| app.uses.iter().any(|u| u == bundle))
+        .map(|(name, _)| name)
+        .collect()
+}
+
 /// Read every `<name>.toml` profile under `dir`, keyed by its filename stem (the app name). Each
 /// file is a standalone top-level [`schema::RawApp`], trusted by location. Infallible, like the
 /// rest of [`mod@load`]: an absent directory yields nothing; an unsafe, unparseable, or

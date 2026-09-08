@@ -5657,3 +5657,72 @@ fn the_resolved_dump_is_stable_across_runs_and_moves_when_the_config_does() {
     assert_ne!(a, c, "a changed config must change the dump");
     assert!(c.contains("other.key"), "and it must carry the change: {c}");
 }
+
+#[test]
+fn bundle_rm_deletes_the_file_and_is_the_inverse_of_import() {
+    let p = Project::new("brm");
+    p.write_bundle("demo", "[packages]\njq = \"nix:jq\"\n");
+    assert!(p.bundle_path("demo").exists());
+
+    let out = p.run(&["bundle", "rm", "demo"]);
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stdout.contains("demo"),
+        "it names what it removed: {stdout}"
+    );
+    assert!(!p.bundle_path("demo").exists(), "the file must be gone");
+
+    // And the listing agrees, which is the half that would still pass if `rm` had written
+    // somewhere else entirely.
+    let listed = p.run(&["bundle"]);
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(!listed.contains("demo"), "still listed: {listed}");
+}
+
+#[test]
+fn bundle_rm_names_the_app_profiles_that_still_use_it() {
+    // The removal is allowed — the config it leaves is valid and a launch warns about the dangling
+    // `use` on its own — but it is said here, while the user can still change their mind.
+    let p = Project::new("brm");
+    p.write_bundle("demo", "[packages]\njq = \"nix:jq\"\n");
+    p.write_profile("user", "cmd = [\"true\"]\nuse = [\"demo\"]\n");
+    p.write_profile("other", "cmd = [\"true\"]\n");
+
+    let out = p.run(&["bundle", "rm", "demo"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "the removal is not refused");
+    assert!(stderr.contains("user"), "it names the user: {stderr}");
+    assert!(
+        !stderr.contains("other"),
+        "and only the ones that name it: {stderr}"
+    );
+    assert!(!p.bundle_path("demo").exists());
+}
+
+#[test]
+fn bundle_rm_refuses_an_absent_name_and_a_bad_one() {
+    let p = Project::new("brm");
+    // Absent: an error, never a silent success — otherwise a typo reads as a removal.
+    let out = p.run(&["bundle", "rm", "nope"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("no bundle"), "stderr: {stderr}");
+
+    // A name that could not key a file is refused before anything is touched.
+    let out = p.run(&["bundle", "rm", "../escape"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("not a valid bundle name"),
+        "stderr: {stderr}"
+    );
+
+    // No name at all prints the usage rather than removing everything.
+    let out = p.run(&["bundle", "rm"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("usage"));
+}

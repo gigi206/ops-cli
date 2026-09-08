@@ -1,5 +1,5 @@
 ---
-description: "List, export and import the reusable tool bundles an app names with `use`."
+description: "List, export, import and remove the reusable tool bundles an app names with `use`."
 ---
 
 # `sbx bundle`
@@ -8,6 +8,7 @@ description: "List, export and import the reusable tool bundles an app names wit
 sbx bundle [<name>...] [--json]
 sbx bundle export [<name>...] [-o|--out <file>] [--out-dir <dir>]
 sbx bundle import <file> [--as <name>] [-f|--force]
+sbx bundle rm <name>...
 ```
 
 The reusable-tool-bundle surface. Host-side: no launch, no nix, and read-only except
@@ -28,6 +29,7 @@ See also: [Tool bundles](../configuration/bundles) · [Apps](../configuration/ap
 | [(none)](#sbx-bundle-1) | list every bundle, or show named ones in full |
 | [`export`](#sbx-bundle-export) | write bundles out as portable files |
 | [`import`](#sbx-bundle-import) | file a bundle under `bundles/<name>.toml` |
+| [`rm`](#sbx-bundle-rm) | delete `bundles/<name>.toml` |
 
 ## `sbx bundle`
 
@@ -117,6 +119,39 @@ in `use`.
 An app *profile* is a different artifact: import that with
 [`sbx app import`](app); the error message says so if you mix them up.
 
+## `sbx bundle rm`
+
+```
+sbx bundle rm <name>...
+```
+
+Delete `bundles/<name>.toml`, the removal half of the cycle `import` opens. A bundle is one entry
+in one file named by that file, so removing the bundle is removing the file, and nothing is left
+behind to reclaim.
+
+```sh
+sbx bundle rm demo
+sbx bundle rm demo other      # several at once
+```
+
+There is no `--purge`/`--gc` pair here, unlike [`sbx app rm`](app#sbx-app-rm), and the difference
+is structural. An app owns runtime state: a home, and the tools its backends installed into it. A
+bundle owns none: it is a declaration that contributes packages, environment and rules to the apps
+that name it. Whatever those apps provisioned belongs to **them**, and is reclaimed with
+[`sbx app rm --purge`](app#sbx-app-rm) or [`sbx gc`](gc).
+
+An app profile that still names the bundle in `use` is **reported, not refused**. The config left
+behind is valid, and a launch already warns about a `use` naming a bundle that is not declared;
+saying it at the moment of removal says it while the decision can still be changed:
+
+```
+removed bundle 'demo'
+sbx: warning: app profile(s) still name `demo` in `use`: claude-code
+```
+
+Only the global app profiles are searched. A project's own `[app.<name>] use` is not, since there
+is no register of every project on the machine.
+
 ## Examples
 
 The full round trip: inspect what a bundle would bring in, use it from an app, then
@@ -161,5 +196,5 @@ is the moment to run `sbx bundle <name>` before wiring it into an app.
 | Code | Meaning |
 |---|---|
 | 0 | success |
-| 1 | the write failed, or there was nothing to export |
+| 1 | the write failed, there was nothing to export, or `rm` found no such bundle |
 | 2 | usage error, an unknown bundle name, an invalid name, or a file that is not a bundle |

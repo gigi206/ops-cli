@@ -25,7 +25,102 @@ pub(crate) fn bundle_cmd(args: &[OsString]) -> ExitCode {
     match args.first().and_then(|a| a.to_str()) {
         Some("export") => bundle_export(&args[1..]),
         Some("import") => bundle_import(&args[1..]),
+        Some("rm") => bundle_rm(&args[1..]),
         _ => bundle_list(args),
+    }
+}
+
+/// `sbx bundle rm <name>...`: delete one or more bundle files from the global config.
+///
+/// The removal half of the cycle `import` opens: a bundle is one file named by that file, so
+/// removing it is removing that file, and there is nothing else to reclaim. Unlike `sbx app rm`
+/// there is no `--purge`/`--gc` pair, and the reason is structural
+/// rather than an omission: an app owns runtime state (a home, the tools its backends installed),
+/// while a bundle is a declaration that contributes packages and rules to the apps that name it.
+/// Whatever those apps provisioned belongs to them and is reclaimed by `sbx app rm --purge` or
+/// `sbx gc`, never by this.
+///
+/// An app still naming the bundle in `use` is reported rather than refused, because the removal is
+/// the user's stated intent and the config it leaves is valid: the next launch warns about the
+/// dangling `use` on its own. Saying it here is saying it while they can still change their mind.
+fn bundle_rm(args: &[OsString]) -> ExitCode {
+    let mut names: Vec<&str> = Vec::new();
+    for arg in args {
+        match arg.to_str() {
+            Some(s) if s.starts_with('-') => {
+                diag::error(&format!("sbx: bundle rm: unknown option `{s}`"));
+                diag::error(&format!(
+                    "sbx: usage: {}",
+                    help::synopsis_of(&["bundle", "rm"])
+                ));
+                return ExitCode::from(2);
+            }
+            Some(s) => names.push(s),
+            None => {
+                diag::error("sbx: bundle rm: a bundle name must be valid UTF-8");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if names.is_empty() {
+        diag::error(&format!(
+            "sbx: usage: {}",
+            help::synopsis_of(&["bundle", "rm"])
+        ));
+        return ExitCode::from(2);
+    }
+    for name in &names {
+        if !config::is_valid_bundle_name(name) {
+            diag::error(&format!("sbx: '{name}' is not a valid bundle name"));
+            return ExitCode::from(2);
+        }
+    }
+    crate::cli::dedupe_names(&mut names);
+
+    let Some(dir) = config::bundles_dir() else {
+        diag::error("sbx: cannot locate the config directory (set $HOME or $XDG_CONFIG_HOME)");
+        return ExitCode::FAILURE;
+    };
+    let pal = style::Palette::for_stream(std::io::stdout().is_terminal());
+    let mut had_error = false;
+    for name in &names {
+        // Asked BEFORE the file goes away: the answer is read out of the profiles, and a reader
+        // would still get it afterwards, but naming the apps in the same breath as the removal is
+        // the point of saying it at all.
+        let users = config::apps_using_bundle(name);
+        let path = dir.join(format!("{name}.toml"));
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                println!(
+                    "{}",
+                    crate::cli::confirm::render_removed(Some("bundle"), name, &pal)
+                );
+                if !users.is_empty() {
+                    diag::warn(&format!(
+                        "app profile(s) still name `{name}` in `use`: {} — each will warn at its \
+                         next launch that the bundle is not declared. A project's own \
+                         `[app.<name>] use` is not searched here.",
+                        users.join(", ")
+                    ));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                diag::error(&format!(
+                    "sbx: no bundle '{name}' (a bundle lives as a file under \
+                     bundles/<name>.toml; `sbx bundle` lists the declared ones)"
+                ));
+                had_error = true;
+            }
+            Err(e) => {
+                diag::error(&format!("sbx: cannot remove {}: {e}", path.display()));
+                had_error = true;
+            }
+        }
+    }
+    if had_error {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 

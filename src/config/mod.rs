@@ -34,10 +34,10 @@ pub(crate) use types::*;
 pub(crate) use apps::{AppHomeScope, ResolvedApp, is_valid_app_name};
 pub(crate) use gate::{is_trust_drop, untrusted_reason};
 pub(crate) use load::{
-    Source, bundles, bundles_dir, control_plane_pins, export_profile, is_valid_bundle_name, load,
-    load_scoped, net_groups, net_groups_dir, profile_path, profiles_dir, read_bundle_fragment,
-    read_net_groups_fragment, sbx_control_plane_roots, validate_bundle, validate_group_file,
-    validate_profile,
+    Source, apps_using_bundle, bundles, bundles_dir, control_plane_pins, export_profile,
+    is_valid_bundle_name, load, load_scoped, net_groups, net_groups_dir, profile_path,
+    profiles_dir, read_bundle_fragment, read_net_groups_fragment, sbx_control_plane_roots,
+    validate_bundle, validate_group_file, validate_profile,
 };
 pub(crate) use overrides::{CliOverrides, Override};
 /// The command form a bundle's install step is written in. Named here only where a test
